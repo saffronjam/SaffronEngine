@@ -12,7 +12,7 @@ Image-based lighting is the ambient, indirect term of the lighting model, where 
 
 | Page | Covers | Code |
 |---|---|---|
-| `ibl-overview` | the split-sum approximation, diffuse + specular, when it replaces flat ambient | `lighting.slang` · ambient block |
+| `ibl-overview` | the split-sum approximation, diffuse + specular, DDGI replacing the IBL diffuse by coverage, [SDF reflection occlusion](../global-illumination-and-raytracing/distance-field-reflection-occlusion/) on the specular | `lighting.slang` · ambient block, `specSkyVis` |
 | `cubemaps-and-mips` | `CUBE_COMPATIBLE` images, 6 layers, mip chains, dual views | `ibl.rs` · `IblCube` |
 | `procedural-sky` | the analytic sky baked once (zenith/horizon gradient + sun disk) | `ibl_skygen.slang` |
 | `procedural-atmosphere` | a Hillaire-2020 LUT chain that fills the env cube as a richer source than the gradient | `atmos_*.slang` · `Ibl::record_atmosphere` |
