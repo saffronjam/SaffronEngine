@@ -396,6 +396,9 @@ pub struct RenderStatsDto {
     /// The active view's dynamic-resolution factor (`(0, 1]`; `1.0` = native). The frame-budget
     /// controller lowers it below the `Low` tier floor to hold the budget; the present blit upscales.
     pub render_scale: f32,
+    /// Whether the Global SDF reflection-occlusion cone is occluding the reflected skybox
+    /// (specular only; indirect diffuse occlusion is DDGI ray-miss + contact GTAO).
+    pub sky_occlusion: bool,
     /// The active render-quality tier (`low`/`medium`/`high`/`ultra`/`custom`) — the knob the
     /// `ssao`/`contact_shadows`/`ssgi` flags above derive from.
     pub quality: String,
@@ -410,6 +413,9 @@ pub struct RenderStatsDto {
     /// The editor viewport power state (`focused`/`unfocused`/`occluded`).
     pub power_state: String,
     pub ddgi: bool,
+    /// Whether the Global Distance Field (the camera-centered cascade clipmap) backs the far-field
+    /// cone-march tap.
+    pub gdf: bool,
     pub rt_supported: bool,
     pub rt_shadows: bool,
     pub restir: bool,
@@ -1092,6 +1098,21 @@ pub struct SetClusteredResult {
 #[ts(export)]
 pub struct SetIblResult {
     pub ibl: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetSkyOcclusionResult {
+    pub sky_occlusion: bool,
+}
+
+/// Result of `set-gdf`: the resolved Global-Distance-Field enable state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetGdfResult {
+    pub gdf: bool,
 }
 
 /// Params for `set-render-quality`: the tier name (`low`/`medium`/`high`/`ultra`/`custom`) — the
