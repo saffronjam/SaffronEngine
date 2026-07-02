@@ -51,6 +51,62 @@ pub fn ray_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
     Some(t)
 }
 
+/// The point on triangle `(a, b, c)` closest to `p` (Ericson, *Real-Time Collision
+/// Detection* §5.1.5): test `p` against the three vertex Voronoi regions, the three
+/// edge regions, then the interior, returning the first that contains the projection.
+///
+/// Used by the SDF bake's nearest-distance query; the unsigned distance is
+/// `(closest - p).length()`.
+pub fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a; // vertex region A
+    }
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b; // vertex region B
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return a + ab * v; // edge AB
+    }
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c; // vertex region C
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return a + ac * w; // edge AC
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + (c - b) * w; // edge BC
+    }
+    // Interior: barycentric combination of the three edge weights.
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    a + ab * v + ac * w
+}
+
+/// The squared distance from `p` to the axis-aligned box `[lo, hi]`, `0` when `p` is
+/// inside. The BVH nearest-distance descent uses it as a node lower bound.
+fn aabb_distance_sq(p: Vec3, lo: Vec3, hi: Vec3) -> f32 {
+    let d = (lo - p).max(Vec3::ZERO).max(p - hi);
+    d.dot(d)
+}
+
 /// Ray-AABB slab intersection.
 ///
 /// Returns `Some((t_enter, t_exit))` when the ray hits the box, or `None` for a
@@ -168,6 +224,11 @@ pub struct MeshBvh {
     nodes: Vec<BvhNode>,
     /// Triangle vertices, reordered by the build so each leaf names a contiguous range.
     tris: Vec<[Vec3; 3]>,
+    /// Orientation of the triangle winding: `+1` when `cross(b-a, c-a)` points outward
+    /// (the signed mesh volume is positive), `-1` when the mesh is wound inward. Multiplied
+    /// into the [`nearest_signed_distance`](Self::nearest_signed_distance) sign so the field
+    /// is negative inside regardless of which way the source happens to wind its faces.
+    winding: f32,
 }
 
 impl MeshBvh {
@@ -180,17 +241,119 @@ impl MeshBvh {
             let a = *positions.get(tri[0] as usize)?;
             let b = *positions.get(tri[1] as usize)?;
             let c = *positions.get(tri[2] as usize)?;
-            tris.push([a, b, c]);
+            // Drop degenerate (zero-area / sliver) triangles: they carry no surface, are
+            // never a ray hit, and their unstable normal would poison the signed-distance
+            // pseudonormal. `sin²θ < 1e-10` between the two edges ⇒ collinear (scale-free).
+            let (e1, e2) = (b - a, c - a);
+            let cross = e1.cross(e2);
+            if cross.length_squared() > 1e-10 * e1.length_squared() * e2.length_squared() {
+                tris.push([a, b, c]);
+            }
         }
         if tris.is_empty() {
             return None;
         }
+        // Signed volume (divergence theorem, ×6): positive when the faces are wound so
+        // `cross(b-a, c-a)` points outward. Its sign orients the pseudonormal so an
+        // inward-wound source still signs as negative inside.
+        let vol6: f32 = tris.iter().map(|t| t[0].dot(t[1].cross(t[2]))).sum();
+        let winding = if vol6 >= 0.0 { 1.0 } else { -1.0 };
         let centroids: Vec<Vec3> = tris.iter().map(|t| (t[0] + t[1] + t[2]) / 3.0).collect();
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
         let mut nodes: Vec<BvhNode> = Vec::new();
         build_node(&mut nodes, &tris, &centroids, &mut order, 0, tris.len());
         let tris = order.iter().map(|&i| tris[i as usize]).collect();
-        Some(MeshBvh { nodes, tris })
+        Some(MeshBvh {
+            nodes,
+            tris,
+            winding,
+        })
+    }
+
+    /// The signed distance from `point` to the nearest triangle, found by a
+    /// distance-bounded BVH descent (a box farther than the running best is pruned, its
+    /// children visited near-first). `point` is in the BVH's build space (mesh-local).
+    ///
+    /// The magnitude is the unsigned nearest-surface distance; the sign comes from the
+    /// **angle-weighted pseudonormal** at the closest point — the summed unit normals of
+    /// every triangle that shares that closest feature (Bærentzen & Aanæs). `point` is
+    /// behind the surface (negative) when `dot(point - closestPoint, pseudonormal) < 0`.
+    /// Summing the incident faces (not one triangle's normal) is what makes the sign
+    /// correct at an edge or corner, where a single face normal can point the wrong way.
+    /// For a watertight mesh this is the usual inside/outside SDF sign; for a
+    /// non-watertight mesh it reads as "which side of the nearest surface", the sensible
+    /// value for an occlusion field (and far cheaper + more robust than ray-stab parity).
+    /// Returns `+∞` for an empty hierarchy.
+    #[must_use]
+    pub fn nearest_signed_distance(&self, point: Vec3) -> f32 {
+        if self.nodes.is_empty() {
+            return f32::INFINITY;
+        }
+        let mut best = f32::INFINITY;
+        let mut best_point = point;
+        // Summed unit normals of the triangles incident to the closest feature.
+        let mut normal_sum = Vec3::Y;
+        // (node index, lower-bound squared distance from `point` to the node's box).
+        let mut stack: Vec<(u32, f32)> = vec![(0, 0.0)];
+        while let Some((idx, lower)) = stack.pop() {
+            // Keep boxes that could still tie the closest distance (`lower <= best`).
+            if lower > best {
+                continue;
+            }
+            let node = self.nodes[idx as usize];
+            if node.count > 0 {
+                for tri in &self.tris[node.first as usize..(node.first + node.count) as usize] {
+                    let cp = closest_point_on_triangle(point, tri[0], tri[1], tri[2]);
+                    let d = cp.distance_squared(point);
+                    let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+                    // A relative epsilon on the squared distance gathers triangles that
+                    // meet at the same vertex/edge (their closest point is that shared
+                    // feature), summing their normals into the pseudonormal.
+                    let tie = 1e-5 * best.max(1.0);
+                    if d < best - tie {
+                        best = d;
+                        best_point = cp;
+                        normal_sum = n;
+                    } else if d <= best + tie
+                        && cp.distance_squared(best_point) <= 1e-6 * best.max(1.0)
+                    {
+                        normal_sum += n;
+                        if d < best {
+                            best = d;
+                            best_point = cp;
+                        }
+                    }
+                }
+            } else {
+                // Push both children with their box lower bounds; visit the nearer last so
+                // it pops first and tightens `best` before the farther child is reached.
+                let l = node.first;
+                let r = node.right;
+                let dl = aabb_distance_sq(
+                    point,
+                    self.nodes[l as usize].min,
+                    self.nodes[l as usize].max,
+                );
+                let dr = aabb_distance_sq(
+                    point,
+                    self.nodes[r as usize].min,
+                    self.nodes[r as usize].max,
+                );
+                if dl <= dr {
+                    stack.push((l, dl));
+                    stack.push((r, dr));
+                } else {
+                    stack.push((r, dr));
+                    stack.push((l, dl));
+                }
+            }
+        }
+        let dist = best.sqrt();
+        if (point - best_point).dot(normal_sum) * self.winding < 0.0 {
+            -dist
+        } else {
+            dist
+        }
     }
 
     /// The nearest forward triangle hit along `ray`, as the ray parameter `t` (the hit point is
@@ -600,7 +763,10 @@ mod tests {
             origin: Vec3::new(-5.0, -5.0, 100.0),
             dir: DOWN,
         };
-        assert_eq!(bvh.raycast(&miss), brute_nearest(&miss, &positions, &indices));
+        assert_eq!(
+            bvh.raycast(&miss),
+            brute_nearest(&miss, &positions, &indices)
+        );
     }
 
     /// An empty (or index-degenerate) mesh has no BVH — "nothing to pick".
