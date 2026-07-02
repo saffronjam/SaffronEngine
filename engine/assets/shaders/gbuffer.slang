@@ -1,7 +1,9 @@
 // Thin G-buffer prepass for screen-space AO: renders view-space normal (rgb) + view-space
-// Z (a, negative) into one rgba16f target, and lays down depth. Instanced like the mesh /
-// depth-prepass (set 2 = per-instance data); the push constant carries viewProj (clip) +
-// view (to take positions/normals into view space).
+// Z (a, negative) into an rgba16f target and per-instance roughness into a second R8 target,
+// and lays down depth. Instanced like the mesh / depth-prepass (set 2 = per-instance data);
+// the push constant carries viewProj (clip) + view (to take positions/normals into view space).
+// The roughness target feeds the specular-occlusion prepass (`specocc.slang`), whose reflection
+// cone widens with roughness.
 
 struct Instance
 {
@@ -34,6 +36,7 @@ struct VertexOutput
     float4 position : SV_Position;
     float3 viewNormal : NORMAL;
     float viewZ : TEXCOORD0;
+    float roughness : TEXCOORD1;
 };
 
 [shader("vertex")]
@@ -47,11 +50,22 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
     float3 worldNormal = mul((float3x3)inst.normalMatrix, input.normal);
     output.viewNormal = mul((float3x3)pc.view, worldNormal);
     output.viewZ = viewPos.z;
+    output.roughness = inst.pbr.y;
     return output;
 }
 
-[shader("fragment")]
-float4 fragmentMain(VertexOutput input) : SV_Target
+// Two MRT targets: view normal + view-Z (rgba16f) and per-instance roughness (R8).
+struct GbufferOut
 {
-    return float4(normalize(input.viewNormal), input.viewZ);
+    float4 normalZ : SV_Target0;
+    float roughness : SV_Target1;
+};
+
+[shader("fragment")]
+GbufferOut fragmentMain(VertexOutput input)
+{
+    GbufferOut o;
+    o.normalZ = float4(normalize(input.viewNormal), input.viewZ);
+    o.roughness = input.roughness;
+    return o;
 }
