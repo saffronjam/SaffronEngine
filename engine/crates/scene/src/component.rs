@@ -614,6 +614,9 @@ pub struct Material {
     pub alpha_clip: bool,
     /// Alpha-clip cutoff.
     pub alpha_cutoff: f32,
+    /// Two-sided (glTF `doubleSided`): render both faces — the scene pass disables backface
+    /// culling for this material so thin geometry (curtains, foliage) shows from both sides.
+    pub double_sided: bool,
 }
 
 impl Default for Material {
@@ -637,6 +640,7 @@ impl Default for Material {
             height_scale: 0.05,
             alpha_clip: false,
             alpha_cutoff: 0.5,
+            double_sided: false,
         }
     }
 }
@@ -680,6 +684,9 @@ pub struct MaterialSlot {
     pub alpha_clip: bool,
     /// Alpha-clip cutoff.
     pub alpha_cutoff: f32,
+    /// Two-sided (glTF `doubleSided`): render both faces — the scene pass disables backface
+    /// culling for this slot so thin geometry (curtains, foliage) shows from both sides.
+    pub double_sided: bool,
 }
 
 impl Default for MaterialSlot {
@@ -703,6 +710,7 @@ impl Default for MaterialSlot {
             height_scale: 0.05,
             alpha_clip: false,
             alpha_cutoff: 0.5,
+            double_sided: false,
         }
     }
 }
