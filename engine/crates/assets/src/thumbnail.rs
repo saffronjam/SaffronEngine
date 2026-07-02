@@ -422,7 +422,7 @@ fn generate_thumbnail(
                 load_mesh_from_bytes(bytes)?
             };
             let mesh_ref = gpu
-                .upload_mesh(&mesh, &[], None)
+                .upload_mesh(&mesh, &[], None, None)
                 .map_err(|e| Error::Thumbnail(e.to_string()))?;
             mesh_out.push((job.id, Arc::clone(&mesh_ref)));
             Ok(gpu
@@ -473,7 +473,7 @@ fn generate_thumbnail(
             }
             let mesh = merge_model_meshes(&chunks);
             let mesh_ref = gpu
-                .upload_mesh(&mesh, &[], None)
+                .upload_mesh(&mesh, &[], None, None)
                 .map_err(|e| Error::Thumbnail(e.to_string()))?;
             Ok(gpu
                 .encode_model_thumbnail_png(&mesh_ref, &submesh_materials, job.size)
@@ -1271,9 +1271,11 @@ mod tests {
             mesh: &Mesh,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
+            sdf_bake: Option<&saffron_rendering::SdfBake>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
             self.mesh_uploads.fetch_add(1, Ordering::SeqCst);
-            self.uploader.upload_mesh(mesh, skin, morph)
+            self.uploader
+                .upload_mesh(&self.descriptors, mesh, skin, morph, sdf_bake)
         }
 
         fn upload_texture(
