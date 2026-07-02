@@ -62,6 +62,13 @@ per frame: over ~20 frames the volume converges to a smooth, many-sample result.
 after enable or resize, the blend push's history-reset flag forces $\alpha = 0$ so no stale history
 blends in.
 
+Because the cage is a [camera-centered clipmap](../probe-volume-and-sampling/), the blend also forces
+$\alpha = 0$ **per probe** for a tile that scrolled into the volume this frame *and* was re-rayed
+this frame — it computes the probe's logical cell from the scroll base + delta, and only resets a
+freshly-relocated tile once fresh rays for its new position exist (so it never snaps to the
+scrolled-out probe's far-away radiance). This is the same one-shot reset, generalized from the whole
+volume to the in-scrolled slab, so the rest of the cage keeps converging while the player walks.
+
 ## The octahedral border wrap
 
 Hardware bilinear filtering across a tile's interior samples its edge texels, which on an
