@@ -245,6 +245,7 @@ impl Instancing {
                             Vec::new()
                         },
                         model: item.model,
+                        submesh_cull: submesh_cull_for(item),
                         instances: Vec::new(),
                     });
                     buckets.len() - 1
@@ -319,6 +320,7 @@ impl Instancing {
                 instance_count: bucket.instances.len() as u32,
                 deformed,
                 deformed_vertex_offset: 0,
+                submesh_cull: bucket.submesh_cull.clone(),
             };
             if deformed {
                 batch.deformed_vertex_offset = deformed_cursor;
@@ -740,7 +742,31 @@ struct Bucket {
     /// The instance's world matrix (used as the RT `world_transform` for an unskinned-morph
     /// instance, whose deformed vertices are mesh-local; skinned instances place identity).
     model: Mat4,
+    /// Per-geometry-submesh backface-cull mode, from the bucket's first item's submesh materials
+    /// (a bucket is one mesh, so its submesh two-sidedness is shared). Copied onto every batch.
+    submesh_cull: Vec<vk::CullModeFlags>,
     instances: Vec<Vec<InstanceData>>,
+}
+
+/// Per-geometry-submesh backface-cull mode from the item's submesh materials (clamped to the last
+/// material like the instance-row build): a two-sided submesh disables culling (`NONE`), otherwise
+/// cull `BACK`. Length matches the geometry submesh count (>= 1 for the no-submesh single-draw path).
+fn submesh_cull_for(item: &DrawItem) -> Vec<vk::CullModeFlags> {
+    let count = item.mesh.submeshes.len().max(1);
+    let last = item.submesh_materials.len().saturating_sub(1);
+    (0..count)
+        .map(|s| {
+            let two_sided = item
+                .submesh_materials
+                .get(s.min(last))
+                .is_some_and(|m| m.double_sided);
+            if two_sided {
+                vk::CullModeFlags::NONE
+            } else {
+                vk::CullModeFlags::BACK
+            }
+        })
+        .collect()
 }
 
 /// Builds one draw item's per-submesh [`InstanceData`] rows, interning each submesh's
@@ -1026,10 +1052,10 @@ mod tests {
         };
 
         let mesh_a = uploader
-            .upload_mesh(&triangle(), &[], None)
+            .upload_mesh(&descriptors, &triangle(), &[], None, None)
             .expect("upload A");
         let mesh_b = uploader
-            .upload_mesh(&triangle(), &[], None)
+            .upload_mesh(&descriptors, &triangle(), &[], None, None)
             .expect("upload B");
         let item = |mesh: &Arc<crate::GpuMesh>| {
             DrawItem::new(
@@ -1100,7 +1126,7 @@ mod tests {
             return;
         };
         let mesh = uploader
-            .upload_mesh(&triangle(), &[], None)
+            .upload_mesh(&descriptors, &triangle(), &[], None, None)
             .expect("upload");
 
         // Two items sharing one material (same factors), then a third with a different
@@ -1227,7 +1253,7 @@ mod tests {
 
     /// A single-submesh triangle with a parallel skin stream (one joint, full weight),
     /// the geometry the skinned-path tests deform.
-    fn skinned_triangle(uploader: &Uploader) -> Arc<crate::GpuMesh> {
+    fn skinned_triangle(descriptors: &Descriptors, uploader: &Uploader) -> Arc<crate::GpuMesh> {
         let v = |x: f32, y: f32| Vertex {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
@@ -1251,7 +1277,7 @@ mod tests {
             3
         ];
         uploader
-            .upload_mesh(&mesh, &skin, None)
+            .upload_mesh(descriptors, &mesh, &skin, None, None)
             .expect("upload skinned")
     }
 
@@ -1275,7 +1301,7 @@ mod tests {
         else {
             return;
         };
-        let mesh = skinned_triangle(&uploader);
+        let mesh = skinned_triangle(&descriptors, &uploader);
 
         // An unskinned draw, even with a palette supplied, emits no skin dispatch.
         let static_item = DrawItem::new(
@@ -1360,7 +1386,7 @@ mod tests {
         else {
             return;
         };
-        let mesh = skinned_triangle(&uploader);
+        let mesh = skinned_triangle(&descriptors, &uploader);
 
         // Frame one: a new entity at the origin. Uncached → prev_model == model and the
         // cache now holds this pose.
