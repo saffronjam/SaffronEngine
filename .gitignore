@@ -4,12 +4,17 @@
 /install/
 /appdata/
 engine/target/
+# Private per-agent target dirs (CARGO_TARGET_DIR=engine/target-<name>, per AGENTS.md).
+engine/target-*/
 # Vendored Jolt 5.3.0 source — compiled by saffron-physics-sys/build.rs.
 # Ignored to keep it out of review; to become a download-on-demand build target (PP-11).
 engine/crates/physics-sys/vendor/
 # ts-rs scratch output from `#[ts(export)]` `cargo test` runs; the real editor TS is
 # emitted by `xtask gen-protocol` (10-protocol-codegen phase 5), not these.
 engine/crates/protocol/bindings/
+
+engine/appdata
+testscenes/
 
 # IDE
 .cache/
