@@ -15,8 +15,8 @@ use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::{Device, checked};
 
 /// Upper bound on GPU scopes the profiler times per frame — top-level passes plus any
-/// nested sub-scopes.
-pub const MAX_PROFILED_SCOPES: u32 = 128;
+/// nested sub-scopes (the scene pass opens child scopes for its opaque / submission phases).
+pub const MAX_PROFILED_SCOPES: u32 = 160;
 
 /// The pipeline-statistics counters captured per pass, in ascending
 /// `VkQueryPipelineStatisticFlagBits` bit order (the order `vkGetQueryPoolResults`
