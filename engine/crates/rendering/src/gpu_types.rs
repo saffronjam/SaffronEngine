@@ -85,6 +85,69 @@ impl Default for InstanceData {
     }
 }
 
+/// One static instance's sparse signed distance field (SDST v3), for the lighting
+/// cone-trace's per-instance iteration. For each instance whose world AABB a cone sample is
+/// near, the shader maps the world sample into the local fine-voxel grid, resolves the
+/// owning 8³ brick through the bindless indirection volume at `params.x`, and takes a
+/// cone-footprint mip-selected tap in the bindless 3-mip brick atlas at the same slot — or,
+/// for an empty brick, reads the open distance from the coarse coverage volume at that slot.
+///
+/// Twelve 16-byte blocks: one `Mat4` (world→local) then four `vec4` (world/local AABB), the
+/// `params` vec4, and three `uvec4` brick locators (fine dims, indirection dims, atlas
+/// tiling). The world AABB culls a cone sample before the lookup; the local AABB + voxel
+/// dims map the local sample to a continuous fine-voxel coordinate.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SdfInstance {
+    /// The inverse world matrix (world→local), mapping a world sample into the field's
+    /// local grid space.
+    pub world_to_local: Mat4,
+    /// The instance's world-space AABB minimum (`xyz`; `w` = base-color **red**) — the cone-march
+    /// culls a sample against `xyz` before transforming into local space. The `.w` carries the
+    /// per-instance base color (with `world_max.w` = green, `local_min.w` = blue) for the GDF lite
+    /// albedo cache the DDGI trace reads; the brick sample touches only `.xyz`.
+    pub world_min: Vec4,
+    /// The instance's world-space AABB maximum (`xyz`; `w` = base-color **green**).
+    pub world_max: Vec4,
+    /// The SDF grid's padded lower corner in local (rest) space (`xyz`; `w` = base-color **blue**) —
+    /// the local sample maps to a fine-voxel coordinate via `local_min.xyz` + the voxel dims.
+    pub local_min: Vec4,
+    /// The SDF grid's padded upper corner in local space (`xyz`; `w` reserved).
+    pub local_max: Vec4,
+    /// `.x` the shared bindless SDF slot (atlas binding 1 + indirection binding 2 + coverage
+    /// binding 3) as a float, `.y` the `R16_SNORM` encode clamp (`max_dist`, local units),
+    /// `.z` the instance's world scale (local→world distance factor); `.w` the atlas mip
+    /// count (read as `mipCount` in `sdf.slang` for the cone-footprint mip select).
+    pub params: Vec4,
+    /// `.xyz` the fine voxel dims; `.w` reserved.
+    pub voxel_dims: UVec4,
+    /// `.xyz` the brick indirection-volume dims (bricks per axis); `.w` reserved.
+    pub indir_dims: UVec4,
+    /// `.xyz` the atlas tiling (occupied bricks per axis in the atlas image); `.w` reserved.
+    pub atlas_bricks: UVec4,
+}
+
+const _: () = assert!(
+    size_of::<SdfInstance>() == 192,
+    "SdfInstance must match the std430 shader layout (12x 16-byte blocks)"
+);
+
+impl Default for SdfInstance {
+    fn default() -> Self {
+        Self {
+            world_to_local: Mat4::IDENTITY,
+            world_min: Vec4::ZERO,
+            world_max: Vec4::ZERO,
+            local_min: Vec4::ZERO,
+            local_max: Vec4::ZERO,
+            params: Vec4::ZERO,
+            voxel_dims: UVec4::ZERO,
+            indir_dims: UVec4::ZERO,
+            atlas_bricks: UVec4::ZERO,
+        }
+    }
+}
+
 /// Per-distinct-material data (set 2, binding 2), indexed by `InstanceData.texture.w`.
 /// Many instances of one material share one entry (deduplicated per frame by hashing
 /// the raw bytes — so the layout below is load-bearing past correctness).
