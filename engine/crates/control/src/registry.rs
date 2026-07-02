@@ -103,6 +103,14 @@ pub trait ControlRenderer {
     fn ddgi_enabled(&self) -> bool;
     /// Toggles DDGI.
     fn set_ddgi(&mut self, enabled: bool);
+    /// Whether SDF distance-field AO is occluding the analytic IBL.
+    fn sky_occlusion_enabled(&self) -> bool;
+    /// Toggles SDF distance-field AO occlusion of the analytic IBL.
+    fn set_sky_occlusion(&mut self, enabled: bool);
+    /// Whether the Global Distance Field (the camera-centered cascade clipmap) is on.
+    fn gdf_enabled(&self) -> bool;
+    /// Toggles the Global Distance Field — the far-field cone-march tap.
+    fn set_gdf(&mut self, enabled: bool);
     /// Whether reflection probes contribute.
     fn reflection_probes_enabled(&self) -> bool;
     /// Toggles reflection probes.
