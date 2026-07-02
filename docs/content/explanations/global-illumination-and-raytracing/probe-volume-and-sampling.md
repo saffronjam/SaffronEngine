@@ -7,25 +7,39 @@ math = true
 # Probe sampling
 
 Probe sampling reconstructs the indirect light at a surface point from a regular grid of irradiance
-probes. DDGI stores that grid as an 8×4×8 cage of probes spanning the scene volume, each probe
-holding a full sphere of irradiance. To shade a fragment, the eight probes of the cell containing
-the point are blended, weighted so probes behind walls or behind the surface do not leak in.
+probes. DDGI stores that grid as a 16×8×16 cage of probes centered on the camera, each probe holding
+a full sphere of irradiance. To shade a fragment, the eight probes of the cell containing the point
+are blended, weighted so probes behind walls or behind the surface do not leak in.
 
 The blend combines three weights: a trilinear interpolation, a backface term, and a Chebyshev
 visibility test. Together they keep indirect light from bleeding through geometry, which is the
 classic DDGI failure mode. `ddgiSampleIrradiance` in `lighting.slang` performs the blend.
 
-## The probe cage
+## The camera-centered cage
 
-The grid holds `DDGI_PROBES_X × DDGI_PROBES_Y × DDGI_PROBES_Z` = 8×4×8 = 256 probes. Probe $p$ sits at
+The grid holds `DDGI_PROBES_X × DDGI_PROBES_Y × DDGI_PROBES_Z` = 16×8×16 = 2048 probes at a fixed
+1.5 m spacing (`DDGI_PROBE_SPACING`), so the volume is a fixed-size box that follows the camera, not
+a fit to the scene. The logical probe $p$ sits at
 
 $$
 \mathbf{x}_p = \mathbf{v}_\text{min} + \frac{\mathbf{p} + \tfrac12}{\mathbf{N}}\,\mathbf{v}_\text{ext}
 $$
 
-where $\mathbf{v}_\text{min}$ and $\mathbf{v}_\text{ext}$ are the volume corner and size, fit to
-the scene each frame, and $\mathbf{N}$ is the per-axis probe count. Each probe stores its full
-sphere of irradiance octahedral-encoded into a small atlas tile.
+where $\mathbf{v}_\text{min} = \text{snapBase}\cdot\text{spacing}$ snaps the box's min corner to the
+probe grid (so the cage centres on the camera without shimmering sub-cell), $\mathbf{v}_\text{ext} =
+\mathbf{N}\cdot\text{spacing}$, and $\mathbf{N}$ is the per-axis probe count. Each probe stores its
+full sphere of irradiance octahedral-encoded into a small atlas tile.
+
+## The toroidal tile fold
+
+Because the cage scrolls with the camera, a probe's *logical* index within the volume is not where
+its data lives in the atlas. A probe is addressed **toroidally**: the physical atlas tile of logical
+probe $p$ is $\operatorname{wrapMod}(p + \text{scrollBase}, \mathbf{N})$, with $\text{scrollBase} =
+\operatorname{wrapMod}(\text{snapBase}, \mathbf{N})$ folded into the light UBO
+(`ddgiScrollBase`). This is what lets a probe that stays in view keep its converged history as the
+volume recenters — only the slab that scrolls in is re-rayed and reset. `ddgiSampleIrradiance`
+applies the fold before reading each corner probe's irradiance + moment tiles, so the sampling reads
+the right physical tile for the logical cell the surface falls in.
 
 ## Octahedral encoding
 
@@ -103,10 +117,10 @@ to fix.
 
 | What | File | Symbols |
 |---|---|---|
-| Eight-probe blend | `lighting.slang` | `ddgiSampleIrradiance` |
+| Eight-probe blend + toroidal fold | `lighting.slang` | `ddgiSampleIrradiance` (the `physTile` wrap) |
 | Octahedral encode | `lighting.slang` | `ddgiOctEncode` |
 | Atlas UV (interior + gutter) | `lighting.slang` | `ddgiAtlasUv` |
-| Probe count / tile interior | `rendering/src/ddgi.rs` | `DDGI_PROBES_X/Y/Z`, `DDGI_IRR_INTERIOR`, `Ddgi::probe_count_ubo` |
+| Probe count / spacing / scroll base | `rendering/src/ddgi.rs` | `DDGI_PROBES_X/Y/Z`, `DDGI_PROBE_SPACING`, `Ddgi::probe_count_ubo`, `Ddgi::scroll_base_ubo` |
 | Moment atlas read | `lighting.slang` | the `distAtlas` sample + Chebyshev block in `ddgiSampleIrradiance` |
 
 ## Related
