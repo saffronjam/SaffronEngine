@@ -114,6 +114,20 @@
       "fixture": "toggle-on"
     },
     {
+      "name": "set-sky-occlusion",
+      "params": "ToggleParams",
+      "result": "SetSkyOcclusionResult",
+      "status": "typed",
+      "fixture": "toggle-on"
+    },
+    {
+      "name": "set-gdf",
+      "params": "ToggleParams",
+      "result": "SetGdfResult",
+      "status": "typed",
+      "fixture": "toggle-on"
+    },
+    {
       "name": "set-render-quality",
       "params": "SetRenderQualityParams",
       "result": "RenderQualityResult",

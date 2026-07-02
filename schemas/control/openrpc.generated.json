@@ -294,6 +294,42 @@
       }
     },
     {
+      "name": "set-sky-occlusion",
+      "summary": "occlude the reflected skybox with the Global SDF reflection-occlusion cone",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ToggleParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetSkyOcclusionResult"
+        }
+      }
+    },
+    {
+      "name": "set-gdf",
+      "summary": "composite per-mesh SDFs into the Global Distance Field cascade clipmap",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ToggleParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetGdfResult"
+        }
+      }
+    },
+    {
       "name": "set-render-quality",
       "summary": "set the render-quality tier (low/medium/high/ultra) — the SSGI/GTAO/contact knob",
       "params": [
@@ -6935,6 +6971,9 @@
           "renderScale": {
             "type": "number"
           },
+          "skyOcclusion": {
+            "type": "boolean"
+          },
           "quality": {
             "type": "string"
           },
@@ -6957,6 +6996,9 @@
             "type": "string"
           },
           "ddgi": {
+            "type": "boolean"
+          },
+          "gdf": {
             "type": "boolean"
           },
           "rtSupported": {
@@ -7053,6 +7095,7 @@
           "contactShadows",
           "ssgi",
           "renderScale",
+          "skyOcclusion",
           "quality",
           "tonemap",
           "idle",
@@ -7060,6 +7103,7 @@
           "redrawReasons",
           "powerState",
           "ddgi",
+          "gdf",
           "rtSupported",
           "rtShadows",
           "restir",
@@ -7766,6 +7810,18 @@
           "entity"
         ]
       },
+      "SetGdfResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "gdf": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "gdf"
+        ]
+      },
       "SetGiParams": {
         "type": "object",
         "additionalProperties": false,
@@ -8205,6 +8261,18 @@
         },
         "required": [
           "skinning"
+        ]
+      },
+      "SetSkyOcclusionResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "skyOcclusion": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "skyOcclusion"
         ]
       },
       "SetSsrResult": {
