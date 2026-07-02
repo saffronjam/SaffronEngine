@@ -22,8 +22,21 @@ use crate::lighting::{SHADOW_DEPTH_BIAS_CONSTANT, SHADOW_DEPTH_BIAS_SLOPE};
 /// Records one batch's submesh draws on `cmd`: one instanced `drawIndexed` per submesh,
 /// the `firstInstance` shifted by the submesh's slice of the submesh-major instance
 /// buffer. A submesh-less mesh draws its whole index buffer as a single range.
-pub(crate) fn record_batch_submeshes(raw: &ash::Device, cmd: vk::CommandBuffer, batch: &DrawBatch) {
+/// Replays a batch's per-submesh instanced draws. `cull_modes` (the scene pass only) sets the
+/// backface-cull mode per submesh via dynamic state — `Some` requires the bound PSO to declare
+/// `VK_DYNAMIC_STATE_CULL_MODE`; passes that keep a baked cull mode (shadow / prepass / g-buffer /
+/// point-shadow) pass `None` and never touch the state.
+pub(crate) fn record_batch_submeshes(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    batch: &DrawBatch,
+    cull_modes: Option<&[vk::CullModeFlags]>,
+) {
     if batch.mesh.submeshes.is_empty() {
+        if let Some(&mode) = cull_modes.and_then(|m| m.first()) {
+            // SAFETY: the ash seam. The scene PSO declares dynamic cull state.
+            unsafe { raw.cmd_set_cull_mode(cmd, mode) };
+        }
         // SAFETY: the ash seam. The bound vertex/index streams + instance set cover the
         // draw; `cmd` is recording inside the pass's rendering scope.
         unsafe {
@@ -39,6 +52,11 @@ pub(crate) fn record_batch_submeshes(raw: &ash::Device, cmd: vk::CommandBuffer, 
         return;
     }
     for (s, submesh) in batch.mesh.submeshes.iter().enumerate() {
+        if let Some(modes) = cull_modes {
+            let mode = modes.get(s).copied().unwrap_or(vk::CullModeFlags::BACK);
+            // SAFETY: the ash seam. The scene PSO declares dynamic cull state.
+            unsafe { raw.cmd_set_cull_mode(cmd, mode) };
+        }
         let vertex_offset = batch.deformed_vertex_offset as i32 + submesh.vertex_offset;
         let first_instance = batch.base_instance + s as u32 * batch.instance_count;
         // SAFETY: the ash seam. As above; the submesh range is within the index buffer.
@@ -234,7 +252,9 @@ pub fn record_scene_draw_list(
             );
         }
         bind_batch_vertices(raw, cmd, batch, deformed);
-        record_batch_submeshes(raw, cmd, batch);
+        // Scene pass: apply the per-submesh backface-cull mode via dynamic state (two-sided
+        // materials → NONE, else BACK). Only this pass's PSO declares the dynamic cull state.
+        record_batch_submeshes(raw, cmd, batch, Some(&batch.submesh_cull));
     }
     binds
 }
@@ -280,7 +300,7 @@ pub fn record_shadow_depth(
     }
     for batch in &list.batches {
         bind_batch_vertices(raw, cmd, batch, deformed);
-        record_batch_submeshes(raw, cmd, batch);
+        record_batch_submeshes(raw, cmd, batch, None);
     }
 }
 
@@ -331,7 +351,7 @@ pub fn record_depth_prepass(
     }
     for batch in &list.batches {
         bind_batch_vertices(raw, cmd, batch, deformed);
-        record_batch_submeshes(raw, cmd, batch);
+        record_batch_submeshes(raw, cmd, batch, None);
     }
 }
 
@@ -375,7 +395,7 @@ pub fn record_gbuffer(
     }
     for batch in &list.batches {
         bind_batch_vertices(raw, cmd, batch, deformed);
-        record_batch_submeshes(raw, cmd, batch);
+        record_batch_submeshes(raw, cmd, batch, None);
     }
 }
 
@@ -554,7 +574,7 @@ pub fn record_point_shadow(
                 continue;
             }
             bind_batch_vertices(raw, cmd, batch, deformed);
-            record_batch_submeshes(raw, cmd, batch);
+            record_batch_submeshes(raw, cmd, batch, None);
         }
         // SAFETY: the ash seam. Closes the per-face rendering scope opened above.
         unsafe { raw.cmd_end_rendering(cmd) };
@@ -689,7 +709,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// A clip-space triangle covering the viewport — geometry for the shadow draws.
-    fn triangle(uploader: &Uploader) -> Arc<crate::GpuMesh> {
+    fn triangle(descriptors: &Descriptors, uploader: &Uploader) -> Arc<crate::GpuMesh> {
         let v = |x: f32, y: f32| Vertex {
             position: G3::new(x, y, 0.0),
             normal: G3::new(0.0, 0.0, 1.0),
@@ -705,7 +725,9 @@ mod tests {
                 material_slot: 0,
             }],
         };
-        uploader.upload_mesh(&mesh, &[], None).expect("upload")
+        uploader
+            .upload_mesh(descriptors, &mesh, &[], None, None)
+            .expect("upload")
     }
 
     /// The directional shadow depth pass + the point-shadow cube pass run on a real
@@ -735,7 +757,7 @@ mod tests {
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
-        let mesh = triangle(&uploader);
+        let mesh = triangle(&descriptors, &uploader);
         let item = DrawItem::new(
             Arc::clone(&mesh),
             Mat4::IDENTITY,
@@ -863,7 +885,7 @@ mod tests {
                         },
                         resolve: None,
                     })
-                    .body(move |cmd| {
+                    .body(move |cmd, _scopes| {
                         record_shadow_depth(
                             &raw_body,
                             cmd,
