@@ -8,23 +8,26 @@ bookCollapseSection = true
 
 Dynamic global illumination computes indirect light that tracks moving geometry, and ray tracing
 resolves visibility and direct lighting stochastically. [Image-based lighting](../image-based-lighting/)
-supplies only a static ambient term, and [screen-space](../screen-space-and-post/) effects
-approximate indirect light from what is on screen. This section covers the fully dynamic tier: DDGI
-irradiance probes fed by a software voxel trace, an optional hardware ray-tracing path (BLAS/TLAS
-plus ray-query shadows), and ReSTIR for many-light direct lighting.
+supplies a static analytic ambient that DDGI replaces where its probes have coverage, and
+[screen-space](../screen-space-and-post/) effects approximate indirect light from what is on screen.
+This section covers the fully dynamic tier: DDGI irradiance probes fed by a software distance-field
+trace (the per-mesh MDF near field + the Global Distance Field beyond, the sky on miss), an optional
+hardware ray-tracing path (BLAS/TLAS plus ray-query shadows), and ReSTIR for many-light direct
+lighting.
 
 > [!NOTE]
 > The RT and ReSTIR paths need a ray-query-capable GPU and run at roughly 1 FPS on the software
-> (llvmpipe) dev device, so they are feature-gated. DDGI's software trace runs everywhere.
+> (llvmpipe) dev device, so they are feature-gated. DDGI's software trace runs everywhere and is on
+> by default.
 
 ## Pages
 
 | Page | Covers | Code |
 |---|---|---|
-| `ddgi-overview` | what DDGI is, the per-frame probe pipeline, why probes over screen-space | `lighting.slang` · `ddgiSampleIrradiance`; `rendering/src/renderer.rs` · `add_ddgi_passes` |
-| `voxel-scene-proxy` | per-frame voxel rasterization of draw AABBs, `Image3D`, dynamic volume fitting | `ddgi_voxelize.slang`; `rendering/src/resources.rs` · `Image3D`; `ddgi.rs` · `Ddgi::set_scene` |
-| `probe-volume-and-sampling` | the 8×4×8 probe cage, octahedral encoding, trilinear + backface + Chebyshev weights | `lighting.slang` · `ddgiSampleIrradiance`, `ddgiOctEncode`; `rendering/src/ddgi.rs` · `Ddgi` |
-| `software-ray-trace` | Fibonacci-sphere rays, voxel march, free multi-bounce via probe reuse | `ddgi_trace.slang` · `computeMain`, `sphericalFibonacci` |
+| `ddgi-overview` | what DDGI is, the four-pass probe pipeline, sky-on-miss, the camera-centered clipmap, replacing the IBL diffuse by coverage | `lighting.slang` · `ddgiSampleIrradiance`; `rendering/src/renderer.rs` · `add_ddgi_passes` |
+| `distance-field-reflection-occlusion` | the one per-pixel SDF consumer left after reconciliation: a roughness-widened cone marching the Global Distance Field along the reflection vector to occlude the reflected skybox (diffuse occlusion is DDGI ray-miss + GTAO) | `sdf.slang` · `sdfReflectionOcclusion`, `gdfDistance` |
+| `probe-volume-and-sampling` | the 16×8×16 camera-centered cage, the toroidal tile fold, octahedral encoding, trilinear + backface + Chebyshev weights | `lighting.slang` · `ddgiSampleIrradiance`, `ddgiOctEncode`; `rendering/src/ddgi.rs` · `Ddgi` |
+| `software-ray-trace` | Fibonacci-sphere rays, sphere-marching the MDF→GDF field, sky-on-miss + albedo-cache hit color, free multi-bounce via probe reuse | `ddgi_trace.slang` · `computeMain`, `sphericalFibonacci`, `sampleAlbedo` |
 | `irradiance-and-moment-atlases` | temporal irradiance blend, Chebyshev moment atlas, octahedral border wrap | `ddgi_blend_irradiance.slang`, `ddgi_blend_distance.slang`, `ddgi_border.slang` |
 | `raytracing-foundation` | per-mesh BLAS, per-frame TLAS + instance buffer, buffer device address | `rendering/src/resources.rs` · `AccelerationStructure`; `rt.rs` · `record_mesh_blas_build`, `record_tlas_build_plan` |
 | `raytracing-device-gating` | optional RT extensions, `rt_supported`, the `ash::khr::acceleration_structure` dispatch | `rendering/src/device.rs` · `probe_optional_features`, `Device::accel_dispatch` |
