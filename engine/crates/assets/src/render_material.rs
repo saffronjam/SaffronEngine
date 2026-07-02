@@ -106,6 +106,7 @@ pub fn build_submesh_material(
         height_scale: material.height_scale,
         alpha_clip: material.blend == "masked",
         alpha_cutoff: material.alpha_cutoff,
+        double_sided: material.double_sided,
         ..SubmeshMaterial::defaults()
     };
     if material.albedo_texture.value() != 0 {
@@ -243,6 +244,7 @@ impl AssetServer {
                 height_scale: material.height_scale,
                 alpha_clip: material.alpha_clip,
                 alpha_cutoff: material.alpha_cutoff,
+                double_sided: material.double_sided,
             };
             out.submeshes.push(self.lower_slot(gpu, &slot));
         }
@@ -269,6 +271,7 @@ impl AssetServer {
             height_scale: slot.height_scale,
             alpha_clip: slot.alpha_clip,
             alpha_cutoff: slot.alpha_cutoff,
+            double_sided: slot.double_sided,
             ..SubmeshMaterial::defaults()
         };
         if slot.albedo_texture.value() != 0 {
@@ -438,6 +441,7 @@ mod tests {
             _mesh: &saffron_geometry::Mesh,
             _skin: &[saffron_geometry::VertexSkin],
             _morph: Option<&saffron_geometry::MorphData>,
+            _sdf_bake: Option<&saffron_rendering::SdfBake>,
         ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuMesh>> {
             unreachable!("the precedence tests use zero texture ids; no upload happens")
         }
