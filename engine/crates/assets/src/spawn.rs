@@ -575,6 +575,7 @@ impl crate::AssetServer {
                 slot.unlit = resolved.unlit;
                 slot.alpha_clip = resolved.blend == "masked";
                 slot.alpha_cutoff = resolved.alpha_cutoff;
+                slot.double_sided = resolved.double_sided;
             } else if let Some(f) = factors.get(&sub_id.value()) {
                 slot.base_color = f.base_color;
                 slot.metallic = f.metallic;
