@@ -165,6 +165,9 @@ fn bake_writes_a_container_with_a_model_parent_and_sub_asset_rows() {
     assert_eq!(mesh.indices.len(), 6);
     assert_eq!(mesh.submeshes.len(), 2);
 
+    // Import is GPU-free: it writes no signed-distance-field chunk (the field is GPU
+    // jump-flood baked at mesh-upload time and cached to an `assets/cache` sidecar).
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
