@@ -23,10 +23,12 @@ mod device;
 mod draw_list;
 mod frame;
 mod frame_history;
+mod global_sdf;
 mod gpu_types;
 mod ibl;
 mod instancing;
 mod lighting;
+mod nested_scopes;
 mod overlay;
 mod pipelines;
 mod present;
@@ -55,12 +57,12 @@ pub use aa::{
 };
 pub use ddgi::{
     BlendPush as DdgiBlendPush, BorderPush as DdgiBorderPush, DDGI_DIST_FORMAT, DDGI_DIST_INTERIOR,
-    DDGI_HYSTERESIS, DDGI_IRR_FORMAT, DDGI_IRR_INTERIOR, DDGI_MAX_BOXES, DDGI_PROBE_TOTAL,
-    DDGI_PROBES_X, DDGI_PROBES_Y, DDGI_PROBES_Z, DDGI_RAYS_PER_PROBE, DDGI_VOXEL_FORMAT,
-    DDGI_VOXEL_RES, Ddgi, TracePush as DdgiTracePush, VoxelizePush as DdgiVoxelizePush,
+    DDGI_HYSTERESIS, DDGI_IRR_FORMAT, DDGI_IRR_INTERIOR, DDGI_PROBE_BUDGET, DDGI_PROBE_SPACING,
+    DDGI_PROBE_TOTAL, DDGI_PROBES_X, DDGI_PROBES_Y, DDGI_PROBES_Z, DDGI_RAY_FORMAT,
+    DDGI_RAYS_PER_PROBE, Ddgi, TracePush as DdgiTracePush,
 };
 pub use descriptors::{
-    DEFAULT_WHITE_SLOT, Descriptors, MAX_BINDLESS_TEXTURES, MAX_REFLECTION_PROBES,
+    DEFAULT_WHITE_SLOT, Descriptors, MAX_BINDLESS_SDF, MAX_BINDLESS_TEXTURES, MAX_REFLECTION_PROBES,
 };
 pub use device::{Capabilities, Device, ProfilerFacts, SurfaceSource, validation_issue_count};
 pub use draw_list::{
@@ -73,7 +75,11 @@ pub use frame_history::{
     AlarmSeverity, AlarmState, FRAME_HISTORY_CAPACITY, FrameHistory, FrameHistoryStats,
     FrameSample, PerfConfig,
 };
-pub use gpu_types::{GpuLight, InstanceData, Material, MaterialParamsData};
+pub use global_sdf::{
+    GDF_BAND_FRACTION, GDF_CASCADE0_EXTENT, GDF_CASCADES, GDF_EXPONENT, GDF_FORMAT, GDF_MAX_CULLED,
+    GDF_NEAR_HANDOFF, GDF_RES, GdfCompositePush, GdfCullPush, GdfParamsUbo, GdfRegion, GlobalSdf,
+};
+pub use gpu_types::{GpuLight, InstanceData, Material, MaterialParamsData, SdfInstance};
 pub use ibl::{
     ATMOS_MULTI_SCATTER_SIZE, ATMOS_SKY_VIEW_H, ATMOS_SKY_VIEW_W, ATMOS_TRANSMITTANCE_H,
     ATMOS_TRANSMITTANCE_W, AtmosphereParams, EnvSource, IBL_COLOR_FORMAT, IBL_ENV_SIZE,
@@ -107,7 +113,7 @@ pub use render_graph::{
 pub use renderer::{RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
 pub use resources::{
     AccelerationStructure, BindlessFreeList, Buffer, DeviceResources, GpuMesh, GpuMeshParts,
-    GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, Pipeline,
+    GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, Pipeline,
 };
 pub use restir::{
     InitialPush as RestirInitialPush, RESTIR_CANDIDATE_COUNT, RESTIR_INITIAL_PUSH_SIZE,
@@ -131,8 +137,8 @@ pub use skinning::{
     wire_morph_set,
 };
 pub use ssao::{
-    AO_FORMAT, ContactPush, G_NORMAL_FORMAT, GbufferPush, GtaoPush, SSGI_HISTORY_WEIGHT, Ssao,
-    SsgiAccumPush, SsgiPush,
+    AO_FORMAT, ContactPush, DfaoPush, G_NORMAL_FORMAT, GbufferPush, GtaoPush, ROUGHNESS_FORMAT,
+    SSGI_HISTORY_WEIGHT, SpecoccPush, Ssao, SsgiAccumPush, SsgiPush,
 };
 pub use swapchain::Swapchain;
 pub use targets::{PointShadowCube, Targets};
@@ -140,7 +146,7 @@ pub use thumbnail::{
     PngTransfer, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
 pub use thumbnail_render::{ThumbnailPng, ThumbnailRenderer};
-pub use upload::{GpuQueue, Uploader};
+pub use upload::{GpuQueue, SdfBake, Uploader};
 pub use view_target::ViewTarget;
 
 use ash::vk;
@@ -199,6 +205,17 @@ pub enum Error {
     /// multiple of 4, or unreadable).
     #[error("shader load failed: {0}")]
     ShaderLoad(String),
+
+    /// The GPU signed-distance-field bake could not run or its sidecar was malformed
+    /// (no bake pipelines, or a decode/IO failure on the cache).
+    #[error("sdf bake failed: {0}")]
+    SdfBake(String),
+
+    /// A bindless array (albedo textures or per-mesh SDF fields) is full — every slot up
+    /// to its capacity is occupied — so the upload was skipped rather than writing an
+    /// out-of-range `dstArrayElement`.
+    #[error("bindless array full: {0}")]
+    BindlessFull(&'static str),
 }
 
 /// A `Result` whose error is this crate's [`Error`].
