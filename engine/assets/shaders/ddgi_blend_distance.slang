@@ -2,7 +2,7 @@
 // visibility test that kills DDGI light leaking. Like ddgi_blend_irradiance but: stores
 // mean distance (r) + mean squared distance (r^2) in RG, a sharper cosine power, and the
 // per-probe tile is larger (16x16 interior). Set 0: b0 = ray image (sampler), b1 = moment
-// atlas (rg16f storage). Push = probe grid + tile + hysteresis + max distance.
+// atlas (rg16f storage). Push = probe grid + tile + hysteresis + max distance + scroll geometry.
 
 [[vk::binding(0, 0)]] Sampler2D rayImage;
 [[vk::image_format("rg16f")]]
@@ -11,12 +11,44 @@
 struct Push
 {
     uint4 probeCount;  // xyz = probes per axis, w = rays per probe
-    uint4 tile;        // x = interior size, y = 1 if first frame
-    float4 params;     // x = hysteresis, y = max distance
+    uint4 tile;        // x = interior size, y = 1 if whole-volume first frame, z = round-robin offset, w = probe budget
+    float4 params;     // x = hysteresis, y = max distance, z = ray-set golden rotation
+    int4 scrollBase;   // xyz = toroidal scroll base, w = total probe count
+    int4 delta;        // xyz = scroll accumulated over one round-robin cycle, w reserved
 };
 [[vk::push_constant]] Push pc;
 
 static const float PI = 3.14159265;
+
+int wrapMod(int v, int n)
+{
+    int r = v % n;
+    return (r < 0) ? r + n : r;
+}
+
+// Whether physical tile `phys` was retraced this frame (its rays match the current rotation). Only
+// these probes may be re-integrated; untraced probes keep their last moments (see ddgi_blend_irradiance).
+bool probeTraced(uint3 phys)
+{
+    uint total = uint(pc.scrollBase.w);
+    uint physIndex = phys.x + phys.y * pc.probeCount.x + phys.z * pc.probeCount.x * pc.probeCount.y;
+    return uint(wrapMod(int(physIndex) - int(pc.tile.z), int(total))) < pc.tile.w;
+}
+
+// Whether physical tile `phys` (3D) resets its history this frame — the whole-volume first frame,
+// or a probe newly-exposed since it was last re-rayed. `delta` accumulates the scroll over one full
+// round-robin cycle (see ddgi_blend_irradiance). Reached only for a traced probe.
+bool probeReset(uint3 phys)
+{
+    if (pc.tile.y != 0u) { return true; }
+    int3 count = int3(pc.probeCount.xyz);
+    int3 lcl = int3(wrapMod(int(phys.x) - pc.scrollBase.x, count.x),
+                    wrapMod(int(phys.y) - pc.scrollBase.y, count.y),
+                    wrapMod(int(phys.z) - pc.scrollBase.z, count.z));
+    int3 g = pc.delta.xyz + lcl;
+    bool newlyExposed = any(g < int3(0)) || any(g >= count);
+    return newlyExposed;
+}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -38,10 +70,16 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     }
     uint tileX = tid.x / full;
     uint tileY = tid.y / full;
-    uint probeIndex = (tileX % pc.probeCount.x) + (tileX / pc.probeCount.x) * pc.probeCount.x
-                      + tileY * pc.probeCount.x * pc.probeCount.y;
+    uint3 phys = uint3(tileX % pc.probeCount.x, tileX / pc.probeCount.x, tileY);
+    uint probeIndex = phys.x + phys.y * pc.probeCount.x + phys.z * pc.probeCount.x * pc.probeCount.y;
     uint total = pc.probeCount.x * pc.probeCount.y * pc.probeCount.z;
     if (probeIndex >= total)
+    {
+        return;
+    }
+    // Skip probes not retraced this frame — re-integrating their stale rays against the current
+    // rotation is the moment-atlas wobble that swims the Chebyshev leak test.
+    if (!probeTraced(phys))
     {
         return;
     }
@@ -63,7 +101,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     {
         float2 ruv = (float2(r, probeIndex) + 0.5) / rayImgSize;
         float dist = min(rayImage.SampleLevel(ruv, 0.0).a, maxDist);
-        float phi = 2.0 * PI * frac(float(r) * 0.618033988749895);
+        // Match the trace's rotated Fibonacci directions (see ddgi_blend_irradiance).
+        float phi = 2.0 * PI * frac(float(r) * 0.618033988749895 + pc.params.z);
         float cosT = 1.0 - (2.0 * float(r) + 1.0) / float(rays);
         float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
         float3 rayDir = float3(cos(phi) * sinT, sin(phi) * sinT, cosT);
@@ -82,6 +121,6 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 
     uint2 px = uint2(tid.xy);
     float2 prev = atlas[px];
-    float hysteresis = pc.tile.y != 0 ? 0.0 : pc.params.x;
+    float hysteresis = probeReset(phys) ? 0.0 : pc.params.x;
     atlas[px] = lerp(moments, prev, hysteresis);
 }
