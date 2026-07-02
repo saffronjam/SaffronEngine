@@ -66,7 +66,7 @@ How a pass uses a non-attachment resource — the single source of truth for bar
 |---|---|
 | `RenderGraph::new()` | an empty graph |
 | `import_image(image, view, aspect, initial_layout, external)` | track an external 2D image; `external: Option<usize>` is a cross-frame layout slot |
-| `import_image_3d(image, view, initial_layout, external)` | track an external 3D image (DDGI voxel proxy) |
+| `import_image_3d(image, view, initial_layout, external)` | track an external 3D image (GDF cascade volume, lite albedo cache) |
 | `import_buffer(buffer)` | track an external buffer; returns an `RgResource` |
 | `alloc_external_layout(initial)` / `external_layout(slot)` | allocate / read a cross-frame layout slot |
 | `add_pass(pass)` | append an `RgPass` |
