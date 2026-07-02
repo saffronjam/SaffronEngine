@@ -1,6 +1,6 @@
-//! The 29 render-domain control commands: render-stats, the profiler/capture group,
-//! perf config, frame history, alarms, the AA / view-mode / clustering / IBL / SSAO /
-//! shadow / GI / skinning / depth-prepass toggles, native viewport info + size,
+//! The 30 render-domain control commands: render-stats, the profiler/capture group,
+//! perf config, frame history, alarms, the AA / view-mode / clustering / IBL / sky-occlusion /
+//! SSAO / shadow / GI / skinning / depth-prepass toggles, native viewport info + size,
 //! exposure, and reflection-probe management.
 //!
 //! Every handler reaches only [`EngineContext::renderer`] (the `recapture-probes` /
@@ -21,12 +21,12 @@ use saffron_protocol::{
     ProfileSpanDto, ProfilerModeDto, ProfilerModeResult, ProfilerSetModeParams,
     RecaptureProbesResult, RenderPassTimingDto, RenderPassTimingsDto, RenderQualityResult,
     RenderStatsDto, SetAaParams, SetAaResult, SetClusteredResult, SetDepthPrepassResult,
-    SetExposureParams, SetExposureResult, SetGiParams, SetGiResult, SetIblResult,
+    SetExposureParams, SetExposureResult, SetGdfResult, SetGiParams, SetGiResult, SetIblResult,
     SetPerfConfigParams, SetProbesParams, SetProbesResult, SetRenderQualityParams, SetRestirResult,
-    SetRtReflectionsResult, SetRtShadowsResult, SetShadowsResult, SetSkinningResult, SetSsrResult,
-    SetTonemapParams, SetViewModeParams, SetViewModeResult, SetViewportPowerStateParams,
-    SetViewportSizeParams, SetViewportSizeResult, ToggleParams, TonemapResult, Uuid, Vec3,
-    ViewModeDto, ViewportNativeInfoResult, ViewportPowerStateResult,
+    SetRtReflectionsResult, SetRtShadowsResult, SetShadowsResult, SetSkinningResult,
+    SetSkyOcclusionResult, SetSsrResult, SetTonemapParams, SetViewModeParams, SetViewModeResult,
+    SetViewportPowerStateParams, SetViewportSizeParams, SetViewportSizeResult, ToggleParams,
+    TonemapResult, Uuid, Vec3, ViewModeDto, ViewportNativeInfoResult, ViewportPowerStateResult,
 };
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmSeverity, CaptureMode, CaptureState,
@@ -214,6 +214,8 @@ fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
         contact_shadows: renderer.contact_shadows_enabled(),
         ssgi: renderer.ssgi_enabled(),
         render_scale: renderer.render_scale(),
+        sky_occlusion: renderer.sky_occlusion_enabled(),
+        gdf: renderer.gdf_enabled(),
         quality: renderer.render_quality_tier(),
         tonemap: renderer.tonemap_mode(),
         idle: renderer.reactive_idle(),
@@ -460,7 +462,7 @@ fn to_chrome_trace(capture: &ProfileCapture) -> String {
     doc.to_string()
 }
 
-/// Registers the 29 render-domain commands, in registration order, onto `reg`.
+/// Registers the 30 render-domain commands, in registration order, onto `reg`.
 pub fn register_render_commands(reg: &mut CommandRegistry) {
     reg.register::<EmptyParams, RenderStatsDto>(
         "render-stats",
@@ -666,6 +668,30 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
             ctx.renderer.set_ibl(params.enabled.unwrap_or(true));
             Ok(SetIblResult {
                 ibl: ctx.renderer.ibl_enabled(),
+            })
+        },
+    );
+
+    reg.register::<ToggleParams, SetSkyOcclusionResult>(
+        "set-sky-occlusion",
+        "set-sky-occlusion {0|1} — occlude the reflected skybox with the Global SDF reflection-occlusion cone",
+        |ctx, params| {
+            ctx.renderer
+                .set_sky_occlusion(params.enabled.unwrap_or(true));
+            Ok(SetSkyOcclusionResult {
+                sky_occlusion: ctx.renderer.sky_occlusion_enabled(),
+            })
+        },
+    );
+
+    reg.register::<ToggleParams, SetGdfResult>(
+        "set-gdf",
+        "set-gdf {0|1} — composite per-mesh SDFs into the Global Distance Field cascade clipmap \
+         (the far-field cone-march tap, O(1) in instance count)",
+        |ctx, params| {
+            ctx.renderer.set_gdf(params.enabled.unwrap_or(true));
+            Ok(SetGdfResult {
+                gdf: ctx.renderer.gdf_enabled(),
             })
         },
     );
