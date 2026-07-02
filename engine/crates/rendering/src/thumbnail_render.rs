@@ -168,7 +168,7 @@ impl ThumbnailRenderer {
     pub fn prewarm(&mut self, device: &Device, descriptors: &Descriptors) -> Result<()> {
         self.ensure_thumbnail_pipeline(device)?;
         self.ensure_preview_pipeline(device, descriptors)?;
-        self.ensure_preview_sphere(device)?;
+        self.ensure_preview_sphere(device, descriptors)?;
         Ok(())
     }
 
@@ -216,11 +216,15 @@ impl ThumbnailRenderer {
         Ok(pipeline)
     }
 
-    fn ensure_preview_sphere(&mut self, device: &Device) -> Result<Arc<GpuMesh>> {
+    fn ensure_preview_sphere(
+        &mut self,
+        device: &Device,
+        descriptors: &Descriptors,
+    ) -> Result<Arc<GpuMesh>> {
         if let Some(sphere) = &self.preview_sphere {
             return Ok(Arc::clone(sphere));
         }
-        let sphere = make_preview_sphere(device)?;
+        let sphere = make_preview_sphere(device, descriptors)?;
         self.preview_sphere = Some(Arc::clone(&sphere));
         Ok(sphere)
     }
@@ -291,7 +295,7 @@ impl ThumbnailRenderer {
                 Arc::new(self.build_preview_pipeline(device, descriptors, &spv, samples)?)
             }
         };
-        let sphere = self.ensure_preview_sphere(device)?;
+        let sphere = self.ensure_preview_sphere(device, descriptors)?;
         let view_proj = framed_view_proj(Vec3::ZERO, 1.0, Vec3::new(0.3, 0.4, 1.0));
         let push = preview_push(material, view_proj);
         let bindless_set = descriptors.bindless_set();
@@ -1258,7 +1262,7 @@ fn format_supports_linear_blit(device: &Device, format: vk::Format) -> bool {
 
 /// Builds + uploads a unit UV sphere (origin-centered, radius 1; normals == positions)
 /// for material previews.
-fn make_preview_sphere(device: &Device) -> Result<Arc<GpuMesh>> {
+fn make_preview_sphere(device: &Device, descriptors: &Descriptors) -> Result<Arc<GpuMesh>> {
     const RINGS: u32 = 32;
     const SECTORS: u32 = 48;
     let mut mesh = Mesh::default();
@@ -1289,7 +1293,7 @@ fn make_preview_sphere(device: &Device) -> Result<Arc<GpuMesh>> {
         material_slot: 0,
     });
     let uploader = Uploader::new(device, &GpuQueue::new(device.graphics_queue))?;
-    uploader.upload_mesh(&mesh, &[], None)
+    uploader.upload_mesh(descriptors, &mesh, &[], None, None)
 }
 
 /// Loads a thumbnail/preview SPIR-V module, resolving `shaders/<x>.spv` against the
@@ -1813,7 +1817,7 @@ mod tests {
         let before = validation_issue_count();
         let mesh = fx
             .uploader
-            .upload_mesh(&cube(), &[], None)
+            .upload_mesh(&fx.descriptors, &cube(), &[], None, None)
             .expect("upload cube");
 
         let png = fx
