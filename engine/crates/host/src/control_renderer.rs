@@ -149,6 +149,18 @@ impl ControlRenderer for HostControlRenderer<'_> {
     fn set_ddgi(&mut self, enabled: bool) {
         self.renderer.set_ddgi(enabled);
     }
+    fn sky_occlusion_enabled(&self) -> bool {
+        self.renderer.sky_occlusion_enabled()
+    }
+    fn set_sky_occlusion(&mut self, enabled: bool) {
+        self.renderer.set_sky_occlusion(enabled);
+    }
+    fn gdf_enabled(&self) -> bool {
+        self.renderer.gdf_enabled()
+    }
+    fn set_gdf(&mut self, enabled: bool) {
+        self.renderer.set_gdf(enabled);
+    }
     fn reflection_probes_enabled(&self) -> bool {
         self.renderer.reflection_probes_enabled()
     }
@@ -414,8 +426,15 @@ impl GpuUploader for HostThumbnailGpu<'_> {
         mesh: &Mesh,
         skin: &[VertexSkin],
         morph: Option<&saffron_geometry::MorphData>,
+        sdf_bake: Option<&saffron_rendering::SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader.upload_mesh(mesh, skin, morph)
+        self.uploader.upload_mesh(
+            self.renderer.borrow().descriptors(),
+            mesh,
+            skin,
+            morph,
+            sdf_bake,
+        )
     }
 
     fn upload_texture(
@@ -579,8 +598,10 @@ impl GpuUploader for WorkerThumbnailGpu {
         mesh: &Mesh,
         skin: &[VertexSkin],
         morph: Option<&saffron_geometry::MorphData>,
+        sdf_bake: Option<&saffron_rendering::SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader.upload_mesh(mesh, skin, morph)
+        self.uploader
+            .upload_mesh(&self.descriptors, mesh, skin, morph, sdf_bake)
     }
 
     fn upload_texture(
