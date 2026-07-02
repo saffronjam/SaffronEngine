@@ -53,8 +53,8 @@ use saffron_protocol::{
 use saffron_rendering::{PngTransfer, ViewId};
 use saffron_scene::{
     AnimationPlayer, AssetEntry, AssetType, Attribution, Colorspace, DirectionalLight, Entity,
-    IdComponent, Material, MaterialAsset as MaterialAssetComponent, Mesh, Name, PreviewGhost, Scene,
-    SkinnedMesh, SkyMode, Transform,
+    IdComponent, Material, MaterialAsset as MaterialAssetComponent, Mesh, Name, PreviewGhost,
+    Scene, SkinnedMesh, SkyMode, Transform,
 };
 use saffron_sceneedit::{PlacementPreview, PlayState, SceneEditCamera};
 use serde_json::{Value, json};
@@ -214,7 +214,10 @@ fn preview_asset_placement(
                 .instantiate_model(&mut ctx.scene_edit.scene, asset, &name)
                 .map_err(|e| Error::command(e.to_string()))?;
             for node in ctx.scene_edit.scene.subtree_entities(root) {
-                let _ = ctx.scene_edit.scene.add_component(node, PreviewGhost::default());
+                let _ = ctx
+                    .scene_edit
+                    .scene
+                    .add_component(node, PreviewGhost::default());
             }
             ctx.scene_edit.placement_preview = Some(PlacementPreview {
                 asset,
