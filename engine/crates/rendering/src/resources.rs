@@ -399,8 +399,8 @@ impl Drop for Image {
     }
 }
 
-/// A VMA-allocated 3D image (the DDGI voxel proxy), owning handle + view +
-/// allocation.
+/// A VMA-allocated 3D image (the GDF cascade clipmap volumes + the lite albedo cache), owning
+/// handle + view + allocation.
 pub struct Image3D {
     resources: Arc<DeviceResources>,
     image: vk::Image,
@@ -418,7 +418,8 @@ pub struct Image3D {
 unsafe impl Send for Image3D {}
 
 impl Image3D {
-    /// Creates a 3D image + a `TYPE_3D` view, allocated device-local.
+    /// Creates a 3D image (with `mip_levels` mip levels) + a `TYPE_3D` view spanning every
+    /// level, allocated device-local.
     ///
     /// # Errors
     ///
@@ -428,13 +429,14 @@ impl Image3D {
         resources: &Arc<DeviceResources>,
         extent: vk::Extent3D,
         format: vk::Format,
+        mip_levels: u32,
         usage: vk::ImageUsageFlags,
     ) -> crate::Result<Self> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_3D)
             .format(format)
             .extent(extent)
-            .mip_levels(1)
+            .mip_levels(mip_levels.max(1))
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -458,7 +460,7 @@ impl Image3D {
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: mip_levels.max(1),
                 base_array_layer: 0,
                 layer_count: 1,
             });
@@ -622,6 +624,176 @@ impl Drop for GpuTexture {
     }
 }
 
+/// A device-local per-mesh signed distance field (sparse SDST v2): two 3D images — the
+/// `R16_SNORM` brick *atlas* (occupied 8³ bricks) and the `R32_UINT` brick *indirection*
+/// volume — sharing one bindless slot (the cone-trace indexes both at the same index), plus
+/// the local-space grid metadata the shader's brick tap needs (padded bounds, encode clamp,
+/// fine voxel dims, indirection dims, atlas tiling).
+///
+/// Owns the same teardown discipline as [`GpuTexture`]: [`Drop`] returns the bindless slot
+/// to the shared SDF free-list under the mutex (a worker-uploaded mesh's field may be
+/// dropped off the main thread), then frees both views + images. Held as an `Arc<GpuSdf>`
+/// on the [`GpuMesh`] it was baked for, so it lives exactly as long as the mesh.
+pub struct GpuSdf {
+    resources: Arc<DeviceResources>,
+    atlas_image: vk::Image,
+    atlas_view: vk::ImageView,
+    atlas_alloc: vk_mem::Allocation,
+    indirection_image: vk::Image,
+    indirection_view: vk::ImageView,
+    indirection_alloc: vk_mem::Allocation,
+    coverage_image: vk::Image,
+    coverage_view: vk::ImageView,
+    coverage_alloc: vk_mem::Allocation,
+    bindless_index: u32,
+    free_list: Option<BindlessFreeList>,
+    /// The padded grid lower corner, local (rest) space.
+    pub bounds_min: Vec3,
+    /// The padded grid upper corner, local (rest) space.
+    pub bounds_max: Vec3,
+    /// The `R16_SNORM` distance normalization clamp: a sampled `+1.0` denormalizes to
+    /// `+max_dist` local units.
+    pub max_dist: f32,
+    /// The fine voxel count per axis.
+    pub voxel_dims: [u32; 3],
+    /// The brick indirection-volume dims (bricks per axis).
+    pub indirection_dims: [u32; 3],
+    /// The atlas tiling (occupied bricks per axis in the atlas image).
+    pub atlas_bricks: [u32; 3],
+    /// The prefiltered atlas mip levels (the brick atlas image carries this many mips).
+    pub mip_count: u32,
+}
+
+// SAFETY: as [`GpuTexture`] — the free-list is `Arc<Mutex<_>>` (Send+Sync); the
+// image/view/allocation carry no thread-affine state. A `GpuSdf` rides inside an
+// `Arc<GpuMesh>` the worker may build + drop off the main thread.
+unsafe impl Send for GpuSdf {}
+// SAFETY: every field is shared read-only after construction; the free-list is
+// `Arc<Mutex<_>>`. The thumbnail worker hands an `Arc<GpuMesh>` (holding the `GpuSdf`)
+// back to the main thread through an `Arc<Mutex<_>>` (README §5), which needs `Sync`.
+unsafe impl Sync for GpuSdf {}
+
+/// The pieces an upload assembles a [`GpuSdf`] from: the two created images + views +
+/// allocations, the claimed (shared) SDF bindless slot, and the v2 brick metadata. A
+/// parameter struct so [`GpuSdf::from_parts`] reads as named fields.
+pub struct GpuSdfParts {
+    /// The device-local `R16_SNORM` brick-atlas 3D image handle.
+    pub atlas_image: vk::Image,
+    /// The atlas `TYPE_3D` sampled image view.
+    pub atlas_view: vk::ImageView,
+    /// The atlas image's VMA allocation.
+    pub atlas_alloc: vk_mem::Allocation,
+    /// The device-local `R32_UINT` indirection-volume 3D image handle.
+    pub indirection_image: vk::Image,
+    /// The indirection `TYPE_3D` sampled image view.
+    pub indirection_view: vk::ImageView,
+    /// The indirection image's VMA allocation.
+    pub indirection_alloc: vk_mem::Allocation,
+    /// The device-local `R16_SNORM` coarse coverage 3D image handle (one texel per brick).
+    pub coverage_image: vk::Image,
+    /// The coverage `TYPE_3D` sampled image view.
+    pub coverage_view: vk::ImageView,
+    /// The coverage image's VMA allocation.
+    pub coverage_alloc: vk_mem::Allocation,
+    /// The claimed slot in the bindless SDF arrays (set 0, bindings 1 + 2 + 3).
+    pub bindless_index: u32,
+    /// The padded grid lower corner, local space.
+    pub bounds_min: Vec3,
+    /// The padded grid upper corner, local space.
+    pub bounds_max: Vec3,
+    /// The `R16_SNORM` distance normalization clamp.
+    pub max_dist: f32,
+    /// The fine voxel count per axis.
+    pub voxel_dims: [u32; 3],
+    /// The brick indirection-volume dims.
+    pub indirection_dims: [u32; 3],
+    /// The atlas tiling (bricks per axis).
+    pub atlas_bricks: [u32; 3],
+    /// The prefiltered atlas mip levels.
+    pub mip_count: u32,
+}
+
+impl GpuSdf {
+    /// Wraps the already-created atlas + indirection `Texture3D`s as a bindless field
+    /// occupying `parts.bindless_index`, returning that slot to `free_list` on [`Drop`].
+    pub fn from_parts(
+        resources: &Arc<DeviceResources>,
+        parts: GpuSdfParts,
+        free_list: &BindlessFreeList,
+    ) -> Self {
+        Self {
+            resources: Arc::clone(resources),
+            atlas_image: parts.atlas_image,
+            atlas_view: parts.atlas_view,
+            atlas_alloc: parts.atlas_alloc,
+            indirection_image: parts.indirection_image,
+            indirection_view: parts.indirection_view,
+            indirection_alloc: parts.indirection_alloc,
+            coverage_image: parts.coverage_image,
+            coverage_view: parts.coverage_view,
+            coverage_alloc: parts.coverage_alloc,
+            bindless_index: parts.bindless_index,
+            free_list: Some(Arc::clone(free_list)),
+            bounds_min: parts.bounds_min,
+            bounds_max: parts.bounds_max,
+            max_dist: parts.max_dist,
+            voxel_dims: parts.voxel_dims,
+            indirection_dims: parts.indirection_dims,
+            atlas_bricks: parts.atlas_bricks,
+            mip_count: parts.mip_count,
+        }
+    }
+
+    /// The brick-atlas image handle.
+    pub fn atlas_handle(&self) -> vk::Image {
+        self.atlas_image
+    }
+
+    /// The brick-atlas sampled `TYPE_3D` image view (bindless binding 1).
+    pub fn atlas_view(&self) -> vk::ImageView {
+        self.atlas_view
+    }
+
+    /// The indirection-volume sampled `TYPE_3D` image view (bindless binding 2).
+    pub fn indirection_view(&self) -> vk::ImageView {
+        self.indirection_view
+    }
+
+    /// The coarse coverage-volume sampled `TYPE_3D` image view (bindless binding 3).
+    pub fn coverage_view(&self) -> vk::ImageView {
+        self.coverage_view
+    }
+
+    /// This field's slot in the bindless SDF arrays (set 0, bindings 1 + 2).
+    pub fn bindless_index(&self) -> u32 {
+        self.bindless_index
+    }
+}
+
+impl Drop for GpuSdf {
+    fn drop(&mut self) {
+        // Reclaim the SDF bindless slot for reuse, under the shared mutex — a
+        // worker-built mesh's field may be dropped off the main thread.
+        if let Some(free_list) = self.free_list.take()
+            && let Ok(mut slots) = free_list.lock()
+        {
+            slots.push(self.bindless_index);
+        }
+        // SAFETY: the ash/VMA seam. The bundle keeps device + allocator alive; each view
+        // then its image, freed exactly once.
+        unsafe {
+            let device = self.resources.device();
+            let allocator = self.resources.allocator();
+            device.destroy_image_view(self.atlas_view, None);
+            allocator.destroy_image(self.atlas_image, &mut self.atlas_alloc);
+            device.destroy_image_view(self.indirection_view, None);
+            allocator.destroy_image(self.indirection_image, &mut self.indirection_alloc);
+            device.destroy_image_view(self.coverage_view, None);
+            allocator.destroy_image(self.coverage_image, &mut self.coverage_alloc);
+        }
+    }
+}
+
 /// A device-local mesh: vertex + index (+ optional skin) buffers, the submesh
 /// ranges, the local-space AABB, the CPU-side copies retained for triangle-precise
 /// picking, and the optional ray-tracing BLAS.
@@ -657,6 +829,11 @@ pub struct GpuMesh {
     pub cpu_skin: Vec<VertexSkin>,
     /// The ray-tracing BLAS (`None` when RT is unsupported or not yet built).
     pub blas: Option<Arc<AccelerationStructure>>,
+    /// The per-mesh signed distance fields — one tight field per primitive (and per spatial
+    /// chunk of an oversized primitive), empty when the mesh baked none (a degenerate mesh, or
+    /// a build without SDF support). Held here so the fields live exactly as long as the mesh
+    /// that owns them; the lighting cone-trace indexes each by [`GpuSdf::bindless_index`].
+    pub sdfs: Vec<Arc<GpuSdf>>,
 }
 
 /// The device-local morph buffers a [`GpuMesh`] carries when it has blend shapes: the flat
@@ -717,6 +894,9 @@ pub struct GpuMeshParts {
     pub cpu_skin: Vec<VertexSkin>,
     /// The built ray-tracing BLAS (`None` when RT is unsupported).
     pub blas: Option<Arc<AccelerationStructure>>,
+    /// The uploaded per-mesh signed distance fields (one per primitive / chunk; empty when
+    /// none was baked).
+    pub sdfs: Vec<Arc<GpuSdf>>,
 }
 
 impl GpuMesh {
@@ -739,7 +919,14 @@ impl GpuMesh {
             cpu_indices: parts.cpu_indices,
             cpu_skin: parts.cpu_skin,
             blas: parts.blas,
+            sdfs: parts.sdfs,
         }
+    }
+
+    /// The per-mesh signed distance fields — one tight field per primitive (and per spatial
+    /// chunk of an oversized primitive); empty when the mesh baked none.
+    pub fn sdfs(&self) -> &[Arc<GpuSdf>] {
+        &self.sdfs
     }
 
     /// The vertex buffer handle.
@@ -1085,7 +1272,7 @@ mod tests {
             "dropping the Buffer reclaimed its allocation"
         );
 
-        // Image (2D color) + Image3D (voxel proxy): each owns image + view.
+        // Image (2D color) + Image3D (GDF cascade volume): each owns image + view.
         {
             let _image = Image::new(
                 resources,
@@ -1107,6 +1294,7 @@ mod tests {
                     depth: 4,
                 },
                 vk::Format::R16G16B16A16_SFLOAT,
+                1,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
             )
             .expect("Image3D::new");
@@ -1144,6 +1332,7 @@ mod tests {
                 cpu_indices: Vec::new(),
                 cpu_skin: Vec::new(),
                 blas: None,
+                sdfs: Vec::new(),
             };
             let mesh = GpuMesh::from_parts(resources, parts);
             assert_eq!(mesh.index_count, 12);
