@@ -102,6 +102,13 @@ pub struct LightUbo {
     pub ddgi_volume_extent: Vec4,
     /// `xyz` DDGI probes per axis, `w` irradiance octahedral interior.
     pub ddgi_probe_count: UVec4,
+    /// `xyz` DDGI toroidal scroll base (`wrapMod(snapBase, count)`) — the mesh maps a logical probe
+    /// index to its physical atlas tile; `w` reserved.
+    pub ddgi_scroll_base: UVec4,
+    /// `x` SDF-occluder instance count (the lighting set's binding-8 SSBO), `y` sky-occlusion
+    /// enable (1 = the analytic IBL diffuse/specular are attenuated by the per-mesh SDF DFAO
+    /// cone-trace); `zw` reserved.
+    pub sdf_occlusion: UVec4,
     /// `rgb` scene-environment ambient (the non-IBL fallback), `a` reflection-probe count.
     pub ambient_color: Vec4,
     /// `x` screen-space-reflection flag, `y` ray-traced-reflection flag; `zw` reserved.
@@ -112,8 +119,8 @@ pub struct LightUbo {
 }
 
 const _: () = assert!(
-    size_of::<LightUbo>() == 400,
-    "LightUbo must match the std140 shader layout (5 vec4 + 2 mat4 + 8 vec4 + 1 mat4)"
+    size_of::<LightUbo>() == 432,
+    "LightUbo must match the std140 shader layout (5 vec4 + 2 mat4 + 10 vec4 + 1 mat4)"
 );
 
 impl Default for LightUbo {
@@ -132,6 +139,8 @@ impl Default for LightUbo {
             ddgi_volume_min: Vec4::ZERO,
             ddgi_volume_extent: Vec4::ZERO,
             ddgi_probe_count: UVec4::ZERO,
+            ddgi_scroll_base: UVec4::ZERO,
+            sdf_occlusion: UVec4::ZERO,
             ambient_color: Vec4::ZERO,
             extra_flags: UVec4::ZERO,
             prev_view_proj: Mat4::IDENTITY,
@@ -262,6 +271,8 @@ pub struct Lighting {
     frame_ddgi_volume_min: Vec4,
     frame_ddgi_volume_extent: Vec4,
     frame_ddgi_probe_count: UVec4,
+    frame_ddgi_scroll_base: UVec4,
+    frame_sdf_occlusion: UVec4,
     cluster_dispatch_pending: bool,
 
     shadow_pending: bool,
@@ -313,6 +324,8 @@ impl Lighting {
             frame_ddgi_volume_min: Vec4::ZERO,
             frame_ddgi_volume_extent: Vec4::ZERO,
             frame_ddgi_probe_count: UVec4::ZERO,
+            frame_ddgi_scroll_base: UVec4::ZERO,
+            frame_sdf_occlusion: UVec4::ZERO,
             cluster_dispatch_pending: false,
             shadow_pending: false,
             shadow_view_proj: Mat4::IDENTITY,
@@ -338,6 +351,33 @@ impl Lighting {
     /// passes.
     pub fn light_set(&self, frame: usize) -> vk::DescriptorSet {
         self.frames[frame].light_set
+    }
+
+    /// Writes the renderer-owned per-mesh SDF-occluder instance SSBO into binding 8 of every
+    /// frame slot's light set (set 1). The buffer is persistent (one allocation for the
+    /// renderer's life, its prefix rewritten each frame by `set_sdf_scene`), so this is a
+    /// one-time wire-up at construction — the cone-trace reads the first `sdf_occlusion.x`
+    /// entries.
+    pub fn bind_sdf_instances(
+        &self,
+        descriptors: &Descriptors,
+        buffer: vk::Buffer,
+        size: vk::DeviceSize,
+    ) {
+        for frame in &self.frames {
+            descriptors.write_storage_buffer(frame.light_set, 8, buffer, size);
+        }
+    }
+
+    /// Writes the Global-SDF cascade samplers (binding 9) + the params UBO (binding 10) into every
+    /// frame slot's light set (set 1). The cascade volumes + UBO are persistent (one allocation for
+    /// the renderer's life), so this is a one-time wire-up at construction; the consumers gate the
+    /// far-field tap on the UBO's `enabled` control flag, so the binding is valid even with the GDF
+    /// off (the cascades rest in `SHADER_READ_ONLY_OPTIMAL`).
+    pub fn bind_gdf(&self, global_sdf: &crate::GlobalSdf) {
+        for (i, frame) in self.frames.iter().enumerate() {
+            global_sdf.write_light_set(frame.light_set, i);
+        }
     }
 
     /// The frame slot's compute cluster set, bound by the light-cull pass.
@@ -481,6 +521,8 @@ impl Lighting {
             ddgi_volume_min: self.frame_ddgi_volume_min,
             ddgi_volume_extent: self.frame_ddgi_volume_extent,
             ddgi_probe_count: self.frame_ddgi_probe_count,
+            ddgi_scroll_base: self.frame_ddgi_scroll_base,
+            sdf_occlusion: self.frame_sdf_occlusion,
             ambient_color: scene.ambient.extend(f32::from_bits(self.frame_probe_count)),
             extra_flags: UVec4::new(
                 u32::from(self.frame_ssr_flag),
@@ -508,22 +550,32 @@ impl Lighting {
         self.frame_probe_count = probe_count;
     }
 
-    /// Folds this frame's DDGI flag (`screen_flags.z`) + the fitted probe-volume
-    /// placement (`ddgi_volume_min`/`extent`) + the probe grid (`ddgi_probe_count`) into
-    /// the next [`Lighting::set_scene_lighting`] write, so the mesh fragment samples the
-    /// DDGI atlases when the volume ran this frame. The renderer reads its `Ddgi`
-    /// sub-state and pushes them here before the UBO write.
+    /// Folds this frame's DDGI flag (`screen_flags.z`) + the camera-centered probe-volume
+    /// placement (`ddgi_volume_min`/`extent`) + the probe grid (`ddgi_probe_count`) + the toroidal
+    /// scroll base (`ddgi_scroll_base`) into the next [`Lighting::set_scene_lighting`] write, so the
+    /// mesh fragment samples the DDGI atlases at the right physical tile when the volume ran this
+    /// frame. The renderer reads its `Ddgi` sub-state and pushes them here before the UBO write.
     pub fn set_frame_ddgi(
         &mut self,
         ddgi_enabled: bool,
         volume_min: Vec3,
         volume_extent: Vec3,
         probe_count: UVec4,
+        scroll_base: UVec4,
     ) {
         self.frame_ddgi_flag = ddgi_enabled;
         self.frame_ddgi_volume_min = volume_min.extend(0.0);
         self.frame_ddgi_volume_extent = volume_extent.extend(0.0);
         self.frame_ddgi_probe_count = probe_count;
+        self.frame_ddgi_scroll_base = scroll_base;
+    }
+
+    /// Folds this frame's GDF reflection-occlusion enable bit (`sdf_occlusion.y`) into the next
+    /// [`Lighting::set_scene_lighting`] write. When enabled the mesh fragment sphere-marches the
+    /// Global Distance Field along the reflection vector to occlude the reflected skybox — the one
+    /// remaining per-pixel SDF consumer (indirect diffuse occlusion is DDGI ray-miss + GTAO).
+    pub fn set_frame_sdf_occlusion(&mut self, reflection_occlusion_enabled: bool) {
+        self.frame_sdf_occlusion = UVec4::new(0, u32::from(reflection_occlusion_enabled), 0, 0);
     }
 
     /// Folds this frame's SSR flag (`extra_flags.x`) into the next
@@ -955,11 +1007,11 @@ mod tests {
     use std::mem::offset_of;
     use std::sync::Mutex;
 
-    /// `LightUbo` is exactly 320 bytes with each field at the std140 offset the mesh
+    /// `LightUbo` is exactly 432 bytes with each field at the std140 offset the mesh
     /// fragment reads — the contract the shaded path reads by raw bytes.
     #[test]
     fn light_ubo_byte_layout_matches_std140() {
-        assert_eq!(size_of::<LightUbo>(), 400);
+        assert_eq!(size_of::<LightUbo>(), 432);
         assert_eq!(align_of::<LightUbo>(), 16);
         assert_eq!(offset_of!(LightUbo, direction_ambient), 0);
         assert_eq!(offset_of!(LightUbo, color_intensity), 16);
@@ -974,9 +1026,11 @@ mod tests {
         assert_eq!(offset_of!(LightUbo, ddgi_volume_min), 256);
         assert_eq!(offset_of!(LightUbo, ddgi_volume_extent), 272);
         assert_eq!(offset_of!(LightUbo, ddgi_probe_count), 288);
-        assert_eq!(offset_of!(LightUbo, ambient_color), 304);
-        assert_eq!(offset_of!(LightUbo, extra_flags), 320);
-        assert_eq!(offset_of!(LightUbo, prev_view_proj), 336);
+        assert_eq!(offset_of!(LightUbo, ddgi_scroll_base), 304);
+        assert_eq!(offset_of!(LightUbo, sdf_occlusion), 320);
+        assert_eq!(offset_of!(LightUbo, ambient_color), 336);
+        assert_eq!(offset_of!(LightUbo, extra_flags), 352);
+        assert_eq!(offset_of!(LightUbo, prev_view_proj), 368);
     }
 
     /// `ClusterParams` is exactly 192 bytes with each field at the std140 offset both
