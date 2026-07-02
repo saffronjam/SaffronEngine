@@ -27,7 +27,7 @@ use saffron_geometry::{
     load_animation, load_animation_from_bytes, load_mesh_from_bytes, load_mesh_morph_from_bytes,
     load_mesh_skin_from_bytes, translate_model,
 };
-use saffron_rendering::{GpuMesh, GpuTexture};
+use saffron_rendering::{GpuMesh, GpuTexture, SdfBake};
 use saffron_scene::{AssetType, Colorspace};
 
 use crate::error::{Error, Result};
@@ -87,22 +87,25 @@ impl AssetServer {
         gpu: &dyn GpuUploader,
         sub_id: Uuid,
         source: &ByteSource,
+        sdf_bake: Option<SdfBake>,
     ) -> Option<Arc<GpuMesh>> {
         if let Some(cached) = self.mesh_by_uuid.get(&sub_id.value()) {
             return cached.clone();
         }
-        let result = self.upload_mesh_from_source(gpu, sub_id, source);
+        let result = self.upload_mesh_from_source(gpu, sub_id, source, sdf_bake);
         self.mesh_by_uuid.insert(sub_id.value(), result.clone());
         result
     }
 
-    /// Reads + decodes + uploads the mesh, or returns `None` (with a warn) on any
-    /// failure. The caller caches the outcome.
+    /// Reads + decodes + uploads the mesh, GPU-baking (or cache-loading) its signed distance
+    /// field when `sdf_bake` is set, or returns `None` (with a warn) on any failure. The
+    /// caller caches the outcome.
     fn upload_mesh_from_source(
         &self,
         gpu: &dyn GpuUploader,
         sub_id: Uuid,
         source: &ByteSource,
+        sdf_bake: Option<SdfBake>,
     ) -> Option<Arc<GpuMesh>> {
         let bytes = match source.read() {
             Ok(bytes) => bytes,
@@ -123,12 +126,22 @@ impl AssetServer {
         // `.smesh` carries its sparse deltas; the deform pass reads them on the GPU.
         let skin = load_mesh_skin_from_bytes(&bytes).unwrap_or_default();
         let morph = load_mesh_morph_from_bytes(&bytes).ok().flatten();
-        match gpu.upload_mesh(&mesh, &skin, morph.as_ref()) {
+        match gpu.upload_mesh(&mesh, &skin, morph.as_ref(), sdf_bake.as_ref()) {
             Ok(mesh_ref) => Some(mesh_ref),
             Err(err) => {
                 tracing::warn!("mesh {}: {err}", sub_id.value());
                 None
             }
+        }
+    }
+
+    /// The per-mesh SDF bake request for a project mesh: the default `resolution_scale` and
+    /// the project's `assets/cache` sidecar directory (a content hash of the geometry keys
+    /// the cache, so a re-load skips the GPU bake). The gizmo/preview meshes pass `None`.
+    fn sdf_bake(&self) -> SdfBake {
+        SdfBake {
+            resolution_scale: 1.0,
+            cache_dir: Some(self.root.join("cache")),
         }
     }
 
@@ -176,7 +189,9 @@ impl AssetServer {
             self.mesh_by_uuid.insert(sub_id.value(), None);
             return None;
         }
-        self.load_mesh_from_source(gpu, sub_id, &source)
+        // The per-mesh signed distance field is GPU jump-flood baked (or sidecar-cache
+        // loaded) at upload time from the mesh geometry, tied to the mesh's lifetime.
+        self.load_mesh_from_source(gpu, sub_id, &source, Some(self.sdf_bake()))
     }
 
     /// Resolves an embedded texture sub-asset to a live GPU texture (colorspace from the
@@ -245,7 +260,9 @@ impl AssetServer {
             path,
             ..ByteSource::default()
         };
-        self.load_mesh_from_source(gpu, id, &source)
+        // The signed distance field is GPU-baked (or sidecar-cache loaded) from the mesh
+        // geometry at upload time — standalone meshes get a field too.
+        self.load_mesh_from_source(gpu, id, &source, Some(self.sdf_bake()))
     }
 
     /// Resolves a texture id to a GPU texture, decoding + uploading the copied file on a
@@ -417,7 +434,7 @@ impl AssetServer {
                 .insert(PREVIEW_FLOOR_MESH_ID.value(), None);
             return false;
         };
-        match gpu.upload_mesh(mesh, &[], None) {
+        match gpu.upload_mesh(mesh, &[], None, None) {
             Ok(mesh_ref) => {
                 self.mesh_by_uuid
                     .insert(PREVIEW_FLOOR_MESH_ID.value(), Some(mesh_ref));
@@ -461,7 +478,7 @@ impl AssetServer {
             return false;
         };
         let submesh_count = mesh.submeshes.len().max(1);
-        let mesh_ref = match gpu.upload_mesh(mesh, skin, None) {
+        let mesh_ref = match gpu.upload_mesh(mesh, skin, None, None) {
             Ok(mesh_ref) => mesh_ref,
             Err(err) => {
                 tracing::warn!("editor camera model: {err}");
@@ -640,9 +657,10 @@ mod tests {
             mesh: &Mesh,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
+            sdf_bake: Option<&saffron_rendering::SdfBake>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
             self.mesh_uploads.fetch_add(1, Ordering::SeqCst);
-            self.inner.upload_mesh(mesh, skin, morph)
+            self.inner.upload_mesh(mesh, skin, morph, sdf_bake)
         }
 
         fn upload_texture(
