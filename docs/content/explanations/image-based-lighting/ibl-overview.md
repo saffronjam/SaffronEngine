@@ -46,11 +46,39 @@ All three are baked once by [the bake](../ibl-bake-pass/) and bound as descripto
 The ambient block in `lighting.slang` (imported by `mesh.slang`) reads all three and assembles diffuse plus specular. Diffuse samples the irradiance cube along the normal $n$ and scales by the energy-conservation factor $k_d$, computed with `fresnelSchlickRoughness` so rough surfaces do not over-reflect at grazing angles. Specular samples the prefiltered cube along the reflection vector $R$ at a mip chosen by roughness, then applies the LUT, where `F0 * ab.x + ab.y` is the split-sum scale and bias.
 
 ```hlsl
-float3 diffuseIBL  = kd * irradiance * albedo;
+float3 irradiance  = irradianceMap.SampleLevel(n, 0.0).rgb;   // along the shading normal
+float3 indirectIrr = irradiance;                              // analytic sky (residual; DDGI replaces it)
+float3 diffuseIBL  = kd * indirectIrr * albedo;
 float3 prefiltered = prefilteredMap.SampleLevel(R, roughness * IblPrefilterMaxMip).rgb;
 float2 ab          = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
-ambient = diffuseIBL + prefiltered * (F0 * ab.x + ab.y);
+float3 specularIBL = prefiltered * (F0 * ab.x + ab.y) * specSkyVis;        // reflection-cone occluded
+ambient = diffuseIBL * ao + specularIBL;                      // ao = material × contact GTAO
 ```
+
+## Why a ceiling does not block the sky on its own
+
+The irradiance cube treats the whole environment as visible from every point. A surface deep inside an enclosed room receives the same sky irradiance as one in open air, because the cube knows nothing about the geometry between them. Material AO maps and screen-space [GTAO](../../screen-space-and-post/) only darken the contact scale (creases, the few centimetres around a corner), so neither can say "a ceiling stands between this floor and the sky." Left alone, the analytic sky leaks into interiors and washes them out.
+
+Two mechanisms fix this, and they compose. Both leave open and outdoor areas alone; they only bite where geometry actually encloses a surface.
+
+### DDGI replaces the IBL diffuse where it has coverage
+
+When [DDGI](../../global-illumination-and-raytracing/ddgi-overview/) is enabled, its probe irradiance already carries sky occlusion intrinsically — a probe inside a sealed room sees the sky only through the gaps its rays actually reach (the sky enters a probe's radiance only on a ray that *misses* every surface). So the indirect diffuse is a *replace*, not an add: the DDGI irradiance lerps over the analytic irradiance by the probe cage's coverage. Where the cage covers a surface, its occluded irradiance wins; where it does not, the analytic term remains as the residual. This DDGI ray-miss is the **large-range** indirect occlusion — there is no longer a distance-field ambient-occlusion prepass dimming the diffuse, which would double-count the same enclosure.
+
+```hlsl
+float3 indirectIrr = irradiance;                     // analytic sky (residual where DDGI is absent)
+if (ddgiEnabled) {
+    float4 ddgi = ddgiSampleIrradiance(worldPos, n); // .w = coverage
+    indirectIrr = lerp(indirectIrr, ddgi.rgb, ddgi.w);
+}
+float3 indirect = kd * indirectIrr * albedo * ao;    // ao = material × contact GTAO
+```
+
+The diffuse is a single replace rather than two stacked terms, so a mid-room floor never reads brighter than the analytic sky alone would have made it — DDGI carries the sky, it does not add a second copy of it. The only further occlusion is **contact-scale**: a small-radius [GTAO](../../screen-space-and-post/gtao/) fills in the creases and corners the coarse probe grid cannot resolve. [Screen-space GI](../../screen-space-and-post/) stays additive on top, because it is a one-bounce screen-space term, not the sky.
+
+### The distance field occludes the specular reflection
+
+The diffuse no longer reads the distance field at all, but the specular does. A separate reflection-cone factor `specSkyVis` cuts back the reflected skybox where the reflection vector is blocked — see [distance field reflection occlusion](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/). It is gated on the sky-occlusion toggle. Dimming specular by a diffuse AO scalar would wrongly darken a chrome surface facing open sky, so the two are kept distinct.
 
 ## When it replaces flat ambient
 
@@ -61,8 +89,11 @@ IBL is the default. It runs whenever `globals.counts.z != 0`, which is `use_ibl 
 | What | File | Symbols |
 |---|---|---|
 | Ambient assembly + set-3 bindings | `engine/assets/shaders/lighting.slang` | ambient block, `irradianceMap`, `prefilteredMap`, `brdfLut`, `IblPrefilterMaxMip` |
+| SDF reflection occlusion | `engine/assets/shaders/lighting.slang` | `globals.sdfOcclusion`, `specSkyVis`, `sdfReflectionOcclusion` |
+| DDGI replaces the IBL diffuse | `engine/assets/shaders/lighting.slang` | `ddgiSampleIrradiance` (coverage in `.w`), the `lerp(indirectIrr, ddgi.rgb, ddgi.w)` |
 | IBL-on flag | `engine/crates/rendering/src/lighting.rs` | `set_frame_ibl`, `frame_ibl_flag` → `counts` |
 | Toggle + default | `engine/crates/rendering/src/ibl.rs` | `Ibl::use_ibl` (default `true`), `Ibl::ready` |
+| Sky-occlusion toggle | `engine/crates/rendering/src/renderer.rs` | `Renderer::set_sky_occlusion`, `sky_occlusion_enabled` |
 | Control command | `engine/crates/control/src/commands_render.rs` | `set-ibl` |
 
 ## Related
@@ -71,4 +102,5 @@ IBL is the default. It runs whenever `globals.counts.z != 0`, which is `use_ibl 
 - [Diffuse irradiance](../diffuse-irradiance/) — the diffuse cube
 - [Specular prefilter](../specular-prefilter/) — the roughness-mipped specular cube
 - [BRDF LUT](../brdf-lut/) — the split-sum scale/bias table
+- [Distance field reflection occlusion](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/) — the SDF cone that occludes the reflected skybox
 - [HDR and exposure](../../lighting-and-brdf/hdr-and-exposure/) — the linear radiance space
