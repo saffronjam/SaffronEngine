@@ -45,16 +45,16 @@ enum ScreenCompute {
     Ssgi,
     SsgiBlur,
     SsgiAccum,
+    DfaoAccum,
     Ssr,
     CopyColor,
-    DdgiVoxelize,
-    DdgiTrace,
     DdgiBlendIrr,
     DdgiBlendDist,
     DdgiBorder,
     RestirInitial,
     RestirReuse,
     RestirResolve,
+    GiResolve,
 }
 
 /// The typed mesh-PSO cache key. One übershader backs every renderable; this tuple is
@@ -125,16 +125,42 @@ pub struct Pipelines {
     ssgi: Option<Arc<Pipeline>>,
     ssgi_blur: Option<Arc<Pipeline>>,
     ssgi_accum: Option<Arc<Pipeline>>,
+    /// The DFAO temporal-accumulation compute PSO. Its own kernel (`dfao_accum.spv`), a clamp-free
+    /// EMA — unlike `ssgi_accum`, DFAO sky visibility is a rotating low-frequency Monte-Carlo
+    /// estimate that must be averaged (not neighborhood-clamped) to converge on a static surface.
+    dfao_accum: Option<Arc<Pipeline>>,
     ssr: Option<Arc<Pipeline>>,
     copy_color: Option<Arc<Pipeline>>,
 
-    /// The five DDGI compute PSOs (voxelize / trace / blend-irradiance / blend-distance /
-    /// border), built lazily once the DDGI sub-state's set layouts are known.
-    ddgi_voxelize: Option<Arc<Pipeline>>,
+    /// The four DDGI compute PSOs (trace / blend-irradiance / blend-distance / border), built
+    /// lazily once the DDGI sub-state's set layouts are known. The trace is a three-set pipeline
+    /// (the bindless bricks + the light set, via the shared `sdf` module, + the DDGI trace set), so
+    /// it carries its own field rather than riding the single-set `ScreenCompute` table.
     ddgi_trace: Option<Arc<Pipeline>>,
     ddgi_blend_irr: Option<Arc<Pipeline>>,
     ddgi_blend_dist: Option<Arc<Pipeline>>,
     ddgi_border: Option<Arc<Pipeline>>,
+
+    /// The DFAO sky-visibility cone-trace PSO — a three-set pipeline (the bindless bricks + the
+    /// light set, via the shared `sdf` module for the GDF clipmap, + this pass's I/O set), so it
+    /// carries its own field rather than riding the single-set `ScreenCompute` table. The blur
+    /// stage reuses the SSGI blur PSO (`ssgi_blur`); the temporal accumulation uses the dedicated
+    /// clamp-free `dfao_accum` PSO.
+    dfao: Option<Arc<Pipeline>>,
+
+    /// The specular reflection-occlusion cone-trace PSO — a three-set pipeline mirroring
+    /// [`Pipelines::dfao`] (the bindless bricks + the light set for the GDF clipmap, via the shared
+    /// `sdf` module, + this pass's I/O set), so it carries its own field rather than riding the
+    /// single-set `ScreenCompute` table. Its I/O set is the compute3 shape (two samplers: the
+    /// G-buffer + roughness, plus the storage image). It is spatial-only: the half-res trace +
+    /// bilateral upsample (`ssgi_blur`) denoise it; the view-dependent reflection term is not
+    /// temporally reprojected (surface motion would smear it), so there is no accumulation stage.
+    specocc: Option<Arc<Pipeline>>,
+
+    /// The two Global-SDF compute PSOs (cull / composite), both two-set pipelines (the bindless
+    /// brick array set 0 + the GDF cull/composite set 1), built lazily once those layouts are known.
+    gdf_cull: Option<Arc<Pipeline>>,
+    gdf_composite: Option<Arc<Pipeline>>,
 
     /// The three ReSTIR DI compute PSOs (initial candidate sampling / temporal+spatial
     /// reuse / resolve incl. the TLAS visibility ray), built lazily once the device-shared
@@ -142,6 +168,8 @@ pub struct Pipelines {
     restir_initial: Option<Arc<Pipeline>>,
     restir_reuse: Option<Arc<Pipeline>>,
     restir_resolve: Option<Arc<Pipeline>>,
+    /// The screen-space indirect-diffuse resolve PSO (`gi_resolve.spv`, the bespoke single set).
+    gi_resolve: Option<Arc<Pipeline>>,
 
     /// The motion-vector prepass PSO (instanced, depth-tested, rg16f motion), built
     /// lazily.
@@ -227,16 +255,21 @@ impl Pipelines {
             ssgi: None,
             ssgi_blur: None,
             ssgi_accum: None,
+            dfao_accum: None,
             ssr: None,
             copy_color: None,
-            ddgi_voxelize: None,
             ddgi_trace: None,
             ddgi_blend_irr: None,
             ddgi_blend_dist: None,
             ddgi_border: None,
+            dfao: None,
+            specocc: None,
+            gdf_cull: None,
+            gdf_composite: None,
             restir_initial: None,
             restir_reuse: None,
             restir_resolve: None,
+            gi_resolve: None,
             motion: None,
             taa: None,
             fxaa: None,
@@ -490,6 +523,17 @@ impl Pipelines {
         self.request_screen_compute(ScreenCompute::Ssgi, "shaders/ssgi.spv", layout, 160)
     }
 
+    /// The screen-space indirect-diffuse resolve compute PSO (the bespoke `gi_resolve` single-set
+    /// layout; no push — its params ride a UBO in the set, being 224 bytes).
+    pub fn request_gi_resolve(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        self.request_screen_compute(
+            ScreenCompute::GiResolve,
+            "shaders/gi_resolve.spv",
+            layout,
+            0,
+        )
+    }
+
     /// The SSGI bilateral-blur compute PSO (compute3 layout, no push).
     pub fn request_ssgi_blur(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
         self.request_screen_compute(ScreenCompute::SsgiBlur, "shaders/ssgi_blur.spv", layout, 0)
@@ -500,6 +544,19 @@ impl Pipelines {
         self.request_screen_compute(
             ScreenCompute::SsgiAccum,
             "shaders/ssgi_accum.spv",
+            layout,
+            16,
+        )
+    }
+
+    /// The DFAO temporal-accumulation compute PSO (taa-shape layout, a 16-byte push). Its own
+    /// clamp-free EMA kernel — DFAO sky visibility is a rotating low-frequency Monte-Carlo estimate
+    /// that must be averaged (not neighborhood-clamped like SSGI radiance) to converge on a static
+    /// surface, so it does not reuse `ssgi_accum`.
+    pub fn request_dfao_accum(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        self.request_screen_compute(
+            ScreenCompute::DfaoAccum,
+            "shaders/dfao_accum.spv",
             layout,
             16,
         )
@@ -521,30 +578,81 @@ impl Pipelines {
         )
     }
 
-    /// The DDGI voxelize compute PSO (its set layout, a 48-byte push).
-    pub fn request_ddgi_voxelize(
+    /// The DDGI trace compute PSO. A three-set pipeline: set 0 = the bindless brick array, set 1 =
+    /// the light set (the per-mesh SDF instance list + the GDF cascade clipmap + params, via the
+    /// shared `sdf` module), set 2 = `trace_layout` (the albedo cache + prev-irradiance samplers +
+    /// the ray-image storage). The 112-byte push carries the probe grid + volume + sun/sky + scroll.
+    pub fn request_ddgi_trace(
         &mut self,
-        layout: vk::DescriptorSetLayout,
+        trace_layout: vk::DescriptorSetLayout,
     ) -> Option<Arc<Pipeline>> {
-        self.request_screen_compute(
-            ScreenCompute::DdgiVoxelize,
-            "shaders/ddgi_voxelize.spv",
-            layout,
-            48,
-        )
+        if let Some(pipeline) = &self.ddgi_trace {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [self.set_layouts[0], self.set_layouts[1], trace_layout];
+        match self.build_compute_multi("shaders/ddgi_trace.spv", &set_layouts, 112) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.ddgi_trace = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_ddgi_trace: {err}");
+                None
+            }
+        }
     }
 
-    /// The DDGI trace compute PSO (its set layout, a 112-byte push).
-    pub fn request_ddgi_trace(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
-        self.request_screen_compute(
-            ScreenCompute::DdgiTrace,
-            "shaders/ddgi_trace.spv",
-            layout,
-            112,
-        )
+    /// The DFAO sky-visibility cone-trace PSO. A three-set pipeline mirroring the DDGI trace:
+    /// set 0 = the bindless brick array, set 1 = the light set (the GDF cascade clipmap + params
+    /// at bindings 9/10, via the shared `sdf` module), set 2 = `io_layout` (the compute2 shape:
+    /// the G-buffer sampler + the half-res sky-visibility storage). A 144-byte push (the camera
+    /// inverses + the frame index).
+    pub fn request_dfao(&mut self, io_layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.dfao {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [self.set_layouts[0], self.set_layouts[1], io_layout];
+        match self.build_compute_multi("shaders/dfao.spv", &set_layouts, 144) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.dfao = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_dfao: {err}");
+                None
+            }
+        }
     }
 
-    /// The DDGI blend-irradiance compute PSO (its set layout, a 48-byte push).
+    /// The specular reflection-occlusion cone-trace PSO. A three-set pipeline mirroring
+    /// [`Pipelines::request_dfao`]: set 0 = the bindless brick array, set 1 = the light set (the GDF
+    /// cascade clipmap + params at bindings 9/10, via the shared `sdf` module), set 2 = `io_layout`
+    /// (the compute3 shape: the G-buffer + roughness samplers + the half-res occlusion storage). A
+    /// 144-byte push (the camera inverses + the frame index).
+    pub fn request_specocc(&mut self, io_layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.specocc {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [self.set_layouts[0], self.set_layouts[1], io_layout];
+        match self.build_compute_multi("shaders/specocc.spv", &set_layouts, 144) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.specocc = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_specocc: {err}");
+                None
+            }
+        }
+    }
+
+    /// The DDGI blend-irradiance compute PSO (its set layout, an 80-byte push).
     pub fn request_ddgi_blend_irr(
         &mut self,
         layout: vk::DescriptorSetLayout,
@@ -553,11 +661,11 @@ impl Pipelines {
             ScreenCompute::DdgiBlendIrr,
             "shaders/ddgi_blend_irradiance.spv",
             layout,
-            48,
+            80,
         )
     }
 
-    /// The DDGI blend-distance compute PSO (its set layout, a 48-byte push).
+    /// The DDGI blend-distance compute PSO (its set layout, an 80-byte push).
     pub fn request_ddgi_blend_dist(
         &mut self,
         layout: vk::DescriptorSetLayout,
@@ -566,7 +674,7 @@ impl Pipelines {
             ScreenCompute::DdgiBlendDist,
             "shaders/ddgi_blend_distance.spv",
             layout,
-            48,
+            80,
         )
     }
 
@@ -581,6 +689,54 @@ impl Pipelines {
             layout,
             32,
         )
+    }
+
+    /// The Global-SDF cull compute PSO: set 0 = the bindless brick array (for the shared
+    /// `SdfInstance` struct), set 1 = `gdf_layout` (instances + cull list), a 64-byte push.
+    pub fn request_gdf_cull(
+        &mut self,
+        gdf_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.gdf_cull {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [self.set_layouts[0], gdf_layout];
+        match self.build_compute_multi("shaders/gdf_cull.spv", &set_layouts, 64) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.gdf_cull = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_gdf_cull: {err}");
+                None
+            }
+        }
+    }
+
+    /// The Global-SDF composite compute PSO: set 0 = the bindless brick array (the `sampleMdfBrick`
+    /// taps), set 1 = `gdf_layout` (instances + cull list + cascade storage images), a 48-byte push.
+    pub fn request_gdf_composite(
+        &mut self,
+        gdf_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.gdf_composite {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [self.set_layouts[0], gdf_layout];
+        match self.build_compute_multi("shaders/gdf_composite.spv", &set_layouts, 48) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.gdf_composite = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_gdf_composite: {err}");
+                None
+            }
+        }
     }
 
     /// The ReSTIR initial-candidate-sampling compute PSO (its set layout, a 176-byte push).
@@ -855,16 +1011,16 @@ impl Pipelines {
             ScreenCompute::Ssgi => self.ssgi.as_ref(),
             ScreenCompute::SsgiBlur => self.ssgi_blur.as_ref(),
             ScreenCompute::SsgiAccum => self.ssgi_accum.as_ref(),
+            ScreenCompute::DfaoAccum => self.dfao_accum.as_ref(),
             ScreenCompute::Ssr => self.ssr.as_ref(),
             ScreenCompute::CopyColor => self.copy_color.as_ref(),
-            ScreenCompute::DdgiVoxelize => self.ddgi_voxelize.as_ref(),
-            ScreenCompute::DdgiTrace => self.ddgi_trace.as_ref(),
             ScreenCompute::DdgiBlendIrr => self.ddgi_blend_irr.as_ref(),
             ScreenCompute::DdgiBlendDist => self.ddgi_blend_dist.as_ref(),
             ScreenCompute::DdgiBorder => self.ddgi_border.as_ref(),
             ScreenCompute::RestirInitial => self.restir_initial.as_ref(),
             ScreenCompute::RestirReuse => self.restir_reuse.as_ref(),
             ScreenCompute::RestirResolve => self.restir_resolve.as_ref(),
+            ScreenCompute::GiResolve => self.gi_resolve.as_ref(),
         }
     }
 
@@ -876,16 +1032,16 @@ impl Pipelines {
             ScreenCompute::Ssgi => &mut self.ssgi,
             ScreenCompute::SsgiBlur => &mut self.ssgi_blur,
             ScreenCompute::SsgiAccum => &mut self.ssgi_accum,
+            ScreenCompute::DfaoAccum => &mut self.dfao_accum,
             ScreenCompute::Ssr => &mut self.ssr,
             ScreenCompute::CopyColor => &mut self.copy_color,
-            ScreenCompute::DdgiVoxelize => &mut self.ddgi_voxelize,
-            ScreenCompute::DdgiTrace => &mut self.ddgi_trace,
             ScreenCompute::DdgiBlendIrr => &mut self.ddgi_blend_irr,
             ScreenCompute::DdgiBlendDist => &mut self.ddgi_blend_dist,
             ScreenCompute::DdgiBorder => &mut self.ddgi_border,
             ScreenCompute::RestirInitial => &mut self.restir_initial,
             ScreenCompute::RestirReuse => &mut self.restir_reuse,
             ScreenCompute::RestirResolve => &mut self.restir_resolve,
+            ScreenCompute::GiResolve => &mut self.gi_resolve,
         }
     }
 
@@ -1024,7 +1180,13 @@ impl Pipelines {
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
 
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // Backface culling is dynamic (set per submesh by the scene pass — two-sided materials cull
+        // NONE, solid geometry culls BACK); the baked `cull_mode(NONE)` above is the fallback.
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+        ];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         let color_formats = [OFFSCREEN_COLOR_FORMAT];
@@ -1099,10 +1261,18 @@ impl Pipelines {
         raw: &ash::Device,
         module: vk::ShaderModule,
     ) -> Result<Pipeline> {
-        let stages = [vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(module)
-            .name(c"vertexMain")];
+        // Vertex writes depth; the fragment does only the alpha-clip discard (masked materials must
+        // not write depth at cutout texels). Opaque materials fall straight through — depth-only.
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vertexMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"depthPrepassFragment"),
+        ];
 
         let bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -1186,9 +1356,9 @@ impl Pipelines {
     }
 
     /// Builds the thin G-buffer prepass PSO from `gbuffer.slang`: binding 0 = the base
-    /// [`Vertex`] stream, one `R16G16B16A16_SFLOAT` color (view normal rgb + view-Z),
-    /// depth `LESS` + write, single-sampled (the G-buffer is post-resolve), sets 0/1/2,
-    /// the `viewProj + view` push.
+    /// [`Vertex`] stream, two colors (`R16G16B16A16_SFLOAT` view normal rgb + view-Z, then
+    /// `R8_UNORM` roughness), depth `LESS` + write, single-sampled (the G-buffer is post-resolve),
+    /// sets 0/1/2, the `viewProj + view` push.
     fn build_gbuffer(&self) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/gbuffer.spv")?;
@@ -1241,15 +1411,21 @@ impl Pipelines {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
-        let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(false)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        // Two color attachments (view normal + view-Z, then roughness); blend disabled on both.
+        let blend_attachment = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+        ];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let color_formats = [crate::ssao::G_NORMAL_FORMAT];
+        let color_formats = [crate::ssao::G_NORMAL_FORMAT, crate::ssao::ROUGHNESS_FORMAT];
         let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
@@ -1797,19 +1973,30 @@ impl Pipelines {
         set_layout: vk::DescriptorSetLayout,
         push_size: u32,
     ) -> Result<Pipeline> {
+        self.build_compute_multi(shader, &[set_layout], push_size)
+    }
+
+    /// Builds a compute PSO whose layout declares several descriptor sets (the single-set
+    /// [`Pipelines::build_compute`] is the one-element case). The DDGI trace binds the bindless
+    /// SDF array (set 0) + the light set (set 1) + the DDGI trace set (set 2).
+    fn build_compute_multi(
+        &self,
+        shader: &str,
+        set_layouts: &[vk::DescriptorSetLayout],
+        push_size: u32,
+    ) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module(shader)?;
 
-        let set_layouts = [set_layout];
         let push_constant = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
             .size(push_size)];
-        let mut layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let mut layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
         if push_size > 0 {
             layout_info = layout_info.push_constant_ranges(&push_constant);
         }
-        // SAFETY: the ash seam. The set layout outlives the call; the layout is owned by
+        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by
         // the returned `Pipeline`.
         let layout = match checked(
             unsafe { raw.create_pipeline_layout(&layout_info, None) },
