@@ -9,7 +9,7 @@ use ash::vk;
 use saffron_geometry::glam::Mat4;
 
 use crate::budget::{BudgetController, BudgetStep};
-use crate::ddgi::{DDGI_RAYS_PER_PROBE, DDGI_VOXEL_RES};
+use crate::ddgi::DDGI_RAYS_PER_PROBE;
 use crate::descriptors::Descriptors;
 use crate::device::SurfaceSource;
 use crate::draw_list::{DrawItem, RenderStats, SceneDrawList};
@@ -23,6 +23,7 @@ use crate::ibl::{
 };
 use crate::instancing::Instancing;
 use crate::lighting::{ClusterCamera, Lighting, SceneLighting, point_shadow_face_matrices};
+use crate::nested_scopes::NestedScopeRecorder;
 use crate::overlay::{
     GridPush, OverlayDraw, OverlayState, OverlayVertex, TonemapMode, TonemapPush,
 };
@@ -146,6 +147,14 @@ pub enum ViewId {
 /// The number of editor render views (scene + asset-preview).
 pub const VIEW_COUNT: usize = 2;
 
+/// Maximum SDF occluder instances the per-frame SDF instance SSBO holds. Each static draw
+/// contributes one instance per baked field, and a mesh bakes one tight field per primitive
+/// (plus per spatial chunk of an oversized primitive), so a modular scene — or a merged mesh
+/// split back into its primitives on bake — reaches the low thousands. The Global Distance
+/// Field clipmap carries the far field; this bounds the near-field per-instance list. Overflow
+/// clamps + logs.
+pub const MAX_SDF_INSTANCES: u32 = 4096;
+
 impl ViewId {
     /// The dense slot index into the renderer's `views` array (`Scene = 0`).
     pub fn index(self) -> usize {
@@ -239,13 +248,39 @@ struct FramePipelines {
     ssgi: Option<Arc<crate::Pipeline>>,
     ssgi_blur: Option<Arc<crate::Pipeline>>,
     ssgi_accum: Option<Arc<crate::Pipeline>>,
+    /// The screen-space indirect-diffuse resolve PSO, resolved when the screen chain runs (it reads
+    /// the G-buffer). Additive until the fragment cutover samples its half-res output.
+    gi_resolve: Option<Arc<crate::Pipeline>>,
+    /// The DFAO cone-trace PSO (three-set, GDF sky-visibility), resolved when sky occlusion is on
+    /// this frame. The blur + accumulation reuse the SSGI denoise PSOs bound with the DFAO sets.
+    dfao: Option<Arc<crate::Pipeline>>,
+    /// The DFAO bilateral-upsample PSO (the ssgi-blur PSO, bound with the DFAO blur set).
+    dfao_blur: Option<Arc<crate::Pipeline>>,
+    /// The DFAO temporal-accumulation PSO (the clamp-free `dfao_accum` PSO, bound with the DFAO
+    /// accum sets), resolved when sky occlusion is on AND motion ran.
+    dfao_accum: Option<Arc<crate::Pipeline>>,
+    /// This frame's DFAO trace push (camera inverses + frame index; bumped at resolve time).
+    dfao_push: crate::DfaoPush,
+    /// The specular reflection-occlusion cone-trace PSO (three-set, GDF reflection occlusion),
+    /// resolved under the same sky-occlusion gate as DFAO. Spatial-only: the blur reuses the SSGI
+    /// blur PSO bound with the specocc set; the view-dependent occlusion term is not temporally
+    /// accumulated (surface-motion reprojection would smear it), so there is no accum PSO.
+    specocc: Option<Arc<crate::Pipeline>>,
+    /// The specular-occlusion bilateral-upsample PSO (the ssgi-blur PSO, bound with the specocc
+    /// blur set).
+    specocc_blur: Option<Arc<crate::Pipeline>>,
+    /// This frame's specocc trace push (camera inverses + frame index; bumped at resolve time).
+    specocc_push: crate::SpecoccPush,
     /// The SSR trace PSO, resolved when SSR runs this frame.
     ssr: Option<Arc<crate::Pipeline>>,
     copy_color: Option<Arc<crate::Pipeline>>,
-    /// The five DDGI compute PSOs, resolved together when DDGI runs this frame (all five
-    /// present or the chain is skipped — the gate ANDs all five). `None`
-    /// arms no DDGI passes.
+    /// The four DDGI trace/blend/border PSOs, resolved together when DDGI runs this frame (all
+    /// four present or the chain is skipped — the gate ANDs all four). `None`
+    /// arms no DDGI sampling passes.
     ddgi: Option<DdgiPipelines>,
+    /// The two Global-SDF compute PSOs (cull + composite), resolved together when the GDF runs this
+    /// frame (both present or the chain is skipped). `None` arms no GDF passes.
+    gdf: Option<GdfPipelines>,
     /// The three ReSTIR DI compute PSOs, resolved together when ReSTIR runs this frame (all
     /// three present or the chain is skipped). `None` arms no
     /// ReSTIR passes; direct lighting then takes the clustered-forward path.
@@ -282,14 +317,35 @@ struct FramePipelines {
     overlay_draw: Option<OverlayDraw>,
 }
 
-/// The five DDGI compute PSOs, resolved together — the `doDdgi` gate requires all five,
-/// so they are bundled (a partial set skips the whole chain).
+/// The four DDGI trace/blend/border PSOs, resolved together — the `doDdgi` gate requires all four,
+/// so they are bundled (a partial set skips the whole chain). The trace sphere-marches the shared
+/// distance field (the per-mesh MDF + the Global SDF), so it carries no geometry proxy of its own.
 struct DdgiPipelines {
-    voxelize: Arc<crate::Pipeline>,
     trace: Arc<crate::Pipeline>,
     blend_irr: Arc<crate::Pipeline>,
     blend_dist: Arc<crate::Pipeline>,
     border: Arc<crate::Pipeline>,
+}
+
+/// The two Global-SDF compute PSOs, resolved together — the GDF gate requires both (a partial set
+/// skips the whole chain).
+struct GdfPipelines {
+    cull: Arc<crate::Pipeline>,
+    composite: Arc<crate::Pipeline>,
+}
+
+/// What [`Renderer::add_gdf_passes`] hands back to the build: the cascade volume resources the
+/// downstream consumers (the DDGI trace's far field) declare `SampledRead` on (so the graph
+/// transitions them ShaderReadOnly after the composite write), plus each cascade's external
+/// layout slot for the cross-frame write-back. Empty when the GDF did not run.
+#[derive(Default)]
+struct GdfResult {
+    cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
+    cascade_slots: [Option<usize>; crate::GDF_CASCADES as usize],
+    /// The lite albedo cache resource (the DDGI trace's `SampledRead`) + its external slot. `Some`
+    /// only when the composite ran this frame (it writes the cache GENERAL).
+    albedo: Option<RgResource>,
+    albedo_slot: Option<usize>,
 }
 
 /// The three ReSTIR DI compute PSOs, resolved together — the `doRestir` gate requires all
@@ -308,7 +364,6 @@ struct RestirPipelines {
 struct DdgiResult {
     irradiance: Option<RgResource>,
     distance: Option<RgResource>,
-    voxel_slot: Option<usize>,
     rays_slot: Option<usize>,
     irradiance_slot: Option<usize>,
     distance_slot: Option<usize>,
@@ -340,6 +395,11 @@ struct ScreenSpaceResult {
     ssgi_history_slots: Option<TaaHistorySlots>,
     /// The ssgi_resolved image's external-layout slot when the accumulation ran.
     ssgi_resolved_slot: Option<usize>,
+    /// `(history-slot, external-layout-slot)` for the two DFAO history images when the DFAO
+    /// temporal accumulation ran (same write-back shape as the SSGI history).
+    dfao_history_slots: Option<TaaHistorySlots>,
+    /// The dfao_resolved image's external-layout slot when the accumulation ran.
+    dfao_resolved_slot: Option<usize>,
     /// The ssr_map image's external-layout slot when the SSR trace ran, so its resolved
     /// exit layout (ShaderReadOnly after the scene's SampledRead) carries to next frame.
     ssr_map_slot: Option<usize>,
@@ -529,8 +589,24 @@ pub struct Renderer {
     reflection: ReflectionProbes,
     ssao: Ssao,
     ddgi: crate::Ddgi,
+    global_sdf: crate::GlobalSdf,
     rt: crate::Rt,
     restir: crate::Restir,
+
+    /// The per-static-instance SDF SSBO: one [`crate::SdfInstance`] per static draw that
+    /// carries a baked field, host-mapped + sized to a fixed capacity (grow-not-needed,
+    /// the same discipline as the DDGI box buffer). The lighting cone-trace iterates the
+    /// first [`Self::sdf_instance_count`] entries. Phase 2 builds + uploads it; Phase 3
+    /// binds it into the lighting set and reads it.
+    sdf_instances: crate::Buffer,
+    /// The active SDF-instance count uploaded this frame.
+    sdf_instance_count: u32,
+    /// The SDF-instance SSBO capacity (entries).
+    sdf_instance_capacity: u32,
+    /// Whether GDF reflection occlusion (the per-pixel reflection-cone march against the Global
+    /// Distance Field that occludes the reflected skybox under overhangs) is enabled. The one
+    /// remaining per-pixel SDF consumer; indirect diffuse occlusion is DDGI ray-miss + GTAO.
+    sky_occlusion: bool,
     /// The bindless descriptor table, behind an `Arc` so the thumbnail worker shares it
     /// (`Descriptors` is `Send + Sync` — every slot claim + write goes through its internal
     /// bindless `Mutex`, so concurrent uploads from the worker + frame loop are serialized).
@@ -542,6 +618,12 @@ pub struct Renderer {
     /// samples this slot, so it must outlive every draw — held here for the renderer's
     /// lifetime.
     default_white: Arc<crate::GpuTexture>,
+
+    /// The 1×1×1 "empty space" SDF seeded into every unbound slot of the bindless
+    /// `Texture3D` SDF array (binding 1). A mesh that baked no SDF leaves its slot holding
+    /// this field, which reads as "far from any surface" (no occlusion); held here so the
+    /// seeded views stay valid for the renderer's lifetime.
+    default_sdf: Arc<crate::GpuSdf>,
 
     /// The offscreen thumbnail + material-preview render sub-state: the lazy
     /// thumbnail/preview PSOs + the preview sphere, plus the render-to-texture and PNG
@@ -638,12 +720,14 @@ impl Renderer {
             ReflectionProbes,
             Ssao,
             crate::Ddgi,
+            crate::GlobalSdf,
             crate::Rt,
             crate::Restir,
             Vec<ViewTarget>,
             BindlessFreeList,
             crate::Aa,
             Arc<crate::GpuTexture>,
+            Arc<crate::GpuSdf>,
         );
         let build = || -> Result<BuildParts> {
             let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
@@ -655,6 +739,11 @@ impl Renderer {
             let queue = crate::GpuQueue::new(device.graphics_queue);
             let uploader = crate::Uploader::new(&device, &queue)?;
             let default_white = uploader.upload_default_white(&descriptors)?;
+            // The bindless SDF array (binding 1) is partially bound; seed every slot with a
+            // 1×1×1 "empty space" field so an unbound slot is never sampled by the
+            // sky-occlusion cone-trace (a lavapipe fault / UB on real hardware). Real
+            // per-mesh SDFs overwrite their own slot as their `GpuMesh` is built.
+            let default_sdf = uploader.upload_default_sdf(&descriptors)?;
 
             let targets = Targets::new(&device)?;
             let lighting = Lighting::new(&device, &descriptors, &targets)?;
@@ -679,11 +768,15 @@ impl Renderer {
             let aa = crate::Aa::new(
                 device.supported_sample_counts(crate::OFFSCREEN_COLOR_FORMAT, crate::DEPTH_FORMAT),
             );
-            // DDGI: the voxel proxy + octahedral atlases + ray image + box SSBO + the six
-            // sets/layouts + the five PSOs deferred to lazy request. Device-shared (one
-            // volume); off by default. Built after descriptors (it needs the mesh set-5
-            // layout + the shared pool).
+            // DDGI: the two octahedral atlases + ray image + the five sets/layouts + the four PSOs
+            // deferred to lazy request. Device-shared (one camera-centered probe clipmap); on by
+            // default. Built after descriptors (it needs the mesh set-5 layout + the shared pool).
             let ddgi = crate::Ddgi::new(&device, &descriptors)?;
+            // Global SDF: the cascade clipmap volumes + cull SSBO + params UBO + the two compute
+            // sets/layouts + the two PSOs deferred to lazy request. Device-shared (one clipmap);
+            // off by default. Built after descriptors (it needs the shared pool + the light layout
+            // it writes the cascade samplers into).
+            let global_sdf = crate::GlobalSdf::new(&device, &descriptors)?;
             // RT: the set-6 TLAS layout + per-frame sets + the seeded empty TLAS (a no-op
             // sub-state on a software device). Built after descriptors (it needs set 6).
             let rt = crate::Rt::new(&device, &descriptors)?;
@@ -726,12 +819,14 @@ impl Renderer {
                 reflection,
                 ssao,
                 ddgi,
+                global_sdf,
                 rt,
                 restir,
                 views,
                 free_list,
                 aa,
                 default_white,
+                default_sdf,
             ))
         };
         let (
@@ -746,12 +841,14 @@ impl Renderer {
             reflection,
             ssao,
             ddgi,
+            global_sdf,
             rt,
             restir,
             views,
             bindless_free_list,
             aa,
             default_white,
+            default_sdf,
         ) = match build() {
             Ok(parts) => parts,
             Err(err) => {
@@ -783,10 +880,45 @@ impl Renderer {
         let software_gpu = device.capabilities.software_gpu;
         let device_name = facts.device_name;
 
+        // The per-static-instance SDF SSBO: host-mapped + persistently mapped, sized to a
+        // fixed capacity (grow-not-needed, the DDGI box-buffer discipline). Built once;
+        // `set_sdf_scene` rewrites its prefix each frame.
+        let sdf_instance_bytes =
+            u64::from(MAX_SDF_INSTANCES) * size_of::<crate::SdfInstance>() as u64;
+        let sdf_alloc = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::Auto,
+            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                | vk_mem::AllocationCreateFlags::MAPPED,
+            ..Default::default()
+        };
+        let sdf_instances = match crate::Buffer::new(
+            device.resources(),
+            sdf_instance_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &sdf_alloc,
+        ) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                let _ = device.wait_idle();
+                return Err(err);
+            }
+        };
+        // Wire the persistent SDF-occluder SSBO into binding 8 of every frame slot's light
+        // set (set 1); the sky-occlusion cone-trace reads the first `sdf_occlusion.x` entries.
+        lighting.bind_sdf_instances(&descriptors, sdf_instances.handle(), sdf_instances.size());
+        // Wire the same SSBO into the GDF cull + composite sets (they bin/min the same per-mesh
+        // instances), and wire the GDF cascade samplers + params UBO into binding 9/10 of every
+        // light set (the consumers' far-field tap). Both are persistent (one-time wire-up).
+        global_sdf.bind_scene(sdf_instances.handle(), sdf_instances.size());
+        lighting.bind_gdf(&global_sdf);
+        // Wire the GDF lite albedo cache (+ its repeat sampler) into the DDGI trace set (set 2,
+        // binding 0); the trace reads it as the hit radiance's per-cell base color. Persistent.
+        ddgi.bind_gdf_albedo(&global_sdf);
+
         Ok(Self {
             clear_color: [0.05, 0.06, 0.08, 1.0],
             wireframe: false,
-            use_depth_prepass: false,
+            use_depth_prepass: true,
             exposure_ev: 0.0,
             show_grid: false,
             present_viewport_only: false,
@@ -842,11 +974,17 @@ impl Renderer {
             reflection,
             ssao,
             ddgi,
+            global_sdf,
             rt,
             restir,
+            sdf_instances,
+            sdf_instance_count: 0,
+            sdf_instance_capacity: MAX_SDF_INSTANCES,
+            sky_occlusion: true,
             descriptors,
             bindless_free_list,
             default_white,
+            default_sdf,
             // The thumbnail render target's color format is read back over the control plane,
             // never presented, so it follows the device's chosen surface format rather than a
             // (possibly absent) swapchain. It is the surface format the swapchain would have
@@ -905,6 +1043,13 @@ impl Renderer {
     /// albedo/ORM texture indexes its bindless slot.
     pub fn default_white(&self) -> &Arc<crate::GpuTexture> {
         &self.default_white
+    }
+
+    /// The 1×1×1 "empty space" SDF seeded into every otherwise-unbound slot of the
+    /// bindless `Texture3D` SDF array (binding 1) — a mesh that baked no field leaves its
+    /// slot reading "far from any surface".
+    pub fn default_sdf(&self) -> &Arc<crate::GpuSdf> {
+        &self.default_sdf
     }
 
     /// The shared bindless free-list every uploaded texture clones (README §5).
@@ -1110,34 +1255,79 @@ impl Renderer {
         self.ddgi.enabled()
     }
 
-    /// Uploads this frame's DDGI scene-box proxy (interleaved world AABBs + albedos,
-    /// clamped to the SSBO capacity) and the fitted probe-volume placement + sun/sky for
-    /// the trace. Call before [`Renderer::set_scene_lighting`], which folds the volume +
-    /// probe grid into the light UBO.
-    #[allow(clippy::too_many_arguments)]
+    /// Toggles GDF reflection occlusion: the per-pixel cone-march along the reflection vector
+    /// against the Global Distance Field that occludes the reflected skybox under overhangs. The
+    /// one remaining per-pixel SDF consumer — indirect diffuse occlusion is DDGI ray-miss + GTAO.
+    pub fn set_sky_occlusion(&mut self, enabled: bool) {
+        self.sky_occlusion = enabled;
+    }
+
+    /// Whether GDF reflection occlusion (the specular reflection-cone march) is enabled.
+    pub fn sky_occlusion_enabled(&self) -> bool {
+        self.sky_occlusion
+    }
+
+    /// Whether the GDF reflection-occlusion term is active for the active view this frame: IBL
+    /// (the analytic specular it occludes) is on, the toggle is set, and the Global Distance Field
+    /// composited (the cascade clipmap the cone-march taps is ready). The lighting UBO enable bit
+    /// ([`Lighting::set_frame_sdf_occlusion`]) gates on this single predicate, so the fragment
+    /// marches the GDF only when its clipmap is valid. There is no longer a screen-space prepass —
+    /// indirect diffuse occlusion is DDGI ray-miss + contact GTAO.
+    fn want_sky_occlusion(&self) -> bool {
+        let ibl_enabled = self.ibl.use_ibl && self.ibl.ready;
+        ibl_enabled && self.sky_occlusion_enabled() && self.global_sdf.enabled()
+    }
+
+    /// Snaps the camera-centered DDGI probe clipmap to the camera + stores the sun/sky for the
+    /// trace. Call before [`Renderer::set_scene_lighting`], which folds the volume + probe grid +
+    /// toroidal scroll base into the light UBO.
     pub fn set_ddgi_scene(
         &mut self,
-        box_mins: &[saffron_geometry::glam::Vec4],
-        box_maxs: &[saffron_geometry::glam::Vec4],
-        box_albedos: &[saffron_geometry::glam::Vec4],
-        volume_min: saffron_geometry::glam::Vec3,
-        volume_extent: saffron_geometry::glam::Vec3,
+        cam_pos: saffron_geometry::glam::Vec3,
         sun_dir: saffron_geometry::glam::Vec3,
         sun_color: saffron_geometry::glam::Vec3,
         sun_intensity: f32,
         sky_color: saffron_geometry::glam::Vec3,
     ) {
-        self.ddgi.set_scene(
-            box_mins,
-            box_maxs,
-            box_albedos,
-            volume_min,
-            volume_extent,
-            sun_dir,
-            sun_color,
-            sun_intensity,
-            sky_color,
-        );
+        self.ddgi
+            .set_scene(cam_pos, sun_dir, sun_color, sun_intensity, sky_color);
+    }
+
+    /// Uploads this frame's per-static-instance SDF list into the host-mapped SSBO,
+    /// clamped to [`MAX_SDF_INSTANCES`]. The lighting cone-trace (Phase 3) iterates the
+    /// first [`Renderer::sdf_instance_count`] entries. Overflow is clamped + warned.
+    pub fn set_sdf_scene(&mut self, instances: &[crate::SdfInstance]) {
+        let count = (instances.len() as u32).min(self.sdf_instance_capacity);
+        if instances.len() as u32 > self.sdf_instance_capacity {
+            tracing::warn!(
+                "SDF instance count {} exceeds capacity {}; clamping (a global distance \
+                 field is the future perf path)",
+                instances.len(),
+                self.sdf_instance_capacity
+            );
+        }
+        if count > 0 {
+            let mapped = self
+                .sdf_instances
+                .mapped_bytes()
+                .expect("SDF instance SSBO is host-mapped");
+            let bytes: &[u8] = bytemuck::cast_slice(&instances[..count as usize]);
+            mapped[..bytes.len()].copy_from_slice(bytes);
+        }
+        self.sdf_instance_count = count;
+        // Feed the same clamped slice to the GDF so the near cascade composites only the voxels
+        // around occluders that actually moved this frame instead of the whole 128³ window.
+        self.global_sdf.set_instances(&instances[..count as usize]);
+    }
+
+    /// The active SDF-instance count uploaded this frame.
+    pub fn sdf_instance_count(&self) -> u32 {
+        self.sdf_instance_count
+    }
+
+    /// The SDF-instance SSBO handle + size (for the Phase 3 lighting-set bind).
+    pub fn sdf_instance_buffer(&self) -> (vk::Buffer, vk::DeviceSize) {
+        (self.sdf_instances.handle(), self.sdf_instances.size())
     }
 
     /// Writes this frame's camera transforms + incoming sun direction for the
@@ -1151,6 +1341,23 @@ impl Renderer {
         sun_direction_world: saffron_geometry::glam::Vec3,
     ) {
         self.ssao.set_camera(view, proj, sun_direction_world);
+        // Recenter the Global-SDF cascade clipmap on the camera eye (the inverse-view translation),
+        // snapping each cascade to its own voxel grid for the toroidal incremental update.
+        let eye = view.inverse().col(3).truncate();
+        // The recording frame's slot — the params UBO this frame's light set (same slot) reads.
+        self.global_sdf.set_camera(eye, self.frames.index());
+    }
+
+    /// Toggles the Global Distance Field: the camera-centered cascade clipmap the far-field cone
+    /// march and the DDGI trace tap as one trilinear read (the per-mesh near field is unchanged). On
+    /// by default — it is the distance oracle the default-on DDGI indirect path sphere-marches.
+    pub fn set_gdf(&mut self, enabled: bool) {
+        self.global_sdf.set_enabled(enabled);
+    }
+
+    /// Whether the Global Distance Field is on and its resources are built.
+    pub fn gdf_enabled(&self) -> bool {
+        self.global_sdf.enabled()
     }
 
     /// Writes the current frame's directional + ambient + eye + punctual lights into the
@@ -1180,7 +1387,13 @@ impl Renderer {
             ddgi_min,
             ddgi_extent,
             self.ddgi.probe_count_ubo(),
+            self.ddgi.scroll_base_ubo(),
         );
+        // Fold the GDF reflection-occlusion enable bit. The mesh fragment marches the Global
+        // Distance Field along the reflection vector only when its cascade clipmap composited
+        // this frame, so the enable bit gates on that readiness (`want_sky_occlusion`).
+        self.lighting
+            .set_frame_sdf_occlusion(self.want_sky_occlusion());
         // Fold the SSR flag (extra_flags.x) so the mesh blends the SSR map only when the
         // trace actually ran this frame.
         self.lighting
@@ -2896,8 +3109,13 @@ impl Renderer {
             && self.restir.supported()
             && self.views[self.active_view.index()].restir.ready()
             && gbuf_ready;
+        // DFAO reconstructs world pos/normal from the thin G-buffer, so it forces the prepass on
+        // (like ReSTIR / RT reflections). It runs the reduced-res GDF sky-visibility cone trace
+        // whenever sky occlusion is active this frame (IBL + the toggle + the GDF ready).
+        let want_dfao = gbuf_ready && self.want_sky_occlusion();
         let want_screen = want_restir
             || want_rt_reflections
+            || want_dfao
             || crate::ssao::wants_gbuffer_prepass(
                 gbuf_ready,
                 self.ssao.use_ssao,
@@ -2907,6 +3125,7 @@ impl Renderer {
             );
         let compute2 = self.ssao.compute2_layout();
         let compute3 = self.ssao.compute3_layout();
+        let gi_resolve_layout = self.ssao.gi_resolve_layout();
         let (gbuffer, gtao, ao_blur, contact, ssgi, ssgi_blur, ssr, copy_color) = if want_screen {
             let gbuffer = self.pipelines.request_gbuffer();
             let (gtao, ao_blur) = if want_ssao {
@@ -2952,15 +3171,45 @@ impl Renderer {
         // where `&mut self.ssao` is live; the `&self` graph build reads the snapshot below.
         let ssgi_push = self.ssao.next_ssgi_push();
         let ssr_push = self.ssao.next_ssr_push();
+        // Screen-space indirect-diffuse resolve PSO — runs whenever the screen chain does (it reads
+        // the G-buffer). Additive: its half-res output is not yet sampled by the fragment.
+        let gi_resolve = if want_screen {
+            self.pipelines.request_gi_resolve(gi_resolve_layout)
+        } else {
+            None
+        };
+        // DFAO: the trace PSO (three-set) + the shared bilateral-upsample PSO (the ssgi-blur PSO,
+        // bound with the DFAO blur set). Resolved when sky occlusion is active this frame.
+        let (dfao, dfao_blur) = if want_dfao {
+            (
+                self.pipelines.request_dfao(compute2),
+                self.pipelines.request_ssgi_blur(compute3),
+            )
+        } else {
+            (None, None)
+        };
+        // Bump the monotonic DFAO frame index (rotating the cone ring) here, where
+        // `&mut self.ssao` is live; the `&self` graph build reads the snapshot below.
+        let dfao_push = self.ssao.next_dfao_push();
+        // Specular occlusion: shares the sky-occlusion gate with DFAO. The trace is a three-set PSO
+        // (its I/O set is the compute3 shape — the G-buffer + roughness samplers + the storage) and
+        // the blur reuses the ssgi-blur PSO, bound with the specocc blur set.
+        let (specocc, specocc_blur) = if want_dfao {
+            (
+                self.pipelines.request_specocc(compute3),
+                self.pipelines.request_ssgi_blur(compute3),
+            )
+        } else {
+            (None, None)
+        };
+        // Bump the monotonic specocc frame index here, where `&mut self.ssao` is live.
+        let specocc_push = self.ssao.next_specocc_push();
 
-        // DDGI: the five compute PSOs, resolved together (the `doDdgi` gate requires all
-        // five — a partial set skips the whole chain). Each takes `&mut self.pipelines`
+        // DDGI: the four trace/blend/border PSOs, resolved together (the `doDdgi` gate requires
+        // all four — a partial set skips the whole chain). Each takes `&mut self.pipelines`
         // with the DDGI sub-state's set layout; resolved here so the `&self` graph build
         // borrows `self.ddgi` immutably. `None` when DDGI is off / not ready / a PSO failed.
         let ddgi = if self.ddgi.use_ddgi && self.ddgi.ready {
-            let voxelize = self
-                .pipelines
-                .request_ddgi_voxelize(self.ddgi.voxel_layout());
             let trace = self.pipelines.request_ddgi_trace(self.ddgi.trace_layout());
             let blend_irr = self
                 .pipelines
@@ -2971,16 +3220,33 @@ impl Renderer {
             let border = self
                 .pipelines
                 .request_ddgi_border(self.ddgi.border_layout());
-            match (voxelize, trace, blend_irr, blend_dist, border) {
-                (Some(voxelize), Some(trace), Some(blend_irr), Some(blend_dist), Some(border)) => {
+            match (trace, blend_irr, blend_dist, border) {
+                (Some(trace), Some(blend_irr), Some(blend_dist), Some(border)) => {
                     Some(DdgiPipelines {
-                        voxelize,
                         trace,
                         blend_irr,
                         blend_dist,
                         border,
                     })
                 }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Global SDF: the cull + composite PSOs, resolved together (both present or the chain is
+        // skipped). Resolved here so the `&self` graph build borrows `self.global_sdf` immutably.
+        // `None` when the GDF is off / not ready / a PSO failed.
+        let gdf = if self.global_sdf.use_gdf && self.global_sdf.ready {
+            let cull = self
+                .pipelines
+                .request_gdf_cull(self.global_sdf.cull_layout());
+            let composite = self
+                .pipelines
+                .request_gdf_composite(self.global_sdf.composite_layout());
+            match (cull, composite) {
+                (Some(cull), Some(composite)) => Some(GdfPipelines { cull, composite }),
                 _ => None,
             }
         } else {
@@ -3024,17 +3290,29 @@ impl Renderer {
             view.motion.is_some() && view.motion_depth.is_some()
         };
         let have_scratch = self.views[self.active_view.index()].scratch.is_some();
-        let want_motion = (self.aa.taa() || want_ssgi) && have_motion_targets;
+        // DFAO also reprojects through the motion target, so it forces motion on (like TAA/SSGI).
+        let want_motion = (self.aa.taa() || want_ssgi || want_dfao) && have_motion_targets;
         let motion = if want_motion {
             self.pipelines.request_motion()
         } else {
             None
         };
-        // SSGI temporal accumulation runs whenever SSGI is on AND motion ran (it reprojects
+        // The SSGI temporal accumulator PSO runs when SSGI is on AND motion ran (it reprojects
         // through the motion target), independent of the final-image AA mode.
         let ssgi_accum = if want_ssgi && have_motion_targets {
             self.pipelines
                 .request_ssgi_accum(self.descriptors.taa_set_layout())
+        } else {
+            None
+        };
+        // The DFAO temporal accumulator uses its own clamp-free `dfao_accum` PSO (a pure EMA over
+        // the rotating cone estimate — a neighborhood clamp would re-inject the per-frame rotation
+        // variance and never converge), bound with the DFAO accum sets; it runs when DFAO is on AND
+        // motion ran. Specular occlusion is spatial-only (the blur denoises it; its view-dependent
+        // term must not be reprojected by surface motion), so it has no accumulator here.
+        let dfao_accum = if want_dfao && have_motion_targets {
+            self.pipelines
+                .request_dfao_accum(self.descriptors.taa_set_layout())
         } else {
             None
         };
@@ -3108,9 +3386,18 @@ impl Renderer {
             ssgi,
             ssgi_blur,
             ssgi_accum,
+            gi_resolve,
+            dfao,
+            dfao_blur,
+            dfao_accum,
+            dfao_push,
+            specocc,
+            specocc_blur,
+            specocc_push,
             ssr,
             copy_color,
             ddgi,
+            gdf,
             restir,
             ssgi_push,
             ssr_push,
@@ -3270,7 +3557,7 @@ impl Renderer {
             let groups = crate::lighting::CLUSTER_COUNT.div_ceil(64);
             let pass = RgPass::compute("light-cull")
                 .access(cluster_buffer, RgUsage::StorageWriteCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch
                     // covers the froxel grid (one invocation per cluster, 64 per group).
                     unsafe {
@@ -3342,7 +3629,7 @@ impl Renderer {
                 let pass = RgPass::compute("morph")
                     .access(deformed, RgUsage::StorageWriteCompute)
                     .access(prev_deformed, RgUsage::StorageWriteCompute)
-                    .body(move |cmd| {
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                         crate::skinning::record_morph(
                             &raw_morph,
                             cmd,
@@ -3369,7 +3656,7 @@ impl Renderer {
                 let pass = RgPass::compute("skin")
                     .access(deformed, RgUsage::StorageWriteCompute)
                     .access(prev_deformed, RgUsage::StorageWriteCompute)
-                    .body(move |cmd| {
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                         crate::skinning::Skinning::record_skin(
                             &raw_body,
                             cmd,
@@ -3403,9 +3690,11 @@ impl Renderer {
                     .prepare_tlas_build(&self.device, frame, &deformed_rt, deformed_handle)
             {
                 let raw_body = raw.clone();
-                let mut tlas_pass = RgPass::compute("tlas-build").body(move |cmd| {
-                    crate::record_tlas_build_plan(&raw_body, cmd, &plan);
-                });
+                let mut tlas_pass = RgPass::compute("tlas-build").body(
+                    move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        crate::record_tlas_build_plan(&raw_body, cmd, &plan);
+                    },
+                );
                 // Declare the deformed-buffer read so the graph orders this after the skin
                 // pass (the skinned BLAS refit reads the freshly deformed vertices).
                 if has_skinned_rt {
@@ -3501,23 +3790,25 @@ impl Renderer {
                 let list = self.scene_draw_list.shallow_clone();
                 let point_static = Arc::clone(point);
                 let raw_body = raw.clone();
-                graph.add_pass(RgPass::compute("point-shadow-static").body(move |cmd| {
-                    record_point_shadow(
-                        &raw_body,
-                        cmd,
-                        &list,
-                        point_pipeline,
-                        point_layout,
-                        instance_set,
-                        &target,
-                        &faces,
-                        light_pos,
-                        far_plane,
-                        None, // static casters never read the deformed buffer
-                        false,
-                    );
-                    drop(point_static);
-                }));
+                graph.add_pass(RgPass::compute("point-shadow-static").body(
+                    move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        record_point_shadow(
+                            &raw_body,
+                            cmd,
+                            &list,
+                            point_pipeline,
+                            point_layout,
+                            instance_set,
+                            &target,
+                            &faces,
+                            light_pos,
+                            far_plane,
+                            None, // static casters never read the deformed buffer
+                            false,
+                        );
+                        drop(point_static);
+                    },
+                ));
                 self.targets.point_shadow.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
             }
 
@@ -3533,23 +3824,25 @@ impl Renderer {
             let list = self.scene_draw_list.shallow_clone();
             let point_dynamic = Arc::clone(point);
             let raw_body = raw.clone();
-            let mut pass = RgPass::compute("point-shadow-dynamic").body(move |cmd| {
-                record_point_shadow(
-                    &raw_body,
-                    cmd,
-                    &list,
-                    point_pipeline,
-                    point_layout,
-                    instance_set,
-                    &dyn_target,
-                    &faces,
-                    light_pos,
-                    far_plane,
-                    deformed_handle,
-                    true,
-                );
-                drop(point_dynamic);
-            });
+            let mut pass = RgPass::compute("point-shadow-dynamic").body(
+                move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    record_point_shadow(
+                        &raw_body,
+                        cmd,
+                        &list,
+                        point_pipeline,
+                        point_layout,
+                        instance_set,
+                        &dyn_target,
+                        &faces,
+                        light_pos,
+                        far_plane,
+                        deformed_handle,
+                        true,
+                    );
+                    drop(point_dynamic);
+                },
+            );
             // A skinned batch draws the deformed buffer into the cube faces; declare the
             // read so the graph orders it after the skin compute write.
             if let Some(deformed) = deformed_res {
@@ -3652,6 +3945,15 @@ impl Renderer {
             (prev_deformed_res, prev_deformed_handle),
         );
 
+        // Global SDF: the cull + composite passes that bin the per-mesh MDF bricks into the
+        // camera-centered cascade clipmap the DDGI trace taps as one trilinear read beyond the near
+        // field (and the scene's GDF reflection-occlusion cone marches per pixel). Runs FIRST
+        // (before the DDGI trace + the scene, both of which sample the cascades via the light set),
+        // so the composite writes are visible before any read. Returns the cascade resources for the
+        // downstream SampledRead declarations + the layout-writeback slots. Empty when the GDF is
+        // off / not ready.
+        let gdf = self.add_gdf_passes(&mut graph, &pipelines, frame);
+
         // Screen-space effects off the thin G-buffer (view normal + view-Z): the gbuffer
         // prepass, then GTAO + bilateral denoise, directional contact shadows, the one-bounce
         // SSGI trace + denoise, and (when motion ran) the SSGI temporal accumulation into the
@@ -3660,12 +3962,59 @@ impl Renderer {
         // (so they transition ShaderReadOnly before the sample), the per-view mesh set 4 to
         // bind, and whether the SSGI accumulation ran (it shares the temporal ping-pong
         // parity flipped after the scene).
+        // Fill this frame's gi-resolve params UBO + (re)write the shared IBL/DDGI bindings into the
+        // current frame's set slot (per-frame-slot → the slot's prior use is fenced, so no in-flight
+        // hazard). Mirrors the mesh's `indirectIrr` inputs so the resolve matches it. Additive: the
+        // fragment does not yet sample the resolve output.
+        if pipelines.gi_resolve.is_some() {
+            let inv_view = self.ssao.view().inverse();
+            let (vol_min, vol_ext) = self.ddgi.volume();
+            let gi_params = crate::ssao::GiParams {
+                inv_projection: self.ssao.inv_projection(),
+                inv_view,
+                volume_min: vol_min.extend(0.0),
+                volume_extent: vol_ext.extend(0.0),
+                probe_count: self.ddgi.probe_count_ubo(),
+                scroll_base: self.ddgi.scroll_base_ubo(),
+                eye_position: inv_view.w_axis,
+                flags: saffron_geometry::glam::UVec4::new(
+                    u32::from(self.ddgi.enabled()),
+                    u32::from(pipelines.dfao.is_some()),
+                    0,
+                    0,
+                ),
+            };
+            let ibl_cube = self.ibl.irradiance_cube_view();
+            let ibl_sampler = self.ibl.sampler();
+            let ddgi_irr = self.ddgi.irradiance().1;
+            let ddgi_dist = self.ddgi.distance().1;
+            let ddgi_sampler = self.ddgi.sampler();
+            let active = self.active_view.index();
+            if let Some(ubo) = self.views[active].gi_params_ubos.get_mut(frame) {
+                if let Some(dst) = ubo.mapped_bytes() {
+                    let src = bytemuck::bytes_of(&gi_params);
+                    dst[..src.len()].copy_from_slice(src);
+                }
+            }
+            self.views[active].write_gi_resolve_shared(
+                &self.device,
+                frame,
+                ibl_cube,
+                ibl_sampler,
+                ddgi_irr,
+                ddgi_dist,
+                ddgi_sampler,
+            );
+        }
+
         let screen = self.add_screen_space_passes(
             &mut graph,
             &pipelines,
             instance_set,
             motion_resource,
             (deformed_res, deformed_handle),
+            light_set,
+            gdf.cascades,
         );
 
         // ReSTIR DI: the three-pass reservoir chain (initial candidate sampling → temporal +
@@ -3677,12 +4026,21 @@ impl Renderer {
         // the graph-derived RAW barriers on the combined-reservoir sentinel buffer.
         let restir = self.add_restir_passes(&mut graph, &pipelines, frame, motion_resource);
 
-        // DDGI: the five-pass voxel-GI chain (voxelize → trace → blend-irr → blend-dist →
-        // border), updating the irradiance + distance atlases the mesh fragment samples
-        // via set 5. Runs before the scene pass; the graph derives the 3D-image storage
-        // barriers + the atlas General↔ShaderReadOnly transitions. Returns the atlases for
-        // the scene's SampledRead declaration + the imported-image layout-writeback slots.
-        let ddgi = self.add_ddgi_passes(&mut graph, &pipelines);
+        // DDGI: the four-pass GI chain (trace → blend-irr → blend-dist → border), updating the
+        // irradiance + distance atlases the mesh fragment samples via set 5. The trace
+        // sphere-marches the shared distance field (the per-mesh MDF near field + the GDF beyond,
+        // via the bindless + light sets) and reads the lite albedo cache for hit color, so it runs
+        // AFTER the GDF composite (its cascades + albedo are this trace's inputs). The graph
+        // derives the atlas General↔ShaderReadOnly transitions. Returns the atlases for the scene's
+        // SampledRead declaration + the imported-image layout-writeback slots.
+        let ddgi = self.add_ddgi_passes(
+            &mut graph,
+            &pipelines,
+            bindless_set,
+            light_set,
+            gdf.cascades,
+            gdf.albedo,
+        );
 
         // Visible sky: a fullscreen pass that fills the scene color target before the
         // geometry. It writes the SAME target the scene pass uses, owns the color clear when
@@ -3708,11 +4066,11 @@ impl Renderer {
                     ],
                 },
             };
-            let sky_pass = RgPass::graphics("sky", extent)
-                .color(color_att)
-                .body(move |cmd| {
+            let sky_pass = RgPass::graphics("sky", extent).color(color_att).body(
+                move |cmd, _scopes: &mut NestedScopeRecorder| {
                     crate::ibl::record_sky(&raw_for_body, cmd, bindless, &draw);
-                });
+                },
+            );
             graph.add_pass(sky_pass);
         }
 
@@ -3724,11 +4082,26 @@ impl Renderer {
             let pipeline = Arc::clone(pipeline);
             let depth_pipeline = pipeline.handle();
             let depth_layout = pipeline.layout();
+            let bindless = bindless_set;
             // The depth pre-pass writes the (multisampled, when MSAA) scene depth the scene
             // pass then loads — the same sample count the scene PSO bakes.
             let mut depth_pass = RgPass::graphics("depth-prepass", extent)
                 .depth_attachment(depth_clear_store(scene_depth))
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // Bind the bindless albedo set (0) so the prepass fragment can alpha-clip masked
+                    // materials; set 0's layout is identical here, so it persists across the PSO bind
+                    // that `record_depth_prepass` issues before the draws.
+                    // SAFETY: the ash seam — the set + layout are valid for this frame.
+                    unsafe {
+                        raw_for_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            depth_layout,
+                            0,
+                            &[bindless],
+                            &[],
+                        );
+                    }
                     record_depth_prepass(
                         &raw_for_body,
                         cmd,
@@ -3821,24 +4194,28 @@ impl Renderer {
         let mut scene = RgPass::graphics("scene", extent)
             .color(color_att)
             .depth_attachment(depth_att)
-            .body(move |cmd| {
-                record_scene_draw_list(
-                    &raw_for_body,
-                    cmd,
-                    &list,
-                    bindless_set,
-                    light_set,
-                    instance_set,
-                    ibl_set,
-                    ssao_mesh_set,
-                    ddgi_mesh_set,
-                    rt_mesh_set,
-                    restir_mesh_set,
-                    deformed_handle,
-                );
-                for body in submissions {
-                    body(cmd);
-                }
+            .body(move |_cmd, scopes: &mut NestedScopeRecorder| {
+                scopes.scope("scene-opaque", |cmd| {
+                    record_scene_draw_list(
+                        &raw_for_body,
+                        cmd,
+                        &list,
+                        bindless_set,
+                        light_set,
+                        instance_set,
+                        ibl_set,
+                        ssao_mesh_set,
+                        ddgi_mesh_set,
+                        rt_mesh_set,
+                        restir_mesh_set,
+                        deformed_handle,
+                    );
+                });
+                scopes.scope("scene-submissions", |cmd| {
+                    for body in submissions {
+                        body(cmd);
+                    }
+                });
             });
         // The scene fragment samples the AO / contact / SSGI maps via set 4; declare the
         // reads so the graph transitions each from GENERAL (compute write) → ShaderReadOnly
@@ -3855,6 +4232,16 @@ impl Renderer {
         }
         if let Some(distance) = ddgi.distance {
             scene = scene.access(distance, RgUsage::SampledRead);
+        }
+        // When the GDF composited this frame, the cascade volumes were storage-written (GENERAL);
+        // the mesh fragment's reflection-occlusion cone taps them (light set binding 9), so declare
+        // the scene's SampledRead to transition each back to ShaderReadOnly before the draw (the
+        // übershader statically references the cascade samplers, so this is required even when the
+        // runtime sky-occlusion flag gates the actual sample off).
+        if let Some(cascades) = gdf.cascades {
+            for cascade in cascades {
+                scene = scene.access(cascade, RgUsage::SampledRead);
+            }
         }
         // When ReSTIR ran this frame, the resolve wrote the radiance image as storage
         // (GENERAL); declare the scene's SampledRead so the graph transitions it back to
@@ -3904,7 +4291,7 @@ impl Renderer {
             let copy_pass = RgPass::compute("ssgi-history")
                 .access(color, RgUsage::SampledReadCompute)
                 .access(copy.prev_color, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch
                     // covers the viewport (8×8 per group).
                     unsafe {
@@ -3925,7 +4312,7 @@ impl Renderer {
             // Barrier-only: General → ShaderReadOnly for next frame's SSGI sample + seed.
             let restore = RgPass::compute("ssgi-history-restore")
                 .access(copy.prev_color, RgUsage::SampledReadCompute)
-                .body(|_cmd| {});
+                .body(|_cmd, _scopes: &mut NestedScopeRecorder| {});
             graph.add_pass(restore);
         }
 
@@ -4010,13 +4397,10 @@ impl Renderer {
             self.spot_shadow_layout = graph.external_layout(slot);
         }
 
-        // Read back the DDGI images' resolved exit layouts (the voxel proxy + ray image +
-        // the two atlases each rode an external slot), then advance the temporal state
-        // (bump the ray-set index, clear the history-reset flag) — but only when the chain
+        // Read back the DDGI images' resolved exit layouts (the ray image + the two atlases each
+        // rode an external slot), then advance the temporal state (bump the ray-set / round-robin
+        // index, commit the scroll base, clear the history-reset flag) — but only when the chain
         // actually ran this frame.
-        if let Some(slot) = ddgi.voxel_slot {
-            self.ddgi.set_voxel_layout(graph.external_layout(slot));
-        }
         if let Some(slot) = ddgi.rays_slot {
             self.ddgi.set_rays_layout(graph.external_layout(slot));
         }
@@ -4028,6 +4412,23 @@ impl Renderer {
         }
         if ddgi.irradiance.is_some() {
             self.ddgi.advance_frame();
+        }
+
+        // Read back the GDF cascade volumes' resolved exit layouts (each rode an external slot,
+        // ending ShaderReadOnly after the scene's SampledRead), then commit the toroidal recenter
+        // state (prev centers + history + the round-robin frame) — only when the chain ran.
+        if gdf.cascades.is_some() {
+            for c in 0..crate::GDF_CASCADES {
+                if let Some(slot) = gdf.cascade_slots[c as usize] {
+                    self.global_sdf
+                        .set_cascade_layout(c, graph.external_layout(slot));
+                }
+            }
+            if let Some(slot) = gdf.albedo_slot {
+                self.global_sdf
+                    .set_albedo_layout(graph.external_layout(slot));
+            }
+            self.global_sdf.advance_frame();
         }
 
         // Read back the ReSTIR radiance image's resolved exit layout (it rode an external
@@ -4043,7 +4444,9 @@ impl Renderer {
         // Read back the temporal images' resolved exit layouts (the cross-frame
         // ShaderReadOnly ↔ General transition is derived from these slots). The TAA history
         // pair + the SSGI history pair + the ssgi_resolved each rode an external slot.
-        let temporal_ran = taa_slots.is_some() || screen.ssgi_history_slots.is_some();
+        let temporal_ran = taa_slots.is_some()
+            || screen.ssgi_history_slots.is_some()
+            || screen.dfao_history_slots.is_some();
         let frame_view_proj = self.scene_draw_list.view_proj;
         let view = &mut self.views[self.active_view.index()];
         if let Some(slots) = &taa_slots {
@@ -4056,6 +4459,15 @@ impl Renderer {
         }
         if let (Some(slot), Some(resolved)) =
             (screen.ssgi_resolved_slot, view.ssgi_resolved.as_mut())
+        {
+            resolved.layout = graph.external_layout(slot);
+        }
+        if let Some(slots) = &screen.dfao_history_slots {
+            writeback_dfao_history_layout(view, &graph, &slots.read);
+            writeback_dfao_history_layout(view, &graph, &slots.write);
+        }
+        if let (Some(slot), Some(resolved)) =
+            (screen.dfao_resolved_slot, view.dfao_resolved.as_mut())
         {
             resolved.layout = graph.external_layout(slot);
         }
@@ -4076,30 +4488,32 @@ impl Renderer {
         view.store_prev_view_proj(frame_view_proj);
     }
 
-    /// Builds the five DDGI compute passes into `graph` when the chain runs this frame
-    /// (DDGI on + ready + all five PSOs resolved): `ddgi-voxelize` (3D voxel storage +
-    /// box SSBO), `ddgi-trace` (voxel storage + prev-irradiance sampler → ray storage),
-    /// `ddgi-blend-irr` (ray sampler → irradiance storage), `ddgi-blend-dist` (ray sampler
-    /// → distance storage), `ddgi-border` (irradiance octahedral gutter copy). The graph
-    /// derives every GENERAL barrier from the declared storage usages (the voxel proxy is
-    /// an [`crate::Image3D`] imported via [`crate::RenderGraph::import_image_3d`]).
+    /// Builds the four DDGI compute passes into `graph` when the chain runs this frame (DDGI on +
+    /// ready + all four PSOs resolved): `ddgi-trace` (the GDF/MDF sphere-march → ray storage),
+    /// `ddgi-blend-irr` (ray sampler → irradiance storage), `ddgi-blend-dist` (ray sampler →
+    /// distance storage), `ddgi-border` (irradiance octahedral gutter copy). The graph derives
+    /// every GENERAL ↔ ShaderReadOnly barrier from the declared usages.
     ///
-    /// Returns the irradiance + distance atlas resources for the scene's `SampledRead`
-    /// declaration + the four imported images' external slots for the layout write-back.
-    /// An empty [`DdgiResult`] when DDGI did not run (the scene skips the SampledRead +
-    /// keeps the atlases at their resting ShaderReadOnly layout).
-    fn add_ddgi_passes(&self, graph: &mut RenderGraph, pipelines: &FramePipelines) -> DdgiResult {
+    /// The trace is a three-set pass (`[bindless, light, trace_set]`) reusing the shared `sdf`
+    /// module's `sampleField` (near MDF → far GDF), so it declares `SampledRead` on the GDF cascade
+    /// volumes + the lite albedo cache (read this frame's composite output) and runs after the GDF
+    /// passes. Returns the irradiance + distance atlas resources for the scene's `SampledRead` +
+    /// the three imported images' external slots for the layout write-back. An empty
+    /// [`DdgiResult`] when DDGI did not run.
+    fn add_ddgi_passes(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        bindless_set: vk::DescriptorSet,
+        light_set: vk::DescriptorSet,
+        gdf_cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
+        gdf_albedo: Option<RgResource>,
+    ) -> DdgiResult {
+        // The four-pass chain runs only when DDGI is on + all PSOs resolved.
         let Some(ddgi_pipelines) = &pipelines.ddgi else {
             return DdgiResult::default();
         };
         let raw = self.device.raw().clone();
-
-        // Import the voxel proxy (3D) + ray image + the two atlases, each on its own
-        // external slot so the resolved exit layout carries across frames (the voxel +
-        // ray images start GENERAL after the first frame, the atlases ShaderReadOnly).
-        let (vox_image, vox_view, vox_layout) = self.ddgi.voxels();
-        let voxel_slot = graph.alloc_external_layout(vox_layout);
-        let voxel_res = graph.import_image_3d(vox_image, vox_view, vox_layout, Some(voxel_slot));
 
         let (ray_image, ray_view, ray_layout) = self.ddgi.rays();
         let rays_slot = graph.alloc_external_layout(ray_layout);
@@ -4131,63 +4545,59 @@ impl Renderer {
             Some(dist_slot),
         );
 
-        // 1. Voxelize: one thread per voxel; the 3D image read uses the RW-storage usage
-        //    (GENERAL) — `StorageReadCompute` is modeled for buffers and would mis-
-        //    transition a 3D image.
-        let groups_3d = DDGI_VOXEL_RES.div_ceil(4);
-        let voxelize = Arc::clone(&ddgi_pipelines.voxelize);
-        let voxelize_handle = voxelize.handle();
-        let voxelize_layout = voxelize.layout();
-        let voxel_set = self.ddgi.voxel_set();
-        let voxelize_push = self.ddgi.voxelize_push();
-        let raw_body = raw.clone();
-        graph.add_pass(
-            RgPass::compute("ddgi-voxelize")
-                .access(voxel_res, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
-                    record_ddgi_compute(
-                        &raw_body,
-                        cmd,
-                        voxelize_handle,
-                        voxelize_layout,
-                        voxel_set,
-                        bytemuck::bytes_of(&voxelize_push),
-                        (groups_3d, groups_3d, groups_3d),
-                    );
-                    drop(voxelize);
-                }),
-        );
-
-        // 2. Trace: voxel storage read + prev-irradiance sampler → ray storage write.
+        // 1. Trace: sphere-march the shared distance field (near MDF via the bindless bricks + the
+        //    light set's instance list; far GDF via the light set's cascade clipmap), reading the
+        //    prev-irradiance atlas (multi-bounce) + the lite albedo cache (hit color), writing the
+        //    ray image. Three sets, so it records its binds directly (like `sdf-ao`).
         let trace = Arc::clone(&ddgi_pipelines.trace);
         let trace_handle = trace.handle();
-        let trace_layout = trace.layout();
+        let trace_pipeline_layout = trace.layout();
         let trace_set = self.ddgi.trace_set();
-        let trace_push = self.ddgi.trace_push();
+        let trace_push = self.ddgi.trace_push(self.sdf_instance_count);
         let trace_groups_x = DDGI_RAYS_PER_PROBE.div_ceil(64);
         let raw_body = raw.clone();
-        graph.add_pass(
-            RgPass::compute("ddgi-trace")
-                .access(voxel_res, RgUsage::StorageImageRwCompute)
-                .access(irr_res, RgUsage::SampledReadCompute)
-                .access(ray_res, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
-                    record_ddgi_compute(
-                        &raw_body,
-                        cmd,
-                        trace_handle,
-                        trace_layout,
-                        trace_set,
-                        bytemuck::bytes_of(&trace_push),
-                        // Round-robin probe budget: trace a rolling slice per frame (the shader
-                        // offsets the probe index by trace_push's sky_color.w), not the whole volume.
-                        (trace_groups_x, crate::ddgi::DDGI_PROBE_BUDGET, 1),
-                    );
-                    drop(trace);
-                }),
-        );
+        let mut trace_pass = RgPass::compute("ddgi-trace")
+            .access(irr_res, RgUsage::SampledReadCompute)
+            .access(ray_res, RgUsage::StorageImageRwCompute);
+        // When the GDF composited this frame, the trace's far-field tap reads the cascade volumes
+        // (light set binding 9) + the albedo cache (trace set 2) — declare the reads so the graph
+        // transitions each from GENERAL (composite write) → ShaderReadOnly before the trace.
+        if let Some(cascades) = gdf_cascades {
+            for cascade in cascades {
+                trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
+            }
+        }
+        if let Some(albedo) = gdf_albedo {
+            trace_pass = trace_pass.access(albedo, RgUsage::SampledReadCompute);
+        }
+        let trace_pass = trace_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+            // SAFETY: the ash seam. The PSO + three sets are valid this frame; the dispatch
+            // covers the round-robin probe-budget slice (the shader offsets the probe index by
+            // trace_push's sky_color.w), not the whole volume.
+            unsafe {
+                raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, trace_handle);
+                raw_body.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    trace_pipeline_layout,
+                    0,
+                    &[bindless_set, light_set, trace_set],
+                    &[],
+                );
+                raw_body.cmd_push_constants(
+                    cmd,
+                    trace_pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::bytes_of(&trace_push),
+                );
+                raw_body.cmd_dispatch(cmd, trace_groups_x, crate::ddgi::DDGI_PROBE_BUDGET, 1);
+            }
+            drop(trace);
+        });
+        graph.add_pass(trace_pass);
 
-        // 3. Blend irradiance: ray sampler → irradiance storage.
+        // 2. Blend irradiance: ray sampler → irradiance storage.
         let irr_w = crate::ddgi::irradiance_atlas_width();
         let irr_h = crate::ddgi::irradiance_atlas_height();
         let blend_irr = Arc::clone(&ddgi_pipelines.blend_irr);
@@ -4200,7 +4610,7 @@ impl Renderer {
             RgPass::compute("ddgi-blend-irr")
                 .access(ray_res, RgUsage::SampledReadCompute)
                 .access(irr_res, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_ddgi_compute(
                         &raw_body,
                         cmd,
@@ -4214,7 +4624,7 @@ impl Renderer {
                 }),
         );
 
-        // 4. Blend distance: ray sampler → moment (distance) storage.
+        // 3. Blend distance: ray sampler → moment (distance) storage.
         let dist_w = crate::ddgi::distance_atlas_width();
         let dist_h = crate::ddgi::distance_atlas_height();
         let blend_dist = Arc::clone(&ddgi_pipelines.blend_dist);
@@ -4227,7 +4637,7 @@ impl Renderer {
             RgPass::compute("ddgi-blend-dist")
                 .access(ray_res, RgUsage::SampledReadCompute)
                 .access(dist_res, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_ddgi_compute(
                         &raw_body,
                         cmd,
@@ -4241,7 +4651,7 @@ impl Renderer {
                 }),
         );
 
-        // 5. Border copy: fix the irradiance octahedral gutters (read+write the same
+        // 4. Border copy: fix the irradiance octahedral gutters (read+write the same
         //    storage image). Leaves irradiance GENERAL; the scene's SampledRead then
         //    transitions it ShaderReadOnly for the mesh sample.
         let border = Arc::clone(&ddgi_pipelines.border);
@@ -4253,7 +4663,7 @@ impl Renderer {
         graph.add_pass(
             RgPass::compute("ddgi-border")
                 .access(irr_res, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_ddgi_compute(
                         &raw_body,
                         cmd,
@@ -4270,10 +4680,179 @@ impl Renderer {
         DdgiResult {
             irradiance: Some(irr_res),
             distance: Some(dist_res),
-            voxel_slot: Some(voxel_slot),
             rays_slot: Some(rays_slot),
             irradiance_slot: Some(irr_slot),
             distance_slot: Some(dist_slot),
+        }
+    }
+
+    /// Builds the two Global-SDF compute passes into `graph` when the chain runs this frame (GDF on,
+    /// ready, both PSOs resolved): `gdf-cull` (bin the per-mesh MDF instances per cascade into a
+    /// compacted list) then `gdf-composite` (per dirty voxel of each cascade, `min()` the culled
+    /// bricks into the toroidal `R16_SNORM` cascade volume). The cull list buffer serializes the two
+    /// via the graph-derived RAW barrier; each cascade volume is imported on its own external slot
+    /// for the cross-frame layout write-back.
+    ///
+    /// Returns the cascade resources (for the downstream DDGI-trace + scene `SampledRead`) + each
+    /// cascade's external slot. An empty [`GdfResult`] when the GDF did not run (the cascades stay
+    /// at their resting ShaderReadOnly layout and the consumers gate the tap off).
+    fn add_gdf_passes(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        frame: usize,
+    ) -> GdfResult {
+        let Some(gdf_pipelines) = &pipelines.gdf else {
+            return GdfResult::default();
+        };
+        let raw = self.device.raw().clone();
+
+        // Import this frame slot's cull-list buffer (the cull writes it, the composite reads it) +
+        // each cascade volume (the composite writes them, the downstream consumers sample them). The
+        // cull list is per-frame-in-flight so frame N+1's clear/rebuild never races frame N's reads.
+        let cull_res = graph.import_buffer(self.global_sdf.cull_buffer(frame));
+        let mut cascade_res = [RgResource { index: 0 }; crate::GDF_CASCADES as usize];
+        let mut cascade_slots = [None; crate::GDF_CASCADES as usize];
+        for c in 0..crate::GDF_CASCADES {
+            let (image, view, layout) = self.global_sdf.cascade(c);
+            let slot = graph.alloc_external_layout(layout);
+            cascade_res[c as usize] = graph.import_image_3d(image, view, layout, Some(slot));
+            cascade_slots[c as usize] = Some(slot);
+        }
+        // The lite albedo cache (the composite splats it for the finest cascade; the DDGI trace
+        // samples it at hit points).
+        let (albedo_image, albedo_view, albedo_layout) = self.global_sdf.albedo_cache();
+        let albedo_slot = graph.alloc_external_layout(albedo_layout);
+        let albedo_res =
+            graph.import_image_3d(albedo_image, albedo_view, albedo_layout, Some(albedo_slot));
+
+        // 1. Cull: clear the per-cascade counters (a `cmd_fill_buffer` + a transfer→compute barrier,
+        //    the one place the graph has no primitive for), then bin every instance into the
+        //    cascade(s) it touches. One thread per instance.
+        {
+            let cull = Arc::clone(&gdf_pipelines.cull);
+            let handle = cull.handle();
+            let layout = cull.layout();
+            let bindless_set = self.descriptors.bindless_set();
+            let cull_set = self.global_sdf.cull_set(frame);
+            let push = self.global_sdf.cull_push(self.sdf_instance_count);
+            let counter_bytes = self.global_sdf.cull_counter_bytes();
+            let cull_buffer = self.global_sdf.cull_buffer(frame);
+            let groups = MAX_SDF_INSTANCES.div_ceil(64);
+            let raw_body = raw.clone();
+            graph.add_pass(
+                RgPass::compute("gdf-cull")
+                    .access(cull_res, RgUsage::StorageWriteCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        // SAFETY: the ash seam. The PSO/sets are valid this frame. The fill zeroes
+                        // the atomic counters; the barrier orders the transfer write before the
+                        // cull's atomic reads (the graph has no fill primitive, so this one barrier
+                        // is hand-written and local to the pass).
+                        unsafe {
+                            raw_body.cmd_fill_buffer(cmd, cull_buffer, 0, counter_bytes, 0);
+                            let barrier = vk::BufferMemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                .dst_access_mask(
+                                    vk::AccessFlags2::SHADER_STORAGE_READ
+                                        | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                                )
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .buffer(cull_buffer)
+                                .offset(0)
+                                .size(counter_bytes);
+                            let barriers = [barrier];
+                            let dep =
+                                vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+                            raw_body.cmd_pipeline_barrier2(cmd, &dep);
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[bindless_set, cull_set],
+                                &[],
+                            );
+                            raw_body.cmd_push_constants(
+                                cmd,
+                                layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                0,
+                                bytemuck::bytes_of(&push),
+                            );
+                            raw_body.cmd_dispatch(cmd, groups, 1, 1);
+                        }
+                        drop(cull);
+                    }),
+            );
+        }
+
+        // 2. Composite: per dirty region of each cascade, `min()` the culled bricks → the toroidal
+        //    cascade volume. The near cascade updates incrementally; one cascade per frame gets the
+        //    staggered full refresh (the round-robin in `dirty_regions`). All cascade writes ride
+        //    the same pass declaring StorageImageRwCompute on every cascade (so the graph holds them
+        //    GENERAL across the region dispatches), reading the cull list.
+        let composite = Arc::clone(&gdf_pipelines.composite);
+        let handle = composite.handle();
+        let layout = composite.layout();
+        let bindless_set = self.descriptors.bindless_set();
+        let composite_set = self.global_sdf.composite_set(frame);
+        // Gather every dirty region (cascade index + push) so the pass body issues one dispatch each.
+        let mut dispatches: Vec<(crate::GdfCompositePush, u32, u32, u32)> = Vec::new();
+        for c in 0..crate::GDF_CASCADES {
+            for region in self.global_sdf.dirty_regions(c) {
+                let push = self.global_sdf.composite_push(c, region);
+                let g = (
+                    region.size.x.div_ceil(4),
+                    region.size.y.div_ceil(4),
+                    region.size.z.div_ceil(4),
+                );
+                dispatches.push((push, g.0, g.1, g.2));
+            }
+        }
+        let mut composite_pass =
+            RgPass::compute("gdf-composite").access(cull_res, RgUsage::StorageReadCompute);
+        for cascade in cascade_res {
+            composite_pass = composite_pass.access(cascade, RgUsage::StorageImageRwCompute);
+        }
+        composite_pass = composite_pass.access(albedo_res, RgUsage::StorageImageRwCompute);
+        let raw_body = raw.clone();
+        composite_pass = composite_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+            // SAFETY: the ash seam. The PSO/sets are valid this frame; each dispatch covers one
+            // dirty region (4³ per group), pushing that region's cascade + bounds.
+            unsafe {
+                raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                raw_body.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[bindless_set, composite_set],
+                    &[],
+                );
+                for (push, gx, gy, gz) in &dispatches {
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::bytes_of(push),
+                    );
+                    raw_body.cmd_dispatch(cmd, *gx, *gy, *gz);
+                }
+            }
+            drop(composite);
+        });
+        graph.add_pass(composite_pass);
+
+        GdfResult {
+            cascades: Some(cascade_res),
+            cascade_slots,
+            albedo: Some(albedo_res),
+            albedo_slot: Some(albedo_slot),
         }
     }
 
@@ -4405,7 +4984,7 @@ impl Renderer {
         graph.add_pass(
             RgPass::compute("restir-initial")
                 .access(sentinel, RgUsage::StorageWriteCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_ddgi_compute(
                         &raw_body,
                         cmd,
@@ -4432,18 +5011,20 @@ impl Renderer {
         if let Some(motion) = motion {
             reuse_pass = reuse_pass.access(motion, RgUsage::SampledReadCompute);
         }
-        graph.add_pass(reuse_pass.body(move |cmd| {
-            record_ddgi_compute(
-                &raw_body,
-                cmd,
-                reuse_handle,
-                reuse_layout,
-                reuse_set,
-                bytemuck::bytes_of(&reuse_push),
-                (groups_x, groups_y, 1),
-            );
-            drop(reuse);
-        }));
+        graph.add_pass(
+            reuse_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                record_ddgi_compute(
+                    &raw_body,
+                    cmd,
+                    reuse_handle,
+                    reuse_layout,
+                    reuse_set,
+                    bytemuck::bytes_of(&reuse_push),
+                    (groups_x, groups_y, 1),
+                );
+                drop(reuse);
+            }),
+        );
 
         // 3. resolve: one TLAS visibility ray per pixel + shade → the radiance image
         //    (storage RW). Reads the sentinel (the combined reservoir) + writes the radiance.
@@ -4455,7 +5036,7 @@ impl Renderer {
             RgPass::compute("restir-resolve")
                 .access(sentinel, RgUsage::StorageReadCompute)
                 .access(radiance_res, RgUsage::StorageImageRwCompute)
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_ddgi_compute(
                         &raw_body,
                         cmd,
@@ -4489,6 +5070,7 @@ impl Renderer {
     /// schedules after the scene pass, and the SSGI history / resolved external-layout
     /// slots (read back after execute). No-op (empty result) when the prepass did not run
     /// this frame.
+    #[allow(clippy::too_many_arguments)]
     fn add_screen_space_passes(
         &self,
         graph: &mut RenderGraph,
@@ -4496,6 +5078,8 @@ impl Renderer {
         instance_set: vk::DescriptorSet,
         motion: Option<RgResource>,
         deformed: (Option<RgResource>, Option<vk::Buffer>),
+        light_set: vk::DescriptorSet,
+        gdf_cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
     ) -> ScreenSpaceResult {
         let (deformed_res, deformed_handle) = deformed;
         let mut result = ScreenSpaceResult::default();
@@ -4525,10 +5109,20 @@ impl Renderer {
         let groups = |n: u32| n.div_ceil(8);
         result.mesh_set = view.mesh_set;
 
-        // The G-buffer prepass: write view normal (rgb) + view-Z (.a) + its own depth.
+        // The G-buffer prepass: write view normal (rgb) + view-Z (.a) + roughness + its own depth.
         let g_normal = graph.import_image(
             view.g_normal.as_ref().expect("g_normal built").handle(),
             view.g_normal.as_ref().expect("g_normal built").view(),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+            None,
+        );
+        let g_roughness = graph.import_image(
+            view.g_roughness
+                .as_ref()
+                .expect("g_roughness built")
+                .handle(),
+            view.g_roughness.as_ref().expect("g_roughness built").view(),
             vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::UNDEFINED,
             None,
@@ -4549,8 +5143,9 @@ impl Renderer {
             let gbuffer_layout = pipeline.layout();
             let mut pass = RgPass::graphics("gbuffer", extent)
                 .color(RgAttachment::clear_store(g_normal))
+                .color(RgAttachment::clear_store(g_roughness))
                 .depth_attachment(depth_clear_store(g_depth))
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_gbuffer(
                         &raw_body,
                         cmd,
@@ -4800,6 +5395,330 @@ impl Renderer {
             }
         }
 
+        // DFAO diffuse sky-visibility: the reduced-resolution GDF cone trace (Wright 2015),
+        // mirroring the SSGI chain — a half-res trace (`dfao`), a bilateral upsample (reusing the
+        // ssgi-blur PSO), then temporal accumulation through the motion vectors (reusing the
+        // ssgi-accum PSO). The mesh samples the resolved sky-visibility (set 4 binding 5) to
+        // occlude the analytic sky irradiance, so the 9-cone march no longer runs per full-res
+        // fragment. The trace is a three-set pass (`[bindless, light, dfao_set]`) like the DDGI
+        // trace: it taps the GDF cascade clipmap via the light set, so it declares SampledRead on
+        // the cascades (transitioning them from the composite's GENERAL) and reads the shared
+        // `sdf` module's `sdfSkyVisibility`.
+        // The gi-resolve pass (added after this block) samples the spatial DFAO as its sky-visibility
+        // input when sky occlusion ran; captured here, `None` when it did not (then gi-resolve's
+        // skyVis flag is 0 and it does not touch dfao).
+        let mut dfao_denoised_res: Option<RgResource> = None;
+        if let Some(dfao) = &pipelines.dfao {
+            let bindless_set = self.descriptors.bindless_set();
+            let dfao_raw = graph.import_image(
+                view.dfao_raw.as_ref().expect("dfao_raw built").handle(),
+                view.dfao_raw.as_ref().expect("dfao_raw built").view(),
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+                None,
+            );
+            let dfao_denoised = graph.import_image(
+                view.dfao_denoised
+                    .as_ref()
+                    .expect("dfao_denoised built")
+                    .handle(),
+                view.dfao_denoised
+                    .as_ref()
+                    .expect("dfao_denoised built")
+                    .view(),
+                vk::ImageAspectFlags::COLOR,
+                view.dfao_denoised
+                    .as_ref()
+                    .expect("dfao_denoised built")
+                    .layout,
+                None,
+            );
+
+            // 1. Trace: reconstruct world pos/normal from the G-buffer, cone-trace the GDF sky
+            //    visibility into the half-res raw map. Records its three sets directly.
+            let trace = Arc::clone(dfao);
+            let trace_handle = trace.handle();
+            let trace_layout = trace.layout();
+            let trace_set = view.dfao_set;
+            let trace_push = pipelines.dfao_push;
+            let raw_body = raw.clone();
+            let trace_gx = groups(half_extent.width);
+            let trace_gy = groups(half_extent.height);
+            let mut trace_pass = RgPass::compute("dfao")
+                .access(g_normal, RgUsage::SampledReadCompute)
+                .access(dfao_raw, RgUsage::StorageImageRwCompute);
+            // The trace taps the GDF cascade clipmap (light set binding 9); declare the reads so
+            // the graph transitions each cascade from GENERAL (composite write) → ShaderReadOnly
+            // before the trace, exactly as the DDGI trace does.
+            if let Some(cascades) = gdf_cascades {
+                for cascade in cascades {
+                    trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
+                }
+            }
+            let trace_pass = trace_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. The PSO + three sets are valid this frame; the dispatch
+                // covers the half-res trace target.
+                unsafe {
+                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, trace_handle);
+                    raw_body.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        trace_layout,
+                        0,
+                        &[bindless_set, light_set, trace_set],
+                        &[],
+                    );
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        trace_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::bytes_of(&trace_push),
+                    );
+                    raw_body.cmd_dispatch(cmd, trace_gx, trace_gy, 1);
+                }
+                drop(trace);
+            });
+            graph.add_pass(trace_pass);
+
+            // 2. Bilateral upsample: dfao_raw (half-res) + g_normal → dfao_denoised (full-res).
+            if let Some(dfao_blur) = &pipelines.dfao_blur {
+                self.add_compute_pass(
+                    graph,
+                    "dfao-blur",
+                    dfao_blur,
+                    view.dfao_blur_set,
+                    &[
+                        (dfao_raw, RgUsage::SampledReadCompute),
+                        (g_normal, RgUsage::SampledReadCompute),
+                        (dfao_denoised, RgUsage::StorageImageRwCompute),
+                    ],
+                    None,
+                    groups(extent.width),
+                    groups(extent.height),
+                );
+            }
+
+            // Expose dfao_denoised to the gi-resolve pass (added after this block so it runs whenever
+            // the screen chain does, not only when sky-occlusion is on): its skyVis input, when present.
+            dfao_denoised_res = Some(dfao_denoised);
+
+            // 3. Temporal accumulation (when motion ran): reproject the DFAO history through
+            //    motion, neighborhood-clamp, EMA into the stable dfao_resolved the mesh samples.
+            if let (Some(accum), Some(motion)) = (&pipelines.dfao_accum, motion) {
+                let p = view.history_index;
+                let dfao_resolved_slot = graph.alloc_external_layout(
+                    view.dfao_resolved
+                        .as_ref()
+                        .expect("dfao_resolved built")
+                        .layout,
+                );
+                let dfao_resolved = graph.import_image(
+                    view.dfao_resolved
+                        .as_ref()
+                        .expect("dfao_resolved built")
+                        .handle(),
+                    view.dfao_resolved
+                        .as_ref()
+                        .expect("dfao_resolved built")
+                        .view(),
+                    vk::ImageAspectFlags::COLOR,
+                    view.dfao_resolved
+                        .as_ref()
+                        .expect("dfao_resolved built")
+                        .layout,
+                    Some(dfao_resolved_slot),
+                );
+                let (read_slot, read) = import_ssgi_history(graph, &view.dfao_history[1 - p]);
+                let (write_slot, write) = import_ssgi_history(graph, &view.dfao_history[p]);
+                let push = crate::SsgiAccumPush {
+                    params: saffron_geometry::glam::Vec4::new(
+                        crate::SSGI_HISTORY_WEIGHT,
+                        if view.history_valid { 1.0 } else { 0.0 },
+                        0.0,
+                        0.0,
+                    ),
+                };
+                self.add_compute_pass(
+                    graph,
+                    "dfao-accum",
+                    accum,
+                    view.dfao_accum_sets[p],
+                    &[
+                        (dfao_denoised, RgUsage::SampledReadCompute),
+                        (read, RgUsage::SampledReadCompute),
+                        (motion, RgUsage::SampledReadCompute),
+                        (dfao_resolved, RgUsage::StorageImageRwCompute),
+                        (write, RgUsage::StorageImageRwCompute),
+                    ],
+                    Some(bytemuck::bytes_of(&push).to_vec()),
+                    groups(extent.width),
+                    groups(extent.height),
+                );
+                result.scene_sampled.push(dfao_resolved);
+                result.dfao_resolved_slot = Some(dfao_resolved_slot);
+                result.dfao_history_slots = Some(TaaHistorySlots {
+                    read: (1 - p, read_slot),
+                    write: (p, write_slot),
+                });
+            } else {
+                // No motion this frame (practically unreachable — DFAO forces motion on): the
+                // scene samples the spatially denoised map instead of the resolved one.
+                result.scene_sampled.push(dfao_denoised);
+            }
+        }
+
+        // Screen-space indirect-diffuse resolve: reconstruct worldPos/n from the G-buffer, integrate
+        // the DDGI cage (shared `giprobe` sampler) + IBL diffuse × the DFAO sky-visibility (when it
+        // ran) into the half-res gi_indirect. Runs whenever the screen chain does (the mesh always
+        // samples gi_indirect at set 4 binding 7), independent of the sky-occlusion gate — its skyVis
+        // flag (GiParams) is 0 when DFAO is off, so it then does not touch dfao_denoised.
+        if let Some(gi_pso) = &pipelines.gi_resolve {
+            // External-layout slot so the graph transitions gi_indirect GENERAL (this pass's storage
+            // write) → SHADER_READ_ONLY for the scene pass's `SampledRead` (fully rewritten each frame,
+            // so the start layout harmlessly discards).
+            let gi_slot = graph.alloc_external_layout(
+                view.gi_indirect.as_ref().expect("gi_indirect built").layout,
+            );
+            let gi_indirect = graph.import_image(
+                view.gi_indirect
+                    .as_ref()
+                    .expect("gi_indirect built")
+                    .handle(),
+                view.gi_indirect.as_ref().expect("gi_indirect built").view(),
+                vk::ImageAspectFlags::COLOR,
+                view.gi_indirect.as_ref().expect("gi_indirect built").layout,
+                Some(gi_slot),
+            );
+            let mut accesses = vec![
+                (g_normal, RgUsage::SampledReadCompute),
+                (gi_indirect, RgUsage::StorageImageRwCompute),
+            ];
+            if let Some(dfao_res) = dfao_denoised_res {
+                accesses.push((dfao_res, RgUsage::SampledReadCompute));
+            }
+            self.add_compute_pass(
+                graph,
+                "gi-resolve",
+                gi_pso,
+                view.gi_resolve_sets[self.frames.index()],
+                &accesses,
+                None,
+                groups(half_extent.width),
+                groups(half_extent.height),
+            );
+            // The scene fragment samples gi_indirect (set 4 binding 7), so declare it — the graph
+            // barriers it ShaderReadOnly before the scene pass.
+            result.scene_sampled.push(gi_indirect);
+        }
+
+        // Specular reflection-occlusion: the reflection-vector twin of the DFAO chain (Wright
+        // 2015) — a half-res trace (`specocc`) along the per-pixel reflection vector against the
+        // GDF, a bilateral upsample (reusing the ssgi-blur PSO), then temporal accumulation through
+        // the motion vectors (reusing the ssgi-accum PSO). The mesh samples the resolved occlusion
+        // (set 4 binding 6) to occlude the reflected skybox, so the reflection cone-march no longer
+        // runs per full-res fragment. The trace is a three-set pass (`[bindless, light, specocc_set]`)
+        // like the DFAO trace, and additionally reads the roughness G-buffer target.
+        if let Some(specocc) = &pipelines.specocc {
+            let bindless_set = self.descriptors.bindless_set();
+            let specocc_raw = graph.import_image(
+                view.specocc_raw
+                    .as_ref()
+                    .expect("specocc_raw built")
+                    .handle(),
+                view.specocc_raw.as_ref().expect("specocc_raw built").view(),
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+                None,
+            );
+            let specocc_denoised = graph.import_image(
+                view.specocc_denoised
+                    .as_ref()
+                    .expect("specocc_denoised built")
+                    .handle(),
+                view.specocc_denoised
+                    .as_ref()
+                    .expect("specocc_denoised built")
+                    .view(),
+                vk::ImageAspectFlags::COLOR,
+                view.specocc_denoised
+                    .as_ref()
+                    .expect("specocc_denoised built")
+                    .layout,
+                None,
+            );
+
+            // 1. Trace: reconstruct world pos/normal + the reflection vector from the G-buffer,
+            //    cone-trace the GDF occlusion into the half-res raw map. Records its three sets.
+            let trace = Arc::clone(specocc);
+            let trace_handle = trace.handle();
+            let trace_layout = trace.layout();
+            let trace_set = view.specocc_set;
+            let trace_push = pipelines.specocc_push;
+            let raw_body = raw.clone();
+            let trace_gx = groups(half_extent.width);
+            let trace_gy = groups(half_extent.height);
+            let mut trace_pass = RgPass::compute("specocc")
+                .access(g_normal, RgUsage::SampledReadCompute)
+                .access(g_roughness, RgUsage::SampledReadCompute)
+                .access(specocc_raw, RgUsage::StorageImageRwCompute);
+            // The trace taps the GDF cascade clipmap (light set binding 9); declare the reads so
+            // the graph transitions each cascade GENERAL (composite) → ShaderReadOnly first.
+            if let Some(cascades) = gdf_cascades {
+                for cascade in cascades {
+                    trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
+                }
+            }
+            let trace_pass = trace_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. The PSO + three sets are valid this frame; the dispatch
+                // covers the half-res trace target.
+                unsafe {
+                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, trace_handle);
+                    raw_body.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        trace_layout,
+                        0,
+                        &[bindless_set, light_set, trace_set],
+                        &[],
+                    );
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        trace_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::bytes_of(&trace_push),
+                    );
+                    raw_body.cmd_dispatch(cmd, trace_gx, trace_gy, 1);
+                }
+                drop(trace);
+            });
+            graph.add_pass(trace_pass);
+
+            // 2. Bilateral upsample: specocc_raw (half-res) + g_normal → specocc_denoised (full-res).
+            if let Some(specocc_blur) = &pipelines.specocc_blur {
+                self.add_compute_pass(
+                    graph,
+                    "specocc-blur",
+                    specocc_blur,
+                    view.specocc_blur_set,
+                    &[
+                        (specocc_raw, RgUsage::SampledReadCompute),
+                        (g_normal, RgUsage::SampledReadCompute),
+                        (specocc_denoised, RgUsage::StorageImageRwCompute),
+                    ],
+                    None,
+                    groups(extent.width),
+                    groups(extent.height),
+                );
+            }
+
+            // Specular reflection occlusion is view-dependent (R); temporally reprojecting it through
+            // surface motion would smear/swim it under camera motion. It is a low-frequency scalar once
+            // bilaterally upsampled, so the mesh samples the spatially-denoised map directly — no temporal reuse.
+            result.scene_sampled.push(specocc_denoised);
+        }
+
         // Screen-space reflections: g_normal + prevColor → ssr_map. The mesh blends ssr_map
         // over the prefiltered-env specular, weighted by hit confidence × (1 - roughness),
         // so only smooth surfaces use it. No separate denoise — TAA cleans the march jitter.
@@ -4908,7 +5827,7 @@ impl Renderer {
         let mut pass = RgPass::graphics("motion", extent)
             .color(RgAttachment::clear_store(motion))
             .depth_attachment(depth_clear_store(motion_depth))
-            .body(move |cmd| {
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                 crate::record_motion(
                     &raw_body,
                     cmd,
@@ -5093,7 +6012,7 @@ impl Renderer {
             let pass = RgPass::graphics("grid", extent)
                 .color(color_load_store(color))
                 .depth_attachment(depth_load_readonly(depth))
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     crate::record_grid(&raw_body, cmd, handle, layout, &push);
                     drop(pipeline);
                 });
@@ -5113,7 +6032,7 @@ impl Renderer {
             let pass = RgPass::graphics("editor-overlay", extent)
                 .color(color_load_store(color))
                 .depth_attachment(depth_load_readonly(depth))
-                .body(move |cmd| {
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     crate::record_overlay(&raw_body, cmd, &draw, on_top_handle, occluded_handle);
                     drop(on_top);
                     drop(occluded);
@@ -5186,7 +6105,7 @@ impl Renderer {
         let mut pass = RgPass::graphics("lit-wireframe", extent)
             .color(color_load_store(color))
             .depth_attachment(depth_load_readonly(depth))
-            .body(move |cmd| {
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                 record_depth_prepass(
                     &raw_for_body,
                     cmd,
@@ -5223,7 +6142,7 @@ impl Renderer {
         let pipeline = Arc::clone(pipeline);
         let handle = pipeline.handle();
         let layout = pipeline.layout();
-        let mut pass = RgPass::compute(name).body(move |cmd| {
+        let mut pass = RgPass::compute(name).body(move |cmd, _scopes: &mut NestedScopeRecorder| {
             // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch covers
             // the viewport (one invocation per pixel, 8×8 per group).
             unsafe {
@@ -5280,7 +6199,7 @@ impl Renderer {
         };
         let mut pass = RgPass::graphics(name, extent)
             .depth_attachment(depth_clear_store(resource))
-            .body(move |cmd| {
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                 record_shadow_depth(
                     &raw_body,
                     cmd,
@@ -5884,9 +6803,9 @@ unsafe fn capture_barrier(
     unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
 }
 
-/// Records one DDGI compute dispatch: bind the PSO + its set 0, push the per-pass
-/// constants, dispatch `groups`. Shared by the five DDGI passes (only the PSO/set/push/
-/// group counts differ).
+/// Records one single-set DDGI compute dispatch: bind the PSO + its set 0, push the per-pass
+/// constants, dispatch `groups`. Shared by the blend + border passes (the trace binds three sets,
+/// so it records its binds directly).
 fn record_ddgi_compute(
     raw: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -5984,6 +6903,18 @@ fn writeback_ssgi_history_layout(
     slot: &(usize, usize),
 ) {
     if let Some(image) = view.ssgi_history[slot.0].as_mut() {
+        image.layout = graph.external_layout(slot.1);
+    }
+}
+
+/// Writes a DFAO history image's resolved exit layout back from the graph's external slot.
+/// `(history-index, slot)` selects the image in `view.dfao_history` and the slot to read.
+fn writeback_dfao_history_layout(
+    view: &mut ViewTarget,
+    graph: &RenderGraph,
+    slot: &(usize, usize),
+) {
+    if let Some(image) = view.dfao_history[slot.0].as_mut() {
         image.layout = graph.external_layout(slot.1);
     }
 }
@@ -6367,7 +7298,9 @@ mod tests {
                 material_slot: 0,
             }],
         };
-        let mesh = uploader.upload_mesh(&mesh, &[], None).expect("upload");
+        let mesh = uploader
+            .upload_mesh(&descriptors, &mesh, &[], None, None)
+            .expect("upload");
         let item = DrawItem::new(
             Arc::clone(&mesh),
             Mat4::IDENTITY,
@@ -6544,7 +7477,7 @@ mod tests {
             graph.add_pass(
                 RgPass::graphics("depth-prepass", extent)
                     .depth_attachment(super::depth_clear_store(depth))
-                    .body(body),
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| body(cmd)),
             );
             graph.execute(device, cmd);
 
@@ -6931,7 +7864,11 @@ mod tests {
                     float32: [0.75, 0.75, 0.75, 1.0],
                 },
             };
-            graph.add_pass(RgPass::graphics("seed", extent).color(seed).body(|_cmd| {}));
+            graph.add_pass(
+                RgPass::graphics("seed", extent)
+                    .color(seed)
+                    .body(|_cmd, _scopes: &mut NestedScopeRecorder| {}),
+            );
             graph.execute(device, cmd);
 
             // The seed pass left the offscreen COLOR_ATTACHMENT_OPTIMAL; copy it out exactly
@@ -7124,7 +8061,7 @@ mod tests {
                 RgPass::graphics("seed", extent)
                     .color(seed_color)
                     .depth_attachment(super::depth_clear_store(depth_res))
-                    .body(|_cmd| {}),
+                    .body(|_cmd, _scopes: &mut NestedScopeRecorder| {}),
             );
 
             // Tonemap (mandatory, in-place compute).
@@ -7134,7 +8071,7 @@ mod tests {
             graph.add_pass(
                 RgPass::compute("tonemap")
                     .access(color, RgUsage::StorageImageRwCompute)
-                    .body(move |cmd| {
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                         // SAFETY: the ash seam. The set/PSO are valid; the dispatch covers
                         // the viewport (8×8 per group).
                         unsafe {
@@ -7174,7 +8111,7 @@ mod tests {
                 RgPass::graphics("grid", extent)
                     .color(super::color_load_store(color))
                     .depth_attachment(super::depth_load_readonly(depth_res))
-                    .body(move |cmd| {
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                         record_grid(&raw_grid, cmd, grid_pipeline, grid_layout, &grid_push);
                     }),
             );
@@ -7185,7 +8122,7 @@ mod tests {
                 RgPass::graphics("editor-overlay", extent)
                     .color(super::color_load_store(color))
                     .depth_attachment(super::depth_load_readonly(depth_res))
-                    .body(move |cmd| {
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                         record_overlay(
                             &raw_ov,
                             cmd,
