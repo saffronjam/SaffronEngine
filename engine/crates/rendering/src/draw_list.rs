@@ -60,6 +60,9 @@ pub struct SubmeshMaterial {
     pub alpha_clip: bool,
     /// The alpha-clip cutoff threshold.
     pub alpha_cutoff: f32,
+    /// Two-sided (glTF `doubleSided`): the scene pass disables backface culling for this submesh so
+    /// both faces shade (curtains, foliage); single-sided submeshes cull `BACK`.
+    pub double_sided: bool,
 }
 
 impl SubmeshMaterial {
@@ -84,6 +87,7 @@ impl SubmeshMaterial {
             height_scale: 0.05,
             alpha_clip: false,
             alpha_cutoff: 0.5,
+            double_sided: false,
         }
     }
 }
@@ -174,6 +178,10 @@ pub struct DrawBatch {
     /// The base vertex of this batch's instance in the deformed buffer (0 for the static
     /// path), added to each submesh's `vertex_offset` in the deformed draw.
     pub deformed_vertex_offset: u32,
+    /// Per-geometry-submesh backface-cull mode (aligned with `mesh.submeshes`; a single entry backs
+    /// the no-submesh single-draw path): `NONE` for a two-sided submesh material, `BACK` otherwise.
+    /// The scene pass applies it via dynamic state; other passes keep their baked cull mode.
+    pub submesh_cull: Vec<vk::CullModeFlags>,
 }
 
 /// One skinned mesh-instance's compute work for the frame: the descriptor set wiring its
