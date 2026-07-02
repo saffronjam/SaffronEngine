@@ -75,10 +75,11 @@ pub fn run_host(title: impl Into<String>, width: u32, height: u32) -> i32 {
         },
         on_create: Box::new(move |app: &mut App| {
             // The native-viewport host always renders present-only (no engine panels), driven
-            // over the control plane. Default AA is MSAA 4×, clamped to device support.
+            // over the control plane. Default AA is 1× MSAA + TAA: TAA is the antialiaser, so
+            // stacking 4× MSAA on top only multiplies attachment bandwidth + edge-fragment shading.
             if let Some(renderer) = app.frame_host.renderer_mut() {
                 renderer.set_present_viewport_only(true);
-                if let Err(err) = renderer.set_aa(4, false, false) {
+                if let Err(err) = renderer.set_aa(1, false, false) {
                     tracing::warn!("default AA setup failed: {err}");
                 }
             }
