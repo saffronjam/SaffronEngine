@@ -26,9 +26,8 @@ use crate::error::{Error, Result};
 use crate::picking::generate_normals;
 use crate::types::{
     AlphaMode, AnimClip, AnimInterp, AnimPath, AnimTarget, AnimTrack, ImportedMaterial,
-    ImportedModel,
-    ImportedNode, ImportedSkin, Mesh, MorphData, MorphDelta, MorphTarget, SkinPayload, Submesh,
-    TextureSource, Vertex, VertexSkin,
+    ImportedModel, ImportedNode, ImportedSkin, Mesh, MorphData, MorphDelta, MorphTarget,
+    SkinPayload, Submesh, TextureSource, Vertex, VertexSkin,
 };
 
 /// Below this squared magnitude a morph delta is treated as zero and dropped, keeping the
