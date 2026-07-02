@@ -16,7 +16,7 @@ use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::pipelines::{DEPTH_FORMAT, OFFSCREEN_COLOR_FORMAT};
 use crate::resources::{Buffer, Image, ImageDesc};
 use crate::restir::RestirView;
-use crate::ssao::{AO_FORMAT, G_NORMAL_FORMAT, Ssao, mesh_set_layout};
+use crate::ssao::{AO_FORMAT, G_NORMAL_FORMAT, ROUGHNESS_FORMAT, Ssao, mesh_set_layout};
 use crate::{Device, Result};
 
 /// One frame-in-flight's viewport shm-publish capture target: a BGRA8 image the
@@ -69,6 +69,9 @@ pub struct ViewTarget {
     /// The thin G-buffer: view normal (rgb) + view-Z (.a), the screen-space chain's
     /// shared input. `None` until the screen-space targets are built.
     pub g_normal: Option<Image>,
+    /// The G-buffer's second target: per-pixel roughness (R8), the specular-occlusion prepass's
+    /// cone-angle input. Written alongside `g_normal` by the gbuffer prepass.
+    pub g_roughness: Option<Image>,
     /// The G-buffer prepass's own depth scratch.
     pub g_depth: Option<Image>,
     /// The raw GTAO trace output (r8).
@@ -86,6 +89,24 @@ pub struct ViewTarget {
     pub ssgi_denoised: Option<Image>,
     /// `ssgi_denoised` after temporal accumulation (rgba16f). Sampled once motion is on.
     pub ssgi_resolved: Option<Image>,
+    /// The raw half-res DFAO sky-visibility cone-trace output (rgba16f, r = [0,1] visibility).
+    pub dfao_raw: Option<Image>,
+    /// `dfao_raw` after the bilateral upsample to full res (rgba16f).
+    pub dfao_denoised: Option<Image>,
+    /// `dfao_denoised` after temporal accumulation — what the mesh samples (rgba16f, set 4
+    /// binding 5).
+    pub dfao_resolved: Option<Image>,
+    /// DFAO temporal history (rgba16f), ping-pong sharing the SSGI/TAA parity.
+    pub dfao_history: [Option<Image>; 2],
+    /// The raw half-res specular reflection-occlusion cone-trace output (rgba16f, r = [0,1]).
+    pub specocc_raw: Option<Image>,
+    /// `specocc_raw` after the bilateral upsample to full res — what the mesh samples (rgba16f,
+    /// set 4 binding 6). Specular occlusion is view-dependent, so it is spatial-only (no temporal
+    /// accumulation): the half-res trace + this bilateral upsample are its whole denoise.
+    pub specocc_denoised: Option<Image>,
+    /// The half-res screen-space indirect-diffuse resolve output (rgba16f: rgb = indirect diffuse
+    /// irradiance, a = view-Z for the denoiser). Additive until the fragment cutover samples it.
+    pub gi_indirect: Option<Image>,
     /// The persistent previous-frame linear-HDR color SSGI gathers from (rgba16f).
     pub prev_color: Option<Image>,
     /// SSGI temporal history (rgba16f), ping-pong sharing TAA's parity.
@@ -132,8 +153,26 @@ pub struct ViewTarget {
     pub ssr_set: vk::DescriptorSet,
     /// ssgi_blur: ssgi_map + g_normal + ssgi_denoised (compute3).
     pub ssgi_blur_set: vk::DescriptorSet,
+    /// dfao trace (set 2 of the trace pipeline): g_normal + dfao_raw (compute2).
+    pub dfao_set: vk::DescriptorSet,
+    /// dfao-blur: dfao_raw + g_normal + dfao_denoised (compute3, reuses the ssgi-blur PSO).
+    pub dfao_blur_set: vk::DescriptorSet,
+    /// dfao-accum (taa-shape: 3 samplers + 2 storage), ping-pong by `history_index` (reuses the
+    /// ssgi-accum PSO).
+    pub dfao_accum_sets: [vk::DescriptorSet; 2],
+    /// specocc trace (set 2 of the trace pipeline): g_normal + g_roughness + specocc_raw (compute3).
+    pub specocc_set: vk::DescriptorSet,
+    /// specocc-blur: specocc_raw + g_normal + specocc_denoised (compute3, reuses the ssgi-blur PSO).
+    pub specocc_blur_set: vk::DescriptorSet,
     /// copy_color: offscreen + prev_color (compute2).
     pub copy_color_set: vk::DescriptorSet,
+    /// gi-resolve per-frame-slot sets (the single `gi_resolve_layout`). Image bindings (G-buffer,
+    /// output, dfao, IBL cube, DDGI atlases) are stable and written once; each slot binds its own
+    /// `gi_params_ubos[i]` at b2, whose contents are memcpy'd per frame — so no per-frame descriptor
+    /// rewrite, no descriptor-in-flight hazard.
+    pub gi_resolve_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+    /// Per-frame-slot `GiParams` UBOs (host-visible, persistently mapped), one per gi-resolve set.
+    pub gi_params_ubos: Vec<Buffer>,
     /// ssgi-accum (taa-shape: 3 samplers + 2 storage), ping-pong by `history_index`.
     pub ssgi_accum_sets: [vk::DescriptorSet; 2],
     /// fxaa: scratch source sampler + offscreen storage (compute2-shape, fxaa layout).
@@ -220,6 +259,7 @@ impl ViewTarget {
             offscreen,
             depth,
             g_normal: None,
+            g_roughness: None,
             g_depth: None,
             ao_raw: None,
             ao_map: None,
@@ -228,6 +268,13 @@ impl ViewTarget {
             ssr_map: None,
             ssgi_denoised: None,
             ssgi_resolved: None,
+            dfao_raw: None,
+            dfao_denoised: None,
+            dfao_resolved: None,
+            dfao_history: [None, None],
+            specocc_raw: None,
+            specocc_denoised: None,
+            gi_indirect: None,
             prev_color: None,
             ssgi_history: [None, None],
             motion: None,
@@ -246,7 +293,14 @@ impl ViewTarget {
             ssgi_set: vk::DescriptorSet::null(),
             ssr_set: vk::DescriptorSet::null(),
             ssgi_blur_set: vk::DescriptorSet::null(),
+            dfao_set: vk::DescriptorSet::null(),
+            dfao_blur_set: vk::DescriptorSet::null(),
+            dfao_accum_sets: [vk::DescriptorSet::null(); 2],
+            specocc_set: vk::DescriptorSet::null(),
+            specocc_blur_set: vk::DescriptorSet::null(),
             copy_color_set: vk::DescriptorSet::null(),
+            gi_resolve_sets: [vk::DescriptorSet::null(); MAX_FRAMES_IN_FLIGHT],
+            gi_params_ubos: Vec::new(),
             motion_vis_set: vk::DescriptorSet::null(),
             ssgi_accum_sets: [vk::DescriptorSet::null(); 2],
             fxaa_set: vk::DescriptorSet::null(),
@@ -343,7 +397,20 @@ impl ViewTarget {
         self.ssgi_set = descriptors.allocate_set(ssao.compute3_layout())?;
         self.ssr_set = descriptors.allocate_set(ssao.compute3_layout())?;
         self.ssgi_blur_set = descriptors.allocate_set(ssao.compute3_layout())?;
+        self.dfao_set = descriptors.allocate_set(ssao.compute2_layout())?;
+        self.dfao_blur_set = descriptors.allocate_set(ssao.compute3_layout())?;
+        self.dfao_accum_sets = [
+            descriptors.allocate_set(descriptors.taa_set_layout())?,
+            descriptors.allocate_set(descriptors.taa_set_layout())?,
+        ];
+        // Specular occlusion: the trace's I/O set is the compute3 shape (two samplers — the
+        // G-buffer + roughness — plus the storage image), unlike DFAO's compute2 trace.
+        self.specocc_set = descriptors.allocate_set(ssao.compute3_layout())?;
+        self.specocc_blur_set = descriptors.allocate_set(ssao.compute3_layout())?;
         self.copy_color_set = descriptors.allocate_set(ssao.compute2_layout())?;
+        for slot in &mut self.gi_resolve_sets {
+            *slot = descriptors.allocate_set(ssao.gi_resolve_layout())?;
+        }
         self.motion_vis_set = descriptors.allocate_set(ssao.compute2_layout())?;
         self.ssgi_accum_sets = [
             descriptors.allocate_set(descriptors.taa_set_layout())?,
@@ -390,6 +457,15 @@ impl ViewTarget {
             &ImageDesc::color_2d(
                 extent,
                 G_NORMAL_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            ),
+        )?;
+        // The G-buffer's roughness target (R8): a color attachment + sampled, like g_normal.
+        let g_roughness = Image::new(
+            resources,
+            &ImageDesc::color_2d(
+                extent,
+                ROUGHNESS_FORMAT,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             ),
         )?;
@@ -442,6 +518,39 @@ impl ViewTarget {
             resources,
             &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
         )?;
+        // DFAO: the cone trace runs at half res (like GTAO/SSGI), then a bilateral upsample
+        // (`dfao_denoised`) + temporal accumulation (`dfao_resolved` + history) bring it to full
+        // res and denoise it across frames.
+        let dfao_raw = Image::new(
+            resources,
+            &ImageDesc::color_2d(half_extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        let dfao_denoised = Image::new(
+            resources,
+            &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        let dfao_resolved = Image::new(
+            resources,
+            &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        let mut dfao_history_0 = Image::new(
+            resources,
+            &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        let mut dfao_history_1 = Image::new(
+            resources,
+            &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        // Specular occlusion is spatial-only (view-dependent — no temporal reuse): a half-res
+        // trace + a full-res bilateral upsample, both rgba16f.
+        let specocc_raw = Image::new(
+            resources,
+            &ImageDesc::color_2d(half_extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        let specocc_denoised = Image::new(
+            resources,
+            &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
         let mut prev_color = Image::new(
             resources,
             &ImageDesc::color_2d(extent, OFFSCREEN_COLOR_FORMAT, storage_sampled),
@@ -460,6 +569,11 @@ impl ViewTarget {
         let mut ssr_map = ssr_map;
         let mut ssgi_denoised = ssgi_denoised;
         let mut ssgi_resolved = ssgi_resolved;
+        let mut dfao_raw = dfao_raw;
+        let mut dfao_denoised = dfao_denoised;
+        let mut dfao_resolved = dfao_resolved;
+        let mut specocc_raw = specocc_raw;
+        let mut specocc_denoised = specocc_denoised;
 
         // Transition the mesh-sampled maps + prevColor + the SSGI history to
         // ShaderReadOnly so their descriptors are valid even before the passes run (the
@@ -468,13 +582,20 @@ impl ViewTarget {
         // storage-only scratch (ao_raw, ssgi_map written first by their producing pass)
         // stay UNDEFINED until the graph transitions them — except ssgi_map, also read
         // as a sampler by ssgi_blur, so it is seeded too.
-        let read_only: [&Image; 9] = [
+        let read_only: [&Image; 16] = [
             &ao_map,
             &contact_map,
             &ssgi_map,
             &ssr_map,
             &ssgi_denoised,
             &ssgi_resolved,
+            &dfao_raw,
+            &dfao_denoised,
+            &dfao_resolved,
+            &dfao_history_0,
+            &dfao_history_1,
+            &specocc_raw,
+            &specocc_denoised,
             &prev_color,
             &ssgi_history_0,
             &ssgi_history_1,
@@ -487,6 +608,13 @@ impl ViewTarget {
             &mut ssr_map,
             &mut ssgi_denoised,
             &mut ssgi_resolved,
+            &mut dfao_raw,
+            &mut dfao_denoised,
+            &mut dfao_resolved,
+            &mut dfao_history_0,
+            &mut dfao_history_1,
+            &mut specocc_raw,
+            &mut specocc_denoised,
             &mut prev_color,
             &mut ssgi_history_0,
             &mut ssgi_history_1,
@@ -494,7 +622,30 @@ impl ViewTarget {
             image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
 
+        // The gi-resolve half-res indirect-diffuse output + its per-frame-slot params UBOs (mapped,
+        // memcpy'd per frame — the descriptor sets stay stable so there is no in-flight hazard).
+        let gi_indirect = Image::new(
+            resources,
+            &ImageDesc::color_2d(half_extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
+        let gi_params_size = size_of::<crate::ssao::GiParams>() as vk::DeviceSize;
+        let mut gi_params_ubos = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            gi_params_ubos.push(Buffer::new(
+                resources,
+                gi_params_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::Auto,
+                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                        | vk_mem::AllocationCreateFlags::MAPPED,
+                    ..Default::default()
+                },
+            )?);
+        }
+
         self.g_normal = Some(g_normal);
+        self.g_roughness = Some(g_roughness);
         self.g_depth = Some(g_depth);
         self.ao_raw = Some(ao_raw);
         self.ao_map = Some(ao_map);
@@ -503,6 +654,14 @@ impl ViewTarget {
         self.ssr_map = Some(ssr_map);
         self.ssgi_denoised = Some(ssgi_denoised);
         self.ssgi_resolved = Some(ssgi_resolved);
+        self.dfao_raw = Some(dfao_raw);
+        self.dfao_denoised = Some(dfao_denoised);
+        self.dfao_resolved = Some(dfao_resolved);
+        self.dfao_history = [Some(dfao_history_0), Some(dfao_history_1)];
+        self.specocc_raw = Some(specocc_raw);
+        self.specocc_denoised = Some(specocc_denoised);
+        self.gi_indirect = Some(gi_indirect);
+        self.gi_params_ubos = gi_params_ubos;
         self.prev_color = Some(prev_color);
         self.ssgi_history = [Some(ssgi_history_0), Some(ssgi_history_1)];
         // A resize invalidates the temporal reprojection; the next frame re-seeds.
@@ -660,6 +819,8 @@ impl ViewTarget {
         let motion = self.aa_view(&self.motion);
         let ssgi_denoised = self.view_of(&self.ssgi_denoised);
         let ssgi_resolved = self.view_of(&self.ssgi_resolved);
+        let dfao_denoised = self.view_of(&self.dfao_denoised);
+        let dfao_resolved = self.view_of(&self.dfao_resolved);
 
         let mut plan: Vec<Binding> = vec![
             // fxaa: scratch source sampler -> offscreen storage.
@@ -705,6 +866,19 @@ impl ViewTarget {
             plan.push(Binding::sampled(accum, 2, linear, motion));
             plan.push(Binding::storage(accum, 3, ssgi_resolved));
             plan.push(Binding::storage(accum, 4, self.history_view(p)));
+
+            // The dfao-accum motion binding (2) is likewise rebound to the real motion target.
+            let dfao = self.dfao_accum_sets[p];
+            plan.push(Binding::sampled(dfao, 0, linear, dfao_denoised));
+            plan.push(Binding::sampled(
+                dfao,
+                1,
+                linear,
+                self.dfao_history_view(1 - p),
+            ));
+            plan.push(Binding::sampled(dfao, 2, linear, motion));
+            plan.push(Binding::storage(dfao, 3, dfao_resolved));
+            plan.push(Binding::storage(dfao, 4, self.dfao_history_view(p)));
         }
 
         let infos: Vec<vk::DescriptorImageInfo> = plan.iter().map(Binding::info).collect();
@@ -763,6 +937,7 @@ impl ViewTarget {
         let raw = device.raw();
         let linear = descriptors.linear_sampler();
         let g_normal = self.view_of(&self.g_normal);
+        let g_roughness = self.view_of(&self.g_roughness);
         let ao_raw = self.view_of(&self.ao_raw);
         let ao_map = self.view_of(&self.ao_map);
         let contact_map = self.view_of(&self.contact_map);
@@ -770,6 +945,12 @@ impl ViewTarget {
         let ssr_map = self.view_of(&self.ssr_map);
         let ssgi_denoised = self.view_of(&self.ssgi_denoised);
         let ssgi_resolved = self.view_of(&self.ssgi_resolved);
+        let dfao_raw = self.view_of(&self.dfao_raw);
+        let dfao_denoised = self.view_of(&self.dfao_denoised);
+        let dfao_resolved = self.view_of(&self.dfao_resolved);
+        let specocc_raw = self.view_of(&self.specocc_raw);
+        let specocc_denoised = self.view_of(&self.specocc_denoised);
+        let gi_indirect = self.view_of(&self.gi_indirect);
         let prev_color = self.view_of(&self.prev_color);
         let offscreen = self.offscreen.view();
 
@@ -802,6 +983,24 @@ impl ViewTarget {
             Binding::sampled(self.ssgi_blur_set, 0, linear, ssgi_map),
             Binding::sampled(self.ssgi_blur_set, 1, nearest, g_normal),
             Binding::storage(self.ssgi_blur_set, 2, ssgi_denoised),
+            // dfao trace (set 2): g_normal -> dfao_raw (the GDF sky-visibility cone trace).
+            Binding::sampled(self.dfao_set, 0, nearest, g_normal),
+            Binding::storage(self.dfao_set, 1, dfao_raw),
+            // dfao-blur: dfao_raw + g_normal -> dfao_denoised. dfao_raw is half-res, so a LINEAR
+            // sampler bilinearly upsamples it (reuses the ssgi-blur PSO shape).
+            Binding::sampled(self.dfao_blur_set, 0, linear, dfao_raw),
+            Binding::sampled(self.dfao_blur_set, 1, nearest, g_normal),
+            Binding::storage(self.dfao_blur_set, 2, dfao_denoised),
+            // specocc trace (set 2): g_normal + g_roughness -> specocc_raw (the GDF reflection
+            // occlusion cone trace). Compute3 shape: two nearest-sampled inputs + one storage out.
+            Binding::sampled(self.specocc_set, 0, nearest, g_normal),
+            Binding::sampled(self.specocc_set, 1, nearest, g_roughness),
+            Binding::storage(self.specocc_set, 2, specocc_raw),
+            // specocc-blur: specocc_raw + g_normal -> specocc_denoised. specocc_raw is half-res, so
+            // a LINEAR sampler bilinearly upsamples it (reuses the ssgi-blur PSO shape).
+            Binding::sampled(self.specocc_blur_set, 0, linear, specocc_raw),
+            Binding::sampled(self.specocc_blur_set, 1, nearest, g_normal),
+            Binding::storage(self.specocc_blur_set, 2, specocc_denoised),
             // copy_color: offscreen -> prev_color
             Binding::sampled(self.copy_color_set, 0, linear, offscreen),
             Binding::storage(self.copy_color_set, 1, prev_color),
@@ -812,10 +1011,43 @@ impl ViewTarget {
             Binding::sampled(self.mesh_set, 2, linear, ssgi_denoised),
             Binding::sampled(self.mesh_set, 3, linear, ssr_map),
             Binding::sampled(self.mesh_set, 4, linear, prev_color),
+            // mesh set 4 binding 5: the temporally-resolved DFAO sky-visibility. The accum runs
+            // whenever motion runs (TAA / SSGI / DFAO all force it on), so the mesh always samples
+            // the resolved map; on a frame with no valid history it equals the spatial result.
+            Binding::sampled(self.mesh_set, 5, linear, dfao_resolved),
+            // mesh set 4 binding 6: the spatially-denoised specular reflection-occlusion. It is
+            // view-dependent, so it is not temporally accumulated (surface-motion reprojection would
+            // smear it); the half-res trace + bilateral upsample are its whole denoise.
+            Binding::sampled(self.mesh_set, 6, linear, specocc_denoised),
+            // mesh set 4 binding 7: the half-res screen-space indirect-diffuse resolve (DDGI + IBL
+            // diffuse × sky-vis), linear-sampled to bilinearly upsample. Replaces the fragment's own
+            // per-pixel DDGI cage + IBL-diffuse resolve.
+            Binding::sampled(self.mesh_set, 7, linear, gi_indirect),
             // The mandatory tonemap set: binding 0 = the offscreen color as a storage
             // image (GENERAL).
             Binding::storage(self.tonemap_set, 0, offscreen),
         ];
+        // gi-resolve view-local image bindings, into every per-frame set (the shared IBL cube +
+        // DDGI atlases at b3/b5/b6 are written from the renderer, which owns those sub-states; the
+        // b2 params UBO is a buffer write, done after this image update). dfao is linear-sampled so
+        // the half-res sky-visibility upsamples cleanly.
+        for &set in &self.gi_resolve_sets {
+            plan.push(Binding::sampled(set, 0, nearest, g_normal));
+            plan.push(Binding::storage(set, 1, gi_indirect));
+            // b4 = the spatially-denoised DFAO (available in the screen-space chain where gi-resolve
+            // runs), linear-sampled for the half-res upsample. (Temporal `dfao_resolved` is only final
+            // after the later accum pass; the spatial result matches it on a converged static frame.)
+            plan.push(Binding::sampled(set, 4, linear, dfao_denoised));
+        }
+        // b2: each slot binds its own mapped GiParams UBO (a buffer write, its own update call).
+        for (i, set) in self.gi_resolve_sets.iter().enumerate() {
+            descriptors.write_uniform_buffer(
+                *set,
+                2,
+                self.gi_params_ubos[i].handle(),
+                self.gi_params_ubos[i].size(),
+            );
+        }
         // ssgi-accum parities: parity p reads ssgi_history[1-p], writes ssgi_history[p].
         // Without motion, binding 2 (motion) gets the denoised map as a neutral placeholder
         // so the set is complete (the accum pass is off without motion).
@@ -826,6 +1058,21 @@ impl ViewTarget {
             plan.push(Binding::sampled(set, 2, linear, ssgi_denoised));
             plan.push(Binding::storage(set, 3, ssgi_resolved));
             plan.push(Binding::storage(set, 4, self.history_view(p)));
+
+            // dfao-accum parities: parity p reads dfao_history[1-p], writes dfao_history[p].
+            // Binding 2 (motion) is the denoised placeholder here; write_aa_sets rebinds it to
+            // the real motion target once it is built.
+            let dfao = self.dfao_accum_sets[p];
+            plan.push(Binding::sampled(dfao, 0, linear, dfao_denoised));
+            plan.push(Binding::sampled(
+                dfao,
+                1,
+                linear,
+                self.dfao_history_view(1 - p),
+            ));
+            plan.push(Binding::sampled(dfao, 2, linear, dfao_denoised));
+            plan.push(Binding::storage(dfao, 3, dfao_resolved));
+            plan.push(Binding::storage(dfao, 4, self.dfao_history_view(p)));
         }
 
         let infos: Vec<vk::DescriptorImageInfo> = plan.iter().map(Binding::info).collect();
@@ -845,6 +1092,53 @@ impl ViewTarget {
         unsafe { raw.update_descriptor_sets(&writes, &[]) };
     }
 
+    /// Writes the *shared* gi-resolve bindings into every per-frame set — b3 the IBL diffuse
+    /// irradiance cube, b5 the DDGI irradiance atlas, b6 the DDGI distance-moment atlas. Separate
+    /// from [`ViewTarget::write_screen_space_sets`] because the IBL + DDGI sub-states are owned by
+    /// the renderer (not visible at view build). The renderer calls this once they are ready, and
+    /// re-calls it on IBL rebake / DDGI rebuild (the views change) — the same triggers the mesh
+    /// sets use. All three are sampled `SHADER_READ_ONLY`, matching how the mesh samples them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_gi_resolve_shared(
+        &self,
+        device: &Device,
+        frame: usize,
+        ibl_cube: vk::ImageView,
+        ibl_sampler: vk::Sampler,
+        ddgi_irradiance: vk::ImageView,
+        ddgi_distance: vk::ImageView,
+        ddgi_sampler: vk::Sampler,
+    ) {
+        // Write ONLY this frame's slot — the other slots may be bound by an in-flight command buffer
+        // (writing them would trip VUID-vkUpdateDescriptorSets-None-03047). This frame's slot was last
+        // used `MAX_FRAMES_IN_FLIGHT` frames ago, whose fence `begin_frame` already waited, so it is
+        // free. Every slot converges to the current views over that many frames.
+        let set = self.gi_resolve_sets[frame];
+        if set == vk::DescriptorSet::null() {
+            return; // sets not allocated yet (screen-space not built)
+        }
+        let plan: [Binding; 3] = [
+            Binding::sampled(set, 3, ibl_sampler, ibl_cube),
+            Binding::sampled(set, 5, ddgi_sampler, ddgi_irradiance),
+            Binding::sampled(set, 6, ddgi_sampler, ddgi_distance),
+        ];
+        let infos: Vec<vk::DescriptorImageInfo> = plan.iter().map(Binding::info).collect();
+        let writes: Vec<vk::WriteDescriptorSet> = plan
+            .iter()
+            .zip(infos.iter())
+            .map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(binding.set)
+                    .dst_binding(binding.binding)
+                    .descriptor_type(binding.kind())
+                    .image_info(std::slice::from_ref(info))
+            })
+            .collect();
+        // SAFETY: the ash seam. Sets/views/samplers are valid; the renderer calls this at a
+        // post-fence point where the sets are not in use by an in-flight frame.
+        unsafe { device.raw().update_descriptor_sets(&writes, &[]) };
+    }
+
     /// The view handle of an `Option<Image>`, or null if it is not built (the
     /// screen-space set writes never run before `build_screen_space`, so this is
     /// always populated when used).
@@ -855,6 +1149,13 @@ impl ViewTarget {
     /// The view handle of SSGI history slot `i`.
     fn history_view(&self, i: usize) -> vk::ImageView {
         self.ssgi_history[i]
+            .as_ref()
+            .map_or(vk::ImageView::null(), Image::view)
+    }
+
+    /// The view handle of DFAO history slot `i`.
+    fn dfao_history_view(&self, i: usize) -> vk::ImageView {
+        self.dfao_history[i]
             .as_ref()
             .map_or(vk::ImageView::null(), Image::view)
     }
@@ -1249,7 +1550,9 @@ mod tests {
                 material_slot: 0,
             }],
         };
-        let mesh = uploader.upload_mesh(&mesh, &[], None).expect("upload");
+        let mesh = uploader
+            .upload_mesh(&descriptors, &mesh, &[], None, None)
+            .expect("upload");
         let item = DrawItem::new(
             Arc::clone(&mesh),
             Mat4::IDENTITY,
@@ -1339,6 +1642,13 @@ mod tests {
             vk::ImageLayout::UNDEFINED,
             None,
         );
+        let g_roughness = graph.import_image(
+            view.g_roughness.as_ref().unwrap().handle(),
+            view.g_roughness.as_ref().unwrap().view(),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+            None,
+        );
         let g_depth = graph.import_image(
             view.g_depth.as_ref().unwrap().handle(),
             view.g_depth.as_ref().unwrap().view(),
@@ -1384,8 +1694,9 @@ mod tests {
             graph.add_pass(
                 RgPass::graphics("gbuffer", extent)
                     .color(RgAttachment::clear_store(g_normal))
+                    .color(RgAttachment::clear_store(g_roughness))
                     .depth_attachment(depth_att)
-                    .body(move |c| {
+                    .body(move |c, _scopes| {
                         crate::record_gbuffer(
                             &raw_body,
                             c,
@@ -1576,7 +1887,7 @@ mod tests {
         let pipeline = Arc::clone(pipeline);
         let handle = pipeline.handle();
         let layout = pipeline.layout();
-        let mut pass = RgPass::compute(name).body(move |cmd| unsafe {
+        let mut pass = RgPass::compute(name).body(move |cmd, _scopes| unsafe {
             raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
             raw_body.cmd_bind_descriptor_sets(
                 cmd,
