@@ -33,6 +33,11 @@ pub struct RenderSettings {
     pub tonemap: Option<String>,
     /// Dynamic diffuse GI on.
     pub ddgi: Option<bool>,
+    /// The Global Distance Field (the camera-centered cascade clipmap the DDGI trace + far-field
+    /// cone march read as their distance oracle) on.
+    pub gdf: Option<bool>,
+    /// SDF distance-field AO occlusion of the analytic IBL on.
+    pub sky_occlusion: Option<bool>,
     /// Ray-traced shadows on (applied only on RT hardware).
     pub rt_shadows: Option<bool>,
     /// ReSTIR DI on (applied only on RT hardware).
@@ -53,6 +58,8 @@ fn settings_to_json(s: &RenderSettings) -> Value {
         "quality": s.quality,
         "tonemap": s.tonemap,
         "ddgi": s.ddgi,
+        "gdf": s.gdf,
+        "skyOcclusion": s.sky_occlusion,
         "rtShadows": s.rt_shadows,
         "restir": s.restir,
     })
@@ -85,6 +92,8 @@ fn parse_render_settings(settings: &Value) -> RenderSettings {
         .and_then(Value::as_str)
         .map(str::to_owned);
     patch.ddgi = b("ddgi");
+    patch.gdf = b("gdf");
+    patch.sky_occlusion = b("skyOcclusion");
     patch.rt_shadows = b("rtShadows");
     patch.restir = b("restir");
     patch
@@ -104,6 +113,8 @@ impl Renderer {
             quality: Some(self.render_quality().tier.as_str().to_owned()),
             tonemap: Some(self.tonemap_mode().as_str().to_owned()),
             ddgi: Some(self.ddgi_enabled()),
+            gdf: Some(self.gdf_enabled()),
+            sky_occlusion: Some(self.sky_occlusion_enabled()),
             rt_shadows: Some(self.rt_shadows_enabled()),
             restir: Some(self.restir_enabled()),
         })
@@ -148,6 +159,12 @@ impl Renderer {
         if let Some(v) = patch.ddgi {
             self.set_ddgi(v);
         }
+        if let Some(v) = patch.gdf {
+            self.set_gdf(v);
+        }
+        if let Some(v) = patch.sky_occlusion {
+            self.set_sky_occlusion(v);
+        }
         if self.rt_supported() {
             if let Some(v) = patch.rt_shadows {
                 self.set_rt_shadows(v);
@@ -179,6 +196,8 @@ mod tests {
             quality: Some("medium".to_owned()),
             tonemap: Some("aces".to_owned()),
             ddgi: Some(true),
+            gdf: Some(true),
+            sky_occlusion: Some(true),
             rt_shadows: Some(false),
             restir: Some(false),
         };
@@ -194,6 +213,8 @@ mod tests {
             "quality",
             "tonemap",
             "ddgi",
+            "gdf",
+            "skyOcclusion",
             "rtShadows",
             "restir",
         ] {
@@ -220,6 +241,8 @@ mod tests {
             "quality": "ultra",
             "tonemap": "agx",
             "ddgi": true,
+            "gdf": false,
+            "skyOcclusion": false,
             "rtShadows": true,
             "restir": false,
         });
@@ -234,6 +257,8 @@ mod tests {
         assert_eq!(patch.quality.as_deref(), Some("ultra"));
         assert_eq!(patch.tonemap.as_deref(), Some("agx"));
         assert_eq!(patch.ddgi, Some(true));
+        assert_eq!(patch.gdf, Some(false));
+        assert_eq!(patch.sky_occlusion, Some(false));
         assert_eq!(patch.rt_shadows, Some(true));
         assert_eq!(patch.restir, Some(false));
 
