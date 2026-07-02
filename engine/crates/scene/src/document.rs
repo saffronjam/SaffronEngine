@@ -251,7 +251,10 @@ mod tests {
 
         let mut names: Vec<String> = Vec::new();
         loaded.for_each::<&Name, _>(|_, n| names.push(n.name.clone()));
-        assert!(names.contains(&"Keep".to_string()), "untagged entity persists");
+        assert!(
+            names.contains(&"Keep".to_string()),
+            "untagged entity persists"
+        );
         assert!(
             !names.contains(&"Ghost".to_string()),
             "PreviewGhost entity must not persist"
