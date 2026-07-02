@@ -32,6 +32,7 @@ impl GpuUploader for StubGpu {
         _mesh: &Mesh,
         _skin: &[VertexSkin],
         _morph: Option<&saffron_geometry::MorphData>,
+        _sdf_bake: Option<&saffron_rendering::SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
         unreachable!("an empty catalog never reaches the stub uploader")
     }
@@ -121,6 +122,8 @@ pub struct StubRenderer {
     /// The active tonemap operator name.
     pub tonemap: String,
     pub ddgi: bool,
+    pub sky_occlusion: bool,
+    pub gdf: bool,
     pub reflection_probes: bool,
     pub skinning: bool,
     pub rt_supported: bool,
@@ -160,6 +163,8 @@ impl Default for StubRenderer {
             power_state: "focused".to_owned(),
             tonemap: "aces".to_owned(),
             ddgi: false,
+            sky_occlusion: true,
+            gdf: false,
             reflection_probes: true,
             skinning: true,
             rt_supported: false,
@@ -284,6 +289,18 @@ impl ControlRenderer for StubRenderer {
     }
     fn set_ddgi(&mut self, enabled: bool) {
         self.ddgi = enabled;
+    }
+    fn sky_occlusion_enabled(&self) -> bool {
+        self.sky_occlusion
+    }
+    fn set_sky_occlusion(&mut self, enabled: bool) {
+        self.sky_occlusion = enabled;
+    }
+    fn gdf_enabled(&self) -> bool {
+        self.gdf
+    }
+    fn set_gdf(&mut self, enabled: bool) {
+        self.gdf = enabled;
     }
     fn reflection_probes_enabled(&self) -> bool {
         self.reflection_probes
