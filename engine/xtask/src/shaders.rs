@@ -17,6 +17,26 @@ use anyhow::{Context, Result, bail};
 /// `import lighting` against the precompiled module rather than recompiling it.
 const LIGHTING_STEM: &str = "lighting";
 
+/// The shared SDF sampling module — like `lighting`, it has no entry points and emits no
+/// `.spv`. Precompiled to `sdf.slang-module`; both `lighting` (the GDF reflection-occlusion cone)
+/// and `ddgi_trace` (the unified near/far field sphere-march) `import sdf` against it.
+const SDF_STEM: &str = "sdf";
+
+/// The shared per-mesh MDF brick-sample module — like `sdf`, no entry points, no `.spv`.
+/// Precompiled to `mdf_brick.slang-module`; `sdf` (the cone trace) and the Global-SDF
+/// `gdf_cull` / `gdf_composite` passes `import mdf_brick` for the one brick-sampling impl.
+const MDF_BRICK_STEM: &str = "mdf_brick";
+
+/// The resource-free octahedral encode module — like `lighting`/`sdf`, no entry points, no
+/// `.spv`. Precompiled to `octahedral.slang-module`; `sdf` re-exports it (the DDGI trace + blend
+/// reach octEncode/octDecode through that re-export) without pulling in `sdf`'s field bindings.
+const OCTAHEDRAL_STEM: &str = "octahedral";
+
+/// The shared DDGI probe-cage sampling module — like `sdf`, no entry points, no `.spv`. Precompiled
+/// to `giprobe.slang-module`; both `lighting` (the mesh forward shade) and `gi_resolve` (the half-res
+/// screen-space GI resolve) `import giprobe` for the one `ddgiSampleIrradiance` implementation.
+const GIPROBE_STEM: &str = "giprobe";
+
 /// The pinned Slang version the toolbox provides (the `SAFFRON_SLANG_VERSION` pin). Used only
 /// to point at the conventional toolbox cache location when `slangc` is not otherwise found.
 const SLANG_VERSION: &str = "2026.10";
@@ -101,11 +121,78 @@ pub fn run(config: &Config) -> Result<Report> {
         );
     }
 
+    let sdf_src = config.shader_src_dir.join("sdf.slang");
+    if !sdf_src.is_file() {
+        bail!("shared sdf source not found: {}", sdf_src.display());
+    }
+
+    let mdf_brick_src = config.shader_src_dir.join("mdf_brick.slang");
+    if !mdf_brick_src.is_file() {
+        bail!(
+            "shared mdf_brick source not found: {}",
+            mdf_brick_src.display()
+        );
+    }
+
+    let octahedral_src = config.shader_src_dir.join("octahedral.slang");
+    if !octahedral_src.is_file() {
+        bail!(
+            "shared octahedral source not found: {}",
+            octahedral_src.display()
+        );
+    }
+
+    let giprobe_src = config.shader_src_dir.join("giprobe.slang");
+    if !giprobe_src.is_file() {
+        bail!("shared giprobe source not found: {}", giprobe_src.display());
+    }
+
     let mut report = Report::default();
 
+    // The `octahedral` module (no imports) compiles first; `sdf` re-exports it and `lighting`
+    // imports `sdf`, so an `octahedral` touch fans out to both modules + every entry-point `.spv`.
+    let octahedral_module = out_dir.join("octahedral.slang-module");
+    if is_stale(&octahedral_module, &[&octahedral_src])? {
+        compile_module(&config.slangc, &octahedral_src, &octahedral_module)?;
+        report.module_compiled = true;
+    }
+
+    // The `giprobe` module (the DDGI probe-cage sampler, no imports) compiles before `lighting`
+    // (which imports it) and `gi_resolve`; a touch fans out to both.
+    let giprobe_module = out_dir.join("giprobe.slang-module");
+    if is_stale(&giprobe_module, &[&giprobe_src])? {
+        compile_module(&config.slangc, &giprobe_src, &giprobe_module)?;
+        report.module_compiled = true;
+    }
+
+    // The `mdf_brick` module (the per-mesh brick sample) is imported by `sdf` and the Global-SDF
+    // passes, so it compiles before `sdf` and a touch fans out to both.
+    let mdf_brick_module = out_dir.join("mdf_brick.slang-module");
+    if is_stale(&mdf_brick_module, &[&mdf_brick_src])? {
+        compile_module(&config.slangc, &mdf_brick_src, &mdf_brick_module)?;
+        report.module_compiled = true;
+    }
+
+    // The `sdf` module imports `octahedral` + `mdf_brick`; `lighting` imports `sdf`, so a `sdf`
+    // touch also rebuilds the lighting module + every entry-point `.spv` (the shared dep edge).
+    let sdf_module = out_dir.join("sdf.slang-module");
+    if is_stale(&sdf_module, &[&sdf_src, &mdf_brick_src, &octahedral_src])? {
+        compile_module(&config.slangc, &sdf_src, &sdf_module)?;
+        report.module_compiled = true;
+    }
+
     let lighting_module = out_dir.join("lighting.slang-module");
-    if is_stale(&lighting_module, &[&lighting_src])? {
-        compile_lighting_module(&config.slangc, &lighting_src, &lighting_module)?;
+    if is_stale(
+        &lighting_module,
+        &[
+            &lighting_src,
+            &sdf_src,
+            &mdf_brick_src,
+            &octahedral_src,
+            &giprobe_src,
+        ],
+    )? {
+        compile_module(&config.slangc, &lighting_src, &lighting_module)?;
         report.module_compiled = true;
     }
 
@@ -120,16 +207,31 @@ pub fn run(config: &Config) -> Result<Report> {
             .file_stem()
             .and_then(|s| s.to_str())
             .with_context(|| format!("non-utf8 shader name: {}", path.display()))?;
-        if stem == LIGHTING_STEM {
+        if stem == LIGHTING_STEM
+            || stem == SDF_STEM
+            || stem == MDF_BRICK_STEM
+            || stem == OCTAHEDRAL_STEM
+            || stem == GIPROBE_STEM
+        {
             continue;
         }
 
         let spv = out_dir.join(format!("{stem}.spv"));
         let src_copy = out_dir.join(format!("{stem}.slang"));
 
-        // Every shader depends on lighting.slang (the shared dep edge), so a lighting.slang
-        // touch forces a full fan-out rebuild.
-        if is_stale(&spv, &[&path, &lighting_src])? {
+        // Every shader depends on the shared lighting + sdf + mdf_brick + octahedral modules (the
+        // dep edge), so a touch of any forces a full fan-out rebuild.
+        if is_stale(
+            &spv,
+            &[
+                &path,
+                &lighting_src,
+                &sdf_src,
+                &mdf_brick_src,
+                &octahedral_src,
+                &giprobe_src,
+            ],
+        )? {
             compile_spv(&config.slangc, &path, &config.shader_src_dir, &spv)?;
             report.spv_compiled += 1;
         } else {
@@ -188,9 +290,9 @@ fn which(name: &str) -> Result<PathBuf> {
     bail!("{name} not found on PATH")
 }
 
-/// `lighting.slang -> lighting.slang-module`: `slangc <src> -emit-ir -o <module>`, no entry
-/// points, no `.spv`.
-fn compile_lighting_module(slangc: &Path, src: &Path, module: &Path) -> Result<()> {
+/// `<name>.slang -> <name>.slang-module`: `slangc <src> -emit-ir -o <module>`, no entry
+/// points, no `.spv`. Shared by the `lighting` + `sdf` module precompiles.
+fn compile_module(slangc: &Path, src: &Path, module: &Path) -> Result<()> {
     let status = Command::new(slangc)
         .arg(src)
         .arg("-emit-ir")
