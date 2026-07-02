@@ -245,6 +245,7 @@ fn material_slot_to_json(s: &MaterialSlot) -> Value {
         ("heightScale", f32_value(s.height_scale)),
         ("alphaClip", Value::Bool(s.alpha_clip)),
         ("alphaCutoff", f32_value(s.alpha_cutoff)),
+        ("doubleSided", Value::Bool(s.double_sided)),
     ])
 }
 
@@ -270,6 +271,7 @@ fn material_as_slot(m: &Material) -> MaterialSlot {
         height_scale: m.height_scale,
         alpha_clip: m.alpha_clip,
         alpha_cutoff: m.alpha_cutoff,
+        double_sided: m.double_sided,
     }
 }
 
@@ -295,6 +297,7 @@ impl SceneSerialize for Material {
         self.height_scale = json_f32_or(value, "heightScale", 0.05);
         self.alpha_clip = json_bool_or(value, "alphaClip", false);
         self.alpha_cutoff = json_f32_or(value, "alphaCutoff", 0.5);
+        self.double_sided = json_bool_or(value, "doubleSided", false);
         Ok(())
     }
 }
@@ -321,6 +324,7 @@ fn material_slot_from_json(sj: &Value) -> MaterialSlot {
         height_scale: json_f32_or(sj, "heightScale", 0.05),
         alpha_clip: json_bool_or(sj, "alphaClip", false),
         alpha_cutoff: json_f32_or(sj, "alphaCutoff", 0.5),
+        double_sided: json_bool_or(sj, "doubleSided", false),
     }
 }
 
