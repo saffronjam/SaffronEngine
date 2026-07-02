@@ -265,7 +265,7 @@ pub fn record_motion(
             raw.cmd_bind_vertex_buffers(cmd, 0, &[cur, prev], &[0, 0]);
             raw.cmd_bind_index_buffer(cmd, batch.mesh.index_buffer(), 0, vk::IndexType::UINT32);
         }
-        record_batch_submeshes(raw, cmd, batch);
+        record_batch_submeshes(raw, cmd, batch, None);
     }
 }
 
