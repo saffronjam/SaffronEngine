@@ -27,6 +27,7 @@ mod image_decode;
 mod obj_import;
 mod picking;
 mod sanim;
+mod sdf;
 mod smesh;
 mod smodel;
 mod sub_id;
@@ -40,11 +41,17 @@ pub use image_decode::{
 };
 pub use obj_import::import_obj_model;
 pub use picking::{
-    MeshBvh, generate_normals, ray_aabb_slab, ray_triangle, world_aabb_from_corners,
+    MeshBvh, closest_point_on_triangle, generate_normals, ray_aabb_slab, ray_triangle,
+    world_aabb_from_corners,
 };
 pub use sanim::{
     ANIM_FORMAT_VERSION, load_animation, load_animation_from_bytes, save_animation,
     save_animation_to_buffer,
+};
+pub use sdf::{
+    GridDesc, SDF_BRICK_SIZE, SDF_BRICK_USEFUL, SDF_CHUNK_CORE_VOXELS, SDF_EMPTY_BRICK,
+    SDF_FORMAT_VERSION, SDF_MAX_GRID_AXIS, SDF_MIN_GRID_AXIS, SDF_MIP_COUNT, SDF_VOXELS_PER_METRE,
+    Sdf, SdfHeader, bake_grid, sdf_chunk_cores, sdf_set_from_bytes, sdf_set_to_bytes,
 };
 pub use smesh::{
     MESH_FORMAT_VERSION, load_mesh, load_mesh_from_bytes, load_mesh_morph_from_bytes,
@@ -59,10 +66,9 @@ pub use sub_id::sub_id_for;
 pub use translate::translate_model;
 pub use types::{
     AlphaMode, AnimClip, AnimInterp, AnimPath, AnimTarget, AnimTrack, DecodedImage,
-    DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedSkin, MaterialMapRole,
-    Mesh, MeshCounts,
-    MorphData, MorphDelta, MorphTarget, Ray, SkinPayload, Submesh, TextureSource, Vertex,
-    VertexSkin,
+    DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedSkin,
+    MaterialMapRole, Mesh, MeshCounts, MorphData, MorphDelta, MorphTarget, Ray, SkinPayload,
+    Submesh, TextureSource, Vertex, VertexSkin,
 };
 
 // Re-export glam so downstream crates share this crate's pinned math vocabulary
