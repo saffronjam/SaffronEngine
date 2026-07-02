@@ -1,5 +1,8 @@
 module lighting;
 
+import sdf;
+import giprobe;
+
 // Instanced mesh shader. Vertex inputs come from an interleaved buffer
 // (position/normal/uv0); per-instance model + normal matrix + base color come from
 // a storage buffer (set 2) indexed by the absolute Vulkan InstanceIndex
@@ -51,6 +54,10 @@ struct Camera
 // matches MaxBindlessTextures in renderer.cppm (a bounded array, not a runtime one).
 [[vk::binding(0, 0)]] public Sampler2D albedoTextures[1024];
 
+// The bindless per-mesh SDF array (set 0, binding 1) is declared by the shared `sdf` module
+// (linked above); the specular reflection-occlusion cone trace below indexes it through that
+// module's `sdfReflectionOcclusion`.
+
 struct LightGlobals
 {
     float4 directionAmbient;     // xyz = travel direction, w = ambient
@@ -66,6 +73,8 @@ struct LightGlobals
     float4 ddgiVolumeMin;        // xyz = DDGI probe volume world min
     float4 ddgiVolumeExtent;     // xyz = DDGI probe volume world size
     uint4 ddgiProbeCount;        // xyz = probes per axis, w = irradiance tile interior
+    uint4 ddgiScrollBase;        // xyz = toroidal scroll base (wrapMod(snapBase, count)), w reserved
+    uint4 sdfOcclusion;          // x reserved, y = GDF reflection-occlusion enabled (0/1), zw reserved
     float4 ambientColor;         // rgb = scene-environment ambient (non-IBL fallback)
     uint4 extraFlags;            // x = screen-space reflections, y = ray-traced reflections
     float4x4 prevViewProj;       // previous frame world->clip, reprojecting an RT hit into prev_color
@@ -107,6 +116,11 @@ struct ClusterParams
 // environment without re-rendering it.
 [[vk::binding(6, 1)]] SamplerCube pointShadowMap;
 [[vk::binding(7, 1)]] SamplerCube pointShadowMapDynamic;
+
+// The shared `sdf` module (linked above) also declares the per-mesh SDF-occluder instance list
+// (set 1, binding 8) + the Global-SDF cascade clipmap (bindings 9/10). The fragment reaches only
+// the GDF tap (the reflection-occlusion cone, `gdfDistance`); the instance list is used solely by
+// the DDGI ray trace's near-field sphere-march, so it is dead-stripped from this fragment.
 
 // Visibility for the shadowed point light: compare the fragment's distance to the light against the
 // nearest occluder distance across both cubes (sampled by light->frag dir).
@@ -172,7 +186,7 @@ public struct MaterialParams
     public uint4 tex0;       // albedo, orm/mr, normal, emissive (bindless indices)
     public uint4 tex1;       // height, reserved, reserved, featureBits
 };
-[[vk::binding(2, 2)]] StructuredBuffer<MaterialParams> materialParams;
+[[vk::binding(2, 2)]] public StructuredBuffer<MaterialParams> materialParams;
 
 // Set 3: image-based lighting — diffuse irradiance cube, prefiltered specular cube, and
 // the split-sum BRDF LUT. Sampled for the ambient term when globals.counts.z != 0.
@@ -201,9 +215,24 @@ float prefilterLod(float roughness)
 [[vk::binding(3, 4)]] Sampler2D ssrMap;
 // Previous frame's lit color, sampled by reprojecting an RT reflection hit (extraFlags.y).
 [[vk::binding(4, 4)]] Sampler2D prevColorMesh;
+// Reduced-resolution, temporally-accumulated DFAO sky-visibility (r = [0,1] factor, 1 = open),
+// produced by the dfao → dfao-blur → dfao-accum prepass. Sampled to occlude the analytic sky
+// irradiance when sdfOcclusion.y != 0 (the diffuse half of the DFAO term; the per-fragment
+// 9-cone GDF march it replaces used to cost ~16 ms at full res).
+[[vk::binding(5, 4)]] Sampler2D dfaoMap;
+// Reduced-resolution, temporally-accumulated specular reflection-occlusion (r = [0,1] factor,
+// 1 = open), produced by the specocc → specocc-blur → specocc-accum prepass. Sampled to occlude
+// the reflected skybox when sdfOcclusion.y != 0 (the specular half of the SDF occlusion term; the
+// per-fragment reflection cone-march it replaces used to cost several ms at full res).
+[[vk::binding(6, 4)]] Sampler2D speoccMap;
+// The half-res screen-space indirect-diffuse resolve (DDGI cage + IBL diffuse × sky-visibility),
+// computed once per half-res pixel by the gi-resolve pass; sampled here (bilinear upsample) instead
+// of resolving the DDGI cage + IBL diffuse per full-res fragment.
+[[vk::binding(7, 4)]] Sampler2D giIndirectMap;
 
-// Set 5: DDGI probe atlases (octahedral irradiance + distance moments), sampled for
-// multi-bounce indirect when screenFlags.z != 0.
+// Set 5: DDGI probe atlases (octahedral irradiance + distance moments), passed to the shared
+// `giprobe::ddgiSampleIrradiance` (which declares no bindings of its own) for multi-bounce indirect
+// when screenFlags.z != 0.
 [[vk::binding(0, 5)]] Sampler2D ddgiIrradiance;
 [[vk::binding(1, 5)]] Sampler2D ddgiDistance;
 
@@ -277,76 +306,17 @@ float rayQueryReflection(float3 worldPos, float3 dir, float maxDist)
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
 }
 
-float2 ddgiOctEncode(float3 d)
+/// Builds the shared [`giprobe::DdgiVolume`] from this frame's light globals (the mesh's view of the
+/// camera-centered probe clipmap) for `giprobe::ddgiSampleIrradiance`.
+DdgiVolume ddgiVolumeFromGlobals()
 {
-    d /= (abs(d.x) + abs(d.y) + abs(d.z));
-    float2 o = d.z >= 0.0 ? d.xy : (1.0 - abs(d.yx)) * float2(d.x >= 0.0 ? 1.0 : -1.0, d.y >= 0.0 ? 1.0 : -1.0);
-    return o * 0.5 + 0.5;
-}
-
-// Atlas UV for probe `p` sampling direction `dir`, given the tile interior + gutter.
-float2 ddgiAtlasUv(uint3 p, float3 dir, uint interior, uint2 atlasSize)
-{
-    uint tile = interior + 2;
-    uint tileX = p.x + p.y * globals.ddgiProbeCount.x;
-    uint tileY = p.z;
-    float2 oct = ddgiOctEncode(normalize(dir));
-    float2 interiorPx = oct * float(interior) + 1.0;
-    float2 atlasPx = float2(tileX, tileY) * float(tile) + interiorPx;
-    return (atlasPx + 0.5) / float2(atlasSize);
-}
-
-// Sample the 8-probe cage around worldPos: trilinear weight * soft backface * Chebyshev
-// visibility (kills light leaking). Returns irradiance to add to the indirect term.
-float3 ddgiSampleIrradiance(float3 worldPos, float3 n)
-{
-    uint3 pc = globals.ddgiProbeCount.xyz;
-    uint interior = globals.ddgiProbeCount.w;
-    uint2 irrAtlas = uint2(pc.x * pc.y * (interior + 2), pc.z * (interior + 2));
-    uint2 distAtlas = uint2(pc.x * pc.y * (16u + 2u), pc.z * (16u + 2u));
-
-    float3 t = (worldPos - globals.ddgiVolumeMin.xyz) / globals.ddgiVolumeExtent.xyz;  // [0,1] in volume
-    float3 grid = t * float3(pc - 1u);                 // probe-space coordinate
-    int3 base = int3(floor(grid));
-    float3 frac = grid - float3(base);
-
-    float3 sum = float3(0.0);
-    float wsum = 0.0;
-    for (uint c = 0; c < 8; c = c + 1)
-    {
-        int3 off = int3(c & 1u, (c >> 1) & 1u, (c >> 2) & 1u);
-        int3 pi = clamp(base + off, int3(0), int3(pc) - 1);
-        float3 probePos = globals.ddgiVolumeMin.xyz + (float3(pi) + 0.5) / float3(pc) * globals.ddgiVolumeExtent.xyz;
-
-        // Trilinear weight.
-        float3 tw = lerp(1.0 - frac, frac, float3(off));
-        float weight = tw.x * tw.y * tw.z;
-
-        // Soft backface: prefer probes the surface normal faces.
-        float3 dirToProbe = probePos - worldPos;
-        float distToProbe = length(dirToProbe);
-        dirToProbe = distToProbe > 1e-4 ? dirToProbe / distToProbe : n;
-        weight *= max(0.05, (dot(dirToProbe, n) * 0.5 + 0.5));
-
-        // Chebyshev visibility: compare distToProbe against the probe's stored moments in
-        // the surface->probe direction (kills leaking through occluders).
-        float2 distUv = ddgiAtlasUv(uint3(pi), -dirToProbe, 16u, distAtlas);
-        float2 moments = ddgiDistance.SampleLevel(distUv, 0.0).rg;
-        float meanDist = moments.x;
-        if (distToProbe > meanDist)
-        {
-            float variance = abs(moments.x * moments.x - moments.y);
-            float d = distToProbe - meanDist;
-            float cheb = variance / (variance + d * d);
-            cheb = max(cheb * cheb * cheb, 0.0);  // sharpen
-            weight *= cheb;
-        }
-
-        float2 irrUv = ddgiAtlasUv(uint3(pi), n, interior, irrAtlas);
-        sum += ddgiIrradiance.SampleLevel(irrUv, 0.0).rgb * weight;
-        wsum += weight;
-    }
-    return wsum > 1e-4 ? sum / wsum : float3(0.0);
+    DdgiVolume v;
+    v.volumeMin = globals.ddgiVolumeMin;
+    v.volumeExtent = globals.ddgiVolumeExtent;
+    v.probeCount = globals.ddgiProbeCount;
+    v.scrollBase = globals.ddgiScrollBase;
+    v.eyePosition = globals.eyePosition;
+    return v;
 }
 
 float3 fresnelSchlickRoughness(float cosT, float3 F0, float roughness)
@@ -683,6 +653,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         float ndotv = max(dot(n, v), 1e-4);
         float3 F = fresnelSchlickRoughness(ndotv, F0, roughness);
         float3 kd = (1.0 - F) * (1.0 - metallic);
+        // Analytic IBL sky irradiance along the shading normal. It is the residual indirect
+        // diffuse where the DDGI cage does not cover the surface; the DDGI replace below overrides
+        // it wherever coverage exists (DDGI carries the sky occlusion intrinsically, via ray-miss).
         float3 irradiance = irradianceMap.SampleLevel(n, 0.0).rgb;
         float3 R = reflect(-v, n);
         float3 prefiltered = prefilteredMap.SampleLevel(R, prefilterLod(roughness)).rgb;
@@ -755,7 +728,14 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
             }
         }
 
-        float3 diffuseIBL = kd * irradiance * albedo;
+        // Specular sky occlusion: a cone along the reflection vector R (widened by roughness)
+        // sphere-marched against the Global Distance Field — the reflected skybox is occluded only
+        // where the reflection direction is blocked, NOT by the diffuse AO scalar (which would
+        // wrongly dim a chrome surface facing open sky). The march runs in the reduced-resolution
+        // specocc prepass (denoised + temporally accumulated); the mesh samples the resolved map.
+        // Off (1.0) unless enabled this frame.
+        float specSkyVis = globals.sdfOcclusion.y != 0 ? speoccMap.SampleLevel(screenUv, 0.0).r : 1.0;
+
         float2 ab = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
         float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
         // Multi-scatter energy compensation (Fdez-Aguera / Filament 4.7.2): single-scatter GGX
@@ -772,37 +752,60 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // from under itself at grazing angles. Uses the GEOMETRIC vertex normal, not the shading n.
         float horizon = min(1.0 + dot(R, normalize(input.worldNormal)), 1.0);
         specularIBL *= horizon * horizon;
-        // Occlusion split: diffuse takes the full AO; specular takes a roughness-aware specular-AO
-        // (Lagarde) that approaches 1 on smooth metals, so a chrome sphere keeps its reflection in
-        // AO creases instead of being wrongly dimmed by the diffuse AO.
+        // Occlusion band split: large-range occlusion of indirect DIFFUSE is the DDGI ray-miss
+        // replace below (the sky reaches the surface only on a ray that escapes), so the diffuse
+        // term here carries only the material occlusion texture + contact-scale GTAO. GTAO is the
+        // contact term: this `ao` (material × GTAO, small radius) drives the roughness-aware
+        // specular-AO (Lagarde, → 1 on smooth metals so a chrome sphere keeps its reflection in
+        // creases), the contact darkening of the indirect diffuse, and the SSGI bounce below.
         float ao = surf.occlusion;  // material occlusion (1.0 = none)
         if (globals.counts.w != 0)
         {
-            ao *= aoMap.SampleLevel(screenUv, 0.0).r;  // screen-space AO
+            ao *= aoMap.SampleLevel(screenUv, 0.0).r;  // screen-space GTAO (contact scale)
         }
         float specAO = saturate(pow(ndotv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
-        specularIBL *= specAO;
+        specularIBL *= specAO * specSkyVis;  // reflection-cone occludes the reflected skybox
         reflectionSpec = specularIBL;
-        ambient = diffuseIBL * ao + specularIBL;
+
+        // Indirect diffuse irradiance (the DDGI cage replacing the analytic IBL diffuse by coverage,
+        // both occluded by the DFAO sky-visibility) is resolved once per HALF-res pixel in the
+        // gi-resolve pass (view-independent), not per full-res fragment — the fragment samples the
+        // bilinearly-upsampled result here and applies the per-pixel kd·albedo tail. This is why the
+        // 8-probe DDGI cage + IBL diffuse cube are no longer sampled in this fragment. See
+        // `gi_resolve.slang`.
+        float3 indirectIrr = giIndirectMap.SampleLevel(screenUv, 0.0).rgb;
+        float3 indirect = kd * indirectIrr * albedo;
+        // Indirect diffuse occlusion: the large-range term is the DDGI ray-miss already folded into
+        // indirectIrr (the sky enters only on a ray that escapes), so the only further occlusion is
+        // contact-scale — the material texture × small-radius GTAO (`ao`) — filling in the contact
+        // detail the coarse probe grid cannot resolve, with no large-range double-count.
+        ambient = indirect * ao + specularIBL;
+        // SSGI adds one-bounce screen-space indirect on top (it is a bounce, not the sky term),
+        // modulated by AO so occluded creases don't over-bounce.
+        if (globals.screenFlags.y != 0)
+        {
+            float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+            ambient += gi * albedo * (1.0 - metallic) * ao;
+        }
     }
     else
     {
         float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
         ambient = albedo * (1.0 - metallic) * globals.ambientColor.rgb * surf.occlusion * ao;
-    }
-    // SSGI adds one-bounce indirect: the gathered radiance acts as extra incoming light on
-    // the diffuse albedo (modulated by AO so occluded creases don't over-bounce).
-    if (globals.screenFlags.y != 0)
-    {
-        float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
-        float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
-        ambient += gi * albedo * (1.0 - metallic) * ao;
-    }
-    // DDGI adds world-space multi-bounce indirect from the probe cage (diffuse only).
-    if (globals.screenFlags.z != 0)
-    {
-        float3 probeIrradiance = ddgiSampleIrradiance(input.worldPos, n);
-        ambient += probeIrradiance * albedo * (1.0 - metallic);
+        // SSGI bounce on the non-IBL fallback path (additive, AO-modulated).
+        if (globals.screenFlags.y != 0)
+        {
+            float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+            ambient += gi * albedo * (1.0 - metallic) * ao;
+        }
+        // DDGI on the fallback path: no analytic IBL diffuse to replace, so add the cage
+        // irradiance directly (weighted by coverage to avoid a hard edge at the cage boundary).
+        if (globals.screenFlags.z != 0)
+        {
+            float4 ddgi = ddgiSampleIrradiance(
+                ddgiVolumeFromGlobals(), ddgiIrradiance, ddgiDistance, input.worldPos, n);
+            ambient += ddgi.rgb * ddgi.w * albedo * (1.0 - metallic);
+        }
     }
     // Two view modes peel a single term off the composed result.
     uint channel = debugViewChannel();
