@@ -14,6 +14,7 @@
 use ash::vk;
 
 use crate::Device;
+use crate::nested_scopes::NestedScopeRecorder;
 use crate::profiler::{CpuMarkerRegistry, CpuSpanBuffer, RgTimestamps, cpu_now_ns};
 
 /// The per-frame profiler recorders the graph drives while executing: the GPU
@@ -115,6 +116,10 @@ impl RgAttachment {
     }
 }
 
+/// A pass's recording closure: receives the command buffer and a recorder for opening nested
+/// profiler sub-scopes over its own phases.
+type PassBody = Box<dyn FnOnce(vk::CommandBuffer, &mut NestedScopeRecorder<'_>)>;
+
 /// A unit of GPU work: its declared resource usage plus the closure that records
 /// it.
 ///
@@ -136,8 +141,9 @@ pub struct RgPass {
     pub depth: Option<RgAttachment>,
     /// The render area for a graphics pass (viewport/scissor/clear extent).
     pub render_area: vk::Extent2D,
-    /// The body that records the pass's commands. Consumed on execute.
-    pub execute: Option<Box<dyn FnOnce(vk::CommandBuffer)>>,
+    /// The body that records the pass's commands. Consumed on execute. The recorder lets
+    /// the body open nested profiler sub-scopes for its own phases.
+    pub execute: Option<PassBody>,
 }
 
 impl RgPass {
@@ -191,9 +197,13 @@ impl RgPass {
         self
     }
 
-    /// Sets the recording body.
+    /// Sets the recording body. The body receives the command buffer and a recorder for
+    /// opening nested profiler sub-scopes.
     #[must_use]
-    pub fn body(mut self, body: impl FnOnce(vk::CommandBuffer) + 'static) -> Self {
+    pub fn body(
+        mut self,
+        body: impl FnOnce(vk::CommandBuffer, &mut NestedScopeRecorder<'_>) + 'static,
+    ) -> Self {
         self.execute = Some(Box::new(body));
         self
     }
@@ -460,7 +470,7 @@ impl RenderGraph {
         }
     }
 
-    /// Imports an external 3D image (e.g. the DDGI voxel proxy). Tracked identically
+    /// Imports an external 3D image (e.g. a GDF cascade volume). Tracked identically
     /// to a 2D image for barrier purposes — the barrier transitions the whole image
     /// and dimensionality is irrelevant.
     pub fn import_image_3d(
@@ -611,11 +621,22 @@ impl RenderGraph {
                 let _ = ts.reserve_stats_slot(index, pixels);
             }
 
-            match pass.kind {
-                RgPassKind::Graphics => self.record_graphics(device, cmd, pass),
-                RgPassKind::Compute => {
-                    if let Some(body) = pass.execute {
-                        body(cmd);
+            {
+                // The pass body may open child scopes; reborrow the recorders into a
+                // handle scoped to the body call so the top-level end_scope below still
+                // sees the recorders free.
+                let mut nested = NestedScopeRecorder::new(
+                    raw,
+                    cmd,
+                    recorders.gpu.as_deref_mut(),
+                    recorders.cpu.as_mut().map(|(r, b)| (&mut **r, &mut **b)),
+                );
+                match pass.kind {
+                    RgPassKind::Graphics => self.record_graphics(device, cmd, pass, &mut nested),
+                    RgPassKind::Compute => {
+                        if let Some(body) = pass.execute {
+                            body(cmd, &mut nested);
+                        }
                     }
                 }
             }
@@ -638,7 +659,13 @@ impl RenderGraph {
     /// Opens a `cmd_begin_rendering` scope for a graphics pass — color/depth
     /// attachment infos (incl. MSAA color `AVERAGE` / depth `SAMPLE_ZERO` resolve),
     /// the full-area viewport/scissor — runs the body, then closes the scope.
-    fn record_graphics(&self, device: &Device, cmd: vk::CommandBuffer, pass: RgPass) {
+    fn record_graphics(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        pass: RgPass,
+        scopes: &mut NestedScopeRecorder<'_>,
+    ) {
         let raw = device.raw();
         let mut color_infos = Vec::with_capacity(pass.colors.len());
         for att in &pass.colors {
@@ -708,7 +735,7 @@ impl RenderGraph {
             raw.cmd_set_scissor(cmd, 0, &[scissor]);
         }
         if let Some(body) = pass.execute {
-            body(cmd);
+            body(cmd, scopes);
         }
         // SAFETY: the ash seam. Closes the rendering scope opened above.
         unsafe { raw.cmd_end_rendering(cmd) };
