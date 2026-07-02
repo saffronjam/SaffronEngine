@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use saffron_geometry::{Mesh, MorphData, VertexSkin};
-use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, Uploader};
+use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, SdfBake, Uploader};
 
 /// The GPU-facing operations the resolve/load paths drive.
 ///
@@ -21,8 +21,13 @@ use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, Uploader};
 /// loaders depend only on this trait, so the get-or-negative-cache logic is exercised
 /// without a Vulkan device while the production path still performs the real upload.
 pub trait GpuUploader {
-    /// Uploads a mesh (with its optional parallel [`VertexSkin`] stream) into
-    /// device-local buffers, returning the shared [`GpuMesh`].
+    /// Uploads a mesh (with its optional parallel [`VertexSkin`] stream) into device-local
+    /// buffers, returning the shared [`GpuMesh`].
+    ///
+    /// When `sdf_bake` is present the per-mesh signed distance field is GPU jump-flood baked
+    /// (or read from the sidecar cache) from the mesh geometry, uploaded into the bindless
+    /// SDF arrays, and tied to the returned mesh's lifetime. A `None` request bakes no field
+    /// (the gizmo/preview meshes).
     ///
     /// # Errors
     ///
@@ -33,6 +38,7 @@ pub trait GpuUploader {
         mesh: &Mesh,
         skin: &[VertexSkin],
         morph: Option<&MorphData>,
+        sdf_bake: Option<&SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>>;
 
     /// Uploads tightly packed RGBA8 (already decoded by the caller) as an sRGB or unorm
@@ -103,8 +109,10 @@ impl GpuUploader for RendererUploader<'_> {
         mesh: &Mesh,
         skin: &[VertexSkin],
         morph: Option<&MorphData>,
+        sdf_bake: Option<&SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader.upload_mesh(mesh, skin, morph)
+        self.uploader
+            .upload_mesh(self.descriptors, mesh, skin, morph, sdf_bake)
     }
 
     fn upload_texture(
