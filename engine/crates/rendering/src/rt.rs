@@ -1375,7 +1375,9 @@ mod tests {
                 material_slot: 0,
             }],
         };
-        let gpu_mesh = uploader.upload_mesh(&mesh, &[], None).expect("upload_mesh");
+        let gpu_mesh = uploader
+            .upload_mesh(&descriptors, &mesh, &[], None, None)
+            .expect("upload_mesh");
         assert!(
             gpu_mesh.blas.is_some(),
             "RT device builds the mesh BLAS at upload"
