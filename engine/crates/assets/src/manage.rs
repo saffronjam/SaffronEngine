@@ -1313,6 +1313,7 @@ mod tests {
                 _: &Mesh,
                 _: &[saffron_geometry::VertexSkin],
                 _morph: Option<&saffron_geometry::MorphData>,
+                _sdf_bake: Option<&saffron_rendering::SdfBake>,
             ) -> saffron_rendering::Result<std::sync::Arc<saffron_rendering::GpuMesh>> {
                 unreachable!("guard fails before any upload")
             }
