@@ -34,6 +34,14 @@ use crate::{Device, Result, checked};
 /// plenty.
 pub const MAX_BINDLESS_TEXTURES: u32 = 1024;
 
+/// Capacity of the bindless per-mesh SDF array (set 0, binding 1). One global
+/// `Texture3D` combined-image-sampler array the lighting cone-trace indexes per static
+/// instance; one slot per unique baked field. A mesh bakes one field per spatial cell
+/// (the whole-mesh partition that localizes indoor GI), so a large scene reaches the low
+/// thousands of distinct fields — update-after-bind + partially-bound means only occupied
+/// slots consume resources, so this is a generous ceiling, not a fixed cost.
+pub const MAX_BINDLESS_SDF: u32 = 1024;
+
 /// The bindless slot the default white texture occupies. Every material that names
 /// no albedo texture indexes this slot, so it is claimed first at init and never
 /// reclaimed.
@@ -64,6 +72,9 @@ pub struct Descriptors {
 
     linear_sampler: vk::Sampler,
     shadow_sampler: vk::Sampler,
+    /// Linear, clamp-to-edge sampler the per-mesh SDF cone-trace reads its `Texture3D`
+    /// with (a repeat wrap would alias the field's positive shell at the grid border).
+    sdf_sampler: vk::Sampler,
 
     bindless_set_layout: vk::DescriptorSetLayout,
     light_set_layout: vk::DescriptorSetLayout,
@@ -84,6 +95,12 @@ pub struct Descriptors {
 
     slots: Mutex<SlotAllocator>,
     free_list: BindlessFreeList,
+
+    /// The per-mesh SDF bindless slot allocator (binding 1 of the bindless set), with
+    /// its own high-water mark + reclaim free-list, the same bounded-pool discipline as
+    /// the albedo allocator above.
+    sdf_slots: Mutex<SlotAllocator>,
+    sdf_free_list: BindlessFreeList,
 }
 
 /// The bindless slot allocator: the high-water `next_index` and a reference to the
@@ -92,21 +109,29 @@ pub struct Descriptors {
 /// (one lock covers both).
 struct SlotAllocator {
     next_index: u32,
+    /// The array's fixed capacity (`descriptor_count` of the binding). A claim past it
+    /// returns `None` rather than handing out an out-of-range `dstArrayElement`.
+    cap: u32,
     free_list: BindlessFreeList,
 }
 
 impl SlotAllocator {
-    /// Hands out the next bindless slot: reuse a reclaimed one (LIFO) if any, else
-    /// grow `next_index`.
-    fn claim(&mut self) -> u32 {
+    /// Hands out the next bindless slot: reuse a reclaimed one (LIFO) if any, else grow
+    /// `next_index` while it stays under `cap`. Returns `None` when the array is full (the
+    /// free-list is empty and the high-water mark reached the capacity) so the caller skips
+    /// the write instead of indexing past the bindless array.
+    fn claim(&mut self) -> Option<u32> {
         if let Ok(mut free) = self.free_list.lock()
             && let Some(slot) = free.pop()
         {
-            return slot;
+            return Some(slot);
+        }
+        if self.next_index >= self.cap {
+            return None;
         }
         let slot = self.next_index;
         self.next_index += 1;
-        slot
+        Some(slot)
     }
 }
 
@@ -135,6 +160,7 @@ impl Descriptors {
 
         partial.linear_sampler = Some(create_linear_sampler(raw)?);
         partial.shadow_sampler = Some(create_shadow_sampler(raw)?);
+        partial.sdf_sampler = Some(create_sdf_sampler(raw)?);
 
         partial.bindless_set_layout = Some(create_bindless_layout(raw)?);
         partial.light_set_layout = Some(create_light_layout(raw)?);
@@ -166,20 +192,32 @@ impl Descriptors {
         // high-water mark starts at 1 and the first uploaded texture gets slot 1.
         let mut allocator = SlotAllocator {
             next_index: 0,
+            cap: MAX_BINDLESS_TEXTURES,
             free_list: Arc::clone(free_list),
         };
-        let white_slot = allocator.claim();
+        let white_slot = allocator.claim().expect("default white slot");
         debug_assert_eq!(white_slot, DEFAULT_WHITE_SLOT);
 
+        // The per-mesh SDF array's own allocator + reclaim free-list. No slot is reserved
+        // up front (a mesh without a baked field simply claims none).
+        let sdf_free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
+        let sdf_allocator = SlotAllocator {
+            next_index: 0,
+            cap: MAX_BINDLESS_SDF,
+            free_list: Arc::clone(&sdf_free_list),
+        };
+
         tracing::info!(
-            "bindless descriptor table ready ({} slots, update-after-bind)",
-            MAX_BINDLESS_TEXTURES
+            "bindless descriptor table ready ({} albedo + {} sdf slots, update-after-bind)",
+            MAX_BINDLESS_TEXTURES,
+            MAX_BINDLESS_SDF
         );
 
         Ok(Self {
             resources: Arc::clone(&resources),
             linear_sampler: partial.take_linear_sampler(),
             shadow_sampler: partial.take_shadow_sampler(),
+            sdf_sampler: partial.take_sdf_sampler(),
             bindless_set_layout: partial.take_bindless_set_layout(),
             light_set_layout: partial.take_light_set_layout(),
             instance_set_layout: partial.take_instance_set_layout(),
@@ -197,6 +235,8 @@ impl Descriptors {
             bindless_set,
             slots: Mutex::new(allocator),
             free_list: Arc::clone(free_list),
+            sdf_slots: Mutex::new(sdf_allocator),
+            sdf_free_list,
         })
     }
 
@@ -296,8 +336,9 @@ impl Descriptors {
     /// Claims a stable bindless slot, reusing a reclaimed one if available, under the
     /// bindless mutex. The upload path then writes the texture into this slot with
     /// [`Descriptors::write_texture`] and constructs the [`crate::GpuTexture`] holding
-    /// the free-list clone.
-    pub fn claim_slot(&self) -> u32 {
+    /// the free-list clone. `None` when the array is full ([`MAX_BINDLESS_TEXTURES`]
+    /// slots occupied); the caller then fails the upload rather than writing out of range.
+    pub fn claim_slot(&self) -> Option<u32> {
         self.slots
             .lock()
             .expect("bindless slot allocator lock")
@@ -361,6 +402,164 @@ impl Descriptors {
                 .device()
                 .update_descriptor_sets(&[write], &[]);
         }
+    }
+
+    /// The per-mesh SDF sampler (linear, clamp-to-edge) the cone-trace reads the
+    /// `Texture3D` field with.
+    pub fn sdf_sampler(&self) -> vk::Sampler {
+        self.sdf_sampler
+    }
+
+    /// The shared reclaim free-list every [`crate::GpuSdf`] clones so its `Drop` returns
+    /// its SDF bindless slot (binding 1 of the bindless set).
+    pub fn sdf_free_list(&self) -> &BindlessFreeList {
+        &self.sdf_free_list
+    }
+
+    /// Claims a stable per-mesh SDF bindless slot (binding 1), reusing a reclaimed one if
+    /// available, under the SDF allocator mutex. The upload path writes the field's view
+    /// into this slot with [`Descriptors::write_sdf_texture`] and constructs the
+    /// [`crate::GpuSdf`] holding the free-list clone. `None` when the array is full
+    /// ([`MAX_BINDLESS_SDF`] fields occupied); the caller then skips the field rather than
+    /// writing an out-of-range `dstArrayElement`.
+    pub fn claim_sdf_slot(&self) -> Option<u32> {
+        self.sdf_slots
+            .lock()
+            .expect("bindless sdf slot allocator lock")
+            .claim()
+    }
+
+    /// Writes the brick-atlas `view` into SDF bindless slot `index` (binding 1) with the
+    /// SDF sampler, the brick-indirection `indirection` view into the same slot at binding 2
+    /// (a sampled image, no sampler), and the coarse `coverage` view at binding 3 (combined
+    /// image sampler). The images must be in `SHADER_READ_ONLY_OPTIMAL` when sampled (the
+    /// upload transitions them there). Serialized under the SDF allocator mutex (the worker
+    /// thread can upload meshes off the main thread — README §5).
+    pub fn write_sdf_texture(
+        &self,
+        view: vk::ImageView,
+        indirection: vk::ImageView,
+        coverage: vk::ImageView,
+        index: u32,
+    ) {
+        let atlas_info = [vk::DescriptorImageInfo {
+            sampler: self.sdf_sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let indir_info = [vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: indirection,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let coverage_info = [vk::DescriptorImageInfo {
+            sampler: self.sdf_sampler,
+            image_view: coverage,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bindless_set)
+                .dst_binding(1)
+                .dst_array_element(index)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&atlas_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bindless_set)
+                .dst_binding(2)
+                .dst_array_element(index)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&indir_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bindless_set)
+                .dst_binding(3)
+                .dst_array_element(index)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&coverage_info),
+        ];
+        let _guard = self
+            .sdf_slots
+            .lock()
+            .expect("bindless sdf slot allocator lock");
+        // SAFETY: the ash seam. The set + layout outlive this; both views are valid for the
+        // call. The lock serializes concurrent worker/main writes to the set.
+        unsafe { self.resources.device().update_descriptor_sets(&writes, &[]) };
+    }
+
+    /// Seeds the default atlas + indirection + coverage views into *every* SDF bindless slot
+    /// (bindings 1 + 2 + 3) in one `vkUpdateDescriptorSets`. Called once at init (from
+    /// [`crate::Uploader::upload_default_sdf`]) with the default "empty space" SDF so the
+    /// partially-bound `Texture3D` arrays are never sampled while unbound (lavapipe faults
+    /// on an unbound slot even one the shader never reads, and it is UB on real hardware).
+    /// Real SDF uploads overwrite their slot afterwards.
+    pub fn seed_all_sdf_textures(
+        &self,
+        atlas: vk::ImageView,
+        indirection: vk::ImageView,
+        coverage: vk::ImageView,
+    ) {
+        let atlas_info = vec![
+            vk::DescriptorImageInfo {
+                sampler: self.sdf_sampler,
+                image_view: atlas,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            MAX_BINDLESS_SDF as usize
+        ];
+        let indir_info = vec![
+            vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: indirection,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            MAX_BINDLESS_SDF as usize
+        ];
+        let coverage_info = vec![
+            vk::DescriptorImageInfo {
+                sampler: self.sdf_sampler,
+                image_view: coverage,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            MAX_BINDLESS_SDF as usize
+        ];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bindless_set)
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&atlas_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bindless_set)
+                .dst_binding(2)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&indir_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bindless_set)
+                .dst_binding(3)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&coverage_info),
+        ];
+        let _guard = self
+            .sdf_slots
+            .lock()
+            .expect("bindless sdf slot allocator lock");
+        // SAFETY: the ash seam. The set + layout outlive this; both views are valid and the
+        // `image_info` vectors live until the call returns; the array lengths equal the
+        // layout's counts.
+        unsafe {
+            self.resources.device().update_descriptor_sets(&writes, &[]);
+        }
+    }
+
+    /// The number of per-mesh SDF bindless slots ever handed out (the high-water mark).
+    pub fn sdf_count(&self) -> u32 {
+        self.sdf_slots
+            .lock()
+            .expect("bindless sdf slot allocator lock")
+            .next_index
     }
 
     /// Allocates one descriptor set of `layout` from the shared descriptor pool (the
@@ -489,6 +688,7 @@ impl Drop for Descriptors {
             raw.destroy_descriptor_set_layout(self.taa_set_layout, None);
             raw.destroy_sampler(self.linear_sampler, None);
             raw.destroy_sampler(self.shadow_sampler, None);
+            raw.destroy_sampler(self.sdf_sampler, None);
         }
     }
 }
@@ -501,6 +701,7 @@ struct Partial<'a> {
     resources: &'a Arc<DeviceResources>,
     linear_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
+    sdf_sampler: Option<vk::Sampler>,
     bindless_set_layout: Option<vk::DescriptorSetLayout>,
     light_set_layout: Option<vk::DescriptorSetLayout>,
     instance_set_layout: Option<vk::DescriptorSetLayout>,
@@ -535,6 +736,7 @@ impl<'a> Partial<'a> {
             resources,
             linear_sampler: None,
             shadow_sampler: None,
+            sdf_sampler: None,
             bindless_set_layout: None,
             light_set_layout: None,
             instance_set_layout: None,
@@ -555,6 +757,7 @@ impl<'a> Partial<'a> {
     partial_take! {
         take_linear_sampler => linear_sampler: vk::Sampler,
         take_shadow_sampler => shadow_sampler: vk::Sampler,
+        take_sdf_sampler => sdf_sampler: vk::Sampler,
         take_bindless_set_layout => bindless_set_layout: vk::DescriptorSetLayout,
         take_light_set_layout => light_set_layout: vk::DescriptorSetLayout,
         take_instance_set_layout => instance_set_layout: vk::DescriptorSetLayout,
@@ -603,6 +806,9 @@ impl Drop for Partial<'_> {
             {
                 raw.destroy_descriptor_set_layout(layout, None);
             }
+            if let Some(sampler) = self.sdf_sampler {
+                raw.destroy_sampler(sampler, None);
+            }
             if let Some(sampler) = self.shadow_sampler {
                 raw.destroy_sampler(sampler, None);
             }
@@ -649,17 +855,69 @@ fn create_shadow_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
     )
 }
 
-/// Set 0: the bindless albedo array — a runtime-sized combined-image-sampler array,
-/// partially bound + update-after-bind, indexed per-instance in the fragment stage.
+/// The per-mesh SDF sampler: linear filtering for the trilinear field lookup, **linear**
+/// mipmap mode so a fractional `SampleLevel` LOD blends across the prefiltered mip pair
+/// (quadrilinear — the cone-footprint mip-select's anti-alias depends on it), clamp-to-edge
+/// so a sample past the grid reads the boundary cell (the positive shell) rather than
+/// wrapping into the field, and no LOD clamp so every baked mip is reachable.
+fn create_sdf_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
+    let info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .max_lod(vk::LOD_CLAMP_NONE);
+    // SAFETY: the ash seam. As [`create_linear_sampler`].
+    checked(
+        unsafe { raw.create_sampler(&info, None) },
+        "createSampler (sdf)",
+    )
+}
+
+/// Set 0: the bindless arrays — binding 0 is the albedo combined-image-sampler array,
+/// binding 1 the per-mesh SDST brick-atlas `Texture3D` array (combined image sampler, mipped),
+/// binding 2 the per-mesh brick-indirection `Texture3D<uint>` array (a sampled image read by
+/// integer `Load`, no sampler), and binding 3 the coarse coverage `Texture3D` array (combined
+/// image sampler). All runtime-sized, partially bound + update-after-bind.
 fn create_bindless_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    let bindings = [vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(MAX_BINDLESS_TEXTURES)
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-    let binding_flags =
-        [vk::DescriptorBindingFlags::PARTIALLY_BOUND
-            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND];
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_BINDLESS_TEXTURES)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_BINDLESS_SDF)
+            // The per-mesh brick atlas. COMPUTE-only: the GDF composite (`gdf_composite`) and the
+            // DDGI ray trace's near field (`sdf::sampleField`) are the only consumers. The
+            // fragment lighting path reads the composited GDF clipmap (set 1 / 9-10), not the
+            // per-mesh bricks.
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(MAX_BINDLESS_SDF)
+            // The brick indirection volume, read by integer texel `Load` in the same two compute
+            // consumers as the atlas (the GDF composite + the DDGI trace near field).
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_BINDLESS_SDF)
+            // The coarse coverage volume (one texel per brick), sampled for the empty-space
+            // march leap + early-out — same two compute consumers as the atlas.
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+    ];
+    let binding_flags = [
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+    ];
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
     let info = vk::DescriptorSetLayoutCreateInfo::default()
@@ -689,6 +947,27 @@ fn create_light_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
         light_binding(5, sampler), // spot shadow map (compare sampler)
         light_binding(6, sampler), // point shadow STATIC distance cube (linear sampler)
         light_binding(7, sampler), // point shadow DYNAMIC distance cube (linear sampler)
+        // per-mesh SDF-occluder instance list (the near-field sphere-march): COMPUTE-only, read
+        // solely by the DDGI ray trace (`sdf::sampleField`). The fragment reflection occlusion taps
+        // the composited GDF clipmap (bindings 9/10), not the per-mesh instance list.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(8)
+            .descriptor_type(storage)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        // Global-SDF cascade clipmap (binding 9: a `GDF_CASCADES` combined-sampler array, the
+        // far-field distance tap) + its params UBO (binding 10). FRAGMENT for the übershader's GDF
+        // reflection occlusion, COMPUTE for the DDGI ray trace's far field.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(9)
+            .descriptor_type(sampler)
+            .descriptor_count(crate::GDF_CASCADES)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(10)
+            .descriptor_type(uniform)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -767,8 +1046,11 @@ fn create_ibl_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     )
 }
 
-/// Set 4 (mesh pipeline): the AO + contact + SSGI + SSR + prev-color sampler set — five
-/// fragment-stage combined-image-samplers (prev-color feeds the RT-reflection reprojection).
+/// Set 4 (mesh pipeline): the AO + contact + SSGI + SSR + prev-color + DFAO + specular-occlusion
+/// sampler set — seven fragment-stage combined-image-samplers (prev-color feeds the RT-reflection
+/// reprojection; DFAO the reduced-resolution sky-visibility that occludes the analytic sky
+/// irradiance; specular-occlusion the reduced-resolution reflection occlusion that occludes the
+/// reflected skybox).
 fn create_ssao_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let sampler = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
     let bindings = [
@@ -777,6 +1059,9 @@ fn create_ssao_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout>
         light_binding(2, sampler),
         light_binding(3, sampler),
         light_binding(4, sampler),
+        light_binding(5, sampler),
+        light_binding(6, sampler),
+        light_binding(7, sampler), // gi_indirect: the half-res screen-space indirect-diffuse resolve
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -786,8 +1071,8 @@ fn create_ssao_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout>
     )
 }
 
-/// Set 5 (mesh pipeline): the DDGI irradiance + distance sampler set — two
-/// fragment-stage combined-image-samplers.
+/// Set 5 (mesh pipeline): the DDGI irradiance + distance sampler set — two fragment-stage
+/// combined-image-samplers.
 fn create_ddgi_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let sampler = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
     let bindings = [light_binding(0, sampler), light_binding(1, sampler)];
@@ -904,12 +1189,21 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
     let views = VIEW_COUNT;
     let pool_sizes = [
         pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1024),
-        pool_size(vk::DescriptorType::UNIFORM_BUFFER, 4 * frames + 8),
+        // +frames for the GDF cascade-params UBO (binding 10) on each frame's light set.
+        pool_size(vk::DescriptorType::UNIFORM_BUFFER, 5 * frames + 8),
+        // +8 for the device-shared GDF cull + composite sets (two storage buffers each).
         pool_size(
             vk::DescriptorType::STORAGE_BUFFER,
-            8 * frames + 16 + 8 * views,
+            8 * frames + 24 + 8 * views,
         ),
-        pool_size(vk::DescriptorType::STORAGE_IMAGE, 48 + 11 * views),
+        // +(GDF_CASCADES + 1) per frame for each composite set's cascade storage-image array + the
+        // lite albedo cache. The per-view budget (28) covers the DFAO and specular-occlusion chains'
+        // storage images (each: trace out + blur out + two accum sets = 6, so 12 total) on top of
+        // the SSGI/AA sets.
+        pool_size(
+            vk::DescriptorType::STORAGE_IMAGE,
+            48 + 28 * views + (crate::GDF_CASCADES + 1) * frames,
+        ),
         pool_size(
             vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
             frames + 2 + views,
@@ -917,7 +1211,7 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
     ];
     let info = vk::DescriptorPoolCreateInfo::default()
         .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-        .max_sets(1024 + 8 * frames + 64 + 10 * views)
+        .max_sets(1024 + 8 * frames + 64 + 21 * views)
         .pool_sizes(&pool_sizes);
     // SAFETY: the ash seam. The pool is owned and freed in teardown.
     checked(
@@ -929,10 +1223,15 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
 /// The bindless set's own pool: `UPDATE_AFTER_BIND`, one set, sized for the full
 /// bindless array.
 fn create_bindless_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
-    let pool_sizes = [pool_size(
-        vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        MAX_BINDLESS_TEXTURES,
-    )];
+    let pool_sizes = [
+        pool_size(
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            // Albedo (binding 0) + brick atlas (binding 1) + coverage (binding 3).
+            MAX_BINDLESS_TEXTURES + 2 * MAX_BINDLESS_SDF,
+        ),
+        // The brick-indirection array is a separate sampled-image (no sampler) binding.
+        pool_size(vk::DescriptorType::SAMPLED_IMAGE, MAX_BINDLESS_SDF),
+    ];
     let info = vk::DescriptorPoolCreateInfo::default()
         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
         .max_sets(1)
@@ -998,14 +1297,15 @@ mod tests {
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let mut allocator = SlotAllocator {
             next_index: 0,
+            cap: MAX_BINDLESS_TEXTURES,
             free_list: Arc::clone(&free_list),
         };
 
         // Slot 0 is the default white, claimed first.
-        assert_eq!(allocator.claim(), DEFAULT_WHITE_SLOT);
+        assert_eq!(allocator.claim(), Some(DEFAULT_WHITE_SLOT));
 
         // Claim five more: the high-water mark grows 1..=5.
-        let claimed: Vec<u32> = (0..5).map(|_| allocator.claim()).collect();
+        let claimed: Vec<u32> = (0..5).map(|_| allocator.claim().unwrap()).collect();
         assert_eq!(claimed, vec![1, 2, 3, 4, 5]);
         assert_eq!(allocator.next_index, 6);
 
@@ -1019,7 +1319,7 @@ mod tests {
 
         // Claim five more: every slot is reused (LIFO, so 5,4,3,2,1) and the
         // high-water mark does NOT grow past 6.
-        let reclaimed: Vec<u32> = (0..5).map(|_| allocator.claim()).collect();
+        let reclaimed: Vec<u32> = (0..5).map(|_| allocator.claim().unwrap()).collect();
         assert_eq!(reclaimed, vec![5, 4, 3, 2, 1]);
         assert_eq!(
             allocator.next_index, 6,
@@ -1028,8 +1328,34 @@ mod tests {
         assert!(free_list.lock().unwrap().is_empty());
 
         // The next claim with an empty free-list grows the high-water mark again.
-        assert_eq!(allocator.claim(), 6);
+        assert_eq!(allocator.claim(), Some(6));
         assert_eq!(allocator.next_index, 7);
+    }
+
+    /// A bounded allocator hands out every slot up to its capacity, then returns `None`
+    /// (never an out-of-range index) — the fix for the SDF-array overflow that wrote past
+    /// `dstArrayElement`. Freeing a slot lets the next claim reuse it below the cap.
+    #[test]
+    fn slot_allocator_returns_none_when_full() {
+        let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
+        let mut allocator = SlotAllocator {
+            next_index: 0,
+            cap: 3,
+            free_list: Arc::clone(&free_list),
+        };
+
+        assert_eq!(allocator.claim(), Some(0));
+        assert_eq!(allocator.claim(), Some(1));
+        assert_eq!(allocator.claim(), Some(2));
+        // The array is full: every further claim is refused, never an out-of-range slot.
+        assert_eq!(allocator.claim(), None);
+        assert_eq!(allocator.claim(), None);
+        assert_eq!(allocator.next_index, 3);
+
+        // Reclaiming a slot lets the next claim reuse it (still within the cap).
+        free_list.lock().unwrap().push(1);
+        assert_eq!(allocator.claim(), Some(1));
+        assert_eq!(allocator.claim(), None);
     }
 
     /// Two threads claiming slots concurrently never alias a slot — every handed-out
@@ -1039,19 +1365,20 @@ mod tests {
     #[test]
     fn concurrent_claims_never_alias_a_slot() {
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
+        const PER_THREAD: usize = 2000;
         let allocator = Arc::new(Mutex::new(SlotAllocator {
             next_index: 0,
+            cap: (2 * PER_THREAD) as u32,
             free_list: Arc::clone(&free_list),
         }));
 
-        const PER_THREAD: usize = 2000;
         let mut handles = Vec::new();
         for _ in 0..2 {
             let allocator = Arc::clone(&allocator);
             handles.push(std::thread::spawn(move || {
                 let mut claimed = Vec::with_capacity(PER_THREAD);
                 for _ in 0..PER_THREAD {
-                    claimed.push(allocator.lock().unwrap().claim());
+                    claimed.push(allocator.lock().unwrap().claim().unwrap());
                 }
                 claimed
             }));
@@ -1111,7 +1438,7 @@ mod tests {
 
         // A claim after init hands out slot 1 (the first uploadable slot), and the
         // free-list reclaim path is wired through `free_list`.
-        assert_eq!(descriptors.claim_slot(), 1);
+        assert_eq!(descriptors.claim_slot(), Some(1));
         assert_eq!(descriptors.texture_count(), 2);
 
         drop(descriptors);
