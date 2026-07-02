@@ -29,7 +29,7 @@ use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use saffron_geometry::{Ray, ray_aabb_slab, ray_triangle, world_aabb_from_corners};
 use saffron_rendering::{
     ClusterCamera, DrawItem, EnvSource, GpuLight, GpuMesh, MAX_REFLECTION_PROBES, Material,
-    ReflectionProbeUpload, SceneLighting, SkyRenderSettings, SkygenParams,
+    ReflectionProbeUpload, SceneLighting, SdfInstance, SkyRenderSettings, SkygenParams,
 };
 use saffron_scene::{
     Camera, CameraView, DirectionalLight, Entity, Mesh as MeshComponent, MorphComponent,
@@ -71,20 +71,19 @@ pub trait SceneRenderer: GpuUploader {
     fn set_directional_shadow(&mut self, light_view_proj: Mat4, casting: bool);
     /// Captures the frame's static RT instances.
     fn set_rt_scene(&mut self, models: Vec<Mat4>, meshes: Vec<Arc<GpuMesh>>);
-    /// Uploads the frame's DDGI scene-box proxy + fitted volume.
-    #[allow(clippy::too_many_arguments)]
+    /// Snaps the camera-centered DDGI probe clipmap to the camera + passes the sun/sky for the
+    /// trace (which sphere-marches the per-mesh MDF + the Global SDF, the sky on miss).
     fn set_ddgi_scene(
         &mut self,
-        box_mins: &[Vec4],
-        box_maxs: &[Vec4],
-        box_albedos: &[Vec4],
-        volume_min: Vec3,
-        volume_extent: Vec3,
+        cam_pos: Vec3,
         sun_dir: Vec3,
         sun_color: Vec3,
         sun_intensity: f32,
         sky_color: Vec3,
     );
+    /// Uploads this frame's per-static-instance SDF list (the lighting cone-trace iterates
+    /// it for directional sky occlusion).
+    fn set_sdf_scene(&mut self, instances: &[SdfInstance]);
     /// Folds the frame's reflection-probe uploads in.
     fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]);
     /// Writes the per-frame light UBO/SSBO.
@@ -167,8 +166,10 @@ impl GpuUploader for RendererScene<'_> {
         mesh: &saffron_geometry::Mesh,
         skin: &[saffron_geometry::VertexSkin],
         morph: Option<&saffron_geometry::MorphData>,
+        sdf_bake: Option<&saffron_rendering::SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader.upload_mesh(mesh, skin, morph)
+        self.uploader
+            .upload_mesh(self.renderer.descriptors(), mesh, skin, morph, sdf_bake)
     }
 
     fn upload_texture(
@@ -234,27 +235,18 @@ impl SceneRenderer for RendererScene<'_> {
 
     fn set_ddgi_scene(
         &mut self,
-        box_mins: &[Vec4],
-        box_maxs: &[Vec4],
-        box_albedos: &[Vec4],
-        volume_min: Vec3,
-        volume_extent: Vec3,
+        cam_pos: Vec3,
         sun_dir: Vec3,
         sun_color: Vec3,
         sun_intensity: f32,
         sky_color: Vec3,
     ) {
-        self.renderer.set_ddgi_scene(
-            box_mins,
-            box_maxs,
-            box_albedos,
-            volume_min,
-            volume_extent,
-            sun_dir,
-            sun_color,
-            sun_intensity,
-            sky_color,
-        );
+        self.renderer
+            .set_ddgi_scene(cam_pos, sun_dir, sun_color, sun_intensity, sky_color);
+    }
+
+    fn set_sdf_scene(&mut self, instances: &[SdfInstance]) {
+        self.renderer.set_sdf_scene(instances);
     }
 
     fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]) {
@@ -589,9 +581,7 @@ pub fn render_scene<R: SceneRenderer>(
         mut items,
         scene_min,
         scene_max,
-        box_mins,
-        box_maxs,
-        box_albedos,
+        sdf_instances,
     } = build;
 
     // Fit an orthographic shadow frustum to the scene's world AABB, looking down the
@@ -627,29 +617,27 @@ pub fn render_scene<R: SceneRenderer>(
         renderer.set_rt_scene(rt_models, rt_meshes);
     }
 
-    // DDGI: fit the probe volume to the scene AABB (padded a little so probes sit just
-    // outside the geometry), upload the box proxy, and pass the sun. Done before the lighting
-    // upload, which reads the volume placement into the light UBO.
-    if !items.is_empty() && scene_max.x >= scene_min.x {
-        let pad = Vec3::ONE;
-        let vol_min = scene_min - pad;
-        let vol_ext = (scene_max + pad) - vol_min;
-        let mut ddgi_sky = Vec3::new(0.1, 0.13, 0.2);
-        if scene.environment.use_sky_for_ambient {
-            ddgi_sky = scene.environment.ambient_color * scene.environment.ambient_intensity;
-        }
-        renderer.set_ddgi_scene(
-            &box_mins,
-            &box_maxs,
-            &box_albedos,
-            vol_min,
-            vol_ext,
-            light_dir,
-            light_color,
-            light_intensity,
-            ddgi_sky,
-        );
+    // Upload the frame's per-static-instance SDF occluder list (empty when no static
+    // mesh carries a baked field — that resets the count). Independent of DDGI: the
+    // lighting cone-trace reads it for directional sky occlusion whether DDGI is on or
+    // off.
+    renderer.set_sdf_scene(&sdf_instances);
+
+    // DDGI: snap the camera-centered probe clipmap to the camera and pass the sun/sky. The trace
+    // sphere-marches the real distance field (per-mesh MDF near + Global SDF far), so it needs no
+    // scene-box proxy. Done before the lighting upload, which reads the volume placement + scroll
+    // base into the light UBO.
+    let mut ddgi_sky = Vec3::new(0.1, 0.13, 0.2);
+    if scene.environment.use_sky_for_ambient {
+        ddgi_sky = scene.environment.ambient_color * scene.environment.ambient_intensity;
     }
+    renderer.set_ddgi_scene(
+        eye_position,
+        light_dir,
+        light_color,
+        light_intensity,
+        ddgi_sky,
+    );
 
     let probe_uploads = gather_reflection_probes(scene);
     renderer.submit_reflection_probes(&probe_uploads);
@@ -825,15 +813,16 @@ fn gather_punctual_lights(
     (lights, point_shadow, spot_shadow)
 }
 
-/// The accumulating draw-list + scene-AABB + DDGI-proxy state built across the static and
+/// The accumulating draw-list + scene-AABB + SDF-occluder state built across the static and
 /// skinned passes.
 struct DrawListBuild {
     items: Vec<DrawItem>,
     scene_min: Vec3,
     scene_max: Vec3,
-    box_mins: Vec<Vec4>,
-    box_maxs: Vec<Vec4>,
-    box_albedos: Vec<Vec4>,
+    /// One [`SdfInstance`] per static draw whose mesh carries a baked signed distance field — the
+    /// lighting cone-trace's + the GDF composite's per-instance occluder list. Its base color rides
+    /// the reserved `.w` of the world/local AABB corners (the GDF albedo cache's per-cell color).
+    sdf_instances: Vec<SdfInstance>,
 }
 
 impl Default for DrawListBuild {
@@ -842,9 +831,7 @@ impl Default for DrawListBuild {
             items: Vec::new(),
             scene_min: Vec3::splat(f32::MAX),
             scene_max: Vec3::splat(f32::MIN),
-            box_mins: Vec::new(),
-            box_maxs: Vec::new(),
-            box_albedos: Vec::new(),
+            sdf_instances: Vec::new(),
         }
     }
 }
@@ -879,9 +866,54 @@ fn gather_static_draw_list<R: SceneRenderer>(
         );
         build.scene_min = build.scene_min.min(box_min);
         build.scene_max = build.scene_max.max(box_max);
-        build.box_mins.push(box_min.extend(0.0));
-        build.box_maxs.push(box_max.extend(0.0));
-        build.box_albedos.push(materials.proxy_albedo.extend(0.0));
+        // A static instance contributes one SDF occluder per baked field — one tight field
+        // per primitive (and per spatial chunk of an oversized primitive). Each carries the
+        // shared world→local transform, the field's OWN world AABB (for the cone-march's
+        // per-sample cull, tight so many small fields cull independently), and its bindless
+        // slot + encode clamp.
+        if !mesh_ref.sdfs().is_empty() {
+            // The fields store distances in local (rest) units, but the cone-trace marches and
+            // compares in world space. The instance's world scale (the mean basis-column length
+            // of the model's upper-left 3×3) converts a sampled local distance to world units,
+            // keeping the AO footprint correct under non-unit instance scale — shared by every
+            // field of this mesh (they share its local frame).
+            let basis = Mat3::from_mat4(model);
+            let world_scale =
+                (basis.x_axis.length() + basis.y_axis.length() + basis.z_axis.length()) / 3.0;
+            let world_to_local = model.inverse();
+            let uvec = |a: [u32; 3]| saffron_geometry::glam::UVec4::new(a[0], a[1], a[2], 0);
+            // The base color rides the reserved `.w` of the world/local AABB corners (r, g, b) —
+            // the GDF composite splats it into the lite albedo cache the DDGI trace reads. The
+            // brick sample reads only `.xyz`, so this packing is transparent to it.
+            let albedo = materials.proxy_albedo;
+            for field in mesh_ref.sdfs() {
+                let mut field_min = Vec3::splat(f32::MAX);
+                let mut field_max = Vec3::splat(f32::MIN);
+                world_aabb_from_corners(
+                    &model,
+                    field.bounds_min,
+                    field.bounds_max,
+                    &mut field_min,
+                    &mut field_max,
+                );
+                build.sdf_instances.push(SdfInstance {
+                    world_to_local,
+                    world_min: field_min.extend(albedo.x),
+                    world_max: field_max.extend(albedo.y),
+                    local_min: field.bounds_min.extend(albedo.z),
+                    local_max: field.bounds_max.extend(0.0),
+                    params: Vec4::new(
+                        field.bindless_index() as f32,
+                        field.max_dist,
+                        world_scale,
+                        field.mip_count as f32,
+                    ),
+                    voxel_dims: uvec(field.voxel_dims),
+                    indir_dims: uvec(field.indirection_dims),
+                    atlas_bricks: uvec(field.atlas_bricks),
+                });
+            }
+        }
         build.items.push(DrawItem {
             mesh: mesh_ref,
             model,
@@ -1327,9 +1359,10 @@ mod tests {
             mesh: &saffron_geometry::Mesh,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
+            sdf_bake: Option<&saffron_rendering::SdfBake>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-            let (uploader, _) = self.gpu.expect("upload_mesh needs a GPU fixture");
-            uploader.upload_mesh(mesh, skin, morph)
+            let (uploader, descriptors) = self.gpu.expect("upload_mesh needs a GPU fixture");
+            uploader.upload_mesh(descriptors, mesh, skin, morph, sdf_bake)
         }
 
         fn upload_texture(
@@ -1399,11 +1432,7 @@ mod tests {
         }
         fn set_ddgi_scene(
             &mut self,
-            _box_mins: &[Vec4],
-            _box_maxs: &[Vec4],
-            _box_albedos: &[Vec4],
-            _volume_min: Vec3,
-            _volume_extent: Vec3,
+            _cam_pos: Vec3,
             _sun_dir: Vec3,
             _sun_color: Vec3,
             _sun_intensity: f32,
@@ -1411,6 +1440,7 @@ mod tests {
         ) {
             self.calls.borrow_mut().push(Call::DdgiScene);
         }
+        fn set_sdf_scene(&mut self, _instances: &[SdfInstance]) {}
         fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]) {
             self.calls
                 .borrow_mut()
@@ -1509,7 +1539,9 @@ mod tests {
             RenderSceneOptions::default(),
         );
         // No lights, no meshes: the shadows are all off, no items, and the procedural sky
-        // bake fires (the default environment). The exact frozen order.
+        // bake fires (the default environment). The DDGI clipmap snaps to the camera every frame
+        // regardless of scene contents (it has no scene-box proxy to gate on). The exact frozen
+        // order.
         assert_eq!(
             renderer.calls(),
             vec![
@@ -1524,6 +1556,7 @@ mod tests {
                 },
                 Call::DirectionalShadow { casting: false },
                 Call::RtScene { static_count: 0 },
+                Call::DdgiScene,
                 Call::ReflectionProbes(0),
                 Call::SceneLighting { light_count: 0 },
                 Call::EnvBake(EnvSource::Procedural),
