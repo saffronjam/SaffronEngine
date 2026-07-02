@@ -17,9 +17,8 @@
 use saffron_core::Uuid;
 use saffron_geometry::{
     AlphaMode, ChunkKind, ContainerChunk, ImportedMaterial, ImportedModel, ImportedNode,
-    ImportedSkin,
-    MaterialMapRole, MorphData, VertexSkin, save_animation_to_buffer, save_mesh_to_buffer,
-    sub_id_for, translate_model, write_container,
+    ImportedSkin, MaterialMapRole, MorphData, VertexSkin, save_animation_to_buffer,
+    save_mesh_to_buffer, sub_id_for, translate_model, write_container,
 };
 use saffron_json::{Value, dump_json, json_bool_or, json_f32_or, json_string_or, uuid_to_json};
 use saffron_scene::{AssetEntry, AssetType, Colorspace};
@@ -461,6 +460,10 @@ impl AssetServer {
                 ..SubAsset::default()
             });
             node_mesh_ids[i] = mesh_sub_id.value();
+            // The per-mesh signed distance fields are not baked at import (which is GPU-free):
+            // they are GPU jump-flood baked at `GpuMesh`-build time — one tight field per
+            // primitive — and cached to an `assets/cache/<meshHash>.sdfset` sidecar. See
+            // `saffron_rendering::Uploader::bake_sdf`.
         }
 
         let mut material_summaries = Vec::with_capacity(graph.materials.len());
