@@ -72,6 +72,23 @@ VertexOutput vertexMainSkinned(SkinnedVertexInput input, uint instanceIndex : SV
     return transformVertexSkinned(input, instanceIndex);
 }
 
+// Depth-prepass fragment: depth-only (no color output), doing solely the alpha-clip test so masked
+// materials (foliage/curtains) do NOT write depth at their cutout texels — otherwise the scene pass,
+// which loads this depth and discards at the same texels, would leave holes bleeding the background.
+// Reads only material params (set 2) + albedo (set 0), never `globals` (set 1), so the prepass PSO
+// binds no light set. The test mirrors `fragmentMain` exactly so the depth matches at edges.
+[shader("fragment")]
+void depthPrepassFragment(VertexOutput input)
+{
+    MaterialParams mat = materialParams[input.materialIndex];
+    if ((mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
+    {
+        float2 uv = input.uv0 * mat.uv.xy + mat.uv.zw;
+        float alpha = albedoTextures[NonUniformResourceIndex(mat.tex0.x)].Sample(uv).a * mat.baseColor.a;
+        if (alpha < mat.pbr.w) { discard; }
+    }
+}
+
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target
 {
