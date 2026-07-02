@@ -286,6 +286,7 @@ export interface RenderStatsDto {
   contactShadows: boolean;
   ssgi: boolean;
   renderScale: number;
+  skyOcclusion: boolean;
   quality: string;
   tonemap: string;
   idle: boolean;
@@ -293,6 +294,7 @@ export interface RenderStatsDto {
   redrawReasons: string[];
   powerState: string;
   ddgi: boolean;
+  gdf: boolean;
   rtSupported: boolean;
   rtShadows: boolean;
   restir: boolean;
@@ -514,6 +516,14 @@ export interface SetClusteredResult {
 
 export interface SetIblResult {
   ibl: boolean;
+}
+
+export interface SetSkyOcclusionResult {
+  skyOcclusion: boolean;
+}
+
+export interface SetGdfResult {
+  gdf: boolean;
 }
 
 export interface SetRenderQualityParams {
@@ -1816,6 +1826,8 @@ export interface CommandParamsMap {
   "set-view-mode": SetViewModeParams;
   "set-clustered": ToggleParams;
   "set-ibl": ToggleParams;
+  "set-sky-occlusion": ToggleParams;
+  "set-gdf": ToggleParams;
   "set-render-quality": SetRenderQualityParams;
   "get-render-quality": EmptyParams;
   "set-tonemap": SetTonemapParams;
@@ -1982,6 +1994,8 @@ export interface CommandResultMap {
   "set-view-mode": SetViewModeResult;
   "set-clustered": SetClusteredResult;
   "set-ibl": SetIblResult;
+  "set-sky-occlusion": SetSkyOcclusionResult;
+  "set-gdf": SetGdfResult;
   "set-render-quality": RenderQualityResult;
   "get-render-quality": RenderQualityResult;
   "set-tonemap": TonemapResult;
