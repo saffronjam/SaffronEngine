@@ -54,7 +54,7 @@ for r in &self.resources {
 
 The slot is an index, not a raw pointer, so the write-back carries the layout across frames safely.
 The renderer reserves one slot per long-lived target (the offscreen, the shadow maps, the TAA
-history, the DDGI proxy) and re-imports against it each frame: the slot both seeds the graph this
+history, the DDGI probe atlases, the GDF cascade clipmap) and re-imports against it each frame: the slot both seeds the graph this
 frame and receives the resolved layout for next frame.
 
 ```mermaid
@@ -102,7 +102,8 @@ scope either over-synchronizes or races the next frame's write against the previ
 | Offscreen color | yes | left shader-read-only by tonemap (read by the present blit) at end of frame, written at start of next |
 | Shadow / spot-shadow map | yes | written by the depth pass, sampled by the scene pass |
 | TAA history images | yes | one frame's write is next frame's read |
-| DDGI voxel proxy | yes | accumulated across frames |
+| DDGI irradiance / moment atlases | yes | one frame's blend is next frame's history + the trace's prev-bounce read |
+| GDF cascade clipmap | yes | toroidally accumulated across frames (only the scrolled-in slab recomposites) |
 | Depth, MSAA color, G-buffer | no | produced and consumed within one frame |
 | Swapchain image | no | fresh acquire each frame; starts undefined, ends in present layout |
 
