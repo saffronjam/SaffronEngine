@@ -11,6 +11,13 @@ render seam, a frame graph, a hecs scene, signal/slot events.
 
 ## Conventions (not optional)
 
+- **ALWAYS the modern, correct approach — cost is never the deciding factor.** When two
+  implementations differ in correctness or modernity, choose the modern, technically-right one
+  *regardless of how large the coding task is*. Never propose or pick a cheaper, simpler, or
+  partial alternative *because* it is less work, smaller, or faster to land — effort is not a
+  reason to compromise on the right design. Surface the correct option as the recommendation and
+  build it; mention a lesser fallback only if explicitly asked. (Scope/phasing may still be
+  discussed, but the destination is always the correct modern design.)
 - **NO LEGACY. NO COMPAT SHIMS. EVER.** This is a clean-slate codebase (`main` is an intentional orphan
   fresh start — there is nothing on disk, in the field, or downstream to be backward-compatible with).
   There is exactly **one** way to do each thing, and one code path for it. When a change would break an
@@ -90,9 +97,19 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
 - The toolbox provides Rust + Cargo (the channel is pinned in `rust-toolchain.toml`), the Vulkan 1.4
   SDK, SDL3, and Slang. `cargo run -p xtask -- shaders` is the shader pipeline; `cargo run -p xtask --
   gen-protocol` regenerates the editor-facing protocol artifacts from the `saffron-protocol` DTOs.
-- GPU is software (Mesa llvmpipe) by default. The `just run*` recipes add the host's NVIDIA Vulkan ICD
-  to the loader search (`VK_ADD_DRIVER_FILES`) when one is present, falling back to llvmpipe when it
-  isn't — software is fine for correctness/validation. `just run-software` forces llvmpipe.
+- **The real GPU is available inside the toolbox** — the host's NVIDIA card enumerates fine (e.g. a
+  discrete RTX). The toolbox reaches the host's Vulkan ICD through the `/run/host` mount; the driver is
+  **not** in the toolbox's own `/usr`. The `just run*` recipes add it via the `nvidia_icd` macro, which
+  resolves and exports:
+  `VK_ADD_DRIVER_FILES=/run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json`
+  (falling back to `/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json`, then to llvmpipe if neither
+  exists). **Do not hand-roll this path in an ad-hoc script** — it is *not* `/usr/share/…/nvidia_icd.json`
+  (wrong location *and* the filename carries the `.x86_64` suffix), and getting it wrong silently drops
+  you to llvmpipe, which reads as "no GPU here" when in fact the card is right there. Reuse
+  `just run-engine-headless` / `just run-engine`, or copy the `nvidia_icd` macro from the `justfile`
+  verbatim. Confirm with `vulkaninfo --summary` (it lists the NVIDIA device) or the host's
+  `vulkan ready — gpu 'NVIDIA …' (discrete)` log line. Mesa llvmpipe is the fallback and is fine for
+  correctness/validation (just slow); `just run-software` forces it.
 
 ### Headless runs & the verification gate
 
@@ -102,6 +119,11 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
   `export WAYLAND_DISPLAY=wl-x`. Use a unique `--socket` + `SAFFRON_CONTROL_SOCK` per run, and capture
   the exit code to a file *before* any `pkill` (the toolbox wrapper surfaces the pkill signal, not the
   real exit code). `just run-engine-headless [frames]` wraps this.
+- **Want the NVIDIA GPU in a headless/ad-hoc run?** It is available (see the GPU note above). Export
+  `VK_ADD_DRIVER_FILES=/run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json` before launching the
+  host, or just use the `just run-engine-headless` recipe which already does it. A bespoke script that
+  probes the toolbox-local `/usr/share/vulkan/icd.d/` (Mesa-only) or the un-suffixed `nvidia_icd.json`
+  will fall to llvmpipe — that is a harness bug, not an absent GPU.
 - The reproducible gate is `tools/ci/check.sh`: workspace build + shaders → present-only smoke →
   control-schema contract test → frontend bun build. `just check` wraps it once the toolbox/bun/display
   are set up (also `just engine|editor|schema|test|e2e`). There is intentionally no GitHub-hosted CI (a
