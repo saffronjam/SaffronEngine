@@ -51,7 +51,15 @@ pub(crate) fn record_batch_submeshes(
         }
         return;
     }
-    for (s, submesh) in batch.mesh.submeshes.iter().enumerate() {
+    // The batch draws its subset of the mesh's submeshes (blend mode split one mesh across
+    // batches). `s` is the original mesh-submesh index, so it keys both `mesh.submeshes[s]` and
+    // the submesh-major instance slice (`base_instance + s * instance_count`) — the same block
+    // the sibling batches share.
+    for &s in &batch.submeshes {
+        let s = s as usize;
+        let Some(submesh) = batch.mesh.submeshes.get(s) else {
+            continue;
+        };
         if let Some(modes) = cull_modes {
             let mode = modes.get(s).copied().unwrap_or(vk::CullModeFlags::BACK);
             // SAFETY: the ash seam. The scene PSO declares dynamic cull state.
@@ -155,13 +163,89 @@ pub fn record_scene_draw_list(
     }
     let binds = scene_draw_list_bind_count(true, rt_mesh_set, restir_mesh_set);
     let layout = list.batches[0].pipeline.layout();
-    let view_proj = bytemuck::bytes_of(&list.view_proj);
+    bind_mesh_descriptor_sets(
+        raw,
+        cmd,
+        layout,
+        list.view_proj,
+        bindless_set,
+        light_set,
+        instance_set,
+        ibl_set,
+        ssao_mesh_set,
+        ddgi_mesh_set,
+        rt_mesh_set,
+        restir_mesh_set,
+    );
+    record_batches(raw, cmd, &list.batches, deformed);
+    binds
+}
+
+/// Records the sorted translucent draws into the scene pass's trailing translucent scope:
+/// the same descriptor-set binds as [`record_scene_draw_list`], then each back-to-front
+/// batch replayed with its blend PSO (depth-test on, depth-write off) so nearer translucent
+/// surfaces composite over the ones behind them. Returns the bind count (0 when there are no
+/// translucent draws). Shares the scene pass's color + depth attachments — no separate pass.
+#[allow(clippy::too_many_arguments)]
+pub fn record_transparent_draw_list(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    list: &SceneDrawList,
+    bindless_set: vk::DescriptorSet,
+    light_set: vk::DescriptorSet,
+    instance_set: vk::DescriptorSet,
+    ibl_set: vk::DescriptorSet,
+    ssao_mesh_set: vk::DescriptorSet,
+    ddgi_mesh_set: vk::DescriptorSet,
+    rt_mesh_set: vk::DescriptorSet,
+    restir_mesh_set: vk::DescriptorSet,
+    deformed: Option<vk::Buffer>,
+) -> u32 {
+    if !list.valid || list.transparent_batches.is_empty() {
+        return 0;
+    }
+    let binds = scene_draw_list_bind_count(true, rt_mesh_set, restir_mesh_set);
+    let layout = list.transparent_batches[0].pipeline.layout();
+    bind_mesh_descriptor_sets(
+        raw,
+        cmd,
+        layout,
+        list.view_proj,
+        bindless_set,
+        light_set,
+        instance_set,
+        ibl_set,
+        ssao_mesh_set,
+        ddgi_mesh_set,
+        rt_mesh_set,
+        restir_mesh_set,
+    );
+    record_batches(raw, cmd, &list.transparent_batches, deformed);
+    binds
+}
+
+/// Binds the mesh descriptor sets (0, {1,2}, 3, 4, 5, and 6/7 when present) and pushes the
+/// viewProj constant — the constant prefix both the opaque and translucent scopes share. The
+/// set roster is documented on [`record_scene_draw_list`].
+#[allow(clippy::too_many_arguments)]
+fn bind_mesh_descriptor_sets(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    view_proj: saffron_geometry::glam::Mat4,
+    bindless_set: vk::DescriptorSet,
+    light_set: vk::DescriptorSet,
+    instance_set: vk::DescriptorSet,
+    ibl_set: vk::DescriptorSet,
+    ssao_mesh_set: vk::DescriptorSet,
+    ddgi_mesh_set: vk::DescriptorSet,
+    rt_mesh_set: vk::DescriptorSet,
+    restir_mesh_set: vk::DescriptorSet,
+) {
+    let view_proj = bytemuck::bytes_of(&view_proj);
     // SAFETY: the ash seam. The sets/layout belong to this frame; the push spans the
-    // declared vertex range; the draws below reference pinned meshes. Sets 1 + 2 bind in
-    // one call (consecutive sets), binding light + instance together.
-    // Set 3 = IBL (irradiance + prefiltered + BRDF LUT, bindings 0-2) plus the reflection
-    // probes (bindings 3-5); baked once, always valid (probes are gated in-shader by the
-    // probe count).
+    // declared vertex range. Sets 1 + 2 bind in one call (consecutive sets). Set 3 = IBL
+    // (irradiance + prefiltered + BRDF LUT + reflection probes), baked once, always valid.
     unsafe {
         raw.cmd_bind_descriptor_sets(
             cmd,
@@ -242,7 +326,17 @@ pub fn record_scene_draw_list(
         }
         raw.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::VERTEX, 0, view_proj);
     }
-    for batch in &list.batches {
+}
+
+/// Replays a batch list: bind each batch's PSO + vertex streams and record its per-submesh
+/// instanced draws, applying the per-submesh dynamic cull mode (two-sided → `NONE`, else `BACK`).
+fn record_batches(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    batches: &[DrawBatch],
+    deformed: Option<vk::Buffer>,
+) {
+    for batch in batches {
         // SAFETY: the ash seam. The PSO is pinned by the batch `Arc`.
         unsafe {
             raw.cmd_bind_pipeline(
@@ -252,11 +346,8 @@ pub fn record_scene_draw_list(
             );
         }
         bind_batch_vertices(raw, cmd, batch, deformed);
-        // Scene pass: apply the per-submesh backface-cull mode via dynamic state (two-sided
-        // materials → NONE, else BACK). Only this pass's PSO declares the dynamic cull state.
         record_batch_submeshes(raw, cmd, batch, Some(&batch.submesh_cull));
     }
-    binds
 }
 
 /// Records the vertex-only shadow depth pass: bind the shadow PSO (depth-biased) + the
@@ -350,6 +441,49 @@ pub fn record_depth_prepass(
         );
     }
     for batch in &list.batches {
+        bind_batch_vertices(raw, cmd, batch, deformed);
+        record_batch_submeshes(raw, cmd, batch, None);
+    }
+}
+
+/// Records the TAA reactive-coverage pass: the same instance-set (2) bind + viewProj push as
+/// [`record_depth_prepass`], then re-draws the **translucent** batches with the coverage PSO
+/// (constant-1.0 fragment into the r8 reactive mask, depth-tested read-only against the scene
+/// depth). Skinned batches draw from the frame's `deformed` buffer, exactly as the prepass. Does
+/// nothing when there are no translucent draws (the mask stays cleared to 0).
+pub fn record_reactive_coverage(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    list: &SceneDrawList,
+    coverage_pipeline: vk::Pipeline,
+    coverage_layout: vk::PipelineLayout,
+    instance_set: vk::DescriptorSet,
+    deformed: Option<vk::Buffer>,
+) {
+    if !list.valid || list.transparent_batches.is_empty() {
+        return;
+    }
+    let view_proj = bytemuck::bytes_of(&list.view_proj);
+    // SAFETY: the ash seam. The coverage PSO/layout/set are valid for this frame.
+    unsafe {
+        raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, coverage_pipeline);
+        raw.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            coverage_layout,
+            2,
+            &[instance_set],
+            &[],
+        );
+        raw.cmd_push_constants(
+            cmd,
+            coverage_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            view_proj,
+        );
+    }
+    for batch in &list.transparent_batches {
         bind_batch_vertices(raw, cmd, batch, deformed);
         record_batch_submeshes(raw, cmd, batch, None);
     }
