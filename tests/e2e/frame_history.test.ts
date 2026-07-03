@@ -5,7 +5,7 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
-import type { FrameHistoryDto, PerfConfigDto } from "@saffron/protocol";
+import type { FrameHistoryDto, PerfConfigDto, SetUpscaleResult } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
@@ -50,19 +50,24 @@ test("frame-history returns the requested recent raw samples", async () => {
   expect(summary.samples.length).toBe(0);
 });
 
-test("perf-config: targetFps drives the derived budget and round-trips", async () => {
+test("upscale: targetMs drives the derived budget and round-trips", async () => {
   const at60 = await engine.call<PerfConfigDto>("get-perf-config");
   expect(at60.targetFps).toBe(60);
   expect(at60.budgetMs).toBeCloseTo(1000 / 60, 2);
 
-  const at30 = await engine.call<PerfConfigDto>("set-perf-config", { targetFps: 30 });
-  expect(at30.targetFps).toBe(30);
-  expect(at30.budgetMs).toBeCloseTo(1000 / 30, 2);
+  // The frame budget is set through set-upscale's targetMs (the render-scale surface); the
+  // get-perf-config read stays as budget telemetry.
+  const at30 = await engine.call<SetUpscaleResult>("set-upscale", { targetMs: 1000 / 30 });
+  expect(at30.upscale.targetMs).toBeCloseTo(1000 / 30, 2);
 
   // The change is observable on the frame-history budget too (one shared source of truth).
   const h = await engine.call<FrameHistoryDto>("frame-history");
   expect(h.budgetMs).toBeCloseTo(1000 / 30, 2);
 
-  await engine.call("set-perf-config", { targetFps: 60 });
+  // And get-perf-config's read-only telemetry reflects it.
+  const cfg = await engine.call<PerfConfigDto>("get-perf-config");
+  expect(cfg.targetFps).toBeCloseTo(30, 1);
+
+  await engine.call("set-upscale", { targetMs: 1000 / 60 });
   expect(engine.validationErrors()).toEqual([]);
 });

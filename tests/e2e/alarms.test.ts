@@ -20,7 +20,8 @@ afterAll(async () => {
 
 test("a tight budget raises a frame-budget alarm; relaxing it resolves the same fingerprint", async () => {
   // Budget so tight that every real frame is over it → frame-budget fires after the debounce.
-  await engine.call("set-perf-config", { targetFps: 5000 });
+  // The frame budget is the set-upscale targetMs (= 1000 / targetFps); 5000 fps ⇒ 0.2ms.
+  await engine.call("set-upscale", { targetMs: 1000 / 5000 });
   await engine.settle(800);
 
   const fired = await engine.call<DrainAlarmsResult>("drain-alarms", { since: 0 });
@@ -42,7 +43,7 @@ test("a tight budget raises a frame-budget alarm; relaxing it resolves the same 
   expect(active.alarms.some((a) => a.metric === "frame-budget")).toBe(true);
 
   // Relax the budget so the smoothed frame time falls under the hysteresis exit → RESOLVED.
-  await engine.call("set-perf-config", { targetFps: 1 });
+  await engine.call("set-upscale", { targetMs: 1000 });
   await engine.settle(500);
 
   const cleared = await engine.call<DrainAlarmsResult>("drain-alarms", { since: fired.highWaterSeq });

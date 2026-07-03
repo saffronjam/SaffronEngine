@@ -21,7 +21,7 @@ afterAll(async () => {
 });
 
 // Plain on/off toggles whose state render-stats echoes back under `field`. The SSGI / GTAO /
-// contact-shadow effects are no longer per-effect toggles — they are driven by the render-quality
+// contact-shadow effects are not per-effect toggles — they are driven by the render-quality
 // tier (see the `set-render-quality` test below).
 const BOOLEAN_TOGGLES = [
   { cmd: "set-shadows", field: "shadows" },
