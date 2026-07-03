@@ -39,7 +39,7 @@ use crate::render_graph::{RenderGraph, RgAttachment, RgPass, RgResource, RgUsage
 use crate::resources::BindlessFreeList;
 use crate::scene_pass::{
     PointShadowTarget, record_depth_prepass, record_gbuffer, record_point_shadow,
-    record_scene_draw_list, record_shadow_depth,
+    record_scene_draw_list, record_shadow_depth, record_transparent_draw_list,
 };
 use crate::skinning::Skinning;
 use crate::ssao::Ssao;
@@ -154,6 +154,11 @@ pub const VIEW_COUNT: usize = 2;
 /// Field clipmap carries the far field; this bounds the near-field per-instance list. Overflow
 /// clamps + logs.
 pub const MAX_SDF_INSTANCES: u32 = 4096;
+
+/// Frames of frame-timing telemetry dropped after a project load, covering the cold-pipeline
+/// warm-up (PSO compiles, acceleration-structure builds, GI convergence) so the HUD's average
+/// reflects steady state, not the load-transition spike.
+const TELEMETRY_WARMUP_FRAMES: u32 = 12;
 
 impl ViewId {
     /// The dense slot index into the renderer's `views` array (`Scene = 0`).
@@ -300,6 +305,16 @@ struct FramePipelines {
     fxaa: Option<Arc<crate::Pipeline>>,
     /// The mandatory tonemap compute PSO (always resolved unless its build fails).
     tonemap: Option<Arc<crate::Pipeline>>,
+    /// The scene-resolve copy PSO (copy_color-shaped): normalized-UV upscale of the input-extent
+    /// scene scratch into the display-extent offscreen, used on the no-AA / MSAA paths (FXAA/TAA
+    /// resolve to the offscreen themselves). Resolved whenever neither FXAA nor TAA is active.
+    scene_resolve: Option<Arc<crate::Pipeline>>,
+    /// The depth-upscale graphics PSO: point-upscales the input-extent scene depth into the
+    /// display-extent overlay depth so the grid / gizmo occlude correctly under upsampling.
+    depth_upscale: Option<Arc<crate::Pipeline>>,
+    /// The TAA reactive-coverage graphics PSO: re-draws the translucent batches into the r8
+    /// reactive mask. Resolved only when TAA is active (the mask feeds the TAA resolve).
+    reactive_coverage: Option<Arc<crate::Pipeline>>,
     /// The ground-grid graphics PSO, resolved when the grid is shown this frame.
     grid: Option<Arc<crate::Pipeline>>,
     /// The on-top + depth-tested overlay graphics PSOs, resolved when overlay geometry
@@ -424,6 +439,14 @@ struct TaaHistorySlots {
     write: (usize, usize),
 }
 
+/// The TAA resolve's cross-frame ping-pong slots: the color history and the pixel-lock image both
+/// carry their layout across frames (read one parity, write the other), so each rides a pair of
+/// external-layout slots the caller reads back after execute.
+struct TaaResolveSlots {
+    history: TaaHistorySlots,
+    lock: TaaHistorySlots,
+}
+
 /// The renderer: device, swapchain, frame ring, and the clear color.
 ///
 /// Drop order is load-bearing — the frame ring and swapchain are destroyed (their
@@ -499,6 +522,10 @@ pub struct Renderer {
     perf_config: PerfConfig,
     /// The rolling frame-time history ring.
     frame_history: FrameHistory,
+    /// Frames of telemetry to drop after a project load: the cold-pipeline warm-up (PSO
+    /// compiles, acceleration-structure builds) is not steady state, so it is kept out of the
+    /// history / EMAs / alarms until the pipeline settles.
+    telemetry_warmup: u32,
     /// The perf-alarm engine: active set + seq-stamped event ring.
     alarms: AlarmState,
     /// The GPU profiler: per-pass timestamps + pipeline statistics.
@@ -561,6 +588,13 @@ pub struct Renderer {
     /// The anti-aliasing selection (MSAA / FXAA / TAA, mutually exclusive). The frame
     /// graph branches the scene output on this; the temporal targets live per-view.
     aa: crate::Aa,
+
+    /// The runtime TAA resolve tuning (feedback range, velocity rejection, clip gamma,
+    /// sharpen). Read into the resolve push each frame; live-tunable over the control plane.
+    taa_params: crate::TaaParams,
+    /// The active camera's `(near, far)` planes, mirrored from the last [`Renderer::set_cluster_camera`]
+    /// so the TAA resolve can linearize `motionDepth` for its disocclusion test.
+    camera_near_far: (f32, f32),
 
     /// The per-editor-pane render targets, indexed by [`ViewId::index`] (`Scene` = 0,
     /// `AssetPreview` = 1). Always [`VIEW_COUNT`] entries.
@@ -803,7 +837,7 @@ impl Renderer {
                 view.build_aa_targets(&device, &descriptors, aa)?;
                 view.restir.allocate_sets(&descriptors, &restir)?;
                 view.restir
-                    .build(&device, &descriptors, &restir, view.extent())?;
+                    .build(&device, &descriptors, &restir, view.scaled_render_extent())?;
                 views.push(view);
             }
             ssao.ready = true;
@@ -936,6 +970,7 @@ impl Renderer {
             vram_budget_bytes: 0,
             perf_config: PerfConfig::default(),
             frame_history: FrameHistory::default(),
+            telemetry_warmup: 0,
             alarms: AlarmState::default(),
             gpu_profiler,
             cpu_profiler: CpuProfiler::default(),
@@ -960,6 +995,8 @@ impl Renderer {
             directional_shadow_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             spot_shadow_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             aa,
+            taa_params: crate::TaaParams::default(),
+            camera_near_far: (0.1, 100.0),
             views,
             active_view: ViewId::Scene,
             shm_publish_enabled: [false; VIEW_COUNT],
@@ -1065,6 +1102,27 @@ impl Renderer {
     /// The active view's offscreen scene-color image handle + view + extent.
     pub fn active_view(&self) -> &ViewTarget {
         &self.views[self.active_view.index()]
+    }
+
+    /// This frame's active-view sub-pixel jitter offset (NDC) — the offset applied to the scene
+    /// view-projection while TAA is active, else zero. The scene driver reads it to jitter the
+    /// projection; a mode flip mid-frame can never leak a stale offset.
+    pub fn active_view_jitter(&self) -> saffron_geometry::glam::Vec2 {
+        if self.aa.taa() {
+            self.active_view().jitter
+        } else {
+            saffron_geometry::glam::Vec2::ZERO
+        }
+    }
+
+    /// The scene view-projection with the TAA sub-pixel jitter removed — the camera the motion
+    /// prepass, the stored previous matrix, and the post-resolve grid/overlays reproject
+    /// against. Jitter is applied as a clip-space `clip.xy += offset·clip.w` translation, so it
+    /// inverts exactly by the opposite translation using only the combined matrix.
+    fn scene_view_proj_unjittered(&self) -> Mat4 {
+        let j = self.active_view_jitter();
+        Mat4::from_translation(saffron_geometry::glam::Vec3::new(-j.x, -j.y, 0.0))
+            * self.scene_draw_list.view_proj
     }
 
     /// Which editor pane is currently rendered/presented.
@@ -1224,8 +1282,13 @@ impl Renderer {
         self.reactive.power_state
     }
 
-    /// Sets the editor viewport power state.
+    /// Sets the editor viewport power state. Leaving the focused state restarts the perf-alarm
+    /// settle window so the render burst on the eventual return (re-converging the temporal effects)
+    /// does not fire a false frame-time alarm — this covers the occluded case, which stops ticking.
     pub fn set_power_state(&mut self, state: PowerState) {
+        if state != PowerState::Focused {
+            self.alarms.reset_focus_settle();
+        }
         self.reactive.power_state = state;
     }
 
@@ -1271,8 +1334,8 @@ impl Renderer {
     /// (the analytic specular it occludes) is on, the toggle is set, and the Global Distance Field
     /// composited (the cascade clipmap the cone-march taps is ready). The lighting UBO enable bit
     /// ([`Lighting::set_frame_sdf_occlusion`]) gates on this single predicate, so the fragment
-    /// marches the GDF only when its clipmap is valid. There is no longer a screen-space prepass —
-    /// indirect diffuse occlusion is DDGI ray-miss + contact GTAO.
+    /// marches the GDF only when its clipmap is valid. Indirect diffuse occlusion is DDGI
+    /// ray-miss + contact GTAO.
     fn want_sky_occlusion(&self) -> bool {
         let ibl_enabled = self.ibl.use_ibl && self.ibl.ready;
         ibl_enabled && self.sky_occlusion_enabled() && self.global_sdf.enabled()
@@ -1426,6 +1489,8 @@ impl Renderer {
     /// exists. Call after [`Renderer::set_scene_lighting`].
     pub fn set_cluster_camera(&mut self, camera: ClusterCamera) {
         let frame = self.frames.index();
+        // Mirror the camera planes for the TAA resolve's depth linearization (disocclusion test).
+        self.camera_near_far = (camera.near, camera.far);
         self.lighting.set_cluster_camera(frame, camera);
     }
 
@@ -1623,31 +1688,50 @@ impl Renderer {
         self.set_render_scale(view, scale)
     }
 
-    /// (Re)sizes view `i`'s render targets to its `scaled_render_extent` (desired × render
-    /// scale), rebuilding the screen-space + AA + ReSTIR targets. A no-op when the offscreen
-    /// is already at that extent.
+    /// Reconciles view `i`'s two extent classes independently: the INPUT class
+    /// (`scaled_render_extent` = desired × render scale — the scene / depth / motion / G-buffer /
+    /// ReSTIR chain) and the DISPLAY class (`published_extent` = desired — the offscreen resolve
+    /// output + TAA history + overlay depth). A desired-size change moves both; a render-scale
+    /// change moves only the input class. Either rebuild resets the temporal reprojection. A
+    /// no-op when neither class changed.
     fn apply_render_extent(&mut self, i: usize) -> Result<()> {
-        let target = self.views[i].scaled_render_extent();
-        let extent = self.views[i].extent();
-        if extent.width == target.width && extent.height == target.height {
+        let input = self.views[i].scaled_render_extent();
+        let display = self.views[i].published_extent();
+        // The last-built sizes are recoverable directly: `scratch` is the input class, `offscreen`
+        // the display class (`scratch` is unconditionally allocated by `build_aa_targets`).
+        let cur_input = self.views[i].scratch.as_ref().map(|s| s.extent);
+        let cur_display = self.views[i].offscreen.extent;
+        let input_changed = cur_input != Some(input);
+        let display_changed = cur_display != display;
+        if !input_changed && !display_changed {
             return Ok(());
         }
+        // A render-scale-only change (input moved, display fixed — dynamic resolution) must NOT
+        // flush the display-extent TAA history: the resolve resamples the newly-sized input into
+        // the fixed display grid every frame, so the accumulator rides through. Flushing it would
+        // flicker at every budget step. A display resize (or first build) rebuilds everything.
+        let scale_only = input_changed && !display_changed;
         self.device.wait_idle()?;
-        self.views[i].resize(&self.device, target.width, target.height)?;
-        // The screen-space images are render-extent-sized; rebuild them + rewrite the per-view
-        // sets, which also resets the SSGI history validity (the reprojection is stale).
+        self.views[i].resize(&self.device, input, display)?;
+        // `build_screen_space` sizes the input-extent chain from `scaled_render_extent`;
+        // `build_aa_targets` sizes the display history + input motion/scratch/reactive/MSAA + the
+        // overlay depth. On a scale-only change the preserving variant keeps the display history.
         self.views[i].build_screen_space(&self.device, &self.descriptors, &self.ssao)?;
-        // The AA targets (motion / history / scratch / MSAA) follow the offscreen extent;
-        // rebuild them too, which invalidates the temporal reprojection.
-        self.views[i].build_aa_targets(&self.device, &self.descriptors, self.aa)?;
-        // The ReSTIR reservoirs + radiance are render-extent-sized; rebuild them at the new
-        // extent (arming a temporal reset — the reservoir history is stale). A no-op on a
-        // software device.
-        let extent = self.views[i].extent();
+        if scale_only {
+            self.views[i].build_aa_targets_preserving_temporal(
+                &self.device,
+                &self.descriptors,
+                self.aa,
+            )?;
+        } else {
+            self.views[i].build_aa_targets(&self.device, &self.descriptors, self.aa)?;
+        }
+        // The ReSTIR reservoirs + radiance are INPUT-extent; rebuild them at the input extent
+        // (arming a temporal reset — the reservoir history is stale). A no-op on a software device.
         self.views[i].restir.reset_history();
         self.views[i]
             .restir
-            .build(&self.device, &self.descriptors, &self.restir, extent)
+            .build(&self.device, &self.descriptors, &self.restir, input)
     }
 
     /// A view's last-requested render width in device pixels (`0` until the view has been
@@ -1756,8 +1840,8 @@ impl Renderer {
         if render_extent.width == 0 || render_extent.height == 0 {
             return Ok(());
         }
-        // The shm capture is at the published (native) size; the blit upscales the
-        // possibly-smaller offscreen into it when dynamic resolution is active.
+        // The offscreen is now the DISPLAY extent (the resolve reconstructs to it), so the blit
+        // is 1:1 — it survives only to convert RGBA16F → BGRA8, at matching extent.
         self.views[active].ensure_shm_capture(&self.device, slot, publish_extent)?;
 
         let raw = self.device.raw();
@@ -1871,9 +1955,9 @@ impl Renderer {
                 dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[blit],
-                // LINEAR so a dynamic-resolution upscale (render_extent < publish_extent) is
-                // smooth; identical to NEAREST when the extents match (native render).
-                vk::Filter::LINEAR,
+                // 1:1 — the offscreen is already the display extent (the resolve reconstructs to
+                // it), so this blit only converts RGBA16F → BGRA8 at matching extent, no scaling.
+                vk::Filter::NEAREST,
             );
             // BGRA8 → TRANSFER_SRC for the buffer copy.
             capture_barrier(
@@ -2450,6 +2534,17 @@ impl Renderer {
         Ok(())
     }
 
+    /// The current TAA resolve tuning (read by the control `get-taa-params`).
+    pub fn taa_params(&self) -> crate::TaaParams {
+        self.taa_params
+    }
+
+    /// Sets the TAA resolve tuning. Takes effect next frame (the push is rebuilt each frame
+    /// from this state); no GPU idle / PSO rebuild — it is push-constant data, not baked state.
+    pub fn set_taa_params(&mut self, params: crate::TaaParams) {
+        self.taa_params = params;
+    }
+
     /// Selects the AA mode by name (`"off"` / `"fxaa"` / `"taa"` / `"msaa2"` / `"msaa4"` /
     /// `"msaa8"`) — the control-plane / CLI entry.
     ///
@@ -2523,14 +2618,19 @@ impl Renderer {
         self.software_gpu
     }
 
-    /// The active view's offscreen render width in device pixels.
+    /// The active view's INPUT (scene render) width in device pixels — the `SceneRenderer` seam
+    /// drives `render_scene` at this extent (the scene rasterises at input res under upsampling).
     pub fn viewport_width(&self) -> u32 {
-        self.views[self.active_view.index()].extent().width
+        self.views[self.active_view.index()]
+            .scaled_render_extent()
+            .width
     }
 
-    /// The active view's offscreen render height in device pixels.
+    /// The active view's INPUT (scene render) height in device pixels.
     pub fn viewport_height(&self) -> u32 {
-        self.views[self.active_view.index()].extent().height
+        self.views[self.active_view.index()]
+            .scaled_render_extent()
+            .height
     }
 
     /// The number of cached PSOs.
@@ -2627,11 +2727,29 @@ impl Renderer {
     /// wait; `dt_sec` is the wall-clock delta since the prior frame (drives the alarm EMA's
     /// irregular-interval alpha). The wall-clock-delta EMA ([`Renderer::observe_frame_delta`])
     /// is split out and called at the loop's frame top, ahead of this tail.
-    pub fn finalize_frame_telemetry(&mut self, busy_ms: f32, wait_ms: f32, dt_sec: f32) {
-        self.observe_cpu_frame(busy_ms, wait_ms);
+    /// Drops the frame-timing distribution + smoothed headlines and holds telemetry off for a short
+    /// warm-up. Called when a project load completes: the prior frames (a different or empty scene)
+    /// and the cold-pipeline frames right after the swap are not steady state, so grading over them
+    /// paints the HUD red the moment a project opens.
+    pub fn reset_frame_telemetry(&mut self) {
+        self.frame_history.reset();
+        self.frame_ms = 0.0;
+        self.cpu_frame_ms = 0.0;
+        self.cpu_wait_ms = 0.0;
+        self.telemetry_warmup = TELEMETRY_WARMUP_FRAMES;
+    }
 
+    pub fn finalize_frame_telemetry(&mut self, busy_ms: f32, wait_ms: f32, dt_sec: f32) {
         let now_ns = cpu_now_ns();
         self.last_frame_ns = now_ns;
+        // Warm-up frames after a project load (PSO compiles, acceleration-structure builds) are not
+        // representative, so keep them out of the smoothed headline, the history distribution, and
+        // the alarm detectors — the average resumes on the first settled frame.
+        if self.telemetry_warmup > 0 {
+            self.telemetry_warmup -= 1;
+            return;
+        }
+        self.observe_cpu_frame(busy_ms, wait_ms);
 
         // Record the raw frame into the history ring (always on; the distribution stays honest
         // only if it sees every frame, un-smoothed), then run the alarm detectors on it (after
@@ -2651,6 +2769,7 @@ impl Renderer {
             vram_usage_bytes: self.vram_usage_bytes,
             vram_budget_bytes: self.vram_budget_bytes,
             pipelines_created: self.stats.pipelines_created,
+            focused: self.reactive.power_state == PowerState::Focused,
         };
         self.alarms
             .tick(&self.frame_history, &self.perf_config, &inputs);
@@ -3328,6 +3447,22 @@ impl Renderer {
         } else {
             None
         };
+        // The scene-resolve copy (input scratch -> display offscreen, normalized-UV upscale) runs
+        // on the no-AA / MSAA paths; FXAA / TAA resolve to the offscreen themselves. Memoized, so
+        // requesting it unconditionally is cheap.
+        let scene_resolve = self.pipelines.request_copy_color(compute2);
+        // The depth-upscale graphics pass fills the display-extent overlay depth from the
+        // input-extent scene depth so the grid / gizmo occlude correctly under upsampling.
+        let depth_upscale = self
+            .pipelines
+            .request_depth_upscale(self.descriptors.depth_upscale_layout());
+        // The reactive-coverage pass (marks translucent geometry into the r8 reactive mask) arms
+        // only under TAA — the mask is a TAA-resolve input. Memoized, so the request is cheap.
+        let reactive_coverage = if self.aa.taa() {
+            self.pipelines.request_reactive_coverage()
+        } else {
+            None
+        };
 
         // The final post chain: the tonemap is mandatory (resolved every frame); the grid
         // arms only when shown; the overlay PSOs arm only when geometry is queued. The
@@ -3405,6 +3540,9 @@ impl Renderer {
             taa,
             fxaa,
             tonemap,
+            scene_resolve,
+            depth_upscale,
+            reactive_coverage,
             grid,
             overlay,
             overlay_depth,
@@ -3530,7 +3668,9 @@ impl Renderer {
             None
         };
         let view = &self.views[self.active_view.index()];
-        let extent = view.extent();
+        // The scene / sky / depth-prepass rasterise at INPUT extent (into the input scratch +
+        // input depth); the resolve reconstructs them up to the display-extent offscreen.
+        let extent = view.scaled_render_extent();
         let color_image = view.offscreen.handle();
         let color_view = view.offscreen.view();
         let depth_image = view.depth.handle();
@@ -3887,9 +4027,11 @@ impl Renderer {
             )
         };
 
-        // FXAA + TAA both render the scene's 1× result into the scratch image; a compute
-        // pass then resolves scratch → offscreen.
-        let scene_output = if fxaa || taa {
+        // The scene always renders its result into the INPUT-extent scratch; the resolve stage
+        // (FXAA / TAA, or the no-AA / MSAA copy below) reconstructs scratch → the display-extent
+        // offscreen. `scratch` is unconditionally allocated by `build_aa_targets`, so there is one
+        // scene→resolve→offscreen path with no `scale == 1` fork.
+        let scene_output = {
             let view = &self.views[self.active_view.index()];
             let scratch = view.scratch.as_ref().expect("scratch built");
             graph.import_image(
@@ -3899,8 +4041,6 @@ impl Renderer {
                 vk::ImageLayout::UNDEFINED,
                 None,
             )
-        } else {
-            color
         };
         // The scene pass attaches the multisampled color (resolving into scene_output) when
         // MSAA is on, else scene_output directly.
@@ -3937,13 +4077,16 @@ impl Renderer {
         // 1× motion target. Runs before the screen-space SSGI accumulation (it reprojects
         // through motion) and before the scene so the TAA resolve (after the scene) reads
         // it; the graph derives ColorWrite → SampledReadCompute. Runs when `taa || do_ssgi`.
-        let motion_resource = self.add_motion_pass(
+        let (motion_resource, motion_depth_resource) = match self.add_motion_pass(
             &mut graph,
             &pipelines,
             instance_set,
             (deformed_res, deformed_handle),
             (prev_deformed_res, prev_deformed_handle),
-        );
+        ) {
+            Some((motion, depth)) => (Some(motion), Some(depth)),
+            None => (None, None),
+        };
 
         // Global SDF: the cull + composite passes that bin the per-mesh MDF bricks into the
         // camera-centered cascade clipmap the DDGI trace taps as one trilinear read beyond the near
@@ -4216,6 +4359,25 @@ impl Renderer {
                         body(cmd);
                     }
                 });
+                // Translucent geometry composites last, over the resolved opaque scene +
+                // submissions, sorted back-to-front with depth-write off (same color + depth
+                // attachments — no separate pass). Empty (a no-op) when nothing is translucent.
+                scopes.scope("scene-translucent", |cmd| {
+                    record_transparent_draw_list(
+                        &raw_for_body,
+                        cmd,
+                        &list,
+                        bindless_set,
+                        light_set,
+                        instance_set,
+                        ibl_set,
+                        ssao_mesh_set,
+                        ddgi_mesh_set,
+                        rt_mesh_set,
+                        restir_mesh_set,
+                        deformed_handle,
+                    );
+                });
             });
         // The scene fragment samples the AO / contact / SSGI maps via set 4; declare the
         // reads so the graph transitions each from GENERAL (compute write) → ShaderReadOnly
@@ -4271,8 +4433,30 @@ impl Renderer {
         // (scratch) into the offscreen + the next-frame history. Mutually exclusive (only
         // one of the PSOs is resolved). Both run after the scene pass.
         self.add_fxaa_pass(&mut graph, &pipelines, scene_output, color);
-        let taa_slots =
-            self.add_taa_pass(&mut graph, &pipelines, scene_output, color, motion_resource);
+        // The reactive-coverage pass (TAA only) marks translucent geometry into the input-extent
+        // reactive mask, depth-tested against the scene depth; the TAA resolve then biases those
+        // pixels toward the current frame.
+        let reactive_resource = self.add_reactive_coverage_pass(
+            &mut graph,
+            &pipelines,
+            scene_depth,
+            instance_set,
+            deformed_handle,
+        );
+        let taa_slots = self.add_taa_pass(
+            &mut graph,
+            &pipelines,
+            scene_output,
+            color,
+            motion_resource,
+            motion_depth_resource,
+            reactive_resource,
+        );
+        // No-AA / MSAA: neither resolve above wrote the offscreen, so upscale the input scene
+        // scratch into the display offscreen (one path — at 1:1 it degenerates to a straight copy).
+        if !fxaa && !taa {
+            self.add_scene_resolve_pass(&mut graph, &pipelines, scene_output, color);
+        }
 
         // SSGI history capture: copy the scene's resolved linear-HDR color into prevColor
         // (before any later tonemap turns it display-referred) so next frame's SSGI can
@@ -4316,12 +4500,18 @@ impl Renderer {
             graph.add_pass(restore);
         }
 
-        // The final post chain on the 1× resolved offscreen color: the mandatory HDR →
-        // display tonemap (in-place compute), then the optional ground grid + editor
+        // The final post chain on the DISPLAY-extent resolved offscreen color: the mandatory
+        // HDR → display tonemap (in-place compute), then the optional ground grid + editor
         // overlay (graphics, over the display-referred color, depth-tested against the
-        // persisted 1× scene depth). By here `color` is always the 1× offscreen — present
-        // / shm publish consume it identically in editor and present-only mode.
+        // display-extent overlay depth). By here `color` is always the display offscreen —
+        // present / shm publish consume it identically in editor and present-only mode.
         self.add_tonemap_pass(&mut graph, &pipelines, color);
+        // The overlays draw at display extent, so they depth-test the display-extent overlay
+        // depth — a point-upscale of the input scene depth. When the upscale PSO / target is
+        // unavailable, fall back to the input depth (valid at render scale 1, where they match).
+        let overlay_depth = self
+            .add_depth_upscale_pass(&mut graph, &pipelines, depth)
+            .unwrap_or(depth);
         // View-mode overlays on the post-tonemap color: the motion-vector visualization
         // overwrites it; the Lit Wireframe overlay draws edges over it. Both no-op unless
         // their mode is active (the PSO is `None` otherwise).
@@ -4330,12 +4520,12 @@ impl Renderer {
             &mut graph,
             &pipelines,
             color,
-            depth,
+            overlay_depth,
             instance_set,
             deformed_res,
             deformed_handle,
         );
-        self.add_grid_overlay_passes(&mut graph, &pipelines, color, depth);
+        self.add_grid_overlay_passes(&mut graph, &pipelines, color, overlay_depth);
 
         // Arm the per-frame GPU timestamp recorder (a cheap no-op when the profiler is `Off`):
         // each pass body is then bracketed by a timestamp scope, written into this slot's pool
@@ -4447,11 +4637,16 @@ impl Renderer {
         let temporal_ran = taa_slots.is_some()
             || screen.ssgi_history_slots.is_some()
             || screen.dfao_history_slots.is_some();
-        let frame_view_proj = self.scene_draw_list.view_proj;
+        // Store the UN-jittered matrix as this view's previous frame (the motion prepass needs a
+        // jitter-free previous camera).
+        let frame_view_proj = self.scene_view_proj_unjittered();
+        let taa_active = self.aa.taa();
         let view = &mut self.views[self.active_view.index()];
         if let Some(slots) = &taa_slots {
-            writeback_history_layout(view, &graph, &slots.read);
-            writeback_history_layout(view, &graph, &slots.write);
+            writeback_history_layout(view, &graph, &slots.history.read);
+            writeback_history_layout(view, &graph, &slots.history.write);
+            writeback_lock_layout(view, &graph, &slots.lock.read);
+            writeback_lock_layout(view, &graph, &slots.lock.write);
         }
         if let Some(slots) = &screen.ssgi_history_slots {
             writeback_ssgi_history_layout(view, &graph, &slots.read);
@@ -4486,6 +4681,11 @@ impl Renderer {
         // frame's motion reprojection (per-view: a re-activated view reprojects against its
         // own last frame).
         view.store_prev_view_proj(frame_view_proj);
+        // Advance the Halton jitter cycle for next frame — only while TAA is active, so an
+        // off/FXAA/MSAA frame renders un-jittered (`jitter` stays zero, the single gate).
+        if taa_active {
+            view.advance_jitter();
+        }
     }
 
     /// Builds the four DDGI compute passes into `graph` when the chain runs this frame (DDGI on +
@@ -4938,7 +5138,7 @@ impl Renderer {
         let inv_projection = self.ssao.inv_projection();
         let eye = inv_view.col(3).truncate();
         let light_count = self.lighting.frame_light_count();
-        let extent = self.views[self.active_view.index()].extent();
+        let extent = self.views[self.active_view.index()].scaled_render_extent();
         let frame_index = self.views[self.active_view.index()].restir.frame_index();
         let history_valid = !self.views[self.active_view.index()].restir.history_reset();
 
@@ -5098,7 +5298,7 @@ impl Renderer {
             return result;
         };
         let view = &self.views[self.active_view.index()];
-        let extent = view.extent();
+        let extent = view.scaled_render_extent();
         // SSGI + GTAO trace into half-resolution targets (matching `build_screen_space`), so their
         // dispatch covers the half extent; the bilateral blur/upsample passes stay full-res.
         let half_extent = vk::Extent2D {
@@ -5786,7 +5986,7 @@ impl Renderer {
         instance_set: vk::DescriptorSet,
         deformed: (Option<RgResource>, Option<vk::Buffer>),
         prev_deformed: (Option<RgResource>, Option<vk::Buffer>),
-    ) -> Option<RgResource> {
+    ) -> Option<(RgResource, RgResource)> {
         let motion_pipeline = pipelines.motion.as_ref()?;
         let (deformed_res, deformed_handle) = deformed;
         let (prev_deformed_res, prev_deformed_handle) = prev_deformed;
@@ -5795,7 +5995,8 @@ impl Renderer {
             (Some(motion), Some(depth)) => (motion, depth),
             _ => return None,
         };
-        let extent = view.extent();
+        // The motion prepass rasterises at INPUT extent (with the scene).
+        let extent = view.scaled_render_extent();
         let motion = graph.import_image(
             motion_image.handle(),
             motion_image.view(),
@@ -5810,13 +6011,16 @@ impl Renderer {
             vk::ImageLayout::UNDEFINED,
             None,
         );
+        // The motion prepass reprojects with the UN-jittered matrices so static geometry keeps
+        // exact zero velocity — the sub-pixel scene jitter must not leak into the velocity buffer.
+        let cur_view_proj = self.scene_view_proj_unjittered();
         let push = crate::MotionPush {
-            cur_view_proj: self.scene_draw_list.view_proj,
+            cur_view_proj,
             prev_view_proj: if view.prev_view_proj_valid {
                 view.prev_view_proj
             } else {
                 // The first frame (no history) reprojects against itself → zero motion.
-                self.scene_draw_list.view_proj
+                cur_view_proj
             },
         };
         let list = self.scene_draw_list.shallow_clone();
@@ -5851,7 +6055,9 @@ impl Renderer {
             pass = pass.access(prev_deformed, RgUsage::VertexInputRead);
         }
         graph.add_pass(pass);
-        Some(motion)
+        // Return the motion colour + the motion-prepass depth (the TAA resolve reads the depth
+        // for closest-depth velocity dilation).
+        Some((motion, motion_depth))
     }
 
     /// Appends the FXAA edge-blur compute pass when its PSO resolved this frame: sample the
@@ -5868,7 +6074,9 @@ impl Renderer {
             return;
         };
         let view = &self.views[self.active_view.index()];
-        let extent = view.extent();
+        // Dispatched over the DISPLAY grid: FXAA reads the input scratch by normalized UV (a
+        // bilinear upscale of the edge-blurred input) and writes the display-extent offscreen.
+        let extent = view.published_extent();
         let groups = |n: u32| n.div_ceil(8);
         self.add_compute_pass(
             graph,
@@ -5885,12 +6093,166 @@ impl Renderer {
         );
     }
 
+    /// Appends the no-AA / MSAA scene-resolve copy: a normalized-UV upscale of the input-extent
+    /// scene scratch (`scene_output`) into the display-extent offscreen (`color`), dispatched over
+    /// the display grid (so a display invocation samples the input scratch bilinearly). FXAA / TAA
+    /// resolve to the offscreen themselves, so the caller runs this only when neither is active.
+    fn add_scene_resolve_pass(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        scene_output: RgResource,
+        color: RgResource,
+    ) {
+        let Some(resolve) = &pipelines.scene_resolve else {
+            return;
+        };
+        let view = &self.views[self.active_view.index()];
+        let extent = view.published_extent();
+        let groups = |n: u32| n.div_ceil(8);
+        self.add_compute_pass(
+            graph,
+            "scene-resolve",
+            resolve,
+            view.scene_resolve_set,
+            &[
+                (scene_output, RgUsage::SampledReadCompute),
+                (color, RgUsage::StorageImageRwCompute),
+            ],
+            None,
+            groups(extent.width),
+            groups(extent.height),
+        );
+    }
+
+    /// Appends the depth-upscale graphics pass: point-upscales the input-extent scene `depth`
+    /// into the view's display-extent `depth_display` (depth-write-always over a fullscreen
+    /// triangle) so the display-extent overlays occlude correctly under upsampling. Returns the
+    /// `depth_display` resource, or `None` when the PSO / target is unavailable.
+    fn add_depth_upscale_pass(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        depth: RgResource,
+    ) -> Option<RgResource> {
+        let pipeline = pipelines.depth_upscale.as_ref()?;
+        let view = &self.views[self.active_view.index()];
+        let depth_display = view.depth_display.as_ref()?;
+        let input = view.scaled_render_extent();
+        let display = view.published_extent();
+        let dd = graph.import_image(
+            depth_display.handle(),
+            depth_display.view(),
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::UNDEFINED,
+            None,
+        );
+        let raw_body = self.device.raw().clone();
+        let pipeline = Arc::clone(pipeline);
+        let handle = pipeline.handle();
+        let layout = pipeline.layout();
+        let set = view.depth_upscale_set;
+        let mut push = Vec::with_capacity(8);
+        push.extend_from_slice(&(input.width as f32).to_ne_bytes());
+        push.extend_from_slice(&(input.height as f32).to_ne_bytes());
+        // The pass samples the input scene depth (declared read → the graph transitions it
+        // DepthWrite → ShaderReadOnly after the scene) and depth-writes `depth_display`.
+        let pass = RgPass::graphics("depth-upscale", display)
+            .depth_attachment(depth_clear_store(dd))
+            .access(depth, RgUsage::SampledRead)
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. Fullscreen triangle: bind the input-depth sampler set +
+                // the inputSize push, then draw 3 vertices (no vertex buffer).
+                unsafe {
+                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, handle);
+                    raw_body.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        &push,
+                    );
+                    raw_body.cmd_draw(cmd, 3, 1, 0, 0);
+                }
+                drop(pipeline);
+            });
+        graph.add_pass(pass);
+        Some(dd)
+    }
+
     /// Appends the TAA resolve compute pass when its PSO + motion resolved this frame:
     /// reproject the previous history through the motion vector, neighborhood-clamp, and
     /// blend with the current scene (`scene_output` = scratch) into the offscreen (`color`)
     /// plus the next-frame history. Parity `p` reads history `1 - p` and writes history `p`,
     /// bound in the per-view TAA set. Returns the history images' external-layout slots when
     /// the pass ran.
+    /// Appends the TAA reactive-coverage pass: color-clears the view's input-extent r8 reactive
+    /// mask, then re-draws the translucent batches into it (constant-1.0 fragment, depth-tested
+    /// read-only against `scene_depth`) so the resolve can bias alpha-blended pixels toward the
+    /// current frame. Runs only under TAA. Returns the reactive-mask resource, or `None` when the
+    /// PSO / target is unavailable (the resolve then falls back to a fully-cleared mask).
+    fn add_reactive_coverage_pass(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        scene_depth: RgResource,
+        instance_set: vk::DescriptorSet,
+        deformed_handle: Option<vk::Buffer>,
+    ) -> Option<RgResource> {
+        let pipeline = pipelines.reactive_coverage.as_ref()?;
+        let view = &self.views[self.active_view.index()];
+        let reactive = view.reactive.as_ref()?;
+        let input = view.scaled_render_extent();
+        // Cleared every frame (LOAD_OP_CLEAR), so the prior content is discarded — import at
+        // UNDEFINED and let the clear own it (no cross-frame layout slot needed).
+        let reactive_res = graph.import_image(
+            reactive.handle(),
+            reactive.view(),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+            None,
+        );
+        let list = self.scene_draw_list.shallow_clone();
+        let raw_body = self.device.raw().clone();
+        let pipeline = Arc::clone(pipeline);
+        let handle = pipeline.handle();
+        let layout = pipeline.layout();
+        let mut color_att = RgAttachment::clear_store(reactive_res);
+        color_att.clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 0.0],
+            },
+        };
+        // Read-only depth test against the resolved scene depth (declared by the attachment), so
+        // occluded translucent fragments don't mark coverage.
+        let pass = RgPass::graphics("reactive-coverage", input)
+            .color(color_att)
+            .depth_attachment(depth_load_readonly(scene_depth))
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                crate::scene_pass::record_reactive_coverage(
+                    &raw_body,
+                    cmd,
+                    &list,
+                    handle,
+                    layout,
+                    instance_set,
+                    deformed_handle,
+                );
+                drop(pipeline);
+            });
+        graph.add_pass(pass);
+        Some(reactive_res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn add_taa_pass(
         &self,
         graph: &mut RenderGraph,
@@ -5898,11 +6260,17 @@ impl Renderer {
         scene_output: RgResource,
         color: RgResource,
         motion: Option<RgResource>,
-    ) -> Option<TaaHistorySlots> {
+        motion_depth: Option<RgResource>,
+        reactive: Option<RgResource>,
+    ) -> Option<TaaResolveSlots> {
         let taa = pipelines.taa.as_ref()?;
         let motion = motion?;
+        // The motion prepass produces the colour + depth together; the resolve needs both.
+        let motion_depth = motion_depth?;
         let view = &self.views[self.active_view.index()];
-        let extent = view.extent();
+        // The resolve dispatches over the DISPLAY grid (one invocation per display pixel); it
+        // samples the input-extent scene / motion by normalized UV and reconstructs upward.
+        let extent = view.published_extent();
         let p = view.history_index;
         let (history_read, history_write) = match (&view.history[1 - p], &view.history[p]) {
             (Some(read), Some(write)) => (read, write),
@@ -5927,34 +6295,107 @@ impl Renderer {
             history_write.layout,
             Some(write_slot),
         );
+        // The pixel-lock ping-pong (same parity as history): read the opposite parity at the
+        // reprojected UV, write this parity. Each carries its layout across frames like history.
+        let (lock_read, lock_write) = match (&view.lock[1 - p], &view.lock[p]) {
+            (Some(read), Some(write)) => (read, write),
+            _ => return None,
+        };
+        let lock_read_slot = graph.alloc_external_layout(lock_read.layout);
+        let lock_write_slot = graph.alloc_external_layout(lock_write.layout);
+        let lock_read_res = graph.import_image(
+            lock_read.handle(),
+            lock_read.view(),
+            vk::ImageAspectFlags::COLOR,
+            lock_read.layout,
+            Some(lock_read_slot),
+        );
+        let lock_write_res = graph.import_image(
+            lock_write.handle(),
+            lock_write.view(),
+            vk::ImageAspectFlags::COLOR,
+            lock_write.layout,
+            Some(lock_write_slot),
+        );
+        let params = self.taa_params;
+        // `screen_size` is the INPUT/render extent (velocity → pixels, and the source grid the
+        // resolve samples); it diverges from the display dispatch/output extent under upsampling.
+        let input = view.scaled_render_extent();
+        // The upscale ratio `n = displayW / inputW` and the per-output accumulation target
+        // (`8·n²`, the jitter cycle length, floored at the native warm-up) the confidence
+        // saturates against — freshly-covered display pixels lean on the reconstructed current
+        // sample and converge over the cycle.
+        let n = extent.width.max(1) as f32 / input.width.max(1) as f32;
+        let sample_target =
+            (crate::TAA_JITTER_PHASES as f32 * n * n).max(crate::TAA_JITTER_PHASES as f32);
         let push = crate::TaaPush {
-            params: saffron_geometry::glam::Vec4::new(
-                crate::TAA_HISTORY_WEIGHT,
+            feedback: saffron_geometry::glam::Vec2::new(params.feedback_min, params.feedback_max),
+            jitter: view.jitter,
+            prev_jitter: view.prev_jitter,
+            screen_size: saffron_geometry::glam::Vec2::new(input.width as f32, input.height as f32),
+            gamma_valid: saffron_geometry::glam::Vec2::new(
+                params.clip_gamma,
                 if view.history_valid { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
+            ),
+            reject_sharp: saffron_geometry::glam::Vec2::new(
+                params.velocity_rejection,
+                params.sharpness,
+            ),
+            upscale: saffron_geometry::glam::Vec2::new(n, sample_target),
+            // Reconstruction robustness (Phase 3): the lock initial lifetime + reactive scale, the
+            // disocclusion + lock-break thresholds, and the camera planes for depth linearization.
+            // `current` + `history` are both raw linear-HDR at one scale — any future pre-exposure
+            // must scale both (and the value written to outHistory), never one, or accumulation drifts.
+            lock_reactive: saffron_geometry::glam::Vec2::new(
+                params.lock_lifetime,
+                params.reactive_scale,
+            ),
+            disoccl: saffron_geometry::glam::Vec2::new(
+                params.disocclusion_threshold,
+                params.lock_break_luma,
+            ),
+            depth_params: saffron_geometry::glam::Vec2::new(
+                self.camera_near_far.0,
+                self.camera_near_far.1,
             ),
         };
+        // The reactive mask feeds slot 6. When the coverage pass didn't run (PSO build failed),
+        // `reactive` is None and the slot keeps its placeholder binding (never a real declared
+        // access — it rests ShaderReadOnly, so the stale sample is validation-safe but inert).
+        let mut accesses = vec![
+            (scene_output, RgUsage::SampledReadCompute),
+            (motion, RgUsage::SampledReadCompute),
+            // Closest-depth dilation source — ordered after the motion prepass's depth store.
+            (motion_depth, RgUsage::SampledReadCompute),
+            (lock_read_res, RgUsage::SampledReadCompute),
+            (hist_read, RgUsage::SampledReadCompute),
+            (color, RgUsage::StorageImageRwCompute),
+            (hist_write, RgUsage::StorageImageRwCompute),
+            (lock_write_res, RgUsage::StorageImageRwCompute),
+        ];
+        if let Some(reactive) = reactive {
+            accesses.push((reactive, RgUsage::SampledReadCompute));
+        }
         let groups = |n: u32| n.div_ceil(8);
         self.add_compute_pass(
             graph,
             "taa",
             taa,
             view.taa_sets[p],
-            &[
-                (scene_output, RgUsage::SampledReadCompute),
-                (motion, RgUsage::SampledReadCompute),
-                (hist_read, RgUsage::SampledReadCompute),
-                (color, RgUsage::StorageImageRwCompute),
-                (hist_write, RgUsage::StorageImageRwCompute),
-            ],
+            &accesses,
             Some(bytemuck::bytes_of(&push).to_vec()),
             groups(extent.width),
             groups(extent.height),
         );
-        Some(TaaHistorySlots {
-            read: (1 - p, read_slot),
-            write: (p, write_slot),
+        Some(TaaResolveSlots {
+            history: TaaHistorySlots {
+                read: (1 - p, read_slot),
+                write: (p, write_slot),
+            },
+            lock: TaaHistorySlots {
+                read: (1 - p, lock_read_slot),
+                write: (p, lock_write_slot),
+            },
         })
     }
 
@@ -5974,7 +6415,8 @@ impl Renderer {
             return;
         };
         let view = &self.views[self.active_view.index()];
-        let extent = view.extent();
+        // In-place on the DISPLAY-extent offscreen (after the resolve reconstructed it).
+        let extent = view.published_extent();
         let push = TonemapPush::new(self.exposure_ev, self.tonemap_mode);
         let groups = |n: u32| n.div_ceil(8);
         self.add_compute_pass(
@@ -6001,14 +6443,18 @@ impl Renderer {
         color: RgResource,
         depth: RgResource,
     ) {
-        let extent = self.views[self.active_view.index()].extent();
+        // Drawn on the DISPLAY-extent resolved color, depth-testing the display-extent overlay
+        // depth (`depth` is the point-upscaled `depth_display`, not the input scene depth).
+        let extent = self.views[self.active_view.index()].published_extent();
 
         if let Some(grid) = &pipelines.grid {
             let raw_body = self.device.raw().clone();
             let pipeline = Arc::clone(grid);
             let handle = pipeline.handle();
             let layout = pipeline.layout();
-            let push = GridPush::new(self.scene_draw_list.view_proj);
+            // The grid composites AFTER TAA on the post-tonemap color, so it must use the
+            // UN-jittered camera or it would shimmer (the resolve never un-jitters it).
+            let push = GridPush::new(self.scene_view_proj_unjittered());
             let pass = RgPass::graphics("grid", extent)
                 .color(color_load_store(color))
                 .depth_attachment(depth_load_readonly(depth))
@@ -6056,7 +6502,8 @@ impl Renderer {
             return;
         };
         let view = &self.views[self.active_view.index()];
-        let extent = view.extent();
+        // In-place over the DISPLAY-extent post-tonemap color; motion is sampled by normalized UV.
+        let extent = view.published_extent();
         let mut push = Vec::with_capacity(8);
         push.extend_from_slice(&extent.width.to_ne_bytes());
         push.extend_from_slice(&extent.height.to_ne_bytes());
@@ -6096,7 +6543,8 @@ impl Renderer {
         let Some(pipeline) = &pipelines.wireframe_overlay else {
             return;
         };
-        let extent = self.views[self.active_view.index()].extent();
+        // Re-drawn at DISPLAY extent, depth-tested against the display-extent overlay depth.
+        let extent = self.views[self.active_view.index()].published_extent();
         let list = self.scene_draw_list.shallow_clone();
         let raw_for_body = self.device.raw().clone();
         let pipeline = Arc::clone(pipeline);
@@ -6895,6 +7343,14 @@ fn writeback_history_layout(view: &mut ViewTarget, graph: &RenderGraph, slot: &(
     }
 }
 
+/// Writes a TAA pixel-lock image's resolved exit layout back from the graph's external slot.
+/// `(lock-index, slot)` selects the image in `view.lock` and the slot to read.
+fn writeback_lock_layout(view: &mut ViewTarget, graph: &RenderGraph, slot: &(usize, usize)) {
+    if let Some(image) = view.lock[slot.0].as_mut() {
+        image.layout = graph.external_layout(slot.1);
+    }
+}
+
 /// Writes an SSGI history image's resolved exit layout back from the graph's external slot.
 /// `(history-index, slot)` selects the image in `view.ssgi_history` and the slot to read.
 fn writeback_ssgi_history_layout(
@@ -7332,7 +7788,7 @@ mod tests {
         let depth_image = crate::Image::new(
             device.resources(),
             &crate::ImageDesc {
-                extent: view.extent(),
+                extent: view.scaled_render_extent(),
                 format: crate::DEPTH_FORMAT,
                 usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC,
@@ -7350,7 +7806,7 @@ mod tests {
             &device,
             depth_image.handle(),
             depth_image.view(),
-            view.extent(),
+            view.scaled_render_extent(),
             &list,
             depth_pipeline.handle(),
             depth_pipeline.layout(),
@@ -7740,13 +8196,25 @@ mod tests {
             let preview = &mut views[ViewId::AssetPreview.index()];
             preview.desired_width = 8;
             preview.desired_height = 8;
-            preview.resize(&device, 8, 8).expect("resize preview");
+            let ext = vk::Extent2D {
+                width: 8,
+                height: 8,
+            };
+            preview.resize(&device, ext, ext).expect("resize preview");
             preview
                 .build_screen_space(&device, &descriptors, &ssao)
                 .expect("rebuild preview screen-space");
         }
-        assert_eq!(views[ViewId::Scene.index()].extent().width, 24);
-        assert_eq!(views[ViewId::AssetPreview.index()].extent().width, 8);
+        assert_eq!(
+            views[ViewId::Scene.index()].scaled_render_extent().width,
+            24
+        );
+        assert_eq!(
+            views[ViewId::AssetPreview.index()]
+                .scaled_render_extent()
+                .width,
+            8
+        );
         assert_eq!(views[ViewId::AssetPreview.index()].desired_width, 8);
 
         // Capture the scene view's offscreen: clear it to a known linear-HDR gray through a
@@ -7976,7 +8444,8 @@ mod tests {
         use crate::render_graph::{RenderGraph, RgPass, RgUsage};
 
         let raw = device.raw();
-        let extent = view.extent();
+        // At the test's render scale 1, the display (offscreen) and input (depth) extents match.
+        let extent = view.published_extent();
         let offscreen = view.offscreen.handle();
         let offscreen_view = view.offscreen.view();
         let depth = view.depth.handle();
