@@ -8,7 +8,6 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { Joint } from "./BoneSelect";
 
@@ -63,34 +62,33 @@ export function BoneMaskField({ value, joints, onChange }: BoneMaskFieldProps) {
               </Button>
             </PopoverTrigger>
             <PopoverContent align="start" className="w-(--radix-popover-trigger-width) p-1">
-              <ScrollArea className="max-h-56">
-                <div className="flex flex-col gap-0.5">
-                  {joints.map((j) => (
-                    <button
-                      key={j.id}
-                      type="button"
-                      onClick={() => toggle(j.index)}
-                      className={cn(
-                        "flex w-full items-center gap-1.5 rounded-sm px-1.5 py-1 text-left font-mono text-[11px]",
-                        "hover:bg-accent hover:text-accent-foreground",
-                        selected.has(j.index) && "bg-accent/60",
-                      )}
-                    >
-                      <span className="flex size-3.5 flex-none items-center justify-center">
-                        {selected.has(j.index) ? (
-                          <Check className="size-3 text-foreground" />
-                        ) : null}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate">{j.name}</span>
-                    </button>
-                  ))}
-                  {total === 0 ? (
-                    <span className="px-2 py-1 text-[11px] italic text-muted-foreground">
-                      No joints
+              {/* Native max-height + overflow scroll: a Radix ScrollArea's `h-full` viewport
+                  can't resolve against a max-height-only (auto-height) parent, so it would grow
+                  to full content height and overshoot the cap instead of scrolling. */}
+              <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+                {joints.map((j) => (
+                  <button
+                    key={j.id}
+                    type="button"
+                    onClick={() => toggle(j.index)}
+                    className={cn(
+                      "flex w-full items-center gap-1.5 rounded-sm px-1.5 py-1 text-left font-mono text-[11px]",
+                      "hover:bg-accent hover:text-accent-foreground",
+                      selected.has(j.index) && "bg-accent/60",
+                    )}
+                  >
+                    <span className="flex size-3.5 flex-none items-center justify-center">
+                      {selected.has(j.index) ? <Check className="size-3 text-foreground" /> : null}
                     </span>
-                  ) : null}
-                </div>
-              </ScrollArea>
+                    <span className="min-w-0 flex-1 truncate">{j.name}</span>
+                  </button>
+                ))}
+                {total === 0 ? (
+                  <span className="px-2 py-1 text-[11px] italic text-muted-foreground">
+                    No joints
+                  </span>
+                ) : null}
+              </div>
             </PopoverContent>
           </Popover>
           <span className="px-0.5 text-[10px] text-muted-foreground">

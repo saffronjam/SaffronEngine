@@ -52,7 +52,7 @@ export function VectorEditor({
   const scrub = useScrubValue(value, onChange);
   const dragRef = useRef<{ axis: string; startX: number; startValue: number } | null>(null);
 
-  function beginDrag(axis: string, event: React.PointerEvent<HTMLLabelElement>): void {
+  function beginDrag(axis: string, event: React.PointerEvent<HTMLDivElement>): void {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     const current = scrub.value[axis];
@@ -65,7 +65,7 @@ export function VectorEditor({
     onDragStart?.();
   }
 
-  function updateDrag(event: React.PointerEvent<HTMLLabelElement>): void {
+  function updateDrag(event: React.PointerEvent<HTMLDivElement>): void {
     const drag = dragRef.current;
     if (!drag) {
       return;
@@ -86,7 +86,7 @@ export function VectorEditor({
   return (
     <div className="flex gap-1">
       {axes.map((axis, i) => (
-        <label
+        <div
           key={axis}
           className="flex min-w-0 flex-1 cursor-ew-resize items-center overflow-hidden rounded-sm border border-border bg-background"
           onPointerDown={(event) => beginDrag(axis, event)}
@@ -111,7 +111,7 @@ export function VectorEditor({
             onPointerDown={(event) => event.stopPropagation()}
             onCommit={(v) => scrub.set({ ...scrub.value, [axis]: v })}
           />
-        </label>
+        </div>
       ))}
     </div>
   );
