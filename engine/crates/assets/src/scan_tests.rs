@@ -271,7 +271,7 @@ fn png_2x2() -> Vec<u8> {
     out.into_inner()
 }
 
-// --- Texture-register tests (need a real upload; skip off-hardware) ---
+// Texture-register tests (need a real upload; skip off-hardware).
 
 use crate::RendererUploader;
 use saffron_rendering::{

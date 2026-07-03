@@ -174,151 +174,226 @@ impl AssetServer {
     /// skipped with a warn), but returns [`Result`] so the cache-write caller composes
     /// with `?`.
     pub fn scan_assets(&mut self) -> Result<ScanDelta> {
-        let mut delta = ScanDelta::default();
-        if self.root.as_os_str().is_empty() || !self.root.exists() {
-            return Ok(delta);
-        }
-        let root = self.root.clone();
-        let previous = self.catalog.clone();
-        let mut rebuilt = AssetCatalog {
-            folders: previous.folders.clone(),
-            ..AssetCatalog::default()
-        };
-
-        for path in sorted_files(&root) {
-            let rel = match path.strip_prefix(&root) {
-                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            let ext = lower_ext(&path);
-            let path_str = path.to_string_lossy().to_string();
-
-            if ext == "smodel" {
-                match read_container_metadata(&path) {
-                    Ok(meta) => {
-                        for mut row in catalog_rows_for_model(&meta, &rel) {
-                            preserve_name_folder(&previous, &mut row);
-                            rebuilt.put(row);
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!("scan: skipping '{rel}': {err}");
-                    }
-                }
-                continue;
-            }
-
-            let (asset_type, hdr) = match ext.as_str() {
-                "smesh" => (AssetType::Mesh, false),
-                "smat" => (AssetType::Material, false),
-                "sanim" => (AssetType::Animation, false),
-                "png" | "jpg" | "jpeg" | "tga" | "bmp" => (AssetType::Texture, false),
-                "hdr" => (AssetType::Texture, true),
-                _ => continue,
-            };
-
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            if let Some(id) = parse_uuid_stem(stem) {
-                // Engine-written standalone file (uuid name). A known one keeps its row's
-                // name/folder/duration/colorspace (not recoverable from the filename) — its
-                // path and content hash refresh. A genuinely new one infers type/hdr from the
-                // extension.
-                if let Some(prev) = previous.find(Uuid(id)) {
-                    let mut row = prev.clone();
-                    row.path = rel;
-                    row.container = Uuid(0);
-                    row.chunk = -1;
-                    row.content_hash = standalone_content_hash(row.asset_type, &path_str);
-                    rebuilt.put(row);
-                } else {
-                    rebuilt.put(AssetEntry {
-                        id: Uuid(id),
-                        name: stem.to_owned(),
-                        asset_type,
-                        path: rel,
-                        hdr,
-                        content_hash: standalone_content_hash(asset_type, &path_str),
-                        ..AssetEntry::default()
-                    });
-                }
-                continue;
-            }
-
-            // A foreign / headerless file: identity + colorspace come from a sibling
-            // `.smeta`, minted + written on first sight (a wrong-colorspace guess is warned).
-            let smeta_path = format!("{path_str}.smeta");
-            let mut sidecar = None;
-            if std::path::Path::new(&smeta_path).exists() {
-                match read_smeta(&smeta_path) {
-                    Ok(loaded) => sidecar = Some(loaded),
-                    Err(err) => {
-                        tracing::warn!("scan: ignoring bad .smeta '{rel}.smeta': {err}");
-                    }
-                }
-            }
-            let sidecar = match sidecar {
-                Some(sidecar) => sidecar,
-                None => {
-                    let colorspace = if hdr {
-                        Colorspace::Hdr
-                    } else {
-                        Colorspace::Srgb
-                    };
-                    let minted = SmetaData {
-                        id: Uuid::new(),
-                        asset_type,
-                        colorspace,
-                        folder: String::new(),
-                        name: stem.to_owned(),
-                    };
-                    if let Err(err) = write_smeta(&smeta_path, &minted) {
-                        tracing::warn!("scan: could not write '{rel}.smeta': {err}");
-                    }
-                    tracing::warn!(
-                        "scan: minted .smeta for foreign file '{rel}' (colorspace {} — verify it for data maps like normals)",
-                        colorspace_name(colorspace)
-                    );
-                    minted
-                }
-            };
-
-            let mut row = AssetEntry {
-                id: sidecar.id,
-                name: if sidecar.name.is_empty() {
-                    stem.to_owned()
-                } else {
-                    sidecar.name.clone()
-                },
-                asset_type: sidecar.asset_type,
-                path: rel,
-                folder: sidecar.folder.clone(),
-                colorspace: sidecar.colorspace,
-                hdr: sidecar.colorspace == Colorspace::Hdr,
-                linear: sidecar.colorspace == Colorspace::Linear,
-                content_hash: standalone_content_hash(sidecar.asset_type, &path_str),
-                ..AssetEntry::default()
-            };
-            preserve_name_folder(&previous, &mut row);
-            rebuilt.put(row);
-        }
-
-        for (&id, &index) in &rebuilt.by_id {
-            if !previous.by_id.contains_key(&id) {
-                delta.added.push(rebuilt.entries[index].clone());
-            }
-        }
-        for &id in previous.by_id.keys() {
-            if !rebuilt.by_id.contains_key(&id) {
-                delta.removed.push(Uuid(id));
-            }
-        }
+        let (rebuilt, delta) =
+            reconcile_catalog_from_disk(&self.root, &self.catalog, &mut |_, _, _| {});
         self.catalog = rebuilt;
         Ok(delta)
     }
+}
 
+/// The cold catalog scan core: walks `root`, rebuilds the catalog from disk, and diffs it
+/// against `previous`. Free of any `AssetServer` borrow (every input is owned/borrowed) so the
+/// off-thread project loader can run it. `progress(done, total, current)` fires per walked file,
+/// driving the loader's determinate `Catalog` stage.
+pub fn reconcile_catalog_from_disk(
+    root: &std::path::Path,
+    previous: &AssetCatalog,
+    progress: &mut dyn FnMut(u32, u32, &str),
+) -> (AssetCatalog, ScanDelta) {
+    let mut delta = ScanDelta::default();
+    if root.as_os_str().is_empty() || !root.exists() {
+        return (previous.clone(), delta);
+    }
+    let root = root.to_path_buf();
+    let previous = previous.clone();
+    let files = sorted_files(&root);
+    let total = files.len() as u32;
+    let mut rebuilt = AssetCatalog {
+        folders: previous.folders.clone(),
+        ..AssetCatalog::default()
+    };
+
+    for (index, path) in files.into_iter().enumerate() {
+        let rel = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        progress(index as u32, total, &rel);
+        let ext = lower_ext(&path);
+        let path_str = path.to_string_lossy().to_string();
+
+        if ext == "smodel" {
+            match read_container_metadata(&path) {
+                Ok(meta) => {
+                    for mut row in catalog_rows_for_model(&meta, &rel) {
+                        preserve_name_folder(&previous, &mut row);
+                        rebuilt.put(row);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("scan: skipping '{rel}': {err}");
+                }
+            }
+            continue;
+        }
+
+        let (asset_type, hdr) = match ext.as_str() {
+            "smesh" => (AssetType::Mesh, false),
+            "smat" => (AssetType::Material, false),
+            "sanim" => (AssetType::Animation, false),
+            "png" | "jpg" | "jpeg" | "tga" | "bmp" => (AssetType::Texture, false),
+            "hdr" => (AssetType::Texture, true),
+            _ => continue,
+        };
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if let Some(id) = parse_uuid_stem(stem) {
+            // Engine-written standalone file (uuid name). A known one keeps its row's
+            // name/folder/duration/colorspace (not recoverable from the filename) — its
+            // path and content hash refresh. A genuinely new one infers type/hdr from the
+            // extension.
+            if let Some(prev) = previous.find(Uuid(id)) {
+                let mut row = prev.clone();
+                row.path = rel;
+                row.container = Uuid(0);
+                row.chunk = -1;
+                row.content_hash = standalone_content_hash(row.asset_type, &path_str);
+                rebuilt.put(row);
+            } else {
+                rebuilt.put(AssetEntry {
+                    id: Uuid(id),
+                    name: stem.to_owned(),
+                    asset_type,
+                    path: rel,
+                    hdr,
+                    content_hash: standalone_content_hash(asset_type, &path_str),
+                    ..AssetEntry::default()
+                });
+            }
+            continue;
+        }
+
+        // A foreign / headerless file: identity + colorspace come from a sibling
+        // `.smeta`, minted + written on first sight (a wrong-colorspace guess is warned).
+        let smeta_path = format!("{path_str}.smeta");
+        let mut sidecar = None;
+        if std::path::Path::new(&smeta_path).exists() {
+            match read_smeta(&smeta_path) {
+                Ok(loaded) => sidecar = Some(loaded),
+                Err(err) => {
+                    tracing::warn!("scan: ignoring bad .smeta '{rel}.smeta': {err}");
+                }
+            }
+        }
+        let sidecar = match sidecar {
+            Some(sidecar) => sidecar,
+            None => {
+                let colorspace = if hdr {
+                    Colorspace::Hdr
+                } else {
+                    Colorspace::Srgb
+                };
+                let minted = SmetaData {
+                    id: Uuid::new(),
+                    asset_type,
+                    colorspace,
+                    folder: String::new(),
+                    name: stem.to_owned(),
+                };
+                if let Err(err) = write_smeta(&smeta_path, &minted) {
+                    tracing::warn!("scan: could not write '{rel}.smeta': {err}");
+                }
+                tracing::warn!(
+                    "scan: minted .smeta for foreign file '{rel}' (colorspace {} — verify it for data maps like normals)",
+                    colorspace_name(colorspace)
+                );
+                minted
+            }
+        };
+
+        let mut row = AssetEntry {
+            id: sidecar.id,
+            name: if sidecar.name.is_empty() {
+                stem.to_owned()
+            } else {
+                sidecar.name.clone()
+            },
+            asset_type: sidecar.asset_type,
+            path: rel,
+            folder: sidecar.folder.clone(),
+            colorspace: sidecar.colorspace,
+            hdr: sidecar.colorspace == Colorspace::Hdr,
+            linear: sidecar.colorspace == Colorspace::Linear,
+            content_hash: standalone_content_hash(sidecar.asset_type, &path_str),
+            ..AssetEntry::default()
+        };
+        preserve_name_folder(&previous, &mut row);
+        rebuilt.put(row);
+    }
+
+    for (&id, &index) in &rebuilt.by_id {
+        if !previous.by_id.contains_key(&id) {
+            delta.added.push(rebuilt.entries[index].clone());
+        }
+    }
+    for &id in previous.by_id.keys() {
+        if !rebuilt.by_id.contains_key(&id) {
+            delta.removed.push(Uuid(id));
+        }
+    }
+    (rebuilt, delta)
+}
+
+/// The `assets/.cache/catalog.json` path under `root`.
+fn catalog_cache_path_for(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(".cache").join("catalog.json")
+}
+
+/// Persists `catalog` + the current asset signature to `root`'s catalog cache. Free of any
+/// `AssetServer` borrow so the off-thread loader can refresh the cache after a cold scan.
+fn write_catalog_cache_to(root: &std::path::Path, catalog: &AssetCatalog) {
+    let cache_path = catalog_cache_path_for(root);
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let doc = serde_json::json!({
+        "version": 1,
+        "signature": asset_signature(root).to_string(),
+        "assets": catalog_to_json(catalog),
+        "assetFolders": catalog_folders_to_json(catalog),
+    });
+    let _ = std::fs::write(&cache_path, dump_json(&doc, 0));
+}
+
+/// The catalog-cache-fast reconcile: reuse a signature-matching `assets/.cache/catalog.json`
+/// verbatim (applied onto `seed`), else a full [`reconcile_catalog_from_disk`] + cache refresh.
+/// Free of any `AssetServer` borrow so the off-thread loader can run it; `progress` drives the
+/// `Catalog` stage on the cold-scan path.
+pub fn resolve_catalog_from_disk(
+    root: &std::path::Path,
+    seed: &AssetCatalog,
+    progress: &mut dyn FnMut(u32, u32, &str),
+) -> (AssetCatalog, ScanDelta) {
+    let cache_path = catalog_cache_path_for(root);
+    if cache_path.exists()
+        && let Ok(text) = std::fs::read_to_string(&cache_path)
+        && let Ok(doc) = parse_json(&text)
+        && doc.is_object()
+    {
+        let cached = json_string_or(&doc, "signature", String::new());
+        let live = asset_signature(root).to_string();
+        if !cached.is_empty() && cached == live {
+            let mut catalog = seed.clone();
+            catalog_from_json(
+                &mut catalog,
+                doc.get("assets").unwrap_or(&Value::Array(Vec::new())),
+            );
+            catalog_folders_from_json(
+                &mut catalog,
+                doc.get("assetFolders").unwrap_or(&Value::Array(Vec::new())),
+            );
+            return (catalog, ScanDelta::default());
+        }
+    }
+    let (rebuilt, delta) = reconcile_catalog_from_disk(root, seed, progress);
+    write_catalog_cache_to(root, &rebuilt);
+    (rebuilt, delta)
+}
+
+impl AssetServer {
     /// Builds the catalog with the cache as a latency shortcut: a valid, signature-matching
     /// `assets/.cache/catalog.json` is reused verbatim; on any mismatch / missing / corrupt
     /// cache it falls back to a full [`Self::scan_assets`] and refreshes the cache.
@@ -329,52 +404,16 @@ impl AssetServer {
     ///
     /// Propagates a [`Self::scan_assets`] error on the fallback path.
     pub fn load_catalog(&mut self) -> Result<ScanDelta> {
-        let cache_path = self.catalog_cache_path();
-        if cache_path.exists() {
-            if let Ok(text) = std::fs::read_to_string(&cache_path) {
-                if let Ok(doc) = parse_json(&text) {
-                    if doc.is_object() {
-                        let cached = json_string_or(&doc, "signature", String::new());
-                        let live = asset_signature(&self.root).to_string();
-                        if !cached.is_empty() && cached == live {
-                            catalog_from_json(
-                                &mut self.catalog,
-                                doc.get("assets").unwrap_or(&Value::Array(Vec::new())),
-                            );
-                            catalog_folders_from_json(
-                                &mut self.catalog,
-                                doc.get("assetFolders").unwrap_or(&Value::Array(Vec::new())),
-                            );
-                            return Ok(ScanDelta::default());
-                        }
-                    }
-                }
-            }
-        }
-        let delta = self.scan_assets()?;
-        self.write_catalog_cache();
+        let (catalog, delta) =
+            resolve_catalog_from_disk(&self.root, &self.catalog, &mut |_, _, _| {});
+        self.catalog = catalog;
         Ok(delta)
     }
 
     /// Persists the catalog + the current asset signature to `assets/.cache/catalog.json`.
     /// Regenerable and gitignored: deleting it is always safe (the next load is a cold scan).
     pub fn write_catalog_cache(&self) {
-        let cache_path = self.catalog_cache_path();
-        if let Some(parent) = cache_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let doc = serde_json::json!({
-            "version": 1,
-            "signature": asset_signature(&self.root).to_string(),
-            "assets": catalog_to_json(&self.catalog),
-            "assetFolders": catalog_folders_to_json(&self.catalog),
-        });
-        let _ = std::fs::write(&cache_path, dump_json(&doc, 0));
-    }
-
-    /// The catalog cache path (`assets/.cache/catalog.json`).
-    fn catalog_cache_path(&self) -> std::path::PathBuf {
-        self.root.join(".cache").join("catalog.json")
+        write_catalog_cache_to(&self.root, &self.catalog);
     }
 
     /// Decodes + uploads `encoded` (RGBA8) as a `srgb`/unorm texture, writes the bytes to

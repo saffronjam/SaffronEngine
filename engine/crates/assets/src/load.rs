@@ -311,6 +311,21 @@ impl AssetServer {
         self.load_texture_from_source(gpu, id, &source, space)
     }
 
+    /// Warms one catalog asset into its GPU cache (mesh or texture), for the project loader's
+    /// residency prefetch. A no-op for other kinds. Idempotent (cache-hit fast path), so the
+    /// loader can call it once per residency step without re-uploading.
+    pub fn warm_asset(&mut self, gpu: &dyn GpuUploader, id: Uuid) {
+        match self.catalog.find(id).map(|entry| entry.asset_type) {
+            Some(AssetType::Mesh) => {
+                self.load_mesh_asset(gpu, id);
+            }
+            Some(AssetType::Texture) => {
+                self.load_texture_asset(gpu, id);
+            }
+            _ => {}
+        }
+    }
+
     /// Loads an animation clip by id into a CPU [`AnimClip`]. An embedded clip reads its
     /// `SANM` chunk through the owning container; a standalone clip reads its file. A
     /// `Result`-returning one-shot (not cache-backed) the animation runtime calls on a
