@@ -27,7 +27,7 @@ function hostFor(id: DockPanelId): HTMLDivElement {
   let host = panelHosts.get(id);
   if (!host) {
     host = document.createElement("div");
-    host.className = "flex h-full min-h-0 w-full flex-col";
+    host.className = "flex h-full min-h-0 w-full min-w-0 flex-col";
     host.dataset.panelHost = id;
     panelHosts.set(id, host);
   }
@@ -111,5 +111,7 @@ export function LeafBody({
     }
   }, [tabs, activeTab]);
 
-  return <div ref={ref} data-leaf-body={leafId} className={cn("min-h-0 flex-1", className)} />;
+  return (
+    <div ref={ref} data-leaf-body={leafId} className={cn("min-h-0 min-w-0 flex-1", className)} />
+  );
 }
