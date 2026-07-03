@@ -26,7 +26,7 @@ The three approaches differ in where they sample and how they combine:
 | Off | `off` | no anti-aliasing | — |
 | MSAA 2× / 4× / 8× | `msaa2` / `msaa4` / `msaa8` | multisampled scene color + depth, resolved into the offscreen | [MSAA](../msaa/) |
 | FXAA | `fxaa` | luma-edge blur, one compute pass on a 1× scratch → offscreen | [FXAA](../fxaa/) |
-| TAA | `taa` | history reprojection + neighbourhood clamp + exponential blend | [TAA](../../screen-space-and-post/taa/) |
+| TAA | `taa` | jittered sampling accumulated over time: dilated reproject, Catmull-Rom history, YCoCg variance clip, velocity-adaptive blend, optional sharpen | [TAA](../../screen-space-and-post/taa/) |
 
 ## Selecting a mode
 
@@ -56,7 +56,7 @@ Switching modes is a full reconfigure, not a flag flip. `Renderer::set_aa` waits
 idle, since the targets and pipeline state objects are about to be destroyed. It stores the new
 sample count and flags through `Aa::set`, then rebuilds each view's AA targets
 (`ViewTarget::build_aa_targets`): the multisampled MSAA pair, the 1× scratch that FXAA and TAA
-share, and the TAA motion + history pair.
+share, and the TAA motion + motion-depth + ping-pong history set.
 
 `Aa::set` returns `true` when the *MSAA sample count* changed. On that signal the renderer clears the
 sample-count-baked PSO cache via `Pipelines::set_sample_count` and rebuilds the depth-prepass
@@ -77,6 +77,11 @@ sample count decides — `"off"` at 1, `"msaaN"` above.
 | Target rebuild | `view_target.rs` | `ViewTarget::build_aa_targets` |
 | Sample-count PSO cache | `pipelines.rs` | `Pipelines::set_sample_count` |
 | CLI front | `commands_render.rs` | `set-aa`, `render-stats`, `aa_mode_from_name` |
+| Upscale command (TAAU) | `commands_render.rs` | `get-upscale`, `set-upscale` (partial update) |
+
+Under TAA the resolve doubles as a temporal upsampler: the scene renders sub-native and the resolve
+reconstructs a sharp display image (`sa set-upscale '{"ratio":0.67}'`, a partial update). See
+[TAA → Temporal upsampling](../../screen-space-and-post/taa/#temporal-upsampling-taau).
 
 ## Related
 

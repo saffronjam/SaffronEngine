@@ -59,20 +59,22 @@ shows it as a dropdown beside anti-aliasing.
 
 ## Auto-quality (frame-budget controller)
 
-The tier can also drive itself. With `auto_quality` on (a `set-perf-config` field, off by default), a
-frame-budget controller watches each frame's work time against the budget (`1000 / target_fps`) and
-steps the tier to hold it: a sustained run of over-budget frames steps **down** (cheaper GI), a
-sustained run with comfortable headroom steps back **up**, and a single hitch ≥ 2× budget steps down
-at once. Hysteresis (consecutive-frame thresholds + a post-switch cooldown) stops it oscillating; it
-never auto-selects `ultra` (a deliberate stills tier). It drives two dials. The first is the tier.
-Below the `low` floor it then steps **dynamic resolution**: the render targets shrink to
-`round(desired × renderScale)` while the published frame stays native (the present blit upscales,
-filtered linear), so a frame even `low` GI can't hold drops pixels instead of breaking. The order is
+The tier can also drive itself. With **dynamic resolution** on (`set-upscale {"dynamic":true}`, off by
+default), a frame-budget controller watches each frame's work time against the budget
+(`targetMs`, = `1000 / target_fps`) and steps the tier to hold it: a sustained run of over-budget
+frames steps **down** (cheaper GI), a sustained run with comfortable headroom steps back **up**, and a
+single hitch ≥ 2× budget steps down at once. Hysteresis (consecutive-frame thresholds + a post-switch
+cooldown) stops it oscillating; it never auto-selects `ultra` (a deliberate stills tier). It drives two
+dials. The first is the tier. Below the `low` floor it then steps the **render scale**: the
+**input**-extent targets shrink to `round(display × ratio)` while the published frame stays native, and
+the temporal upsampler ([TAAU](../taa/#temporal-upsampling-taau)) reconstructs the sub-native input to
+a sharp display image — far better than the filtered-linear present blit it replaced. The order is
 deliberate — going down it spends tier steps first (cheaper GI is less visible than fewer pixels), and
-coming back up it restores resolution before raising the tier. Hysteresis (consecutive-frame
-thresholds + a post-switch cooldown) stops it oscillating, and a scale change reallocates targets at a
-safe frame boundary, never mid-frame. `renderScale` is reported in `render-stats` and can be set
-manually with `set-perf-config --renderScale` (when `auto_quality` is on the controller owns it).
+coming back up it restores resolution before raising the tier. A scale change reallocates only the
+input-extent targets at a safe frame boundary (never mid-frame) and **keeps the display-extent TAA
+history valid**, so a budget step is a one-frame trace of extra reconstruction softness, not a flush.
+The ratio is reported by `get-upscale` and can be pinned manually with `set-upscale {"ratio":…}` (when
+dynamic resolution is on the controller owns it); the budget itself is `set-upscale`'s `targetMs`.
 
 ## In the code
 
@@ -85,6 +87,7 @@ manually with `set-perf-config --renderScale` (when `auto_quality` is on the con
 | Project save/load | `rendering/src/render_settings.rs` | `RenderSettings::quality` |
 | Editor UI | `editor/src/panels/RenderPanel.tsx` | the Quality `Select` |
 | Auto-quality controller | `rendering/src/budget.rs` | `BudgetController`; `PerfConfig::auto_quality` |
+| Upscale / dynamic-resolution command | `control/src/commands_render.rs` | `get-upscale`, `set-upscale`, `upscale_dto` |
 
 ## Related
 
