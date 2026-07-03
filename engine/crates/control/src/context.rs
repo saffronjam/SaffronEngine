@@ -12,6 +12,7 @@ use saffron_sceneedit::SceneEditContext;
 use saffron_window::Window;
 
 use crate::error::Result;
+use crate::project_loader::ProjectLoader;
 use crate::registry::{CommandRegistry, ControlRenderer, EngineContext, register_builtin_commands};
 use crate::server::{ControlServer, control_socket_path, start_control_server};
 
@@ -24,6 +25,8 @@ use crate::server::{ControlServer, control_socket_path, start_control_server};
 pub struct ControlContext {
     registry: CommandRegistry,
     server: Option<ControlServer>,
+    /// The once-per-frame non-blocking project loader, advanced from the host each frame.
+    loader: ProjectLoader,
 }
 
 impl Default for ControlContext {
@@ -51,7 +54,11 @@ impl ControlContext {
             }
         };
 
-        Self { registry, server }
+        Self {
+            registry,
+            server,
+            loader: ProjectLoader::default(),
+        }
     }
 
     /// Whether the socket bound successfully and the context is serving.
@@ -91,27 +98,24 @@ impl ControlContext {
         self.registry.register(name, help, handler);
     }
 
-    /// Brings the host's project up from the editor-set environment once at startup, before
-    /// the first frame: `SAFFRON_PROJECT` opens/creates a named project, else
-    /// `SAFFRON_SCRATCH_PROJECT` makes a per-shell scratch project, else a
-    /// working-directory `project.json` opens; otherwise nothing loads and the host waits
-    /// for the editor's picker. Runs the same project-bring-up path the lifecycle commands
-    /// use, against the live subsystem borrows.
-    pub fn bootstrap_project_from_env(
+    /// Seeds the project-load inbox from the editor-set environment once at startup: `SAFFRON_PROJECT`
+    /// opens/creates a named project, else `SAFFRON_SCRATCH_PROJECT` makes a per-shell scratch
+    /// project, else a working-directory `project.json` opens; otherwise nothing is seeded and the
+    /// host waits for the editor's picker. The load itself runs non-blocking through
+    /// [`Self::advance_project_load`] on the first frames — startup never blocks.
+    pub fn bootstrap_project_from_env(&mut self, scene_edit: &mut SceneEditContext) {
+        crate::commands_asset::bootstrap_project_from_env(scene_edit);
+    }
+
+    /// Advances the non-blocking project loader one bounded step. Called every frame from the host
+    /// (right after [`Self::poll`]). Returns `true` when it did redraw-worthy work.
+    pub fn advance_project_load(
         &mut self,
-        window: &mut Window,
         renderer: &mut dyn ControlRenderer,
         scene_edit: &mut SceneEditContext,
         assets: &mut AssetServer,
-    ) {
-        let mut ctx = EngineContext {
-            window,
-            renderer,
-            scene_edit,
-            assets,
-            physics: None,
-        };
-        crate::commands_asset::bootstrap_project_from_env(&mut ctx);
+    ) -> bool {
+        self.loader.advance(renderer, scene_edit, assets)
     }
 
     /// Drains and runs any pending control requests on the calling (main) thread.

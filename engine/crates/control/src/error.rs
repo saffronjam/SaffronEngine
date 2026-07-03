@@ -23,12 +23,28 @@ pub enum Error {
     /// A request param failed to deserialize into the handler's typed DTO.
     #[error("{0}")]
     Params(String),
+    /// A command was rejected because a project load is in flight; the editor drops and retries.
+    #[error("engine busy loading project")]
+    Busy,
 }
 
 impl Error {
     /// Builds a [`Error::Command`] from anything that renders as a string.
     pub fn command(message: impl Into<String>) -> Self {
         Self::Command(message.into())
+    }
+
+    /// The machine-readable code that crosses the wire alongside the human message. One arm per
+    /// variant (no catch-all) so a new variant is a compile error until it gets a code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::Socket(_) => "socket",
+            Error::PathTooLong(_) => "path-too-long",
+            Error::Command(_) => "command",
+            Error::Params(_) => "params",
+            Error::Busy => "busy-loading",
+        }
     }
 }
 
