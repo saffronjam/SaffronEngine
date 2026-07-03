@@ -113,6 +113,19 @@ export class Engine {
       engine.cleanupAppdata();
       throw new Error(`engine exited before the control socket appeared:\n${engine.buf}`);
     }
+    // The bootstrap load (env/scratch project) is non-blocking, so the socket answers before the
+    // project is up. When a project is expected, wait for it to reach `ready` so a test never races
+    // the load (an empty scene or a `busy-loading` reply).
+    const expectsProject =
+      (env.SAFFRON_PROJECT ?? "") !== "" || (env.SAFFRON_SCRATCH_PROJECT ?? "") !== "";
+    if (expectsProject) {
+      try {
+        await engine.awaitProjectReady();
+      } catch (err) {
+        engine.cleanupAppdata();
+        throw new Error(`project did not load on boot: ${String(err)}\n${engine.buf}`);
+      }
+    }
     return engine;
   }
 
@@ -187,6 +200,57 @@ export class Engine {
   /// Let the engine run a few render frames so deferred GPU work + validation surface.
   async settle(ms = 300): Promise<void> {
     await delay(ms);
+  }
+
+  /// Poll `project-status` until the non-blocking loader (Phase 2) reaches `ready`; reject on
+  /// `failed` or timeout. Every project bring-up is async now — the env/scratch bootstrap and each
+  /// lifecycle command kick the load, then it runs across frames — so a test must await this before
+  /// touching the loaded scene/catalog. `project-status` is allow-listed during `Loading`.
+  async awaitProjectReady(timeoutMs = 30_000): Promise<void> {
+    const start = Date.now();
+    for (;;) {
+      let status: { phase: string; error: string } = { phase: "loading", error: "" };
+      try {
+        status = await this.call<{ phase: string; error: string }>("project-status");
+      } catch {
+        // Socket briefly busy mid-load; retry.
+      }
+      if (status.phase === "ready") {
+        return;
+      }
+      if (status.phase === "failed") {
+        throw new Error(`project load failed: ${status.error}`);
+      }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timeout waiting for project ready (phase=${status.phase})`);
+      }
+      await delay(50);
+    }
+  }
+
+  /// Kick a project open + await the load — the async-contract replacement for a raw
+  /// `call("load-project")` that assumed the load finished synchronously.
+  async loadProject(path: string): Promise<void> {
+    await this.call("load-project", { path });
+    await this.awaitProjectReady();
+  }
+
+  /// Kick a project open by folder/path + await the load.
+  async openProject(path: string): Promise<void> {
+    await this.call("open-project", { path });
+    await this.awaitProjectReady();
+  }
+
+  /// Kick a fresh-project create + await the load.
+  async newProject(params: Record<string, unknown>): Promise<void> {
+    await this.call("new-project", params);
+    await this.awaitProjectReady();
+  }
+
+  /// Kick a reload of the active project + await the load.
+  async reloadProject(): Promise<void> {
+    await this.call("reload-project", {});
+    await this.awaitProjectReady();
   }
 
   /// Import a glTF/OBJ as a .smodel asset, then instantiate it into the scene, returning the placed
