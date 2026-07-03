@@ -12,7 +12,7 @@ import type { ProfilerModeResult, RenderPassTimingsDto, RenderStats } from "@saf
 let engine: Engine;
 let caps: ProfilerModeResult;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // Need a drawn scene for the per-pass breakdown + throughput counters to be non-trivial.
   await engine.call("add-entity", { preset: "cube" });
   caps = await engine.call<ProfilerModeResult>("profiler.set-mode", { args: ["timestamps"] });

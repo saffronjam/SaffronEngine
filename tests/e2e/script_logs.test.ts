@@ -25,7 +25,7 @@ interface ScriptLogs {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   const project = await engine.call<{ root: string }>("get-project");
   const root = isAbsolute(project.root) ? project.root : join(REPO, project.root);
   srcDir = join(root, "src");

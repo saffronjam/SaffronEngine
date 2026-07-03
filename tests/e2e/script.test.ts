@@ -37,7 +37,7 @@ interface ScriptErrors {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // The auto project's root is relative to the engine's cwd (the repo root).
   const project = await engine.call<{ root: string }>("get-project");
   const root = isAbsolute(project.root) ? project.root : join(REPO, project.root);
@@ -760,7 +760,7 @@ test("declared defaults drive the script; an override on the slot wins", async (
 });
 
 test("a new project scaffolds src/ with a runnable starter script", async () => {
-  // createProject (which the auto-empty boot rides) ensures src/ + example.lua.
+  // createProject (which the scratch boot rides) ensures src/ + example.lua.
   const example = join(srcDir, "example.lua");
   expect(existsSync(example)).toBe(true);
   const text = readFileSync(example, "utf8");

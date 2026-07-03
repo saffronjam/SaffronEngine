@@ -11,7 +11,7 @@ import type { DrainAlarmsResult, ActiveAlarmsDto } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("add-entity", { preset: "cube" });
 });
 afterAll(async () => {

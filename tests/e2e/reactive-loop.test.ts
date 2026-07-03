@@ -3,7 +3,7 @@
 // viewport power-state suppresses rendering when the view is hidden. `render-stats` exposes the
 // otherwise-invisible loop state (`idle`, `converged`, `redrawReasons`, `powerState`).
 //
-// Boots with SAFFRON_AUTO_EMPTY_PROJECT so a scene is loaded (the host seeds one redraw on attach,
+// Boots with SAFFRON_SCRATCH_PROJECT so a scene is loaded (the host seeds one redraw on attach,
 // then settles to idle once the keep-warm window + temporal convergence elapse).
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
@@ -12,7 +12,7 @@ import type { RenderStats } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();
