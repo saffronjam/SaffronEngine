@@ -72,6 +72,20 @@
       "fixture": "perf-config-30"
     },
     {
+      "name": "get-upscale",
+      "params": "EmptyParams",
+      "result": "GetUpscaleResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "set-upscale",
+      "params": "SetUpscaleParams",
+      "result": "SetUpscaleResult",
+      "status": "typed",
+      "fixture": "upscale"
+    },
+    {
       "name": "drain-alarms",
       "params": "DrainAlarmsParams",
       "result": "DrainAlarmsResult",
@@ -91,6 +105,20 @@
       "result": "SetAaResult",
       "status": "typed",
       "fixture": "aa"
+    },
+    {
+      "name": "get-taa-params",
+      "params": "EmptyParams",
+      "result": "GetTaaParamsResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "set-taa-params",
+      "params": "SetTaaParamsParams",
+      "result": "SetTaaParamsResult",
+      "status": "typed",
+      "fixture": "taa-sharpness"
     },
     {
       "name": "set-view-mode",
@@ -779,9 +807,23 @@
       "fixture": "empty"
     },
     {
+      "name": "project-status",
+      "params": "EmptyParams",
+      "result": "ProjectStatusDto",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "cancel-load",
+      "params": "EmptyParams",
+      "result": "ProjectStatusDto",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
       "name": "new-project",
       "params": "NewProjectParams",
-      "result": "ProjectInfoDto",
+      "result": "ProjectStatusDto",
       "status": "typed",
       "fixture": "new-project"
     },
@@ -795,7 +837,7 @@
     {
       "name": "open-project",
       "params": "PathParams",
-      "result": "ProjectInfoDto",
+      "result": "ProjectStatusDto",
       "status": "typed",
       "fixture": "project-name"
     },
@@ -1089,14 +1131,14 @@
     {
       "name": "load-project",
       "params": "OptionalPathParams",
-      "result": "ProjectInfoDto",
+      "result": "ProjectStatusDto",
       "status": "typed",
       "fixture": "project-name"
     },
     {
       "name": "reload-project",
       "params": "EmptyParams",
-      "result": "ProjectInfoDto",
+      "result": "ProjectStatusDto",
       "status": "typed",
       "skip": "reloads and replaces the active project's scene and catalog"
     },

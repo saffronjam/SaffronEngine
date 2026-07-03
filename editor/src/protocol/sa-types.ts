@@ -6,6 +6,9 @@
 
 export type WireUuid = string;
 
+/** The material alpha/blend mode (glTF `alphaMode`). */
+export type BlendMode = "opaque" | "masked" | "translucent";
+
 export interface Name {
   name: string;
 }
@@ -45,7 +48,7 @@ export interface Material {
   heightTexture: WireUuid;
   normalStrength: number;
   heightScale: number;
-  alphaClip: boolean;
+  blend: BlendMode;
   alphaCutoff: number;
 }
 
@@ -439,15 +442,36 @@ export interface PerfConfigDto {
 }
 
 export interface SetPerfConfigParams {
-  targetFps?: number;
-  autoQuality?: boolean;
-  renderScale?: number;
   greenBudgetFrac?: number;
   greenMedianMul?: number;
   amberMedianMul?: number;
   frozenMs?: number;
   vramWarnFrac?: number;
   vramCritFrac?: number;
+}
+
+export interface GetUpscaleResult {
+  upscale: UpscaleDto;
+}
+
+export interface UpscaleDto {
+  ratio: number;
+  dynamic: boolean;
+  targetMs: number;
+  inputWidth: number;
+  inputHeight: number;
+  displayWidth: number;
+  displayHeight: number;
+}
+
+export interface SetUpscaleParams {
+  ratio?: number;
+  dynamic?: boolean;
+  targetMs?: number;
+}
+
+export interface SetUpscaleResult {
+  upscale: UpscaleDto;
 }
 
 export interface DrainAlarmsParams {
@@ -496,6 +520,30 @@ export interface SetAaParams {
 
 export interface SetAaResult {
   aa: "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
+}
+
+export interface GetTaaParamsResult {
+  params: TaaParamsDto;
+}
+
+export interface TaaParamsDto {
+  feedbackMin: number;
+  feedbackMax: number;
+  velocityRejection: number;
+  clipGamma: number;
+  sharpness: number;
+}
+
+export interface SetTaaParamsParams {
+  feedbackMin?: number;
+  feedbackMax?: number;
+  velocityRejection?: number;
+  clipGamma?: number;
+  sharpness?: number;
+}
+
+export interface SetTaaParamsResult {
+  params: TaaParamsDto;
 }
 
 export interface SetViewModeParams {
@@ -698,6 +746,7 @@ export interface SetMaterialParams {
   emissive?: Vec3;
   emissiveStrength?: number;
   unlit?: boolean;
+  blend?: string;
   slot?: number;
   smooth?: boolean;
 }
@@ -1302,6 +1351,19 @@ export interface ProjectInfoDto {
   displayName: string;
 }
 
+export interface ProjectStatusDto {
+  phase: "unloaded" | "loading" | "ready" | "failed";
+  stage: "manifest" | "catalog" | "scene" | "install" | "assets" | "skybox" | "accel" | "ready" | "failed";
+  done: number;
+  total: number;
+  label: string;
+  currentItem: string;
+  error: string;
+  version: number;
+  name: string;
+  path: string;
+}
+
 export interface NewProjectParams {
   name?: string;
   displayName?: string;
@@ -1389,6 +1451,7 @@ export interface AssetEntryDto {
   container?: WireUuid;
   duration?: number;
   rigged?: boolean;
+  createdAt: number;
   attribution?: AssetAttributionDto;
 }
 
@@ -1820,9 +1883,13 @@ export interface CommandParamsMap {
   "frame-history": FrameHistoryParams;
   "get-perf-config": EmptyParams;
   "set-perf-config": SetPerfConfigParams;
+  "get-upscale": EmptyParams;
+  "set-upscale": SetUpscaleParams;
   "drain-alarms": DrainAlarmsParams;
   "list-active-alarms": EmptyParams;
   "set-aa": SetAaParams;
+  "get-taa-params": EmptyParams;
+  "set-taa-params": SetTaaParamsParams;
   "set-view-mode": SetViewModeParams;
   "set-clustered": ToggleParams;
   "set-ibl": ToggleParams;
@@ -1921,6 +1988,8 @@ export interface CommandParamsMap {
   "list-probes": EmptyParams;
   "set-exposure": SetExposureParams;
   "get-project": EmptyParams;
+  "project-status": EmptyParams;
+  "cancel-load": EmptyParams;
   "new-project": NewProjectParams;
   "create-script": CreateScriptParams;
   "open-project": PathParams;
@@ -1988,9 +2057,13 @@ export interface CommandResultMap {
   "frame-history": FrameHistoryDto;
   "get-perf-config": PerfConfigDto;
   "set-perf-config": PerfConfigDto;
+  "get-upscale": GetUpscaleResult;
+  "set-upscale": SetUpscaleResult;
   "drain-alarms": DrainAlarmsResult;
   "list-active-alarms": ActiveAlarmsDto;
   "set-aa": SetAaResult;
+  "get-taa-params": GetTaaParamsResult;
+  "set-taa-params": SetTaaParamsResult;
   "set-view-mode": SetViewModeResult;
   "set-clustered": SetClusteredResult;
   "set-ibl": SetIblResult;
@@ -2089,9 +2162,11 @@ export interface CommandResultMap {
   "list-probes": ListProbesResult;
   "set-exposure": SetExposureResult;
   "get-project": ProjectInfoDto;
-  "new-project": ProjectInfoDto;
+  "project-status": ProjectStatusDto;
+  "cancel-load": ProjectStatusDto;
+  "new-project": ProjectStatusDto;
   "create-script": CreateScriptResult;
-  "open-project": ProjectInfoDto;
+  "open-project": ProjectStatusDto;
   "import-model": ImportModelResult;
   "instantiate-model": EntityRef;
   "asset-placement": AssetPlacementResult;
@@ -2133,8 +2208,8 @@ export interface CommandResultMap {
   "save-scene": PathResult;
   "load-scene": PathResult;
   "save-project": ProjectInfoDto;
-  "load-project": ProjectInfoDto;
-  "reload-project": ProjectInfoDto;
+  "load-project": ProjectStatusDto;
+  "reload-project": ProjectStatusDto;
   "get-stores": ProjectStoresDto;
   "set-stores": ProjectStoresDto;
   "screenshot": ScreenshotResult;

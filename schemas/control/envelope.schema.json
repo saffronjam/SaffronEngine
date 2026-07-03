@@ -7,6 +7,10 @@
   "properties": {
     "ok": { "type": "boolean" },
     "error": { "type": "string" },
+    "code": {
+      "type": "string",
+      "description": "machine-readable error code (present on ok:false)"
+    },
     "result": { "type": "object" }
   },
   "required": ["ok"]

@@ -5,6 +5,7 @@ import type {
   CommandResultMap as DtoCommandResultMap,
   EntityRef,
   ProjectInfoDto,
+  ProjectStatusDto,
   RenderStatsDto,
   ThumbnailResult,
   Vec3,
@@ -146,6 +147,10 @@ export type {
   SetIblResult,
   SetLightParams,
   SetPerfConfigParams,
+  UpscaleDto,
+  GetUpscaleResult,
+  SetUpscaleParams,
+  SetUpscaleResult,
   SetMaterialParams,
   SetProbesParams,
   SetProbesResult,
@@ -172,6 +177,11 @@ export type Uuid = WireUuid;
 export type AssetEntry = AssetEntryDto;
 export type AssetList = DtoAssetList;
 export type ProjectInfo = ProjectInfoDto;
+export type ProjectStatus = ProjectStatusDto;
+// The codegen inlines enums into the DTOs that use them (no standalone enum exports), so the phase /
+// boot-stage unions are derived from the status DTO's fields — the single source of truth.
+export type ProjectPhase = ProjectStatusDto["phase"];
+export type BootStage = ProjectStatusDto["stage"];
 export type RenderStats = RenderStatsDto;
 export type Thumbnail = Omit<ThumbnailResult, "format"> & { format: "png" };
 

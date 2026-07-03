@@ -186,6 +186,42 @@
       }
     },
     {
+      "name": "get-upscale",
+      "summary": "TAAU ratio, dynamic-resolution state, and input/display extents",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/GetUpscaleResult"
+        }
+      }
+    },
+    {
+      "name": "set-upscale",
+      "summary": "set the TAAU input:display ratio + dynamic resolution",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetUpscaleParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetUpscaleResult"
+        }
+      }
+    },
+    {
       "name": "drain-alarms",
       "summary": "drain perf-alarm events (seq cursor)",
       "params": [
@@ -236,6 +272,42 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SetAaResult"
+        }
+      }
+    },
+    {
+      "name": "get-taa-params",
+      "summary": "current TAA blend/sharpen parameters",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/GetTaaParamsResult"
+        }
+      }
+    },
+    {
+      "name": "set-taa-params",
+      "summary": "tune TAA blend/sharpen parameters (partial update)",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetTaaParamsParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetTaaParamsResult"
         }
       }
     },
@@ -2004,6 +2076,42 @@
       }
     },
     {
+      "name": "project-status",
+      "summary": "project-load phase + progress",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ProjectStatusDto"
+        }
+      }
+    },
+    {
+      "name": "cancel-load",
+      "summary": "abort the in-flight project load",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ProjectStatusDto"
+        }
+      }
+    },
+    {
       "name": "new-project",
       "summary": "new-project {name}",
       "params": [
@@ -2017,7 +2125,7 @@
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/ProjectInfoDto"
+          "$ref": "#/components/schemas/ProjectStatusDto"
         }
       }
     },
@@ -2053,7 +2161,7 @@
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/ProjectInfoDto"
+          "$ref": "#/components/schemas/ProjectStatusDto"
         }
       }
     },
@@ -2809,7 +2917,7 @@
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/ProjectInfoDto"
+          "$ref": "#/components/schemas/ProjectStatusDto"
         }
       }
     },
@@ -2827,7 +2935,7 @@
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/ProjectInfoDto"
+          "$ref": "#/components/schemas/ProjectStatusDto"
         }
       }
     },
@@ -3423,6 +3531,9 @@
           "rigged": {
             "type": "boolean"
           },
+          "createdAt": {
+            "type": "integer"
+          },
           "attribution": {
             "$ref": "#/components/schemas/AssetAttributionDto"
           }
@@ -3431,7 +3542,8 @@
           "id",
           "name",
           "type",
-          "path"
+          "path",
+          "createdAt"
         ]
       },
       "AssetList": {
@@ -5077,6 +5189,30 @@
           "fields"
         ]
       },
+      "GetTaaParamsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "params": {
+            "$ref": "#/components/schemas/TaaParamsDto"
+          }
+        },
+        "required": [
+          "params"
+        ]
+      },
+      "GetUpscaleResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "upscale": {
+            "$ref": "#/components/schemas/UpscaleDto"
+          }
+        },
+        "required": [
+          "upscale"
+        ]
+      },
       "GizmoPointerParams": {
         "type": "object",
         "additionalProperties": false,
@@ -6586,6 +6722,71 @@
           "displayName"
         ]
       },
+      "ProjectStatusDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": [
+              "unloaded",
+              "loading",
+              "ready",
+              "failed"
+            ]
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "manifest",
+              "catalog",
+              "scene",
+              "install",
+              "assets",
+              "skybox",
+              "accel",
+              "ready",
+              "failed"
+            ]
+          },
+          "done": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "currentItem": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase",
+          "stage",
+          "done",
+          "total",
+          "label",
+          "currentItem",
+          "error",
+          "version",
+          "name",
+          "path"
+        ]
+      },
       "ProjectStoresDto": {
         "type": "object",
         "additionalProperties": false,
@@ -7976,6 +8177,9 @@
           "unlit": {
             "type": "boolean"
           },
+          "blend": {
+            "type": "string"
+          },
           "slot": {
             "type": "integer"
           },
@@ -8037,15 +8241,6 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "targetFps": {
-            "type": "number"
-          },
-          "autoQuality": {
-            "type": "boolean"
-          },
-          "renderScale": {
-            "type": "number"
-          },
           "greenBudgetFrac": {
             "type": "number"
           },
@@ -8287,6 +8482,40 @@
           "ssr"
         ]
       },
+      "SetTaaParamsParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "feedbackMin": {
+            "type": "number"
+          },
+          "feedbackMax": {
+            "type": "number"
+          },
+          "velocityRejection": {
+            "type": "number"
+          },
+          "clipGamma": {
+            "type": "number"
+          },
+          "sharpness": {
+            "type": "number"
+          }
+        },
+        "required": []
+      },
+      "SetTaaParamsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "params": {
+            "$ref": "#/components/schemas/TaaParamsDto"
+          }
+        },
+        "required": [
+          "params"
+        ]
+      },
       "SetTonemapParams": {
         "type": "object",
         "additionalProperties": false,
@@ -8328,6 +8557,34 @@
         },
         "required": [
           "entity"
+        ]
+      },
+      "SetUpscaleParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ratio": {
+            "type": "number"
+          },
+          "dynamic": {
+            "type": "boolean"
+          },
+          "targetMs": {
+            "type": "number"
+          }
+        },
+        "required": []
+      },
+      "SetUpscaleResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "upscale": {
+            "$ref": "#/components/schemas/UpscaleDto"
+          }
+        },
+        "required": [
+          "upscale"
         ]
       },
       "SetViewModeParams": {
@@ -8491,6 +8748,34 @@
         },
         "required": []
       },
+      "TaaParamsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "feedbackMin": {
+            "type": "number"
+          },
+          "feedbackMax": {
+            "type": "number"
+          },
+          "velocityRejection": {
+            "type": "number"
+          },
+          "clipGamma": {
+            "type": "number"
+          },
+          "sharpness": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "feedbackMin",
+          "feedbackMax",
+          "velocityRejection",
+          "clipGamma",
+          "sharpness"
+        ]
+      },
       "ThumbnailCacheParams": {
         "type": "object",
         "additionalProperties": false,
@@ -8593,6 +8878,42 @@
         },
         "required": [
           "mode"
+        ]
+      },
+      "UpscaleDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ratio": {
+            "type": "number"
+          },
+          "dynamic": {
+            "type": "boolean"
+          },
+          "targetMs": {
+            "type": "number"
+          },
+          "inputWidth": {
+            "type": "integer"
+          },
+          "inputHeight": {
+            "type": "integer"
+          },
+          "displayWidth": {
+            "type": "integer"
+          },
+          "displayHeight": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ratio",
+          "dynamic",
+          "targetMs",
+          "inputWidth",
+          "inputHeight",
+          "displayWidth",
+          "displayHeight"
         ]
       },
       "Vec3": {
@@ -8841,8 +9162,13 @@
           "heightScale": {
             "type": "number"
           },
-          "alphaClip": {
-            "type": "boolean"
+          "blend": {
+            "type": "string",
+            "enum": [
+              "opaque",
+              "masked",
+              "translucent"
+            ]
           },
           "alphaCutoff": {
             "type": "number"
@@ -8863,7 +9189,7 @@
           "heightTexture",
           "normalStrength",
           "heightScale",
-          "alphaClip",
+          "blend",
           "alphaCutoff"
         ]
       },

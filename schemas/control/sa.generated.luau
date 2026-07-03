@@ -190,7 +190,7 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field heightTexture string
 ---@field normalStrength number
 ---@field heightScale number
----@field alphaClip boolean
+---@field blend sa.BlendMode
 ---@field alphaCutoff number
 
 ---@class sa.MaterialAsset
