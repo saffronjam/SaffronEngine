@@ -346,6 +346,8 @@ fn format_text(cmd: &str, result: &Value) -> Vec<String> {
         }
         "list-assets" if result.get("assets").is_some() => format_list_assets(result),
         "get-asset-model" => format_asset_model(result),
+        "project-status" | "cancel-load" | "new-project" | "open-project" | "load-project"
+        | "reload-project" => vec![format_project_status(result)],
         "list-clips" if result.get("clips").is_some() => field_array(result, "clips")
             .iter()
             .map(|c| format_clip(c, "", 32))
@@ -836,6 +838,26 @@ fn format_drain_contacts(result: &Value) -> Vec<String> {
         events.len(),
     ));
     lines
+}
+
+/// The `project-status` line: the project name, phase, boot stage, `n/m` when determinate, and the
+/// human label — or the error on a failed load.
+fn format_project_status(result: &Value) -> String {
+    let name = field_str(result, "name");
+    let phase = field_str(result, "phase");
+    let error = field_str(result, "error");
+    if !error.is_empty() {
+        return format!("{name}  {phase}  error: {error}");
+    }
+    let stage = field_str(result, "stage");
+    let label = field_str(result, "label");
+    let (done, total) = (field_i64(result, "done"), field_i64(result, "total"));
+    let progress = if total > 0 {
+        format!("  {done}/{total}")
+    } else {
+        String::new()
+    };
+    format!("{name}  {phase}  [{stage}]{progress}  {label}")
 }
 
 /// The `get-selection` line: the selected entity name, or "no selection", with the selection/scene

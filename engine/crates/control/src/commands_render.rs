@@ -1,4 +1,4 @@
-//! The 30 render-domain control commands: render-stats, the profiler/capture group,
+//! The 34 render-domain control commands: render-stats, the profiler/capture group,
 //! perf config, frame history, alarms, the AA / view-mode / clustering / IBL / sky-occlusion /
 //! SSAO / shadow / GI / skinning / depth-prepass toggles, native viewport info + size,
 //! exposure, and reflection-probe management.
@@ -16,17 +16,19 @@ use saffron_protocol::{
     AaModeDto, ActiveAlarmDto, ActiveAlarmsDto, AlarmEventDto, AlarmSeverityDto, AlarmStateDto,
     CaptureModeDto, CaptureStartParams, CaptureStartResult, CaptureStateDto, CaptureStatusResult,
     CaptureStopResult, DrainAlarmsParams, DrainAlarmsResult, EmptyParams, FrameHistoryDto,
-    FrameHistoryParams, FrameSampleDto, GiModeDto, ListProbesResult, PerfConfigDto,
-    PipelineStatsDto, ProbeRef, ProfileCaptureDto, ProfileCaptureMetadataDto, ProfileLaneDto,
-    ProfileSpanDto, ProfilerModeDto, ProfilerModeResult, ProfilerSetModeParams,
-    RecaptureProbesResult, RenderPassTimingDto, RenderPassTimingsDto, RenderQualityResult,
-    RenderStatsDto, SetAaParams, SetAaResult, SetClusteredResult, SetDepthPrepassResult,
-    SetExposureParams, SetExposureResult, SetGdfResult, SetGiParams, SetGiResult, SetIblResult,
-    SetPerfConfigParams, SetProbesParams, SetProbesResult, SetRenderQualityParams, SetRestirResult,
-    SetRtReflectionsResult, SetRtShadowsResult, SetShadowsResult, SetSkinningResult,
-    SetSkyOcclusionResult, SetSsrResult, SetTonemapParams, SetViewModeParams, SetViewModeResult,
-    SetViewportPowerStateParams, SetViewportSizeParams, SetViewportSizeResult, ToggleParams,
-    TonemapResult, Uuid, Vec3, ViewModeDto, ViewportNativeInfoResult, ViewportPowerStateResult,
+    FrameHistoryParams, FrameSampleDto, GetTaaParamsResult, GetUpscaleResult, GiModeDto,
+    ListProbesResult, PerfConfigDto, PipelineStatsDto, ProbeRef, ProfileCaptureDto,
+    ProfileCaptureMetadataDto, ProfileLaneDto, ProfileSpanDto, ProfilerModeDto, ProfilerModeResult,
+    ProfilerSetModeParams, RecaptureProbesResult, RenderPassTimingDto, RenderPassTimingsDto,
+    RenderQualityResult, RenderStatsDto, SetAaParams, SetAaResult, SetClusteredResult,
+    SetDepthPrepassResult, SetExposureParams, SetExposureResult, SetGdfResult, SetGiParams,
+    SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams, SetProbesResult,
+    SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult, SetRtShadowsResult,
+    SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult, SetTaaParamsParams,
+    SetTaaParamsResult, SetTonemapParams, SetUpscaleParams, SetUpscaleResult, SetViewModeParams,
+    SetViewModeResult, SetViewportPowerStateParams, SetViewportSizeParams, SetViewportSizeResult,
+    ToggleParams, TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto, ViewportNativeInfoResult,
+    ViewportPowerStateResult,
 };
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmSeverity, CaptureMode, CaptureState,
@@ -270,6 +272,24 @@ fn perf_config_dto(config: PerfConfig) -> PerfConfigDto {
     }
 }
 
+/// The live TAAU upscale surface off the renderer: the fixed ratio, the dynamic-resolution toggle +
+/// budget (from the perf config), and the current input/display extents. A partial `set-upscale`
+/// merges onto this — reading it back through the same helper keeps the two in one shape.
+fn upscale_dto(renderer: &dyn ControlRenderer) -> UpscaleDto {
+    let config = renderer.perf_config();
+    let (input_width, input_height) = renderer.input_extent();
+    let (display_width, display_height) = renderer.display_extent();
+    UpscaleDto {
+        ratio: renderer.render_scale(),
+        dynamic: config.auto_quality,
+        target_ms: config.budget_ms(),
+        input_width,
+        input_height,
+        display_width,
+        display_height,
+    }
+}
+
 fn frame_history_dto(renderer: &dyn ControlRenderer, samples: i32) -> FrameHistoryDto {
     let stats = renderer.frame_history_stats();
     let mut out = FrameHistoryDto {
@@ -462,7 +482,7 @@ fn to_chrome_trace(capture: &ProfileCapture) -> String {
     doc.to_string()
 }
 
-/// Registers the 30 render-domain commands, in registration order, onto `reg`.
+/// Registers the 34 render-domain commands, in registration order, onto `reg`.
 pub fn register_render_commands(reg: &mut CommandRegistry) {
     reg.register::<EmptyParams, RenderStatsDto>(
         "render-stats",
@@ -578,12 +598,9 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
 
     reg.register::<SetPerfConfigParams, PerfConfigDto>(
         "set-perf-config",
-        "set-perf-config {targetFps,...} — frame budget + green/amber/red thresholds",
+        "set-perf-config {greenBudgetFrac,...} — green/amber/red alarm thresholds",
         |ctx, params| {
             let mut config = ctx.renderer.perf_config();
-            if let Some(v) = params.target_fps {
-                config.target_fps = v;
-            }
             if let Some(v) = params.green_budget_frac {
                 config.green_budget_frac = v;
             }
@@ -602,14 +619,41 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
             if let Some(v) = params.vram_crit_frac {
                 config.vram_crit_frac = v;
             }
-            if let Some(v) = params.auto_quality {
-                config.auto_quality = v;
+            ctx.renderer.set_perf_config(config);
+            Ok(perf_config_dto(ctx.renderer.perf_config()))
+        },
+    );
+
+    reg.register::<EmptyParams, GetUpscaleResult>(
+        "get-upscale",
+        "get-upscale — the TAAU ratio, dynamic-resolution state, and input/display extents",
+        |ctx, _params| {
+            Ok(GetUpscaleResult {
+                upscale: upscale_dto(ctx.renderer),
+            })
+        },
+    );
+
+    reg.register::<SetUpscaleParams, SetUpscaleResult>(
+        "set-upscale",
+        "set-upscale {ratio,dynamic,targetMs} — the TAAU input:display scale + dynamic resolution",
+        |ctx, params| {
+            if let Some(ratio) = params.ratio {
+                ctx.renderer.set_render_scale(ratio);
+            }
+            let mut config = ctx.renderer.perf_config();
+            if let Some(dynamic) = params.dynamic {
+                config.auto_quality = dynamic;
+            }
+            if let Some(ms) = params.target_ms {
+                // targetMs <= 0 means uncapped (target_fps = 0), matching the budget controller's
+                // budget_ms <= 0 hold.
+                config.target_fps = if ms > 0.0 { 1000.0 / ms } else { 0.0 };
             }
             ctx.renderer.set_perf_config(config);
-            if let Some(v) = params.render_scale {
-                ctx.renderer.set_render_scale(v);
-            }
-            Ok(perf_config_dto(ctx.renderer.perf_config()))
+            Ok(SetUpscaleResult {
+                upscale: upscale_dto(ctx.renderer),
+            })
         },
     );
 
@@ -636,6 +680,42 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
             Ok(SetAaResult {
                 aa: aa_mode_from_name(&ctx.renderer.aa_mode()),
             })
+        },
+    );
+
+    reg.register::<EmptyParams, GetTaaParamsResult>(
+        "get-taa-params",
+        "get-taa-params — current TAA blend/sharpen parameters",
+        |ctx, _params| {
+            Ok(GetTaaParamsResult {
+                params: ctx.renderer.taa_params(),
+            })
+        },
+    );
+
+    reg.register::<SetTaaParamsParams, SetTaaParamsResult>(
+        "set-taa-params",
+        "set-taa-params {feedbackMin,feedbackMax,velocityRejection,clipGamma,sharpness} — tune TAA (partial update)",
+        |ctx, p| {
+            // Partial update: read current, overlay only the provided fields, write back.
+            let mut cur = ctx.renderer.taa_params();
+            if let Some(v) = p.feedback_min {
+                cur.feedback_min = v;
+            }
+            if let Some(v) = p.feedback_max {
+                cur.feedback_max = v;
+            }
+            if let Some(v) = p.velocity_rejection {
+                cur.velocity_rejection = v;
+            }
+            if let Some(v) = p.clip_gamma {
+                cur.clip_gamma = v;
+            }
+            if let Some(v) = p.sharpness {
+                cur.sharpness = v;
+            }
+            ctx.renderer.set_taa_params(cur.clone());
+            Ok(SetTaaParamsResult { params: cur })
         },
     );
 
@@ -1208,14 +1288,37 @@ mod tests {
     }
 
     #[test]
-    fn set_perf_config_clamps_and_reads_back_budget() {
+    fn set_upscale_sets_ratio_budget_and_reports_extents() {
         let mut stub = StubRenderer::default();
-        let reply = run(&mut stub, "set-perf-config", json!({ "targetFps": 30.0 }));
+        let target_ms = 1000.0 / 30.0; // → target_fps 30, budget ≈ 33.33ms
+        let reply = run(
+            &mut stub,
+            "set-upscale",
+            json!({ "ratio": 0.5, "dynamic": true, "targetMs": target_ms }),
+        );
         assert_eq!(reply["ok"], json!(true));
-        assert_eq!(reply["result"]["targetFps"], json!(30.0));
-        // budget = 1000 / 30 ≈ 33.33ms.
-        let budget = reply["result"]["budgetMs"].as_f64().unwrap();
-        assert!((budget - 1000.0 / 30.0).abs() < 1e-3);
+        let up = &reply["result"]["upscale"];
+        assert_eq!(up["ratio"], json!(0.5));
+        assert_eq!(up["dynamic"], json!(true));
+        assert!((up["targetMs"].as_f64().unwrap() - target_ms).abs() < 1e-2);
+        // The input extent is the display extent scaled by the ratio (1280×720 × 0.5).
+        assert_eq!(up["inputWidth"], json!(640));
+        assert_eq!(up["displayWidth"], json!(1280));
+    }
+
+    #[test]
+    fn set_upscale_is_a_partial_merge() {
+        let mut stub = StubRenderer::default();
+        run(
+            &mut stub,
+            "set-upscale",
+            json!({ "ratio": 0.5, "dynamic": true }),
+        );
+        // A follow-up with only `ratio` must not clear `dynamic`.
+        let reply = run(&mut stub, "set-upscale", json!({ "ratio": 0.75 }));
+        let up = &reply["result"]["upscale"];
+        assert_eq!(up["ratio"], json!(0.75));
+        assert_eq!(up["dynamic"], json!(true), "omitted field keeps its value");
     }
 
     #[test]
