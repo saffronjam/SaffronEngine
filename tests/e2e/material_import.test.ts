@@ -18,7 +18,7 @@ const PNG = Buffer.from(
 );
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   dir = mkdtempSync(join(tmpdir(), "saffron-matimport-"));
   for (const f of [
     "rock_diff_4k.png",

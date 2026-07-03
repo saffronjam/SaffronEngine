@@ -28,7 +28,7 @@ const ATTRIBUTION = {
 let materialId = "";
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   dir = mkdtempSync(join(tmpdir(), "saffron-store-mat-"));
   for (const f of ["Wood050_1K_Color.png", "Wood050_1K_NormalGL.png", "Wood050_1K_Roughness.png"]) {
     writeFileSync(join(dir, f), PNG);

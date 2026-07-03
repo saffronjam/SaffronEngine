@@ -10,7 +10,7 @@ let engine: Engine;
 const MAPPED = join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb");
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();
