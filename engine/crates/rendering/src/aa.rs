@@ -21,8 +21,48 @@ use crate::scene_pass::record_batch_submeshes;
 /// offset TAA / SSGI reproject through.
 pub const MOTION_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
 
-/// The TAA history exponential-moving-average weight (the history's share of the resolve).
-pub const TAA_HISTORY_WEIGHT: f32 = 0.9;
+/// The TAA reactive-coverage mask format (r8): per-input-pixel `[0, 1]` translucency coverage
+/// the resolve reads to bias alpha-blended pixels toward the current frame.
+pub const REACTIVE_FORMAT: vk::Format = vk::Format::R8_UNORM;
+
+/// Number of jitter phases in the Halton(2,3) cycle. 8 is the balanced native-resolution
+/// default (the follow-on upsampling set scales this with the upscale ratio).
+pub const TAA_JITTER_PHASES: u32 = 8;
+
+/// Radical-inverse Halton sample in `[0, 1)` for 1-based index `i` in base `b`.
+fn halton(mut i: u32, b: u32) -> f32 {
+    let mut f = 1.0f32;
+    let mut r = 0.0f32;
+    while i > 0 {
+        f /= b as f32;
+        r += f * (i % b) as f32;
+        i /= b;
+    }
+    r
+}
+
+/// The sub-pixel jitter offset in NDC for Halton phase `index` at a render extent:
+/// `(2·halton − 1) / dim`, i.e. up to ±0.5 px (1 px == `2/dim` in NDC). The scene view-
+/// projection applies it as a clip-space translation (`clip.xy += offset · clip.w`); the motion
+/// prepass reprojects with the un-jittered matrices so velocity stays exact.
+pub fn jitter_offset(index: u32, width: u32, height: u32) -> saffron_geometry::glam::Vec2 {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    saffron_geometry::glam::Vec2::new(
+        (2.0 * halton(index + 1, 2) - 1.0) / w,
+        (2.0 * halton(index + 1, 3) - 1.0) / h,
+    )
+}
+
+/// Halton jitter phases for an input→display upscale (FSR2 `ceil(8·n²)`, `n = displayW /
+/// inputW`). More phases at heavier upscale so every display pixel is eventually covered by a
+/// jittered input sample; degenerates to [`TAA_JITTER_PHASES`] (8) at 1:1. Keyed off width alone
+/// because `scaled_render_extent` scales both axes by the one render scale, so `displayW/inputW ==
+/// displayH/inputH` — one source of truth.
+pub fn jitter_phase_count(input: vk::Extent2D, display: vk::Extent2D) -> u32 {
+    let n = display.width.max(1) as f32 / input.width.max(1) as f32;
+    ((TAA_JITTER_PHASES as f32 * n * n).ceil() as u32).max(TAA_JITTER_PHASES)
+}
 
 /// The anti-aliasing selection: the device's supported sample counts (a fact), the chosen
 /// MSAA count, and the FXAA / TAA toggles. Mutually exclusive by construction — only
@@ -199,17 +239,82 @@ pub struct MotionPush {
 
 const _: () = assert!(size_of::<MotionPush>() == 128);
 
-/// The TAA resolve push: a params vec4 (`x` = history weight, `y` = 1 if history is valid
-/// this frame). 16 bytes, matching `taa.slang`'s `Push`.
+/// The runtime TAA resolve tuning (replaces the old fixed history-weight constant). All are
+/// live-tunable over the control plane; the defaults are the balanced reference values
+/// (Karis/Lottes/Playdead).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TaaParams {
+    /// History weight under fast motion / shading change (the floor). ~0.88.
+    pub feedback_min: f32,
+    /// History weight when still with stable luma (the ceiling). ~0.97.
+    pub feedback_max: f32,
+    /// How hard screen-space velocity pulls feedback toward `feedback_min`
+    /// (`saturate(velPx * velocity_rejection)`; ~0.025 ≈ full rejection near 40 px/frame).
+    pub velocity_rejection: f32,
+    /// The YCoCg variance-clip half-extent multiplier `gamma`. ~1.0 (0.75..1.25).
+    pub clip_gamma: f32,
+    /// RCAS-style sharpen strength (0 = off). Carried here so the push layout is final.
+    pub sharpness: f32,
+    /// Frames a freshly created lock survives before it must be renewed (FSR2 ≈ a few frames).
+    /// 0 disables locking. ~4.0.
+    pub lock_lifetime: f32,
+    /// How hard the reactive mask pulls the blend toward the current frame
+    /// (`saturate(mask * reactive_scale)`). ~1.0.
+    pub reactive_scale: f32,
+    /// Relative reprojected-depth mismatch counted as a disocclusion (`|d - dPrev| > k · d`). ~0.10.
+    pub disocclusion_threshold: f32,
+    /// Luma disagreement (vs the stored lock luma) that breaks a lock, as a fraction. ~0.25.
+    pub lock_break_luma: f32,
+}
+
+impl Default for TaaParams {
+    fn default() -> Self {
+        Self {
+            feedback_min: 0.88,
+            feedback_max: 0.97,
+            velocity_rejection: 0.025,
+            clip_gamma: 1.0,
+            sharpness: 0.0,
+            lock_lifetime: 4.0,
+            reactive_scale: 1.0,
+            disocclusion_threshold: 0.10,
+            lock_break_luma: 0.25,
+        }
+    }
+}
+
+/// The TAA resolve push (56 bytes, matching `taa.slang`'s `Push`). Seven `vec2`s so the std430
+/// layout is unambiguous: the adaptive feedback range, the current + previous NDC jitter, the
+/// input render extent in pixels, the clip gamma + history-valid flag, the velocity-rejection +
+/// sharpen knobs, and the upscale mapping (ratio + accumulation target).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TaaPush {
-    /// `x` = history EMA weight (0..1), `y` = 1 if history is valid (else fall back to the
-    /// current frame), `zw` unused.
-    pub params: saffron_geometry::glam::Vec4,
+    /// `x` = feedback_min, `y` = feedback_max.
+    pub feedback: saffron_geometry::glam::Vec2,
+    /// This frame's NDC jitter offset (`ViewTarget::jitter`).
+    pub jitter: saffron_geometry::glam::Vec2,
+    /// Last frame's NDC jitter offset (`ViewTarget::prev_jitter`).
+    pub prev_jitter: saffron_geometry::glam::Vec2,
+    /// The input/render extent in pixels (`velPx = length(mv * screen_size)`, and the source grid
+    /// the resolve reconstructs from — its reciprocal is the input texel size).
+    pub screen_size: saffron_geometry::glam::Vec2,
+    /// `x` = clip gamma (variance clip), `y` = 1.0 if history is valid this frame.
+    pub gamma_valid: saffron_geometry::glam::Vec2,
+    /// `x` = velocity_rejection, `y` = sharpness.
+    pub reject_sharp: saffron_geometry::glam::Vec2,
+    /// `x` = upscale ratio `n = displayW / inputW` (1.0 at native); `y` = accumulation target
+    /// (`sampleTarget`) the per-output confidence saturates against.
+    pub upscale: saffron_geometry::glam::Vec2,
+    /// `x` = lock initial lifetime (frames), `y` = reactive_scale.
+    pub lock_reactive: saffron_geometry::glam::Vec2,
+    /// `x` = disocclusion_threshold (relative), `y` = lock_break_luma.
+    pub disoccl: saffron_geometry::glam::Vec2,
+    /// Camera near/far for linearizing `motionDepth` in the disocclusion test (`x` = near, `y` = far).
+    pub depth_params: saffron_geometry::glam::Vec2,
 }
 
-const _: () = assert!(size_of::<TaaPush>() == 16);
+const _: () = assert!(size_of::<TaaPush>() == 80);
 
 /// Records the motion-vector prepass: bind the instance set (2) + the cur/prev camera
 /// viewProj push, then draw every batch's submeshes with both vertex bindings pointing at
@@ -427,6 +532,59 @@ mod tests {
     fn push_layouts_match_shaders() {
         assert_eq!(MOTION_FORMAT, vk::Format::R16G16_SFLOAT);
         assert_eq!(size_of::<MotionPush>(), 128);
-        assert_eq!(size_of::<TaaPush>(), 16);
+        assert_eq!(size_of::<TaaPush>(), 80);
+    }
+
+    /// The resolution-aware jitter phase count: `8` at 1:1, `ceil(8·n²)` under upscale
+    /// (`32` at n = 2, a 0.5 render scale), and monotonic non-decreasing as the input shrinks.
+    #[test]
+    fn jitter_phase_count_scales_with_upscale() {
+        let display = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+        let at = |w: u32, h: u32| {
+            jitter_phase_count(
+                vk::Extent2D {
+                    width: w,
+                    height: h,
+                },
+                display,
+            )
+        };
+        assert_eq!(at(1920, 1080), TAA_JITTER_PHASES); // 1:1 → 8
+        assert_eq!(at(960, 540), 32); // n = 2 → ceil(8·4) = 32
+        let mut prev = 0;
+        for w in [1920u32, 1440, 1280, 960, 640, 480] {
+            let count = at(w, w * 1080 / 1920);
+            assert!(
+                count >= prev,
+                "phase count must not decrease as input shrinks"
+            );
+            prev = count;
+        }
+    }
+
+    /// The Halton radical-inverse matches the known base-2 (1/2, 1/4, 3/4, 1/8) and base-3
+    /// (1/3, 2/3, 1/9) sequences for 1-based indices.
+    #[test]
+    fn halton_matches_known_radical_inverse() {
+        for (i, expected) in [(1u32, 0.5), (2, 0.25), (3, 0.75), (4, 0.125)] {
+            assert!((halton(i, 2) - expected).abs() < 1e-6, "halton({i}, 2)");
+        }
+        for (i, expected) in [(1u32, 1.0 / 3.0), (2, 2.0 / 3.0), (3, 1.0 / 9.0)] {
+            assert!((halton(i, 3) - expected).abs() < 1e-6, "halton({i}, 3)");
+        }
+    }
+
+    /// Every jitter phase stays within ±1/dim (±0.5 px) on each axis, for the whole cycle.
+    #[test]
+    fn jitter_offset_stays_within_half_pixel() {
+        let (w, h) = (1920u32, 1080u32);
+        for index in 0..TAA_JITTER_PHASES {
+            let o = jitter_offset(index, w, h);
+            assert!(o.x.abs() <= 1.0 / w as f32 + 1e-6, "phase {index} x");
+            assert!(o.y.abs() <= 1.0 / h as f32 + 1e-6, "phase {index} y");
+        }
     }
 }
