@@ -153,7 +153,7 @@ fn instantiate_flat_model_spawns_one_mesh_entity_with_base_color() {
 /// An *animated* single identity node must NOT collapse to one entity: the clip needs an
 /// `AnimationPlayer` on a container root, so a collapsed (player-less) entity would lose the
 /// animation. This is the glTF `SimpleMorph` shape — one identity node carrying a morph mesh
-/// with a morph-weights clip — which previously collapsed and silently dropped the clip.
+/// with a morph-weights clip.
 #[test]
 fn instantiate_animated_single_morph_node_keeps_its_player() {
     let dir = scratch("morphclip");

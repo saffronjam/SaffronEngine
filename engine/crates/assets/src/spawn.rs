@@ -20,7 +20,7 @@ use saffron_scene::{
 };
 use saffron_scene::{Entity, Scene};
 
-use saffron_core::Uuid;
+use saffron_core::{BlendMode, Uuid};
 use saffron_scene::AssetType;
 use serde_json::Value;
 
@@ -222,7 +222,7 @@ fn apply_imported_materials(scene: &mut Scene, entity: Entity, input: &ModelSpaw
         material.uv_tiling = slot.uv_tiling;
         material.uv_offset = slot.uv_offset;
         material.height_scale = slot.height_scale;
-        material.alpha_clip = slot.alpha_clip;
+        material.blend_mode = slot.blend_mode;
         material.alpha_cutoff = slot.alpha_cutoff;
     }
     let _ = scene.add_component(entity, material);
@@ -573,7 +573,7 @@ impl crate::AssetServer {
                 slot.uv_offset = resolved.uv_offset;
                 slot.height_scale = resolved.height_scale;
                 slot.unlit = resolved.unlit;
-                slot.alpha_clip = resolved.blend == "masked";
+                slot.blend_mode = BlendMode::from_wire(&resolved.blend);
                 slot.alpha_cutoff = resolved.alpha_cutoff;
                 slot.double_sided = resolved.double_sided;
             } else if let Some(f) = factors.get(&sub_id.value()) {
