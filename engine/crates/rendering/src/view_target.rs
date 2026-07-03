@@ -120,6 +120,19 @@ pub struct ViewTarget {
     /// TAA's two ping-pong history color images (display-format rgba16f), built when TAA
     /// is on.
     pub history: [Option<Image>; 2],
+    /// TAA pixel-lock ping-pong (display-extent rgba16f, `history_index` parity): r = remaining
+    /// lock lifetime in frames, g = the luma the lock was created at (its break test). A lock
+    /// pins a display pixel to accumulated history through a jitter cycle so thin, sub-input-pixel
+    /// features survive; it breaks on a large luma disagreement or a disocclusion. Built with TAA.
+    pub lock: [Option<Image>; 2],
+    /// TAA reactive coverage mask (input-extent r8): translucent / particle fragments raise it so
+    /// the resolve biases those pixels toward the current frame (history reprojects poorly through
+    /// alpha-blended content). Written by the reactive-coverage pass, read by the TAA resolve.
+    pub reactive: Option<Image>,
+    /// The display-extent overlay depth: a point-upscale of the input-extent scene [`depth`] so
+    /// the grid / gizmo (drawn on the display-extent resolved color) depth-test correctly under
+    /// temporal upsampling. Built whenever TAA/FXAA/no-AA can run (i.e. always with AA targets).
+    pub depth_display: Option<Image>,
     /// The multisampled scene color + depth the scene renders into when MSAA is active
     /// (resolved into `offscreen` / `depth`). `None` when MSAA is off.
     pub msaa_color: Option<Image>,
@@ -140,6 +153,14 @@ pub struct ViewTarget {
     pub prev_view_proj: saffron_geometry::glam::Mat4,
     /// False until the first frame stores `prev_view_proj`.
     pub prev_view_proj_valid: bool,
+    /// The Halton jitter phase index, advanced once per rendered frame while TAA is active.
+    /// Per-view for the same reason as `prev_view_proj`: a re-activated view restarts cleanly.
+    pub jitter_index: u32,
+    /// This frame's sub-pixel jitter offset (NDC), applied to the scene view-projection as a
+    /// clip-space translation. Zero while TAA is inactive.
+    pub jitter: saffron_geometry::glam::Vec2,
+    /// Last frame's jitter offset (NDC), rolled from `jitter` at the frame tail.
+    pub prev_jitter: saffron_geometry::glam::Vec2,
 
     /// gtao: g_normal + ao_raw (compute2).
     pub gtao_set: vk::DescriptorSet,
@@ -166,6 +187,12 @@ pub struct ViewTarget {
     pub specocc_blur_set: vk::DescriptorSet,
     /// copy_color: offscreen + prev_color (compute2).
     pub copy_color_set: vk::DescriptorSet,
+    /// scene-resolve: input-extent scratch sampler + display-extent offscreen storage (compute2,
+    /// the copy_color layout). The no-AA / MSAA path's normalized-UV upscale scratch → offscreen.
+    pub scene_resolve_set: vk::DescriptorSet,
+    /// depth-upscale: input-extent scene depth sampler (the depth_upscale graphics layout, one
+    /// fragment sampler) feeding the display-extent overlay depth pass.
+    pub depth_upscale_set: vk::DescriptorSet,
     /// gi-resolve per-frame-slot sets (the single `gi_resolve_layout`). Image bindings (G-buffer,
     /// output, dfao, IBL cube, DDGI atlases) are stable and written once; each slot binds its own
     /// `gi_params_ubos[i]` at b2, whose contents are memcpy'd per frame — so no per-frame descriptor
@@ -280,6 +307,9 @@ impl ViewTarget {
             motion: None,
             motion_depth: None,
             history: [None, None],
+            lock: [None, None],
+            reactive: None,
+            depth_display: None,
             msaa_color: None,
             msaa_depth: None,
             scratch: None,
@@ -287,6 +317,9 @@ impl ViewTarget {
             history_valid: false,
             prev_view_proj: saffron_geometry::glam::Mat4::IDENTITY,
             prev_view_proj_valid: false,
+            jitter_index: 0,
+            jitter: saffron_geometry::glam::Vec2::ZERO,
+            prev_jitter: saffron_geometry::glam::Vec2::ZERO,
             gtao_set: vk::DescriptorSet::null(),
             ao_blur_set: vk::DescriptorSet::null(),
             contact_set: vk::DescriptorSet::null(),
@@ -299,6 +332,8 @@ impl ViewTarget {
             specocc_set: vk::DescriptorSet::null(),
             specocc_blur_set: vk::DescriptorSet::null(),
             copy_color_set: vk::DescriptorSet::null(),
+            scene_resolve_set: vk::DescriptorSet::null(),
+            depth_upscale_set: vk::DescriptorSet::null(),
             gi_resolve_sets: [vk::DescriptorSet::null(); MAX_FRAMES_IN_FLIGHT],
             gi_params_ubos: Vec::new(),
             motion_vis_set: vk::DescriptorSet::null(),
@@ -408,6 +443,10 @@ impl ViewTarget {
         self.specocc_set = descriptors.allocate_set(ssao.compute3_layout())?;
         self.specocc_blur_set = descriptors.allocate_set(ssao.compute3_layout())?;
         self.copy_color_set = descriptors.allocate_set(ssao.compute2_layout())?;
+        // The scene-resolve copy (input scratch -> display offscreen) shares the copy_color
+        // compute2 shape; the depth-upscale set is the single fragment-sampler graphics layout.
+        self.scene_resolve_set = descriptors.allocate_set(ssao.compute2_layout())?;
+        self.depth_upscale_set = descriptors.allocate_set(descriptors.depth_upscale_layout())?;
         for slot in &mut self.gi_resolve_sets {
             *slot = descriptors.allocate_set(ssao.gi_resolve_layout())?;
         }
@@ -442,7 +481,8 @@ impl ViewTarget {
         descriptors: &Descriptors,
         ssao: &Ssao,
     ) -> Result<()> {
-        let extent = self.offscreen.extent;
+        // The whole screen-space / G-buffer chain rasterises at the INPUT (render) extent.
+        let extent = self.scaled_render_extent();
         if extent.width == 0 || extent.height == 0 {
             return Ok(());
         }
@@ -690,19 +730,62 @@ impl ViewTarget {
         descriptors: &Descriptors,
         aa: crate::Aa,
     ) -> Result<()> {
-        let extent = self.offscreen.extent;
-        // Drop the previous mode's targets; rebuilt below for the active mode.
+        self.build_aa_targets_impl(device, descriptors, aa, false)
+    }
+
+    /// Rebuilds the AA targets for a render-scale-only change (dynamic resolution): recreates the
+    /// INPUT-extent members (motion, its depth, the scene scratch, the reactive mask) while
+    /// PRESERVING the DISPLAY-extent TAA history + lock ping-pong and `history_valid`. The resolve
+    /// resamples the (now differently-sized) input into the fixed display grid every frame and
+    /// motion reprojects in resolution-independent UV space, so the accumulator rides an input
+    /// change — flushing it would flicker at every budget step (the bug this variant prevents).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Vk`] for any failing image creation or init transition.
+    pub fn build_aa_targets_preserving_temporal(
+        &mut self,
+        device: &Device,
+        descriptors: &Descriptors,
+        aa: crate::Aa,
+    ) -> Result<()> {
+        self.build_aa_targets_impl(device, descriptors, aa, true)
+    }
+
+    fn build_aa_targets_impl(
+        &mut self,
+        device: &Device,
+        descriptors: &Descriptors,
+        aa: crate::Aa,
+        preserve_temporal: bool,
+    ) -> Result<()> {
+        // Two extent classes: the scene / motion / MSAA targets rasterise at INPUT extent; the
+        // history + overlay depth live at DISPLAY extent (where the resolve reconstructs).
+        let input = self.scaled_render_extent();
+        let display = self.published_extent();
+        // Drop the previous mode's INPUT-extent targets; rebuilt below for the active mode. The
+        // DISPLAY-extent history + lock are preserved on a scale-only change (see below).
         self.motion = None;
         self.motion_depth = None;
-        self.history = [None, None];
+        self.reactive = None;
+        self.depth_display = None;
         self.scratch = None;
         self.msaa_color = None;
         self.msaa_depth = None;
-        // A mode change / resize invalidates the temporal reprojection + ping-pong parity.
-        self.history_valid = false;
-        self.history_index = 0;
-        self.prev_view_proj_valid = false;
-        if extent.width == 0 || extent.height == 0 {
+        if !preserve_temporal {
+            // A mode change / resize invalidates the temporal reprojection + ping-pong parity, and
+            // restarts the jitter cycle (seed phase 0 so the first frame is already jittered). The
+            // jitter is a fraction of an INPUT pixel — the scene renders at input extent.
+            self.history = [None, None];
+            self.lock = [None, None];
+            self.history_valid = false;
+            self.history_index = 0;
+            self.prev_view_proj_valid = false;
+            self.jitter_index = 0;
+            self.jitter = crate::jitter_offset(0, input.width, input.height);
+            self.prev_jitter = self.jitter;
+        }
+        if input.width == 0 || input.height == 0 || display.width == 0 || display.height == 0 {
             return Ok(());
         }
         let resources = device.resources();
@@ -718,7 +801,7 @@ impl ViewTarget {
             self.motion = Some(Image::new(
                 resources,
                 &ImageDesc::color_2d(
-                    extent,
+                    input,
                     crate::MOTION_FORMAT,
                     vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 ),
@@ -726,9 +809,11 @@ impl ViewTarget {
             self.motion_depth = Some(Image::new(
                 resources,
                 &ImageDesc {
-                    extent,
+                    extent: input,
                     format: DEPTH_FORMAT,
-                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    // SAMPLED so the TAA resolve can read it for closest-depth velocity dilation.
+                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED,
                     aspect: vk::ImageAspectFlags::DEPTH,
                     view_type: vk::ImageViewType::TYPE_2D,
                     mip_levels: 1,
@@ -738,44 +823,96 @@ impl ViewTarget {
             )?);
         }
 
-        // TAA's two display-format ping-pong history images (storage + sampled).
+        // TAA's two DISPLAY-extent ping-pong history images + the lock ping-pong (storage +
+        // sampled) — the reconstruction accumulator + reconstruction state live at display
+        // resolution. On a render-scale-only change these are PRESERVED (`preserve_temporal`): the
+        // display extent is unchanged, so the accumulated history rides the input-extent change.
         if aa.taa() {
-            let mut history_0 = Image::new(
-                resources,
-                &ImageDesc::color_2d(extent, OFFSCREEN_COLOR_FORMAT, storage_sampled),
-            )?;
-            let mut history_1 = Image::new(
-                resources,
-                &ImageDesc::color_2d(extent, OFFSCREEN_COLOR_FORMAT, storage_sampled),
-            )?;
-            // The history images rest ShaderReadOnly so their sampler bindings are valid
-            // before the first TAA write (`history_valid` gates the actual blend).
-            initialize_screen_space_layouts(device, &[&history_0, &history_1])?;
-            history_0.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-            history_1.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-            self.history = [Some(history_0), Some(history_1)];
-        }
+            if !preserve_temporal {
+                let mut history_0 = Image::new(
+                    resources,
+                    &ImageDesc::color_2d(display, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+                )?;
+                let mut history_1 = Image::new(
+                    resources,
+                    &ImageDesc::color_2d(display, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+                )?;
+                // The history images rest ShaderReadOnly so their sampler bindings are valid
+                // before the first TAA write (`history_valid` gates the actual blend).
+                initialize_screen_space_layouts(device, &[&history_0, &history_1])?;
+                history_0.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                history_1.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                self.history = [Some(history_0), Some(history_1)];
 
-        // The 1× scratch FXAA + TAA both render the scene into.
-        if aa.fxaa() || aa.taa() {
-            self.scratch = Some(Image::new(
+                // The pixel-lock ping-pong (DISPLAY extent, same parity as history): storage +
+                // sampled, resting ShaderReadOnly so slot 7's binding is valid before the first write.
+                let mut lock_0 = Image::new(
+                    resources,
+                    &ImageDesc::color_2d(display, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+                )?;
+                let mut lock_1 = Image::new(
+                    resources,
+                    &ImageDesc::color_2d(display, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+                )?;
+                initialize_screen_space_layouts(device, &[&lock_0, &lock_1])?;
+                lock_0.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                lock_1.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                self.lock = [Some(lock_0), Some(lock_1)];
+            }
+
+            // The reactive coverage mask (INPUT extent, r8): the coverage pass writes it, the
+            // resolve samples it. Rest ShaderReadOnly so slot 6's binding is valid before the
+            // first coverage write (a scene with no translucent content leaves it cleared to 0).
+            let mut reactive = Image::new(
                 resources,
                 &ImageDesc::color_2d(
-                    extent,
-                    OFFSCREEN_COLOR_FORMAT,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::SAMPLED
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                    input,
+                    crate::REACTIVE_FORMAT,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 ),
-            )?);
+            )?;
+            initialize_screen_space_layouts(device, &[&reactive])?;
+            reactive.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            self.reactive = Some(reactive);
         }
 
-        // The MSAA multisampled scene color + depth (resolved into offscreen / depth).
+        // The INPUT-extent scene-color scratch: the scene always rasterises into it, and the
+        // resolve stage (FXAA / TAA, or the no-AA copy) always writes the DISPLAY-extent offscreen
+        // — so a graphics pass never mixes attachment extents. Allocated unconditionally.
+        self.scratch = Some(Image::new(
+            resources,
+            &ImageDesc::color_2d(
+                input,
+                OFFSCREEN_COLOR_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+            ),
+        )?);
+
+        // The DISPLAY-extent overlay depth: point-upscaled from the input-extent scene depth each
+        // frame (the depth-upscale pass) so the grid / gizmo depth-test on the display grid. Built
+        // whenever AA targets exist (the overlays run in every AA mode).
+        self.depth_display = Some(Image::new(
+            resources,
+            &ImageDesc {
+                extent: display,
+                format: DEPTH_FORMAT,
+                usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                aspect: vk::ImageAspectFlags::DEPTH,
+                view_type: vk::ImageViewType::TYPE_2D,
+                mip_levels: 1,
+                array_layers: 1,
+                samples: vk::SampleCountFlags::TYPE_1,
+            },
+        )?);
+
+        // The MSAA multisampled scene color + depth (INPUT extent, resolved into scratch / depth).
         if aa.msaa() {
             self.msaa_color = Some(Image::new(
                 resources,
                 &ImageDesc {
-                    extent,
+                    extent: input,
                     format: OFFSCREEN_COLOR_FORMAT,
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
                     aspect: vk::ImageAspectFlags::COLOR,
@@ -788,7 +925,7 @@ impl ViewTarget {
             self.msaa_depth = Some(Image::new(
                 resources,
                 &ImageDesc {
-                    extent,
+                    extent: input,
                     format: DEPTH_FORMAT,
                     usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
                     aspect: vk::ImageAspectFlags::DEPTH,
@@ -817,6 +954,8 @@ impl ViewTarget {
             .map_or(self.offscreen.view(), Image::view);
         let offscreen = self.offscreen.view();
         let motion = self.aa_view(&self.motion);
+        let motion_depth = self.aa_view(&self.motion_depth);
+        let reactive = self.aa_view(&self.reactive);
         let ssgi_denoised = self.view_of(&self.ssgi_denoised);
         let ssgi_resolved = self.view_of(&self.ssgi_resolved);
         let dfao_denoised = self.view_of(&self.dfao_denoised);
@@ -843,6 +982,13 @@ impl ViewTarget {
                     ssgi_denoised
                 },
             ),
+            // Scene-resolve copy (no-AA / MSAA path): the input-extent scratch sampler -> the
+            // display-extent offscreen storage, a normalized-UV upscale dispatched at display.
+            Binding::sampled(self.scene_resolve_set, 0, linear, scene_input),
+            Binding::storage(self.scene_resolve_set, 1, offscreen),
+            // Depth-upscale: the input-extent scene depth sampler feeding the display-extent
+            // overlay depth (the fragment point-samples it per display pixel).
+            Binding::sampled(self.depth_upscale_set, 0, linear, self.depth.view()),
         ];
         // TAA parities: parity p reads scratch/history[1-p]/motion, writes offscreen +
         // history[p]. The ssgi-accum binding 2 (motion) is rebound to the real motion
@@ -859,6 +1005,14 @@ impl ViewTarget {
             plan.push(Binding::sampled(taa, 2, linear, motion));
             plan.push(Binding::storage(taa, 3, offscreen));
             plan.push(Binding::storage(taa, 4, self.taa_history_view(p)));
+            // Motion-prepass depth for closest-depth velocity dilation (placeholder when TAA
+            // is off, never sampled until the mode turns on and rebinds).
+            plan.push(Binding::sampled(taa, 5, linear, motion_depth));
+            // Phase 3: reactive coverage (6), the previous lock read at the reprojected UV (7,
+            // the opposite parity), and this frame's lock write (8, this parity).
+            plan.push(Binding::sampled(taa, 6, linear, reactive));
+            plan.push(Binding::sampled(taa, 7, linear, self.taa_lock_view(1 - p)));
+            plan.push(Binding::storage(taa, 8, self.taa_lock_view(p)));
 
             let accum = self.ssgi_accum_sets[p];
             plan.push(Binding::sampled(accum, 0, linear, ssgi_denoised));
@@ -912,6 +1066,14 @@ impl ViewTarget {
             .map_or(self.offscreen.view(), Image::view)
     }
 
+    /// The view handle of TAA pixel-lock slot `i`, or the offscreen as a placeholder when TAA
+    /// is off (same lifetime + parity as the history ping-pong).
+    fn taa_lock_view(&self, i: usize) -> vk::ImageView {
+        self.lock[i]
+            .as_ref()
+            .map_or(self.offscreen.view(), Image::view)
+    }
+
     /// Flips the temporal ping-pong parity + marks the history valid after a frame's TAA /
     /// SSGI accumulation consumed this frame's parity. The next frame reprojects through the
     /// buffer just written.
@@ -925,6 +1087,22 @@ impl ViewTarget {
     pub fn store_prev_view_proj(&mut self, view_proj: saffron_geometry::glam::Mat4) {
         self.prev_view_proj = view_proj;
         self.prev_view_proj_valid = true;
+    }
+
+    /// Advances the Halton jitter cycle for the next frame: rolls this frame's offset into
+    /// `prev_jitter`, steps the phase index, and recomputes `jitter` for the new index at the
+    /// current extent. Called at the frame tail only while TAA is active — mirroring
+    /// `store_prev_view_proj`, which records this frame's matrix as next frame's previous.
+    pub fn advance_jitter(&mut self) {
+        self.prev_jitter = self.jitter;
+        // The jitter is a fraction of an INPUT pixel — the scene renders at input extent — and the
+        // cycle length scales with the upscale ratio so a heavier upscale eventually covers every
+        // display pixel with a jittered input sample.
+        let input = self.scaled_render_extent();
+        let display = self.published_extent();
+        let phases = crate::jitter_phase_count(input, display);
+        self.jitter_index = (self.jitter_index + 1) % phases;
+        self.jitter = crate::jitter_offset(self.jitter_index, input.width, input.height);
     }
 
     /// Writes every per-view screen-space set to bind this view's freshly built images.
@@ -1175,24 +1353,38 @@ impl ViewTarget {
     ///
     /// Returns [`crate::Error::Vk`] if recreation fails (the old targets are left
     /// in place on failure).
-    pub fn resize(&mut self, device: &Device, width: u32, height: u32) -> Result<()> {
-        let extent = vk::Extent2D { width, height };
+    pub fn resize(
+        &mut self,
+        device: &Device,
+        input: vk::Extent2D,
+        display: vk::Extent2D,
+    ) -> Result<()> {
         let resources = device.resources();
-        let offscreen = Image::new(
-            resources,
-            &ImageDesc::color_2d(
-                extent,
-                OFFSCREEN_COLOR_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::STORAGE,
-            ),
-        )?;
+        // Recreate only the class whose extent changed: the offscreen is the DISPLAY-extent resolve
+        // output, the scene depth is INPUT extent. A render-scale-only change moves the input class
+        // alone, so the offscreen (and every descriptor set that binds it — tonemap, resolve) is
+        // left intact; only the input-extent depth is rebuilt.
+        if self.offscreen.extent != display {
+            self.offscreen = Image::new(
+                resources,
+                &ImageDesc::color_2d(
+                    display,
+                    OFFSCREEN_COLOR_FORMAT,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::STORAGE,
+                ),
+            )?;
+        }
+        if self.depth.extent == input {
+            self.generation += 1;
+            return Ok(());
+        }
         let depth = Image::new(
             resources,
             &ImageDesc {
-                extent,
+                extent: input,
                 format: DEPTH_FORMAT,
                 usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 aspect: vk::ImageAspectFlags::DEPTH,
@@ -1202,20 +1394,15 @@ impl ViewTarget {
                 samples: vk::SampleCountFlags::TYPE_1,
             },
         )?;
-        self.offscreen = offscreen;
         self.depth = depth;
         self.generation += 1;
         Ok(())
     }
 
-    /// The viewport extent of the targets.
-    pub fn extent(&self) -> vk::Extent2D {
-        self.offscreen.extent
-    }
-
-    /// The native (published) extent the frame is presented at — the last requested viewport
-    /// size, independent of [`ViewTarget::render_scale`]. The shm capture + the present blit's
-    /// destination use this; the render targets ([`ViewTarget::extent`]) may be smaller.
+    /// The DISPLAY extent — the last requested viewport size, independent of
+    /// [`ViewTarget::render_scale`]. The offscreen resolve output, TAA history, tonemap,
+    /// overlays, shm capture, and the present blit all live here; the scene renders smaller
+    /// (see [`ViewTarget::scaled_render_extent`]) and the resolve reconstructs up to this.
     pub fn published_extent(&self) -> vk::Extent2D {
         vk::Extent2D {
             width: self.desired_width.max(1),
@@ -1223,9 +1410,10 @@ impl ViewTarget {
         }
     }
 
-    /// The render-target extent for the current desired size + [`ViewTarget::render_scale`]:
-    /// `round(desired * scale)`, clamped to at least 1px. This is what the offscreen + all
-    /// per-view render targets are sized to.
+    /// The INPUT (render) extent for the current desired size + [`ViewTarget::render_scale`]:
+    /// `round(desired * scale)`, clamped to at least 1px. The scene color scratch, depth,
+    /// motion, and the whole G-buffer / SSGI / DFAO / ReSTIR chain rasterise here; the TAA
+    /// resolve reconstructs them up to [`ViewTarget::published_extent`].
     pub fn scaled_render_extent(&self) -> vk::Extent2D {
         let scale = self.render_scale.clamp(0.1, 1.0);
         vk::Extent2D {
@@ -1593,7 +1781,7 @@ mod tests {
             .request_ssgi_blur(ssao.compute3_layout())
             .expect("ssgi_blur");
 
-        let extent = view.extent();
+        let extent = view.scaled_render_extent();
         let instance_set = instancing.instance_set(0);
         let groups = |n: u32| n.div_ceil(8);
 
@@ -1936,7 +2124,13 @@ mod tests {
         // A frame validates the history; a resize must invalidate it again.
         view.history_valid = true;
         view.history_index = 1;
-        view.resize(&device, 64, 48).expect("resize");
+        view.desired_width = 64;
+        view.desired_height = 48;
+        let ext = vk::Extent2D {
+            width: 64,
+            height: 48,
+        };
+        view.resize(&device, ext, ext).expect("resize");
         view.build_screen_space(&device, &descriptors, &ssao)
             .expect("rebuild");
         assert!(
@@ -1952,13 +2146,13 @@ mod tests {
         drop(device);
     }
 
-    /// `build_aa_targets` creates exactly the per-mode AA targets: the motion target + its
-    /// depth are always built (SSGI feeds them, the pass gates per frame); TAA adds the two
-    /// history images + the scratch; FXAA adds the scratch but no TAA history; MSAA builds
-    /// the multisampled scene color + depth and no scratch/history; off adds neither. The
-    /// build + descriptor set writes + teardown are validation-clean across every mode (a
-    /// GPU gate the toolbox can run — no ray tracing, no present). Skips when no Vulkan
-    /// device is present.
+    /// `build_aa_targets` creates the per-mode AA targets: the motion target + its depth ride
+    /// with SSGI; the INPUT-extent scene scratch and the DISPLAY-extent overlay depth are built
+    /// in every mode (the scene always rasterises into scratch, the resolve reconstructs to the
+    /// display offscreen); TAA adds the two DISPLAY-extent history images; MSAA adds the
+    /// multisampled scene color + depth. The build + descriptor set writes + teardown are
+    /// validation-clean across every mode (a GPU gate the toolbox can run — no ray tracing, no
+    /// present). Skips when no Vulkan device is present.
     #[test]
     fn build_aa_targets_per_mode_is_validation_clean() {
         let device = match Device::new(&SurfaceSource::Offscreen) {
@@ -1981,13 +2175,21 @@ mod tests {
         view.build_screen_space(&device, &descriptors, &ssao)
             .expect("build screen-space");
 
-        // Off: the motion target is built (SSGI feeds it), but no scratch / history / MSAA.
+        // Off: motion (SSGI feeds it), the input scratch + display overlay depth (always built),
+        // but no TAA history / MSAA.
         let mut aa = crate::Aa::new(supported);
         view.build_aa_targets(&device, &descriptors, aa)
             .expect("build off");
         assert!(view.motion.is_some(), "the motion target rides with SSGI");
         assert!(view.motion_depth.is_some());
-        assert!(view.scratch.is_none(), "off builds no scratch");
+        assert!(
+            view.scratch.is_some(),
+            "the scene always renders into the input scratch"
+        );
+        assert!(
+            view.depth_display.is_some(),
+            "the display-extent overlay depth is always built"
+        );
         assert!(view.history[0].is_none() && view.history[1].is_none());
         assert!(view.msaa_color.is_none());
 
@@ -2031,7 +2233,10 @@ mod tests {
                 "MSAA builds the multisampled color"
             );
             assert!(view.msaa_depth.is_some());
-            assert!(view.scratch.is_none(), "MSAA has no FXAA/TAA scratch");
+            assert!(
+                view.scratch.is_some(),
+                "the scene always renders into the input scratch (MSAA resolves into it)"
+            );
             assert!(view.history[0].is_none() && view.history[1].is_none());
         }
 
@@ -2089,7 +2294,13 @@ mod tests {
         assert_eq!(view.history_index, 1, "the ping-pong parity flipped");
 
         // A resize rebuilds the screen-space + AA targets and re-invalidates everything.
-        view.resize(&device, 64, 48).expect("resize");
+        view.desired_width = 64;
+        view.desired_height = 48;
+        let ext = vk::Extent2D {
+            width: 64,
+            height: 48,
+        };
+        view.resize(&device, ext, ext).expect("resize");
         view.build_screen_space(&device, &descriptors, &ssao)
             .expect("rebuild screen-space");
         view.build_aa_targets(&device, &descriptors, aa)

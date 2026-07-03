@@ -88,6 +88,7 @@ pub struct Descriptors {
     tonemap_set_layout: vk::DescriptorSetLayout,
     fxaa_set_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
+    depth_upscale_set_layout: vk::DescriptorSetLayout,
 
     descriptor_pool: vk::DescriptorPool,
     bindless_pool: vk::DescriptorPool,
@@ -178,6 +179,7 @@ impl Descriptors {
         partial.tonemap_set_layout = Some(create_tonemap_layout(raw)?);
         partial.fxaa_set_layout = Some(create_fxaa_layout(raw)?);
         partial.taa_set_layout = Some(create_taa_layout(raw)?);
+        partial.depth_upscale_set_layout = Some(create_depth_upscale_layout(raw)?);
 
         partial.descriptor_pool = Some(create_descriptor_pool(raw)?);
         partial.bindless_pool = Some(create_bindless_pool(raw)?);
@@ -230,6 +232,7 @@ impl Descriptors {
             tonemap_set_layout: partial.take_tonemap_set_layout(),
             fxaa_set_layout: partial.take_fxaa_set_layout(),
             taa_set_layout: partial.take_taa_set_layout(),
+            depth_upscale_set_layout: partial.take_depth_upscale_set_layout(),
             descriptor_pool: partial.take_descriptor_pool(),
             bindless_pool: partial.take_bindless_pool(),
             bindless_set,
@@ -314,6 +317,11 @@ impl Descriptors {
     /// history storage images).
     pub fn taa_set_layout(&self) -> vk::DescriptorSetLayout {
         self.taa_set_layout
+    }
+
+    /// The depth-upscale graphics layout (one fragment sampler: the input scene depth).
+    pub fn depth_upscale_layout(&self) -> vk::DescriptorSetLayout {
+        self.depth_upscale_set_layout
     }
 
     /// The descriptor pool the per-frame light/instance/cluster + per-view sets are
@@ -686,6 +694,7 @@ impl Drop for Descriptors {
             raw.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
             raw.destroy_descriptor_set_layout(self.fxaa_set_layout, None);
             raw.destroy_descriptor_set_layout(self.taa_set_layout, None);
+            raw.destroy_descriptor_set_layout(self.depth_upscale_set_layout, None);
             raw.destroy_sampler(self.linear_sampler, None);
             raw.destroy_sampler(self.shadow_sampler, None);
             raw.destroy_sampler(self.sdf_sampler, None);
@@ -714,6 +723,7 @@ struct Partial<'a> {
     tonemap_set_layout: Option<vk::DescriptorSetLayout>,
     fxaa_set_layout: Option<vk::DescriptorSetLayout>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
+    depth_upscale_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
     bindless_pool: Option<vk::DescriptorPool>,
 }
@@ -749,6 +759,7 @@ impl<'a> Partial<'a> {
             tonemap_set_layout: None,
             fxaa_set_layout: None,
             taa_set_layout: None,
+            depth_upscale_set_layout: None,
             descriptor_pool: None,
             bindless_pool: None,
         }
@@ -768,6 +779,7 @@ impl<'a> Partial<'a> {
         take_tonemap_set_layout => tonemap_set_layout: vk::DescriptorSetLayout,
         take_fxaa_set_layout => fxaa_set_layout: vk::DescriptorSetLayout,
         take_taa_set_layout => taa_set_layout: vk::DescriptorSetLayout,
+        take_depth_upscale_set_layout => depth_upscale_set_layout: vk::DescriptorSetLayout,
         take_descriptor_pool => descriptor_pool: vk::DescriptorPool,
         take_bindless_pool => bindless_pool: vk::DescriptorPool,
     }
@@ -800,6 +812,7 @@ impl Drop for Partial<'_> {
                 self.tonemap_set_layout,
                 self.fxaa_set_layout,
                 self.taa_set_layout,
+                self.depth_upscale_set_layout,
             ]
             .into_iter()
             .flatten()
@@ -1152,8 +1165,8 @@ fn create_fxaa_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     )
 }
 
-/// The TAA resolve compute set: current/history/motion samplers (0–2) + offscreen/
-/// history storage images (3–4).
+/// The TAA resolve compute set: current/history/motion samplers (0–2), offscreen/history
+/// storage images (3–4), and the motion-prepass depth (5) for closest-depth velocity dilation.
 fn create_taa_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let bindings = [
         compute_binding(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
@@ -1161,6 +1174,13 @@ fn create_taa_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
         compute_binding(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
         compute_binding(3, vk::DescriptorType::STORAGE_IMAGE),
         compute_binding(4, vk::DescriptorType::STORAGE_IMAGE),
+        compute_binding(5, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        // Phase 3 reconstruction robustness: 6 = reactive coverage (input R8), 7 = the previous
+        // lock image (display, sampled at the reprojected UV), 8 = this frame's lock image
+        // (display, written).
+        compute_binding(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(8, vk::DescriptorType::STORAGE_IMAGE),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1172,6 +1192,22 @@ fn create_taa_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
 
 /// One compute-stage binding of `kind` at `slot`, count 1 — the post-process set
 /// shape.
+/// The depth-upscale graphics set: one fragment sampler (the input-extent scene depth), sampled
+/// per display pixel to fill the display-extent overlay depth.
+fn create_depth_upscale_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: the ash seam.
+    checked(
+        unsafe { raw.create_descriptor_set_layout(&info, None) },
+        "depthUpscaleSetLayout",
+    )
+}
+
 fn compute_binding(slot: u32, kind: vk::DescriptorType) -> vk::DescriptorSetLayoutBinding<'static> {
     vk::DescriptorSetLayoutBinding::default()
         .binding(slot)
@@ -1197,12 +1233,12 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
             8 * frames + 24 + 8 * views,
         ),
         // +(GDF_CASCADES + 1) per frame for each composite set's cascade storage-image array + the
-        // lite albedo cache. The per-view budget (28) covers the DFAO and specular-occlusion chains'
+        // lite albedo cache. The per-view budget (29) covers the DFAO and specular-occlusion chains'
         // storage images (each: trace out + blur out + two accum sets = 6, so 12 total) on top of
-        // the SSGI/AA sets.
+        // the SSGI/AA sets, plus the TAA lock-write storage image (binding 8).
         pool_size(
             vk::DescriptorType::STORAGE_IMAGE,
-            48 + 28 * views + (crate::GDF_CASCADES + 1) * frames,
+            48 + 29 * views + (crate::GDF_CASCADES + 1) * frames,
         ),
         pool_size(
             vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
