@@ -58,6 +58,26 @@ const TARGET_FPS_OPTIONS: { value: string; label: string }[] = [
   { value: "240", label: "240 Hz" },
 ];
 
+/// The TAAU input:display render-scale presets. The temporal upsampler reconstructs the sub-native
+/// input to a sharp display image; a lower ratio trades reconstruction softness for frame time.
+const RESOLUTION_PRESETS: { value: string; label: string }[] = [
+  { value: "1", label: "Native (100%)" },
+  { value: "0.83", label: "Quality (83%)" },
+  { value: "0.67", label: "Balanced (67%)" },
+  { value: "0.5", label: "Performance (50%)" },
+];
+
+/// Maps a live ratio to the nearest preset value string (for the Select's controlled value).
+function nearestResolutionPreset(ratio: number): string {
+  let best = RESOLUTION_PRESETS[0];
+  for (const p of RESOLUTION_PRESETS) {
+    if (Math.abs(Number(p.value) - ratio) < Math.abs(Number(best.value) - ratio)) {
+      best = p;
+    }
+  }
+  return best.value;
+}
+
 /// The HDR→display tonemap operator.
 const TONEMAP_OPTIONS: { value: string; label: string }[] = [
   { value: "aces", label: "ACES" },
@@ -155,6 +175,8 @@ export function RenderPanel() {
   const setTargetFpsMode = useEditorStore((s) => s.setTargetFpsMode);
   const setPerfConfig = useEditorStore((s) => s.setPerfConfig);
   const perfTargetFps = useEditorStore((s) => s.perfConfig?.targetFps ?? null);
+  const upscale = useEditorStore((s) => s.upscale);
+  const setUpscale = useEditorStore((s) => s.setUpscale);
   // The true display refresh from the Wayland presenter (the webview's rAF is 60-pinned, useless
   // here). `0` until the first presented frame reports it, so we poll until it settles.
   const [displayRefreshHz, setDisplayRefreshHz] = useState(0);
@@ -225,8 +247,10 @@ export function RenderPanel() {
     };
   }, [ready, displayRefreshHz]);
 
-  // Keep the engine's target_fps in sync with the selected mode. `Default` follows the display
-  // refresh, so this re-pushes when the measured refresh settles or the mode changes.
+  // Keep the engine's frame budget in sync with the selected target-FPS mode. The budget lives on
+  // the TAAU surface now (set-upscale's targetMs = 1000 / fps); get-perf-config stays the budget
+  // telemetry read, so we refresh it after the write to settle this effect. `Default` follows the
+  // display refresh, so this re-pushes when the measured refresh settles or the mode changes.
   useEffect(() => {
     if (!ready || perfTargetFps === null) {
       return;
@@ -234,7 +258,8 @@ export function RenderPanel() {
     const want = resolveTargetFps(targetFpsMode, displayRefreshHz, perfTargetFps);
     if (want >= 1 && Math.round(perfTargetFps) !== want) {
       void client
-        .setPerfConfig({ targetFps: want })
+        .setUpscale({ targetMs: 1000 / want })
+        .then(() => client.getPerfConfig())
         .then((config) => setPerfConfig(config))
         .catch((err: unknown) => notifyError(errorText(err)));
     }
@@ -304,6 +329,23 @@ export function RenderPanel() {
           contactShadows: res.contactShadows,
         }),
       )
+      .catch((err: unknown) => notifyError(errorText(err)));
+  };
+
+  /// The TAAU render scale (input:display ratio). A partial set-upscale; the reply carries the
+  /// merged state (including the recomputed input extent).
+  const onRatio = (ratio: number): void => {
+    void client
+      .setUpscale({ ratio })
+      .then((res) => setUpscale(res.upscale))
+      .catch((err: unknown) => notifyError(errorText(err)));
+  };
+
+  /// Dynamic resolution: hand the input extent to the frame-budget controller (targetMs).
+  const onDynamic = (next: boolean): void => {
+    void client
+      .setUpscale({ dynamic: next })
+      .then((res) => setUpscale(res.upscale))
       .catch((err: unknown) => notifyError(errorText(err)));
   };
 
@@ -442,6 +484,48 @@ export function RenderPanel() {
               </SelectContent>
             </Select>
           </div>
+
+          <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
+            <Label className="truncate text-[11px] font-normal text-muted-foreground">
+              Resolution
+            </Label>
+            <Select
+              value={upscale ? nearestResolutionPreset(upscale.ratio) : "1"}
+              disabled={!ready || upscale === null || upscale.dynamic}
+              onValueChange={(v) => onRatio(Number(v))}
+            >
+              <SelectTrigger size="sm" className="h-7 w-[112px] font-mono text-[11px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RESOLUTION_PRESETS.map((p) => (
+                  <SelectItem key={p.value} value={p.value} className="text-[11px]">
+                    {p.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <ToggleRow
+            label="Dynamic resolution"
+            checked={upscale?.dynamic ?? false}
+            disabled={!ready || upscale === null}
+            tooltip="Let the frame-budget controller drive the render scale toward the target FPS"
+            onCheckedChange={onDynamic}
+          />
+
+          {upscale && (
+            <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
+              <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                Render → display
+              </Label>
+              <span className="font-mono text-[11px] text-muted-foreground">
+                {upscale.inputWidth}×{upscale.inputHeight} → {upscale.displayWidth}×
+                {upscale.displayHeight}
+              </span>
+            </div>
+          )}
 
           <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
             <Label className="truncate text-[11px] font-normal text-muted-foreground">

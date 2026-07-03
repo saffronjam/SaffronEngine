@@ -4,7 +4,7 @@
 /// ingests. Both are loaded into ui.perfetto.dev manually (see PERFETTO_URL).
 import type { ProfileCaptureDto } from "../protocol";
 
-// --- minimal protobuf writer (only what the Trace proto needs) ---
+// Minimal protobuf writer (only what the Trace proto needs).
 // Varint over a JS number: values stay under 2^53 (host-ns timestamps ≈ 1e14, uuids tiny), so
 // modulo arithmetic is exact — `& 0x7f` would wrongly truncate to 32 bits past 2^32.
 function pushVarint(out: number[], value: number): void {

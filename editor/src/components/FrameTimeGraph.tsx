@@ -234,5 +234,13 @@ export function FrameTimeGraph({
     plotRef.current?.redraw();
   }, [budgetMs]);
 
-  return <div ref={hostRef} className="w-full" style={{ height: HEIGHT }} />;
+  // The uPlot host is `absolute inset-0` inside an `overflow-hidden min-w-0` box so uPlot's
+  // explicit pixel width can never prop the box (or the shrink-to-content ScrollArea wrapper
+  // above it) open: the ResizeObserver then measures the true available width and the chart
+  // shrinks with the sidebar instead of pinning it wide.
+  return (
+    <div className="relative w-full min-w-0 overflow-hidden" style={{ height: HEIGHT }}>
+      <div ref={hostRef} className="absolute inset-0" />
+    </div>
+  );
 }
