@@ -30,7 +30,7 @@ async function screenshot(tag: string): Promise<Buffer> {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   const model = await engine.call<{ id: string }>("import-model", { path: FIXTURE });
   const inst = await engine.call<{ id: string }>("instantiate-model", { asset: model.id });
   rootId = inst.id;

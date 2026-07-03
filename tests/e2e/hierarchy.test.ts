@@ -9,7 +9,7 @@ import { Engine } from "./harness.ts";
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // yaw 0 / pitch 0 looks down -Z, so after a focus the world X axis projects screen-right
   // and world Y screen-up — deterministic gizmo probing.
   await engine.call("set-camera", { yaw: 0, pitch: 0 });
