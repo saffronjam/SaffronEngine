@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ExternalLink, Loader2, Maximize2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 import { errorText, notifyError } from "../lib/flash";
 import { AssetDetailModal } from "./AssetDetailModal";
@@ -191,12 +192,14 @@ const StoreCard = React.memo(function StoreCard({
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-1 p-2">
         <div className="flex items-start gap-1">
-          <div
-            className="min-w-0 flex-1 truncate text-xs font-medium text-foreground"
-            title={result.name}
-          >
-            {result.name}
-          </div>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+                {result.name}
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>{result.name}</TooltipContent>
+          </Tooltip>
           <button
             type="button"
             aria-label="Open on the provider's site"
