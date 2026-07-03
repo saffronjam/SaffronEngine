@@ -238,6 +238,8 @@ async function paramsForFixture(
       return {};
     case "aa":
       return { mode: "fxaa" };
+    case "taa-sharpness":
+      return { sharpness: 0.5 };
     case "view-mode-wireframe":
       return { mode: "wireframe" };
     case "render-quality":
@@ -347,7 +349,11 @@ async function paramsForFixture(
     case "frame-history-samples":
       return { samples: 16 };
     case "perf-config-30":
-      return { targetFps: 30 };
+      // The frame budget / dynamic resolution moved to set-upscale; set-perf-config now carries
+      // only the alarm thresholds.
+      return { greenBudgetFrac: 0.5 };
+    case "upscale":
+      return { ratio: 0.67, dynamic: true, targetMs: 16.7 };
     case "alarms-since-0":
       return { since: 0 };
     case "script-schema-file": {
