@@ -16,7 +16,7 @@ beforeAll(async () => {
   rmSync(projectDir, { recursive: true, force: true });
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
 });
 afterAll(async () => {
   await engine?.shutdown();
@@ -47,7 +47,7 @@ test("a dropped foreign .png gets a minted .smeta with a stable id on scan", asy
 });
 
 test("the .smeta identity is stable across a reload", async () => {
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   await engine.settle();
   const assets = await engine.call<AssetList>("list-assets");
   const wood = assets.assets.find((a) => a.name === "wood");

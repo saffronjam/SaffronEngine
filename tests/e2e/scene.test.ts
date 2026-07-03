@@ -92,7 +92,7 @@ test("component order is explicit, add-at-bottom, validated, and persisted", asy
   const dir = await mkdtemp(join(tmpdir(), "saffron-component-order-"));
   const projectPath = join(dir, "project.json");
   await engine.call("save-project", { path: projectPath });
-  await engine.call("load-project", { path: projectPath });
+  await engine.loadProject(projectPath);
 
   info = await engine.call<Inspect>("inspect", { entity: name });
   expect(info.componentOrder).toEqual(["Name", "Transform", "Material"]);

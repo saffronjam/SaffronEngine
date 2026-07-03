@@ -27,7 +27,7 @@ beforeAll(async () => {
   rmSync(projectDir, { recursive: true, force: true });
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
 });
 afterAll(async () => {
   await engine?.shutdown();
@@ -45,7 +45,7 @@ test("1. import bakes one .smodel asset and spawns no entity", async () => {
 });
 
 test("2. a reload reconstructs the catalog from disk (the import survives)", async () => {
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   await engine.settle();
   const assets = await engine.call<AssetList>("list-assets");
   expect(assets.assets.some((a) => a.id === modelId)).toBe(true);
