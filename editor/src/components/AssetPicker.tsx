@@ -16,7 +16,6 @@ import type { AssetEntry } from "../protocol";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ScrollArea } from "@/components/ui/scroll-area";
 
 const NONE_UUID = "0";
 
@@ -163,25 +162,26 @@ export function AssetPicker({ value, assetType, onChange }: AssetPickerProps) {
           </Button>
         </PopoverTrigger>
         <PopoverContent align="start" className="w-(--radix-popover-trigger-width) p-1">
-          <ScrollArea className="max-h-56">
-            <div className="flex flex-col gap-0.5">
-              <PickerRow label="(none)" active={isNone} onSelect={() => pick(NONE_UUID)} />
-              {options.map((asset) => (
-                <PickerRow
-                  key={asset.id}
-                  label={asset.name}
-                  swatch={<AssetSwatch asset={asset} size={16} />}
-                  active={asset.id === value}
-                  onSelect={() => pick(asset.id)}
-                />
-              ))}
-              {options.length === 0 ? (
-                <span className="px-2 py-1 text-[11px] italic text-muted-foreground">
-                  No {assetType} assets
-                </span>
-              ) : null}
-            </div>
-          </ScrollArea>
+          {/* Native max-height + overflow scroll: a Radix ScrollArea's `h-full` viewport
+              can't resolve against a max-height-only (auto-height) parent, so it would grow
+              to full content height and overshoot the cap instead of scrolling. */}
+          <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+            <PickerRow label="(none)" active={isNone} onSelect={() => pick(NONE_UUID)} />
+            {options.map((asset) => (
+              <PickerRow
+                key={asset.id}
+                label={asset.name}
+                swatch={<AssetSwatch asset={asset} size={16} />}
+                active={asset.id === value}
+                onSelect={() => pick(asset.id)}
+              />
+            ))}
+            {options.length === 0 ? (
+              <span className="px-2 py-1 text-[11px] italic text-muted-foreground">
+                No {assetType} assets
+              </span>
+            ) : null}
+          </div>
         </PopoverContent>
       </Popover>
     </div>

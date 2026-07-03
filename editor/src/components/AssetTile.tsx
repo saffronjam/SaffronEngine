@@ -295,7 +295,10 @@ export const AssetTile = memo(function AssetTile({
         }}
         className={cn(
           "group flex w-[72px] cursor-grab flex-col gap-1 rounded-md border border-transparent p-1",
-          "transition-[opacity,color,border-color,background-color] duration-150 hover:border-ring hover:bg-accent/40 active:cursor-grabbing",
+          "transition-[opacity,color,border-color,background-color] duration-150 active:cursor-grabbing",
+          // Hover affordance only when not already selected — a selected tile keeps its
+          // appearance on hover instead of stacking a second highlight on top.
+          !selected && "hover:border-ring hover:bg-accent/40",
           selected && "border-ring bg-accent/60 ring-1 ring-ring",
           dragging && "opacity-45",
         )}
