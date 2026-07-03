@@ -616,6 +616,19 @@ impl AssetServer {
     }
 }
 
+/// The deterministic per-shell scratch project name, keyed to the current working directory + the
+/// `$SAFFRON_CONTROL_SOCK` (`scratch-<fnv>`), so a host launched without a project resolves the
+/// same scratch project each run.
+#[must_use]
+pub fn scratch_project_name() -> String {
+    let socket = std::env::var("SAFFRON_CONTROL_SOCK").unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let suffix = scratch_suffix(&format!("{cwd}{socket}"));
+    format!("scratch-{}", &suffix[..suffix.len().min(12)])
+}
+
 /// An FNV-1a fold of `key` as a decimal string, for the scratch project name suffix.
 ///
 /// FNV-1a is deterministic, giving a stable per-`(cwd, socket)` suffix.
