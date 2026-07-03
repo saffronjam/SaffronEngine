@@ -53,7 +53,7 @@ test("the editor camera roundtrips through project save/load", async () => {
   await engine.call("save-project", { path: `${projectDir}/project.json` });
 
   await engine.call("set-camera", { position: { x: 0, y: 0, z: 0 }, yaw: 0, pitch: 0, fov: 45 });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
 
   const loaded = await engine.call<EditorCamera>("get-camera");
   expect(loaded.position).toEqual(saved.position);
@@ -90,7 +90,7 @@ test("scene camera editor helpers default on and roundtrip", async () => {
   });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
 
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   const loaded = await engine.call<Inspect>("inspect", { entity: camera.id });
   expect(loaded.components.Camera.showModel).toBe(false);
   expect(loaded.components.Camera.showFrustum).toBe(false);

@@ -27,7 +27,7 @@ test("an assigned normal map survives project save + reload", async () => {
   // Reuse the albedo texture as the normal slot, then round-trip the project.
   await engine.call("assign-asset", { entity: e.id, slot: "normal", asset: albedo });
   await engine.call("save-project");
-  await engine.call("reload-project");
+  await engine.reloadProject();
 
   const after = await engine.call<InspectResult>("inspect", { entity: e.id });
   const normal = (after.components.Material as { normalTexture?: string }).normalTexture;

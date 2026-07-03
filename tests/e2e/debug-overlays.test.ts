@@ -139,7 +139,7 @@ test("the overlay toggles round-trip through project save/load", async () => {
     lightVolumes: false,
     grid: false,
   });
-  await engine.call("load-project", { path: projectPath });
+  await engine.loadProject(projectPath);
 
   const loaded = await engine.call<DebugOverlays>("get-debug-overlays", {});
   expect(loaded.bounds).toBe(true);

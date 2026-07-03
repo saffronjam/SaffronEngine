@@ -23,6 +23,8 @@ test("probe-asset returns on-disk metadata for a mesh", async () => {
   const assets = await engine.call<AssetList>("list-assets");
   const mesh = assets.assets.find((a) => a.type === "mesh");
   expect(mesh).toBeDefined();
+  // The list entry carries the file's creation time so the browser can sort by it.
+  expect(mesh!.createdAt).toBeGreaterThan(0);
 
   const meta = await engine.call<AssetMetadataDto>("probe-asset", { asset: mesh!.id });
   expect(meta.id).toBe(mesh!.id);

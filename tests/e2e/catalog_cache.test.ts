@@ -17,10 +17,10 @@ beforeAll(async () => {
   rmSync(projectDir, { recursive: true, force: true });
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   await engine.call("import-model", { path: FIXTURE });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   await engine.settle();
 });
 afterAll(async () => {
@@ -43,7 +43,7 @@ test("loading a project writes a catalog cache", async () => {
 
 test("deleting the cache yields an identical catalog from a cold scan", async () => {
   rmSync(cachePath, { force: true });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   await engine.settle();
   expect(await catalogIds()).toEqual(baseline);
   expect(existsSync(cachePath)).toBe(true); // a cold scan rewrites it
@@ -51,7 +51,7 @@ test("deleting the cache yields an identical catalog from a cold scan", async ()
 
 test("a corrupt cache falls back to a clean full scan", async () => {
   writeFileSync(cachePath, "{ not valid json ]");
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
   await engine.settle();
   expect(await catalogIds()).toEqual(baseline);
 });

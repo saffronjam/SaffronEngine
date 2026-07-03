@@ -33,7 +33,7 @@ test("destroyed textures return their bindless slots to the free-list", async ()
   expect(before.bindlessTextures).toBeGreaterThan(0);
 
   // A fresh project clears the asset caches → the imported textures are destroyed → their slots free.
-  await engine.call("new-project", { name: "reclaim-test", root });
+  await engine.newProject({ name: "reclaim-test", root });
   await engine.settle(400);
   const after = await engine.call<Stats>("render-stats");
 
