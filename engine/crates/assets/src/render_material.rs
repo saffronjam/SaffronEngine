@@ -18,8 +18,8 @@
 //!
 //! A material's single ORM texture (`orm_texture`) drives **both** the
 //! metallic-roughness slot (roughness in G, metalness in B) and the occlusion slot (AO
-//! in R), so one map covers all three. [`SubmeshMaterial::alpha_clip`] is derived from
-//! `blend == "masked"`.
+//! in R), so one map covers all three. [`SubmeshMaterial::blend_mode`] is parsed from the
+//! `.smat` `blend` string via [`BlendMode::from_wire`].
 //!
 //! # Component precedence
 //!
@@ -32,6 +32,7 @@
 
 use std::sync::Arc;
 
+use saffron_core::BlendMode;
 use saffron_geometry::Submesh;
 use saffron_geometry::glam::Vec3;
 use saffron_rendering::{GpuTexture, SubmeshMaterial};
@@ -85,7 +86,7 @@ impl Default for ResolvedMaterials {
 /// thumbnail worker passes its own uploader. A zero texture id leaves that handle unset —
 /// the draw path's default-white substitution is a renderer concern, not done here. The
 /// packed `orm_texture` feeds **both** the metallic-roughness and the occlusion slot, and
-/// `alpha_clip` is `blend == "masked"`.
+/// `blend_mode` parses the `.smat` `blend` string.
 ///
 /// The loader is `FnMut`: the main path's closure fills the texture cache as it resolves,
 /// so a borrowed mutable closure is the allocation-free shape — no trait object for a
@@ -104,7 +105,7 @@ pub fn build_submesh_material(
         uv_tiling: material.uv_tiling,
         uv_offset: material.uv_offset,
         height_scale: material.height_scale,
-        alpha_clip: material.blend == "masked",
+        blend_mode: BlendMode::from_wire(&material.blend),
         alpha_cutoff: material.alpha_cutoff,
         double_sided: material.double_sided,
         ..SubmeshMaterial::defaults()
@@ -242,7 +243,7 @@ impl AssetServer {
                 uv_offset: material.uv_offset,
                 height_texture: material.height_texture,
                 height_scale: material.height_scale,
-                alpha_clip: material.alpha_clip,
+                blend_mode: material.blend_mode,
                 alpha_cutoff: material.alpha_cutoff,
                 double_sided: material.double_sided,
             };
@@ -257,7 +258,7 @@ impl AssetServer {
     ///
     /// Distinct from [`build_submesh_material`]: a slot carries an explicit
     /// `metallic_roughness_texture` and `occlusion_texture` separately (it is not a packed
-    /// ORM), so they resolve from their own ids, and `alpha_clip` rides the slot directly.
+    /// ORM), so they resolve from their own ids, and `blend_mode` rides the slot directly.
     fn lower_slot(&mut self, gpu: &dyn GpuUploader, slot: &MaterialSlot) -> SubmeshMaterial {
         let mut sm = SubmeshMaterial {
             base_color: slot.base_color,
@@ -269,7 +270,7 @@ impl AssetServer {
             uv_tiling: slot.uv_tiling,
             uv_offset: slot.uv_offset,
             height_scale: slot.height_scale,
-            alpha_clip: slot.alpha_clip,
+            blend_mode: slot.blend_mode,
             alpha_cutoff: slot.alpha_cutoff,
             double_sided: slot.double_sided,
             ..SubmeshMaterial::defaults()
@@ -381,8 +382,8 @@ mod tests {
         assert_eq!(sm.uv_offset, Vec2::new(0.1, 0.2));
         assert_eq!(sm.height_scale, 0.1);
         assert_eq!(sm.alpha_cutoff, 0.25);
-        // `alpha_clip` is true iff blend == "masked".
-        assert!(sm.alpha_clip);
+        // `blend == "masked"` lowers to the masked blend mode.
+        assert_eq!(sm.blend_mode, BlendMode::Masked);
 
         // The packed ORM id is requested for *both* the metallic-roughness and the
         // occlusion slot. `load`'s mutable borrow of `requests` ends at the call above
@@ -401,14 +402,18 @@ mod tests {
         // real `GpuTexture` off-GPU, so this asserts the *handle presence* contract via the
         // request count instead: an ORM id present yields two requests, mr + occlusion,
         // and the slots are set from the same id (proved by the request-count test above).
-        // Here we assert the alpha-clip derivation across blend modes.
-        for (blend, expect) in [("opaque", false), ("masked", true), ("translucent", false)] {
+        // Here we assert the blend-mode derivation across the three glTF alpha modes.
+        for (blend, expect) in [
+            ("opaque", BlendMode::Opaque),
+            ("masked", BlendMode::Masked),
+            ("translucent", BlendMode::Blend),
+        ] {
             let material = MaterialAsset {
                 blend: blend.to_owned(),
                 ..MaterialAsset::default()
             };
             let sm = build_submesh_material(&material, &mut |_| None);
-            assert_eq!(sm.alpha_clip, expect, "blend {blend}");
+            assert_eq!(sm.blend_mode, expect, "blend {blend}");
         }
     }
 
@@ -622,7 +627,7 @@ mod tests {
                 Material {
                     base_color: Vec4::new(0.7, 0.8, 0.9, 1.0),
                     unlit: true,
-                    alpha_clip: true,
+                    blend_mode: BlendMode::Masked,
                     ..Material::default()
                 },
             )
@@ -634,7 +639,7 @@ mod tests {
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
         assert_eq!(resolved.submeshes.len(), 1);
         assert!(resolved.unlit);
-        assert!(resolved.submeshes[0].alpha_clip);
+        assert_eq!(resolved.submeshes[0].blend_mode, BlendMode::Masked);
         assert_eq!(resolved.proxy_albedo, Vec3::new(0.7, 0.8, 0.9));
 
         let _ = std::fs::remove_dir_all(&tmp);
