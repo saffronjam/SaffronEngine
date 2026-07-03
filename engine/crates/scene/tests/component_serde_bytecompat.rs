@@ -66,7 +66,7 @@ impl RegistryExt for ComponentRegistry {
 const EXPECT_TRANSFORM_DEFAULT: &str = r#"{"rotation":{"x":0.0,"y":0.0,"z":0.0},"scale":{"x":1.0,"y":1.0,"z":1.0},"translation":{"x":0.0,"y":0.0,"z":0.0}}"#;
 const EXPECT_TRANSFORM_VALUES: &str = r#"{"rotation":{"x":0.10000000149011612,"y":0.20000000298023224,"z":0.30000001192092896},"scale":{"x":2.0,"y":2.0,"z":2.0},"translation":{"x":1.5,"y":-2.0,"z":3.25}}"#;
 const EXPECT_CAMERA_DEFAULT: &str = r#"{"far":100.0,"fov":45.0,"frustumMaxDistance":10.0,"near":0.10000000149011612,"primary":true,"showFrustum":true,"showModel":true}"#;
-const EXPECT_MATERIAL_DEFAULT: &str = r#"{"albedoTexture":"0","alphaClip":false,"alphaCutoff":0.5,"baseColor":{"w":1.0,"x":1.0,"y":1.0,"z":1.0},"emissive":{"x":0.0,"y":0.0,"z":0.0},"emissiveStrength":1.0,"emissiveTexture":"0","heightScale":0.05000000074505806,"heightTexture":"0","metallic":0.0,"metallicRoughnessTexture":"0","normalStrength":1.0,"normalTexture":"0","occlusionTexture":"0","roughness":1.0,"unlit":false}"#;
+const EXPECT_MATERIAL_DEFAULT: &str = r#"{"albedoTexture":"0","alphaCutoff":0.5,"baseColor":{"w":1.0,"x":1.0,"y":1.0,"z":1.0},"blend":"opaque","doubleSided":false,"emissive":{"x":0.0,"y":0.0,"z":0.0},"emissiveStrength":1.0,"emissiveTexture":"0","heightScale":0.05000000074505806,"heightTexture":"0","metallic":0.0,"metallicRoughnessTexture":"0","normalStrength":1.0,"normalTexture":"0","occlusionTexture":"0","roughness":1.0,"unlit":false}"#;
 const EXPECT_MESH: &str = r#"{"mesh":"1024"}"#;
 const EXPECT_MATERIALASSET: &str = r#"{"material":"4242"}"#;
 const EXPECT_MODELINSTANCE: &str = r#"{"modelId":"9999"}"#;

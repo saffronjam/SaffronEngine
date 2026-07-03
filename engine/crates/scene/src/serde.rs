@@ -31,7 +31,7 @@
 use glam::{BVec3, Mat4, Vec3, Vec4};
 use serde_json::{Map, Value};
 
-use saffron_core::Uuid;
+use saffron_core::{BlendMode, Uuid};
 use saffron_json::{json_bool_or, json_f32_or, json_string_or, json_u64_or, uuid_to_json};
 
 use crate::component::{
@@ -243,7 +243,7 @@ fn material_slot_to_json(s: &MaterialSlot) -> Value {
         ("heightTexture", uuid_to_json(s.height_texture.value())),
         ("normalStrength", f32_value(s.normal_strength)),
         ("heightScale", f32_value(s.height_scale)),
-        ("alphaClip", Value::Bool(s.alpha_clip)),
+        ("blend", Value::String(s.blend_mode.as_wire().to_owned())),
         ("alphaCutoff", f32_value(s.alpha_cutoff)),
         ("doubleSided", Value::Bool(s.double_sided)),
     ])
@@ -269,7 +269,7 @@ fn material_as_slot(m: &Material) -> MaterialSlot {
         uv_tiling: m.uv_tiling,
         uv_offset: m.uv_offset,
         height_scale: m.height_scale,
-        alpha_clip: m.alpha_clip,
+        blend_mode: m.blend_mode,
         alpha_cutoff: m.alpha_cutoff,
         double_sided: m.double_sided,
     }
@@ -295,7 +295,8 @@ impl SceneSerialize for Material {
         self.height_texture = Uuid(json_u64_or(value, "heightTexture", 0));
         self.normal_strength = json_f32_or(value, "normalStrength", 1.0);
         self.height_scale = json_f32_or(value, "heightScale", 0.05);
-        self.alpha_clip = json_bool_or(value, "alphaClip", false);
+        self.blend_mode =
+            BlendMode::from_wire(&json_string_or(value, "blend", "opaque".to_owned()));
         self.alpha_cutoff = json_f32_or(value, "alphaCutoff", 0.5);
         self.double_sided = json_bool_or(value, "doubleSided", false);
         Ok(())
@@ -322,7 +323,7 @@ fn material_slot_from_json(sj: &Value) -> MaterialSlot {
         uv_tiling: MaterialSlot::default().uv_tiling,
         uv_offset: MaterialSlot::default().uv_offset,
         height_scale: json_f32_or(sj, "heightScale", 0.05),
-        alpha_clip: json_bool_or(sj, "alphaClip", false),
+        blend_mode: BlendMode::from_wire(&json_string_or(sj, "blend", "opaque".to_owned())),
         alpha_cutoff: json_f32_or(sj, "alphaCutoff", 0.5),
         double_sided: json_bool_or(sj, "doubleSided", false),
     }
