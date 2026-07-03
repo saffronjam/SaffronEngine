@@ -120,7 +120,10 @@ e2e:
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=e2e; {{reenter}}
-    cd "{{repo}}/tests/e2e" && bun test
+    # A generous per-test/hook timeout: boots wait for the non-blocking project load to reach
+    # `ready`, and on the llvmpipe fallback the first content renders are slow, so the 5s default is
+    # too tight for the heavier setup hooks (boot + multiple loads + import).
+    cd "{{repo}}/tests/e2e" && bun test --timeout 30000
 
 # run the Rust workspace unit + integration tests
 test:
