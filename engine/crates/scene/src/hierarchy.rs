@@ -669,7 +669,8 @@ mod tests {
         assert_eq!(scene.model_rig_entity(single), None);
 
         // S2: a static multi-node forest — the container holds nothing; two child nodes hold
-        // the meshes. The single-entity probe on the container is exactly what used to reject it.
+        // the meshes. A single-entity probe on the container finds no mesh, so the resolver must
+        // descend into the children.
         let mut scene = Scene::new();
         let container = scene.create_entity("Forest");
         let door_a = scene.create_entity("DoorA");

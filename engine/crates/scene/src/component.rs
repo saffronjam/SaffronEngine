@@ -17,7 +17,7 @@
 use glam::{BVec3, Mat4, Quat, Vec2, Vec3, Vec4};
 use serde_json::Value;
 
-use saffron_core::Uuid;
+use saffron_core::{BlendMode, Uuid};
 
 use crate::scene::Entity;
 
@@ -610,9 +610,10 @@ pub struct Material {
     pub uv_offset: Vec2,
     /// Parallax height scale.
     pub height_scale: f32,
-    /// Masked: discard fragments below `alpha_cutoff`.
-    pub alpha_clip: bool,
-    /// Alpha-clip cutoff.
+    /// Alpha/blend mode (glTF `alphaMode`): opaque, masked (alpha-tested cutout), or
+    /// translucent (alpha-blended).
+    pub blend_mode: BlendMode,
+    /// Alpha-clip cutoff (used by [`BlendMode::Masked`]).
     pub alpha_cutoff: f32,
     /// Two-sided (glTF `doubleSided`): render both faces — the scene pass disables backface
     /// culling for this material so thin geometry (curtains, foliage) shows from both sides.
@@ -638,7 +639,7 @@ impl Default for Material {
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             height_scale: 0.05,
-            alpha_clip: false,
+            blend_mode: BlendMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
         }
@@ -680,9 +681,10 @@ pub struct MaterialSlot {
     pub uv_offset: Vec2,
     /// Parallax height scale.
     pub height_scale: f32,
-    /// Masked: discard fragments below `alpha_cutoff`.
-    pub alpha_clip: bool,
-    /// Alpha-clip cutoff.
+    /// Alpha/blend mode (glTF `alphaMode`): opaque, masked (alpha-tested cutout), or
+    /// translucent (alpha-blended).
+    pub blend_mode: BlendMode,
+    /// Alpha-clip cutoff (used by [`BlendMode::Masked`]).
     pub alpha_cutoff: f32,
     /// Two-sided (glTF `doubleSided`): render both faces — the scene pass disables backface
     /// culling for this slot so thin geometry (curtains, foliage) shows from both sides.
@@ -708,7 +710,7 @@ impl Default for MaterialSlot {
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             height_scale: 0.05,
-            alpha_clip: false,
+            blend_mode: BlendMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
         }
@@ -1063,7 +1065,7 @@ mod tests {
         assert_eq!(m.uv_tiling, Vec2::ONE);
         assert_eq!(m.uv_offset, Vec2::ZERO);
         assert_eq!(m.height_scale, 0.05);
-        assert!(!m.alpha_clip);
+        assert_eq!(m.blend_mode, BlendMode::Opaque);
         assert_eq!(m.alpha_cutoff, 0.5);
     }
 
