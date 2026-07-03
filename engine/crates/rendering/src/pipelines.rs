@@ -69,6 +69,13 @@ pub struct PsoKey {
     pub skinned: bool,
     /// The wireframe rasterizer permutation (`PolygonMode::LINE`).
     pub wireframe: bool,
+    /// The translucent permutation: straight-alpha blending enabled, depth-write off (the
+    /// opaque permutation writes depth with blending off).
+    pub blend: bool,
+    /// The alpha-to-coverage permutation (a masked material under MSAA): the multisample state
+    /// enables A2C and the fragment sharpens the cutout into per-sample coverage. Derived as
+    /// `masked && sample_count > 1`, so a masked material at 1× shares the opaque PSO.
+    pub alpha_to_coverage: bool,
     /// The MSAA sample count the PSO's multisample state matches.
     pub sample_count: vk::SampleCountFlags,
 }
@@ -174,7 +181,8 @@ pub struct Pipelines {
     /// The motion-vector prepass PSO (instanced, depth-tested, rg16f motion), built
     /// lazily.
     motion: Option<Arc<Pipeline>>,
-    /// The TAA resolve compute PSO (taa-shape set layout, a 16-byte push), built lazily.
+    /// The TAA resolve compute PSO (taa-shape set layout + motion depth, a 48-byte push),
+    /// built lazily.
     taa: Option<Arc<Pipeline>>,
     /// The FXAA edge-blur compute PSO (fxaa set layout, no push), built lazily.
     fxaa: Option<Arc<Pipeline>>,
@@ -184,6 +192,14 @@ pub struct Pipelines {
     tonemap: Option<Arc<Pipeline>>,
     /// The tonemap compute set layout (one storage image) the tonemap PSO binds (set 0).
     tonemap_set_layout: vk::DescriptorSetLayout,
+    /// The depth-upscale graphics PSO (fullscreen triangle, depth-write-always, one fragment
+    /// sampler + an 8-byte inputSize push): point-upscales the input-extent scene depth into the
+    /// display-extent overlay depth so the grid / gizmo occlude correctly under upsampling.
+    depth_upscale: Option<Arc<Pipeline>>,
+    /// The TAA reactive-coverage graphics PSO (mesh vertex + a constant-1.0 fragment into an r8
+    /// target, depth-tested read-only against the scene depth, set 2 + a viewProj push): re-draws
+    /// the translucent batches to mark the reactive mask. Built lazily when TAA first resolves.
+    reactive_coverage: Option<Arc<Pipeline>>,
     /// The analytic ground-grid graphics PSO (fullscreen, depth-tested, alpha-blended,
     /// a 2×mat4 push), built lazily.
     grid: Option<Arc<Pipeline>>,
@@ -275,6 +291,8 @@ impl Pipelines {
             fxaa: None,
             tonemap: None,
             tonemap_set_layout: descriptors.tonemap_set_layout(),
+            depth_upscale: None,
+            reactive_coverage: None,
             grid: None,
             overlay: None,
             overlay_depth: None,
@@ -320,11 +338,17 @@ impl Pipelines {
         wireframe: bool,
     ) -> Option<Arc<Pipeline>> {
         let wireframe = wireframe && self.fill_mode_non_solid;
+        // A2C only exists under MSAA; a masked material at 1× is a plain runtime discard on the
+        // opaque PSO, so it must not mint a separate cache entry.
+        let alpha_to_coverage =
+            material.masked && self.sample_count != vk::SampleCountFlags::TYPE_1;
         let key = PsoKey {
             shader: material.shader.clone(),
             unlit: material.unlit,
             skinned,
             wireframe,
+            blend: material.blend,
+            alpha_to_coverage,
             sample_count: self.sample_count,
         };
         if let Some(pipeline) = self.cache.get(&key) {
@@ -802,13 +826,17 @@ impl Pipelines {
         }
     }
 
-    /// The TAA resolve compute PSO (the taa-shape set layout: 3 samplers + 2 storage, a
-    /// 16-byte push), built and cached on first request.
+    /// The TAA resolve compute PSO (the taa-shape set layout: 3 samplers + 2 storage + the
+    /// motion-depth sampler, a 48-byte push), built and cached on first request.
     pub fn request_taa(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
         if let Some(pipeline) = &self.taa {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_compute("shaders/taa.spv", layout, 16) {
+        match self.build_compute(
+            "shaders/taa.spv",
+            layout,
+            size_of::<crate::TaaPush>() as u32,
+        ) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
                 self.taa = Some(Arc::clone(&pipeline));
@@ -867,6 +895,50 @@ impl Pipelines {
     /// writing, alpha-blended, a 2×mat4 vertex+fragment push), built and cached on first
     /// request. Single-sampled (the grid draws on the 1× resolved color after tonemap).
     /// Returns `None` on a build failure (logged).
+    /// The depth-upscale graphics PSO (point-upscales the input-extent scene depth into the
+    /// display-extent overlay depth), built and cached on first request. `layout` is
+    /// [`crate::Descriptors::depth_upscale_layout`]. Returns `None` on a build failure (logged).
+    pub fn request_depth_upscale(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.depth_upscale {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_depth_upscale(layout) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.depth_upscale = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_depth_upscale: {err}");
+                None
+            }
+        }
+    }
+
+    /// The TAA reactive-coverage graphics PSO (marks the translucent batches into the r8 reactive
+    /// mask), built and cached on first request. Returns `None` on a build failure (logged).
+    pub fn request_reactive_coverage(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.reactive_coverage {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_reactive_coverage() {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.reactive_coverage = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_reactive_coverage: {err}");
+                None
+            }
+        }
+    }
+
     pub fn request_grid(&mut self) -> Option<Arc<Pipeline>> {
         if let Some(pipeline) = &self.grid {
             return Some(Arc::clone(pipeline));
@@ -1077,13 +1149,23 @@ impl Pipelines {
         key: &PsoKey,
         module: vk::ShaderModule,
     ) -> Result<Pipeline> {
-        // The übershader's unlit branch is specialization constant id 0.
+        // Fragment spec constants: id 0 = unlit branch, id 1 = alpha-to-coverage (masked+MSAA)
+        // — the fragment sharpens the cutout into per-sample coverage when set.
         let unlit_value: vk::Bool32 = u32::from(key.unlit);
-        let spec_data = unlit_value.to_ne_bytes();
-        let spec_entries = [vk::SpecializationMapEntry::default()
-            .constant_id(0)
-            .offset(0)
-            .size(std::mem::size_of::<vk::Bool32>())];
+        let a2c_value: vk::Bool32 = u32::from(key.alpha_to_coverage);
+        let mut spec_data = [0u8; 8];
+        spec_data[0..4].copy_from_slice(&unlit_value.to_ne_bytes());
+        spec_data[4..8].copy_from_slice(&a2c_value.to_ne_bytes());
+        let spec_entries = [
+            vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(std::mem::size_of::<vk::Bool32>()),
+            vk::SpecializationMapEntry::default()
+                .constant_id(1)
+                .offset(4)
+                .size(std::mem::size_of::<vk::Bool32>()),
+        ];
         let spec_info = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
             .data(&spec_data);
@@ -1166,17 +1248,36 @@ impl Pipelines {
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
 
+        // Alpha-to-coverage: a masked material under MSAA turns its sharpened cutout alpha into
+        // a per-sample coverage mask — anti-aliased foliage edges, order-independent, no blending.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(key.sample_count);
+            .rasterization_samples(key.sample_count)
+            .alpha_to_coverage_enable(key.alpha_to_coverage);
 
+        // Translucent geometry tests against the opaque depth but does not write it (so
+        // stacked translucent layers all shade); opaque/masked writes depth as usual.
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(true)
+            .depth_write_enable(!key.blend)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
 
-        let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(false)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        // Opaque/masked: blend off, depth-written. Translucent: straight-alpha `over`
+        // (`src.rgb*src.a + dst.rgb*(1-src.a)`), the shader emitting `surf.opacity` in alpha.
+        let blend_attachment = [if key.blend {
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+        } else {
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+        }];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
 
@@ -1348,6 +1449,128 @@ impl Pipelines {
                 unsafe { raw.destroy_pipeline_layout(layout, None) };
                 return Err(Error::Vk {
                     context: "create_graphics_pipelines (depth-prepass)",
+                    result,
+                });
+            }
+        };
+        Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
+    }
+
+    /// Builds the TAA reactive-coverage PSO from `mesh.spv` (`vertexMain` +
+    /// `reactiveCoverageFragment`): binding 0 = the base [`Vertex`] stream (skinned batches bind
+    /// their deformed buffer, same as the depth prepass), one `R8_UNORM` color the constant-1.0
+    /// fragment writes, depth `LESS_OR_EQUAL` **read-only** (test against the resolved scene depth
+    /// so occluded translucents don't mark), single-sampled (the reactive target + TAA scratch are
+    /// 1×), cull off (translucents are often double-sided), sets 0/1/2 + the viewProj push.
+    fn build_reactive_coverage(&self) -> Result<Pipeline> {
+        let raw = self.resources.device();
+        let module = self.load_shader_module("shaders/mesh.spv")?;
+        let result = self.build_reactive_coverage_with_module(raw, module);
+        // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it after
+        // creation is valid and required.
+        unsafe { raw.destroy_shader_module(module, None) };
+        result
+    }
+
+    fn build_reactive_coverage_with_module(
+        &self,
+        raw: &ash::Device,
+        module: vk::ShaderModule,
+    ) -> Result<Pipeline> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vertexMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"reactiveCoverageFragment"),
+        ];
+
+        let bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let attributes = base_vertex_attributes();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        // The reactive mask + the TAA scratch it feeds are always single-sampled (TAA and MSAA
+        // are mutually exclusive), so this PSO is not sample-count baked.
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // Read-only depth test against the resolved scene depth: mark only visible translucent
+        // fragments (never write, so the scene depth the later passes read is untouched).
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::R)
+            .blend_enable(false)];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let color_formats = [crate::REACTIVE_FORMAT];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+
+        let push_constant = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)];
+        // Same set prefix as the mesh layout (0 bindless, 1 light, 2 instance); the coverage pass
+        // binds only set 2 + the viewProj push, matching the depth prepass.
+        let set_layouts = &self.set_layouts[..3];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(set_layouts)
+            .push_constant_ranges(&push_constant);
+        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by the
+        // returned `Pipeline`.
+        let layout = checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "create_pipeline_layout (reactive-coverage)",
+        )?;
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout);
+        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the layout is
+        // freed exactly once.
+        let created = unsafe {
+            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        let pipeline = match created {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => {
+                // SAFETY: the ash seam. The layout was created above; freed once here.
+                unsafe { raw.destroy_pipeline_layout(layout, None) };
+                return Err(Error::Vk {
+                    context: "create_graphics_pipelines (reactive-coverage)",
                     result,
                 });
             }
@@ -2043,6 +2266,107 @@ impl Pipelines {
     /// to occlude against the persisted 1× scene depth), alpha-blended over the resolved
     /// color, single-sampled, the `viewProj + invViewProj` push (vertex+fragment), no
     /// descriptor sets.
+    fn build_depth_upscale(&self, set_layout: vk::DescriptorSetLayout) -> Result<Pipeline> {
+        let raw = self.resources.device();
+        let module = self.load_shader_module("shaders/depth_upscale.spv")?;
+        let result = self.build_depth_upscale_with_module(raw, module, set_layout);
+        // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
+        // after creation is valid and required.
+        unsafe { raw.destroy_shader_module(module, None) };
+        result
+    }
+
+    fn build_depth_upscale_with_module(
+        &self,
+        raw: &ash::Device,
+        module: vk::ShaderModule,
+        set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Pipeline> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vertexMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"fragmentMain"),
+        ];
+        // Fullscreen triangle — no vertex buffer.
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // Depth-write-always: the fragment emits the point-sampled input depth as SV_Depth for
+        // every display pixel (compare ALWAYS so the write is unconditional). No color attachment.
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::ALWAYS);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        // Depth-only: no color attachment, depth attachment format only.
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
+
+        // The push is the input depth extent (for the nearest-texel-centre fetch), fragment-only.
+        let push_constant = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(2 * size_of::<f32>() as u32)];
+        let set_layouts = [set_layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant);
+        // SAFETY: the ash seam. The set layout + push range outlive the call; the layout is
+        // owned by the returned `Pipeline`.
+        let layout = checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "create_pipeline_layout (depth-upscale)",
+        )?;
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout);
+        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the
+        // layout is freed exactly once.
+        let created = unsafe {
+            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        let pipeline = match created {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => {
+                // SAFETY: the ash seam. The layout was created above; freed once here.
+                unsafe { raw.destroy_pipeline_layout(layout, None) };
+                return Err(Error::Vk {
+                    context: "create_graphics_pipelines (depth-upscale)",
+                    result,
+                });
+            }
+        };
+        Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
+    }
+
     fn build_grid(&self) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/grid.spv")?;
@@ -2423,6 +2747,8 @@ mod tests {
             unlit: false,
             skinned: false,
             wireframe: false,
+            blend: false,
+            alpha_to_coverage: false,
             sample_count: vk::SampleCountFlags::TYPE_1,
         };
         let mut set = HashSet::new();
@@ -2445,13 +2771,21 @@ mod tests {
                 ..base.clone()
             },
             PsoKey {
+                blend: true,
+                ..base.clone()
+            },
+            PsoKey {
+                alpha_to_coverage: true,
+                ..base.clone()
+            },
+            PsoKey {
                 sample_count: vk::SampleCountFlags::TYPE_4,
                 ..base.clone()
             },
         ] {
             assert!(set.insert(variant));
         }
-        assert_eq!(set.len(), 5);
+        assert_eq!(set.len(), 7);
     }
 
     /// The same variant requested twice returns the *same* `Arc` (one PSO, a cache
