@@ -32,7 +32,7 @@ pub struct SubmeshMaterial {       // textures + PBR factors for one submesh
     pub roughness: f32,
     pub emissive: Vec3,
     pub emissive_strength: f32,
-    // uv tiling/offset, normal/height strength, alpha clip ...
+    // uv tiling/offset, normal/height strength, blend mode (opaque/masked/translucent) ...
 }
 
 pub struct DrawItem {

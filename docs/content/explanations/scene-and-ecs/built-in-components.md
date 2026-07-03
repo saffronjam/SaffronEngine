@@ -77,7 +77,8 @@ pub struct Material {
     pub emissive: Vec3,
     pub emissive_strength: f32,
     pub unlit: bool,                        // skip lighting — a distinct PSO
-    // ... normal / occlusion / emissive / height maps, UV tiling, parallax, alpha clip
+    pub blend_mode: BlendMode,              // opaque / masked / translucent
+    // ... normal / occlusion / emissive / height maps, UV tiling, parallax, alpha cutoff
 }
 ```
 
