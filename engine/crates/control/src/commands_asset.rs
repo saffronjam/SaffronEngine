@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 
 use saffron_assets::{
-    AssetServer, ContainerMetadata, NewProject, ProjectHost, ProjectInfo, analyze_clean,
-    asset_bytes, asset_type_name, build_dependency_graph, clear_extraction, create_project_script,
+    AssetServer, ContainerMetadata, ProjectHost, ProjectInfo, analyze_clean, asset_bytes,
+    asset_type_name, build_dependency_graph, clear_extraction, create_project_script,
     default_display_name, default_material_asset, delete_unused, extract_sub_asset,
     import_material_folder, load_catalog_material_asset, load_catalog_material_asset_raw,
     load_material_asset, load_material_asset_raw, lower_graph_to_params, model_render_aabb,
@@ -30,11 +30,11 @@ use saffron_protocol::{
     AssetMetadataDto, AssetMetadataParams, AssetModelResult, AssetPlacementParams,
     AssetPlacementPhaseDto, AssetPlacementResult, AssetRef, AssetReferencesParams,
     AssetReferencesResult, AssetSlotDto, AssetTypeDto, AssetUsageDto, AssetUsagesParams,
-    AssetUsagesResult, AssignAssetParams, AssignAssetResult, BoneDto, CleanAssetsParams,
-    CleanCandidateDto, CleanReport, ClearExtractionParams, CreateAssetFolderParams,
-    CreateScriptParams, CreateScriptResult, DeleteAssetFolderParams, DeleteAssetParams,
-    DeleteAssetResult, DeleteUnusedParams, DeleteUnusedResult, EmptyParams, EntityRef,
-    ExportAppParams, ExportAppResult, ExtractSubAssetParams, GetAssetModelParams,
+    AssetUsagesResult, AssignAssetParams, AssignAssetResult, BoneDto, BootStageDto,
+    CleanAssetsParams, CleanCandidateDto, CleanReport, ClearExtractionParams,
+    CreateAssetFolderParams, CreateScriptParams, CreateScriptResult, DeleteAssetFolderParams,
+    DeleteAssetParams, DeleteAssetResult, DeleteUnusedParams, DeleteUnusedResult, EmptyParams,
+    EntityRef, ExportAppParams, ExportAppResult, ExtractSubAssetParams, GetAssetModelParams,
     ImportModelParams, ImportModelResult, ImportTextureParams, ImportTextureResult,
     InstantiateModelParams, MaterialAssignParams, MaterialAssignResult, MaterialCompileParams,
     MaterialCompileResult, MaterialCookResult, MaterialCreateInstanceParams, MaterialCreateParams,
@@ -44,11 +44,11 @@ use saffron_protocol::{
     MaterialUpdateParams, MaterialUpdateResult, ModelInfoParams, ModelInfoResult, ModelSubAssetDto,
     MoveAssetParams, NewProjectParams, OptionalPathParams, PathParams, PathResult,
     PlacementTransformDto, PlayStateResult, PreviewRenderParams, PreviewRenderResult,
-    ProjectInfoDto, ProjectStoresDto, QuitResult, ReimportModelParams, ReimportModelResult,
-    RenameAssetFolderParams, RenameAssetParams, ScanAssetsResult, ScreenshotParams,
-    ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams, SetActiveViewResult,
-    ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailParams, ThumbnailResult, Uuid as WireUuid,
-    Vec3, Vec4,
+    ProjectInfoDto, ProjectPhaseDto, ProjectStatusDto, ProjectStoresDto, QuitResult,
+    ReimportModelParams, ReimportModelResult, RenameAssetFolderParams, RenameAssetParams,
+    ScanAssetsResult, ScreenshotParams, ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams,
+    SetActiveViewResult, ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailParams,
+    ThumbnailResult, Uuid as WireUuid, Vec3, Vec4,
 };
 use saffron_rendering::{PngTransfer, ViewId};
 use saffron_scene::{
@@ -56,7 +56,10 @@ use saffron_scene::{
     IdComponent, Material, MaterialAsset as MaterialAssetComponent, Mesh, Name, PreviewGhost,
     Scene, SkinnedMesh, SkyMode, Transform,
 };
-use saffron_sceneedit::{PlacementPreview, PlayState, SceneEditCamera};
+use saffron_sceneedit::{
+    BootStage, NewProjectSpec, PlacementPreview, PlayState, ProjectLoadRequest, ProjectPhase,
+    SceneEditCamera, SceneEditContext,
+};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -412,8 +415,23 @@ fn rebuild_asset_index(catalog: &mut saffron_scene::AssetCatalog) {
     }
 }
 
+/// Creation time (seconds since the Unix epoch) of the file backing a catalog entry, preferring
+/// the filesystem birth time and falling back to the modified time; `0` if neither is available.
+fn asset_created_at(root: &Path, rel_path: &str) -> i64 {
+    let metadata = match std::fs::metadata(root.join(rel_path)) {
+        Ok(metadata) => metadata,
+        Err(_) => return 0,
+    };
+    metadata
+        .created()
+        .or_else(|_| metadata.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// The wire DTO for one catalog entry.
-fn asset_dto(entry: &AssetEntry) -> AssetEntryDto {
+fn asset_dto(root: &Path, entry: &AssetEntry) -> AssetEntryDto {
     AssetEntryDto {
         id: WireUuid(entry.id.value()),
         name: entry.name.clone(),
@@ -423,6 +441,7 @@ fn asset_dto(entry: &AssetEntry) -> AssetEntryDto {
         container: (entry.container.value() != 0).then(|| WireUuid(entry.container.value())),
         duration: (entry.asset_type == AssetType::Animation).then_some(entry.duration),
         rigged: entry.rigged.then_some(true),
+        created_at: asset_created_at(root, &entry.path),
         attribution: entry.attribution.as_ref().map(attribution_to_dto),
     }
 }
@@ -449,9 +468,13 @@ fn asset_ref(entry: &AssetEntry) -> AssetRef {
 }
 
 /// The full catalog as an [`AssetList`].
-fn asset_list_dto(catalog: &saffron_scene::AssetCatalog) -> AssetList {
+fn asset_list_dto(root: &Path, catalog: &saffron_scene::AssetCatalog) -> AssetList {
     AssetList {
-        assets: catalog.entries.iter().map(asset_dto).collect(),
+        assets: catalog
+            .entries
+            .iter()
+            .map(|entry| asset_dto(root, entry))
+            .collect(),
         folders: catalog.folders.clone(),
     }
 }
@@ -597,7 +620,7 @@ fn clear_asset_usages(scene: &mut Scene, asset: Uuid) -> Vec<AssetUsageDto> {
 /// The current project's identity, read from the editor.
 fn current_project_info(ctx: &EngineContext<'_>) -> ProjectInfo {
     ProjectInfo {
-        loaded: ctx.scene_edit.project_loaded,
+        loaded: ctx.scene_edit.project_ready(),
         root: ctx.scene_edit.project_root.clone(),
         path: ctx.scene_edit.project_path.clone(),
         name: ctx.scene_edit.project_name.clone(),
@@ -607,7 +630,11 @@ fn current_project_info(ctx: &EngineContext<'_>) -> ProjectInfo {
 
 /// Writes a [`ProjectInfo`] back onto the editor, also resetting the scene path.
 fn apply_project_info(ctx: &mut EngineContext<'_>, project: &ProjectInfo) {
-    ctx.scene_edit.project_loaded = project.loaded;
+    ctx.scene_edit.project_phase = if project.loaded {
+        ProjectPhase::Ready
+    } else {
+        ProjectPhase::Unloaded
+    };
     ctx.scene_edit.project_root = project.root.clone();
     ctx.scene_edit.project_path = project.path.clone();
     ctx.scene_edit.project_name = project.name.clone();
@@ -615,120 +642,42 @@ fn apply_project_info(ctx: &mut EngineContext<'_>, project: &ProjectInfo) {
     ctx.scene_edit.scene_path = project.path.clone();
 }
 
-/// Brings the host's project up from the editor-set environment at startup:
-/// `SAFFRON_PROJECT` selects a project to open (or create when the name is valid and
-/// unborn), else `SAFFRON_SCRATCH_PROJECT`
-/// makes a deterministic per-shell scratch project, else a `project.json` in the working
-/// directory is opened. With none of those set the host waits for the editor's project
-/// picker. Drives the same [`AssetServer`] + [`apply_project_info`] path the lifecycle
-/// commands use, so there is one project-bring-up code path. Failures are logged, not fatal.
-pub fn bootstrap_project_from_env(ctx: &mut EngineContext<'_>) {
-    let defs = ctx.renderer.sa_lua_defs();
-
-    if let Some(selected) = std::env::var_os("SAFFRON_PROJECT")
+/// Brings the host's project up from the editor-set environment at startup by seeding the loader
+/// inbox — the same non-blocking path the lifecycle commands use, so there is one project
+/// bring-up code path: `SAFFRON_PROJECT` selects a project to open (or create when the name is
+/// valid and unborn), else `SAFFRON_SCRATCH_PROJECT` makes a deterministic per-shell scratch
+/// project, else a `project.json` in the working directory is opened. With none of those set the
+/// host waits for the editor's project picker (phase stays `Unloaded`).
+pub fn bootstrap_project_from_env(scene_edit: &mut SceneEditContext) {
+    let request = if let Some(selected) = std::env::var_os("SAFFRON_PROJECT")
         .map(|v| v.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
     {
-        let mut project = ProjectInfo::default();
         let create_new =
             valid_project_name(&selected) && !saffron_assets::project_json_path(&selected).exists();
-        let mut host = RendererProjectHost {
-            renderer: ctx.renderer,
-        };
-        let outcome = if create_new {
-            let spec = NewProject {
-                name: selected.clone(),
+        if create_new {
+            ProjectLoadRequest::New(NewProjectSpec {
+                name: selected,
                 display_name: String::new(),
                 root: String::new(),
-            };
-            ctx.assets
-                .create_project(
-                    &mut host,
-                    &ctx.scene_edit.registry,
-                    &mut ctx.scene_edit.scene,
-                    &mut project,
-                    &spec,
-                    &defs,
-                )
-                .map(|()| None)
+            })
         } else {
-            ctx.assets
-                .load_project(
-                    &mut host,
-                    &ctx.scene_edit.registry,
-                    &mut ctx.scene_edit.scene,
-                    &mut project,
-                    &selected,
-                    &defs,
-                )
-                .map(Some)
-        };
-        match outcome {
-            Ok(sidecar) => apply_loaded_project(ctx, &project, sidecar.as_ref()),
-            Err(err) => tracing::error!("project bring-up: {err}"),
+            ProjectLoadRequest::Open(selected)
         }
-        return;
-    }
+    } else if std::env::var_os("SAFFRON_SCRATCH_PROJECT").is_some() {
+        ProjectLoadRequest::New(NewProjectSpec {
+            name: saffron_assets::scratch_project_name(),
+            display_name: "Scratch Project".to_owned(),
+            root: String::new(),
+        })
+    } else if Path::new("project.json").exists() {
+        ProjectLoadRequest::Open("project.json".to_owned())
+    } else {
+        return; // Nothing to bring up — wait for the editor's project picker.
+    };
 
-    if std::env::var_os("SAFFRON_SCRATCH_PROJECT").is_some() {
-        let mut project = ProjectInfo::default();
-        let mut host = RendererProjectHost {
-            renderer: ctx.renderer,
-        };
-        match ctx.assets.create_scratch_project(
-            &mut host,
-            &ctx.scene_edit.registry,
-            &mut ctx.scene_edit.scene,
-            &mut project,
-            &defs,
-        ) {
-            Ok(()) => apply_loaded_project(ctx, &project, None),
-            Err(err) => tracing::error!("scratch project bring-up: {err}"),
-        }
-        return;
-    }
-
-    let default_project = Path::new("project.json");
-    if default_project.exists() {
-        let mut project = ProjectInfo::default();
-        let mut host = RendererProjectHost {
-            renderer: ctx.renderer,
-        };
-        match ctx.assets.load_project(
-            &mut host,
-            &ctx.scene_edit.registry,
-            &mut ctx.scene_edit.scene,
-            &mut project,
-            "project.json",
-            &defs,
-        ) {
-            Ok(sidecar) => apply_loaded_project(ctx, &project, Some(&sidecar)),
-            Err(err) => tracing::error!("default project bring-up: {err}"),
-        }
-    }
-}
-
-/// Applies a freshly created/opened project to the live editor state: the project metadata,
-/// the (optional) loaded sidecar camera + debug overlays, the scene-version bump, and the
-/// reset selection/script-input — the shared tail of the project bring-up + the
-/// `open-project` command.
-fn apply_loaded_project(
-    ctx: &mut EngineContext<'_>,
-    project: &ProjectInfo,
-    sidecar: Option<&saffron_assets::ProjectSidecar>,
-) {
-    apply_project_info(ctx, project);
-    if let Some(sidecar) = sidecar {
-        ctx.scene_edit.camera.from_json(&sidecar.editor_camera);
-        saffron_sceneedit::debug_overlays_from_json(
-            &mut ctx.scene_edit.debug_overlays,
-            &sidecar.debug_overlays,
-        );
-        ctx.scene_edit.stores = sidecar.stores.clone();
-    }
-    ctx.scene_edit.scene_version += 1;
-    ctx.scene_edit.script_input = saffron_scene::ScriptInputState::default();
-    ctx.scene_edit.set_selection(Entity::NULL);
+    scene_edit.project_load_inbox = Some(request);
+    scene_edit.project_phase = ProjectPhase::Loading;
 }
 
 /// The wire DTO for a [`ProjectInfo`].
@@ -742,9 +691,47 @@ fn project_dto(project: &ProjectInfo) -> ProjectInfoDto {
     }
 }
 
+/// The wire DTO for the live project-load phase + progress.
+fn project_status_dto(ctx: &EngineContext<'_>) -> ProjectStatusDto {
+    let sc = &ctx.scene_edit;
+    let p = &sc.project_load;
+    ProjectStatusDto {
+        phase: match sc.project_phase {
+            ProjectPhase::Unloaded => ProjectPhaseDto::Unloaded,
+            ProjectPhase::Loading => ProjectPhaseDto::Loading,
+            ProjectPhase::Ready => ProjectPhaseDto::Ready,
+            ProjectPhase::Failed => ProjectPhaseDto::Failed,
+        },
+        stage: boot_stage_dto(p.stage),
+        done: i32::try_from(p.done).unwrap_or(i32::MAX),
+        total: i32::try_from(p.total).unwrap_or(i32::MAX),
+        label: p.label.clone(),
+        current_item: p.current_item.clone(),
+        error: p.error.clone(),
+        version: i64::try_from(p.version).unwrap_or(i64::MAX),
+        name: sc.project_name.clone(),
+        path: sc.project_path.clone(),
+    }
+}
+
+/// Maps a [`BootStage`] onto its wire enum.
+fn boot_stage_dto(stage: BootStage) -> BootStageDto {
+    match stage {
+        BootStage::Manifest => BootStageDto::Manifest,
+        BootStage::Catalog => BootStageDto::Catalog,
+        BootStage::Scene => BootStageDto::Scene,
+        BootStage::Install => BootStageDto::Install,
+        BootStage::Assets => BootStageDto::Assets,
+        BootStage::Skybox => BootStageDto::Skybox,
+        BootStage::Accel => BootStageDto::Accel,
+        BootStage::Ready => BootStageDto::Ready,
+        BootStage::Failed => BootStageDto::Failed,
+    }
+}
+
 /// The "no project loaded" guard.
 fn require_project_loaded(ctx: &EngineContext<'_>) -> Result<()> {
-    if ctx.scene_edit.project_loaded {
+    if ctx.scene_edit.project_ready() {
         Ok(())
     } else {
         Err(Error::command("no project loaded"))
@@ -757,8 +744,8 @@ fn require_project_loaded(ctx: &EngineContext<'_>) -> Result<()> {
 /// GPU-idle + render-settings serde the renderer owns. Wraps `&mut dyn ControlRenderer`,
 /// so it borrows only the renderer field of the [`EngineContext`] — disjoint from `assets`
 /// and `scene_edit`.
-struct RendererProjectHost<'a> {
-    renderer: &'a mut dyn ControlRenderer,
+pub(crate) struct RendererProjectHost<'a> {
+    pub(crate) renderer: &'a mut dyn ControlRenderer,
 }
 
 impl ProjectHost for RendererProjectHost<'_> {
@@ -1140,7 +1127,22 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, _params| Ok(project_dto(&current_project_info(ctx))),
     );
 
-    reg.register::<NewProjectParams, ProjectInfoDto>(
+    reg.register::<EmptyParams, ProjectStatusDto>(
+        "project-status",
+        "project-status — project-load phase + progress",
+        |ctx, _params| Ok(project_status_dto(ctx)),
+    );
+
+    reg.register::<EmptyParams, ProjectStatusDto>(
+        "cancel-load",
+        "cancel-load — abort the in-flight project load",
+        |ctx, _params| {
+            ctx.scene_edit.project_cancel = true;
+            Ok(project_status_dto(ctx))
+        },
+    );
+
+    reg.register::<NewProjectParams, ProjectStatusDto>(
         "new-project",
         "new-project {name, displayName?, root?}",
         |ctx, params| {
@@ -1150,31 +1152,13 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if ctx.scene_edit.previewing() {
                 return Err(Error::command("exit the asset preview first"));
             }
-            let spec = NewProject {
+            ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::New(NewProjectSpec {
                 name: params.name.unwrap_or_default(),
                 display_name: params.display_name.unwrap_or_default(),
                 root: params.root.unwrap_or_default(),
-            };
-            let defs = ctx.renderer.sa_lua_defs();
-            let mut project = ProjectInfo::default();
-            let mut host = RendererProjectHost {
-                renderer: ctx.renderer,
-            };
-            ctx.assets
-                .create_project(
-                    &mut host,
-                    &ctx.scene_edit.registry,
-                    &mut ctx.scene_edit.scene,
-                    &mut project,
-                    &spec,
-                    &defs,
-                )
-                .map_err(|e| Error::command(e.to_string()))?;
-            apply_project_info(ctx, &project);
-            ctx.scene_edit.scene_version += 1;
-            ctx.scene_edit.script_input = saffron_scene::ScriptInputState::default();
-            ctx.scene_edit.set_selection(Entity::NULL);
-            Ok(project_dto(&project))
+            }));
+            ctx.scene_edit.project_phase = ProjectPhase::Loading;
+            Ok(project_status_dto(ctx))
         },
     );
 
@@ -1182,7 +1166,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "create-script",
         "create-script {name} — boilerplate .lua under the project src/",
         |ctx, params| {
-            if !ctx.scene_edit.project_loaded {
+            if !ctx.scene_edit.project_ready() {
                 return Err(Error::command("no project loaded"));
             }
             let path = create_project_script(&ctx.scene_edit.project_root, &params.name)
@@ -1191,7 +1175,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         },
     );
 
-    reg.register::<PathParams, ProjectInfoDto>(
+    reg.register::<PathParams, ProjectStatusDto>(
         "open-project",
         "open-project {path}",
         |ctx, params| {
@@ -1204,24 +1188,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if params.path.is_empty() {
                 return Err(Error::command("missing 'path'"));
             }
-            let defs = ctx.renderer.sa_lua_defs();
-            let mut project = ProjectInfo::default();
-            let mut host = RendererProjectHost {
-                renderer: ctx.renderer,
-            };
-            let sidecar = ctx
-                .assets
-                .load_project(
-                    &mut host,
-                    &ctx.scene_edit.registry,
-                    &mut ctx.scene_edit.scene,
-                    &mut project,
-                    &params.path,
-                    &defs,
-                )
-                .map_err(|e| Error::command(e.to_string()))?;
-            apply_loaded_project(ctx, &project, Some(&sidecar));
-            Ok(project_dto(&project))
+            ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::Open(params.path.clone()));
+            ctx.scene_edit.project_phase = ProjectPhase::Loading;
+            Ok(project_status_dto(ctx))
         },
     );
 
@@ -1339,7 +1308,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
     reg.register::<EmptyParams, AssetList>(
         "list-assets",
         "list the project asset catalog",
-        |ctx, _params| Ok(asset_list_dto(&ctx.assets.catalog)),
+        |ctx, _params| Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog)),
     );
 
     reg.register::<EmptyParams, ScanAssetsResult>("scan-assets", "scan-assets", |ctx, _params| {
@@ -1706,7 +1675,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 ctx.assets.catalog.folders.push(params.folder.clone());
                 ctx.scene_edit.scene_version += 1;
             }
-            Ok(asset_list_dto(&ctx.assets.catalog))
+            Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
         },
     );
 
@@ -1726,7 +1695,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 )));
             }
             if params.folder == params.name {
-                return Ok(asset_list_dto(&ctx.assets.catalog));
+                return Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog));
             }
             if is_folder_descendant(&params.name, &params.folder) {
                 return Err(Error::command("asset folder cannot be moved inside itself"));
@@ -1751,7 +1720,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 }
             }
             ctx.scene_edit.scene_version += 1;
-            Ok(asset_list_dto(&ctx.assets.catalog))
+            Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
         },
     );
 
@@ -1783,7 +1752,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 }
             }
             ctx.scene_edit.scene_version += 1;
-            Ok(asset_list_dto(&ctx.assets.catalog))
+            Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
         },
     );
 
@@ -1824,13 +1793,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?
                 .clone();
             let abs = ctx.assets.root.join(&entry.path);
-            let metadata = std::fs::metadata(&abs);
-            let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            let created_at = metadata
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            let size_bytes = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            let created_at = asset_created_at(&ctx.assets.root, &entry.path);
             let mut vertex_count = None;
             let mut triangle_count = None;
             if entry.asset_type == AssetType::Mesh
@@ -2402,7 +2366,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         },
     );
 
-    reg.register::<OptionalPathParams, ProjectInfoDto>(
+    reg.register::<OptionalPathParams, ProjectStatusDto>(
         "load-project",
         "load-project {path} — assets catalog + scene",
         |ctx, params| {
@@ -2416,12 +2380,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 .path
                 .clone()
                 .unwrap_or_else(|| "project.json".to_owned());
-            let project = load_project_into(ctx, &path)?;
-            Ok(project_dto(&project))
+            load_project_into(ctx, &path);
+            Ok(project_status_dto(ctx))
         },
     );
 
-    reg.register::<EmptyParams, ProjectInfoDto>(
+    reg.register::<EmptyParams, ProjectStatusDto>(
         "reload-project",
         "reload-project — close and re-open the active project",
         |ctx, _params| {
@@ -2432,9 +2396,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 return Err(Error::command("exit the asset preview first"));
             }
             require_project_loaded(ctx)?;
-            let path = ctx.scene_edit.project_path.clone();
-            let project = load_project_into(ctx, &path)?;
-            Ok(project_dto(&project))
+            ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::Reload);
+            ctx.scene_edit.project_phase = ProjectPhase::Loading;
+            Ok(project_status_dto(ctx))
         },
     );
 
@@ -2556,36 +2520,13 @@ fn ensure_material(scene: &mut Scene, entity: Entity) {
     }
 }
 
-/// The shared `load-project` / `reload-project` body: idle + reload the catalog + scene +
-/// sidecar, then reset the editor state.
-fn load_project_into(ctx: &mut EngineContext<'_>, path: &str) -> Result<ProjectInfo> {
-    let defs = ctx.renderer.sa_lua_defs();
-    let mut project = ProjectInfo::default();
-    let mut host = RendererProjectHost {
-        renderer: ctx.renderer,
-    };
-    let sidecar = ctx
-        .assets
-        .load_project(
-            &mut host,
-            &ctx.scene_edit.registry,
-            &mut ctx.scene_edit.scene,
-            &mut project,
-            path,
-            &defs,
-        )
-        .map_err(|e| Error::command(e.to_string()))?;
-    apply_project_info(ctx, &project);
-    ctx.scene_edit.camera.from_json(&sidecar.editor_camera);
-    saffron_sceneedit::debug_overlays_from_json(
-        &mut ctx.scene_edit.debug_overlays,
-        &sidecar.debug_overlays,
-    );
-    ctx.scene_edit.stores = sidecar.stores.clone();
-    ctx.scene_edit.scene_version += 1;
-    ctx.scene_edit.script_input = saffron_scene::ScriptInputState::default();
-    ctx.scene_edit.set_selection(Entity::NULL);
-    Ok(project)
+/// The shared `load-project` body: seed the loader inbox with an `Open` request and set the
+/// `Loading` phase, then return the current identity as an immediate ack. The non-blocking loader
+/// (`ProjectLoader::advance`, driven from the host each frame) runs the read/parse/scan off-thread
+/// and installs on the main thread, so the control drain never blocks.
+fn load_project_into(ctx: &mut EngineContext<'_>, path: &str) {
+    ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::Open(path.to_owned()));
+    ctx.scene_edit.project_phase = ProjectPhase::Loading;
 }
 
 /// The `enter-asset-preview` body: build an isolated preview scene, commit it, furnish it
@@ -2935,6 +2876,7 @@ fn from_vec4(v: Vec4) -> saffron_geometry::glam::Vec4 {
 #[cfg(test)]
 mod tests {
     use saffron_scene::{AssetEntry, AssetType, Material, Mesh};
+    use saffron_sceneedit::ProjectPhase;
     use serde_json::json;
 
     use super::preview_codegen_spv;
@@ -2980,7 +2922,7 @@ mod tests {
         let mut renderer = StubRenderer::default();
         with_stub(&mut renderer, |ctx| {
             scratch_root(ctx, "empty");
-            ctx.scene_edit.project_loaded = true;
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
 
             let list = reg.dispatch(ctx, &json!({ "cmd": "list-assets" }));
             assert_eq!(list["ok"], json!(true));
@@ -3316,7 +3258,7 @@ mod tests {
         let reg = registry();
         let mut renderer = StubRenderer::default();
         with_stub(&mut renderer, |ctx| {
-            ctx.scene_edit.project_loaded = true;
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
             ctx.scene_edit.project_name = "demo".to_owned();
             ctx.scene_edit.project_display_name = "Demo".to_owned();
             let reply = reg.dispatch(ctx, &json!({ "cmd": "get-project" }));
@@ -3334,6 +3276,8 @@ mod tests {
     fn asset_commands_register_in_manifest_order() {
         const FROZEN: &[&str] = &[
             "get-project",
+            "project-status",
+            "cancel-load",
             "new-project",
             "create-script",
             "open-project",
@@ -3375,11 +3319,14 @@ mod tests {
             "material-set-override",
             "material-compile-graph",
             "material-cook",
+            "export-app",
             "save-scene",
             "load-scene",
             "save-project",
             "load-project",
             "reload-project",
+            "get-stores",
+            "set-stores",
             "screenshot",
             "get-thumbnail",
             "view-asset",
