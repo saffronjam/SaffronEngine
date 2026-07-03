@@ -54,11 +54,15 @@ import type {
   PickSkeletonJointResult,
   Selection,
   SetPerfConfigParams,
+  GetUpscaleResult,
+  SetUpscaleParams,
+  SetUpscaleResult,
   SkeletonOverlayResult,
   Thumbnail,
   Transform,
   Vec3,
   ProjectInfo,
+  ProjectStatus,
   AppManifest,
   ExportAppResult,
 } from "../protocol";
@@ -126,17 +130,57 @@ type EmptyCommandName = {
   [C in CommandName]: keyof CommandParamsMap[C] extends never ? C : never;
 }[CommandName];
 
+/// A rejected control call, carrying the engine's machine-readable `code` (present on every
+/// `ok:false` reply) alongside the human message. The Rust bridge rejects the `control`
+/// passthrough with a `{ message, code }` object; `call()` normalizes it to this one Error type so
+/// callers can `isBusyLoading(err)` and `errorText(err)` uniformly.
+export class ControlError extends Error {
+  code?: string;
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = "ControlError";
+    this.code = code;
+  }
+}
+
+/// True when a call was discarded because a project load is in flight (the dispatch gate's
+/// `busy-loading` code). Background poll lanes drop these silently and retry once the load settles.
+export function isBusyLoading(err: unknown): boolean {
+  return err instanceof ControlError && err.code === "busy-loading";
+}
+
+/// Coerce whatever `invoke` rejected with (the serialized bridge `{ message, code }`, or a bare
+/// string when the Tauri layer itself failed) into a `ControlError`.
+function toControlError(raw: unknown): ControlError {
+  if (raw instanceof ControlError) {
+    return raw;
+  }
+  if (raw && typeof raw === "object" && "message" in raw) {
+    const obj = raw as { message?: unknown; code?: unknown };
+    return new ControlError(
+      typeof obj.message === "string" ? obj.message : String(raw),
+      typeof obj.code === "string" ? obj.code : undefined,
+    );
+  }
+  return new ControlError(typeof raw === "string" ? raw : String(raw));
+}
+
 function call<C extends EmptyCommandName>(cmd: C): Promise<CommandResultMap[C]>;
 function call<C extends CommandName>(
   cmd: C,
   params: CommandParamsMap[C],
 ): Promise<CommandResultMap[C]>;
-/// Typed passthrough: resolves with the command's declared result type.
+/// Typed passthrough: resolves with the command's declared result type; rejects with a
+/// [`ControlError`] carrying the engine's `code`.
 async function call<C extends CommandName>(
   cmd: C,
   params?: CommandParamsMap[C],
 ): Promise<CommandResultMap[C]> {
-  return invoke<CommandResultMap[C]>("control", { cmd, params: params ?? {} });
+  try {
+    return await invoke<CommandResultMap[C]>("control", { cmd, params: params ?? {} });
+  } catch (raw) {
+    throw toControlError(raw);
+  }
 }
 
 export const client = {
@@ -617,7 +661,18 @@ export const client = {
   getProject(): Promise<ProjectInfo> {
     return call("get-project");
   },
-  newProject(name: string, displayName: string, root?: string): Promise<ProjectInfo> {
+  /// The live project-load phase + boot stage + progress. Allow-listed during `Loading`, so the
+  /// loading-screen poll is always answered. See [`isBusyLoading`] for the discarded-command case.
+  projectStatus(): Promise<ProjectStatus> {
+    return call("project-status");
+  },
+  /// Abort the in-flight project load; the loader resets to `Unloaded` at its next step.
+  cancelLoad(): Promise<ProjectStatus> {
+    return call("cancel-load");
+  },
+  /// Kick off a non-blocking project create — returns the initial `Loading` status snapshot, not
+  /// the finished project. Progress + completion come from [`projectStatus`] polling.
+  newProject(name: string, displayName: string, root?: string): Promise<ProjectStatus> {
     const params: CommandParamsMap["new-project"] = {
       name,
       displayName,
@@ -627,7 +682,9 @@ export const client = {
     }
     return call("new-project", params);
   },
-  openProject(path: string): Promise<ProjectInfo> {
+  /// Kick off a non-blocking project open — returns the initial `Loading` status snapshot; follow
+  /// progress via [`projectStatus`].
+  openProject(path: string): Promise<ProjectStatus> {
     return call("open-project", { path });
   },
   appDataInfo(): Promise<AppDataInfo> {
@@ -685,6 +742,14 @@ export const client = {
   },
   setPerfConfig(params: SetPerfConfigParams): Promise<PerfConfigDto> {
     return call("set-perf-config", params);
+  },
+  /// The TAAU ratio + dynamic-resolution state + live input/display extents.
+  getUpscale(): Promise<GetUpscaleResult> {
+    return call("get-upscale", {});
+  },
+  /// Partial update of the upscale surface (ratio / dynamic / targetMs); omitted fields hold.
+  setUpscale(params: SetUpscaleParams): Promise<SetUpscaleResult> {
+    return call("set-upscale", params);
   },
   /// Drain perf-alarm events with seq > since (non-blocking) plus the cursor metadata.
   drainAlarms(since: number): Promise<DrainAlarmsResult> {
@@ -794,9 +859,9 @@ export const client = {
   exportApp(outputDir: string, app: AppManifest): Promise<ExportAppResult> {
     return call("export-app", { outputDir, app });
   },
-  /// Close the active project and load it again from its own path (catalog + scene +
-  /// GPU assets). Clears the engine's selection; the caller resets the store.
-  reloadProject(): Promise<ProjectInfo> {
+  /// Kick off a non-blocking reload of the active project from its own path. Returns the initial
+  /// `Loading` status snapshot; progress + completion come from [`projectStatus`] polling.
+  reloadProject(): Promise<ProjectStatus> {
     return call("reload-project");
   },
   /// Write the scene only to `path` (required).
