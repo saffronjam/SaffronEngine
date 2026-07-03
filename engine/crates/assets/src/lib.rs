@@ -157,6 +157,11 @@ pub struct AssetServer {
     pub editor_camera_model: SystemMeshVisual,
     /// Off-thread thumbnail generation (`None` until the worker is started).
     pub thumbnail_worker: Option<ThumbnailWorker>,
+    /// The app-level, content-addressed thumbnail cache dir, defaulted from
+    /// [`app_data_root`] so it is shared across every project and survives a project switch
+    /// (it is *not* repointed by [`Self::set_asset_root`]). Overridable so a test can isolate
+    /// its cache to a temp dir.
+    pub thumbnail_cache_root: PathBuf,
 }
 
 impl AssetServer {
@@ -173,6 +178,7 @@ impl AssetServer {
             model_by_uuid: AssetCache::new(),
             editor_camera_model: SystemMeshVisual::default(),
             thumbnail_worker: None,
+            thumbnail_cache_root: Path::new(&app_data_root()).join("thumbnail-cache"),
         };
         assets.ensure_asset_directories();
         assets
@@ -184,27 +190,26 @@ impl AssetServer {
         self.ensure_asset_directories();
     }
 
-    /// Creates the standard asset subdirectories under the root (and the sibling
-    /// thumbnail-cache dir), idempotently.
+    /// Creates the standard asset subdirectories under the root, idempotently.
     ///
-    /// `models/`, `textures/`, `materials/` live under the asset root; the
-    /// thumbnail cache lives at `<projectRoot>/cache/thumbnails/` — a sibling of the
-    /// root, so the catalog scan and project save/load never see it. Directory
-    /// creation errors are swallowed: a missing dir surfaces later as the real I/O
-    /// failure that needs it.
+    /// `models/`, `textures/`, `materials/` live under the asset root. The thumbnail cache
+    /// is app-level (shared across projects) and created lazily on first write. Directory
+    /// creation errors are swallowed: a missing dir surfaces later as the real I/O failure
+    /// that needs it.
     pub fn ensure_asset_directories(&self) {
         for sub in ["models", "textures", "materials"] {
             let _ = std::fs::create_dir_all(self.root.join(sub));
         }
-        let _ = std::fs::create_dir_all(self.thumbnail_cache_dir());
     }
 
-    /// The on-disk thumbnail cache directory, a sibling of the asset root
-    /// (`<projectRoot>/cache/thumbnails/`).
+    /// The app-level thumbnail cache directory (`<appDataRoot>/thumbnail-cache/` by default).
+    ///
+    /// Content-addressed and shared across every project, so it survives a project switch
+    /// and dedups identical assets. Lives outside any project root, so the catalog scan and
+    /// project save/load never see it.
     #[must_use]
     pub fn thumbnail_cache_dir(&self) -> PathBuf {
-        let project_root = self.root.parent().unwrap_or_else(|| Path::new("."));
-        project_root.join("cache").join("thumbnails")
+        self.thumbnail_cache_root.clone()
     }
 
     /// Drops the three GPU caches (and abandons stale worker jobs), freeing every
@@ -264,12 +269,10 @@ mod tests {
         assert!(root.join("models").is_dir());
         assert!(root.join("textures").is_dir());
         assert!(root.join("materials").is_dir());
-        // The thumbnail cache is a sibling of the asset root.
+        // The thumbnail cache is app-level (created lazily on write), not a project sibling.
         assert!(
-            tmp.join("project")
-                .join("cache")
-                .join("thumbnails")
-                .is_dir()
+            !tmp.join("project").join("cache").exists(),
+            "no per-project thumbnail cache dir is created"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

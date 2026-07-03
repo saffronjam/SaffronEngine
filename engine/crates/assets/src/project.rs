@@ -13,7 +13,7 @@
 //! parse → version-gate → `wait_gpu_idle` → clear the worker queue + the GPU
 //! caches → set the asset root → ensure the script `src/` + library → load the catalog
 //! from the doc → reconcile against disk (the filesystem is the source of truth, a cold
-//! scan on a cache miss) → sweep orphan thumbnail cache files → apply render settings →
+//! scan on a cache miss) → apply render settings →
 //! pull camera/overlays → `scene_from_json`. The idle-before-clear is the use-after-free
 //! guard: the GPU must be idle before the caches' `Arc`s drop, because an in-flight frame
 //! may still reference an `Arc<GpuTexture>` and dropping it under the GPU is a runtime
@@ -508,7 +508,6 @@ impl AssetServer {
             }
             Err(err) => tracing::warn!("scan: {err}"),
         }
-        self.sweep_thumbnail_cache_orphans();
 
         if let Some(settings) = doc.get("renderSettings") {
             host.apply_render_settings(settings);
@@ -587,14 +586,14 @@ impl AssetServer {
         )
     }
 
-    /// Creates an auto-named empty project keyed to the current working directory + the
-    /// `$SAFFRON_CONTROL_SOCK`: a deterministic per-shell scratch project so a host launched
+    /// Creates an auto-named scratch project keyed to the current working directory + the
+    /// `$SAFFRON_CONTROL_SOCK`: a deterministic per-shell project so a host launched
     /// without a project still has a loadable one.
     ///
     /// # Errors
     ///
     /// The [`AssetServer::create_project`] errors.
-    pub fn create_auto_empty_project(
+    pub fn create_scratch_project(
         &mut self,
         host: &mut dyn ProjectHost,
         reg: &ComponentRegistry,
@@ -606,21 +605,21 @@ impl AssetServer {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let suffix = auto_empty_suffix(&format!("{cwd}{socket}"));
-        let name = format!("auto-empty-{}", &suffix[..suffix.len().min(12)]);
+        let suffix = scratch_suffix(&format!("{cwd}{socket}"));
+        let name = format!("scratch-{}", &suffix[..suffix.len().min(12)]);
         let spec = NewProject {
             name,
-            display_name: "Auto Empty Project".to_string(),
+            display_name: "Scratch Project".to_string(),
             root: String::new(),
         };
         self.create_project(host, reg, scene, project, &spec, sa_lua_defs)
     }
 }
 
-/// An FNV-1a fold of `key` as a decimal string, for the auto-empty project name suffix.
+/// An FNV-1a fold of `key` as a decimal string, for the scratch project name suffix.
 ///
 /// FNV-1a is deterministic, giving a stable per-`(cwd, socket)` suffix.
-fn auto_empty_suffix(key: &str) -> String {
+fn scratch_suffix(key: &str) -> String {
     const FNV_OFFSET: u64 = 1469598103934665603;
     const FNV_PRIME: u64 = 1099511628211;
     let mut hash = FNV_OFFSET;

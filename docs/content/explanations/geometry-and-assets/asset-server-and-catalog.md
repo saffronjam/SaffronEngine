@@ -52,6 +52,7 @@ pub struct AssetEntry {
     pub container: Uuid,     // 0 = standalone; else the owning .smodel
     pub chunk: i32,          // TOC chunk index inside the container (-1 = standalone)
     pub colorspace: Colorspace,
+    pub content_hash: u64,   // FNV of the baked content; the thumbnail cache key
     // + folder, hdr/linear flags, animation duration/tracks, rigged
 }
 
@@ -82,6 +83,28 @@ colorspace, minted on first sight. `load_project` reconciles the loaded catalog 
 scan, so an import you never saved is rediscovered rather than orphaned. `load_catalog` is the
 fast path: `assets/.cache/catalog.json` memoizes the scan keyed by a signature of the tree.
 It is a latency shortcut only — delete it and a cold scan rebuilds an identical catalog.
+
+The scan also records each row's `content_hash` — an FNV fold of the asset's baked bytes.
+An embedded sub-asset's hash is baked into the `.smodel` META, so the scan recovers it for
+free; a standalone file is hashed on the cold scan (which runs exactly when a file changed).
+
+## The thumbnail cache
+
+Thumbnails are **content-addressed** and **app-level**: a PNG lives at
+`<appDataRoot>/thumbnail-cache/<contentHash>-<size>.png`, keyed on the asset's baked content
+rather than its uuid or a file stat. The consequences fall out of the key. A cache entry
+survives a project switch and is shared across projects (identical content resolves to one
+file); a bare touch that bumps a file's mtime without changing bytes still hits; and only a
+real content change mints a new key and regenerates. Materials are the exception: their key is
+a hash of the *resolved* material state, so editing a parent reflows every instance's
+thumbnail without touching the child `.smat`.
+
+`request_thumbnail` checks the cache **before** loading anything: a mesh/texture/model reads
+its `content_hash` straight from the catalog (in memory) and looks up the file, so a hit never
+opens the 50 MB container it would otherwise decode on the main thread. Only a miss builds the
+full job. A legacy row with no stored hash self-heals — it derives the hash from the gathered
+bytes, backfills the catalog, and persists it, so the next boot takes the cheap path. The
+shared cache is bounded: a write that pushes it over its size cap evicts the oldest files.
 
 ## Resolving an id to a GPU resource
 
@@ -127,6 +150,7 @@ a missing or corrupt asset from flooding the log and re-hitting the disk many ti
 | The cache shape | `assets/src/cache.rs` | `AssetCache`, `resolve_cached` |
 | Resolve + cache | `assets/src/load.rs` | `load_mesh_asset`, `load_texture_asset`, `resolve_mesh`, `resolve_texture` |
 | Scan + sidecar + cache | `assets/src/scan.rs` | `scan_assets`, `load_catalog`, `read_smeta` |
+| Thumbnail cache | `assets/src/thumbnail.rs` | `request_thumbnail`, `thumbnail_content_cache_path`, `evict_thumbnail_cache` |
 
 ## Related
 

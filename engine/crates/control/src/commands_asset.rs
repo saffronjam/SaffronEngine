@@ -617,7 +617,7 @@ fn apply_project_info(ctx: &mut EngineContext<'_>, project: &ProjectInfo) {
 
 /// Brings the host's project up from the editor-set environment at startup:
 /// `SAFFRON_PROJECT` selects a project to open (or create when the name is valid and
-/// unborn), else `SAFFRON_AUTO_EMPTY_PROJECT`
+/// unborn), else `SAFFRON_SCRATCH_PROJECT`
 /// makes a deterministic per-shell scratch project, else a `project.json` in the working
 /// directory is opened. With none of those set the host waits for the editor's project
 /// picker. Drives the same [`AssetServer`] + [`apply_project_info`] path the lifecycle
@@ -670,12 +670,12 @@ pub fn bootstrap_project_from_env(ctx: &mut EngineContext<'_>) {
         return;
     }
 
-    if std::env::var_os("SAFFRON_AUTO_EMPTY_PROJECT").is_some() {
+    if std::env::var_os("SAFFRON_SCRATCH_PROJECT").is_some() {
         let mut project = ProjectInfo::default();
         let mut host = RendererProjectHost {
             renderer: ctx.renderer,
         };
-        match ctx.assets.create_auto_empty_project(
+        match ctx.assets.create_scratch_project(
             &mut host,
             &ctx.scene_edit.registry,
             &mut ctx.scene_edit.scene,
@@ -683,7 +683,7 @@ pub fn bootstrap_project_from_env(ctx: &mut EngineContext<'_>) {
             &defs,
         ) {
             Ok(()) => apply_loaded_project(ctx, &project, None),
-            Err(err) => tracing::error!("auto-empty project bring-up: {err}"),
+            Err(err) => tracing::error!("scratch project bring-up: {err}"),
         }
         return;
     }
@@ -1875,7 +1875,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             } else {
                 std::fs::remove_file(ctx.assets.root.join(&entry.path)).is_ok()
             };
-            ctx.assets.remove_thumbnail_cache_for_asset(entry.id);
+            // The thumbnail cache is content-addressed and shared across assets/projects, so
+            // a delete leaves its PNG for the eviction sweep — another asset may share it.
             ctx.scene_edit.scene_version += 1;
             Ok(DeleteAssetResult {
                 id: WireUuid(entry.id.value()),
@@ -2501,7 +2502,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
 
     reg.register::<ThumbnailCacheParams, ThumbnailCacheResult>(
         "thumbnail-cache",
-        "thumbnail-cache {action: stats|clear} — inspect or empty the disk cache",
+        "thumbnail-cache {action: stats|clear} — inspect or empty the app-level cache",
         |ctx, params| {
             if params.action == "clear" {
                 let removed = ctx.assets.clear_thumbnail_cache_dir();

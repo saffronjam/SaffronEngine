@@ -46,9 +46,10 @@ use crate::material::MaterialAsset;
 use crate::render_material::build_submesh_material;
 use crate::{AssetServer, Error, Result};
 
-/// The thumbnail cache version, folded into every stamp so a behaviour change retires
-/// the whole on-disk cache. At `v2`, model thumbnails render textured.
-pub const THUMBNAIL_CACHE_VERSION: u32 = 3;
+/// The thumbnail cache version, folded into every content hash so a render-behaviour
+/// change retires the whole on-disk cache. At `v4`, the cache is content-addressed
+/// (`<contentHash>-<size>.png` under the app-level cache dir).
+pub const THUMBNAIL_CACHE_VERSION: u32 = 4;
 
 /// The FNV-1a 64-bit offset basis.
 const FNV_OFFSET: u64 = 1469598103934665603;
@@ -231,8 +232,14 @@ pub struct ThumbnailJob {
     pub id: Uuid,
     /// The requested square pixel size.
     pub size: u32,
-    /// The on-disk cache path (`<projectRoot>/cache/thumbnails/<…>.png`).
+    /// The content-addressed cache path (`<contentHash>-<size>.png` under the app-level
+    /// cache dir); empty when the content hash is unknown (unreadable bytes → uncacheable).
     pub cache_path: String,
+    /// The content hash keying `cache_path` (`0` when uncacheable).
+    pub content_hash: u64,
+    /// The content hash was derived from the gathered bytes because the catalog row carried
+    /// none (a legacy row); the caller backfills + persists it.
+    pub self_healed: bool,
     /// The type-specific content + inputs.
     pub content: ThumbnailContent,
 }
@@ -482,7 +489,7 @@ fn generate_thumbnail(
     }
 }
 
-/// An FNV-1a 64-bit accumulator: the thumbnail-stamp fold over `u64` words + `f32` bits.
+/// An FNV-1a 64-bit accumulator: the content-hash fold over `u64` words + `f32` bits.
 struct FnvHash(u64);
 
 impl FnvHash {
@@ -498,26 +505,12 @@ impl FnvHash {
     fn mix_f(&mut self, f: f32) {
         self.mix(u64::from(f.to_bits()));
     }
-
-    fn hex(&self) -> String {
-        format!("{:016x}", self.0)
-    }
-}
-
-/// FNV-1a folds `version | file_size | mtime_ticks` into a compact hex token — the
-/// `<stamp>` filename field.
-fn fold_thumbnail_stamp(version: u64, file_size: u64, mtime_ticks: u64) -> String {
-    let mut h = FnvHash::new();
-    h.mix(version);
-    h.mix(file_size);
-    h.mix(mtime_ticks);
-    h.hex()
 }
 
 /// A material thumbnail keys on its *resolved* state (a content hash of the resolved
-/// params + texture uuids), not a file stamp — editing a parent material reflows every
-/// instance without touching the child `.smat`. Folded with the cache version.
-fn thumbnail_material_stamp(m: &MaterialAsset) -> String {
+/// params + texture uuids), not a stored catalog hash — editing a parent material reflows
+/// every instance without touching the child `.smat`. Folded with the cache version.
+fn thumbnail_material_hash(m: &MaterialAsset) -> u64 {
     let mut h = FnvHash::new();
     h.mix(u64::from(THUMBNAIL_CACHE_VERSION));
     h.mix_f(m.base_color.x);
@@ -550,15 +543,59 @@ fn thumbnail_material_stamp(m: &MaterialAsset) -> String {
     for c in m.blend.bytes() {
         h.mix(u64::from(c));
     }
-    h.hex()
+    h.0
 }
 
-/// The leading uuid of a cache filename (`<uuid>-<size>-<stamp>.png`); `0` if it doesn't
-/// parse.
-fn thumbnail_cache_file_uuid(filename: &str) -> u64 {
-    match filename.split_once('-') {
-        Some((head, _)) => head.parse().unwrap_or(0),
-        None => 0,
+/// The content hash of a resolved thumbnail job's inputs, mirroring the value scan/bake
+/// store on the [`AssetEntry`] — used to self-heal a legacy row (`content_hash == 0`) whose
+/// container predates the content-addressed cache. A single mesh/texture folds its chunk (or
+/// file) bytes exactly as bake/scan does; a model folds its merged mesh bytes + node
+/// transforms + material state. `0` when the bytes are unreadable (the entry stays
+/// uncacheable) or for a material (which keys on resolved state, never self-heals).
+fn content_hash_from_content(content: &ThumbnailContent) -> u64 {
+    match content {
+        ThumbnailContent::Texture(src) => {
+            if src.bytes.is_empty() {
+                std::fs::read(&src.path)
+                    .map(|b| crate::import::hash_bytes_fnv(&b))
+                    .unwrap_or(0)
+            } else {
+                crate::import::hash_bytes_fnv(&src.bytes)
+            }
+        }
+        ThumbnailContent::Mesh { path, bytes } => {
+            if bytes.is_empty() {
+                std::fs::read(path)
+                    .map(|b| crate::import::hash_bytes_fnv(&b))
+                    .unwrap_or(0)
+            } else {
+                crate::import::hash_bytes_fnv(bytes)
+            }
+        }
+        ThumbnailContent::Model {
+            meshes,
+            materials,
+            textures,
+        } => {
+            let mut h = FnvHash::new();
+            h.mix(u64::from(THUMBNAIL_CACHE_VERSION));
+            for chunk in meshes {
+                h.mix(crate::import::hash_bytes_fnv(&chunk.bytes));
+                for f in chunk.transform.to_cols_array() {
+                    h.mix_f(f);
+                }
+            }
+            for mat in materials {
+                h.mix(thumbnail_material_hash(mat));
+            }
+            for t in textures {
+                if !t.bytes.is_empty() {
+                    h.mix(crate::import::hash_bytes_fnv(&t.bytes));
+                }
+            }
+            h.0
+        }
+        ThumbnailContent::Material { .. } => 0,
     }
 }
 
@@ -586,7 +623,16 @@ fn read_thumbnail_cache(path: &Path) -> Option<ThumbnailPng> {
     })
 }
 
-/// Writes a generated PNG into the cache dir, creating the parent dir.
+/// The app-level cache is bounded to this many bytes; a write that pushes it over the cap
+/// evicts the oldest files (by mtime) down to [`THUMBNAIL_CACHE_EVICT_BYTES`].
+const THUMBNAIL_CACHE_MAX_BYTES: u64 = 1 << 30; // 1 GiB
+/// The low-water mark eviction drains down to, so a burst of writes does not re-trigger a
+/// full eviction on every file.
+const THUMBNAIL_CACHE_EVICT_BYTES: u64 = THUMBNAIL_CACHE_MAX_BYTES / 5 * 4; // 80%
+
+/// Writes a generated PNG into the cache dir, creating the parent dir, then bounds the
+/// shared cache. Runs on the worker thread in production, so the eviction scan never touches
+/// the main-thread frame budget.
 ///
 /// # Errors
 ///
@@ -600,7 +646,47 @@ fn write_thumbnail_cache(path: &Path, bytes: &[u8]) -> Result<()> {
             "write failed for thumbnail cache '{}': {e}",
             path.display()
         ))
-    })
+    })?;
+    if let Some(parent) = path.parent() {
+        evict_thumbnail_cache_over_cap(parent);
+    }
+    Ok(())
+}
+
+/// Bounds the shared content-addressed cache to the production cap.
+fn evict_thumbnail_cache_over_cap(dir: &Path) {
+    evict_thumbnail_cache(dir, THUMBNAIL_CACHE_MAX_BYTES, THUMBNAIL_CACHE_EVICT_BYTES);
+}
+
+/// When `dir`'s total size exceeds `max`, deletes the oldest files (by mtime) until it is
+/// back under `target`. A no-op while under `max` (the common case).
+fn evict_thumbnail_cache(dir: &Path, max: u64, target: u64) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let mut total = 0u64;
+    for entry in read.flatten() {
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            total += meta.len();
+            files.push((entry.path(), mtime, meta.len()));
+        }
+    }
+    if total <= max {
+        return;
+    }
+    files.sort_by_key(|(_, mtime, _)| *mtime); // oldest first
+    for (file, _, size) in files {
+        if total <= target {
+            break;
+        }
+        if std::fs::remove_file(&file).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
 }
 
 /// Inserts handed-back GPU resources into the caches, skipping uuids already cached.
@@ -622,32 +708,11 @@ fn insert_thumbnail_handback(
 }
 
 impl AssetServer {
-    /// The cache path for `{id, size, stamp}` (`<uuid>-<size>-<stamp>.png` under the
-    /// thumbnail cache dir).
-    fn thumbnail_cache_path(&self, id: Uuid, size: u32, stamp: &str) -> PathBuf {
+    /// The cache path for a content hash + size (`<contentHash>-<size>.png` under the
+    /// app-level thumbnail cache dir).
+    fn thumbnail_content_cache_path(&self, content_hash: u64, size: u32) -> PathBuf {
         self.thumbnail_cache_dir()
-            .join(format!("{}-{size}-{stamp}.png", id.value()))
-    }
-
-    /// FNV-1a stamp of the asset's source file (size + mtime, folded with the cache
-    /// version). Empty when the file is missing/unstattable — the entry is then never
-    /// cached.
-    fn thumbnail_source_stamp(&self, rel_path: &str) -> String {
-        if rel_path.is_empty() {
-            return String::new();
-        }
-        let src = self.root.join(rel_path);
-        let Ok(meta) = std::fs::metadata(&src) else {
-            return String::new();
-        };
-        let Ok(modified) = meta.modified() else {
-            return String::new();
-        };
-        let mtime = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        fold_thumbnail_stamp(u64::from(THUMBNAIL_CACHE_VERSION), meta.len(), mtime)
+            .join(format!("{content_hash}-{size}.png"))
     }
 
     /// What the on-disk thumbnail cache holds (count + bytes).
@@ -669,7 +734,7 @@ impl AssetServer {
         stats
     }
 
-    /// Empties the project's cache dir, returning what was removed.
+    /// Empties the app-level cache dir, returning what was removed.
     pub fn clear_thumbnail_cache_dir(&self) -> ThumbnailCacheStats {
         let removed = self.thumbnail_cache_stats();
         let dir = self.thumbnail_cache_dir();
@@ -679,37 +744,6 @@ impl AssetServer {
             }
         }
         removed
-    }
-
-    /// Removes every cached thumbnail for one asset uuid (all sizes/stamps) — on delete +
-    /// reimport.
-    pub fn remove_thumbnail_cache_for_asset(&self, id: Uuid) {
-        let dir = self.thumbnail_cache_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if thumbnail_cache_file_uuid(&name.to_string_lossy()) == id.value() {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-
-    /// Deletes cache files whose uuid is no longer in the catalog (reimport mints new
-    /// uuids, orphaning the old PNGs). Run on project load.
-    pub fn sweep_thumbnail_cache_orphans(&self) {
-        let dir = self.thumbnail_cache_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let uuid = thumbnail_cache_file_uuid(&name.to_string_lossy());
-            if uuid == 0 || !self.catalog.by_id.contains_key(&uuid) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
     }
 
     /// Starts the off-thread thumbnail worker over `gpu` (a `'static` GPU seam), if not
@@ -793,10 +827,12 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
         .ok_or(Error::NotInCatalog(id.value()))?
         .clone();
 
-    let (content, stamp): (ThumbnailContent, String) = match entry.asset_type {
+    // Materials key on their resolved state (a live hash); every other kind keys on the
+    // stored catalog `content_hash`, so the arm returns `Some(hash)` only for a material.
+    let (content, material_hash): (ThumbnailContent, Option<u64>) = match entry.asset_type {
         AssetType::Material => {
             let material = crate::material::load_catalog_material_asset(assets, id)?;
-            let stamp = thumbnail_material_stamp(&material);
+            let hash = thumbnail_material_hash(&material);
             let textures = if entry.container.value() == 0 {
                 resolve_material_textures(assets, &material)
             } else {
@@ -815,13 +851,12 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
                     material: Box::new(material),
                     textures,
                 },
-                stamp,
+                Some(hash),
             )
         }
         // An embedded texture sub-asset lives inside its `.smodel`; read the chunk bytes
         // from the container instead of decoding the container path as an image.
         AssetType::Texture if entry.container.value() != 0 => {
-            let stamp = assets.thumbnail_source_stamp(&entry.path);
             let container = assets.load_model_asset(entry.container).ok_or_else(|| {
                 Error::Thumbnail(format!("model {} is not loadable", entry.container.value()))
             })?;
@@ -844,10 +879,9 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
                 srgb: space != Colorspace::Linear && space != Colorspace::Hdr,
                 bytes,
             };
-            (ThumbnailContent::Texture(src), stamp)
+            (ThumbnailContent::Texture(src), None)
         }
         AssetType::Texture => {
-            let stamp = assets.thumbnail_source_stamp(&entry.path);
             let space = if entry.colorspace != Colorspace::Auto {
                 entry.colorspace
             } else if entry.hdr {
@@ -864,20 +898,19 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
                 srgb: space != Colorspace::Linear && space != Colorspace::Hdr,
                 bytes: Vec::new(),
             };
-            (ThumbnailContent::Texture(src), stamp)
+            (ThumbnailContent::Texture(src), None)
         }
         AssetType::Mesh if entry.container.value() == 0 => {
-            let stamp = assets.thumbnail_source_stamp(&entry.path);
             let path = format!("{}/{}", assets.root.display(), entry.path);
             (
                 ThumbnailContent::Mesh {
                     path,
                     bytes: Vec::new(),
                 },
-                stamp,
+                None,
             )
         }
-        AssetType::Mesh | AssetType::Model => build_embedded_job(assets, id, &entry)?,
+        AssetType::Mesh | AssetType::Model => (build_embedded_job(assets, id, &entry)?, None),
         _ => {
             return Err(Error::Thumbnail(format!(
                 "asset {} has no thumbnail",
@@ -886,11 +919,19 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
         }
     };
 
-    let cache_path = if stamp.is_empty() {
+    // Resolve the content-addressed key: a material's live hash, else the stored catalog
+    // hash, self-healing a legacy `0` from the gathered bytes (flagged so the caller persists
+    // it). A `0` hash is uncacheable (unreadable bytes) — generated but not cached.
+    let (content_hash, self_healed) = match material_hash {
+        Some(hash) => (hash, false),
+        None if entry.content_hash != 0 => (entry.content_hash, false),
+        None => (content_hash_from_content(&content), true),
+    };
+    let cache_path = if content_hash == 0 {
         String::new()
     } else {
         assets
-            .thumbnail_cache_path(id, size, &stamp)
+            .thumbnail_content_cache_path(content_hash, size)
             .display()
             .to_string()
     };
@@ -899,6 +940,8 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
         id,
         size,
         cache_path,
+        content_hash,
+        self_healed,
         content,
     })
 }
@@ -910,9 +953,8 @@ fn build_embedded_job(
     assets: &mut AssetServer,
     id: Uuid,
     entry: &saffron_scene::AssetEntry,
-) -> Result<(ThumbnailContent, String)> {
+) -> Result<ThumbnailContent> {
     let is_model = entry.asset_type == AssetType::Model;
-    let stamp = assets.thumbnail_source_stamp(&entry.path);
 
     // An embedded mesh sub-asset previews that one chunk; a model previews its whole forest.
     if !is_model {
@@ -926,13 +968,10 @@ fn build_embedded_job(
                 id.value()
             )));
         }
-        return Ok((
-            ThumbnailContent::Mesh {
-                path: String::new(),
-                bytes: source.read()?,
-            },
-            stamp,
-        ));
+        return Ok(ThumbnailContent::Mesh {
+            path: String::new(),
+            bytes: source.read()?,
+        });
     }
 
     let container = assets
@@ -1009,14 +1048,11 @@ fn build_embedded_job(
         materials.push(material);
     }
 
-    Ok((
-        ThumbnailContent::Model {
-            meshes,
-            materials,
-            textures,
-        },
-        stamp,
-    ))
+    Ok(ThumbnailContent::Model {
+        meshes,
+        materials,
+        textures,
+    })
 }
 
 /// World transforms for an imported node forest: each node's local `T·R·S` composed up its
@@ -1167,10 +1203,21 @@ fn colorspace_from_flags(flags: u32) -> Colorspace {
     }
 }
 
+/// A ready [`ThumbnailReply`] from a decoded/generated PNG.
+fn ready_reply(png: ThumbnailPng) -> ThumbnailReply {
+    ThumbnailReply {
+        png: png.bytes,
+        width: png.width,
+        height: png.height,
+        pending: false,
+    }
+}
+
 /// Resolves `{asset, size}` to a thumbnail over `gpu` — a cache hit returns the PNG, a
 /// miss generates it (sync when there is no worker, else enqueued with a `pending` reply).
 ///
-/// Materials key on resolved state, mesh/texture on the source-file stat.
+/// The cache is content-addressed: a mesh/texture/model keys on the catalog `content_hash`
+/// (checked before any container load), a material on its live resolved state.
 ///
 /// # Errors
 ///
@@ -1182,17 +1229,41 @@ pub fn request_thumbnail(
     id: Uuid,
     size: u32,
 ) -> Result<ThumbnailReply> {
+    let entry = assets
+        .catalog
+        .find(id)
+        .ok_or(Error::NotInCatalog(id.value()))?
+        .clone();
+
+    // Cheap content-addressed hit: a mesh/texture/model carries a stored content hash, so the
+    // cache is checked WITHOUT loading the container — the boot-hitch fix. Materials key on
+    // their live resolved state, so they fall through to the job build (cheap for a standalone
+    // `.smat`, a container read for an embedded one).
+    if matches!(
+        entry.asset_type,
+        AssetType::Texture | AssetType::Mesh | AssetType::Model
+    ) && entry.content_hash != 0
+        && let Some(hit) =
+            read_thumbnail_cache(&assets.thumbnail_content_cache_path(entry.content_hash, size))
+    {
+        return Ok(ready_reply(hit));
+    }
+
     let job = build_thumbnail_job(assets, id, size)?;
 
+    // Self-heal a legacy row: persist the derived hash so later boots take the cheap path
+    // above instead of re-loading the container every time.
+    if job.self_healed && job.content_hash != 0 {
+        assets.catalog.set_content_hash(id, job.content_hash);
+        assets.write_catalog_cache();
+    }
+
+    // The shared, content-addressed cache may already hold this exact content (rendered for
+    // another asset or in another project).
     if !job.cache_path.is_empty()
         && let Some(hit) = read_thumbnail_cache(Path::new(&job.cache_path))
     {
-        return Ok(ThumbnailReply {
-            png: hit.bytes,
-            width: hit.width,
-            height: hit.height,
-            pending: false,
-        });
+        return Ok(ready_reply(hit));
     }
 
     // No worker, or no cache key to dedup/persist against: generate inline on the calling
@@ -1207,12 +1278,7 @@ pub fn request_thumbnail(
                 tracing::warn!("{err}");
             }
         }
-        return Ok(ThumbnailReply {
-            png: png.bytes,
-            width: png.width,
-            height: png.height,
-            pending: false,
-        });
+        return Ok(ready_reply(png));
     }
 
     // Worker path: dedup on the cache path, enqueue once, reply pending.
@@ -1499,6 +1565,16 @@ mod tests {
         dir.join("project").join("assets")
     }
 
+    /// An asset server whose content-addressed thumbnail cache is isolated to a unique temp
+    /// dir. The production cache is app-level (shared), so tests must point it at their own
+    /// dir to get a cold miss and exercise the worker/generate path deterministically.
+    fn isolated_server(root: &Path) -> AssetServer {
+        let mut assets = AssetServer::new(root);
+        assets.thumbnail_cache_root = root.parent().unwrap_or(root).join("thumbnail-cache");
+        let _ = std::fs::remove_dir_all(&assets.thumbnail_cache_root);
+        assets
+    }
+
     fn put_mesh_row(assets: &mut AssetServer, id: Uuid) {
         std::fs::create_dir_all(assets.root.join("models")).expect("models dir");
         std::fs::write(assets.root.join("models/m.smesh"), smesh_bytes()).expect("smesh");
@@ -1574,7 +1650,7 @@ mod tests {
     #[test]
     fn model_thumbnail_job_reads_embedded_material_chunks() {
         let root = temp_root("embedded-model-material");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         let material = MaterialAsset {
             base_color: saffron_geometry::glam::Vec4::new(0.25, 0.5, 0.75, 1.0),
             metallic: 0.4,
@@ -1596,7 +1672,7 @@ mod tests {
     #[test]
     fn material_thumbnail_job_reads_embedded_material_chunks() {
         let root = temp_root("embedded-material");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         let material = MaterialAsset {
             base_color: saffron_geometry::glam::Vec4::new(0.8, 0.2, 0.1, 1.0),
             unlit: true,
@@ -1619,7 +1695,7 @@ mod tests {
     fn worker_decodes_uploads_and_drains_into_the_mesh_cache() {
         let Some(gpu) = gpu_or_skip() else { return };
         let root = temp_root("drain");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         put_mesh_row(&mut assets, Uuid(5000));
 
         assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
@@ -1649,7 +1725,7 @@ mod tests {
     fn enqueuing_the_same_cache_path_twice_yields_one_cache_file() {
         let Some(gpu) = gpu_or_skip() else { return };
         let root = temp_root("dedup");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         put_mesh_row(&mut assets, Uuid(6000));
 
         assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
@@ -1663,10 +1739,14 @@ mod tests {
 
         let worker = assets.thumbnail_worker.as_ref().expect("worker");
         assert!(wait_until(worker, |s| s.in_flight.is_empty()));
-        let count = std::fs::read_dir(assets.thumbnail_cache_dir())
-            .map(|d| d.flatten().count())
-            .unwrap_or(0);
-        assert_eq!(count, 1, "exactly one cache file for one dedup'd job");
+        // The two identical requests dedup to one job, which writes the one content-addressed
+        // file for that mesh's hash (backfilled onto the row by the self-heal on the miss).
+        let hash = assets.catalog.find(Uuid(6000)).expect("row").content_hash;
+        assert_ne!(hash, 0, "the self-heal backfilled the content hash");
+        assert!(
+            assets.thumbnail_content_cache_path(hash, 64).exists(),
+            "the dedup'd job produced its one content-addressed cache file"
+        );
 
         assets.stop_thumbnail_worker();
         gpu.teardown(assets);
@@ -1676,7 +1756,7 @@ mod tests {
     fn a_failing_job_marks_failed_and_is_not_retried() {
         let Some(gpu) = gpu_or_skip() else { return };
         let root = temp_root("fail");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         put_mesh_row(&mut assets, Uuid(7000));
 
         assets.start_thumbnail_worker(Box::new(gpu.seam(true)));
@@ -1706,7 +1786,7 @@ mod tests {
     fn stop_joins_before_a_recorded_wait_gpu_idle() {
         let Some(gpu) = gpu_or_skip() else { return };
         let root = temp_root("stop");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
         assert!(assets.thumbnail_worker.is_some());
 
@@ -1728,7 +1808,7 @@ mod tests {
     fn clear_thumbnail_queue_empties_queue_dedup_and_handbacks() {
         let Some(gpu) = gpu_or_skip() else { return };
         let root = temp_root("clear");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         put_mesh_row(&mut assets, Uuid(9100));
         assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
 
@@ -1789,7 +1869,7 @@ mod tests {
     fn sync_fallback_generates_inline_when_no_worker() {
         let Some(gpu) = gpu_or_skip() else { return };
         let root = temp_root("sync");
-        let mut assets = AssetServer::new(&root);
+        let mut assets = isolated_server(&root);
         put_mesh_row(&mut assets, Uuid(8000));
 
         // No worker started: the request generates inline and returns the PNG directly.
@@ -1819,45 +1899,70 @@ mod tests {
     }
 
     #[test]
-    fn material_stamp_changes_with_resolved_params() {
+    fn material_hash_changes_with_resolved_params() {
         // No GPU needed: a pure CPU hash over the resolved material.
         let mut a = crate::material::default_material_asset();
-        let s1 = thumbnail_material_stamp(&a);
+        let s1 = thumbnail_material_hash(&a);
         a.metallic = 0.5;
-        let s2 = thumbnail_material_stamp(&a);
+        let s2 = thumbnail_material_hash(&a);
         assert_ne!(
             s1, s2,
             "a param change retires the cached material thumbnail"
         );
         a.albedo_texture = Uuid(1234);
-        let s3 = thumbnail_material_stamp(&a);
-        assert_ne!(s2, s3, "a texture id change moves the stamp");
+        let s3 = thumbnail_material_hash(&a);
+        assert_ne!(s2, s3, "a texture id change moves the hash");
     }
 
     #[test]
-    fn cache_stats_count_files_and_sweep_drops_orphans() {
-        let root = temp_root("stats");
-        let mut assets = AssetServer::new(&root);
-        let dir = assets.thumbnail_cache_dir();
-        std::fs::create_dir_all(&dir).expect("dir");
-        std::fs::write(dir.join("100-64-abc.png"), [0u8; 30]).expect("png1");
-        std::fs::write(dir.join("200-64-def.png"), [0u8; 30]).expect("png2");
-
-        let stats = assets.thumbnail_cache_stats();
-        assert_eq!(stats.entries, 2);
-        assert_eq!(stats.bytes, 60);
-
-        assets.catalog.put(saffron_scene::AssetEntry {
-            id: Uuid(200),
-            name: "k".to_owned(),
-            asset_type: AssetType::Mesh,
-            ..Default::default()
-        });
-        assets.sweep_thumbnail_cache_orphans();
-        assert!(!dir.join("100-64-abc.png").exists(), "the orphan is swept");
-        assert!(
-            dir.join("200-64-def.png").exists(),
-            "the catalog'd file is kept"
+    fn content_cache_path_is_hash_and_size() {
+        // The cache is content-addressed: the filename is `<contentHash>-<size>.png`, with
+        // no project/uuid in it, so identical content shares one file across projects.
+        let assets = AssetServer::new(temp_root("path"));
+        let path = assets.thumbnail_content_cache_path(0xABCD, 128);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("43981-128.png"),
+            "the filename is the decimal content hash and size"
         );
+        assert_eq!(path.parent(), Some(assets.thumbnail_cache_dir().as_path()));
+    }
+
+    #[test]
+    fn eviction_drops_oldest_files_down_to_target() {
+        let dir = temp_root("evict")
+            .parent()
+            .expect("parent")
+            .join("thumb-cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        // Five 100-byte files, written oldest-first with strictly increasing mtimes so the
+        // eviction order is deterministic.
+        for i in 0..5u32 {
+            let path = dir.join(format!("{i}.png"));
+            std::fs::write(&path, [0u8; 100]).expect("write");
+            filetime_set(&path, 1_000 + u64::from(i));
+        }
+
+        // Cap 500, target 250: over-cap by one file's worth; evict oldest until <= 250.
+        evict_thumbnail_cache(&dir, 450, 250);
+
+        let survivors: Vec<u32> = (0..5)
+            .filter(|i| dir.join(format!("{i}.png")).exists())
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![3, 4],
+            "the two newest files survive; the three oldest are evicted to reach the target"
+        );
+    }
+
+    /// Sets a file's mtime to `secs` past the epoch (test-only, so eviction order is
+    /// deterministic rather than depending on write timing).
+    fn filetime_set(path: &Path, secs: u64) {
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::File::open(path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set mtime");
     }
 }
