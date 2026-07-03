@@ -3,7 +3,7 @@
 //! `register_*_commands` joins this table to handler fns by name to dispatch, and the
 //! OpenRPC/manifest emitters read the same slice to emit `methods`.
 //!
-//! [`COMMANDS`] holds exactly the **160 typed commands** in the frozen wire order (the committed
+//! [`COMMANDS`] holds exactly the **162 typed commands** in the frozen wire order (the committed
 //! `schemas/control/command-manifest.generated.json` order, `ping` first, `quit` last) — the order
 //! is load-bearing: it is the manifest's `commands` order and the OpenRPC `methods` order, so the
 //! emitters reproduce the committed artifacts byte-for-byte. The lone untyped reflective builtin
@@ -32,7 +32,7 @@ pub struct CommandSpec {
     pub result: &'static str,
 }
 
-/// The 160 typed commands in frozen wire order (`help` excluded — see module docs).
+/// The 162 typed commands in frozen wire order (`help` excluded — see module docs).
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ping",
@@ -95,6 +95,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         result: "PerfConfigDto",
     },
     CommandSpec {
+        name: "get-upscale",
+        summary: "TAAU ratio, dynamic-resolution state, and input/display extents",
+        params: "EmptyParams",
+        result: "GetUpscaleResult",
+    },
+    CommandSpec {
+        name: "set-upscale",
+        summary: "set the TAAU input:display ratio + dynamic resolution",
+        params: "SetUpscaleParams",
+        result: "SetUpscaleResult",
+    },
+    CommandSpec {
         name: "drain-alarms",
         summary: "drain perf-alarm events (seq cursor)",
         params: "DrainAlarmsParams",
@@ -111,6 +123,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         summary: "set anti-aliasing mode",
         params: "SetAaParams",
         result: "SetAaResult",
+    },
+    CommandSpec {
+        name: "get-taa-params",
+        summary: "current TAA blend/sharpen parameters",
+        params: "EmptyParams",
+        result: "GetTaaParamsResult",
+    },
+    CommandSpec {
+        name: "set-taa-params",
+        summary: "tune TAA blend/sharpen parameters (partial update)",
+        params: "SetTaaParamsParams",
+        result: "SetTaaParamsResult",
     },
     CommandSpec {
         name: "set-view-mode",
@@ -701,10 +725,22 @@ pub static COMMANDS: &[CommandSpec] = &[
         result: "ProjectInfoDto",
     },
     CommandSpec {
+        name: "project-status",
+        summary: "project-load phase + progress",
+        params: "EmptyParams",
+        result: "ProjectStatusDto",
+    },
+    CommandSpec {
+        name: "cancel-load",
+        summary: "abort the in-flight project load",
+        params: "EmptyParams",
+        result: "ProjectStatusDto",
+    },
+    CommandSpec {
         name: "new-project",
         summary: "new-project {name}",
         params: "NewProjectParams",
-        result: "ProjectInfoDto",
+        result: "ProjectStatusDto",
     },
     CommandSpec {
         name: "create-script",
@@ -716,7 +752,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         name: "open-project",
         summary: "open-project {path}",
         params: "PathParams",
-        result: "ProjectInfoDto",
+        result: "ProjectStatusDto",
     },
     CommandSpec {
         name: "import-model",
@@ -968,13 +1004,13 @@ pub static COMMANDS: &[CommandSpec] = &[
         name: "load-project",
         summary: "load-project {path}",
         params: "OptionalPathParams",
-        result: "ProjectInfoDto",
+        result: "ProjectStatusDto",
     },
     CommandSpec {
         name: "reload-project",
         summary: "reload the active project",
         params: "EmptyParams",
-        result: "ProjectInfoDto",
+        result: "ProjectStatusDto",
     },
     CommandSpec {
         name: "get-stores",
@@ -1045,9 +1081,13 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("frame-history", "frame-history-samples"),
     ("get-perf-config", "empty"),
     ("set-perf-config", "perf-config-30"),
+    ("get-upscale", "empty"),
+    ("set-upscale", "upscale"),
     ("drain-alarms", "alarms-since-0"),
     ("list-active-alarms", "empty"),
     ("set-aa", "aa"),
+    ("get-taa-params", "empty"),
+    ("set-taa-params", "taa-sharpness"),
     ("set-view-mode", "view-mode-wireframe"),
     ("set-clustered", "toggle-on"),
     ("set-ibl", "toggle-on"),
@@ -1125,6 +1165,8 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("list-probes", "empty"),
     ("set-exposure", "exposure-zero"),
     ("get-project", "empty"),
+    ("project-status", "empty"),
+    ("cancel-load", "empty"),
     ("new-project", "new-project"),
     ("open-project", "project-name"),
     ("list-assets", "empty"),
@@ -1375,6 +1417,10 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "FrameHistoryDto",
     "PerfConfigDto",
     "SetPerfConfigParams",
+    "UpscaleDto",
+    "GetUpscaleResult",
+    "SetUpscaleParams",
+    "SetUpscaleResult",
     "AlarmEventDto",
     "DrainAlarmsParams",
     "DrainAlarmsResult",
@@ -1417,6 +1463,10 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "ActiveAlarmsDto",
     "SetAaParams",
     "SetAaResult",
+    "TaaParamsDto",
+    "GetTaaParamsResult",
+    "SetTaaParamsParams",
+    "SetTaaParamsResult",
     "SetViewModeParams",
     "SetViewModeResult",
     "ToggleParams",
@@ -1445,6 +1495,9 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "SetActiveViewParams",
     "SetActiveViewResult",
     "ProjectInfoDto",
+    "ProjectPhaseDto",
+    "BootStageDto",
+    "ProjectStatusDto",
     "NewProjectParams",
     "PathParams",
     "ProjectStoresDto",
@@ -1763,9 +1816,13 @@ mod tests {
             "frame-history",
             "get-perf-config",
             "set-perf-config",
+            "get-upscale",
+            "set-upscale",
             "drain-alarms",
             "list-active-alarms",
             "set-aa",
+            "get-taa-params",
+            "set-taa-params",
             "set-view-mode",
             "set-clustered",
             "set-ibl",
@@ -1845,6 +1902,8 @@ mod tests {
     fn asset_domain() -> &'static [&'static str] {
         &[
             "get-project",
+            "project-status",
+            "cancel-load",
             "new-project",
             "create-script",
             "open-project",

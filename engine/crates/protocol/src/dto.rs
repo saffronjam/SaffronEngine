@@ -629,14 +629,6 @@ pub struct PerfConfigDto {
 #[ts(export)]
 pub struct SetPerfConfigParams {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_fps: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auto_quality: Option<bool>,
-    /// Manual dynamic-resolution override `(0, 1]` for the active view (`1.0` = native). When
-    /// `auto_quality` is on the budget controller resets it each frame.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub render_scale: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub green_budget_frac: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub green_median_mul: Option<f32>,
@@ -648,6 +640,56 @@ pub struct SetPerfConfigParams {
     pub vram_warn_frac: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_crit_frac: Option<f32>,
+}
+
+/// The temporal-upsampling (TAAU) render-scale + dynamic-resolution surface: the fixed input:display
+/// ratio, the frame-budget-driven dynamic toggle + target, and the live input/display extents. The
+/// single wire home of the render scale — a separate concern from [`SetTaaParamsParams`] (the blend /
+/// sharpen look tunables).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UpscaleDto {
+    /// Fixed input:display render scale in `(0, 1]`; `1.0` = native (no upscaling).
+    pub ratio: f32,
+    /// Dynamic resolution: the frame-budget controller drives `ratio` toward `target_ms`.
+    pub dynamic: bool,
+    /// The per-frame budget (ms) the dynamic driver holds to (`= 1000 / target_fps`).
+    pub target_ms: f32,
+    /// Current input extent (scene / depth / motion render size) in device pixels.
+    pub input_width: u32,
+    pub input_height: u32,
+    /// Fixed display extent the resolve reconstructs to (the present size), in device pixels.
+    pub display_width: u32,
+    pub display_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GetUpscaleResult {
+    pub upscale: UpscaleDto,
+}
+
+/// Partial update of the upscale surface — every field `Option`, so an omitted field keeps its prior
+/// value (`{ "ratio": 0.67 }` pins the ratio without touching `dynamic` / `target_ms`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetUpscaleParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_ms: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetUpscaleResult {
+    pub upscale: UpscaleDto,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -1059,6 +1101,54 @@ pub struct SetAaResult {
     pub aa: AaModeDto,
 }
 
+/// The runtime TAA resolve tuning (mirrors `saffron_rendering::TaaParams`): the adaptive
+/// feedback range, the velocity-rejection scale, the YCoCg variance-clip gamma, and the
+/// RCAS sharpen strength.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaaParamsDto {
+    pub feedback_min: f32,
+    pub feedback_max: f32,
+    pub velocity_rejection: f32,
+    pub clip_gamma: f32,
+    pub sharpness: f32,
+}
+
+/// `get-taa-params` reply: the current TAA blend/sharpen parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GetTaaParamsResult {
+    pub params: TaaParamsDto,
+}
+
+/// `set-taa-params` request: a partial update — each present field overwrites, each omitted
+/// field keeps its current value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetTaaParamsParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_min: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_max: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub velocity_rejection: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_gamma: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sharpness: Option<f32>,
+}
+
+/// `set-taa-params` reply: the fully-resolved parameters after the merge (echo).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetTaaParamsResult {
+    pub params: TaaParamsDto,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -1294,6 +1384,51 @@ pub struct ProjectInfoDto {
     pub display_name: String,
 }
 
+/// Coarse project-load lifecycle (mirrors `saffron_sceneedit::ProjectPhase`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum ProjectPhaseDto {
+    Unloaded,
+    Loading,
+    Ready,
+    Failed,
+}
+
+/// The current boot stage within `Loading` (mirrors `saffron_sceneedit::BootStage`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum BootStageDto {
+    Manifest,
+    Catalog,
+    Scene,
+    Install,
+    Assets,
+    Skybox,
+    Accel,
+    Ready,
+    Failed,
+}
+
+/// Project-load phase + progress. `total == 0` means indeterminate (spinner). `version` is
+/// monotonic; the editor dedups on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProjectStatusDto {
+    pub phase: ProjectPhaseDto,
+    pub stage: BootStageDto,
+    pub done: i32,
+    pub total: i32,
+    pub label: String,
+    pub current_item: String,
+    pub error: String,
+    pub version: i64,
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -1480,6 +1615,8 @@ pub struct AssetEntryDto {
     pub duration: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rigged: Option<bool>,
+    /// Creation time (seconds since the Unix epoch) of the asset's backing file, for sorting.
+    pub created_at: i64,
     /// Store source/license, present for assets imported from a connector.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attribution: Option<AssetAttributionDto>,
@@ -2186,6 +2323,9 @@ pub struct SetMaterialParams {
         deserialize_with = "coerce::opt_boolean"
     )]
     pub unlit: Option<bool>,
+    /// The alpha/blend mode (glTF `alphaMode`): `opaque` | `masked` | `translucent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blend: Option<String>,
     /// Target a slot of the entity's MaterialSetComponent instead of its
     /// MaterialComponent. Out of range is an error; ignored without a MaterialSet.
     #[serde(skip_serializing_if = "Option::is_none")]

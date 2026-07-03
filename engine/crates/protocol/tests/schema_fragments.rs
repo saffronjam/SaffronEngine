@@ -146,6 +146,7 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(SetActiveViewParams, "SetActiveViewParams");
     check!(SetActiveViewResult, "SetActiveViewResult");
     check!(ProjectInfoDto, "ProjectInfoDto");
+    check!(ProjectStatusDto, "ProjectStatusDto");
     check!(NewProjectParams, "NewProjectParams");
     check!(PathParams, "PathParams");
     check!(OptionalPathParams, "OptionalPathParams");
