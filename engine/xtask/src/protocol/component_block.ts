@@ -1,3 +1,6 @@
+/** The material alpha/blend mode (glTF `alphaMode`). */
+export type BlendMode = "opaque" | "masked" | "translucent";
+
 export interface Name {
   name: string;
 }
@@ -37,7 +40,7 @@ export interface Material {
   heightTexture: WireUuid;
   normalStrength: number;
   heightScale: number;
-  alphaClip: boolean;
+  blend: BlendMode;
   alphaCutoff: number;
 }
 

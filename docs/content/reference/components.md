@@ -65,8 +65,8 @@ The scene renders through the first primary camera. `show_model` / `show_frustum
 | `uv_tiling` | `Vec2` | `{1,1}` | |
 | `uv_offset` | `Vec2` | `{0,0}` | |
 | `height_scale` | `f32` | `0.05` | parallax depth |
-| `alpha_clip` | `bool` | `false` | discard below `alpha_cutoff` |
-| `alpha_cutoff` | `f32` | `0.5` | |
+| `blend` | `enum` | `"opaque"` | `opaque` / `masked` (alpha-test + alpha-to-coverage under MSAA) / `translucent` (sorted blend pass) |
+| `alpha_cutoff` | `f32` | `0.5` | the `masked` discard/coverage threshold |
 
 `MaterialSlot` has the same field set as `Material` and the same defaults.
 
