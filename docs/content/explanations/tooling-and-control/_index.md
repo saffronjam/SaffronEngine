@@ -17,5 +17,6 @@ The control plane is a JSON-over-unix-socket protocol that drives a running edit
 | `scene-commands` | list/create/destroy/select, parent, set component(-field), transform, material, light, camera, gizmo, pick, focus, inspect | `engine/crates/control/src/commands_scene.rs` |
 | `render-commands` | set-aa / set-clustered / set-ibl / set-ssao / set-ssgi / set-shadows / set-gi / set-exposure / set-depth-prepass, render-stats | `engine/crates/control/src/commands_render.rs` |
 | `asset-commands` | import-model/texture, instantiate-model, catalog + folders, assign-asset, thumbnails, save/load project | `engine/crates/control/src/commands_asset.rs` |
+| `project-loading` | non-blocking project bring-up: phases + boot stages, the off-thread doc worker, the busy gate, `project-status` / `cancel-load` | `engine/crates/control/src/project_loader.rs`; `engine/crates/assets/src/project_load.rs` |
 | `screenshots-and-capture` | viewport vs. window PNG, deferred swapchain capture | `engine/crates/control/src/commands_asset.rs`; `engine/crates/rendering/src/renderer.rs` |
 | `shared-types` | DTO-first wire contract: Rust DTOs → serde / OpenRPC / TS / manifest via `xtask gen-protocol`, the freshness gate, wire invariants | `engine/crates/protocol`; `engine/xtask/src/protocol` |
