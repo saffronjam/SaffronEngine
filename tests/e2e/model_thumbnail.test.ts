@@ -16,7 +16,7 @@ type Thumb = { base64: string; width: number; height: number; format: string };
 let modelId = "";
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   modelId = (await engine.call<{ id: string }>("import-model", { path: FIXTURE })).id;
 });
 afterAll(async () => {

@@ -14,7 +14,7 @@ let dir: string;
 let id: string;
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   dir = mkdtempSync(join(tmpdir(), "saffron-hdrthumb-"));
   // 6x6 (stb reads flat RGBE under width 8). Radiance ramps from ~0.05 to ~3.2 across the image,
   // tinted per channel — many pixels exceed 1.0, which a clamp would crush to white.

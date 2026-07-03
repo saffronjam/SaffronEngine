@@ -14,7 +14,7 @@ let dir: string;
 let id: string;
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   dir = mkdtempSync(join(tmpdir(), "saffron-texthumb-"));
   const png = makePng(1024, 640, (x, y) => [x & 255, y & 255, (x ^ y) & 255]);
   writeFileSync(join(dir, "big.png"), png);

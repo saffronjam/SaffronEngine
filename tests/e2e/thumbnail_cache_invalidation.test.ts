@@ -1,6 +1,7 @@
-// Phase-4 invalidation: deleting an asset removes its cached PNGs; editing a *parent* material
-// reflows the instance's resolved-state key so its thumbnail regenerates; and the thumbnail-cache
-// control command reports + empties the disk cache.
+// Content-addressed cache semantics: deleting an asset leaves the shared cache intact (another
+// asset/project may reference the same content bytes); editing a *parent* material reflows the
+// instance's resolved-state key so its thumbnail regenerates; and the thumbnail-cache control
+// command reports + empties the app-level cache.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -13,7 +14,7 @@ let engine: Engine;
 let root: string;
 
 function cachePngs(): string[] {
-  const dir = join(root, "cache", "thumbnails");
+  const dir = join(engine.appdata, "thumbnail-cache");
   return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".png")) : [];
 }
 
@@ -27,16 +28,19 @@ afterAll(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-test("delete-asset removes the asset's cached thumbnails", async () => {
+test("delete-asset leaves the shared content-addressed cache intact", async () => {
   writeFileSync(join(root, "tex.png"), makePng(256, 256, (x, y) => [x & 255, y & 255, 128]));
   const { texture } = await engine.call<{ texture: string }>("import-texture", {
     path: join(root, "tex.png"),
   });
   await engine.getThumbnail("get-thumbnail", { asset: texture, size: 128 });
-  expect(cachePngs().some((f) => f.startsWith(`${texture}-`))).toBe(true);
+  const before = cachePngs();
+  expect(before.length).toBeGreaterThan(0); // the miss wrote a content-addressed file
 
   await engine.call("delete-asset", { asset: texture });
-  expect(cachePngs().some((f) => f.startsWith(`${texture}-`))).toBe(false);
+  // The cache is content-addressed and shared across assets/projects, so a delete must NOT purge
+  // the bytes — another asset may reference the same content; eviction bounds growth instead.
+  expect(cachePngs()).toEqual(before);
   expect(engine.validationErrors()).toEqual([]);
 });
 
@@ -57,7 +61,7 @@ test("editing a parent material regenerates the instance thumbnail", async () =>
   expect(engine.validationErrors()).toEqual([]);
 });
 
-test("thumbnail-cache stats counts the dir and clear empties it", async () => {
+test("thumbnail-cache stats counts the app-level dir and clear empties it", async () => {
   const stats = await engine.call<{ entries: number; bytes: number }>("thumbnail-cache", {
     action: "stats",
   });
