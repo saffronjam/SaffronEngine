@@ -3,7 +3,7 @@
 /// input and calls `client.createEntity(name)`. The engine auto-selects the new
 /// entity, so on success we mirror that locally (optimistic `selectEntity`) and the
 /// reconcile poll's sceneVersion bump refreshes the hierarchy list. A rejected call
-/// surfaces in the inline flash beside the trigger.
+/// surfaces via `notifyError` (the shared error toast).
 ///
 /// The menu and the named-empty popover live in the left column (the Hierarchy
 /// header) and anchor there.
@@ -12,7 +12,7 @@ import type { LucideIcon } from "lucide-react";
 import { Box, Camera, CircleDashed, Flashlight, Lightbulb, Orbit, Plus, Sun } from "lucide-react";
 import { client, type EntityPreset } from "../control/client";
 import { recordEntityCreation, useEditorStore } from "../state/store";
-import { errorText, useFlash } from "../lib/flash";
+import { errorText, notifyError } from "../lib/flash";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -41,7 +41,6 @@ export const CREATE_PRESETS: { label: string; preset: EntityPreset; icon: Lucide
 export function CreateMenu() {
   const phase = useEditorStore((s) => s.engineStatus.phase);
   const selectEntity = useEditorStore((s) => s.selectEntity);
-  const { message, flash } = useFlash();
   const [namingOpen, setNamingOpen] = useState(false);
 
   const ready = phase === "ready";
@@ -53,7 +52,7 @@ export function CreateMenu() {
         selectEntity(ref.id);
         recordEntityCreation(ref.id, "Create entity");
       })
-      .catch((err: unknown) => flash(errorText(err)));
+      .catch((err: unknown) => notifyError(errorText(err)));
   };
 
   const createNamed = (name: string): void => {
@@ -68,7 +67,7 @@ export function CreateMenu() {
         selectEntity(ref.id);
         recordEntityCreation(ref.id, "Create entity");
       })
-      .catch((err: unknown) => flash(errorText(err)));
+      .catch((err: unknown) => notifyError(errorText(err)));
   };
 
   return (
@@ -101,7 +100,6 @@ export function CreateMenu() {
           <NamedEmptyForm onCommit={createNamed} onCancel={() => setNamingOpen(false)} />
         </PopoverContent>
       </Popover>
-      {message ? <span className="truncate text-xs text-destructive">{message}</span> : null}
     </div>
   );
 }

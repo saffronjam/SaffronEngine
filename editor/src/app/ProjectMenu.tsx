@@ -24,7 +24,7 @@ const JSON_FILTER = [{ name: "Saffron Project", extensions: ["json"] }];
 
 export function ProjectMenu() {
   const phase = useEditorStore((s) => s.engineStatus.phase);
-  const resetSceneState = useEditorStore((s) => s.resetSceneState);
+  const startProjectLoad = useEditorStore((s) => s.startProjectLoad);
   const setProject = useEditorStore((s) => s.setProject);
   const project = useEditorStore((s) => s.project);
   const nativeDialogOpen = useEditorStore((s) => s.nativeDialogOpen);
@@ -81,18 +81,11 @@ export function ProjectMenu() {
     }
   };
 
-  // The shared open path: swap the engine to `path`, reset the editor scene state, and stamp it
-  // most-recently-used. Used by "Open Project..." and every "Open Recent" entry.
-  const loadProjectPath = async (path: string): Promise<void> => {
-    try {
-      const res = await client.openProject(path);
-      setProject(res);
-      resetSceneState();
-      await rememberProject(res);
-      notify(`Loaded project: ${res.path}`);
-    } catch (err) {
-      notify(`Load project failed: ${errorText(err)}`);
-    }
+  // The shared open path: kick off the non-blocking load. Progress + completion (setProject, scene
+  // reset, recents) are owned by the startup modal's loading view + useProjectLoadPoll — the same
+  // one seam as the picker. Used by "Open Project..." and every "Open Recent" entry.
+  const loadProjectPath = (path: string): void => {
+    void startProjectLoad({ kind: "open", path });
   };
 
   const openProject = async (): Promise<void> => {
@@ -100,7 +93,7 @@ export function ProjectMenu() {
     if (typeof selection !== "string") {
       return;
     }
-    await loadProjectPath(selection);
+    loadProjectPath(selection);
   };
 
   // Refresh the recent-project list when the menu opens (cheap; reflects saves/opens since last
@@ -129,15 +122,8 @@ export function ProjectMenu() {
     }
   };
 
-  const reloadProject = async (): Promise<void> => {
-    try {
-      const res = await client.reloadProject();
-      setProject(res);
-      resetSceneState();
-      notify(`Reloaded project: ${res.path}`);
-    } catch (err) {
-      notify(`Reload project failed: ${errorText(err)}`);
-    }
+  const reloadProject = (): void => {
+    void startProjectLoad({ kind: "reload" });
   };
 
   return (
