@@ -53,6 +53,9 @@ pub trait SceneRenderer: GpuUploader {
     fn viewport_width(&self) -> u32;
     /// The active offscreen viewport height in pixels. `0` early-outs.
     fn viewport_height(&self) -> u32;
+    /// This frame's sub-pixel TAA jitter offset in NDC (zero when TAA is inactive). Applied to
+    /// the scene view-projection only; clustered lighting / SSAO / picking stay un-jittered.
+    fn jitter_offset(&self) -> Vec2;
 
     /// Arms the spot shadow pass.
     fn set_spot_shadow(&mut self, light_view_proj: Mat4, light_index: u32, casting: bool);
@@ -200,11 +203,16 @@ impl GpuUploader for RendererScene<'_> {
 
 impl SceneRenderer for RendererScene<'_> {
     fn viewport_width(&self) -> u32 {
-        self.renderer.active_view().extent().width
+        // The scene renders at INPUT extent; the TAA resolve reconstructs it to display.
+        self.renderer.active_view().scaled_render_extent().width
     }
 
     fn viewport_height(&self) -> u32 {
-        self.renderer.active_view().extent().height
+        self.renderer.active_view().scaled_render_extent().height
+    }
+
+    fn jitter_offset(&self) -> Vec2 {
+        self.renderer.active_view_jitter()
     }
 
     fn set_spot_shadow(&mut self, light_view_proj: Mat4, light_index: u32, casting: bool) {
@@ -540,7 +548,13 @@ pub fn render_scene<R: SceneRenderer>(
     let view = camera.view;
     let mut proj = camera_projection(camera, aspect);
     proj.y_axis.y *= -1.0; // flip Y into Vulkan clip space
-    let view_projection = proj * view;
+    // Sub-pixel TAA jitter: shift NDC by the Halton offset as a clip-space translation
+    // (`clip.xy += jitter · clip.w`). Applied to the scene view-projection only — `proj` stays
+    // un-jittered for clustered lighting / SSAO / picking. The offset is zero unless TAA is on,
+    // and the renderer reprojects the motion prepass / grid against the un-jittered matrix.
+    let jitter = renderer.jitter_offset();
+    let view_projection =
+        Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.0)) * (proj * view);
 
     // Flatten the hierarchy once per frame before any consumer reads: every loop below
     // (lights, meshes, probes) and the between-frame pick/gizmo paths read the world-
@@ -922,6 +936,11 @@ fn gather_static_draw_list<R: SceneRenderer>(
             material: Material {
                 shader: materials.shader,
                 unlit: materials.unlit,
+                // blend/masked are per-submesh now — each SubmeshMaterial carries its own blend
+                // mode, and the draw-list batcher resolves the PSO + pass per submesh. The item's
+                // Material is only the shared PSO base (shader + unlit).
+                blend: false,
+                masked: false,
             },
             skinned: false,
             joint_offset: 0,
@@ -978,6 +997,11 @@ fn gather_skinned_draw_list<R: SceneRenderer>(
             material: Material {
                 shader: materials.shader,
                 unlit: materials.unlit,
+                // blend/masked are per-submesh now — each SubmeshMaterial carries its own blend
+                // mode, and the draw-list batcher resolves the PSO + pass per submesh. The item's
+                // Material is only the shared PSO base (shader + unlit).
+                blend: false,
+                masked: false,
             },
             skinned: true,
             joint_offset: frame_joints.len() as u32,
@@ -1398,6 +1422,9 @@ mod tests {
         }
         fn viewport_height(&self) -> u32 {
             self.height
+        }
+        fn jitter_offset(&self) -> Vec2 {
+            Vec2::ZERO
         }
         fn set_spot_shadow(&mut self, _view_proj: Mat4, light_index: u32, casting: bool) {
             self.calls.borrow_mut().push(Call::SpotShadow {
