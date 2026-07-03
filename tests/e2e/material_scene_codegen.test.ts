@@ -15,7 +15,7 @@ const MAPPED = join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb");
 const shots: string[] = [];
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("set-ibl", { args: ["on"] }).catch(() => {});
   await engine.call("add-entity", { args: ["directional-light"] }).catch(() => {});
 });
