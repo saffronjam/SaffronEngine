@@ -2,7 +2,7 @@
 /// the slices in sync with the running engine. The data panels read the slices
 /// this fills.
 import { create } from "zustand";
-import { client, type Client } from "../control/client";
+import { client, isBusyLoading, type Client } from "../control/client";
 import type { ProjectInfo } from "../control/client";
 import { COMMANDS_BY_ID, isCommandId, type CommandId } from "../lib/keybindings";
 import { routeAlarmToasts } from "../lib/alarmToasts";
@@ -59,6 +59,7 @@ import type {
   GizmoState,
   InspectResult,
   PerfConfigDto,
+  UpscaleDto,
   ProfileCaptureDto,
   RenderPassTimingsDto,
   RenderStats,
@@ -84,6 +85,42 @@ const CAPTURE_WINDOW_STORAGE_KEY = "saffron.captureWindowFrames";
 const CAPTURE_STATS_STORAGE_KEY = "saffron.captureIncludeStats";
 
 export type EnginePhase = "idle" | "starting" | "attaching" | "ready" | "error";
+
+/// Project-load phase — a DISTINCT axis from `EnginePhase` (a reload runs while the engine stays
+/// `ready`; an env/scratch bootstrap load lands before `phase === "ready"`). Drives the startup
+/// modal's loading view, not the engine-process `LoadingOverlay`.
+export type ProjectLoadPhase = "idle" | "loading" | "ready" | "error";
+
+/// What a `startProjectLoad` kicks off. Stashed in `ProjectLoadState.request` so a failed load's
+/// Retry can replay it.
+export interface ProjectLoadRequest {
+  kind: "open" | "new" | "reload";
+  /// `open`: the project path / name.
+  path?: string;
+  /// `new`: the validated project slug.
+  name?: string;
+  /// `new`: optional human display name.
+  displayName?: string;
+}
+
+/// The live project-load progress mirror, fed by the `project-status` poll. `total === 0` means
+/// the current stage is indeterminate (spinner, not a filled bar). `version` is the DTO's monotonic
+/// stamp — the poll + `setProjectLoad` dedup on it.
+export interface ProjectLoadState {
+  phase: ProjectLoadPhase;
+  stage: string;
+  done: number;
+  total: number;
+  label: string;
+  currentItem: string;
+  error?: string;
+  version: number;
+  request?: ProjectLoadRequest;
+  /// The load reached 100% and is settling: the bar sits full while the status text fades out,
+  /// just before the modal dismisses. Set by the poll's completion hold; drives the fade in the
+  /// loading view.
+  finalizing?: boolean;
+}
 
 /// The profiler capture lifecycle, mirrored from the engine's recorder. On-demand: a
 /// capture is armed by a button, never polled on the metrics lane.
@@ -163,6 +200,10 @@ export type PlayState = "edit" | "playing" | "paused";
 /// The Assets-grid shift anchor: the last clicked tile, folder or asset.
 export type AssetSelectionAnchor = { kind: "asset" | "folder"; key: string } | null;
 
+/// How the Assets grid orders its asset tiles. Name uses a natural (numeric) locale compare;
+/// created uses each asset's `createdAt` file timestamp. Folders stay alphabetical regardless.
+export type AssetSortMode = "name-asc" | "name-desc" | "created-desc" | "created-asc";
+
 export interface CatalogDragPayload {
   assetIds: string[];
   folderPaths: string[];
@@ -241,6 +282,9 @@ export interface EditorState {
   /// rAF cadence), or a fixed Hz. Drives the engine's `target_fps` (which paces the render loop).
   /// UI-only state — the resolved Hz lives in `perfConfig.targetFps`.
   targetFpsMode: "default" | number;
+  /// The TAAU upscale surface (fixed ratio, dynamic-resolution toggle + budget, live extents),
+  /// seeded on connect. `null` until the first `get-upscale`.
+  upscale: UpscaleDto | null;
   /// Performance-telemetry slices, filled by the gated metrics poll only while the
   /// Stats tab is open (history/passes) or always (alarms, for the badge).
   perfConfig: PerfConfigDto | null;
@@ -282,6 +326,9 @@ export interface EditorState {
   uiFrameRateHz: number;
   uiFrameMs: number;
   engineStatus: EngineStatus;
+  /// Project-load progress (a distinct axis from `engineStatus`); drives the startup modal's
+  /// loading view. Fed by the `project-status` poll (`useProjectLoadPoll`).
+  projectLoad: ProjectLoadState;
   dragActive: boolean;
   /// The current asset-browser drag payload, populated at dragstart so hover targets
   /// can inspect it without relying on DataTransfer.getData during dragover.
@@ -318,6 +365,11 @@ export interface EditorState {
   /// startup until a project loads; the project menu's "New Project" reopens it (then
   /// dismissable, since a project is already loaded).
   projectModalOpen: boolean;
+  /// The user hit Cancel on the loading screen. The engine aborts an in-flight load, but a fast
+  /// load can already have reached `ready` (and the completion hold started) by the time the click
+  /// lands — so the poll checks this flag and refuses to complete a cancelled load, returning to
+  /// the picker instead. Reset when a fresh load starts.
+  projectLoadCancelling: boolean;
   /// Whether the "Export App" dialog is open (project-menu action).
   exportModalOpen: boolean;
   /// Show the SELECTED entity's components as read-only leaf subrows in the
@@ -328,6 +380,8 @@ export interface EditorState {
   /// their non-bone descendants re-anchor to the nearest visible ancestor. A
   /// persisted view preference like the subrows toggle.
   hideBones: boolean;
+  /// How the Assets grid sorts asset tiles; a persisted view preference (default name A–Z).
+  assetSort: AssetSortMode;
   /// One-shot "jump the Inspector to this component" signal set by a subrow click;
   /// the Inspector consumes and clears it. Never gated on the poll's versions.
   focusComponent: string | null;
@@ -463,6 +517,7 @@ export interface EditorState {
   clearScriptLogs(): void;
   setDebugOverlays(debugOverlays: DebugOverlaysResult | null): void;
   setPerfConfig(perfConfig: PerfConfigDto | null): void;
+  setUpscale(upscale: UpscaleDto | null): void;
   setTargetFpsMode(mode: "default" | number): void;
   setFrameHistory(frameHistory: FrameHistoryDto | null): void;
   setPassTimings(passTimings: RenderPassTimingsDto | null): void;
@@ -486,6 +541,12 @@ export interface EditorState {
   setCaptureIncludeStats(captureIncludeStats: boolean): void;
   setSelectedPass(selectedPass: string | null): void;
   setProject(project: ProjectInfo | null): void;
+  /// Merge a project-load progress patch, identity-stable (like `setGizmo`): no re-render when the
+  /// patch changes nothing, and dedup on the DTO `version`. The `project-status` poll calls this.
+  setProjectLoad(patch: Partial<ProjectLoadState>): void;
+  /// Kick off a non-blocking project load: stash the request, flip to `loading`, fire the engine
+  /// kick without awaiting completion. Progress + completion come from `useProjectLoadPoll`.
+  startProjectLoad(request: ProjectLoadRequest): Promise<void>;
   setPollRateHz(pollRateHz: number): void;
   setUiFrameStats(frameRateHz: number, frameMs: number): void;
   /// Hard scene reset after a project/scene load: clear entities + selection +
@@ -504,9 +565,11 @@ export interface EditorState {
   setViewportHidden(viewportHidden: boolean): void;
   setNativeDialogOpen(nativeDialogOpen: boolean): void;
   setProjectModalOpen(projectModalOpen: boolean): void;
+  setProjectLoadCancelling(cancelling: boolean): void;
   setExportModalOpen(exportModalOpen: boolean): void;
   toggleComponentSubrows(): void;
   toggleHideBones(): void;
+  setAssetSort(assetSort: AssetSortMode): void;
   setFocusComponent(focusComponent: string | null): void;
   /// Set one binding override and persist. A value equal to the registry default
   /// removes the override instead, keeping settings.json delta-minimal.
@@ -572,6 +635,7 @@ export const useEditorStore = create<EditorState>((set) => ({
   scriptLogsOverflowed: false,
   debugOverlays: null,
   perfConfig: null,
+  upscale: null,
   targetFpsMode: "default",
   frameHistory: null,
   passTimings: null,
@@ -592,6 +656,16 @@ export const useEditorStore = create<EditorState>((set) => ({
   uiFrameRateHz: 0,
   uiFrameMs: 0,
   engineStatus: { running: false, phase: "idle" },
+  projectLoad: {
+    phase: "idle",
+    stage: "",
+    done: 0,
+    total: 0,
+    label: "",
+    currentItem: "",
+    version: 0,
+    finalizing: false,
+  },
   dragActive: false,
   catalogDrag: null,
   // True at startup: the scene view is the active view from the first frame, so authored entities load
@@ -604,9 +678,11 @@ export const useEditorStore = create<EditorState>((set) => ({
   viewportHidden: false,
   nativeDialogOpen: false,
   projectModalOpen: false,
+  projectLoadCancelling: false,
   exportModalOpen: false,
   showComponentSubrows: loadShowSubrows(),
   hideBones: loadHideBones(),
+  assetSort: loadAssetSort(),
   focusComponent: null,
   keyBindings: {},
   settingsOpen: false,
@@ -1123,6 +1199,7 @@ export const useEditorStore = create<EditorState>((set) => ({
     }),
   clearScriptLogs: () => set({ scriptLogs: [], scriptLogsOverflowed: false }),
   setPerfConfig: (perfConfig) => set({ perfConfig }),
+  setUpscale: (upscale) => set({ upscale }),
   setTargetFpsMode: (targetFpsMode) => set({ targetFpsMode }),
   setFrameHistory: (frameHistory) => set({ frameHistory }),
   setPassTimings: (passTimings) => set({ passTimings }),
@@ -1191,6 +1268,55 @@ export const useEditorStore = create<EditorState>((set) => ({
       project,
       expandedIds: project?.path ? loadExpanded(project.path) : new Set<string>(),
     }),
+  // Identity-stable (like setGizmo): a same-snapshot patch from the ~10 Hz poll returns {} so no
+  // subscriber re-renders. Dedups on version + every progress field.
+  setProjectLoad: (patch) =>
+    set((s) => {
+      const next = { ...s.projectLoad, ...patch };
+      const unchanged =
+        next.phase === s.projectLoad.phase &&
+        next.stage === s.projectLoad.stage &&
+        next.done === s.projectLoad.done &&
+        next.total === s.projectLoad.total &&
+        next.label === s.projectLoad.label &&
+        next.currentItem === s.projectLoad.currentItem &&
+        next.error === s.projectLoad.error &&
+        next.version === s.projectLoad.version &&
+        next.request === s.projectLoad.request &&
+        next.finalizing === s.projectLoad.finalizing;
+      return unchanged ? {} : { projectLoad: next };
+    }),
+  startProjectLoad: async (request) => {
+    // Flip to loading + stash the request immediately so the combined modal shows the loading view
+    // before the first poll. Progress + completion are owned by useProjectLoadPoll, never awaited here.
+    useEditorStore.getState().setProjectLoadCancelling(false);
+    useEditorStore.getState().setProjectLoad({
+      phase: "loading",
+      stage: "",
+      done: 0,
+      total: 0,
+      label: "",
+      currentItem: "",
+      error: undefined,
+      request,
+      finalizing: false,
+    });
+    try {
+      if (request.kind === "open") {
+        await client.openProject(request.path ?? "");
+      } else if (request.kind === "new") {
+        await client.newProject(request.name ?? "", request.displayName ?? "");
+      } else {
+        await client.reloadProject();
+      }
+    } catch (err) {
+      // A busy-loading rejection means a load is already in flight — the poll drives it; ignore.
+      // Any other kick failure is terminal for this attempt.
+      if (!isBusyLoading(err)) {
+        useEditorStore.getState().setProjectLoad({ phase: "error", error: errorText(err) });
+      }
+    }
+  },
   setPollRateHz: (pollRateHz) => set({ pollRateHz }),
   setUiFrameStats: (uiFrameRateHz, uiFrameMs) => set({ uiFrameRateHz, uiFrameMs }),
   resetSceneState: () => {
@@ -1253,6 +1379,7 @@ export const useEditorStore = create<EditorState>((set) => ({
   setViewportHidden: (viewportHidden) => set({ viewportHidden }),
   setNativeDialogOpen: (nativeDialogOpen) => set({ nativeDialogOpen }),
   setProjectModalOpen: (projectModalOpen) => set({ projectModalOpen }),
+  setProjectLoadCancelling: (projectLoadCancelling) => set({ projectLoadCancelling }),
   setExportModalOpen: (exportModalOpen) => set({ exportModalOpen }),
   toggleComponentSubrows: () =>
     set((s) => {
@@ -1274,6 +1401,14 @@ export const useEditorStore = create<EditorState>((set) => ({
       }
       return { hideBones };
     }),
+  setAssetSort: (assetSort) => {
+    try {
+      localStorage.setItem(ASSET_SORT_STORAGE_KEY, assetSort);
+    } catch {
+      // Storage unavailable; the preference is then session-only.
+    }
+    set({ assetSort });
+  },
   setFocusComponent: (focusComponent) => set({ focusComponent }),
   setKeyBinding: (id, value) =>
     set((s) => {
@@ -1645,6 +1780,23 @@ function loadHideBones(): boolean {
   }
 }
 
+const ASSET_SORT_STORAGE_KEY = "saffron.assetSort";
+const ASSET_SORT_MODES: readonly AssetSortMode[] = [
+  "name-asc",
+  "name-desc",
+  "created-desc",
+  "created-asc",
+];
+
+function loadAssetSort(): AssetSortMode {
+  try {
+    const raw = localStorage.getItem(ASSET_SORT_STORAGE_KEY);
+    return ASSET_SORT_MODES.includes(raw as AssetSortMode) ? (raw as AssetSortMode) : "name-asc";
+  } catch {
+    return "name-asc";
+  }
+}
+
 /// Developer mode persists app-wide (one key, not per-project), default off.
 /// `VITE_SAFFRON_DEV_MODE=1` (set by `make run-debug`) forces it on for the session
 /// without touching the persisted flag.
@@ -1984,6 +2136,16 @@ export function startReconcile(client: Client): () => void {
         useEditorStore.getState().setPerfConfig(config);
       }
 
+      // Seed the TAAU upscale surface (ratio / dynamic / extents); the Resolution control
+      // refreshes it on write.
+      if (useEditorStore.getState().upscale === null) {
+        const up = await client.getUpscale();
+        if (stopped) {
+          return;
+        }
+        useEditorStore.getState().setUpscale(up.upscale);
+      }
+
       if (isPanelOpen(useEditorStore.getState(), "stats")) {
         const history = await client.frameHistory(FRAME_HISTORY_SAMPLES);
         if (stopped) {
@@ -2122,6 +2284,19 @@ export function startReconcile(client: Client): () => void {
       const live = useEditorStore.getState();
       if (live.dragActive || live.engineStatus.phase !== "ready") {
         return;
+      }
+
+      // A project load / scene swap stamps sceneVersion (and selectionVersion) to -1 via
+      // resetSceneState to demand a fresh heavy refetch. Honor it by dropping our cached version
+      // diff, so the hierarchy/inspector/assets/env re-fetch even if an earlier tick already
+      // recorded the engine's post-load version before `complete()` cleared the store — the
+      // load-completion race the closure-cached diff would otherwise lose.
+      if (live.sceneVersion === -1) {
+        knownSceneVersion = -1;
+      }
+      if (live.selectionVersion === -1) {
+        knownSelectionVersion = -1;
+        knownSelectedId = null;
       }
 
       live.setRenderStats(stats);
