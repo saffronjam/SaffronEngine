@@ -37,7 +37,7 @@ pub const IBL_ENV_SIZE: u32 = 256;
 /// Diffuse irradiance cube resolution per face.
 pub const IBL_IRRADIANCE_SIZE: u32 = 32;
 /// Prefiltered specular cube base resolution per face: 256² mip-0 gives near-mirror metals 4× the
-/// texels of the old 128².
+/// texels of a 128² base.
 pub const IBL_PREFILTER_SIZE: u32 = 256;
 /// Prefiltered specular mip count — `mesh.slang`'s `IblPrefilterMaxMip` must be this − 1.
 pub const IBL_PREFILTER_MIPS: u32 = 5;
