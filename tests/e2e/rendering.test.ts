@@ -9,8 +9,8 @@ import type { EntityList, RenderStats } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
-  // import-model needs a loaded project; auto-create an empty one (under the gitignored appdata/).
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  // import-model needs a loaded project; SAFFRON_SCRATCH_PROJECT makes one (under the harness temp appdata dir).
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();

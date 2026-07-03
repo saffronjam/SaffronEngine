@@ -15,7 +15,7 @@ interface Ref {
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // A scene camera (showFrustum defaults true, so the overlay draws its frustum) at the origin
   // facing -Z, plus a cube parked inside the frustum so the depth-tested lines actually get
   // occluded.

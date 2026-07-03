@@ -9,7 +9,7 @@ import type { FrameHistoryDto, PerfConfigDto } from "@saffron/protocol";
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // Let the ring fill with enough frames for percentiles to be meaningful.
   await engine.settle(600);
 });
