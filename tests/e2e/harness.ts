@@ -8,7 +8,8 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,16 +33,29 @@ async function waitFor(ready: () => boolean, timeoutMs: number, what: string): P
 /// A booted engine plus a typed control client. Always call shutdown() (afterAll/finally).
 export class Engine {
   readonly socketPath: string;
+  /// The per-boot app-data root the host writes its `userdata/` (and any scratch project) into.
+  /// The harness owns a fresh temp dir per boot and removes it on shutdown, so runs are isolated
+  /// and never pollute the source tree. A caller that passes its own `SAFFRON_APPDATA_DIR` owns it.
+  readonly appdata: string;
   private proc: ChildProcess;
   private weston: ChildProcess;
   private exited = false;
   private buf = "";
   private nextId = 1;
+  private ownsAppdata: boolean;
 
-  private constructor(proc: ChildProcess, weston: ChildProcess, socketPath: string) {
+  private constructor(
+    proc: ChildProcess,
+    weston: ChildProcess,
+    socketPath: string,
+    appdata: string,
+    ownsAppdata: boolean,
+  ) {
     this.proc = proc;
     this.weston = weston;
     this.socketPath = socketPath;
+    this.appdata = appdata;
+    this.ownsAppdata = ownsAppdata;
   }
 
   /// Everything the engine has written to stdout+stderr so far.
@@ -68,6 +82,13 @@ export class Engine {
     );
     await waitFor(() => existsSync(join(runtime, wlSocket)), 10_000, "weston socket");
 
+    // A per-boot app-data root under the temp dir so a booted project (e.g. SAFFRON_SCRATCH_PROJECT)
+    // writes its userdata/ there and never pollutes the source tree — the host runs with cwd=REPO,
+    // where the default relative appdata/ would otherwise land. A caller that sets its own
+    // SAFFRON_APPDATA_DIR owns cleanup; otherwise the harness removes this dir on shutdown.
+    const ownsAppdata = env.SAFFRON_APPDATA_DIR === undefined;
+    const appdata = ownsAppdata ? mkdtempSync(join(tmpdir(), "saffron-e2e-appdata-")) : env.SAFFRON_APPDATA_DIR;
+
     const socketPath = `/tmp/saffron-e2e-${stamp}.sock`;
     const proc = spawn(ENGINE_BIN, [], {
       cwd: REPO,
@@ -77,20 +98,28 @@ export class Engine {
         WAYLAND_DISPLAY: wlSocket,
         SDL_VIDEODRIVER: "wayland",
         SAFFRON_CONTROL_SOCK: socketPath,
+        SAFFRON_APPDATA_DIR: appdata,
         ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const engine = new Engine(proc, weston, socketPath);
+    const engine = new Engine(proc, weston, socketPath, appdata, ownsAppdata);
     proc.stdout?.on("data", (d) => (engine.buf += d.toString()));
     proc.stderr?.on("data", (d) => (engine.buf += d.toString()));
     proc.on("exit", () => (engine.exited = true));
 
     await waitFor(() => engine.exited || existsSync(socketPath), 30_000, "control socket");
     if (engine.exited) {
+      engine.cleanupAppdata();
       throw new Error(`engine exited before the control socket appeared:\n${engine.buf}`);
     }
     return engine;
+  }
+
+  private cleanupAppdata(): void {
+    if (this.ownsAppdata) {
+      rmSync(this.appdata, { recursive: true, force: true });
+    }
   }
 
   /// Send one control command; resolves its `result`, rejects on `ok:false` or transport error.
@@ -192,5 +221,6 @@ export class Engine {
     this.proc.kill("SIGTERM");
     this.weston.kill("SIGTERM");
     await delay(100);
+    this.cleanupAppdata();
   }
 }
