@@ -7,6 +7,7 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   DragEvent as ReactDragEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
@@ -18,14 +19,16 @@ import {
   Eye,
   Folder,
   FolderPlus,
+  Info,
   Pen,
   Pencil,
   Plus,
   Trash,
+  X,
 } from "lucide-react";
 import { client } from "../control/client";
 import { invalidateThumbnails, useEditorStore, withNativeDialog } from "../state/store";
-import type { AssetGridItem } from "../state/store";
+import type { AssetGridItem, AssetSortMode } from "../state/store";
 import { AssetTile } from "../components/AssetTile";
 import {
   ASSET_DND_MIME,
@@ -41,11 +44,10 @@ import {
 import { AssetFolderTree, folderAncestorPaths, folderLabel } from "./AssetFolderTree";
 import { logRender } from "../lib/renderLog";
 import { matchesBinding } from "../lib/keybindings";
-import { AssetMetadataPanel } from "../components/AssetMetadataPanel";
+import { AssetDetailsDialog } from "../components/AssetDetailsDialog";
 import { errorText, notify, notifyError } from "../lib/flash";
 import { useOutsideCommit } from "../lib/useOutsideCommit";
-import { useElementSize } from "../lib/useElementSize";
-import type { AssetEntry, AssetMetadataDto, AssetUsageDto } from "../protocol";
+import type { AssetEntry, AssetUsageDto } from "../protocol";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -59,7 +61,17 @@ import {
 import { Input } from "@/components/ui/input";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AnimaSearchbar } from "../components/anima/AnimaSearchbar";
+import { emptySearchState } from "../components/anima/chipSearch";
+import type { ChipConfig, SearchState } from "../components/anima/chipSearch";
 import { cn } from "@/lib/utils";
 import {
   ContextMenu,
@@ -72,6 +84,56 @@ import {
 /// Image extensions that import as a catalog texture; everything else is imported
 /// as a model.
 const TEXTURE_EXTS = new Set(["png", "jpg", "jpeg", "hdr", "tga", "bmp"]);
+
+/// Asset kinds offered by the search bar's `type:` chip.
+const ASSET_TYPE_VALUES = ["mesh", "texture", "material", "animation", "model", "other"] as const;
+
+/// The Assets search bar's single chip: `type:<kind>` narrows the grid to one asset kind.
+const ASSET_SEARCH_CHIPS: ChipConfig[] = [
+  {
+    keyword: "type",
+    label: "Type",
+    options: (input) => {
+      const query = input.toLowerCase();
+      return ASSET_TYPE_VALUES.filter((value) => value.includes(query)).map((value) => ({
+        value,
+        label: value,
+      }));
+    },
+  },
+];
+
+/// The sort dropdown's entries (label + mode), in display order.
+const ASSET_SORT_OPTIONS: { value: AssetSortMode; label: string }[] = [
+  { value: "name-asc", label: "Name (A–Z)" },
+  { value: "name-desc", label: "Name (Z–A)" },
+  { value: "created-desc", label: "Newest first" },
+  { value: "created-asc", label: "Oldest first" },
+];
+
+const byName = (a: AssetEntry, b: AssetEntry): number =>
+  a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+
+/// Order assets for the grid by the chosen sort mode. Ties on creation time fall back to name so
+/// the order is deterministic across restarts. Folders sort separately (always by name).
+function sortAssets(assets: AssetEntry[], mode: AssetSortMode): AssetEntry[] {
+  const sorted = [...assets];
+  switch (mode) {
+    case "name-asc":
+      sorted.sort(byName);
+      break;
+    case "name-desc":
+      sorted.sort((a, b) => byName(b, a));
+      break;
+    case "created-desc":
+      sorted.sort((a, b) => b.createdAt - a.createdAt || byName(a, b));
+      break;
+    case "created-asc":
+      sorted.sort((a, b) => a.createdAt - b.createdAt || byName(a, b));
+      break;
+  }
+  return sorted;
+}
 
 /// Model + image extensions offered in the file dialog.
 const MODEL_EXTS = ["gltf", "glb", "obj", "smesh"];
@@ -186,7 +248,14 @@ export function AssetsPanel() {
   const closeViewTab = useEditorStore((s) => s.closeViewTab);
   const setAssetsPanelHovered = useEditorStore((s) => s.setAssetsPanelHovered);
   const setAssetsFolderNav = useEditorStore((s) => s.setAssetsFolderNav);
+  const assetSort = useEditorStore((s) => s.assetSort);
+  const setAssetSort = useEditorStore((s) => s.setAssetSort);
   const [history, setHistory] = useState<FolderHistory>({ stack: [null], index: 0 });
+  // The Ctrl+F find bar: an overlay revealed by the shortcut, filtering the current folder's tiles.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [search, setSearch] = useState<SearchState>(emptySearchState());
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const panelRootRef = useRef<HTMLDivElement | null>(null);
   const [creatingFolder, setCreatingFolder] = useState<CreatingFolder | null>(null);
   const [creatingFolderName, setCreatingFolderName] = useState("");
   const [renamingFolder, setRenamingFolder] = useState<FolderActionTarget | null>(null);
@@ -194,6 +263,8 @@ export function AssetsPanel() {
   const menuTargetRef = useRef<GridMenuTarget>(null);
   const [pendingAssetDelete, setPendingAssetDelete] = useState<PendingAssetDelete | null>(null);
   const [pendingFolderDelete, setPendingFolderDelete] = useState<string | null>(null);
+  // The asset whose Details modal is open (opened from the grid context menu), or null.
+  const [detailsAssetId, setDetailsAssetId] = useState<string | null>(null);
   // Grid selection lives in the store so tiles subscribe to their own membership;
   // this panel deliberately never reads it at render time (event handlers use
   // getState()), so a selection delta re-renders tiles, not the panel.
@@ -205,25 +276,40 @@ export function AssetsPanel() {
   const [dropActive, setDropActive] = useState(false);
   const [assetDropTarget, setAssetDropTarget] = useState<string | null>(null);
   const currentFolder = history.stack[history.index] ?? null;
+  // Free text (lowercased) and the optional `type:` chip that drive the find bar's filtering.
+  const searchText = search.freeText.trim().toLowerCase();
+  const typeFilter = search.chips.find((chip) => chip.keyword === "type")?.value ?? null;
   // Embedded sub-assets (a `.smodel`'s mesh/material/texture rows) are hidden from the top level so a
   // model imports as ONE tile, not a flood — they resolve through their container by (modelId, subId).
-  const visibleAssets = useMemo(
+  // `folderAssets` is every asset in the current folder (drives selection pruning); `visibleAssets`
+  // then applies the sort and the find-bar filter for what the grid actually renders.
+  const folderAssets = useMemo(
     () =>
       assets.filter((asset) => (asset.folder ?? "") === (currentFolder ?? "") && !asset.container),
     [assets, currentFolder],
   );
+  const visibleAssets = useMemo(() => {
+    let list = folderAssets;
+    if (typeFilter) {
+      list = list.filter((asset) => asset.type === typeFilter);
+    }
+    if (searchText) {
+      list = list.filter((asset) => asset.name.toLowerCase().includes(searchText));
+    }
+    return sortAssets(list, assetSort);
+  }, [folderAssets, typeFilter, searchText, assetSort]);
 
   // The grid's selection order: folder tiles (sorted) then asset tiles, matching
   // the body's render order, so a shift-range can span folders and assets.
   const gridOrder = useMemo<AssetGridItem[]>(() => {
-    const folderKeys = sortedFolderItems(folders, currentFolder, false).flatMap((item) =>
-      item.kind === "folder" ? [{ kind: "folder" as const, key: item.path }] : [],
+    const folderKeys = sortedFolderItems(folders, currentFolder, false, searchText).flatMap(
+      (item) => (item.kind === "folder" ? [{ kind: "folder" as const, key: item.path }] : []),
     );
     return [
       ...folderKeys,
       ...visibleAssets.map((asset) => ({ kind: "asset" as const, key: asset.id })),
     ];
-  }, [folders, currentFolder, visibleAssets]);
+  }, [folders, currentFolder, visibleAssets, searchText]);
 
   const navigateTo = useCallback((folder: string | null): void => {
     setHistory((current) => {
@@ -270,15 +356,51 @@ export function AssetsPanel() {
     }
   }, [currentFolder, folders, navigateTo]);
 
+  // Focus the find input whenever the bar opens (or is re-summoned with Ctrl+F).
+  useEffect(() => {
+    if (searchOpen) {
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    }
+  }, [searchOpen]);
+
+  // Return focus to the panel root so Ctrl+F still routes here after the bar closes (the
+  // focused search input unmounts, which would otherwise drop focus to the body). Covers
+  // every close path: Ctrl+F toggle, Escape, and the bar's own X button.
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearch(emptySearchState());
+    panelRootRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  const onPanelKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+      if ((event.ctrlKey || event.metaKey) && (event.key === "f" || event.key === "F")) {
+        event.preventDefault();
+        if (searchOpen) {
+          closeSearch();
+        } else {
+          setSearchOpen(true);
+          requestAnimationFrame(() => searchInputRef.current?.focus());
+        }
+        return;
+      }
+      if (event.key === "Escape" && searchOpen) {
+        event.preventDefault();
+        closeSearch();
+      }
+    },
+    [searchOpen, closeSearch],
+  );
+
   // Prune the selection (and a rename-in-progress) when assets leave the visible
   // grid or folders cease to exist; the store action bails out identity-stable, so
   // the StrictMode double-run is a no-op.
   useEffect(() => {
-    pruneAssetSelection(visibleAssets, folders);
+    pruneAssetSelection(folderAssets, folders);
     setRenamingAsset((current) =>
-      current !== null && !visibleAssets.some((asset) => asset.id === current) ? null : current,
+      current !== null && !folderAssets.some((asset) => asset.id === current) ? null : current,
     );
-  }, [visibleAssets, folders, pruneAssetSelection]);
+  }, [folderAssets, folders, pruneAssetSelection]);
 
   const importMany = useCallback(
     async (paths: string[]): Promise<void> => {
@@ -746,17 +868,13 @@ export function AssetsPanel() {
   const shownUsages = pendingDelete?.usages.slice(0, MAX_USAGE_LINES) ?? [];
   const extraUsages = (pendingDelete?.usages.length ?? 0) - shownUsages.length;
 
-  // The grid area's width drives the Details pane: docked narrow (e.g. on the right) it moves to
-  // the bottom so a 256px side pane never swallows the grid. Seed wide (right) for the first paint.
-  const gridRef = useRef<HTMLDivElement>(null);
-  const gridSize = useElementSize(gridRef);
-  const detailOrientation: "right" | "bottom" =
-    gridSize.width > 0 && gridSize.width < 480 ? "bottom" : "right";
-
   return (
     <div
-      className="flex h-full min-h-0 flex-col"
+      ref={panelRootRef}
+      className="flex h-full min-h-0 flex-col outline-none"
       data-asset-panel="true"
+      tabIndex={0}
+      onKeyDown={onPanelKeyDown}
       onPointerEnter={() => setAssetsPanelHovered(true)}
       onPointerLeave={() => setAssetsPanelHovered(false)}
     >
@@ -810,6 +928,18 @@ export function AssetsPanel() {
             </TooltipTrigger>
             <TooltipContent>Import a model or texture</TooltipContent>
           </Tooltip>
+          <Select value={assetSort} onValueChange={(value) => setAssetSort(value as AssetSortMode)}>
+            <SelectTrigger size="sm" className="w-[8.5rem]" aria-label="Sort assets">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="end">
+              {ASSET_SORT_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       </div>
       <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
@@ -869,7 +999,6 @@ export function AssetsPanel() {
           <ContextMenu modal={false}>
             <ContextMenuTrigger asChild>
               <div
-                ref={gridRef}
                 className="h-full min-h-0"
                 // Resolve the tile under a right-click into the ref before Radix
                 // opens the one shared menu; the menu items read it at open time.
@@ -890,6 +1019,7 @@ export function AssetsPanel() {
                   assets={visibleAssets}
                   folders={folders}
                   currentFolder={currentFolder}
+                  searchText={searchText}
                   dropActive={dropActive}
                   creatingFolder={creatingFolder?.origin === "grid"}
                   creatingFolderName={creatingFolderName}
@@ -932,6 +1062,7 @@ export function AssetsPanel() {
                 onViewAsset={routeView}
                 onInstantiate={onInstantiate}
                 onRenameAsset={setRenamingAsset}
+                onShowDetails={setDetailsAssetId}
                 onDeleteAsset={deleteAsset}
                 onDeleteAssets={(targets) => void requestDeleteAssets(targets)}
                 onRenameFolder={(folder) => startRenameFolder(folder, "grid")}
@@ -941,7 +1072,31 @@ export function AssetsPanel() {
               />
             </ContextMenuContent>
           </ContextMenu>
-          <AssetDetailOverlay orientation={detailOrientation} />
+          {/* Find bar: a top-right overlay revealed by Ctrl+F, dismissed by Esc or its X. */}
+          {searchOpen ? (
+            <div className="absolute top-1.5 right-1.5 z-20 flex w-72 max-w-[calc(100%-0.75rem)] items-center gap-1 rounded-md border border-border bg-card p-1 shadow-lg">
+              <AnimaSearchbar
+                value={search}
+                onChange={setSearch}
+                chips={ASSET_SEARCH_CHIPS}
+                placeholder="Find assets"
+                debounceMs={120}
+                inputRef={searchInputRef}
+                showClear={false}
+                className="flex-1"
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6 shrink-0"
+                onClick={closeSearch}
+                aria-label="Close find"
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+          ) : null}
         </ResizablePanel>
       </ResizablePanelGroup>
       <Dialog
@@ -988,6 +1143,7 @@ export function AssetsPanel() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <AssetDetailsDialog assetId={detailsAssetId} onClose={() => setDetailsAssetId(null)} />
     </div>
   );
 }
@@ -1004,6 +1160,7 @@ function GridContextMenuItems({
   onViewAsset,
   onInstantiate,
   onRenameAsset,
+  onShowDetails,
   onDeleteAsset,
   onDeleteAssets,
   onRenameFolder,
@@ -1020,6 +1177,7 @@ function GridContextMenuItems({
   onViewAsset(asset: AssetEntry): void;
   onInstantiate(modelId: string): void;
   onRenameAsset(assetId: string): void;
+  onShowDetails(assetId: string): void;
   onDeleteAsset(asset: AssetEntry): void;
   onDeleteAssets(assets: AssetEntry[]): void;
   onRenameFolder(folder: string): void;
@@ -1086,11 +1244,15 @@ function GridContextMenuItems({
             Add to scene
           </ContextMenuItem>
         ) : null}
+        <ContextMenuItem onSelect={() => onShowDetails(asset.id)}>
+          <Info />
+          Details
+        </ContextMenuItem>
+        <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => onRenameAsset(asset.id)}>
           <Pencil />
           Rename
         </ContextMenuItem>
-        <ContextMenuSeparator />
         <ContextMenuItem
           variant="destructive"
           className="bg-destructive/10 text-destructive focus:bg-destructive focus:text-destructive-foreground"
@@ -1133,53 +1295,6 @@ function GridContextMenuItems({
         Import
       </ContextMenuItem>
     </>
-  );
-}
-
-/// The details overlay for a single selected asset, isolated so its open/close and
-/// the probe-asset round trip never render the grid. The selector collapses the
-/// selection to a primitive (the lone asset id or null), and the marquee gate keeps
-/// it closed while a sweep flips the selection through "exactly one" — it opens
-/// once, on release.
-function AssetDetailOverlay({ orientation }: { orientation: "right" | "bottom" }) {
-  logRender("AssetDetailOverlay");
-  const detailAssetId = useEditorStore((s) =>
-    !s.assetMarqueeActive && s.selectedAssetIds.size === 1 && s.selectedFolderPaths.size === 0
-      ? ([...s.selectedAssetIds][0] ?? null)
-      : null,
-  );
-  const setAssetSelection = useEditorStore((s) => s.setAssetSelection);
-  const [metadata, setMetadata] = useState<AssetMetadataDto | null>(null);
-
-  // Probe on-disk metadata for the single selected asset; ignore stale responses
-  // when the selection changes mid-flight.
-  useEffect(() => {
-    if (!detailAssetId) {
-      setMetadata(null);
-      return;
-    }
-    let active = true;
-    setMetadata(null);
-    void client
-      .probeAsset(detailAssetId)
-      .then((meta) => {
-        if (active) {
-          setMetadata(meta);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, [detailAssetId]);
-
-  return (
-    <AssetMetadataPanel
-      metadata={metadata}
-      open={detailAssetId !== null}
-      orientation={orientation}
-      onClose={() => setAssetSelection([], [])}
-    />
   );
 }
 
@@ -1266,6 +1381,7 @@ const AssetPanelBody = memo(function AssetPanelBody({
   assets,
   folders,
   currentFolder,
+  searchText,
   dropActive,
   creatingFolder,
   creatingFolderName,
@@ -1295,6 +1411,7 @@ const AssetPanelBody = memo(function AssetPanelBody({
   assets: AssetEntry[];
   folders: string[];
   currentFolder: string | null;
+  searchText: string;
   dropActive: boolean;
   creatingFolder: boolean;
   creatingFolderName: string;
@@ -1322,13 +1439,13 @@ const AssetPanelBody = memo(function AssetPanelBody({
   onRenameEnd(): void;
 }) {
   logRender("AssetPanelBody");
-  const folderItems = sortedFolderItems(folders, currentFolder, creatingFolder);
+  const folderItems = sortedFolderItems(folders, currentFolder, creatingFolder, searchText);
   const parentFolder = currentFolder !== null ? parentFolderPath(currentFolder) : null;
   const hasParentTile = currentFolder !== null;
+  const searching = searchText.length > 0;
+  // Nothing to show at the top level (the `../` tile aside): the grid gives way to a hint.
   const blank =
     !hasParentTile && !creatingFolder && folderItems.length === 0 && assets.length === 0;
-  const empty = blank && !currentFolder;
-  const folderEmpty = blank && currentFolder !== null;
   const panelRef = useRef<HTMLDivElement | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
   const marqueeRef = useRef<MarqueeDrag | null>(null);
@@ -1421,6 +1538,10 @@ const AssetPanelBody = memo(function AssetPanelBody({
       return;
     }
     event.preventDefault();
+    // preventDefault above suppresses the click's default focus, so an empty-grid press
+    // would leave the panel unfocused and Ctrl+F (handled on the panel root) dead. Focus
+    // the panel explicitly so keyboard shortcuts still route while marqueeing.
+    event.currentTarget.closest<HTMLElement>("[data-asset-panel]")?.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
     const panelRect = event.currentTarget.getBoundingClientRect();
     const drag: MarqueeDrag = {
@@ -1529,13 +1650,11 @@ const AssetPanelBody = memo(function AssetPanelBody({
     >
       <ScrollArea className="h-full">
         <div className="min-h-full p-2">
-          {empty ? (
+          {blank ? (
             <p className="px-1 py-3 text-center text-xs italic text-muted-foreground">
-              No assets yet. Import or drag-and-drop a model or texture.
-            </p>
-          ) : folderEmpty ? (
-            <p className="px-1 py-3 text-center text-xs italic text-muted-foreground">
-              This folder is empty. Drag assets here to move them.
+              {searching
+                ? "No assets match your search."
+                : "No assets yet. Import or drag-and-drop a model or texture."}
             </p>
           ) : (
             <div
@@ -1605,7 +1724,20 @@ const AssetPanelBody = memo(function AssetPanelBody({
         </div>
       </ScrollArea>
       {marqueeActive ? (
-        <div ref={boxRef} className="pointer-events-none absolute border border-ring bg-ring/15" />
+        // Seed the box at the press point with zero size. Without an explicit rect it would
+        // lay out at its unpositioned static offset (below the full-height ScrollArea, at the
+        // panel's bottom edge), which perturbs layout and flashes a spurious scrollbar/reflow
+        // on press-and-hold; applyMarquee takes over the position on the first move.
+        <div
+          ref={boxRef}
+          className="pointer-events-none absolute border border-ring bg-ring/15"
+          style={{
+            left: (marqueeRef.current?.startX ?? 0) - (marqueeRef.current?.panelLeft ?? 0),
+            top: (marqueeRef.current?.startY ?? 0) - (marqueeRef.current?.panelTop ?? 0),
+            width: 0,
+            height: 0,
+          }}
+        />
       ) : null}
     </div>
   );
@@ -1716,7 +1848,7 @@ const ParentFolderTile = memo(function ParentFolderTile({
           "flex w-[72px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors hover:border-ring hover:bg-accent/40",
           dragActive && "border-ring bg-accent/60 ring-1 ring-ring",
         )}
-        onClick={() => onOpen(target)}
+        onDoubleClick={() => onOpen(target)}
         onDragEnter={(event) => {
           if (isCatalogDrag(event.dataTransfer)) {
             setDragActive(true);
@@ -1826,7 +1958,10 @@ const FolderTile = memo(function FolderTile({
       data-asset-folder="true"
       data-asset-folder-path={path}
       className={cn(
-        "flex w-[72px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors hover:border-ring hover:bg-accent/40",
+        "flex w-[72px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors",
+        // Hover affordance only when not already highlighted (selected or drop-target), so a
+        // selected folder keeps its appearance on hover instead of stacking a second highlight.
+        !selected && !dragActive && "hover:border-ring hover:bg-accent/40",
         selected && "border-ring bg-accent/60 ring-1 ring-ring",
         dragActive && "border-ring bg-accent/60 ring-1 ring-ring",
       )}
@@ -2008,6 +2143,7 @@ function sortedFolderItems(
   folders: string[],
   currentFolder: string | null,
   creatingFolder: boolean,
+  filter = "",
 ): FolderItem[] {
   const parentPrefix = currentFolder ? `${currentFolder}/` : "";
   const items: FolderItem[] = folders.flatMap((folder) => {
@@ -2019,9 +2155,15 @@ function sortedFolderItems(
       if (!rest || rest.includes("/")) {
         return [];
       }
+      if (filter && !rest.toLowerCase().includes(filter)) {
+        return [];
+      }
       return [{ kind: "folder", path: folder, label: rest, sortName: rest }];
     }
     if (folder.includes("/")) {
+      return [];
+    }
+    if (filter && !folder.toLowerCase().includes(filter)) {
       return [];
     }
     return [{ kind: "folder", path: folder, label: folder, sortName: folder }];
