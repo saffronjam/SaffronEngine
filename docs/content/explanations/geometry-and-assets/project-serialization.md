@@ -111,7 +111,7 @@ rediscovered and a deleted file's row is dropped.
 
 The Tauri editor owns startup project choice. If `SAFFRON_PROJECT` is set, the engine opens
 (or creates) that project immediately — a project name under userdata, a project directory, or
-a direct `project.json` path. `SAFFRON_AUTO_EMPTY_PROJECT` creates a per-shell scratch project
+a direct `project.json` path. `SAFFRON_SCRATCH_PROJECT` creates a per-shell scratch project
 without showing the startup modal.
 
 The control plane exposes project-aware commands (in `commands_asset.rs`):

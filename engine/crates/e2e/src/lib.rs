@@ -258,7 +258,7 @@ impl TestEngine {
         let log = Arc::new(Mutex::new(String::new()));
 
         // A per-run app-data root under the temp dir, so a booted project (e.g.
-        // `SAFFRON_AUTO_EMPTY_PROJECT`) writes its `userdata/` there and never pollutes the source
+        // `SAFFRON_SCRATCH_PROJECT`) writes its `userdata/` there and never pollutes the source
         // tree — `cargo test` runs the host with the crate as cwd, where the default relative
         // `appdata/` would otherwise land. The caller can still override `SAFFRON_APPDATA_DIR`.
         let appdata_dir = std::env::temp_dir().join(format!("saffron-e2e-appdata-{stamp}"));

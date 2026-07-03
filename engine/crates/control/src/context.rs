@@ -93,7 +93,7 @@ impl ControlContext {
 
     /// Brings the host's project up from the editor-set environment once at startup, before
     /// the first frame: `SAFFRON_PROJECT` opens/creates a named project, else
-    /// `SAFFRON_AUTO_EMPTY_PROJECT` makes a per-shell scratch project, else a
+    /// `SAFFRON_SCRATCH_PROJECT` makes a per-shell scratch project, else a
     /// working-directory `project.json` opens; otherwise nothing loads and the host waits
     /// for the editor's picker. Runs the same project-bring-up path the lifecycle commands
     /// use, against the live subsystem borrows.

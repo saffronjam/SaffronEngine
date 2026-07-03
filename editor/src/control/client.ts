@@ -105,7 +105,7 @@ export interface AppDataInfo {
   appDataDir: string;
   userdataDir: string;
   envProject: boolean;
-  autoEmptyProject: boolean;
+  scratchProject: boolean;
 }
 
 /// Editor-wide settings persisted in appdata/settings.json. `keyBindings` holds only

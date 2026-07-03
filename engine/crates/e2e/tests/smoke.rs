@@ -70,7 +70,7 @@ fn render_stats_deserializes_into_the_typed_dto() {
 /// let the engine render a handful of frames, and assert no Vulkan validation error surfaced.
 #[test]
 fn one_cube_scene_renders_validation_clean() {
-    let mut engine = TestEngine::boot(&[("SAFFRON_AUTO_EMPTY_PROJECT", "1")]).expect("boot engine");
+    let mut engine = TestEngine::boot(&[("SAFFRON_SCRATCH_PROJECT", "1")]).expect("boot engine");
 
     // `add-entity cube` imports the cube preset (needs a loaded project) and places it.
     let cube: EntityRef = engine

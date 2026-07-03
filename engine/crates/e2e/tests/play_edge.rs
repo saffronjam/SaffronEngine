@@ -24,7 +24,7 @@ fn box_y(engine: &mut TestEngine, box_id: &str) -> f32 {
 
 #[test]
 fn play_edge_drops_a_box_and_stop_restores_it() {
-    let mut engine = TestEngine::boot(&[("SAFFRON_AUTO_EMPTY_PROJECT", "1")]).expect("boot engine");
+    let mut engine = TestEngine::boot(&[("SAFFRON_SCRATCH_PROJECT", "1")]).expect("boot engine");
 
     // Static floor: a thin wide collider with no rigidbody (implicitly static).
     let floor: EntityRef = engine

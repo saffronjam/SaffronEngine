@@ -389,7 +389,7 @@ async function main(): Promise<number> {
       ...process.env,
       SAFFRON_CONTROL_SOCK: SOCK,
       SAFFRON_APPDATA_DIR: APPDATA,
-      SAFFRON_AUTO_EMPTY_PROJECT: "1",
+      SAFFRON_SCRATCH_PROJECT: "1",
     },
     stdout: "ignore",
     stderr: "ignore",

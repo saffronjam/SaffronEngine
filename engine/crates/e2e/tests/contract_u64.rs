@@ -12,7 +12,7 @@ use serde_json::json;
 /// after a reparent) exercises the multi-id path the same way.
 #[test]
 fn live_id_returning_commands_emit_decimal_string_ids() {
-    let mut engine = TestEngine::boot(&[("SAFFRON_AUTO_EMPTY_PROJECT", "1")]).expect("boot engine");
+    let mut engine = TestEngine::boot(&[("SAFFRON_SCRATCH_PROJECT", "1")]).expect("boot engine");
 
     // `add-entity cube` needs a loaded project (the auto empty project above) and returns the id.
     let added = engine

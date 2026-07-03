@@ -45,7 +45,7 @@ struct AppDataInfo {
     app_data_dir: String,
     userdata_dir: String,
     env_project: bool,
-    auto_empty_project: bool,
+    scratch_project: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -760,7 +760,7 @@ fn app_data_info() -> Result<AppDataInfo, String> {
         app_data_dir: app_data_dir().to_string_lossy().into_owned(),
         userdata_dir: userdata_dir().to_string_lossy().into_owned(),
         env_project: std::env::var_os("SAFFRON_PROJECT").is_some(),
-        auto_empty_project: std::env::var_os("SAFFRON_AUTO_EMPTY_PROJECT").is_some(),
+        scratch_project: std::env::var_os("SAFFRON_SCRATCH_PROJECT").is_some(),
     })
 }
 

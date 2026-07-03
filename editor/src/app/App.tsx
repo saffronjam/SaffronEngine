@@ -273,7 +273,7 @@ export function App() {
           return;
         }
         setProject(project.loaded ? project : null);
-        setProjectModalOpen(!project.loaded && !info.envProject && !info.autoEmptyProject);
+        setProjectModalOpen(!project.loaded && !info.envProject && !info.scratchProject);
       } catch {
         if (!cancelled) {
           setProjectModalOpen(false);

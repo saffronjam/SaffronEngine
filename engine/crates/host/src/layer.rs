@@ -525,7 +525,7 @@ impl HostLayer {
     /// Brings the project up from the editor-set environment once at attach time, before the
     /// first frame. Routes through the control context's one project-bring-up path, against the
     /// renderer's upload seam — so a host launched with `SAFFRON_PROJECT` /
-    /// `SAFFRON_AUTO_EMPTY_PROJECT` / a `project.json` has a loaded scene before the loop starts,
+    /// `SAFFRON_SCRATCH_PROJECT` / a `project.json` has a loaded scene before the loop starts,
     /// instead of an empty one waiting on the editor.
     fn bootstrap_project(&mut self, window: &mut Window, renderer: &mut Renderer) {
         self.ensure_uploader(renderer);

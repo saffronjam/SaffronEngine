@@ -419,29 +419,29 @@ fn load_idles_and_clears_caches_before_swapping_the_catalog() {
 }
 
 #[test]
-fn create_auto_empty_project_produces_a_loadable_minimal_project() {
-    // The auto-empty project lands under the default userdata root (env overriding is
+fn create_scratch_project_produces_a_loadable_minimal_project() {
+    // The scratch project lands under the default userdata root (env overriding is
     // unsafe under #![deny(unsafe_code)] and racy across parallel tests), so the project
     // dir is computed from the deterministic name and removed afterward.
-    let mut assets = AssetServer::new(scratch("autoempty").join("assets"));
+    let mut assets = AssetServer::new(scratch("scratch-project").join("assets"));
     let reg = builtin_reg();
     let mut scene = Scene::default();
     let mut info = ProjectInfo::default();
     let mut host = plain_host();
 
     assets
-        .create_auto_empty_project(&mut host, &reg, &mut scene, &mut info, "---@meta\n")
+        .create_scratch_project(&mut host, &reg, &mut scene, &mut info, "---@meta\n")
         .unwrap();
 
     assert!(info.loaded);
-    assert!(info.name.starts_with("auto-empty-"));
-    assert_eq!(info.display_name, "Auto Empty Project");
+    assert!(info.name.starts_with("scratch-"));
+    assert_eq!(info.display_name, "Scratch Project");
     assert!(valid_project_name(&info.name), "the auto name is valid");
     // The project.json was written under <userdata>/<name>/ and is loadable.
     let project_root = PathBuf::from(&info.root);
     assert!(std::path::Path::new(&info.path).exists());
 
-    let mut load_assets = AssetServer::new(scratch("autoempty-load").join("assets"));
+    let mut load_assets = AssetServer::new(scratch("scratch-project-load").join("assets"));
     let mut load_scene = Scene::default();
     let mut load_info = ProjectInfo::default();
     let mut load_host = plain_host();
@@ -454,7 +454,7 @@ fn create_auto_empty_project_produces_a_loadable_minimal_project() {
             &info.path,
             "---@meta\n",
         )
-        .expect("the auto-empty project loads");
+        .expect("the scratch project loads");
     assert_eq!(load_info.name, info.name);
 
     let _ = std::fs::remove_dir_all(&project_root);
