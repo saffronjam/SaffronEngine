@@ -14,7 +14,7 @@ const FIXTURE = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
 const shots: string[] = [];
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("set-camera", { yaw: 0, pitch: 0 });
   await engine.call("set-aa", { mode: "taa" });
   const imported = await engine.importEntity(FIXTURE);

@@ -27,7 +27,7 @@ async function morphEntity(engine: Engine): Promise<string> {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.importEntity(FIXTURE);
   morphId = await morphEntity(engine);
   await engine.call("focus", { entity: morphId });
