@@ -18,7 +18,7 @@ beforeAll(async () => {
   rmSync(projectDir, { recursive: true, force: true });
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
-  await engine.call("load-project", { path: `${projectDir}/project.json` });
+  await engine.loadProject(`${projectDir}/project.json`);
 });
 afterAll(async () => {
   await engine?.shutdown();
@@ -49,7 +49,7 @@ test("save-project writes the stores block into project.json", async () => {
 });
 
 test("a reload restores the enabled set from disk", async () => {
-  await engine.call("reload-project");
+  await engine.reloadProject();
   await engine.settle();
   const stores = await engine.call<StoresDto>("get-stores");
   expect(stores.enabled).toEqual(["polyhaven", "poly-pizza"]);
