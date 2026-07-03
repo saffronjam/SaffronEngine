@@ -301,7 +301,10 @@ a feature — follow and update a matching plan rather than starting cold.
   behind `saffron-animation` (glTF clip import, an animation-player runtime with transitions/blending, a
   compute-skinning prepass feeding motion vectors + skinned-BLAS rebuild, foot IK, a native skeleton
   overlay, animation control commands, and the editor timeline panel); the control plane + `sa` CLI; the
-  Tauri editor; per-entity Luau scripting (behind `saffron-script`: ScriptComponent slots,
+  Tauri editor (with editor-only per-tab undo/redo reconstructed from inverse control calls, and an
+  in-editor Asset Store that imports models/textures/HDRIs/materials from external providers — Poly Haven,
+  ambientCG, Poly Pizza, Sketchfab — over an editor-local connector backend with OS-keyring credentials
+  and OAuth loopback); per-entity Luau scripting (behind `saffron-script`: ScriptComponent slots,
   script-declared fields + overrides, Inspector UI, project `src/` scaffold); physics behind
   `saffron-physics` (Jolt vendored, cross-platform-deterministic; a per-play world on the play edge;
   rigidbody/collider split components with five shapes + materials + auto-fit; object-layer matrix +
@@ -309,4 +312,4 @@ a feature — follow and update a matching plan rather than starting cold.
   controller; raycast/shapecast queries + a Luau `sa.raycast`; and a motor-driven ragdoll routed through
   the pose-buffer override/weight blend layer — passive, active, and partial, with import auto-fit).
 - **Not yet:** transient render-graph resources (graph-created images + aliasing) + async compute;
-  GPU-driven culling (MDI / mesh shaders); undo/redo; hardware GPU in the toolbox.
+  GPU-driven culling (MDI / mesh shaders); hardware GPU in the toolbox.
