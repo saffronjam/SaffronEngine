@@ -25,6 +25,14 @@ per-frame signals (frame time, the history ring, VRAM, the throughput counters).
   `1.0 × budget`. Between them the state holds.
 - **Debounce.** The enter condition must hold for ~300 ms before the alarm fires at all. Hysteresis
   stops edge oscillation; debounce stops a single slow frame from ever firing. They are orthogonal.
+- **Focus gate.** The three frame-*time* detectors only judge a viewport that is focused and has
+  settled. An unfocused viewport is paced down (the reactive loop caps it to a few FPS), and the
+  first frames back are the temporal effects re-converging — both are transients, not real hitches.
+  So the frame-time detectors stay held until the viewport has been focused for a full settle window
+  (`ALARM_RESUME_SETTLE_FRAMES`, one frame-hitch MAD window, so the recent-frame baseline is entirely
+  representative before they read it); the same gate swallows the startup burst. While held, any
+  active frame-time alarm is resolved so a pre-blur toast never lingers. VRAM and PSO-compile are
+  focus-independent and always run.
 
 ## Three (plus two) detectors → severity
 
@@ -105,7 +113,7 @@ sa set-perf-config --targetFps 60    # relax → the next drain shows the RESOLV
 
 | What | File | Symbols |
 |---|---|---|
-| Detectors + the per-frame tick | `frame_history.rs` | `AlarmState::tick`, `raise`, `clear`, `AlarmInputs` |
+| Detectors + the per-frame tick | `frame_history.rs` | `AlarmState::tick`, `raise`, `clear`, `AlarmInputs` (`focused`), `ALARM_RESUME_SETTLE_FRAMES` |
 | Alarm state: active set, event ring, seq, fingerprint | `frame_history.rs` | `AlarmState`, `ActiveAlarm`, `AlarmEvent`, `AlarmSeverity`, `AlarmEventKind`, `alarm_fingerprint` |
 | Non-blocking delivery + cursor | `frame_history.rs`, `renderer.rs` | `AlarmState::drain`, `AlarmDrain`, `Renderer::drain_alarms`, `active_alarms` |
 | Wire surface | `protocol/src/dto.rs`, `control/src/commands_render.rs` | `AlarmEventDto`, `ActiveAlarmDto`, `drain-alarms`, `list-active-alarms` |

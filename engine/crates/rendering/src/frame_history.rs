@@ -16,6 +16,13 @@ pub const FRAME_HISTORY_CAPACITY: usize = 1024;
 /// Capacity of the alarm event ring (FIRING/RESOLVED history).
 pub const ALARM_EVENT_RING_CAPACITY: usize = 256;
 
+/// Focused frames the frame-time detectors wait for after the viewport regains focus (or at
+/// startup) before judging performance again. It spans the frame-hitch MAD window (64), so the
+/// recent-frame baseline is entirely representative before the detectors read it: the paced-down
+/// frames recorded while unfocused and the TAA/GI re-convergence burst on resume are transients,
+/// not real hitches, and must never raise an alarm.
+pub const ALARM_RESUME_SETTLE_FRAMES: u32 = 64;
+
 /// One frame's raw (un-smoothed) timing, pushed once per frame at end-of-frame. The
 /// frame time used for percentiles + stutter is `cpu_ms + cpu_wait_ms` (the
 /// render-thread wall clock: work plus the fence wait, which absorbs GPU-bound stalls).
@@ -173,6 +180,15 @@ impl FrameHistory {
     /// The ns of the most recent detected stutter.
     pub fn last_stutter_ns(&self) -> u64 {
         self.last_stutter_ns
+    }
+
+    /// Empties the distribution (a fresh window) — used when a project load makes the prior
+    /// frames unrepresentative, so the percentiles/mean the HUD grades don't span the load.
+    pub fn reset(&mut self) {
+        self.head = 0;
+        self.count = 0;
+        self.stutter_count = 0;
+        self.last_stutter_ns = 0;
     }
 
     /// The oldest→newest physical index for logical position `i` in `[0, count)`.
@@ -402,6 +418,10 @@ pub struct AlarmState {
     budget_crit_held_sec: f32,
     /// Clean frames since the last spike (to auto-resolve a hitch).
     hitch_clear_frames: u32,
+    /// Consecutive focused frames observed; the frame-time detectors gate on this reaching
+    /// [`ALARM_RESUME_SETTLE_FRAMES`], so an unfocused→focused resume (and startup) settles before
+    /// they judge again. Reset to 0 on any unfocused frame.
+    focused_streak: u32,
 }
 
 impl Default for AlarmState {
@@ -417,6 +437,7 @@ impl Default for AlarmState {
             budget_warn_held_sec: 0.0,
             budget_crit_held_sec: 0.0,
             hitch_clear_frames: 0,
+            focused_streak: 0,
         }
     }
 }
@@ -450,6 +471,11 @@ pub struct AlarmInputs {
     pub vram_budget_bytes: u64,
     /// PSOs compiled this frame (a mid-frame compile is a hitch).
     pub pipelines_created: u32,
+    /// Whether the viewport is focused (rendering at the full target rate). While unfocused the
+    /// loop paces render down and on resume it re-converges the temporal effects, so those frame
+    /// timings are unrepresentative; the frame-time detectors stay quiet until the viewport has
+    /// been focused for [`ALARM_RESUME_SETTLE_FRAMES`] frames.
+    pub focused: bool,
 }
 
 impl AlarmState {
@@ -461,6 +487,14 @@ impl AlarmState {
     /// The frame counter the detectors advance.
     pub fn frame_counter(&self) -> u64 {
         self.frame_counter
+    }
+
+    /// Restart the post-resume settle window (see [`ALARM_RESUME_SETTLE_FRAMES`]). Called when the
+    /// viewport leaves the focused state, so any later return — including from an occluded viewport,
+    /// which stops rendering (and so ticking) entirely — re-settles before the frame-time detectors
+    /// judge the re-convergence burst.
+    pub fn reset_focus_settle(&mut self) {
+        self.focused_streak = 0;
     }
 
     fn push_event(&mut self, mut event: AlarmEvent) -> u64 {
@@ -591,9 +625,32 @@ impl AlarmState {
             self.ema_frame_ms = frame_time_ms;
         }
 
+        // Frame-time perf gate. While the viewport is unfocused the loop paces render down, and on
+        // resume it re-converges the temporal effects — both make the frame timings unrepresentative,
+        // so the frame-time detectors (budget / hitch / burn-rate) would fire false positives every
+        // time the user returns to the viewport. Hold them until the viewport has been focused for a
+        // full settle window (also swallows the startup burst), and while held clear any that were
+        // active and reset the debounce so a pre-blur alarm and the resume transient never surface.
+        // VRAM and PSO-compile are focus-independent and run unconditionally below.
+        let perf_ready = if inputs.focused {
+            self.focused_streak = (self.focused_streak + 1).min(ALARM_RESUME_SETTLE_FRAMES);
+            self.focused_streak >= ALARM_RESUME_SETTLE_FRAMES
+        } else {
+            self.focused_streak = 0;
+            false
+        };
+        if !perf_ready {
+            self.budget_warn_held_sec = 0.0;
+            self.budget_crit_held_sec = 0.0;
+            self.hitch_clear_frames = 0;
+            self.clear(now_ns, "frame-budget", "");
+            self.clear(now_ns, "frame-hitch", "");
+            self.clear(now_ns, "burn-rate", "");
+        }
+
         // frame-budget: sustained over-budget with hysteresis (enter 1.2× / exit 1.0×) +
         // a debounce; escalates to critical at 2× budget.
-        if budget > 0.0 {
+        if perf_ready && budget > 0.0 {
             let enter_th = 1.2 * budget;
             let exit_th = budget;
             let critical_th = 2.0 * budget;
@@ -631,7 +688,7 @@ impl AlarmState {
         // frame-hitch: a robust spike via the modified z-score over a recent window
         // (median/MAD beat mean/stddev — the outlier inflates stddev and masks itself).
         let window = history.count.min(64);
-        if window >= 8 {
+        if perf_ready && window >= 8 {
             let mut sorted = history.window_times(window);
             sorted.sort_by(f32::total_cmp);
             let median = sorted[sorted.len() / 2];
@@ -666,7 +723,7 @@ impl AlarmState {
 
         // burn-rate: a short and a long window must both breach (fast detect, low
         // false-positive, clears quickly when the problem stops).
-        if budget > 0.0 && history.count >= 60 {
+        if perf_ready && budget > 0.0 && history.count >= 60 {
             let sli_short = history.window_over_budget(60, budget); // ~1 s @ 60 Hz
             let sli_long = history.window_over_budget(600, budget); // ~10 s
             if sli_short > 0.5 && sli_long > 0.5 {
@@ -878,8 +935,10 @@ mod tests {
         assert_eq!(c.budget_ms(), 0.0);
     }
 
-    /// Feed `frames` over-budget frames into the alarm engine and return its state.
-    fn run_over_budget(frames: u32, frame_ms: f32) -> (FrameHistory, AlarmState) {
+    /// Feed `frames` over-budget frames into the alarm engine and return its state. `focused` sets
+    /// the per-frame power gate: unfocused frames are throttled, so the frame-time detectors stay
+    /// quiet on them regardless of the timing.
+    fn run_over_budget(frames: u32, frame_ms: f32, focused: bool) -> (FrameHistory, AlarmState) {
         let config = PerfConfig::default(); // 60fps → 16.6ms budget
         let mut history = FrameHistory::default();
         let mut alarms = AlarmState::default();
@@ -894,6 +953,7 @@ mod tests {
                 vram_usage_bytes: 0,
                 vram_budget_bytes: 0,
                 pipelines_created: 0,
+                focused,
             };
             alarms.tick(&history, &config, &inputs);
         }
@@ -902,9 +962,9 @@ mod tests {
 
     #[test]
     fn sustained_over_budget_fires_a_frame_budget_alarm() {
-        // 40ms/frame is well over 1.2×16.6=20ms; with dt=0.05s/frame the EMA needs ~6
-        // frames to clear enter, plus 0.3s/0.05 = 6 frames of debounce.
-        let (_, alarms) = run_over_budget(60, 40.0);
+        // 40ms/frame is well over 1.2×16.6=20ms; the run first burns through the focus settle
+        // window (ALARM_RESUME_SETTLE_FRAMES), then the EMA + 0.3s debounce fire frame-budget.
+        let (_, alarms) = run_over_budget(128, 40.0, true);
         assert!(
             alarms.active().iter().any(|a| a.metric == "frame-budget"),
             "a sustained 40ms frame raises frame-budget"
@@ -922,10 +982,77 @@ mod tests {
 
     #[test]
     fn a_steady_in_budget_session_raises_nothing() {
-        let (_, alarms) = run_over_budget(120, 8.0); // 8ms < 16.6ms budget
+        let (_, alarms) = run_over_budget(120, 8.0, true); // 8ms < 16.6ms budget
         assert!(alarms.active().is_empty(), "no alarms under budget");
         let drain = alarms.drain(0);
         assert!(drain.events.is_empty());
+    }
+
+    #[test]
+    fn unfocused_frames_raise_no_frame_time_alarm() {
+        // Every frame is far over budget, but the viewport is unfocused (the loop paces render
+        // down), so the frame-time detectors stay silent — no hitch / budget / burn toast fires
+        // while the user is working in another window.
+        let (_, alarms) = run_over_budget(200, 40.0, false);
+        assert!(
+            alarms.active().is_empty(),
+            "unfocused over-budget frames raise nothing"
+        );
+        assert!(alarms.drain(0).events.is_empty(), "no events either");
+    }
+
+    #[test]
+    fn a_resume_spike_is_swallowed_until_the_settle_window_passes() {
+        // The core fix: returning to a paced-down viewport leaves a calm baseline of cheap frames
+        // in the ring and re-converges the temporal effects, so the first focused frame looks like
+        // a huge spike. The settle window must swallow it, then judge normally once representative.
+        let config = PerfConfig::default(); // 16.6ms budget
+        let mut history = FrameHistory::default();
+        let mut alarms = AlarmState::default();
+        let mut now_ns = 0u64;
+        let budget = config.budget_ms();
+        let tick = |alarms: &mut AlarmState, history: &FrameHistory, now_ns: u64, ms: f32| {
+            alarms.tick(
+                history,
+                &config,
+                &AlarmInputs {
+                    frame_time_ms: ms,
+                    dt_sec: 0.016,
+                    now_ns,
+                    vram_usage_bytes: 0,
+                    vram_budget_bytes: 0,
+                    pipelines_created: 0,
+                    focused: true,
+                },
+            );
+        };
+
+        // The cheap paced-down frames still sitting in the ring right after resume.
+        for _ in 0..64 {
+            now_ns += 16_000_000;
+            history.record(4.0, 0.0, 0.0, budget, now_ns);
+        }
+        // Regain focus: the first focused frame is a resume transient spike; the settle window
+        // must hold the hitch detector until it has ALARM_RESUME_SETTLE_FRAMES representative frames.
+        for i in 0..ALARM_RESUME_SETTLE_FRAMES {
+            now_ns += 16_000_000;
+            let ms = if i == 0 { 40.0 } else { 4.0 };
+            history.record(ms, 0.0, 0.0, budget, now_ns);
+            tick(&mut alarms, &history, now_ns, ms);
+        }
+        assert!(
+            !alarms.active().iter().any(|a| a.metric == "frame-hitch"),
+            "the resume-transient spike is swallowed during the settle window"
+        );
+
+        // Past the settle window a genuine spike against the now-representative baseline fires.
+        now_ns += 16_000_000;
+        history.record(40.0, 0.0, 0.0, budget, now_ns);
+        tick(&mut alarms, &history, now_ns, 40.0);
+        assert!(
+            alarms.active().iter().any(|a| a.metric == "frame-hitch"),
+            "a real hitch after the settle window still fires"
+        );
     }
 
     #[test]
@@ -944,6 +1071,7 @@ mod tests {
                 vram_usage_bytes: 99,
                 vram_budget_bytes: 100, // 99% ≥ crit 95%
                 pipelines_created: 0,
+                focused: true,
             },
         );
         assert!(
@@ -964,6 +1092,7 @@ mod tests {
                 vram_usage_bytes: 50,
                 vram_budget_bytes: 100, // 50% < 0.8*0.95 = 76%
                 pipelines_created: 0,
+                focused: true,
             },
         );
         assert!(
@@ -997,6 +1126,7 @@ mod tests {
                     vram_usage_bytes: 0,
                     vram_budget_bytes: 0,
                     pipelines_created: if i % 2 == 0 { 1 } else { 0 },
+                    focused: true,
                 },
             );
         }
