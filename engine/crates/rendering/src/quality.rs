@@ -1,7 +1,7 @@
 //! The render-quality tier: one named knob that expands to the per-effect parameters of the
 //! scalable screen-space GI stack (SSGI, GTAO, contact shadows).
 //!
-//! Replaces the old per-effect on/off control commands with a single source of truth: a
+//! A single source of truth for the screen-space GI stack: a
 //! [`QualityTier`] resolves to a [`RenderQuality`] the renderer applies to [`crate::Ssao`]. The
 //! editor drives it over the control plane, the exported game exposes it as its graphics-settings
 //! slider, and a `Custom` tier carries hand-tuned parameters for power users. Ray count and a

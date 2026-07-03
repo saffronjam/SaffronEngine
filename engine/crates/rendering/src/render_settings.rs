@@ -27,7 +27,7 @@ pub struct RenderSettings {
     /// Image-based lighting on.
     pub ibl: Option<bool>,
     /// The render-quality tier name (`"low"`/`"medium"`/`"high"`/`"ultra"`/`"custom"`) — the single
-    /// knob for the SSGI / GTAO / contact-shadow stack, replacing the old per-effect bools.
+    /// knob for the SSGI / GTAO / contact-shadow stack.
     pub quality: Option<String>,
     /// The tonemap operator name (`"reinhard"`/`"aces"`/`"agx"`/`"pbr-neutral"`).
     pub tonemap: Option<String>,
