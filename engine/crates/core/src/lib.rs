@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 mod base64;
+mod blend;
 mod error;
 mod time;
 mod uuid;
@@ -13,6 +14,7 @@ mod uuid;
 use std::sync::Arc;
 
 pub use base64::base64_encode;
+pub use blend::BlendMode;
 pub use error::{Error, Result};
 pub use time::TimeSpan;
 pub use uuid::Uuid;
