@@ -17,7 +17,7 @@ let id: string;
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "saffron-thumbasync-"));
   engine = await Engine.boot();
-  await engine.call("new-project", { name: "async", root });
+  await engine.newProject({ name: "async", root });
   // A 4096x2048 HDR: ~1s of decode + 33.5M floatToHalf + 64MB upload if it ran synchronously.
   writeFileSync(
     join(root, "sky.hdr"),

@@ -39,7 +39,7 @@ afterAll(() => {
 test("content-addressed thumbnails persist across a restart, survive a touch, and regenerate on a real edit", async () => {
   // First engine: create the project, import a texture, generate its thumbnail.
   const e1 = await Engine.boot({ SAFFRON_APPDATA_DIR: appdata });
-  await e1.call("new-project", { name: "cachetest", root });
+  await e1.newProject({ name: "cachetest", root });
   const src = join(root, "src.png");
   writeFileSync(src, makePng(1024, 640, (x, y) => [x & 255, y & 255, (x ^ y) & 255]));
   const imported = await e1.call<{ texture: string }>("import-texture", { path: src });
@@ -63,7 +63,7 @@ test("content-addressed thumbnails persist across a restart, survive a touch, an
 
   // Second engine, same app-data + project: the thumbnail comes from the shared content cache.
   const e2 = await Engine.boot({ SAFFRON_APPDATA_DIR: appdata });
-  await e2.call("open-project", { path: root });
+  await e2.openProject(root);
   const t2 = await e2.getThumbnail<{ base64: string; width: number; height: number }>("get-thumbnail", {
     asset: id,
     size: 128,
@@ -74,7 +74,7 @@ test("content-addressed thumbnails persist across a restart, survive a touch, an
   expect(t2.height).toBe(dims.height);
 
   // A touch with no content change must NOT invalidate — the key is the content hash, not the
-  // file stat, so the sentinel is still served (the old mtime-keyed cache would have regenerated).
+  // file stat, so the sentinel is still served.
   const future = new Date(Date.now() + 4000);
   utimesSync(join(root, "assets", "textures", `${id}.png`), future, future);
   const t3 = await e2.getThumbnail<{ base64: string }>("get-thumbnail", { asset: id, size: 128 });
@@ -86,7 +86,7 @@ test("content-addressed thumbnails persist across a restart, survive a touch, an
     join(root, "assets", "textures", `${id}.png`),
     makePng(1024, 640, (x, y) => [(x + 7) & 255, (y + 9) & 255, (x & y) & 255]),
   );
-  await e2.call("reload-project", {});
+  await e2.reloadProject();
   const t4 = await e2.getThumbnail<{ base64: string }>("get-thumbnail", { asset: id, size: 128 });
   expect(Buffer.from(t4.base64, "base64").equals(sentinel)).toBe(false); // regenerated under a new key
   expect(cachePngs().length).toBeGreaterThanOrEqual(2); // a new content-key file was written

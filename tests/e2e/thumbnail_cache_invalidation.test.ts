@@ -21,7 +21,7 @@ function cachePngs(): string[] {
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "saffron-thumbinval-"));
   engine = await Engine.boot();
-  await engine.call("new-project", { name: "inval", root });
+  await engine.newProject({ name: "inval", root });
 });
 afterAll(async () => {
   await engine?.shutdown();
