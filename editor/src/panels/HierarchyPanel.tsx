@@ -10,13 +10,13 @@
 /// The context menu and the inline rename input are Radix/native controls anchored
 /// on each row in the left column, and every drag affordance stays in the sidebar
 /// DOM (the reparented X11 viewport paints over anything floating). Rejected control
-/// calls surface in an inline flash at the bottom of the panel (no silent failures).
+/// calls surface via `notifyError` (the shared error toast), never a per-panel banner.
 import { useCallback, useMemo, useState } from "react";
 import { Bone, ListTree } from "lucide-react";
 import { client } from "../control/client";
 import { recordEntityCreation, useEditorStore } from "../state/store";
 import { CreateMenu } from "../app/CreateMenu";
-import { errorText, useFlash } from "../lib/flash";
+import { errorText, notifyError } from "../lib/flash";
 import type { EntityListEntry } from "../protocol";
 import { HierarchyTree, type TreeActions } from "./HierarchyTree";
 import { Button } from "@/components/ui/button";
@@ -35,7 +35,6 @@ export function HierarchyPanel() {
   const toggleComponentSubrows = useEditorStore((s) => s.toggleComponentSubrows);
   const hideBones = useEditorStore((s) => s.hideBones);
   const toggleHideBones = useEditorStore((s) => s.toggleHideBones);
-  const { message, flash } = useFlash();
   const [renamingId, setRenamingId] = useState<string | null>(null);
 
   // Left-click a row: optimistic local select, then tell the engine. The poll
@@ -43,17 +42,14 @@ export function HierarchyPanel() {
   const onSelect = useCallback(
     (entity: EntityListEntry): void => {
       selectEntity(entity.id);
-      void client.selectEntity(entity.id).catch((err: unknown) => flash(errorText(err)));
+      void client.selectEntity(entity.id).catch((err: unknown) => notifyError(errorText(err)));
     },
-    [selectEntity, flash],
+    [selectEntity],
   );
   // Aim the editor camera at the entity.
-  const onFocus = useCallback(
-    (id: string): void => {
-      void client.focus(id).catch((err: unknown) => flash(errorText(err)));
-    },
-    [flash],
-  );
+  const onFocus = useCallback((id: string): void => {
+    void client.focus(id).catch((err: unknown) => notifyError(errorText(err)));
+  }, []);
   // Copy duplicates the entity; the engine selects the dup, so mirror it locally
   // and let the sceneVersion bump refresh the list.
   const onCopy = useCallback(
@@ -64,9 +60,9 @@ export function HierarchyPanel() {
           selectEntity(ref.id);
           recordEntityCreation(ref.id, "Duplicate entity");
         })
-        .catch((err: unknown) => flash(errorText(err)));
+        .catch((err: unknown) => notifyError(errorText(err)));
     },
-    [selectEntity, flash],
+    [selectEntity],
   );
   // Delete removes the entity and its subtree; clear selection if it was selected.
   const onDelete = useCallback(
@@ -74,22 +70,22 @@ export function HierarchyPanel() {
       if (useEditorStore.getState().selectedId === id) {
         setSelectedId(null);
       }
-      void client.destroyEntity(id).catch((err: unknown) => flash(errorText(err)));
+      void client.destroyEntity(id).catch((err: unknown) => notifyError(errorText(err)));
     },
-    [setSelectedId, flash],
+    [setSelectedId],
   );
   // Reparent (drag-drop or the context menu); the store action relinks
   // optimistically and rolls back on rejection — surface the error here.
   const onReparent = useCallback(
     (id: string, parentId: string | null): void => {
-      void setParent(id, parentId).catch((err: unknown) => flash(errorText(err)));
+      void setParent(id, parentId).catch((err: unknown) => notifyError(errorText(err)));
     },
-    [setParent, flash],
+    [setParent],
   );
   const onRenameStart = useCallback((id: string): void => setRenamingId(id), []);
   // Inline rename: optimistically update the row name and commit via rename-entity;
   // the sceneVersion bump re-fetches the authoritative list. A rejection reverts to
-  // the next poll's value and surfaces in the flash.
+  // the next poll's value and surfaces via the error toast.
   const onRenameCommit = useCallback(
     (id: string, next: string): void => {
       setRenamingId(null);
@@ -114,9 +110,9 @@ export function HierarchyPanel() {
             );
           }
         })
-        .catch((err: unknown) => flash(errorText(err)));
+        .catch((err: unknown) => notifyError(errorText(err)));
     },
-    [applyOptimisticEntityName, flash],
+    [applyOptimisticEntityName],
   );
   const onRenameCancel = useCallback((): void => setRenamingId(null), []);
 
@@ -195,16 +191,11 @@ export function HierarchyPanel() {
             return;
           }
           setSelectedId(null);
-          void client.deselect().catch((err: unknown) => flash(errorText(err)));
+          void client.deselect().catch((err: unknown) => notifyError(errorText(err)));
         }}
       >
         <HierarchyTree actions={actions} />
       </ScrollArea>
-      {message ? (
-        <p className="flex-none border-t border-destructive/40 bg-destructive/10 px-2.5 py-1 text-[11px] text-destructive">
-          {message}
-        </p>
-      ) : null}
     </div>
   );
 }
