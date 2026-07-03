@@ -42,7 +42,7 @@ use saffron_sceneedit::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::registry::{CommandRegistry, EngineContext};
 use crate::selector::{entity_ref_dto, entity_uuid, fit_collider, resolve_entity};
 
@@ -68,6 +68,17 @@ fn vec3_json(v: &Vec3) -> Value {
 /// A wire `Vec4` as its `{x,y,z,w}` JSON object.
 fn vec4_json(v: &Vec4) -> Value {
     json!({ "x": v.x, "y": v.y, "z": v.z, "w": v.w })
+}
+
+/// Validates a `set-material` blend token, returning it unchanged for the JSON body or an
+/// error naming the accepted values. The three glTF alpha modes are the only valid inputs.
+fn validate_blend(blend: &str) -> Result<&str> {
+    match blend {
+        "opaque" | "masked" | "translucent" => Ok(blend),
+        other => Err(Error::command(format!(
+            "invalid blend '{other}': expected opaque | masked | translucent"
+        ))),
+    }
 }
 
 /// The editor fly-camera as its wire DTO.
@@ -572,7 +583,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
         "set-material",
         "set-material {entity, baseColor?:{x,y,z,w}, albedoTexture?:uuid, \
          metallicRoughnessTexture?:uuid, metallic?, roughness?, emissive?:{x,y,z}, \
-         emissiveStrength?, unlit?:0|1, slot?, smooth?:0|1}",
+         emissiveStrength?, unlit?:0|1, blend?:opaque|masked|translucent, slot?, smooth?:0|1}",
         |ctx, params| {
             if ctx.scene_edit.previewing() {
                 return Err(Error::command("exit the asset preview first"));
@@ -620,6 +631,9 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 }
                 if let Some(u) = params.unlit {
                     slot["unlit"] = json!(u);
+                }
+                if let Some(b) = &params.blend {
+                    slot["blend"] = json!(validate_blend(b)?);
                 }
                 (set_row.deserialize)(ctx.scene_edit.active_scene(), entity, &set_body)
                     .map_err(|e| Error::command(e.to_string()))?;
@@ -673,6 +687,9 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             }
             if let Some(u) = params.unlit {
                 body["unlit"] = json!(u);
+            }
+            if let Some(b) = &params.blend {
+                body["blend"] = json!(validate_blend(b)?);
             }
             (row.deserialize)(ctx.scene_edit.active_scene(), entity, &body)
                 .map_err(|e| Error::command(e.to_string()))?;
@@ -1240,7 +1257,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             let entity = match preset {
                 AddEntityPreset::Empty => ctx.scene_edit.active_scene().create_entity("Entity"),
                 AddEntityPreset::Cube | AddEntityPreset::Model => {
-                    if !ctx.scene_edit.project_loaded {
+                    if !ctx.scene_edit.project_ready() {
                         return Err(Error::command("no project loaded"));
                     }
                     // The built-in cube is a model asset like any other: ensure its .smodel

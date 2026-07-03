@@ -84,6 +84,12 @@ pub trait ControlRenderer {
     /// Sets the active view's dynamic-resolution factor (clamped to `(0, 1]`). A manual override;
     /// when `auto_quality` is on the budget controller resets it each frame.
     fn set_render_scale(&mut self, scale: f32);
+    /// The active view's current input (scene-render) extent `(width, height)` in device pixels —
+    /// `round(display × render_scale)`, what the TAAU resolve reconstructs from.
+    fn input_extent(&self) -> (u32, u32);
+    /// The active view's fixed display (present) extent `(width, height)` in device pixels — what
+    /// the resolve reconstructs to, independent of the render scale.
+    fn display_extent(&self) -> (u32, u32);
     /// The active tonemap operator name (`reinhard`/`aces`/`agx`/`pbr-neutral`).
     fn tonemap_mode(&self) -> String;
     /// Selects the tonemap operator by name; returns `false` for an unknown name.
@@ -164,6 +170,12 @@ pub trait ControlRenderer {
     /// Returns the device error message if the GPU cannot idle or the AA targets
     /// cannot be recreated.
     fn set_aa(&mut self, samples: u32, fxaa: bool, taa: bool) -> std::result::Result<(), String>;
+
+    /// The current TAA blend/sharpen parameters. Uses `TaaParamsDto` as the currency so the
+    /// trait keeps no dependency on `saffron-rendering` (as `aa_mode` returns `String`, not `Aa`).
+    fn taa_params(&self) -> saffron_protocol::TaaParamsDto;
+    /// Applies fully-resolved TAA parameters (no idle — it is a per-frame push value).
+    fn set_taa_params(&mut self, params: saffron_protocol::TaaParamsDto);
 
     /// The tonemap exposure in stops.
     fn exposure_ev(&self) -> f32;
@@ -303,6 +315,11 @@ pub trait ControlRenderer {
     /// `sa_lua_defs` the host generates from the script bindings). Empty under the test
     /// stub.
     fn sa_lua_defs(&self) -> String;
+
+    /// Drops the frame-timing distribution + smoothed headlines and holds telemetry off for a
+    /// short warm-up. The loader calls this when a project reaches `Ready` so the perf HUD grades
+    /// steady-state frames, not the load transition + cold-pipeline warm-up.
+    fn reset_frame_telemetry(&mut self);
 }
 
 /// The slice of live engine state a command may touch.
@@ -432,6 +449,7 @@ impl CommandRegistry {
                 "id": id,
                 "ok": false,
                 "error": format!("unknown command '{command}'"),
+                "code": "command",
             });
         };
         // `help` reflects over the live registry, so it is served here rather
@@ -441,10 +459,20 @@ impl CommandRegistry {
         if command == "help" {
             return json!({ "id": id, "ok": true, "result": self.help_listing() });
         }
+        // While a project load is in flight the scene/catalog are mid-swap, so all but a tiny
+        // allow-list of commands are discarded with the busy error — never queued for replay.
+        if ctx.scene_edit.project_phase == saffron_sceneedit::ProjectPhase::Loading
+            && !is_loading_safe_command(command)
+        {
+            let error = Error::Busy;
+            return json!({ "id": id, "ok": false, "error": error.to_string(), "code": error.code() });
+        }
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
         match row.run(ctx, &params) {
             Ok(result) => json!({ "id": id, "ok": true, "result": result }),
-            Err(error) => json!({ "id": id, "ok": false, "error": error.to_string() }),
+            Err(error) => {
+                json!({ "id": id, "ok": false, "error": error.to_string(), "code": error.code() })
+            }
         }
     }
 
@@ -591,6 +619,30 @@ pub fn is_read_only_command(name: &str) -> bool {
         // it sets the selection, which changes the rendered gizmo / skeleton overlay, so a
         // viewport-click select must request a redraw under the reactive loop.
         | "raycast" | "shapecast" | "pick-skeleton-joint"
+        // project-load phase + progress the editor's loading screen polls each tick
+        | "project-status"
+    )
+}
+
+/// Commands that stay serviceable while a project load is in flight. Deliberately tiny: during a
+/// load the scene/catalog are mid-swap, so even reads (`inspect`, `list-entities`) could observe a
+/// torn state — they get the busy error and the editor retries them once `Ready`. The loading
+/// screen polls `project-status` for progress and offers `cancel-load` to abort; both must pass the
+/// gate they run under. `viewport-native-info` is here too: it reads only the (swap-independent)
+/// viewport surface, and the editor's readiness probe drives it to flip the engine to `ready` — a
+/// gate the project-load poll itself runs behind, so blocking it during a load would stall the very
+/// progress the load is trying to report.
+#[must_use]
+pub fn is_loading_safe_command(name: &str) -> bool {
+    matches!(
+        name,
+        "ping"
+            | "help"
+            | "get-project"
+            | "project-status"
+            | "cancel-load"
+            | "quit"
+            | "viewport-native-info"
     )
 }
 
@@ -685,7 +737,47 @@ mod tests {
         assert_eq!(reply["id"], Value::Null);
         assert_eq!(reply["ok"], json!(false));
         assert_eq!(reply["error"], json!("unknown command 'nope'"));
+        assert_eq!(reply["code"], json!("command"));
         assert!(reply.get("result").is_none());
+    }
+
+    #[test]
+    fn loading_gate_discards_non_allow_listed_commands() {
+        let reg = builtins();
+        with_ctx(|ctx| {
+            ctx.scene_edit.project_phase = saffron_sceneedit::ProjectPhase::Loading;
+
+            // A mutating command is discarded with the busy code while Loading.
+            let blocked = reg.dispatch(ctx, &json!({ "id": 1, "cmd": "add-entity" }));
+            assert_eq!(blocked["ok"], json!(false));
+            assert_eq!(blocked["code"], json!("busy-loading"));
+            assert_eq!(blocked["id"], json!(1));
+
+            // Allow-listed liveness / identity commands stay serviceable.
+            assert_eq!(
+                reg.dispatch(ctx, &json!({ "cmd": "ping" }))["ok"],
+                json!(true)
+            );
+            assert_eq!(
+                reg.dispatch(ctx, &json!({ "cmd": "get-project" }))["ok"],
+                json!(true)
+            );
+        });
+    }
+
+    #[test]
+    fn error_arm_emits_code_uniformly() {
+        // A params deserialize failure carries the `params` code, proving the `Err` arm emits a
+        // code for every business/params error, not just the busy gate.
+        let reg = builtins();
+        let reply = with_ctx(|ctx| {
+            reg.dispatch(
+                ctx,
+                &json!({ "cmd": "set-aa", "params": { "args": ["nonsense"] } }),
+            )
+        });
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(reply["code"], json!("params"));
     }
 
     #[test]

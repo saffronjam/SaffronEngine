@@ -135,6 +135,7 @@ pub struct StubRenderer {
     pub aa_samples: u32,
     pub aa_fxaa: bool,
     pub aa_taa: bool,
+    pub taa_params: saffron_protocol::TaaParamsDto,
     pub exposure_ev: f32,
     pub profiler_mode: ProfilerMode,
     pub timestamps_supported: bool,
@@ -146,6 +147,8 @@ pub struct StubRenderer {
     pub capture_id: u32,
     pub width: u32,
     pub height: u32,
+    /// The active view's dynamic-resolution factor `(0, 1]`; the input extent is `display × this`.
+    pub render_scale: f32,
     pub probes: Vec<ReflectionProbe>,
     pub active_view: ViewId,
     /// Per-view desired offscreen size, indexed by [`ViewId::index`].
@@ -176,6 +179,13 @@ impl Default for StubRenderer {
             aa_samples: 1,
             aa_fxaa: false,
             aa_taa: false,
+            taa_params: saffron_protocol::TaaParamsDto {
+                feedback_min: 0.88,
+                feedback_max: 0.97,
+                velocity_rejection: 0.025,
+                clip_gamma: 1.0,
+                sharpness: 0.0,
+            },
             exposure_ev: 0.0,
             profiler_mode: ProfilerMode::Off,
             timestamps_supported: false,
@@ -187,6 +197,7 @@ impl Default for StubRenderer {
             capture_id: 0,
             width: 1280,
             height: 720,
+            render_scale: 1.0,
             probes: Vec::new(),
             active_view: ViewId::Scene,
             view_sizes: [(1280, 720); saffron_rendering::VIEW_COUNT],
@@ -250,9 +261,21 @@ impl ControlRenderer for StubRenderer {
         }
     }
     fn render_scale(&self) -> f32 {
-        1.0
+        self.render_scale
     }
-    fn set_render_scale(&mut self, _scale: f32) {}
+    fn set_render_scale(&mut self, scale: f32) {
+        self.render_scale = scale.clamp(0.1, 1.0);
+    }
+    fn input_extent(&self) -> (u32, u32) {
+        let scale = self.render_scale.clamp(0.1, 1.0);
+        (
+            ((self.width as f32 * scale).round() as u32).max(1),
+            ((self.height as f32 * scale).round() as u32).max(1),
+        )
+    }
+    fn display_extent(&self) -> (u32, u32) {
+        (self.width.max(1), self.height.max(1))
+    }
     fn tonemap_mode(&self) -> String {
         self.tonemap.clone()
     }
@@ -382,6 +405,13 @@ impl ControlRenderer for StubRenderer {
         self.aa_fxaa = fxaa;
         self.aa_taa = taa;
         Ok(())
+    }
+
+    fn taa_params(&self) -> saffron_protocol::TaaParamsDto {
+        self.taa_params.clone()
+    }
+    fn set_taa_params(&mut self, params: saffron_protocol::TaaParamsDto) {
+        self.taa_params = params;
     }
 
     fn exposure_ev(&self) -> f32 {
@@ -529,6 +559,8 @@ impl ControlRenderer for StubRenderer {
     fn sa_lua_defs(&self) -> String {
         String::new()
     }
+
+    fn reset_frame_telemetry(&mut self) {}
 }
 
 /// Runs `body` against a fresh `EngineContext` built from the cheaply constructible

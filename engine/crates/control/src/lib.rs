@@ -18,6 +18,7 @@ mod commands_render;
 mod commands_scene;
 mod context;
 mod error;
+mod project_loader;
 mod registry;
 mod selector;
 mod server;
