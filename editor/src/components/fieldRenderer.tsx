@@ -100,7 +100,14 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Material.heightScale": { kind: "number", min: 0, max: 0.5, step: 0.001 },
   "Material.emissive": { kind: "color3" },
   "Material.emissiveStrength": { kind: "number", min: 0, max: 100, step: 0.05 },
-  "Material.alphaClip": { kind: "bool" },
+  "Material.blend": {
+    kind: "enum",
+    options: [
+      { value: "opaque", label: "Opaque" },
+      { value: "masked", label: "Masked" },
+      { value: "translucent", label: "Translucent" },
+    ],
+  },
   "Material.alphaCutoff": { kind: "slider", min: 0, max: 1, step: 0.01 },
   "Material.unlit": { kind: "bool" },
 
