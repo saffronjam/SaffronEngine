@@ -63,7 +63,7 @@ test("an out-of-range slot is rejected", async () => {
 
 test("the MaterialSet slots survive a project save + reload", async () => {
   await engine.call("save-project");
-  await engine.call("reload-project");
+  await engine.reloadProject();
   await engine.settle();
   // Reload replaces the scene with fresh entities; the model was instantiated as an entity named "Mesh".
   const list = await engine.call<{ entities: { id: string; name: string }[] }>("list-entities");
@@ -92,7 +92,7 @@ test("a glTF metallic-roughness texture is imported onto the Material", async ()
 
   // Survives save + reload (serde + catalog round-trip; the entry stays a linear texture).
   await engine.call("save-project");
-  await engine.call("reload-project");
+  await engine.reloadProject();
   await engine.settle();
   const list = await engine.call<{ entities: { id: string }[] }>("list-entities");
   let found = "0";
