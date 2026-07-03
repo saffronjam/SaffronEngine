@@ -237,14 +237,58 @@ export function AssetFolderTree(props: FolderTreeProps) {
     >
       <ScrollArea className="h-full">
         <div className="p-1" role="tree" aria-label="Asset folders">
+          <RootRow tree={tree} />
           {props.creatingIn && props.creatingIn.parent === null ? (
-            <NewFolderRow depth={0} tree={tree} />
+            <NewFolderRow depth={1} tree={tree} />
           ) : null}
           {roots.map((node) => (
-            <FolderRow key={node.path} node={node} depth={0} tree={tree} />
+            <FolderRow key={node.path} node={node} depth={1} tree={tree} />
           ))}
         </div>
       </ScrollArea>
+    </div>
+  );
+}
+
+/// Drop-highlight identity for the pinned Root row (an empty string is never a valid
+/// folder path, so it can't collide with a real node).
+const ROOT_ROW_KEY = "";
+
+/// The pinned Root row at the top of the tree: the common parent of every top-level
+/// folder (which render indented beneath it). Selects the catalog root on click, is a
+/// move-to-root drop target, and offers New Folder — but is virtual, so it cannot be
+/// renamed or deleted.
+function RootRow({ tree }: { tree: TreeContext }) {
+  const selected = tree.currentFolder === null;
+  const row = (
+    <button
+      type="button"
+      role="treeitem"
+      aria-selected={selected}
+      className={rowStateClass(selected, tree.dropTarget === ROOT_ROW_KEY)}
+      style={{ paddingLeft: 4 }}
+      onClick={() => tree.onNavigate(null)}
+      {...dropHandlers(tree, ROOT_ROW_KEY, null)}
+    >
+      <span className="size-4 flex-none" />
+      <Folder className="size-3.5 flex-none opacity-70" />
+      <span className="truncate">Root</span>
+    </button>
+  );
+  return (
+    <div className="relative" onContextMenu={(event) => event.stopPropagation()}>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
+        <ContextMenuContent
+          className="min-w-36"
+          onCloseAutoFocus={(event) => event.preventDefault()}
+        >
+          <ContextMenuItem onSelect={() => tree.onNewFolder(null)}>
+            <FolderPlus />
+            New Folder
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
     </div>
   );
 }
