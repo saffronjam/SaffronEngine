@@ -1,6 +1,6 @@
 # Project loading (non-blocking load + loading screen)
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Make `saffron-host` stay responsive while a thick project loads (control drain + frame publish every
 iteration), gate/discard commands that make no sense mid-load with a typed reply, expose pollable
@@ -44,7 +44,7 @@ the load state as a pollable progress snapshot, and turns the editor picker into
 | Phase | File | Summary | Depends on |
 |-------|------|---------|------------|
 | 1 | `phase-1-project-load-state-machine.md` | `ProjectPhase` on `SceneEditContext` (replaces the `project_loaded` bool), the dispatch-level command gate + allow-list, the typed `Error::Busy` / `code:"busy-loading"` wire error, the envelope `code` field, and the editor drop-on-busy hook. | — |
-| 2 | `phase-2-non-blocking-load.md` | The one-shot `ProjectDocWorker` + persistent `AssetLoadWorker` + host-owned `ProjectLoader` state machine advanced one step per frame; the resolve-or-skip draw path; cancel; and routing bootstrap + open/new/reload through one loader seam. | Phase 1 |
+| 2 | `phase-2-non-blocking-load.md` | The off-thread `ProjectDocWorker` (read/parse/cold catalog scan) + main-thread install + stepped GPU residency, driven by the control-owned `ProjectLoader` state machine one bounded step per frame; cancel; and routing bootstrap + open/new/reload through one loader seam. (As-built: no second GPU worker — see the phase-2 header.) | Phase 1 |
 | 3 | `phase-3-progress-protocol-and-boot-stages.md` | The ordered `BootStage` list, the `ProjectStatusDto` + `project-status` / `cancel-load` control commands, protocol codegen, `sa` CLI formatter, and the docs page. | Phase 2 |
 | 4 | `phase-4-editor-loading-screen.md` | `ProjectStartupModal` → picker + loading-view split, the `useProjectLoadPoll` hook, the `projectLoad` store slice, and its relation to `LoadingOverlay`. | Phases 3, 1 |
 

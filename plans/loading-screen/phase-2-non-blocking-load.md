@@ -1,6 +1,58 @@
 # Phase 2 — Non-blocking staged project load
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
+
+## As-built (the shipped architecture)
+
+The shipped design keeps the goal — the host main loop never stalls during a load — with a
+lower-risk decomposition than the original two-worker proposal below:
+
+- **Off-thread doc worker** (`engine/crates/assets/src/project_load.rs`, `ProjectDocWorker`): runs
+  the heavy, blocking CPU/IO — `read_to_string` + `parse_json` + version-gate (`Manifest`), then the
+  cold catalog disk reconcile (`Catalog`, determinate `done`/`total`) — building a **fresh owned**
+  `AssetCatalog`. The cold scan is factored into `reconcile_catalog_from_disk` /
+  `resolve_catalog_from_disk` (`scan.rs`), free of any `AssetServer` borrow, so both the worker and
+  the sync path call one copy.
+- **Main-thread install** (`engine/crates/control/src/project_loader.rs`, `install_doc`): one bounded
+  step — `wait_gpu_idle` → `clear_asset_caches` → swap scene/catalog → `scene_from_json` (needs the
+  main-thread `ComponentRegistry`, so it stays here) → apply render settings + sidecar. The
+  idle-before-clear UAF discipline lives here now.
+- **Stepped main-thread residency**: instead of a second GPU worker thread + shared `GpuQueue` +
+  unsafe `Send` wrapper, the loader warms up to `RESIDENCY_PER_FRAME` scene-referenced meshes/textures
+  per frame through the existing `with_gpu_uploader` seam (`AssetServer::warm_asset` →
+  `load_mesh_asset`/`load_texture_asset`). Bounded per frame, so the loop drains + publishes between
+  steps; determinate `Assets` `n/m` from the scene reference set (`scene_residency_ids`).
+- **Orchestrator** lives in `saffron-control` (`ProjectLoader`, owned by `ControlContext`), advanced
+  each frame from `HostLayer::on_update` via `ControlContext::advance_project_load` — not on
+  `HostLayer` — because the install reuses the control-side `RendererProjectHost` + scene helpers.
+- **No renderer warmup hooks / no `Skybox`/`Accel` driving**: those `BootStage` variants exist (the
+  Phase-3 DTO mirrors the full enum) but are not driven; the sky panorama warms as part of `Assets`
+  (`scene_residency_ids` includes `Environment.sky_texture`). `Ready` follows residency drain.
+- **Sync methods retained for `saffron-player`**: `AssetServer::load_project` / `create_project` /
+  `create_scratch_project` stay for the standalone exported game (it boots blocking — no control
+  plane to keep responsive). The **host** has exactly one bring-up path (the loader); this is not a
+  duplicate path for the same flow.
+- **Teardown**: the doc worker is pure CPU/IO (no GPU handbacks), so it is safe to abandon on exit —
+  no `LoadWorkerJoined` teardown step was needed (unlike the thumbnail worker).
+- **Render is suppressed while `phase == Loading`** (`HostLayer` sets `RedrawController::set_suppressed`).
+  `on_update` runs every loop iteration regardless of whether a frame renders, so the control socket
+  drains and the loader advances without any continuous-render reason — and *not* rendering across the
+  install means no frame ever draws against a half-swapped scene / cleared caches (which wedged
+  `end_frame` on the llvmpipe software path). The `Loading → Ready` flip requests a redraw, so the
+  loaded scene draws once the load settles. The viewport is parked behind the loading screen the whole
+  time, so nothing visible is lost.
+- **A fresh (New) project installs with `Scene::default()`, not `scene_from_json`** — its off-thread
+  doc carries an empty `{}` scene, which `scene_from_json` rejects as versionless (matching the old
+  `create_project`, which never deserialized). `install_doc` only deserializes a non-empty scene doc.
+
+Validated live: during a `dev`-project load, `get-project` stayed answered (socket responsive) while
+`add-entity` returned `busy-loading` (discarded, not queued), then flipped to `loaded:true` +
+`add-entity` succeeding once residency drained.
+
+The original design write-up follows for reference.
+
+---
+
 
 ## Goal
 

@@ -1,6 +1,6 @@
 # Phase 1 — Project-load state machine + command gate
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of the `plans/loading-screen/` feature (non-blocking project load + loading screen). This is the
 first, self-contained phase: it lands the state machine and the dispatch-level gate that later phases
