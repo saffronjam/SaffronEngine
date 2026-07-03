@@ -30,7 +30,7 @@ use saffron_core::TimeSpan;
 use saffron_protocol::{GetScriptSchemaParams, GetScriptSchemaResult, ScriptFieldDto};
 use saffron_rendering::{GpuQueue, Renderer, Uploader};
 use saffron_scene::{AnimationPlayer, CameraView, Entity, Mesh, Scene};
-use saffron_sceneedit::{PlayState, SceneEditContext, update_scene_edit_camera};
+use saffron_sceneedit::{PlayState, ProjectPhase, SceneEditContext, update_scene_edit_camera};
 use saffron_signal::SubscriptionId;
 use saffron_window::Window;
 
@@ -527,18 +527,23 @@ impl HostLayer {
     /// renderer's upload seam — so a host launched with `SAFFRON_PROJECT` /
     /// `SAFFRON_SCRATCH_PROJECT` / a `project.json` has a loaded scene before the loop starts,
     /// instead of an empty one waiting on the editor.
-    fn bootstrap_project(&mut self, window: &mut Window, renderer: &mut Renderer) {
+    fn bootstrap_project(&mut self) {
+        // Seed the loader inbox from the editor-set environment; the load itself runs non-blocking
+        // across the first frames via `advance_project_load`, so the first frame is never stalled.
+        self.control.bootstrap_project_from_env(&mut self.editor);
+    }
+
+    /// Advances the non-blocking project loader one bounded step against the live renderer, editor,
+    /// and asset borrows (mirrors [`Self::poll_control`]'s borrow assembly). Returns `true` when the
+    /// step did redraw-worthy work.
+    fn advance_project_load(&mut self, renderer: &mut Renderer) -> bool {
         self.ensure_uploader(renderer);
         let Some(uploader) = self.uploader.as_ref() else {
-            return; // No uploader (device create failed): nothing to load into.
+            return false;
         };
         let mut control_renderer = HostControlRenderer::new(renderer, uploader);
-        self.control.bootstrap_project_from_env(
-            window,
-            &mut control_renderer,
-            &mut self.editor,
-            &mut self.assets,
-        );
+        self.control
+            .advance_project_load(&mut control_renderer, &mut self.editor, &mut self.assets)
     }
 
     /// Renders the scene through the active camera and submits the native gizmo overlay: track
@@ -779,10 +784,8 @@ impl Layer for HostLayer {
         // auto-select the first mesh entity so the native-viewport host (no hierarchy panel)
         // starts with something selected. Both need the renderer; the GPU-free test host skips
         // them and drives the session spine alone.
+        self.bootstrap_project();
         if let Some(renderer) = app.frame_host.renderer_mut() {
-            let mut headless = Window::headless();
-            let window = app.window.as_mut().unwrap_or(&mut headless);
-            self.bootstrap_project(window, renderer);
             self.start_thumbnail_worker(renderer);
         }
         self.auto_select_first_mesh();
@@ -809,6 +812,11 @@ impl Layer for HostLayer {
             mutated = self.poll_control(window, renderer);
             // Insert any thumbnails the worker finished this interval into the GPU caches.
             self.assets.drain_thumbnail_completions();
+            // Advance a non-blocking project load one bounded step (doc-worker poll / install /
+            // residency), so a load never stalls the drain + publish loop.
+            if self.advance_project_load(renderer) {
+                mutated = true;
+            }
         }
 
         if self.update_session(dt, current_ppid) == ParentWatch::ParentDied {
@@ -840,7 +848,13 @@ impl Layer for HostLayer {
         app.redraw.set_continuous(!reasons.is_empty());
         app.redraw.set_reasons(reasons.clone());
         app.redraw.set_temporal_active(temporal_active);
-        app.redraw.set_suppressed(suppress);
+        // Suppress rendering while a project load is in flight: the scene + asset caches are being
+        // swapped across frames, so a mid-load render would draw against a torn scene (and, with the
+        // caches cleared, can wedge the GPU). The viewport is parked behind the loading screen
+        // anyway. `on_update` still runs every iteration, so the control socket stays responsive and
+        // the loader advances; the flip to `Ready` requests a redraw, so the loaded scene draws then.
+        let loading = self.editor.project_phase == ProjectPhase::Loading;
+        app.redraw.set_suppressed(suppress || loading);
         if mutated {
             app.redraw.request_redraw();
         }

@@ -577,7 +577,7 @@ fn run_inner(config: AppConfig, mode: HostMode) -> Result<()> {
 /// Passed into [`drive`] so the loop body never reads the environment itself,
 /// which keeps the loop tests free of process-global env mutation (the crate
 /// denies `unsafe`, so `std::env::set_var` is unavailable here). The render *rate*
-/// is no longer an env knob — the reactive loop paces to the renderer's `target_fps`
+/// is paced by the reactive loop to the renderer's `target_fps`
 /// ([`FrameHost::pace_target_fps`]).
 #[derive(Clone, Copy, Default)]
 struct LoopLimits {

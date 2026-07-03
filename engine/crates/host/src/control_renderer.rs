@@ -101,6 +101,14 @@ impl ControlRenderer for HostControlRenderer<'_> {
             tracing::error!("set_render_scale failed: {err}");
         }
     }
+    fn input_extent(&self) -> (u32, u32) {
+        let e = self.renderer.active_view().scaled_render_extent();
+        (e.width, e.height)
+    }
+    fn display_extent(&self) -> (u32, u32) {
+        let e = self.renderer.active_view().published_extent();
+        (e.width, e.height)
+    }
     fn set_render_quality(&mut self, tier: &str) -> bool {
         match saffron_rendering::QualityTier::from_name(tier) {
             Some(tier) => {
@@ -234,6 +242,29 @@ impl ControlRenderer for HostControlRenderer<'_> {
             .map_err(|e| e.to_string())
     }
 
+    fn taa_params(&self) -> saffron_protocol::TaaParamsDto {
+        let p = self.renderer.taa_params();
+        saffron_protocol::TaaParamsDto {
+            feedback_min: p.feedback_min,
+            feedback_max: p.feedback_max,
+            velocity_rejection: p.velocity_rejection,
+            clip_gamma: p.clip_gamma,
+            sharpness: p.sharpness,
+        }
+    }
+    fn set_taa_params(&mut self, params: saffron_protocol::TaaParamsDto) {
+        // The DTO carries the five wire-exposed knobs; the reconstruction-robustness knobs
+        // (lock lifetime, reactive scale, disocclusion / lock-break thresholds) are renderer-side
+        // and preserved across a wire update by overlaying onto the current state.
+        let mut cur = self.renderer.taa_params();
+        cur.feedback_min = params.feedback_min;
+        cur.feedback_max = params.feedback_max;
+        cur.velocity_rejection = params.velocity_rejection;
+        cur.clip_gamma = params.clip_gamma;
+        cur.sharpness = params.sharpness;
+        self.renderer.set_taa_params(cur);
+    }
+
     fn exposure_ev(&self) -> f32 {
         self.renderer.exposure_ev()
     }
@@ -292,6 +323,9 @@ impl ControlRenderer for HostControlRenderer<'_> {
     }
     fn frame_samples(&self, max_samples: u32) -> Vec<FrameSample> {
         self.renderer.frame_samples(max_samples)
+    }
+    fn reset_frame_telemetry(&mut self) {
+        self.renderer.reset_frame_telemetry();
     }
     fn perf_config(&self) -> PerfConfig {
         self.renderer.perf_config()
