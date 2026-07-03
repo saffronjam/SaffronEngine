@@ -114,6 +114,20 @@ fn write_smeta(path: &str, meta: &SmetaData) -> Result<()> {
         .map_err(|e| Error::Io(format!("cannot write '{path}': {e}")))
 }
 
+/// The content hash for a standalone thumbnail-bearing file (mesh/texture), the
+/// content-addressed thumbnail cache key. `0` for kinds keyed differently (materials key on
+/// resolved state, animations have no thumbnail) or an unreadable file. Read once here on a
+/// cold scan — which runs exactly when a file changed — so an in-place edit reflows the key.
+fn standalone_content_hash(asset_type: AssetType, path: &str) -> u64 {
+    if !matches!(asset_type, AssetType::Mesh | AssetType::Texture) {
+        return 0;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => crate::import::hash_bytes_fnv(&bytes),
+        Err(_) => 0,
+    }
+}
+
 /// Whether `name` parses as a pure decimal uuid stem (an engine-written standalone file).
 fn parse_uuid_stem(stem: &str) -> Option<u64> {
     if stem.is_empty() {
@@ -208,15 +222,16 @@ impl AssetServer {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
             if let Some(id) = parse_uuid_stem(stem) {
-                // Engine-written standalone file (uuid name). A known one keeps its row
-                // verbatim (name/folder/duration/colorspace are not recoverable from the
-                // filename) — only its path is refreshed. A genuinely new one infers
-                // type/hdr from the extension.
+                // Engine-written standalone file (uuid name). A known one keeps its row's
+                // name/folder/duration/colorspace (not recoverable from the filename) — its
+                // path and content hash refresh. A genuinely new one infers type/hdr from the
+                // extension.
                 if let Some(prev) = previous.find(Uuid(id)) {
                     let mut row = prev.clone();
                     row.path = rel;
                     row.container = Uuid(0);
                     row.chunk = -1;
+                    row.content_hash = standalone_content_hash(row.asset_type, &path_str);
                     rebuilt.put(row);
                 } else {
                     rebuilt.put(AssetEntry {
@@ -225,6 +240,7 @@ impl AssetServer {
                         asset_type,
                         path: rel,
                         hdr,
+                        content_hash: standalone_content_hash(asset_type, &path_str),
                         ..AssetEntry::default()
                     });
                 }
@@ -282,6 +298,7 @@ impl AssetServer {
                 colorspace: sidecar.colorspace,
                 hdr: sidecar.colorspace == Colorspace::Hdr,
                 linear: sidecar.colorspace == Colorspace::Linear,
+                content_hash: standalone_content_hash(sidecar.asset_type, &path_str),
                 ..AssetEntry::default()
             };
             preserve_name_folder(&previous, &mut row);
@@ -384,7 +401,14 @@ impl AssetServer {
         let relative_path = format!("textures/{}.{extension}", id.value());
         std::fs::write(format!("{}/{relative_path}", self.root.display()), encoded)
             .map_err(|e| Error::Io(format!("cannot write texture '{relative_path}': {e}")))?;
-        self.put_texture_row(id, name, relative_path, false, !srgb);
+        self.put_texture_row(
+            id,
+            name,
+            relative_path,
+            false,
+            !srgb,
+            crate::import::hash_bytes_fnv(encoded),
+        );
         self.texture_by_uuid.insert(id.value(), Some(texture));
         Ok(id)
     }
@@ -410,7 +434,14 @@ impl AssetServer {
         let relative_path = format!("textures/{}.hdr", id.value());
         std::fs::write(format!("{}/{relative_path}", self.root.display()), encoded)
             .map_err(|e| Error::Io(format!("cannot write texture '{relative_path}': {e}")))?;
-        self.put_texture_row(id, name, relative_path, true, false);
+        self.put_texture_row(
+            id,
+            name,
+            relative_path,
+            true,
+            false,
+            crate::import::hash_bytes_fnv(encoded),
+        );
         self.texture_by_uuid.insert(id.value(), Some(texture));
         Ok(id)
     }
@@ -455,7 +486,15 @@ impl AssetServer {
     }
 
     /// Inserts a standalone Texture row with a name uniqued against the live catalog.
-    fn put_texture_row(&mut self, id: Uuid, name: &str, path: String, hdr: bool, linear: bool) {
+    fn put_texture_row(
+        &mut self,
+        id: Uuid,
+        name: &str,
+        path: String,
+        hdr: bool,
+        linear: bool,
+        content_hash: u64,
+    ) {
         let unique = self.catalog.unique_name(name);
         self.catalog.put(AssetEntry {
             id,
@@ -464,6 +503,7 @@ impl AssetServer {
             path,
             hdr,
             linear,
+            content_hash,
             ..AssetEntry::default()
         });
     }

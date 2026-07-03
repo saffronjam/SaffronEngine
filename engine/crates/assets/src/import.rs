@@ -20,7 +20,9 @@ use saffron_geometry::{
     ImportedSkin, MaterialMapRole, MorphData, VertexSkin, save_animation_to_buffer,
     save_mesh_to_buffer, sub_id_for, translate_model, write_container,
 };
-use saffron_json::{Value, dump_json, json_bool_or, json_f32_or, json_string_or, uuid_to_json};
+use saffron_json::{
+    Value, dump_json, dump_json_sorted, json_bool_or, json_f32_or, json_string_or, uuid_to_json,
+};
 use saffron_scene::{AssetEntry, AssetType, Colorspace};
 
 use crate::AssetServer;
@@ -160,6 +162,7 @@ pub fn catalog_rows_for_model(meta: &ContainerMetadata, relative_path: &str) -> 
         asset_type: AssetType::Model,
         path: relative_path.to_owned(),
         rigged,
+        content_hash: model_content_hash(meta),
         ..AssetEntry::default()
     });
     for sub in &meta.sub_assets {
@@ -171,6 +174,7 @@ pub fn catalog_rows_for_model(meta: &ContainerMetadata, relative_path: &str) -> 
             colorspace: colorspace_from_name(&sub.colorspace),
             duration: sub.duration,
             tracks: sub.tracks,
+            content_hash: sub.content_hash,
             ..AssetEntry::default()
         };
         let key = sub.sub_id.value().to_string();
@@ -199,6 +203,23 @@ const FNV_OFFSET: u64 = 1469598103934665603;
 /// The FNV-1a prime (64-bit).
 const FNV_PRIME: u64 = 1099511628211;
 
+/// One FNV-1a step: mix `v` into the running `hash`.
+#[must_use]
+fn fnv_mix(hash: u64, v: u64) -> u64 {
+    (hash ^ v).wrapping_mul(FNV_PRIME)
+}
+
+/// The FNV-1a fold over a byte slice — the content hash of a baked chunk (mesh/texture/
+/// material bytes), used as the content-addressed thumbnail cache key.
+#[must_use]
+pub fn hash_bytes_fnv(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET;
+    for &byte in bytes {
+        hash = fnv_mix(hash, u64::from(byte));
+    }
+    hash
+}
+
 /// The FNV-1a fold over a source file's bytes, as a decimal string. The reimport recipe
 /// stores this — a **content** hash, not the mtime — so a touched-but-unchanged source is
 /// a content-addressed skip. An unreadable path hashes to the empty string.
@@ -207,12 +228,32 @@ pub fn hash_file_fnv(path: &str) -> String {
     let Ok(bytes) = std::fs::read(path) else {
         return String::new();
     };
+    hash_bytes_fnv(&bytes).to_string()
+}
+
+/// The model preview's content hash: a fold of its embedded mesh/material/texture sub-hashes
+/// plus the canonical (sorted) node block, so the whole-forest thumbnail key changes only
+/// when the baked geometry, materials, or layout change. Deterministic across bake and scan
+/// (sub-hashes live in META; nodes fold via [`dump_json_sorted`]). Returns `0` for a legacy
+/// container whose sub-assets carry no per-chunk hash, so the model row self-heals.
+#[must_use]
+fn model_content_hash(meta: &ContainerMetadata) -> u64 {
     let mut hash = FNV_OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
+    let mut folded = 0usize;
+    for sub in &meta.sub_assets {
+        if sub.content_hash != 0 {
+            hash = fnv_mix(hash, sub.sub_id.value());
+            hash = fnv_mix(hash, sub.content_hash);
+            folded += 1;
+        }
     }
-    hash.to_string()
+    if folded == 0 {
+        return 0;
+    }
+    for byte in dump_json_sorted(&meta.nodes, -1).into_bytes() {
+        hash = fnv_mix(hash, u64::from(byte));
+    }
+    hash
 }
 
 /// The import node forest as the META `nodes` block (glTF-shaped; the quaternion in
@@ -445,6 +486,7 @@ impl AssetServer {
                 None
             };
             let mesh_bytes = save_mesh_to_buffer(mesh, stream, node_morph)?;
+            let mesh_hash = hash_bytes_fnv(&mesh_bytes);
             let mesh_chunk = pending.len() as u32;
             pending.push(Pending {
                 kind: ChunkKind::Mesh,
@@ -457,6 +499,7 @@ impl AssetServer {
                 asset_type: AssetType::Mesh,
                 name: format!("{model_key}_{}", node.name),
                 chunk: mesh_chunk,
+                content_hash: mesh_hash,
                 ..SubAsset::default()
             });
             node_mesh_ids[i] = mesh_sub_id.value();
@@ -495,6 +538,7 @@ impl AssetServer {
                     name: format!("{material_name}_{role_name}"),
                     chunk: index,
                     colorspace: colorspace_name(space).to_owned(),
+                    content_hash: hash_bytes_fnv(bytes),
                     ..SubAsset::default()
                 });
                 tex_id
@@ -541,6 +585,7 @@ impl AssetServer {
 
             let material_id = sub_id_for(&model_key, "material", &material_name, m as u32);
             let material_bytes = material_chunk_json(src, &tex_ids);
+            let material_hash = hash_bytes_fnv(&material_bytes);
             let material_chunk_index = pending.len() as u32;
             pending.push(Pending {
                 kind: ChunkKind::Material,
@@ -553,6 +598,7 @@ impl AssetServer {
                 asset_type: AssetType::Material,
                 name: material_name,
                 chunk: material_chunk_index,
+                content_hash: material_hash,
                 ..SubAsset::default()
             });
 

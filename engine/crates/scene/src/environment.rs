@@ -218,6 +218,10 @@ pub struct AssetEntry {
     pub colorspace: Colorspace,
     /// Source/license, set when the asset was imported from an online store.
     pub attribution: Option<Attribution>,
+    /// FNV-1a hash of the asset's baked content, the content-addressed thumbnail cache
+    /// key; `0` when unknown (materials key on resolved state instead, and legacy rows
+    /// backfill lazily).
+    pub content_hash: u64,
 }
 
 impl Default for AssetEntry {
@@ -237,6 +241,7 @@ impl Default for AssetEntry {
             chunk: -1,
             colorspace: Colorspace::Auto,
             attribution: None,
+            content_hash: 0,
         }
     }
 }
@@ -282,6 +287,19 @@ impl AssetCatalog {
         match self.by_id.get(&id.value()) {
             Some(&i) => {
                 self.entries[i].attribution = Some(attribution);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records the content hash on the entry for `id`, returning whether it existed.
+    /// Backfilled when a thumbnail lookup self-heals a legacy row that predates the
+    /// content-addressed cache.
+    pub fn set_content_hash(&mut self, id: Uuid, content_hash: u64) -> bool {
+        match self.by_id.get(&id.value()) {
+            Some(&i) => {
+                self.entries[i].content_hash = content_hash;
                 true
             }
             None => false,
@@ -380,6 +398,7 @@ mod tests {
         assert_eq!(e.container, Uuid(0));
         assert_eq!(e.chunk, -1);
         assert_eq!(e.colorspace, Colorspace::Auto);
+        assert_eq!(e.content_hash, 0);
     }
 
     fn named_entry(id: u64, name: &str) -> AssetEntry {

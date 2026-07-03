@@ -60,6 +60,9 @@ pub fn catalog_to_json(catalog: &AssetCatalog) -> Value {
         if let Some(attribution) = &entry.attribution {
             record.insert("attribution".to_owned(), attribution_to_json(attribution));
         }
+        if entry.content_hash != 0 {
+            record.insert("contentHash".to_owned(), Value::from(entry.content_hash));
+        }
         assets.push(Value::Object(record));
     }
     Value::Array(assets)
@@ -103,6 +106,7 @@ pub fn catalog_from_json(catalog: &mut AssetCatalog, assets: &Value) {
                 "auto".to_owned(),
             )),
             attribution: record.get("attribution").and_then(attribution_from_json),
+            content_hash: json_u64_or(record, "contentHash", 0),
         };
         if parsed.id.value() != 0 {
             catalog.put(parsed);

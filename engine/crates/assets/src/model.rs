@@ -82,6 +82,9 @@ pub struct SubAsset {
     pub duration: f32,
     /// Animation: animated joint-channel count.
     pub tracks: i32,
+    /// FNV-1a hash of this sub-asset's baked chunk bytes, the content-addressed thumbnail
+    /// cache key; `0` for kinds that carry no thumbnail (animation).
+    pub content_hash: u64,
 }
 
 impl Default for SubAsset {
@@ -94,6 +97,7 @@ impl Default for SubAsset {
             colorspace: String::new(),
             duration: 0.0,
             tracks: 0,
+            content_hash: 0,
         }
     }
 }
@@ -184,6 +188,9 @@ pub fn encode_container_metadata(meta: &ContainerMetadata) -> Vec<u8> {
         if sub.asset_type == AssetType::Animation {
             record.insert("duration".to_owned(), Value::from(sub.duration));
             record.insert("tracks".to_owned(), Value::from(sub.tracks));
+        }
+        if sub.content_hash != 0 {
+            record.insert("contentHash".to_owned(), Value::from(sub.content_hash));
         }
         subs.push(Value::Object(record));
     }
@@ -315,6 +322,7 @@ fn metadata_from_doc(doc: &Value) -> ContainerMetadata {
                 colorspace: json_string_or(record, "colorspace", String::new()),
                 duration: json_f32_or(record, "duration", 0.0),
                 tracks: json_u64_or(record, "tracks", 0) as i32,
+                content_hash: json_u64_or(record, "contentHash", 0),
             });
         }
     }
@@ -355,14 +363,22 @@ impl ByteSource {
     /// Reads the source's bytes: the whole file when `length == 0`, else the
     /// `[offset, offset + length)` slice.
     ///
+    /// Seeks to the slice and reads exactly its bytes rather than reading the whole file —
+    /// a `.smodel` chunk read must not pull a 50 MB container into memory to hand back one
+    /// mesh (the thumbnail preview reads many chunks of one container).
+    ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the file cannot be opened, or the requested slice exceeds the
+    /// [`Error::Io`] if the file cannot be opened/read, or the requested slice exceeds the
     /// file's size.
     pub fn read(&self) -> Result<Vec<u8>> {
-        let bytes = fs::read(&self.path)
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(&self.path)
             .map_err(|e| Error::Io(format!("cannot open '{}': {e}", self.path)))?;
-        let file_size = bytes.len() as u64;
+        let file_size = file
+            .metadata()
+            .map_err(|e| Error::Io(format!("cannot stat '{}': {e}", self.path)))?
+            .len();
         let (begin, count) = if self.length == 0 {
             (0u64, file_size)
         } else {
@@ -375,9 +391,14 @@ impl ByteSource {
                 self.path
             )));
         }
-        let start = begin as usize;
-        let end = start + count as usize;
-        Ok(bytes[start..end].to_vec())
+        if begin != 0 {
+            file.seek(SeekFrom::Start(begin))
+                .map_err(|e| Error::Io(format!("cannot seek '{}': {e}", self.path)))?;
+        }
+        let mut buf = vec![0u8; count as usize];
+        file.read_exact(&mut buf)
+            .map_err(|e| Error::Io(format!("cannot read '{}': {e}", self.path)))?;
+        Ok(buf)
     }
 
     /// Whether this source resolves to nothing (an empty path).
@@ -561,6 +582,7 @@ mod tests {
                     asset_type: AssetType::Mesh,
                     name: "town_mesh".to_owned(),
                     chunk: 1,
+                    content_hash: 0x1111_2222_3333_4444,
                     ..SubAsset::default()
                 },
                 SubAsset {
@@ -569,6 +591,7 @@ mod tests {
                     name: "town_albedo".to_owned(),
                     chunk: 2,
                     colorspace: "srgb".to_owned(),
+                    content_hash: 0x5555_6666_7777_8888,
                     ..SubAsset::default()
                 },
                 SubAsset {
@@ -576,6 +599,7 @@ mod tests {
                     asset_type: AssetType::Material,
                     name: "stone".to_owned(),
                     chunk: 3,
+                    content_hash: 0x9999_aaaa_bbbb_cccc,
                     ..SubAsset::default()
                 },
                 SubAsset {
