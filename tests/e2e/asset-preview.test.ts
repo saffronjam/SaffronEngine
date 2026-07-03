@@ -36,14 +36,12 @@ let legModel = "";
 let projectPath = "";
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   const ref = await engine.call<{ id: string }>("import-model", { path: LEG });
   legModel = ref.id;
   await engine.settle();
-  const proj = await engine.call<{ path: string }>("get-project");
-  // The auto-empty project path is relative to the engine cwd (REPO, set by the harness); the test
-  // process runs in tests/e2e, so resolve it against REPO before reading the file.
-  projectPath = join(REPO, proj.path);
+  // get-project reports an absolute project.json path under the harness's per-boot appdata temp dir.
+  projectPath = (await engine.call<{ path: string }>("get-project")).path;
 });
 afterAll(async () => {
   await engine?.shutdown();
@@ -276,7 +274,7 @@ test("set-viewport-size targets independent per-view offscreen sizes", async () 
   // engine creates + unlinks its own segments, so no reader is needed.
   const stamp = `${process.pid}-${Date.now()}`;
   const shm = await Engine.boot({
-    SAFFRON_AUTO_EMPTY_PROJECT: "1",
+    SAFFRON_SCRATCH_PROJECT: "1",
     SAFFRON_VIEWPORT_SHM_SCENE: `/saffron-e2e-scene-${stamp}`,
     SAFFRON_VIEWPORT_SHM_ASSET: `/saffron-e2e-asset-${stamp}`,
   });

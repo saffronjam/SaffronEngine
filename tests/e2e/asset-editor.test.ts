@@ -26,14 +26,12 @@ let stripModel = "";
 let projectPath = "";
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   legModel = (await engine.call<{ id: string }>("import-model", { path: LEG })).id;
   stripModel = (await engine.call<{ id: string }>("import-model", { path: STRIP })).id;
   await engine.settle();
-  // get-project reports project.json relative to the engine CWD (REPO via the harness); the auto-empty
-  // project lives at appdata/userdata/auto-empty-<suffix>/project.json there. Resolve against REPO so the
-  // test process (cwd tests/e2e) reads the file the engine actually wrote.
-  projectPath = join(REPO, (await engine.call<{ path: string }>("get-project")).path);
+  // get-project reports an absolute project.json path under the harness's per-boot appdata temp dir.
+  projectPath = (await engine.call<{ path: string }>("get-project")).path;
 });
 afterAll(async () => {
   await engine?.shutdown();

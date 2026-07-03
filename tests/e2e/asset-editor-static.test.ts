@@ -5,7 +5,7 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
 
 let engine: Engine;
@@ -35,13 +35,11 @@ let staticModel = "";
 let projectPath = "";
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   staticModel = (await engine.call<{ id: string }>("import-model", { path: STATIC })).id;
   await engine.settle();
-  // The auto-empty project's project.json path is reported relative to the engine CWD (REPO,
-  // set by the harness), e.g. appdata/userdata/auto-empty-<suffix>/project.json. readFileSync
-  // resolves against this test's cwd, so anchor it to REPO to read where the engine wrote it.
-  projectPath = resolve(REPO, (await engine.call<{ path: string }>("get-project")).path);
+  // get-project reports an absolute project.json path under the harness's per-boot appdata temp dir.
+  projectPath = (await engine.call<{ path: string }>("get-project")).path;
 });
 afterAll(async () => {
   await engine?.shutdown();
