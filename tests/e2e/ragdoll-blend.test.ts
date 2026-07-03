@@ -30,7 +30,7 @@ const worldY = async (entity: string): Promise<number> =>
   (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation.y;
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   meshId = (await engine.importEntity(LEG)).id;
   rigId = await engine.rig(meshId); // the rig descendant carries SkinnedMesh + BonePhysics
   const info = await engine.call<Inspect>("inspect", { entity: rigId });

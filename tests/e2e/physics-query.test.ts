@@ -34,7 +34,7 @@ async function collider(name: string, y: number, half: Vec3): Promise<string> {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   floor = await collider("Floor", 0, { x: 10, y: 0.1, z: 10 }); // static, top at y=0.1
   box = await collider("Box", 1, { x: 0.5, y: 0.5, z: 0.5 }); // static, spans x[-0.5,0.5] y[0.5,1.5]
 

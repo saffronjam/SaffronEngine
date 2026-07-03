@@ -32,7 +32,7 @@ async function spawn(name: string): Promise<string> {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterEach(async () => {
   await engine.call("stop").catch(() => {});
