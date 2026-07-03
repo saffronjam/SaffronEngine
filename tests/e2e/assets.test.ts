@@ -1,7 +1,7 @@
 // Asset control-plane behaviour:
 //   - probe-asset reports on-disk metadata (size, vertex/triangle counts, mtime);
 //   - assign-asset with the "0" none sentinel clears a slot instead of erroring.
-// Boots with SAFFRON_AUTO_EMPTY_PROJECT so the cube preset (which imports a model and
+// Boots with SAFFRON_SCRATCH_PROJECT so the cube preset (which imports a model and
 // so needs a loaded project) populates the asset catalog.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
@@ -10,7 +10,7 @@ import type { AssetList, AssetMetadataDto, EntityRef, InspectResult } from "@saf
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();

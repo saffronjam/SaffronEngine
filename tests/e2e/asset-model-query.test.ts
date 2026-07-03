@@ -43,7 +43,7 @@ let clipSub = "";
 let clipName = "";
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   const ref = await engine.call<{ id: string }>("import-model", { path: LEG });
   legModel = ref.id;
   await engine.settle();

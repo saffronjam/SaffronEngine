@@ -15,7 +15,7 @@ const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
 
 beforeAll(async () => {
   rmSync(projectDir, { recursive: true, force: true });
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("save-project", { path: `${projectDir}/project.json` });
   await engine.call("load-project", { path: `${projectDir}/project.json` });
   await engine.call("import-model", { path: FIXTURE });
