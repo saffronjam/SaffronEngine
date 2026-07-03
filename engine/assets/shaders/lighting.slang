@@ -218,12 +218,12 @@ float prefilterLod(float roughness)
 // Reduced-resolution, temporally-accumulated DFAO sky-visibility (r = [0,1] factor, 1 = open),
 // produced by the dfao → dfao-blur → dfao-accum prepass. Sampled to occlude the analytic sky
 // irradiance when sdfOcclusion.y != 0 (the diffuse half of the DFAO term; the per-fragment
-// 9-cone GDF march it replaces used to cost ~16 ms at full res).
+// 9-cone GDF march it replaces).
 [[vk::binding(5, 4)]] Sampler2D dfaoMap;
 // Reduced-resolution, temporally-accumulated specular reflection-occlusion (r = [0,1] factor,
 // 1 = open), produced by the specocc → specocc-blur → specocc-accum prepass. Sampled to occlude
 // the reflected skybox when sdfOcclusion.y != 0 (the specular half of the SDF occlusion term; the
-// per-fragment reflection cone-march it replaces used to cost several ms at full res).
+// per-fragment reflection cone-march it replaces).
 [[vk::binding(6, 4)]] Sampler2D speoccMap;
 // The half-res screen-space indirect-diffuse resolve (DDGI cage + IBL diffuse × sky-visibility),
 // computed once per half-res pixel by the gi-resolve pass; sampled here (bilinear upsample) instead
