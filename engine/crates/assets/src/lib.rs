@@ -36,6 +36,7 @@ mod material;
 mod model;
 mod names;
 mod project;
+mod project_load;
 mod render_material;
 mod render_scene;
 mod scan;
@@ -75,8 +76,9 @@ pub use project::{
     LUARC_JSON, NewProject, PROJECT_VERSION, ProjectHost, ProjectInfo, ProjectSidecar,
     STARTER_SCRIPT, app_data_root, create_project_script, default_display_name,
     ensure_script_library, ensure_script_src, project_info_from_path, project_json_path,
-    project_userdata_root, valid_project_name,
+    project_userdata_root, scratch_project_name, valid_project_name,
 };
+pub use project_load::{DocProgress, DocStage, LoadInput, LoadedDoc, ProjectDocWorker};
 pub use render_material::{ResolvedMaterials, build_submesh_material};
 pub use render_scene::{
     RendererScene, SceneRenderer, SceneSurfaceHit, model_render_aabb, pick_entity,
