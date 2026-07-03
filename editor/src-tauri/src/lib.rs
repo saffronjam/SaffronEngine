@@ -10,7 +10,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, RunEvent, State};
+use tauri::{
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, RunEvent, State,
+};
 
 mod connectors;
 mod wayland_viewport;
@@ -260,7 +262,17 @@ fn configure_main_window(window: &tauri::WebviewWindow) {
         MAIN_WINDOW_MIN_WIDTH,
         MAIN_WINDOW_MIN_HEIGHT,
     )));
-    let _ = window.set_size(LogicalSize::new(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT));
+    if let Ok(Some(monitor)) = window
+        .current_monitor()
+        .or_else(|_| window.primary_monitor())
+    {
+        let position = monitor.position();
+        let size = monitor.size();
+        let _ = window.set_position(PhysicalPosition::new(position.x, position.y));
+        let _ = window.set_size(PhysicalSize::new(size.width, size.height));
+    } else {
+        let _ = window.set_size(LogicalSize::new(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT));
+    }
 }
 
 // Serializes every control-plane socket round-trip. The engine drains control once per frame, so
@@ -270,13 +282,40 @@ fn configure_main_window(window: &tauri::WebviewWindow) {
 // connect+write+read keeps exactly one round-trip outstanding, regardless of caller.
 static CONTROL_IO: Mutex<()> = Mutex::new(());
 
+// A control-plane failure surfaced to the webview: the engine's human message plus the
+// machine-readable `code` from the reply envelope (present on every `ok:false`). Serialized to a
+// `{ message, code }` object so the typed client can match on `code` — e.g. drop a `busy-loading`
+// reply on a background poll lane instead of toasting it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ControlError {
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+impl From<String> for ControlError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: None,
+        }
+    }
+}
+
+impl From<ControlError> for String {
+    fn from(err: ControlError) -> Self {
+        err.message
+    }
+}
+
 // The one socket round-trip helper the whole bridge is built on. Newline-delimited JSON;
-// surfaces the engine's `ok:false` error string as a typed Err (→ a rejected JS promise).
+// surfaces the engine's `ok:false` reply as a typed Err (message + envelope `code`) → a rejected
+// JS promise.
 fn control_request_with_params(
     socket_path: &str,
     command: &str,
     params: Value,
-) -> Result<Value, String> {
+) -> Result<Value, ControlError> {
     // The guarded data is () (it carries no invariant), so recover a poisoned lock rather than fail.
     let _guard = CONTROL_IO
         .lock()
@@ -308,14 +347,20 @@ fn control_request_with_params(
     if value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Ok(value.get("result").cloned().unwrap_or_default());
     }
-    Err(value
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("control command failed")
-        .to_string())
+    Err(ControlError {
+        message: value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("control command failed")
+            .to_string(),
+        code: value
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    })
 }
 
-fn control_request(socket_path: &str, command: &str) -> Result<Value, String> {
+fn control_request(socket_path: &str, command: &str) -> Result<Value, ControlError> {
     control_request_with_params(socket_path, command, json!({}))
 }
 
@@ -385,7 +430,7 @@ async fn control(
     state: State<'_, EditorState>,
     cmd: String,
     params: Option<Value>,
-) -> Result<Value, String> {
+) -> Result<Value, ControlError> {
     control_request_with_params(
         &state.socket_path,
         &cmd,
