@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 use ash::vk;
+use saffron_core::BlendMode;
 use saffron_geometry::glam::{Mat4, UVec4, Vec4};
 
 use crate::descriptors::Descriptors;
@@ -31,7 +32,7 @@ use crate::draw_list::{
     SkinDispatch, SubmeshMaterial,
 };
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
-use crate::gpu_types::{InstanceData, MaterialParamsData};
+use crate::gpu_types::{InstanceData, Material, MaterialParamsData};
 use crate::pipelines::Pipelines;
 use crate::resources::{Buffer, DeviceResources, GpuMesh};
 use crate::skinning::{SkinBucket, SkinBufferSet, Skinning, clamp_to_set_budget};
@@ -206,35 +207,41 @@ impl Instancing {
             if item.skinned && item.mesh.skin_buffer().is_none() {
                 continue;
             }
-            // Skinned meshes draw the deformed buffer as a static stream, so they resolve
-            // to the non-skinned PSO; the deform happens in the compute pre-pass.
-            let Some(pipeline) = pipelines.request_mesh_pipeline(&item.material, false, wireframe)
-            else {
-                continue;
-            };
 
             // A morph item carries per-target weights and a mesh with morph buffers; it
             // deforms into its own slice (before skin), so it never merges either.
             let is_morph = !item.morph_weights.is_empty() && item.mesh.morph().is_some();
 
-            // Find an existing (pipeline, mesh) bucket; a deforming item (skinned or morph)
-            // never merges (each deforms once into its own deformed-buffer slice).
-            let bucket_index = if item.skinned || is_morph {
+            // The per-submesh blend pattern (drives the per-submesh PSO + routing at emit). A
+            // bucket with any translucent submesh is drawn sorted back-to-front, so it never
+            // merges — each keeps its own lone-instance depth key.
+            let blend_modes = submesh_blend_modes(item);
+            let has_blend = blend_modes.contains(&BlendMode::Blend);
+
+            // Find an existing (mesh, base material, blend pattern) bucket; a deforming item
+            // (skinned or morph) or a blend-carrying item never merges (each keeps its own slice /
+            // depth order). PSO is resolved per submesh at emit, so the merge key is the base
+            // material (shader + unlit) plus the whole blend pattern, not a single pipeline.
+            let bucket_index = if item.skinned || is_morph || has_blend {
                 None
             } else {
                 buckets.iter().position(|b| {
                     !b.skinned
                         && b.morph_weights.is_empty()
-                        && Arc::ptr_eq(&b.pipeline, &pipeline)
+                        && !b.blend_modes.contains(&BlendMode::Blend)
                         && Arc::ptr_eq(&b.mesh, &item.mesh)
+                        && b.material.shader == item.material.shader
+                        && b.material.unlit == item.material.unlit
+                        && b.blend_modes == blend_modes
                 })
             };
             let bucket_index = match bucket_index {
                 Some(index) => index,
                 None => {
                     buckets.push(Bucket {
-                        pipeline,
                         mesh: Arc::clone(&item.mesh),
+                        material: item.material.clone(),
+                        blend_modes,
                         skinned: item.skinned,
                         joint_offset: item.joint_offset,
                         joint_count: item.joint_count,
@@ -279,6 +286,9 @@ impl Instancing {
         // cursor concatenates each skinned instance's full vertex array.
         let mut instances: Vec<InstanceData> = Vec::new();
         let mut batches: Vec<DrawBatch> = Vec::new();
+        // Translucent batches paired with their back-to-front depth key (clip-space `w`, larger
+        // = farther); sorted farthest-first after the loop into `list.transparent_batches`.
+        let mut transparent: Vec<(f32, DrawBatch)> = Vec::new();
         let mut skin_buckets: Vec<SkinBucket> = Vec::new();
         let mut skinned_rt: Vec<DeformedRtInstance> = Vec::new();
         // The morph deform work: one cur + one prev dispatch + mesh per morph-active bucket,
@@ -313,17 +323,10 @@ impl Instancing {
             let has_morph = !morph_active.is_empty();
             let deformed = bucket.skinned || has_morph;
 
-            let mut batch = DrawBatch {
-                pipeline: Arc::clone(&bucket.pipeline),
-                mesh: Arc::clone(&bucket.mesh),
-                base_instance: instances.len() as u32,
-                instance_count: bucket.instances.len() as u32,
-                deformed,
-                deformed_vertex_offset: 0,
-                submesh_cull: bucket.submesh_cull.clone(),
-            };
+            let base_instance = instances.len() as u32;
+            let instance_count = bucket.instances.len() as u32;
+            let deformed_vertex_offset = if deformed { deformed_cursor } else { 0 };
             if deformed {
-                batch.deformed_vertex_offset = deformed_cursor;
                 let vertex_count = bucket.mesh.vertex_count;
                 if bucket.skinned {
                     skin_buckets.push(SkinBucket {
@@ -409,12 +412,74 @@ impl Instancing {
                     instances.push(rows[s]);
                 }
             }
-            batches.push(batch);
+
+            // Resolve each submesh's PSO from the base material + its blend mode, then group
+            // submeshes sharing a PSO into one batch. Opaque and (at 1×) masked collapse to the
+            // same PSO; under MSAA masked is the distinct alpha-to-coverage PSO; translucent is
+            // the blend PSO. Every group draws from the one shared submesh-major instance block.
+            let no_submesh = bucket.mesh.submeshes.is_empty();
+            let last_mode = bucket.blend_modes.len().saturating_sub(1);
+            let mut groups: Vec<(Arc<crate::Pipeline>, bool, Vec<u32>)> = Vec::new();
+            for s in 0..submesh_count as usize {
+                let mode = bucket
+                    .blend_modes
+                    .get(s.min(last_mode))
+                    .copied()
+                    .unwrap_or_default();
+                let material = Material {
+                    shader: bucket.material.shader.clone(),
+                    unlit: bucket.material.unlit,
+                    blend: mode == BlendMode::Blend,
+                    masked: mode == BlendMode::Masked,
+                };
+                let Some(pipeline) = pipelines.request_mesh_pipeline(&material, false, wireframe)
+                else {
+                    continue;
+                };
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|(p, _, _)| Arc::ptr_eq(p, &pipeline))
+                {
+                    group.2.push(s as u32);
+                } else {
+                    groups.push((pipeline, mode == BlendMode::Blend, vec![s as u32]));
+                }
+            }
+            for (pipeline, is_blend, submesh_indices) in groups {
+                let batch = DrawBatch {
+                    pipeline,
+                    mesh: Arc::clone(&bucket.mesh),
+                    base_instance,
+                    instance_count,
+                    deformed,
+                    deformed_vertex_offset,
+                    submesh_cull: bucket.submesh_cull.clone(),
+                    submeshes: if no_submesh {
+                        Vec::new()
+                    } else {
+                        submesh_indices
+                    },
+                };
+                if is_blend {
+                    // Depth key: the object's world-space origin projected to clip `w`. For a
+                    // perspective view `w = -view_z`, so a larger `w` is farther from the camera.
+                    let clip_w = (view_proj * bucket.model.w_axis).w;
+                    transparent.push((clip_w, batch));
+                } else {
+                    batches.push(batch);
+                }
+            }
         }
 
         if instances.is_empty() {
             return Ok((list, RenderStats::default()));
         }
+
+        // Back-to-front: farthest (largest clip `w`) first, so nearer translucent surfaces
+        // blend over the ones behind them.
+        transparent.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let transparent_batches: Vec<DrawBatch> =
+            transparent.into_iter().map(|(_, batch)| batch).collect();
 
         // Upload the instance SSBO, growing/rebinding it on demand.
         self.ensure_instance_capacity(descriptors, frame, instances.len() as u32)?;
@@ -517,9 +582,14 @@ impl Instancing {
                 .extend(morph_rt.into_iter().filter(|s| s.entity != 0));
         }
 
-        let stats = compute_stats(&batches, pipelines.pipelines_created() - pipelines_before);
+        let stats = compute_stats(
+            &batches,
+            &transparent_batches,
+            pipelines.pipelines_created() - pipelines_before,
+        );
 
         list.batches = batches;
+        list.transparent_batches = transparent_batches;
         list.live_textures = live_textures;
         list.valid = true;
         Ok((list, stats))
@@ -724,12 +794,20 @@ fn build_active_targets(
     (active, scatter_base)
 }
 
-/// One (pipeline, mesh) bucket accumulating instance rows before the submesh-major
-/// flatten. Each instance contributes one [`InstanceData`] row per mesh submesh. A
-/// skinned bucket never merges and carries the palette slice + entity for the dispatch.
+/// One (mesh, base material, blend pattern) bucket accumulating instance rows before the
+/// submesh-major flatten. Each instance contributes one [`InstanceData`] row per mesh submesh.
+/// The PSO is resolved per submesh at emit time (from the base material + the submesh's blend
+/// mode), so one mesh's submeshes split into opaque/masked/blend batches. A skinned, morph, or
+/// blend-carrying bucket never merges and carries the palette slice + entity for the dispatch.
 struct Bucket {
-    pipeline: Arc<crate::Pipeline>,
     mesh: Arc<crate::GpuMesh>,
+    /// The item's base PSO identity: shader + unlit. `blend`/`masked` are ignored here — the
+    /// per-submesh blend mode drives them at emit time.
+    material: Material,
+    /// Per-geometry-submesh blend mode (clamped to the submesh count), driving the per-submesh
+    /// PSO + opaque/translucent routing at emit. Part of the merge key: instances merge only when
+    /// their whole blend pattern matches, so the submesh split aligns across the bucket.
+    blend_modes: Vec<BlendMode>,
     skinned: bool,
     /// Skinned only: the base of this instance's joints in the palette.
     joint_offset: u32,
@@ -740,12 +818,29 @@ struct Bucket {
     /// Per-target morph weights (empty = not a morph bucket); a morph bucket never merges.
     morph_weights: Vec<f32>,
     /// The instance's world matrix (used as the RT `world_transform` for an unskinned-morph
-    /// instance, whose deformed vertices are mesh-local; skinned instances place identity).
+    /// instance, whose deformed vertices are mesh-local; skinned instances place identity). Also
+    /// the translucent depth key origin (a blend-carrying bucket never merges, so it is one item).
     model: Mat4,
     /// Per-geometry-submesh backface-cull mode, from the bucket's first item's submesh materials
     /// (a bucket is one mesh, so its submesh two-sidedness is shared). Copied onto every batch.
     submesh_cull: Vec<vk::CullModeFlags>,
     instances: Vec<Vec<InstanceData>>,
+}
+
+/// Per-geometry-submesh blend mode from the item's submesh materials (clamped to the last material
+/// like the instance-row build), driving the per-submesh PSO + opaque/translucent routing. Length
+/// matches the geometry submesh count (>= 1 for the no-submesh single-draw path).
+fn submesh_blend_modes(item: &DrawItem) -> Vec<BlendMode> {
+    let count = item.mesh.submeshes.len().max(1);
+    let last = item.submesh_materials.len().saturating_sub(1);
+    (0..count)
+        .map(|s| {
+            item.submesh_materials
+                .get(s.min(last))
+                .map(|m| m.blend_mode)
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Per-geometry-submesh backface-cull mode from the item's submesh materials (clamped to the last
@@ -846,7 +941,7 @@ fn resolve_material(
     if pin(&material.height_texture, &mut height_index) {
         features |= FEATURE_HEIGHT;
     }
-    if material.alpha_clip {
+    if material.blend_mode == BlendMode::Masked {
         features |= FEATURE_ALPHACLIP;
     }
 
@@ -940,22 +1035,34 @@ fn make_mapped_storage_buffer(
 
 /// Tallies the per-frame draw counters from the batch list — one `drawIndexed` per
 /// submesh per batch, the instance + triangle totals.
-fn compute_stats(batches: &[DrawBatch], pipelines_created: u32) -> RenderStats {
+fn compute_stats(
+    batches: &[DrawBatch],
+    transparent: &[DrawBatch],
+    pipelines_created: u32,
+) -> RenderStats {
     let mut stats = RenderStats {
-        batches: batches.len() as u32,
+        batches: (batches.len() + transparent.len()) as u32,
         pipelines_created,
         ..RenderStats::default()
     };
-    for batch in batches {
-        let submeshes = batch.mesh.submeshes.len().max(1) as u32;
-        stats.draw_calls += submeshes;
+    for batch in batches.iter().chain(transparent) {
+        // A batch draws only its submesh subset (one mesh's submeshes split across batches by
+        // blend mode), so the draw-call + triangle tallies key off that subset, not the whole mesh.
+        if batch.mesh.submeshes.is_empty() {
+            stats.draw_calls += 1;
+            stats.instances += batch.instance_count;
+            stats.triangles += (batch.mesh.index_count / 3) * batch.instance_count;
+            continue;
+        }
+        stats.draw_calls += batch.submeshes.len() as u32;
         stats.instances += batch.instance_count;
-        let mesh_indices: u32 = if batch.mesh.submeshes.is_empty() {
-            batch.mesh.index_count
-        } else {
-            batch.mesh.submeshes.iter().map(|s| s.index_count).sum()
-        };
-        stats.triangles += (mesh_indices / 3) * batch.instance_count;
+        let indices: u32 = batch
+            .submeshes
+            .iter()
+            .filter_map(|&s| batch.mesh.submeshes.get(s as usize))
+            .map(|s| s.index_count)
+            .sum();
+        stats.triangles += (indices / 3) * batch.instance_count;
     }
     stats
 }
@@ -1038,6 +1145,101 @@ mod tests {
                 material_slot: 0,
             }],
         }
+    }
+
+    /// A two-submesh quad (two triangles, one submesh each), for the per-submesh blend split.
+    fn two_submesh_quad() -> Mesh {
+        let v = |x: f32, y: f32| Vertex {
+            position: Vec3::new(x, y, 0.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            uv0: Vec2::ZERO,
+        };
+        Mesh {
+            vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0)],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![
+                Submesh {
+                    first_index: 0,
+                    index_count: 3,
+                    vertex_offset: 0,
+                    material_slot: 0,
+                },
+                Submesh {
+                    first_index: 3,
+                    index_count: 3,
+                    vertex_offset: 0,
+                    material_slot: 1,
+                },
+            ],
+        }
+    }
+
+    /// One mesh whose two submeshes are opaque + translucent splits into an opaque batch (submesh
+    /// 0) and a sorted-transparent batch (submesh 1), both keyed off the same shared instance
+    /// block — the per-submesh blend routing that makes a mixed-material model's `BLEND` panels
+    /// actually blend instead of taking slot 0's mode for the whole mesh.
+    #[test]
+    fn submit_draw_list_splits_submeshes_by_blend_mode() {
+        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
+            fixture_or_skip()
+        else {
+            return;
+        };
+        let mesh = uploader
+            .upload_mesh(&descriptors, &two_submesh_quad(), &[], None, None)
+            .expect("upload quad");
+        let opaque = SubmeshMaterial {
+            blend_mode: BlendMode::Opaque,
+            ..SubmeshMaterial::defaults()
+        };
+        let blend = SubmeshMaterial {
+            blend_mode: BlendMode::Blend,
+            ..SubmeshMaterial::defaults()
+        };
+        let item = DrawItem::new(Arc::clone(&mesh), Mat4::IDENTITY, vec![opaque, blend]);
+
+        let (list, stats) = instancing
+            .submit_draw_list(
+                &descriptors,
+                &mut pipelines,
+                &mut skinning,
+                &[item],
+                &[],
+                inputs(0),
+            )
+            .expect("submit_draw_list");
+
+        assert!(list.valid);
+        // Submesh 0 (opaque) draws in the opaque list; submesh 1 (translucent) in the sorted
+        // transparent list — one batch each, from the one mesh.
+        assert_eq!(
+            list.batches.len(),
+            1,
+            "the opaque submesh is one opaque batch"
+        );
+        assert_eq!(list.batches[0].submeshes, vec![0]);
+        assert_eq!(
+            list.transparent_batches.len(),
+            1,
+            "the translucent submesh is one transparent batch"
+        );
+        assert_eq!(list.transparent_batches[0].submeshes, vec![1]);
+        // Both batches share the one submesh-major instance block.
+        assert_eq!(list.batches[0].base_instance, 0);
+        assert_eq!(list.transparent_batches[0].base_instance, 0);
+        // Two draw calls total (one per submesh), across the two lists.
+        assert_eq!(stats.draw_calls, 2);
+        assert_eq!(stats.batches, 2);
+
+        drop(list);
+        drop(mesh);
+        drop(instancing);
+        device.wait_idle().expect("idle before teardown");
+        drop(skinning);
+        drop(uploader);
+        drop(pipelines);
+        drop(descriptors);
+        drop(device);
     }
 
     /// Three items of two meshes (A×2, B×1) batch into two (pipeline, mesh) buckets
