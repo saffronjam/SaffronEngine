@@ -4,8 +4,8 @@
 //     strings);
 //   - every scene mutation bumps sceneVersion (observed through get-selection);
 //   - render-stats carries live frame timing (frameMs/fps/gpuMs).
-// Boots with SAFFRON_AUTO_EMPTY_PROJECT so add-entity's cube preset (which imports a model,
-// and so needs a loaded project) works; the project lives under the gitignored appdata/.
+// Boots with SAFFRON_SCRATCH_PROJECT so add-entity's cube preset (which imports a model,
+// and so needs a loaded project) works; the project lives under the harness temp appdata dir.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
@@ -13,7 +13,7 @@ import type { EntityList, EntityRef, InspectResult, RenderStats, Selection } fro
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();
