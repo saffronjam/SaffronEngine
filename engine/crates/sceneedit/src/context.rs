@@ -16,6 +16,7 @@ use crate::camera::{SceneEditCamera, SceneEditCameraInput};
 use crate::gizmo::{GizmoOp, GizmoSpace, NativeGizmoState};
 use crate::overlay::{DebugOverlayOptions, SkeletonOverlayOptions};
 use crate::play::{PlayState, ScriptError, ScriptLog};
+use crate::project::{ProjectLoadProgress, ProjectLoadRequest, ProjectPhase};
 use crate::smoothing::{MaterialSmoothTarget, TransformSmoothTarget};
 use saffron_scene::ScriptInputState;
 
@@ -66,8 +67,15 @@ pub struct SceneEditContext {
     pub on_selection_changed: SubscriberList<Entity>,
     /// The current scene file path.
     pub scene_path: String,
-    /// Whether a project is loaded.
-    pub project_loaded: bool,
+    /// The project bring-up lifecycle phase — the single authoritative source of whether a
+    /// project is loaded.
+    pub project_phase: ProjectPhase,
+    /// The per-frame load-progress snapshot the host loader writes and `project-status` reads.
+    pub project_load: ProjectLoadProgress,
+    /// A pending load request, set by a lifecycle command / bootstrap and taken by the loader.
+    pub project_load_inbox: Option<ProjectLoadRequest>,
+    /// Set by `cancel-load`; read + cleared by the loader to abort an in-flight load.
+    pub project_cancel: bool,
     /// The project root directory.
     pub project_root: String,
     /// The project file path.
@@ -172,7 +180,10 @@ impl Default for SceneEditContext {
             selected: Entity::NULL,
             on_selection_changed: SubscriberList::new(),
             scene_path: String::new(),
-            project_loaded: false,
+            project_phase: ProjectPhase::default(),
+            project_load: ProjectLoadProgress::default(),
+            project_load_inbox: None,
+            project_cancel: false,
             project_root: String::new(),
             project_path: String::new(),
             project_name: String::new(),
@@ -242,6 +253,13 @@ impl SceneEditContext {
 
         ctx.set_selection(camera);
         ctx
+    }
+
+    /// True only when a project is fully open and resident. The guard the per-handler
+    /// `require_project_loaded` and inline project checks read.
+    #[must_use]
+    pub fn project_ready(&self) -> bool {
+        self.project_phase == ProjectPhase::Ready
     }
 
     /// The scene every consumer addresses: the asset preview while it is the active view,

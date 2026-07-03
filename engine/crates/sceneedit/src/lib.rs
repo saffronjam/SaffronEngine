@@ -41,6 +41,7 @@ mod error;
 mod gizmo;
 mod overlay;
 mod play;
+mod project;
 mod smoothing;
 
 pub use camera::{SceneEditCamera, SceneEditCameraInput, update_scene_edit_camera};
@@ -57,6 +58,9 @@ pub use overlay::{
 pub use play::{
     PLAY_FIXED_STEP, PLAY_MAX_DELTA, PlayState, SCRIPT_ERROR_RING_CAP, SCRIPT_LOG_RING_CAP,
     ScriptError, ScriptLog,
+};
+pub use project::{
+    BootStage, NewProjectSpec, ProjectLoadProgress, ProjectLoadRequest, ProjectPhase,
 };
 pub use saffron_scene::{ScriptInputState, derive_script_input_edges};
 pub use smoothing::{MaterialSmoothTarget, TransformSmoothTarget};
