@@ -53,7 +53,8 @@ mod upload;
 mod view_target;
 
 pub use aa::{
-    Aa, MOTION_FORMAT, MotionPush, TAA_HISTORY_WEIGHT, TaaPush, clamp_sample_count, record_motion,
+    Aa, MOTION_FORMAT, MotionPush, REACTIVE_FORMAT, TAA_JITTER_PHASES, TaaParams, TaaPush,
+    clamp_sample_count, jitter_offset, jitter_phase_count, record_motion,
 };
 pub use ddgi::{
     BlendPush as DdgiBlendPush, BorderPush as DdgiBorderPush, DDGI_DIST_FORMAT, DDGI_DIST_INTERIOR,
@@ -71,9 +72,9 @@ pub use draw_list::{
 };
 pub use frame::MAX_FRAMES_IN_FLIGHT;
 pub use frame_history::{
-    ALARM_EVENT_RING_CAPACITY, ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmInputs,
-    AlarmSeverity, AlarmState, FRAME_HISTORY_CAPACITY, FrameHistory, FrameHistoryStats,
-    FrameSample, PerfConfig,
+    ALARM_EVENT_RING_CAPACITY, ALARM_RESUME_SETTLE_FRAMES, ActiveAlarm, AlarmDrain, AlarmEvent,
+    AlarmEventKind, AlarmInputs, AlarmSeverity, AlarmState, FRAME_HISTORY_CAPACITY, FrameHistory,
+    FrameHistoryStats, FrameSample, PerfConfig,
 };
 pub use global_sdf::{
     GDF_BAND_FRACTION, GDF_CASCADE0_EXTENT, GDF_CASCADES, GDF_EXPONENT, GDF_FORMAT, GDF_MAX_CULLED,
@@ -127,7 +128,8 @@ pub use rt::{
 };
 pub use scene_pass::{
     PointShadowTarget, record_depth_prepass, record_gbuffer, record_point_shadow,
-    record_scene_draw_list, record_shadow_depth,
+    record_reactive_coverage, record_scene_draw_list, record_shadow_depth,
+    record_transparent_draw_list,
 };
 pub use shm_publish::{
     MIN_SHM_SLOT_CAPACITY, SHM_HEADER_BYTES, SHM_MAGIC, SHM_RING_SLOTS, ShmPublish,

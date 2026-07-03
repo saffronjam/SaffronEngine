@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use ash::vk;
+use saffron_core::BlendMode;
 use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::gpu_types::Material;
@@ -56,9 +57,10 @@ pub struct SubmeshMaterial {
     pub uv_offset: Vec2,
     /// Parallax height scale.
     pub height_scale: f32,
-    /// Masked / alpha-clip: discard fragments below [`SubmeshMaterial::alpha_cutoff`].
-    pub alpha_clip: bool,
-    /// The alpha-clip cutoff threshold.
+    /// Alpha/blend mode: opaque, masked (alpha-clip discard below [`SubmeshMaterial::alpha_cutoff`]),
+    /// or translucent (routed to the sorted, blended translucent draw list).
+    pub blend_mode: BlendMode,
+    /// The alpha-clip cutoff threshold (used by [`BlendMode::Masked`]).
     pub alpha_cutoff: f32,
     /// Two-sided (glTF `doubleSided`): the scene pass disables backface culling for this submesh so
     /// both faces shade (curtains, foliage); single-sided submeshes cull `BACK`.
@@ -85,7 +87,7 @@ impl SubmeshMaterial {
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             height_scale: 0.05,
-            alpha_clip: false,
+            blend_mode: BlendMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
         }
@@ -182,6 +184,12 @@ pub struct DrawBatch {
     /// the no-submesh single-draw path): `NONE` for a two-sided submesh material, `BACK` otherwise.
     /// The scene pass applies it via dynamic state; other passes keep their baked cull mode.
     pub submesh_cull: Vec<vk::CullModeFlags>,
+    /// The original mesh-submesh indices this batch draws (into `mesh.submeshes`), letting one
+    /// mesh's submeshes split across batches by blend mode: opaque/masked submeshes draw with the
+    /// opaque PSO here, translucent ones with the blend PSO in `transparent_batches` — every batch
+    /// from the same mesh shares one submesh-major instance block (`base_instance`), so a subset
+    /// just picks its `s` slices. Empty for a submesh-less mesh (the whole index buffer draws once).
+    pub submeshes: Vec<u32>,
 }
 
 /// One skinned mesh-instance's compute work for the frame: the descriptor set wiring its
@@ -249,8 +257,12 @@ pub struct DeformedRtInstance {
 pub struct SceneDrawList {
     /// The camera view-projection (the per-frame vertex push constant).
     pub view_proj: Mat4,
-    /// The batched instanced draws, in first-seen bucket order.
+    /// The batched instanced opaque + masked draws, in first-seen bucket order.
     pub batches: Vec<DrawBatch>,
+    /// The translucent draws, each a lone-instance batch, sorted back-to-front (farthest
+    /// first) by clip-space depth. Recorded by the scene pass's trailing translucent scope
+    /// with the blend PSO (depth-test on, depth-write off), never in the depth pre-pass.
+    pub transparent_batches: Vec<DrawBatch>,
     /// Per skinned mesh-instance: the compute work the `skin` pass dispatches before any
     /// geometry pass reads the deformed buffer. Empty when no skinned instances exist.
     pub skin_dispatches: Vec<SkinDispatch>,
@@ -282,6 +294,7 @@ impl SceneDrawList {
         Self {
             view_proj: self.view_proj,
             batches: self.batches.clone(),
+            transparent_batches: self.transparent_batches.clone(),
             skin_dispatches: self.skin_dispatches.clone(),
             prev_skin_dispatches: self.prev_skin_dispatches.clone(),
             morph_dispatches: self.morph_dispatches.clone(),
