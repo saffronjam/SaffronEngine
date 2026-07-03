@@ -23,9 +23,10 @@ import { useUndoRedoShortcuts } from "./useUndoRedoShortcuts";
 import { useMouseBindings } from "./useMouseBindings";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectStartupModal } from "./ProjectStartupModal";
+import { useProjectLoadPoll } from "./useProjectLoadPoll";
 import { SettingsModal } from "./SettingsModal";
 import { ExportModal } from "./ExportModal";
-import type { ProjectInfo, ViewId } from "../control/client";
+import type { ViewId } from "../control/client";
 import { AssetPreview } from "../components/AssetViewer";
 import { CaptureFlame } from "../components/CaptureFlame";
 import { MaterialGraphEditor } from "../panels/MaterialGraphEditor";
@@ -176,6 +177,10 @@ export function App() {
     return stop;
   }, []);
 
+  // The project-load poll (a distinct axis from the reconcile poll): drives the startup modal's
+  // loading view + owns load completion. Mounted once so it covers modal-, menu-, and bootstrap loads.
+  useProjectLoadPoll();
+
   // Report viewport visibility so the host idles a hidden/unfocused window (the engine suppresses
   // rendering when occluded). Fire-and-forget on focus/blur + tab visibility; gated on readiness.
   //
@@ -286,11 +291,6 @@ export function App() {
     };
   }, [phase, setProject, setProjectModalOpen]);
 
-  const handleProjectLoaded = (project: ProjectInfo): void => {
-    setProject(project);
-    setProjectModalOpen(false);
-  };
-
   // Push the full per-view state to the engine, gated on the control socket being up (phase === 'ready')
   // — the startup push must not fire before the engine answers (the calls would silently fail and never
   // re-run), and it re-pushes on any later park/active-view change. Per view: park its surface unless its
@@ -385,7 +385,7 @@ export function App() {
             />
           </div>
         )}
-        <ProjectStartupModal open={projectModalOpen} onProjectLoaded={handleProjectLoaded} />
+        <ProjectStartupModal open={projectModalOpen} />
         <SettingsModal />
         <ExportModal />
         <Toaster />
