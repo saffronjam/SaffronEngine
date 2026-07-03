@@ -25,7 +25,7 @@ interface RenderStats {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("set-camera", { yaw: 0, pitch: 0 });
   const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
   await engine.call("focus", { entity: cube.id });

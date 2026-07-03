@@ -11,7 +11,7 @@ const STRIP = join(REPO, "tests", "e2e", "fixtures", "skinned-strip.gltf");
 
 let engine: Engine;
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // yaw 0 / pitch 0 looks down -Z, so world +Y projects screen-up.
   await engine.call("set-camera", { yaw: 0, pitch: 0 });
 });
