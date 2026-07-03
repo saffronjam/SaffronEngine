@@ -24,7 +24,7 @@ interface AnimState {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   const imported = await engine.importEntity(FIXTURE);
   meshId = imported.id;
   await engine.settle();

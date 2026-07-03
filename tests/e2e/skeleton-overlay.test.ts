@@ -25,7 +25,7 @@ interface Entry {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("set-camera", { yaw: 0, pitch: 0 });
   await engine.importEntity(FIXTURE);
   await engine.settle();

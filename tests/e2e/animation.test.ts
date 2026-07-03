@@ -4,22 +4,18 @@
 // self-tests; this file proves the import + catalog wire.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
 
 let engine: Engine;
-let appdata: string;
 const FIXTURE = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
 
 beforeAll(async () => {
-  appdata = mkdtempSync(join(tmpdir(), "saffron-anim-e2e-"));
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1", SAFFRON_APPDATA_DIR: appdata });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();
-  rmSync(appdata, { recursive: true, force: true });
 });
 
 interface Asset {
@@ -49,8 +45,8 @@ test("importing a rigged+animated glTF registers an Animation clip asset", async
 
 test("the clip is an embedded chunk of one .smodel, not a loose .sanim sidecar", async () => {
   // Exactly one container on disk; no loose .sanim — the clip lives as a SANM chunk inside it.
-  expect(findByExt(appdata, ".smodel").length).toBe(1);
-  expect(findByExt(appdata, ".sanim").length).toBe(0);
+  expect(findByExt(engine.appdata, ".smodel").length).toBe(1);
+  expect(findByExt(engine.appdata, ".sanim").length).toBe(0);
   // The Animation catalog row is a sub-asset of the model (container-linked), not a standalone file.
   const { assets } = await engine.call<{ assets: Asset[] }>("list-assets");
   const clip = assets.find((a) => a.type === "animation");
@@ -59,9 +55,9 @@ test("the clip is an embedded chunk of one .smodel, not a loose .sanim sidecar",
 
 test("save-project persists the Animation entry to project.json", async () => {
   await engine.call("save-project");
-  const projectFile = findByExt(appdata, "project.json")[0];
+  const projectFile = findByExt(engine.appdata, "project.json")[0];
   expect(projectFile).toBeDefined();
-  const doc = JSON.parse(readFileSync(join(appdata, projectFile), "utf8"));
+  const doc = JSON.parse(readFileSync(join(engine.appdata, projectFile), "utf8"));
   const clips = (doc.assets ?? []).filter((a: Asset) => a.type === "animation");
   expect(clips.length).toBe(1);
   expect(clips[0].name).toBe("Bend");
