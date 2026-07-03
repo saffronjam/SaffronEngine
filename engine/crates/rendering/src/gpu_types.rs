@@ -29,6 +29,13 @@ pub struct Material {
     pub shader: String,
     /// Selects the unlit übershader permutation — a distinct cached PSO.
     pub unlit: bool,
+    /// Selects the translucent (alpha-blended) PSO permutation — blend enabled, depth-write
+    /// off. A distinct cached PSO; the item is then recorded in the sorted translucent pass.
+    pub blend: bool,
+    /// Alpha-tested (glTF `MASK`). Under MSAA this enables alpha-to-coverage (a distinct PSO
+    /// permutation) for anti-aliased cutout edges; at 1× it is a plain runtime discard on the
+    /// opaque PSO, so it does not split the cache.
+    pub masked: bool,
 }
 
 impl Default for Material {
@@ -36,6 +43,8 @@ impl Default for Material {
         Self {
             shader: "shaders/mesh.spv".to_string(),
             unlit: false,
+            blend: false,
+            masked: false,
         }
     }
 }
@@ -351,5 +360,13 @@ mod tests {
             ..Material::default()
         };
         assert_ne!(m, unlit);
+
+        // The blend permutation is a distinct PSO key too.
+        let blend = Material {
+            blend: true,
+            ..Material::default()
+        };
+        assert!(!m.blend);
+        assert_ne!(m, blend);
     }
 }

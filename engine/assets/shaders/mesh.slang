@@ -4,6 +4,11 @@ import lighting;
 // keeping it out of the module avoids relying on spec-constant export across the link.
 [[vk::constant_id(0)]] const bool kUnlit = false;
 
+// Alpha-to-coverage (a masked material under MSAA): the fragment sharpens the alpha-test cutoff into
+// per-sample coverage (written to `SV_Target.a`, which the A2C-enabled PSO reads) instead of the hard
+// per-pixel discard — anti-aliased foliage/cutout edges without blending or sorting. Off elsewhere.
+[[vk::constant_id(1)]] const bool kAlphaToCoverage = false;
+
 SurfaceData evalSurface(MaterialInput m)
 {
     MaterialParams mat = m.mat;
@@ -89,12 +94,38 @@ void depthPrepassFragment(VertexOutput input)
     }
 }
 
+// Reactive-coverage fragment: the TAA reactive mask's producer. The reactive-coverage pass draws
+// only the translucent batches, so every fragment reaching here is alpha-blended content whose
+// reprojected history is unreliable — mark it fully reactive (1.0) so the resolve biases the pixel
+// toward the current frame. Outputs a single channel into the r8 reactive target and reads no
+// material/texture (set-2-only, matching the pass's instance-only bind).
+[shader("fragment")]
+float reactiveCoverageFragment(VertexOutput input) : SV_Target
+{
+    return 1.0;
+}
+
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target
 {
     MaterialInput mi = makeMaterialInput(input);
     SurfaceData surf = evalSurface(mi);
-    if (((mi.mat.tex1.w & FEATURE_ALPHACLIP) != 0u) && (surf.opacity < mi.mat.pbr.w))
+    bool masked = (mi.mat.tex1.w & FEATURE_ALPHACLIP) != 0u;
+    float cutoff = mi.mat.pbr.w;
+    // Alpha-to-coverage (masked + MSAA): rescale alpha around the cutoff by its screen-space
+    // derivative so the transition spans ~one pixel, giving a crisp anti-aliased edge instead of a
+    // hard 1-bit cut. The A2C-enabled PSO reads the returned `.a` as per-sample coverage; a fully
+    // outside fragment (coverage <= 0) is still discarded.
+    if (masked && kAlphaToCoverage)
+    {
+        float coverage = saturate((surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5);
+        if (coverage <= 0.0) { discard; }
+        float4 lit = evalViewMode(input, surf, kUnlit);
+        lit.a = coverage;
+        return lit;
+    }
+    // The hard alpha-test cutout (masked without MSAA, or A2C off): a per-pixel discard.
+    if (masked && (surf.opacity < cutoff))
     {
         discard;
     }
