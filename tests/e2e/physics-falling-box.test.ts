@@ -29,7 +29,7 @@ const BOX_HALF = 0.5;
 const REST_Y = FLOOR_TOP + BOX_HALF; // ~0.6
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 
   // Static floor: a thin wide collider with no rigidbody (implicitly static).
   floor = (await engine.call<{ id: string }>("create-entity", { name: "Floor" })).id;

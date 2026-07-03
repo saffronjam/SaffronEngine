@@ -24,7 +24,7 @@ interface PhysicsBodies {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // A dynamic box over a static floor — the box lands and generates a contact.
   const floor = (await engine.call<{ id: string }>("create-entity", { name: "Floor" })).id;
   await engine.call("set-transform", { entity: floor, translation: { x: 0, y: 0, z: 0 } });

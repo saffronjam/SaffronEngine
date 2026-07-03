@@ -57,7 +57,7 @@ async function makeFloor(): Promise<string> {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   const model = await engine.call<{ id: string }>("import-model", { path: FIXTURE });
   await engine.settle();
   const info = await engine.call<ModelInfo>("model-info", { asset: model.id });

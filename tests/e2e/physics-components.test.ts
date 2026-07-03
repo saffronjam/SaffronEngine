@@ -20,7 +20,7 @@ const inspect = async (): Promise<Record<string, Record<string, unknown>>> =>
   (await engine.call<Inspect>("inspect", { entity })).components;
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_AUTO_EMPTY_PROJECT: "1" });
+  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   entity = (await engine.call<{ id: string }>("create-entity", { name: "Body" })).id;
   await engine.call("add-component", { entity, component: "Rigidbody" });
   await engine.call("add-component", { entity, component: "Collider" });
