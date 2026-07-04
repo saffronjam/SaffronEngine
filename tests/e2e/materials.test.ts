@@ -1,14 +1,15 @@
 // Multi-material import over the control plane: a glTF whose single mesh has two
-// primitives with distinct PBR materials imports as one entity carrying a
-// MaterialSetComponent of two slots — each slot preserving its metallic/roughness
-// factors. Editing a
-// single slot through set-material with `slot` leaves the others untouched, and the
-// slots round-trip through project save/reload.
+// primitives with distinct PBR materials imports as one entity carrying a MaterialSet of
+// two slots — each slot *referencing* a baked `.smat` chunk (a non-zero material id, empty
+// overrides), one slot per source material. The per-source factors live on the referenced
+// `.smat` (read back via material-get). Editing a single slot through set-component-field
+// (component MaterialSet, field slots, the slot index) merges a sparse override into just
+// that slot and leaves the others untouched, and the slots round-trip through save/reload.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { EntityRef, InspectResult } from "@saffron/protocol";
+import type { InspectResult } from "@saffron/protocol";
 
 let engine: Engine;
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
@@ -22,9 +23,8 @@ afterAll(async () => {
 });
 
 interface MaterialSlot {
-  baseColor: [number, number, number, number];
-  metallic: number;
-  roughness: number;
+  material: string;
+  overrides: Record<string, unknown>;
 }
 
 async function slotsOf(id: string): Promise<MaterialSlot[]> {
@@ -33,32 +33,59 @@ async function slotsOf(id: string): Promise<MaterialSlot[]> {
   return set?.slots ?? [];
 }
 
+// The per-source factors now live on the referenced `.smat`, not inline on the slot.
+async function materialFactors(id: string): Promise<{ metallic: number; roughness: number }> {
+  return engine.call<{ metallic: number; roughness: number }>("material-get", { material: id });
+}
+
 let meshId = "";
 
-test("a two-material glTF imports as a MaterialSet preserving each slot's factors", async () => {
+test("a two-material glTF imports as a MaterialSet referencing a .smat per slot", async () => {
   const imported = await engine.importEntity(FIXTURE, "Mesh");
   meshId = imported.id;
   await engine.settle();
 
   const slots = await slotsOf(meshId);
   expect(slots.length).toBe(2);
-  // The importer must keep the factors (not the 0.0/1.0 defaults) per source material.
-  expect(slots[0].metallic).toBeCloseTo(1.0, 3);
-  expect(slots[0].roughness).toBeCloseTo(0.1, 3);
-  expect(slots[1].metallic).toBeCloseTo(0.0, 3);
-  expect(slots[1].roughness).toBeCloseTo(0.9, 3);
+  // Each slot references a baked `.smat` chunk (a real id, empty overrides), not inline factors.
+  expect(slots[0].material).not.toBe("0");
+  expect(slots[1].material).not.toBe("0");
+  expect(slots[0].overrides).toEqual({});
+  expect(slots[1].overrides).toEqual({});
+
+  // The importer must bake the factors (not the 0.0/1.0 defaults) onto each referenced `.smat`.
+  const m0 = await materialFactors(slots[0].material);
+  const m1 = await materialFactors(slots[1].material);
+  expect(m0.metallic).toBeCloseTo(1.0, 3);
+  expect(m0.roughness).toBeCloseTo(0.1, 3);
+  expect(m1.metallic).toBeCloseTo(0.0, 3);
+  expect(m1.roughness).toBeCloseTo(0.9, 3);
 });
 
-test("set-material with a slot edits only that slot", async () => {
-  await engine.call("set-material", { entity: meshId, slot: 1, roughness: 0.25 });
+test("set-component-field with a slot index edits only that slot", async () => {
+  await engine.call("set-component-field", {
+    entity: meshId,
+    component: "MaterialSet",
+    field: "slots",
+    index: 1,
+    value: { overrides: { roughness: 0.25 } },
+  });
   await engine.settle();
   const slots = await slotsOf(meshId);
-  expect(slots[1].roughness).toBeCloseTo(0.25, 3);
-  expect(slots[0].roughness).toBeCloseTo(0.1, 3); // untouched
+  expect(slots[1].overrides.roughness).toBeCloseTo(0.25, 3);
+  expect(slots[0].overrides.roughness).toBeUndefined(); // untouched
 });
 
-test("an out-of-range slot is rejected", async () => {
-  await expect(engine.call("set-material", { entity: meshId, slot: 9, metallic: 0.5 })).rejects.toThrow();
+test("an out-of-range slot index is rejected", async () => {
+  await expect(
+    engine.call("set-component-field", {
+      entity: meshId,
+      component: "MaterialSet",
+      field: "slots",
+      index: 9,
+      value: { overrides: { metallic: 0.5 } },
+    }),
+  ).rejects.toThrow();
 });
 
 test("the MaterialSet slots survive a project save + reload", async () => {
@@ -71,22 +98,28 @@ test("the MaterialSet slots survive a project save + reload", async () => {
   expect(entity).toBeDefined();
   const slots = await slotsOf(entity!.id);
   expect(slots.length).toBe(2);
-  expect(slots[1].roughness).toBeCloseTo(0.25, 3);
-  expect(slots[0].metallic).toBeCloseTo(1.0, 3);
+  expect(slots[1].overrides.roughness).toBeCloseTo(0.25, 3); // the override survived
+  expect(slots[0].material).not.toBe("0"); // the reference survived
+  expect((await materialFactors(slots[0].material)).metallic).toBeCloseTo(1.0, 3);
 });
 
 // A single-material glTF that maps metalness/roughness through a metallicRoughnessTexture
 // (the shape of the Khronos MetalRoughSpheres ball matrix) must import that texture, not
-// drop it. The reference is carried on the Material and survives a save/reload round-trip.
-function materialOf(components: InspectResult["components"]): { metallicRoughnessTexture?: string } {
-  return (components.Material ?? {}) as { metallicRoughnessTexture?: string };
+// drop it. The reference is baked onto the slot's referenced `.smat` (as the packed ORM map)
+// and survives a save/reload round-trip.
+async function ormTextureOf(entityId: string): Promise<string> {
+  const slots = await slotsOf(entityId);
+  if (slots.length === 0) {
+    return "0";
+  }
+  const m = await engine.call<{ ormTexture: string }>("material-get", { material: slots[0].material });
+  return m.ormTexture;
 }
 
-test("a glTF metallic-roughness texture is imported onto the Material", async () => {
+test("a glTF metallic-roughness texture is imported onto the material asset", async () => {
   const imported = await engine.importEntity(MAPPED);
   await engine.settle();
-  const info = await engine.call<InspectResult>("inspect", { entity: imported.id });
-  const mr = materialOf(info.components).metallicRoughnessTexture;
+  const mr = await ormTextureOf(imported.id);
   expect(mr).toBeDefined();
   expect(mr).not.toBe("0"); // a real texture id, not the none sentinel
 
@@ -97,9 +130,8 @@ test("a glTF metallic-roughness texture is imported onto the Material", async ()
   const list = await engine.call<{ entities: { id: string }[] }>("list-entities");
   let found = "0";
   for (const e of list.entities) {
-    const info = await engine.call<InspectResult>("inspect", { entity: e.id });
-    const mrAfter = materialOf(info.components).metallicRoughnessTexture;
-    if (mrAfter && mrAfter !== "0") {
+    const mrAfter = await ormTextureOf(e.id);
+    if (mrAfter !== "0") {
       found = mrAfter;
     }
   }

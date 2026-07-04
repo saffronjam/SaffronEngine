@@ -161,23 +161,35 @@ test("an asset assignment during play is discarded; delete-asset is blocked", as
   expect((await engine.call<Inspect>("inspect", { entity: target.id })).components.Mesh).toBeUndefined();
 });
 
-test("a smoothed material edit during play is discarded on stop", async () => {
+test("a material edit during play is discarded on stop", async () => {
   const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
-  await engine.call("set-material", { entity: cube.id, roughness: 0.2 });
+  // Author a slot-0 roughness override on the cube's MaterialSet (the cube instantiates with a
+  // single default slot).
+  const setRoughness = (id: string, roughness: number) =>
+    engine.call("set-component-field", {
+      entity: id,
+      component: "MaterialSet",
+      field: "slots",
+      index: 0,
+      value: { overrides: { roughness } },
+    });
+  const roughnessOf = async (id: string) =>
+    (await engine.call<Inspect>("inspect", { entity: id })).components.MaterialSet.slots[0].overrides
+      .roughness;
+
+  await setRoughness(cube.id, 0.2);
   await engine.settle();
-  const authored = (await engine.call<Inspect>("inspect", { entity: cube.id })).components.Material
-    .roughness;
+  const authored = await roughnessOf(cube.id);
+  expect(authored).toBeCloseTo(0.2);
 
   await engine.call("play");
-  await engine.call("set-material", { entity: cube.id, roughness: 0.9, smooth: true });
-  await engine.settle(400); // tau is 25ms; ~16 time constants — converged
-  const during = (await engine.call<Inspect>("inspect", { entity: cube.id })).components.Material
-    .roughness;
+  await setRoughness(cube.id, 0.9);
+  await engine.settle();
+  const during = await roughnessOf(cube.id);
   expect(during).toBeGreaterThan(authored + 0.1);
 
   await engine.call("stop");
-  const back = (await engine.call<Inspect>("inspect", { entity: cube.id })).components.Material
-    .roughness;
+  const back = await roughnessOf(cube.id);
   expect(back).toBeCloseTo(authored);
 });
 

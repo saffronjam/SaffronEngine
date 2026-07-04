@@ -4,7 +4,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
-import type { EntityRef, InspectResult } from "@saffron/protocol";
+import type { InspectResult } from "@saffron/protocol";
 
 let engine: Engine;
 const MAPPED = join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb");
@@ -17,9 +17,16 @@ afterAll(async () => {
 });
 
 test("material-update assigns a texture slot to a material asset", async () => {
+  // Grab a real texture id from an imported model's referenced `.smat`.
   const e = await engine.importEntity(MAPPED);
+  await engine.settle();
   const info = await engine.call<InspectResult>("inspect", { entity: e.id });
-  const tex = (info.components.Material as { albedoTexture?: string }).albedoTexture;
+  const slots = (info.components.MaterialSet as { slots?: { material: string }[] }).slots ?? [];
+  expect(slots.length).toBeGreaterThan(0);
+  const src = await engine.call<{ albedoTexture: string }>("material-get", {
+    material: slots[0].material,
+  });
+  const tex = src.albedoTexture;
   expect(tex).toBeDefined();
   expect(tex).not.toBe("0");
 
