@@ -26,16 +26,32 @@ surface. If you add a field to a Rust DTO in `connectors/`, add it to `types.ts`
 
 ## Conventions
 
+- **One store at a time.** A store dropdown (left of the search bar) picks which enabled connector
+  to search — there is no cross-store mixing. Switching the dropdown re-runs the current query on the
+  new store; disabling the store you're viewing (in the provider modal) auto-selects another enabled
+  one. `SearchQuery.provider` carries the single store id.
 - **Search commits on Enter only.** The query bar is the shared `anima` chip-search
   (`components/anima`) configured with a 10-minute debounce (`COMMIT_ONLY_DEBOUNCE_MS = 600_000`), so
-  a search fires on Enter, not per keystroke — every provider hit is a real network round-trip.
-  `provider:` chips scope the search to a subset.
-- **Results are a windowed, infinite-scroll grid** (`StoreResultsGrid`): each source advances its own
-  server-side cursor and the grid pulls the next round-robin batch near the end, stopping when the
-  session reports all sources exhausted. A `pendingReset` ref swaps the result set on a new query
-  without a blank-frame flash.
+  a search fires on Enter, not per keystroke — every provider hit is a real network round-trip. A
+  `type:` chip filters by asset kind.
+- **Browse state lives in the Zustand store, not the component** (`state/store.ts` `storeBrowse`
+  slice): `storeSelected` / `storeSearchText` / `storeKind` persist to localStorage (reopening the
+  Store returns you to where you left off); `storeSession` / `storeResults` / `storeScrollTop` are
+  in-memory (a live backend session dies on a bridge restart, so a restart re-runs the last search).
+- **Results are a row-virtualized, infinite-scroll grid** (`StoreResultsGrid`, via
+  `@tanstack/react-virtual`'s `useVirtualizer` — one virtual row per grid row, each laying out
+  `columns` cards): the store advances its server-side cursor and the grid pulls the next batch near
+  the end, stopping when the session reports the store exhausted. The virtualizer re-renders only when
+  the visible row range changes (not per scroll pixel), so don't reintroduce scroll-position React
+  state. A `pendingReset` ref swaps the result set on a new query without a blank-frame flash; a
+  remount whose results already match the session restores them (and scroll) without refetching.
 - **Galleries and parts are lazy** — resolved (`store_asset_gallery` / `store_asset_parts`) only when
   a card is hovered/expanded or the split-import dropdown opens.
+- **Provider images load through the cache, never a raw CDN URL.** Every `<img>` showing a remote
+  thumbnail/preview wraps its src in `cachedImage(url)` (`cachedImage.ts`), which points at the
+  `saffron-img://` scheme the bridge serves from the shared `ResourceCache` — fetched once,
+  throttled, kept on disk. Loading a provider URL directly bursts the CDN (broken-image tiles) and
+  never caches. `GalleryViewer` and `AssetDetailModal` are the only image sites; keep it that way.
 - **`StoreWorkspace` is always mounted, gated by an `active` prop** (`active={activeKind === "store"}`
   in `App.tsx`) — like every `ViewTab` body, it keeps its state when hidden rather than unmounting;
   it suppresses its portaled provider modal while inactive.

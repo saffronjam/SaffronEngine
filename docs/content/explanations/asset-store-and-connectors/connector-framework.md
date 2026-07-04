@@ -6,8 +6,8 @@ weight = 1
 # The connector framework
 
 A connector is one external asset service the editor can search and import from. The framework
-that holds them has three jobs: present every service through one normalized result shape, run a
-search across all enabled services at once, and turn a chosen result into a catalog asset. It
+that holds them has three jobs: present every service through one normalized result shape, search
+the one store you pick from the Store's dropdown, and turn a chosen result into a catalog asset. It
 lives in `editor/src-tauri/src/connectors/` because service calls are HTTP from native Rust (no
 browser CORS), any credentials stay out of the renderer, and provider thumbnails are just URLs
 the webview loads directly.
@@ -16,7 +16,7 @@ the webview loads directly.
 |---|---|---|
 | Trait + normalized types | `editor/src-tauri/src/connectors/mod.rs` | `StoreConnector`, `StoreResult`, `StoreLicense`, `AuthKind` |
 | First connector (keyless, CC0) | `editor/src-tauri/src/connectors/polyhaven.rs` | `PolyHaven` |
-| Search aggregation | `editor/src-tauri/src/connectors/aggregator.rs` | `SearchSession` |
+| Search session (one store) | `editor/src-tauri/src/connectors/session.rs` | `SearchSession` |
 | Registry | `editor/src-tauri/src/connectors/registry.rs` | `ConnectorRegistry` |
 | API-key connector | `editor/src-tauri/src/connectors/polypizza.rs` | `PolyPizza` |
 | Credentials (keyring) | `editor/src-tauri/src/connectors/credentials.rs` | `Credentials` |
@@ -54,14 +54,20 @@ can inject a key with `SAFFRON_SECRET_<ID>`, so a headless host boots without a 
 Opening the Store with nothing enabled shows an onboarding panel: enabling a `none` connector is
 instant; an `api_key` connector wants its key first.
 
-## Search across sources
+## Search one store at a time
 
-Heterogeneous services cannot share a page number, so the Store does not paginate — it scrolls. A
-`SearchSession` holds each connector's own cursor and exhaustion flag, pulls a page from a source
-only when its buffer runs low, and interleaves results round-robin. There is no synthesized global
-relevance order; the grid's scroll position is what drives how many batches are pulled, and the
-session stops only once every source is exhausted. A connector that errors is dropped from the
-round for that session rather than blanking the whole Store.
+Different services rank and weight their catalogs differently, so mixing them into one grid has no
+principled global order. The Store sidesteps that: a store dropdown (left of the search bar) picks
+which enabled connector to search, and results come back in that store's own order. Switching the
+dropdown re-runs the current query against the newly-selected store.
+
+Heterogeneous services also cannot share a page number, so the Store does not paginate — it
+scrolls. A `SearchSession` holds the store's own cursor and exhaustion flag and pulls the next page
+when its buffer runs low; the grid's scroll position drives how many batches are pulled, and the
+session stops once the store is exhausted. A search that errors marks the session exhausted rather
+than leaving the Store spinning. The selected store and last query persist per machine, so
+reopening the Store returns you to where you left off; disabling the store you're viewing
+auto-selects another enabled one.
 
 Search runs only on a committed query — Enter or a chip commit in the shared `AnimaSearchbar` —
 never on each keystroke, so typing does not fire a request per character.
@@ -115,3 +121,25 @@ opens a two-pane detail modal — the gallery (with a thumbnail strip) on the le
 metadata, license, and the same Import split button on the right. Both views share one `useGallery`
 fetch so they stay on the same image. Like every store call, `gallery()` is editor-side only; nothing
 about it crosses to the host until an import.
+
+## One cache for every fetch
+
+| What | File | Symbols |
+|---|---|---|
+| Resource cache | `editor/src-tauri/src/connectors/cache.rs` | `ResourceCache` |
+| Image scheme | `editor/src-tauri/src/lib.rs` | `saffron-img://` |
+
+Every remote fetch — thumbnails, gallery previews, deliverable downloads, extracted map bundles —
+goes through one `ResourceCache`, not a per-connector client or directory. It keeps bytes on disk
+under `appdata/cache/` (a persistent location, so the cache is **not** wiped on reboot), stores
+each blob content-addressed with a small metadata sidecar (source url, content type, fetched-at),
+and materializes multi-file deliverables (a glTF file set, an extracted map folder) into a
+directory built once and atomically renamed into place. A bounded semaphore caps how many upstream
+fetches run at once, so a burst never stampedes a provider.
+
+Thumbnails are the reason this matters. The webview does not load a provider CDN URL directly;
+it loads `saffron-img://fetch/?u=<provider-url>`, a custom scheme the bridge serves from the cache
+(fetching once, throttled). A screenful of tiles that used to fire a hundred simultaneous resize
+requests at the CDN — and get some dropped as broken images — now draws from disk after the first
+visit. A connector never touches the cache's storage itself: it holds an `Arc<ResourceCache>` and
+calls `client()` for dynamic API calls, or the fetch/store methods for anything cacheable.
