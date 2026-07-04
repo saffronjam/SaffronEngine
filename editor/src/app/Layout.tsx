@@ -13,11 +13,12 @@ import { RevealBands, type RevealBand } from "@/components/dock/RevealBands";
 import { logRender } from "../lib/renderLog";
 
 /// The empty Scene edge regions that accept a torn tab while collapsed. The right/bottom docks
-/// are single persistent leaves, so their band tracks that leaf directly. The left column is a
-/// branch (`hierarchy` over the persistent `leftBottom`); its band tracks the whole branch and
-/// docks into `leftBottom`, so it appears only once the *entire* left column has collapsed.
+/// are single persistent leaves, so their band tracks that leaf directly. The left column holds
+/// two leaves (`hierarchy` over the persistent `leftBottom`); its band tracks *both* and docks
+/// into `leftBottom`, so it appears only once the entire left column is empty — and stops as soon
+/// as either leaf is repopulated, handing the drop back to the real (full-width) leaf.
 const SCENE_REVEAL_BANDS: RevealBand[] = [
-  { leafId: "leaf:leftBottom", regionId: "branch:scene-left", edge: "left" },
+  { leafId: "leaf:leftBottom", regionLeaves: ["leaf:hierarchy", "leaf:leftBottom"], edge: "left" },
   { leafId: "leaf:right", edge: "right" },
   { leafId: "leaf:bottom", edge: "bottom" },
 ];

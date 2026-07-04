@@ -11,11 +11,13 @@ import { useDockDrag } from "./dockDrag";
 export interface RevealBand {
   /// The persistent leaf a drop on this band docks into (re-expanding the region).
   leafId: DockNodeId;
-  /// The subtree whose collapse this band stands in for. Defaults to `leafId` when the edge
-  /// region is a single leaf; when the region is a branch (the Scene's left column is
-  /// `hierarchy` over the persistent `leftBottom`) it is that branch, so the band appears only
-  /// once the *whole* region has collapsed — not merely when `leafId` alone is empty.
-  regionId?: DockNodeId;
+  /// Every leaf that makes up this edge region. The band appears only once *all* of them have
+  /// collapsed (none rendered), so it never overlays a still-visible sibling. Keyed on the
+  /// leaves — not their enclosing branch — because `normalize` elides a single-child branch out
+  /// of existence (the Scene's left column becomes just `leftBottom` once `hierarchy` is emptied),
+  /// which would make a branch-keyed test read a missing node and mis-fire. Defaults to `[leafId]`
+  /// for a single-leaf region (the right/bottom docks, the asset-editor edges).
+  regionLeaves?: DockNodeId[];
   edge: "left" | "right" | "bottom";
 }
 
@@ -33,7 +35,9 @@ export function RevealBands({ space, bands }: { space: DockSpaceKind; bands: Rev
   const collapsed = useEditorStore(
     useShallow((s) => {
       const layout = s.dockLayouts[space];
-      return bands.map((band) => !isNodeRendered(layout, band.regionId ?? band.leafId));
+      return bands.map((band) =>
+        (band.regionLeaves ?? [band.leafId]).every((id) => !isNodeRendered(layout, id)),
+      );
     }),
   );
   if (!dragging) {
