@@ -117,6 +117,10 @@ pub struct Pipelines {
     /// The compute morph PSO (morph set layout, a 20-byte push), built lazily.
     morph: Option<Arc<Pipeline>>,
 
+    /// The compute displacement PSO (bindless set 0 + the displace set 1, a 32-byte push),
+    /// built lazily.
+    displace: Option<Arc<Pipeline>>,
+
     /// The cluster compute set layout the cull PSO binds (set 0).
     cluster_set_layout: vk::DescriptorSetLayout,
 
@@ -263,6 +267,7 @@ impl Pipelines {
             light_cull: None,
             skin: None,
             morph: None,
+            displace: None,
             cluster_set_layout: descriptors.cluster_set_layout(),
             gbuffer: None,
             gtao: None,
@@ -499,6 +504,36 @@ impl Pipelines {
             }
             Err(err) => {
                 tracing::error!("request_morph: {err}");
+                None
+            }
+        }
+    }
+
+    /// The compute displacement PSO, built and cached on first request. A two-set pipeline: set 0 is
+    /// the shared bindless albedo array (`bindless_set_layout`, owned by [`crate::Descriptors`]) so
+    /// the kernel samples the height map by index, set 1 is the displace buffers (`displace_set_layout`,
+    /// owned by [`crate::displacement::Displacement`]); a 32-byte push. `None` on a build failure.
+    pub fn request_displace(
+        &mut self,
+        bindless_set_layout: vk::DescriptorSetLayout,
+        displace_set_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.displace {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute_multi(
+            "shaders/displace.spv",
+            &[bindless_set_layout, displace_set_layout],
+            32,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.displace = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_displace: {err}");
                 None
             }
         }

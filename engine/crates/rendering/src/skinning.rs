@@ -201,6 +201,31 @@ impl Skinning {
         self.peak_vertices
     }
 
+    /// Ensures both the deformed and prev-deformed buffers hold at least `vertex_count` vertices
+    /// (growing if needed) and returns their handles — for a **non-skin deformation** (displacement)
+    /// that writes the same shared buffers at its own `deformed_offset` slice. Idempotent: a no-op
+    /// when the skin path already sized them for the frame's full deformed cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Vk`] if a buffer allocation fails.
+    pub fn ensure_deformed_buffers(
+        &mut self,
+        frame: usize,
+        vertex_count: u32,
+    ) -> Result<(vk::Buffer, vk::Buffer)> {
+        self.ensure_deformed_capacity(frame, vertex_count)?;
+        self.ensure_prev_deformed_capacity(frame, vertex_count)?;
+        let f = &self.frames[frame];
+        Ok((
+            f.deformed.as_ref().expect("deformed buffer").handle(),
+            f.prev_deformed
+                .as_ref()
+                .expect("prev deformed buffer")
+                .handle(),
+        ))
+    }
+
     /// Looks up the entity's cached previous world matrix, or `None` when uncached (a new
     /// entity reprojects against its current pose → zero object motion on frame one). The
     /// draw-list batcher reads this when building each instance's `prev_model`.

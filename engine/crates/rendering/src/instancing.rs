@@ -27,6 +27,7 @@ use saffron_core::BlendMode;
 use saffron_geometry::glam::{Mat4, UVec4, Vec4};
 
 use crate::descriptors::Descriptors;
+use crate::displacement::{DISPLACE_MAX_SETS_PER_FRAME, DisplaceBucket, Displacement};
 use crate::draw_list::{
     DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
     SkinDispatch, SubmeshMaterial,
@@ -56,6 +57,9 @@ pub struct DrawListInputs {
     /// Whether an RT consumer is armed this frame — gates building the skinned RT-instance
     /// list (a non-RT scene pays nothing).
     pub rt_skinned: bool,
+    /// Whether the GPU compute-displacement path runs. Off leaves displacement-enabled meshes at
+    /// their base geometry (no displace prepass, no deformed-buffer routing).
+    pub displace_enabled: bool,
 }
 
 /// Initial instance-buffer capacity (in [`InstanceData`] elements).
@@ -172,11 +176,13 @@ impl Instancing {
     /// # Errors
     ///
     /// Returns [`crate::Error::Vk`] if growing/rewriting an SSBO or deformed buffer fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_draw_list(
         &mut self,
         descriptors: &Descriptors,
         pipelines: &mut Pipelines,
         skinning: &mut Skinning,
+        displacement: &mut Displacement,
         items: &[DrawItem],
         joints: &[Mat4],
         inputs: DrawListInputs,
@@ -187,6 +193,7 @@ impl Instancing {
             wireframe,
             default_texture_index,
             rt_skinned,
+            displace_enabled,
         } = inputs;
         let pipelines_before = pipelines.pipelines_created();
         let mut list = SceneDrawList {
@@ -212,6 +219,14 @@ impl Instancing {
             // deforms into its own slice (before skin), so it never merges either.
             let is_morph = !item.morph_weights.is_empty() && item.mesh.morph().is_some();
 
+            // A displacement-enabled item is deformed by the `displace` prepass into its own slice,
+            // so — like skin/morph — it never merges. Gated off leaves it as base geometry.
+            let displace = if displace_enabled {
+                displace_info_for(item)
+            } else {
+                None
+            };
+
             // The per-submesh blend pattern (drives the per-submesh PSO + routing at emit). A
             // bucket with any translucent submesh is drawn sorted back-to-front, so it never
             // merges — each keeps its own lone-instance depth key.
@@ -222,12 +237,13 @@ impl Instancing {
             // (skinned or morph) or a blend-carrying item never merges (each keeps its own slice /
             // depth order). PSO is resolved per submesh at emit, so the merge key is the base
             // material (shader + unlit) plus the whole blend pattern, not a single pipeline.
-            let bucket_index = if item.skinned || is_morph || has_blend {
+            let bucket_index = if item.skinned || is_morph || has_blend || displace.is_some() {
                 None
             } else {
                 buckets.iter().position(|b| {
                     !b.skinned
                         && b.morph_weights.is_empty()
+                        && b.displace.is_none()
                         && !b.blend_modes.contains(&BlendMode::Blend)
                         && Arc::ptr_eq(&b.mesh, &item.mesh)
                         && b.material.shader == item.material.shader
@@ -253,6 +269,7 @@ impl Instancing {
                         },
                         model: item.model,
                         submesh_cull: submesh_cull_for(item),
+                        displace,
                         instances: Vec::new(),
                     });
                     buckets.len() - 1
@@ -291,6 +308,10 @@ impl Instancing {
         let mut transparent: Vec<(f32, DrawBatch)> = Vec::new();
         let mut skin_buckets: Vec<SkinBucket> = Vec::new();
         let mut skinned_rt: Vec<DeformedRtInstance> = Vec::new();
+        // The displacement deform work: one bucket per displaced instance (writing its slice of the
+        // shared deformed buffer), plus its TLAS instance (mesh-local displaced vertices).
+        let mut displace_buckets: Vec<DisplaceBucket> = Vec::new();
+        let mut displaced_rt: Vec<DeformedRtInstance> = Vec::new();
         // The morph deform work: one cur + one prev dispatch + mesh per morph-active bucket,
         // and the frame's concatenated active-target list (each dispatch reads its
         // `active_base` slice — cur and prev both index the same buffer, differing only in
@@ -321,7 +342,7 @@ impl Instancing {
                 _ => (Vec::new(), 0),
             };
             let has_morph = !morph_active.is_empty();
-            let deformed = bucket.skinned || has_morph;
+            let deformed = bucket.skinned || has_morph || bucket.displace.is_some();
 
             let base_instance = instances.len() as u32;
             let instance_count = bucket.instances.len() as u32;
@@ -404,6 +425,26 @@ impl Instancing {
                             world_transform: bucket.model,
                         });
                     }
+                }
+                // A displaced (non-skinned, non-morph) instance: the `displace` prepass writes this
+                // slice from the height field; its deformed vertices are mesh-local, so the TLAS
+                // places it at the node world matrix.
+                if let Some(info) = bucket.displace {
+                    displace_buckets.push(DisplaceBucket {
+                        mesh: Arc::clone(&bucket.mesh),
+                        deformed_offset: deformed_cursor,
+                        height_index: info.height_index,
+                        height_scale: info.height_scale,
+                        uv_transform: info.uv_transform,
+                    });
+                    displaced_rt.push(DeformedRtInstance {
+                        entity: if rt_skinned { bucket.entity } else { 0 },
+                        deformed_offset: deformed_cursor,
+                        vertex_count,
+                        index_count: bucket.mesh.index_count,
+                        mesh: Arc::clone(&bucket.mesh),
+                        world_transform: bucket.model,
+                    });
                 }
                 deformed_cursor += vertex_count;
             }
@@ -580,6 +621,24 @@ impl Instancing {
             // `wire_skin_dispatches`); drop the non-RT-armed placeholders.
             list.deformed_rt_instances
                 .extend(morph_rt.into_iter().filter(|s| s.entity != 0));
+        }
+
+        // Wire the displacement dispatches: they write the same deformed / prev-deformed buffers at
+        // their own cursor slices, so size those buffers to the full deform cursor (idempotent when
+        // skin/morph already grew them), then build one cur + one prev dispatch per displaced bucket.
+        if !displace_buckets.is_empty() {
+            let kept = clamp_to_set_budget(displace_buckets.len())
+                .min(DISPLACE_MAX_SETS_PER_FRAME as usize);
+            displace_buckets.truncate(kept);
+            displaced_rt.truncate(kept);
+            let (deformed, prev_deformed) =
+                skinning.ensure_deformed_buffers(frame, deformed_cursor)?;
+            let (cur, prev) =
+                displacement.wire_dispatches(frame, deformed, prev_deformed, &displace_buckets);
+            list.displace_dispatches = cur;
+            list.prev_displace_dispatches = prev;
+            list.deformed_rt_instances
+                .extend(displaced_rt.into_iter().filter(|s| s.entity != 0));
         }
 
         let stats = compute_stats(
@@ -824,6 +883,10 @@ struct Bucket {
     /// Per-geometry-submesh backface-cull mode, from the bucket's first item's submesh materials
     /// (a bucket is one mesh, so its submesh two-sidedness is shared). Copied onto every batch.
     submesh_cull: Vec<vk::CullModeFlags>,
+    /// Set when the mesh-instance is displacement-enabled: the `displace` compute prepass writes its
+    /// height-displaced vertices into the shared deformed buffer (like a skinned bucket, it never
+    /// merges and carries a `deformed_offset`). `None` for a normal bucket.
+    displace: Option<DisplaceInfo>,
     instances: Vec<Vec<InstanceData>>,
 }
 
@@ -846,6 +909,30 @@ fn submesh_blend_modes(item: &DrawItem) -> Vec<BlendMode> {
 /// Per-geometry-submesh backface-cull mode from the item's submesh materials (clamped to the last
 /// material like the instance-row build): a two-sided submesh disables culling (`NONE`), otherwise
 /// cull `BACK`. Length matches the geometry submesh count (>= 1 for the no-submesh single-draw path).
+/// The height-map index + amplitude + uv transform a displaced mesh-instance's `displace` compute
+/// dispatch needs, derived from a submesh material. The whole mesh-instance is displaced by one
+/// height field (its first displacement-enabled submesh material).
+#[derive(Clone, Copy)]
+struct DisplaceInfo {
+    height_index: u32,
+    height_scale: f32,
+    uv_transform: [f32; 4],
+}
+
+/// The displacement info for an item, if any submesh material is displacement-enabled with a height
+/// map. A mesh-instance is displaced as a whole by the first such material (terrain/displaced planes
+/// carry a single material; multi-material displacement picks the first). `None` → not displaced.
+fn displace_info_for(item: &DrawItem) -> Option<DisplaceInfo> {
+    item.submesh_materials.iter().find_map(|m| {
+        let texture = m.height_texture.as_ref()?;
+        m.displacement.then(|| DisplaceInfo {
+            height_index: texture.bindless_index(),
+            height_scale: m.height_scale,
+            uv_transform: [m.uv_tiling.x, m.uv_tiling.y, m.uv_offset.x, m.uv_offset.y],
+        })
+    })
+}
+
 fn submesh_cull_for(item: &DrawItem) -> Vec<vk::CullModeFlags> {
     let count = item.mesh.submeshes.len().max(1);
     let last = item.submesh_materials.len().saturating_sub(1);
@@ -939,7 +1026,14 @@ fn resolve_material(
         features |= FEATURE_OCCLUSION;
     }
     if pin(&material.height_texture, &mut height_index) {
-        features |= FEATURE_HEIGHT;
+        // A displacement material moves real geometry in the `displace` compute pre-pass (true
+        // silhouette, consistent across passes, BLAS-able); the default height path is
+        // parallax-occlusion mapping in the fragment.
+        features |= if material.displacement {
+            FEATURE_DISPLACE
+        } else {
+            FEATURE_HEIGHT
+        };
     }
     if material.blend_mode == BlendMode::Masked {
         features |= FEATURE_ALPHACLIP;
@@ -976,6 +1070,9 @@ const FEATURE_OCCLUSION: u32 = 4;
 const FEATURE_HEIGHT: u32 = 8;
 /// `ALPHACLIP` (masked) feature bit.
 const FEATURE_ALPHACLIP: u32 = 16;
+/// `DISPLACE` feature bit: the height map drives vertex-shader displacement (true geometry) rather
+/// than the fragment parallax march.
+const FEATURE_DISPLACE: u32 = 32;
 
 /// Interns a material into the frame's deduplicated table, hashing its raw bytes (the
 /// [`MaterialParamsData`] `Hash`/`Eq` are byte-exact), so identical materials collapse
@@ -1090,6 +1187,7 @@ mod tests {
         Pipelines,
         Instancing,
         Skinning,
+        Displacement,
         Uploader,
     )> {
         let device = match Device::new(&SurfaceSource::Offscreen) {
@@ -1104,6 +1202,7 @@ mod tests {
         let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let instancing = Instancing::new(&device, &descriptors).expect("Instancing::new");
         let skinning = Skinning::new(&device).expect("Skinning::new");
+        let displacement = Displacement::new(&device).expect("Displacement::new");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         Some((
@@ -1112,6 +1211,7 @@ mod tests {
             pipelines,
             instancing,
             skinning,
+            displacement,
             uploader,
         ))
     }
@@ -1125,6 +1225,7 @@ mod tests {
             wireframe: false,
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
             rt_skinned: false,
+            displace_enabled: true,
         }
     }
 
@@ -1180,8 +1281,15 @@ mod tests {
     /// actually blend instead of taking slot 0's mode for the whole mesh.
     #[test]
     fn submit_draw_list_splits_submeshes_by_blend_mode() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
+        let Some((
+            device,
+            descriptors,
+            mut pipelines,
+            mut instancing,
+            mut skinning,
+            mut displacement,
+            uploader,
+        )) = fixture_or_skip()
         else {
             return;
         };
@@ -1203,6 +1311,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[item],
                 &[],
                 inputs(0),
@@ -1236,6 +1345,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1247,8 +1357,15 @@ mod tests {
     /// the stats report 2 batches / 3 instances — the phase's named batching gate.
     #[test]
     fn submit_draw_list_batches_by_pipeline_and_mesh() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
+        let Some((
+            device,
+            descriptors,
+            mut pipelines,
+            mut instancing,
+            mut skinning,
+            mut displacement,
+            uploader,
+        )) = fixture_or_skip()
         else {
             return;
         };
@@ -1273,6 +1390,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &items,
                 &[],
                 inputs(0),
@@ -1311,6 +1429,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1322,8 +1441,15 @@ mod tests {
     /// dedup case), then asserted by the resulting instance rows' `texture.w` indices.
     #[test]
     fn submit_draw_list_dedups_identical_materials() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
+        let Some((
+            device,
+            descriptors,
+            mut pipelines,
+            mut instancing,
+            mut skinning,
+            mut displacement,
+            uploader,
+        )) = fixture_or_skip()
         else {
             return;
         };
@@ -1359,6 +1485,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &same,
                 &[],
                 inputs(0),
@@ -1373,6 +1500,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &distinct,
                 &[],
                 inputs(1),
@@ -1402,6 +1530,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1498,8 +1627,15 @@ mod tests {
     /// is armed only when `skin_dispatches` is non-empty — the phase's named gate.
     #[test]
     fn skin_dispatch_appears_only_for_skinned_draws() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
+        let Some((
+            device,
+            descriptors,
+            mut pipelines,
+            mut instancing,
+            mut skinning,
+            mut displacement,
+            uploader,
+        )) = fixture_or_skip()
         else {
             return;
         };
@@ -1517,6 +1653,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[static_item],
                 &palette,
                 inputs(0),
@@ -1535,6 +1672,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[item],
                 &palette,
                 inputs(1),
@@ -1572,6 +1710,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1583,8 +1722,15 @@ mod tests {
     /// second frame reflects last frame's pose — the phase's named cross-frame gate.
     #[test]
     fn cross_frame_motion_caches_track_the_entity() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
+        let Some((
+            device,
+            descriptors,
+            mut pipelines,
+            mut instancing,
+            mut skinning,
+            mut displacement,
+            uploader,
+        )) = fixture_or_skip()
         else {
             return;
         };
@@ -1598,6 +1744,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[skinned_item(&mesh, first, 7)],
                 &[Mat4::IDENTITY],
                 inputs(0),
@@ -1617,6 +1764,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[skinned_item(&mesh, second, 7)],
                 &[Mat4::IDENTITY],
                 inputs(1),
@@ -1635,6 +1783,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
