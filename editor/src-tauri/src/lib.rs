@@ -718,7 +718,7 @@ async fn store_import(
         ),
         StoreKind::Hdri => (
             "import-texture",
-            json!({ "path": path, "colorspace": "hdr" }),
+            json!({ "path": path, "role": "hdri" }),
         ),
     };
     let reply = control_request_with_params(&state.socket_path, cmd, params)?;
@@ -767,15 +767,6 @@ async fn store_asset_gallery(
         .map_err(|err| err.to_string())
 }
 
-/// The import colorspace for a map role: color/albedo is sRGB, every data map is linear.
-fn colorspace_for_role(role: Option<&str>) -> &'static str {
-    match role {
-        Some("color") | Some("diffuse") | Some("albedo") => "srgb",
-        Some(_) => "linear",
-        None => "auto",
-    }
-}
-
 /// Downloads and imports a single part: a map → a colorspace-correct texture; a whole
 /// model/material → the same path as `store_import`.
 #[tauri::command]
@@ -804,9 +795,15 @@ async fn store_import_part(
         "storeId": result.store.id,
     });
     let (cmd, params) = match part.import_kind {
-        StoreKind::Texture | StoreKind::Hdri => (
+        // The engine owns the role→colorspace policy: send the connector's map role and let
+        // `import-texture` derive the upload space (and persist the semantic role for previews).
+        StoreKind::Texture => (
             "import-texture",
-            json!({ "path": path, "colorspace": colorspace_for_role(part.role.as_deref()) }),
+            json!({ "path": path, "role": part.role }),
+        ),
+        StoreKind::Hdri => (
+            "import-texture",
+            json!({ "path": path, "role": "hdri" }),
         ),
         StoreKind::Model => (
             "import-model",
