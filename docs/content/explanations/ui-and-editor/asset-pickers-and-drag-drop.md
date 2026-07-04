@@ -21,7 +21,7 @@ const selected = isNone ? null : (options.find((a) => a.id === value) ?? null);
 
 A Mesh field passes `assetType: "mesh"`, an albedo or sky field `"texture"`, so a field can only hold the right kind of asset. Each row draws a small swatch through `getThumbnailUrl` at 64px — the same [blob-URL cache](../assets-panel-and-thumbnails/) the tiles use, so the picker and the grid never double-fetch a thumbnail.
 
-The picker is **field-agnostic**: it only emits the chosen id. The inspector owns the write. `Mesh.mesh` and `Material.albedoTexture` go through the dedicated `assign-asset`; every other uuid field goes through `set-component-field`. The id is a **string** end-to-end (engine Uuids are u64), never `Number()`d.
+The picker is **field-agnostic**: it only emits the chosen id. The inspector owns the write. `Mesh.mesh` goes through the dedicated `assign-asset`; a `MaterialSet` slot's material and its texture-override rows go through `set-component-field` with the slot index; every other uuid field goes through `set-component-field`. The id is a **string** end-to-end (engine Uuids are u64), never `Number()`d.
 
 ## Type-gated field drops
 

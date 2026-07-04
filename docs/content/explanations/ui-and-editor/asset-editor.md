@@ -27,7 +27,7 @@ The scene edit context already had two modes routed through one accessor, `activ
 
 Preview stays in `PlayState::Edit` (it is mutually exclusive with Play), so it is best read as "Edit, but looking at an isolated asset instead of your scene." The authored scene cannot leak into a save, because `save-project` serializes `ctx.scene_edit.scene` explicitly — never `active_scene`. The keystone invariant the end-to-end tests guard: entering a preview, scrubbing it, and leaving it returns `project.json` **byte-identical**, including the `editorCamera` block — and that holds for static models too, which carry no animation to scrub. The camera, the selection, and the skeleton-overlay preferences are stashed on enter and restored on exit, all engine-side, so even a CLI-driven `enter`/`exit` with no editor in the loop is leak-proof.
 
-Commands that would mutate the authored scene or project — `new-project`, `open-project`, `load-scene`, `load-project`, `reload-project`, `delete-asset`, `import-model`, `assign-asset`, `set-material` — refuse while a preview is engaged ("exit the asset preview first"), the same way they refuse during Play. Entering a preview while Play is running is likewise refused, and `play` is refused while previewing.
+Commands that would mutate the authored scene or project — `new-project`, `open-project`, `load-scene`, `load-project`, `reload-project`, `delete-asset`, `import-model`, `assign-asset` — refuse while a preview is engaged ("exit the asset preview first"), the same way they refuse during Play. Entering a preview while Play is running is likewise refused, and `play` is refused while previewing.
 
 ## Its own viewport surface
 
