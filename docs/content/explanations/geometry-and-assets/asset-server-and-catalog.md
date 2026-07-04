@@ -52,6 +52,7 @@ pub struct AssetEntry {
     pub container: Uuid,     // 0 = standalone; else the owning .smodel
     pub chunk: i32,          // TOC chunk index inside the container (-1 = standalone)
     pub colorspace: Colorspace,
+    pub role: TextureRole,   // albedo/normal/roughness/…/hdri — how a texture previews
     pub content_hash: u64,   // FNV of the baked content; the thumbnail cache key
     // + folder, hdr/linear flags, animation duration/tracks, rigged
 }
@@ -71,8 +72,11 @@ renderer; the asset layer hands the scene a shared read-only handle (`Option<Arc
 `AssetEntry` carries container linkage — `container` (the owning [`.smodel`](../smodel-container/))
 and `chunk` — so one row can be the model and another a mesh/material/texture embedded inside
 it, resolved by `(container, sub-id)`. A standalone asset's editable `name`, `folder`, and (for a
-texture) `colorspace` are the fields its filename can't carry, so they live in a co-located
-`.smeta` sidecar (see below); an embedded sub-asset recovers them from the container META.
+texture) `colorspace` and `role` are the fields its filename can't carry, so they live in a co-located
+`.smeta` sidecar (see below); an embedded sub-asset recovers them from the container META. A texture's
+`role` — albedo, normal, roughness, height, hdri, … — is inferred from its filename token at import and
+drives how it previews (its map on a lit sphere, or an HDRI as a lit environment); the [asset
+editor](../../ui-and-editor/asset-editor/) reads it to route the preview.
 
 ## The filesystem is the source of truth
 
@@ -87,7 +91,7 @@ identical catalog.
 ### The `.smeta` sidecar
 
 A file's bytes carry its geometry, not its display name — so an asset's editable metadata
-(`name`, `folder`, and a texture's `colorspace`) lives beside it in a `<path>.smeta` sidecar.
+(`name`, `folder`, and a texture's `colorspace` + `role`) lives beside it in a `<path>.smeta` sidecar.
 It is written **eagerly**: an import mints it, and `rename-asset` / `move-asset` rewrite it, so the
 metadata is durable the instant you touch it, with no project save. The scan overlays the sidecar
 onto the row it matches **by id** — authoritative over the `project.json` seed (which is only as
