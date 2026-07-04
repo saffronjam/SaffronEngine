@@ -219,8 +219,14 @@ const StoreCard = React.memo(function StoreCard({
   const nav = useGalleryNav(images.length);
 
   return (
+    // Paint containment isolates each card's rasterization: an animation of a compositing
+    // property inside one card (the gallery's slide transform, an overlay fade) confines its
+    // repaint to this box and can't re-rasterize sibling cards — whose text would otherwise flip
+    // antialiasing on the software-composited webview, reading as a font-size shimmer. It's a
+    // containment boundary, not a compositing layer (unlike translateZ, which promotes a layer per
+    // card and stalls the software compositor), so it stays cheap.
     <div
-      className="group absolute flex flex-col overflow-hidden rounded-md border border-border bg-card"
+      className="group absolute flex flex-col overflow-hidden rounded-md border border-border bg-card [contain:paint]"
       style={{ top: 0, left, width: CELL_W - 12, height: CELL_H - 12 }}
       onMouseEnter={() => setHovered(true)}
     >
