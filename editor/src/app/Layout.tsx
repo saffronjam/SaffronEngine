@@ -1,20 +1,23 @@
 /// The Scene dockspace: a recursive `DockRoot` renders the Scene dock tree — a horizontal
 /// [left sidebar | center column | right dock] over the center's vertical
 /// [viewport | assets | bottom dock]. Every region is a dock leaf: drag a tab to retab or
-/// split it; an empty right/bottom region collapses and the viewport reclaims the space.
+/// split it; an empty left/right/bottom region collapses and the viewport reclaims the space.
 /// The per-project layout loads on mount (App remounts this component per project via its
 /// `key`). The viewport leaf is the only host the engine paints over — it is `locked` (no
 /// strip, no drops) and keeps the live subsurface; reveal bands stand in for the empty
-/// right/bottom regions during a torn drag so a panel can be dropped back into them.
+/// left/right/bottom regions during a torn drag so a panel can be dropped back into them.
 import { useEffect } from "react";
 import { useEditorStore } from "../state/store";
 import { DockRoot } from "@/components/dock/DockRoot";
 import { RevealBands, type RevealBand } from "@/components/dock/RevealBands";
 import { logRender } from "../lib/renderLog";
 
-/// The empty Scene edge regions that accept a torn tab while collapsed (the persistent
-/// right/bottom docks).
+/// The empty Scene edge regions that accept a torn tab while collapsed. The right/bottom docks
+/// are single persistent leaves, so their band tracks that leaf directly. The left column is a
+/// branch (`hierarchy` over the persistent `leftBottom`); its band tracks the whole branch and
+/// docks into `leftBottom`, so it appears only once the *entire* left column has collapsed.
 const SCENE_REVEAL_BANDS: RevealBand[] = [
+  { leafId: "leaf:leftBottom", regionId: "branch:scene-left", edge: "left" },
   { leafId: "leaf:right", edge: "right" },
   { leafId: "leaf:bottom", edge: "bottom" },
 ];

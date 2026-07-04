@@ -5,11 +5,17 @@
 /// rect hit-test. Parameterized by dockspace so the Scene and asset-editor islands share it.
 import { useShallow } from "zustand/react/shallow";
 import { useEditorStore } from "../../state/store";
-import { isLeaf, type DockNodeId, type DockSpaceKind } from "../../state/dockLayout";
+import { isNodeRendered, type DockNodeId, type DockSpaceKind } from "../../state/dockLayout";
 import { useDockDrag } from "./dockDrag";
 
 export interface RevealBand {
+  /// The persistent leaf a drop on this band docks into (re-expanding the region).
   leafId: DockNodeId;
+  /// The subtree whose collapse this band stands in for. Defaults to `leafId` when the edge
+  /// region is a single leaf; when the region is a branch (the Scene's left column is
+  /// `hierarchy` over the persistent `leftBottom`) it is that branch, so the band appears only
+  /// once the *whole* region has collapsed — not merely when `leafId` alone is empty.
+  regionId?: DockNodeId;
   edge: "left" | "right" | "bottom";
 }
 
@@ -21,15 +27,13 @@ const BAND_POSITION: Record<RevealBand["edge"], string> = {
 
 export function RevealBands({ space, bands }: { space: DockSpaceKind; bands: RevealBand[] }) {
   const dragging = useDockDrag() !== null;
-  // One selector returns the empty-state of each band's leaf. `bands` is a stable-length constant
-  // per call site, so the hook count never varies; `useShallow` keeps the boolean array stable.
-  const empty = useEditorStore(
+  // One selector returns whether each band's region has collapsed (nothing rendered). `bands` is a
+  // stable-length constant per call site, so the hook count never varies; `useShallow` keeps the
+  // boolean array stable.
+  const collapsed = useEditorStore(
     useShallow((s) => {
       const layout = s.dockLayouts[space];
-      return bands.map((band) => {
-        const leaf = layout.nodes[band.leafId];
-        return isLeaf(leaf) && leaf.tabs.length === 0;
-      });
+      return bands.map((band) => !isNodeRendered(layout, band.regionId ?? band.leafId));
     }),
   );
   if (!dragging) {
@@ -38,7 +42,7 @@ export function RevealBands({ space, bands }: { space: DockSpaceKind; bands: Rev
   return (
     <>
       {bands.map((band, i) =>
-        empty[i] ? (
+        collapsed[i] ? (
           <div
             key={band.leafId}
             data-dock-leaf={band.leafId}
