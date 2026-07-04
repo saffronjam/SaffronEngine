@@ -136,6 +136,7 @@ fn every_catalog_dto_exists_and_derives() {
         SetGiResult,
         SetShadowsResult,
         SetSkinningResult,
+        SetDisplacementResult,
         SetDepthPrepassResult,
         ViewportNativeInfoResult,
         SetViewportPowerStateParams,

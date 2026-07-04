@@ -137,6 +137,7 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(SetGiResult, "SetGiResult");
     check!(SetShadowsResult, "SetShadowsResult");
     check!(SetSkinningResult, "SetSkinningResult");
+    check!(SetDisplacementResult, "SetDisplacementResult");
     check!(SetDepthPrepassResult, "SetDepthPrepassResult");
     check!(ViewportNativeInfoResult, "ViewportNativeInfoResult");
     check!(SetViewportPowerStateParams, "SetViewportPowerStateParams");

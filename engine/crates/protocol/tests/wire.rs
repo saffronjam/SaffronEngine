@@ -20,7 +20,8 @@ fn enum_wire_spellings_match_cpp_table() {
 
     check!(AddEntityPreset::Empty, "empty");
     check!(AddEntityPreset::Cube, "cube");
-    check!(AddEntityPreset::Model, "model");
+    check!(AddEntityPreset::Plane, "plane");
+    check!(AddEntityPreset::Sphere, "sphere");
     check!(AddEntityPreset::PointLight, "point-light");
     check!(AddEntityPreset::SpotLight, "spot-light");
     check!(AddEntityPreset::DirectionalLight, "directional-light");
