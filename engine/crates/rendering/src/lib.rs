@@ -20,6 +20,7 @@ mod budget;
 mod ddgi;
 mod descriptors;
 mod device;
+mod displacement;
 mod draw_list;
 mod frame;
 mod frame_history;
@@ -49,6 +50,7 @@ mod swapchain;
 mod targets;
 mod thumbnail;
 mod thumbnail_render;
+mod transient;
 mod upload;
 mod view_target;
 
@@ -66,9 +68,12 @@ pub use descriptors::{
     DEFAULT_WHITE_SLOT, Descriptors, MAX_BINDLESS_SDF, MAX_BINDLESS_TEXTURES, MAX_REFLECTION_PROBES,
 };
 pub use device::{Capabilities, Device, ProfilerFacts, SurfaceSource, validation_issue_count};
+pub use displacement::{
+    DISPLACE_MAX_SETS_PER_FRAME, DisplaceBucket, Displacement, request_displace_pipeline,
+};
 pub use draw_list::{
-    DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
-    SkinDispatch, SubmeshMaterial, normal_matrix,
+    DeformedRtInstance, DisplaceDispatch, DrawBatch, DrawItem, MorphDispatch, RenderStats,
+    SceneDrawList, SkinDispatch, SubmeshMaterial, normal_matrix,
 };
 pub use frame::MAX_FRAMES_IN_FLIGHT;
 pub use frame_history::{
@@ -148,6 +153,7 @@ pub use thumbnail::{
     PngTransfer, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
 pub use thumbnail_render::{ThumbnailPng, ThumbnailRenderer};
+pub use transient::TransientResources;
 pub use upload::{GpuQueue, SdfBake, Uploader};
 pub use view_target::ViewTarget;
 

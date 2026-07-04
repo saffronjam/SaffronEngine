@@ -888,6 +888,7 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
+        let mut displacement = crate::Displacement::new(&device).expect("Displacement");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
@@ -902,6 +903,7 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[item],
                 &[],
                 DrawListInputs {
@@ -910,6 +912,7 @@ mod tests {
                     wireframe: false,
                     default_texture_index: crate::DEFAULT_WHITE_SLOT,
                     rt_skinned: false,
+                    displace_enabled: true,
                 },
             )
             .expect("submit_draw_list");
@@ -928,6 +931,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(_lighting);

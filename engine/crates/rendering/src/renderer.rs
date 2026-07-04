@@ -12,6 +12,7 @@ use crate::budget::{BudgetController, BudgetStep};
 use crate::ddgi::DDGI_RAYS_PER_PROBE;
 use crate::descriptors::Descriptors;
 use crate::device::SurfaceSource;
+use crate::displacement::Displacement;
 use crate::draw_list::{DrawItem, RenderStats, SceneDrawList};
 use crate::frame::FrameRing;
 use crate::frame_history::{
@@ -44,6 +45,7 @@ use crate::scene_pass::{
 use crate::skinning::Skinning;
 use crate::ssao::Ssao;
 use crate::targets::Targets;
+use crate::transient::TransientResources;
 use crate::view_target::ViewTarget;
 use crate::{Device, Error, Result, Swapchain, checked};
 
@@ -239,6 +241,8 @@ struct FramePipelines {
     skin: Option<Arc<crate::Pipeline>>,
     /// The compute morph PSO, resolved when the frame has morph dispatches.
     morph: Option<Arc<crate::Pipeline>>,
+    /// The compute displacement PSO, resolved when the frame has displace dispatches.
+    displace: Option<Arc<crate::Pipeline>>,
     shadow: Option<Arc<crate::Pipeline>>,
     point_shadow: Option<Arc<crate::Pipeline>>,
     /// Whether the **static** point-shadow cube needs re-rendering this frame (its content key or
@@ -496,6 +500,10 @@ pub struct Renderer {
     /// back to bind-pose meshes. Defaults on.
     skinning_enabled: bool,
 
+    /// Whether the GPU compute-displacement path runs. Off leaves displacement-enabled meshes
+    /// undisplaced (the base geometry). Defaults on.
+    displacement_enabled: bool,
+
     /// Whether the device is a software rasterizer (llvmpipe/lavapipe): GPU timings are
     /// CPU rasterization time. Mirrored from the device capabilities.
     software_gpu: bool,
@@ -617,6 +625,8 @@ pub struct Renderer {
     targets: Targets,
     instancing: Instancing,
     skinning: Skinning,
+    displacement: Displacement,
+    transient: TransientResources,
     pipelines: Pipelines,
     ibl: Ibl,
     sky: Sky,
@@ -749,6 +759,8 @@ impl Renderer {
             Pipelines,
             Instancing,
             Skinning,
+            Displacement,
+            TransientResources,
             Ibl,
             Sky,
             ReflectionProbes,
@@ -784,6 +796,8 @@ impl Renderer {
             let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
             let instancing = Instancing::new(&device, &descriptors)?;
             let skinning = Skinning::new(&device)?;
+            let displacement = Displacement::new(&device)?;
+            let transient = TransientResources::new(device.resources().clone());
 
             // IBL: the cubes + LUT sampler + set 3, then the first (procedural) bake so set
             // 3 is valid before the first frame. The sky reuses the env cube; the reflection
@@ -848,6 +862,8 @@ impl Renderer {
                 pipelines,
                 instancing,
                 skinning,
+                displacement,
+                transient,
                 ibl,
                 sky,
                 reflection,
@@ -870,6 +886,8 @@ impl Renderer {
             pipelines,
             instancing,
             skinning,
+            displacement,
+            transient,
             ibl,
             sky,
             reflection,
@@ -960,6 +978,7 @@ impl Renderer {
             present_scene_signaled: false,
             view_mode: ViewMode::Lit,
             skinning_enabled: true,
+            displacement_enabled: true,
             software_gpu,
             frame_ms: 0.0,
             cpu_frame_ms: 0.0,
@@ -1005,6 +1024,8 @@ impl Renderer {
             targets,
             instancing,
             skinning,
+            displacement,
+            transient,
             pipelines,
             ibl,
             sky,
@@ -2251,6 +2272,21 @@ impl Renderer {
         )
     }
 
+    /// Renders a static chrome sphere mirroring `hdri` (an equirectangular environment) into a
+    /// `size`×`size` texture — the HDRI asset tile.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any pipeline-build, target-allocation, or submit failure.
+    pub fn render_hdri_ball_preview(
+        &mut self,
+        hdri: &Arc<crate::GpuTexture>,
+        size: u32,
+    ) -> Result<Arc<crate::GpuTexture>> {
+        self.thumbnail
+            .render_hdri_ball_preview(&self.device, &self.descriptors, hdri, size)
+    }
+
     /// Renders `mesh` shaded per-submesh with its materials into a `size`×`size` texture.
     ///
     /// # Errors
@@ -2611,6 +2647,16 @@ impl Renderer {
     /// Whether GPU skinning is on.
     pub fn skinning_enabled(&self) -> bool {
         self.skinning_enabled
+    }
+
+    /// Toggles the GPU compute-displacement path.
+    pub fn set_displacement(&mut self, enabled: bool) {
+        self.displacement_enabled = enabled;
+    }
+
+    /// Whether GPU displacement is on.
+    pub fn displacement_enabled(&self) -> bool {
+        self.displacement_enabled
     }
 
     /// Whether the device is a software rasterizer.
@@ -2990,11 +3036,13 @@ impl Renderer {
             // reflections on, on an RT device) — they feed the per-frame refit BLAS the
             // `tlas-build` reads.
             rt_skinned: self.rt.use_rt_shadows() || self.rt.use_rt_reflections(),
+            displace_enabled: self.displacement_enabled,
         };
         let (list, stats) = self.instancing.submit_draw_list(
             &self.descriptors,
             &mut self.pipelines,
             &mut self.skinning,
+            &mut self.displacement,
             items,
             joints,
             inputs,
@@ -3036,6 +3084,9 @@ impl Renderer {
             unsafe { raw.wait_for_fences(&[in_flight], true, u64::MAX) },
             "wait_for_fences (begin)",
         )?;
+        // The slot's prior GPU work is done, so its transient scratch allocations are free to
+        // recycle: rewind the pool's acquire cursors for this frame index.
+        self.transient.begin_frame(self.frames.index());
         // This slot's GPU work (from MAX_FRAMES_IN_FLIGHT frames ago) is now complete, so its
         // timestamp pool reads back without blocking: fold the prior frame's per-pass GPU spans
         // into `gpu_frame_ms` + `last_timings` at the begin-frame fence wait. A no-op when the
@@ -3174,6 +3225,18 @@ impl Renderer {
         // morph pass deforms each morph instance into the deformed buffer before skin.
         let morph_pipeline = if !self.scene_draw_list.morph_dispatches.is_empty() {
             crate::skinning::request_morph_pipeline(&mut self.pipelines, &self.skinning)
+        } else {
+            None
+        };
+        // The displacement compute PSO, resolved only when the frame built displace dispatches.
+        // The displace pass writes each displacement-enabled instance's height-displaced vertices
+        // into the same deformed buffer as skin/morph, before every geometry pass reads it.
+        let displace_pipeline = if !self.scene_draw_list.displace_dispatches.is_empty() {
+            crate::request_displace_pipeline(
+                &mut self.pipelines,
+                &self.descriptors,
+                &self.displacement,
+            )
         } else {
             None
         };
@@ -3511,6 +3574,7 @@ impl Renderer {
             cull: cull_pipeline,
             skin: skin_pipeline,
             morph: morph_pipeline,
+            displace: displace_pipeline,
             shadow: shadow_pipeline,
             point_shadow: point_shadow_pipeline,
             static_point_shadow_dirty,
@@ -3735,7 +3799,13 @@ impl Renderer {
             && !self.scene_draw_list.morph_dispatches.is_empty()
             && self.skinning.deformed_buffer(frame).is_some()
             && self.skinning.prev_deformed_buffer(frame).is_some();
-        let do_deform = do_skin || do_morph;
+        // Displacement writes the same deformed / prev-deformed buffers (its wiring sized them), so
+        // it joins the deform scope on the same terms as skin/morph.
+        let do_displace = pipelines.displace.is_some()
+            && !self.scene_draw_list.displace_dispatches.is_empty()
+            && self.skinning.deformed_buffer(frame).is_some()
+            && self.skinning.prev_deformed_buffer(frame).is_some();
+        let do_deform = do_skin || do_morph || do_displace;
         let deformed_handle = if do_deform {
             self.skinning.deformed_buffer(frame)
         } else {
@@ -3806,6 +3876,44 @@ impl Renderer {
                             &list.prev_skin_dispatches,
                         );
                         drop(skin);
+                    });
+                graph.add_pass(pass);
+            }
+
+            // Displacement pre-pass: displace each displacement-enabled instance's base vertices by
+            // its height field into the deformed (current) + prev-deformed (previous — identical, a
+            // static field) buffers. It writes the same resources as skin/morph, so the graph orders
+            // it in the deform scope (WAW) and every geometry consumer's `VertexInputRead` already
+            // covers it. The bindless set (0) lets the kernel sample the height map by index.
+            if do_displace {
+                let displace = pipelines.displace.as_ref().expect("displace PSO");
+                let displace = Arc::clone(displace);
+                let displace_handle = displace.handle();
+                let displace_layout = displace.layout();
+                let bindless_set = self.descriptors.bindless_set();
+                let raw_displace = raw.clone();
+                let displace_list = self.scene_draw_list.shallow_clone();
+                let pass = RgPass::compute("displace")
+                    .access(deformed, RgUsage::StorageWriteCompute)
+                    .access(prev_deformed, RgUsage::StorageWriteCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        crate::Displacement::record_displace(
+                            &raw_displace,
+                            cmd,
+                            displace_handle,
+                            displace_layout,
+                            bindless_set,
+                            &displace_list.displace_dispatches,
+                        );
+                        crate::Displacement::record_displace(
+                            &raw_displace,
+                            cmd,
+                            displace_handle,
+                            displace_layout,
+                            bindless_set,
+                            &displace_list.prev_displace_dispatches,
+                        );
+                        drop(displace);
                     });
                 graph.add_pass(pass);
             }
@@ -7733,6 +7841,7 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
+        let mut displacement = Displacement::new(&device).expect("Displacement");
         let view = ViewTarget::new(&device, 16, 16).expect("ViewTarget");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
@@ -7768,12 +7877,14 @@ mod tests {
             wireframe: false,
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
             rt_skinned: false,
+            displace_enabled: true,
         };
         let (list, stats) = instancing
             .submit_draw_list(
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
+                &mut displacement,
                 &[item],
                 &[],
                 inputs,
@@ -7811,6 +7922,7 @@ mod tests {
             depth_pipeline.handle(),
             depth_pipeline.layout(),
             instancing.instance_set(0),
+            descriptors.bindless_set(),
         )
         .expect("depth readback");
 
@@ -7830,6 +7942,7 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
+        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -7858,6 +7971,7 @@ mod tests {
         depth_pipeline: vk::Pipeline,
         depth_layout: vk::PipelineLayout,
         instance_set: vk::DescriptorSet,
+        bindless_set: vk::DescriptorSet,
     ) -> Result<Vec<f32>> {
         use crate::render_graph::{RenderGraph, RgPass};
         use crate::scene_pass::record_depth_prepass;
@@ -7898,6 +8012,19 @@ mod tests {
         let raw_body = raw.clone();
         let body_set = instance_set;
         let body = move |cmd: vk::CommandBuffer| {
+            // Bind the bindless albedo set (0) so the prepass fragment can alpha-clip masked
+            // materials — mirrors the real depth-prepass pass body.
+            // SAFETY: the ash seam — the set + layout are valid for this recording.
+            unsafe {
+                raw_body.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    depth_layout,
+                    0,
+                    &[bindless_set],
+                    &[],
+                );
+            }
             record_depth_prepass(
                 &raw_body,
                 cmd,
