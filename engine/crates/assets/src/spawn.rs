@@ -11,16 +11,16 @@
 //! `w,x,y,z`; [`imported_nodes_from_json`] reorders it to glam's `xyzw` at the byte
 //! boundary, and the per-bone transform takes the engine's ZYX Euler from there.
 
-use saffron_geometry::glam::{Mat4, Quat, Vec3, Vec4};
+use saffron_geometry::glam::{Mat4, Quat, Vec3};
 use saffron_geometry::{ImportedNode, ImportedSkin};
 use saffron_scene::{
-    AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, IdComponent, Joint, Material,
-    MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Relationship, SkinnedMesh,
-    Transform, Wrap, quat_to_euler_zyx,
+    AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, IdComponent, Joint, MaterialSet,
+    MaterialSlot, Mesh, ModelInstance, MorphComponent, Relationship, SkinnedMesh, Transform, Wrap,
+    quat_to_euler_zyx,
 };
 use saffron_scene::{Entity, Scene};
 
-use saffron_core::{BlendMode, Uuid};
+use saffron_core::Uuid;
 use saffron_scene::AssetType;
 use serde_json::Value;
 
@@ -32,17 +32,12 @@ use crate::error::{Error, Result};
 ///
 /// Reconstructed by [`AssetServer::instantiate_model`] from a container's META; it is
 /// never an import output (`bake_model` produces a container, not a `ModelSpawnInput`).
-/// `materials[0]` mirrors `base_color`/`albedo_texture`; more than one slot spawns a
-/// [`MaterialSet`].
+/// `materials` become a [`MaterialSet`] whose slots reference the imported `.smat` chunks.
 #[derive(Clone, Debug, Default)]
 pub struct ModelSpawnInput {
     /// The mesh sub-id (a soft reference resolved at draw time).
     pub mesh: Uuid,
-    /// The base color of the first material slot.
-    pub base_color: Vec4,
-    /// The first material slot's albedo texture sub-id (`0` == none).
-    pub albedo_texture: Uuid,
-    /// The imported material table; slot 0 mirrors `base_color`/`albedo_texture`.
+    /// The imported material table — one reference slot per source material.
     pub materials: Vec<MaterialSlot>,
     /// Whether the import carries a skin (gates the skinned spawn path).
     pub has_skin: bool,
@@ -191,41 +186,17 @@ fn f32_at(array: &[Value], i: usize) -> f32 {
     array.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32
 }
 
-/// Applies the spawn input's material table to `entity`: a [`MaterialSet`] when more than
-/// one slot, otherwise an inline [`Material`] from the first slot. An empty table leaves
-/// a default [`Material`].
+/// Attaches the spawn input's material table to `entity` as a [`MaterialSet`] — one slot
+/// per source material, each *referencing* the imported `.smat` chunk (no inline copy). An
+/// empty table leaves a single default-material slot so the entity always resolves a
+/// material.
 fn apply_imported_materials(scene: &mut Scene, entity: Entity, input: &ModelSpawnInput) {
-    if input.materials.len() > 1 {
-        let _ = scene.add_component(
-            entity,
-            MaterialSet {
-                slots: input.materials.clone(),
-            },
-        );
-        return;
-    }
-    let mut material = Material::default();
-    if let Some(slot) = input.materials.first() {
-        material.base_color = slot.base_color;
-        material.albedo_texture = slot.albedo_texture;
-        material.metallic_roughness_texture = slot.metallic_roughness_texture;
-        material.metallic = slot.metallic;
-        material.roughness = slot.roughness;
-        material.emissive = slot.emissive;
-        material.emissive_strength = slot.emissive_strength;
-        material.unlit = slot.unlit;
-        material.normal_texture = slot.normal_texture;
-        material.occlusion_texture = slot.occlusion_texture;
-        material.emissive_texture = slot.emissive_texture;
-        material.height_texture = slot.height_texture;
-        material.normal_strength = slot.normal_strength;
-        material.uv_tiling = slot.uv_tiling;
-        material.uv_offset = slot.uv_offset;
-        material.height_scale = slot.height_scale;
-        material.blend_mode = slot.blend_mode;
-        material.alpha_cutoff = slot.alpha_cutoff;
-    }
-    let _ = scene.add_component(entity, material);
+    let slots = if input.materials.is_empty() {
+        vec![MaterialSlot::default()]
+    } else {
+        input.materials.clone()
+    };
+    let _ = scene.add_component(entity, MaterialSet { slots });
 }
 
 /// Seeds the durable [`MorphComponent`] on a mesh-bearing entity when the import carries
@@ -543,45 +514,17 @@ impl crate::AssetServer {
 
         let mut input = ModelSpawnInput::default();
 
-        // Each baked material sub-asset resolves to its full `.smat` (factors + texture sub-ids)
-        // from the container's material chunk, so the spawned entity's `Material` carries the
-        // imported texture slots — not just the flat factors. A chunk that fails to resolve
-        // falls back to the META `materials` flat factors (a logged degradation, never a hard
-        // failure).
-        let factors = material_factors(&meta.materials);
-        let material_subs: Vec<Uuid> = meta
-            .sub_assets
-            .iter()
-            .filter(|s| s.asset_type == AssetType::Material)
-            .map(|s| s.sub_id)
-            .collect();
-        for sub_id in material_subs {
-            let mut slot = MaterialSlot::default();
-            if let Some(resolved) = self.resolve_container_material(&model, sub_id) {
-                slot.base_color = resolved.base_color;
-                slot.metallic = resolved.metallic;
-                slot.roughness = resolved.roughness;
-                slot.emissive = resolved.emissive;
-                slot.emissive_strength = resolved.emissive_strength;
-                slot.albedo_texture = resolved.albedo_texture;
-                slot.metallic_roughness_texture = resolved.orm_texture;
-                slot.normal_texture = resolved.normal_texture;
-                slot.emissive_texture = resolved.emissive_texture;
-                slot.height_texture = resolved.height_texture;
-                slot.normal_strength = resolved.normal_strength;
-                slot.uv_tiling = resolved.uv_tiling;
-                slot.uv_offset = resolved.uv_offset;
-                slot.height_scale = resolved.height_scale;
-                slot.unlit = resolved.unlit;
-                slot.blend_mode = BlendMode::from_wire(&resolved.blend);
-                slot.alpha_cutoff = resolved.alpha_cutoff;
-                slot.double_sided = resolved.double_sided;
-            } else if let Some(f) = factors.get(&sub_id.value()) {
-                slot.base_color = f.base_color;
-                slot.metallic = f.metallic;
-                slot.roughness = f.roughness;
+        // Each baked material sub-asset is catalog-addressable by its `sub_id` (a row with
+        // `container == model_id`), so a slot *references* the `.smat` chunk directly — the
+        // resolve path loads factors + textures from it at draw time. Editing that material
+        // then propagates to every instance.
+        for sub in &meta.sub_assets {
+            if sub.asset_type == AssetType::Material {
+                input.materials.push(MaterialSlot {
+                    material: sub.sub_id,
+                    ..MaterialSlot::default()
+                });
             }
-            input.materials.push(slot);
         }
 
         for sub in &meta.sub_assets {
@@ -626,86 +569,11 @@ impl crate::AssetServer {
                 .find(|id| id.value() != 0)
                 .unwrap_or(Uuid(0))
         };
-        if let Some(first) = input.materials.first() {
-            input.base_color = first.base_color;
-            input.albedo_texture = first.albedo_texture;
-        }
 
         let root = spawn_model(scene, name, &input);
         let _ = scene.add_component(root, ModelInstance { model_id });
         Ok(root)
     }
-
-    /// Resolves a baked material sub-asset to its full [`MaterialAsset`] by reading the
-    /// container's `SMAT` chunk and parsing the `.smat` JSON. Returns `None` when the chunk
-    /// is absent or unparseable, so the
-    /// caller falls back to the META flat factors. The texture sub-ids it carries reference the
-    /// container's own texture sub-assets, which resolve through the catalog at draw time.
-    fn resolve_container_material(
-        &self,
-        model: &crate::model::ModelAsset,
-        sub_id: Uuid,
-    ) -> Option<crate::material::MaterialAsset> {
-        let source = self.chunk_source_for(model, saffron_geometry::ChunkKind::Material, sub_id);
-        if source.is_empty() {
-            return None;
-        }
-        let bytes = source.read().ok()?;
-        let text = std::str::from_utf8(&bytes).ok()?;
-        let doc = saffron_json::parse_json(text).ok()?;
-        Some(crate::material::material_asset_from_json(&doc))
-    }
-}
-
-/// The per-material flat factors the import wrote into the META `materials` block.
-struct MaterialFactors {
-    base_color: Vec4,
-    metallic: f32,
-    roughness: f32,
-}
-
-/// Indexes the META `materials` array by sub-id (the import-written
-/// `[{subId, baseColor, metallic, roughness}]`). The full `.smat` resolve is a later
-/// phase; the flat factors here are the soft-reference baseline a spawn places.
-fn material_factors(materials: &Value) -> std::collections::HashMap<u64, MaterialFactors> {
-    let mut out = std::collections::HashMap::new();
-    let Some(array) = materials.as_array() else {
-        return out;
-    };
-    for record in array {
-        let Some(record) = record.as_object() else {
-            continue;
-        };
-        let sub_id = record
-            .get("subId")
-            .and_then(decimal_u64)
-            .unwrap_or_default();
-        if sub_id == 0 {
-            continue;
-        }
-        let base_color = record
-            .get("baseColor")
-            .and_then(Value::as_array)
-            .filter(|a| a.len() == 4)
-            .map_or(Vec4::ONE, |a| {
-                Vec4::new(f32_at(a, 0), f32_at(a, 1), f32_at(a, 2), f32_at(a, 3))
-            });
-        out.insert(
-            sub_id,
-            MaterialFactors {
-                base_color,
-                metallic: record
-                    .get("metallic")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0) as f32,
-                roughness: record
-                    .get("roughness")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(1.0) as f32,
-            },
-        );
-    }
-    out
 }
 
 /// A uuid encoded the wire way — a decimal string (preferred) or a JSON number.

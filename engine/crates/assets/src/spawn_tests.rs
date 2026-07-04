@@ -10,7 +10,7 @@ use saffron_geometry::{
     Vertex, VertexSkin,
 };
 use saffron_scene::{
-    AnimationPlayer, Bone, BonePhysicsComponent, Material, MaterialSet, ModelInstance, Scene,
+    AnimationPlayer, AssetType, Bone, BonePhysicsComponent, MaterialSet, ModelInstance, Scene,
     SkinnedMesh,
 };
 use std::path::PathBuf;
@@ -92,7 +92,7 @@ fn bake_into_catalog(assets: &mut AssetServer, graph: &ImportedModel, source: &s
 }
 
 #[test]
-fn instantiate_flat_model_spawns_one_mesh_entity_with_base_color() {
+fn instantiate_flat_model_spawns_one_mesh_entity_referencing_its_material() {
     let dir = scratch("flat");
     let root = dir.join("assets");
     let mut assets = AssetServer::new(&root);
@@ -120,20 +120,19 @@ fn instantiate_flat_model_spawns_one_mesh_entity_with_base_color() {
         .instantiate_model(&mut scene, model_id, "Cube")
         .expect("instantiate");
 
-    // One material -> an inline Material with the baked sub-id's base color.
+    // One material -> a `MaterialSet` with a single slot *referencing* the baked `.smat`
+    // sub-id (no inline factor copy).
     assert!(scene.has_component::<saffron_scene::Mesh>(entity));
-    assert!(scene.has_component::<Material>(entity));
-    assert!(!scene.has_component::<MaterialSet>(entity));
+    assert!(scene.has_component::<MaterialSet>(entity));
     assert!(scene.has_component::<ModelInstance>(entity));
 
+    let model = assets.load_model_asset(model_id).unwrap();
     let mesh_id = scene.component::<saffron_scene::Mesh>(entity).unwrap().mesh;
-    let baked_mesh = assets
-        .load_model_asset(model_id)
-        .unwrap()
+    let baked_mesh = model
         .meta
         .sub_assets
         .iter()
-        .find(|s| s.asset_type == saffron_scene::AssetType::Mesh)
+        .find(|s| s.asset_type == AssetType::Mesh)
         .unwrap()
         .sub_id;
     assert_eq!(
@@ -141,9 +140,26 @@ fn instantiate_flat_model_spawns_one_mesh_entity_with_base_color() {
         "the spawned mesh id is the baked sub-id"
     );
 
-    let material = scene.component::<Material>(entity).unwrap();
-    assert!((material.base_color.x - 0.25).abs() < 1e-5);
-    assert!((material.base_color.z - 0.75).abs() < 1e-5);
+    let baked_material = model
+        .meta
+        .sub_assets
+        .iter()
+        .find(|s| s.asset_type == AssetType::Material)
+        .unwrap()
+        .sub_id;
+    let slots = scene
+        .with_component::<MaterialSet, _>(entity, |s| s.slots.clone())
+        .expect("a material set");
+    assert_eq!(slots.len(), 1, "one slot for the single source material");
+    assert_ne!(
+        slots[0].material.value(),
+        0,
+        "the slot references a real id"
+    );
+    assert_eq!(
+        slots[0].material, baked_material,
+        "the slot references the baked `.smat` sub-id"
+    );
 
     let instance = scene.component::<ModelInstance>(entity).unwrap();
     assert_eq!(instance.model_id, model_id);
@@ -265,18 +281,34 @@ fn instantiate_multi_material_model_spawns_a_material_set_in_slot_order() {
         .instantiate_model(&mut scene, model_id, "Two")
         .expect("instantiate");
 
-    assert!(!scene.has_component::<Material>(entity));
+    // Two source materials -> two slots, each referencing its baked `.smat` sub-id in the
+    // baked (slot) order.
+    let material_ids: Vec<Uuid> = assets
+        .load_model_asset(model_id)
+        .unwrap()
+        .meta
+        .sub_assets
+        .iter()
+        .filter(|s| s.asset_type == AssetType::Material)
+        .map(|s| s.sub_id)
+        .collect();
+    assert_eq!(material_ids.len(), 2, "two baked material sub-assets");
+
     let set = scene
         .with_component::<MaterialSet, _>(entity, |s| s.slots.clone())
         .expect("a material set");
     assert_eq!(set.len(), 2, "two slots, in slot order");
-    assert!(
-        (set[0].base_color.x - 1.0).abs() < 1e-5,
-        "slot 0 is material a"
+    assert_eq!(
+        set[0].material, material_ids[0],
+        "slot 0 references material a"
+    );
+    assert_eq!(
+        set[1].material, material_ids[1],
+        "slot 1 references material b"
     );
     assert!(
-        (set[1].base_color.y - 1.0).abs() < 1e-5,
-        "slot 1 is material b"
+        set.iter().all(|slot| slot.material.value() != 0),
+        "both slots reference real sub-ids"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
