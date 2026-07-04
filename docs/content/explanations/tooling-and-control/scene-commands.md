@@ -28,7 +28,6 @@ entity.
 | `set-component` | `{entity, component, json}` | Applies a serialized component body via the registry's deserialize. |
 | `set-component-order` | `{entity, components}` | Reorders the entity's components (inspector ordering). |
 | `set-transform` | `{entity, translation?, rotation?, scale?}` | Merges the given fields over the current transform. Rotation is Euler XYZ radians. |
-| `set-material` | `{entity, baseColor?, albedoTexture?, …, slot?}` | Adds Material if missing, then merges the given fields. With `slot`, edits that slot of the entity's MaterialSet instead. |
 | `set-light` | `{entity?, direction?, color?, intensity?, ambient?}` | Edits the directional light (the given entity, else the first one found). |
 | `select` | `{entity}` | Sets editor selection; returns `{id, name}`. |
 | `get-selection` | — | Returns the current selection plus the `selectionVersion`/`sceneVersion` counters. |
@@ -36,7 +35,7 @@ entity.
 | `add-entity` | `{preset?}` | Creates an entity from a preset (default `empty`); selects it; returns `{id, name}`. |
 | `copy-entity` | `{entity}` | Deep-duplicates the entity (all components, new UUID); selects the copy; returns `{id, name}`. |
 | `rename-entity` | `{entity, name}` | Sets the entity's Name component; returns its `{id, name}`. |
-| `set-component-field` | `{entity, component, field, value}` | Merges a single field into a component (generic; adds the component if missing). |
+| `set-component-field` | `{entity, component, field, value, index?}` | Merges a single field into a component (generic; adds the component if missing). With `index`, addresses one element of an array field — an object `value` merges into that element, e.g. one `MaterialSet` slot. |
 | `pick` | `{u=0.5, v=0.5}` | Ray-picks at a viewport UV (`0,0` = top-left) and selects the hit. Returns `{hit, id?, name?}`. |
 | `inspect` | `{entity}` | Dumps every present component as JSON under `components`. |
 | `focus` | `{entity}` | Moves the editor camera to look at the entity's transform. |
@@ -79,7 +78,7 @@ re-listing the whole scene each frame:
 
 | Counter | Bumped when |
 |---|---|
-| `scene_version` | every scene-mutating command: `create-entity`, `destroy-entity`, `set-parent`, `add-component`, `remove-component`, `set-component`, `set-component-field`, `set-transform`, `set-material`, `set-light`, `set-environment`, `set-atmosphere`, `add-entity`, `copy-entity`, `rename-entity`, plus the [asset commands](../asset-commands/) that touch the scene (`instantiate-model`, `assign-asset`, `load-scene`/`load-project`, `new-project`/`open-project`). |
+| `scene_version` | every scene-mutating command: `create-entity`, `destroy-entity`, `set-parent`, `add-component`, `remove-component`, `set-component`, `set-component-field`, `set-transform`, `set-light`, `set-environment`, `set-atmosphere`, `add-entity`, `copy-entity`, `rename-entity`, plus the [asset commands](../asset-commands/) that touch the scene (`instantiate-model`, `assign-asset`, `load-scene`/`load-project`, `new-project`/`open-project`). |
 | `selection_version` | every `set_selection` (including `select`, `deselect`, `pick`, the auto-select on `add-entity`/`copy-entity`/`instantiate-model`, and an entity destroy or scene/project load that clears it). |
 
 A client reads a counter once, then re-fetches the entity list or the selection only when the number
@@ -88,10 +87,10 @@ the right one regardless of who invoked it.
 
 ## Merge, don't reset
 
-`set-transform`, `set-material`, and `set-light` first serialize the current value, copy the provided
-fields over it, then deserialize the merged body. Setting only the translation therefore leaves scale
-untouched. Vectors are `{x,y,z}` objects (`baseColor` is `{x,y,z,w}`), matching the scene-file
-encoding.
+`set-transform`, `set-light`, and `set-component-field` first serialize the current value, copy the
+provided field(s) over it, then deserialize the merged body. Setting only the translation therefore
+leaves scale untouched. Vectors are `{x,y,z}` objects (`baseColor` is `{x,y,z,w}`), matching the
+scene-file encoding.
 
 ## Picking and focus
 
@@ -108,7 +107,7 @@ its forward axis so the target sits in view. Both use the same editor
 |---|---|---|
 | Registration | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands` |
 | Entity resolution | `engine/crates/control/src/selector.rs` | `resolve_entity`, `entity_ref_dto`, `entity_uuid` |
-| Component edits | `engine/crates/control/src/commands_scene.rs` | the `set-transform`, `set-material`, `set-light`, `set-component`, `set-component-field` rows |
+| Component edits | `engine/crates/control/src/commands_scene.rs` | the `set-transform`, `set-light`, `set-component`, `set-component-field` rows |
 | Presets + duplicate + rename | `engine/crates/control/src/commands_scene.rs` | the `add-entity`, `copy-entity`, `rename-entity` rows |
 | Selection + picking | `engine/crates/control/src/commands_scene.rs` | the `select`/`get-selection`/`deselect`/`pick`/`focus` rows; `camera_dto` |
 | Picker | `engine/crates/assets/src/render_scene.rs` | `pick_entity` |

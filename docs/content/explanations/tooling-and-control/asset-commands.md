@@ -26,20 +26,27 @@ project. They act on both the `AssetServer` — the catalog and its GPU caches �
 | `move-asset` | `{asset, folder?}` | Moves an asset into a virtual folder, or back to root when `folder` is omitted. |
 | `asset-usages` | `{asset}` | Lists scene/environment slots that reference an asset. |
 | `delete-asset` | `{asset}` | Deletes the catalog entry and imported file, clears usages, and returns what was cleared. |
-| `assign-asset` | `{entity, slot, asset}` | Sets one of the entity's material/mesh slots to a catalog asset. |
+| `assign-asset` | `{entity, slot, asset}` | Sets the entity's mesh, or writes a texture into its material slot 0's overrides. |
 
 `import-model` bakes the source into a `.smodel` container in the catalog; `instantiate-model` is the
 command that spawns — it resolves the catalog model and creates a selected entity carrying it.
-`import-texture` adds to the catalog alone; the result is attached later with `assign-asset` or
-`set-material --albedoTexture`. `assign-asset` takes `slot` (one of `mesh`, `albedo`,
-`metallicRoughness`, `normal`, `occlusion`, `emissive`, `height`), resolves the asset by id or name,
-adds the target component if the entity lacks it, and writes the asset id into the slot.
+`import-texture` adds to the catalog alone; the result is attached later with `assign-asset` or by
+writing the texture id into a `MaterialSet` slot override with `set-component-field`. `assign-asset`
+takes `slot` (one of `mesh`, `albedo`, `metallicRoughness`, `normal`, `occlusion`, `emissive`,
+`height`), resolves the asset by id or name, and — for a texture slot — writes the id as an override
+on the entity's material slot 0 (the packed ORM means `metallicRoughness` and `occlusion` share
+`ormTexture`); `mesh` writes `Mesh.mesh`, adding the component if the entity lacks it.
 
 Folders are catalog metadata, not filesystem directories. They are saved next to the asset list so
 empty folders survive a reload. Renaming a folder updates the folder list and each catalog entry
 assigned to the old name. Deleting a folder only removes that virtual folder; assigned assets move
 back to root. `delete-asset` clears the scene references (mesh, material textures, sky texture) before
 removing the entry and cache records.
+
+`import-texture`, `rename-asset`, and `move-asset` persist an asset's name / folder / colorspace to a
+co-located [`.smeta` sidecar](../../geometry-and-assets/asset-server-and-catalog/#the-smeta-sidecar)
+the moment they run, so those edits survive a cold catalog scan even if you never save the project —
+`delete-asset` removes the sidecar alongside the file.
 
 ## Thumbnails and previews
 
@@ -112,5 +119,5 @@ has its own page.
 ## Related
 - [Capture](../screenshots-and-capture/) — the PNG capture path behind `screenshot` and the thumbnail readback
 - [Shared types](../shared-types/) — the base64-PNG result shape and the wire contract
-- [Scene commands](../scene-commands/) — `set-material` is the other way to set albedo
+- [Scene commands](../scene-commands/) — `set-component-field` is the other way to set albedo
 - [Geometry & assets](../../geometry-and-assets/) — import and the asset catalog

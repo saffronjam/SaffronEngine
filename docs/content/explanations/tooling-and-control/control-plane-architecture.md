@@ -139,7 +139,7 @@ no-op.
 
 | Counter | Bumped by |
 |---|---|
-| `scene_version` | every scene-mutating command: `create-entity`, `destroy-entity`, `add-component`, `remove-component`, `set-component`, `set-component-field`, `set-transform`, `set-material`, `set-light`, `set-environment`, `add-entity`, `copy-entity`, `rename-entity`; the asset/project commands that touch the scene: `import-model`, `assign-asset`, `load-scene`, `load-project`, `open-project`, `new-project` |
+| `scene_version` | every scene-mutating command: `create-entity`, `destroy-entity`, `add-component`, `remove-component`, `set-component`, `set-component-field`, `set-transform`, `set-light`, `set-environment`, `add-entity`, `copy-entity`, `rename-entity`; the asset/project commands that touch the scene: `import-model`, `assign-asset`, `load-scene`, `load-project`, `open-project`, `new-project` |
 | `selection_version` | every `set_selection`: `select`, `deselect`, `pick`, the commands that auto-select (`add-entity`, `copy-entity`, `instantiate-model`) or auto-deselect (`destroy-entity` of the selected entity, and the project/scene loads that clear selection) |
 
 A command that loads a scene or project moves both: the scene contents change and the selection is
