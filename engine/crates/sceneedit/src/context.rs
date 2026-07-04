@@ -160,6 +160,9 @@ pub struct SceneEditContext {
     pub saved_camera: SceneEditCamera,
     /// Overlay prefs stashed on enter (preview forces it on).
     pub saved_overlay: SkeletonOverlayOptions,
+    /// The tonemap exposure (EV) stashed on enter, restored on exit — so an HDRI preview's EV
+    /// sweep leaves the authored viewport's exposure untouched.
+    pub saved_exposure: f32,
     /// The preview floor slab toggle.
     pub preview_show_floor: bool,
     /// The spawned floor slab in `preview_scene` (for the toggle).
@@ -220,6 +223,7 @@ impl Default for SceneEditContext {
             saved_selection: Entity::NULL,
             saved_camera: SceneEditCamera::default(),
             saved_overlay: SkeletonOverlayOptions::default(),
+            saved_exposure: 0.0,
             preview_show_floor: true,
             preview_floor_entity: Entity::NULL,
             preview_active_view: false,

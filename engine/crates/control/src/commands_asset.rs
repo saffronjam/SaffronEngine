@@ -15,13 +15,15 @@
 use std::path::{Path, PathBuf};
 
 use saffron_assets::{
-    AssetServer, ContainerMetadata, ProjectHost, ProjectInfo, analyze_clean, asset_bytes,
-    asset_type_name, build_dependency_graph, clear_extraction, create_project_script,
-    default_display_name, default_material_asset, delete_unused, exposed_parameter,
-    extract_sub_asset, import_material_folder, load_catalog_material_asset,
-    load_catalog_material_asset_raw, load_material_asset, load_material_asset_raw,
-    lower_graph_to_params, model_render_aabb, pbr_exposed_parameters, pick_scene_surface,
-    reimport_model, request_thumbnail, save_material_asset, update_material_asset,
+    AssetServer, BUILTIN_SPHERE_MESH_ID, BuiltinMesh, ContainerMetadata, MaterialAsset,
+    PREVIEW_DISPLACE_SPHERE_MESH_ID, PREVIEW_MATERIAL_ID, ProjectHost, ProjectInfo, analyze_clean,
+    asset_bytes, asset_type_name, build_dependency_graph, clear_extraction,
+    colorspace_for_role_explicit, colorspace_name, create_project_script, default_display_name,
+    default_material_asset, delete_unused, exposed_parameter, extract_sub_asset,
+    import_material_folder, load_catalog_material_asset, load_catalog_material_asset_raw,
+    load_material_asset, load_material_asset_raw, lower_graph_to_params, model_render_aabb,
+    pbr_exposed_parameters, pick_scene_surface, reimport_model, request_thumbnail,
+    save_material_asset, texture_role_from_hint, texture_role_name, update_material_asset,
     valid_project_name, viewport_ray,
 };
 use saffron_core::Uuid;
@@ -56,7 +58,7 @@ use saffron_rendering::{PngTransfer, ViewId};
 use saffron_scene::{
     AnimationPlayer, AssetEntry, AssetType, Attribution, Colorspace, DirectionalLight, Entity,
     IdComponent, MaterialSet, MaterialSlot, Mesh, Name, PreviewGhost, Scene, SkinnedMesh, SkyMode,
-    Transform,
+    TextureRole, Transform,
 };
 use saffron_sceneedit::{
     BootStage, NewProjectSpec, PlacementPreview, PlayState, ProjectLoadRequest, ProjectPhase,
@@ -434,6 +436,22 @@ fn asset_created_at(root: &Path, rel_path: &str) -> i64 {
 
 /// The wire DTO for one catalog entry.
 fn asset_dto(root: &Path, entry: &AssetEntry) -> AssetEntryDto {
+    let is_texture = entry.asset_type == AssetType::Texture;
+    // Resolve the effective upload space (never surface `Auto`), matching the loader/sidecar.
+    let colorspace = is_texture.then(|| {
+        let cs = if entry.colorspace != Colorspace::Auto {
+            entry.colorspace
+        } else if entry.hdr {
+            Colorspace::Hdr
+        } else if entry.linear {
+            Colorspace::Linear
+        } else {
+            Colorspace::Srgb
+        };
+        colorspace_name(cs).to_owned()
+    });
+    let role = (is_texture && entry.role != TextureRole::Unknown)
+        .then(|| texture_role_name(entry.role).to_owned());
     AssetEntryDto {
         id: WireUuid(entry.id.value()),
         name: entry.name.clone(),
@@ -443,6 +461,8 @@ fn asset_dto(root: &Path, entry: &AssetEntry) -> AssetEntryDto {
         container: (entry.container.value() != 0).then(|| WireUuid(entry.container.value())),
         duration: (entry.asset_type == AssetType::Animation).then_some(entry.duration),
         rigged: entry.rigged.then_some(true),
+        colorspace,
+        role,
         created_at: asset_created_at(root, &entry.path),
         attribution: entry.attribution.as_ref().map(attribution_to_dto),
     }
@@ -1298,18 +1318,24 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
 
     reg.register::<ImportTextureParams, ImportTextureResult>(
         "import-texture",
-        "import-texture {path} [colorspace]",
+        "import-texture {path} [colorspace] [role]",
         |ctx, params| {
             if params.path.is_empty() {
                 return Err(Error::command("missing 'path'"));
             }
             require_project_loaded(ctx)?;
-            let colorspace = colorspace_from_str(params.colorspace.as_deref());
+            // A `role` hint (from an import connector, or manual) resolves both the stored role
+            // and — absent an explicit `colorspace` override — the upload colorspace. No role and
+            // no override leaves colorspace `None`, so the loader falls back to its ext heuristic.
+            let role = params.role.as_deref().map(texture_role_from_hint);
+            let colorspace = colorspace_from_str(params.colorspace.as_deref())
+                .or_else(|| role.map(colorspace_for_role_explicit));
+            let role = role.unwrap_or(TextureRole::Unknown);
             let assets = &mut *ctx.assets;
             let path = params.path.clone();
             let mut result = None;
             ctx.renderer.with_gpu_uploader(&mut |gpu| {
-                result = Some(assets.import_texture(gpu, &path, colorspace));
+                result = Some(assets.import_texture(gpu, &path, colorspace, role));
             });
             let id = result
                 .ok_or_else(|| Error::command("upload seam unavailable"))?
@@ -1563,6 +1589,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, _params| {
             if ctx.scene_edit.previewing() {
                 ctx.renderer.set_active_view(ViewId::Scene);
+                // Restore the authored tonemap exposure the HDRI preview's EV sweep may have moved.
+                ctx.renderer.set_exposure(ctx.scene_edit.saved_exposure);
             }
             leave_asset_preview(ctx.scene_edit);
             Ok(play_state_result(ctx))
@@ -1594,6 +1622,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if view == ViewId::AssetPreview {
                 activate_preview_view(ctx.scene_edit);
             } else {
+                // Leaving the preview for the scene: restore the authored exposure so an HDRI EV
+                // sweep never bleeds into the scene tab (the preview workspace re-applies its EV on
+                // return).
+                if ctx.scene_edit.previewing() {
+                    ctx.renderer.set_exposure(ctx.scene_edit.saved_exposure);
+                }
                 deactivate_preview_view(ctx.scene_edit);
             }
             Ok(SetActiveViewResult {
@@ -1916,6 +1950,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 || params.asset.as_i64() == Some(0);
             let (assign_id, assign_name) = if clearing {
                 (Uuid(0), String::new())
+            } else if let Some(builtin) =
+                BuiltinMesh::from_reserved_id(Uuid(selector_id(&params.asset)))
+            {
+                // A built-in primitive is referenced by its reserved id, not a catalog row —
+                // its display name comes from the enum, not `catalog.find`.
+                (builtin.reserved_id(), builtin.display_name().to_owned())
             } else {
                 let id = resolve_asset(ctx, &params.asset)?;
                 let name = ctx
@@ -2640,6 +2680,11 @@ fn enter_asset_preview(
     if ctx.scene_edit.play_state != PlayState::Edit {
         return Err(Error::command("stop play first"));
     }
+    // A native built-in primitive has no catalog row or model container — preview it on its
+    // own geometry rather than resolving + instantiating a model.
+    if let Some(builtin) = BuiltinMesh::from_reserved_id(Uuid(selector_id(&params.asset))) {
+        return enter_builtin_preview(ctx, builtin);
+    }
     let id = resolve_asset(ctx, &params.asset)?;
     let entry = ctx
         .assets
@@ -2647,6 +2692,21 @@ fn enter_asset_preview(
         .find(id)
         .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?;
     let entry_type = entry.asset_type;
+    let entry_role = entry.role;
+    let entry_hdr = entry.hdr;
+    // A standalone texture previews on the isolated sphere, not as a model: an HDRI lights + backs a
+    // three-ball environment rig; every other role is its map on one lit sphere (role picks the slot).
+    if entry_type == AssetType::Texture {
+        if entry_role == TextureRole::Hdri || entry_hdr {
+            return enter_hdri_preview(ctx, id);
+        }
+        return enter_texture_preview(ctx, id, entry_role);
+    }
+    // A material (`.smat`) previews as itself on the studio sphere — the same subject the
+    // material-graph editor's live pane drives.
+    if entry_type == AssetType::Material {
+        return enter_material_preview(ctx, id);
+    }
     let container_id = if entry_type == AssetType::Model {
         id
     } else {
@@ -2739,6 +2799,7 @@ fn enter_asset_preview(
         ctx.scene_edit.saved_camera = ctx.scene_edit.camera;
         ctx.scene_edit.saved_selection = ctx.scene_edit.selected;
         ctx.scene_edit.saved_overlay = ctx.scene_edit.skeleton_overlay;
+        ctx.scene_edit.saved_exposure = ctx.renderer.exposure_ev();
         ctx.scene_edit.preview_active_view = true;
         let (w, h) = (
             ctx.renderer.viewport_width(),
@@ -2756,7 +2817,7 @@ fn enter_asset_preview(
     ctx.scene_edit.preview_floor_entity = Entity::NULL;
     ctx.scene_edit.skeleton_overlay.show = true;
     ctx.scene_edit.skeleton_overlay.highlight_joint = -1;
-    let framing = furnish_preview_scene(ctx, root);
+    let framing = furnish_preview_scene(ctx, root, PreviewEnv::Procedural);
     ctx.scene_edit.set_selection(root);
     ctx.scene_edit.scene_version += 1;
     ctx.scene_edit.animation_version += 1;
@@ -2768,6 +2829,310 @@ fn enter_asset_preview(
             distance: framing.distance,
         },
     ))
+}
+
+/// Builds an isolated preview scene for a native built-in primitive (no catalog row, no
+/// model container): a single entity carrying the reserved-id mesh + a default material,
+/// framed on the shared asset-preview view. Mirrors the commit tail of
+/// [`enter_asset_preview`] for a container-less, rig-less subject.
+fn enter_builtin_preview(
+    ctx: &mut EngineContext<'_>,
+    builtin: BuiltinMesh,
+) -> Result<AssetPreviewResultWrap> {
+    let mut preview = Scene::new();
+    preview.catalog = ctx.scene_edit.scene.catalog.clone();
+    let root = preview.create_entity(builtin.display_name());
+    let _ = preview.add_component(
+        root,
+        Mesh {
+            mesh: builtin.reserved_id(),
+        },
+    );
+    let _ = preview.add_component(
+        root,
+        MaterialSet {
+            slots: vec![MaterialSlot::default()],
+        },
+    );
+    Ok(commit_preview_subject(
+        ctx,
+        preview,
+        root,
+        builtin.reserved_id(),
+        PreviewEnv::Procedural,
+    ))
+}
+
+/// The `enter-asset-preview` branch for a standalone texture: shade a preview sphere with an
+/// ephemeral single-slot material carrying the texture in the slot its role feeds (albedo lit,
+/// normal bumped, roughness/metallic/AO/ORM through the packed slot, height parallaxed, emissive
+/// glowing). The material is seeded into `material_by_uuid` under the reserved
+/// [`PREVIEW_MATERIAL_ID`] — no catalog row, rebuilt on each enter — so the scene resolver shades
+/// the sphere with it. HDRI is filtered out upstream (it is the environment preview).
+fn enter_texture_preview(
+    ctx: &mut EngineContext<'_>,
+    tid: Uuid,
+    role: TextureRole,
+) -> Result<AssetPreviewResultWrap> {
+    let material = preview_material_for_texture(role, tid);
+    ctx.assets.material_by_uuid.insert(
+        PREVIEW_MATERIAL_ID.value(),
+        Some(std::sync::Arc::new(material)),
+    );
+
+    let name = ctx
+        .assets
+        .catalog
+        .find(tid)
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| "Texture".to_owned());
+    let mut preview = Scene::new();
+    preview.catalog = ctx.scene_edit.scene.catalog.clone();
+    let root = preview.create_entity(&name);
+    // The dense sphere so a height map's vertex displacement reads as a true silhouette.
+    let _ = preview.add_component(
+        root,
+        Mesh {
+            mesh: PREVIEW_DISPLACE_SPHERE_MESH_ID,
+        },
+    );
+    let _ = preview.add_component(
+        root,
+        MaterialSet {
+            slots: vec![MaterialSlot {
+                material: PREVIEW_MATERIAL_ID,
+                ..MaterialSlot::default()
+            }],
+        },
+    );
+    Ok(commit_preview_subject(
+        ctx,
+        preview,
+        root,
+        tid,
+        PreviewEnv::Procedural,
+    ))
+}
+
+/// The `enter-asset-preview` branch for an HDRI (an `.hdr`/`.exr` texture): the imported equirect
+/// becomes both the visible backdrop and the IBL source (`SkyMode::Texture`), and three PBR balls —
+/// chrome, diffuse grey, colored satin — read the environment's reflections / irradiance / color
+/// response (the AmbientCG-style env rig). The balls differ only by per-slot overrides on the
+/// default material, so no ephemeral material assets are needed. The center ball parents the other
+/// two so the framing bounds cover all three.
+fn enter_hdri_preview(
+    ctx: &mut EngineContext<'_>,
+    hdri_id: Uuid,
+) -> Result<AssetPreviewResultWrap> {
+    use saffron_geometry::glam::Vec3 as GVec3;
+
+    let mut preview = Scene::new();
+    preview.catalog = ctx.scene_edit.scene.catalog.clone();
+    // (x offset, name, material overrides): chrome mirror / diffuse grey / colored satin.
+    let balls = [
+        (
+            -2.3_f32,
+            "Chrome",
+            serde_json::json!({ "metallic": 1.0, "roughness": 0.04, "baseColor": [1.0, 1.0, 1.0, 1.0] }),
+        ),
+        (
+            0.0_f32,
+            "Diffuse",
+            serde_json::json!({ "metallic": 0.0, "roughness": 1.0, "baseColor": [0.5, 0.5, 0.5, 1.0] }),
+        ),
+        (
+            2.3_f32,
+            "Satin",
+            serde_json::json!({ "metallic": 0.0, "roughness": 0.4, "baseColor": [0.85, 0.5, 0.35, 1.0] }),
+        ),
+    ];
+    let mut entities = Vec::with_capacity(balls.len());
+    for (x, name, overrides) in &balls {
+        let e = preview.create_entity(*name);
+        let _ = preview.add_component(
+            e,
+            Mesh {
+                mesh: BUILTIN_SPHERE_MESH_ID,
+            },
+        );
+        let _ = preview.add_component(
+            e,
+            MaterialSet {
+                slots: vec![MaterialSlot {
+                    material: Uuid(0),
+                    overrides: overrides.clone(),
+                }],
+            },
+        );
+        let _ = preview.with_component_mut::<Transform, _>(e, |t| {
+            t.translation = GVec3::new(*x, 0.0, 0.0);
+        });
+        entities.push(e);
+    }
+    // The center ball is the framing root; the outer two parent to it so the AABB spans all three.
+    let root = entities[1];
+    for &e in &[entities[0], entities[2]] {
+        let _ = preview.set_parent(e, Some(root), true);
+    }
+    Ok(commit_preview_subject(
+        ctx,
+        preview,
+        root,
+        hdri_id,
+        PreviewEnv::Hdri(hdri_id),
+    ))
+}
+
+/// The `enter-asset-preview` branch for a material (`.smat`): a built-in sphere carrying that
+/// material **by id**, in the shared procedural studio. Referencing by id (not a copy) is the join
+/// point — a later `material-set-graph` / `material-update` mutates the `.smat` in the asset cache
+/// and the sphere re-renders next frame, so the material-graph editor's live pane and a standalone
+/// material "View" tab are one host path.
+fn enter_material_preview(
+    ctx: &mut EngineContext<'_>,
+    mid: Uuid,
+) -> Result<AssetPreviewResultWrap> {
+    let name = ctx
+        .assets
+        .catalog
+        .find(mid)
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| "Material".to_owned());
+    let mut preview = Scene::new();
+    preview.catalog = ctx.scene_edit.scene.catalog.clone();
+    let root = preview.create_entity(&name);
+    // The dense sphere so a displacement-enabled `.smat` shows a true displaced silhouette.
+    let _ = preview.add_component(
+        root,
+        Mesh {
+            mesh: PREVIEW_DISPLACE_SPHERE_MESH_ID,
+        },
+    );
+    let _ = preview.add_component(
+        root,
+        MaterialSet {
+            slots: vec![MaterialSlot {
+                material: mid,
+                ..MaterialSlot::default()
+            }],
+        },
+    );
+    Ok(commit_preview_subject(
+        ctx,
+        preview,
+        root,
+        mid,
+        PreviewEnv::Procedural,
+    ))
+}
+
+/// The ephemeral single-slot material the texture preview shades the sphere with: the texture in
+/// the slot its role feeds, neutral factors elsewhere (neutral albedo = mid-grey), so the ball
+/// reads the map the way a surface uses it. `Albedo`/`Opacity`/`Gloss`/`Unknown` fall back to the
+/// base-color slot (show the map as a plain surface texture); HDRI never reaches here.
+fn preview_material_for_texture(role: TextureRole, tid: Uuid) -> MaterialAsset {
+    use saffron_geometry::glam::{Vec3 as GVec3, Vec4 as GVec4};
+    let grey = |v: f32| GVec4::new(v, v, v, 1.0);
+    let mut m = default_material_asset();
+    m.metallic = 0.0;
+    m.roughness = 0.6;
+    match role {
+        TextureRole::Normal => {
+            m.normal_texture = tid;
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Roughness => {
+            m.orm_texture = tid;
+            m.roughness = 1.0;
+            m.base_color = grey(0.55);
+        }
+        TextureRole::Metallic => {
+            m.orm_texture = tid;
+            m.metallic = 1.0;
+            m.roughness = 0.35;
+            m.base_color = grey(0.8);
+        }
+        TextureRole::Ao => {
+            m.orm_texture = tid;
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Orm => {
+            m.orm_texture = tid;
+            m.metallic = 1.0;
+            m.roughness = 1.0;
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Height => {
+            // Real vertex-shader displacement on the dense preview sphere — a true deformed
+            // silhouette (not parallax). `height_scale` is the world-space amplitude on the unit
+            // sphere; keep it modest so the surface bulges without turning inside-out.
+            m.height_texture = tid;
+            m.height_scale = 0.08;
+            m.displacement = true;
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Emissive => {
+            m.emissive_texture = tid;
+            m.emissive = GVec3::ONE;
+            m.emissive_strength = 2.0;
+            m.base_color = grey(0.02);
+        }
+        _ => {
+            m.albedo_texture = tid;
+            m.base_color = GVec4::ONE;
+        }
+    }
+    m
+}
+
+/// Commits a container-less preview subject (a built-in primitive or a texture sphere): stashes
+/// the authored view on a fresh enter, installs `preview` as the active preview scene, furnishes
+/// it (floor / key light / procedural sky / framed cam), and returns the framing. Shared by
+/// [`enter_builtin_preview`] and [`enter_texture_preview`] — the rig-less commit tail of
+/// [`enter_asset_preview`].
+fn commit_preview_subject(
+    ctx: &mut EngineContext<'_>,
+    preview: Scene,
+    root: Entity,
+    preview_asset: Uuid,
+    env: PreviewEnv,
+) -> AssetPreviewResultWrap {
+    let root_uuid = preview
+        .component::<IdComponent>(root)
+        .map(|c| c.id.value())
+        .unwrap_or(0);
+    if !ctx.scene_edit.previewing() {
+        ctx.scene_edit.saved_camera = ctx.scene_edit.camera;
+        ctx.scene_edit.saved_selection = ctx.scene_edit.selected;
+        ctx.scene_edit.saved_overlay = ctx.scene_edit.skeleton_overlay;
+        ctx.scene_edit.saved_exposure = ctx.renderer.exposure_ev();
+        ctx.scene_edit.preview_active_view = true;
+        let (w, h) = (
+            ctx.renderer.viewport_width(),
+            ctx.renderer.viewport_height(),
+        );
+        let _ = ctx
+            .renderer
+            .set_view_desired_size(ViewId::AssetPreview, w, h);
+        ctx.renderer.set_active_view(ViewId::AssetPreview);
+    }
+    ctx.scene_edit.preview_scene = Some(preview);
+    ctx.scene_edit.preview_asset = preview_asset;
+    ctx.scene_edit.preview_root_entity = root;
+    ctx.scene_edit.preview_bone_by_node = Vec::new();
+    ctx.scene_edit.preview_floor_entity = Entity::NULL;
+    ctx.scene_edit.skeleton_overlay.show = false;
+    ctx.scene_edit.skeleton_overlay.highlight_joint = -1;
+    let framing = furnish_preview_scene(ctx, root, env);
+    ctx.scene_edit.set_selection(root);
+    ctx.scene_edit.scene_version += 1;
+    ctx.scene_edit.animation_version += 1;
+    AssetPreviewResultWrap(saffron_protocol::AssetPreviewResult {
+        root_entity: WireUuid(root_uuid),
+        bones: Vec::new(),
+        target: vec3(framing.target),
+        distance: framing.distance,
+    })
 }
 
 /// A newtype around [`AssetPreviewResult`](saffron_protocol::AssetPreviewResult) so the
@@ -2790,13 +3155,28 @@ pub(crate) struct PreviewBounds {
     min_y: f32,
 }
 
-/// Make the preview look like a preview: floor / key light / procedural sky / framed
-/// fly-cam; returns the orbit pivot + distance. Operates on the committed preview scene.
-fn furnish_preview_scene(ctx: &mut EngineContext<'_>, root: Entity) -> PreviewFraming {
+/// The lighting/backdrop a preview subject is furnished with.
+#[derive(Clone, Copy)]
+enum PreviewEnv {
+    /// A studio key light over the procedural sky (a model / a lone texture sphere).
+    Procedural,
+    /// An imported HDRI as both the visible backdrop and the IBL source (the environment rig).
+    Hdri(Uuid),
+}
+
+/// Make the preview look like a preview: floor + key light + procedural sky, or the HDRI
+/// environment; framed fly-cam. Returns the orbit pivot + distance. Operates on the committed
+/// preview scene.
+fn furnish_preview_scene(
+    ctx: &mut EngineContext<'_>,
+    root: Entity,
+    env: PreviewEnv,
+) -> PreviewFraming {
     use saffron_geometry::glam::Vec3 as GVec3;
 
     let bounds = compute_preview_bounds(ctx, root);
-    if ctx.scene_edit.preview_show_floor {
+    // The HDRI environment is its own backdrop — no floor slab under the rig.
+    if ctx.scene_edit.preview_show_floor && matches!(env, PreviewEnv::Procedural) {
         let floor = spawn_preview_floor(ctx, &bounds);
         ctx.scene_edit.preview_floor_entity = floor;
     }
@@ -2806,19 +3186,32 @@ fn furnish_preview_scene(ctx: &mut EngineContext<'_>, root: Entity) -> PreviewFr
         .preview_scene
         .as_mut()
         .expect("preview scene present");
-    let light = preview.create_entity("PreviewLight");
-    let _ = preview.add_component(
-        light,
-        DirectionalLight {
-            direction: GVec3::new(-0.4, -1.0, -0.5).normalize(),
-            color: GVec3::ONE,
-            intensity: 3.0,
-            ambient: 0.25,
-        },
-    );
-    preview.environment.sky_mode = SkyMode::Procedural;
-    preview.environment.use_sky_for_ambient = true;
-    preview.environment.ambient_intensity = 0.3;
+    match env {
+        PreviewEnv::Procedural => {
+            let light = preview.create_entity("PreviewLight");
+            let _ = preview.add_component(
+                light,
+                DirectionalLight {
+                    direction: GVec3::new(-0.4, -1.0, -0.5).normalize(),
+                    color: GVec3::ONE,
+                    intensity: 3.0,
+                    ambient: 0.25,
+                },
+            );
+            preview.environment.sky_mode = SkyMode::Procedural;
+            preview.environment.use_sky_for_ambient = true;
+            preview.environment.ambient_intensity = 0.3;
+        }
+        PreviewEnv::Hdri(id) => {
+            // The HDRI both lights (IBL prefilter of the equirect) and backs the scene — no
+            // directional key light, so the balls read the environment's own illumination.
+            preview.environment.sky_mode = SkyMode::Texture;
+            preview.environment.sky_texture = id;
+            preview.environment.sky_intensity = 1.0;
+            preview.environment.use_sky_for_ambient = true;
+            preview.environment.ambient_intensity = 1.0;
+        }
+    }
 
     ctx.scene_edit.camera = frame_preview_camera(ctx.scene_edit.camera, &bounds);
     let fovy = ctx.scene_edit.camera.fov.to_radians();
