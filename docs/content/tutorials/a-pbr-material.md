@@ -14,12 +14,22 @@ scene with one mesh entity.
 
 ## Set base color and metallic-roughness
 
-A mesh's look comes from its `Material`: a base color, an optional albedo texture,
-and the PBR knobs `metallic` and `roughness`. `set-material` adds the component if missing
-and merges only the fields you pass:
+A mesh's look comes from its `MaterialSet`: each slot references a `.smat`
+[material](../../explanations/materials-and-pipelines/native-materials/) asset and layers
+per-object overrides on top. Give the cube a dedicated material so the PBR knobs — a base color,
+`metallic`, and `roughness` — live in one editable asset, then assign it to the mesh:
 
 ```sh
-just sa set-material Mesh --baseColor '{"x":0.95,"y":0.64,"z":0.22,"w":1}' --metallic 1 --roughness 0.25
+just sa material-create --name Gold
+just sa material-assign --entity Mesh --material Gold
+```
+
+`material-update` merges the factors you name onto the material and leaves the rest untouched, so
+you can set each knob without resetting the others:
+
+```sh
+just sa material-update --material Gold \
+  --baseColor '{"x":0.95,"y":0.64,"z":0.22,"w":1}' --metallic 1 --roughness 0.25
 ```
 
 That makes the cube gold: warm base color, fully metallic, fairly smooth. The metallic flag
@@ -30,12 +40,13 @@ $$
 F_0 = \operatorname{lerp}(0.04,\ \text{baseColor},\ \text{metallic})
 $$
 
-Roughness controls how tight the highlight is; lower is sharper. In the editor these are the
-**Base Color**, **Metallic**, and **Roughness** controls in the Inspector's Material section
-(Metallic and Roughness are `0..1` sliders). Read back what you set:
+Roughness controls how tight the highlight is; lower is sharper. In the editor, open **Gold** in the
+Material panel and edit **Base Color**, **Metallic**, and **Roughness** against the live preview
+sphere (Metallic and Roughness are `0..1` sliders); to change only this cube instead, override the
+same knobs in the Inspector's **MaterialSet** slot. Read back what you set:
 
 ```sh
-just sa inspect Mesh        # the Material block shows baseColor, metallic, roughness
+just sa material-get --material Gold        # shows baseColor, metallic, roughness
 ```
 
 > [!NOTE]
@@ -90,13 +101,13 @@ Pick the value where the highlight reads as a bright spot rather than a flat whi
 ## Make it glow (optional)
 
 `emissive` adds light the surface emits on its own, independent of any scene light. Give
-the mesh a faint emissive tint:
+the Gold material a faint emissive tint:
 
 ```sh
-just sa set-material Mesh --emissive '{"x":0.2,"y":0.1,"z":0}' --emissiveStrength 2
+just sa material-update --material Gold --emissive '{"x":0.2,"y":0.1,"z":0}' --emissiveStrength 2
 ```
 
-Emissive radiance is added after lighting, so it shows even in shadow. In the Inspector it's
+Emissive radiance is added after lighting, so it shows even in shadow. In the **Material** panel it's
 **Emissive** (a color) and **Emissive Strength** (a multiplier). Set the strength to 0 to
 turn it off.
 
