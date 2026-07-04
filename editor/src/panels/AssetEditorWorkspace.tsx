@@ -17,10 +17,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Axis3d, Bone, Box, Grid2x2 } from "lucide-react";
 import { client } from "../control/client";
-import { makeCoalescer } from "../control/coalesce";
 import { useSubsurfaceBounds } from "../lib/useSubsurfaceBounds";
+import { useOrbitCamera, type OrbitState } from "../lib/useOrbitCamera";
 import { errorText, notifyError } from "../lib/flash";
 import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
 import { DockRoot } from "@/components/dock/DockRoot";
 import { DockPanelsHost } from "@/components/dock/DockPanelsHost";
 import { RevealBands, type RevealBand } from "@/components/dock/RevealBands";
@@ -40,56 +41,6 @@ const AE_REVEAL_BANDS: RevealBand[] = [
   { leafId: "leaf:aeBottom", edge: "bottom" },
 ];
 
-/// Orbit drag sensitivity (degrees of yaw/pitch per CSS pixel) and zoom factor per wheel notch.
-const ORBIT_SENS_DEG_PER_PX = 0.4;
-const ZOOM_PER_WHEEL = 1.1;
-/// Orbit easing: drain current→target each frame at this time constant (mirrors the engine's tau=0.025
-/// gizmo/edit smoothing); stop when within the epsilons. The distance/target epsilon is a fraction of
-/// the live distance (an absolute epsilon would never settle a tiny model and would over-shoot a large one).
-const ORBIT_TAU_S = 0.025;
-const ORBIT_EPS_DEG = 0.01;
-const ORBIT_EPS_DIST_FRAC = 0.0005;
-/// Zoom bounds relative to the engine-framed distance, so a small model can be dollied in close while a
-/// ceiling stops it flying away (scaling the floor to the model lets a tiny one zoom past a fixed limit).
-const ZOOM_MIN_FRAC = 0.02;
-const ZOOM_MAX_FRAC = 8;
-const ZOOM_MIN_ABS = 0.001;
-/// A pointer-up within this many pixels of pointer-down is a click (joint pick), not an orbit drag.
-const CLICK_SLOP_PX = 4;
-
-interface OrbitState {
-  target: { x: number; y: number; z: number };
-  distance: number;
-  yaw: number;
-  pitch: number;
-}
-
-const INITIAL_ORBIT: OrbitState = {
-  target: { x: 0, y: 0, z: 0 },
-  distance: 5,
-  yaw: -37,
-  pitch: -29,
-};
-
-/// The engine's fly-cam forward basis from yaw/pitch (mirrors sceneEditCameraForward), so the editor's
-/// orbit reconstructs the eye as target - forward * distance.
-function forwardFromYawPitch(
-  yawDeg: number,
-  pitchDeg: number,
-): { x: number; y: number; z: number } {
-  const yaw = (yawDeg * Math.PI) / 180;
-  const pitch = (pitchDeg * Math.PI) / 180;
-  return {
-    x: Math.cos(pitch) * Math.sin(yaw),
-    y: Math.sin(pitch),
-    z: -Math.cos(pitch) * Math.cos(yaw),
-  };
-}
-
-function cloneOrbit(o: OrbitState): OrbitState {
-  return { target: { ...o.target }, distance: o.distance, yaw: o.yaw, pitch: o.pitch };
-}
-
 export function AssetEditorWorkspace({ assetId, active }: { assetId: string; active: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -103,6 +54,25 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // The bone the tree has highlighted (a get-asset-model node index); local view state, not selection.
   const [highlightJoint, setHighlightJoint] = useState(-1);
 
+  // The catalog row (for a texture subject: drives the pan-only orbit + the Applied/Flat picker).
+  const asset = useEditorStore(
+    useCallback((s) => s.assets.find((a) => a.id === assetId), [assetId]),
+  );
+  const openImageViewerTab = useEditorStore((s) => s.openImageViewerTab);
+  // A texture previews as its map on the studio sphere: orbit-only (no dolly — the framed sphere is
+  // the subject) and offers a Flat-image representation alongside the Applied 3D one. An HDRI is the
+  // exception: a full environment scene (three balls) that keeps dolly + gains an exposure sweep.
+  const isTexture = asset?.type === "texture";
+  const isHdr = asset?.role === "hdri" || asset?.colorspace === "hdr";
+  const panOnly = isTexture && !isHdr;
+  // The HDRI preview's exposure sweep (EV, exp2). Restored engine-side on exit-asset-preview, so it
+  // never dirties the authored viewport's exposure.
+  const [exposureEv, setExposureEv] = useState(0);
+  const onExposure = useCallback((ev: number) => {
+    setExposureEv(ev);
+    void client.setExposure(ev).catch((err: unknown) => notifyError(errorText(err)));
+  }, []);
+
   // What the model can do gates the panels: the skeleton tree only for a rigged model, the clip list +
   // timeline only when it has clips. A static model shows just the viewport + floor toggle.
   const caps = model?.capabilities ?? null;
@@ -110,81 +80,35 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   const hasClips = (caps?.clipCount ?? 0) > 0;
   const ready = status === "ready";
 
-  // Orbit: the input target and the eased current, both refs (the rAF loop must not re-render). framed
-  // distance seeds the zoom bounds so they scale to the model.
-  const targetOrbit = useRef<OrbitState>(cloneOrbit(INITIAL_ORBIT));
-  const currentOrbit = useRef<OrbitState>(cloneOrbit(INITIAL_ORBIT));
-  const framedDistance = useRef(INITIAL_ORBIT.distance);
-  const rafId = useRef<number | null>(null);
-  const lastFrameTs = useRef(0);
-
   // Drive this pane's OWN "assetPreview" viewport surface (permanently sized to the pane). Gated on
   // `active && ready` so a parked/loading pane emits nothing; App.tsx parks the surface when inactive.
   useSubsurfaceBounds(hostRef, "assetPreview", { enabled: active && ready });
 
-  // One coalesced set-camera in flight at a time (the serialized wire — never one call per frame tick).
-  const cameraCoalescer = useMemo(
-    () =>
-      makeCoalescer<OrbitState>({
-        throttleMs: 16,
-        send: (o) => {
-          const f = forwardFromYawPitch(o.yaw, o.pitch);
-          return client
-            .setCamera({
-              position: {
-                x: o.target.x - f.x * o.distance,
-                y: o.target.y - f.y * o.distance,
-                z: o.target.z - f.z * o.distance,
-              },
-              yaw: o.yaw,
-              pitch: o.pitch,
-            })
-            .then(() => {});
-        },
-      }),
-    [],
+  // Highlight a bone in the live overlay (a get-asset-model node index) — view state, not selection.
+  const onBoneSelect = useCallback((joint: number) => {
+    setHighlightJoint(joint);
+    void client.setSkeletonHighlight(joint).catch((err: unknown) => notifyError(errorText(err)));
+  }, []);
+
+  // A click (no drag) on a rigged model picks the nearest joint and selects its bone in the tree.
+  const pickJoint = useCallback(
+    (u: number, v: number) => {
+      void client
+        .pickSkeletonJoint(u, v)
+        .then((res) => {
+          if (res.found && res.nodeIndex >= 0) {
+            onBoneSelect(res.nodeIndex);
+          }
+        })
+        .catch((err: unknown) => notifyError(errorText(err)));
+    },
+    [onBoneSelect],
   );
 
-  // Ease current→target one frame, push the eased camera, and either re-arm or settle. Refs only.
-  const tickOrbit = useCallback(() => {
-    const now = performance.now();
-    const dt = lastFrameTs.current ? (now - lastFrameTs.current) / 1000 : 0;
-    lastFrameTs.current = now;
-    const t = targetOrbit.current;
-    const c = currentOrbit.current;
-    const alpha = 1 - Math.exp(-dt / ORBIT_TAU_S);
-    c.yaw += (t.yaw - c.yaw) * alpha;
-    c.pitch += (t.pitch - c.pitch) * alpha;
-    c.distance += (t.distance - c.distance) * alpha;
-    c.target.x += (t.target.x - c.target.x) * alpha;
-    c.target.y += (t.target.y - c.target.y) * alpha;
-    c.target.z += (t.target.z - c.target.z) * alpha;
-    cameraCoalescer.push(cloneOrbit(c));
-
-    const distEps = ORBIT_EPS_DIST_FRAC * Math.max(c.distance, 1e-4);
-    const settled =
-      Math.abs(t.yaw - c.yaw) < ORBIT_EPS_DEG &&
-      Math.abs(t.pitch - c.pitch) < ORBIT_EPS_DEG &&
-      Math.abs(t.distance - c.distance) < distEps &&
-      Math.abs(t.target.x - c.target.x) < distEps &&
-      Math.abs(t.target.y - c.target.y) < distEps &&
-      Math.abs(t.target.z - c.target.z) < distEps;
-    if (settled) {
-      currentOrbit.current = cloneOrbit(t);
-      cameraCoalescer.push(cloneOrbit(t)); // land exactly on the target
-      rafId.current = null;
-      lastFrameTs.current = 0;
-      return;
-    }
-    rafId.current = requestAnimationFrame(tickOrbit);
-  }, [cameraCoalescer]);
-
-  const ensureOrbitLoop = useCallback(() => {
-    if (rafId.current === null) {
-      lastFrameTs.current = 0;
-      rafId.current = requestAnimationFrame(tickOrbit);
-    }
-  }, [tickOrbit]);
+  // The eased orbit for this pane: a lone texture sphere is orbit-only (no dolly — the framed sphere
+  // is the whole subject); a model / the HDRI three-ball rig dollies; a click picks a joint only on a
+  // rigged model.
+  const orbit = useOrbitCamera({ enableZoom: !panOnly, onClick: hasRig ? pickJoint : undefined });
 
   // Enter the preview on mount, exit on unmount. Remounting (a different assetId) runs cleanup first,
   // so a model A -> model B switch is a real exit/enter. A real failure lands the workspace in its
@@ -209,10 +133,16 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
           yaw: cam.yaw,
           pitch: cam.pitch,
         };
-        targetOrbit.current = cloneOrbit(framed);
-        currentOrbit.current = cloneOrbit(framed);
-        framedDistance.current = entered.distance;
-        const loaded = await client.getAssetModel(assetId);
+        orbit.setFramed(framed);
+        // A container-less preview subject (a standalone texture on the studio sphere, a built-in
+        // primitive) has no `.smodel`, so `get-asset-model` fails — that is not an error: show just
+        // the viewport + floor toggle (no rig, no clips), the same as a static model.
+        let loaded: AssetModelResult | null = null;
+        try {
+          loaded = await client.getAssetModel(assetId);
+        } catch {
+          loaded = null;
+        }
         if (cancelled) {
           return;
         }
@@ -227,13 +157,9 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     })();
     return () => {
       cancelled = true;
-      if (rafId.current !== null) {
-        cancelAnimationFrame(rafId.current);
-        rafId.current = null;
-      }
       void client.exitAssetPreview().catch(() => {});
     };
-  }, [assetId]);
+  }, [assetId, orbit]);
 
   // This pane owns its OWN viewport surface (the "assetPreview" view), permanently sized to the pane.
   // App.tsx drives set-active-view + per-view park on a tab switch — switching is instant (the surface
@@ -241,10 +167,14 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // enters the preview on mount, exits on unmount, and otherwise just drives its surface bounds (gated on
   // `active` so the parked pane's 0x0 host emits nothing).
 
-  const onBoneSelect = useCallback((joint: number) => {
-    setHighlightJoint(joint);
-    void client.setSkeletonHighlight(joint).catch((err: unknown) => notifyError(errorText(err)));
-  }, []);
+  // Re-apply the HDRI preview's EV whenever this tab becomes active: leaving the preview view
+  // restores the authored exposure engine-side (so the scene tab is never wrong), so returning must
+  // re-assert the sweep. No-op for a non-HDR subject (EV stays 0).
+  useEffect(() => {
+    if (active && ready && isHdr && exposureEv !== 0) {
+      void client.setExposure(exposureEv).catch((err: unknown) => notifyError(errorText(err)));
+    }
+  }, [active, ready, isHdr, exposureEv]);
 
   // Capability gating runs through the dock model, not a render branch: once the model's
   // capabilities are known, open the panels it supports (rig → skeleton; clips → clips +
@@ -330,78 +260,6 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     });
   }, []);
 
-  // Orbit: left-drag rotates the camera around the framed target, wheel dollies. Both write the orbit
-  // TARGET and arm the ease loop; exit-asset-preview restores the stash so this never dirties the saved
-  // editorCamera. A click (no drag) on a rigged model picks the nearest joint and selects it in the tree.
-  const dragging = useRef(false);
-  const lastPointer = useRef({ x: 0, y: 0 });
-  const downPos = useRef({ x: 0, y: 0 });
-  const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) {
-      return;
-    }
-    dragging.current = true;
-    lastPointer.current = { x: e.clientX, y: e.clientY };
-    downPos.current = { x: e.clientX, y: e.clientY };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  }, []);
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!dragging.current) {
-        return;
-      }
-      const dx = e.clientX - lastPointer.current.x;
-      const dy = e.clientY - lastPointer.current.y;
-      lastPointer.current = { x: e.clientX, y: e.clientY };
-      const o = targetOrbit.current;
-      o.yaw += dx * ORBIT_SENS_DEG_PER_PX;
-      o.pitch = Math.max(-89, Math.min(89, o.pitch - dy * ORBIT_SENS_DEG_PER_PX));
-      ensureOrbitLoop();
-    },
-    [ensureOrbitLoop],
-  );
-  const onPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      dragging.current = false;
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-      // A click (negligible movement) on a rigged model picks the nearest joint and selects its bone.
-      if (
-        !hasRig ||
-        Math.hypot(e.clientX - downPos.current.x, e.clientY - downPos.current.y) >= CLICK_SLOP_PX
-      ) {
-        return;
-      }
-      const rect = e.currentTarget.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) {
-        return;
-      }
-      const u = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-      const v = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-      void client
-        .pickSkeletonJoint(u, v)
-        .then((res) => {
-          if (res.found && res.nodeIndex >= 0) {
-            onBoneSelect(res.nodeIndex);
-          }
-        })
-        .catch((err: unknown) => notifyError(errorText(err)));
-    },
-    [hasRig, onBoneSelect],
-  );
-  const onWheel = useCallback(
-    (e: React.WheelEvent<HTMLDivElement>) => {
-      const o = targetOrbit.current;
-      const minD = Math.max(ZOOM_MIN_ABS, framedDistance.current * ZOOM_MIN_FRAC);
-      const maxD = framedDistance.current * ZOOM_MAX_FRAC;
-      const next = o.distance * (e.deltaY > 0 ? ZOOM_PER_WHEEL : 1 / ZOOM_PER_WHEEL);
-      o.distance = Math.min(maxD, Math.max(minD, next));
-      ensureOrbitLoop();
-    },
-    [ensureOrbitLoop],
-  );
-
   // The live preview state the dock panels read. Provided around this island's DockRoot +
   // DockPanelsHost so the portaled panel bodies inherit it across the leaves they land in.
   const previewContext: AssetPreviewContextValue = useMemo(
@@ -411,22 +269,16 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       highlightJoint,
       onBoneSelect,
       hostRef,
-      orbit: { onPointerDown, onPointerMove, onPointerUp, onWheel },
+      orbit: {
+        onPointerDown: orbit.onPointerDown,
+        onPointerMove: orbit.onPointerMove,
+        onPointerUp: orbit.onPointerUp,
+        onWheel: orbit.onWheel,
+      },
       active,
       ready,
     }),
-    [
-      model,
-      rootEntity,
-      highlightJoint,
-      onBoneSelect,
-      onPointerDown,
-      onPointerMove,
-      onPointerUp,
-      onWheel,
-      active,
-      ready,
-    ],
+    [model, rootEntity, highlightJoint, onBoneSelect, orbit, active, ready],
   );
 
   if (status === "error") {
@@ -451,9 +303,47 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex items-center gap-3 border-b border-border bg-background px-3 py-2">
         <Box className="size-4 text-muted-foreground" />
-        <span className="text-sm font-medium text-foreground">{model?.name ?? "Asset"}</span>
+        <span className="text-sm font-medium text-foreground">
+          {asset?.name ?? model?.name ?? "Asset"}
+        </span>
         {ready ? (
           <div className="ml-auto flex items-center gap-1">
+            {isHdr ? (
+              // The HDRI environment preview's exposure sweep: reveal clipped sun/window detail at
+              // low EV, lift shadows at high EV. Engine-restored on exit, so it is preview-only.
+              <div className="mr-1 flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">EV</span>
+                <Slider
+                  className="w-28"
+                  value={[exposureEv]}
+                  min={-6}
+                  max={6}
+                  step={0.1}
+                  onValueChange={([v]) => onExposure(v)}
+                  aria-label="Preview exposure (EV)"
+                />
+                <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">
+                  {exposureEv > 0 ? `+${exposureEv.toFixed(1)}` : exposureEv.toFixed(1)}
+                </span>
+              </div>
+            ) : null}
+            {isTexture ? (
+              // Representation: Applied (the lit sphere / HDRI environment) vs Flat (the raw texture
+              // / equirect). Applied is active here; Flat opens the flat image view of the same map.
+              <div className="mr-1 flex items-center overflow-hidden rounded-md border border-border">
+                <Button variant="secondary" size="sm" className="rounded-none" disabled>
+                  {isHdr ? "3D" : "Applied"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="rounded-none"
+                  onClick={() => asset && openImageViewerTab(asset)}
+                >
+                  Flat
+                </Button>
+              </div>
+            ) : null}
             {hasRig ? (
               <>
                 <Button
