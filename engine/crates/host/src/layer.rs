@@ -375,7 +375,7 @@ impl HostLayer {
         self.editor.fly_input.look_delta = Vec2::ZERO;
         update_scene_edit_camera(&mut self.editor.camera, &input, dt.seconds);
 
-        // Smoothed edits (`set-material` / `set-transform smooth:1`) converge here too.
+        // Smoothed edits (`set-transform smooth:1`) converge here too.
         self.editor.step_edit_smoothing(dt.seconds);
 
         ParentWatch::Alive
@@ -391,9 +391,8 @@ impl HostLayer {
         if self.editor.play_state == PlayState::Playing {
             reasons.push("play");
         }
-        // Smoothed edits (`set-material` / `set-transform smooth:1`) converge over frames.
-        if !self.editor.material_smoothing.is_empty() || !self.editor.transform_smoothing.is_empty()
-        {
+        // Smoothed edits (`set-transform smooth:1`) converge over frames.
+        if !self.editor.transform_smoothing.is_empty() {
             reasons.push("smoothing");
         }
         // The fly-cam look smoothing eases out over a few frames after the last input.
@@ -568,9 +567,7 @@ impl HostLayer {
 
         let options = RenderSceneOptions {
             show_editor_camera_models: self.editor.play_state == PlayState::Edit,
-            show_grid: self.editor.debug_overlays.grid
-                && self.editor.play_state == PlayState::Edit
-                && !self.editor.previewing(),
+            show_grid: self.editor.debug_overlays.grid && self.editor.editor_chrome_visible(),
         };
 
         let skinning = renderer.skinning_enabled();
@@ -645,8 +642,7 @@ impl HostLayer {
         width: u32,
         height: u32,
     ) {
-        let edit_chrome =
-            self.editor.play_state == PlayState::Edit && self.editor.preview_scene.is_none();
+        let edit_chrome = self.editor.editor_chrome_visible();
         // The overlay's debug/collider builders resolve meshes through the renderer's uploader
         // + descriptors (the bindless texture binds); the gizmo / billboards / skeleton are
         // pure projection. Skinning is off for the resolve (bounds only, no skin stream).

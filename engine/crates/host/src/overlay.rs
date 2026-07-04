@@ -1196,11 +1196,7 @@ fn build_collider_overlays(
     height: u32,
     vertices: &mut Vec<OverlayVertex>,
 ) {
-    if !editor.debug_overlays.colliders
-        || editor.preview_scene.is_some()
-        || width == 0
-        || height == 0
-    {
+    if !editor.debug_overlays.colliders || editor.previewing() || width == 0 || height == 0 {
         return;
     }
     let selected = editor.selected;
