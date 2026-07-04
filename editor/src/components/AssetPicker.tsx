@@ -9,7 +9,17 @@
 ///
 /// Lives in the side docks (inspector / environment); the popover anchors there.
 import { useEffect, useState } from "react";
-import { Box, Check, ChevronsUpDown, File, Image as ImageIcon, Loader2 } from "lucide-react";
+import {
+  Box,
+  Check,
+  ChevronsUpDown,
+  Circle,
+  File,
+  Image as ImageIcon,
+  Loader2,
+  Square,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { getCachedThumbnailUrl, getThumbnailUrl, useEditorStore } from "../state/store";
 import { ASSET_DND_MIME, assetIdsFromPayload, readAssetPayload } from "./AssetTile";
 import type { AssetEntry } from "../protocol";
@@ -23,6 +33,39 @@ const NONE_UUID = "0";
 /// albedo/sky/texture fields show textures; modelId shows `.smodel` containers; a
 /// clip slot shows animation assets.)
 export type PickerAssetKind = "mesh" | "texture" | "material" | "model" | "animation";
+
+/// The native built-in primitive meshes, mirroring the engine's `BuiltinMesh` reserved
+/// ids (`saffron-assets`). They are choosable in the mesh picker but are never catalog
+/// rows, so they carry their id + label here rather than coming from `assets`.
+const BUILTIN_MESHES: { id: string; label: string; icon: LucideIcon }[] = [
+  { id: "3", label: "Cube", icon: Box },
+  { id: "4", label: "Plane", icon: Square },
+  { id: "5", label: "Sphere", icon: Circle },
+];
+
+/// The built-in primitive for a mesh id, or `undefined` for a catalog / none value. The
+/// single `< 1024` decoder on the editor side (mirrors `BuiltinMesh::from_reserved_id`).
+function builtinMesh(value: string): (typeof BUILTIN_MESHES)[number] | undefined {
+  return BUILTIN_MESHES.find((b) => b.id === value);
+}
+
+/// A small badge marking a value as engine-native rather than a project asset.
+function BuiltinChip() {
+  return (
+    <span className="flex-none rounded-sm bg-muted px-1 py-px text-[9px] font-medium uppercase tracking-wide text-muted-foreground">
+      Built-in
+    </span>
+  );
+}
+
+/// A subtle section header inside the picker popover.
+function PickerGroupLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="px-1.5 pt-1 text-[9px] uppercase tracking-wide text-muted-foreground">
+      {children}
+    </span>
+  );
+}
 
 /// A small thumbnail swatch fetched at 64 px and shown at the given CSS size; falls
 /// back to a lucide type icon while loading or on failure. Seeds from the shared
@@ -97,6 +140,10 @@ export function AssetPicker({ value, assetType, onChange }: AssetPickerProps) {
 
   const options = assets.filter((a) => a.type === assetType);
   const isNone = value === NONE_UUID || value === "";
+  // The mesh picker offers the native built-in primitives (cube/plane/sphere) above the
+  // catalog rows; they are reserved-id meshes, never catalog assets.
+  const showBuiltins = assetType === "mesh";
+  const selectedBuiltin = showBuiltins ? builtinMesh(value) : undefined;
 
   // Warm the thumbnail cache while the popover is closed, so the first open
   // paints images instead of fallback icons (the shared cache dedupes, so this
@@ -155,8 +202,20 @@ export function AssetPicker({ value, assetType, onChange }: AssetPickerProps) {
             className="h-7 w-full justify-between gap-1.5 px-1.5 font-mono text-[11px]"
           >
             <span className="flex min-w-0 items-center gap-1.5">
-              {selected ? <AssetSwatch asset={selected} size={16} /> : null}
-              <span className="truncate">{selected ? selected.name : "(none)"}</span>
+              {selectedBuiltin ? (
+                <>
+                  <selectedBuiltin.icon className="size-4 flex-none text-muted-foreground" />
+                  <span className="truncate">{selectedBuiltin.label}</span>
+                  <BuiltinChip />
+                </>
+              ) : selected ? (
+                <>
+                  <AssetSwatch asset={selected} size={16} />
+                  <span className="truncate">{selected.name}</span>
+                </>
+              ) : (
+                <span className="truncate">(none)</span>
+              )}
             </span>
             <ChevronsUpDown className="size-3 flex-none opacity-50" />
           </Button>
@@ -167,6 +226,21 @@ export function AssetPicker({ value, assetType, onChange }: AssetPickerProps) {
               to full content height and overshoot the cap instead of scrolling. */}
           <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
             <PickerRow label="(none)" active={isNone} onSelect={() => pick(NONE_UUID)} />
+            {showBuiltins ? (
+              <>
+                <PickerGroupLabel>Built-in</PickerGroupLabel>
+                {BUILTIN_MESHES.map((b) => (
+                  <PickerRow
+                    key={b.id}
+                    label={b.label}
+                    swatch={<b.icon className="size-4 flex-none text-muted-foreground" />}
+                    active={b.id === value}
+                    onSelect={() => pick(b.id)}
+                  />
+                ))}
+                {options.length > 0 ? <PickerGroupLabel>Assets</PickerGroupLabel> : null}
+              </>
+            ) : null}
             {options.map((asset) => (
               <PickerRow
                 key={asset.id}
@@ -176,7 +250,7 @@ export function AssetPicker({ value, assetType, onChange }: AssetPickerProps) {
                 onSelect={() => pick(asset.id)}
               />
             ))}
-            {options.length === 0 ? (
+            {options.length === 0 && !showBuiltins ? (
               <span className="px-2 py-1 text-[11px] italic text-muted-foreground">
                 No {assetType} assets
               </span>
