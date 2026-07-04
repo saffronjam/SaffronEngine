@@ -7,7 +7,7 @@
 //!
 //! This is the most `sceneEdit`-coupled domain: the handlers drive the
 //! [`SceneEditContext`] (selection, gizmo state, play machine, the active-scene
-//! resolution) and read the scene world through its component registry. `set-material` /
+//! resolution) and read the scene world through its component registry. `set-component` /
 //! `add-entity` / `pick` also touch `assets` and the renderer.
 //!
 //! The `get/set-debug-overlays` commands live in the animation domain
@@ -16,7 +16,7 @@
 //! `get-script-schema` in the asset domain / host. This file holds the remaining 42.
 
 use saffron_assets::{engine_asset_path, model_render_aabb, pick_entity};
-use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3, Vec4 as GlamVec4};
+use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3};
 use saffron_protocol::{
     AddComponentResult, AddEntityParams, AddEntityPreset, ComponentList, ComponentParams,
     CreateEntityParams, DeselectResult, DestroyEntityResult, DrainScriptErrorsParams,
@@ -28,8 +28,8 @@ use saffron_protocol::{
     ScriptInputResult, ScriptLogDto, ScriptStatusResult, SelectionResult, SetAtmosphereParams,
     SetCameraParams, SetComponentFieldParams, SetComponentFieldResult, SetComponentOrderParams,
     SetComponentOrderResult, SetComponentParams, SetComponentResult, SetEnvironmentParams,
-    SetGizmoParams, SetLightParams, SetMaterialParams, SetParentParams, SetScriptOverrideParams,
-    SetScriptOverrideResult, SetTransformParams, StepParams, Uuid as WireUuid, Vec3, Vec4,
+    SetGizmoParams, SetLightParams, SetParentParams, SetScriptOverrideParams,
+    SetScriptOverrideResult, SetTransformParams, StepParams, Uuid as WireUuid, Vec3,
 };
 use saffron_scene::{
     Bone, Camera, CameraView, ComponentTraits, DirectionalLight, Entity, IdComponent, Mesh, Name,
@@ -42,7 +42,7 @@ use saffron_sceneedit::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::registry::{CommandRegistry, EngineContext};
 use crate::selector::{entity_ref_dto, entity_uuid, fit_collider, resolve_entity};
 
@@ -63,22 +63,6 @@ fn from_glam3(v: GlamVec3) -> Vec3 {
 /// A wire `Vec3` as its `{x,y,z}` JSON object.
 fn vec3_json(v: &Vec3) -> Value {
     json!({ "x": v.x, "y": v.y, "z": v.z })
-}
-
-/// A wire `Vec4` as its `{x,y,z,w}` JSON object.
-fn vec4_json(v: &Vec4) -> Value {
-    json!({ "x": v.x, "y": v.y, "z": v.z, "w": v.w })
-}
-
-/// Validates a `set-material` blend token, returning it unchanged for the JSON body or an
-/// error naming the accepted values. The three glTF alpha modes are the only valid inputs.
-fn validate_blend(blend: &str) -> Result<&str> {
-    match blend {
-        "opaque" | "masked" | "translucent" => Ok(blend),
-        other => Err(Error::command(format!(
-            "invalid blend '{other}': expected opaque | masked | translucent"
-        ))),
-    }
 }
 
 /// The editor fly-camera as its wire DTO.
@@ -570,148 +554,6 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                         .active_scene()
                         .set_local_from_matrix(child, inv_world * world);
                 }
-            }
-            ctx.scene_edit.scene_version += 1;
-            let scene = ctx.scene_edit.active_scene();
-            Ok(entity_ref_dto(scene, entity))
-        },
-    );
-
-    // Adds/updates the entity's Material, merging the provided fields over its current value
-    // (baseColor as {x,y,z,w}).
-    reg.register::<SetMaterialParams, EntityRef>(
-        "set-material",
-        "set-material {entity, baseColor?:{x,y,z,w}, albedoTexture?:uuid, \
-         metallicRoughnessTexture?:uuid, metallic?, roughness?, emissive?:{x,y,z}, \
-         emissiveStrength?, unlit?:0|1, blend?:opaque|masked|translucent, slot?, smooth?:0|1}",
-        |ctx, params| {
-            if ctx.scene_edit.previewing() {
-                return Err(Error::command("exit the asset preview first"));
-            }
-            let entity = resolve_entity(ctx, &params.entity)?;
-            // Slot path: merge the given fields into one slot of the MaterialSet (direct
-            // writes; per-slot smoothing is not animated).
-            if let Some(slot_index) = params.slot {
-                let set_row = *ctx
-                    .scene_edit
-                    .registry
-                    .find_by_name("MaterialSet")
-                    .ok_or_else(|| Error::command("MaterialSet component is not registered"))?;
-                if !(set_row.has)(ctx.scene_edit.active_scene(), entity) {
-                    return Err(Error::command("entity has no MaterialSet component"));
-                }
-                let mut set_body = (set_row.serialize)(ctx.scene_edit.active_scene(), entity);
-                let slots = set_body.get("slots").and_then(Value::as_array);
-                if slots.is_none_or(|s| slot_index as usize >= s.len()) {
-                    return Err(Error::command(format!(
-                        "material slot {slot_index} out of range"
-                    )));
-                }
-                let slot = &mut set_body["slots"][slot_index as usize];
-                if let Some(v) = &params.base_color {
-                    slot["baseColor"] = vec4_json(v);
-                }
-                if let Some(t) = params.albedo_texture {
-                    slot["albedoTexture"] = json!(t.value());
-                }
-                if let Some(t) = params.metallic_roughness_texture {
-                    slot["metallicRoughnessTexture"] = json!(t.value());
-                }
-                if let Some(m) = params.metallic {
-                    slot["metallic"] = json!(m);
-                }
-                if let Some(r) = params.roughness {
-                    slot["roughness"] = json!(r);
-                }
-                if let Some(e) = &params.emissive {
-                    slot["emissive"] = vec3_json(e);
-                }
-                if let Some(s) = params.emissive_strength {
-                    slot["emissiveStrength"] = json!(s);
-                }
-                if let Some(u) = params.unlit {
-                    slot["unlit"] = json!(u);
-                }
-                if let Some(b) = &params.blend {
-                    slot["blend"] = json!(validate_blend(b)?);
-                }
-                (set_row.deserialize)(ctx.scene_edit.active_scene(), entity, &set_body)
-                    .map_err(|e| Error::command(e.to_string()))?;
-                ctx.scene_edit.scene_version += 1;
-                let scene = ctx.scene_edit.active_scene();
-                return Ok(entity_ref_dto(scene, entity));
-            }
-            let row = *ctx
-                .scene_edit
-                .registry
-                .find_by_name("Material")
-                .ok_or_else(|| Error::command("Material component is not registered"))?;
-            if !(row.has)(ctx.scene_edit.active_scene(), entity) {
-                (row.add_default)(ctx.scene_edit.active_scene(), entity);
-            }
-            let smooth = params.smooth.unwrap_or(false);
-            let mut body = (row.serialize)(ctx.scene_edit.active_scene(), entity);
-            // With smooth, numeric fields become per-frame animation targets instead of
-            // direct writes (merging only texture/unlit here keeps the JSON round-trip from
-            // stomping the component's mid-animation values back).
-            if let Some(v) = &params.base_color
-                && !smooth
-            {
-                body["baseColor"] = vec4_json(v);
-            }
-            if let Some(t) = params.albedo_texture {
-                body["albedoTexture"] = json!(t.value());
-            }
-            if let Some(t) = params.metallic_roughness_texture {
-                body["metallicRoughnessTexture"] = json!(t.value());
-            }
-            if let Some(m) = params.metallic
-                && !smooth
-            {
-                body["metallic"] = json!(m);
-            }
-            if let Some(r) = params.roughness
-                && !smooth
-            {
-                body["roughness"] = json!(r);
-            }
-            if let Some(e) = &params.emissive
-                && !smooth
-            {
-                body["emissive"] = vec3_json(e);
-            }
-            if let Some(s) = params.emissive_strength
-                && !smooth
-            {
-                body["emissiveStrength"] = json!(s);
-            }
-            if let Some(u) = params.unlit {
-                body["unlit"] = json!(u);
-            }
-            if let Some(b) = &params.blend {
-                body["blend"] = json!(validate_blend(b)?);
-            }
-            (row.deserialize)(ctx.scene_edit.active_scene(), entity, &body)
-                .map_err(|e| Error::command(e.to_string()))?;
-            if smooth {
-                let target = ctx.scene_edit.material_smooth_entry_for(entity);
-                if let Some(v) = &params.base_color {
-                    target.base_color = Some(GlamVec4::new(v.x, v.y, v.z, v.w));
-                }
-                if let Some(m) = params.metallic {
-                    target.metallic = Some(m);
-                }
-                if let Some(r) = params.roughness {
-                    target.roughness = Some(r);
-                }
-                if let Some(e) = &params.emissive {
-                    target.emissive = Some(to_glam3(*e));
-                }
-                if let Some(s) = params.emissive_strength {
-                    target.emissive_strength = Some(s);
-                }
-            } else {
-                ctx.scene_edit.cancel_material_smoothing(entity);
             }
             ctx.scene_edit.scene_version += 1;
             let scene = ctx.scene_edit.active_scene();
