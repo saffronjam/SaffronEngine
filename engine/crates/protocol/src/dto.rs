@@ -158,7 +158,8 @@ pub struct ExportAppResult {
 pub enum AddEntityPreset {
     Empty,
     Cube,
-    Model,
+    Plane,
+    Sphere,
     PointLight,
     SpotLight,
     DirectionalLight,
@@ -1322,6 +1323,13 @@ pub struct SetSkinningResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
+pub struct SetDisplacementResult {
+    pub displacement: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SetDepthPrepassResult {
     pub depth_prepass: bool,
 }
@@ -1587,8 +1595,14 @@ pub struct ClearExtractionParams {
 #[ts(export)]
 pub struct ImportTextureParams {
     pub path: String,
+    /// Explicit upload colorspace override (`srgb`/`linear`/`hdr`); usually left unset and
+    /// derived from `role`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colorspace: Option<String>,
+    /// Semantic role hint (`albedo`/`normal`/`roughness`/…/`hdri`, or a connector map key like
+    /// `nor_gl`/`arm`). Drives preview routing and, absent `colorspace`, the upload colorspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -1615,6 +1629,13 @@ pub struct AssetEntryDto {
     pub duration: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rigged: Option<bool>,
+    /// Texture: how its bytes are interpreted on upload (`srgb`/`linear`/`hdr`/`auto`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colorspace: Option<String>,
+    /// Texture: its semantic role (`albedo`/`normal`/`roughness`/…/`hdri`), for preview routing.
+    /// Omitted for a non-texture asset or an unrecognized (`unknown`) role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Creation time (seconds since the Unix epoch) of the asset's backing file, for sorting.
     pub created_at: i64,
     /// Store source/license, present for assets imported from a connector.
