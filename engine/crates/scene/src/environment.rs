@@ -162,6 +162,41 @@ pub enum Colorspace {
     Hdr,
 }
 
+/// A texture's semantic role — what surface channel it feeds.
+///
+/// Inferred from the filename at scan/import, or supplied authoritatively by an import
+/// connector (Poly Haven, ambientCG). Drives two things: the preview routing (which slot of the
+/// preview ball material a lone texture is shown through) and the colorspace policy for an
+/// imported/foreign file (color maps → sRGB, data maps → linear, HDR → float).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureRole {
+    /// Role not recognized (the default) — treated as a plain color map for display.
+    #[default]
+    Unknown,
+    /// Base color / albedo (sRGB).
+    Albedo,
+    /// Tangent-space normal map (linear).
+    Normal,
+    /// Roughness (linear).
+    Roughness,
+    /// Metallic (linear).
+    Metallic,
+    /// Ambient occlusion (linear).
+    Ao,
+    /// Height / displacement (linear).
+    Height,
+    /// Emissive (sRGB).
+    Emissive,
+    /// Opacity / alpha mask (linear).
+    Opacity,
+    /// Packed occlusion-roughness-metallic / ARM (linear).
+    Orm,
+    /// Glossiness (linear).
+    Gloss,
+    /// HDR environment / equirectangular map (float).
+    Hdri,
+}
+
 /// Where an imported asset came from and under what license.
 ///
 /// Captured at import for assets pulled from an online store connector so the
@@ -216,6 +251,8 @@ pub struct AssetEntry {
     pub chunk: i32,
     /// Texture: how its bytes are interpreted on upload.
     pub colorspace: Colorspace,
+    /// Texture: its semantic role (albedo/normal/roughness/…), for preview routing.
+    pub role: TextureRole,
     /// Source/license, set when the asset was imported from an online store.
     pub attribution: Option<Attribution>,
     /// FNV-1a hash of the asset's baked content, the content-addressed thumbnail cache
@@ -240,6 +277,7 @@ impl Default for AssetEntry {
             container: Uuid(0),
             chunk: -1,
             colorspace: Colorspace::Auto,
+            role: TextureRole::Unknown,
             attribution: None,
             content_hash: 0,
         }

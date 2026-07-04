@@ -34,7 +34,7 @@ pub use component::{
 pub use document::SCENE_VERSION;
 pub use environment::{
     AssetCatalog, AssetEntry, AssetType, AtmosphereSettings, Attribution, Colorspace,
-    SceneEnvironment, SkyMode,
+    SceneEnvironment, SkyMode, TextureRole,
 };
 pub use error::{Error, Result};
 pub use hierarchy::{
