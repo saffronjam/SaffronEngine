@@ -36,39 +36,38 @@ The scene renders through the first primary camera. `show_model` / `show_frustum
 
 ## Materials
 
-`Material` is the per-entity material applied to the whole mesh. A multi-material mesh carries `MaterialSet` instead; a shared `.smat` asset is referenced by `MaterialAsset` (which takes precedence over the inline material when present).
+`MaterialSet` is the one per-entity material component: an ordered list of `MaterialSlot`s, one per submesh. Each slot references a `.smat` [material asset](../../explanations/materials-and-pipelines/native-materials/) and layers a sparse per-object override map on top. A single-material mesh is a `MaterialSet` with one slot; each [`Submesh.material_slot`](../../explanations/geometry-and-assets/mesh-and-vertex-layout/) indexes the list (clamped to the last slot).
 
 | Type | JSON key | Fields (default) |
 |---|---|---|
-| `Material` | `Material` | see below |
-| `MaterialSet` | `MaterialSet` | `slots: Vec<MaterialSlot>` (each slot has the `Material` fields) |
-| `MaterialAsset` | `MaterialAsset` | `material: Uuid {0}` (the `.smat` asset id; `0` → built-in default) |
+| `MaterialSet` | `MaterialSet` | `slots: Vec<MaterialSlot>` |
+| `MaterialSlot` | (slot) | `material: Uuid {0}` (the `.smat` asset id; `0` → built-in default); `overrides: {}` (sparse override map) |
 | `ModelInstance` | `ModelInstance` | `model_id: Uuid {0}` (marks the root of an expanded `.smodel`) |
 
-`Material` fields (all `Uuid` texture ids default to `0` = none → renderer default):
+`overrides` is opaque `{ paramName: value }` JSON holding only the parameters that deviate from the referenced material. The recognized keys are the exposed PBR parameters (colours and vectors are arrays, texture ids are decimal strings, matching the `.smat` wire shape):
 
-| Field | Type | Default | Note |
+| Key | Type | Default | Note |
 |---|---|---|---|
-| `base_color` | `Vec4` | `{1,1,1,1}` | RGBA |
-| `albedo_texture` | `Uuid` | `0` | sRGB; 0 = default white |
-| `metallic_roughness_texture` | `Uuid` | `0` | glTF map (rough=G, metal=B); linear |
-| `metallic` | `f32` | `0.0` | |
-| `roughness` | `f32` | `1.0` | |
-| `emissive` | `Vec3` | `{0,0,0}` | |
-| `emissive_strength` | `f32` | `1.0` | |
-| `unlit` | `bool` | `false` | distinct PSO |
-| `normal_texture` | `Uuid` | `0` | tangent-space (+Y) |
-| `occlusion_texture` | `Uuid` | `0` | AO in R |
-| `emissive_texture` | `Uuid` | `0` | modulates `emissive` |
-| `height_texture` | `Uuid` | `0` | R, for parallax |
-| `normal_strength` | `f32` | `1.0` | |
-| `uv_tiling` | `Vec2` | `{1,1}` | |
-| `uv_offset` | `Vec2` | `{0,0}` | |
-| `height_scale` | `f32` | `0.05` | parallax depth |
-| `blend` | `enum` | `"opaque"` | `opaque` / `masked` (alpha-test + alpha-to-coverage under MSAA) / `translucent` (sorted blend pass) |
-| `alpha_cutoff` | `f32` | `0.5` | the `masked` discard/coverage threshold |
+| `baseColor` | color4 | `[1,1,1,1]` | RGBA |
+| `metallic` | scalar | `0.0` | |
+| `roughness` | scalar | `1.0` | |
+| `emissive` | color3 | `[0,0,0]` | |
+| `emissiveStrength` | scalar | `1.0` | |
+| `normalStrength` | scalar | `1.0` | |
+| `alphaCutoff` | scalar | `0.5` | the `masked` discard/coverage threshold |
+| `heightScale` | scalar | `0.05` | parallax depth |
+| `uvTiling` | vec2 | `[1,1]` | |
+| `uvOffset` | vec2 | `[0,0]` | |
+| `unlit` | bool | `false` | skip lighting (distinct PSO) |
+| `doubleSided` | bool | `false` | |
+| `blend` | enum | `"opaque"` | `opaque` / `masked` (alpha-test + alpha-to-coverage under MSAA) / `translucent` (sorted blend pass) |
+| `albedoTexture` | texture | `"0"` | sRGB; `0` = none |
+| `ormTexture` | texture | `"0"` | packed ORM (AO=R, roughness=G, metallic=B); linear |
+| `normalTexture` | texture | `"0"` | tangent-space (+Y) |
+| `emissiveTexture` | texture | `"0"` | modulates `emissive` |
+| `heightTexture` | texture | `"0"` | R, for parallax |
 
-`MaterialSlot` has the same field set as `Material` and the same defaults.
+Parameter meanings and defaults live in the `.smat` asset (see [native materials](../../explanations/materials-and-pipelines/native-materials/)); an override names only the ones that differ for this object.
 
 ## Lights
 

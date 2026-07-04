@@ -67,42 +67,30 @@ caches.
 
 ```rust
 pub struct Mesh { pub mesh: Uuid }
-
-pub struct Material {
-    pub base_color: Vec4,
-    pub albedo_texture: Uuid,               // 0 == none
-    pub metallic_roughness_texture: Uuid,   // 0 == none; glTF MR map (rough=G, metal=B)
-    pub metallic: f32,
-    pub roughness: f32,
-    pub emissive: Vec3,
-    pub emissive_strength: f32,
-    pub unlit: bool,                        // skip lighting — a distinct PSO
-    pub blend_mode: BlendMode,              // opaque / masked / translucent
-    // ... normal / occlusion / emissive / height maps, UV tiling, parallax, alpha cutoff
-}
 ```
 
-`Material` is per-entity and applies to the whole mesh. `albedo_texture == 0` means none: the
-renderer binds its default white texture, so `base_color` shows directly. `metallic` and `roughness`
-feed the [Cook-Torrance BRDF](../../lighting-and-brdf/cook-torrance-brdf/); `unlit` selects a
-separate [PSO permutation](../../materials-and-pipelines/ubershader-and-specialization/). The
-metallic-roughness map is glTF's packed map (roughness in G, metalness in B), a **linear** texture
-unlike the sRGB albedo; the default white (when none) leaves the scalar factors unchanged.
-
-A mesh imported with more than one material instead carries a `MaterialSet`: an ordered table of
-`MaterialSlot`s, each with the same fields as `Material`. Every
-[`Submesh.material_slot`](../../geometry-and-assets/mesh-and-vertex-layout/) indexes this table, so
-each submesh draws with its own material.
+An entity's material is one component, `MaterialSet`: an ordered list of `MaterialSlot`s, one per
+submesh. A slot is a **reference plus overrides** — a `.smat`
+[material asset](../../materials-and-pipelines/native-materials/) id and a sparse per-object override
+map applied over that material's resolved parameters. A single-material mesh is a `MaterialSet` with
+one slot.
 
 ```rust
-pub struct MaterialSlot { /* same fields as Material */ }
+pub struct MaterialSlot {
+    pub material: Uuid,   // the referenced .smat asset; 0 == the built-in default
+    pub overrides: Value, // sparse { paramName: value }, {} when nothing is overridden
+}
 pub struct MaterialSet { pub slots: Vec<MaterialSlot> }
 ```
 
-An entity uses one or the other: single-material meshes (and hand-created entities) keep `Material`;
-a multi-material import gets `MaterialSet`. A shared `.smat` asset is referenced by a third
-component, `MaterialAsset { material: Uuid }`, which takes precedence over the inline material when
-present. The [draw list](../../geometry-and-assets/draw-list/) reads whichever is present.
+Each [`Submesh.material_slot`](../../geometry-and-assets/mesh-and-vertex-layout/) indexes the list
+(clamped to the last slot), so each submesh draws with its own slot. `material == 0` binds the
+built-in default. `overrides` is opaque editor-shaped JSON; the engine applies only the recognized
+exposed PBR parameters — `baseColor`, `metallic`, `roughness`, `emissive`, the texture ids
+(`albedoTexture`, the packed `ormTexture`, …), and the rest of the exposed set — at resolve time.
+Because a slot references the `.smat` rather than copying its factors, editing that material
+re-renders every entity that points at it; the override map carries only the per-object deviations.
+The [draw list](../../geometry-and-assets/draw-list/) resolves the set into one material per submesh.
 
 ## Camera
 
@@ -162,7 +150,7 @@ the GPU light buffer.
 | Identity + transform | `scene/src/component.rs` | `IdComponent`, `Name`, `Transform` |
 | Hierarchy | `scene/src/component.rs` | `Relationship`, `WorldTransform` |
 | Skeleton | `scene/src/component.rs` | `SkinnedMesh`, `Bone` |
-| Renderables | `scene/src/component.rs` | `Mesh`, `Material`, `MaterialSet`, `MaterialSlot`, `MaterialAsset` |
+| Renderables | `scene/src/component.rs` | `Mesh`, `MaterialSet`, `MaterialSlot` |
 | Camera | `scene/src/component.rs` | `Camera` |
 | Lights + probe | `scene/src/component.rs` | `DirectionalLight`, `PointLight`, `SpotLight`, `ReflectionProbe` |
 | Camera resolve | `scene/src/hierarchy.rs` | `primary_camera` |

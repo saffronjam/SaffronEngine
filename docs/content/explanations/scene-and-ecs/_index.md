@@ -16,7 +16,7 @@ needs editing when a component is added.
 | Page | Covers | Code |
 |---|---|---|
 | `ecs-architecture` | `hecs`-backed `Scene`/`Entity`, component-access methods, `for_each` | `scene/src/scene.rs` |
-| `built-in-components` | Id, Name, Transform, Mesh, Material, Camera, the three light types | `scene/src/component.rs` |
+| `built-in-components` | Id, Name, Transform, Mesh, MaterialSet, Camera, the three light types | `scene/src/component.rs` |
 | `transform-and-matrices` | `Transform` (Euler XYZ radians), `T·R·S` composition, the stable Euler extraction | `scene/src/hierarchy.rs` · `transform_matrix` |
 | `scene-hierarchy` | parent/child via `Relationship`, cached world transforms, reparent + subtree destroy | `scene/src/hierarchy.rs` · `set_parent` |
 | `component-registry` | the fn-pointer itable, `register_component!`, lookup by name/type | `scene/src/registry.rs` · `ComponentRegistry` |
