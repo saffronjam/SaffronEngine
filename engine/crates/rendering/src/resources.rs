@@ -200,7 +200,7 @@ impl Drop for Buffer {
 /// How to create an [`Image`]: extent + format + usage + the view's aspect/type
 /// and mip/layer counts. A parameter struct so [`Image::new`] reads as named fields
 /// rather than a positional argument list.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageDesc {
     /// The 2D image extent.
     pub extent: vk::Extent2D,
