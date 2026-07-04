@@ -12,7 +12,7 @@ file carries its own identity and a recipe for rebuilding itself, which lets the
 the source of truth for the asset catalog.
 
 Importing Sponza touches around fifty textures. Scattered across loose
-`textures/<uuid>.<ext>` files plus inline material data on a spawned entity, a forgotten save
+`textures/<uuid>.<ext>` files plus loose `.smat` material files, a forgotten save
 turns them into dead orphans the catalog never knew about. One container closes that gap: it is
 the record, so a scan rediscovers it whether or not the project was saved.
 
@@ -78,9 +78,11 @@ exactly the rig payload the instantiate path expands.
 
 The filesystem is the source of truth. `scan_assets` walks `assets/`, prefix-reads every
 `.smodel` into one `Model` row plus a row per sub-asset (via `read_container_metadata`), and
-identifies engine-written standalone files by their uuid filename. A foreign file dropped in (a
-raw `.png`) gets a `.smeta` sidecar holding its id and colorspace. `load_project` reconciles the
-loaded catalog against the scan, so a never-saved import can never become an orphan. A
+identifies engine-written standalone files by their uuid filename. Each standalone file's editable
+metadata (name / folder / colorspace) lives in a co-located [`.smeta` sidecar](../asset-server-and-catalog/#the-smeta-sidecar),
+written eagerly on import and rename so it survives a cold scan without a save; a foreign file
+dropped in (a raw `.png`) additionally takes its stable id from that sidecar. `load_project`
+reconciles the loaded catalog against the scan, so a never-saved import can never become an orphan. A
 regenerable `assets/.cache/catalog.json` is a latency shortcut keyed by a signature of the tree
 — delete it and a cold scan (`load_catalog`) yields the identical catalog.
 

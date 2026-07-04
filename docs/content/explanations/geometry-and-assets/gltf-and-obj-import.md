@@ -107,10 +107,10 @@ reads `diffuse`, the `Pm`/`Pr` MTL keys, `emissive`, and `diffuse_texture` per m
 encoded texture bytes are carried as-is; decoding happens later, in
 [image decoding](../image-decoding/).
 
-The downstream [import pipeline](../import-pipeline/) bakes each slot's textures into the
-`.smodel` (colorspace tagged per role) and lowers the table into the scene: a single-material
-model becomes one `Material` component, a multi-material model a
-[`MaterialSet`](../../scene-and-ecs/built-in-components/).
+The downstream [import pipeline](../import-pipeline/) bakes each material into the `.smodel` as an
+`SMAT` chunk (textures colorspace-tagged per role) and lowers the table into the scene as a
+[`MaterialSet`](../../scene-and-ecs/built-in-components/) whose slots **reference** those baked
+`.smat` chunks — one slot per source material, so editing a baked material re-renders every instance.
 
 ## In the code
 

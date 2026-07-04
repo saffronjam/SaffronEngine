@@ -80,11 +80,11 @@ one logical model can carry several draw ranges. The draw path loops every batch
 submeshes and issues one `drawIndexed` per submesh. A model with three glTF primitives
 becomes three draw ranges against one bound buffer pair.
 
-Each submesh selects a material through `material_slot`. For a single-material mesh every
-submesh keeps slot 0 and the whole mesh draws with the entity's
-[`Material`](../../scene-and-ecs/built-in-components/) component. A multi-material import
-instead carries a `MaterialSet`, and the [draw list](../draw-list/) indexes its slots by
-`material_slot` so each submesh gets its own material.
+Each submesh selects a material through `material_slot`, an index into the entity's
+[`MaterialSet`](../../scene-and-ecs/built-in-components/). A single-material mesh keeps every
+submesh at slot 0 (one slot); a multi-material import gets one slot per material, and the
+[draw list](../draw-list/) indexes the slots by `material_slot` so each submesh draws with its
+own material.
 
 ## In the code
 

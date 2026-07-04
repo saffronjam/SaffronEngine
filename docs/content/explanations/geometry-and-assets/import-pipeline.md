@@ -44,8 +44,8 @@ Import populates the catalog; it never spawns. `AssetServer::instantiate_model` 
 `instantiate-model` command) reconstructs a `ModelSpawnInput` from the container's `META` and
 expands the stored hierarchy into entities: `spawn_model` builds the mesh entity, dispatching
 to `spawn_skinned_model` for a rig (with its bone entities, joints, and a stopped
-`AnimationPlayer`), and `apply_imported_materials` attaches a `Material` component (one
-material) or a `MaterialSet` (several). The root carries a `ModelInstance` component naming its
+`AnimationPlayer`), and `apply_imported_materials` attaches a `MaterialSet` whose slots reference the
+baked `.smat` chunks — one slot per material. The root carries a `ModelInstance` component naming its
 source asset. One `.smodel` instantiates into many independent entity trees, so the
 `add-entity cube` preset is just an instantiate of the built-in cube model.
 

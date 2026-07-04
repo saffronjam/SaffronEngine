@@ -70,19 +70,33 @@ renderer; the asset layer hands the scene a shared read-only handle (`Option<Arc
 
 `AssetEntry` carries container linkage — `container` (the owning [`.smodel`](../smodel-container/))
 and `chunk` — so one row can be the model and another a mesh/material/texture embedded inside
-it, resolved by `(container, sub-id)`. `colorspace` records how a texture's bytes are
-interpreted, recovered from a chunk flag or a `.smeta`.
+it, resolved by `(container, sub-id)`. A standalone asset's editable `name`, `folder`, and (for a
+texture) `colorspace` are the fields its filename can't carry, so they live in a co-located
+`.smeta` sidecar (see below); an embedded sub-asset recovers them from the container META.
 
 ## The filesystem is the source of truth
 
 The catalog is **derived from a scan**, not authored in `project.json`. `scan_assets` walks
 `assets/`, prefix-reads every `.smodel` into a `Model` row plus a row per sub-asset, and
-identifies engine-written standalone files by their uuid filename. A foreign file with no
-identity in its bytes (a raw `.png` dropped in) gets a `.smeta` sidecar holding its id and
-colorspace, minted on first sight. `load_project` reconciles the loaded catalog against the
-scan, so an import you never saved is rediscovered rather than orphaned. `load_catalog` is the
-fast path: `assets/.cache/catalog.json` memoizes the scan keyed by a signature of the tree.
-It is a latency shortcut only — delete it and a cold scan rebuilds an identical catalog.
+identifies engine-written standalone files by their uuid filename. `load_project` reconciles the
+loaded catalog against the scan, so an import you never saved is rediscovered rather than
+orphaned. `load_catalog` is the fast path: `assets/.cache/catalog.json` memoizes the scan keyed
+by a signature of the tree. It is a latency shortcut only — delete it and a cold scan rebuilds an
+identical catalog.
+
+### The `.smeta` sidecar
+
+A file's bytes carry its geometry, not its display name — so an asset's editable metadata
+(`name`, `folder`, and a texture's `colorspace`) lives beside it in a `<path>.smeta` sidecar.
+It is written **eagerly**: an import mints it, and `rename-asset` / `move-asset` rewrite it, so the
+metadata is durable the instant you touch it, with no project save. The scan overlays the sidecar
+onto the row it matches **by id** — authoritative over the `project.json` seed (which is only as
+fresh as the last save), so a *never-saved rename survives a restart* and a linear normal map can't
+silently rescan as sRGB. A foreign file with no identity in its own bytes (a raw `.png` dropped in)
+additionally takes its stable id from the sidecar, minted on first sight. The id guard keeps a
+`.smodel`'s sidecar from bleeding onto an embedded sub-asset that shares its path — which is also
+the one gap: an *embedded* sub-asset has no own file, so its rename stays in the container META
+until the sub-asset is extracted.
 
 The scan also records each row's `content_hash` — an FNV fold of the asset's baked bytes.
 An embedded sub-asset's hash is baked into the `.smodel` META, so the scan recovers it for
@@ -149,7 +163,7 @@ a missing or corrupt asset from flooding the log and re-hitting the disk many ti
 | Catalog ops | `scene/src/environment.rs` | `AssetCatalog::put`, `find`, `rename`, `unique_name` |
 | The cache shape | `assets/src/cache.rs` | `AssetCache`, `resolve_cached` |
 | Resolve + cache | `assets/src/load.rs` | `load_mesh_asset`, `load_texture_asset`, `resolve_mesh`, `resolve_texture` |
-| Scan + sidecar + cache | `assets/src/scan.rs` | `scan_assets`, `load_catalog`, `read_smeta` |
+| Scan + sidecar + cache | `assets/src/scan.rs` | `scan_assets`, `load_catalog`, `apply_sidecar_overrides`, `read_smeta`, `write_asset_sidecar` |
 | Thumbnail cache | `assets/src/thumbnail.rs` | `request_thumbnail`, `thumbnail_content_cache_path`, `evict_thumbnail_cache` |
 
 ## Related

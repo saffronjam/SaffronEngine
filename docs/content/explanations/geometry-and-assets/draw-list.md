@@ -47,9 +47,9 @@ pub struct DrawItem {
 ```
 
 `resolve_entity_materials` builds a `ResolvedMaterials` whose `submeshes` are sized to the
-mesh's submeshes: a `MaterialSet` component is indexed by each submesh's `material_slot`; a
-plain `Material` (or a `MaterialAsset`) applies to every submesh; a missing component falls
-back to the engine default. A single entry is reused for all submeshes.
+mesh's submeshes: the entity's `MaterialSet` is indexed by each submesh's `material_slot`
+(clamped to the last slot), each slot resolving its referenced `.smat` with the slot's sparse
+overrides layered on top. An entity with no `MaterialSet` falls back to the engine default.
 
 The same loop also accumulates the world-space scene bounds: it transforms each mesh's local
 AABB by its model matrix, and those bounds fit the
