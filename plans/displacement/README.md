@@ -1,6 +1,14 @@
 # True geometric displacement — research track + phased plan
 
-**Status:** NOT STARTED (Phase A is near-term product; Phases B–C are long-horizon research/build)
+**Status:** IN PROGRESS — **A, B1, B2, C1 IMPLEMENTED** (build + `clippy --workspace -D warnings` + `fmt`
++ 185 rendering-lib GPU tests + control/protocol tests all green; on-screen visuals still want a
+GPU-with-eyes pass). The in-scene displacement system is built: a `displace` compute pre-pass bakes the
+height field into the shared deformed-vertex buffer that **every** pass reads (Phase A's übershader VS
+path is retired — one mechanism), and the RT BLAS refits over that buffer for free (C1). **B3** (vector
+displacement) is **blocked** on a UV-aligned per-vertex tangent stream the engine's `Vertex` lacks — a
+separate infrastructure feature, out of displacement scope. **C2** (mesh-shader front end) stays
+roadmap-gated (no mesh-shader pipeline exists). **Deferred within B2:** adaptive tessellation + watertight
+welding (documented follow-ups; the baseline displaces the base vertices without subdividing).
 
 "True" displacement means **new vertices exist at displaced positions** — real silhouettes, and the
 detail is visible to shadow maps, the RT BVH, and GI. That is the line separating this from the

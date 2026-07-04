@@ -1,6 +1,33 @@
 # Phase A — displaced preview via pre-subdivided base + VS displacement
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. A height-map material now moves **real vertices** on a densely-subdivided
+preview sphere — a true deformed silhouette in the interactive preview, not the smooth-outline POM.
+Pieces: `saffron_geometry::preview_displacement_sphere()` (192×288 UV sphere) seeded under the reserved
+`PREVIEW_DISPLACE_SPHERE_MESH_ID` (cache-first, not spawnable); a `FEATURE_DISPLACE` bit + a
+`displacement: bool` on `MaterialAsset` / `SubmeshMaterial` (serialized, carried through
+`build_submesh_material` → `resolve_material`, mutually exclusive with the parallax `FEATURE_HEIGHT`);
+**VS displacement** in the übershader — `applyVertexDisplacement` in `lighting.slang` samples the height
+map in `transformVertex`/`transformVertexSkinned` and offsets the world position along the world normal
+by `height_scale`; the `mesh.slang` fragment derives the fine shading normal from the height gradient (a
+bump) so lighting matches the displaced microsurface. The interactive texture/material previews use the
+dense sphere; a standalone height texture enables displacement. This **completes
+`texture-material-previews/phase-5`** (the height preview it left wired-but-POM). **Scope note:** the VS
+path lives in the übershader (gated by `FEATURE_DISPLACE`), so the *interactive* preview — the primary
+inspection surface — shows the real silhouette; the small offscreen **thumbnail keeps its height→normal
+bump** (indistinguishable at 128px and avoids a dense-sphere re-render per thumbnail). In-scene POM
+(`FEATURE_HEIGHT`) is untouched, retired for general meshes by Phase B2. **Verified:** shader compile +
+`cargo build --workspace` + `clippy --workspace -D warnings` + `fmt --check` + geometry/material unit
+tests green. **Visual** (true silhouette at grazing angle) needs a GPU+eyes run — the mechanism is
+sound but I can't see the frame here.
+
+> **Superseded by B2 (NO-LEGACY):** the übershader *vertex-shader* displacement this phase added has been
+> **retired** — Phase B2's `displace` compute pre-pass is now the one displacement mechanism (it bakes the
+> height offset into the shared deformed buffer, consistent across every pass, including the point-shadow
+> cubes the VS path missed). Everything else Phase A introduced stays and is still how the preview works:
+> the dense `preview_displacement_sphere`, the reserved id, the `displacement` material flag +
+> `FEATURE_DISPLACE` bit + the `mesh.slang` height-gradient shading normal, and the preview wiring. The
+> interactive preview sphere is a scene instance with a displacement material, so B2's compute pre-pass
+> displaces it automatically — same visual, one code path.
 **Scope:** `saffron-geometry`, `saffron-rendering` (`preview.slang`, `thumbnail_render.rs`),
 `saffron-control` (`furnish_preview_scene`)
 **Depends on:** **`primitive-meshes/`** (a subdividable sphere/plane base)
