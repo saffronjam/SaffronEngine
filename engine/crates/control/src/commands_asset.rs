@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 use saffron_assets::{
     AssetServer, ContainerMetadata, ProjectHost, ProjectInfo, analyze_clean, asset_bytes,
     asset_type_name, build_dependency_graph, clear_extraction, create_project_script,
-    default_display_name, default_material_asset, delete_unused, extract_sub_asset,
-    import_material_folder, load_catalog_material_asset, load_catalog_material_asset_raw,
-    load_material_asset, load_material_asset_raw, lower_graph_to_params, model_render_aabb,
-    pick_scene_surface, reimport_model, request_thumbnail, save_material_asset,
-    update_material_asset, valid_project_name, viewport_ray,
+    default_display_name, default_material_asset, delete_unused, exposed_parameter,
+    extract_sub_asset, import_material_folder, load_catalog_material_asset,
+    load_catalog_material_asset_raw, load_material_asset, load_material_asset_raw,
+    lower_graph_to_params, model_render_aabb, pbr_exposed_parameters, pick_scene_surface,
+    reimport_model, request_thumbnail, save_material_asset, update_material_asset,
+    valid_project_name, viewport_ray,
 };
 use saffron_core::Uuid;
 use saffron_geometry::glam::{Vec2, Vec3 as MathVec3};
@@ -34,27 +35,28 @@ use saffron_protocol::{
     CleanAssetsParams, CleanCandidateDto, CleanReport, ClearExtractionParams,
     CreateAssetFolderParams, CreateScriptParams, CreateScriptResult, DeleteAssetFolderParams,
     DeleteAssetParams, DeleteAssetResult, DeleteUnusedParams, DeleteUnusedResult, EmptyParams,
-    EntityRef, ExportAppParams, ExportAppResult, ExtractSubAssetParams, GetAssetModelParams,
-    ImportModelParams, ImportModelResult, ImportTextureParams, ImportTextureResult,
-    InstantiateModelParams, MaterialAssignParams, MaterialAssignResult, MaterialCompileParams,
-    MaterialCompileResult, MaterialCookResult, MaterialCreateInstanceParams, MaterialCreateParams,
-    MaterialCreateResult, MaterialGetParams, MaterialGetResult, MaterialImportParams,
-    MaterialImportResultDto, MaterialListResult, MaterialRefDto, MaterialSetGraphParams,
-    MaterialSetGraphResult, MaterialSetOverrideParams, MaterialSetOverrideResult,
-    MaterialUpdateParams, MaterialUpdateResult, ModelInfoParams, ModelInfoResult, ModelSubAssetDto,
-    MoveAssetParams, NewProjectParams, OptionalPathParams, PathParams, PathResult,
-    PlacementTransformDto, PlayStateResult, PreviewRenderParams, PreviewRenderResult,
-    ProjectInfoDto, ProjectPhaseDto, ProjectStatusDto, ProjectStoresDto, QuitResult,
-    ReimportModelParams, ReimportModelResult, RenameAssetFolderParams, RenameAssetParams,
-    ScanAssetsResult, ScreenshotParams, ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams,
-    SetActiveViewResult, ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailParams,
-    ThumbnailResult, Uuid as WireUuid, Vec3, Vec4,
+    EntityRef, ExportAppParams, ExportAppResult, ExposedParamDto, ExtractSubAssetParams,
+    GetAssetModelParams, ImportModelParams, ImportModelResult, ImportTextureParams,
+    ImportTextureResult, InstantiateModelParams, MaterialAssignParams, MaterialAssignResult,
+    MaterialCompileParams, MaterialCompileResult, MaterialCookResult, MaterialCreateInstanceParams,
+    MaterialCreateParams, MaterialCreateResult, MaterialGetParams, MaterialGetResult,
+    MaterialImportParams, MaterialImportResultDto, MaterialListResult, MaterialRefDto,
+    MaterialSchemaParams, MaterialSchemaResult, MaterialSetGraphParams, MaterialSetGraphResult,
+    MaterialSetOverrideParams, MaterialSetOverrideResult, MaterialUpdateParams,
+    MaterialUpdateResult, ModelInfoParams, ModelInfoResult, ModelSubAssetDto, MoveAssetParams,
+    NewProjectParams, OptionalPathParams, PathParams, PathResult, PlacementTransformDto,
+    PlayStateResult, PreviewRenderParams, PreviewRenderResult, ProjectInfoDto, ProjectPhaseDto,
+    ProjectStatusDto, ProjectStoresDto, QuitResult, ReimportModelParams, ReimportModelResult,
+    RenameAssetFolderParams, RenameAssetParams, ScanAssetsResult, ScreenshotParams,
+    ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams, SetActiveViewResult,
+    ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailParams, ThumbnailResult, Uuid as WireUuid,
+    Vec3, Vec4,
 };
 use saffron_rendering::{PngTransfer, ViewId};
 use saffron_scene::{
     AnimationPlayer, AssetEntry, AssetType, Attribution, Colorspace, DirectionalLight, Entity,
-    IdComponent, Material, MaterialAsset as MaterialAssetComponent, Mesh, Name, PreviewGhost,
-    Scene, SkinnedMesh, SkyMode, Transform,
+    IdComponent, MaterialSet, MaterialSlot, Mesh, Name, PreviewGhost, Scene, SkinnedMesh, SkyMode,
+    Transform,
 };
 use saffron_sceneedit::{
     BootStage, NewProjectSpec, PlacementPreview, PlayState, ProjectLoadRequest, ProjectPhase,
@@ -467,6 +469,16 @@ fn asset_ref(entry: &AssetEntry) -> AssetRef {
     }
 }
 
+/// Rewrites the durable `.smeta` sidecar for each id after a folder mutation touched many
+/// rows. Best-effort: an IO failure is logged, not surfaced, so the command still succeeds.
+fn write_asset_sidecars(assets: &AssetServer, ids: &[Uuid], label: &str) {
+    for &id in ids {
+        if let Err(err) = assets.write_asset_sidecar(id) {
+            tracing::warn!("{label}: could not write .smeta for {}: {err}", id.value());
+        }
+    }
+}
+
 /// The full catalog as an [`AssetList`].
 fn asset_list_dto(root: &Path, catalog: &saffron_scene::AssetCatalog) -> AssetList {
     AssetList {
@@ -543,12 +555,13 @@ fn scan_asset_references(scene: &mut Scene, asset: Uuid) -> (Vec<Reference>, boo
             refs.push((entity, "mesh"));
         }
     });
-    scene.for_each::<(&Material,), _>(|entity, (material,)| {
-        if material.albedo_texture.value() == asset.value() {
-            refs.push((entity, "albedo"));
-        }
-        if material.metallic_roughness_texture.value() == asset.value() {
-            refs.push((entity, "metallic-roughness"));
+    scene.for_each::<(&MaterialSet,), _>(|entity, (set,)| {
+        if set
+            .slots
+            .iter()
+            .any(|s| s.material.value() == asset.value())
+        {
+            refs.push((entity, "material"));
         }
     });
     let sky = scene.environment.sky_texture.value() == asset.value();
@@ -564,8 +577,8 @@ fn usage_dto(scene: &Scene, entity: Entity, slot: &str) -> AssetUsageDto {
     }
 }
 
-/// Every place `asset` is referenced in the active scene: mesh slots, material albedo /
-/// metallic-roughness slots, and the environment sky texture.
+/// Every place `asset` is referenced in the active scene: `Mesh` slots, `MaterialSet` slot
+/// material references, and the environment sky texture.
 fn collect_asset_usages(scene: &mut Scene, asset: Uuid) -> Vec<AssetUsageDto> {
     let (refs, sky) = scan_asset_references(scene, asset);
     let mut usages: Vec<AssetUsageDto> = refs
@@ -595,13 +608,15 @@ fn clear_asset_usages(scene: &mut Scene, asset: Uuid) -> Vec<AssetUsageDto> {
             "mesh" => {
                 let _ = scene.with_component_mut::<Mesh, _>(entity, |m| m.mesh = Uuid(0));
             }
-            "albedo" => {
-                let _ =
-                    scene.with_component_mut::<Material, _>(entity, |m| m.albedo_texture = Uuid(0));
-            }
+            // "material": clear every slot that referenced the deleted material to the
+            // built-in default.
             _ => {
-                let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                    m.metallic_roughness_texture = Uuid(0);
+                let _ = scene.with_component_mut::<MaterialSet, _>(entity, |set| {
+                    for s in &mut set.slots {
+                        if s.material.value() == asset.value() {
+                            s.material = Uuid(0);
+                        }
+                    }
                 });
             }
         }
@@ -1652,13 +1667,27 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 return Err(Error::command("usage: rename-asset {id|name} {newName}"));
             }
             let by_id = selector.parse::<u64>().unwrap_or(0);
+            let mut renamed = None;
             for entry in &mut ctx.assets.catalog.entries {
                 if entry.id.value() == by_id || entry.name == selector {
                     entry.name = params.name.clone();
-                    return Ok(asset_ref(entry));
+                    renamed = Some(entry.id);
+                    break;
                 }
             }
-            Err(Error::command(format!("no asset '{selector}'")))
+            let Some(id) = renamed else {
+                return Err(Error::command(format!("no asset '{selector}'")));
+            };
+            // Persist the new name to the durable sidecar so it survives a cold scan without a save.
+            if let Err(err) = ctx.assets.write_asset_sidecar(id) {
+                tracing::warn!(
+                    "rename-asset: could not write .smeta for {}: {err}",
+                    id.value()
+                );
+            }
+            Ok(asset_ref(
+                ctx.assets.catalog.find(id).expect("just renamed"),
+            ))
         },
     );
 
@@ -1711,15 +1740,18 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     *folder = replace_folder_prefix(folder, &params.folder, &params.name);
                 }
             }
+            let mut touched = Vec::new();
             for entry in &mut ctx.assets.catalog.entries {
                 if entry.folder == params.folder
                     || is_folder_descendant(&entry.folder, &params.folder)
                 {
                     entry.folder =
                         replace_folder_prefix(&entry.folder, &params.folder, &params.name);
+                    touched.push(entry.id);
                 }
             }
             ctx.scene_edit.scene_version += 1;
+            write_asset_sidecars(ctx.assets, &touched, "rename-asset-folder");
             Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
         },
     );
@@ -1744,14 +1776,17 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 )));
             }
             ctx.assets.catalog.folders = folders;
+            let mut touched = Vec::new();
             for entry in &mut ctx.assets.catalog.entries {
                 if entry.folder == params.folder
                     || is_folder_descendant(&entry.folder, &params.folder)
                 {
                     entry.folder.clear();
+                    touched.push(entry.id);
                 }
             }
             ctx.scene_edit.scene_version += 1;
+            write_asset_sidecars(ctx.assets, &touched, "delete-asset-folder");
             Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
         },
     );
@@ -1766,7 +1801,14 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 return Err(Error::command(format!("no asset folder '{folder}'")));
             }
             ctx.assets.catalog.entries[index].folder = folder;
+            let id = ctx.assets.catalog.entries[index].id;
             ctx.scene_edit.scene_version += 1;
+            if let Err(err) = ctx.assets.write_asset_sidecar(id) {
+                tracing::warn!(
+                    "move-asset: could not write .smeta for {}: {err}",
+                    id.value()
+                );
+            }
             Ok(asset_ref(&ctx.assets.catalog.entries[index]))
         },
     );
@@ -1834,9 +1876,17 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             rebuild_asset_index(&mut ctx.assets.catalog);
             ctx.assets.mesh_by_uuid.remove(&entry.id.value());
             ctx.assets.texture_by_uuid.remove(&entry.id.value());
+            // The deleted row (and any instance that referenced it as a parent) is now stale.
+            ctx.assets.invalidate_material_caches();
             let file_deleted = if entry.path.is_empty() {
                 false
             } else {
+                // Drop the co-located durable sidecar too (unless it's an embedded sub-asset,
+                // whose `.smeta` is the shared model's — not ours to delete).
+                if entry.container.value() == 0 {
+                    let _ =
+                        std::fs::remove_file(ctx.assets.root.join(format!("{}.smeta", entry.path)));
+                }
                 std::fs::remove_file(ctx.assets.root.join(&entry.path)).is_ok()
             };
             // The thumbnail cache is content-addressed and shared across assets/projects, so
@@ -1884,41 +1934,25 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     }
                     let _ = scene.with_component_mut::<Mesh, _>(entity, |m| m.mesh = assign_id);
                 }
+                // Texture slots write a per-object override on the entity's material slot 0.
+                // The packed ORM means `metallic-roughness` and `occlusion` share `ormTexture`.
                 AssetSlotDto::Albedo => {
-                    ensure_material(scene, entity);
-                    let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                        m.albedo_texture = assign_id
-                    });
+                    set_slot0_texture_override(scene, entity, "albedoTexture", assign_id);
                 }
                 AssetSlotDto::MetallicRoughness => {
-                    ensure_material(scene, entity);
-                    let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                        m.metallic_roughness_texture = assign_id;
-                    });
+                    set_slot0_texture_override(scene, entity, "ormTexture", assign_id);
                 }
                 AssetSlotDto::Normal => {
-                    ensure_material(scene, entity);
-                    let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                        m.normal_texture = assign_id
-                    });
+                    set_slot0_texture_override(scene, entity, "normalTexture", assign_id);
                 }
                 AssetSlotDto::Occlusion => {
-                    ensure_material(scene, entity);
-                    let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                        m.occlusion_texture = assign_id;
-                    });
+                    set_slot0_texture_override(scene, entity, "ormTexture", assign_id);
                 }
                 AssetSlotDto::Emissive => {
-                    ensure_material(scene, entity);
-                    let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                        m.emissive_texture = assign_id;
-                    });
+                    set_slot0_texture_override(scene, entity, "emissiveTexture", assign_id);
                 }
                 AssetSlotDto::Height => {
-                    ensure_material(scene, entity);
-                    let _ = scene.with_component_mut::<Material, _>(entity, |m| {
-                        m.height_texture = assign_id
-                    });
+                    set_slot0_texture_override(scene, entity, "heightTexture", assign_id);
                 }
             }
             ctx.scene_edit.scene_version += 1;
@@ -1973,11 +2007,14 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 targets.push(entity);
             }
             for target in targets {
-                if !scene.has_component::<MaterialAssetComponent>(target) {
-                    let _ = scene.add_component(target, MaterialAssetComponent::default());
-                }
-                let _ = scene.with_component_mut::<MaterialAssetComponent, _>(target, |m| {
-                    m.material = mat_id;
+                ensure_material_slot(scene, target);
+                let _ = scene.with_component_mut::<MaterialSet, _>(target, |set| {
+                    if set.slots.is_empty() {
+                        set.slots.push(MaterialSlot::default());
+                    }
+                    for slot in &mut set.slots {
+                        slot.material = mat_id;
+                    }
                 });
             }
             ctx.scene_edit.scene_version += 1;
@@ -2061,6 +2098,25 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 height_texture: WireUuid(m.height_texture.value()),
                 graph,
             })
+        },
+    );
+
+    reg.register::<MaterialSchemaParams, MaterialSchemaResult>(
+        "material-schema",
+        "material-schema {id|name} — the material's exposed override parameters",
+        |ctx, params| {
+            // Validate the material resolves; the exposed set is the fixed übershader's for
+            // now (the same list a `MaterialSet` slot's overrides validate against).
+            resolve_asset(ctx, &params.material)?;
+            let params = pbr_exposed_parameters()
+                .into_iter()
+                .map(|p| ExposedParamDto {
+                    name: p.name.to_owned(),
+                    kind: p.kind.as_wire().to_owned(),
+                    default: p.default,
+                })
+                .collect();
+            Ok(MaterialSchemaResult { params })
         },
     );
 
@@ -2194,6 +2250,18 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "material-set-override {material, field, value}",
         |ctx, params| {
             let id = resolve_asset(ctx, &params.material)?;
+            // The override key must be one of the material's exposed parameters, and the
+            // value must be well-typed for its kind — the schema is the single gate.
+            let param = exposed_parameter(&params.field).ok_or_else(|| {
+                Error::command(format!("unknown material parameter '{}'", params.field))
+            })?;
+            if !param.kind.accepts(&params.value) {
+                return Err(Error::command(format!(
+                    "material parameter '{}' expects a {} value",
+                    params.field,
+                    param.kind.as_wire()
+                )));
+            }
             let mut m = load_material_asset_raw(ctx.assets, id)
                 .map_err(|e| Error::command(e.to_string()))?;
             if !m.overrides.is_object() {
@@ -2265,6 +2333,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     failed += 1;
                 }
             }
+            // The recompiled `_mesh.spv` artifacts change what `codegen_shader_for` resolves.
+            ctx.assets.invalidate_material_caches();
             Ok(MaterialCookResult { compiled, failed })
         },
     );
@@ -2513,11 +2583,41 @@ fn preview_codegen_spv(assets: &AssetServer, id: Uuid) -> Option<PathBuf> {
     assets.compile_material_preview_shader(&raw.graph, id).ok()
 }
 
-/// Ensures the entity carries a [`Material`] before an `assign-asset` texture slot write.
-fn ensure_material(scene: &mut Scene, entity: Entity) {
-    if !scene.has_component::<Material>(entity) {
-        let _ = scene.add_component(entity, Material::default());
+/// Ensures the entity carries a [`MaterialSet`] with at least one slot before a slot write.
+fn ensure_material_slot(scene: &mut Scene, entity: Entity) {
+    if scene.has_component::<MaterialSet>(entity) {
+        let _ = scene.with_component_mut::<MaterialSet, _>(entity, |set| {
+            if set.slots.is_empty() {
+                set.slots.push(MaterialSlot::default());
+            }
+        });
+    } else {
+        let _ = scene.add_component(
+            entity,
+            MaterialSet {
+                slots: vec![MaterialSlot::default()],
+            },
+        );
     }
+}
+
+/// Sets (or clears, when `tex_id == 0`) one texture override on the entity's material slot 0,
+/// attaching a default `MaterialSet` slot first. The `assign-asset` texture path — a
+/// per-object override layered over the slot's referenced `.smat`.
+fn set_slot0_texture_override(scene: &mut Scene, entity: Entity, key: &str, tex_id: Uuid) {
+    ensure_material_slot(scene, entity);
+    let _ = scene.with_component_mut::<MaterialSet, _>(entity, |set| {
+        let Some(slot) = set.slots.first_mut() else {
+            return;
+        };
+        if let Some(map) = slot.overrides.as_object_mut() {
+            if tex_id.value() == 0 {
+                map.remove(key);
+            } else {
+                map.insert(key.to_owned(), json!(tex_id.value().to_string()));
+            }
+        }
+    });
 }
 
 /// The shared `load-project` body: seed the loader inbox with an `Open` request and set the
@@ -2770,7 +2870,7 @@ pub(crate) fn compute_preview_bounds(ctx: &mut EngineContext<'_>, root: Entity) 
 
 /// A thin floor slab centered under the model's feet.
 pub(crate) fn spawn_preview_floor(ctx: &mut EngineContext<'_>, bounds: &PreviewBounds) -> Entity {
-    use saffron_geometry::glam::{Vec3 as GVec3, Vec4 as GVec4};
+    use saffron_geometry::glam::Vec3 as GVec3;
 
     let assets = &mut *ctx.assets;
     let mut ensured = false;
@@ -2794,11 +2894,15 @@ pub(crate) fn spawn_preview_floor(ctx: &mut EngineContext<'_>, bounds: &PreviewB
     );
     let _ = preview.add_component(
         floor,
-        Material {
-            base_color: GVec4::new(0.32, 0.33, 0.35, 1.0),
-            roughness: 0.92,
-            metallic: 0.0,
-            ..Material::default()
+        MaterialSet {
+            slots: vec![MaterialSlot {
+                overrides: json!({
+                    "baseColor": [0.32, 0.33, 0.35, 1.0],
+                    "roughness": 0.92,
+                    "metallic": 0.0,
+                }),
+                ..MaterialSlot::default()
+            }],
         },
     );
     let span = (bounds.radius * 8.0).max(0.5);
@@ -2875,7 +2979,7 @@ fn from_vec4(v: Vec4) -> saffron_geometry::glam::Vec4 {
 
 #[cfg(test)]
 mod tests {
-    use saffron_scene::{AssetEntry, AssetType, Material, Mesh};
+    use saffron_scene::{AssetEntry, AssetType, MaterialSet, Mesh};
     use saffron_sceneedit::ProjectPhase;
     use serde_json::json;
 
@@ -3005,7 +3109,7 @@ mod tests {
 
     /// `assign-asset` on a texture slot attaches a `Material` and writes the texture id.
     #[test]
-    fn assign_asset_albedo_attaches_material() {
+    fn assign_asset_albedo_overrides_slot_zero() {
         let reg = registry();
         let mut renderer = StubRenderer::default();
         with_stub(&mut renderer, |ctx| {
@@ -3027,15 +3131,22 @@ mod tests {
             );
             assert_eq!(reply["ok"], json!(true));
             assert_eq!(reply["result"]["slot"], json!("albedo"));
-            assert_eq!(
-                ctx.scene_edit
-                    .active_scene()
-                    .component::<Material>(entity)
-                    .unwrap()
-                    .albedo_texture
-                    .value(),
-                tex_id
-            );
+            // A MaterialSet with a default slot is attached, and the albedo texture lands as
+            // a per-object override (a decimal-string uuid) on slot 0.
+            let albedo = ctx
+                .scene_edit
+                .active_scene()
+                .with_component::<MaterialSet, _>(entity, |set| {
+                    set.slots
+                        .first()
+                        .and_then(|s| s.overrides.as_object())
+                        .and_then(|o| o.get("albedoTexture"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                })
+                .ok()
+                .flatten();
+            assert_eq!(albedo.as_deref(), Some(tex_id.to_string().as_str()));
         });
     }
 
@@ -3092,6 +3203,43 @@ mod tests {
                     .name,
                 "new-name"
             );
+        });
+    }
+
+    /// `rename-asset` persists the new name to a durable `<path>.smeta` sidecar, so it survives a
+    /// cold scan without a project save. Asserts the on-disk sidecar (not a rescan): `with_stub`
+    /// reuses one `AssetServer`, so `preserve_name_folder` would mask a regression — the true
+    /// cold-scan proof lives in the assets-crate unit test.
+    #[test]
+    fn rename_asset_writes_a_durable_smeta() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "renamesmeta");
+            // A texture row + its directory so the sidecar writer's parent exists.
+            let tex = saffron_core::Uuid::new();
+            let rel = format!("textures/{}.png", tex.value());
+            std::fs::create_dir_all(ctx.assets.root.join("textures")).unwrap();
+            ctx.assets.catalog.put(AssetEntry {
+                id: tex,
+                name: "old".to_owned(),
+                asset_type: AssetType::Texture,
+                path: rel.clone(),
+                ..AssetEntry::default()
+            });
+
+            let reply = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "rename-asset", "params": { "asset": tex.value().to_string(), "name": "Brick Wall" } }),
+            );
+            assert_eq!(reply["ok"], json!(true));
+            assert_eq!(reply["result"]["name"], json!("Brick Wall"));
+
+            let smeta = ctx.assets.root.join(format!("{rel}.smeta"));
+            assert!(smeta.exists(), "rename writes the sidecar beside the file");
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&smeta).unwrap()).unwrap();
+            assert_eq!(doc["name"], json!("Brick Wall"));
         });
     }
 
@@ -3312,6 +3460,7 @@ mod tests {
             "material-import",
             "material-list",
             "material-get",
+            "material-schema",
             "material-update",
             "preview-render",
             "material-set-graph",
