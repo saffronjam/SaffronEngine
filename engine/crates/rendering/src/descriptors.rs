@@ -159,7 +159,10 @@ impl Descriptors {
         // short-circuits to the cleanup.
         let mut partial = Partial::new(&resources);
 
-        partial.linear_sampler = Some(create_linear_sampler(raw)?);
+        partial.linear_sampler = Some(create_linear_sampler(
+            raw,
+            device.capabilities.max_anisotropy,
+        )?);
         partial.shadow_sampler = Some(create_shadow_sampler(raw)?);
         partial.sdf_sampler = Some(create_sdf_sampler(raw)?);
 
@@ -833,8 +836,8 @@ impl Drop for Partial<'_> {
 }
 
 /// The linear repeat sampler: linear min/mag/mip, repeat address, no LOD clamp.
-fn create_linear_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
-    let info = vk::SamplerCreateInfo::default()
+fn create_linear_sampler(raw: &ash::Device, max_anisotropy: f32) -> Result<vk::Sampler> {
+    let mut info = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
         .min_filter(vk::Filter::LINEAR)
         .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
@@ -842,6 +845,12 @@ fn create_linear_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
         .address_mode_v(vk::SamplerAddressMode::REPEAT)
         .address_mode_w(vk::SamplerAddressMode::REPEAT)
         .max_lod(vk::LOD_CLAMP_NONE);
+    // Anisotropic minification: sample along the projected texel footprint so
+    // high-frequency albedo/AO at grazing angles stays band-limited instead of aliasing.
+    // `max_anisotropy <= 1.0` means the device lacks the feature — leave it isotropic.
+    if max_anisotropy > 1.0 {
+        info = info.anisotropy_enable(true).max_anisotropy(max_anisotropy);
+    }
     // SAFETY: the ash seam. The create-info is valid for the call; the sampler is
     // owned and freed in `Descriptors::drop` (or the `Partial` error path).
     checked(unsafe { raw.create_sampler(&info, None) }, "createSampler")

@@ -91,6 +91,9 @@ pub struct Capabilities {
     pub software_gpu: bool,
     /// The surface allows `TRANSFER_SRC` swapchain images (window screenshots).
     pub capture_supported: bool,
+    /// The effective anisotropic-filtering cap for the material sampler: `1.0` when the
+    /// device lacks `samplerAnisotropy`, else `min(16, maxSamplerAnisotropy)`.
+    pub max_anisotropy: f32,
 }
 
 /// The GPU-timestamp profiler facts read once from the physical device at init,
@@ -1060,6 +1063,11 @@ fn probe_optional_features(
         pipeline_stats: core_features.pipeline_statistics_query != 0,
         software_gpu,
         capture_supported: false,
+        max_anisotropy: if core_features.sampler_anisotropy != 0 {
+            props.limits.max_sampler_anisotropy.min(16.0)
+        } else {
+            1.0
+        },
     }
 }
 
@@ -1138,6 +1146,12 @@ fn create_logical_device(
     }
     if core_features.fill_mode_non_solid != 0 {
         enabled_core = enabled_core.fill_mode_non_solid(true);
+    }
+    // Anisotropic filtering for the material sampler: the correct minification filter for
+    // high-frequency albedo/AO textures at grazing angles, so they stay band-limited
+    // rather than aliasing into the in-motion shimmer TAA would otherwise have to hide.
+    if core_features.sampler_anisotropy != 0 {
+        enabled_core = enabled_core.sampler_anisotropy(true);
     }
 
     // Slang's `SV_VertexID` fullscreen-triangle shaders (the sky / post passes) emit the
