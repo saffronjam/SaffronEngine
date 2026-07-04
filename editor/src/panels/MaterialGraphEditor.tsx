@@ -1,9 +1,12 @@
-/// The node-graph material editor: a React Flow canvas + live preview, hosted as a main tab (see
-/// App.tsx / openMaterialGraphTab). Loads a material's stored graph (material-get), lets you
+/// The node-graph material editor: a React Flow canvas + a LIVE 3D preview sphere, hosted as a main
+/// tab (see App.tsx / openMaterialGraphTab). Loads a material's stored graph (material-get), lets you
 /// add (right-click the canvas) / connect / edit nodes, and auto-applies changes (debounced) via
-/// material-set-graph — re-rendering the studio-lit preview sphere so the surface morphs as you
-/// edit. "Compile" forces codegen (material-compile-graph) for procedural graphs that don't fold to
-/// params. Node types mirror the engine emitter (materials/graph.ts).
+/// material-set-graph. The preview pane is the modal `assetPreview` subsurface (the same view the
+/// asset editor drives) showing the edited `.smat` on a built-in sphere under real IBL — orbit it
+/// (pan-only, no dolly); it re-renders on its own each frame as the material cache is invalidated by
+/// the apply, so there is no readback round-trip. "Compile" forces codegen (material-compile-graph)
+/// for procedural graphs that don't fold to params. Node types mirror the engine emitter
+/// (materials/graph.ts).
 import {
   createContext,
   useCallback,
@@ -34,6 +37,8 @@ import "@xyflow/react/dist/style.css";
 import { Hammer } from "lucide-react";
 import { client } from "../control/client";
 import { ColorField } from "../components/ColorField";
+import { useSubsurfaceBounds } from "../lib/useSubsurfaceBounds";
+import { useOrbitCamera } from "../lib/useOrbitCamera";
 import { errorText, notifyError } from "../lib/flash";
 import { humanizeFieldName } from "../lib/humanize";
 import {
@@ -49,6 +54,7 @@ import {
 } from "../materials/graph";
 import { useTabSnapshotHistory } from "../lib/useTabSnapshotHistory";
 import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   Select,
@@ -58,9 +64,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-/// Last rendered preview PNG per material, kept module-level so it survives the tab unmounting:
-/// switching to the Scene tab and back shows the cached sphere immediately instead of re-rendering.
-const previewCache = new Map<string, string>();
 
 /// Stable, order-insensitive equality of two graphs (nodes/edges sorted by id/endpoints),
 /// so a settle that only reorders the arrays or rounds a position back records no entry.
@@ -208,9 +211,52 @@ const PALETTE_CATEGORIES: NodeCategory[] = ["input", "math", "output"];
 function GraphCanvas({ materialId }: { materialId: string }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const [preview, setPreview] = useState<string | null>(() => previewCache.get(materialId) ?? null);
   const [status, setStatus] = useState<string>("");
   const loadedRef = useRef(false);
+
+  // The live preview sphere: its own transparent hole down to the modal `assetPreview` subsurface,
+  // orbit-only (pan around the framed sphere, no dolly). This tab renders only while active (App.tsx),
+  // so mount == activate: enter the material preview on mount, exit on unmount.
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const [previewReady, setPreviewReady] = useState(false);
+  const orbit = useOrbitCamera({ enableZoom: false });
+  useSubsurfaceBounds(hostRef, "assetPreview", { enabled: previewReady });
+  // Preview exposure sweep (EV, exp2) — judge the material across a stop range. Stashed on preview
+  // enter and restored on exit engine-side, so it never dirties the authored viewport's exposure.
+  const [exposureEv, setExposureEv] = useState(0);
+  const onExposure = useCallback((ev: number) => {
+    setExposureEv(ev);
+    void client.setExposure(ev).catch((err: unknown) => notifyError(errorText(err)));
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    setPreviewReady(false);
+    void (async () => {
+      try {
+        const entered = await client.enterAssetPreview(materialId);
+        if (cancelled) {
+          return;
+        }
+        const cam = await client.getCamera();
+        if (cancelled) {
+          return;
+        }
+        orbit.setFramed({
+          target: { ...entered.target },
+          distance: entered.distance,
+          yaw: cam.yaw,
+          pitch: cam.pitch,
+        });
+        setPreviewReady(true);
+      } catch (err) {
+        notifyError(errorText(err));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      void client.exitAssetPreview().catch(() => {});
+    };
+  }, [materialId, orbit]);
   // The node-create menu is a controlled, positioned element (not Radix) so every right-click reopens
   // it at the new cursor — Radix ContextMenu re-anchors unreliably while open. menuPosRef feeds addNode
   // (screen → flow coords); `menu` drives the rendered position.
@@ -230,20 +276,16 @@ function GraphCanvas({ materialId }: { materialId: string }) {
       setEdges(e);
       const set = await client.materialSetGraph(materialId, g);
       setStatus(set.foldable ? "applied (folded to params)" : "applied (codegen)");
-      const result = await client.previewRender(materialId, 256);
-      previewCache.set(materialId, result.png);
-      setPreview(result.png);
     },
     equals: graphsEqual,
     label: "Edit material graph",
     selectionId: materialId,
   });
 
-  // Load the material's stored graph into the canvas. Show the cached preview immediately, then
-  // re-render to refresh it (and cache the result so the next tab switch is instant).
+  // Load the material's stored graph into the canvas. The live preview sphere reflects the material
+  // on its own (it references the `.smat` by id), so there is nothing to render here.
   useEffect(() => {
     loadedRef.current = false;
-    setPreview(previewCache.get(materialId) ?? null);
     void (async () => {
       try {
         const material = await client.materialGet(materialId);
@@ -255,9 +297,6 @@ function GraphCanvas({ materialId }: { materialId: string }) {
         // Baseline for the first real edit: the normalized loaded graph (same space the
         // apply effect produces), so a no-op first settle records nothing.
         history.seed(flowToGraph(n, e));
-        const result = await client.previewRender(materialId, 256);
-        previewCache.set(materialId, result.png);
-        setPreview(result.png);
       } catch (err) {
         notifyError(errorText(err));
       }
@@ -310,8 +349,8 @@ function GraphCanvas({ materialId }: { materialId: string }) {
     [reactFlow, setNodes],
   );
 
-  // Debounced auto-apply: push the graph to the engine and re-render the preview as it changes. Skip
-  // the very first settle after load (that graph is already saved).
+  // Debounced auto-apply: push the graph to the engine as it changes; the live sphere reflects it on
+  // its own next frame. Skip the very first settle after load (that graph is already saved).
   useEffect(() => {
     if (!loadedRef.current) {
       loadedRef.current = true;
@@ -328,9 +367,8 @@ function GraphCanvas({ materialId }: { materialId: string }) {
           const graph = flowToGraph(nodes, edges);
           const set = await client.materialSetGraph(materialId, graph);
           setStatus(set.foldable ? "applied (folded to params)" : "applied (codegen)");
-          const result = await client.previewRender(materialId, 256);
-          previewCache.set(materialId, result.png);
-          setPreview(result.png);
+          // The live sphere re-renders on its own — material-set-graph invalidates the material
+          // cache, so the next frame re-resolves the edited `.smat`. No readback round-trip.
           history.record(graph);
         } catch (err) {
           notifyError(errorText(err));
@@ -383,9 +421,13 @@ function GraphCanvas({ materialId }: { materialId: string }) {
     };
   }, [menu]);
 
+  // No bg on the root or the preview pane's hole: the preview is a transparent region down to the
+  // engine's `assetPreview` subsurface (composited below the webview). Every other region paints its
+  // own opaque bg-background (toolbar, the ReactFlow panel, the Preview header, the loading overlay),
+  // so only the hole shows through.
   return (
-    <div className="flex h-full w-full flex-col bg-background text-[12px] text-foreground">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+    <div className="flex h-full w-full flex-col text-[12px] text-foreground">
+      <div className="flex items-center gap-2 border-b border-border bg-background px-3 py-2">
         <span className="font-medium">Material graph</span>
         <span className="text-muted-foreground">{status}</span>
         <div className="ml-auto flex gap-2">
@@ -396,7 +438,7 @@ function GraphCanvas({ materialId }: { materialId: string }) {
         </div>
       </div>
       <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
-        <ResizablePanel defaultSize={76} minSize={40} className="min-w-0">
+        <ResizablePanel defaultSize={76} minSize={40} className="min-w-0 bg-background">
           <NodeCallbacksContext.Provider value={nodeCallbacks}>
             <ReactFlow
               nodes={nodes}
@@ -425,19 +467,40 @@ function GraphCanvas({ materialId }: { materialId: string }) {
         </ResizablePanel>
         <ResizableHandle />
         <ResizablePanel defaultSize={24} minSize={12} className="min-w-0">
-          <div className="h-full overflow-y-auto p-3">
-            <div className="mb-2 text-[10px] uppercase text-muted-foreground">Preview</div>
-            {preview ? (
-              <img
-                src={`data:image/png;base64,${preview}`}
-                alt="material preview"
-                className="aspect-square w-full rounded border border-border object-cover"
-              />
-            ) : (
-              <div className="flex aspect-square w-full items-center justify-center rounded border border-dashed border-border text-muted-foreground">
-                Rendering…
+          <div className="flex h-full flex-col">
+            <div className="flex items-center gap-2 border-b border-border bg-background px-3 py-2">
+              <span className="text-[10px] uppercase text-muted-foreground">Preview</span>
+              <div className="ml-auto flex items-center gap-1.5">
+                <span className="text-[10px] uppercase text-muted-foreground">EV</span>
+                <Slider
+                  className="w-16"
+                  value={[exposureEv]}
+                  min={-6}
+                  max={6}
+                  step={0.1}
+                  onValueChange={([v]) => onExposure(v)}
+                  aria-label="Preview exposure (EV)"
+                />
+                <span className="w-7 text-right text-[10px] tabular-nums text-muted-foreground">
+                  {exposureEv > 0 ? `+${exposureEv.toFixed(1)}` : exposureEv.toFixed(1)}
+                </span>
               </div>
-            )}
+            </div>
+            {/* The transparent hole: the live sphere composites through here. Orbit-only (no dolly). */}
+            <div
+              ref={hostRef}
+              className="relative min-h-0 flex-1 cursor-grab active:cursor-grabbing"
+              onPointerDown={orbit.onPointerDown}
+              onPointerMove={orbit.onPointerMove}
+              onPointerUp={orbit.onPointerUp}
+              onWheel={orbit.onWheel}
+            >
+              {!previewReady && (
+                <div className="absolute inset-0 flex items-center justify-center bg-background text-muted-foreground">
+                  Rendering…
+                </div>
+              )}
+            </div>
           </div>
         </ResizablePanel>
       </ResizablePanelGroup>
