@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use ash::vk;
-use saffron_geometry::glam::{Mat4, UVec4, Vec2, Vec3, Vec4};
-use saffron_geometry::{Mesh, Submesh, Vertex};
+use saffron_geometry::glam::{Mat4, UVec4, Vec3, Vec4};
+use saffron_geometry::{Submesh, Vertex};
 use vk_mem::Alloc;
 
 use crate::descriptors::Descriptors;
@@ -31,6 +31,7 @@ use crate::draw_list::SubmeshMaterial;
 use crate::resources::{DeviceResources, GpuMesh, GpuTexture, GpuTextureParts, Pipeline};
 use crate::thumbnail::{PngTransfer, format_pixel_bytes};
 use crate::{DEFAULT_WHITE_SLOT, Device, Error, GpuQueue, Result, Uploader, checked};
+use saffron_core::BlendMode;
 
 /// Encoded PNG bytes plus the actual encoded pixel dimensions (so a reply reports the
 /// truthful width/height rather than the requested size).
@@ -45,15 +46,17 @@ pub struct ThumbnailPng {
 }
 
 /// The material-preview push constant — matches `preview.slang`'s `PreviewPush`
-/// (112 bytes: `mat4` + `vec4` + `uvec4` + `vec4`, std140/std430 identical here).
+/// (128 bytes: `mat4` + `vec4` + 2×`uvec4` + `vec4`, std140/std430 identical here).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PreviewPush {
     view_proj: Mat4,
     base_color: Vec4,
-    /// x = albedo, y = metallic-roughness, z = normal bindless index, w = feature bits.
+    /// x = albedo, y = metallic-roughness, z = normal, w = occlusion (bindless indices).
     tex: UVec4,
-    /// x = metallic, y = roughness, z = normalStrength, w = 0.
+    /// x = emissive, y = height (bindless indices), z = feature bits, w = 0.
+    tex2: UVec4,
+    /// x = metallic, y = roughness, z = normalStrength, w = emissiveStrength.
     pbr: Vec4,
 }
 
@@ -65,8 +68,13 @@ struct ThumbnailPush {
     normal_matrix: Mat4,
 }
 
-/// `FEATURE_NORMAL` bit in `PreviewPush::tex.w` (matches `preview.slang`).
+/// Feature bits in `PreviewPush::tex2.z`, selecting which optional slots the fragment samples
+/// (matches `preview.slang`).
 const FEATURE_NORMAL: u32 = 1;
+const FEATURE_OCCLUSION: u32 = 2;
+const FEATURE_EMISSIVE: u32 = 4;
+const FEATURE_HEIGHT: u32 = 8;
+const FEATURE_ALPHA: u32 = 16;
 
 /// The offscreen thumbnail + material-preview render sub-state: the lazy thumbnail /
 /// preview PSOs + the preview sphere, the render-target color format, and the
@@ -88,6 +96,9 @@ pub struct ThumbnailRenderer {
     /// The studio-lit material-preview PSO (binds the bindless set, a 112-byte
     /// `PreviewPush`), built lazily.
     preview_pipeline: Option<Arc<Pipeline>>,
+    /// The HDRI chrome-ball PSO (same layout as the preview PSO; the `hdri_ball.spv`
+    /// fragment mirrors the equirect instead of studio lighting), built lazily.
+    hdri_ball_pipeline: Option<Arc<Pipeline>>,
     /// The unit UV sphere the material preview renders, built lazily.
     preview_sphere: Option<Arc<GpuMesh>>,
 }
@@ -122,6 +133,7 @@ impl ThumbnailRenderer {
             color_format,
             thumbnail_pipeline: None,
             preview_pipeline: None,
+            hdri_ball_pipeline: None,
             preview_sphere: None,
         }
     }
@@ -213,6 +225,27 @@ impl ThumbnailRenderer {
             samples,
         )?);
         self.preview_pipeline = Some(Arc::clone(&pipeline));
+        Ok(pipeline)
+    }
+
+    fn ensure_hdri_ball_pipeline(
+        &mut self,
+        device: &Device,
+        descriptors: &Descriptors,
+    ) -> Result<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.hdri_ball_pipeline {
+            return Ok(Arc::clone(pipeline));
+        }
+        let samples = self.sample_count(device);
+        // Same layout as the preview PSO (bindless set 0 + `PreviewPush`); only the fragment
+        // differs, so `build_preview_pipeline` is reused with the chrome-ball `.spv`.
+        let pipeline = Arc::new(self.build_preview_pipeline(
+            device,
+            descriptors,
+            "shaders/hdri_ball.spv",
+            samples,
+        )?);
+        self.hdri_ball_pipeline = Some(Arc::clone(&pipeline));
         Ok(pipeline)
     }
 
@@ -336,6 +369,68 @@ impl ThumbnailRenderer {
         // destroyed only after the GPU is done with it, not when the draw closure is consumed.
         drop(pipeline);
         texture
+    }
+
+    /// Renders a static chrome sphere mirroring `hdri` (an equirectangular environment) into a
+    /// `size`×`size` texture — the HDRI asset tile. A direct per-fragment reflection of the raw
+    /// equirect (no IBL prefilter); the interactive 3D tab renders lit balls in the prefiltered
+    /// environment instead.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any pipeline-build, target-allocation, or submit failure.
+    pub fn render_hdri_ball_preview(
+        &mut self,
+        device: &Device,
+        descriptors: &Descriptors,
+        hdri: &Arc<GpuTexture>,
+        size: u32,
+    ) -> Result<Arc<GpuTexture>> {
+        let pipeline = self.ensure_hdri_ball_pipeline(device, descriptors)?;
+        let sphere = self.ensure_preview_sphere(device, descriptors)?;
+        let dir = Vec3::new(0.3, 0.4, 1.0);
+        let view_proj = framed_view_proj(Vec3::ZERO, 1.0, dir);
+        let eye = framed_eye(Vec3::ZERO, 1.0, dir);
+        // The chrome-ball fragment reuses `PreviewPush`: `baseColor.xyz` carries the camera
+        // world position (for the view ray) and `tex.x` the HDRI's bindless index.
+        let push = PreviewPush {
+            view_proj,
+            base_color: Vec4::new(eye.x, eye.y, eye.z, 1.0),
+            tex: UVec4::new(hdri.bindless_index(), 0, 0, 0),
+            tex2: UVec4::ZERO,
+            pbr: Vec4::ZERO,
+        };
+        let bindless_set = descriptors.bindless_set();
+        let layout = pipeline.layout();
+        let pipeline_handle = pipeline.handle();
+        self.render_to_texture(
+            device,
+            descriptors,
+            size,
+            [0.06, 0.06, 0.07, 1.0],
+            move |raw, cmd| {
+                // SAFETY: the ash seam. The pipeline + bindless set + sphere outlive the submit.
+                unsafe {
+                    raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_handle);
+                    raw.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        layout,
+                        0,
+                        &[bindless_set],
+                        &[],
+                    );
+                    raw.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        bytemuck::bytes_of(&push),
+                    );
+                    draw_submeshes(raw, cmd, &sphere);
+                }
+            },
+        )
     }
 
     /// Renders `mesh` shaded per-submesh with its own material from `submesh_materials`
@@ -1260,40 +1355,11 @@ fn format_supports_linear_blit(device: &Device, format: vk::Format) -> bool {
     props.optimal_tiling_features.contains(needed)
 }
 
-/// Builds + uploads a unit UV sphere (origin-centered, radius 1; normals == positions)
-/// for material previews.
+/// Builds + uploads the shared unit UV sphere (origin-centered, radius 1) for material
+/// previews — the same geometry [`saffron_geometry::uv_sphere`] spawns into scenes.
 fn make_preview_sphere(device: &Device, descriptors: &Descriptors) -> Result<Arc<GpuMesh>> {
-    const RINGS: u32 = 32;
-    const SECTORS: u32 = 48;
-    let mut mesh = Mesh::default();
-    for r in 0..=RINGS {
-        let phi = std::f32::consts::PI * (r as f32) / (RINGS as f32);
-        for s in 0..=SECTORS {
-            let theta = 2.0 * std::f32::consts::PI * (s as f32) / (SECTORS as f32);
-            let position = Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
-            mesh.vertices.push(Vertex {
-                position,
-                normal: position,
-                uv0: Vec2::new((s as f32) / (SECTORS as f32), (r as f32) / (RINGS as f32)),
-            });
-        }
-    }
-    for r in 0..RINGS {
-        for s in 0..SECTORS {
-            let a = r * (SECTORS + 1) + s;
-            let b = a + SECTORS + 1;
-            mesh.indices
-                .extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
-        }
-    }
-    mesh.submeshes.push(Submesh {
-        first_index: 0,
-        index_count: mesh.indices.len() as u32,
-        vertex_offset: 0,
-        material_slot: 0,
-    });
     let uploader = Uploader::new(device, &GpuQueue::new(device.graphics_queue))?;
-    uploader.upload_mesh(descriptors, &mesh, &[], None, None)
+    uploader.upload_mesh(descriptors, &saffron_geometry::uv_sphere(), &[], None, None)
 }
 
 /// Loads a thumbnail/preview SPIR-V module, resolving `shaders/<x>.spv` against the
@@ -1338,6 +1404,20 @@ fn preview_push(material: &SubmeshMaterial, view_proj: Mat4) -> PreviewPush {
     if material.normal_texture.is_some() {
         features |= FEATURE_NORMAL;
     }
+    if material.occlusion_texture.is_some() {
+        features |= FEATURE_OCCLUSION;
+    }
+    if material.emissive_texture.is_some() {
+        features |= FEATURE_EMISSIVE;
+    }
+    // Height bumps the normal only when there is no explicit normal map (the shader prefers the
+    // real normal map when both are present).
+    if material.height_texture.is_some() && material.normal_texture.is_none() {
+        features |= FEATURE_HEIGHT;
+    }
+    if material.blend_mode == BlendMode::Masked {
+        features |= FEATURE_ALPHA;
+    }
     PreviewPush {
         view_proj,
         base_color: material.base_color,
@@ -1345,13 +1425,19 @@ fn preview_push(material: &SubmeshMaterial, view_proj: Mat4) -> PreviewPush {
             idx(&material.albedo_texture),
             idx(&material.metallic_roughness_texture),
             idx(&material.normal_texture),
+            idx(&material.occlusion_texture),
+        ),
+        tex2: UVec4::new(
+            idx(&material.emissive_texture),
+            idx(&material.height_texture),
             features,
+            0,
         ),
         pbr: Vec4::new(
             material.metallic,
             material.roughness,
             material.normal_strength,
-            0.0,
+            material.emissive_strength,
         ),
     }
 }
@@ -1373,7 +1459,7 @@ fn mesh_bounds(mesh: &GpuMesh) -> (Vec3, f32) {
 fn framed_view_proj(center: Vec3, radius: f32, dir: Vec3) -> Mat4 {
     let fovy = 45.0_f32.to_radians();
     let distance = radius / (fovy * 0.5).tan() * 1.3;
-    let eye = center + dir.normalize() * distance;
+    let eye = framed_eye(center, radius, dir);
     let view = Mat4::look_at_rh(eye, center, Vec3::Y);
     let mut proj = Mat4::perspective_rh(
         fovy,
@@ -1385,6 +1471,14 @@ fn framed_view_proj(center: Vec3, radius: f32, dir: Vec3) -> Mat4 {
     // framing is upright in the Vulkan-clip viewport.
     proj.y_axis.y *= -1.0;
     proj * view
+}
+
+/// The camera world position [`framed_view_proj`] places for the same `center`/`radius`/`dir` —
+/// the eye a fragment shader needs to build its per-pixel view ray.
+fn framed_eye(center: Vec3, radius: f32, dir: Vec3) -> Vec3 {
+    let fovy = 45.0_f32.to_radians();
+    let distance = radius / (fovy * 0.5).tan() * 1.3;
+    center + dir.normalize() * distance
 }
 
 impl Drop for ManagedImage {
@@ -1883,6 +1977,59 @@ mod tests {
             before,
             after,
             "the material preview must be validation-clean (saw {} new issue(s))",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// The HDRI chrome ball renders a mirror sphere (not just the clear) reflecting an
+    /// equirect, encodes to a 64×64 PNG, and is validation-clean. Exercises the dedicated
+    /// `hdri_ball.spv` PSO: the bindless bind (the HDRI at its slot) + the `PreviewPush`
+    /// carrying the camera position + HDRI index.
+    #[test]
+    fn hdri_ball_renders_nontrivial_pixels() {
+        let Some(mut fx) = fixture_or_skip() else {
+            return;
+        };
+        let before = validation_issue_count();
+
+        // A tiny 2×2 float equirect: distinct bright quadrants so the reflection is non-uniform.
+        let equirect: [f32; 16] = [
+            0.9, 0.3, 0.1, 1.0, // warm
+            0.1, 0.3, 0.9, 1.0, // cool
+            0.2, 0.8, 0.2, 1.0, // green
+            0.8, 0.8, 0.2, 1.0, // yellow
+        ];
+        let hdri = fx
+            .uploader
+            .upload_texture_float(&fx.descriptors, &equirect, 2, 2)
+            .expect("upload equirect");
+        let tex = fx
+            .thumb
+            .render_hdri_ball_preview(&fx.device, &fx.descriptors, &hdri, 64)
+            .expect("hdri ball preview");
+        let png = fx
+            .thumb
+            .encode_texture_thumbnail_png(&fx.device, &tex, 64, PngTransfer::Clamp)
+            .expect("encode ball");
+        assert_eq!((png.width, png.height), (64, 64));
+
+        // The ball clear is (0.06, 0.06, 0.07) → ~(15, 15, 18); the sphere covers the center.
+        let fraction = non_clear_fraction(&png.bytes, [15, 15, 18]);
+        assert!(
+            fraction > 0.05,
+            "the mirror ball covers a meaningful fraction (saw {fraction})"
+        );
+
+        drop(tex);
+        drop(hdri);
+        fx.device.wait_idle().expect("idle before teardown");
+        drop(fx);
+
+        let after = validation_issue_count();
+        assert_eq!(
+            before,
+            after,
+            "the HDRI chrome ball must be validation-clean (saw {} new issue(s))",
             after.saturating_sub(before)
         );
     }

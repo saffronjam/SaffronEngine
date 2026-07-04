@@ -32,14 +32,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use saffron_core::BlendMode;
 use saffron_core::Uuid;
-use saffron_geometry::glam::{Mat3, Mat4};
+use saffron_geometry::glam::{Mat3, Mat4, Vec3, Vec4};
 use saffron_geometry::{
     ChunkKind, Mesh, Submesh, Vertex, decode_image, decode_image_from_memory,
     decode_image_from_memory_hdr, decode_image_hdr, load_mesh, load_mesh_from_bytes,
 };
 use saffron_rendering::{GpuMesh, GpuTexture, PngTransfer, SubmeshMaterial};
-use saffron_scene::{AssetType, Colorspace};
+use saffron_scene::{AssetType, Colorspace, TextureRole};
 
 use crate::gpu::GpuUploader;
 use crate::material::MaterialAsset;
@@ -158,6 +159,19 @@ pub trait ThumbnailGpu: GpuUploader {
         size: u32,
         shader_spv: Option<&Path>,
     ) -> saffron_rendering::Result<Arc<GpuTexture>>;
+
+    /// Renders a static chrome sphere mirroring `hdri` (an equirectangular environment) into a
+    /// `size`×`size` texture — the HDRI asset tile (a direct reflection of the raw equirect, no
+    /// IBL prefilter; the interactive 3D tab renders lit balls in the prefiltered environment).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the renderer's preview-render failure.
+    fn render_hdri_ball_preview(
+        &self,
+        hdri: &Arc<GpuTexture>,
+        size: u32,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>>;
 }
 
 /// One texture the worker must decode + upload, resolved from the catalog at enqueue.
@@ -171,6 +185,11 @@ pub struct ThumbnailTextureSource {
     pub hdr: bool,
     /// LDR colorspace: albedo/emissive sRGB, data maps linear.
     pub srgb: bool,
+    /// The texture's semantic role: a standalone texture tile renders on the studio sphere in its
+    /// role (albedo lit, normal bumped, …); `Hdri` renders as a chrome ball reflecting the
+    /// environment; `Unknown`/`Gloss` fall back to the flat swatch. Ignored when this source is one
+    /// texture of a material/model (the material decides the slot).
+    pub role: TextureRole,
     /// Embedded chunk image bytes (decoded from memory when non-empty).
     pub bytes: Vec<u8>,
 }
@@ -403,6 +422,69 @@ fn upload_thumbnail_texture(
 ///
 /// [`Error::Thumbnail`] when the asset fails to load/decode/render, propagating the
 /// renderer's failure message.
+/// The studio-sphere preview material for a standalone texture of role `role`, placing it in the
+/// role's slot with neutral factors elsewhere (neutral albedo = mid-grey) so the tile reads the
+/// map the way a surface uses it. `None` for a role with no lit-sphere preview: `Hdri` renders as a
+/// chrome ball upstream, and `Unknown`/`Gloss` keep the flat swatch. The interactive tab (phase 3)
+/// shades the same synthesized material through the real scene pass instead.
+fn texture_preview_material(role: TextureRole, tex: &Arc<GpuTexture>) -> Option<SubmeshMaterial> {
+    let grey = |v: f32| Vec4::new(v, v, v, 1.0);
+    let tex = Arc::clone(tex);
+    let mut m = SubmeshMaterial::defaults();
+    m.metallic = 0.0;
+    m.roughness = 0.6;
+    match role {
+        TextureRole::Albedo => {
+            m.albedo_texture = Some(tex);
+            m.base_color = Vec4::ONE;
+        }
+        TextureRole::Normal => {
+            m.normal_texture = Some(tex);
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Roughness => {
+            m.metallic_roughness_texture = Some(tex);
+            m.roughness = 1.0;
+            m.base_color = grey(0.55);
+        }
+        TextureRole::Metallic => {
+            m.metallic_roughness_texture = Some(tex);
+            m.metallic = 1.0;
+            m.roughness = 0.35;
+            m.base_color = grey(0.8);
+        }
+        TextureRole::Ao => {
+            m.occlusion_texture = Some(tex);
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Orm => {
+            m.metallic_roughness_texture = Some(Arc::clone(&tex));
+            m.occlusion_texture = Some(tex);
+            m.metallic = 1.0;
+            m.roughness = 1.0;
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Height => {
+            m.height_texture = Some(tex);
+            m.base_color = grey(0.6);
+        }
+        TextureRole::Emissive => {
+            m.emissive_texture = Some(tex);
+            m.emissive = Vec3::ONE;
+            m.emissive_strength = 2.0;
+            m.base_color = grey(0.02);
+        }
+        TextureRole::Opacity => {
+            m.albedo_texture = Some(tex);
+            m.blend_mode = BlendMode::Masked;
+            m.alpha_cutoff = 0.5;
+            m.base_color = Vec4::ONE;
+        }
+        TextureRole::Gloss | TextureRole::Hdri | TextureRole::Unknown => return None,
+    }
+    Some(m)
+}
+
 fn generate_thumbnail(
     gpu: &dyn ThumbnailGpu,
     job: &ThumbnailJob,
@@ -413,14 +495,40 @@ fn generate_thumbnail(
         ThumbnailContent::Texture(src) => {
             let tex = upload_thumbnail_texture(gpu, src, texture_out)
                 .ok_or_else(|| Error::Thumbnail("texture failed to load".to_owned()))?;
-            let transfer = if src.hdr {
-                PngTransfer::Tonemap
-            } else {
-                PngTransfer::Clamp
-            };
-            Ok(gpu
-                .encode_texture_thumbnail_png(&tex, job.size, transfer)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?)
+            // An HDRI previews as a static chrome ball reflecting the environment — a real 3D
+            // tile, consistent with the material/texture spheres. The interactive tab renders lit
+            // balls in the prefiltered environment; this cheap tile mirrors the raw equirect.
+            if src.role == TextureRole::Hdri {
+                let ball = gpu
+                    .render_hdri_ball_preview(&tex, job.size)
+                    .map_err(|e| Error::Thumbnail(e.to_string()))?;
+                return gpu
+                    .encode_texture_thumbnail_png(&ball, job.size, PngTransfer::Clamp)
+                    .map_err(|e| Error::Thumbnail(e.to_string()));
+            }
+            match texture_preview_material(src.role, &tex) {
+                // A routable role renders on the studio sphere in that role (albedo lit, normal
+                // bumped, roughness's highlight, AO darkened, emissive glowing, opacity cut out).
+                Some(material) => {
+                    let preview = gpu
+                        .render_material_preview(&material, job.size, None)
+                        .map_err(|e| Error::Thumbnail(e.to_string()))?;
+                    Ok(gpu
+                        .encode_texture_thumbnail_png(&preview, job.size, PngTransfer::Clamp)
+                        .map_err(|e| Error::Thumbnail(e.to_string()))?)
+                }
+                // Unknown / gloss: the flat clamped swatch (no meaningful lit or reflective tile).
+                None => {
+                    let transfer = if src.hdr {
+                        PngTransfer::Tonemap
+                    } else {
+                        PngTransfer::Clamp
+                    };
+                    Ok(gpu
+                        .encode_texture_thumbnail_png(&tex, job.size, transfer)
+                        .map_err(|e| Error::Thumbnail(e.to_string()))?)
+                }
+            }
         }
         ThumbnailContent::Mesh { path, bytes } => {
             let mesh = if bytes.is_empty() {
@@ -877,6 +985,7 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
                 path: String::new(),
                 hdr: space == Colorspace::Hdr,
                 srgb: space != Colorspace::Linear && space != Colorspace::Hdr,
+                role: entry.role,
                 bytes,
             };
             (ThumbnailContent::Texture(src), None)
@@ -896,6 +1005,7 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
                 path: format!("{}/{}", assets.root.display(), entry.path),
                 hdr: space == Colorspace::Hdr,
                 srgb: space != Colorspace::Linear && space != Colorspace::Hdr,
+                role: entry.role,
                 bytes: Vec::new(),
             };
             (ThumbnailContent::Texture(src), None)
@@ -1139,6 +1249,7 @@ fn resolve_material_textures(
                 path: format!("{}/{}", assets.root.display(), te.path),
                 hdr: te.hdr,
                 srgb: !te.linear,
+                role: te.role,
                 bytes: Vec::new(),
             });
         }
@@ -1420,6 +1531,17 @@ mod tests {
         ) -> saffron_rendering::Result<Arc<GpuTexture>> {
             self.renders.fetch_add(1, Ordering::SeqCst);
             // A 1×1 white texture stands in for the rendered sphere.
+            self.uploader
+                .upload_texture(&self.descriptors, &[255, 255, 255, 255], 1, 1, true)
+        }
+
+        fn render_hdri_ball_preview(
+            &self,
+            _hdri: &Arc<GpuTexture>,
+            _size: u32,
+        ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            // A 1×1 white texture stands in for the rendered chrome ball.
             self.uploader
                 .upload_texture(&self.descriptors, &[255, 255, 255, 255], 1, 1, true)
         }
