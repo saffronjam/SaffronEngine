@@ -29,6 +29,7 @@ import { SettingsModal } from "./SettingsModal";
 import { ExportModal } from "./ExportModal";
 import type { ViewId } from "../control/client";
 import { AssetPreview } from "../components/AssetViewer";
+import { Button } from "@/components/ui/button";
 import { CaptureFlame } from "../components/CaptureFlame";
 import { MaterialGraphEditor } from "../panels/MaterialGraphEditor";
 import { AssetEditorWorkspace } from "../panels/AssetEditorWorkspace";
@@ -97,12 +98,17 @@ export function App() {
   useEffect(() => {
     // One source of truth for which asset editor is mounted. An ACTIVE asset tab is always the mounted
     // one — and this branch takes precedence so that closing the active asset tab while another asset tab
-    // becomes active swaps the preview to it (remount via the key) rather than unmounting. Only when no
-    // asset tab is active AND the kept (sticky) asset's tab has since closed do we unmount + exit the
-    // preview; otherwise the most-recently-active asset stays mounted (hidden) so returning is instant.
+    // becomes active swaps the preview to it (remount via the key) rather than unmounting. It also
+    // unmounts (releasing the single modal preview) when the material-graph editor takes it over — the
+    // two preview tabs are a modal swap, never co-resident owners of `preview_scene`. Otherwise, when no
+    // asset tab is active AND the kept (sticky) asset's tab has since closed, we unmount + exit the
+    // preview; else the most-recently-active asset stays mounted (hidden) so returning is instant.
     if (activeKind === "assetEditor" && activeAssetEditorId !== null) {
       setMountedAssetId(activeAssetEditorId);
-    } else if (mountedAssetId !== null && !mountedAssetTabExists) {
+    } else if (
+      mountedAssetId !== null &&
+      (!mountedAssetTabExists || activeKind === "materialGraph")
+    ) {
       setMountedAssetId(null);
     }
   }, [activeKind, activeAssetEditorId, mountedAssetId, mountedAssetTabExists]);
@@ -115,9 +121,12 @@ export function App() {
   // active pane (or a modal covers the region). activeRenderView tells the engine which scene+camera to
   // render into which target.
   const viewportHidden = useEditorStore((s) => s.viewportHidden);
-  const activeRenderView: ViewId = activeKind === "assetEditor" ? "assetPreview" : "scene";
+  // Both preview-bearing tab kinds drive the single modal `assetPreview` view (the asset editor and the
+  // material-graph editor's live sphere) — only ever one is active, so they share the one view/surface.
+  const previewTabActive = activeKind === "assetEditor" || activeKind === "materialGraph";
+  const activeRenderView: ViewId = previewTabActive ? "assetPreview" : "scene";
   const sceneParked = viewportHidden || !sceneTabActive;
-  const assetParked = viewportHidden || activeKind !== "assetEditor";
+  const assetParked = viewportHidden || !previewTabActive;
 
   // W/E/R → translate/rotate/scale, gated off while a text field is focused.
   useGizmoShortcuts();
@@ -511,6 +520,7 @@ function StatusFooter() {
 }
 
 function ImageViewerWorkspace({ asset }: { asset: AssetEntry | null }) {
+  const openAssetEditorForAsset = useEditorStore((s) => s.openAssetEditorForAsset);
   if (!asset) {
     return (
       <main className="flex min-h-0 flex-1 items-center justify-center bg-background text-xs italic text-muted-foreground">
@@ -518,9 +528,32 @@ function ImageViewerWorkspace({ asset }: { asset: AssetEntry | null }) {
       </main>
     );
   }
+  // Any texture can flip back to its 3D preview: a non-HDR map on the studio sphere, an HDRI as the
+  // lit environment.
+  const canApply = asset.type === "texture";
   return (
-    <main className="flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-background p-6">
-      <AssetPreview entry={asset} className="h-full max-h-full w-auto max-w-full" />
+    <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
+      {canApply ? (
+        <div className="flex items-center gap-3 border-b border-border px-3 py-2">
+          <span className="text-sm font-medium text-foreground">{asset.name}</span>
+          <div className="ml-auto flex items-center overflow-hidden rounded-md border border-border">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="rounded-none"
+              onClick={() => openAssetEditorForAsset(asset.id, asset.name)}
+            >
+              Applied
+            </Button>
+            <Button variant="secondary" size="sm" className="rounded-none" disabled>
+              Flat
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6">
+        <AssetPreview entry={asset} className="h-full max-h-full w-auto max-w-full" />
+      </div>
     </main>
   );
 }
@@ -551,8 +584,10 @@ function MaterialGraphWorkspace({ materialId }: { materialId: string | null }) {
       </main>
     );
   }
+  // No bg here: the editor's preview pane is a transparent hole down to the `assetPreview` subsurface,
+  // so this wrapper must not paint over it (the editor's own regions paint their opaque backgrounds).
   return (
-    <main className="min-h-0 flex-1 overflow-hidden bg-background">
+    <main className="min-h-0 flex-1 overflow-hidden">
       <MaterialGraphEditor materialId={materialId} />
     </main>
   );
