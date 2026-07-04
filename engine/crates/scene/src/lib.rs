@@ -26,10 +26,10 @@ mod serde;
 pub use component::{
     AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
     Collider, ComponentOrder, DirectionalLight, FootChain, FootIk, IdComponent, Joint,
-    KinematicBones, Material, MaterialAsset, MaterialSet, MaterialSlot, Mesh, ModelInstance,
-    MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight, PoseOverride,
-    PreviewGhost, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh,
-    SpotLight, Transform, Transition, WorldTransform, Wrap,
+    KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent,
+    MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight, PoseOverride, PreviewGhost,
+    ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh, SpotLight,
+    Transform, Transition, WorldTransform, Wrap,
 };
 pub use document::SCENE_VERSION;
 pub use environment::{

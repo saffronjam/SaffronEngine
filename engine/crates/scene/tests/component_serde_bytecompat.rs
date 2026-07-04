@@ -17,7 +17,7 @@ use saffron_core::Uuid;
 use saffron_scene::{
     AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
     Collider, ComponentRegistry, DirectionalLight, Entity, FootChain, FootIk, Joint,
-    KinematicBones, Material, MaterialAsset, Mesh, ModelInstance, Motion, PhysicsMaterial,
+    KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance, Motion, PhysicsMaterial,
     PointLight, ReflectionProbe, Relationship, Rigidbody, Scene, Script, ScriptSlot, Shape,
     SkinnedMesh, SpotLight, Transform, Transition, Wrap, environment_from_json,
     environment_to_json,
@@ -66,9 +66,8 @@ impl RegistryExt for ComponentRegistry {
 const EXPECT_TRANSFORM_DEFAULT: &str = r#"{"rotation":{"x":0.0,"y":0.0,"z":0.0},"scale":{"x":1.0,"y":1.0,"z":1.0},"translation":{"x":0.0,"y":0.0,"z":0.0}}"#;
 const EXPECT_TRANSFORM_VALUES: &str = r#"{"rotation":{"x":0.10000000149011612,"y":0.20000000298023224,"z":0.30000001192092896},"scale":{"x":2.0,"y":2.0,"z":2.0},"translation":{"x":1.5,"y":-2.0,"z":3.25}}"#;
 const EXPECT_CAMERA_DEFAULT: &str = r#"{"far":100.0,"fov":45.0,"frustumMaxDistance":10.0,"near":0.10000000149011612,"primary":true,"showFrustum":true,"showModel":true}"#;
-const EXPECT_MATERIAL_DEFAULT: &str = r#"{"albedoTexture":"0","alphaCutoff":0.5,"baseColor":{"w":1.0,"x":1.0,"y":1.0,"z":1.0},"blend":"opaque","doubleSided":false,"emissive":{"x":0.0,"y":0.0,"z":0.0},"emissiveStrength":1.0,"emissiveTexture":"0","heightScale":0.05000000074505806,"heightTexture":"0","metallic":0.0,"metallicRoughnessTexture":"0","normalStrength":1.0,"normalTexture":"0","occlusionTexture":"0","roughness":1.0,"unlit":false}"#;
+const EXPECT_MATERIALSET: &str = r#"{"slots":[{"material":"4242","overrides":{}}]}"#;
 const EXPECT_MESH: &str = r#"{"mesh":"1024"}"#;
-const EXPECT_MATERIALASSET: &str = r#"{"material":"4242"}"#;
 const EXPECT_MODELINSTANCE: &str = r#"{"modelId":"9999"}"#;
 const EXPECT_RELATIONSHIP: &str = r#"{"parent":"7"}"#;
 const EXPECT_BONE: &str = r#"{}"#;
@@ -133,12 +132,18 @@ fn camera_matches_cpp() {
 }
 
 #[test]
-fn material_matches_cpp() {
+fn material_set_matches_cpp() {
+    let set = MaterialSet {
+        slots: vec![MaterialSlot {
+            material: Uuid(4242),
+            ..MaterialSlot::default()
+        }],
+    };
     assert_eq!(
-        serialize_via_registry("Material", Material::default()),
-        EXPECT_MATERIAL_DEFAULT
+        serialize_via_registry("MaterialSet", set),
+        EXPECT_MATERIALSET
     );
-    assert_round_trips("Material", EXPECT_MATERIAL_DEFAULT);
+    assert_round_trips("MaterialSet", EXPECT_MATERIALSET);
 }
 
 #[test]
@@ -148,20 +153,6 @@ fn mesh_matches_cpp() {
         EXPECT_MESH
     );
     assert_round_trips("Mesh", EXPECT_MESH);
-}
-
-#[test]
-fn material_asset_matches_cpp() {
-    assert_eq!(
-        serialize_via_registry(
-            "MaterialAsset",
-            MaterialAsset {
-                material: Uuid(4242),
-            }
-        ),
-        EXPECT_MATERIALASSET
-    );
-    assert_round_trips("MaterialAsset", EXPECT_MATERIALASSET);
 }
 
 #[test]
@@ -478,10 +469,18 @@ fn no_uuid_field_emits_a_json_number() {
     );
     assert!(rel.contains(r#""parent":"18446744073709551615""#), "{rel}");
 
-    let asset = serialize_via_registry("MaterialAsset", MaterialAsset { material: big });
+    let set = serialize_via_registry(
+        "MaterialSet",
+        MaterialSet {
+            slots: vec![MaterialSlot {
+                material: big,
+                ..MaterialSlot::default()
+            }],
+        },
+    );
     assert!(
-        asset.contains(r#""material":"18446744073709551615""#),
-        "{asset}"
+        set.contains(r#""material":"18446744073709551615""#),
+        "{set}"
     );
 
     let model = serialize_via_registry("ModelInstance", ModelInstance { model_id: big });
@@ -503,7 +502,7 @@ fn no_uuid_field_emits_a_json_number() {
     );
 
     // None of these payloads contains the bare numeric form of the id.
-    for payload in [&mesh, &rel, &asset, &model, &col] {
+    for payload in [&mesh, &rel, &set, &model, &col] {
         assert!(
             !payload.contains(":18446744073709551615"),
             "a Uuid leaked as a bare JSON number: {payload}"

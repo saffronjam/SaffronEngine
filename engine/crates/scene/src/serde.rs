@@ -28,18 +28,18 @@
 //! via `saffron_json::dump_json_sorted`. The emit order of the `insert` calls below is
 //! therefore incidental to the output bytes.
 
-use glam::{BVec3, Mat4, Vec3, Vec4};
+use glam::{BVec3, Mat4, Vec3};
 use serde_json::{Map, Value};
 
-use saffron_core::{BlendMode, Uuid};
+use saffron_core::Uuid;
 use saffron_json::{json_bool_or, json_f32_or, json_string_or, json_u64_or, uuid_to_json};
 
 use crate::component::{
     AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
-    Collider, DirectionalLight, FootChain, FootIk, Joint, KinematicBones, Material, MaterialAsset,
-    MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name, PhysicsMaterial,
-    PointLight, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh,
-    SpotLight, Transform, Transition, Wrap,
+    Collider, DirectionalLight, FootChain, FootIk, Joint, KinematicBones, MaterialSet,
+    MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name, PhysicsMaterial, PointLight,
+    ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh, SpotLight,
+    Transform, Transition, Wrap,
 };
 use crate::environment::{AtmosphereSettings, SceneEnvironment, SkyMode};
 use crate::error::Result;
@@ -85,27 +85,6 @@ fn bvec3_from_json(j: &Value) -> BVec3 {
         json_bool_or(j, "x", false),
         json_bool_or(j, "y", false),
         json_bool_or(j, "z", false),
-    )
-}
-
-/// A named-object `vec4` → `{"x","y","z","w"}`.
-fn vec4_to_json(v: Vec4) -> Value {
-    Value::Object(Map::from_iter([
-        ("x".to_string(), f32_value(v.x)),
-        ("y".to_string(), f32_value(v.y)),
-        ("z".to_string(), f32_value(v.z)),
-        ("w".to_string(), f32_value(v.w)),
-    ]))
-}
-
-/// Reads a `vec4` from a named object, each component defaulting to `1`. Note the default
-/// differs from `vec3` (`1`, not `0`).
-fn vec4_from_json(j: &Value) -> Vec4 {
-    Vec4::new(
-        json_f32_or(j, "x", 1.0),
-        json_f32_or(j, "y", 1.0),
-        json_f32_or(j, "z", 1.0),
-        json_f32_or(j, "w", 1.0),
     )
 }
 
@@ -221,111 +200,23 @@ impl SceneSerialize for Camera {
 /// `MaterialSlot` — identical field sets, so one serializer over `MaterialSlot` covers
 /// both. `uv_tiling` / `uv_offset` are intentionally absent — they must not appear on the
 /// wire.
+/// Serializes one [`MaterialSlot`] — a `.smat` reference id plus its sparse override map.
 fn material_slot_to_json(s: &MaterialSlot) -> Value {
     object([
-        ("baseColor", vec4_to_json(s.base_color)),
-        ("albedoTexture", uuid_to_json(s.albedo_texture.value())),
-        (
-            "metallicRoughnessTexture",
-            uuid_to_json(s.metallic_roughness_texture.value()),
-        ),
-        ("metallic", f32_value(s.metallic)),
-        ("roughness", f32_value(s.roughness)),
-        ("emissive", vec3_to_json(s.emissive)),
-        ("emissiveStrength", f32_value(s.emissive_strength)),
-        ("unlit", Value::Bool(s.unlit)),
-        ("normalTexture", uuid_to_json(s.normal_texture.value())),
-        (
-            "occlusionTexture",
-            uuid_to_json(s.occlusion_texture.value()),
-        ),
-        ("emissiveTexture", uuid_to_json(s.emissive_texture.value())),
-        ("heightTexture", uuid_to_json(s.height_texture.value())),
-        ("normalStrength", f32_value(s.normal_strength)),
-        ("heightScale", f32_value(s.height_scale)),
-        ("blend", Value::String(s.blend_mode.as_wire().to_owned())),
-        ("alphaCutoff", f32_value(s.alpha_cutoff)),
-        ("doubleSided", Value::Bool(s.double_sided)),
+        ("material", uuid_to_json(s.material.value())),
+        ("overrides", s.overrides.clone()),
     ])
 }
 
-/// Projects a [`Material`] onto the shared [`MaterialSlot`] field set so both serialize
-/// through one body.
-fn material_as_slot(m: &Material) -> MaterialSlot {
-    MaterialSlot {
-        base_color: m.base_color,
-        albedo_texture: m.albedo_texture,
-        metallic_roughness_texture: m.metallic_roughness_texture,
-        metallic: m.metallic,
-        roughness: m.roughness,
-        emissive: m.emissive,
-        emissive_strength: m.emissive_strength,
-        unlit: m.unlit,
-        normal_texture: m.normal_texture,
-        occlusion_texture: m.occlusion_texture,
-        emissive_texture: m.emissive_texture,
-        height_texture: m.height_texture,
-        normal_strength: m.normal_strength,
-        uv_tiling: m.uv_tiling,
-        uv_offset: m.uv_offset,
-        height_scale: m.height_scale,
-        blend_mode: m.blend_mode,
-        alpha_cutoff: m.alpha_cutoff,
-        double_sided: m.double_sided,
-    }
-}
-
-impl SceneSerialize for Material {
-    fn to_json(&self) -> Value {
-        material_slot_to_json(&material_as_slot(self))
-    }
-
-    fn load_json(&mut self, value: &Value) -> Result<()> {
-        self.base_color = vec4_from_json(&object_field(value, "baseColor"));
-        self.albedo_texture = Uuid(json_u64_or(value, "albedoTexture", 0));
-        self.metallic_roughness_texture = Uuid(json_u64_or(value, "metallicRoughnessTexture", 0));
-        self.metallic = json_f32_or(value, "metallic", 0.0);
-        self.roughness = json_f32_or(value, "roughness", 1.0);
-        self.emissive = vec3_from_json(&object_field(value, "emissive"));
-        self.emissive_strength = json_f32_or(value, "emissiveStrength", 1.0);
-        self.unlit = json_bool_or(value, "unlit", false);
-        self.normal_texture = Uuid(json_u64_or(value, "normalTexture", 0));
-        self.occlusion_texture = Uuid(json_u64_or(value, "occlusionTexture", 0));
-        self.emissive_texture = Uuid(json_u64_or(value, "emissiveTexture", 0));
-        self.height_texture = Uuid(json_u64_or(value, "heightTexture", 0));
-        self.normal_strength = json_f32_or(value, "normalStrength", 1.0);
-        self.height_scale = json_f32_or(value, "heightScale", 0.05);
-        self.blend_mode =
-            BlendMode::from_wire(&json_string_or(value, "blend", "opaque".to_owned()));
-        self.alpha_cutoff = json_f32_or(value, "alphaCutoff", 0.5);
-        self.double_sided = json_bool_or(value, "doubleSided", false);
-        Ok(())
-    }
-}
-
-/// Reads a [`MaterialSlot`] from one entry of the `slots` array.
+/// Reads a [`MaterialSlot`] from one entry of the `slots` array. `material` accepts a
+/// decimal string or an unsigned number; a non-object `overrides` defaults to `{}`.
 fn material_slot_from_json(sj: &Value) -> MaterialSlot {
     MaterialSlot {
-        base_color: vec4_from_json(&object_field(sj, "baseColor")),
-        albedo_texture: Uuid(json_u64_or(sj, "albedoTexture", 0)),
-        metallic_roughness_texture: Uuid(json_u64_or(sj, "metallicRoughnessTexture", 0)),
-        metallic: json_f32_or(sj, "metallic", 0.0),
-        roughness: json_f32_or(sj, "roughness", 1.0),
-        emissive: vec3_from_json(&object_field(sj, "emissive")),
-        emissive_strength: json_f32_or(sj, "emissiveStrength", 1.0),
-        unlit: json_bool_or(sj, "unlit", false),
-        normal_texture: Uuid(json_u64_or(sj, "normalTexture", 0)),
-        occlusion_texture: Uuid(json_u64_or(sj, "occlusionTexture", 0)),
-        emissive_texture: Uuid(json_u64_or(sj, "emissiveTexture", 0)),
-        height_texture: Uuid(json_u64_or(sj, "heightTexture", 0)),
-        normal_strength: json_f32_or(sj, "normalStrength", 1.0),
-        // `uv_tiling` / `uv_offset` are not on the wire — keep their struct defaults.
-        uv_tiling: MaterialSlot::default().uv_tiling,
-        uv_offset: MaterialSlot::default().uv_offset,
-        height_scale: json_f32_or(sj, "heightScale", 0.05),
-        blend_mode: BlendMode::from_wire(&json_string_or(sj, "blend", "opaque".to_owned())),
-        alpha_cutoff: json_f32_or(sj, "alphaCutoff", 0.5),
-        double_sided: json_bool_or(sj, "doubleSided", false),
+        material: Uuid(json_u64_or(sj, "material", 0)),
+        overrides: field(sj, "overrides")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
     }
 }
 
@@ -342,20 +233,6 @@ impl SceneSerialize for MaterialSet {
                 self.slots.push(material_slot_from_json(sj));
             }
         }
-        Ok(())
-    }
-}
-
-impl SceneSerialize for MaterialAsset {
-    fn to_json(&self) -> Value {
-        // A decimal-string uuid, not `uuid_to_json` — both emit the same bytes.
-        object([("material", Value::String(self.material.value().to_string()))])
-    }
-
-    fn load_json(&mut self, value: &Value) -> Result<()> {
-        // Accepts a string or an unsigned number; `json_u64_or`'s lenient union defaults to
-        // the existing value when the key is absent.
-        self.material = Uuid(json_u64_or(value, "material", self.material.value()));
         Ok(())
     }
 }

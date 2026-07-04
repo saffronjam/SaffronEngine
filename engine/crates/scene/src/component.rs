@@ -14,10 +14,10 @@
 //! serialize and never copy, encoded by simply not registering them in the registry
 //! phase.
 
-use glam::{BVec3, Mat4, Quat, Vec2, Vec3, Vec4};
+use glam::{BVec3, Mat4, Quat, Vec3};
 use serde_json::Value;
 
-use saffron_core::{BlendMode, Uuid};
+use saffron_core::Uuid;
 
 use crate::scene::Entity;
 
@@ -572,170 +572,41 @@ pub struct Mesh {
     pub mesh: Uuid,
 }
 
-/// Per-entity material applied to the whole mesh.
+/// One material binding for a submesh: a reference to a `.smat` material asset plus a
+/// sparse per-object override map applied over the referenced material's resolved params.
 ///
-/// `albedo_texture == 0` means "none" (the renderer binds its default white texture).
-/// `metallic`/`roughness` drive the Cook-Torrance BRDF; `emissive` adds unlit radiance.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Material {
-    /// Base color (RGBA).
-    pub base_color: Vec4,
-    /// Albedo texture id (`0` = none).
-    pub albedo_texture: Uuid,
-    /// glTF metallic-roughness map id (modulates the factors).
-    pub metallic_roughness_texture: Uuid,
-    /// Metallic factor.
-    pub metallic: f32,
-    /// Roughness factor.
-    pub roughness: f32,
-    /// Emissive color.
-    pub emissive: Vec3,
-    /// Emissive intensity.
-    pub emissive_strength: f32,
-    /// Skip lighting (albedo * base color only) — a distinct PSO.
-    pub unlit: bool,
-    /// Tangent-space normal map id (OpenGL +Y convention).
-    pub normal_texture: Uuid,
-    /// Ambient-occlusion map id (AO in R).
-    pub occlusion_texture: Uuid,
-    /// Emissive map id (modulates the emissive factor).
-    pub emissive_texture: Uuid,
-    /// Height/displacement map id (R) for parallax occlusion mapping.
-    pub height_texture: Uuid,
-    /// Normal-map strength.
-    pub normal_strength: f32,
-    /// UV tiling.
-    pub uv_tiling: Vec2,
-    /// UV offset.
-    pub uv_offset: Vec2,
-    /// Parallax height scale.
-    pub height_scale: f32,
-    /// Alpha/blend mode (glTF `alphaMode`): opaque, masked (alpha-tested cutout), or
-    /// translucent (alpha-blended).
-    pub blend_mode: BlendMode,
-    /// Alpha-clip cutoff (used by [`BlendMode::Masked`]).
-    pub alpha_cutoff: f32,
-    /// Two-sided (glTF `doubleSided`): render both faces — the scene pass disables backface
-    /// culling for this material so thin geometry (curtains, foliage) shows from both sides.
-    pub double_sided: bool,
-}
-
-impl Default for Material {
-    fn default() -> Self {
-        Self {
-            base_color: Vec4::ONE,
-            albedo_texture: Uuid(0),
-            metallic_roughness_texture: Uuid(0),
-            metallic: 0.0,
-            roughness: 1.0,
-            emissive: Vec3::ZERO,
-            emissive_strength: 1.0,
-            unlit: false,
-            normal_texture: Uuid(0),
-            occlusion_texture: Uuid(0),
-            emissive_texture: Uuid(0),
-            height_texture: Uuid(0),
-            normal_strength: 1.0,
-            uv_tiling: Vec2::ONE,
-            uv_offset: Vec2::ZERO,
-            height_scale: 0.05,
-            blend_mode: BlendMode::Opaque,
-            alpha_cutoff: 0.5,
-            double_sided: false,
-        }
-    }
-}
-
-/// One material in a multi-material mesh; the same fields as [`Material`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `material == 0` resolves to the built-in default material. `overrides` is opaque,
+/// editor-shaped JSON `{ paramName: value }` (empty in the common case); the engine applies
+/// only the recognized exposed parameters at resolve time (see the assets crate's material
+/// schema). This is the single per-object material shape — a single-material mesh is a
+/// [`MaterialSet`] with one slot.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MaterialSlot {
-    /// Base color (RGBA).
-    pub base_color: Vec4,
-    /// Albedo texture id (`0` = none).
-    pub albedo_texture: Uuid,
-    /// glTF metallic-roughness map id (modulates the factors).
-    pub metallic_roughness_texture: Uuid,
-    /// Metallic factor.
-    pub metallic: f32,
-    /// Roughness factor.
-    pub roughness: f32,
-    /// Emissive color.
-    pub emissive: Vec3,
-    /// Emissive intensity.
-    pub emissive_strength: f32,
-    /// Skip lighting (albedo * base color only).
-    pub unlit: bool,
-    /// Tangent-space normal map id.
-    pub normal_texture: Uuid,
-    /// Ambient-occlusion map id.
-    pub occlusion_texture: Uuid,
-    /// Emissive map id.
-    pub emissive_texture: Uuid,
-    /// Height/displacement map id.
-    pub height_texture: Uuid,
-    /// Normal-map strength.
-    pub normal_strength: f32,
-    /// UV tiling.
-    pub uv_tiling: Vec2,
-    /// UV offset.
-    pub uv_offset: Vec2,
-    /// Parallax height scale.
-    pub height_scale: f32,
-    /// Alpha/blend mode (glTF `alphaMode`): opaque, masked (alpha-tested cutout), or
-    /// translucent (alpha-blended).
-    pub blend_mode: BlendMode,
-    /// Alpha-clip cutoff (used by [`BlendMode::Masked`]).
-    pub alpha_cutoff: f32,
-    /// Two-sided (glTF `doubleSided`): render both faces — the scene pass disables backface
-    /// culling for this slot so thin geometry (curtains, foliage) shows from both sides.
-    pub double_sided: bool,
+    /// The referenced `.smat` material asset id (`0` = the built-in default material).
+    pub material: Uuid,
+    /// Sparse `{ paramName: value }` overrides applied over the referenced material.
+    /// Opaque editor-shaped JSON, defaulted to an empty object `{}`.
+    pub overrides: Value,
 }
 
 impl Default for MaterialSlot {
     fn default() -> Self {
         Self {
-            base_color: Vec4::ONE,
-            albedo_texture: Uuid(0),
-            metallic_roughness_texture: Uuid(0),
-            metallic: 0.0,
-            roughness: 1.0,
-            emissive: Vec3::ZERO,
-            emissive_strength: 1.0,
-            unlit: false,
-            normal_texture: Uuid(0),
-            occlusion_texture: Uuid(0),
-            emissive_texture: Uuid(0),
-            height_texture: Uuid(0),
-            normal_strength: 1.0,
-            uv_tiling: Vec2::ONE,
-            uv_offset: Vec2::ZERO,
-            height_scale: 0.05,
-            blend_mode: BlendMode::Opaque,
-            alpha_cutoff: 0.5,
-            double_sided: false,
+            material: Uuid(0),
+            overrides: Value::Object(serde_json::Map::new()),
         }
     }
 }
 
-/// An ordered material table for a mesh with more than one source material.
+/// An entity's material bindings, one slot per submesh.
 ///
-/// Each submesh's material slot indexes `slots`. Supersedes [`Material`] when present;
-/// single-material meshes keep using [`Material`] instead.
+/// Each submesh's `material_slot` indexes `slots` (clamped to the slot count); a slot
+/// references a `.smat` material asset and layers sparse per-object overrides on top. This
+/// is the single per-entity material component — a single-material mesh is one slot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MaterialSet {
-    /// The ordered material slots.
+    /// The ordered material slots, indexed by submesh `material_slot`.
     pub slots: Vec<MaterialSlot>,
-}
-
-/// References a shared `.smat` material asset by id.
-///
-/// Takes precedence over the inline [`Material`] / [`MaterialSet`] when present
-/// (edit-once-propagate). A missing or zero id falls back to the built-in default
-/// material at resolve time.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MaterialAsset {
-    /// The `.smat` asset id.
-    pub material: Uuid,
 }
 
 /// Marks an entity (the root of an expanded model) as an instance of a `.smodel` asset.
@@ -1053,31 +924,15 @@ mod tests {
     }
 
     #[test]
-    fn material_defaults() {
-        let m = Material::default();
-        assert_eq!(m.base_color, Vec4::ONE);
-        assert_eq!(m.metallic, 0.0);
-        assert_eq!(m.roughness, 1.0);
-        assert_eq!(m.emissive, Vec3::ZERO);
-        assert_eq!(m.emissive_strength, 1.0);
-        assert!(!m.unlit);
-        assert_eq!(m.normal_strength, 1.0);
-        assert_eq!(m.uv_tiling, Vec2::ONE);
-        assert_eq!(m.uv_offset, Vec2::ZERO);
-        assert_eq!(m.height_scale, 0.05);
-        assert_eq!(m.blend_mode, BlendMode::Opaque);
-        assert_eq!(m.alpha_cutoff, 0.5);
+    fn material_slot_defaults_to_the_default_material_with_empty_overrides() {
+        let s = MaterialSlot::default();
+        assert_eq!(s.material, Uuid(0));
+        assert_eq!(s.overrides, Value::Object(serde_json::Map::new()));
     }
 
     #[test]
-    fn material_slot_matches_material_defaults() {
-        let s = MaterialSlot::default();
-        let m = Material::default();
-        assert_eq!(s.base_color, m.base_color);
-        assert_eq!(s.metallic, m.metallic);
-        assert_eq!(s.roughness, m.roughness);
-        assert_eq!(s.height_scale, m.height_scale);
-        assert_eq!(s.alpha_cutoff, m.alpha_cutoff);
+    fn material_set_defaults_to_no_slots() {
+        assert!(MaterialSet::default().slots.is_empty());
     }
 
     #[test]
