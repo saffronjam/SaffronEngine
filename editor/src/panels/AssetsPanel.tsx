@@ -774,8 +774,16 @@ export function AssetsPanel() {
   // the image viewer.
   const routeView = useCallback(
     (asset: AssetEntry) => {
+      // Every texture opens the 3D asset editor: an HDRI as a lit environment with three PBR balls,
+      // any other role as its map on the studio sphere. Models/meshes/clips do too, and a material
+      // previews as itself on the studio sphere (the graph editor stays the place to *edit* it).
+      // Only non-previewable files ("other") fall back to the flat image view.
       const ridesAssetEditor =
-        asset.type === "model" || asset.type === "mesh" || asset.type === "animation";
+        asset.type === "model" ||
+        asset.type === "mesh" ||
+        asset.type === "animation" ||
+        asset.type === "texture" ||
+        asset.type === "material";
       if (ridesAssetEditor) {
         openAssetEditorForAsset(asset.id, asset.name);
       } else {
