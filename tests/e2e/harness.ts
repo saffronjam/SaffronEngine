@@ -141,10 +141,13 @@ export class Engine {
       const socket = net.connect({ path: this.socketPath });
       const id = this.nextId++;
       let data = "";
+      // Default 15s; overridable for slow environments (a cold pipeline cache on a proxied
+      // GPU driver can stall the host's control drain past 15s during first-render PSO
+      // compilation) via SAFFRON_E2E_CALL_TIMEOUT_MS.
       const timer = setTimeout(() => {
         socket.destroy();
         reject(new Error(`timeout calling ${cmd}`));
-      }, 15_000);
+      }, Number(process.env.SAFFRON_E2E_CALL_TIMEOUT_MS) || 15_000);
       socket.on("connect", () => socket.write(JSON.stringify({ id, cmd, params }) + "\n"));
       socket.on("data", (chunk) => {
         data += chunk.toString();
