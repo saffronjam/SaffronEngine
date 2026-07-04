@@ -1,6 +1,9 @@
 # Material instances (entity materials reference `.smat` assets + sparse overrides)
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — Phases 1–4 COMPLETED (engine + protocol + control + import + Phase-1 e2e
+verified); Phase 5 (inspector override editor) IN PROGRESS (implemented + tsc/lint green; pending user
+visual verification, the `material-schema` command, the "Edit material" button, and the docs page). The
+full-suite e2e re-run for the new slot shape is the final gate.
 
 Collapse the two parallel material worlds into one. Today an entity carries its PBR parameters as an
 **inline blob** (`Material` / `MaterialSet` components) that is forked from — and drifts forever apart

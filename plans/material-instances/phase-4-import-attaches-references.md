@@ -1,6 +1,17 @@
 # Phase 4 — Model import attaches material references, not inline copies
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
+
+**As built:** `instantiate_model` (`engine/crates/assets/src/spawn.rs`) attaches a `MaterialSet` whose
+slots **reference** the container's baked material sub-ids (`MaterialSlot { material: sub.sub_id,
+overrides: {} }`), one slot per source material — no inline factor copy (the old
+`resolve_container_material` / `MaterialFactors` / inline-copy path is deleted). A container material's
+catalog row already has `id == sub_id` with `container == model_id`, so a slot resolves through
+`load_catalog_material_asset` at draw time; editing that `.smat` propagates to every instance.
+`apply_imported_materials` always attaches a `MaterialSet` (a single default-material slot when the
+import had no materials). The built-in default material (`DEFAULT_MATERIAL_ID`, id `1`) is the `0`/
+missing-reference fallback. spawn/instantiate tests are migrated to assert references, not inline
+factors.
 
 Part of `plans/material-instances/`. Close the fork at its source: a model import must produce entity
 slots that **reference** the baked `.smat` material assets by id, instead of copying their parameters

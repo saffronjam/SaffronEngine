@@ -1,6 +1,18 @@
 # Phase 3 — The entity slot references a material asset + sparse overrides
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
+
+**As built:** `MaterialSlot` is now `{ material: Uuid, overrides: serde_json::Value }`
+(`engine/crates/scene/src/component.rs`); the `Material` and `MaterialAsset` scene components are
+deleted; `MaterialSet` is the one per-entity material component (a single-material mesh is one slot).
+Serde (`scene/serde.rs`), the registry (`registry.rs`, `BUILTIN_COMPONENT_NAMES`), and the protocol
+`component_schemas` (`protocol/schema.rs`) are updated; `resolve_entity_materials`
+(`assets/render_material.rs`) is one path — resolve each slot's referenced `.smat` (parent-chain,
+default fallback) + `apply_overrides`, submesh→slot clamped, whole-mesh flags/shader from slot 0. The
+delete-asset cascade, residency prewarm, `assign-asset` (texture slots → slot-0 overrides), and
+`material-assign` (points every slot's `material`) are migrated in `saffron-control`. All engine unit
+tests + the `.smat` golden pass; the component byte-golden was updated to the new shape. The ORM
+divergence is resolved (the slot/override texture set is the packed `ormTexture`, matching the `.smat`).
 
 Part of `plans/material-instances/`. This is the model cutover: the entity stops storing inline PBR
 params and instead **references** a `.smat` material asset per submesh, with an optional **sparse

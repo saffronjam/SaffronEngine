@@ -1,6 +1,20 @@
 # Phase 2 — Exposed-parameter schema on the `.smat` material asset
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
+
+**As built (scope refinement):** the engine-side schema foundation landed here — the
+`ExposedParam` / `ExposedParamKind` schema (`engine/crates/assets/src/material_schema.rs`,
+`pbr_exposed_parameters()` + `exposed_parameter()`), `apply_overrides` widened to cover the full
+exposed set (`material.rs`, with a drift-guard test that fails if the schema and `apply_overrides`
+diverge), and override validation in `material-set-override` (`commands_asset.rs` — unknown key or
+mistyped value now rejects with a typed error). The **`material-schema` wire command and the material
+docs-page rewrite are folded into Phase 5**, where the inspector's override editor consumes them —
+adding the command with its consumer avoids an unconsumed wire surface and one docs churn. The ORM
+decision is settled here (the exposed schema's texture params are `albedoTexture`, `ormTexture`,
+`normalTexture`, `emissiveTexture`, `heightTexture` — the packed `ormTexture` is canonical); the
+entity slot adopts that representation in Phase 3. The params-buffer layout stays a direct field
+mapping in `build_submesh_material` (the übershader's uniform layout is fixed), with the exposed schema
+as the single source of truth for overrides/validation/inspector rather than the GPU struct.
 
 Part of `plans/material-instances/`. Establish the **one parameter schema** that Phases 3–5 resolve
 against: give the `.smat` `MaterialAsset` a declared list of *exposed parameters* (name, type, default),

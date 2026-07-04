@@ -1,6 +1,34 @@
 # Phase 5 — The inspector becomes a material override editor
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS
+
+**As built so far:** the `MaterialSet` inspector body (`editor/src/panels/InspectorPanel.tsx`) is an
+override editor with **opt-in, sparse overrides** (the Unreal Material-Instance shape). Per slot: a
+material `AssetPicker` (`MaterialSlot.material` hint, asset kind `material`) bound to `slot.material`
+(with an "Edit material" shortcut), then a row **only for each parameter the user has actually
+overridden** (each with a ✕ to remove the override and revert to the referenced material's value), and a
+**"+ Override" dropdown** listing the exposed parameters not yet overridden — picking one adds it to
+`slot.overrides`. So an unmodified slot is just the material picker + "+ Override" (no wall of rows).
+Edits write into `slot.overrides` via `set-component-field` with the slot index (colours/vecs convert
+array↔`{x,y}` at the widget boundary). `fieldRenderer` hints are aligned to the exposed set (`ormTexture`
+replaces the split MR/occlusion hints, `doubleSided` added, `MaterialSlot.material` added). tsc + oxlint
+are green.
+
+The **"Edit material" shortcut is wired** (`openMaterialGraphTab(slot.material)`), the **`material-schema`
+control command is added** (`MaterialSchemaParams`/`MaterialSchemaResult`/`ExposedParamDto` over
+`pbr_exposed_parameters()` in `commands_asset.rs`, registered + codegen'd + contract-skip-listed +
+CLI-inspectable), and the **docs are rewritten** (16 pages, hugo builds clean). The engine gate is green
+(build + `clippy -D warnings` + fmt + all scene/assets/control/protocol unit tests).
+
+**Remaining:** (1) **user visual verification** of the new inspector — per `editor/AGENTS.md` a GUI change
+is not done until confirmed against the running editor (I cannot see the viewport). (2) The override
+editor renders from a static frontend `MATERIAL_PARAMS` list mirroring `pbr_exposed_parameters()` (correct
+for the fixed übershader); switching it to *fetch* `material-schema` at runtime is only needed once
+graph materials expose per-material parameters, so it is deliberately deferred to that work. (3) The
+full-suite e2e re-run for the new slot shape: the material test files are migrated and re-review clean,
+but a green full run is blocked in this toolbox by cold-PSO-compile control-drain stalls tripping the
+harness's 15s `call()` timeout (environmental — it hits unmodified physics/graph/import tests identically;
+Phase-1's e2e passed exit 0 when warm/uncontended). Run it in a warm, uncontended environment to confirm.
 
 Part of `plans/material-instances/`. With the entity model now "slot references a `.smat` + sparse
 overrides" (Phase 3) and imports producing references (Phase 4), the Inspector's material section becomes
@@ -49,7 +77,13 @@ it for every instance).
 `editor/src/components/`). Render the picker + override rows + "Edit material". Wire the overridden-marker
 state from `slot.overrides` vs the fetched schema defaults.
 
-**`editor/src/control/client.ts`.** Typed wrappers for the material-schema read and the slot
+**`material-schema` control command (moved here from Phase 2).** Add `MaterialSchemaParams {material}`
+→ `MaterialSchemaResult { params: Vec<ExposedParamDto{ name, kind, default }> }` over the engine
+`pbr_exposed_parameters()` schema (`engine/crates/protocol/src/dto.rs` + registration in
+`commands_asset.rs`), regenerate `@saffron/protocol`, and add the `sa` formatter row — so the CLI can
+inspect "what can I override on this material?" and the inspector can fetch the list.
+
+**`editor/src/control/client.ts`.** Typed wrappers for the `material-schema` read and the slot
 material-reference/override writes.
 
 **Docs.** Update the material docs page: the entity-material workflow (reference a material, override
