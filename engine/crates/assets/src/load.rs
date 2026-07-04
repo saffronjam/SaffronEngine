@@ -244,6 +244,33 @@ impl AssetServer {
         if let Some(cached) = self.mesh_by_uuid.get(&id.value()) {
             return cached.clone();
         }
+        // A reserved built-in id has no catalog row: generate + upload its geometry on
+        // demand and cache it. This re-seeds automatically after a project-load cache
+        // clear, so a primitive survives project switches with no eager bookkeeping.
+        if let Some(builtin) = crate::BuiltinMesh::from_reserved_id(id) {
+            return self.seed_builtin_mesh(gpu, builtin);
+        }
+        // The dense preview-displacement sphere is a reserved mesh with no `BuiltinMesh` (it is not
+        // spawnable) — seed its generated geometry the same on-demand, cache-first way.
+        if id == crate::PREVIEW_DISPLACE_SPHERE_MESH_ID {
+            let key = id.value();
+            return match gpu.upload_mesh(
+                &saffron_geometry::preview_displacement_sphere(),
+                &[],
+                None,
+                None,
+            ) {
+                Ok(mesh_ref) => {
+                    self.mesh_by_uuid.insert(key, Some(mesh_ref.clone()));
+                    Some(mesh_ref)
+                }
+                Err(err) => {
+                    tracing::warn!("preview displacement sphere mesh: {err}");
+                    self.mesh_by_uuid.insert(key, None);
+                    None
+                }
+            };
+        }
         // Extract the owned row fields, dropping the catalog borrow before the `&mut self`
         // resolve/upload calls below.
         let (container, rel_path) = match self.catalog.find(id) {
@@ -460,6 +487,29 @@ impl AssetServer {
                 self.mesh_by_uuid
                     .insert(PREVIEW_FLOOR_MESH_ID.value(), None);
                 false
+            }
+        }
+    }
+
+    /// Generates + uploads a [`crate::BuiltinMesh`] into the GPU cache under its reserved
+    /// id, returning the resolved mesh. No catalog row, no SDF bake (like the preview
+    /// floor) — a primitive works with no project loaded. A `None` cached on failure is a
+    /// negative-cache marker cleared by [`AssetServer::clear_asset_caches`].
+    fn seed_builtin_mesh(
+        &mut self,
+        gpu: &dyn GpuUploader,
+        builtin: crate::BuiltinMesh,
+    ) -> Option<Arc<GpuMesh>> {
+        let key = builtin.reserved_id().value();
+        match gpu.upload_mesh(&builtin.geometry(), &[], None, None) {
+            Ok(mesh_ref) => {
+                self.mesh_by_uuid.insert(key, Some(mesh_ref.clone()));
+                Some(mesh_ref)
+            }
+            Err(err) => {
+                tracing::warn!("built-in {builtin:?} mesh: {err}");
+                self.mesh_by_uuid.insert(key, None);
+                None
             }
         }
     }

@@ -685,32 +685,6 @@ impl AssetServer {
         }
         Ok(bake)
     }
-
-    /// Ensures a built-in model asset (the editor's add-entity cube preset) exists, baking
-    /// it once under a deterministic id derived from its source name so repeated use reuses
-    /// the same container rather than re-baking or colliding on the source-name sub-ids.
-    /// Returns the model id to instantiate.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Geometry`] if the source cannot be translated, or any [`Self::bake_model`]
-    /// error.
-    pub fn ensure_builtin_model_asset(&mut self, source_path: &str) -> Result<Uuid> {
-        let key = std::path::Path::new(source_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        let model_id = sub_id_for(key, "model", "0", 0);
-        if self.catalog.find(model_id).is_some() {
-            return Ok(model_id);
-        }
-        let graph = translate_model(source_path)?;
-        let bake = self.bake_model(&graph, ImportOptions::default(), source_path, model_id)?;
-        for row in &bake.rows {
-            self.catalog.put(row.clone());
-        }
-        Ok(model_id)
-    }
 }
 
 #[cfg(test)]

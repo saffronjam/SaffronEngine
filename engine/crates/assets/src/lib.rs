@@ -75,7 +75,10 @@ pub use model::{
     ByteSource, ContainerMetadata, Import, METADATA_SCHEMA_VERSION, ModelAsset, SubAsset,
     encode_container_metadata, read_container_metadata,
 };
-pub use names::{asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name};
+pub use names::{
+    asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name,
+    texture_role_from_name, texture_role_name,
+};
 pub use project::{
     LUARC_JSON, NewProject, PROJECT_VERSION, ProjectHost, ProjectInfo, ProjectSidecar,
     STARTER_SCRIPT, app_data_root, create_project_script, default_display_name,
@@ -88,7 +91,9 @@ pub use render_scene::{
     RendererScene, SceneRenderer, SceneSurfaceHit, model_render_aabb, pick_entity,
     pick_scene_surface, render_scene, scene_render_aabb, viewport_ray,
 };
-pub use scan::detect_material_role;
+pub use scan::{
+    colorspace_for_role_explicit, detect_material_role, infer_texture_role, texture_role_from_hint,
+};
 pub use spawn::{ModelSpawnInput, imported_nodes_from_json, imported_skin_from_json, spawn_model};
 pub use thumbnail::{
     THUMBNAIL_CACHE_VERSION, ThumbnailCacheStats, ThumbnailContent, ThumbnailGpu, ThumbnailJob,
@@ -111,6 +116,80 @@ pub const DEFAULT_MATERIAL_ID: Uuid = Uuid(1);
 /// into the GPU mesh cache (not the catalog), so the preview floor renders without a
 /// catalog row that would serialize.
 pub const PREVIEW_FLOOR_MESH_ID: Uuid = Uuid(2);
+
+/// The built-in cube primitive's mesh id, in the reserved (`< 1024`) range.
+pub const BUILTIN_CUBE_MESH_ID: Uuid = Uuid(3);
+/// The built-in plane primitive's mesh id, in the reserved (`< 1024`) range.
+pub const BUILTIN_PLANE_MESH_ID: Uuid = Uuid(4);
+/// The built-in sphere primitive's mesh id, in the reserved (`< 1024`) range.
+pub const BUILTIN_SPHERE_MESH_ID: Uuid = Uuid(5);
+
+/// The reserved (`< 1024`) id of the ephemeral single-slot material the texture preview seeds
+/// into `material_by_uuid` to shade the preview sphere. Never a catalog row: it exists only
+/// while a standalone texture is open in the interactive preview and is rebuilt on each enter.
+pub const PREVIEW_MATERIAL_ID: Uuid = Uuid(6);
+
+/// The densely-subdivided sphere the interactive material/texture preview shades on, in the
+/// reserved (`< 1024`) range. Its high tessellation lets a displacement-enabled `.smat` move real
+/// vertices under vertex-shader displacement (a true silhouette). Seeded into the GPU mesh cache on
+/// demand — never a catalog row, and not a spawnable primitive.
+pub const PREVIEW_DISPLACE_SPHERE_MESH_ID: Uuid = Uuid(7);
+
+/// A native built-in primitive mesh — geometry the engine generates itself, referenced by
+/// a reserved id and seeded into the GPU cache on demand. Never a catalog asset: a
+/// primitive entity carries the reserved id, which serializes as a stable decimal string
+/// and resolves cache-first (see [`AssetServer::load_mesh_asset`]), so it needs no project
+/// and pollutes no catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinMesh {
+    /// A unit cube (edge 1, `±0.5`).
+    Cube,
+    /// A unit plane on XZ (`1×1`, facing +Y).
+    Plane,
+    /// A unit UV sphere (radius 1).
+    Sphere,
+}
+
+impl BuiltinMesh {
+    /// The reserved mesh id a [`saffron_scene::Mesh`] component carries to reference this
+    /// primitive.
+    pub fn reserved_id(self) -> Uuid {
+        match self {
+            BuiltinMesh::Cube => BUILTIN_CUBE_MESH_ID,
+            BuiltinMesh::Plane => BUILTIN_PLANE_MESH_ID,
+            BuiltinMesh::Sphere => BUILTIN_SPHERE_MESH_ID,
+        }
+    }
+
+    /// The primitive for a reserved id, or `None` for any non-built-in id. The single
+    /// `< 1024` → primitive decoder used across the engine.
+    pub fn from_reserved_id(id: Uuid) -> Option<Self> {
+        match id {
+            BUILTIN_CUBE_MESH_ID => Some(BuiltinMesh::Cube),
+            BUILTIN_PLANE_MESH_ID => Some(BuiltinMesh::Plane),
+            BUILTIN_SPHERE_MESH_ID => Some(BuiltinMesh::Sphere),
+            _ => None,
+        }
+    }
+
+    /// The human label shown in the Inspector's built-in picker group.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            BuiltinMesh::Cube => "Cube",
+            BuiltinMesh::Plane => "Plane",
+            BuiltinMesh::Sphere => "Sphere",
+        }
+    }
+
+    /// The generated CPU geometry (position / normal / uv0, one submesh).
+    pub fn geometry(self) -> saffron_geometry::Mesh {
+        match self {
+            BuiltinMesh::Cube => saffron_geometry::cube(),
+            BuiltinMesh::Plane => saffron_geometry::plane(),
+            BuiltinMesh::Sphere => saffron_geometry::uv_sphere(),
+        }
+    }
+}
 
 /// A renderer-internal mesh visual (the editor-camera gizmo): an attempted-once
 /// shared mesh plus its resolved submesh material table. Held by [`AssetServer`],
@@ -288,7 +367,27 @@ mod tests {
     fn reserved_sentinels_are_in_the_reserved_range() {
         assert!(DEFAULT_MATERIAL_ID.value() < 1024);
         assert!(PREVIEW_FLOOR_MESH_ID.value() < 1024);
+        assert!(PREVIEW_MATERIAL_ID.value() < 1024);
+        assert!(PREVIEW_DISPLACE_SPHERE_MESH_ID.value() < 1024);
         assert_ne!(DEFAULT_MATERIAL_ID, PREVIEW_FLOOR_MESH_ID);
+        assert_ne!(PREVIEW_MATERIAL_ID, DEFAULT_MATERIAL_ID);
+        assert_ne!(PREVIEW_DISPLACE_SPHERE_MESH_ID, PREVIEW_MATERIAL_ID);
+        for builtin in [BuiltinMesh::Cube, BuiltinMesh::Plane, BuiltinMesh::Sphere] {
+            let id = builtin.reserved_id();
+            assert!(id.value() < 1024);
+            assert_ne!(id, DEFAULT_MATERIAL_ID);
+            assert_ne!(id, PREVIEW_FLOOR_MESH_ID);
+            assert_ne!(id, PREVIEW_MATERIAL_ID);
+            assert_ne!(id, PREVIEW_DISPLACE_SPHERE_MESH_ID);
+            assert_eq!(BuiltinMesh::from_reserved_id(id), Some(builtin));
+        }
+        // The dense preview sphere is a reserved mesh but not a spawnable `BuiltinMesh`.
+        assert_eq!(
+            BuiltinMesh::from_reserved_id(PREVIEW_DISPLACE_SPHERE_MESH_ID),
+            None
+        );
+        assert_eq!(BuiltinMesh::from_reserved_id(DEFAULT_MATERIAL_ID), None);
+        assert_eq!(BuiltinMesh::from_reserved_id(Uuid(4096)), None);
     }
 
     #[test]
