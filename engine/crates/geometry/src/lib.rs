@@ -26,6 +26,7 @@ mod gltf_import;
 mod image_decode;
 mod obj_import;
 mod picking;
+mod primitives;
 mod sanim;
 mod sdf;
 mod smesh;
@@ -44,6 +45,7 @@ pub use picking::{
     MeshBvh, closest_point_on_triangle, generate_normals, ray_aabb_slab, ray_triangle,
     world_aabb_from_corners,
 };
+pub use primitives::{cube, plane, preview_displacement_sphere, uv_sphere};
 pub use sanim::{
     ANIM_FORMAT_VERSION, load_animation, load_animation_from_bytes, save_animation,
     save_animation_to_buffer,
