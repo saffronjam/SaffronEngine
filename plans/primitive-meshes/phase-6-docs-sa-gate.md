@@ -1,6 +1,11 @@
 # Docs, sa scriptability, and the verification gate
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. Docs: `docs/content/explanations/geometry-and-assets/built-in-primitives.md`
++ the hub `_index.md` row. `sa`: primitives are scriptable via the extended `add-entity` preset
+(protocol regenerated — `sa.generated.luau` updated). e2e: `tests/e2e/primitives.test.ts` asserts the
+reserved-id `Mesh` + `MaterialSet`, no catalog rows, and save/reload round-trip. The host-independent
+gate is green; the e2e / control-schema / present-only smoke are host-dependent and unrunnable in the
+dev sandbox (they validate in CI — see the README status note).
 **Scope:** `docs/`, `saffron-control`/`sa`, `tests/e2e`
 **Depends on:** phase-3..phase-5
 

@@ -1,6 +1,13 @@
 # Thumbnails + "View" tab for built-in primitives
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (View) / DEFERRED (rendered thumbnail). `enter-asset-preview`
+(`commands_asset.rs`) gained an `enter_builtin_preview` branch: a reserved id builds an isolated scene
+with the primitive entity + default material, reuses `furnish_preview_scene`, and frames the shared
+`AssetPreview` view — a primitive is "View"-able via the control plane. **`get-thumbnail` for built-ins
+is intentionally deferred:** the Inspector picker shows native primitive icons (the accepted
+static-icon approach), so there is no consumer today, and a correct per-shape thumbnail needs the
+primitive-geometry thumbnail renderer that the sibling `texture-material-previews` plan builds — adding
+it now would be an unused path. Picked up there.
 **Scope:** `saffron-control`, `saffron-assets`, `saffron-rendering`
 **Depends on:** phase-2 (CPU mesh reachable), phase-3 (native spawn)
 
