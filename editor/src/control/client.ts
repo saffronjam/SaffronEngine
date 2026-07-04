@@ -41,7 +41,6 @@ import type {
   ListClipsResult,
   ClipBindingsResult,
   MorphWeightsResult,
-  Material,
   PerfConfigDto,
   PlayStateResult,
   ProfilerModeResult,
@@ -227,25 +226,6 @@ export const client = {
   setTransform(id: string, partial: Partial<Transform>, smooth?: boolean): Promise<unknown> {
     return call("set-transform", { entity: id, ...partial, ...(smooth ? { smooth: true } : {}) });
   },
-  /// Material merge helper (server-side merge over the current material, like
-  /// set-transform). `albedoTexture` is a string uuid the engine coerces to u64.
-  /// `smooth` makes the engine animate numeric fields toward the values (~25ms)
-  /// instead of snapping — sent only mid-drag; the release send omits it.
-  /// `slot` targets one entry of the entity's MaterialSetComponent instead of its
-  /// MaterialComponent (direct write; numeric fields are not animated per slot).
-  setMaterial(
-    id: string,
-    partial: Partial<Material>,
-    smooth?: boolean,
-    slot?: number,
-  ): Promise<unknown> {
-    return call("set-material", {
-      entity: id,
-      ...partial,
-      ...(slot === undefined ? {} : { slot }),
-      ...(smooth ? { smooth: true } : {}),
-    });
-  },
   addComponent(id: string, component: string): Promise<unknown> {
     return call("add-component", { entity: id, component });
   },
@@ -258,13 +238,24 @@ export const client = {
   setComponentOrder(id: string, components: string[]): Promise<unknown> {
     return call("set-component-order", { entity: id, components });
   },
+  /// Merge one field of a component (read-modify-write, server-side). `index` addresses one
+  /// element of an array field (e.g. a `MaterialSet` slot): an object `value` merges its keys
+  /// into that element, so `{component:"MaterialSet", field:"slots", index, value:{...}}`
+  /// edits a single slot. Auto-adds the component (with defaults) if the entity lacks it.
   setComponentField(
     id: string,
     component: string,
     field: string,
     value: unknown,
+    index?: number,
   ): Promise<unknown> {
-    return call("set-component-field", { entity: id, component, field, value });
+    return call("set-component-field", {
+      entity: id,
+      component,
+      field,
+      value,
+      ...(index === undefined ? {} : { index }),
+    });
   },
   /// Re-fit an entity's Collider shape to its mesh AABB (the substitute for interactive
   /// collider-resize handles); bumps sceneVersion engine-side so the inspector re-reads.
@@ -570,7 +561,8 @@ export const client = {
   ): Promise<unknown> {
     return call("material-update", { material, ...patch });
   },
-  /// Assign a material asset to an entity (its MaterialAssetComponent; "0" clears).
+  /// Point every `MaterialSet` slot of an entity at a `.smat` material asset ("0" clears to
+  /// the built-in default).
   materialAssign(entity: string, material: string): Promise<unknown> {
     return call("material-assign", { entity, material });
   },

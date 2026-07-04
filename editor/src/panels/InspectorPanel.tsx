@@ -7,8 +7,9 @@
 ///
 /// Writes are read-modify-write: `set-component` rewrites the whole component (no
 /// merge), so a single field edit sends the full DTO with that one field patched.
-/// Transform/Material use the server-merge helpers instead; uuid fields use the
-/// single-field merge. High-frequency edits (scrub/slider) funnel through a per-
+/// `Transform` uses the server-merge helper; uuid fields and `MaterialSet` slot edits use
+/// `set-component-field` (the latter with the slot index, merging into one slot's
+/// reference/overrides). High-frequency edits (scrub/slider) funnel through a per-
 /// (component,field) coalescer; the scrub brackets flip `store.dragActive` so the
 /// reconcile poll won't clobber the optimistic value mid-drag.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -24,7 +25,7 @@ import { SliderField } from "../components/SliderField";
 import { BoneMaskField } from "../components/BoneMaskField";
 import { FootChainsEditor, type FootChain } from "../components/FootChainsEditor";
 import { BonePhysicsEditor, type BonePhysicsEntry } from "../components/BonePhysicsEditor";
-import type { Material, ScriptSlot, Transform } from "../protocol";
+import type { ScriptSlot, Transform } from "../protocol";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { humanizeComponentName, humanizeFieldName } from "@/lib/humanize";
@@ -66,6 +67,44 @@ const NON_ADDABLE = new Set<string>([
   "SkinnedMesh",
   "Morph",
 ]);
+
+/// The exposed PBR parameters a `MaterialSet` slot can override, with their engine
+/// defaults (colours/vectors are arrays, matching the `.smat` + override wire shape). Each
+/// renders via the `Material.<field>` hint. Overrides are opt-in and sparse: a slot's
+/// `overrides` map holds only the keys the user added (via the "+ Override" menu), and only
+/// those render as rows — every other parameter inherits the referenced material silently.
+/// `uvTiling`/`uvOffset` are intentionally omitted (no 2-vector widget, rarely tweaked per
+/// object). This list is both the "+ Override" menu order and the overridden-row order.
+const MATERIAL_PARAMS: readonly { field: string; default: unknown }[] = [
+  { field: "baseColor", default: [1, 1, 1, 1] },
+  { field: "albedoTexture", default: "0" },
+  { field: "metallic", default: 0 },
+  { field: "roughness", default: 1 },
+  { field: "ormTexture", default: "0" },
+  { field: "normalTexture", default: "0" },
+  { field: "normalStrength", default: 1 },
+  { field: "emissive", default: [0, 0, 0] },
+  { field: "emissiveStrength", default: 1 },
+  { field: "emissiveTexture", default: "0" },
+  { field: "heightTexture", default: "0" },
+  { field: "heightScale", default: 0.05 },
+  { field: "blend", default: "opaque" },
+  { field: "alphaCutoff", default: 0.5 },
+  { field: "unlit", default: false },
+  { field: "doubleSided", default: false },
+];
+
+/// The vector axes a colour/vector field kind maps to, or `null` for a scalar/other kind —
+/// the override editor converts the array wire form ↔ the `{x,y,…}` widget shape across it.
+function vectorAxes(kind: string): readonly string[] | null {
+  if (kind === "color4" || kind === "vec4") {
+    return ["x", "y", "z", "w"];
+  }
+  if (kind === "color3" || kind === "vec3") {
+    return ["x", "y", "z"];
+  }
+  return null;
+}
 
 /// The Add Component list, in known order, minus the non-addable set.
 const ADDABLE_COMPONENTS = COMPONENT_ORDER.filter((c) => !NON_ADDABLE.has(c));
@@ -109,6 +148,7 @@ export function InspectorPanel() {
   const inspected = useEditorStore((s) => s.componentsBySelected);
   const selectionVersion = useEditorStore((s) => s.selectionVersion);
   const applyOptimisticComponent = useEditorStore((s) => s.applyOptimisticComponent);
+  const openMaterialGraphTab = useEditorStore((s) => s.openMaterialGraphTab);
   const focusComponent = useEditorStore((s) => s.focusComponent);
   const setFocusComponent = useEditorStore((s) => s.setFocusComponent);
   // Catalog + entity list, used to resolve the read-only id references in the rig bodies
@@ -329,9 +369,6 @@ export function InspectorPanel() {
     }
     if (component === "Transform") {
       return client.setTransform(id, { [field]: dto[field] } as Partial<Transform>, smooth);
-    }
-    if (component === "Material") {
-      return client.setMaterial(id, { [field]: dto[field] } as Partial<Material>, smooth);
     }
     return client.setComponent(id, component, dto);
   };
@@ -589,8 +626,10 @@ export function InspectorPanel() {
     }
   };
 
-  // MaterialSet slots: edits route through the slot-aware set-material command rather
-  // than the generic field machinery (the field lives at slots[i].field, not top-level).
+  // MaterialSet slots: edits route through set-component-field with the slot index (which
+  // merges the pushed slot object into slots[slotIndex]), not the generic top-level field
+  // machinery — the field lives at slots[i].field, and the registry deserializer reads every
+  // slot field so all of them round-trip (no per-field allow-list to drift).
   const slotCoalescerFor = (slotIndex: number, field: string): Coalescer<object> => {
     const key = `MaterialSet#${slotIndex}.${field}`;
     let c = coalescers.current.get(key);
@@ -601,14 +640,7 @@ export function InspectorPanel() {
           if (!id) {
             return Promise.resolve();
           }
-          const slotDto = latest as Record<string, unknown>;
-          const smooth = useEditorStore.getState().dragActive;
-          return client.setMaterial(
-            id,
-            { [field]: slotDto[field] } as Partial<Material>,
-            smooth,
-            slotIndex,
-          );
+          return client.setComponentField(id, "MaterialSet", "slots", latest, slotIndex);
         },
       });
       coalescers.current.set(key, c);
@@ -616,7 +648,7 @@ export function InspectorPanel() {
     return c;
   };
 
-  // Record one scene-tab undo entry for a MaterialSet slot edit (set-material with the
+  // Record one scene-tab undo entry for a MaterialSet slot edit (set-component-field with the
   // slot index), replayed against the captured entity id.
   const recordSlotEdit = (
     id: string,
@@ -629,7 +661,7 @@ export function InspectorPanel() {
       return;
     }
     const apply = (slot: Record<string, unknown>): Promise<unknown> =>
-      client.setMaterial(id, { [field]: slot[field] } as Partial<Material>, false, slotIndex);
+      client.setComponentField(id, "MaterialSet", "slots", { [field]: slot[field] }, slotIndex);
     pushEdit(
       {
         label: humanizeFieldName(field),
@@ -686,6 +718,25 @@ export function InspectorPanel() {
     if (gesture && gesture.slotIndex === slotIndex && gesture.field === field && slot) {
       recordSlotEdit(gesture.id, slotIndex, field, gesture.prior, structuredClone(slot));
     }
+  };
+
+  // Write one exposed-parameter override onto a slot: merge it into the slot's `overrides`
+  // map and push the whole map as the slot's `overrides` field (set-component-field merges
+  // it into slots[i]). The referenced material's own value shows through for any key absent.
+  const setSlotOverride = (slotIndex: number, field: string, value: unknown): void => {
+    const set = (componentsObj["MaterialSet"] ?? {}) as { slots?: Record<string, unknown>[] };
+    const prior = (set.slots?.[slotIndex]?.overrides as Record<string, unknown> | undefined) ?? {};
+    onSlotFieldChange(slotIndex, "overrides", { ...prior, [field]: value });
+  };
+
+  // Clear one override (revert the parameter to the referenced material's value).
+  const clearSlotOverride = (slotIndex: number, field: string): void => {
+    const set = (componentsObj["MaterialSet"] ?? {}) as { slots?: Record<string, unknown>[] };
+    const next = {
+      ...((set.slots?.[slotIndex]?.overrides as Record<string, unknown> | undefined) ?? {}),
+    };
+    delete next[field];
+    onSlotFieldChange(slotIndex, "overrides", next);
   };
 
   // Add/remove a component records its inverse only after the engine accepts it (a
@@ -800,34 +851,116 @@ export function InspectorPanel() {
       const slots = (dto.slots as Record<string, unknown>[] | undefined) ?? [];
       return (
         <>
-          {slots.map((slot, slotIndex) => (
-            <div key={slotIndex} className="rounded border border-border/60">
-              <div className="border-b border-border/60 bg-muted/30 px-2 py-1 text-[11px] font-medium text-muted-foreground">
-                Slot {slotIndex}
-              </div>
-              <div className="flex flex-col gap-1.5 px-2 py-1.5">
-                {Object.entries(slot).map(([field, value]) => (
-                  <div key={field} className="grid grid-cols-[78px_1fr] items-center gap-1.5">
+          {slots.map((slot, slotIndex) => {
+            const overrides = (slot.overrides as Record<string, unknown> | undefined) ?? {};
+            return (
+              <div key={slotIndex} className="rounded border border-border/60">
+                <div className="border-b border-border/60 bg-muted/30 px-2 py-1 text-[11px] font-medium text-muted-foreground">
+                  Slot {slotIndex}
+                </div>
+                <div className="flex flex-col gap-1.5 px-2 py-1.5">
+                  {/* The referenced .smat material this slot binds to. */}
+                  <div className="grid grid-cols-[78px_1fr_20px] items-center gap-1.5">
                     <Label className="truncate text-[11px] font-normal text-muted-foreground">
-                      {humanizeFieldName(field)}
+                      Material
                     </Label>
                     <div className="min-w-0">
                       {renderField(
-                        "Material",
-                        field,
-                        value,
-                        (next) => onSlotFieldChange(slotIndex, field, next),
-                        {
-                          onDragStart: () => onSlotFieldDragStart(slotIndex, field),
-                          onDragEnd: () => onSlotFieldDragEnd(slotIndex, field),
-                        },
+                        "MaterialSlot",
+                        "material",
+                        slot.material ?? "0",
+                        (next) => onSlotFieldChange(slotIndex, "material", next),
+                        { onDragStart: () => {}, onDragEnd: () => {} },
                       )}
                     </div>
+                    {typeof slot.material === "string" && slot.material !== "0" ? (
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="ghost"
+                        className="h-5 w-5 p-0 text-muted-foreground"
+                        aria-label="Edit material"
+                        onClick={() => openMaterialGraphTab(slot.material as string)}
+                      >
+                        ✎
+                      </Button>
+                    ) : (
+                      <span />
+                    )}
                   </div>
-                ))}
+                  {/* Only the parameters this object overrides — a sparse list. Each shows its
+                      widget layered over the referenced material's value; ✕ removes the override
+                      (reverting to the material's value). Everything not listed inherits. */}
+                  {MATERIAL_PARAMS.filter((p) => p.field in overrides).map(
+                    ({ field, default: def }) => {
+                      const hint = resolveHint("Material", field, def);
+                      const axes = vectorAxes(hint.kind);
+                      const raw = overrides[field];
+                      const widgetValue =
+                        axes && Array.isArray(raw)
+                          ? Object.fromEntries(axes.map((a, i) => [a, (raw as number[])[i] ?? 0]))
+                          : raw;
+                      const onChange = (next: unknown): void => {
+                        const stored =
+                          axes && next && typeof next === "object" && !Array.isArray(next)
+                            ? axes.map((a) => (next as Record<string, number>)[a] ?? 0)
+                            : next;
+                        setSlotOverride(slotIndex, field, stored);
+                      };
+                      return (
+                        <div
+                          key={field}
+                          className="grid grid-cols-[78px_1fr_20px] items-center gap-1.5"
+                        >
+                          <Label className="truncate text-[11px] font-normal text-foreground">
+                            {humanizeFieldName(field)}
+                          </Label>
+                          <div className="min-w-0">
+                            {renderField("Material", field, widgetValue, onChange, {
+                              onDragStart: () => onSlotFieldDragStart(slotIndex, "overrides"),
+                              onDragEnd: () => onSlotFieldDragEnd(slotIndex, "overrides"),
+                            })}
+                          </div>
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant="ghost"
+                            className="h-5 w-5 p-0 text-muted-foreground"
+                            aria-label={`Remove ${humanizeFieldName(field)} override`}
+                            onClick={() => clearSlotOverride(slotIndex, field)}
+                          >
+                            ✕
+                          </Button>
+                        </div>
+                      );
+                    },
+                  )}
+                  {/* Opt-in: overrides are sparse, so a parameter only appears once added here. */}
+                  {MATERIAL_PARAMS.some((p) => !(p.field in overrides)) ? (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button type="button" size="sm" variant="outline" className="self-center">
+                          + Override
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start" className="max-h-64 overflow-y-auto">
+                        {MATERIAL_PARAMS.filter((p) => !(p.field in overrides)).map(
+                          ({ field, default: def }) => (
+                            <DropdownMenuItem
+                              key={field}
+                              onSelect={() => setSlotOverride(slotIndex, field, def)}
+                            >
+                              {humanizeFieldName(field)}
+                            </DropdownMenuItem>
+                          ),
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  ) : null}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </>
       );
     }

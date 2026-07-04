@@ -87,10 +87,12 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Camera.showFrustum": { kind: "bool" },
   "Camera.frustumMaxDistance": { kind: "number", min: 0, step: 0.5 },
 
+  // A `MaterialSet` slot: the referenced `.smat` material, then per-parameter overrides
+  // keyed under the `Material.` namespace (the exposed PBR parameter set).
+  "MaterialSlot.material": { kind: "uuid", asset: "material" },
   "Material.baseColor": { kind: "color4" },
   "Material.albedoTexture": { kind: "uuid", asset: "texture" },
-  "Material.metallicRoughnessTexture": { kind: "uuid", asset: "texture" },
-  "Material.occlusionTexture": { kind: "uuid", asset: "texture" },
+  "Material.ormTexture": { kind: "uuid", asset: "texture" },
   "Material.normalTexture": { kind: "uuid", asset: "texture" },
   "Material.emissiveTexture": { kind: "uuid", asset: "texture" },
   "Material.heightTexture": { kind: "uuid", asset: "texture" },
@@ -110,6 +112,7 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   },
   "Material.alphaCutoff": { kind: "slider", min: 0, max: 1, step: 0.01 },
   "Material.unlit": { kind: "bool" },
+  "Material.doubleSided": { kind: "bool" },
 
   "DirectionalLight.direction": { kind: "vec3", step: 0.01 },
   "DirectionalLight.color": { kind: "color3" },
