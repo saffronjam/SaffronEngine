@@ -49,7 +49,7 @@ saffron-log = { path = "../../engine/crates/log" }
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 gdk = "0.18"
-glib = "0.18"
+glib = "0.20"
 webkit2gtk = "2.0"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
