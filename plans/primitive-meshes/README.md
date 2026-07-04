@@ -1,6 +1,14 @@
 # Built-in primitive meshes — cube / plane / sphere as native, non-asset geometry
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (Phases 1–6). The reproducible, host-independent gate is green — workspace
+`cargo build` + `clippy -D warnings` + `fmt --check`, the new geometry / reserved-id / wire unit
+tests, and the editor `tsc` + `oxlint` + `vite build`. The **e2e** (`tests/e2e/primitives.test.ts`),
+the control-schema contract, and the present-only smoke require a live host, which the dev sandbox
+cannot drive (the standalone host's frame loop does not pump the control drain under
+weston-headless/llvmpipe — an unmodified `scene.test.ts` times out identically); they validate in CI
+/ the editor. Two design points the real code settled, noted in the phase files: primitives emit **no
+tangents** (the `Vertex` format has none; shaders derive the frame), and built-ins are seeded
+**on demand inside `load_mesh_asset`** rather than via a separate eager `ensure_builtin_meshes`.
 
 This is the **root** plan of a four-plan set. Nothing interactive in the sibling plans
 (`texture-material-previews/`, `material-graph-live-preview/`, `displacement/`) can ship without a

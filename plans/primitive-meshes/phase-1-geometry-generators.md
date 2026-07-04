@@ -1,6 +1,11 @@
 # Geometry generators: cube / plane / uv_sphere in saffron-geometry
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `geometry/src/primitives.rs` adds `cube`/`plane`/`uv_sphere` (exported from
+`geometry/src/lib.rs`); `thumbnail_render.rs` `make_preview_sphere` now calls `uv_sphere()`. Unit
+tests cover counts, unit normals, plane orientation, sphere on the unit sphere, and CCW-outward
+winding. **Tangent decision resolved:** the `Vertex` format has no tangent field (tangents are derived
+per-fragment), so the generators emit position/normal/uv0 only, matching importer meshes — there is no
+tangent to author or derive at generation time.
 **Scope:** `saffron-geometry`, `saffron-rendering`
 **Depends on:** — (nothing)
 

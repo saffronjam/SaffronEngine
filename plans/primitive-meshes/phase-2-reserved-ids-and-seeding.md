@@ -1,6 +1,12 @@
 # Reserved ids + GPU cache seeding for built-in meshes
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `assets/src/lib.rs` adds `BUILTIN_{CUBE,PLANE,SPHERE}_MESH_ID` (3/4/5) +
+`BuiltinMesh` (`reserved_id`/`from_reserved_id`/`display_name`/`geometry`). **Refinement:** instead of a
+separate eager `ensure_builtin_meshes`, `load_mesh_asset` (`assets/src/load.rs`) resolves a reserved
+built-in id **on demand** via `seed_builtin_mesh` (generate → upload → cache, no SDF, no catalog) — a
+single resolution path that re-seeds automatically after a project-load cache clear. The CPU-mesh
+concern is moot: `GpuMesh` already carries `cpu_positions`/`cpu_indices`, so `mesh_pick_bvh` works for
+built-ins with no extra plumbing. Reserved-id assertions extended in the `reserved_sentinels` test.
 **Scope:** `saffron-assets`
 **Depends on:** phase-1 (the generators)
 
