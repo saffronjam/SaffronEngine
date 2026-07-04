@@ -60,6 +60,20 @@ SurfaceData evalSurface(MaterialInput m)
         mapN.xy *= mat.pbr.z;  // normalStrength
         n = normalize(mul(mapN, tbn));
     }
+    else if ((features & FEATURE_DISPLACE) != 0u)
+    {
+        // The vertices are already displaced (vertex stage); derive the fine shading normal from the
+        // height gradient in the tangent frame so lighting matches the displaced microsurface (a
+        // height-to-normal bump — the per-vertex silhouette plus per-pixel normal detail).
+        const float eps = 1.0 / 512.0;
+        uint hi = mat.tex1.x;
+        float h0 = albedoTextures[NonUniformResourceIndex(hi)].SampleLevel(uv, 0.0).r;
+        float hu = albedoTextures[NonUniformResourceIndex(hi)].SampleLevel(uv + float2(eps, 0.0), 0.0).r;
+        float hv = albedoTextures[NonUniformResourceIndex(hi)].SampleLevel(uv + float2(0.0, eps), 0.0).r;
+        float2 grad = float2(hu - h0, hv - h0) / eps * mat.emissive.w;  // heightScale = emissive.w
+        float3 bumpN = normalize(float3(-grad, 1.0));
+        n = normalize(mul(bumpN, tbn));
+    }
     s.normal = n;
 
     // Emissive: factor radiance, modulated by the emissive map when present.

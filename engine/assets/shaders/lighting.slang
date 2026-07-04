@@ -324,6 +324,11 @@ float3 fresnelSchlickRoughness(float cosT, float3 F0, float roughness)
     return F0 + (max(float3(1.0 - roughness), F0) - F0) * pow(1.0 - cosT, 5.0);
 }
 
+// Displacement lives entirely in the `displace` compute pre-pass now: it bakes each displacement
+// material's height offset into the shared deformed vertex buffer, which every geometry pass (this
+// vertex shader included) reads as an ordinary static stream — so a displaced instance is already
+// displaced by the time it reaches here, consistently across the main view, depth, and every shadow
+// map, and the buffer can back an RT BLAS. The vertex shader therefore does no displacement itself.
 public VertexOutput transformVertex(VertexInput input, uint instanceIndex)
 {
     Instance inst = instances[instanceIndex];
@@ -501,6 +506,11 @@ public static const uint FEATURE_EMISSIVE_TEX = 2u;
 public static const uint FEATURE_OCCLUSION = 4u;
 public static const uint FEATURE_HEIGHT = 8u;
 public static const uint FEATURE_ALPHACLIP = 16u;
+// The height map drives real geometry displacement (a `displace` compute pre-pass bakes it into the
+// deformed vertex buffer — true silhouette, consistent across every pass, BLAS-able) rather than the
+// fragment parallax march. The fragment still reads it for a height-gradient shading normal. Mutually
+// exclusive with FEATURE_HEIGHT (the material sets one or neither).
+public static const uint FEATURE_DISPLACE = 32u;
 
 // Per-fragment tangent frame from screen-space derivatives (no stored tangents needed). Schüler's
 // method: solve for the tangent/bitangent that map the UV gradients onto the world-position gradients.

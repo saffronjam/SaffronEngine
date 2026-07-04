@@ -75,6 +75,9 @@ pub struct MaterialAsset {
     pub alpha_cutoff: f32,
     /// The parallax/displacement height-map scale.
     pub height_scale: f32,
+    /// Route the height map through **vertex-shader displacement** (real geometry, true silhouette)
+    /// instead of parallax-occlusion mapping. Needs a densely-tessellated mesh to read well.
+    pub displacement: bool,
     /// The UV tiling (scale) factor.
     pub uv_tiling: Vec2,
     /// The UV offset (translation).
@@ -121,6 +124,7 @@ impl Default for MaterialAsset {
             normal_strength: 1.0,
             alpha_cutoff: 0.5,
             height_scale: 0.05,
+            displacement: false,
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             albedo_texture: Uuid(0),
@@ -202,6 +206,7 @@ pub fn material_asset_to_json(material: &MaterialAsset) -> Value {
         "blend": material.blend,
         "unlit": material.unlit,
         "doubleSided": material.double_sided,
+        "displacement": material.displacement,
         "normalConvention": material.normal_convention,
         "factors": {
             "baseColor": [
@@ -245,6 +250,7 @@ pub fn material_asset_from_json(doc: &Value) -> MaterialAsset {
         blend: json_string_or(doc, "blend", "opaque".to_owned()),
         unlit: json_bool_or(doc, "unlit", false),
         double_sided: json_bool_or(doc, "doubleSided", false),
+        displacement: json_bool_or(doc, "displacement", false),
         normal_convention: json_string_or(doc, "normalConvention", "gl".to_owned()),
         ..MaterialAsset::default()
     };
@@ -663,6 +669,7 @@ mod tests {
             normal_strength: 0.75,
             alpha_cutoff: 0.33,
             height_scale: 0.125,
+            displacement: true,
             uv_tiling: Vec2::new(2.0, 3.0),
             uv_offset: Vec2::new(0.25, 0.5),
             albedo_texture: Uuid(1001),
@@ -745,7 +752,7 @@ mod tests {
         // `heightScale` (f32 `0.05`) carries its f64-promoted long decimal (an
         // exactly-representable value like `0.5` stays short).
         let expected = concat!(
-            r#"{"blend":"opaque","doubleSided":false,"#,
+            r#"{"blend":"opaque","displacement":false,"doubleSided":false,"#,
             r#""factors":{"alphaCutoff":0.5,"baseColor":[1.0,1.0,1.0,1.0],"#,
             r#""emissive":[0.0,0.0,0.0],"emissiveStrength":1.0,"#,
             r#""heightScale":0.05000000074505806,"#,

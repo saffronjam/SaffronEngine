@@ -37,7 +37,8 @@ pub struct SubmeshMaterial {
     pub occlusion_texture: Option<Arc<GpuTexture>>,
     /// Emissive map (modulates the emissive factor; sets `EMISSIVE_TEX`).
     pub emissive_texture: Option<Arc<GpuTexture>>,
-    /// Height / displacement map for parallax (sets the `HEIGHT` feature bit).
+    /// Height / displacement map (sets the `HEIGHT` feature bit for parallax, or `DISPLACE` when
+    /// [`SubmeshMaterial::displacement`] routes it through vertex-shader displacement instead).
     pub height_texture: Option<Arc<GpuTexture>>,
     /// Base color (RGBA), multiplied with the albedo texture.
     pub base_color: Vec4,
@@ -55,8 +56,13 @@ pub struct SubmeshMaterial {
     pub uv_tiling: Vec2,
     /// UV offset (added to the tiled UV).
     pub uv_offset: Vec2,
-    /// Parallax height scale.
+    /// Height scale — parallax march depth, or the world-space displacement amplitude when
+    /// [`SubmeshMaterial::displacement`] is set.
     pub height_scale: f32,
+    /// Route the height map through **vertex-shader displacement** (real geometry, true silhouette)
+    /// rather than parallax-occlusion mapping. Requires a densely-tessellated mesh to look right;
+    /// the interactive preview sphere is seeded dense for exactly this.
+    pub displacement: bool,
     /// Alpha/blend mode: opaque, masked (alpha-clip discard below [`SubmeshMaterial::alpha_cutoff`]),
     /// or translucent (routed to the sorted, blended translucent draw list).
     pub blend_mode: BlendMode,
@@ -87,6 +93,7 @@ impl SubmeshMaterial {
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             height_scale: 0.05,
+            displacement: false,
             blend_mode: BlendMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
@@ -208,6 +215,26 @@ pub struct SkinDispatch {
     pub deformed_offset: u32,
 }
 
+/// One displaced mesh-instance's compute work for the frame: the descriptor set wiring its base
+/// vertices (in) + the shared deformed buffer (out), plus the height-map index / amplitude / uv
+/// transform the `displace` kernel pushes. Built by [`crate::Instancing::submit_draw_list`] and
+/// replayed in the `displace` pass (which writes the same deformed buffer as skin/morph).
+#[derive(Clone, Copy)]
+pub struct DisplaceDispatch {
+    /// The per-dispatch descriptor set (base vertices in, deformed out).
+    pub set: vk::DescriptorSet,
+    /// The displaced mesh-instance's vertex count (one compute invocation each).
+    pub vertex_count: u32,
+    /// The base of this instance's vertices in the deformed output buffer.
+    pub deformed_offset: u32,
+    /// Bindless index of the height map (sampled from the shared set-0 albedo array).
+    pub height_index: u32,
+    /// Local-space displacement amplitude (`MaterialParams.emissive.w`).
+    pub height_scale: f32,
+    /// `tiling.xy, offset.xy` (`MaterialParams.uv`).
+    pub uv_transform: [f32; 4],
+}
+
 /// One morph mesh-instance's compute work for the frame: the descriptor set wiring its
 /// base + delta + range + active-target + accumulator + deformed-output buffers, plus the
 /// counts the `morph` kernel's three passes (clear/scatter/resolve) dispatch over. Built
@@ -275,6 +302,13 @@ pub struct SceneDrawList {
     /// The parallel prev-pose morph dispatches (prev weights → prev-deformed), read only
     /// by the motion pass. Wired in Phase 5; the field lands here so the shape is complete.
     pub prev_morph_dispatches: Vec<MorphDispatch>,
+    /// Per displaced mesh-instance: the compute work the `displace` pass dispatches (in the same
+    /// deform scope as skin/morph) to write the height-displaced base into the deformed buffer.
+    /// Empty when no displacement-enabled instances exist.
+    pub displace_dispatches: Vec<DisplaceDispatch>,
+    /// The parallel displace dispatches writing the prev-deformed buffer (identical displacement —
+    /// a zero deformation delta), read only by the motion pass. Empty when no displaced instances.
+    pub prev_displace_dispatches: Vec<DisplaceDispatch>,
     /// Per deforming instance (skin or morph): the entity + deformed offset the RT refit
     /// BLAS reads + the TLAS placement. Empty unless an RT consumer is armed.
     pub deformed_rt_instances: Vec<DeformedRtInstance>,
@@ -299,6 +333,8 @@ impl SceneDrawList {
             prev_skin_dispatches: self.prev_skin_dispatches.clone(),
             morph_dispatches: self.morph_dispatches.clone(),
             prev_morph_dispatches: self.prev_morph_dispatches.clone(),
+            displace_dispatches: self.displace_dispatches.clone(),
+            prev_displace_dispatches: self.prev_displace_dispatches.clone(),
             deformed_rt_instances: self.deformed_rt_instances.clone(),
             live_textures: Vec::new(),
             valid: self.valid,

@@ -107,6 +107,7 @@ pub fn build_submesh_material(
         uv_tiling: material.uv_tiling,
         uv_offset: material.uv_offset,
         height_scale: material.height_scale,
+        displacement: material.displacement,
         blend_mode: BlendMode::from_wire(&material.blend),
         alpha_cutoff: material.alpha_cutoff,
         double_sided: material.double_sided,
