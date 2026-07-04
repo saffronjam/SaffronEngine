@@ -276,8 +276,6 @@ async function paramsForFixture(
       };
     case "cube-transform":
       return { entity: state.cubeId, translation: { x: 1, y: 2, z: 3 } };
-    case "cube-material":
-      return { entity: state.cubeId, roughness: 0.45, metallic: 0.1 };
     case "temp-directional-light": {
       const light = await call("add-entity", { preset: "directional-light" });
       const id = firstResultId(light.raw);

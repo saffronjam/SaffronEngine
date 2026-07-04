@@ -1976,6 +1976,32 @@ pub struct MaterialGetResult {
     pub graph: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MaterialSchemaParams {
+    pub material: AssetSelector,
+}
+
+/// One exposed material parameter — its override key, type token, and default value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExposedParamDto {
+    pub name: String,
+    /// `scalar` | `color3` | `color4` | `vec2` | `bool` | `blend` | `texture`.
+    pub kind: String,
+    pub default: Value,
+}
+
+/// The exposed-parameter schema of a material — the keys a `MaterialSet` slot may override.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MaterialSchemaResult {
+    pub params: Vec<ExposedParamDto>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2290,48 +2316,6 @@ pub struct SetTransformParams {
     pub scale: Option<Vec3>,
     /// Animate the fields toward the given values over ~25ms instead of snapping
     /// (ignored when preserve-children must rebase the subtree on each write).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "coerce::opt_boolean"
-    )]
-    pub smooth: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct SetMaterialParams {
-    pub entity: EntitySelector,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_color: Option<Vec4>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub albedo_texture: Option<Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metallic_roughness_texture: Option<Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metallic: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roughness: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emissive: Option<Vec3>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emissive_strength: Option<f32>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "coerce::opt_boolean"
-    )]
-    pub unlit: Option<bool>,
-    /// The alpha/blend mode (glTF `alphaMode`): `opaque` | `masked` | `translucent`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blend: Option<String>,
-    /// Target a slot of the entity's MaterialSetComponent instead of its
-    /// MaterialComponent. Out of range is an error; ignored without a MaterialSet.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slot: Option<u32>,
-    /// Animate numeric fields toward the given values over ~25ms instead of
-    /// snapping; texture/unlit still apply immediately.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

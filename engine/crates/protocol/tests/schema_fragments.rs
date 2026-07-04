@@ -194,6 +194,9 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(MaterialListResult, "MaterialListResult");
     check!(MaterialGetParams, "MaterialGetParams");
     check!(MaterialGetResult, "MaterialGetResult");
+    check!(MaterialSchemaParams, "MaterialSchemaParams");
+    check!(ExposedParamDto, "ExposedParamDto");
+    check!(MaterialSchemaResult, "MaterialSchemaResult");
     check!(MaterialUpdateParams, "MaterialUpdateParams");
     check!(MaterialUpdateResult, "MaterialUpdateResult");
     check!(PreviewRenderParams, "PreviewRenderParams");
@@ -230,7 +233,6 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(SetComponentOrderParams, "SetComponentOrderParams");
     check!(SetComponentOrderResult, "SetComponentOrderResult");
     check!(SetTransformParams, "SetTransformParams");
-    check!(SetMaterialParams, "SetMaterialParams");
     check!(SetLightParams, "SetLightParams");
     check!(PickParams, "PickParams");
     check!(PickResult, "PickResult");

@@ -736,28 +736,6 @@ export interface Vec3 {
   z: number;
 }
 
-export interface SetMaterialParams {
-  entity: WireUuid | string | number;
-  baseColor?: Vec4;
-  albedoTexture?: WireUuid;
-  metallicRoughnessTexture?: WireUuid;
-  metallic?: number;
-  roughness?: number;
-  emissive?: Vec3;
-  emissiveStrength?: number;
-  unlit?: boolean;
-  blend?: string;
-  slot?: number;
-  smooth?: boolean;
-}
-
-export interface Vec4 {
-  x: number;
-  y: number;
-  z: number;
-  w: number;
-}
-
 export interface SetLightParams {
   entity?: WireUuid | string | number;
   direction?: Vec3;
@@ -1737,6 +1715,27 @@ export interface MaterialGetResult {
   graph: unknown;
 }
 
+export interface Vec4 {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+}
+
+export interface MaterialSchemaParams {
+  material: unknown;
+}
+
+export interface MaterialSchemaResult {
+  params: ExposedParamDto[];
+}
+
+export interface ExposedParamDto {
+  name: string;
+  kind: string;
+  default: unknown;
+}
+
 export interface MaterialUpdateParams {
   material: WireUuid | string | number;
   baseColor?: Vec4;
@@ -1919,7 +1918,6 @@ export interface CommandParamsMap {
   "set-component": SetComponentParams;
   "set-component-order": SetComponentOrderParams;
   "set-transform": SetTransformParams;
-  "set-material": SetMaterialParams;
   "set-light": SetLightParams;
   "select": EntityParams;
   "pick": PickParams;
@@ -2024,6 +2022,7 @@ export interface CommandParamsMap {
   "material-import": MaterialImportParams;
   "material-list": EmptyParams;
   "material-get": MaterialGetParams;
+  "material-schema": MaterialSchemaParams;
   "material-update": MaterialUpdateParams;
   "preview-render": PreviewRenderParams;
   "material-set-graph": MaterialSetGraphParams;
@@ -2093,7 +2092,6 @@ export interface CommandResultMap {
   "set-component": SetComponentResult;
   "set-component-order": SetComponentOrderResult;
   "set-transform": EntityRef;
-  "set-material": EntityRef;
   "set-light": EntityRef;
   "select": EntityRef;
   "pick": PickResult;
@@ -2198,6 +2196,7 @@ export interface CommandResultMap {
   "material-import": MaterialImportResultDto;
   "material-list": MaterialListResult;
   "material-get": MaterialGetResult;
+  "material-schema": MaterialSchemaResult;
   "material-update": MaterialUpdateResult;
   "preview-render": PreviewRenderResult;
   "material-set-graph": MaterialSetGraphResult;

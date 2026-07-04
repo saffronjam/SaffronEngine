@@ -78,7 +78,6 @@ pub const SELECTOR_FIELDS: &[(&str, &str)] = &[
     ("SetComponentParams", "entity"),
     ("SetComponentOrderParams", "entity"),
     ("SetTransformParams", "entity"),
-    ("SetMaterialParams", "entity"),
     ("SetLightParams", "entity"),
     ("GetAssetModelParams", "asset"),
     ("EnterAssetPreviewParams", "asset"),
@@ -261,7 +260,6 @@ fn strip_null(type_value: &Value) -> Value {
 #[must_use]
 pub fn component_schemas() -> Map<String, Value> {
     let vec3 = json!({ "$ref": "#/components/schemas/Vec3" });
-    let vec4 = json!({ "$ref": "#/components/schemas/Vec4" });
     let uuid = json!({ "type": "string" });
     let bvec3 = json!({
         "type": "object",
@@ -318,42 +316,24 @@ pub fn component_schemas() -> Map<String, Value> {
         }),
     );
     schemas.insert(
-        "Material".into(),
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "baseColor": vec4,
-                "albedoTexture": uuid,
-                "metallicRoughnessTexture": uuid,
-                "metallic": { "type": "number" },
-                "roughness": { "type": "number" },
-                "emissive": vec3,
-                "emissiveStrength": { "type": "number" },
-                "unlit": { "type": "boolean" },
-                "normalTexture": uuid,
-                "occlusionTexture": uuid,
-                "emissiveTexture": uuid,
-                "heightTexture": uuid,
-                "normalStrength": { "type": "number" },
-                "heightScale": { "type": "number" },
-                "blend": { "type": "string", "enum": ["opaque", "masked", "translucent"] },
-                "alphaCutoff": { "type": "number" },
-            },
-            "required": [
-                "baseColor", "albedoTexture", "metallicRoughnessTexture", "metallic", "roughness",
-                "emissive", "emissiveStrength", "unlit", "normalTexture", "occlusionTexture",
-                "emissiveTexture", "heightTexture", "normalStrength", "heightScale", "blend",
-                "alphaCutoff",
-            ],
-        }),
-    );
-    schemas.insert(
         "MaterialSet".into(),
         json!({
             "type": "object",
             "additionalProperties": false,
-            "properties": { "slots": { "type": "array", "items": { "$ref": "#/components/schemas/Material" } } },
+            "properties": {
+                "slots": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "material": { "type": "string" },
+                            "overrides": { "type": "object" },
+                        },
+                        "required": ["material", "overrides"],
+                    },
+                },
+            },
             "required": ["slots"],
         }),
     );
@@ -673,7 +653,6 @@ pub const COMPONENT_NAMES: &[&str] = &[
     "Transform",
     "Mesh",
     "Camera",
-    "Material",
     "MaterialSet",
     "Script",
     "DirectionalLight",
@@ -893,13 +872,13 @@ mod tests {
         assert!(schemas.contains_key("ComponentBody"));
         assert!(schemas.contains_key("Environment"));
         assert!(schemas.contains_key("AtmosphereSettingsDto"));
-        assert_eq!(COMPONENT_NAMES.len(), 21);
+        assert_eq!(COMPONENT_NAMES.len(), 20);
     }
 
     #[test]
     fn component_schemas_match_committed_openrpc() {
         // The hand-authored block must equal the committed `openrpc.generated.json` byte-shape
-        // (after a canonical key sort) for the 21 shapes + the aggregates + Environment.
+        // (after a canonical key sort) for the 20 shapes + the aggregates + Environment.
         let committed: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../schemas/control/openrpc.generated.json"

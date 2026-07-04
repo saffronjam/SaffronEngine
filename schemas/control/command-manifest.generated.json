@@ -324,13 +324,6 @@
       "fixture": "cube-transform"
     },
     {
-      "name": "set-material",
-      "params": "SetMaterialParams",
-      "result": "EntityRef",
-      "status": "typed",
-      "fixture": "cube-material"
-    },
-    {
       "name": "set-light",
       "params": "SetLightParams",
       "result": "EntityRef",
@@ -1055,6 +1048,13 @@
       "name": "material-get",
       "params": "MaterialGetParams",
       "result": "MaterialGetResult",
+      "status": "typed",
+      "skip": "needs a created material asset"
+    },
+    {
+      "name": "material-schema",
+      "params": "MaterialSchemaParams",
+      "result": "MaterialSchemaResult",
       "status": "typed",
       "skip": "needs a created material asset"
     },

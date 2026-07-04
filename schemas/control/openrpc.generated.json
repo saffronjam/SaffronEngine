@@ -834,24 +834,6 @@
       }
     },
     {
-      "name": "set-material",
-      "summary": "set-material {entity, material fields..., slot?}",
-      "params": [
-        {
-          "name": "params",
-          "schema": {
-            "$ref": "#/components/schemas/SetMaterialParams"
-          }
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/EntityRef"
-        }
-      }
-    },
-    {
       "name": "set-light",
       "summary": "set-light {entity?, direction?, color?, intensity?, ambient?}",
       "params": [
@@ -2720,6 +2702,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/MaterialGetResult"
+        }
+      }
+    },
+    {
+      "name": "material-schema",
+      "summary": "material-schema {id|name} — the material's exposed override parameters",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/MaterialSchemaParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MaterialSchemaResult"
         }
       }
     },
@@ -4871,6 +4871,24 @@
           "warnings"
         ]
       },
+      "ExposedParamDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "required": [
+          "name",
+          "kind",
+          "default"
+        ]
+      },
       "ExtractSubAssetParams": {
         "type": "object",
         "additionalProperties": false,
@@ -5771,6 +5789,31 @@
           "id",
           "name",
           "folder"
+        ]
+      },
+      "MaterialSchemaParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "material": {}
+        },
+        "required": [
+          "material"
+        ]
+      },
+      "MaterialSchemaResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExposedParamDto"
+            }
+          }
+        },
+        "required": [
+          "params"
         ]
       },
       "MaterialSetGraphParams": {
@@ -8139,58 +8182,6 @@
         },
         "required": []
       },
-      "SetMaterialParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
-          },
-          "baseColor": {
-            "$ref": "#/components/schemas/Vec4"
-          },
-          "albedoTexture": {
-            "type": "string"
-          },
-          "metallicRoughnessTexture": {
-            "type": "string"
-          },
-          "metallic": {
-            "type": "number"
-          },
-          "roughness": {
-            "type": "number"
-          },
-          "emissive": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "emissiveStrength": {
-            "type": "number"
-          },
-          "unlit": {
-            "type": "boolean"
-          },
-          "blend": {
-            "type": "string"
-          },
-          "slot": {
-            "type": "integer"
-          },
-          "smooth": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "entity"
-        ]
-      },
       "SetMorphWeightsParams": {
         "type": "object",
         "additionalProperties": false,
@@ -9116,83 +9107,6 @@
           "frustumMaxDistance"
         ]
       },
-      "Material": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "baseColor": {
-            "$ref": "#/components/schemas/Vec4"
-          },
-          "albedoTexture": {
-            "type": "string"
-          },
-          "metallicRoughnessTexture": {
-            "type": "string"
-          },
-          "metallic": {
-            "type": "number"
-          },
-          "roughness": {
-            "type": "number"
-          },
-          "emissive": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "emissiveStrength": {
-            "type": "number"
-          },
-          "unlit": {
-            "type": "boolean"
-          },
-          "normalTexture": {
-            "type": "string"
-          },
-          "occlusionTexture": {
-            "type": "string"
-          },
-          "emissiveTexture": {
-            "type": "string"
-          },
-          "heightTexture": {
-            "type": "string"
-          },
-          "normalStrength": {
-            "type": "number"
-          },
-          "heightScale": {
-            "type": "number"
-          },
-          "blend": {
-            "type": "string",
-            "enum": [
-              "opaque",
-              "masked",
-              "translucent"
-            ]
-          },
-          "alphaCutoff": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "baseColor",
-          "albedoTexture",
-          "metallicRoughnessTexture",
-          "metallic",
-          "roughness",
-          "emissive",
-          "emissiveStrength",
-          "unlit",
-          "normalTexture",
-          "occlusionTexture",
-          "emissiveTexture",
-          "heightTexture",
-          "normalStrength",
-          "heightScale",
-          "blend",
-          "alphaCutoff"
-        ]
-      },
       "MaterialSet": {
         "type": "object",
         "additionalProperties": false,
@@ -9200,7 +9114,20 @@
           "slots": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Material"
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "material": {
+                  "type": "string"
+                },
+                "overrides": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "material",
+                "overrides"
+              ]
             }
           }
         },
@@ -9740,9 +9667,6 @@
           "Camera": {
             "$ref": "#/components/schemas/Camera"
           },
-          "Material": {
-            "$ref": "#/components/schemas/Material"
-          },
           "MaterialSet": {
             "$ref": "#/components/schemas/MaterialSet"
           },
@@ -9806,9 +9730,6 @@
           },
           {
             "$ref": "#/components/schemas/Camera"
-          },
-          {
-            "$ref": "#/components/schemas/Material"
           },
           {
             "$ref": "#/components/schemas/MaterialSet"

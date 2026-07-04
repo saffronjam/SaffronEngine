@@ -151,7 +151,6 @@ export type {
   GetUpscaleResult,
   SetUpscaleParams,
   SetUpscaleResult,
-  SetMaterialParams,
   SetProbesParams,
   SetProbesResult,
   SetRenderQualityParams,
