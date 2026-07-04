@@ -1,6 +1,18 @@
 # Polish + keep-current
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. **Exposure:** the preview pane's header carries a −6…+6 EV `Slider` (→
+`set-exposure`), reusing the engine exposure stash/restore around the preview (enter stashes,
+`exit-asset-preview` / `set-active-view → Scene` restore), so the sweep never touches the authored
+viewport. **`sa`:** confirmed scriptable with no new command — `sa` is a generic passthrough, so
+`sa enter-asset-preview <materialId>` reaches the phase-1 `Material` branch the moment the engine
+registers it (a material previews from the shell just like a model). **Docs:** added
+`docs/content/explanations/ui-and-editor/material-graph-live-preview.md` (what it is, the reused modal
+`assetPreview` view + modal swap, the by-id live-edit reflection, pan-only orbit, EV) + the hub
+`_index.md` row, and refreshed the asset-editor page's routing paragraph (materials now route to the
+asset editor too); `hugo --gc --minify` builds clean (240 pages). **Deferred stretch (own follow-up):**
+the shape toggle (sphere / plane / cube) and a middle-grey exposure-calibration region. Verified:
+`tsc` + `oxlint` (0 new warnings) + `cargo clippy --workspace -D warnings` + `cargo fmt --check` + docs
+build clean.
 **Scope:** editor, `saffron-control`/`sa`, `docs/`
 **Depends on:** phase-3
 

@@ -1,6 +1,14 @@
 # Cutover: delete the PNG preview path in the graph tab
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `MaterialGraphEditor` has exactly one preview path now — the live sphere. The
+`<img>` block, the module-level `previewCache`, the `preview`/`setPreview` state, and all three
+`client.previewRender(...)` call sites (load, debounced apply, undo replay) are gone. The 500 ms
+graph-push debounce survives but calls only `materialSetGraph`; the live view re-renders on its own
+because `material-set-graph` → `update_material_asset` invalidates the material cache, so the next
+frame re-resolves the edited `.smat` on the id-referencing sphere — no readback-to-PNG round trip, and
+the user can orbit continuously. `preview-render` / `render_material_preview` / `preview.slang` are
+untouched (they still back thumbnails via `get-thumbnail` / the asset grid + picker swatches — a
+distinct code path). Verified: no `previewRender` remains in the component; editor `build` clean.
 **Scope:** editor (`MaterialGraphEditor`)
 **Depends on:** phase-2
 

@@ -1,6 +1,20 @@
 # Editor pane + pan-only orbit in the material-graph tab
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. The `AssetEditorWorkspace` orbit machinery (eased target→current rAF loop,
+coalesced `set-camera`, pointer/wheel handlers, framed-pose seed, joint-pick-on-click) was lifted into
+`editor/src/lib/useOrbitCamera.ts` (`useOrbitCamera({ enableZoom, onClick? })`) — one orbit
+implementation for both consumers; the asset editor now calls it (zoom on for models / the HDRI rig,
+off for a lone texture sphere; `onClick` = joint pick only when rigged). The material-graph editor's
+preview pane became a `hostRef` transparent hole + `useSubsurfaceBounds(hostRef, "assetPreview", {
+enabled: previewReady })`, a **pan-only** orbit (`enableZoom: false`), and enter/exit on mount/unmount
+(the tab renders only while active, so mount == activate). `App.tsx` `activeRenderView` + `assetParked`
+now treat `materialGraph` as a preview-bearing tab (both it and `assetEditor` drive the single modal
+`assetPreview` view). The two are a **modal swap, never co-resident owners** of `preview_scene`: the
+kept-mounted asset editor is released (`mountedAssetId → null`) when a material-graph tab becomes
+active, so exactly one preview subject is ever live. The `MaterialGraphWorkspace` wrapper + editor root
+dropped their `bg-background` so the hole's ancestor chain is transparent; toolbar / ReactFlow panel /
+Preview header paint their own opaque bg. Verified: `tsc` + `oxlint` (0 new warnings) + editor `build`
++ workspace build clean.
 **Scope:** editor (`MaterialGraphEditor`, `App`, a reusable orbit hook)
 **Depends on:** phase-1
 

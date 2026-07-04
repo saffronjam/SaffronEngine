@@ -1,6 +1,9 @@
 # Material-graph live preview — a mini "spin-the-sphere" 3D pane
 
-**Status:** NOT STARTED
+**Status:** COMPLETED (phases 1–4). The material-graph editor's static PNG is replaced by a live,
+orbitable IBL sphere on the reused modal `assetPreview` view; a standalone material also gains a 3D
+"View" tab on the same host path. The stretch shape toggle (sphere/plane/cube) is a noted follow-up.
+See each `phase-*.md` `**Status:**` line for detail.
 
 Replace the static PNG preview in the material-graph editor with a **live, orbitable 3D sphere** showing
 the edited `.smat` under real IBL — a mini version of the asset "View" tab embedded in the graph editor.

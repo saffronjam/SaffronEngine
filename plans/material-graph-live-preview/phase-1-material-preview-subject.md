@@ -1,6 +1,15 @@
 # Material asset as a sphere subject + live graph-edit reflection
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `enter-asset-preview` gained a `Material` branch → `enter_material_preview`:
+a built-in sphere (`BUILTIN_SPHERE_MESH_ID`) carrying a `MaterialSet` whose slot 0 references the
+`.smat` **by id**, committed through the shared furnisher as `PreviewEnv::Procedural`. Because the
+reference is by id (not a copy), `material-update` / `material-set-graph` call `update_material_asset`,
+which invalidates the material caches, so the sphere re-resolves the edited `.smat` next frame — live
+edits reflect with no re-entry. `routeView` now sends a `material` asset to the 3D asset editor (the
+`AssetEditorWorkspace` enters the preview unconditionally; `get-asset-model` fails gracefully for the
+container-less material → static viewport, no rig/clip panels). The material-graph editor's *edit*
+entry points (Inspector / MaterialEditorPanel buttons) are untouched. Verified: `clippy -D warnings`
++ editor `tsc` clean.
 **Scope:** `saffron-control`, `saffron-sceneedit`
 **Depends on:** **`primitive-meshes/`**, **`texture-material-previews/phase-3`** (furnisher `&mut Scene`
 refactor)
