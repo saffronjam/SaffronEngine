@@ -121,13 +121,12 @@ impl SceneEditContext {
             .map_or(0, |id| id.id.0)
     }
 
-    /// Drops both smoothing queues.
+    /// Drops the smoothing queue.
     ///
     /// The smoothing targets hold raw `Entity` handles, which index one specific scene's
     /// world — a half-converged edit must never keep converging against the other scene
     /// across a transition.
     fn drop_smoothing(&mut self) {
-        self.material_smoothing.clear();
         self.transform_smoothing.clear();
     }
 

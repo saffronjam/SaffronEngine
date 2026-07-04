@@ -17,7 +17,7 @@ use crate::gizmo::{GizmoOp, GizmoSpace, NativeGizmoState};
 use crate::overlay::{DebugOverlayOptions, SkeletonOverlayOptions};
 use crate::play::{PlayState, ScriptError, ScriptLog};
 use crate::project::{ProjectLoadProgress, ProjectLoadRequest, ProjectPhase};
-use crate::smoothing::{MaterialSmoothTarget, TransformSmoothTarget};
+use crate::smoothing::TransformSmoothTarget;
 use saffron_scene::ScriptInputState;
 
 /// The payload dragged from an asset tile onto a component picker field.
@@ -110,8 +110,6 @@ pub struct SceneEditContext {
     /// opaque JSON persisted in `project.json`; the editor owns its shape, credentials
     /// never live here.
     pub stores: serde_json::Value,
-    /// Pending smoothed material edits, one entry per entity.
-    pub material_smoothing: Vec<MaterialSmoothTarget>,
     /// Pending smoothed transform edits, one entry per entity.
     pub transform_smoothing: Vec<TransformSmoothTarget>,
     /// The latest fly-input command state; `look_delta` accumulates until the host drains
@@ -199,7 +197,6 @@ impl Default for SceneEditContext {
             skeleton_overlay: SkeletonOverlayOptions::default(),
             debug_overlays: DebugOverlayOptions::default(),
             stores: serde_json::Value::Null,
-            material_smoothing: Vec::new(),
             transform_smoothing: Vec::new(),
             fly_input: SceneEditCameraInput::default(),
             play_state: PlayState::default(),
@@ -327,6 +324,20 @@ impl SceneEditContext {
     #[must_use]
     pub fn previewing(&self) -> bool {
         self.preview_scene.is_some() && self.preview_active_view
+    }
+
+    /// Whether the editor's in-viewport chrome — the gizmo, entity billboards, camera
+    /// frustums, and debug overlays — should render this frame.
+    ///
+    /// True only in Edit mode with the authored scene as the active view. It stays hidden in
+    /// Play and while the asset preview owns the viewport — including a *parked* preview whose
+    /// scene is still alive but not the active view (`preview_scene.is_some()` yet
+    /// `!preview_active_view`), where the authored scene renders again and the chrome must come
+    /// back. Keyed off [`previewing`](Self::previewing) so it can never drift from the grid
+    /// gate the way a bare `preview_scene.is_none()` check does.
+    #[must_use]
+    pub fn editor_chrome_visible(&self) -> bool {
+        self.play_state == PlayState::Edit && !self.previewing()
     }
 
     /// Sets the selection, bumps `selection_version`, and publishes the change.
@@ -512,5 +523,35 @@ mod tests {
                 .is_some(),
             "the active preview view takes precedence"
         );
+    }
+
+    #[test]
+    fn editor_chrome_hidden_only_while_a_preview_owns_the_view() {
+        let mut ctx = SceneEditContext::new();
+
+        // Edit, no preview: the authored scene is live, so the gizmo/billboards/frustums show.
+        ctx.play_state = PlayState::Edit;
+        assert!(ctx.editor_chrome_visible());
+
+        // Play hides the chrome regardless of the preview state.
+        ctx.play_state = PlayState::Playing;
+        assert!(!ctx.editor_chrome_visible());
+
+        // A preview scene kept alive but PARKED (not the active view) still renders the
+        // authored scene, so back in Edit the chrome must return — the regression: a bare
+        // `preview_scene.is_none()` gate wrongly hid the gizmo here while the grid stayed up.
+        ctx.play_state = PlayState::Edit;
+        ctx.preview_scene = Some(Scene::new());
+        ctx.preview_active_view = false;
+        assert!(!ctx.previewing());
+        assert!(
+            ctx.editor_chrome_visible(),
+            "a parked preview must not hide the authored scene's chrome"
+        );
+
+        // The preview as the active view (the orbit) hides the authored chrome.
+        ctx.preview_active_view = true;
+        assert!(ctx.previewing());
+        assert!(!ctx.editor_chrome_visible());
     }
 }

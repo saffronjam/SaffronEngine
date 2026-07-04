@@ -30,7 +30,7 @@
 //! [`apply_native_gizmo_drag`](SceneEditContext::apply_native_gizmo_drag)), the `tau = 0.025`
 //! pointer + edit smoothing ([`SceneEditContext::step_native_gizmo_drag`] /
 //! [`step_edit_smoothing`](SceneEditContext::step_edit_smoothing) + the
-//! material/transform smooth-entry/cancel helpers), and
+//! transform smooth-entry/cancel helpers), and
 //! [`SceneEditContext::sync_native_gizmo`].
 
 #![deny(unsafe_code)]
@@ -63,7 +63,7 @@ pub use project::{
     BootStage, NewProjectSpec, ProjectLoadProgress, ProjectLoadRequest, ProjectPhase,
 };
 pub use saffron_scene::{ScriptInputState, derive_script_input_edges};
-pub use smoothing::{MaterialSmoothTarget, TransformSmoothTarget};
+pub use smoothing::TransformSmoothTarget;
 
 /// Re-exported from `saffron-scene`: the single canonical registration site for every
 /// built-in serialized component. [`SceneEditContext::new`] calls it to populate the

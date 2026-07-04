@@ -1,8 +1,8 @@
-// `set-material`/`set-transform smooth:1` animate fields toward the target over a few
-// frames (the gizmo-style exponential step) and snap exactly on convergence, so a
-// settled read-back must equal the target verbatim. A non-smooth write cancels any
-// pending animation — the exact value always wins. Targets use f32-exact literals so
-// the JSON round-trip compares with toEqual.
+// `set-transform smooth:1` animates fields toward the target over a few frames (the
+// gizmo-style exponential step) and snaps exactly on convergence, so a settled read-back
+// must equal the target verbatim. A non-smooth write cancels any pending animation — the
+// exact value always wins. Targets use f32-exact literals so the JSON round-trip compares
+// with toEqual.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
@@ -13,54 +13,6 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   await engine?.shutdown();
-});
-
-interface MaterialInspect {
-  components: {
-    Material: {
-      baseColor: { x: number; y: number; z: number; w: number };
-      roughness: number;
-      metallic: number;
-    };
-  };
-}
-
-test("smooth set-material converges exactly to the target", async () => {
-  const name = "e2e-smooth-material";
-  await engine.call("create-entity", { args: [name] });
-  await engine.call("add-component", { entity: name, component: "Material" });
-
-  const target = { x: 0.25, y: 0.5, z: 0.75, w: 1 };
-  await engine.call("set-material", {
-    entity: name,
-    baseColor: target,
-    roughness: 0.5,
-    smooth: true,
-  });
-  // tau is 25ms; 400ms is ~16 time constants — converged and snapped.
-  await engine.settle(400);
-
-  const info = await engine.call<MaterialInspect>("inspect", { entity: name });
-  expect(info.components.Material.baseColor).toEqual(target);
-  expect(info.components.Material.roughness).toBe(0.5);
-});
-
-test("a non-smooth set-material overrides a pending smooth animation", async () => {
-  const name = "e2e-smooth-cancel";
-  await engine.call("create-entity", { args: [name] });
-  await engine.call("add-component", { entity: name, component: "Material" });
-
-  await engine.call("set-material", {
-    entity: name,
-    baseColor: { x: 1, y: 0, z: 0, w: 1 },
-    smooth: true,
-  });
-  const exact = { x: 0, y: 0.25, z: 1, w: 0.5 };
-  await engine.call("set-material", { entity: name, baseColor: exact });
-  await engine.settle(400);
-
-  const info = await engine.call<MaterialInspect>("inspect", { entity: name });
-  expect(info.components.Material.baseColor).toEqual(exact);
 });
 
 interface TransformInspect {
@@ -105,11 +57,10 @@ test("a non-smooth set-transform overrides a pending smooth animation", async ()
 
 test("destroying the entity mid-smooth is harmless", async () => {
   const name = "e2e-smooth-destroyed";
-  await engine.call("create-entity", { args: [name] });
-  await engine.call("add-component", { entity: name, component: "Material" });
-  await engine.call("set-material", {
+  await engine.call("create-entity", { args: [name] }); // createEntity adds a Transform
+  await engine.call("set-transform", {
     entity: name,
-    baseColor: { x: 0, y: 1, z: 0, w: 1 },
+    translation: { x: 0, y: 5, z: 0 },
     smooth: true,
   });
   await engine.call("destroy-entity", { entity: name });

@@ -1,4 +1,4 @@
-//! Pending smoothed material / transform edits and the per-frame convergence stepper.
+//! Pending smoothed transform edits and the per-frame convergence stepper.
 //!
 //! A `smooth:1` edit merges its per-field targets into an entry here instead of writing
 //! the component directly; [`SceneEditContext::step_edit_smoothing`] converges the entity's
@@ -6,9 +6,9 @@
 //! gizmo pointer drag and the look-drain share), snapping exactly and dropping the entry
 //! once converged.
 
-use glam::{Vec3, Vec4};
+use glam::Vec3;
 
-use saffron_scene::{Entity, Material, Transform};
+use saffron_scene::{Entity, Transform};
 
 use crate::context::SceneEditContext;
 
@@ -24,40 +24,6 @@ pub(crate) const SMOOTH_TAU: f32 = 0.025;
 /// The convergence epsilon: an edit snaps exactly and its entry drops once every smoothed
 /// field is within this of its target.
 const SMOOTH_EPSILON: f32 = 1e-4;
-
-/// A pending smoothed material edit (`set-material smooth:1`).
-///
-/// Absent fields are untouched; repeated smooth sends merge into the entry.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MaterialSmoothTarget {
-    /// The entity whose `Material` is converging.
-    pub entity: Entity,
-    /// The target base color (RGBA), if set.
-    pub base_color: Option<Vec4>,
-    /// The target metallic factor, if set.
-    pub metallic: Option<f32>,
-    /// The target roughness factor, if set.
-    pub roughness: Option<f32>,
-    /// The target emissive color, if set.
-    pub emissive: Option<Vec3>,
-    /// The target emissive strength, if set.
-    pub emissive_strength: Option<f32>,
-}
-
-impl MaterialSmoothTarget {
-    /// An empty entry targeting `entity` with no fields set.
-    #[must_use]
-    pub fn new(entity: Entity) -> Self {
-        Self {
-            entity,
-            base_color: None,
-            metallic: None,
-            roughness: None,
-            emissive: None,
-            emissive_strength: None,
-        }
-    }
-}
 
 /// A pending smoothed transform edit (`set-transform smooth:1`): Inspector scrubs converge
 /// like gizmo drags instead of stepping at the send rate.
@@ -120,39 +86,7 @@ impl BlendToward for Vec3 {
     }
 }
 
-impl BlendToward for Vec4 {
-    fn blend_toward(&mut self, target: Self, alpha: f32) -> bool {
-        *self += (target - *self) * alpha;
-        if (target - *self)
-            .abs()
-            .cmple(Vec4::splat(SMOOTH_EPSILON))
-            .all()
-        {
-            *self = target;
-            return true;
-        }
-        false
-    }
-}
-
 impl SceneEditContext {
-    /// The pending smoothed-material entry for `entity`, appended if absent. A `smooth:1`
-    /// material edit merges its fields here instead of writing the component.
-    pub fn material_smooth_entry_for(&mut self, entity: Entity) -> &mut MaterialSmoothTarget {
-        if let Some(index) = self
-            .material_smoothing
-            .iter()
-            .position(|entry| entry.entity == entity)
-        {
-            return &mut self.material_smoothing[index];
-        }
-        self.material_smoothing
-            .push(MaterialSmoothTarget::new(entity));
-        self.material_smoothing
-            .last_mut()
-            .expect("just pushed an entry")
-    }
-
     /// The pending smoothed-transform entry for `entity`, appended if absent.
     pub fn transform_smooth_entry_for(&mut self, entity: Entity) -> &mut TransformSmoothTarget {
         if let Some(index) = self
@@ -169,21 +103,14 @@ impl SceneEditContext {
             .expect("just pushed an entry")
     }
 
-    /// Drops `entity`'s smoothed-material entry — an exact (non-smooth) write always wins.
-    pub fn cancel_material_smoothing(&mut self, entity: Entity) {
-        self.material_smoothing
-            .retain(|entry| entry.entity != entity);
-    }
-
     /// Drops `entity`'s smoothed-transform entry.
     pub fn cancel_transform_smoothing(&mut self, entity: Entity) {
         self.transform_smoothing
             .retain(|entry| entry.entity != entity);
     }
 
-    /// Converges every smoothed edit (material + transform) toward its targets one rendered
-    /// frame (the `tau = 0.025` exponential), snapping exactly and dropping each entry once
-    /// converged.
+    /// Converges every smoothed transform edit toward its targets one rendered frame (the
+    /// `tau = 0.025` exponential), snapping exactly and dropping each entry once converged.
     ///
     /// A smooth edit issued during play converges in — and is discarded with — the play
     /// scene; in Edit it is the authored scene. A live gizmo drag owns its target's
@@ -191,45 +118,13 @@ impl SceneEditContext {
     /// own smoothing wins). Bumps `scene_version` on any applied frame so the control poll
     /// tracks the convergence live.
     pub fn step_edit_smoothing(&mut self, dt: f32) {
-        if self.material_smoothing.is_empty() && self.transform_smoothing.is_empty() {
+        if self.transform_smoothing.is_empty() {
             return;
         }
         let alpha = 1.0 - (-dt.max(0.0) / SMOOTH_TAU).exp();
         let dragging = self.native_gizmo.dragging;
         let drag_target = self.native_gizmo.target;
         let mut applied = false;
-
-        let mut material = std::mem::take(&mut self.material_smoothing);
-        let scene = self.active_scene();
-        material.retain_mut(|entry| {
-            if !scene.valid(entry.entity) || !scene.has_component::<Material>(entry.entity) {
-                return false;
-            }
-            let converged = scene
-                .with_component_mut::<Material, _>(entry.entity, |m| {
-                    let mut converged = true;
-                    if let Some(target) = entry.base_color {
-                        converged &= m.base_color.blend_toward(target, alpha);
-                    }
-                    if let Some(target) = entry.metallic {
-                        converged &= m.metallic.blend_toward(target, alpha);
-                    }
-                    if let Some(target) = entry.roughness {
-                        converged &= m.roughness.blend_toward(target, alpha);
-                    }
-                    if let Some(target) = entry.emissive {
-                        converged &= m.emissive.blend_toward(target, alpha);
-                    }
-                    if let Some(target) = entry.emissive_strength {
-                        converged &= m.emissive_strength.blend_toward(target, alpha);
-                    }
-                    converged
-                })
-                .unwrap_or(true);
-            applied = true;
-            !converged
-        });
-        self.material_smoothing = material;
 
         let mut transform = std::mem::take(&mut self.transform_smoothing);
         let scene = self.active_scene();
@@ -270,11 +165,10 @@ impl SceneEditContext {
 mod tests {
     use super::*;
 
-    /// A context with a transformable, materialized entity selected.
+    /// A context with a transformable entity selected.
     fn smoothing_context() -> (SceneEditContext, Entity) {
         let mut ctx = SceneEditContext::default();
         let entity = ctx.scene.create_entity("Target");
-        let _ = ctx.scene.add_component(entity, Material::default());
         ctx.set_selection(entity);
         (ctx, entity)
     }
@@ -289,28 +183,18 @@ mod tests {
         let entry = &ctx.transform_smoothing[0];
         assert_eq!(entry.translation, Some(Vec3::new(1.0, 2.0, 3.0)));
         assert_eq!(entry.scale, Some(Vec3::splat(2.0)));
-
-        ctx.material_smooth_entry_for(entity).metallic = Some(0.5);
-        ctx.material_smooth_entry_for(entity).roughness = Some(0.25);
-        assert_eq!(ctx.material_smoothing.len(), 1);
-        assert_eq!(ctx.material_smoothing[0].metallic, Some(0.5));
-        assert_eq!(ctx.material_smoothing[0].roughness, Some(0.25));
     }
 
     #[test]
     fn cancel_drops_the_entry() {
         let (mut ctx, entity) = smoothing_context();
         ctx.transform_smooth_entry_for(entity).scale = Some(Vec3::splat(3.0));
-        ctx.material_smooth_entry_for(entity).metallic = Some(1.0);
         assert_eq!(ctx.transform_smoothing.len(), 1);
-        assert_eq!(ctx.material_smoothing.len(), 1);
         ctx.cancel_transform_smoothing(entity);
-        ctx.cancel_material_smoothing(entity);
         assert!(
             ctx.transform_smoothing.is_empty(),
             "transform entry dropped"
         );
-        assert!(ctx.material_smoothing.is_empty(), "material entry dropped");
     }
 
     #[test]
@@ -351,35 +235,6 @@ mod tests {
             ctx.scene_version > before_version,
             "applied frames bump scene_version"
         );
-    }
-
-    #[test]
-    fn step_material_converges_each_field() {
-        let (mut ctx, entity) = smoothing_context();
-        {
-            let entry = ctx.material_smooth_entry_for(entity);
-            entry.base_color = Some(Vec4::new(0.2, 0.4, 0.6, 1.0));
-            entry.metallic = Some(0.9);
-            entry.roughness = Some(0.1);
-            entry.emissive = Some(Vec3::new(1.0, 0.5, 0.0));
-            entry.emissive_strength = Some(3.0);
-        }
-        for _ in 0..600 {
-            ctx.step_edit_smoothing(1.0 / 60.0);
-            if ctx.material_smoothing.is_empty() {
-                break;
-            }
-        }
-        assert!(
-            ctx.material_smoothing.is_empty(),
-            "material entry converged"
-        );
-        let m = ctx.scene.component::<Material>(entity).unwrap();
-        assert_eq!(m.base_color, Vec4::new(0.2, 0.4, 0.6, 1.0));
-        assert!((m.metallic - 0.9).abs() < 1e-6);
-        assert!((m.roughness - 0.1).abs() < 1e-6);
-        assert_eq!(m.emissive, Vec3::new(1.0, 0.5, 0.0));
-        assert!((m.emissive_strength - 3.0).abs() < 1e-6);
     }
 
     #[test]
