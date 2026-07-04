@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { cn } from "@/lib/utils";
 
 import { errorText, notifyError } from "../lib/flash";
+import { cachedImage } from "./cachedImage";
 import { GalleryViewer } from "./GalleryViewer";
 import { ImportControls } from "./ImportControls";
 import type { GalleryImage, StoreResult } from "./types";
@@ -64,7 +65,12 @@ export function AssetDetailModal({
                     i === nav.index ? "border-ring ring-1 ring-ring" : "border-border",
                   )}
                 >
-                  <img src={img.url} alt="" className="size-full object-cover" loading="lazy" />
+                  <img
+                    src={cachedImage(img.url)}
+                    alt=""
+                    className="size-full object-cover"
+                    loading="lazy"
+                  />
                 </button>
               ))}
             </div>

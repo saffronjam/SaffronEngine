@@ -6,6 +6,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
+import { cachedImage } from "./cachedImage";
 import type { GalleryImage } from "./types";
 import type { GalleryNav } from "./useGallery";
 
@@ -52,7 +53,7 @@ export function GalleryViewer({
             <img
               // Re-key the active slide on a fade so its fade-in animation replays.
               key={mode === "fade" && i === index ? `fade-${tick}` : "slide"}
-              src={large ? (img.fullUrl ?? img.url) : img.url}
+              src={cachedImage(large ? (img.fullUrl ?? img.url) : img.url)}
               alt={i === index ? alt : ""}
               loading="lazy"
               className={cn(
@@ -78,7 +79,7 @@ export function GalleryViewer({
             type="button"
             aria-label="Previous image"
             onClick={stop(prev)}
-            className="absolute top-1/2 left-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 transition-opacity group-hover/gallery:opacity-100 hover:bg-background"
+            className="absolute top-1/2 left-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 group-hover/gallery:opacity-100 hover:bg-background"
           >
             <ChevronLeft className="size-4" />
           </button>
@@ -86,11 +87,11 @@ export function GalleryViewer({
             type="button"
             aria-label="Next image"
             onClick={stop(next)}
-            className="absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 transition-opacity group-hover/gallery:opacity-100 hover:bg-background"
+            className="absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 group-hover/gallery:opacity-100 hover:bg-background"
           >
             <ChevronRight className="size-4" />
           </button>
-          <div className="absolute right-1 bottom-1 rounded bg-background/70 px-1 text-[9px] text-muted-foreground opacity-0 transition-opacity group-hover/gallery:opacity-100">
+          <div className="absolute right-1 bottom-1 rounded bg-background/70 px-1 text-[9px] text-muted-foreground opacity-0 group-hover/gallery:opacity-100">
             {index + 1}/{count}
           </div>
         </>
