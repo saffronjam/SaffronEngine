@@ -296,8 +296,10 @@ a feature — follow and update a matching plan rather than starting cold.
   graph; hecs scene + registry-driven JSON project format with scene-graph parenting (a `Relationship`
   component, parent-composed world transforms, and a `set-parent` reparent command); glTF/OBJ import +
   asset catalog; a native
-  material system (`.smat` PBR assets + params buffer, importer, instances/overrides, thumbnails) with a
-  node-graph editor (React Flow model → Slang codegen for preview and scene entities); skeletal animation
+  material system (`.smat` PBR assets + params buffer, importer, asset-level instances/overrides,
+  thumbnails; entities bind materials through one `MaterialSet` component whose submesh-indexed slots
+  *reference* a `.smat` asset plus a sparse per-object override map — no inline per-entity PBR blob) with
+  a node-graph editor (React Flow model → Slang codegen for preview and scene entities); skeletal animation
   behind `saffron-animation` (glTF clip import, an animation-player runtime with transitions/blending, a
   compute-skinning prepass feeding motion vectors + skinned-BLAS rebuild, foot IK, a native skeleton
   overlay, animation control commands, and the editor timeline panel); the control plane + `sa` CLI; the
