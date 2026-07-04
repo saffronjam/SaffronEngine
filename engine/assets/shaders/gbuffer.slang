@@ -62,10 +62,15 @@ struct GbufferOut
 };
 
 [shader("fragment")]
-GbufferOut fragmentMain(VertexOutput input)
+GbufferOut fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace)
 {
     GbufferOut o;
-    o.normalZ = float4(normalize(input.viewNormal), input.viewZ);
+    // Double-sided geometry rasterizes both faces; invert the back-face normal (glTF) so the
+    // screen-space AO/GI/SSR that read this G-buffer see the actually-visible face. Single-sided
+    // geometry culls back faces, so `isFront` is always true and this is a no-op.
+    float3 viewNormal = normalize(input.viewNormal);
+    if (!isFront) { viewNormal = -viewNormal; }
+    o.normalZ = float4(viewNormal, input.viewZ);
     o.roughness = input.roughness;
     return o;
 }

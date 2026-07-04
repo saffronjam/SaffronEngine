@@ -9,6 +9,13 @@ import lighting;
 // per-pixel discard — anti-aliased foliage/cutout edges without blending or sorting. Off elsewhere.
 [[vk::constant_id(1)]] const bool kAlphaToCoverage = false;
 
+// The translucent (alpha-blended) permutation, baked into the blend PSO. Translucent surfaces are
+// drawn forward, after opaque, with depth-write off — so the opaque G-buffer's screen-space terms
+// (SSAO, screen-space GI, contact shadows, SSR, SSGI) at a translucent fragment's screen UV belong
+// to the OPAQUE geometry behind it, not the fragment. This constant gates those off and substitutes
+// world-space indirect (analytic IBL irradiance + DDGI) — see `evalLighting`. Off (opaque) elsewhere.
+[[vk::constant_id(2)]] const bool kTranslucent = false;
+
 SurfaceData evalSurface(MaterialInput m)
 {
     MaterialParams mat = m.mat;
@@ -106,8 +113,14 @@ float reactiveCoverageFragment(VertexOutput input) : SV_Target
 }
 
 [shader("fragment")]
-float4 fragmentMain(VertexOutput input) : SV_Target
+float4 fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace) : SV_Target
 {
+    // Double-sided materials rasterize both faces (cull NONE); glTF requires the back-face normal be
+    // inverted before lighting, else a back-facing fragment reads N·L < 0 (no direct light) and samples
+    // IBL along the wrong hemisphere. Single-sided materials cull back faces, so `isFront` is always
+    // true for them and this is a no-op. Flip the interpolated normal in this by-value copy so the whole
+    // downstream chain (tangent frame, normal-map perturb, the specular horizon term) sees it.
+    if (!isFront) { input.worldNormal = -input.worldNormal; }
     MaterialInput mi = makeMaterialInput(input);
     SurfaceData surf = evalSurface(mi);
     bool masked = (mi.mat.tex1.w & FEATURE_ALPHACLIP) != 0u;
@@ -120,7 +133,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     {
         float coverage = saturate((surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5);
         if (coverage <= 0.0) { discard; }
-        float4 lit = evalViewMode(input, surf, kUnlit);
+        float4 lit = evalViewMode(input, surf, kUnlit, kTranslucent);
         lit.a = coverage;
         return lit;
     }
@@ -131,5 +144,5 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     }
     // Resolve the active view mode (full shading, a debug channel, or the unlit permutation). Debug
     // channels write into the HDR scene color, so tonemap still applies — values are display-referred.
-    return evalViewMode(input, surf, kUnlit);
+    return evalViewMode(input, surf, kUnlit, kTranslucent);
 }

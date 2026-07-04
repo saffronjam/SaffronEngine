@@ -1149,13 +1149,17 @@ impl Pipelines {
         key: &PsoKey,
         module: vk::ShaderModule,
     ) -> Result<Pipeline> {
-        // Fragment spec constants: id 0 = unlit branch, id 1 = alpha-to-coverage (masked+MSAA)
-        // — the fragment sharpens the cutout into per-sample coverage when set.
+        // Fragment spec constants: id 0 = unlit branch, id 1 = alpha-to-coverage (masked+MSAA,
+        // the fragment sharpens the cutout into per-sample coverage when set), id 2 = translucent
+        // (the blend permutation — gates off the opaque G-buffer's screen-space terms and uses
+        // world-space indirect instead; see mesh.slang / lighting.slang).
         let unlit_value: vk::Bool32 = u32::from(key.unlit);
         let a2c_value: vk::Bool32 = u32::from(key.alpha_to_coverage);
-        let mut spec_data = [0u8; 8];
+        let translucent_value: vk::Bool32 = u32::from(key.blend);
+        let mut spec_data = [0u8; 12];
         spec_data[0..4].copy_from_slice(&unlit_value.to_ne_bytes());
         spec_data[4..8].copy_from_slice(&a2c_value.to_ne_bytes());
+        spec_data[8..12].copy_from_slice(&translucent_value.to_ne_bytes());
         let spec_entries = [
             vk::SpecializationMapEntry::default()
                 .constant_id(0)
@@ -1164,6 +1168,10 @@ impl Pipelines {
             vk::SpecializationMapEntry::default()
                 .constant_id(1)
                 .offset(4)
+                .size(std::mem::size_of::<vk::Bool32>()),
+            vk::SpecializationMapEntry::default()
+                .constant_id(2)
+                .offset(8)
                 .size(std::mem::size_of::<vk::Bool32>()),
         ];
         let spec_info = vk::SpecializationInfo::default()

@@ -585,7 +585,13 @@ float3 heatmap(float t)
 
 // The shared lighting half: turns a SurfaceData into lit radiance (direct + punctual + IBL/GI).
 // Compiled once into this module; each material variant links it instead of recompiling it.
-public float4 evalLighting(VertexOutput input, SurfaceData surf)
+//
+// `translucent` (the blend permutation) gates off every screen-space term — contact shadows, the
+// screen-space GI resolve, GTAO, SSR, specular sky-occlusion, SSGI, and the ReSTIR direct sample —
+// because a blend fragment's screen UV addresses the OPAQUE geometry behind it, not the fragment.
+// It substitutes world-space indirect (analytic IBL irradiance + world-space DDGI), matching how
+// forward renderers (UE forward-shaded translucency, Unity/URP transparents) light blended surfaces.
+public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucent)
 {
     float3 n = surf.normal;
     float3 albedo = surf.albedo;
@@ -610,9 +616,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
     {
         shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
     }
-    if (globals.screenFlags.x != 0)
+    if (globals.screenFlags.x != 0 && !translucent)
     {
-        shadow *= contactMap.SampleLevel(screenUv, 0.0).r;  // fine contact detail
+        shadow *= contactMap.SampleLevel(screenUv, 0.0).r;  // fine contact detail (opaque only)
     }
     float3 lo = brdf(n, v, lDir, albedo, metallic, roughness,
                      globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
@@ -620,8 +626,10 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
     // Punctual lights. ReSTIR (screenFlags.w) replaces the per-light loop with one resolved
     // stochastic many-light direct radiance sample (diffuse term); otherwise loop the
     // froxel cluster's lights (clustered) or every light (reference).
-    if (globals.screenFlags.w != 0)
+    if (globals.screenFlags.w != 0 && !translucent)
     {
+        // ReSTIR's resolved direct radiance is a screen-space buffer keyed to the opaque G-buffer, so
+        // a translucent fragment falls through to the real clustered/reference punctual loop instead.
         float3 restir = restirRadiance.SampleLevel(screenUv, 0.0).rgb;
         lo += restir * albedo / PI;  // resolved radiance already includes geometry * vis * W
     }
@@ -694,7 +702,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // environment). Weighted by hit confidence × a smoothness gate (full at roughness 0,
         // zero past ~0.4) so rough surfaces keep the cube fallback. Applied at the radiance
         // level so the BRDF + multi-scatter + horizon + specular-AO below treat it uniformly.
-        if (globals.extraFlags.x != 0)
+        if (globals.extraFlags.x != 0 && !translucent)
         {
             float4 ssr = ssrMap.SampleLevel(screenUv, 0.0);
             float gate = saturate(1.0 - roughness * 2.0);
@@ -705,7 +713,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // off-screen, where SSR fails) and reproject the world-space hit through last frame's
         // view-proj into prev_color for its reflected radiance. Gated to smooth surfaces; an
         // off-screen reprojection or a missed ray falls back to the (SSR-or-env) radiance.
-        if (globals.extraFlags.y != 0)
+        if (globals.extraFlags.y != 0 && !translucent)
         {
             float gate = saturate(1.0 - roughness * 2.0);
             if (gate > 0.0)
@@ -734,7 +742,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // wrongly dim a chrome surface facing open sky). The march runs in the reduced-resolution
         // specocc prepass (denoised + temporally accumulated); the mesh samples the resolved map.
         // Off (1.0) unless enabled this frame.
-        float specSkyVis = globals.sdfOcclusion.y != 0 ? speoccMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent) ? speoccMap.SampleLevel(screenUv, 0.0).r : 1.0;
 
         float2 ab = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
         float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
@@ -759,9 +767,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // specular-AO (Lagarde, → 1 on smooth metals so a chrome sphere keeps its reflection in
         // creases), the contact darkening of the indirect diffuse, and the SSGI bounce below.
         float ao = surf.occlusion;  // material occlusion (1.0 = none)
-        if (globals.counts.w != 0)
+        if (globals.counts.w != 0 && !translucent)
         {
-            ao *= aoMap.SampleLevel(screenUv, 0.0).r;  // screen-space GTAO (contact scale)
+            ao *= aoMap.SampleLevel(screenUv, 0.0).r;  // screen-space GTAO (contact scale, opaque only)
         }
         float specAO = saturate(pow(ndotv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
         specularIBL *= specAO * specSkyVis;  // reflection-cone occludes the reflected skybox
@@ -773,7 +781,25 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // bilinearly-upsampled result here and applies the per-pixel kd·albedo tail. This is why the
         // 8-probe DDGI cage + IBL diffuse cube are no longer sampled in this fragment. See
         // `gi_resolve.slang`.
-        float3 indirectIrr = giIndirectMap.SampleLevel(screenUv, 0.0).rgb;
+        float3 indirectIrr;
+        if (translucent)
+        {
+            // Translucent surfaces can't read the screen-space GI resolve (it's keyed to the opaque
+            // G-buffer behind them), so take indirect diffuse from world-space sources: the analytic
+            // IBL sky irradiance (already reflection-probe-blended above), overlaid by the world-space
+            // DDGI cage where it has coverage — the same terms the fallback path uses.
+            indirectIrr = irradiance;
+            if (globals.screenFlags.z != 0)
+            {
+                float4 ddgi = ddgiSampleIrradiance(
+                    ddgiVolumeFromGlobals(), ddgiIrradiance, ddgiDistance, input.worldPos, n);
+                indirectIrr = lerp(irradiance, ddgi.rgb, ddgi.w);
+            }
+        }
+        else
+        {
+            indirectIrr = giIndirectMap.SampleLevel(screenUv, 0.0).rgb;
+        }
         float3 indirect = kd * indirectIrr * albedo;
         // Indirect diffuse occlusion: the large-range term is the DDGI ray-miss already folded into
         // indirectIrr (the sky enters only on a ray that escapes), so the only further occlusion is
@@ -781,8 +807,8 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
         // detail the coarse probe grid cannot resolve, with no large-range double-count.
         ambient = indirect * ao + specularIBL;
         // SSGI adds one-bounce screen-space indirect on top (it is a bounce, not the sky term),
-        // modulated by AO so occluded creases don't over-bounce.
-        if (globals.screenFlags.y != 0)
+        // modulated by AO so occluded creases don't over-bounce. Screen-space, so opaque only.
+        if (globals.screenFlags.y != 0 && !translucent)
         {
             float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
@@ -790,10 +816,10 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
     }
     else
     {
-        float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float ao = (globals.counts.w != 0 && !translucent) ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
         ambient = albedo * (1.0 - metallic) * globals.ambientColor.rgb * surf.occlusion * ao;
-        // SSGI bounce on the non-IBL fallback path (additive, AO-modulated).
-        if (globals.screenFlags.y != 0)
+        // SSGI bounce on the non-IBL fallback path (additive, AO-modulated). Screen-space, opaque only.
+        if (globals.screenFlags.y != 0 && !translucent)
         {
             float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
@@ -826,7 +852,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf)
 // screen-space channels return here; material-override modes recolour the surface and fall through
 // to evalLighting (which itself peels off the Reflections/GI terms by channel). `Wireframe`,
 // `LitWireframe`, and `MotionVectors` are channel 0 here — produced by dedicated passes.
-public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit)
+public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bool translucent)
 {
     uint channel = debugViewChannel();
 
@@ -910,5 +936,5 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit)
         surf.roughness = 0.02;
     }
 
-    return evalLighting(input, surf);
+    return evalLighting(input, surf, translucent);
 }
