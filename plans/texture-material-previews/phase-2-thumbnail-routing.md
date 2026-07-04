@@ -1,6 +1,16 @@
 # Per-type texture thumbnails + preview.slang slot completion
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `thumbnail.rs` carries the texture's `role` on `ThumbnailTextureSource` and,
+for a standalone texture, synthesizes a single-slot `SubmeshMaterial` (`texture_preview_material`) and
+renders it on the studio sphere via the existing `render_material_preview` — albedo lit, normal bumped,
+roughness's highlight, metallic (best-effort, no IBL), AO darkened, ORM combined, height as
+gradient-bump relief, emissive glowing on a near-black base, opacity as a one-pass checker cutout.
+`Unknown`/`Hdri`/`Gloss` keep the flat swatch. `preview.slang` grew to a 128-byte push (exactly the
+guaranteed `maxPushConstantsSize`) with occlusion / emissive / height-bump / alpha-checker sampling and
+matching feature bits; `preview_push` fills the new slots from the material. The **normal flip-Y**
+uniform was dropped (dead code — the role model carries no GL/DX distinction to drive it; revisit when
+`nor_gl`/`nor_dx` are distinguished). Verified: `xtask shaders` + workspace build + `clippy -D warnings`
+clean. (Live thumbnail render is GPU-test-fixture-limited in this sandbox — see phase-1 note.)
 **Scope:** `saffron-assets`, `saffron-rendering` (`preview.slang`)
 **Depends on:** phase-1 (role known). Sphere thumbnail path is otherwise unblocked (uses the existing
 offscreen `make_preview_sphere`).

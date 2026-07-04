@@ -1,6 +1,17 @@
 # Texture role data model — persist it, plumb it, surface it
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `saffron-scene` gained a `TextureRole` enum + `AssetEntry.role`; the role is
+inferred from the filename token (`infer_texture_role`) and persisted through `.smeta`
+(`SmetaData.role`) and the catalog cache JSON, surviving cold scans. `import-texture` gained a `role`
+hint (`texture_role_from_hint`, canonical-first so a connector `"normal"` dodges the `detect`
+`"normal"⊃"orm"` quirk); the **engine now owns the role→colorspace policy** (`colorspace_for_role_explicit`)
+and the editor's duplicated `colorspace_for_role` is deleted — connectors send the role, the engine
+derives the upload space (color→sRGB, HDRI→float, every other explicit role→linear) *and* stores the
+role. `AssetEntryDto` exposes `colorspace` + `role`. Verified: build + `clippy -D warnings` + `fmt`
+clean, `texture_role_names_round_trip` + role-inference/round-trip scan tests pass in isolation,
+frontend `tsc` + Tauri-bridge `cargo check` clean. (The shared GPU test fixture SIGSEGVs at Vulkan
+device teardown when several GPU tests share a process — a pre-existing environmental fixture leak, not
+this change; each test's assertions pass alone.)
 **Scope:** `saffron-scene`, `saffron-assets`, `saffron-protocol`, `saffron-control`, editor connectors
 **Depends on:** — (independent; start early, in parallel with `primitive-meshes/`)
 
