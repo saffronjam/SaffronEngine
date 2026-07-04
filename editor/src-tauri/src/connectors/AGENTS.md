@@ -13,10 +13,11 @@ frontend half is `editor/src/storefront/` (its own `AGENTS.md`); the two are bri
 ```
 mod.rs           the framework: the StoreConnector trait; the normalized DTOs (StoreResult,
                  StoreImportDescriptor, AssetPart, StoreLicense, StoreKind, AuthKind, …);
-                 ConnectorRuntime (Tauri-managed registry + live search sessions); and the
-                 shared HTTP helpers (stream_get, cached_fetch, extract_zip, store_cache_dir)
+                 ConnectorRuntime (Tauri-managed registry + resource cache + live search
+                 sessions); ProgressFn + extract_zip
+cache.rs         ResourceCache — the ONE outbound-HTTP + disk-cache + throttle layer (see below)
 registry.rs      ConnectorRegistry — the fixed set of connectors the editor knows about
-aggregator.rs    SearchSession — a round-robin multi-provider search cursor (no ranking)
+session.rs       SearchSession — a scroll-driven cursor over the one selected store
 credentials.rs   the OS-keyring credential store (secrets never touch the project file)
 oauth_loopback.rs a reusable RFC 8252 loopback OAuth (implicit-flow) login
 polyhaven.rs · ambientcg.rs · polypizza.rs · sketchfab.rs   one StoreConnector each
@@ -65,13 +66,35 @@ callback is accepted, then the token is written to the keyring.
 - **Structured licenses, never a free string** (`StoreLicense { id, requires_attribution, url }`) so
   attribution can be enforced at import; default to an attribution-safe license when a provider is
   vague.
-- **Download to a temp cache, then hand off by `StoreKind`.** Deliverables land under
-  `store_cache_dir()` (content-addressed via `cached_fetch`); the bridge routes the path to the host
-  importer by kind (a material map set ships as a flat, role-named zip that the host's
-  `import_material_folder` scans by filename).
-- The aggregator is **round-robin with no cross-provider ranking**; per-project enablement is applied
-  by the caller via the `providers` scope on a search (the editor passes the project's enabled set),
-  not inside the registry.
+- **Everything remote goes through `ResourceCache` — never a bespoke client, folder, or download.**
+  A connector holds an `Arc<ResourceCache>` and uses `cache.client()` for **dynamic** calls (search
+  listings, download manifests, HEAD probes) and the cache's fetch/store methods for anything
+  cacheable. The bridge then routes the returned path to the host importer by `StoreKind` (a
+  material map set ships as a flat, role-named zip the host's `import_material_folder` scans).
+- A search runs against **one store** (`SearchQuery.provider`, resolved by `ConnectorRuntime::
+  start_session` via `ConnectorRegistry::by_id`); there is no cross-provider merge. Per-project
+  enablement (which stores the dropdown offers) is control-plane state the editor owns, not the
+  registry — the registry knows every connector and resolves the one a search names.
+
+## The resource cache (`cache.rs`)
+
+`ResourceCache` is the **one** place the bridge fetches a remote resource, keeps it on disk
+(rooted at `appdata/cache/`, so it **survives restarts** — not the temp dir), and serves it back.
+Anything that needs "fetch a URL once, keep it, serve it" routes through it; do not mint a second
+cache or a per-feature directory.
+
+- `client()` — the shared `reqwest::Client` (User-Agent baked in) for **uncacheable** dynamic calls.
+- `bytes(url)` — content-addressed blob (bytes + content type), fetch-once. Backs the
+  `saffron-img://` image scheme (registered in `lib.rs`) that thumbnails/gallery previews load
+  through, so a screenful of tiles never stampedes a provider CDN.
+- `file(url, ext, progress)` / `file_keyed(key, url, ext, progress)` — a cached single file by url,
+  or by an explicit key when the url is signed/ephemeral (Sketchfab archives keyed by model uid).
+- `fetch(url, progress)` — throttled, **un**-cached bytes for content materialized elsewhere.
+- `derived(key)` — a materialized directory (extracted map set, multi-file glTF) built once into a
+  `.partial` sibling and atomically renamed in, so a crashed build never looks cached.
+
+Each blob carries a `{key}.meta.json` sidecar (source url, ext, content type, fetched-at). A
+bounded `Semaphore` caps upstream concurrency; only cache misses take a permit.
 
 ## Trap
 

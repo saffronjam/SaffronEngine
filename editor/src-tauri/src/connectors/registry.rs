@@ -1,13 +1,14 @@
-//! The connector registry: the set of connectors the editor knows about. Phase 1 enables
-//! Poly Haven by default; Phase 2 makes the enabled set per-project.
+//! The connector registry: the fixed set of connectors the editor knows about. Which of them a
+//! project uses is per-project state (`get-stores`/`set-stores`, saved in `project.json`); a
+//! search names the one store to run against, resolved here by id.
 
 use std::sync::Arc;
 
 use serde::Serialize;
 
 use super::{
-    AuthKind, StoreConnector, ambientcg::AmbientCg, polyhaven::PolyHaven, polypizza::PolyPizza,
-    sketchfab::Sketchfab,
+    AuthKind, ResourceCache, StoreConnector, ambientcg::AmbientCg, polyhaven::PolyHaven,
+    polypizza::PolyPizza, sketchfab::Sketchfab,
 };
 
 /// A connector's identity + state, surfaced to the webview.
@@ -27,20 +28,14 @@ pub struct ConnectorRegistry {
 }
 
 impl ConnectorRegistry {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new(cache: Arc<ResourceCache>) -> Self {
         let connectors: Vec<Arc<dyn StoreConnector>> = vec![
-            Arc::new(PolyHaven::new(http.clone())),
-            Arc::new(AmbientCg::new(http.clone())),
-            Arc::new(PolyPizza::new(http.clone())),
-            Arc::new(Sketchfab::new(http)),
+            Arc::new(PolyHaven::new(Arc::clone(&cache))),
+            Arc::new(AmbientCg::new(Arc::clone(&cache))),
+            Arc::new(PolyPizza::new(Arc::clone(&cache))),
+            Arc::new(Sketchfab::new(cache)),
         ];
         Self { connectors }
-    }
-
-    /// Every available connector. Per-project enablement is applied by the caller via the
-    /// `providers` scope on a search (the editor passes the project's enabled set).
-    pub fn enabled(&self) -> &[Arc<dyn StoreConnector>] {
-        &self.connectors
     }
 
     pub fn by_id(&self, id: &str) -> Option<Arc<dyn StoreConnector>> {

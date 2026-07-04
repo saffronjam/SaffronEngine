@@ -5,14 +5,14 @@
 //! Imports default to 2K; a chosen resolution swaps the download's `_<n>K` token.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    AssetPart, AuthKind, ConnectorError, SearchPage, SearchQuery, StoreConnector, StoreCursor,
-    StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult, cache_key, cached_fetch,
-    extract_zip, store_cache_dir, user_agent,
+    AssetPart, AuthKind, ConnectorError, ResourceCache, SearchPage, SearchQuery, StoreConnector,
+    StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult, extract_zip,
 };
 
 const API_BASE: &str = "https://ambientcg.com/api/v2/full_json";
@@ -32,12 +32,30 @@ fn role_of(map: &str) -> Option<(&'static str, &'static str, &'static str)> {
 }
 
 pub struct AmbientCg {
-    http: reqwest::Client,
+    cache: Arc<ResourceCache>,
 }
 
 impl AmbientCg {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(cache: Arc<ResourceCache>) -> Self {
+        Self { cache }
+    }
+
+    /// Fetch `requested`, falling back to `fallback` if that resolution variant is missing.
+    /// Returns the url actually fetched plus its bytes.
+    async fn fetch_with_fallback(
+        &self,
+        requested: &str,
+        fallback: &str,
+        progress: &super::ProgressFn<'_>,
+    ) -> Result<(String, Vec<u8>), ConnectorError> {
+        match self.cache.fetch(requested, Some(progress)).await {
+            Ok((bytes, _)) => Ok((requested.to_owned(), bytes)),
+            Err(_) if requested != fallback => {
+                let (bytes, _) = self.cache.fetch(fallback, Some(progress)).await?;
+                Ok((fallback.to_owned(), bytes))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn cc0() -> StoreLicense {
@@ -160,7 +178,8 @@ impl StoreConnector for AmbientCg {
         };
         let offset: usize = cursor.as_ref().and_then(|c| c.0.parse().ok()).unwrap_or(0);
         let resp = self
-            .http
+            .cache
+            .client()
             .get(API_BASE)
             .query(&[
                 ("type", api_type),
@@ -170,7 +189,6 @@ impl StoreConnector for AmbientCg {
                 ("q", query.text.trim()),
                 ("sort", "popular"),
             ])
-            .header(reqwest::header::USER_AGENT, user_agent())
             .send()
             .await
             .map_err(|e| ConnectorError::Http(e.to_string()))?;
@@ -210,34 +228,36 @@ impl StoreConnector for AmbientCg {
             Some(res) => url_with_resolution(&descriptor.ref_, res),
             None => descriptor.ref_.clone(),
         };
-        let report = |done: u64, total: Option<u64>| {
-            if let Some(t) = total.filter(|t| *t > 0) {
-                progress(done as f64 / t as f64);
-            }
-        };
-        let (url, bytes) = match super::stream_get(&self.http, &requested, &report).await {
-            Ok(b) => (requested, b),
-            Err(_) if requested != descriptor.ref_ => (
-                descriptor.ref_.clone(),
-                super::stream_get(&self.http, &descriptor.ref_, &report).await?,
-            ),
-            Err(e) => return Err(e),
-        };
-        let base = store_cache_dir().join("ambientcg");
         match descriptor.format.as_str() {
-            // A material map set: extract the folder the host's material importer scans.
+            // A material map set: extract into a cached folder the host's material importer scans.
             "texture-zip" => {
-                let dir = base.join(format!("set-{}", stable_id(&url)));
-                let _ = std::fs::remove_dir_all(&dir);
-                extract_zip(&bytes, &dir)?;
-                Ok(dir)
+                let derived = self.cache.derived(&format!("acg-set-{}", stable_id(&requested)));
+                if derived.exists() {
+                    progress(1.0);
+                } else {
+                    let (_, bytes) = self
+                        .fetch_with_fallback(&requested, &descriptor.ref_, progress)
+                        .await?;
+                    let dir = derived.begin()?;
+                    extract_zip(&bytes, &dir)?;
+                    derived.commit()?;
+                }
+                Ok(derived.path().to_path_buf())
             }
-            // An HDRI zipped: extract and return the single environment file inside.
+            // An HDRI zipped: extract (cached) and return the single environment file inside.
             "hdri-zip" => {
-                let dir = base.join(format!("hdri-{}", stable_id(&url)));
-                let _ = std::fs::remove_dir_all(&dir);
-                extract_zip(&bytes, &dir)?;
-                std::fs::read_dir(&dir)
+                let derived = self.cache.derived(&format!("acg-hdri-{}", stable_id(&requested)));
+                if derived.exists() {
+                    progress(1.0);
+                } else {
+                    let (_, bytes) = self
+                        .fetch_with_fallback(&requested, &descriptor.ref_, progress)
+                        .await?;
+                    let dir = derived.begin()?;
+                    extract_zip(&bytes, &dir)?;
+                    derived.commit()?;
+                }
+                std::fs::read_dir(derived.path())
                     .map_err(|e| ConnectorError::Download(e.to_string()))?
                     .flatten()
                     .map(|e| e.path())
@@ -250,15 +270,16 @@ impl StoreConnector for AmbientCg {
                         ConnectorError::Download("no .hdr/.exr in HDRI archive".to_owned())
                     })
             }
-            // A direct HDRI file.
-            _ => {
-                std::fs::create_dir_all(&base)
-                    .map_err(|e| ConnectorError::Download(e.to_string()))?;
-                let dest = base.join(format!("{}.hdr", stable_id(&url)));
-                std::fs::write(&dest, &bytes)
-                    .map_err(|e| ConnectorError::Download(e.to_string()))?;
-                Ok(dest)
-            }
+            // A direct HDRI file — blob-cached (fetch-once), with the resolution fallback.
+            _ => match self.cache.file(&requested, "hdr", Some(progress)).await {
+                Ok(p) => Ok(p),
+                Err(_) if requested != descriptor.ref_ => self
+                    .cache
+                    .file(&descriptor.ref_, "hdr", Some(progress))
+                    .await
+                    .map_err(Into::into),
+                Err(e) => Err(e.into()),
+            },
         }
     }
 
@@ -270,10 +291,10 @@ impl StoreConnector for AmbientCg {
             return Ok(Vec::new());
         }
         let resp = self
-            .http
+            .cache
+            .client()
             .get(API_BASE)
             .query(&[("id", result.id.as_str()), ("include", "downloadData")])
-            .header(reqwest::header::USER_AGENT, user_agent())
             .send()
             .await
             .map_err(|e| ConnectorError::Http(e.to_string()))?;
@@ -322,21 +343,25 @@ impl StoreConnector for AmbientCg {
             Some(res) => url_with_resolution(bundle0, res),
             None => bundle0.to_owned(),
         };
-        let (bundle, zip) = match cached_fetch(&self.http, &requested, "zip").await {
+        let (bundle, zip) = match self.cache.file(&requested, "zip", None).await {
             Ok(z) => (requested, z),
             Err(_) if requested != bundle0 => (
                 bundle0.to_owned(),
-                cached_fetch(&self.http, bundle0, "zip").await?,
+                self.cache.file(bundle0, "zip", None).await?,
             ),
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
-        let bytes = std::fs::read(&zip).map_err(|e| ConnectorError::Download(e.to_string()))?;
-        let dir = store_cache_dir()
-            .join("cache")
-            .join(format!("acg-{}", cache_key(&bundle)));
-        extract_zip(&bytes, &dir)?;
+        // Extract the (cached) bundle zip into a cached folder, reused across every map picked
+        // from the same bundle.
+        let derived = self.cache.derived(&format!("acg-bundle-{}", stable_id(&bundle)));
+        if !derived.exists() {
+            let bytes = std::fs::read(&zip).map_err(|e| ConnectorError::Download(e.to_string()))?;
+            let dir = derived.begin()?;
+            extract_zip(&bytes, &dir)?;
+            derived.commit()?;
+        }
         let token = part.ref_.to_lowercase();
-        std::fs::read_dir(&dir)
+        std::fs::read_dir(derived.path())
             .map_err(|e| ConnectorError::Download(e.to_string()))?
             .flatten()
             .map(|e| e.path())

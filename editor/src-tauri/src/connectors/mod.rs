@@ -7,13 +7,14 @@
 //! The single switch every later capability branches on is [`AuthKind`]; Phase 1 only
 //! constructs [`AuthKind::None`].
 
-mod aggregator;
 mod ambientcg;
+mod cache;
 mod credentials;
 mod oauth_loopback;
 mod polyhaven;
 mod polypizza;
 mod registry;
+mod session;
 mod sketchfab;
 
 use std::collections::HashMap;
@@ -26,10 +27,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
-pub use aggregator::SearchSession;
+pub use cache::ResourceCache;
 pub use credentials::Credentials;
 pub use oauth_loopback::{OAuthLoopbackConfig, run_loopback_login};
 pub use registry::{ConnectorInfo, ConnectorRegistry};
+pub use session::SearchSession;
 
 /// How a connector authenticates — the one switch the framework branches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +161,7 @@ pub struct GalleryImage {
     pub full_url: Option<String>,
 }
 
-/// A committed search: free text, an optional kind filter, and the provider scope.
+/// A committed search: free text, an optional kind filter, and the store to search.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
@@ -167,9 +169,9 @@ pub struct SearchQuery {
     pub text: String,
     #[serde(default)]
     pub kind: Option<StoreKind>,
-    /// When non-empty, only these connector ids run (the `provider:` chips).
+    /// The single connector id the search runs against (chosen in the Store's store dropdown).
     #[serde(default)]
-    pub providers: Vec<String>,
+    pub provider: String,
 }
 
 /// An opaque, connector-defined cursor (offset, page token, …).
@@ -255,24 +257,30 @@ pub trait StoreConnector: Send + Sync {
     }
 }
 
-/// The Tauri-managed connector runtime: the registry plus live search sessions.
+/// The Tauri-managed connector runtime: the registry, the shared resource cache, plus live
+/// search sessions.
 pub struct ConnectorRuntime {
     registry: ConnectorRegistry,
+    cache: Arc<ResourceCache>,
     sessions: StdMutex<HashMap<String, Arc<AsyncMutex<SearchSession>>>>,
     next_id: AtomicU64,
 }
 
 impl ConnectorRuntime {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(user_agent())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        // A persistent root (survives restarts), shared by every connector and the image scheme.
+        let cache = ResourceCache::new(crate::app_data_dir().join("cache"));
         Self {
-            registry: ConnectorRegistry::new(http),
+            registry: ConnectorRegistry::new(Arc::clone(&cache)),
+            cache,
             sessions: StdMutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    /// The shared resource cache — used by the `saffron-img://` scheme to serve thumbnails.
+    pub fn cache(&self) -> Arc<ResourceCache> {
+        Arc::clone(&self.cache)
     }
 
     pub fn infos(&self) -> Vec<ConnectorInfo> {
@@ -288,25 +296,20 @@ impl ConnectorRuntime {
         self.registry.by_id(id).and_then(|c| c.oauth_config())
     }
 
-    /// Starts a session for `query` (scoped to the `provider:` chips when present) and
-    /// returns its id. Old sessions are dropped when the webview stops polling them.
-    pub fn start_session(&self, query: SearchQuery) -> String {
-        let connectors: Vec<Arc<dyn StoreConnector>> = if query.providers.is_empty() {
-            self.registry.enabled().to_vec()
-        } else {
-            query
-                .providers
-                .iter()
-                .filter_map(|id| self.registry.by_id(id))
-                .collect()
-        };
-        let session = SearchSession::new(query, connectors);
+    /// Starts a session searching `query.provider` and returns its id. Errors when the id names
+    /// no known connector. Old sessions are dropped when the webview stops polling them.
+    pub fn start_session(&self, query: SearchQuery) -> Result<String, ConnectorError> {
+        let connector = self
+            .registry
+            .by_id(&query.provider)
+            .ok_or_else(|| ConnectorError::NotConfigured(query.provider.clone()))?;
+        let session = SearchSession::new(query, connector);
         let id = format!("s{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(id.clone(), Arc::new(AsyncMutex::new(session)));
-        id
+        Ok(id)
     }
 
     pub fn session(&self, id: &str) -> Option<Arc<AsyncMutex<SearchSession>>> {
@@ -332,87 +335,8 @@ pub fn user_agent() -> String {
     )
 }
 
-/// A scratch directory for downloaded deliverables; the host reads from here.
-pub fn store_cache_dir() -> PathBuf {
-    std::env::temp_dir().join("saffron-anima-store")
-}
-
 /// A download-progress sink: receives a 0.0–1.0 fraction as bytes arrive.
 pub type ProgressFn<'a> = dyn Fn(f64) + Send + Sync + 'a;
-
-/// Streams a GET into memory, invoking `on_bytes(downloaded, total)` after each chunk so the
-/// caller can report progress. `total` is the `Content-Length` when the server provides it.
-pub async fn stream_get(
-    http: &reqwest::Client,
-    url: &str,
-    mut on_bytes: impl FnMut(u64, Option<u64>),
-) -> Result<Vec<u8>, ConnectorError> {
-    let mut resp = http
-        .get(url)
-        .header(reqwest::header::USER_AGENT, user_agent())
-        .send()
-        .await
-        .map_err(|e| ConnectorError::Download(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(ConnectorError::Download(format!(
-            "{} for {url}",
-            resp.status()
-        )));
-    }
-    let total = resp.content_length();
-    let mut buf = Vec::with_capacity(total.unwrap_or(0) as usize);
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| ConnectorError::Download(e.to_string()))?
-    {
-        buf.extend_from_slice(&chunk);
-        on_bytes(buf.len() as u64, total);
-    }
-    Ok(buf)
-}
-
-/// A stable, filesystem-safe cache key for a url.
-pub fn cache_key(url: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    url.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
-
-/// Fetches `url` into a content-addressed cache file (reused across parts) and returns its
-/// path. The `ext` is only for a readable filename. Skips the request when already cached.
-pub async fn cached_fetch(
-    http: &reqwest::Client,
-    url: &str,
-    ext: &str,
-) -> Result<PathBuf, ConnectorError> {
-    let dir = store_cache_dir().join("cache");
-    std::fs::create_dir_all(&dir).map_err(|e| ConnectorError::Download(e.to_string()))?;
-    let dest = dir.join(format!("{}.{ext}", cache_key(url)));
-    if dest.exists() {
-        return Ok(dest);
-    }
-    let resp = http
-        .get(url)
-        .header(reqwest::header::USER_AGENT, user_agent())
-        .send()
-        .await
-        .map_err(|e| ConnectorError::Download(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(ConnectorError::Download(format!(
-            "{} for {url}",
-            resp.status()
-        )));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ConnectorError::Download(e.to_string()))?;
-    std::fs::write(&dest, &bytes).map_err(|e| ConnectorError::Download(e.to_string()))?;
-    Ok(dest)
-}
 
 /// Extracts a zip's files (flattened to basenames) into `dir`. Material map sets ship as a
 /// flat zip of role-named images, which the host's `import_material_folder` scans by name.

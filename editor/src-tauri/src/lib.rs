@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, RunEvent, State,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, RunEvent, State, WindowEvent,
 };
 
 mod connectors;
@@ -73,6 +73,55 @@ struct EditorSettings {
     #[serde(default)]
     key_bindings: std::collections::HashMap<String, String>,
 }
+
+/// The generic "remember where I left it" bucket, persisted hand-rolled to appdata/state.json — a
+/// sibling of settings.json / recent-projects.json. This is transient UI memory, not configured
+/// settings: a missing or corrupt file means no memory, so the window falls back to filling the
+/// current monitor. New top-level blocks can be added as more transient state is remembered.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RememberedState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<WindowState>,
+}
+
+/// The editor window's last-known geometry, in physical pixels so it round-trips 1:1 with
+/// `inner_size()` / `outer_position()` and the monitor rects used for clamping. `maximized`
+/// re-applies the maximized state on top of the remembered normal-size geometry. `scale` and
+/// `monitor` are best-effort hints — native Wayland cannot force an output or a position, so they
+/// are advisory (`scale` records the DPI the size was captured at, for a future cross-DPI pass).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowState {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+    #[serde(default)]
+    scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    monitor: Option<String>,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: MAIN_WINDOW_WIDTH as u32,
+            height: MAIN_WINDOW_HEIGHT as u32,
+            maximized: false,
+            scale: 1.0,
+            monitor: None,
+        }
+    }
+}
+
+/// The live in-memory geometry snapshot, managed as Tauri state and flushed to state.json on exit.
+/// Updated on every resize/move while not maximized; the maximized flag tracks every change.
+#[derive(Default)]
+struct WindowStateTracker(Mutex<WindowState>);
 
 impl Default for EditorState {
     fn default() -> Self {
@@ -210,6 +259,36 @@ fn app_data_dir() -> PathBuf {
     repo_root().join("appdata")
 }
 
+/// Percent-decode a `%XX` string (the `?u=` image url). Bytes that aren't a valid `%XX` escape pass
+/// through, so an already-decoded url decodes to itself.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// An empty error body for a failed `saffron-img://` fetch; the webview shows its broken-image glyph.
+fn img_scheme_error() -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(502)
+        .body(Vec::new())
+        .expect("build image error response")
+}
+
 fn userdata_dir() -> PathBuf {
     app_data_dir().join("userdata")
 }
@@ -256,22 +335,121 @@ fn write_settings_file(settings: &EditorSettings) -> Result<(), String> {
     fs::write(settings_path(), text).map_err(|err| format!("write editor settings: {err}"))
 }
 
-fn configure_main_window(window: &tauri::WebviewWindow) {
-    let _ = window.set_title("Saffron Anima");
-    let _ = window.set_min_size(Some(LogicalSize::new(
-        MAIN_WINDOW_MIN_WIDTH,
-        MAIN_WINDOW_MIN_HEIGHT,
-    )));
+fn state_path() -> PathBuf {
+    app_data_dir().join("state.json")
+}
+
+// A missing or corrupt state file falls back to defaults (no remembered window).
+fn read_state_file() -> RememberedState {
+    let Ok(text) = fs::read_to_string(state_path()) else {
+        return RememberedState::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_state_file(state: &RememberedState) -> Result<(), String> {
+    ensure_app_dirs()?;
+    let text = serde_json::to_string_pretty(state)
+        .map_err(|err| format!("encode remembered state: {err}"))?;
+    fs::write(state_path(), text).map_err(|err| format!("write remembered state: {err}"))
+}
+
+// Window-geometry restore. The editor window is the on-screen window (the host renders headless),
+// so its geometry is remembered in appdata/state.json and re-applied here, before the window is
+// revealed from JS.
+//
+// Only SIZE and MAXIMIZED are acted on. Position and monitor are still recorded (they may be useful
+// on a platform that can honor them), but never applied: native Wayland — GNOME/Mutter in
+// particular — gives a client no way to place its own toplevel or choose an output, so acting on
+// them is pointless here. The compositor owns placement.
+
+/// Re-apply a remembered geometry: SIZE then MAXIMIZED (position/monitor are recorded but not
+/// acted on). Size is set before maximize so the un-maximize restore-size equals the remembered
+/// normal size.
+fn apply_window_state(window: &tauri::WebviewWindow, want: &WindowState) {
+    let _ = window.set_size(PhysicalSize::new(want.width, want.height));
+    if want.maximized {
+        let _ = window.maximize();
+    }
+}
+
+/// The no-memory default: size to the current (else primary) monitor. Returns the geometry applied
+/// so the caller can seed the live tracker (recording the monitor's position/name even though only
+/// its size is acted on).
+fn fill_current_monitor(window: &tauri::WebviewWindow) -> WindowState {
     if let Ok(Some(monitor)) = window
         .current_monitor()
         .or_else(|_| window.primary_monitor())
     {
         let position = monitor.position();
         let size = monitor.size();
-        let _ = window.set_position(PhysicalPosition::new(position.x, position.y));
         let _ = window.set_size(PhysicalSize::new(size.width, size.height));
+        WindowState {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+            maximized: false,
+            scale: monitor.scale_factor(),
+            monitor: monitor.name().cloned(),
+        }
     } else {
         let _ = window.set_size(LogicalSize::new(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT));
+        WindowState::default()
+    }
+}
+
+/// Fold the window's current geometry into the live tracker (called on every resize/move). The
+/// maximized flag always tracks; x/y/width/height only update while not maximized, because a
+/// maximized window reports the maximized bounds and we must remember the last normal geometry so
+/// un-maximize (and next launch's restore-then-maximize) return to the right size.
+fn capture_window_geometry(window: &tauri::WebviewWindow, tracker: &WindowStateTracker) {
+    let mut guard = tracker.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let maximized = window.is_maximized().unwrap_or(false);
+    guard.maximized = maximized;
+    // Monitor + scale are best-effort hints that reflect current reality regardless of maximized;
+    // if they only updated while restored, a window opened-and-kept maximized would keep a stale
+    // monitor from a previous session.
+    if let Ok(scale) = window.scale_factor() {
+        guard.scale = scale;
+    }
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        guard.monitor = monitor.name().cloned();
+    }
+    // Size (and the normal position) must stay the last NON-maximized geometry, so un-maximize —
+    // and next launch's restore-then-maximize — return to the right size.
+    if maximized {
+        return;
+    }
+    if let Ok(size) = window.inner_size()
+        && size.width > 0
+        && size.height > 0
+    {
+        guard.width = size.width;
+        guard.height = size.height;
+    }
+    // outer_position() errors on native Wayland — keep the last-known x/y rather than lose it.
+    if let Ok(pos) = window.outer_position() {
+        guard.x = pos.x;
+        guard.y = pos.y;
+    }
+}
+
+/// Restore the window's remembered geometry (or fill the current monitor when there is no memory),
+/// before the window is shown. Returns the applied geometry so the caller seeds the live tracker.
+fn configure_main_window(window: &tauri::WebviewWindow) -> WindowState {
+    let _ = window.set_title("Saffron Anima");
+    let _ = window.set_min_size(Some(LogicalSize::new(
+        MAIN_WINDOW_MIN_WIDTH,
+        MAIN_WINDOW_MIN_HEIGHT,
+    )));
+
+    match read_state_file().window {
+        Some(want) if want.width > 0 && want.height > 0 => {
+            apply_window_state(window, &want);
+            want
+        }
+        _ => fill_current_monitor(window),
     }
 }
 
@@ -446,13 +624,14 @@ fn store_list_connectors(
     connectors.infos()
 }
 
-/// Starts (or replaces) a search session for a committed query; returns its id.
+/// Starts (or replaces) a search session for a committed query; returns its id. Errors when the
+/// query names no known store.
 #[tauri::command]
 fn store_search_session(
     connectors: State<'_, connectors::ConnectorRuntime>,
     query: connectors::SearchQuery,
-) -> String {
-    connectors.start_session(query)
+) -> Result<String, String> {
+    connectors.start_session(query).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -462,8 +641,7 @@ struct StoreSearchMore {
     exhausted: bool,
 }
 
-/// The virtual-scroll driver: the next round-robin batch plus whether all sources are
-/// exhausted.
+/// The virtual-scroll driver: the next batch from the store plus whether it is exhausted.
 #[tauri::command]
 async fn store_search_more(
     connectors: State<'_, connectors::ConnectorRuntime>,
@@ -1069,7 +1247,43 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(EditorState::default())
+        .manage(WindowStateTracker::default())
         .manage(connectors::ConnectorRuntime::new())
+        // Thumbnails / gallery previews load through the shared resource cache instead of hitting
+        // the provider CDN directly: the webview requests `saffron-img://fetch/?u=<provider-url>`,
+        // and this serves the bytes from disk (fetching once, throttled) so a screenful of tiles
+        // never stampedes the provider.
+        .register_asynchronous_uri_scheme_protocol("saffron-img", |ctx, request, responder| {
+            let cache = ctx
+                .app_handle()
+                .state::<connectors::ConnectorRuntime>()
+                .cache();
+            // Take everything after `u=` and percent-decode it. Robust whether the webview hands
+            // the URI encoded or already decoded — the provider url's own `?`/`&` can't split it.
+            let target = request
+                .uri()
+                .to_string()
+                .split_once("u=")
+                .map(|(_, rest)| percent_decode(rest));
+            tauri::async_runtime::spawn(async move {
+                let response = match target {
+                    Some(url) => match cache.bytes(&url).await {
+                        Ok((bytes, content_type)) => tauri::http::Response::builder()
+                            .status(200)
+                            .header(tauri::http::header::CONTENT_TYPE, content_type)
+                            .header(
+                                tauri::http::header::CACHE_CONTROL,
+                                "public, max-age=31536000, immutable",
+                            )
+                            .body(bytes)
+                            .unwrap_or_else(|_| img_scheme_error()),
+                        Err(_) => img_scheme_error(),
+                    },
+                    None => img_scheme_error(),
+                };
+                responder.respond(response);
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             control,
             start_engine,
@@ -1101,7 +1315,20 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                configure_main_window(&window);
+                // Restore the remembered geometry (or fill the monitor) before the window is shown,
+                // then seed the tracker so a snapshot persists even if no resize/move fires first.
+                let seed = configure_main_window(&window);
+                *app.state::<WindowStateTracker>()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = seed;
+                let handle = app.handle().clone();
+                let tracked = window.clone();
+                window.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Resized(_) | WindowEvent::Moved(_)) {
+                        capture_window_geometry(&tracked, &handle.state::<WindowStateTracker>());
+                    }
+                });
                 let viewports = Arc::clone(&app.state::<EditorState>().viewports);
                 if let Err(err) = wayland_viewport::install(
                     &window,
@@ -1123,6 +1350,15 @@ pub fn run() {
             if let RunEvent::ExitRequested { .. } = event {
                 let state = handle.state::<EditorState>();
                 teardown(&state);
+                let snapshot = handle
+                    .state::<WindowStateTracker>()
+                    .0
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let _ = write_state_file(&RememberedState {
+                    window: Some(snapshot),
+                });
             }
         });
 }

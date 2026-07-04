@@ -4,26 +4,26 @@
 //! silently empty results.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    AuthKind, ConnectorError, Credentials, SearchPage, SearchQuery, StoreConnector, StoreCursor,
-    StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult, store_cache_dir,
-    user_agent,
+    AuthKind, ConnectorError, Credentials, ResourceCache, SearchPage, SearchQuery, StoreConnector,
+    StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult,
 };
 
 const API_BASE: &str = "https://api.poly.pizza/v1.1";
 const PAGE: usize = 24;
 
 pub struct PolyPizza {
-    http: reqwest::Client,
+    cache: Arc<ResourceCache>,
 }
 
 impl PolyPizza {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(cache: Arc<ResourceCache>) -> Self {
+        Self { cache }
     }
 
     fn key(&self) -> Result<String, ConnectorError> {
@@ -153,11 +153,11 @@ impl StoreConnector for PolyPizza {
         let page: usize = cursor.as_ref().and_then(|c| c.0.parse().ok()).unwrap_or(1);
         let url = format!("{API_BASE}/search/{}", encode_segment(term));
         let resp = self
-            .http
+            .cache
+            .client()
             .get(&url)
             .query(&[("page", page.to_string()), ("limit", PAGE.to_string())])
             .header("x-auth-token", key)
-            .header(reqwest::header::USER_AGENT, user_agent())
             .send()
             .await
             .map_err(|e| ConnectorError::Http(e.to_string()))?;
@@ -191,28 +191,11 @@ impl StoreConnector for PolyPizza {
         descriptor: &StoreImportDescriptor,
         progress: &super::ProgressFn,
     ) -> Result<PathBuf, ConnectorError> {
-        let url = &descriptor.ref_;
-        let bytes = super::stream_get(&self.http, url, |done, total| {
-            if let Some(t) = total.filter(|t| *t > 0) {
-                progress(done as f64 / t as f64);
-            }
-        })
-        .await?;
-        let dir = store_cache_dir().join("poly-pizza");
-        std::fs::create_dir_all(&dir).map_err(|e| ConnectorError::Download(e.to_string()))?;
-        let stem = url
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("model.glb");
-        let file = if stem.to_lowercase().ends_with(".glb") {
-            stem.to_owned()
-        } else {
-            format!("{stem}.glb")
-        };
-        let dest = dir.join(file);
-        std::fs::write(&dest, &bytes).map_err(|e| ConnectorError::Download(e.to_string()))?;
-        Ok(dest)
+        // A single GLB, keyed by its (stable) download url — cached, so a re-import is instant.
+        self.cache
+            .file(&descriptor.ref_, "glb", Some(progress))
+            .await
+            .map_err(Into::into)
     }
 }
 

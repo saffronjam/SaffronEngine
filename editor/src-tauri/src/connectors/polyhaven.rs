@@ -13,9 +13,9 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use super::{
-    AssetPart, AuthKind, ConnectorError, GalleryImage, SearchPage, SearchQuery, StoreConnector,
-    StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult,
-    cached_fetch, store_cache_dir, user_agent,
+    AssetPart, AuthKind, ConnectorError, GalleryImage, ResourceCache, SearchPage, SearchQuery,
+    StoreConnector, StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef,
+    StoreResult,
 };
 
 const API_BASE: &str = "https://api.polyhaven.com";
@@ -132,24 +132,24 @@ struct ModelRow {
 }
 
 pub struct PolyHaven {
-    http: reqwest::Client,
+    cache: Arc<ResourceCache>,
     /// The full model listing, fetched once per process and filtered client-side.
-    cache: Mutex<Option<Arc<Vec<ModelRow>>>>,
+    listing: Mutex<Option<Arc<Vec<ModelRow>>>>,
 }
 
 impl PolyHaven {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new(cache: Arc<ResourceCache>) -> Self {
         Self {
-            http,
-            cache: Mutex::new(None),
+            cache,
+            listing: Mutex::new(None),
         }
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, ConnectorError> {
         let resp = self
-            .http
+            .cache
+            .client()
             .get(url)
-            .header(reqwest::header::USER_AGENT, user_agent())
             .send()
             .await
             .map_err(|e| ConnectorError::Http(e.to_string()))?;
@@ -162,7 +162,7 @@ impl PolyHaven {
     }
 
     async fn ensure_listing(&self) -> Result<Arc<Vec<ModelRow>>, ConnectorError> {
-        let mut guard = self.cache.lock().await;
+        let mut guard = self.listing.lock().await;
         if let Some(rows) = guard.as_ref() {
             return Ok(Arc::clone(rows));
         }
@@ -251,9 +251,9 @@ impl PolyHaven {
     /// A cheap HEAD probe — Poly Haven renders aren't listed by the API, so a predictable
     /// render URL is only included in the gallery once confirmed to exist.
     async fn url_exists(&self, url: &str) -> bool {
-        self.http
+        self.cache
+            .client()
             .head(url)
-            .header(reqwest::header::USER_AGENT, user_agent())
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -353,46 +353,48 @@ impl StoreConnector for PolyHaven {
             .filter(|s| !s.is_empty())
             .unwrap_or("model.gltf");
 
-        let dir = store_cache_dir().join(format!("polyhaven-{slug}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).map_err(|e| ConnectorError::Download(e.to_string()))?;
-
-        // The deliverable is the manifest plus every external buffer/image it references;
-        // sizes come from the manifest, so progress can be reported across the whole set.
-        let main_path = dir.join(filename);
-        let mut targets: Vec<(String, PathBuf, u64)> = vec![(
-            main_url.to_owned(),
-            main_path.clone(),
-            entry.get("size").and_then(Value::as_u64).unwrap_or(0),
-        )];
-        if let Some(include) = entry.get("include").and_then(Value::as_object) {
-            for (rel, info) in include {
-                if let Some(url) = info.get("url").and_then(Value::as_str) {
-                    targets.push((
-                        url.to_owned(),
-                        dir.join(rel),
-                        info.get("size").and_then(Value::as_u64).unwrap_or(0),
-                    ));
+        // The whole glTF file set (manifest + external buffers/images) is a materialized
+        // directory in the cache, keyed by slug + resolution. A repeat import of the same asset +
+        // resolution reuses it — only the small `/files` manifest lookup above still runs.
+        let derived = self.cache.derived(&format!("polyhaven-{slug}-{res_key}"));
+        if !derived.exists() {
+            let dir = derived.begin()?;
+            // Fetch the manifest plus every referenced file; sizes come from the manifest, so
+            // progress spans the whole set (each file's fraction folded into the aggregate).
+            let mut targets: Vec<(String, PathBuf, u64)> = vec![(
+                main_url.to_owned(),
+                dir.join(filename),
+                entry.get("size").and_then(Value::as_u64).unwrap_or(0),
+            )];
+            if let Some(include) = entry.get("include").and_then(Value::as_object) {
+                for (rel, info) in include {
+                    if let Some(url) = info.get("url").and_then(Value::as_str) {
+                        targets.push((
+                            url.to_owned(),
+                            dir.join(rel),
+                            info.get("size").and_then(Value::as_u64).unwrap_or(0),
+                        ));
+                    }
                 }
             }
-        }
-        let total = targets.iter().map(|(_, _, s)| *s).sum::<u64>().max(1);
-
-        let mut done: u64 = 0;
-        for (url, dest, size) in &targets {
-            let bytes = super::stream_get(&self.http, url, |file_done, _| {
-                progress((done + file_done) as f64 / total as f64);
-            })
-            .await?;
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ConnectorError::Download(e.to_string()))?;
+            let total = targets.iter().map(|(_, _, s)| *s).sum::<u64>().max(1) as f64;
+            let mut done: u64 = 0;
+            for (url, dest, size) in &targets {
+                let base = done as f64;
+                let sz = *size as f64;
+                let file_prog = move |frac: f64| progress((base + frac * sz) / total);
+                let (bytes, _) = self.cache.fetch(url, Some(&file_prog)).await?;
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| ConnectorError::Download(e.to_string()))?;
+                }
+                std::fs::write(dest, &bytes).map_err(|e| ConnectorError::Download(e.to_string()))?;
+                done += size;
             }
-            std::fs::write(dest, &bytes).map_err(|e| ConnectorError::Download(e.to_string()))?;
-            done += size;
+            derived.commit()?;
         }
         progress(1.0);
-        Ok(main_path)
+        Ok(derived.path().join(filename))
     }
 
     async fn parts(&self, result: &StoreResult) -> Result<Vec<AssetPart>, ConnectorError> {
@@ -446,10 +448,12 @@ impl StoreConnector for PolyHaven {
             }
             _ => part.ref_.clone(),
         };
-        match cached_fetch(&self.http, &url, ext).await {
+        match self.cache.file(&url, ext, None).await {
             Ok(p) => Ok(p),
-            Err(_) if url != part.ref_ => cached_fetch(&self.http, &part.ref_, ext).await,
-            Err(e) => Err(e),
+            Err(_) if url != part.ref_ => {
+                self.cache.file(&part.ref_, ext, None).await.map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
         }
     }
 

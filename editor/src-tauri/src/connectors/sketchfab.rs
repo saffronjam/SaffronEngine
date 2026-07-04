@@ -7,25 +7,26 @@
 //! is a known risk.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    AuthKind, ConnectorError, Credentials, OAuthLoopbackConfig, SearchPage, SearchQuery,
-    StoreConnector, StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef,
-    StoreResult, store_cache_dir, user_agent,
+    AuthKind, ConnectorError, Credentials, OAuthLoopbackConfig, ResourceCache, SearchPage,
+    SearchQuery, StoreConnector, StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense,
+    StoreRef, StoreResult,
 };
 
 const API_BASE: &str = "https://api.sketchfab.com/v3";
 
 pub struct Sketchfab {
-    http: reqwest::Client,
+    cache: Arc<ResourceCache>,
 }
 
 impl Sketchfab {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(cache: Arc<ResourceCache>) -> Self {
+        Self { cache }
     }
 
     fn token(&self) -> Result<String, ConnectorError> {
@@ -141,7 +142,8 @@ impl StoreConnector for Sketchfab {
         }
         let token = self.token()?;
         let mut req = self
-            .http
+            .cache
+            .client()
             .get(format!("{API_BASE}/search"))
             .query(&[
                 ("type", "models"),
@@ -149,8 +151,7 @@ impl StoreConnector for Sketchfab {
                 ("q", query.text.trim()),
                 ("count", "24"),
             ])
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(reqwest::header::USER_AGENT, user_agent());
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
         // The v3 cursor is an opaque offset token echoed back as `cursor`.
         if let Some(StoreCursor(c)) = &cursor {
             req = req.query(&[("cursor", c.as_str())]);
@@ -195,10 +196,10 @@ impl StoreConnector for Sketchfab {
         let token = self.token()?;
         let uid = &descriptor.ref_;
         let resp = self
-            .http
+            .cache
+            .client()
             .get(format!("{API_BASE}/models/{uid}/download"))
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(reqwest::header::USER_AGENT, user_agent())
             .send()
             .await
             .map_err(|e| ConnectorError::Download(e.to_string()))?;
@@ -223,17 +224,12 @@ impl StoreConnector for Sketchfab {
             })
             .ok_or_else(|| ConnectorError::UnsupportedFormat("no deliverable".to_owned()))?;
 
-        let bytes = super::stream_get(&self.http, &url, |done, total| {
-            if let Some(t) = total.filter(|t| *t > 0) {
-                progress(done as f64 / t as f64);
-            }
-        })
-        .await?;
-        let dir = store_cache_dir().join("sketchfab");
-        std::fs::create_dir_all(&dir).map_err(|e| ConnectorError::Download(e.to_string()))?;
-        let dest = dir.join(format!("{uid}.{ext}"));
-        std::fs::write(&dest, &bytes).map_err(|e| ConnectorError::Download(e.to_string()))?;
-        Ok(dest)
+        // The download url is signed/ephemeral, so cache by the (stable) model uid + format
+        // rather than the url — a repeat import reuses the cached archive.
+        self.cache
+            .file_keyed(&format!("sketchfab-{uid}-{ext}"), &url, ext, Some(progress))
+            .await
+            .map_err(Into::into)
     }
 }
 
