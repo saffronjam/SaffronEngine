@@ -1846,9 +1846,11 @@ mod tests {
             scene
                 .add_component(
                     e,
-                    saffron_scene::Material {
-                        base_color: Vec4::new(0.2, 0.4, 0.6, 1.0),
-                        ..saffron_scene::Material::default()
+                    saffron_scene::MaterialSet {
+                        slots: vec![saffron_scene::MaterialSlot {
+                            overrides: serde_json::json!({ "baseColor": [0.2, 0.4, 0.6, 1.0] }),
+                            ..saffron_scene::MaterialSlot::default()
+                        }],
                     },
                 )
                 .unwrap();

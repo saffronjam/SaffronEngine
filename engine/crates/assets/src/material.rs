@@ -309,9 +309,10 @@ fn is_non_empty_object(value: &Value) -> bool {
 /// Applies a sparse override map `{ field: value }` onto a base material — the instance
 /// path.
 ///
-/// Writes only the named, well-typed fields and leaves the rest untouched. A
-/// non-object `overrides` is a no-op. The field set is the scalar factors, the two color
-/// vectors, and the five texture ids.
+/// Writes only the named, well-typed fields and leaves the rest untouched. A non-object
+/// `overrides` is a no-op. The field set is the material's exposed parameters (see
+/// [`crate::material_schema`]): the scalar factors, the two colour vectors, the two UV
+/// vectors, the three flags/enum, and the five texture ids.
 pub fn apply_overrides(material: &mut MaterialAsset, overrides: &Value) {
     let Some(map) = overrides.as_object() else {
         return;
@@ -326,6 +327,16 @@ pub fn apply_overrides(material: &mut MaterialAsset, overrides: &Value) {
             "emissive" => {
                 if let Some([r, g, b]) = read_array3(value) {
                     material.emissive = Vec3::new(r, g, b);
+                }
+            }
+            "uvTiling" => {
+                if let Some([x, y]) = read_array2(value) {
+                    material.uv_tiling = Vec2::new(x, y);
+                }
+            }
+            "uvOffset" => {
+                if let Some([x, y]) = read_array2(value) {
+                    material.uv_offset = Vec2::new(x, y);
                 }
             }
             "metallic" => {
@@ -346,6 +357,31 @@ pub fn apply_overrides(material: &mut MaterialAsset, overrides: &Value) {
             "normalStrength" => {
                 if let Some(v) = value.as_f64() {
                     material.normal_strength = v as f32;
+                }
+            }
+            "alphaCutoff" => {
+                if let Some(v) = value.as_f64() {
+                    material.alpha_cutoff = v as f32;
+                }
+            }
+            "heightScale" => {
+                if let Some(v) = value.as_f64() {
+                    material.height_scale = v as f32;
+                }
+            }
+            "unlit" => {
+                if let Some(v) = value.as_bool() {
+                    material.unlit = v;
+                }
+            }
+            "doubleSided" => {
+                if let Some(v) = value.as_bool() {
+                    material.double_sided = v;
+                }
+            }
+            "blend" => {
+                if let Some(v) = value.as_str() {
+                    material.blend = v.to_owned();
                 }
             }
             "albedoTexture" => material.albedo_texture = uuid_from_value(value),
@@ -385,6 +421,16 @@ fn read_array3(value: &Value) -> Option<[f32; 3]> {
         array[1].as_f64()? as f32,
         array[2].as_f64()? as f32,
     ])
+}
+
+/// Reads a 2-element `f32` array from a JSON value (with at least 2 numbers), for the
+/// override path's `uvTiling` / `uvOffset`.
+fn read_array2(value: &Value) -> Option<[f32; 2]> {
+    let array = value.as_array()?;
+    if array.len() < 2 {
+        return None;
+    }
+    Some([array[0].as_f64()? as f32, array[1].as_f64()? as f32])
 }
 
 /// Reads the stored `.smat` as-is — no parent resolution, no graph fold. The editor's
@@ -559,6 +605,12 @@ pub fn save_material_asset(
         folder: folder.to_owned(),
         ..AssetEntry::default()
     });
+    if let Err(err) = assets.write_asset_sidecar(id) {
+        tracing::warn!("material: could not write .smeta for {}: {err}", id.value());
+    }
+    // A fresh id has no cached form, but an instance-create rewrites the parent link others resolve
+    // through — clear so the resolve sees the new topology on the next frame.
+    assets.invalidate_material_caches();
     Ok(id)
 }
 
@@ -588,6 +640,8 @@ pub fn update_material_asset(
     let path = assets.root.join(&entry.path);
     let text = saffron_json::dump_json_sorted(&material_asset_to_json(material), 2);
     std::fs::write(path, text).map_err(|e| Error::Io(e.to_string()))?;
+    // The edited `.smat` (and every instance that resolves through it) is now stale in the cache.
+    assets.invalidate_material_caches();
     Ok(())
 }
 

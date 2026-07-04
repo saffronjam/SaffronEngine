@@ -33,6 +33,7 @@ mod import;
 mod load;
 mod manage;
 mod material;
+mod material_schema;
 mod model;
 mod names;
 mod project;
@@ -66,6 +67,9 @@ pub use material::{
     MaterialAsset, apply_overrides, default_material_asset, load_catalog_material_asset,
     load_catalog_material_asset_raw, load_material_asset, load_material_asset_raw,
     material_asset_from_json, material_asset_to_json, save_material_asset, update_material_asset,
+};
+pub use material_schema::{
+    ExposedParam, ExposedParamKind, exposed_parameter, pbr_exposed_parameters,
 };
 pub use model::{
     ByteSource, ContainerMetadata, Import, METADATA_SCHEMA_VERSION, ModelAsset, SubAsset,
@@ -155,6 +159,17 @@ pub struct AssetServer {
     pub texture_by_uuid: AssetCache<GpuTexture>,
     /// Opened `.smodel` containers, keyed by model id. `None` = negative marker.
     pub model_by_uuid: AssetCache<ModelAsset>,
+    /// Parent-resolved material assets (parent chain walked, instance overrides baked, *before*
+    /// per-slot overrides), keyed by material id. The draw path resolves each entity's materials
+    /// every frame; without this it re-read + re-parsed each `.smat` (and, for a container-embedded
+    /// material, re-read the whole `.smodel`) from disk per entity per frame. `None` = negative
+    /// marker. Coarsely cleared on any material mutation (see [`Self::invalidate_material_caches`]).
+    pub material_by_uuid: AssetCache<MaterialAsset>,
+    /// The codegen `_mesh.spv` shader path per material id (a non-foldable node-graph material's
+    /// compiled übershader variant), or `None` (the common case: no graph shader). Memoizes
+    /// [`render_material`](crate::render_material)'s `codegen_shader_for` so the per-frame resolve
+    /// stops probing the disk. Invalidated with [`Self::material_by_uuid`].
+    pub material_shader_by_uuid: AssetCache<String>,
     /// The editor-camera gizmo's mesh visual.
     pub editor_camera_model: SystemMeshVisual,
     /// Off-thread thumbnail generation (`None` until the worker is started).
@@ -178,6 +193,8 @@ impl AssetServer {
             mesh_bvh_by_uuid: AssetCache::new(),
             texture_by_uuid: AssetCache::new(),
             model_by_uuid: AssetCache::new(),
+            material_by_uuid: AssetCache::new(),
+            material_shader_by_uuid: AssetCache::new(),
             editor_camera_model: SystemMeshVisual::default(),
             thumbnail_worker: None,
             thumbnail_cache_root: Path::new(&app_data_root()).join("thumbnail-cache"),
@@ -230,11 +247,24 @@ impl AssetServer {
         self.mesh_bvh_by_uuid.clear();
         self.texture_by_uuid.clear();
         self.model_by_uuid.clear();
+        self.invalidate_material_caches();
         // The editor-camera gizmo visual is a cached GPU `Ref` too (its `Arc<GpuMesh>` +
         // resolved submesh materials), so it must drop here with the other caches — before
         // the renderer frees the device/allocator. Leaving it would `vmaDestroyBuffer` on a
         // dead allocator when `AssetServer` finally drops (a teardown use-after-free).
         self.editor_camera_model = SystemMeshVisual::default();
+    }
+
+    /// Drops the memoized material resolutions so the next frame re-reads them from disk.
+    ///
+    /// Coarse by design: a material's resolved value depends on its parent chain, and several
+    /// mutation paths rebuild the whole catalog, so a precise per-id drop would need a
+    /// parent→child index to stay correct. Material edits are never per-frame, so clearing the
+    /// (small, CPU-only) caches wholesale is cheap and always correct. Called at every material
+    /// write/rebake/delete seam so every control command inherits invalidation.
+    pub fn invalidate_material_caches(&mut self) {
+        self.material_by_uuid.clear();
+        self.material_shader_by_uuid.clear();
     }
 
     /// Abandons the worker's queued/failed jobs and un-drained handbacks on a project

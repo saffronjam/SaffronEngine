@@ -33,16 +33,18 @@
 use std::sync::Arc;
 
 use saffron_core::BlendMode;
+use saffron_core::Uuid;
 use saffron_geometry::Submesh;
 use saffron_geometry::glam::Vec3;
+use saffron_json::Value;
 use saffron_rendering::{GpuTexture, SubmeshMaterial};
-use saffron_scene::{
-    Entity, Material, MaterialAsset as MaterialAssetComponent, MaterialSet, MaterialSlot, Scene,
-};
+use saffron_scene::{Entity, MaterialSet, Scene};
 
 use crate::gpu::GpuUploader;
 use crate::graph::lower_graph_to_params;
-use crate::material::{MaterialAsset, default_material_asset, load_material_asset_raw};
+use crate::material::{
+    MaterialAsset, apply_overrides, default_material_asset, load_material_asset_raw,
+};
 use crate::{AssetServer, DEFAULT_MATERIAL_ID};
 
 /// The default übershader the scene PSO selects for a non-codegen material.
@@ -145,15 +147,14 @@ impl AssetServer {
     }
 
     /// Resolves a single renderable's whole submesh-material table from the entity's
-    /// material components, applying the precedence and the codegen-shader override.
+    /// [`MaterialSet`] — the one per-entity material component.
     ///
-    /// A [`MaterialAsset`](saffron_scene::MaterialAsset) component (a `.smat` id) wins:
-    /// the resolved material fills every submesh slot, and when its raw graph is
-    /// non-foldable and a compiled `<id>_mesh.spv` exists on disk, the result points its
-    /// shader at that variant. Else a [`MaterialSet`] component drives per-submesh slots
-    /// (each submesh's `material_slot` clamped to the slot count). Else a single
-    /// [`Material`] component applies to every submesh. The resolved base color's rgb is
-    /// the DDGI proxy albedo.
+    /// Each slot references a `.smat` material asset (resolved through its parent chain,
+    /// falling back to the built-in default when missing) with the slot's sparse overrides
+    /// layered on top; each submesh's `material_slot` selects a slot, clamped to the slot
+    /// count. The whole-mesh `unlit` flag, the DDGI proxy albedo, and the codegen-shader
+    /// override follow slot 0 (the PSO is per-item). An entity with no `MaterialSet` (or an
+    /// empty one) resolves to empty — the draw path falls back to engine defaults.
     ///
     /// `submeshes` is the renderable mesh's submesh table — the only thing read from the
     /// mesh — so the resolve never needs the GPU mesh itself.
@@ -166,135 +167,98 @@ impl AssetServer {
     ) -> ResolvedMaterials {
         let mut out = ResolvedMaterials::default();
 
-        if scene.has_component::<MaterialAssetComponent>(entity) {
-            let material_id = scene
-                .component::<MaterialAssetComponent>(entity)
-                .map(|c| c.material)
-                .unwrap_or_default();
-            if material_id.value() != 0 {
-                let loaded = load_material_asset(self, material_id);
-                let material = loaded.unwrap_or_else(|| {
-                    tracing::warn!(
-                        "entity material asset {} missing; using default",
-                        material_id.value()
-                    );
-                    default_material_asset()
-                });
-                out.unlit = material.unlit;
-                out.proxy_albedo = material.base_color.truncate();
-                // A non-foldable graph renders via its compiled übershader variant (built
-                // at material-set-graph time). Fall back to the shared übershader if it
-                // isn't on disk yet.
-                if let Ok(raw) = load_material_asset_raw(self, material_id)
-                    && is_non_empty_object(&raw.graph)
-                {
-                    let mut probe = raw.clone();
-                    if !lower_graph_to_params(&raw.graph, &mut probe) {
-                        let spv = self
-                            .root
-                            .join("materials")
-                            .join(format!("{}_mesh.spv", material_id.value()));
-                        if spv.exists() {
-                            out.shader = spv.to_string_lossy().into_owned();
-                        }
-                    }
-                }
-                let sm = self.resolve_material_asset(gpu, &material);
-                let count = submeshes.len().max(1);
-                out.submeshes = vec![sm; count];
-                return out;
-            }
+        let slots = scene
+            .with_component::<MaterialSet, _>(entity, |set| set.slots.clone())
+            .unwrap_or_default();
+        if slots.is_empty() {
+            return out;
         }
 
-        if scene.has_component::<MaterialSet>(entity) {
-            let slots = scene
-                .with_component::<MaterialSet, _>(entity, |set| set.slots.clone())
-                .unwrap_or_default();
-            if !slots.is_empty() {
-                out.unlit = slots[0].unlit;
-                out.proxy_albedo = slots[0].base_color.truncate();
-                out.submeshes.reserve(submeshes.len());
-                for submesh in submeshes {
-                    let slot = (submesh.material_slot as usize).min(slots.len() - 1);
-                    out.submeshes.push(self.lower_slot(gpu, &slots[slot]));
-                }
-                return out;
-            }
+        // Resolve each slot's referenced material (parent chain) with its sparse overrides
+        // once, so a submesh reusing a slot does not re-load it.
+        let resolved: Vec<MaterialAsset> = slots
+            .iter()
+            .map(|slot| self.resolve_slot_material(slot.material, &slot.overrides))
+            .collect();
+
+        // The whole-mesh flags + codegen shader follow slot 0.
+        out.unlit = resolved[0].unlit;
+        out.proxy_albedo = resolved[0].base_color.truncate();
+        if let Some(shader) = self.codegen_shader_for(slots[0].material) {
+            out.shader = shader;
         }
 
-        if scene.has_component::<Material>(entity) {
-            let material = scene.component::<Material>(entity).unwrap_or_default();
-            out.unlit = material.unlit;
-            out.proxy_albedo = material.base_color.truncate();
-            let slot = MaterialSlot {
-                base_color: material.base_color,
-                albedo_texture: material.albedo_texture,
-                metallic_roughness_texture: material.metallic_roughness_texture,
-                metallic: material.metallic,
-                roughness: material.roughness,
-                emissive: material.emissive,
-                emissive_strength: material.emissive_strength,
-                unlit: material.unlit,
-                normal_texture: material.normal_texture,
-                occlusion_texture: material.occlusion_texture,
-                emissive_texture: material.emissive_texture,
-                normal_strength: material.normal_strength,
-                uv_tiling: material.uv_tiling,
-                uv_offset: material.uv_offset,
-                height_texture: material.height_texture,
-                height_scale: material.height_scale,
-                blend_mode: material.blend_mode,
-                alpha_cutoff: material.alpha_cutoff,
-                double_sided: material.double_sided,
-            };
-            out.submeshes.push(self.lower_slot(gpu, &slot));
+        out.submeshes.reserve(submeshes.len());
+        for submesh in submeshes {
+            let index = (submesh.material_slot as usize).min(resolved.len() - 1);
+            out.submeshes
+                .push(self.resolve_material_asset(gpu, &resolved[index]));
         }
-
         out
     }
 
-    /// Lowers one inline [`MaterialSlot`] to a [`SubmeshMaterial`], resolving each texture
-    /// id through the GPU cache.
-    ///
-    /// Distinct from [`build_submesh_material`]: a slot carries an explicit
-    /// `metallic_roughness_texture` and `occlusion_texture` separately (it is not a packed
-    /// ORM), so they resolve from their own ids, and `blend_mode` rides the slot directly.
-    fn lower_slot(&mut self, gpu: &dyn GpuUploader, slot: &MaterialSlot) -> SubmeshMaterial {
-        let mut sm = SubmeshMaterial {
-            base_color: slot.base_color,
-            metallic: slot.metallic,
-            roughness: slot.roughness,
-            emissive: slot.emissive,
-            emissive_strength: slot.emissive_strength,
-            normal_strength: slot.normal_strength,
-            uv_tiling: slot.uv_tiling,
-            uv_offset: slot.uv_offset,
-            height_scale: slot.height_scale,
-            blend_mode: slot.blend_mode,
-            alpha_cutoff: slot.alpha_cutoff,
-            double_sided: slot.double_sided,
-            ..SubmeshMaterial::defaults()
+    /// Resolves one slot: loads its referenced `.smat` (parent chain resolved) and layers the
+    /// slot's sparse overrides on top. A `0` reference is the built-in default (the common
+    /// case — no warning); a non-zero id that fails to load warns and falls back to default.
+    fn resolve_slot_material(&mut self, material_id: Uuid, overrides: &Value) -> MaterialAsset {
+        let mut material = if material_id.value() == 0 {
+            default_material_asset()
+        } else {
+            load_material_asset(self, material_id).unwrap_or_else(|| {
+                tracing::warn!(
+                    "slot material asset {} missing; using default",
+                    material_id.value()
+                );
+                default_material_asset()
+            })
         };
-        if slot.albedo_texture.value() != 0 {
-            sm.albedo_texture = self.load_texture_asset(gpu, slot.albedo_texture);
+        apply_overrides(&mut material, overrides);
+        material
+    }
+
+    /// The compiled übershader variant for a material with a non-foldable node graph, if one
+    /// exists on disk (built at `material-set-graph` time); `None` for a plain material or a
+    /// foldable graph (which use the shared übershader). Embedded (container) materials have
+    /// no graph, so a non-standalone id resolves to `None`.
+    ///
+    /// Memoized in [`AssetServer::material_shader_by_uuid`] (the resolve runs per entity per
+    /// frame); the result only changes through the invalidation seams. A container-embedded id
+    /// short-circuits to `None` without touching disk — imported materials never carry a graph,
+    /// and reading the whole binary `.smodel` as a UTF-8 string was pure per-frame waste.
+    fn codegen_shader_for(&mut self, material_id: Uuid) -> Option<String> {
+        if let Some(cached) = self.material_shader_by_uuid.get(&material_id.value()) {
+            return cached.as_ref().map(|s| (**s).clone());
         }
-        if slot.metallic_roughness_texture.value() != 0 {
-            sm.metallic_roughness_texture =
-                self.load_texture_asset(gpu, slot.metallic_roughness_texture);
+        let embedded = self
+            .catalog
+            .find(material_id)
+            .is_some_and(|entry| entry.container.value() != 0);
+        let shader = if embedded {
+            None
+        } else {
+            self.probe_codegen_shader(material_id)
+        };
+        self.material_shader_by_uuid
+            .insert(material_id.value(), shader.clone().map(Arc::new));
+        shader
+    }
+
+    /// The uncached probe behind [`Self::codegen_shader_for`]: reads the standalone `.smat`
+    /// graph and, when it is a non-foldable graph, returns the compiled `_mesh.spv` path.
+    fn probe_codegen_shader(&self, material_id: Uuid) -> Option<String> {
+        let raw = load_material_asset_raw(self, material_id).ok()?;
+        if !is_non_empty_object(&raw.graph) {
+            return None;
         }
-        if slot.normal_texture.value() != 0 {
-            sm.normal_texture = self.load_texture_asset(gpu, slot.normal_texture);
+        let mut probe = raw.clone();
+        if lower_graph_to_params(&raw.graph, &mut probe) {
+            return None;
         }
-        if slot.occlusion_texture.value() != 0 {
-            sm.occlusion_texture = self.load_texture_asset(gpu, slot.occlusion_texture);
-        }
-        if slot.emissive_texture.value() != 0 {
-            sm.emissive_texture = self.load_texture_asset(gpu, slot.emissive_texture);
-        }
-        if slot.height_texture.value() != 0 {
-            sm.height_texture = self.load_texture_asset(gpu, slot.height_texture);
-        }
-        sm
+        let spv = self
+            .root
+            .join("materials")
+            .join(format!("{}_mesh.spv", material_id.value()));
+        spv.exists().then(|| spv.to_string_lossy().into_owned())
     }
 }
 
@@ -305,7 +269,18 @@ fn load_material_asset(assets: &mut AssetServer, id: saffron_core::Uuid) -> Opti
     if id == DEFAULT_MATERIAL_ID {
         return Some(default_material_asset());
     }
-    crate::material::load_catalog_material_asset(assets, id).ok()
+    // Cached parent-resolved material (before the per-slot overrides the caller layers on the
+    // returned clone). A present key — including a negative-cached `None` — skips the disk read;
+    // only a true miss reads + parses the `.smat` (and, for a container material, slices the
+    // `.smodel` chunk). Cleared wholesale on any material mutation.
+    if let Some(cached) = assets.material_by_uuid.get(&id.value()) {
+        return cached.as_ref().map(|material| (**material).clone());
+    }
+    let loaded = crate::material::load_catalog_material_asset(assets, id).ok();
+    assets
+        .material_by_uuid
+        .insert(id.value(), loaded.clone().map(Arc::new));
+    loaded
 }
 
 /// Whether `value` is a JSON object with at least one member (a present, non-empty
@@ -319,6 +294,7 @@ mod tests {
     use super::*;
 
     use saffron_geometry::glam::{Vec2, Vec3, Vec4};
+    use saffron_scene::MaterialSlot;
 
     use crate::material::save_material_asset;
 
@@ -435,9 +411,9 @@ mod tests {
         assert!(sm.height_texture.is_none());
     }
 
-    /// A `GpuUploader` stub that never uploads — every resolve runs off-GPU. The
-    /// resolve-precedence tests don't need real textures: every material id under test is
-    /// zero, so the loader is never called.
+    /// A `GpuUploader` stub that never uploads — every resolve runs off-GPU. The resolve
+    /// tests reference materials with zero texture ids, so the texture loader is never
+    /// called.
     struct NoGpu;
 
     impl GpuUploader for NoGpu {
@@ -475,10 +451,19 @@ mod tests {
         }
     }
 
+    /// One [`MaterialSet`] with the given slots on a fresh entity, returning the scene +
+    /// entity ready to resolve.
+    fn scene_with_slots(slots: Vec<MaterialSlot>) -> (Scene, Entity) {
+        let mut scene = Scene::default();
+        let entity = scene.create_entity("e");
+        scene.add_component(entity, MaterialSet { slots }).unwrap();
+        (scene, entity)
+    }
+
     #[test]
-    fn precedence_material_asset_beats_set_and_component() {
-        let (mut assets, tmp) = scratch_server("precedence");
-        // Save a `.smat` with a recognizable base color, and reference it from the entity.
+    fn slot_resolves_the_referenced_smat_factors() {
+        let (mut assets, tmp) = scratch_server("slot-smat");
+        // Save a `.smat` with a recognizable base color + unlit, reference it from a slot.
         let smat = MaterialAsset {
             base_color: Vec4::new(0.11, 0.22, 0.33, 1.0),
             unlit: true,
@@ -486,88 +471,98 @@ mod tests {
         };
         let smat_id = save_material_asset(&mut assets, &smat, "Asset", "").unwrap();
 
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        scene
-            .add_component(entity, MaterialAssetComponent { material: smat_id })
-            .unwrap();
-        // Also attach a MaterialSet and a Material — they must be ignored.
-        scene
-            .add_component(
-                entity,
-                MaterialSet {
-                    slots: vec![MaterialSlot {
-                        base_color: Vec4::new(9.0, 9.0, 9.0, 9.0),
-                        ..MaterialSlot::default()
-                    }],
-                },
-            )
-            .unwrap();
-        scene
-            .add_component(
-                entity,
-                Material {
-                    base_color: Vec4::new(8.0, 8.0, 8.0, 8.0),
-                    ..Material::default()
-                },
-            )
-            .unwrap();
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot {
+            material: smat_id,
+            ..MaterialSlot::default()
+        }]);
 
         let meshes = [submesh(0), submesh(0), submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
 
-        // The `.smat` wins: its base color, its unlit flag, one entry per submesh.
+        // The slot's `.smat`: its base color, its unlit flag, one entry per submesh.
         assert_eq!(resolved.submeshes.len(), 3);
         assert!(resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::new(0.11, 0.22, 0.33));
         for sm in &resolved.submeshes {
             assert_eq!(sm.base_color, Vec4::new(0.11, 0.22, 0.33, 1.0));
         }
-        // A foldable / no-graph material keeps the shared übershader.
+        // A no-graph material keeps the shared übershader.
         assert_eq!(resolved.shader, DEFAULT_MESH_SHADER);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn precedence_set_beats_component() {
-        let (mut assets, tmp) = scratch_server("set-over-component");
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        scene
-            .add_component(
-                entity,
-                MaterialSet {
-                    slots: vec![
-                        MaterialSlot {
-                            base_color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-                            unlit: true,
-                            ..MaterialSlot::default()
-                        },
-                        MaterialSlot {
-                            base_color: Vec4::new(0.0, 1.0, 0.0, 1.0),
-                            ..MaterialSlot::default()
-                        },
-                    ],
-                },
-            )
-            .unwrap();
-        scene
-            .add_component(
-                entity,
-                Material {
-                    base_color: Vec4::new(8.0, 8.0, 8.0, 8.0),
-                    ..Material::default()
-                },
-            )
-            .unwrap();
+    fn slot_overrides_layer_over_the_referenced_material() {
+        let (mut assets, tmp) = scratch_server("slot-overrides");
+        // The `.smat` sets base color + a low metallic; the slot overrides only metallic.
+        let smat = MaterialAsset {
+            base_color: Vec4::new(0.4, 0.5, 0.6, 1.0),
+            metallic: 0.1,
+            ..MaterialAsset::default()
+        };
+        let smat_id = save_material_asset(&mut assets, &smat, "Asset", "").unwrap();
 
-        // Three submeshes referencing slots 0, 1, and an out-of-range slot 5 (clamped to 1).
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot {
+            material: smat_id,
+            overrides: serde_json::json!({ "metallic": 0.9 }),
+        }]);
+
+        let meshes = [submesh(0)];
+        let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
+        assert_eq!(resolved.submeshes.len(), 1);
+        // Base color rides through from the `.smat`; metallic comes from the override.
+        assert_eq!(
+            resolved.submeshes[0].base_color,
+            Vec4::new(0.4, 0.5, 0.6, 1.0)
+        );
+        assert_eq!(resolved.submeshes[0].metallic, 0.9);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn submeshes_map_to_slots_and_clamp_to_the_last() {
+        let (mut assets, tmp) = scratch_server("multi-slot");
+        let red = save_material_asset(
+            &mut assets,
+            &MaterialAsset {
+                base_color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+                unlit: true,
+                ..MaterialAsset::default()
+            },
+            "Red",
+            "",
+        )
+        .unwrap();
+        let green = save_material_asset(
+            &mut assets,
+            &MaterialAsset {
+                base_color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+                ..MaterialAsset::default()
+            },
+            "Green",
+            "",
+        )
+        .unwrap();
+
+        let (scene, entity) = scene_with_slots(vec![
+            MaterialSlot {
+                material: red,
+                ..MaterialSlot::default()
+            },
+            MaterialSlot {
+                material: green,
+                ..MaterialSlot::default()
+            },
+        ]);
+
+        // Submeshes reference slots 0, 1, and an out-of-range slot 5 (clamped to 1).
         let meshes = [submesh(0), submesh(1), submesh(5)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
 
         assert_eq!(resolved.submeshes.len(), 3);
-        // The set's first slot drives `unlit` + the proxy albedo.
+        // Slot 0 drives the whole-mesh `unlit` + proxy albedo.
         assert!(resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(
@@ -588,27 +583,28 @@ mod tests {
     }
 
     #[test]
-    fn material_set_clamps_to_slot_count_per_submesh() {
-        let (mut assets, tmp) = scratch_server("set-clamp");
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        scene
-            .add_component(
-                entity,
-                MaterialSet {
-                    slots: vec![MaterialSlot {
-                        base_color: Vec4::new(0.5, 0.5, 0.5, 1.0),
-                        ..MaterialSlot::default()
-                    }],
-                },
-            )
-            .unwrap();
+    fn a_single_slot_clamps_every_submesh() {
+        let (mut assets, tmp) = scratch_server("single-slot");
+        let id = save_material_asset(
+            &mut assets,
+            &MaterialAsset {
+                base_color: Vec4::new(0.5, 0.5, 0.5, 1.0),
+                ..MaterialAsset::default()
+            },
+            "Gray",
+            "",
+        )
+        .unwrap();
 
-        // Four submeshes but only one slot: every submesh resolves the single slot, one
-        // entry produced per submesh.
-        let meshes = [submesh(0), submesh(3), submesh(0), submesh(9)];
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot {
+            material: id,
+            ..MaterialSlot::default()
+        }]);
+
+        // Several submeshes but one slot: every submesh resolves that slot, one entry each.
+        let meshes = [submesh(0), submesh(3), submesh(9)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
-        assert_eq!(resolved.submeshes.len(), 4);
+        assert_eq!(resolved.submeshes.len(), meshes.len());
         for sm in &resolved.submeshes {
             assert_eq!(sm.base_color, Vec4::new(0.5, 0.5, 0.5, 1.0));
         }
@@ -617,48 +613,13 @@ mod tests {
     }
 
     #[test]
-    fn material_component_applies_a_single_submesh() {
-        let (mut assets, tmp) = scratch_server("component");
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        scene
-            .add_component(
-                entity,
-                Material {
-                    base_color: Vec4::new(0.7, 0.8, 0.9, 1.0),
-                    unlit: true,
-                    blend_mode: BlendMode::Masked,
-                    ..Material::default()
-                },
-            )
-            .unwrap();
-
-        // Exactly one submesh material is pushed for the single inline Material,
-        // regardless of submesh count.
-        let meshes = [submesh(0), submesh(0)];
-        let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
-        assert_eq!(resolved.submeshes.len(), 1);
-        assert!(resolved.unlit);
-        assert_eq!(resolved.submeshes[0].blend_mode, BlendMode::Masked);
-        assert_eq!(resolved.proxy_albedo, Vec3::new(0.7, 0.8, 0.9));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
     fn missing_smat_id_falls_back_to_default_material() {
         let (mut assets, tmp) = scratch_server("missing-smat");
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        // Reference a `.smat` id that is not in the catalog.
-        scene
-            .add_component(
-                entity,
-                MaterialAssetComponent {
-                    material: saffron_core::Uuid(424_242),
-                },
-            )
-            .unwrap();
+        // A slot referencing a `.smat` id that is not in the catalog.
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot {
+            material: saffron_core::Uuid(424_242),
+            ..MaterialSlot::default()
+        }]);
 
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
@@ -673,49 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn zero_smat_id_falls_through_to_next_precedence_level() {
-        let (mut assets, tmp) = scratch_server("zero-smat");
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        // A MaterialAsset component with a zero id is *not* a winner — the precedence
-        // falls through to the Material component (the `matId != 0` guard).
-        scene
-            .add_component(
-                entity,
-                MaterialAssetComponent {
-                    material: saffron_core::Uuid(0),
-                },
-            )
-            .unwrap();
-        scene
-            .add_component(
-                entity,
-                Material {
-                    base_color: Vec4::new(0.3, 0.3, 0.3, 1.0),
-                    ..Material::default()
-                },
-            )
-            .unwrap();
+    fn zero_slot_id_resolves_the_builtin_default_material() {
+        let (mut assets, tmp) = scratch_server("zero-slot");
+        // A default slot references `Uuid(0)` — the built-in default material.
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot::default()]);
 
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
         assert_eq!(resolved.submeshes.len(), 1);
-        assert_eq!(
-            resolved.submeshes[0].base_color,
-            Vec4::new(0.3, 0.3, 0.3, 1.0)
-        );
+        assert!(!resolved.unlit);
+        assert_eq!(resolved.proxy_albedo, Vec3::ONE);
+        assert_eq!(resolved.submeshes[0].base_color, Vec4::ONE);
+        assert_eq!(resolved.shader, DEFAULT_MESH_SHADER);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn no_material_components_yields_empty_defaults() {
+    fn no_material_set_yields_empty_defaults() {
         let (mut assets, tmp) = scratch_server("none");
         let mut scene = Scene::default();
         let entity = scene.create_entity("e");
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
-        // No components: an empty submesh list with default flags.
+        // No `MaterialSet`: an empty submesh list with default flags.
         assert!(resolved.submeshes.is_empty());
         assert!(!resolved.unlit);
         assert_eq!(resolved.proxy_albedo, Vec3::ONE);
@@ -725,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn codegen_override_points_shader_at_mesh_spv_for_non_foldable_graph() {
+    fn codegen_slot_points_shader_at_mesh_spv_for_non_foldable_graph() {
         let (mut assets, tmp) = scratch_server("codegen");
         // A `.smat` whose graph is non-foldable (a `multiply` math node forces codegen).
         let smat = MaterialAsset {
@@ -753,11 +695,10 @@ mod tests {
             .join(format!("{}_mesh.spv", smat_id.value()));
         std::fs::write(&spv, b"\x03\x02\x23\x07").unwrap();
 
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        scene
-            .add_component(entity, MaterialAssetComponent { material: smat_id })
-            .unwrap();
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot {
+            material: smat_id,
+            ..MaterialSlot::default()
+        }]);
 
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
@@ -768,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn foldable_graph_keeps_the_shared_ubershader() {
+    fn foldable_graph_slot_keeps_the_shared_ubershader() {
         let (mut assets, tmp) = scratch_server("foldable");
         // A graph that folds entirely (a constant wired into baseColor): no codegen.
         let smat = MaterialAsset {
@@ -792,11 +733,10 @@ mod tests {
             .join(format!("{}_mesh.spv", smat_id.value()));
         std::fs::write(&spv, b"\x03\x02\x23\x07").unwrap();
 
-        let mut scene = Scene::default();
-        let entity = scene.create_entity("e");
-        scene
-            .add_component(entity, MaterialAssetComponent { material: smat_id })
-            .unwrap();
+        let (scene, entity) = scene_with_slots(vec![MaterialSlot {
+            material: smat_id,
+            ..MaterialSlot::default()
+        }]);
 
         let meshes = [submesh(0)];
         let resolved = assets.resolve_entity_materials(&NoGpu, &scene, entity, &meshes);
@@ -836,5 +776,48 @@ mod tests {
         });
         let mut probe2 = MaterialAsset::default();
         assert!(!lower_graph_to_params(&non_foldable, &mut probe2));
+    }
+
+    /// The draw-path material load is memoized, and an edit invalidates it: a resolve populates
+    /// the cache, [`update_material_asset`](crate::material::update_material_asset) clears it, and
+    /// the next resolve returns the *edited* value — never a stale cached one. This is the whole
+    /// point of the cache: the per-frame resolve stops re-reading the `.smat` from disk, but an
+    /// edit is still seen on the next frame.
+    #[test]
+    fn material_load_is_cached_and_invalidated_on_edit() {
+        use crate::material::update_material_asset;
+
+        let (mut assets, tmp) = scratch_server("cache-invalidate");
+        let red = MaterialAsset {
+            base_color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+            ..MaterialAsset::default()
+        };
+        let id = save_material_asset(&mut assets, &red, "Mat", "").expect("save");
+
+        // First resolve reads from disk and fills the cache.
+        assert!(assets.material_by_uuid.is_empty());
+        let first = load_material_asset(&mut assets, id).expect("resolve");
+        assert_eq!(first.base_color, Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert!(
+            assets.material_by_uuid.contains_key(&id.value()),
+            "the resolve must populate the material cache"
+        );
+
+        // An in-place edit writes the new `.smat` and invalidates the cache.
+        let green = MaterialAsset {
+            base_color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+            ..MaterialAsset::default()
+        };
+        update_material_asset(&mut assets, id, &green).expect("update");
+        assert!(
+            assets.material_by_uuid.is_empty(),
+            "editing a material must clear the memoized resolution"
+        );
+
+        // The next resolve sees the edit, not the stale cached red.
+        let second = load_material_asset(&mut assets, id).expect("re-resolve");
+        assert_eq!(second.base_color, Vec4::new(0.0, 1.0, 0.0, 1.0));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
