@@ -26,10 +26,29 @@ A `.smat` is reference-only JSON: scalar factors plus texture references as deci
 
 `MaterialAsset` (the in-memory form) adds a `parent` `Uuid` and an `overrides` set, so an **instance**
 material inherits a base and overrides only named fields — the UE material-instance model.
-`load_material_asset` resolves the parent chain, applies overrides, then folds any graph;
-`resolve_entity_materials` decides precedence between a mesh's built-in material and an assigned
-`MaterialAssetComponent`. `material_asset_to_json` / `material_asset_from_json` are the frozen JSON
-contract.
+`load_material_asset` resolves the parent chain, applies overrides, then folds any graph.
+`material_asset_to_json` / `material_asset_from_json` are the frozen JSON contract.
+
+## Binding to an entity
+
+An entity carries exactly one material component,
+[`MaterialSet`](../../scene-and-ecs/built-in-components/) — an ordered list of slots, one per
+submesh. A slot is a **reference plus overrides**: a `.smat` id and a sparse `{ paramName: value }`
+map applied over the referenced material's resolved parameters. A single-material mesh is one slot;
+`material == 0` binds the built-in default.
+
+`resolve_entity_materials` is the single resolve path. For each slot it loads the referenced `.smat`
+(parent chain resolved, default when missing), layers the slot's overrides on top with
+`apply_overrides`, and lowers the result to a `SubmeshMaterial`. Each submesh's `material_slot`
+selects a slot, clamped to the last, and the whole-mesh `unlit` flag, proxy albedo, and codegen
+shader follow slot 0. Because a slot references the asset rather than copying its factors, editing a
+`.smat` re-renders every instance; the override map holds only the per-object deviations.
+
+The overridable set is one declared list — the exposed-parameter schema (`pbr_exposed_parameters`,
+`ExposedParamKind`): `baseColor`, `metallic`, `roughness`, `emissive`, `blend`, the texture ids
+(`albedoTexture`, the packed `ormTexture`, `normalTexture`, `emissiveTexture`, `heightTexture`), and
+the remaining PBR knobs. It is the single source of truth that override validation and the inspector's
+override editor share, so the two never drift on what a material exposes.
 
 ## The params buffer and the surface seam
 
@@ -68,9 +87,10 @@ operation has a control command, so the `sa` CLI and the editor drive the same s
 
 | What | File | Symbols |
 |---|---|---|
-| Asset model + IO | `material.rs` | `MaterialAsset`, `material_asset_to_json`, `load_material_asset`, `save_material_asset` |
+| Asset model + IO | `material.rs` | `MaterialAsset`, `apply_overrides`, `load_material_asset`, `save_material_asset` |
+| Exposed-parameter schema | `material_schema.rs` | `pbr_exposed_parameters`, `ExposedParamKind` |
 | Import + role detection | `manage.rs`; `scan.rs` | `import_material_folder`; `detect_material_role` |
-| Entity precedence | `render_material.rs` | `resolve_entity_materials`, `MaterialAssetComponent` |
+| Entity binding + resolve | `render_material.rs` | `resolve_entity_materials`, `resolve_slot_material`, `build_submesh_material` |
 | Params record + dedup | `gpu_types.rs`; `instancing.rs` | `MaterialParamsData`; `intern_material`, `ensure_material_capacity` |
 | Surface seam + slots | `mesh.slang`; `lighting.slang` | `evalSurface`, `perturbNormal`, `parallaxUv` |
 | Preview render | `thumbnail_render.rs` | `render_material_preview` |
