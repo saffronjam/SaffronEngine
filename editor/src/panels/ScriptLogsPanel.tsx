@@ -190,7 +190,7 @@ export function ScriptLogsPanel() {
           ref={scrollRef}
           onScroll={onScroll}
           tabIndex={0}
-          className="min-h-0 flex-1 overflow-auto font-mono text-[11px] outline-none"
+          className="min-h-0 flex-1 overflow-auto font-mono text-[11px] outline-none select-text"
         >
           {total === 0 ? (
             <p className="p-3 text-muted-foreground italic">

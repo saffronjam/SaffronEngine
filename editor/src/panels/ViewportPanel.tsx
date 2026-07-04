@@ -449,6 +449,10 @@ export function ViewportPanel() {
     });
 
     const onPointerDown = (event: PointerEvent): void => {
+      // Engaging the viewport takes over input: drop focus off the chrome so a
+      // lingering-focused control (a just-clicked toolbar button, an open text field)
+      // can't swallow the next Space/Enter — e.g. Space re-toggling Play/Pause.
+      (document.activeElement as HTMLElement | null)?.blur();
       // Left button only; RMB is the fly-cam (pointer lock) gesture.
       if (event.button !== 0 || pointerId !== null || document.pointerLockElement === el) {
         return;

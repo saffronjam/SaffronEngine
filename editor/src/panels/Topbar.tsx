@@ -280,7 +280,10 @@ export function Topbar() {
                 type="button"
                 size="icon-sm"
                 variant={playState === "edit" ? "ghost" : "default"}
-                onClick={onPlayPause}
+                onClick={(e) => {
+                  onPlayPause();
+                  e.currentTarget.blur();
+                }}
                 disabled={!ready}
                 aria-pressed={playState !== "edit"}
                 aria-label={playState === "playing" ? "Pause" : "Play"}
@@ -302,7 +305,10 @@ export function Topbar() {
                 type="button"
                 size="icon-sm"
                 variant="ghost"
-                onClick={onStop}
+                onClick={(e) => {
+                  onStop();
+                  e.currentTarget.blur();
+                }}
                 disabled={!ready || playState === "edit"}
                 aria-label="Stop"
               >
@@ -317,7 +323,10 @@ export function Topbar() {
                 type="button"
                 size="icon-sm"
                 variant="ghost"
-                onClick={onStep}
+                onClick={(e) => {
+                  onStep();
+                  e.currentTarget.blur();
+                }}
                 disabled={!ready || playState !== "paused"}
                 aria-label="Step"
               >
