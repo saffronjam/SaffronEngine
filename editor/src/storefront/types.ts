@@ -54,7 +54,8 @@ export interface ConnectorInfo {
 export interface SearchQuery {
   text: string;
   kind?: StoreKind;
-  providers: string[];
+  /// The single connector id the search runs against (chosen in the Store's store dropdown).
+  provider: string;
 }
 
 export interface SearchMore {

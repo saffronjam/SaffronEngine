@@ -68,6 +68,7 @@ import type {
   ContactEventDto,
   ScriptLogDto,
 } from "../protocol";
+import type { StoreKind, StoreResult } from "../storefront/types";
 
 /// Cap on the retained alarm-log entries (the dashboard shows the most recent).
 const ALARM_LOG_LIMIT = 200;
@@ -239,6 +240,9 @@ export interface EditorState {
   /// True while the Assets-grid marquee is sweeping; gates the details overlay so
   /// it opens once on release instead of flickering per crossed tile.
   assetMarqueeActive: boolean;
+  /// The asset/folder tile whose grid context menu is open, so that tile keeps a
+  /// highlight while the menu is up (cleared on close). Null when no menu is open.
+  assetMenuTarget: AssetSelectionAnchor;
   /// True while the pointer is over the Assets panel. Arbitrates the mouse side
   /// buttons: when set, back/forward drive the Assets folder history; otherwise they
   /// drive cross-tab navigation.
@@ -382,6 +386,20 @@ export interface EditorState {
   hideBones: boolean;
   /// How the Assets grid sorts asset tiles; a persisted view preference (default name A–Z).
   assetSort: AssetSortMode;
+  /// Asset Store browse state (the `store` ViewTab). `storeSelected`/`storeSearchText`/
+  /// `storeKind` persist to localStorage so reopening returns you to the same store + query;
+  /// the rest is in-memory (a live backend search session dies when the bridge restarts).
+  storeSelected: string | null;
+  storeSearchText: string;
+  storeKind: StoreKind | null;
+  /// The active backend search-session id (null = no search yet / after a restart).
+  storeSession: string | null;
+  storeResults: StoreResult[];
+  storeExhausted: boolean;
+  storeScrollTop: number;
+  /// The session id `storeResults` were loaded for; a grid remount whose results already match
+  /// the active session restores them (and the scroll) instead of refetching.
+  storeResultsSession: string | null;
   /// One-shot "jump the Inspector to this component" signal set by a subrow click;
   /// the Inspector consumes and clears it. Never gated on the poll's versions.
   focusComponent: string | null;
@@ -461,6 +479,7 @@ export interface EditorState {
   /// Rewrite selected folder paths through a folder move (prefix rename).
   rewriteSelectedFolderPaths(rewrite: (path: string) => string): void;
   setAssetMarqueeActive(assetMarqueeActive: boolean): void;
+  setAssetMenuTarget(target: AssetSelectionAnchor): void;
   setAssetsPanelHovered(assetsPanelHovered: boolean): void;
   setAssetsFolderNav(assetsFolderNav: AssetsFolderNav | null): void;
   setHoveredTabId(hoveredTabId: string | null): void;
@@ -570,6 +589,20 @@ export interface EditorState {
   toggleComponentSubrows(): void;
   toggleHideBones(): void;
   setAssetSort(assetSort: AssetSortMode): void;
+  /// Set the Asset Store's selected store and persist it. The caller re-runs the search.
+  setStoreSelected(storeSelected: string | null): void;
+  /// Set + persist the Asset Store's committed query (free text + optional kind filter).
+  setStoreQuery(query: { text: string; kind: StoreKind | null }): void;
+  /// Set the active backend search-session id (in-memory).
+  setStoreSession(storeSession: string | null): void;
+  /// Replace the browse results, stamping the session they belong to (a fresh search's first batch).
+  setStoreResults(storeResults: StoreResult[], session: string): void;
+  /// Append the next batch of browse results for `session` (infinite scroll).
+  appendStoreResults(results: StoreResult[], session: string): void;
+  setStoreExhausted(storeExhausted: boolean): void;
+  setStoreScrollTop(storeScrollTop: number): void;
+  /// Clear the live browse session + results (nothing selectable, or the selected store was removed).
+  resetStoreBrowse(): void;
   setFocusComponent(focusComponent: string | null): void;
   /// Set one binding override and persist. A value equal to the registry default
   /// removes the override instead, keeping settings.json delta-minimal.
@@ -616,6 +649,7 @@ export const useEditorStore = create<EditorState>((set) => ({
   selectedFolderPaths: new Set<string>(),
   assetSelectionAnchor: null,
   assetMarqueeActive: false,
+  assetMenuTarget: null,
   assetsPanelHovered: false,
   assetsFolderNav: null,
   viewTabs: [SCENE_TAB],
@@ -683,6 +717,14 @@ export const useEditorStore = create<EditorState>((set) => ({
   showComponentSubrows: loadShowSubrows(),
   hideBones: loadHideBones(),
   assetSort: loadAssetSort(),
+  storeSelected: loadStoreSelected(),
+  storeSearchText: loadStoreSearchText(),
+  storeKind: loadStoreKind(),
+  storeSession: null,
+  storeResults: [],
+  storeExhausted: false,
+  storeScrollTop: 0,
+  storeResultsSession: null,
   focusComponent: null,
   keyBindings: {},
   settingsOpen: false,
@@ -934,6 +976,7 @@ export const useEditorStore = create<EditorState>((set) => ({
       return changed ? { selectedFolderPaths: next } : {};
     }),
   setAssetMarqueeActive: (assetMarqueeActive) => set({ assetMarqueeActive }),
+  setAssetMenuTarget: (assetMenuTarget) => set({ assetMenuTarget }),
   setAssetsPanelHovered: (assetsPanelHovered) => set({ assetsPanelHovered }),
   setAssetsFolderNav: (assetsFolderNav) => set({ assetsFolderNav }),
   setHoveredTabId: (hoveredTabId) => set({ hoveredTabId }),
@@ -1333,6 +1376,7 @@ export const useEditorStore = create<EditorState>((set) => ({
       selectedFolderPaths: new Set<string>(),
       assetSelectionAnchor: null,
       assetMarqueeActive: false,
+      assetMenuTarget: null,
       viewTabs: [SCENE_TAB],
       activeViewTabId: "scene",
       previousActiveTabId: null,
@@ -1409,6 +1453,40 @@ export const useEditorStore = create<EditorState>((set) => ({
     }
     set({ assetSort });
   },
+  setStoreSelected: (storeSelected) => {
+    try {
+      if (storeSelected === null) localStorage.removeItem(STORE_SELECTED_STORAGE_KEY);
+      else localStorage.setItem(STORE_SELECTED_STORAGE_KEY, storeSelected);
+    } catch {
+      // Storage unavailable; the selection is then session-only.
+    }
+    set({ storeSelected });
+  },
+  setStoreQuery: ({ text, kind }) => {
+    try {
+      localStorage.setItem(STORE_SEARCH_TEXT_STORAGE_KEY, text);
+      if (kind === null) localStorage.removeItem(STORE_KIND_STORAGE_KEY);
+      else localStorage.setItem(STORE_KIND_STORAGE_KEY, kind);
+    } catch {
+      // Storage unavailable; the query is then session-only.
+    }
+    set({ storeSearchText: text, storeKind: kind });
+  },
+  setStoreSession: (storeSession) => set({ storeSession }),
+  setStoreResults: (storeResults, session) =>
+    set({ storeResults, storeResultsSession: session }),
+  appendStoreResults: (results, session) =>
+    set((s) => ({ storeResults: [...s.storeResults, ...results], storeResultsSession: session })),
+  setStoreExhausted: (storeExhausted) => set({ storeExhausted }),
+  setStoreScrollTop: (storeScrollTop) => set({ storeScrollTop }),
+  resetStoreBrowse: () =>
+    set({
+      storeSession: null,
+      storeResults: [],
+      storeResultsSession: null,
+      storeExhausted: false,
+      storeScrollTop: 0,
+    }),
   setFocusComponent: (focusComponent) => set({ focusComponent }),
   setKeyBinding: (id, value) =>
     set((s) => {
@@ -1797,6 +1875,39 @@ function loadAssetSort(): AssetSortMode {
   }
 }
 
+/// The Asset Store's selected store + last query persist app-wide (not per-project) so reopening
+/// the Store returns you to where you left off; the store id is reconciled against the project's
+/// enabled set on load.
+const STORE_SELECTED_STORAGE_KEY = "saffron.store.selected";
+const STORE_SEARCH_TEXT_STORAGE_KEY = "saffron.store.searchText";
+const STORE_KIND_STORAGE_KEY = "saffron.store.kind";
+const STORE_KINDS: readonly StoreKind[] = ["model", "hdri", "material", "texture"];
+
+function loadStoreSelected(): string | null {
+  try {
+    return localStorage.getItem(STORE_SELECTED_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function loadStoreSearchText(): string {
+  try {
+    return localStorage.getItem(STORE_SEARCH_TEXT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function loadStoreKind(): StoreKind | null {
+  try {
+    const raw = localStorage.getItem(STORE_KIND_STORAGE_KEY);
+    return STORE_KINDS.includes(raw as StoreKind) ? (raw as StoreKind) : null;
+  } catch {
+    return null;
+  }
+}
+
 /// Developer mode persists app-wide (one key, not per-project), default off.
 /// `VITE_SAFFRON_DEV_MODE=1` (set by `make run-debug`) forces it on for the session
 /// without touching the persisted flag.
@@ -1948,6 +2059,11 @@ export function startReconcile(client: Client): () => void {
   let knownPlayVersion = -1;
   let knownAnimationVersion = -1;
   let animationInFlight = false;
+  // Tracks the scene-view "live" gate so a false→true transition (a view switch resolving) forces
+  // a heavy refetch: a tick that ran while it was false fetched the hierarchy but dropped it, yet
+  // still advanced the version — so without this the entities never re-fetch. Init true (store
+  // default) so a steady session never spuriously re-fetches.
+  let prevSceneEntitiesLive = true;
 
   let lastTickAt = 0;
   let emaIntervalMs = 0;
@@ -2298,6 +2414,15 @@ export function startReconcile(client: Client): () => void {
         knownSelectionVersion = -1;
         knownSelectedId = null;
       }
+      // The scene view just became live again (a view switch resolved — e.g. the startup modal
+      // closed and unparked the viewport). A tick during the not-live window fetched the hierarchy
+      // but dropped it (the `sceneEntitiesLive` gate below), so force a refetch now.
+      if (live.sceneEntitiesLive && !prevSceneEntitiesLive) {
+        knownSceneVersion = -1;
+        knownSelectionVersion = -1;
+        knownSelectedId = null;
+      }
+      prevSceneEntitiesLive = live.sceneEntitiesLive;
 
       live.setRenderStats(stats);
       // Reflect the engine's gizmo state (so an external `sa set-gizmo` shows up
