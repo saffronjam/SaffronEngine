@@ -25,7 +25,7 @@
 use saffron_core::Uuid;
 use saffron_geometry::{decode_image_from_memory, decode_image_from_memory_hdr};
 use saffron_json::{Value, dump_json, json_string_or, json_u64_or, parse_json, uuid_to_json};
-use saffron_scene::{AssetCatalog, AssetEntry, AssetType, Colorspace};
+use saffron_scene::{AssetCatalog, AssetEntry, AssetType, Colorspace, TextureRole};
 use walkdir::WalkDir;
 
 use crate::AssetServer;
@@ -36,7 +36,10 @@ use crate::error::{Error, Result};
 use crate::gpu::GpuUploader;
 use crate::import::{ScanDelta, catalog_rows_for_model};
 use crate::model::read_container_metadata;
-use crate::names::{asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name};
+use crate::names::{
+    asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name,
+    texture_role_from_name, texture_role_name,
+};
 
 /// The `.smeta` sidecar co-located with an asset file — the durable, id-keyed home for its
 /// name / folder / colorspace.
@@ -51,6 +54,7 @@ struct SmetaData {
     id: Uuid,
     asset_type: AssetType,
     colorspace: Colorspace,
+    role: TextureRole,
     folder: String,
     name: String,
 }
@@ -61,6 +65,7 @@ impl Default for SmetaData {
             id: Uuid(0),
             asset_type: AssetType::Texture,
             colorspace: Colorspace::Auto,
+            role: TextureRole::Unknown,
             folder: String::new(),
             name: String::new(),
         }
@@ -83,6 +88,7 @@ fn read_smeta(path: &str) -> Result<SmetaData> {
         id: Uuid(json_u64_or(&doc, "id", 0)),
         asset_type: asset_type_from_name(&json_string_or(&doc, "type", "texture".to_owned())),
         colorspace: colorspace_from_name(&json_string_or(&doc, "colorspace", "auto".to_owned())),
+        role: texture_role_from_name(&json_string_or(&doc, "role", "unknown".to_owned())),
         folder: json_string_or(&doc, "folder", String::new()),
         name: json_string_or(&doc, "name", String::new()),
     };
@@ -109,6 +115,12 @@ fn write_smeta(path: &str, meta: &SmetaData) -> Result<()> {
         "colorspace".to_owned(),
         Value::String(colorspace_name(meta.colorspace).to_owned()),
     );
+    if meta.role != TextureRole::Unknown {
+        doc.insert(
+            "role".to_owned(),
+            Value::String(texture_role_name(meta.role).to_owned()),
+        );
+    }
     if !meta.folder.is_empty() {
         doc.insert("folder".to_owned(), Value::String(meta.folder.clone()));
     }
@@ -289,15 +301,29 @@ pub fn reconcile_catalog_from_disk(
         let sidecar = match sidecar {
             Some(sidecar) => sidecar,
             None => {
-                let colorspace = if hdr {
-                    Colorspace::Hdr
+                // Infer the role from the filename so a data map (normal/roughness/AO) drops in
+                // linear instead of the old blanket sRGB guess; a truly unrecognized image keeps
+                // the safe sRGB default (which we still warn about).
+                let role = if asset_type == AssetType::Texture {
+                    infer_texture_role(stem, hdr)
                 } else {
-                    Colorspace::Srgb
+                    TextureRole::Unknown
+                };
+                let colorspace = match role {
+                    TextureRole::Unknown => {
+                        if hdr {
+                            Colorspace::Hdr
+                        } else {
+                            Colorspace::Srgb
+                        }
+                    }
+                    known => colorspace_for_role_explicit(known),
                 };
                 let minted = SmetaData {
                     id: Uuid::new(),
                     asset_type,
                     colorspace,
+                    role,
                     folder: String::new(),
                     name: stem.to_owned(),
                 };
@@ -305,8 +331,9 @@ pub fn reconcile_catalog_from_disk(
                     tracing::warn!("scan: could not write '{rel}.smeta': {err}");
                 }
                 tracing::warn!(
-                    "scan: minted .smeta for foreign file '{rel}' (colorspace {} — verify it for data maps like normals)",
-                    colorspace_name(colorspace)
+                    "scan: minted .smeta for foreign file '{rel}' (colorspace {}, role {} — verify it for data maps like normals)",
+                    colorspace_name(colorspace),
+                    texture_role_name(role)
                 );
                 minted
             }
@@ -323,6 +350,7 @@ pub fn reconcile_catalog_from_disk(
             path: rel,
             folder: sidecar.folder.clone(),
             colorspace: sidecar.colorspace,
+            role: sidecar.role,
             hdr: sidecar.colorspace == Colorspace::Hdr,
             linear: sidecar.colorspace == Colorspace::Linear,
             content_hash: standalone_content_hash(sidecar.asset_type, &path_str),
@@ -466,6 +494,7 @@ impl AssetServer {
             id,
             asset_type: row.asset_type,
             colorspace,
+            role: row.role,
             folder: row.folder.clone(),
             name: row.name.clone(),
         };
@@ -501,6 +530,7 @@ impl AssetServer {
         ext: &str,
         name: &str,
         srgb: bool,
+        role: TextureRole,
     ) -> Result<Uuid> {
         let decoded = decode_image_from_memory(encoded)?;
         let texture = gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, srgb)?;
@@ -512,11 +542,14 @@ impl AssetServer {
             .map_err(|e| Error::Io(format!("cannot write texture '{relative_path}': {e}")))?;
         self.put_texture_row(
             id,
-            name,
-            relative_path,
-            false,
-            !srgb,
-            crate::import::hash_bytes_fnv(encoded),
+            TextureRowSpec {
+                name,
+                path: relative_path,
+                hdr: false,
+                linear: !srgb,
+                content_hash: crate::import::hash_bytes_fnv(encoded),
+                role,
+            },
         );
         self.texture_by_uuid.insert(id.value(), Some(texture));
         Ok(id)
@@ -545,11 +578,14 @@ impl AssetServer {
             .map_err(|e| Error::Io(format!("cannot write texture '{relative_path}': {e}")))?;
         self.put_texture_row(
             id,
-            name,
-            relative_path,
-            true,
-            false,
-            crate::import::hash_bytes_fnv(encoded),
+            TextureRowSpec {
+                name,
+                path: relative_path,
+                hdr: true,
+                linear: false,
+                content_hash: crate::import::hash_bytes_fnv(encoded),
+                role: TextureRole::Hdri,
+            },
         );
         self.texture_by_uuid.insert(id.value(), Some(texture));
         Ok(id)
@@ -567,6 +603,7 @@ impl AssetServer {
         gpu: &dyn GpuUploader,
         path: &str,
         colorspace: Option<Colorspace>,
+        role: TextureRole,
     ) -> Result<Uuid> {
         let encoded =
             std::fs::read(path).map_err(|e| Error::Io(format!("cannot open '{path}': {e}")))?;
@@ -579,40 +616,43 @@ impl AssetServer {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or_default();
+        // The caller resolves `colorspace` (an explicit override, or the role-derived policy).
+        // `None` means neither was given (a plain manual import): dispatch `.hdr` to the float
+        // path, else sRGB — the prior heuristic. `role` still rides through for preview routing.
         match colorspace {
-            // Data maps (normal/roughness/metallic/AO/…) must upload linear, not sRGB.
             Some(Colorspace::Linear) => {
-                self.register_texture_bytes(gpu, &encoded, ext, stem, false)
+                self.register_texture_bytes(gpu, &encoded, ext, stem, false, role)
             }
-            Some(Colorspace::Srgb) => self.register_texture_bytes(gpu, &encoded, ext, stem, true),
+            Some(Colorspace::Srgb) => {
+                self.register_texture_bytes(gpu, &encoded, ext, stem, true, role)
+            }
             Some(Colorspace::Hdr) => self.register_hdr_texture_bytes(gpu, &encoded, stem),
-            // Auto / unspecified: dispatch `.hdr` to the float path, else sRGB (prior behaviour).
             _ if ext.eq_ignore_ascii_case("hdr") => {
                 self.register_hdr_texture_bytes(gpu, &encoded, stem)
             }
-            _ => self.register_texture_bytes(gpu, &encoded, ext, stem, true),
+            _ => self.register_texture_bytes(gpu, &encoded, ext, stem, true, role),
         }
     }
 
-    /// Inserts a standalone Texture row with a name uniqued against the live catalog.
-    fn put_texture_row(
-        &mut self,
-        id: Uuid,
-        name: &str,
-        path: String,
-        hdr: bool,
-        linear: bool,
-        content_hash: u64,
-    ) {
-        let unique = self.catalog.unique_name(name);
+    /// Inserts a standalone Texture row with a name uniqued against the live catalog. A
+    /// [`TextureRole::Unknown`] role is inferred from the (pre-unique) filename + HDR-ness;
+    /// an explicit role (a connector, or the HDR path) is kept verbatim.
+    fn put_texture_row(&mut self, id: Uuid, spec: TextureRowSpec<'_>) {
+        let role = if spec.role == TextureRole::Unknown {
+            infer_texture_role(spec.name, spec.hdr)
+        } else {
+            spec.role
+        };
+        let unique = self.catalog.unique_name(spec.name);
         self.catalog.put(AssetEntry {
             id,
             name: unique,
             asset_type: AssetType::Texture,
-            path,
-            hdr,
-            linear,
-            content_hash,
+            path: spec.path,
+            hdr: spec.hdr,
+            linear: spec.linear,
+            content_hash: spec.content_hash,
+            role,
             ..AssetEntry::default()
         });
         if let Err(err) = self.write_asset_sidecar(id) {
@@ -622,6 +662,16 @@ impl AssetServer {
             );
         }
     }
+}
+
+/// The fields of a standalone Texture catalog row, as [`AssetServer::put_texture_row`] takes them.
+struct TextureRowSpec<'a> {
+    name: &'a str,
+    path: String,
+    hdr: bool,
+    linear: bool,
+    content_hash: u64,
+    role: TextureRole,
 }
 
 /// Restores a row's display name (and non-empty folder) from a prior catalog entry by id.
@@ -750,6 +800,48 @@ pub fn detect_material_role(filename: &str) -> &'static str {
         "opacity"
     } else {
         ""
+    }
+}
+
+/// The [`TextureRole`] a texture should carry, inferred from its filename and HDR-ness.
+/// An `.hdr`/float texture is always [`TextureRole::Hdri`]; otherwise the filename token
+/// ([`detect_material_role`]) decides. An unrecognized name is [`TextureRole::Unknown`].
+#[must_use]
+pub fn infer_texture_role(name: &str, hdr: bool) -> TextureRole {
+    if hdr {
+        return TextureRole::Hdri;
+    }
+    texture_role_from_name(detect_material_role(name))
+}
+
+/// The [`TextureRole`] for a free-form hint — a connector's map role (`"color"`, `"nor_gl"`,
+/// `"arm"`) or a filename fragment. Tries the strict canonical map first (so a connector that
+/// already speaks canonical, e.g. `"normal"`, is exact and dodges the `detect_material_role`
+/// `"normal" ⊃ "orm"` quirk), then falls back to the loose filename tokenizer.
+#[must_use]
+pub fn texture_role_from_hint(hint: &str) -> TextureRole {
+    let lower = hint.to_ascii_lowercase();
+    if lower == "hdri" || lower == "hdr" || lower == "environment" || lower == "equirect" {
+        return TextureRole::Hdri;
+    }
+    let canonical = texture_role_from_name(&lower);
+    if canonical != TextureRole::Unknown {
+        return canonical;
+    }
+    texture_role_from_name(detect_material_role(&lower))
+}
+
+/// The upload [`Colorspace`] for a texture whose role was **explicitly** supplied (an import
+/// connector or an `import-texture` `role` hint). Color/emissive → sRGB, HDRI → float, and every
+/// other role — *including* [`TextureRole::Unknown`] — → linear, because an explicit role string
+/// means a data map (a connector's `"specular"` / `"data"`), never a color image. Contrast the
+/// scan mint of a *foreign* file, where an unrecognized filename stays sRGB.
+#[must_use]
+pub fn colorspace_for_role_explicit(role: TextureRole) -> Colorspace {
+    match role {
+        TextureRole::Hdri => Colorspace::Hdr,
+        TextureRole::Albedo | TextureRole::Emissive => Colorspace::Srgb,
+        _ => Colorspace::Linear,
     }
 }
 

@@ -9,7 +9,7 @@ use super::*;
 use crate::import::ImportOptions;
 use saffron_geometry::glam::{Vec2, Vec3};
 use saffron_geometry::{ImportedMaterial, ImportedModel, Mesh, Submesh, Vertex};
-use saffron_scene::{AssetEntry, AssetType, Colorspace};
+use saffron_scene::{AssetEntry, AssetType, Colorspace, TextureRole};
 use std::path::PathBuf;
 
 /// A unique scratch dir under the system temp, removed and recreated per test.
@@ -414,7 +414,7 @@ fn register_texture_bytes_writes_the_file_adds_a_row_and_seeds_the_cache() {
     let gpu = RendererUploader::new(&fx.uploader, &fx.descriptors, true);
     let png = png_2x2();
     let id = assets
-        .register_texture_bytes(&gpu, &png, "png", "brick", true)
+        .register_texture_bytes(&gpu, &png, "png", "brick", true, TextureRole::Unknown)
         .expect("register");
 
     // The file landed under textures/<uuid>.png with the exact encoded bytes.
@@ -458,11 +458,16 @@ fn import_texture_reads_a_file_and_registers_it() {
 
     let gpu = RendererUploader::new(&fx.uploader, &fx.descriptors, true);
     let id = assets
-        .import_texture(&gpu, external.to_str().unwrap(), None)
+        .import_texture(&gpu, external.to_str().unwrap(), None, TextureRole::Unknown)
         .expect("import");
     let row = assets.catalog.find(id).expect("row");
     assert_eq!(row.name, "external_albedo", "the name is the filename stem");
     assert_eq!(row.asset_type, AssetType::Texture);
+    assert_eq!(
+        row.role,
+        TextureRole::Albedo,
+        "the role is inferred from the '_albedo' filename token"
+    );
     assert!(matches!(
         assets.texture_by_uuid.get(&id.value()),
         Some(Some(_))
@@ -486,7 +491,12 @@ fn import_texture_writes_a_durable_smeta_recovered_on_a_cold_scan() {
 
     let gpu = RendererUploader::new(&fx.uploader, &fx.descriptors, true);
     let id = assets
-        .import_texture(&gpu, external.to_str().unwrap(), Some(Colorspace::Linear))
+        .import_texture(
+            &gpu,
+            external.to_str().unwrap(),
+            Some(Colorspace::Linear),
+            TextureRole::Normal,
+        )
         .expect("import");
 
     let rel = format!("textures/{}.png", id.value());
@@ -495,13 +505,19 @@ fn import_texture_writes_a_durable_smeta_recovered_on_a_cold_scan() {
         "import writes a co-located .smeta"
     );
 
-    // A cold scan (fresh server, no cache) recovers the name + linear colorspace from the sidecar.
+    // A cold scan (fresh server, no cache) recovers the name + linear colorspace + role from the
+    // sidecar.
     let mut cold = AssetServer::new(&root);
     cold.scan_assets().expect("cold scan");
     let row = cold.catalog.find(id).expect("row");
     assert_eq!(row.name, "brick_nor");
     assert_eq!(row.colorspace, Colorspace::Linear);
     assert!(row.linear);
+    assert_eq!(
+        row.role,
+        TextureRole::Normal,
+        "the normal-map role survives a cold scan via the .smeta"
+    );
 
     fx.teardown(assets);
     let _ = std::fs::remove_dir_all(&dir);

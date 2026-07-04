@@ -916,8 +916,18 @@ pub fn import_material_folder(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
+        // Unknown role → inferred from the filename in `put_texture_row`; these files are named
+        // by role (that is how `detect_material_role` slotted them), so the stored role matches
+        // the texture's actual content (an AO map packed into the ORM slot still records `Ao`).
         assets
-            .register_texture_bytes(gpu, &bytes, ext, stem, srgb)
+            .register_texture_bytes(
+                gpu,
+                &bytes,
+                ext,
+                stem,
+                srgb,
+                saffron_scene::TextureRole::Unknown,
+            )
             .unwrap_or(Uuid(0))
     };
 
