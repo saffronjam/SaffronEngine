@@ -9,7 +9,7 @@ use super::*;
 use crate::import::ImportOptions;
 use saffron_geometry::glam::{Vec2, Vec3};
 use saffron_geometry::{ImportedMaterial, ImportedModel, Mesh, Submesh, Vertex};
-use saffron_scene::AssetType;
+use saffron_scene::{AssetEntry, AssetType, Colorspace};
 use std::path::PathBuf;
 
 /// A unique scratch dir under the system temp, removed and recreated per test.
@@ -239,6 +239,87 @@ fn foreign_file_gets_a_minted_smeta_and_a_texture_row() {
 }
 
 #[test]
+fn native_uuid_texture_recovers_name_and_colorspace_from_its_smeta() {
+    let dir = scratch("nativesmeta");
+    let root = dir.join("assets");
+    std::fs::create_dir_all(root.join("textures")).unwrap();
+
+    // A uuid-named native texture on disk (as an import writes it), with no prior catalog row.
+    let id = Uuid::new();
+    let rel = format!("textures/{}.png", id.value());
+    std::fs::write(format!("{}/{rel}", root.display()), png_2x2()).unwrap();
+
+    // Seed a row + write its durable sidecar (a linear data map), as an import does, then drop
+    // that server so the next scan starts cold (empty `previous`, no cache).
+    {
+        let mut seed = AssetServer::new(&root);
+        seed.catalog.put(AssetEntry {
+            id,
+            name: "Brick Normal".to_owned(),
+            asset_type: AssetType::Texture,
+            path: rel.clone(),
+            linear: true,
+            ..AssetEntry::default()
+        });
+        seed.write_asset_sidecar(id).expect("write sidecar");
+    }
+    assert!(std::path::Path::new(&format!("{}/{rel}.smeta", root.display())).exists());
+
+    // The cold scan recovers name + colorspace from the sidecar, not the uuid stem / defaults.
+    let mut cold = AssetServer::new(&root);
+    cold.scan_assets().expect("cold scan");
+    let row = cold.catalog.find(id).expect("row");
+    assert_eq!(
+        row.name, "Brick Normal",
+        "the .smeta name beats the uuid stem"
+    );
+    assert_eq!(
+        row.colorspace,
+        Colorspace::Linear,
+        "linear colorspace survives (no silent revert to sRGB)"
+    );
+    assert!(row.linear, "the linear flag survives");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_wrong_id_smeta_does_not_bleed_onto_a_path_sharing_row() {
+    let dir = scratch("smetaguard");
+    let root = dir.join("assets");
+    std::fs::create_dir_all(root.join("textures")).unwrap();
+
+    // A native texture whose sibling `.smeta` names a *different* id (as a model sidecar sitting
+    // beside an embedded sub-asset would): the id guard must reject it, keeping the uuid-stem name.
+    let id = Uuid::new();
+    let rel = format!("textures/{}.png", id.value());
+    std::fs::write(format!("{}/{rel}", root.display()), png_2x2()).unwrap();
+    {
+        let other = Uuid::new();
+        let mut seed = AssetServer::new(&root);
+        seed.catalog.put(AssetEntry {
+            id: other,
+            name: "Someone Else".to_owned(),
+            asset_type: AssetType::Texture,
+            path: rel.clone(),
+            ..AssetEntry::default()
+        });
+        seed.write_asset_sidecar(other).expect("write sidecar");
+    }
+
+    let mut cold = AssetServer::new(&root);
+    cold.scan_assets().expect("cold scan");
+    let row = cold.catalog.find(id).expect("row");
+    assert_eq!(
+        row.name,
+        id.value().to_string(),
+        "an id-mismatched sidecar is ignored; the row keeps its stem name"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn detect_material_role_classifies_filenames() {
     assert_eq!(detect_material_role("rock_ARM.png"), "orm");
     assert_eq!(detect_material_role("wood_orm.jpg"), "orm");
@@ -386,6 +467,41 @@ fn import_texture_reads_a_file_and_registers_it() {
         assets.texture_by_uuid.get(&id.value()),
         Some(Some(_))
     ));
+
+    fx.teardown(assets);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_texture_writes_a_durable_smeta_recovered_on_a_cold_scan() {
+    let Some(fx) = gpu_or_skip() else {
+        return;
+    };
+    let dir = scratch("importsmeta");
+    let root = dir.join("project").join("assets");
+    let mut assets = AssetServer::new(&root);
+    // A normal map imported linear: the sidecar must pin both name and the linear colorspace.
+    let external = dir.join("brick_nor.png");
+    std::fs::write(&external, png_2x2()).unwrap();
+
+    let gpu = RendererUploader::new(&fx.uploader, &fx.descriptors, true);
+    let id = assets
+        .import_texture(&gpu, external.to_str().unwrap(), Some(Colorspace::Linear))
+        .expect("import");
+
+    let rel = format!("textures/{}.png", id.value());
+    assert!(
+        std::path::Path::new(&format!("{}/{rel}.smeta", root.display())).exists(),
+        "import writes a co-located .smeta"
+    );
+
+    // A cold scan (fresh server, no cache) recovers the name + linear colorspace from the sidecar.
+    let mut cold = AssetServer::new(&root);
+    cold.scan_assets().expect("cold scan");
+    let row = cold.catalog.find(id).expect("row");
+    assert_eq!(row.name, "brick_nor");
+    assert_eq!(row.colorspace, Colorspace::Linear);
+    assert!(row.linear);
 
     fx.teardown(assets);
     let _ = std::fs::remove_dir_all(&dir);

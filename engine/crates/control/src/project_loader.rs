@@ -17,7 +17,7 @@ use saffron_assets::{
     AssetServer, LoadInput, LoadedDoc, NewProject, ProjectDocWorker, ProjectSidecar,
 };
 use saffron_core::Uuid;
-use saffron_scene::{Entity, Material, Mesh, Scene, ScriptInputState};
+use saffron_scene::{Entity, Mesh, Scene, ScriptInputState};
 use saffron_sceneedit::{
     BootStage, ProjectLoadRequest, ProjectPhase, SceneEditContext, debug_overlays_from_json,
 };
@@ -348,8 +348,8 @@ fn install_doc(
 }
 
 /// The distinct mesh + texture asset ids the scene references directly (the residency prefetch
-/// set): every `Mesh.mesh`, the `Material` texture slots, and the environment sky panorama. `.smat`
-/// materials and their nested textures resolve lazily on the draw path.
+/// set): every `Mesh.mesh` and the environment sky panorama. `MaterialSet` slots reference `.smat`
+/// materials, whose params and nested textures resolve lazily on the draw path.
 fn scene_residency_ids(scene: &mut Scene) -> Vec<Uuid> {
     let mut ids: Vec<Uuid> = Vec::new();
     let push = |ids: &mut Vec<Uuid>, id: Uuid| {
@@ -358,10 +358,6 @@ fn scene_residency_ids(scene: &mut Scene) -> Vec<Uuid> {
         }
     };
     scene.for_each::<&Mesh, _>(|_, mesh| push(&mut ids, mesh.mesh));
-    scene.for_each::<&Material, _>(|_, material| {
-        push(&mut ids, material.albedo_texture);
-        push(&mut ids, material.metallic_roughness_texture);
-    });
     let sky = scene.environment.sky_texture;
     push(&mut ids, sky);
     ids

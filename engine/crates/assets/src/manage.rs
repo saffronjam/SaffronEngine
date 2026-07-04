@@ -229,12 +229,22 @@ pub fn extract_sub_asset(
         tracks: sub.tracks,
         ..AssetEntry::default()
     });
+    // Pin the name/colorspace to the now-standalone leaf so a cold scan can't fall back to the
+    // uuid stem (and doesn't depend on the walk order vs the container's remap row).
+    if let Err(err) = assets.write_asset_sidecar(sub_id) {
+        tracing::warn!(
+            "extract: could not write .smeta for {}: {err}",
+            sub_id.value()
+        );
+    }
 
     // Drop the stale reader (its TOC offsets shifted) and the sub-asset's GPU ref so the
-    // next resolve reads the external file.
+    // next resolve reads the external file. A material sub-asset now resolves from the external
+    // `.smat`, so drop its memoized resolution too.
     assets.model_by_uuid.remove(&model_id.value());
     assets.mesh_by_uuid.remove(&sub_id.value());
     assets.texture_by_uuid.remove(&sub_id.value());
+    assets.invalidate_material_caches();
     Ok(sub_id)
 }
 
@@ -270,6 +280,7 @@ pub fn clear_extraction(assets: &mut AssetServer, model_id: Uuid, sub_id: Uuid) 
     rewrite_container_meta(&container_full, &model.reader, &updated)?;
     if let Some(external) = external {
         let _ = std::fs::remove_file(format!("{}/{external}", assets.root.display()));
+        let _ = std::fs::remove_file(format!("{}/{external}.smeta", assets.root.display()));
     }
 
     // Revert the catalog row to the embedded sub-asset (container + chunk).
@@ -295,6 +306,8 @@ pub fn clear_extraction(assets: &mut AssetServer, model_id: Uuid, sub_id: Uuid) 
     assets.model_by_uuid.remove(&model_id.value());
     assets.mesh_by_uuid.remove(&sub_id.value());
     assets.texture_by_uuid.remove(&sub_id.value());
+    // The sub-asset resolves from the embedded chunk again; drop its memoized material resolution.
+    assets.invalidate_material_caches();
     Ok(())
 }
 
@@ -410,6 +423,8 @@ pub fn reimport_model(assets: &mut AssetServer, model_id: Uuid) -> Result<Reimpo
         assets.mesh_by_uuid.remove(sid);
         assets.texture_by_uuid.remove(sid);
     }
+    // Embedded material chunks were re-baked under stable ids, so their cached resolutions are stale.
+    assets.invalidate_material_caches();
     Ok(delta)
 }
 
@@ -530,25 +545,15 @@ fn entity_asset_pairs(scene: &mut Scene) -> Vec<(Uuid, Uuid)> {
     let mut refs: Vec<(saffron_scene::Entity, Uuid)> = Vec::new();
     scene.for_each::<&MeshComponent, _>(|entity, mesh| refs.push((entity, mesh.mesh)));
     scene.for_each::<&SkinnedMesh, _>(|entity, skin| refs.push((entity, skin.mesh)));
+    // Each material slot references a `.smat` material asset; the material→texture edges
+    // (a `.smat`'s own texture references) are added by the dependency-graph builder, so an
+    // entity keeps its material alive and the material keeps its textures alive transitively.
     scene.for_each::<&MaterialSet, _>(|entity, set| {
         for slot in &set.slots {
-            for tex in [
-                slot.albedo_texture,
-                slot.metallic_roughness_texture,
-                slot.normal_texture,
-                slot.occlusion_texture,
-                slot.emissive_texture,
-            ] {
-                refs.push((entity, tex));
-            }
+            refs.push((entity, slot.material));
         }
     });
     scene.for_each::<&ModelInstance, _>(|entity, instance| refs.push((entity, instance.model_id)));
-    // The shared-material-asset component is `saffron_scene::MaterialAsset` (id-by-ref),
-    // imported aliased so it never collides with the asset crate's `MaterialAsset` value.
-    scene.for_each::<&saffron_scene::MaterialAsset, _>(|entity, mat| {
-        refs.push((entity, mat.material))
-    });
 
     let mut out = Vec::new();
     for (entity, asset) in refs {

@@ -5,8 +5,11 @@
 //! contributes a [`AssetType::Model`] parent + sub-asset rows via the prefix read;
 //! engine-written standalone files (a uuid filename stem) keep their prior row (only the
 //! path is refreshed); a foreign file (a raw `.png` dropped in) identifies via a sibling
-//! `.smeta` minted on first sight. Display names + folders are preserved from the prior
-//! catalog by id, and the walk is **sorted** so the catalog cache is reproducible.
+//! `.smeta` minted on first sight. A co-located `<path>.smeta` is then overlaid on every
+//! row as the durable, id-keyed home for its name / folder / colorspace — authoritative
+//! over the (only-as-fresh-as-the-last-save) `project.json` seed, so a never-saved import
+//! or rename survives a cold scan. The walk is **sorted** so the catalog cache is
+//! reproducible.
 //!
 //! [`AssetServer::load_catalog`] is the cache-fast path: if `assets/.cache/catalog.json`'s
 //! stored signature still matches the on-disk signature, it reuses the cached rows
@@ -35,12 +38,14 @@ use crate::import::{ScanDelta, catalog_rows_for_model};
 use crate::model::read_container_metadata;
 use crate::names::{asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name};
 
-/// The `.smeta` sidecar for a foreign/headerless file (a raw `.png` dropped into
-/// `assets/`): the one place a file with no room in its own bytes carries a stable id +
-/// colorspace.
+/// The `.smeta` sidecar co-located with an asset file — the durable, id-keyed home for its
+/// name / folder / colorspace.
 ///
-/// Engine-written files (`.smodel`, extracted `.smat`/`.smesh`) never get one — their
-/// identity is the bytes/name.
+/// A foreign/headerless file (a raw `.png` dropped into `assets/`) also uses it for a stable
+/// id (its bytes carry none). Engine-written files (`.smodel`, `textures/<uuid>.*`, extracted
+/// `.smat`/`.smesh`/`.sanim`) take their *identity* from the uuid stem / container, but their
+/// *metadata* lives here too — written eagerly on import and on every rename/move so it
+/// survives a cold scan without a project save.
 #[derive(Clone, Debug)]
 struct SmetaData {
     id: Uuid,
@@ -177,6 +182,9 @@ impl AssetServer {
         let (rebuilt, delta) =
             reconcile_catalog_from_disk(&self.root, &self.catalog, &mut |_, _, _| {});
         self.catalog = rebuilt;
+        // The catalog was rebuilt from disk (ids/paths may have changed), so any memoized material
+        // resolution keyed by id could be stale.
+        self.invalidate_material_caches();
         Ok(delta)
     }
 }
@@ -324,6 +332,8 @@ pub fn reconcile_catalog_from_disk(
         rebuilt.put(row);
     }
 
+    apply_sidecar_overrides(&root, &mut rebuilt);
+
     for (&id, &index) in &rebuilt.by_id {
         if !previous.by_id.contains_key(&id) {
             delta.added.push(rebuilt.entries[index].clone());
@@ -414,6 +424,66 @@ impl AssetServer {
     /// Regenerable and gitignored: deleting it is always safe (the next load is a cold scan).
     pub fn write_catalog_cache(&self) {
         write_catalog_cache_to(&self.root, &self.catalog);
+    }
+
+    /// Writes the durable `<path>.smeta` sidecar for the catalog row `id` — its name, folder,
+    /// and (for a texture) colorspace. Call after any create / rename / move so the metadata
+    /// survives a cold scan without a project save; [`apply_sidecar_overrides`] reads it back.
+    ///
+    /// A no-op for an unknown id, a row with no own file, or an **embedded** sub-asset
+    /// (`container != 0`): those share their `.smodel`'s path, so writing there would clobber the
+    /// model's own sidecar — their durable rename is out of scope (identity/name stay in the
+    /// container META). The model row and *extracted* sub-assets have `container == 0` and their
+    /// own file, so they get one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the sidecar cannot be written.
+    pub fn write_asset_sidecar(&self, id: Uuid) -> Result<()> {
+        let Some(row) = self.catalog.find(id) else {
+            return Ok(());
+        };
+        if row.path.is_empty() || row.container != Uuid(0) {
+            return Ok(());
+        }
+        // Resolve a texture's upload space the way the loader does, so the sidecar records a
+        // concrete colorspace (never `Auto`) and a never-saved linear data map can't rescan as
+        // sRGB. Non-textures carry the row's colorspace verbatim (meaningless but harmless).
+        let colorspace = if row.asset_type == AssetType::Texture {
+            if row.colorspace != Colorspace::Auto {
+                row.colorspace
+            } else if row.hdr {
+                Colorspace::Hdr
+            } else if row.linear {
+                Colorspace::Linear
+            } else {
+                Colorspace::Srgb
+            }
+        } else {
+            row.colorspace
+        };
+        let meta = SmetaData {
+            id,
+            asset_type: row.asset_type,
+            colorspace,
+            folder: row.folder.clone(),
+            name: row.name.clone(),
+        };
+        let smeta_path = format!("{}/{}.smeta", self.root.display(), row.path);
+        write_smeta(&smeta_path, &meta)
+    }
+
+    /// Removes the `<path>.smeta` sidecar co-located with the row for `id`, if any. Best-effort;
+    /// call before dropping a row on delete so no orphan sidecar lingers. Skips embedded
+    /// sub-assets (`container != 0`) so it never deletes the shared model sidecar.
+    pub fn remove_asset_sidecar(&self, id: Uuid) {
+        if let Some(row) = self.catalog.find(id)
+            && !row.path.is_empty()
+            && row.container == Uuid(0)
+        {
+            let smeta_path = format!("{}/{}.smeta", self.root.display(), row.path);
+            let _ = std::fs::remove_file(smeta_path);
+        }
     }
 
     /// Decodes + uploads `encoded` (RGBA8) as a `srgb`/unorm texture, writes the bytes to
@@ -545,6 +615,12 @@ impl AssetServer {
             content_hash,
             ..AssetEntry::default()
         });
+        if let Err(err) = self.write_asset_sidecar(id) {
+            tracing::warn!(
+                "import: could not write texture .smeta for {}: {err}",
+                id.value()
+            );
+        }
     }
 }
 
@@ -554,6 +630,45 @@ fn preserve_name_folder(previous: &AssetCatalog, row: &mut AssetEntry) {
         row.name = prev.name.clone();
         if !prev.folder.is_empty() {
             row.folder = prev.folder.clone();
+        }
+    }
+}
+
+/// Overlays each row's durable metadata from a co-located `<path>.smeta` sidecar — the
+/// authoritative home for an asset's name / folder / colorspace. Runs after the walk (and
+/// after [`preserve_name_folder`]) so the eagerly-written sidecar wins over the stale
+/// `project.json` seed; that is what makes a never-saved rename or import survive a cold scan.
+///
+/// **Id-guarded.** A `.smodel` sidecar carries only the model row's metadata, and an embedded
+/// sub-asset row can share the model's `.smodel` path — so a sidecar is applied only to the row
+/// whose id it names, never to a path-sharing sibling. This also makes the extracted-asset
+/// case order-independent: the leaf row and the container's remap row share an id, so the
+/// overlay lands on whichever won the `put`. The invariant it rests on: every name/folder/
+/// colorspace mutation writes the sidecar, so it never lags `project.json`.
+fn apply_sidecar_overrides(root: &std::path::Path, rebuilt: &mut AssetCatalog) {
+    for row in &mut rebuilt.entries {
+        if row.path.is_empty() {
+            continue;
+        }
+        let smeta_path = format!("{}/{}.smeta", root.display(), row.path);
+        if !std::path::Path::new(&smeta_path).exists() {
+            continue;
+        }
+        match read_smeta(&smeta_path) {
+            Ok(sidecar) if sidecar.id == row.id => {
+                if !sidecar.name.is_empty() {
+                    row.name = sidecar.name;
+                }
+                row.folder = sidecar.folder;
+                if row.asset_type == AssetType::Texture && sidecar.colorspace != Colorspace::Auto {
+                    row.colorspace = sidecar.colorspace;
+                    row.hdr = sidecar.colorspace == Colorspace::Hdr;
+                    row.linear = sidecar.colorspace == Colorspace::Linear;
+                }
+            }
+            // A sidecar whose id names a different asset (a path-sharing sibling) is not ours.
+            Ok(_) => {}
+            Err(err) => tracing::warn!("scan: ignoring bad .smeta '{}.smeta': {err}", row.path),
         }
     }
 }
