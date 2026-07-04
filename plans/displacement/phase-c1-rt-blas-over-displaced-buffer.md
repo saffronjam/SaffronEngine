@@ -1,6 +1,17 @@
 # Phase C1 — RT: build/refit BLAS over the displaced buffer
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED — falls out of B2's shared-buffer design for free (builds + green with B2; a
+live RT-shadows-on displaced scene wants a GPU-with-eyes run). B2 writes displaced vertices into the
+**same deformed buffer** the skinned-BLAS refit already reads, and `Instancing` appends each displaced
+instance to `SceneDrawList::deformed_rt_instances` (with its `deformed_offset`, `world_transform` = the
+node model matrix since the displaced vertices are mesh-local). `plan_skinned_blas_refits` /
+`SkinnedBlas` is agnostic to *how* a vertex slice was deformed — it reads a device-address slice of the
+shared buffer — so a displaced instance (keyed by its entity uuid, RT-armed) gets a BUILD-then-in-place
+`MODE_UPDATE` refit exactly like a skinned one. The `tlas-build` pass's `AccelStructBuildRead` on the
+shared `deformed` resource orders it after the `displace` compute pass automatically (the graph derives
+the compute-write → AS-build barrier). The deformed buffer already carries
+`ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR` (via `make_deformed_buffer` when RT is supported). No
+displacement-specific RT code was needed — the shared-buffer architecture is what makes RT free.
 **Scope:** `saffron-rendering` (RT acceleration structures)
 **Depends on:** phase-b2
 
