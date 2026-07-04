@@ -25,3 +25,4 @@ layers add their own passes to the cull → scene → UI frame.
 | [Performance alarms](performance-alarms/) | EMA + hysteresis + debounce, MAD-spike / burn-rate detectors, severity, the non-blocking `drain-alarms` seq cursor | `frame_history.rs`, `renderer.rs` |
 | [Renderer profiling](renderer-profiling/) | the capture model (merged CPU+GPU spans, nesting, calibration), timestamp caveats, capture modes, Chrome-Trace + Perfetto export, pipeline statistics, software-GPU honesty | `profiler.rs`, `render_graph.rs` |
 | [Compute skinning](compute-skinning/) | deform-once into a base-layout buffer, the deformed buffer + per-instance dispatch, compute→vertex barrier | `skin.slang`, `skinning.rs` |
+| [Compute displacement](compute-displacement/) | height-map displacement baked into the shared deformed buffer, consistent across every pass + the BLAS, one mechanism | `displace.slang`, `displacement.rs` |
