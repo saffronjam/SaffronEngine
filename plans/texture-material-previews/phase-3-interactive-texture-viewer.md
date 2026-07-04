@@ -1,6 +1,21 @@
 # Interactive 3D texture viewer + representation picker
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED (core) / PARTIAL (per-type toggles deferred). A standalone non-HDR texture now
+opens the real-renderer 3D "View" tab as its map on the built-in sphere: `enter-asset-preview` branches
+on a `Texture` role (`enter_texture_preview`) — it seeds an ephemeral single-slot `MaterialAsset` into
+`material_by_uuid` under the reserved `PREVIEW_MATERIAL_ID` (role → slot; `preview_material_for_texture`)
+and spawns a `BUILTIN_SPHERE_MESH_ID` entity bound to it, reusing a new `commit_preview_subject` helper
+(dedups the built-in-preview tail). The workspace tolerates a container-less subject (non-fatal
+`get-asset-model` → shows just the viewport + floor, which also fixed built-in-primitive "View"), the
+texture orbit is **pan-only (no dolly)** per the chosen interaction, and an **Applied / Flat**
+representation picker sits in both the 3D toolbar and the flat image view (`openImageViewerTab` is the
+single flat-view mechanism, reached as the picker's Flat mode — no duplicate flat path). `routeView`
+sends non-HDR textures to the 3D tab. **Deferred:** the per-type toggles (normal GL/DX flip, ORM R/G/B
+split) — GL/DX needs a `nor_gl`/`nor_dx` distinction the role model lacks (see phase-2), ORM-split needs
+channel isolation; and the `furnish_preview_scene → &mut Scene` refactor is left to
+`material-graph-live-preview` (this phase reuses the existing `preview_scene`, so it isn't needed here).
+HDRI stays flat until phase-4. Verified: workspace build + `clippy -D warnings` + `fmt` + frontend
+`tsc`/`oxlint` clean, `reserved_sentinels` test passes.
 **Scope:** `saffron-control`, `saffron-sceneedit`, `saffron-protocol`, editor (`AssetsPanel`,
 `AssetEditorWorkspace`, `App`)
 **Depends on:** phase-1, phase-2, **`primitive-meshes/`** (spawnable sphere)

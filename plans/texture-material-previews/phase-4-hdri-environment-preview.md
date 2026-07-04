@@ -1,6 +1,22 @@
 # HDRI environment preview — Thumbnail / 3D Preview / Exposure
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. An HDRI (`role == hdri` / `colorspace == hdr`) opens the AmbientCG-style
+environment preview: `enter-asset-preview` routes it to `enter_hdri_preview`, which spawns **three PBR
+balls** (chrome / diffuse grey / colored satin — differing only by per-slot `apply_overrides`, so no
+extra reserved materials; the center ball parents the outer two so the framing spans all three) and
+furnishes the scene as `PreviewEnv::Hdri`: `SkyMode::Texture` with `sky_texture = hdri`, **no
+directional key light** so the balls read the environment's own IBL (reflections / irradiance / color).
+`furnish_preview_scene`/`commit_preview_subject` gained a `PreviewEnv` parameter (the shared Procedural
+path is unchanged). **Exposure (mode C):** the tonemap EV is stashed on preview enter
+(`saved_exposure`) and restored on `exit-asset-preview` **and** on `set-active-view → Scene`, so an EV
+sweep never bleeds into the authored viewport; the editor's HDRI toolbar carries a −6…+6 EV `Slider`
+(→ `set-exposure`) and re-applies its EV when the tab regains focus. `routeView` sends every texture to
+the 3D tab; the HDRI keeps dolly (three balls to move between) while a lone texture sphere stays
+pan-only; the flat "Thumbnail" (mode A) is the existing tonemapped HDR swatch reached via the Flat
+picker. **Deferred:** the fixed-stop EV contact sheet, and IBL-prefilter caching keyed by `content_hash`
+(the preview uses the existing `SkyMode::Texture` IBL path, same as an in-scene HDRI — no new cost path
+introduced, but a re-prefilter-per-enter cache is a future optimization). Verified: workspace build +
+`clippy -D warnings` + frontend `tsc`/`oxlint` clean.
 **Scope:** `saffron-control`, `saffron-sceneedit`, `saffron-rendering`, editor
 **Depends on:** phase-1, phase-3 (furnisher refactor + 3D tab), **`primitive-meshes/`** (balls)
 

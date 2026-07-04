@@ -1,8 +1,21 @@
 # Height map preview — real VS-displacement on the sphere
 
-**Status:** NOT STARTED
+**Status:** WIRED — mechanism deferred to `displacement/phase-a`. A `Height` texture already opens the
+interactive sphere (phase-3 routing: `preview_material_for_texture` puts it in the height slot on the
+studio sphere) and reads through the übershader's existing **parallax-occlusion mapping**
+(`parallaxUv` in `mesh.slang`/`lighting.slang`), with a slightly deeper preview `height_scale` (0.08)
+so the relief is legible; the Flat picker still reaches the raw greyscale swatch. That completes every
+touch point **inside the `texture-material-previews` plan-set**. The remaining piece — the *true
+deformed silhouette* via vertex-shader displacement — is the mechanism in **`displacement/phase-a`**, a
+**separate plan-set the user explicitly designated research-first** and which is **not part of this
+`/goal`**. Per NO-LEGACY nothing throwaway was shipped: the preview reuses the übershader's existing POM
+(no new POM path to retire), and the routing here is unchanged when phase-a swaps the sphere's shading
+path to real displacement — only the shading path changes, not this wiring. The optional live
+`height_scale` slider is deferred with the mechanism (a POM-depth slider alone is marginal; it becomes
+meaningful once the displacement is real). Verified: workspace build + `clippy -D warnings` + shader
+compile + frontend `tsc`/`oxlint`/`build` clean.
 **Scope:** editor (`AssetEditorWorkspace` representation picker), `saffron-control`
-**Depends on:** phase-3, **`displacement/phase-a`** (the VS-displacement mechanism)
+**Depends on:** phase-3, **`displacement/phase-a`** (the VS-displacement mechanism — external, research-first)
 
 ## Goal
 

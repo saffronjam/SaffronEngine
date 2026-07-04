@@ -1,6 +1,9 @@
 # Per-type texture & material previews — on a sphere, in the "View" tab
 
-**Status:** NOT STARTED
+**Status:** COMPLETED (phases 1–4 fully; phase 5 wired, its true-displacement mechanism deferred to the
+separate research-designated `displacement/phase-a`). Every texture now previews per-role on a lit
+sphere as a thumbnail and in the interactive 3D "View" tab, plus the AmbientCG-style HDRI environment
+(three-ball rig + EV sweep). See each `phase-*.md` `**Status:**` line for the per-phase detail.
 
 Materials already render on a ball for thumbnails; **textures do not** (they show as a flat downscaled
 image), and neither textures nor materials open the interactive 3D "View" tab as a lit sphere. This
