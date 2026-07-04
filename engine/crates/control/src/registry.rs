@@ -127,6 +127,10 @@ pub trait ControlRenderer {
     fn skinning_enabled(&self) -> bool;
     /// Toggles GPU skinning.
     fn set_skinning(&mut self, enabled: bool);
+    /// Whether the GPU displacement path is on.
+    fn displacement_enabled(&self) -> bool;
+    /// Toggles GPU displacement.
+    fn set_displacement(&mut self, enabled: bool);
 
     /// Whether the device supports hardware ray tracing.
     fn rt_supported(&self) -> bool;

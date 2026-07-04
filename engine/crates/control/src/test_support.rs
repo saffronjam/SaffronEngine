@@ -98,6 +98,14 @@ impl ThumbnailGpu for StubGpu {
     ) -> saffron_rendering::Result<Arc<GpuTexture>> {
         unreachable!("an empty catalog never reaches the stub material-preview path")
     }
+
+    fn render_hdri_ball_preview(
+        &self,
+        _hdri: &Arc<GpuTexture>,
+        _size: u32,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        unreachable!("an empty catalog never reaches the stub HDRI-ball preview path")
+    }
 }
 
 /// Resolves a tier name to its [`saffron_rendering::RenderQuality`], `None` for an unknown name —
@@ -126,6 +134,7 @@ pub struct StubRenderer {
     pub gdf: bool,
     pub reflection_probes: bool,
     pub skinning: bool,
+    pub displacement: bool,
     pub rt_supported: bool,
     pub rt_shadows: bool,
     pub restir: bool,
@@ -170,6 +179,7 @@ impl Default for StubRenderer {
             gdf: false,
             reflection_probes: true,
             skinning: true,
+            displacement: true,
             rt_supported: false,
             rt_shadows: false,
             restir: false,
@@ -339,6 +349,12 @@ impl ControlRenderer for StubRenderer {
     }
     fn set_skinning(&mut self, enabled: bool) {
         self.skinning = enabled;
+    }
+    fn displacement_enabled(&self) -> bool {
+        self.displacement
+    }
+    fn set_displacement(&mut self, enabled: bool) {
+        self.displacement = enabled;
     }
 
     fn rt_supported(&self) -> bool {

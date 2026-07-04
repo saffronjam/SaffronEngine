@@ -184,6 +184,12 @@ impl ControlRenderer for HostControlRenderer<'_> {
     fn set_skinning(&mut self, enabled: bool) {
         self.renderer.set_skinning(enabled);
     }
+    fn displacement_enabled(&self) -> bool {
+        self.renderer.displacement_enabled()
+    }
+    fn set_displacement(&mut self, enabled: bool) {
+        self.renderer.set_displacement(enabled);
+    }
 
     fn rt_supported(&self) -> bool {
         self.renderer.rt_supported()
@@ -560,6 +566,16 @@ impl ThumbnailGpu for HostThumbnailGpu<'_> {
             .borrow_mut()
             .render_material_preview(material, size, shader_spv)
     }
+
+    fn render_hdri_ball_preview(
+        &self,
+        hdri: &Arc<GpuTexture>,
+        size: u32,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        self.renderer
+            .borrow_mut()
+            .render_hdri_ball_preview(hdri, size)
+    }
 }
 
 /// Maps the renderer's [`saffron_rendering::ThumbnailPng`] to the assets-layer
@@ -727,6 +743,19 @@ impl ThumbnailGpu for WorkerThumbnailGpu {
             material,
             size,
             shader_spv,
+        )
+    }
+
+    fn render_hdri_ball_preview(
+        &self,
+        hdri: &Arc<GpuTexture>,
+        size: u32,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        self.thumbnail.borrow_mut().render_hdri_ball_preview(
+            &self.device,
+            &self.descriptors,
+            hdri,
+            size,
         )
     }
 }

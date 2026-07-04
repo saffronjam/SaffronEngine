@@ -1,7 +1,7 @@
-//! The 34 render-domain control commands: render-stats, the profiler/capture group,
+//! The 35 render-domain control commands: render-stats, the profiler/capture group,
 //! perf config, frame history, alarms, the AA / view-mode / clustering / IBL / sky-occlusion /
-//! SSAO / shadow / GI / skinning / depth-prepass toggles, native viewport info + size,
-//! exposure, and reflection-probe management.
+//! SSAO / shadow / GI / skinning / displacement / depth-prepass toggles, native viewport info +
+//! size, exposure, and reflection-probe management.
 //!
 //! Every handler reaches only [`EngineContext::renderer`] (the `recapture-probes` /
 //! `list-probes` pair additionally reads the active scene's reflection-probe state),
@@ -21,14 +21,14 @@ use saffron_protocol::{
     ProfileCaptureMetadataDto, ProfileLaneDto, ProfileSpanDto, ProfilerModeDto, ProfilerModeResult,
     ProfilerSetModeParams, RecaptureProbesResult, RenderPassTimingDto, RenderPassTimingsDto,
     RenderQualityResult, RenderStatsDto, SetAaParams, SetAaResult, SetClusteredResult,
-    SetDepthPrepassResult, SetExposureParams, SetExposureResult, SetGdfResult, SetGiParams,
-    SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams, SetProbesResult,
-    SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult, SetRtShadowsResult,
-    SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult, SetTaaParamsParams,
-    SetTaaParamsResult, SetTonemapParams, SetUpscaleParams, SetUpscaleResult, SetViewModeParams,
-    SetViewModeResult, SetViewportPowerStateParams, SetViewportSizeParams, SetViewportSizeResult,
-    ToggleParams, TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto, ViewportNativeInfoResult,
-    ViewportPowerStateResult,
+    SetDepthPrepassResult, SetDisplacementResult, SetExposureParams, SetExposureResult,
+    SetGdfResult, SetGiParams, SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams,
+    SetProbesResult, SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult,
+    SetRtShadowsResult, SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult,
+    SetTaaParamsParams, SetTaaParamsResult, SetTonemapParams, SetUpscaleParams, SetUpscaleResult,
+    SetViewModeParams, SetViewModeResult, SetViewportPowerStateParams, SetViewportSizeParams,
+    SetViewportSizeResult, ToggleParams, TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto,
+    ViewportNativeInfoResult, ViewportPowerStateResult,
 };
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmSeverity, CaptureMode, CaptureState,
@@ -897,6 +897,18 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
         },
     );
 
+    reg.register::<ToggleParams, SetDisplacementResult>(
+        "set-displacement",
+        "set-displacement {0|1} — toggle the GPU compute-displacement path",
+        |ctx, params| {
+            let enabled = params.enabled.unwrap_or(true);
+            ctx.renderer.set_displacement(enabled);
+            Ok(SetDisplacementResult {
+                displacement: enabled,
+            })
+        },
+    );
+
     reg.register::<SetExposureParams, SetExposureResult>(
         "set-exposure",
         "set-exposure {ev} — tonemap exposure in stops (exp2)",
@@ -1108,6 +1120,7 @@ mod tests {
             ("set-ibl", "ibl"),
             ("set-shadows", "shadows"),
             ("set-skinning", "skinning"),
+            ("set-displacement", "displacement"),
             ("set-depth-prepass", "depthPrepass"),
             ("set-probes", "probes"),
         ];
