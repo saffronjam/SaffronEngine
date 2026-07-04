@@ -1,6 +1,11 @@
 # Native primitive spawn + delete the fake-asset path
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `AddEntityPreset` is now `Cube | Plane | Sphere` (the `Model` alias removed —
+the asset browser's "Add to scene" already covers instantiating a catalog model); the `add-entity`
+handler spawns a native `Mesh { reserved id } + MaterialSet` with the project gate dropped;
+`ensure_builtin_model_asset` is **deleted**; the wire round-trip test and `CreateMenu` gained
+plane/sphere. `models/cube.gltf` is **retained** — it still backs the asset-preview floor
+(`ensure_preview_floor_mesh`), so it is not orphaned. Protocol regenerated (`xtask gen-protocol`).
 **Scope:** `saffron-protocol`, `saffron-control`, `saffron-assets`, editor (`CreateMenu`)
 **Depends on:** phase-2 (seeded reserved-id meshes)
 

@@ -1,6 +1,10 @@
 # Inspector mesh picker: "Built-ins" group + "Built-in" chip
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED. `AssetPicker.tsx` shows a fixed **Built-in** group (cube/plane/sphere, from a
+TS constant mirroring `BuiltinMesh`) above the catalog rows for mesh fields, renders a **Built-in**
+chip on the trigger for a reserved id, and keeps `list-assets` catalog-only. `assign-asset`
+(`commands_asset.rs`) gained a built-in-aware branch: a reserved id yields `BuiltinMesh::display_name`
+and skips the catalog lookup.
 **Scope:** editor (`AssetPicker`, `fieldRenderer`), `saffron-control`
 **Depends on:** phase-2 (reserved ids exist), phase-3 (native spawn)
 
