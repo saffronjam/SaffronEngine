@@ -226,6 +226,13 @@
       "fixture": "toggle-on"
     },
     {
+      "name": "set-displacement",
+      "params": "ToggleParams",
+      "result": "SetDisplacementResult",
+      "status": "typed",
+      "fixture": "toggle-on"
+    },
+    {
       "name": "set-depth-prepass",
       "params": "ToggleParams",
       "result": "SetDepthPrepassResult",

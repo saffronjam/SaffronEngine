@@ -625,6 +625,10 @@ export interface SetSkinningResult {
   skinning: boolean;
 }
 
+export interface SetDisplacementResult {
+  displacement: boolean;
+}
+
 export interface SetDepthPrepassResult {
   depthPrepass: boolean;
 }
@@ -1190,7 +1194,7 @@ export interface SetScriptOverrideResult {
 }
 
 export interface AddEntityParams {
-  preset?: "empty" | "cube" | "model" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe";
+  preset?: "empty" | "cube" | "plane" | "sphere" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe";
 }
 
 export interface RenameEntityParams {
@@ -1409,6 +1413,7 @@ export interface PlacementTransformDto {
 export interface ImportTextureParams {
   path: string;
   colorspace?: string;
+  role?: string;
 }
 
 export interface ImportTextureResult {
@@ -1429,6 +1434,8 @@ export interface AssetEntryDto {
   container?: WireUuid;
   duration?: number;
   rigged?: boolean;
+  colorspace?: string;
+  role?: string;
   createdAt: number;
   attribution?: AssetAttributionDto;
 }
@@ -1904,6 +1911,7 @@ export interface CommandParamsMap {
   "set-gi": SetGiParams;
   "set-shadows": ToggleParams;
   "set-skinning": ToggleParams;
+  "set-displacement": ToggleParams;
   "set-depth-prepass": ToggleParams;
   "viewport-native-info": EmptyParams;
   "set-viewport-power-state": SetViewportPowerStateParams;
@@ -2078,6 +2086,7 @@ export interface CommandResultMap {
   "set-gi": SetGiResult;
   "set-shadows": SetShadowsResult;
   "set-skinning": SetSkinningResult;
+  "set-displacement": SetDisplacementResult;
   "set-depth-prepass": SetDepthPrepassResult;
   "viewport-native-info": ViewportNativeInfoResult;
   "set-viewport-power-state": ViewportPowerStateResult;

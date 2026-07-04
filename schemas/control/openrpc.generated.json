@@ -582,6 +582,24 @@
       }
     },
     {
+      "name": "set-displacement",
+      "summary": "toggle GPU displacement",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ToggleParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetDisplacementResult"
+        }
+      }
+    },
+    {
       "name": "set-depth-prepass",
       "summary": "toggle depth prepass",
       "params": [
@@ -3167,7 +3185,8 @@
             "enum": [
               "empty",
               "cube",
-              "model",
+              "plane",
+              "sphere",
               "point-light",
               "spot-light",
               "directional-light",
@@ -3530,6 +3549,12 @@
           },
           "rigged": {
             "type": "boolean"
+          },
+          "colorspace": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
           },
           "createdAt": {
             "type": "integer"
@@ -5341,6 +5366,9 @@
             "type": "string"
           },
           "colorspace": {
+            "type": "string"
+          },
+          "role": {
             "type": "string"
           }
         },
@@ -7965,6 +7993,18 @@
         },
         "required": [
           "depthPrepass"
+        ]
+      },
+      "SetDisplacementResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "displacement": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "displacement"
         ]
       },
       "SetEnvironmentParams": {
