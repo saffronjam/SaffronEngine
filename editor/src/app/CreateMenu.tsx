@@ -9,7 +9,18 @@
 /// header) and anchor there.
 import { useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Box, Camera, CircleDashed, Flashlight, Lightbulb, Orbit, Plus, Sun } from "lucide-react";
+import {
+  Box,
+  Camera,
+  Circle,
+  CircleDashed,
+  Flashlight,
+  Lightbulb,
+  Orbit,
+  Plus,
+  Square,
+  Sun,
+} from "lucide-react";
 import { client, type EntityPreset } from "../control/client";
 import { recordEntityCreation, useEditorStore } from "../state/store";
 import { errorText, notifyError } from "../lib/flash";
@@ -26,11 +37,14 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 
 /// The hand-maintained mapping of menu labels to `add-entity` presets and their
 /// Lucide icons (the preset union itself comes from the typed client / protocol):
-/// empty, cube, point light, spot light, directional light, camera, and reflection
-/// probe. Exported so other add surfaces can reuse the same list.
+/// empty, the built-in primitives (cube, plane, sphere), point light, spot light,
+/// directional light, camera, and reflection probe. Exported so other add surfaces can
+/// reuse the same list.
 export const CREATE_PRESETS: { label: string; preset: EntityPreset; icon: LucideIcon }[] = [
   { label: "Empty", preset: "empty", icon: CircleDashed },
   { label: "Cube", preset: "cube", icon: Box },
+  { label: "Plane", preset: "plane", icon: Square },
+  { label: "Sphere", preset: "sphere", icon: Circle },
   { label: "Point Light", preset: "point-light", icon: Lightbulb },
   { label: "Spot Light", preset: "spot-light", icon: Flashlight },
   { label: "Directional Light", preset: "directional-light", icon: Sun },

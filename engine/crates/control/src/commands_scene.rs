@@ -15,7 +15,7 @@
 //! render domain (`commands_render.rs`), and `quit` / `create-script` /
 //! `get-script-schema` in the asset domain / host. This file holds the remaining 42.
 
-use saffron_assets::{engine_asset_path, model_render_aabb, pick_entity};
+use saffron_assets::{BuiltinMesh, model_render_aabb, pick_entity};
 use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3};
 use saffron_protocol::{
     AddComponentResult, AddEntityParams, AddEntityPreset, ComponentList, ComponentParams,
@@ -32,9 +32,9 @@ use saffron_protocol::{
     SetScriptOverrideResult, SetTransformParams, StepParams, Uuid as WireUuid, Vec3,
 };
 use saffron_scene::{
-    Bone, Camera, CameraView, ComponentTraits, DirectionalLight, Entity, IdComponent, Mesh, Name,
-    PointLight, PreviewGhost, Relationship, Script, SpotLight, Transform, environment_from_json,
-    environment_to_json,
+    Bone, Camera, CameraView, ComponentTraits, DirectionalLight, Entity, IdComponent, MaterialSet,
+    MaterialSlot, Mesh, Name, PointLight, PreviewGhost, Relationship, Script, SpotLight, Transform,
+    environment_from_json, environment_to_json,
 };
 use saffron_sceneedit::{
     GizmoOp, GizmoSpace, NativeGizmoHandle, PlayState, SceneEditCamera, SceneEditContext,
@@ -1093,25 +1093,35 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 
     reg.register::<AddEntityParams, EntityRef>(
         "add-entity",
-        "add-entity {preset=empty|cube|model|point-light|spot-light|directional-light|camera|reflection-probe}",
+        "add-entity {preset=empty|cube|plane|sphere|point-light|spot-light|directional-light|camera|reflection-probe}",
         |ctx, params| {
             let preset = params.preset.unwrap_or(AddEntityPreset::Empty);
             let entity = match preset {
                 AddEntityPreset::Empty => ctx.scene_edit.active_scene().create_entity("Entity"),
-                AddEntityPreset::Cube | AddEntityPreset::Model => {
-                    if !ctx.scene_edit.project_ready() {
-                        return Err(Error::command("no project loaded"));
-                    }
-                    // The built-in cube is a model asset like any other: ensure its .smodel
-                    // exists, then instantiate it into the scene.
-                    let cube_path = engine_asset_path("models/cube.gltf");
-                    let cube_id = ctx
-                        .assets
-                        .ensure_builtin_model_asset(&cube_path.to_string_lossy())
-                        .map_err(|e| Error::command(e.to_string()))?;
-                    ctx.assets
-                        .instantiate_model(ctx.scene_edit.active_scene(), cube_id, "Cube")
-                        .map_err(|e| Error::command(e.to_string()))?
+                AddEntityPreset::Cube | AddEntityPreset::Plane | AddEntityPreset::Sphere => {
+                    // Built-in primitives are native geometry: a reserved-id mesh (seeded on
+                    // demand, never a catalog asset) plus a default material slot. No project
+                    // required.
+                    let (builtin, name) = match preset {
+                        AddEntityPreset::Plane => (BuiltinMesh::Plane, "Plane"),
+                        AddEntityPreset::Sphere => (BuiltinMesh::Sphere, "Sphere"),
+                        _ => (BuiltinMesh::Cube, "Cube"),
+                    };
+                    let scene = ctx.scene_edit.active_scene();
+                    let e = scene.create_entity(name);
+                    let _ = scene.add_component(
+                        e,
+                        Mesh {
+                            mesh: builtin.reserved_id(),
+                        },
+                    );
+                    let _ = scene.add_component(
+                        e,
+                        MaterialSet {
+                            slots: vec![MaterialSlot::default()],
+                        },
+                    );
+                    e
                 }
                 AddEntityPreset::PointLight => {
                     let e = ctx.scene_edit.active_scene().create_entity("Point Light");
