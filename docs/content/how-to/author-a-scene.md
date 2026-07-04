@@ -35,9 +35,11 @@ Start with an active project. In the editor, use the startup modal. From a shell
    sa create-entity Camera
    sa add-component Camera Camera
    ```
-5. Tint a surface via its material:
+5. Tint a surface: give it a material, then set its factors (`material-update` merges the fields you name):
    ```sh
-   sa set-material Floor --baseColor '{"x":0.8,"y":0.8,"z":0.8,"w":1}' --roughness 0.9
+   sa material-create --name FloorMat
+   sa material-assign --entity Floor --material FloorMat
+   sa material-update --material FloorMat --baseColor '{"x":0.8,"y":0.8,"z":0.8,"w":1}' --roughness 0.9
    ```
 6. Save the active project (catalog + scene):
    ```sh
@@ -58,7 +60,7 @@ The editor offers the same operations: the **Create** menu, the in-viewport gizm
 | What | File | Symbols |
 |---|---|---|
 | Entities + components + transform | `engine/crates/control/src/commands_scene.rs` | `create-entity`, `add-component`, `set-transform` |
-| Lights + material | `engine/crates/control/src/commands_scene.rs` | `set-light`, `set-material` |
+| Lights + material | `engine/crates/control/src/commands_scene.rs` | `set-light`, `set-component-field` |
 | Assign catalog assets | `engine/crates/control/src/commands_asset.rs` | `assign-asset` |
 | Save / load project | `engine/crates/control/src/commands_asset.rs` | `save-project`, `load-project` |
 
