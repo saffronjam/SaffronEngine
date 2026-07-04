@@ -18,6 +18,7 @@ crate owns the CPU types and byte codecs; `saffron-assets` owns the catalog, imp
 | Page | Covers | Code |
 |---|---|---|
 | `mesh-and-vertex-layout` | `Vertex` (pos/normal/uv), `Mesh`, `Submesh`, the pinned 32-byte stride | `geometry/src/types.rs` · `Vertex`, `Mesh` |
+| `built-in-primitives` | native cube/plane/sphere as reserved-id meshes, never catalog assets | `geometry/src/primitives.rs`; `assets/src/lib.rs` · `BuiltinMesh` |
 | `gltf-and-obj-import` | the `gltf` + `tobj` crates into one common `ImportedModel` | `geometry/src/*_import.rs` · `translate_model` |
 | `smesh-format` | the baked, versioned binary mesh image | `geometry/src/smesh.rs` · `save_mesh_to_buffer`, `load_mesh_from_bytes` |
 | `sanim-format` | the baked, versioned animation-clip image | `geometry/src/sanim.rs` · `save_animation`, `load_animation` |
