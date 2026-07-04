@@ -101,6 +101,14 @@ engine:
     cargo build --workspace
     cargo run -p xtask -- shaders
 
+# compile shaders only (*.slang -> SPIR-V + copy assets), no workspace build
+shaders:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=shaders; {{reenter}}
+    cd "{{engine}}"
+    cargo run -p xtask -- shaders
+
 # gen @saffron/protocol + tsc + vite build of the frontend
 editor:
     #!/usr/bin/env bash
