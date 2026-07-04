@@ -10,9 +10,12 @@
 
 use saffron_core::Uuid;
 use saffron_json::{Value, json_bool_or, json_f32_or, json_string_or, json_u64_or, uuid_to_json};
-use saffron_scene::{AssetCatalog, AssetEntry, AssetType, Attribution, Colorspace};
+use saffron_scene::{AssetCatalog, AssetEntry, AssetType, Attribution, Colorspace, TextureRole};
 
-use crate::names::{asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name};
+use crate::names::{
+    asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name,
+    texture_role_from_name, texture_role_name,
+};
 
 /// Serializes a catalog's entries to the `assets` JSON array.
 ///
@@ -52,6 +55,12 @@ pub fn catalog_to_json(catalog: &AssetCatalog) -> Value {
             record.insert(
                 "colorspace".to_owned(),
                 Value::String(colorspace_name(entry.colorspace).to_owned()),
+            );
+        }
+        if entry.role != TextureRole::Unknown {
+            record.insert(
+                "role".to_owned(),
+                Value::String(texture_role_name(entry.role).to_owned()),
             );
         }
         if entry.rigged {
@@ -105,6 +114,7 @@ pub fn catalog_from_json(catalog: &mut AssetCatalog, assets: &Value) {
                 "colorspace",
                 "auto".to_owned(),
             )),
+            role: texture_role_from_name(&json_string_or(record, "role", "unknown".to_owned())),
             attribution: record.get("attribution").and_then(attribution_from_json),
             content_hash: json_u64_or(record, "contentHash", 0),
         };
