@@ -21,6 +21,7 @@ import { WindowTitlebar } from "./WindowTitlebar";
 import { useGizmoShortcuts } from "./useGizmoShortcuts";
 import { useUndoRedoShortcuts } from "./useUndoRedoShortcuts";
 import { useMouseBindings } from "./useMouseBindings";
+import { useFocusPolicy } from "./useFocusPolicy";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectStartupModal } from "./ProjectStartupModal";
 import { useProjectLoadPoll } from "./useProjectLoadPoll";
@@ -124,6 +125,8 @@ export function App() {
   useUndoRedoShortcuts();
   // Mouse-button commands (tab back/forward, close hovered tab) via the keybinding registry.
   useMouseBindings();
+  // Trap the Tab key so browser focus never walks the chrome (Tab still navigates modals).
+  useFocusPolicy();
 
   useEffect(() => {
     if (didRevealWindow) {

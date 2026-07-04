@@ -227,6 +227,19 @@ user confirms it against real output — say "this should fix it, please verify 
   `e.key` literals. Add a shortcut by registering a command. Bindings are rebound in `app/SettingsModal.tsx`
   (capture mode + per-scope conflict detection) and persisted **delta-only** in `appdata/settings.json`. A
   few (the redo alias `Ctrl+Y`, the `Ctrl+P` play family) are intentionally non-rebindable.
+- **Window geometry is remembered state, not a setting — and only size + maximized are acted on.** The
+  editor window's last size / position / monitor / maximized state lives in `appdata/state.json` (a
+  generic "remember where I left it" bucket, separate from `settings.json`; missing file = no memory =
+  size to the current monitor). `configure_main_window` (`lib.rs`) restores it before the window is
+  shown (no visible jump); a `WindowStateTracker` folds every resize/move into a live snapshot flushed
+  on `ExitRequested`. On **native Wayland** (the `just run` path — GNOME/Mutter in particular) a client
+  cannot place its own toplevel or choose an output, so `configure_main_window` **only re-applies size +
+  maximized**. Position and `monitor` are still *captured and persisted* (they may be useful on a
+  platform that can honor them) but deliberately **never applied** — do not re-add a `set_position` /
+  monitor-clamp restore path. `capture_window_geometry` records size/x/y only while **not** maximized
+  (so a restored maximized window un-maximizes to the right size) and refreshes monitor/scale every
+  event (else an always-maximized window keeps a stale monitor); `outer_position()` may `Err` on
+  Wayland, so it keeps the last-known x/y rather than dropping the snapshot.
 
 The Rust bridge sets a per-PID socket under `$XDG_RUNTIME_DIR` and a per-PID, per-view shm
 segment for each viewport (scene + asset preview), spawns `$SAFFRON_ANIMA_BIN` (default

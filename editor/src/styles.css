@@ -115,6 +115,27 @@
     font-family: var(--font-sans);
     font-size: 14px;
     -webkit-font-smoothing: antialiased;
+    /* A native desktop editor, not a web page: dragging across the chrome must not
+       paint a text/element selection. Real text-entry (and the log output you copy
+       from, via `select-text`) opts back in below. */
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  input,
+  textarea,
+  select,
+  [contenteditable="true"] {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* No wandering browser focus ring: Tab traversal is trapped (useFocusPolicy) and the
+     design system supplies its own focus-visible ring (box-shadow) for the controls that
+     want one, so the raw UA outline only ever leaked onto the hand-rolled focusable rows. */
+  :focus,
+  :focus-visible {
+    outline: none;
   }
 }
 
