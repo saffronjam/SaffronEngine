@@ -88,7 +88,10 @@ const TEXTURE_EXTS = new Set(["png", "jpg", "jpeg", "hdr", "tga", "bmp"]);
 /// Asset kinds offered by the search bar's `type:` chip.
 const ASSET_TYPE_VALUES = ["mesh", "texture", "material", "animation", "model", "other"] as const;
 
-/// The Assets search bar's single chip: `type:<kind>` narrows the grid to one asset kind.
+const sentenceCase = (value: string): string => value.charAt(0).toUpperCase() + value.slice(1);
+
+/// The Assets search bar's single chip: `type:<kind>` narrows the grid to one asset kind. The lowercase
+/// value matches `asset.type`; both the suggestion list and the committed chip show it sentence-cased.
 const ASSET_SEARCH_CHIPS: ChipConfig[] = [
   {
     keyword: "type",
@@ -97,9 +100,10 @@ const ASSET_SEARCH_CHIPS: ChipConfig[] = [
       const query = input.toLowerCase();
       return ASSET_TYPE_VALUES.filter((value) => value.includes(query)).map((value) => ({
         value,
-        label: value,
+        label: sentenceCase(value),
       }));
     },
+    resolveLabel: sentenceCase,
   },
 ];
 
@@ -253,6 +257,8 @@ export function AssetsPanel() {
   const [history, setHistory] = useState<FolderHistory>({ stack: [null], index: 0 });
   // The Ctrl+F find bar: an overlay revealed by the shortcut, filtering the current folder's tiles.
   const [searchOpen, setSearchOpen] = useState(false);
+  // Kept mounted through the exit animation; unmounted on animationend once closed.
+  const [searchMounted, setSearchMounted] = useState(false);
   const [search, setSearch] = useState<SearchState>(emptySearchState());
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const panelRootRef = useRef<HTMLDivElement | null>(null);
@@ -261,6 +267,7 @@ export function AssetsPanel() {
   const [renamingFolder, setRenamingFolder] = useState<FolderActionTarget | null>(null);
   const [renamingAsset, setRenamingAsset] = useState<string | null>(null);
   const menuTargetRef = useRef<GridMenuTarget>(null);
+  const setAssetMenuTarget = useEditorStore((s) => s.setAssetMenuTarget);
   const [pendingAssetDelete, setPendingAssetDelete] = useState<PendingAssetDelete | null>(null);
   const [pendingFolderDelete, setPendingFolderDelete] = useState<string | null>(null);
   // The asset whose Details modal is open (opened from the grid context menu), or null.
@@ -356,9 +363,11 @@ export function AssetsPanel() {
     }
   }, [currentFolder, folders, navigateTo]);
 
-  // Focus the find input whenever the bar opens (or is re-summoned with Ctrl+F).
+  // Focus the find input whenever the bar opens (or is re-summoned with Ctrl+F); mount it for the
+  // enter animation (the exit animation unmounts it on animationend, below).
   useEffect(() => {
     if (searchOpen) {
+      setSearchMounted(true);
       requestAnimationFrame(() => searchInputRef.current?.focus());
     }
   }, [searchOpen]);
@@ -996,7 +1005,20 @@ export function AssetsPanel() {
         </ResizablePanel>
         <ResizableHandle />
         <ResizablePanel className="relative min-w-0 overflow-hidden">
-          <ContextMenu modal={false}>
+          <ContextMenu
+            modal={false}
+            // Mirror the resolved target into the store while the menu is open so the
+            // right-clicked tile keeps a highlight; clear it on close. `onContextMenu`
+            // (below) has already populated the ref by the time this fires with open=true.
+            onOpenChange={(menuOpen) => {
+              const target = menuOpen ? menuTargetRef.current : null;
+              setAssetMenuTarget(
+                target
+                  ? { kind: target.kind, key: target.kind === "asset" ? target.id : target.path }
+                  : null,
+              );
+            }}
+          >
             <ContextMenuTrigger asChild>
               <div
                 className="h-full min-h-0"
@@ -1072,9 +1094,19 @@ export function AssetsPanel() {
               />
             </ContextMenuContent>
           </ContextMenu>
-          {/* Find bar: a top-right overlay revealed by Ctrl+F, dismissed by Esc or its X. */}
-          {searchOpen ? (
-            <div className="absolute top-1.5 right-1.5 z-20 flex w-72 max-w-[calc(100%-0.75rem)] items-center gap-1 rounded-md border border-border bg-card p-1 shadow-lg">
+          {/* Find bar: a top-right overlay revealed by Ctrl+F, dismissed by Esc or its X. A quick
+              slide+fade in on open and out on close; the closed state stays mounted until its exit
+              animation ends. The animationend guard ignores child animations that bubble up. */}
+          {searchMounted ? (
+            <div
+              data-state={searchOpen ? "open" : "closed"}
+              onAnimationEnd={(event) => {
+                if (event.target === event.currentTarget && !searchOpen) {
+                  setSearchMounted(false);
+                }
+              }}
+              className="absolute top-1.5 right-1.5 z-20 flex w-72 max-w-[calc(100%-0.75rem)] items-center gap-1 rounded-md border border-border bg-card p-1 shadow-lg duration-150 ease-out data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-1 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-top-1 data-[state=open]:zoom-in-95"
+            >
               <AnimaSearchbar
                 value={search}
                 onChange={setSearch}
@@ -1218,6 +1250,12 @@ function GridContextMenuItems({
           </ContextMenuItem>
         ) : null}
         <ContextMenuSeparator />
+        {batchAssets.length === 1 ? (
+          <ContextMenuItem onSelect={() => onRenameAsset(batchAssets[0].id)}>
+            <Pencil />
+            Rename
+          </ContextMenuItem>
+        ) : null}
         <ContextMenuItem
           variant="destructive"
           className="bg-destructive/10 text-destructive focus:bg-destructive focus:text-destructive-foreground"
@@ -1659,7 +1697,7 @@ const AssetPanelBody = memo(function AssetPanelBody({
           ) : (
             <div
               className="grid gap-2"
-              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(72px, 1fr))" }}
+              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(86px, 1fr))" }}
             >
               {hasParentTile ? (
                 <ParentFolderTile
@@ -1795,7 +1833,7 @@ function NewFolderTile({
 
   return (
     <div
-      className="flex w-[72px] flex-col gap-1 rounded-md border border-ring bg-background p-1"
+      className="flex w-[86px] flex-col gap-1 rounded-md border border-ring bg-background p-1"
       data-asset-folder="true"
     >
       <div className="flex aspect-square w-full items-center justify-center">
@@ -1806,7 +1844,7 @@ function NewFolderTile({
         value={value}
         aria-invalid={invalid}
         className={cn(
-          "h-5 rounded-sm px-1 py-0 text-center font-mono text-[11px]",
+          "h-6 rounded-sm px-1 py-0 text-center font-mono text-[13px]",
           invalid && "border-destructive ring-1 ring-destructive",
         )}
         onChange={(event) => onChange(event.currentTarget.value)}
@@ -1840,12 +1878,12 @@ const ParentFolderTile = memo(function ParentFolderTile({
   logRender("ParentFolderTile");
   const [dragActive, setDragActive] = useState(false);
   return (
-    <div className="relative w-[72px]">
+    <div className="relative w-[86px]">
       <button
         type="button"
         data-asset-parent-folder="true"
         className={cn(
-          "flex w-[72px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors hover:border-ring hover:bg-accent/40",
+          "flex w-[86px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors hover:border-ring hover:bg-accent/40",
           dragActive && "border-ring bg-accent/60 ring-1 ring-ring",
         )}
         onDoubleClick={() => onOpen(target)}
@@ -1882,7 +1920,7 @@ const ParentFolderTile = memo(function ParentFolderTile({
         <div className="flex aspect-square w-full items-center justify-center">
           <Folder className="size-16 fill-current stroke-current text-yellow-500" />
         </div>
-        <span className="truncate px-0.5 text-center font-mono text-[11px] leading-tight text-foreground">
+        <span className="min-h-[2.5em] truncate px-0.5 text-center font-mono text-[13px] leading-tight text-foreground">
           ../
         </span>
       </button>
@@ -1931,6 +1969,10 @@ const FolderTile = memo(function FolderTile({
 }) {
   logRender("FolderTile");
   const selected = useEditorStore((s) => s.selectedFolderPaths.has(path));
+  // Persist the hover highlight while this folder's grid context menu is open.
+  const menuActive = useEditorStore(
+    (s) => s.assetMenuTarget?.kind === "folder" && s.assetMenuTarget.key === path,
+  );
   const content = (
     <>
       <div className="flex aspect-square w-full items-center justify-center">
@@ -1945,7 +1987,7 @@ const FolderTile = memo(function FolderTile({
           onCancel={onCancelRename}
         />
       ) : (
-        <span className="truncate px-0.5 text-center text-[11px] leading-tight text-foreground">
+        <span className="line-clamp-2 min-h-[2.5em] break-words px-0.5 text-center text-[13px] leading-tight text-foreground">
           {name}
         </span>
       )}
@@ -1958,10 +2000,12 @@ const FolderTile = memo(function FolderTile({
       data-asset-folder="true"
       data-asset-folder-path={path}
       className={cn(
-        "flex w-[72px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors",
+        "flex w-[86px] flex-col gap-1 rounded-md border border-transparent p-1 text-left transition-colors",
         // Hover affordance only when not already highlighted (selected or drop-target), so a
         // selected folder keeps its appearance on hover instead of stacking a second highlight.
+        // An open context menu holds that same hover look so the target folder stays marked.
         !selected && !dragActive && "hover:border-ring hover:bg-accent/40",
+        !selected && !dragActive && menuActive && "border-ring bg-accent/40",
         selected && "border-ring bg-accent/60 ring-1 ring-ring",
         dragActive && "border-ring bg-accent/60 ring-1 ring-ring",
       )}
@@ -2018,7 +2062,7 @@ const FolderTile = memo(function FolderTile({
     </button>
   );
 
-  return <div className="relative w-[72px]">{tile}</div>;
+  return <div className="relative w-[86px]">{tile}</div>;
 });
 
 /// Usage lines shown in the delete dialog before collapsing into "And X additional".

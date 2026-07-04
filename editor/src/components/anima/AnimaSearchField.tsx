@@ -182,7 +182,15 @@ export function AnimaSearchField({
           return;
         }
       }
-      if (liveText !== "") commitFreeText();
+      if (liveText !== "") {
+        commitFreeText();
+      } else {
+        // Enter on an empty field still commits the current query (chips-only, or fully empty).
+        // A commit-only searchbar (the Store) has no other way to run/persist an empty "show
+        // everything" search; emit the current tokens without appending a blank free-text token.
+        setOpen(false);
+        onFreeTextCommit(tokens);
+      }
       return;
     }
 
@@ -294,7 +302,9 @@ export function AnimaSearchField({
               ref={inputRef}
               type="text"
               value={liveChip ? liveValue : liveText}
-              placeholder={placeholder}
+              // The placeholder is the free-text hint; while a chip keyword is active the input
+              // holds that chip's value, so showing it inside the chip badge reads wrong.
+              placeholder={liveChip ? "" : placeholder}
               size={liveChip ? Math.max(liveValue.length + 1, 3) : undefined}
               className={cn(
                 "w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground",

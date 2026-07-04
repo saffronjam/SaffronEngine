@@ -11,6 +11,7 @@ import { matchesBinding } from "../lib/keybindings";
 import type { AssetEntry } from "../protocol";
 import { cn } from "@/lib/utils";
 import { useOutsideCommit } from "../lib/useOutsideCommit";
+import { errorText, notifyError } from "../lib/flash";
 import { logRender } from "../lib/renderLog";
 import { Input } from "@/components/ui/input";
 
@@ -91,7 +92,7 @@ export function AssetDragPreviewTile({ entry }: { entry: AssetEntry }) {
   const url = getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE);
 
   return (
-    <div className="flex w-[72px] flex-col gap-1 rounded-md border border-ring bg-card/95 p-1 shadow-lg ring-1 ring-ring">
+    <div className="flex w-[86px] flex-col gap-1 rounded-md border border-ring bg-card/95 p-1 shadow-lg ring-1 ring-ring">
       <div className="relative flex aspect-square w-full items-center justify-center overflow-hidden rounded-sm bg-muted">
         {url ? (
           <img src={url} alt={entry.name} className="size-full object-contain" draggable={false} />
@@ -104,7 +105,7 @@ export function AssetDragPreviewTile({ entry }: { entry: AssetEntry }) {
           </span>
         ) : null}
       </div>
-      <div className="truncate rounded-sm px-0.5 text-center text-[11px] leading-tight text-foreground">
+      <div className="line-clamp-2 min-h-[2.5em] break-words rounded-sm px-0.5 text-center text-[13px] leading-tight text-foreground">
         {entry.name}
       </div>
     </div>
@@ -214,6 +215,10 @@ export const AssetTile = memo(function AssetTile({
   // Membership-only subscription: the tile re-renders when ITS selected bit flips,
   // never on unrelated selection changes.
   const selected = useEditorStore((s) => s.selectedAssetIds.has(entry.id));
+  // Persist the hover highlight while this tile's grid context menu is open.
+  const menuActive = useEditorStore(
+    (s) => s.assetMenuTarget?.kind === "asset" && s.assetMenuTarget.key === entry.id,
+  );
   const dragging = useEditorStore((s) => s.catalogDrag?.assetIds.includes(entry.id) ?? false);
   const [url, setUrl] = useState<string | null>(() =>
     getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE),
@@ -222,6 +227,10 @@ export const AssetTile = memo(function AssetTile({
     getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE) ? "ready" : "loading",
   );
   const [draft, setDraft] = useState(entry.name);
+  // The just-committed name, shown optimistically until the catalog refresh reflects it — so a
+  // commit never flashes the stale `entry.name` for a frame between exiting rename mode and the
+  // poll landing the new name.
+  const [pendingName, setPendingName] = useState<string | null>(null);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
 
   // Lazy thumbnail: fetch on mount / id change. The shared cache dedupes across
@@ -257,6 +266,14 @@ export const AssetTile = memo(function AssetTile({
     }
   }, [entry.name, renaming]);
 
+  // Drop the optimistic name once the catalog catches up (rename sets the name verbatim, so the
+  // two always converge); the error path clears it in the catch below.
+  useEffect(() => {
+    if (pendingName !== null && entry.name === pendingName) {
+      setPendingName(null);
+    }
+  }, [entry.name, pendingName]);
+
   const commitRename = (): void => {
     onRenameEnd();
     const next = draft.trim();
@@ -264,14 +281,19 @@ export const AssetTile = memo(function AssetTile({
       setDraft(entry.name);
       return;
     }
+    setPendingName(next); // show the new name this frame; don't flash the stale entry.name
     void client
       .renameAsset(entry.id, next)
       .then(() => refreshAssets())
-      .catch(() => setDraft(entry.name));
+      .catch((err) => {
+        setPendingName(null);
+        setDraft(entry.name);
+        notifyError(errorText(err));
+      });
   };
 
   return (
-    <div className="relative w-[72px]">
+    <div className="relative w-[86px]">
       <div
         data-asset-tile-id={entry.id}
         data-asset-item="true"
@@ -294,11 +316,13 @@ export const AssetTile = memo(function AssetTile({
           }
         }}
         className={cn(
-          "group flex w-[72px] cursor-grab flex-col gap-1 rounded-md border border-transparent p-1",
+          "group flex w-[86px] cursor-grab flex-col gap-1 rounded-md border border-transparent p-1",
           "transition-[opacity,color,border-color,background-color] duration-150 active:cursor-grabbing",
           // Hover affordance only when not already selected — a selected tile keeps its
-          // appearance on hover instead of stacking a second highlight on top.
+          // appearance on hover instead of stacking a second highlight on top. An open
+          // context menu holds that same hover look so the target tile stays marked.
           !selected && "hover:border-ring hover:bg-accent/40",
+          !selected && menuActive && "border-ring bg-accent/40",
           selected && "border-ring bg-accent/60 ring-1 ring-ring",
           dragging && "opacity-45",
         )}
@@ -335,9 +359,9 @@ export const AssetTile = memo(function AssetTile({
         ) : (
           <button
             type="button"
-            className="truncate rounded-sm px-0.5 text-center text-[11px] leading-tight text-foreground"
+            className="line-clamp-2 min-h-[2.5em] break-words rounded-sm px-0.5 text-center text-[13px] leading-tight text-foreground"
           >
-            {entry.name}
+            {pendingName ?? entry.name}
           </button>
         )}
       </div>
@@ -376,7 +400,7 @@ function RenameInput({ value, onChange, onCommit, onCancel }: RenameInputProps) 
           onCancel();
         }
       }}
-      className="h-5 rounded-sm px-1 py-0 text-center font-mono text-[11px]"
+      className="h-6 rounded-sm px-1 py-0 text-center font-mono text-[13px]"
     />
   );
 }
