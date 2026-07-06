@@ -286,13 +286,19 @@ export function AssetsPanel() {
   // Free text (lowercased) and the optional `type:` chip that drive the find bar's filtering.
   const searchText = search.freeText.trim().toLowerCase();
   const typeFilter = search.chips.find((chip) => chip.keyword === "type")?.value ?? null;
-  // Embedded sub-assets (a `.smodel`'s mesh/material/texture rows) are hidden from the top level so a
-  // model imports as ONE tile, not a flood — they resolve through their container by (modelId, subId).
-  // `folderAssets` is every asset in the current folder (drives selection pruning); `visibleAssets`
-  // then applies the sort and the find-bar filter for what the grid actually renders.
+  // Embedded sub-assets (a `.smodel`'s mesh/material/texture rows, or a material import's maps) are
+  // hidden from the top level so a container imports as ONE tile, not a flood — they resolve through
+  // their container by (containerId, subId). A material import is a *self-container* (`container === id`):
+  // the parent row points at itself, so it must stay visible while its embedded maps (which point at a
+  // *different* container id) stay hidden. `folderAssets` is every asset in the current folder (drives
+  // selection pruning); `visibleAssets` then applies the sort and find-bar filter for what renders.
   const folderAssets = useMemo(
     () =>
-      assets.filter((asset) => (asset.folder ?? "") === (currentFolder ?? "") && !asset.container),
+      assets.filter(
+        (asset) =>
+          (asset.folder ?? "") === (currentFolder ?? "") &&
+          (!asset.container || asset.container === asset.id),
+      ),
     [assets, currentFolder],
   );
   const visibleAssets = useMemo(() => {

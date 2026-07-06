@@ -433,30 +433,34 @@ impl AssetServer {
             return cached.clone();
         }
 
-        let opened = self.open_model_container(model_id);
+        let opened = self.open_container(model_id);
         self.model_by_uuid.insert(model_id.value(), opened.clone());
         opened
     }
 
-    /// Reads + validates the container for `model_id` from the catalog row, or returns
-    /// `None` (with a warn) on any failure. The caller caches the outcome.
-    fn open_model_container(&self, model_id: Uuid) -> Option<Arc<ModelAsset>> {
-        let entry = self.catalog.find(model_id)?;
-        if entry.asset_type != AssetType::Model {
+    /// Reads + validates the container at `container_id`'s catalog row, or returns `None`
+    /// (with a warn) on any failure. The caller caches the outcome.
+    ///
+    /// A container parent is a `.smodel` **Model** (mesh/material/texture chunks) or a
+    /// texture-embedding **Material** (its own `.smat` chunk + one texture chunk per map);
+    /// both open identically. Any other asset type is not a container.
+    fn open_container(&self, container_id: Uuid) -> Option<Arc<ModelAsset>> {
+        let entry = self.catalog.find(container_id)?;
+        if !matches!(entry.asset_type, AssetType::Model | AssetType::Material) {
             return None;
         }
         let full_path = format!("{}/{}", self.root.display(), entry.path);
         let meta = match read_container_metadata(&full_path) {
             Ok(meta) => meta,
             Err(err) => {
-                tracing::warn!("model {}: {err}", model_id.value());
+                tracing::warn!("container {}: {err}", container_id.value());
                 return None;
             }
         };
         let reader = match read_container(&full_path) {
             Ok(reader) => reader,
             Err(err) => {
-                tracing::warn!("model {}: {err}", model_id.value());
+                tracing::warn!("container {}: {err}", container_id.value());
                 return None;
             }
         };
@@ -634,16 +638,19 @@ mod tests {
                     position: Vec3::new(0.0, 0.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::ZERO,
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(1.0, 0.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(0.0, 1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(0.0, 1.0),
+                    ..Vertex::default()
                 },
             ],
             indices: vec![0, 1, 2],

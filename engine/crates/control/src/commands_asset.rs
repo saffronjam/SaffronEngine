@@ -21,12 +21,11 @@ use saffron_assets::{
     colorspace_for_role_explicit, colorspace_name, create_project_script, default_display_name,
     default_material_asset, delete_unused, exposed_parameter, extract_sub_asset,
     import_material_folder, load_catalog_material_asset, load_catalog_material_asset_raw,
-    load_material_asset, load_material_asset_raw, lower_graph_to_params, model_render_aabb,
-    pbr_exposed_parameters, pick_scene_surface, reimport_model, request_thumbnail,
-    save_material_asset, texture_role_from_hint, texture_role_name, update_material_asset,
-    valid_project_name, viewport_ray,
+    lower_graph_to_params, model_render_aabb, pbr_exposed_parameters, pick_scene_surface,
+    reimport_model, request_thumbnail, save_material_asset, texture_role_from_hint,
+    texture_role_name, update_material_asset, valid_project_name, viewport_ray,
 };
-use saffron_core::Uuid;
+use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3 as MathVec3};
 use saffron_protocol::{
     AnimationClipDto, AssetAttributionDto, AssetCapabilitiesDto, AssetEntryDto, AssetList,
@@ -61,8 +60,8 @@ use saffron_scene::{
     TextureRole, Transform,
 };
 use saffron_sceneedit::{
-    BootStage, NewProjectSpec, PlacementPreview, PlayState, ProjectLoadRequest, ProjectPhase,
-    SceneEditCamera, SceneEditContext,
+    BootStage, NewProjectSpec, OrbitState, PlacementPreview, PlayState, ProjectLoadRequest,
+    ProjectPhase, SceneEditCamera, SceneEditContext,
 };
 use serde_json::{Value, json};
 
@@ -824,7 +823,7 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
         .map(|e| e.id)
         .collect();
     for id in material_ids {
-        let Ok(raw) = load_material_asset_raw(ctx.assets, id) else {
+        let Ok(raw) = load_catalog_material_asset_raw(ctx.assets, id) else {
             continue;
         };
         if !raw.graph.is_object() || raw.graph.as_object().is_none_or(|g| g.is_empty()) {
@@ -2068,15 +2067,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "material-import",
         "material-import {path} [name]",
         |ctx, params| {
-            let assets = &mut *ctx.assets;
-            let path = params.path.clone();
-            let name = params.name.clone();
-            let mut result = None;
-            ctx.renderer.with_gpu_uploader(&mut |gpu| {
-                result = Some(import_material_folder(assets, gpu, &path, &name));
-            });
-            let imported = result
-                .ok_or_else(|| Error::command("upload seam unavailable"))?
+            // Baking the material container is pure disk — no GPU uploader needed; the maps
+            // load lazily from the container when the material is first rendered / previewed.
+            let imported = import_material_folder(&mut *ctx.assets, &params.path, &params.name)
                 .map_err(|e| Error::command(e.to_string()))?;
             if let Some(attribution) = params.attribution {
                 ctx.assets
@@ -2131,11 +2124,14 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 roughness: m.roughness,
                 emissive: vec3(m.emissive),
                 emissive_strength: m.emissive_strength,
+                height_scale: m.height_scale,
+                height_mode: m.height_mode.as_wire().to_owned(),
                 albedo_texture: WireUuid(m.albedo_texture.value()),
                 orm_texture: WireUuid(m.orm_texture.value()),
                 normal_texture: WireUuid(m.normal_texture.value()),
                 emissive_texture: WireUuid(m.emissive_texture.value()),
                 height_texture: WireUuid(m.height_texture.value()),
+                vector_displacement_texture: WireUuid(m.vector_displacement_texture.value()),
                 graph,
             })
         },
@@ -2165,8 +2161,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "material-update {id} [baseColor metallic roughness emissive emissiveStrength]",
         |ctx, params| {
             let id = resolve_asset(ctx, &params.material)?;
-            let mut m =
-                load_material_asset(ctx.assets, id).map_err(|e| Error::command(e.to_string()))?;
+            let mut m = load_catalog_material_asset(ctx.assets, id)
+                .map_err(|e| Error::command(e.to_string()))?;
             if let Some(base) = params.base_color {
                 m.base_color = from_vec4(base);
             }
@@ -2185,6 +2181,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if let Some(normal_strength) = params.normal_strength {
                 m.normal_strength = normal_strength;
             }
+            if let Some(height_scale) = params.height_scale {
+                m.height_scale = height_scale;
+            }
+            if let Some(height_mode) = &params.height_mode {
+                m.height_mode = HeightMode::from_wire(height_mode);
+            }
             if let Some(tex) = params.albedo_texture {
                 m.albedo_texture = Uuid(tex.0);
             }
@@ -2199,6 +2201,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             }
             if let Some(tex) = params.height_texture {
                 m.height_texture = Uuid(tex.0);
+            }
+            if let Some(tex) = params.vector_displacement_texture {
+                m.vector_displacement_texture = Uuid(tex.0);
             }
             update_material_asset(ctx.assets, id, &m).map_err(|e| Error::command(e.to_string()))?;
             ctx.scene_edit.scene_version += 1;
@@ -2243,8 +2248,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "material-set-graph {material, graph}",
         |ctx, params| {
             let id = resolve_asset(ctx, &params.material)?;
-            let mut m =
-                load_material_asset(ctx.assets, id).map_err(|e| Error::command(e.to_string()))?;
+            let mut m = load_catalog_material_asset(ctx.assets, id)
+                .map_err(|e| Error::command(e.to_string()))?;
             m.graph = params.graph.clone();
             let mut folded = m.clone();
             let foldable = lower_graph_to_params(&m.graph, &mut folded);
@@ -2302,7 +2307,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     param.kind.as_wire()
                 )));
             }
-            let mut m = load_material_asset_raw(ctx.assets, id)
+            let mut m = load_catalog_material_asset_raw(ctx.assets, id)
                 .map_err(|e| Error::command(e.to_string()))?;
             if !m.overrides.is_object() {
                 m.overrides = json!({});
@@ -2323,7 +2328,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "material-compile-graph {material}",
         |ctx, params| {
             let id = resolve_asset(ctx, &params.material)?;
-            let raw = load_material_asset_raw(ctx.assets, id)
+            let raw = load_catalog_material_asset_raw(ctx.assets, id)
                 .map_err(|e| Error::command(e.to_string()))?;
             if !raw.graph.is_object() || raw.graph.as_object().is_none_or(|g| g.is_empty()) {
                 return Err(Error::command("material has no node graph to compile"));
@@ -2353,7 +2358,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let mut compiled = 0u32;
             let mut failed = 0u32;
             for id in material_ids {
-                let Ok(raw) = load_material_asset_raw(ctx.assets, id) else {
+                let Ok(raw) = load_catalog_material_asset_raw(ctx.assets, id) else {
                     continue;
                 };
                 if !raw.graph.is_object() || raw.graph.as_object().is_none_or(|g| g.is_empty()) {
@@ -2610,8 +2615,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
 /// flat params (a procedural node) gets a freshly compiled preview shader; a foldable or
 /// graph-less material renders through the cached default pipeline. A compile failure
 /// degrades to `None` (the default preview still renders the folded params), never an error.
-fn preview_codegen_spv(assets: &AssetServer, id: Uuid) -> Option<PathBuf> {
-    let raw = load_material_asset_raw(assets, id).ok()?;
+fn preview_codegen_spv(assets: &mut AssetServer, id: Uuid) -> Option<PathBuf> {
+    let raw = load_catalog_material_asset_raw(assets, id).ok()?;
     let non_empty_graph = raw.graph.as_object().is_some_and(|obj| !obj.is_empty());
     if !non_empty_graph {
         return None;
@@ -3063,12 +3068,12 @@ fn preview_material_for_texture(role: TextureRole, tid: Uuid) -> MaterialAsset {
             m.base_color = grey(0.6);
         }
         TextureRole::Height => {
-            // Real vertex-shader displacement on the dense preview sphere — a true deformed
-            // silhouette (not parallax). `height_scale` is the world-space amplitude on the unit
-            // sphere; keep it modest so the surface bulges without turning inside-out.
+            // Real per-vertex displacement on the dense preview sphere — a true deformed silhouette
+            // (not parallax). `height_scale` is the world-space amplitude on the unit sphere; keep
+            // it modest so the surface bulges without turning inside-out.
             m.height_texture = tid;
             m.height_scale = 0.08;
-            m.displacement = true;
+            m.height_mode = HeightMode::Displacement;
             m.base_color = grey(0.6);
         }
         TextureRole::Emissive => {
@@ -3325,6 +3330,15 @@ fn frame_preview_camera(mut cam: SceneEditCamera, bounds: &PreviewBounds) -> Sce
     cam.yaw = forward.x.atan2(-forward.z).to_degrees();
     cam.far_plane = cam.far_plane.max(distance + bounds.radius * 4.0);
     cam.near_plane = (distance * 0.01).clamp(1e-4, 0.1);
+    // Frame into orbit mode about the model centre so preview drags sweep the arc; the framed
+    // pose shows at once (sync_target snaps pivot/distance/angles, no ease from the prior pose).
+    cam.orbit = Some(OrbitState {
+        pivot: bounds.center,
+        distance,
+        target_pivot: bounds.center,
+        target_distance: distance,
+    });
+    cam.sync_target();
     cam
 }
 

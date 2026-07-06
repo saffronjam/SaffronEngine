@@ -53,7 +53,7 @@ pub use error::{Error, Result};
 pub use gpu::{GpuUploader, RendererUploader};
 pub use graph::{emit_graph_surface, lower_graph_to_params};
 pub use import::{
-    Axis, BakeResult, IMPORTER_VERSION, ImportOptions, ScanDelta, catalog_rows_for_model,
+    Axis, BakeResult, IMPORTER_VERSION, ImportOptions, ScanDelta, catalog_rows_for_container,
     hash_file_fnv,
 };
 pub use load::engine_asset_path;
@@ -92,7 +92,8 @@ pub use render_scene::{
     pick_scene_surface, render_scene, scene_render_aabb, viewport_ray,
 };
 pub use scan::{
-    colorspace_for_role_explicit, detect_material_role, infer_texture_role, texture_role_from_hint,
+    colorspace_for_role_explicit, detect_height_mode, detect_material_role, infer_texture_role,
+    texture_role_from_hint,
 };
 pub use spawn::{ModelSpawnInput, imported_nodes_from_json, imported_skin_from_json, spawn_model};
 pub use thumbnail::{

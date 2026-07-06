@@ -419,6 +419,60 @@ fn load_idles_and_clears_caches_before_swapping_the_catalog() {
 }
 
 #[test]
+fn stores_block_round_trips_through_save_and_load() {
+    // The per-project enabled-connector set persists into project.json's `stores` block and
+    // comes back unchanged on load (credentials live editor-side; only enablement is host state).
+    let root = scratch("stores").join("game");
+    let writer = AssetServer::new(root.join("assets"));
+    let reg = builtin_reg();
+    let mut scene = Scene::default();
+    let info = ProjectInfo {
+        loaded: true,
+        root: root.to_string_lossy().into_owned(),
+        path: root.join("project.json").to_string_lossy().into_owned(),
+        name: "game".to_string(),
+        display_name: "Game".to_string(),
+    };
+    let write_host = plain_host();
+    let enabled = serde_json::json!({ "enabled": ["polyhaven", "poly-pizza"] });
+    writer
+        .save_project(
+            &write_host,
+            &reg,
+            &mut scene,
+            &info,
+            &info.path.clone(),
+            &ProjectSidecar {
+                stores: enabled.clone(),
+                ..ProjectSidecar::default()
+            },
+        )
+        .unwrap();
+
+    // The saved doc carries the stores block verbatim.
+    let text = std::fs::read_to_string(&info.path).unwrap();
+    let doc = parse_json(&text).unwrap();
+    assert_eq!(doc.get("stores"), Some(&enabled));
+
+    // A load returns the opaque stores block unchanged to the caller.
+    let mut loaded_assets = AssetServer::new(scratch("stores-load").join("assets"));
+    let mut loaded_scene = Scene::default();
+    let mut loaded_info = ProjectInfo::default();
+    let mut load_host = plain_host();
+    let sidecar = loaded_assets
+        .load_project(
+            &mut load_host,
+            &reg,
+            &mut loaded_scene,
+            &mut loaded_info,
+            &info.path,
+            "---@meta\n",
+        )
+        .unwrap();
+    assert_eq!(sidecar.stores, enabled);
+}
+
+#[test]
 fn create_scratch_project_produces_a_loadable_minimal_project() {
     // The scratch project lands under the default userdata root (env overriding is
     // unsafe under #![deny(unsafe_code)] and racy across parallel tests), so the project

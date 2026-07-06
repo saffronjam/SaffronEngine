@@ -308,4 +308,41 @@ mod tests {
         catalog_folders_from_json(&mut restored, &catalog_folders_to_json(&catalog));
         assert_eq!(restored.folders, catalog.folders);
     }
+
+    #[test]
+    fn material_store_attribution_round_trips() {
+        let mut catalog = AssetCatalog::default();
+        catalog.put(AssetEntry {
+            id: Uuid(300),
+            name: "Wood050".to_owned(),
+            asset_type: AssetType::Material,
+            path: "materials/300.smat".to_owned(),
+            attribution: Some(Attribution {
+                license_id: "cc0".to_owned(),
+                requires_attribution: false,
+                license_url: "https://creativecommons.org/publicdomain/zero/1.0/".to_owned(),
+                author: "ambientCG".to_owned(),
+                source_url: "https://ambientcg.com/view?id=Wood050".to_owned(),
+                store_id: "ambientcg".to_owned(),
+            }),
+            ..AssetEntry::default()
+        });
+
+        // `list-assets` serializes the catalog; the source/license attribution must survive
+        // to disk and back for the editor's credits view.
+        let mut restored = AssetCatalog::default();
+        catalog_from_json(&mut restored, &catalog_to_json(&catalog));
+        let attribution = restored
+            .find(Uuid(300))
+            .and_then(|e| e.attribution.as_ref())
+            .expect("attribution survives the round-trip");
+        assert_eq!(attribution.store_id, "ambientcg");
+        assert_eq!(attribution.license_id, "cc0");
+        assert!(!attribution.requires_attribution);
+        assert_eq!(attribution.author, "ambientCG");
+        assert_eq!(
+            attribution.source_url,
+            "https://ambientcg.com/view?id=Wood050"
+        );
+    }
 }

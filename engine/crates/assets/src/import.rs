@@ -1,5 +1,5 @@
 //! The disk-side import pipeline: `bake_model` / `import_model` and the shared
-//! `catalog_rows_for_model`.
+//! `catalog_rows_for_container`.
 //!
 //! Bake is pure disk + catalog — no GPU, no spawn. It turns an [`ImportedModel`] (from
 //! geometry's `translate_model`) into one self-contained `assets/models/<uuid>.smodel`:
@@ -11,10 +11,10 @@
 //!
 //! Sub-ids are stable via geometry's `sub_id_for`, keyed by source name, so a re-bake of
 //! the same source resolves every sub-asset to its prior identity. `model_id` is reused
-//! on reimport (`0` mints a fresh one). [`catalog_rows_for_model`] is shared by bake and
+//! on reimport (`0` mints a fresh one). [`catalog_rows_for_container`] is shared by bake and
 //! the scan so a freshly-baked container and a rediscovered one yield identical rows.
 
-use saffron_core::Uuid;
+use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::{
     AlphaMode, ChunkKind, ContainerChunk, ImportedMaterial, ImportedModel, ImportedNode,
     ImportedSkin, MaterialMapRole, MorphData, VertexSkin, save_animation_to_buffer,
@@ -130,6 +130,33 @@ pub struct BakeResult {
     pub rows: Vec<AssetEntry>,
 }
 
+/// One role-tagged map fed to [`AssetServer::bake_material_container`].
+#[derive(Clone, Debug)]
+pub struct MaterialMap {
+    /// The canonical role (`albedo`/`normal`/`orm`/`roughness`/`metallic`/`ao`/`height`/
+    /// `emissive`) that selects the material slot + colorspace.
+    pub role: String,
+    /// For a `height` role, the technique the source implies (from the filename —
+    /// [`detect_height_mode`](crate::detect_height_mode)); ignored for every other role.
+    pub height_mode: HeightMode,
+    /// The raw encoded image bytes (png/jpg/…); the loader sniffs the format on decode.
+    pub bytes: Vec<u8>,
+}
+
+/// The result of baking a material container: the parent material id, its `.smatx` path,
+/// the catalog rows it contributes (the self-container material + its hidden texture
+/// sub-rows), and the space-joined role summary.
+pub struct MaterialBakeResult {
+    /// The baked material's id (also its own container id).
+    pub material_id: Uuid,
+    /// Project-relative path to the `.smatx`.
+    pub path: String,
+    /// The catalog rows the container contributes.
+    pub rows: Vec<AssetEntry>,
+    /// The space-joined roles that were slotted (e.g. `"albedo normal roughness height "`).
+    pub roles: String,
+}
+
 /// What a scan changed relative to the live catalog: rows added (newly discovered on
 /// disk) and ids removed (their backing file is gone).
 ///
@@ -143,25 +170,39 @@ pub struct ScanDelta {
     pub removed: Vec<Uuid>,
 }
 
-/// The catalog rows a container contributes: one [`AssetType::Model`] parent + one row
-/// per embedded sub-asset (container linkage + chunk index + colorspace).
+/// The catalog rows a container contributes: one `parent_type` parent + one row per
+/// embedded sub-asset (container linkage + chunk index + colorspace).
 ///
-/// Shared by [`AssetServer::bake_model`] and the scan so a freshly-baked container and a
-/// rediscovered one yield **identical** rows. A rigged container (its META carries a skin)
-/// flags every row it contributes so the editor routes a rigged mesh to the rig editor
-/// without a per-click probe. An extracted (remapped) sub-asset is a standalone file: its
-/// row points at the external path with `container == 0` / `chunk == -1`, so the scan
-/// agrees with the resolver and the ids never alias.
+/// Shared by [`AssetServer::bake_model`] / [`AssetServer::bake_material_container`] and the
+/// scan so a freshly-baked container and a rediscovered one yield **identical** rows. A
+/// `Model` parent is a standalone container (`container == 0`); a texture-embedding
+/// `Material` parent points its own `container` at itself so its `.smat` chunk resolves
+/// through the shared container path while the frontend still shows it (its `container`
+/// equals its `id`, and only sub-assets — `container != id` — are hidden). A rigged
+/// container (its META carries a skin) flags every row so the editor routes a rigged mesh
+/// to the rig editor without a per-click probe. An extracted (remapped) sub-asset is a
+/// standalone file: its row points at the external path with `container == 0` / `chunk ==
+/// -1`, so the scan agrees with the resolver and the ids never alias.
 #[must_use]
-pub fn catalog_rows_for_model(meta: &ContainerMetadata, relative_path: &str) -> Vec<AssetEntry> {
+pub fn catalog_rows_for_container(
+    meta: &ContainerMetadata,
+    relative_path: &str,
+    parent_type: AssetType,
+) -> Vec<AssetEntry> {
     let rigged = !meta.skin.is_null();
+    let parent_container = if parent_type == AssetType::Material {
+        meta.model_id
+    } else {
+        Uuid(0)
+    };
     let mut rows = Vec::with_capacity(meta.sub_assets.len() + 1);
     rows.push(AssetEntry {
         id: meta.model_id,
         name: meta.name.clone(),
-        asset_type: AssetType::Model,
+        asset_type: parent_type,
         path: relative_path.to_owned(),
         rigged,
+        container: parent_container,
         content_hash: model_content_hash(meta),
         ..AssetEntry::default()
     });
@@ -661,11 +702,135 @@ impl AssetServer {
         self.ensure_asset_directories();
         write_container(format!("{}/{relative_path}", self.root.display()), &chunks)?;
 
-        let rows = catalog_rows_for_model(&meta, &relative_path);
+        let rows = catalog_rows_for_container(&meta, &relative_path, AssetType::Model);
         Ok(BakeResult {
             model_id,
             path: relative_path,
             rows,
+        })
+    }
+
+    /// Bakes a set of role-tagged maps + their material into one self-contained material
+    /// container (`assets/materials/<uuid>.smatx`): the `.smat`-JSON chunk (referencing the
+    /// embedded textures by sub-id) plus one texture chunk per map (colorspace in the chunk
+    /// flags), and a META listing the texture sub-assets.
+    ///
+    /// The material is the container **parent** (a self-referencing `Material` row, resolved
+    /// from the TOC), so it is not a META sub-asset; each texture is a hidden sub-row keyed
+    /// by `container == material_id`. Mirrors [`Self::bake_model`] — pure disk, no GPU.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the container file cannot be written.
+    pub fn bake_material_container(
+        &self,
+        name: &str,
+        maps: &[MaterialMap],
+    ) -> Result<MaterialBakeResult> {
+        let material_id = Uuid::new();
+        let mut pending = vec![Pending {
+            kind: ChunkKind::Meta,
+            sub_id: 0,
+            flags: 0,
+            bytes: Vec::new(),
+        }];
+        let mut meta = ContainerMetadata {
+            model_id: material_id,
+            name: name.to_owned(),
+            source_format: "material".to_owned(),
+            ..ContainerMetadata::default()
+        };
+        let mut material = crate::material::MaterialAsset::default();
+        let mut roles = String::new();
+        for map in maps {
+            // Only base color / emissive carry sRGB; every data map (normal, packed ORM,
+            // height, AO) is linear — the same policy the single-map import applies.
+            let space = match map.role.as_str() {
+                "albedo" | "emissive" => Colorspace::Srgb,
+                _ => Colorspace::Linear,
+            };
+            let sub_id = Uuid::new();
+            let chunk_index = pending.len() as u32;
+            pending.push(Pending {
+                kind: ChunkKind::Texture,
+                sub_id: sub_id.value(),
+                flags: space as u32,
+                bytes: map.bytes.clone(),
+            });
+            meta.sub_assets.push(SubAsset {
+                sub_id,
+                asset_type: AssetType::Texture,
+                name: format!("{name} {}", map.role),
+                chunk: chunk_index,
+                colorspace: colorspace_name(space).to_owned(),
+                content_hash: hash_bytes_fnv(&map.bytes),
+                ..SubAsset::default()
+            });
+            match map.role.as_str() {
+                "albedo" => {
+                    material.albedo_texture = sub_id;
+                    roles.push_str("albedo ");
+                }
+                "normal" => {
+                    material.normal_texture = sub_id;
+                    roles.push_str("normal ");
+                }
+                role @ ("orm" | "roughness" | "metallic") => {
+                    material.orm_texture = sub_id;
+                    roles.push_str(role);
+                    roles.push(' ');
+                }
+                "ao" => {
+                    if material.orm_texture.value() == 0 {
+                        material.orm_texture = sub_id;
+                    }
+                    roles.push_str("ao ");
+                }
+                "height" => {
+                    material.height_texture = sub_id;
+                    // The filename picks the technique: a provider Displacement map imports as real
+                    // displacement (library intent), a bump map as a shading bump, else parallax.
+                    material.height_mode = map.height_mode;
+                    roles.push_str("height ");
+                }
+                "emissive" => {
+                    material.emissive_texture = sub_id;
+                    roles.push_str("emissive ");
+                }
+                _ => {}
+            }
+        }
+
+        let material_bytes =
+            dump_json_sorted(&crate::material::material_asset_to_json(&material), 2).into_bytes();
+        pending.push(Pending {
+            kind: ChunkKind::Material,
+            sub_id: material_id.value(),
+            flags: 0,
+            bytes: material_bytes,
+        });
+
+        pending[0].bytes = crate::model::encode_container_metadata(&meta);
+        let chunks: Vec<ContainerChunk> = pending
+            .iter()
+            .map(|p| ContainerChunk {
+                kind: p.kind,
+                sub_id: p.sub_id,
+                flags: p.flags,
+                bytes: &p.bytes,
+            })
+            .collect();
+
+        let relative_path = format!("materials/{}.smatx", material_id.value());
+        self.ensure_asset_directories();
+        write_container(format!("{}/{relative_path}", self.root.display()), &chunks)?;
+
+        let rows = catalog_rows_for_container(&meta, &relative_path, AssetType::Material);
+        Ok(MaterialBakeResult {
+            material_id,
+            path: relative_path,
+            rows,
+            roles,
         })
     }
 

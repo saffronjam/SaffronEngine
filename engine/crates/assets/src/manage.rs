@@ -19,12 +19,13 @@ use saffron_scene::{
     Script, SkinnedMesh,
 };
 
-use crate::gpu::GpuUploader;
-use crate::import::{IMPORTER_VERSION, ImportOptions, catalog_rows_for_model, hash_file_fnv};
-use crate::material::{MaterialAsset, material_asset_from_json, save_material_asset};
+use crate::import::{
+    IMPORTER_VERSION, ImportOptions, MaterialMap, catalog_rows_for_container, hash_file_fnv,
+};
+use crate::material::{MaterialAsset, material_asset_from_json};
 use crate::model::{ContainerMetadata, encode_container_metadata, read_container_metadata};
 use crate::names::colorspace_from_name;
-use crate::scan::detect_material_role;
+use crate::scan::{detect_height_mode, detect_material_role};
 use crate::{AssetServer, Error, Result};
 
 /// The standalone destination path an extracted sub-asset defaults to, by type. Mesh →
@@ -117,6 +118,77 @@ fn rewrite_container_meta(
         });
     }
     write_container(full_path, &chunks)?;
+    Ok(())
+}
+
+/// Rewrites a container in place, replacing only the material sub-asset's `ChunkKind::Material`
+/// chunk with `material_json` while preserving the META + every other chunk (its textures)
+/// verbatim. This is the container-aware edit path for [`crate::material::update_material_asset`]:
+/// a `.smatx` self-container's own material, or a material embedded in a model container.
+///
+/// # Errors
+///
+/// [`Error::NotInCatalog`] if `id` is absent; [`Error::Io`] if the container is not loadable;
+/// [`Error::ContainerMissingSubAsset`] if the container holds no material chunk for `id`;
+/// propagates a chunk-read or container-write failure.
+pub(crate) fn rewrite_material_chunk(
+    assets: &mut AssetServer,
+    id: Uuid,
+    material_json: Vec<u8>,
+) -> Result<()> {
+    let container = assets
+        .catalog
+        .find(id)
+        .ok_or(Error::NotInCatalog(id.value()))?
+        .container;
+    let full_path = container_path(assets, container)
+        .map(|rel| format!("{}/{rel}", assets.root.display()))
+        .ok_or_else(|| Error::Io(format!("container {} not in catalog", container.value())))?;
+    let model = assets.load_model_asset(container).ok_or_else(|| {
+        Error::Io(format!(
+            "material {}: container {} is not loadable",
+            id.value(),
+            container.value()
+        ))
+    })?;
+
+    let mut new_bytes = Some(material_json);
+    let mut payloads: Vec<(ChunkKind, u64, u32, Vec<u8>)> =
+        Vec::with_capacity(model.reader.toc().len());
+    for entry in model.reader.toc() {
+        let Some(kind) = chunk_kind_from_fourcc(entry.fourcc) else {
+            continue;
+        };
+        let bytes =
+            if kind == ChunkKind::Material && entry.sub_id == id.value() && new_bytes.is_some() {
+                new_bytes.take().expect("new_bytes checked is_some above")
+            } else {
+                model.reader.read_chunk(entry)?
+            };
+        payloads.push((kind, entry.sub_id, entry.flags, bytes));
+    }
+    if new_bytes.is_some() {
+        return Err(Error::ContainerMissingSubAsset {
+            container: container.value(),
+            sub: id.value(),
+        });
+    }
+
+    let chunks: Vec<ContainerChunk> = payloads
+        .iter()
+        .map(|(kind, sub_id, flags, bytes)| ContainerChunk {
+            kind: *kind,
+            sub_id: *sub_id,
+            flags: *flags,
+            bytes,
+        })
+        .collect();
+    write_container(&full_path, &chunks)?;
+
+    // The rewritten container's TOC offsets shifted, so the memoized reader + material resolutions
+    // are stale; drop them so the next resolve reopens the container and slices the fresh chunk.
+    assets.model_by_uuid.remove(&container.value());
+    assets.invalidate_material_caches();
     Ok(())
 }
 
@@ -414,7 +486,7 @@ pub fn reimport_model(assets: &mut AssetServer, model_id: Uuid) -> Result<Reimpo
     // Refresh the catalog rows (remap-aware) and drop the stale reader + every affected
     // sub-id's GPU ref so live instances re-resolve the new bytes.
     if let Ok(final_meta) = read_container_metadata(&container_full) {
-        for row in catalog_rows_for_model(&final_meta, &bake.path) {
+        for row in catalog_rows_for_container(&final_meta, &bake.path, AssetType::Model) {
             assets.catalog.put(row);
         }
     }
@@ -583,9 +655,14 @@ pub fn build_dependency_graph(scene: &mut Scene, assets: &mut AssetServer) -> De
         });
     }
     for entry in &entries {
-        if entry.asset_type == AssetType::Model {
+        // A Model container owns its children by `container == parent id`; a material import is
+        // a self-container (`container == its own id`), so it owns its embedded maps the same
+        // way — minus the self-edge, since the parent row itself matches that predicate.
+        let is_container_parent = entry.asset_type == AssetType::Model
+            || (entry.asset_type == AssetType::Material && entry.container == entry.id);
+        if is_container_parent {
             for child in &entries {
-                if child.container.value() == entry.id.value() {
+                if child.container.value() == entry.id.value() && child.id != entry.id {
                     graph.edges.push(RefEdge {
                         from: entry.id,
                         to: child.id,
@@ -785,8 +862,13 @@ pub fn analyze_clean(
     }
 
     for entry in &catalog.entries {
-        if reachable.contains(&entry.id.value()) || entry.container.value() != 0 {
-            continue; // kept, or an embedded sub-asset (the container is the deletable unit)
+        // A self-container (material import: `container == id`) is the deletable unit itself, not
+        // an embedded sub-asset — deleting its `.smatx` takes the maps with it — so it must stay
+        // eligible; only a true embedded sub-asset (`container` points at a *different* row) is
+        // skipped here.
+        let embedded_sub_asset = entry.container.value() != 0 && entry.container != entry.id;
+        if reachable.contains(&entry.id.value()) || embedded_sub_asset {
+            continue;
         }
         let bytes = graph.bytes_of(entry.id);
         let candidate = if script_refs.contains(&entry.id.value()) {
@@ -880,17 +962,17 @@ pub struct MaterialImportResult {
 }
 
 /// Drag-a-folder material import: scans `dir` for textures, detects each map's role by
-/// filename suffix, imports it with the right colorspace, assembles a `.smat`, and saves
-/// it. Normal maps assume OpenGL convention; a packed ARM/ORM also feeds the occlusion
-/// slot.
+/// filename, and bakes one self-contained material container (`materials/<id>.smatx`) that
+/// embeds every map as a texture chunk (see [`AssetServer::bake_material_container`]). The
+/// result is a single Material tile whose maps are hidden sub-assets — extractable on demand
+/// — not a flood of loose textures. Normal maps assume OpenGL convention; a packed ARM/ORM
+/// also feeds the occlusion slot.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] if `dir` is not a directory; propagates the texture-register /
-/// material-save failure.
+/// [`Error::Io`] if `dir` is not a directory; propagates the container-bake failure.
 pub fn import_material_folder(
     assets: &mut AssetServer,
-    gpu: &dyn GpuUploader,
     dir: &str,
     name: &str,
 ) -> Result<MaterialImportResult> {
@@ -898,38 +980,6 @@ pub fn import_material_folder(
     if !dir_path.is_dir() {
         return Err(Error::Io(format!("not a directory: {dir}")));
     }
-
-    let mut material = MaterialAsset::default();
-    let mut roles = String::new();
-    let register = |assets: &mut AssetServer, path: &std::path::Path, srgb: bool| -> Uuid {
-        let Ok(bytes) = std::fs::read(path) else {
-            return Uuid(0);
-        };
-        if bytes.is_empty() {
-            return Uuid(0);
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default();
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        // Unknown role → inferred from the filename in `put_texture_row`; these files are named
-        // by role (that is how `detect_material_role` slotted them), so the stored role matches
-        // the texture's actual content (an AO map packed into the ORM slot still records `Ao`).
-        assets
-            .register_texture_bytes(
-                gpu,
-                &bytes,
-                ext,
-                stem,
-                srgb,
-                saffron_scene::TextureRole::Unknown,
-            )
-            .unwrap_or(Uuid(0))
-    };
 
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)
         .map_err(|e| Error::Io(e.to_string()))?
@@ -939,6 +989,7 @@ pub fn import_material_folder(
         .collect();
     files.sort();
 
+    let mut maps = Vec::new();
     for path in &files {
         let ext = path
             .extension()
@@ -952,36 +1003,22 @@ pub fn import_material_folder(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        match detect_material_role(filename) {
-            "albedo" => {
-                material.albedo_texture = register(assets, path, true);
-                roles.push_str("albedo ");
-            }
-            "normal" => {
-                material.normal_texture = register(assets, path, false);
-                roles.push_str("normal ");
-            }
-            role @ ("orm" | "roughness" | "metallic") => {
-                material.orm_texture = register(assets, path, false);
-                roles.push_str(role);
-                roles.push(' ');
-            }
-            "ao" => {
-                if material.orm_texture.value() == 0 {
-                    material.orm_texture = register(assets, path, false);
-                }
-                roles.push_str("ao ");
-            }
-            "height" => {
-                material.height_texture = register(assets, path, false);
-                roles.push_str("height ");
-            }
-            "emissive" => {
-                material.emissive_texture = register(assets, path, true);
-                roles.push_str("emissive ");
-            }
-            _ => {}
+        let role = detect_material_role(filename);
+        if role.is_empty() {
+            continue;
         }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        maps.push(MaterialMap {
+            role: role.to_owned(),
+            // Only the `height` role reads this; the filename decides the technique.
+            height_mode: detect_height_mode(filename),
+            bytes,
+        });
     }
 
     let mut material_name = name.to_owned();
@@ -995,10 +1032,22 @@ pub fn import_material_folder(
     if material_name.is_empty() {
         material_name = "Material".to_owned();
     }
-    let id = save_material_asset(assets, &material, &material_name, "")?;
+
+    let baked = assets.bake_material_container(&material_name, &maps)?;
+    let material_id = baked.material_id;
+    let unique = assets.catalog.unique_name(&material_name);
+    for mut row in baked.rows {
+        // The parent material row wears the catalog-unique display name; sub-texture rows
+        // keep their baked `<name> <role>` names.
+        if row.id == material_id {
+            row.name = unique.clone();
+        }
+        assets.catalog.put(row);
+    }
+    assets.invalidate_material_caches();
     Ok(MaterialImportResult {
-        material: id,
-        roles,
+        material: material_id,
+        roles: baked.roles,
     })
 }
 
@@ -1009,7 +1058,7 @@ mod tests {
     use saffron_geometry::glam::{Vec2, Vec3};
     use saffron_geometry::{ImportedMaterial, ImportedModel, Mesh, Submesh, TextureSource, Vertex};
 
-    use crate::import::{ImportOptions, catalog_rows_for_model};
+    use crate::import::{ImportOptions, catalog_rows_for_container};
     use crate::model::read_container_metadata;
 
     /// A unique scratch dir under the system temp, removed and recreated per test.
@@ -1031,16 +1080,19 @@ mod tests {
                     position: Vec3::ZERO,
                     normal: Vec3::Z,
                     uv0: Vec2::ZERO,
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::X,
                     normal: Vec3::Z,
                     uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::Y,
                     normal: Vec3::Z,
                     uv0: Vec2::new(0.0, 1.0),
+                    ..Vertex::default()
                 },
             ],
             indices: vec![0, 1, 2],
@@ -1087,7 +1139,7 @@ mod tests {
             .expect("bake");
         let full = format!("{}/{}", assets.root.display(), bake.path);
         let meta = read_container_metadata(&full).expect("meta");
-        for row in catalog_rows_for_model(&meta, &bake.path) {
+        for row in catalog_rows_for_container(&meta, &bake.path, AssetType::Model) {
             assets.catalog.put(row);
         }
         bake.model_id
@@ -1315,121 +1367,319 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A material self-container is ONE deletable unit: an unused import is flagged `Unused` (its
+    /// `.smatx`), its embedded maps are never separate candidates, and `delete_unused` removes the
+    /// container file so the rescan drops the map rows with it.
+    #[test]
+    fn clean_deletes_an_unused_material_container_as_a_unit() {
+        let dir = scratch("clean-mat");
+        let root = dir.join("project").join("assets");
+        let mut assets = AssetServer::new(&root);
+
+        let folder = dir.join("Rock063");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Color.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_NormalGL.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Roughness.png"), png_2x2()).unwrap();
+        let imported = import_material_folder(&mut assets, &folder.to_string_lossy(), "Rock 063")
+            .expect("import");
+        let smatx = assets
+            .catalog
+            .find(imported.material)
+            .expect("material row")
+            .path
+            .clone();
+
+        // Nothing references it → the material is Unused; its embedded maps are part of the unit,
+        // not separate candidates.
+        let mut scene = Scene::new();
+        let report = analyze_clean(&mut scene, &mut assets, &[]);
+        let unused: Vec<u64> = report
+            .candidates
+            .iter()
+            .filter(|c| c.category == CleanCategory::Unused)
+            .map(|c| c.id.value())
+            .collect();
+        assert!(
+            unused.contains(&imported.material.value()),
+            "the unused material self-container is a deletion candidate"
+        );
+        let map_ids: Vec<u64> = assets
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| e.container == imported.material && e.id != imported.material)
+            .map(|e| e.id.value())
+            .collect();
+        assert!(
+            map_ids.iter().all(|id| !unused.contains(id)),
+            "embedded maps are never flagged individually — the container is the unit"
+        );
+
+        // Deleting the container removes the `.smatx`; the rescan drops every embedded map row.
+        let deleted =
+            delete_unused(&mut assets, &mut scene, &[imported.material], true).expect("delete");
+        assert_eq!(deleted.deleted, 1);
+        assert!(!root.join(&smatx).exists(), "the .smatx container is gone");
+        assert!(
+            assets.catalog.find(imported.material).is_none(),
+            "the material row is gone"
+        );
+        for id in &map_ids {
+            assert!(
+                assets.catalog.find(Uuid(*id)).is_none(),
+                "the embedded map row is gone with its container"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn import_material_folder_rejects_a_non_directory() {
         let dir = scratch("matfolder-bad");
         let root = dir.join("project").join("assets");
         let mut assets = AssetServer::new(&root);
-        // A GPU is never reached on the not-a-directory guard, so a stub is unnecessary.
-        struct NoGpu;
-        impl GpuUploader for NoGpu {
-            fn upload_mesh(
-                &self,
-                _: &Mesh,
-                _: &[saffron_geometry::VertexSkin],
-                _morph: Option<&saffron_geometry::MorphData>,
-                _sdf_bake: Option<&saffron_rendering::SdfBake>,
-            ) -> saffron_rendering::Result<std::sync::Arc<saffron_rendering::GpuMesh>> {
-                unreachable!("guard fails before any upload")
-            }
-            fn upload_texture(
-                &self,
-                _: &[u8],
-                _: u32,
-                _: u32,
-                _: bool,
-            ) -> saffron_rendering::Result<std::sync::Arc<saffron_rendering::GpuTexture>>
-            {
-                unreachable!("guard fails before any upload")
-            }
-            fn upload_texture_float(
-                &self,
-                _: &[f32],
-                _: u32,
-                _: u32,
-            ) -> saffron_rendering::Result<std::sync::Arc<saffron_rendering::GpuTexture>>
-            {
-                unreachable!("guard fails before any upload")
-            }
-            fn skinning_enabled(&self) -> bool {
-                false
-            }
-        }
-        let err = import_material_folder(&mut assets, &NoGpu, "/no/such/dir", "Mat")
+        let err = import_material_folder(&mut assets, "/no/such/dir", "Mat")
             .expect_err("not a directory");
         assert!(matches!(err, Error::Io(_)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(test)]
-    mod gpu {
-        use super::*;
-        use crate::RendererUploader;
-        use saffron_rendering::{
-            BindlessFreeList, Descriptors, Device, GpuQueue, SurfaceSource, Uploader,
+    /// A material import bakes ONE self-contained `.smatx` container: the parent Material row
+    /// self-references (`container == id`, so the frontend still shows it) and every map is a
+    /// hidden texture sub-row (`container == material_id`). The `.smat` + textures load back
+    /// from the container chunks (pure disk), the ambientCG `NormalGL` lands in the normal
+    /// slot and `Displacement` in height, and extract pulls one map out to a standalone file.
+    #[test]
+    fn import_material_folder_bakes_a_self_contained_container() {
+        let dir = scratch("matfolder");
+        let root = dir.join("project").join("assets");
+        let mut assets = AssetServer::new(&root);
+        // An ambientCG-style map set — the exact `*_NormalGL` / `*_Displacement` names the
+        // store extracts, exercising the real role routing end to end.
+        let folder = dir.join("Rock063");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Color.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_NormalGL.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Roughness.png"), png_2x2()).unwrap();
+        std::fs::write(
+            folder.join("Rock063_2K-PNG_AmbientOcclusion.png"),
+            png_2x2(),
+        )
+        .unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Displacement.png"), png_2x2()).unwrap();
+
+        let result = import_material_folder(&mut assets, &folder.to_string_lossy(), "Rock 063")
+            .expect("import");
+        assert!(result.roles.contains("albedo"));
+        assert!(result.roles.contains("normal"));
+        assert!(result.roles.contains("roughness"));
+        assert!(result.roles.contains("height"));
+
+        // The parent Material row is a self-container (shown, not hidden); its maps are hidden
+        // sub-rows keyed by `container == material_id`.
+        let entry = assets.catalog.find(result.material).expect("material row");
+        assert_eq!(entry.asset_type, AssetType::Material);
+        assert_eq!(
+            entry.container, result.material,
+            "the material self-references so the frontend `container == id` rule shows it"
+        );
+        let subs: Vec<AssetEntry> = assets
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| e.container == result.material && e.id != result.material)
+            .cloned()
+            .collect();
+        assert_eq!(subs.len(), 5, "five hidden texture sub-rows (one per map)");
+        assert!(
+            subs.iter().all(|e| e.asset_type == AssetType::Texture),
+            "every sub-row is a texture"
+        );
+
+        // The material JSON loads from the container chunk: NormalGL → normal, Displacement →
+        // height (Fix 1), and the slots point at the embedded texture sub-ids.
+        let material = crate::material::load_catalog_material_asset(&mut assets, result.material)
+            .expect("load");
+        assert_ne!(material.albedo_texture.value(), 0);
+        assert_ne!(material.normal_texture.value(), 0);
+        assert_ne!(material.orm_texture.value(), 0);
+        assert_ne!(material.height_texture.value(), 0);
+        // The ambientCG `*_Displacement` map imports in real-displacement mode (D2 routing) so the
+        // preview shows a true silhouette, not swimming POM.
+        assert_eq!(material.height_mode, saffron_core::HeightMode::Displacement);
+        assert!(
+            subs.iter().any(|e| e.id == material.normal_texture),
+            "the normal slot points at an embedded sub-texture"
+        );
+
+        // Each texture's bytes resolve from the container chunk (pure disk, no GPU).
+        for sub in &subs {
+            assert!(
+                asset_bytes(&mut assets, sub) > 0,
+                "embedded texture chunk has bytes"
+            );
+        }
+
+        // Reload from disk: a rescan re-derives identical rows from the `.smatx` META — the parent
+        // stays a self-container and every map stays a hidden sub-row of it.
+        let _ = assets.scan_assets();
+        let reloaded = assets
+            .catalog
+            .find(result.material)
+            .expect("material survives a rescan");
+        assert_eq!(
+            reloaded.container, result.material,
+            "still a self-container after reload"
+        );
+        assert_eq!(
+            assets
+                .catalog
+                .entries
+                .iter()
+                .filter(|e| e.container == result.material && e.id != result.material)
+                .count(),
+            5,
+            "the five embedded map rows are re-derived from the container"
+        );
+
+        // Extract-on-demand: pull the normal map out to a standalone file (container → 0).
+        extract_sub_asset(&mut assets, result.material, material.normal_texture, "")
+            .expect("extract normal");
+        let extracted = assets.catalog.find(material.normal_texture).expect("row");
+        assert_eq!(
+            extracted.container,
+            Uuid(0),
+            "extraction makes the map a standalone file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Editing an imported (self-container `.smatx`) material rewrites only its material chunk:
+    /// the edited fields persist on reload, the row stays a self-container, and every embedded
+    /// texture chunk survives — the mutation path is container-aware, not a blind `fs::write`
+    /// that would clobber the container framing.
+    #[test]
+    fn update_material_asset_rewrites_a_container_material_in_place() {
+        let dir = scratch("matupdate-container");
+        let root = dir.join("project").join("assets");
+        let mut assets = AssetServer::new(&root);
+        let folder = dir.join("Rock063");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Color.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_NormalGL.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Roughness.png"), png_2x2()).unwrap();
+        std::fs::write(folder.join("Rock063_2K-PNG_Displacement.png"), png_2x2()).unwrap();
+        let material_id =
+            import_material_folder(&mut assets, &folder.to_string_lossy(), "Rock 063")
+                .expect("import")
+                .material;
+
+        // Capture the embedded map ids so we can prove they survive the rewrite untouched.
+        let subs: Vec<Uuid> = assets
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| e.container == material_id && e.id != material_id)
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            subs.len(),
+            4,
+            "four embedded map sub-rows (one per source map)"
+        );
+
+        // Load, edit the height amplitude (the user-visible field) + a factor, and write back.
+        let mut material =
+            crate::material::load_catalog_material_asset(&mut assets, material_id).expect("load");
+        let original_normal = material.normal_texture;
+        assert!(
+            (material.height_scale - 0.05).abs() < 1e-6,
+            "imports at the default amplitude"
+        );
+        material.height_scale = 0.5;
+        material.base_color = saffron_geometry::glam::Vec4::new(0.1, 0.2, 0.3, 1.0);
+        crate::material::update_material_asset(&mut assets, material_id, &material)
+            .expect("update the container material");
+
+        // Reload from disk: the edits persisted, the slots are intact, and the row is still a
+        // self-container (the container was rewritten, not overwritten with bare JSON).
+        let reloaded =
+            crate::material::load_catalog_material_asset(&mut assets, material_id).expect("reload");
+        assert!(
+            (reloaded.height_scale - 0.5).abs() < 1e-6,
+            "height_scale persisted through the container rewrite"
+        );
+        assert!(
+            (reloaded.base_color.x - 0.1).abs() < 1e-6,
+            "base_color persisted"
+        );
+        assert_eq!(
+            reloaded.normal_texture, original_normal,
+            "the normal slot is unchanged"
+        );
+        assert_eq!(
+            assets.catalog.find(material_id).unwrap().container,
+            material_id,
+            "still a self-container after the edit"
+        );
+
+        // Every embedded texture chunk still resolves — META + all texture chunks were preserved.
+        for sub_id in &subs {
+            let sub = assets.catalog.find(*sub_id).expect("sub row").clone();
+            assert!(
+                asset_bytes(&mut assets, &sub) > 0,
+                "embedded texture survives the rewrite"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A standalone `.smat` (`container == 0`) still round-trips through the plain `fs::write`
+    /// branch, unchanged by the container-aware split.
+    #[test]
+    fn update_material_asset_still_rewrites_a_standalone_smat() {
+        let dir = scratch("matupdate-standalone");
+        let root = dir.join("project").join("assets");
+        let mut assets = AssetServer::new(&root);
+        let material = MaterialAsset {
+            roughness: 0.2,
+            ..MaterialAsset::default()
         };
+        let id = crate::material::save_material_asset(&mut assets, &material, "Plain", "")
+            .expect("save");
+        assert_eq!(
+            assets.catalog.find(id).unwrap().container.value(),
+            0,
+            "a fresh `.smat` is standalone"
+        );
 
-        fn png_2x2() -> Vec<u8> {
-            let buffer = image::RgbaImage::from_pixel(2, 2, image::Rgba([180, 120, 60, 255]));
-            let mut out = std::io::Cursor::new(Vec::new());
-            buffer
-                .write_to(&mut out, image::ImageFormat::Png)
-                .expect("encode png");
-            out.into_inner()
-        }
+        let edited = MaterialAsset {
+            roughness: 0.9,
+            ..material
+        };
+        crate::material::update_material_asset(&mut assets, id, &edited)
+            .expect("update standalone");
+        let reloaded =
+            crate::material::load_catalog_material_asset(&mut assets, id).expect("reload");
+        assert!(
+            (reloaded.roughness - 0.9).abs() < 1e-6,
+            "the standalone edit persisted"
+        );
 
-        #[test]
-        fn import_material_folder_detects_roles_and_saves_a_material() {
-            let device = match Device::new(&SurfaceSource::Offscreen) {
-                Ok(device) => device,
-                Err(err) => {
-                    eprintln!("skipping (no Vulkan device): {err}");
-                    return;
-                }
-            };
-            let free_list: BindlessFreeList =
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let descriptors = Descriptors::new(&device, &free_list).expect("descriptors");
-            let queue = GpuQueue::new(device.graphics_queue);
-            let uploader = Uploader::new(&device, &queue).expect("uploader");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-            let dir = scratch("matfolder");
-            let root = dir.join("project").join("assets");
-            let mut assets = AssetServer::new(&root);
-            // A folder of role-named textures.
-            let folder = dir.join("brick");
-            std::fs::create_dir_all(&folder).unwrap();
-            // "normal" contains the "orm" substring detect_material_role keys on, so a
-            // normal map is named with the `_nor` token to avoid the collision.
-            std::fs::write(folder.join("brick_albedo.png"), png_2x2()).unwrap();
-            std::fs::write(folder.join("brick_nor.png"), png_2x2()).unwrap();
-            std::fs::write(folder.join("brick_roughness.png"), png_2x2()).unwrap();
-
-            let gpu = RendererUploader::new(&uploader, &descriptors, false);
-            let result =
-                import_material_folder(&mut assets, &gpu, &folder.to_string_lossy(), "Brick")
-                    .expect("import");
-
-            assert!(result.roles.contains("albedo"));
-            assert!(result.roles.contains("normal"));
-            assert!(result.roles.contains("roughness"));
-            // The saved material row exists and its texture slots are populated.
-            let entry = assets.catalog.find(result.material).expect("material row");
-            assert_eq!(entry.asset_type, AssetType::Material);
-            let material =
-                crate::material::load_material_asset(&assets, result.material).expect("load");
-            assert_ne!(material.albedo_texture.value(), 0);
-            assert_ne!(material.normal_texture.value(), 0);
-            assert_ne!(material.orm_texture.value(), 0);
-
-            device.wait_idle().expect("idle");
-            assets.clear_asset_caches();
-            drop(assets);
-            drop(uploader);
-            drop(descriptors);
-            drop(device);
-            let _ = std::fs::remove_dir_all(&dir);
-        }
+    fn png_2x2() -> Vec<u8> {
+        let buffer = image::RgbaImage::from_pixel(2, 2, image::Rgba([180, 120, 60, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        buffer
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("encode png");
+        out.into_inner()
     }
 }

@@ -29,16 +29,19 @@ fn triangle_mesh() -> Mesh {
                 position: Vec3::ZERO,
                 normal: Vec3::Z,
                 uv0: Vec2::ZERO,
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::X,
                 normal: Vec3::Z,
                 uv0: Vec2::new(1.0, 0.0),
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::Y,
                 normal: Vec3::Z,
                 uv0: Vec2::new(0.0, 1.0),
+                ..Vertex::default()
             },
         ],
         indices: vec![0, 1, 2],
@@ -192,6 +195,36 @@ fn load_catalog_falls_back_to_a_scan_when_the_dir_changes() {
 }
 
 #[test]
+fn load_catalog_falls_back_to_a_clean_scan_on_a_corrupt_cache() {
+    let dir = scratch("corruptcache");
+    let root = dir.join("assets");
+    let mut assets = AssetServer::new(&root);
+    bake_fixture(&assets, "/tmp/flat.glb");
+
+    // A cold load scans and writes the cache; that catalog is the source of truth.
+    assets.load_catalog().expect("cold load");
+    let baseline: Vec<Uuid> = assets.catalog.entries.iter().map(|e| e.id).collect();
+    assert!(!baseline.is_empty());
+
+    // Corrupt the cache file. A fresh server's load must fail to parse it and fall back to a
+    // full scan, rebuilding the identical catalog — the cache is never load-bearing.
+    std::fs::write(
+        root.join(".cache").join("catalog.json"),
+        b"{ not valid json ]",
+    )
+    .unwrap();
+    let mut reloaded = AssetServer::new(&root);
+    reloaded.load_catalog().expect("reload over corrupt cache");
+    let recovered: Vec<Uuid> = reloaded.catalog.entries.iter().map(|e| e.id).collect();
+    assert_eq!(
+        recovered, baseline,
+        "a corrupt cache yields the cold-scan catalog"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scan_preserves_display_names_across_runs() {
     let dir = scratch("preserve");
     let root = dir.join("assets");
@@ -320,18 +353,64 @@ fn a_wrong_id_smeta_does_not_bleed_onto_a_path_sharing_row() {
 }
 
 #[test]
+fn cold_scan_recovers_renamed_model_and_extracted_subasset_names_from_sidecars() {
+    // A never-saved rename survives a cold scan because the name lives in a co-located `.smeta`
+    // sidecar, not only in project.json — across a `.smodel` model row and an extracted sub-asset.
+    let dir = scratch("durablenames");
+    let root = dir.join("assets");
+    let mut assets = AssetServer::new(&root);
+    let (model_id, _path) = bake_fixture(&assets, "/tmp/flat.glb");
+    assets.scan_assets().expect("scan");
+
+    let material_sub = assets
+        .catalog
+        .entries
+        .iter()
+        .find(|e| e.asset_type == AssetType::Material && e.container == model_id)
+        .map(|e| e.id)
+        .expect("embedded material sub-asset");
+
+    // Rename the model row and write its durable sidecar (as a rename command does).
+    assert!(assets.catalog.rename(model_id, "Hero"));
+    assets.write_asset_sidecar(model_id).expect("model sidecar");
+
+    // Extract the embedded material to a standalone `.smat`, rename it, and write its sidecar.
+    let extracted =
+        crate::manage::extract_sub_asset(&mut assets, model_id, material_sub, "").expect("extract");
+    assert!(assets.catalog.rename(extracted, "Brass"));
+    assets
+        .write_asset_sidecar(extracted)
+        .expect("sub-asset sidecar");
+
+    // A cold scan (fresh server, no cache, empty previous) recovers both names from the sidecars
+    // alone — the "imported asset came back as a bare uuid" regression guard.
+    let mut cold = AssetServer::new(&root);
+    cold.scan_assets().expect("cold scan");
+    assert_eq!(cold.catalog.find(model_id).expect("model row").name, "Hero");
+    assert_eq!(
+        cold.catalog.find(extracted).expect("extracted row").name,
+        "Brass"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn detect_material_role_classifies_filenames() {
     assert_eq!(detect_material_role("rock_ARM.png"), "orm");
     assert_eq!(detect_material_role("wood_orm.jpg"), "orm");
     assert_eq!(detect_material_role("brick_BaseColor.png"), "albedo");
     assert_eq!(detect_material_role("metal_diffuse.tga"), "albedo");
-    // Normal maps are detected by the `_nor`/`nrm` tokens. A literal "normal" name
-    // classifies as "orm" first (the word "normal" contains the substring "orm"), the
-    // substring-precedence behavior — so the importer-side convention is to name normal
-    // maps `*_nor`/`*_nrm`.
+    // Normal is matched before the packed `orm`/`arm`/`mra` acronyms, so a literal "normal"
+    // name (which contains the substring "orm") classifies as "normal", as do the `_nor`/`nrm`
+    // tokens. This is what lets ambientCG's `*_NormalGL` land in the normal slot.
     assert_eq!(detect_material_role("stone_nor.png"), "normal");
     assert_eq!(detect_material_role("floor_nrm.png"), "normal");
-    assert_eq!(detect_material_role("literal_normal.png"), "orm");
+    assert_eq!(detect_material_role("literal_normal.png"), "normal");
+    assert_eq!(
+        detect_material_role("Rock063_2K-PNG_NormalGL.png"),
+        "normal"
+    );
     assert_eq!(detect_material_role("surface_roughness.png"), "roughness");
     assert_eq!(detect_material_role("plate_metallic.png"), "metallic");
     assert_eq!(detect_material_role("lava_emissive.png"), "emissive");
@@ -340,6 +419,24 @@ fn detect_material_role_classifies_filenames() {
     assert_eq!(detect_material_role("shiny_gloss.png"), "gloss");
     assert_eq!(detect_material_role("glass_opacity.png"), "opacity");
     assert_eq!(detect_material_role("random_texture.png"), "");
+}
+
+/// The height-map technique routing (D2): a provider Displacement map → real displacement (library
+/// intent), an explicit bump map → shading bump, any other height map → parallax.
+#[test]
+fn detect_height_mode_routes_by_provider_label() {
+    use saffron_core::HeightMode;
+    assert_eq!(
+        detect_height_mode("Rock063_2K-PNG_Displacement.png"),
+        HeightMode::Displacement
+    );
+    assert_eq!(
+        detect_height_mode("wood_disp.png"),
+        HeightMode::Displacement
+    );
+    assert_eq!(detect_height_mode("brick_bump.png"), HeightMode::Bump);
+    // A generic "Height"-named map is parallax (POM) — the user can promote it in the editor.
+    assert_eq!(detect_height_mode("stone_height.png"), HeightMode::Parallax);
 }
 
 /// A 2x2 RGBA8 PNG (the encoded bytes the texture register decodes).

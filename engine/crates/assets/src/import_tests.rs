@@ -29,21 +29,25 @@ fn quad_mesh() -> Mesh {
                 position: Vec3::ZERO,
                 normal: Vec3::Z,
                 uv0: Vec2::ZERO,
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::X,
                 normal: Vec3::Z,
                 uv0: Vec2::new(1.0, 0.0),
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::new(1.0, 1.0, 0.0),
                 normal: Vec3::Z,
                 uv0: Vec2::ONE,
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::Y,
                 normal: Vec3::Z,
                 uv0: Vec2::new(0.0, 1.0),
+                ..Vertex::default()
             },
         ],
         indices: vec![0, 1, 2, 0, 2, 3],
@@ -243,7 +247,7 @@ fn catalog_rows_from_meta_equal_rows_from_a_reread_container() {
 
     let full = format!("{}/{}", root.display(), bake.path);
     let meta = read_container_metadata(&full).expect("prefix read");
-    let scanned_rows = catalog_rows_for_model(&meta, &bake.path);
+    let scanned_rows = catalog_rows_for_container(&meta, &bake.path, AssetType::Model);
     assert_eq!(
         scanned_rows, bake.rows,
         "bake rows must equal scan-derived rows"
@@ -275,7 +279,7 @@ fn remapped_sub_asset_row_points_at_the_external_path() {
     );
     meta.remap = saffron_json::Value::Object(remap);
 
-    let rows = catalog_rows_for_model(&meta, "models/4242.smodel");
+    let rows = catalog_rows_for_container(&meta, "models/4242.smodel", AssetType::Model);
     let mesh_row = rows.iter().find(|r| r.id == Uuid(5000)).unwrap();
     assert_eq!(mesh_row.path, "meshes/town_extracted.smesh");
     assert_eq!(mesh_row.container, Uuid(0));

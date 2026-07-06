@@ -22,7 +22,7 @@
 //! catalog row, and seed the GPU texture cache so the just-uploaded texture is served
 //! without a re-read.
 
-use saffron_core::Uuid;
+use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::{decode_image_from_memory, decode_image_from_memory_hdr};
 use saffron_json::{Value, dump_json, json_string_or, json_u64_or, parse_json, uuid_to_json};
 use saffron_scene::{AssetCatalog, AssetEntry, AssetType, Colorspace, TextureRole};
@@ -34,7 +34,7 @@ use crate::catalog::{
 };
 use crate::error::{Error, Result};
 use crate::gpu::GpuUploader;
-use crate::import::{ScanDelta, catalog_rows_for_model};
+use crate::import::{ScanDelta, catalog_rows_for_container};
 use crate::model::read_container_metadata;
 use crate::names::{
     asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name,
@@ -180,7 +180,7 @@ impl AssetServer {
     /// Walks `assets/`, rebuilds the catalog from disk, and diffs it against the live one.
     ///
     /// The filesystem is the source of truth: a never-saved import is rediscovered, a
-    /// deleted file's row is dropped. Containers contribute rows via [`catalog_rows_for_model`];
+    /// deleted file's row is dropped. Containers contribute rows via [`catalog_rows_for_container`];
     /// engine-written standalone files identify by their uuid filename stem; foreign files
     /// identify via a `.smeta` sidecar (minted + written on first sight). Display names +
     /// folders are preserved from the prior catalog by id.
@@ -232,10 +232,17 @@ pub fn reconcile_catalog_from_disk(
         let ext = lower_ext(&path);
         let path_str = path.to_string_lossy().to_string();
 
-        if ext == "smodel" {
+        // A container file: a `.smodel` model or a `.smatx` texture-embedding material. The
+        // parent row's type follows the extension; both read the same META + TOC.
+        if ext == "smodel" || ext == "smatx" {
+            let parent_type = if ext == "smatx" {
+                AssetType::Material
+            } else {
+                AssetType::Model
+            };
             match read_container_metadata(&path) {
                 Ok(meta) => {
-                    for mut row in catalog_rows_for_model(&meta, &rel) {
+                    for mut row in catalog_rows_for_container(&meta, &rel, parent_type) {
                         preserve_name_folder(&previous, &mut row);
                         rebuilt.put(row);
                     }
@@ -771,7 +778,12 @@ fn asset_signature(root: &std::path::Path) -> u64 {
 pub fn detect_material_role(filename: &str) -> &'static str {
     let lower = filename.to_ascii_lowercase();
     let has = |token: &str| lower.contains(token);
-    if has("arm") || has("orm") || has("_mra") {
+    // Normal is matched before the packed `arm`/`orm`/`mra` acronyms: `orm` is a substring of
+    // `normal` (n-orm-al), so a bare-substring `orm` check would otherwise claim every normal
+    // map (e.g. ambientCG's `NormalGL`). A real packed map never contains `normal`.
+    if has("normal") || has("_nor") || has("nrm") {
+        "normal"
+    } else if has("arm") || has("orm") || has("_mra") {
         "orm"
     } else if has("albedo")
         || has("basecolor")
@@ -782,8 +794,6 @@ pub fn detect_material_role(filename: &str) -> &'static str {
         || has("color")
     {
         "albedo"
-    } else if has("normal") || has("_nor") || has("nrm") {
-        "normal"
     } else if has("rough") {
         "roughness"
     } else if has("metal") {
@@ -800,6 +810,26 @@ pub fn detect_material_role(filename: &str) -> &'static str {
         "opacity"
     } else {
         ""
+    }
+}
+
+/// The height technique an imported map's filename implies (the material-import routing): a
+/// provider **Displacement** map (ambientCG `*_Displacement`, Poly Haven `*_disp`) → real
+/// per-vertex [`HeightMode::Displacement`] — the library authoring intent (these maps are cut for
+/// real mesh displacement, the same default three.js applies to a `displacementMap`); an explicit
+/// **bump** map → the shading-only [`HeightMode::Bump`]; any other height map → [`HeightMode::Parallax`]
+/// (parallax-occlusion mapping). Only meaningful for a map whose role is `height`; a per-material
+/// `heightMode` in the editor overrides it.
+#[must_use]
+pub fn detect_height_mode(filename: &str) -> HeightMode {
+    let lower = filename.to_ascii_lowercase();
+    let has = |token: &str| lower.contains(token);
+    if has("displace") || has("_disp") {
+        HeightMode::Displacement
+    } else if has("bump") {
+        HeightMode::Bump
+    } else {
+        HeightMode::Parallax
     }
 }
 
