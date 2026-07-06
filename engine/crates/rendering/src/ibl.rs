@@ -148,7 +148,8 @@ impl Default for SkygenParams {
 /// values (0 = Color, 1 = Texture, 2 = Procedural).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SkyRenderSettings {
-    /// 0 = Color (flat fill), 1 = Texture (bindless panorama), 2 = Procedural (env cube).
+    /// 0 = Color (flat fill), 1 = Texture (bindless panorama), 2 = Procedural (env cube),
+    /// 3 = the fixed studio gradient (see [`SKY_MODE_THUMBNAIL_GRADIENT`]).
     pub mode: u32,
     /// Color-mode flat fill (also the sky pass's clear color).
     pub clear_color: Vec3,
@@ -161,6 +162,12 @@ pub struct SkyRenderSettings {
     /// Bindless panorama slot (Texture mode).
     pub texture_index: u32,
 }
+
+/// The visible-sky mode that draws the fixed neutral studio gradient (`sky.slang` mode 3): a
+/// backdrop independent of the environment, forced on the offscreen thumbnail view so every subject
+/// — including a chrome ball reflecting a dark HDRI — reads as a clean silhouette. Never a scene
+/// `sky_mode`; the renderer overrides the submitted mode for the thumbnail draw only.
+pub const SKY_MODE_THUMBNAIL_GRADIENT: u32 = 3;
 
 impl Default for SkyRenderSettings {
     fn default() -> Self {
@@ -2030,7 +2037,15 @@ impl Sky {
     /// Resolves this frame's sky draw into `Copy` handles + push data a render-graph pass
     /// body captures (never `&self`). The render-graph closure must not borrow the renderer
     /// aggregate (README §2), so the sky pass captures a [`SkyDraw`] instead.
-    pub fn draw_data(&self, view_proj: saffron_geometry::glam::Mat4) -> SkyDraw {
+    ///
+    /// `mode_override` forces the visible-sky mode for this draw (the offscreen thumbnail view
+    /// passes the studio-gradient mode so the backdrop is independent of the IBL); `None` uses the
+    /// submitted scene mode.
+    pub fn draw_data(
+        &self,
+        view_proj: saffron_geometry::glam::Mat4,
+        mode_override: Option<u32>,
+    ) -> SkyDraw {
         SkyDraw {
             pipeline: self.pipeline,
             layout: self.pipeline_layout,
@@ -2040,7 +2055,7 @@ impl Sky {
                 params: Vec4::new(
                     self.intensity,
                     self.rotation,
-                    self.mode as f32,
+                    mode_override.unwrap_or(self.mode) as f32,
                     self.texture_index as f32,
                 ),
                 clear_color: self.clear_color.extend(1.0),
@@ -2231,16 +2246,25 @@ impl ReflectionProbes {
     /// writes the metadata-SSBO binding (5), so the mesh bind is valid before any capture.
     /// Called once after the first IBL bake.
     pub fn seed(&self, ibl: &Ibl) {
+        self.seed_set(self.mesh_set, ibl);
+    }
+
+    /// Seeds an arbitrary IBL set's probe bindings — the shared [`Ibl::set`] for the project IBL
+    /// (via [`ReflectionProbes::seed`]), or a secondary set (the offscreen thumbnail preview IBL)
+    /// whose bindings 3/4/5 must be valid before it is bound even though probes are never captured
+    /// into it. The fallback cubes come from `ibl`; binding 5 shares the one metadata SSBO (a
+    /// secondary set carries no probes, so it is read for `probe_count == 0`, i.e. never).
+    pub fn seed_set(&self, dst_set: vk::DescriptorSet, ibl: &Ibl) {
         let raw = self.resources.device();
         for slot in 0..MAX_REFLECTION_PROBES {
-            self.write_slot(raw, ibl, slot as usize);
+            self.write_slot(raw, dst_set, ibl, slot as usize);
         }
         let buffer_info = [vk::DescriptorBufferInfo::default()
             .buffer(self.meta_buffer.handle())
             .offset(0)
             .range(self.meta_buffer.size())];
         let write = [vk::WriteDescriptorSet::default()
-            .dst_set(self.mesh_set)
+            .dst_set(dst_set)
             .dst_binding(5)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&buffer_info)];
@@ -2251,7 +2275,7 @@ impl ReflectionProbes {
     /// Writes one probe slot's prefiltered (binding 3) + irradiance (binding 4) cube into
     /// the IBL set. A slot with no captured probe falls back to the global IBL cubes, so
     /// every array element is always valid.
-    fn write_slot(&self, raw: &ash::Device, ibl: &Ibl, slot: usize) {
+    fn write_slot(&self, raw: &ash::Device, dst_set: vk::DescriptorSet, ibl: &Ibl, slot: usize) {
         // There is no per-slot cube storage — every slot resolves to the global IBL cubes
         // (a real capture overwrites the slot via `write_captured`).
         let pre = ibl.prefiltered_cube.view;
@@ -2268,13 +2292,13 @@ impl ReflectionProbes {
         ];
         let writes = [
             vk::WriteDescriptorSet::default()
-                .dst_set(self.mesh_set)
+                .dst_set(dst_set)
                 .dst_binding(3)
                 .dst_array_element(slot as u32)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(std::slice::from_ref(&infos[0])),
             vk::WriteDescriptorSet::default()
-                .dst_set(self.mesh_set)
+                .dst_set(dst_set)
                 .dst_binding(4)
                 .dst_array_element(slot as u32)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)

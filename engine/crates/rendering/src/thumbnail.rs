@@ -1,11 +1,5 @@
-//! Screenshot/thumbnail read-back encode: the captured-framebuffer → RGB conversion
-//! and the PNG encode, plus the thumbnail worker thread's command pool + queue
-//! discipline.
-//!
-//! The worker owns its own one-off command
-//! pool (Vulkan command pools are not thread-safe — README §5) and submits on the
-//! shared [`crate::GpuQueue`], holding the queue mutex for the submit and the bindless
-//! mutex for any upload.
+//! Screenshot/thumbnail read-back encode: the captured-framebuffer → RGB conversion and the PNG
+//! encode.
 //!
 //! The PNG encode uses the `image` crate's [`image::codecs::png::PngEncoder`] rather
 //! than an stb binding — the bytes are an internal preview artifact, not a hash-parity
@@ -14,6 +8,18 @@
 use ash::vk;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
+
+/// Encoded PNG bytes plus the actual encoded pixel dimensions (so a reply reports the truthful
+/// width/height rather than the requested size).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThumbnailPng {
+    /// The encoded PNG bytes.
+    pub bytes: Vec<u8>,
+    /// The encoded image width.
+    pub width: u32,
+    /// The encoded image height.
+    pub height: u32,
+}
 
 /// Which HDR→display mapping a thumbnail/screenshot PNG applies to an `RGBA16F` source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -50,9 +50,9 @@ pub const DEFAULT_WHITE_SLOT: u32 = 0;
 /// Hard cap on reflection probes. The IBL set's probe-cube arrays are sized to it.
 pub const MAX_REFLECTION_PROBES: u32 = 8;
 
-/// The number of editor render views (scene + asset-preview). The general descriptor
-/// pool sizes its per-view post-process headroom against this.
-const VIEW_COUNT: u32 = 2;
+/// The number of editor render views (scene + asset-preview + offscreen thumbnail). The
+/// general descriptor pool sizes its per-view post-process headroom against this.
+const VIEW_COUNT: u32 = 3;
 
 /// The device-global descriptor infrastructure: layouts, pools, the bindless set,
 /// the samplers, and the bindless slot allocator.

@@ -145,10 +145,15 @@ pub enum ViewId {
     Scene,
     /// The asset-preview viewport (slot `1`).
     AssetPreview,
+    /// The offscreen thumbnail-render view (slot `2`). Never shm-published and not selectable
+    /// over the wire — a background render target for material/texture preview tiles, isolated
+    /// from the Scene/AssetPreview size + temporal state so a tile can render while a viewport is
+    /// live. Its readback goes straight to a PNG, never the presenter ring.
+    Thumbnail,
 }
 
-/// The number of editor render views (scene + asset-preview).
-pub const VIEW_COUNT: usize = 2;
+/// The number of editor render views (scene + asset-preview + offscreen thumbnail).
+pub const VIEW_COUNT: usize = 3;
 
 /// Maximum SDF occluder instances the per-frame SDF instance SSBO holds. Each static draw
 /// contributes one instance per baked field, and a mesh bakes one tight field per primitive
@@ -169,6 +174,7 @@ impl ViewId {
         match self {
             ViewId::Scene => 0,
             ViewId::AssetPreview => 1,
+            ViewId::Thumbnail => 2,
         }
     }
 
@@ -176,21 +182,24 @@ impl ViewId {
     pub fn from_index(index: usize) -> Self {
         match index {
             1 => ViewId::AssetPreview,
+            2 => ViewId::Thumbnail,
             _ => ViewId::Scene,
         }
     }
 
     /// The control-plane / shm wire token, FROZEN end-to-end with the presenter's reader
-    /// (`editor/src-tauri/src/wayland_viewport.rs`). Exactly `"scene"` / `"assetPreview"`.
+    /// (`editor/src-tauri/src/wayland_viewport.rs`). Exactly `"scene"` / `"assetPreview"`; the
+    /// `Thumbnail` view is offscreen-only (`"thumbnail"`) and never reaches the presenter.
     pub fn wire(self) -> &'static str {
         match self {
             ViewId::Scene => "scene",
             ViewId::AssetPreview => "assetPreview",
+            ViewId::Thumbnail => "thumbnail",
         }
     }
 
-    /// Parses a wire token into a [`ViewId`]; `None` for an
-    /// unknown token.
+    /// Parses a wire token into a [`ViewId`]; `None` for an unknown token. The offscreen
+    /// `Thumbnail` view is intentionally **not** parseable — `set-active-view` cannot select it.
     pub fn from_wire(token: &str) -> Option<Self> {
         match token {
             "scene" => Some(ViewId::Scene),
@@ -635,6 +644,11 @@ pub struct Renderer {
     transient: TransientResources,
     pipelines: Pipelines,
     ibl: Ibl,
+    /// A second IBL baked once to the fixed procedural preview environment, bound only when the
+    /// active view is [`ViewId::Thumbnail`]. It isolates the background thumbnail render's
+    /// procedural lighting from the project `ibl`, so draining the thumbnail queue while the scene
+    /// is live never thrashes the project environment bake against the preview environment.
+    preview_ibl: Ibl,
     sky: Sky,
     reflection: ReflectionProbes,
     ssao: Ssao,
@@ -674,11 +688,6 @@ pub struct Renderer {
     /// this field, which reads as "far from any surface" (no occlusion); held here so the
     /// seeded views stay valid for the renderer's lifetime.
     default_sdf: Arc<crate::GpuSdf>,
-
-    /// The offscreen thumbnail + material-preview render sub-state: the lazy
-    /// thumbnail/preview PSOs + the preview sphere, plus the render-to-texture and PNG
-    /// read-back primitives.
-    pub(crate) thumbnail: crate::ThumbnailRenderer,
 
     /// A pending window/composited-output screenshot path, armed by
     /// [`Renderer::request_window_capture`] and consumed at the next present (the swapchain
@@ -770,6 +779,7 @@ impl Renderer {
             bool,
             TransientResources,
             Ibl,
+            Ibl,
             Sky,
             ReflectionProbes,
             Ssao,
@@ -826,6 +836,14 @@ impl Renderer {
             sky.bind_env_cube(&ibl);
             let reflection = ReflectionProbes::new(&device, ibl.set())?;
             reflection.seed(&ibl);
+
+            // The offscreen thumbnail preview IBL: a second set validated with the global procedural
+            // bake now (so set 3 is bindable) and re-baked to the actual fixed preview environment on
+            // the first thumbnail render (routed there by `request_env_bake` on the Thumbnail view).
+            // Its probe bindings ride the same fallback seeding — thumbnails never capture probes.
+            let mut preview_ibl = Ibl::new(&device, &descriptors)?;
+            preview_ibl.bake(&device, true)?;
+            reflection.seed_set(preview_ibl.set(), &preview_ibl);
 
             // Screen-space effects: the device-shared sub-state (sampler + the two
             // compute layouts). `ready` flips once the views are built.
@@ -885,6 +903,7 @@ impl Renderer {
                 meshlet_enabled,
                 transient,
                 ibl,
+                preview_ibl,
                 sky,
                 reflection,
                 ssao,
@@ -911,6 +930,7 @@ impl Renderer {
             meshlet_enabled,
             transient,
             ibl,
+            preview_ibl,
             sky,
             reflection,
             ssao,
@@ -1052,6 +1072,7 @@ impl Renderer {
             transient,
             pipelines,
             ibl,
+            preview_ibl,
             sky,
             reflection,
             ssao,
@@ -1067,14 +1088,6 @@ impl Renderer {
             bindless_free_list,
             default_white,
             default_sdf,
-            // The thumbnail render target's color format is read back over the control plane,
-            // never presented, so it follows the device's chosen surface format rather than a
-            // (possibly absent) swapchain. It is the surface format the swapchain would have
-            // used, matching the eventual present format.
-            thumbnail: crate::ThumbnailRenderer::new(
-                device.resources(),
-                device.surface_format.format,
-            ),
             capture_next_window_path: None,
             frames,
             swapchain,
@@ -1231,16 +1244,39 @@ impl Renderer {
         self.sky.submit(settings);
     }
 
+    /// The IBL the scene pass binds for the active view: the fixed procedural [`Renderer::preview_ibl`]
+    /// on the offscreen [`ViewId::Thumbnail`] view, else the project [`Renderer::ibl`].
+    fn scene_ibl(&self) -> &Ibl {
+        if self.active_view == ViewId::Thumbnail {
+            &self.preview_ibl
+        } else {
+            &self.ibl
+        }
+    }
+
+    /// The mutable twin of [`Renderer::scene_ibl`] — routes an environment bake to the preview IBL
+    /// while a thumbnail renders, so the project IBL is never touched by a thumbnail's env sync.
+    fn scene_ibl_mut(&mut self) -> &mut Ibl {
+        if self.active_view == ViewId::Thumbnail {
+            &mut self.preview_ibl
+        } else {
+            &mut self.ibl
+        }
+    }
+
     /// Re-arms the IBL environment bake when the source / panorama / params change.
     /// The bake fires at the next [`Renderer::render_scene_offscreen`]
-    /// (a GPU-idle point), so the visible sky + IBL relight together.
+    /// (a GPU-idle point), so the visible sky + IBL relight together. Routed to the active view's
+    /// IBL, so a thumbnail render's procedural env re-arms [`Renderer::preview_ibl`], not the
+    /// project IBL.
     pub fn request_env_bake(
         &mut self,
         source: EnvSource,
         panorama: Option<Arc<crate::GpuTexture>>,
         params: SkygenParams,
     ) {
-        self.ibl.request_env_bake(source, panorama, params);
+        self.scene_ibl_mut()
+            .request_env_bake(source, panorama, params);
     }
 
     /// Whether IBL ambient is on (false = the flat scalar ambient fallback).
@@ -1382,7 +1418,8 @@ impl Renderer {
     /// marches the GDF only when its clipmap is valid. Indirect diffuse occlusion is DDGI
     /// ray-miss + contact GTAO.
     fn want_sky_occlusion(&self) -> bool {
-        let ibl_enabled = self.ibl.use_ibl && self.ibl.ready;
+        let ibl = self.scene_ibl();
+        let ibl_enabled = ibl.use_ibl && ibl.ready;
         ibl_enabled && self.sky_occlusion_enabled() && self.global_sdf.enabled()
     }
 
@@ -1479,8 +1516,9 @@ impl Renderer {
         let frame = self.frames.index();
         // Fold the IBL-ambient flag + the reflection-probe count into the UBO write.
         // Probes contribute only when IBL is baked + their toggle is on.
-        let ibl_enabled = self.ibl.use_ibl && self.ibl.ready;
-        let probes_on = self.reflection.use_probes && self.ibl.ready;
+        let ibl = self.scene_ibl();
+        let ibl_enabled = ibl.use_ibl && ibl.ready;
+        let probes_on = self.reflection.use_probes && ibl.ready;
         let probe_count = if probes_on {
             self.reflection.frame_probe_count()
         } else {
@@ -1814,6 +1852,42 @@ impl Renderer {
             |err| Error::ShaderLoad(format!("capture: write {}: {err}", path.display())),
         )?;
         Ok(())
+    }
+
+    /// Reads the active view's post-processed offscreen back and encodes it to PNG bytes **in
+    /// memory** — the bytes-returning twin of [`Renderer::capture_viewport`], for a background
+    /// thumbnail render whose result ships over the control protocol rather than to a file. The
+    /// caller selects the active view first (via [`Renderer::set_active_view`]). The offscreen is
+    /// already display-range, so its `RGBA16F` halves are clamped ([`PngTransfer::Clamp`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Vk`] if the read-back's device idle / Vulkan calls fail, or an
+    /// [`Error::ShaderLoad`]-shaped wrapper carrying a PNG encode failure.
+    pub fn encode_active_offscreen_png(&mut self) -> Result<crate::ThumbnailPng> {
+        let (extent, format, pixels) = self.read_active_offscreen()?;
+        let bytes = crate::encode_to_png(
+            &pixels,
+            extent.width,
+            extent.height,
+            format,
+            crate::PngTransfer::Clamp,
+        )
+        .map_err(|err| Error::ShaderLoad(format!("thumbnail: encode png: {err}")))?;
+        Ok(crate::ThumbnailPng {
+            bytes,
+            width: extent.width,
+            height: extent.height,
+        })
+    }
+
+    /// Restores the active view **without** resetting its temporal state, unlike
+    /// [`Renderer::set_active_view`]. A background thumbnail render makes a brief
+    /// `Scene → Thumbnail → Scene` excursion each drained frame; going back through
+    /// `set_active_view` would wipe the Scene view's accumulated TAA / SSGI / ReSTIR / DDGI
+    /// history every time and re-converge it visibly. This leaves that history intact.
+    pub fn restore_active_view_no_reset(&mut self, view: ViewId) {
+        self.active_view = view;
     }
 
     /// Sets the active view this frame, and whether each view's shm publish is enabled (the
@@ -2249,136 +2323,6 @@ impl Renderer {
     /// Whether a window capture is armed for the next present.
     pub fn window_capture_pending(&self) -> bool {
         self.capture_next_window_path.is_some()
-    }
-
-    /// Builds the lazy thumbnail/preview PSOs + the preview sphere up front.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any pipeline-build or mesh-upload failure.
-    pub fn prewarm_thumbnail_resources(&mut self) -> Result<()> {
-        self.thumbnail.prewarm(&self.device, &self.descriptors)
-    }
-
-    /// Renders `mesh` framed by its AABB under a fixed light into a `size`×`size` texture.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any pipeline-build, target-allocation, or submit failure.
-    pub fn render_mesh_thumbnail(
-        &mut self,
-        mesh: &Arc<crate::GpuMesh>,
-        size: u32,
-    ) -> Result<Arc<crate::GpuTexture>> {
-        self.thumbnail
-            .render_mesh_thumbnail(&self.device, &self.descriptors, mesh, size)
-    }
-
-    /// Renders a unit sphere with `material` under studio lighting into a `size`×`size`
-    /// texture (`shader_spv` of `None` uses the default preview pipeline; a codegen
-    /// material passes its compiled `.spv` path).
-    ///
-    /// # Errors
-    ///
-    /// Propagates any pipeline-build, target-allocation, or submit failure.
-    pub fn render_material_preview(
-        &mut self,
-        material: &crate::SubmeshMaterial,
-        size: u32,
-        shader_spv: Option<&std::path::Path>,
-    ) -> Result<Arc<crate::GpuTexture>> {
-        self.thumbnail.render_material_preview(
-            &self.device,
-            &self.descriptors,
-            material,
-            size,
-            shader_spv,
-        )
-    }
-
-    /// Renders a static chrome sphere mirroring `hdri` (an equirectangular environment) into a
-    /// `size`×`size` texture — the HDRI asset tile.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any pipeline-build, target-allocation, or submit failure.
-    pub fn render_hdri_ball_preview(
-        &mut self,
-        hdri: &Arc<crate::GpuTexture>,
-        size: u32,
-    ) -> Result<Arc<crate::GpuTexture>> {
-        self.thumbnail
-            .render_hdri_ball_preview(&self.device, &self.descriptors, hdri, size)
-    }
-
-    /// Renders `mesh` shaded per-submesh with its materials into a `size`×`size` texture.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any pipeline-build, target-allocation, or submit failure.
-    pub fn render_model_thumbnail(
-        &mut self,
-        mesh: &Arc<crate::GpuMesh>,
-        submesh_materials: &[crate::SubmeshMaterial],
-        size: u32,
-    ) -> Result<Arc<crate::GpuTexture>> {
-        self.thumbnail.render_model_thumbnail(
-            &self.device,
-            &self.descriptors,
-            mesh,
-            submesh_materials,
-            size,
-        )
-    }
-
-    /// Renders the framed mesh to a `size`×`size` texture, then reads it back to a PNG.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the render or read-back/encode failure.
-    pub fn encode_asset_thumbnail_png(
-        &mut self,
-        mesh: &Arc<crate::GpuMesh>,
-        size: u32,
-    ) -> Result<crate::ThumbnailPng> {
-        self.thumbnail
-            .encode_asset_thumbnail_png(&self.device, &self.descriptors, mesh, size)
-    }
-
-    /// Renders the framed, textured model to a `size`×`size` texture, then reads it back
-    /// to a PNG.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the render or read-back/encode failure.
-    pub fn encode_model_thumbnail_png(
-        &mut self,
-        mesh: &Arc<crate::GpuMesh>,
-        submesh_materials: &[crate::SubmeshMaterial],
-        size: u32,
-    ) -> Result<crate::ThumbnailPng> {
-        self.thumbnail.encode_model_thumbnail_png(
-            &self.device,
-            &self.descriptors,
-            mesh,
-            submesh_materials,
-            size,
-        )
-    }
-
-    /// Renders `texture` (downscaled to fit `size`×`size`) and reads it back to a PNG.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any allocation / blit / read-back / encode failure.
-    pub fn encode_texture_thumbnail_png(
-        &self,
-        texture: &Arc<crate::GpuTexture>,
-        size: u32,
-        transfer: crate::PngTransfer,
-    ) -> Result<crate::ThumbnailPng> {
-        self.thumbnail
-            .encode_texture_thumbnail_png(&self.device, texture, size, transfer)
     }
 
     /// Copies the just-presented swapchain `image` (left in `PRESENT_SRC_KHR` by
@@ -3195,10 +3139,16 @@ impl Renderer {
         // Re-bake the IBL environment if the sky inputs changed (the directional light
         // moved). Deferred to here — a GPU-idle point — so the visible sky + IBL relight
         // together. The bake waits idle internally; an editor-time event, not per-frame hot
-        // A failure is logged, not fatal.
+        // A failure is logged, not fatal. The preview IBL re-bakes the same way on the first
+        // thumbnail render (its `rebake_pending` stays false on every non-thumbnail frame).
         if self.ibl.rebake_pending {
             if let Err(err) = self.ibl.fire_rebake(&self.device) {
                 tracing::error!("ibl re-bake failed: {err}");
+            }
+        }
+        if self.preview_ibl.rebake_pending {
+            if let Err(err) = self.preview_ibl.fire_rebake(&self.device) {
+                tracing::error!("preview ibl re-bake failed: {err}");
             }
         }
 
@@ -3767,7 +3717,7 @@ impl Renderer {
         let bindless_set = self.descriptors.bindless_set();
         let light_set = self.lighting.light_set(frame);
         let instance_set = self.instancing.instance_set(frame);
-        let ibl_set = self.ibl.set();
+        let ibl_set = self.scene_ibl().set();
         let raw = self.device.raw().clone();
 
         let mut graph = RenderGraph::new();
@@ -4259,8 +4209,8 @@ impl Renderer {
                     0,
                 ),
             };
-            let ibl_cube = self.ibl.irradiance_cube_view();
-            let ibl_sampler = self.ibl.sampler();
+            let ibl_cube = self.scene_ibl().irradiance_cube_view();
+            let ibl_sampler = self.scene_ibl().sampler();
             let ddgi_irr = self.ddgi.irradiance().1;
             let ddgi_dist = self.ddgi.distance().1;
             let ddgi_sampler = self.ddgi.sampler();
@@ -4324,7 +4274,15 @@ impl Renderer {
         if did_sky {
             let bindless = bindless_set;
             let raw_for_body = raw.clone();
-            let draw = self.sky.draw_data(self.scene_draw_list.view_proj);
+            // The offscreen thumbnail view draws a fixed studio gradient instead of the scene's
+            // sky, so the backdrop never samples the IBL cube — a subject (incl. a chrome ball
+            // reflecting a dark HDRI) always has silhouette contrast. Interactive views keep their
+            // submitted sky.
+            let sky_mode_override = (self.active_view == ViewId::Thumbnail)
+                .then_some(crate::ibl::SKY_MODE_THUMBNAIL_GRADIENT);
+            let draw = self
+                .sky
+                .draw_data(self.scene_draw_list.view_proj, sky_mode_override);
             // The sky clears + STORES the (multisampled, under MSAA) scene color; the scene
             // pass then LOADs it and owns the single MSAA resolve into scene_output. The sky
             // must NOT resolve or DONT_CARE here — discarding the multisampled samples would
@@ -8327,19 +8285,27 @@ mod tests {
         assert_eq!(ViewId::default(), ViewId::Scene);
         assert_eq!(ViewId::Scene.index(), 0);
         assert_eq!(ViewId::AssetPreview.index(), 1);
+        assert_eq!(ViewId::Thumbnail.index(), 2);
         assert_eq!(ViewId::Scene.wire(), "scene");
         assert_eq!(ViewId::AssetPreview.wire(), "assetPreview");
+        assert_eq!(ViewId::Thumbnail.wire(), "thumbnail");
         assert_eq!(ViewId::from_wire("scene"), Some(ViewId::Scene));
         assert_eq!(
             ViewId::from_wire("assetPreview"),
             Some(ViewId::AssetPreview)
         );
         assert_eq!(ViewId::from_wire("nope"), None);
-        // Round-trip every variant through its wire token.
+        // The offscreen Thumbnail view is not wire-selectable, so its token never parses back.
+        assert_eq!(ViewId::from_wire("thumbnail"), None);
+        // Round-trip the two presenter-facing variants through their wire tokens.
         for view in [ViewId::Scene, ViewId::AssetPreview] {
             assert_eq!(ViewId::from_wire(view.wire()), Some(view));
         }
-        assert_eq!(VIEW_COUNT, 2);
+        // The dense index round-trips for all three, including the offscreen view.
+        for view in [ViewId::Scene, ViewId::AssetPreview, ViewId::Thumbnail] {
+            assert_eq!(ViewId::from_index(view.index()), view);
+        }
+        assert_eq!(VIEW_COUNT, 3);
     }
 
     /// Both editor views are created at startup, each with its own offscreen targets;

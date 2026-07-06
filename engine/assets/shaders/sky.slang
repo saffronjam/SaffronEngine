@@ -4,7 +4,10 @@
 // Camera translation cancels in (far - near), so the sky is naturally camera-locked.
 //
 // Modes (push.params.z): 0 = flat clear color, 1 = equirectangular panorama (a bindless 2D
-// texture, set 0, indexed by push.params.w), 2 = the procedural IBL environment cube (set 1).
+// texture, set 0, indexed by push.params.w), 2 = the procedural IBL environment cube (set 1),
+// 3 = a fixed neutral studio gradient independent of the environment (the offscreen thumbnail
+// backdrop — decouples the visible backdrop from the IBL so a subject always reads as a silhouette,
+// e.g. a chrome ball reflecting a dark HDRI on a light gradient).
 
 static const float PI = 3.14159265;
 
@@ -68,9 +71,18 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         uint index = (uint)push.params.w;
         color = albedoTextures[NonUniformResourceIndex(index)].SampleLevel(uv, 0.0).rgb;
     }
-    else
+    else if (mode == 2u)
     {
         color = envCube.SampleLevel(dir, 0.0).rgb;
+    }
+    else
+    {
+        // Fixed neutral studio gradient (linear HDR): a light upper hemisphere fading to a darker
+        // floor, keyed only on the view ray's elevation. Independent of the environment, so the
+        // subject (a lit sphere, or a chrome ball reflecting a dark HDRI) always has contrast at its
+        // silhouette.
+        float t = smoothstep(0.0, 1.0, saturate(dir.y * 0.5 + 0.5));
+        color = lerp(float3(0.16, 0.16, 0.18), float3(0.48, 0.50, 0.55), t);
     }
     return float4(color * intensity, 1.0);
 }

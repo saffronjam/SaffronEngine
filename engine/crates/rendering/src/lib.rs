@@ -50,7 +50,6 @@ mod ssao;
 mod swapchain;
 mod targets;
 mod thumbnail;
-mod thumbnail_render;
 mod transient;
 mod upload;
 mod view_target;
@@ -151,9 +150,8 @@ pub use ssao::{
 pub use swapchain::Swapchain;
 pub use targets::{PointShadowCube, Targets};
 pub use thumbnail::{
-    PngTransfer, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
+    PngTransfer, ThumbnailPng, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
-pub use thumbnail_render::{ThumbnailPng, ThumbnailRenderer};
 pub use transient::TransientResources;
 pub use upload::{GpuQueue, SdfBake, Uploader};
 pub use view_target::ViewTarget;
