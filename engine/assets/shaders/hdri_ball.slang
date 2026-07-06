@@ -5,6 +5,8 @@
 // environment; this is the cheap static tile). The equirect mapping matches sky.slang so a tile
 // reflects the environment at the same orientation the scene backdrop shows.
 
+import tonemap_ops;
+
 struct PreviewPush
 {
     float4x4 viewProj;
@@ -65,6 +67,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     float fresnel = pow(1.0 - saturate(dot(-view, n)), 5.0);
     float3 color = env + fresnel * 0.15;
 
-    color = color / (color + 1.0);  // Reinhard into [0,1], matching the material-preview tile
+    // PBR Neutral + sRGB encode, shared with the material-preview tile + the viewport tonemap.
+    color = tonemapAndEncode(color, 3u);
     return float4(color, 1.0);
 }

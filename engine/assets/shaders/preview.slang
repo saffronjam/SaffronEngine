@@ -5,6 +5,8 @@
 // look (a key directional light + hemisphere ambient), matching how DCC tools preview materials.
 // The view direction is a constant that matches the camera framing in renderMaterialPreview.
 
+import tonemap_ops;
+
 struct PreviewPush
 {
     float4x4 viewProj;
@@ -122,9 +124,11 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         n = normalize(mul(bumpN, tbn));
     }
 
-    // Fixed studio lighting: a key directional light + hemisphere ambient. V matches the camera dir.
+    // Fixed studio lighting: a top-front key directional light + hemisphere ambient. V matches the
+    // camera dir; L mirrors the interactive preview's key (furnish_preview_scene, direction toward
+    // light) so a cached tile reads like the same asset in the live preview.
     float3 V = normalize(float3(0.3, 0.4, 1.0));
-    float3 L = normalize(float3(0.5, 0.6, 0.6));
+    float3 L = normalize(float3(0.4, 0.9, 0.5));
     float3 H = normalize(L + V);
     float ndotl = max(dot(n, L), 0.0);
     float ndotv = max(dot(n, V), 1e-3);
@@ -141,10 +145,10 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     float3 F = F0 + (1.0 - F0) * pow(1.0 - hdotv, 5.0);
     float3 spec = D * G * F / max(4.0 * ndotv * ndotl, 1e-4);
     float3 kd = (1.0 - F) * (1.0 - metallic);
-    float3 lit = (kd * albedo / PI + spec) * ndotl * 2.5;
+    float3 lit = (kd * albedo / PI + spec) * ndotl * 3.0;
 
     float hemi = 0.5 + 0.5 * n.y;
-    float3 ambient = albedo * (1.0 - metallic) * lerp(float3(0.08, 0.08, 0.10), float3(0.30, 0.32, 0.38), hemi);
+    float3 ambient = albedo * (1.0 - metallic) * lerp(float3(0.10, 0.10, 0.12), float3(0.36, 0.38, 0.44), hemi);
 
     float3 color = (lit + ambient) * ao;
 
@@ -154,6 +158,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         color += emis * push.pbr.w;
     }
 
-    color = color / (color + 1.0);  // Reinhard tonemap into [0,1]
+    // Khronos PBR Neutral + sRGB encode, shared with the viewport tonemap so the tile's color
+    // response matches the scene (the UNORM target has no hardware OETF, so it is applied here).
+    color = tonemapAndEncode(color, 3u);
     return float4(color, 1.0);
 }

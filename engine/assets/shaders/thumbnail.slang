@@ -2,6 +2,8 @@
 // neutral albedo. No instancing/textures/light buffers — the push constant carries the
 // mvp + normal matrix. Used by renderMeshThumbnail to preview a mesh in the asset panel.
 
+import tonemap_ops;
+
 struct VertexInput
 {
     [[vk::location(0)]] float3 position;
@@ -39,5 +41,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     float ndotl = max(dot(n, -lightDir), 0.0);
     float3 albedo = float3(0.80, 0.80, 0.82);
     float3 color = albedo * (0.28 + 0.72 * ndotl);
+    // sRGB encode (+ PBR Neutral), shared with the other thumbnail tiles + the viewport tonemap
+    // (the UNORM target has no hardware OETF, so it is applied here).
+    color = tonemapAndEncode(color, 3u);
     return float4(color, 1.0);
 }

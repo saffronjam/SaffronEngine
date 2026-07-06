@@ -47,10 +47,12 @@ use crate::material::MaterialAsset;
 use crate::render_material::build_submesh_material;
 use crate::{AssetServer, Error, Result};
 
-/// The thumbnail cache version, folded into every content hash so a render-behaviour
-/// change retires the whole on-disk cache. At `v4`, the cache is content-addressed
-/// (`<contentHash>-<size>.png` under the app-level cache dir).
-pub const THUMBNAIL_CACHE_VERSION: u32 = 4;
+/// The thumbnail cache version. It prefixes every on-disk cache filename
+/// (`v<VERSION>-<contentHash>-<size>.png` under the app-level cache dir), so a render-behaviour
+/// change retires the whole cache — every kind, not just materials — by bumping this one number:
+/// the new prefix simply never matches the old files (which age out via the size-cap eviction).
+/// Bump it whenever the rendered look of a tile changes.
+pub const THUMBNAIL_CACHE_VERSION: u32 = 5;
 
 /// The FNV-1a 64-bit offset basis.
 const FNV_OFFSET: u64 = 1469598103934665603;
@@ -251,7 +253,7 @@ pub struct ThumbnailJob {
     pub id: Uuid,
     /// The requested square pixel size.
     pub size: u32,
-    /// The content-addressed cache path (`<contentHash>-<size>.png` under the app-level
+    /// The content-addressed cache path (`v<VERSION>-<contentHash>-<size>.png` under the app-level
     /// cache dir); empty when the content hash is unknown (unreadable bytes → uncacheable).
     pub cache_path: String,
     /// The content hash keying `cache_path` (`0` when uncacheable).
@@ -816,11 +818,14 @@ fn insert_thumbnail_handback(
 }
 
 impl AssetServer {
-    /// The cache path for a content hash + size (`<contentHash>-<size>.png` under the
-    /// app-level thumbnail cache dir).
+    /// The cache path for a content hash + size (`v<VERSION>-<contentHash>-<size>.png` under the
+    /// app-level thumbnail cache dir). The [`THUMBNAIL_CACHE_VERSION`] prefix makes a version bump
+    /// retire every kind's tiles (mesh/texture/model key on the stored `content_hash`, which carries
+    /// no version of its own), so the one constant is authoritative for the whole cache.
     fn thumbnail_content_cache_path(&self, content_hash: u64, size: u32) -> PathBuf {
-        self.thumbnail_cache_dir()
-            .join(format!("{content_hash}-{size}.png"))
+        self.thumbnail_cache_dir().join(format!(
+            "v{THUMBNAIL_CACHE_VERSION}-{content_hash}-{size}.png"
+        ))
     }
 
     /// What the on-disk thumbnail cache holds (count + bytes).
@@ -1191,13 +1196,17 @@ fn node_world_transforms(nodes: &[saffron_geometry::ImportedNode]) -> Vec<Mat4> 
 fn merge_model_meshes(chunks: &[(Mesh, Mat4)]) -> Mesh {
     let mut out = Mesh::default();
     for (mesh, world) in chunks {
-        let normal_mat = Mat3::from_mat4(*world).inverse().transpose();
+        let linear = Mat3::from_mat4(*world);
+        let normal_mat = linear.inverse().transpose();
         let base_vertex = out.vertices.len() as i64;
         for v in &mesh.vertices {
+            let tangent =
+                (linear * Vec3::new(v.tangent[0], v.tangent[1], v.tangent[2])).normalize_or_zero();
             out.vertices.push(Vertex {
                 position: world.transform_point3(v.position),
                 normal: (normal_mat * v.normal).normalize_or_zero(),
                 uv0: v.uv0,
+                tangent: [tangent.x, tangent.y, tangent.z, v.tangent[3]],
             });
         }
         for sm in &mesh.submeshes {
@@ -1638,16 +1647,19 @@ mod tests {
                     position: Vec3::ZERO,
                     normal: Vec3::Z,
                     uv0: Vec2::ZERO,
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::X,
                     normal: Vec3::Z,
                     uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::Y,
                     normal: Vec3::Z,
                     uv0: Vec2::new(0.0, 1.0),
+                    ..Vertex::default()
                 },
             ],
             indices: vec![0, 1, 2],
@@ -1764,7 +1776,7 @@ mod tests {
             },
         ];
         write_container(assets.root.join(&rel), &chunks).expect("smodel");
-        for row in crate::import::catalog_rows_for_model(&meta, &rel) {
+        for row in crate::import::catalog_rows_for_container(&meta, &rel, AssetType::Model) {
             assets.catalog.put(row);
         }
     }
@@ -2037,15 +2049,16 @@ mod tests {
     }
 
     #[test]
-    fn content_cache_path_is_hash_and_size() {
-        // The cache is content-addressed: the filename is `<contentHash>-<size>.png`, with
-        // no project/uuid in it, so identical content shares one file across projects.
+    fn content_cache_path_is_version_hash_and_size() {
+        // The cache is content-addressed with a version prefix: `v<VERSION>-<contentHash>-<size>.png`,
+        // no project/uuid in it, so identical content shares one file across projects and a version
+        // bump retires every kind's tiles.
         let assets = AssetServer::new(temp_root("path"));
         let path = assets.thumbnail_content_cache_path(0xABCD, 128);
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
-            Some("43981-128.png"),
-            "the filename is the decimal content hash and size"
+            Some(format!("v{THUMBNAIL_CACHE_VERSION}-43981-128.png")).as_deref(),
+            "the filename is the version prefix, decimal content hash, and size"
         );
         assert_eq!(path.parent(), Some(assets.thumbnail_cache_dir().as_path()));
     }

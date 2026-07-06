@@ -76,6 +76,11 @@ const FEATURE_EMISSIVE: u32 = 4;
 const FEATURE_HEIGHT: u32 = 8;
 const FEATURE_ALPHA: u32 = 16;
 
+/// The clear color behind every 3D-render thumbnail. The backdrop-gradient fullscreen triangle
+/// paints over it, so it only shows through an anti-aliased silhouette edge — matched to the
+/// gradient's darker floor (`thumbnail_bg.slang`) so those edges blend.
+const THUMBNAIL_BG_CLEAR: [f32; 4] = [0.11, 0.11, 0.125, 1.0];
+
 /// The offscreen thumbnail + material-preview render sub-state: the lazy thumbnail /
 /// preview PSOs + the preview sphere, the render-target color format, and the
 /// render-to-texture + PNG read-back primitives.
@@ -99,6 +104,10 @@ pub struct ThumbnailRenderer {
     /// The HDRI chrome-ball PSO (same layout as the preview PSO; the `hdri_ball.spv`
     /// fragment mirrors the equirect instead of studio lighting), built lazily.
     hdri_ball_pipeline: Option<Arc<Pipeline>>,
+    /// The backdrop-gradient PSO (a fullscreen triangle, no vertex input / descriptor sets /
+    /// depth, drawn first in every tile so all 3D-render tiles share one studio backdrop),
+    /// built lazily.
+    bg_pipeline: Option<Arc<Pipeline>>,
     /// The unit UV sphere the material preview renders, built lazily.
     preview_sphere: Option<Arc<GpuMesh>>,
 }
@@ -125,6 +134,15 @@ struct ManagedImage {
     format: vk::Format,
 }
 
+/// The per-PSO knobs the shared thumbnail graphics-pipeline builder varies: the build-failure
+/// label, whether to bind the three-attribute [`Vertex`] stream (off for the vertex-buffer-less
+/// fullscreen backdrop), and whether depth test + write are enabled (off for the backdrop).
+struct GraphicsPipelineOpts {
+    context: &'static str,
+    has_vertex_input: bool,
+    depth_enabled: bool,
+}
+
 impl ThumbnailRenderer {
     /// Creates the sub-state against the device's shared bundle + the target color format.
     pub fn new(resources: &Arc<DeviceResources>, color_format: vk::Format) -> Self {
@@ -134,6 +152,7 @@ impl ThumbnailRenderer {
             thumbnail_pipeline: None,
             preview_pipeline: None,
             hdri_ball_pipeline: None,
+            bg_pipeline: None,
             preview_sphere: None,
         }
     }
@@ -180,6 +199,7 @@ impl ThumbnailRenderer {
     pub fn prewarm(&mut self, device: &Device, descriptors: &Descriptors) -> Result<()> {
         self.ensure_thumbnail_pipeline(device)?;
         self.ensure_preview_pipeline(device, descriptors)?;
+        self.ensure_bg_pipeline(device)?;
         self.ensure_preview_sphere(device, descriptors)?;
         Ok(())
     }
@@ -197,6 +217,11 @@ impl ThumbnailRenderer {
     /// Whether the preview sphere has been built (test/inspection).
     pub fn preview_sphere_built(&self) -> bool {
         self.preview_sphere.is_some()
+    }
+
+    /// Whether the backdrop-gradient PSO has been built (test/inspection).
+    pub fn bg_pipeline_built(&self) -> bool {
+        self.bg_pipeline.is_some()
     }
 
     fn ensure_thumbnail_pipeline(&mut self, device: &Device) -> Result<Arc<Pipeline>> {
@@ -249,6 +274,16 @@ impl ThumbnailRenderer {
         Ok(pipeline)
     }
 
+    fn ensure_bg_pipeline(&mut self, device: &Device) -> Result<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.bg_pipeline {
+            return Ok(Arc::clone(pipeline));
+        }
+        let samples = self.sample_count(device);
+        let pipeline = Arc::new(self.build_bg_pipeline(device, samples)?);
+        self.bg_pipeline = Some(Arc::clone(&pipeline));
+        Ok(pipeline)
+    }
+
     fn ensure_preview_sphere(
         &mut self,
         device: &Device,
@@ -276,6 +311,7 @@ impl ThumbnailRenderer {
         size: u32,
     ) -> Result<Arc<GpuTexture>> {
         let pipeline = self.ensure_thumbnail_pipeline(device)?;
+        let bg = self.ensure_bg_pipeline(device)?.handle();
         let (center, radius) = mesh_bounds(mesh);
         let view_proj = framed_view_proj(center, radius, Vec3::new(1.0, 0.7, 1.0));
         let push = ThumbnailPush {
@@ -287,10 +323,11 @@ impl ThumbnailRenderer {
             device,
             descriptors,
             size,
-            [0.12, 0.12, 0.14, 1.0],
+            THUMBNAIL_BG_CLEAR,
             move |raw, cmd| {
-                // SAFETY: the ash seam. The pipeline + mesh outlive the submit.
+                // SAFETY: the ash seam. The backdrop + pipeline + mesh outlive the submit.
                 unsafe {
+                    draw_backdrop(raw, cmd, bg);
                     raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.handle());
                     raw.cmd_push_constants(
                         cmd,
@@ -329,21 +366,19 @@ impl ThumbnailRenderer {
             }
         };
         let sphere = self.ensure_preview_sphere(device, descriptors)?;
+        let bg = self.ensure_bg_pipeline(device)?.handle();
         let view_proj = framed_view_proj(Vec3::ZERO, 1.0, Vec3::new(0.3, 0.4, 1.0));
         let push = preview_push(material, view_proj);
         let bindless_set = descriptors.bindless_set();
         let layout = pipeline.layout();
         let pipeline_handle = pipeline.handle();
-        let texture = self.render_to_texture(
-            device,
-            descriptors,
-            size,
-            [0.10, 0.10, 0.12, 1.0],
-            |raw, cmd| {
-                // SAFETY: the ash seam. The pipeline + bindless set + sphere outlive the submit:
-                // `pipeline` is held in this outer scope (dropped only after the submit waited),
-                // so the per-call codegen pipeline is not destroyed mid-recording.
+        let texture =
+            self.render_to_texture(device, descriptors, size, THUMBNAIL_BG_CLEAR, |raw, cmd| {
+                // SAFETY: the ash seam. The backdrop + pipeline + bindless set + sphere outlive the
+                // submit: `pipeline` is held in this outer scope (dropped only after the submit
+                // waited), so the per-call codegen pipeline is not destroyed mid-recording.
                 unsafe {
+                    draw_backdrop(raw, cmd, bg);
                     raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_handle);
                     raw.cmd_bind_descriptor_sets(
                         cmd,
@@ -362,8 +397,7 @@ impl ThumbnailRenderer {
                     );
                     draw_submeshes(raw, cmd, &sphere);
                 }
-            },
-        );
+            });
         // Keep the pipeline alive until here — past the submit-and-wait inside
         // `render_to_texture` — so a per-call codegen pipeline (held only by this `Arc`) is
         // destroyed only after the GPU is done with it, not when the draw closure is consumed.
@@ -388,6 +422,7 @@ impl ThumbnailRenderer {
     ) -> Result<Arc<GpuTexture>> {
         let pipeline = self.ensure_hdri_ball_pipeline(device, descriptors)?;
         let sphere = self.ensure_preview_sphere(device, descriptors)?;
+        let bg = self.ensure_bg_pipeline(device)?.handle();
         let dir = Vec3::new(0.3, 0.4, 1.0);
         let view_proj = framed_view_proj(Vec3::ZERO, 1.0, dir);
         let eye = framed_eye(Vec3::ZERO, 1.0, dir);
@@ -407,10 +442,11 @@ impl ThumbnailRenderer {
             device,
             descriptors,
             size,
-            [0.06, 0.06, 0.07, 1.0],
+            THUMBNAIL_BG_CLEAR,
             move |raw, cmd| {
-                // SAFETY: the ash seam. The pipeline + bindless set + sphere outlive the submit.
+                // SAFETY: the ash seam. The backdrop + pipeline + bindless set + sphere outlive the submit.
                 unsafe {
+                    draw_backdrop(raw, cmd, bg);
                     raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_handle);
                     raw.cmd_bind_descriptor_sets(
                         cmd,
@@ -449,6 +485,7 @@ impl ThumbnailRenderer {
         size: u32,
     ) -> Result<Arc<GpuTexture>> {
         let pipeline = self.ensure_preview_pipeline(device, descriptors)?;
+        let bg = self.ensure_bg_pipeline(device)?.handle();
         let (center, radius) = mesh_bounds(mesh);
         let view_proj = framed_view_proj(center, radius, Vec3::new(0.3, 0.4, 1.0));
 
@@ -473,10 +510,11 @@ impl ThumbnailRenderer {
             device,
             descriptors,
             size,
-            [0.10, 0.10, 0.12, 1.0],
+            THUMBNAIL_BG_CLEAR,
             move |raw, cmd| {
-                // SAFETY: the ash seam. The pipeline + bindless set + mesh outlive the submit.
+                // SAFETY: the ash seam. The backdrop + pipeline + bindless set + mesh outlive the submit.
                 unsafe {
+                    draw_backdrop(raw, cmd, bg);
                     raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.handle());
                     raw.cmd_bind_descriptor_sets(
                         cmd,
@@ -767,7 +805,17 @@ impl ThumbnailRenderer {
                 return Err(err);
             }
         };
-        let result = self.build_graphics_pipeline(device, module, layout, samples, false);
+        let result = self.build_graphics_pipeline(
+            device,
+            module,
+            layout,
+            samples,
+            GraphicsPipelineOpts {
+                context: "create_graphics_pipelines (thumbnail)",
+                has_vertex_input: true,
+                depth_enabled: true,
+            },
+        );
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freed after.
         unsafe { raw.destroy_shader_module(module, None) };
         result
@@ -804,24 +852,78 @@ impl ThumbnailRenderer {
                 return Err(err);
             }
         };
-        let result = self.build_graphics_pipeline(device, module, layout, samples, true);
+        let result = self.build_graphics_pipeline(
+            device,
+            module,
+            layout,
+            samples,
+            GraphicsPipelineOpts {
+                context: "create_graphics_pipelines (preview)",
+                has_vertex_input: true,
+                depth_enabled: true,
+            },
+        );
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freed after.
         unsafe { raw.destroy_shader_module(module, None) };
         result
     }
 
-    /// The shared graphics-pipeline body for the thumbnail + preview PSOs: a triangle
-    /// list of the three-attribute [`Vertex`] stream, fill rasterizer (no cull),
-    /// depth-test+write (LESS), the color + depth formats, dynamic viewport/scissor.
-    /// `layout` is already created (and freed here on a build error).
+    /// Builds the backdrop-gradient PSO from `thumbnail_bg.spv`: a fullscreen triangle with no
+    /// vertex input, no descriptor sets, no push constants, and depth disabled.
+    fn build_bg_pipeline(
+        &self,
+        device: &Device,
+        samples: vk::SampleCountFlags,
+    ) -> Result<Pipeline> {
+        let module = load_thumbnail_shader(device, "shaders/thumbnail_bg.spv")?;
+        let raw = device.raw();
+        let layout_info = vk::PipelineLayoutCreateInfo::default();
+        // SAFETY: the ash seam. The empty layout is owned by the returned `Pipeline` (freed on the
+        // build-error path); the module is freed here after pipeline creation consumes it.
+        let layout = match checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "thumbnail-bg: create_pipeline_layout",
+        ) {
+            Ok(layout) => layout,
+            Err(err) => {
+                // SAFETY: the ash seam. The module was created above; freed once here.
+                unsafe { raw.destroy_shader_module(module, None) };
+                return Err(err);
+            }
+        };
+        let result = self.build_graphics_pipeline(
+            device,
+            module,
+            layout,
+            samples,
+            GraphicsPipelineOpts {
+                context: "create_graphics_pipelines (thumbnail-bg)",
+                has_vertex_input: false,
+                depth_enabled: false,
+            },
+        );
+        // SAFETY: the ash seam. The module is consumed by pipeline creation; freed after.
+        unsafe { raw.destroy_shader_module(module, None) };
+        result
+    }
+
+    /// The shared graphics-pipeline body for the thumbnail / preview / backdrop PSOs: a
+    /// triangle list, fill rasterizer (no cull), the color + depth formats, dynamic
+    /// viewport/scissor. `opts` carries the per-PSO knobs (see [`GraphicsPipelineOpts`]).
+    /// `layout` is already created (and freed here on error).
     fn build_graphics_pipeline(
         &self,
         device: &Device,
         module: vk::ShaderModule,
         layout: vk::PipelineLayout,
         samples: vk::SampleCountFlags,
-        is_preview: bool,
+        opts: GraphicsPipelineOpts,
     ) -> Result<Pipeline> {
+        let GraphicsPipelineOpts {
+            context,
+            has_vertex_input,
+            depth_enabled,
+        } = opts;
         let raw = device.raw();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -855,9 +957,13 @@ impl ThumbnailRenderer {
                 .format(vk::Format::R32G32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, uv0) as u32),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+        let vertex_input = if has_vertex_input {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes)
+        } else {
+            vk::PipelineVertexInputStateCreateInfo::default()
+        };
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -872,8 +978,8 @@ impl ThumbnailRenderer {
         let multisample =
             vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
+            .depth_test_enable(depth_enabled)
+            .depth_write_enable(depth_enabled)
             .depth_compare_op(vk::CompareOp::LESS);
         let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(false)
@@ -910,14 +1016,7 @@ impl ThumbnailRenderer {
             Err((_, result)) => {
                 // SAFETY: the ash seam. The layout was created by the caller; freed once.
                 unsafe { raw.destroy_pipeline_layout(layout, None) };
-                Err(Error::Vk {
-                    context: if is_preview {
-                        "create_graphics_pipelines (preview)"
-                    } else {
-                        "create_graphics_pipelines (thumbnail)"
-                    },
-                    result,
-                })
+                Err(Error::Vk { context, result })
             }
         }
     }
@@ -1080,6 +1179,20 @@ impl ThumbnailRenderer {
 /// this is a throwaway list dropped with the texture — it never touches the renderer's.
 fn thumbnail_free_list() -> crate::BindlessFreeList {
     Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+/// Records the shared backdrop gradient as the first (depth-off) draw of a thumbnail so every
+/// 3D-render tile shares one studio backdrop; the object then draws over it.
+///
+/// # Safety
+///
+/// `cmd` recording; the `bg` pipeline outlives the submit.
+unsafe fn draw_backdrop(raw: &ash::Device, cmd: vk::CommandBuffer, bg: vk::Pipeline) {
+    // SAFETY: forwarded from the caller's recording contract.
+    unsafe {
+        raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, bg);
+        raw.cmd_draw(cmd, 3, 1, 0, 0);
+    }
 }
 
 /// Binds `mesh`'s vertex + index buffers and draws every submesh.
@@ -1867,6 +1980,7 @@ mod tests {
                 position,
                 normal: position.normalize(),
                 uv0: Vec2::new(0.5, 0.5),
+                ..Vertex::default()
             })
             .collect();
         let indices = vec![
@@ -1885,20 +1999,18 @@ mod tests {
         }
     }
 
-    /// The fraction of RGB bytes that differ from the clear color by more than a small
-    /// tolerance — a render that drew geometry has many; a bare clear has ~none.
-    fn non_clear_fraction(png: &[u8], clear: [u8; 3]) -> f32 {
+    /// The fraction of pixels brighter than `threshold` in any channel. Every 3D-render tile now
+    /// draws over the shared backdrop gradient (`thumbnail_bg.slang`, peaking at ~65/255 at the
+    /// top), so a lit object reads well above it while a bare backdrop has ~none — the check that
+    /// geometry actually rendered, robust to the non-flat backdrop.
+    fn bright_fraction(png: &[u8], threshold: u8) -> f32 {
         let decoded = image::load_from_memory(png).expect("decode png").to_rgb8();
         let (w, h) = decoded.dimensions();
-        let differing = decoded
+        let bright = decoded
             .pixels()
-            .filter(|p| {
-                (p.0[0] as i32 - clear[0] as i32).abs() > 6
-                    || (p.0[1] as i32 - clear[1] as i32).abs() > 6
-                    || (p.0[2] as i32 - clear[2] as i32).abs() > 6
-            })
+            .filter(|p| p.0[0].max(p.0[1]).max(p.0[2]) > threshold)
             .count() as f32;
-        differing / (w * h) as f32
+        bright / (w * h) as f32
     }
 
     /// A mesh thumbnail renders the framed cube (not just the clear), encodes to a 64×64
@@ -1921,8 +2033,8 @@ mod tests {
         assert_eq!((png.width, png.height), (64, 64));
         assert!(!png.bytes.is_empty());
 
-        // The mesh-thumbnail clear is (0.12, 0.12, 0.14) → ~(31, 31, 36).
-        let fraction = non_clear_fraction(&png.bytes, [31, 31, 36]);
+        // The lit cube reads brighter than the backdrop gradient (which peaks at ~65/255).
+        let fraction = bright_fraction(&png.bytes, 80);
         assert!(
             fraction > 0.05,
             "the framed cube covers a meaningful fraction (saw {fraction})"
@@ -1961,8 +2073,8 @@ mod tests {
             .expect("encode preview");
         assert_eq!((png.width, png.height), (64, 64));
 
-        // The preview clear is (0.10, 0.10, 0.12) → ~(26, 26, 31).
-        let fraction = non_clear_fraction(&png.bytes, [26, 26, 31]);
+        // The lit sphere reads brighter than the backdrop gradient (which peaks at ~65/255).
+        let fraction = bright_fraction(&png.bytes, 80);
         assert!(
             fraction > 0.05,
             "the lit sphere covers a meaningful fraction (saw {fraction})"
@@ -2013,8 +2125,9 @@ mod tests {
             .expect("encode ball");
         assert_eq!((png.width, png.height), (64, 64));
 
-        // The ball clear is (0.06, 0.06, 0.07) → ~(15, 15, 18); the sphere covers the center.
-        let fraction = non_clear_fraction(&png.bytes, [15, 15, 18]);
+        // The mirror ball reflects the bright equirect, reading well above the backdrop gradient
+        // (which peaks at ~65/255); the sphere covers the center.
+        let fraction = bright_fraction(&png.bytes, 80);
         assert!(
             fraction > 0.05,
             "the mirror ball covers a meaningful fraction (saw {fraction})"
@@ -2067,16 +2180,10 @@ mod tests {
             .expect("encode preview");
 
         // The white albedo passes through the lighting (white × factor = factor), so the
-        // sphere reads bright. An unwritten slot 0 would sample zero → a near-black sphere,
-        // so a meaningfully bright fraction proves the seeded white reached the shader.
-        let decoded = image::load_from_memory(&png.bytes)
-            .expect("decode png")
-            .to_rgb8();
-        let bright = decoded
-            .pixels()
-            .filter(|p| p.0[0] as u32 + p.0[1] as u32 + p.0[2] as u32 > 180)
-            .count() as f32;
-        let fraction = bright / (decoded.width() * decoded.height()) as f32;
+        // sphere reads bright — well above the backdrop gradient's ~65/255 peak. An unwritten
+        // slot 0 would sample zero → a near-black sphere, so a meaningfully bright fraction
+        // proves the seeded white reached the shader.
+        let fraction = bright_fraction(&png.bytes, 110);
         assert!(
             fraction > 0.05,
             "the white-lit sphere must read bright (the seeded default white passed \
@@ -2111,6 +2218,7 @@ mod tests {
             .expect("prewarm");
         assert!(fx.thumb.thumbnail_pipeline_built());
         assert!(fx.thumb.preview_pipeline_built());
+        assert!(fx.thumb.bg_pipeline_built());
         assert!(fx.thumb.preview_sphere_built());
 
         let material = SubmeshMaterial::defaults();

@@ -40,8 +40,9 @@ flat color. The render is multisampled at the highest count the device supports 
 thumbnail sizes geometry edges alias hard without it, and a one-shot tiny render makes the extra
 samples free in practice. The pass draws into a transient MSAA target and resolves into the 1x image
 that gets read back; the sample count is independent of the viewport's [AA mode](../../anti-aliasing/aa-modes/).
-`render_to_texture` records a one-time-submit command buffer through dynamic rendering — clear to dark
-gray, then the closure binds the pipeline, pushes the matrices, and draws each submesh:
+`render_to_texture` records a one-time-submit command buffer through dynamic rendering — clear, then
+the closure paints the shared backdrop gradient (below) and binds the pipeline, pushes the matrices,
+and draws each submesh:
 
 ```rust
 raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.handle());
@@ -80,8 +81,27 @@ let pushes: Vec<(Submesh, PreviewPush)> = mesh.submeshes.iter().map(|submesh| {
 The materials and their textures live as chunks of the container, so the thumbnail worker has no
 `AssetServer`: the main thread resolves them at enqueue — the mesh chunk into bytes, each material
 into a `MaterialAsset`, and each referenced texture's chunk into bytes — and the
-worker decodes from memory, uploads, and builds the `SubmeshMaterial` table. Bumping
-`THUMBNAIL_CACHE_VERSION` retires the older flat-rendered model thumbnails so they regenerate textured.
+worker decodes from memory, uploads, and builds the `SubmeshMaterial` table. `THUMBNAIL_CACHE_VERSION`
+prefixes every cache filename (`v<VERSION>-<contentHash>-<size>.png`), so bumping that one number
+retires the whole on-disk cache — every kind, not just materials — and the tiles regenerate.
+
+## A shared backdrop and matched color
+
+Every 3D-render tile — a bare mesh, a textured model, a material or texture sphere, an HDRI chrome
+ball — draws over one shared studio backdrop, so the grid reads as a set rather than four different
+near-black squares. The backdrop is a fullscreen-triangle vertical gradient (`thumbnail_bg.slang`,
+lighter at the top), recorded as the first draw of each tile through a depth-disabled pipeline
+(`build_bg_pipeline`) so it paints under the object without touching the depth buffer the object needs.
+
+The tiles also match the viewport's color response. The offscreen target is a non-sRGB `UNORM` image,
+so — exactly like the scene [tonemap pass](../../screen-space-and-post/tonemap-and-exposure/) — the
+display transfer must be applied in the shader, not by the hardware. The preview shaders share that
+step: `tonemap_ops.slang` is a resource-free module holding the tonemap operators plus a
+`tonemapAndEncode` that folds in the sRGB gamma, imported by both `tonemap.slang` and the thumbnail
+shaders so there is one encode. The tiles run it as **Khronos PBR Neutral** — the operator tuned to
+keep material color true for asset previews — over a fixed studio key light, so a thumbnail reads like
+the same asset in the live [material preview](../../materials-and-pipelines/native-materials/), only
+cheaper.
 
 ## Across the socket as a PNG
 
@@ -109,6 +129,8 @@ readback runs once per asset, not once per tile or per frame. That
 | Textured model render | `engine/crates/rendering/src/thumbnail_render.rs` · `engine/crates/assets/src/thumbnail.rs` | `render_model_thumbnail`, the `ThumbnailContent::Model` arm in `generate_thumbnail` |
 | Auto-framing | `engine/crates/rendering/src/thumbnail_render.rs` | `mesh_bounds`, `framed_view_proj`, the `(1, 0.7, 1)` eye |
 | The minimal pipeline | `engine/crates/rendering/src/thumbnail_render.rs` | `ensure_thumbnail_pipeline`, `render_to_texture` |
+| Shared backdrop gradient | `engine/assets/shaders/thumbnail_bg.slang` · `engine/crates/rendering/src/thumbnail_render.rs` | `build_bg_pipeline`, `draw_backdrop`, `THUMBNAIL_BG_CLEAR` |
+| Shared tonemap + sRGB encode | `engine/assets/shaders/tonemap_ops.slang` · `preview.slang` · `hdri_ball.slang` · `thumbnail.slang` | `tonemapAndEncode` (PBR Neutral) |
 | MSAA + resolve | `engine/crates/rendering/src/thumbnail_render.rs` | `ThumbnailTargets::sample_count`, the resolve attachment |
 | Readback → base64 PNG (engine) | `engine/crates/control/src/commands_asset.rs` | `get-thumbnail`, `view-asset` |
 | Decode + blob-URL cache (client) | `editor/src/state/store.ts` | `getThumbnailUrl`, `base64ToBlob`, `thumbnailCache` |
