@@ -140,6 +140,20 @@ user confirms it against real output — say "this should fix it, please verify 
   tooltip that repeats the element's own visible text or adjacent labels, and none on
   universally understood controls (window min/max/close, an X in a panel corner, back/forward
   arrows) — give those an `aria-label` instead.
+- **Overlays must not run whole-document modal machinery, and hidden regions must be cheap.** The
+  whole editor DOM stays mounted (every dock panel; the scene / store / asset-editor tab regions are
+  `display:none` when inactive, never unmounted). On that DOM, a *modal* Radix overlay is a ~250–500 ms
+  stall: `react-remove-scroll` writes the `--removed-body-scroll-bar-size` custom property to `<body>`,
+  and a custom-property change on an inherited ancestor forces WebKitGTK to recalc style for the entire
+  document. So: (1) the app's `Select` (`components/ui/select.tsx`) is built on a **non-modal Popover**,
+  **not** `SelectPrimitive` (which has no `modal={false}` and always mounts the scroll-lock) — keep it
+  that way; (2) `DropdownMenu` / `ContextMenu` default `modal={false}` (opt-in `modal` for a rare true
+  blocker); (3) dialogs are the non-modal scoped-container pattern (`storefront/` dialogs + `dialog.tsx`
+  `DialogScopedOverlay`). Every dockable panel is a `contain: layout paint` boundary (`.contain-panel`
+  in `styles.css`, applied in `DockPanelsHost.hostFor` + the tab regions in `App.tsx`), and the root is
+  `overflow:hidden` so a scroll-lock's body write is a no-op. A large grid uses **one shared overlay per
+  surface**, never a Radix root per row (the store grid's shared truncation tooltip). Dev-time, time an
+  open with the `perfLabel` prop on any overlay Root (`lib/overlayPerf.ts`, gated on dev mode).
 - **Panel surfaces paint with the semantic theme tokens, never raw `neutral`.** A panel's
   opaque region is `bg-background` (every sibling panel uses it) with `text-foreground` /
   `text-muted-foreground` and `border-border`; inset surfaces (cards, node bodies, recessed
