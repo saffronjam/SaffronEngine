@@ -35,6 +35,12 @@ interface ScriptErrors {
   oldestSeq: number;
   overflowed: boolean;
 }
+interface ScriptLogs {
+  events: { seq: number; entity: string; message: string; epochMs: number; tick: number }[];
+  highWaterSeq: number;
+  oldestSeq: number;
+  overflowed: boolean;
+}
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
@@ -332,6 +338,18 @@ function Caster.on_update(self, dt)
   end
 end
 return Caster
+`,
+  );
+  // sa.log capture: on_create fires once per instance (deterministic, no per-tick spam); the empty
+  // on_update is the required method that makes the class instantiate.
+  writeFileSync(
+    join(srcDir, "logger.lua"),
+    `local Logger = {}
+function Logger:on_create()
+  sa.log("hello from " .. self.entity:name())
+end
+function Logger:on_update(dt) end
+return Logger
 `,
   );
 });
@@ -816,6 +834,39 @@ test("a missing script file is a logged skip, not a crash", async () => {
   expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
   await engine.call("stop");
   await engine.call("destroy-entity", { entity: cube.id });
+});
+
+// sa.log(...) lands in the drain-script-logs ring tagged with the logging entity, drains via a seq
+// cursor (like drain-script-errors), and — unlike an error — never pauses play.
+test("sa.log lands in drain-script-logs tagged with the logging entity, and does not pause play", async () => {
+  const robot = await engine.call<Ref>("create-entity", { name: "Robot" });
+  await engine.call("add-component", { entity: robot.id, component: "Script" });
+  await engine.call("set-component", {
+    entity: robot.id,
+    component: "Script",
+    json: { scripts: [{ scriptPath: "logger.lua", overrides: {} }] },
+  });
+
+  await engine.call("play");
+  await engine.settle();
+
+  const drained = await engine.call<ScriptLogs>("drain-script-logs", { since: 0 });
+  const line = drained.events.find((e) => e.message.includes("hello from Robot"));
+  expect(line).toBeDefined();
+  expect(line!.entity).toBe(robot.id); // tagged with the logging entity (currentSenderUuid)
+  expect(line!.epochMs).toBeGreaterThan(0);
+  expect(drained.highWaterSeq).toBeGreaterThanOrEqual(line!.seq);
+  expect(drained.overflowed).toBe(false);
+
+  // A plain log must NOT pause play (that is the error path's behaviour).
+  expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
+
+  // The cursor is exhausted: draining from the high-water mark returns nothing new.
+  const again = await engine.call<ScriptLogs>("drain-script-logs", { since: drained.highWaterSeq });
+  expect(again.events).toEqual([]);
+
+  await engine.call("stop");
+  await engine.call("destroy-entity", { entity: robot.id });
 });
 
 test("the scripting cases leave the validation log clean", () => {
