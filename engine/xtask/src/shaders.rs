@@ -38,8 +38,7 @@ const OCTAHEDRAL_STEM: &str = "octahedral";
 const GIPROBE_STEM: &str = "giprobe";
 
 /// The resource-free tonemap-operator module — like `octahedral`, no entry points, no `.spv`.
-/// Imported from source (via `-I`) by `tonemap.slang` and the offscreen thumbnail/preview shaders
-/// so scene + thumbnails encode identically. No runtime codegen splices it, so it needs no
+/// Imported from source (via `-I`) by `tonemap.slang`. No runtime codegen splices it, so it needs no
 /// precompiled `.slang-module`; it is only excluded from the entry-point `.spv` compile.
 const TONEMAP_OPS_STEM: &str = "tonemap_ops";
 
