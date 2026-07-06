@@ -5,9 +5,24 @@ import { CheckIcon, ChevronRightIcon, CircleIcon } from "lucide-react";
 import { ContextMenu as ContextMenuPrimitive } from "radix-ui";
 
 import { cn } from "@/lib/utils";
+import { withOverlayPerf } from "@/lib/overlayPerf";
 
-function ContextMenu({ ...props }: React.ComponentProps<typeof ContextMenuPrimitive.Root>) {
-  return <ContextMenuPrimitive.Root data-slot="context-menu" {...props} />;
+function ContextMenu({
+  perfLabel,
+  onOpenChange,
+  // Non-modal by default — see the note in `dropdown-menu.tsx`; avoids the scroll-lock's
+  // body-level custom-property write that forces a whole-document style recalc on open.
+  modal = false,
+  ...props
+}: React.ComponentProps<typeof ContextMenuPrimitive.Root> & { perfLabel?: string }) {
+  return (
+    <ContextMenuPrimitive.Root
+      data-slot="context-menu"
+      modal={modal}
+      onOpenChange={withOverlayPerf(perfLabel, onOpenChange)}
+      {...props}
+    />
+  );
 }
 
 function ContextMenuTrigger({

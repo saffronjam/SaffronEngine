@@ -52,7 +52,7 @@ export function ImportControls({
     <div className="flex items-center justify-end gap-1.5">
       {showResolution ? (
         interactive ? (
-          <Select value={resolution} onValueChange={setResolution}>
+          <Select value={resolution} onValueChange={setResolution} perfLabel="resolution">
             <SelectTrigger
               size="sm"
               className={cn(compact ? "!h-6 w-14 px-1.5 text-[11px]" : "h-8 w-20")}
@@ -114,7 +114,7 @@ export function ImportControls({
         </Button>
         {result.hasParts ? (
           interactive ? (
-            <DropdownMenu onOpenChange={loadParts}>
+            <DropdownMenu onOpenChange={loadParts} perfLabel="parts">
               <DropdownMenuTrigger asChild>
                 <Button
                   type="button"

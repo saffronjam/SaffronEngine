@@ -3,9 +3,25 @@ import { CheckIcon, ChevronRightIcon, CircleIcon } from "lucide-react";
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 
 import { cn } from "@/lib/utils";
+import { withOverlayPerf } from "@/lib/overlayPerf";
 
-function DropdownMenu({ ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
-  return <DropdownMenuPrimitive.Root data-slot="dropdown-menu" {...props} />;
+function DropdownMenu({
+  perfLabel,
+  onOpenChange,
+  // Non-modal by default: a modal menu mounts `react-remove-scroll`, whose body-level
+  // `--removed-body-scroll-bar-size` custom-property write forces a whole-document style recalc on
+  // this never-unmounted editor DOM. Pass `modal` to restore blocking behaviour for a rare case.
+  modal = false,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Root> & { perfLabel?: string }) {
+  return (
+    <DropdownMenuPrimitive.Root
+      data-slot="dropdown-menu"
+      modal={modal}
+      onOpenChange={withOverlayPerf(perfLabel, onOpenChange)}
+      {...props}
+    />
+  );
 }
 
 function DropdownMenuPortal({

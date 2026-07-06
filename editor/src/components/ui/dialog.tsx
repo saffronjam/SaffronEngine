@@ -4,9 +4,20 @@ import { Dialog as DialogPrimitive } from "radix-ui";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { withOverlayPerf } from "@/lib/overlayPerf";
 
-function Dialog({ ...props }: React.ComponentProps<typeof DialogPrimitive.Root>) {
-  return <DialogPrimitive.Root data-slot="dialog" {...props} />;
+function Dialog({
+  perfLabel,
+  onOpenChange,
+  ...props
+}: React.ComponentProps<typeof DialogPrimitive.Root> & { perfLabel?: string }) {
+  return (
+    <DialogPrimitive.Root
+      data-slot="dialog"
+      onOpenChange={withOverlayPerf(perfLabel, onOpenChange)}
+      {...props}
+    />
+  );
 }
 
 function DialogTrigger({ ...props }: React.ComponentProps<typeof DialogPrimitive.Trigger>) {
@@ -41,17 +52,27 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  container,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
+  /// Portal target. Set it to scope the dialog to a region instead of the whole window — the
+  /// content portals into `container` and, since a scoped dialog runs non-modal and brings its own
+  /// backdrop (`DialogScopedOverlay`), the built-in fixed overlay is skipped.
+  container?: HTMLElement | null;
 }) {
   return (
-    <DialogPortal data-slot="dialog-portal">
-      <DialogOverlay />
+    <DialogPortal data-slot="dialog-portal" container={container ?? undefined}>
+      {container == null && <DialogOverlay />}
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border bg-background p-6 shadow-lg duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 sm:max-w-lg",
+          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border bg-background p-6 shadow-lg duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 sm:max-w-lg",
+          // A scoped dialog persists across its region's `display:none` (a hidden tab); a CSS
+          // *entrance* animation would replay every time the tab is revealed, so only a window-level
+          // (portal-to-body) dialog gets the open animation. The exit animation is safe either way.
+          container == null &&
+            "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
           className,
         )}
         {...props}
@@ -67,6 +88,41 @@ function DialogContent({
           </DialogPrimitive.Close>
         )}
       </DialogPrimitive.Content>
+    </DialogPortal>
+  );
+}
+
+/// The backdrop for a scoped (non-modal) dialog. Rendered as a `DialogPortal` child so Radix's
+/// Presence mounts/unmounts it with the dialog's open state; it dims only `container` (not the whole
+/// window), leaving the surrounding chrome — the main tab strip — live. Pass `onClose` to dismiss on
+/// backdrop click; omit it for a backdrop that can't be clicked away. It carries only an *exit* fade,
+/// no entrance one: a scoped dialog stays mounted across its region's `display:none`, and a CSS
+/// entrance animation would replay every time the hidden tab is revealed (reading as a re-open).
+function DialogScopedOverlay({
+  open,
+  container,
+  onClose,
+  className,
+}: {
+  open: boolean;
+  container: HTMLElement | null;
+  onClose?: () => void;
+  className?: string;
+}) {
+  if (!container) return null;
+  return (
+    <DialogPortal data-slot="dialog-portal" container={container}>
+      <div
+        data-slot="dialog-scoped-overlay"
+        data-state={open ? "open" : "closed"}
+        aria-hidden
+        onClick={onClose}
+        className={cn(
+          "absolute inset-0 z-40 bg-black/50 data-[state=closed]:animate-out data-[state=closed]:fade-out-0",
+          onClose && "cursor-pointer",
+          className,
+        )}
+      />
     </DialogPortal>
   );
 }
@@ -137,6 +193,7 @@ export {
   DialogHeader,
   DialogOverlay,
   DialogPortal,
+  DialogScopedOverlay,
   DialogTitle,
   DialogTrigger,
 };

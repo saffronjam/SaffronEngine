@@ -476,7 +476,9 @@ export function Topbar() {
                 (g, gi) => (
                   <Fragment key={g.group}>
                     {gi > 0 ? <DropdownMenuSeparator /> : null}
-                    <DropdownMenuLabel>{g.label}</DropdownMenuLabel>
+                    <DropdownMenuLabel className="px-2 pt-2 pb-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                      {g.label}
+                    </DropdownMenuLabel>
                     {SCENE_PANEL_MENU.filter((def) => def.group === g.group).map((def) => (
                       <DropdownMenuItem key={def.id} onSelect={() => openPanel(def.id)}>
                         {def.title}

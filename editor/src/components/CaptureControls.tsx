@@ -276,7 +276,7 @@ export function CaptureControls() {
             >
               <SelectValue />
             </SelectTrigger>
-            <SelectContent position="popper" align="end">
+            <SelectContent align="end">
               {WINDOW_PRESETS.map((frames) => (
                 <SelectItem
                   key={frames}

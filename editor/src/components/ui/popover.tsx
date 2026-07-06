@@ -2,9 +2,20 @@ import * as React from "react";
 import { Popover as PopoverPrimitive } from "radix-ui";
 
 import { cn } from "@/lib/utils";
+import { withOverlayPerf } from "@/lib/overlayPerf";
 
-function Popover({ ...props }: React.ComponentProps<typeof PopoverPrimitive.Root>) {
-  return <PopoverPrimitive.Root data-slot="popover" {...props} />;
+function Popover({
+  perfLabel,
+  onOpenChange,
+  ...props
+}: React.ComponentProps<typeof PopoverPrimitive.Root> & { perfLabel?: string }) {
+  return (
+    <PopoverPrimitive.Root
+      data-slot="popover"
+      onOpenChange={withOverlayPerf(perfLabel, onOpenChange)}
+      {...props}
+    />
+  );
 }
 
 function PopoverTrigger({ ...props }: React.ComponentProps<typeof PopoverPrimitive.Trigger>) {
