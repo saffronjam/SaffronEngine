@@ -5,13 +5,20 @@ import { ExternalLink } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogScopedOverlay,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 
 import { errorText, notifyError } from "../lib/flash";
 import { cachedImage } from "./cachedImage";
 import { GalleryViewer } from "./GalleryViewer";
 import { ImportControls } from "./ImportControls";
+import { useStoreOverlayContainer } from "./storeOverlay";
 import type { GalleryImage, StoreResult } from "./types";
 import { useGalleryNav } from "./useGallery";
 
@@ -38,6 +45,7 @@ export function AssetDetailModal({
 }) {
   // The modal navigates independently of the card behind it.
   const nav = useGalleryNav(images.length);
+  const container = useStoreOverlayContainer();
   const facts: { label: string; value: string }[] = [];
   if (result.kind) facts.push({ label: "Type", value: result.kind });
   if (result.triCount) facts.push({ label: "Triangles", value: result.triCount.toLocaleString() });
@@ -45,9 +53,23 @@ export function AssetDetailModal({
   const size = fmtSize(result.fileSize);
   if (size) facts.push({ label: "Size", value: size });
 
+  // Scoped to the Store view's region; hold off until that container exists so we never briefly
+  // portal to document.body.
+  const visible = open && container != null;
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[560px] w-auto max-w-[calc(100%-2rem)] gap-0 overflow-hidden p-0 sm:max-w-[940px]">
+    <Dialog open={visible} onOpenChange={onOpenChange} modal={false}>
+      <DialogScopedOverlay
+        open={visible}
+        container={container}
+        onClose={() => onOpenChange(false)}
+      />
+      <DialogContent
+        container={container}
+        onInteractOutside={(e) => e.preventDefault()}
+        onPointerDownOutside={(e) => e.preventDefault()}
+        className="absolute flex h-[560px] w-auto max-w-[calc(100%-2rem)] gap-0 overflow-hidden p-0 sm:max-w-[940px]"
+      >
         <div className="flex w-[560px] shrink-0 flex-col bg-muted">
           <div className="min-h-0 flex-1 p-4">
             <GalleryViewer images={images} nav={nav} alt={result.name} showLabel large />

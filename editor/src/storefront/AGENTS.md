@@ -53,8 +53,26 @@ surface. If you add a field to a Rust DTO in `connectors/`, add it to `types.ts`
   throttled, kept on disk. Loading a provider URL directly bursts the CDN (broken-image tiles) and
   never caches. `GalleryViewer` and `AssetDetailModal` are the only image sites; keep it that way.
 - **`StoreWorkspace` is always mounted, gated by an `active` prop** (`active={activeKind === "store"}`
-  in `App.tsx`) — like every `ViewTab` body, it keeps its state when hidden rather than unmounting;
-  it suppresses its portaled provider modal while inactive.
+  in `App.tsx`) — like every `ViewTab` body, it keeps its state when hidden rather than unmounting.
+  `active` drives the auto-focus and landing-search effects; it does **not** gate the dialogs.
+- **The Store dialogs (`AssetDetailModal`, `ProviderModal`) are non-modal and scoped to the Store
+  view.** They portal into `StoreWorkspace`'s root region (via `storeOverlay.ts`'s
+  `useStoreOverlayContainer`) instead of `document.body`, run `modal={false}`, and bring their own
+  backdrop (`DialogScopedOverlay` from `components/ui/dialog`). So they dim only the Store view and
+  leave the **main tab strip live and uncovered** — you can switch tabs with a dialog open (their
+  `onInteractOutside`/`onPointerDownOutside` are prevented so a tab click doesn't dismiss them). They
+  stay open across tab switches, hidden with the view (`display:none` when inactive), so returning to
+  the Store shows the same dialog with the same selection. Never revert them to a body-portaled modal
+  `Dialog` — that covers the tab strip and locks out navigation.
+- **The Store tab restores exactly as left — no rebuild, no re-animate.** Two `display:none` side
+  effects are neutralized so a tab switch doesn't *look* like a re-open: (1) the results grid's
+  virtualizer is given a custom `observeElementRect` that ignores `0×0` (`StoreResultsGrid`), so the
+  hidden grid doesn't collapse its window and tear down/rebuild cards on reveal — which also keeps a
+  card's open detail modal alive; (2) the scoped dialogs omit the CSS *entrance* animation
+  (`DialogContent` gates `animate-in` on `container == null`; `DialogScopedOverlay` carries only the
+  exit fade), because `display:none → visible` restarts CSS `animation`, which would replay the open
+  animation on every reveal. Keep both: an element that persists across a `display:none` must not use
+  an entrance `animation`, and a hidden virtual grid must not trust a `0×0` measurement.
 - **The first-provider `ProviderModal` is undismissable until one provider is enabled**
   (`canClose = enabled.length > 0`) — it opens automatically when nothing is enabled and from the gear
   button. `ApiKeyField` is shared with `app/SettingsModal.tsx`.

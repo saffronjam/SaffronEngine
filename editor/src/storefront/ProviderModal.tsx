@@ -7,12 +7,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogScopedOverlay,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 
 import { ApiKeyField } from "./ApiKeyField";
 import { ProviderLogo } from "./connectorIcons";
 import { errorText, notifyError } from "../lib/flash";
+import { useStoreOverlayContainer } from "./storeOverlay";
 import { connectorLogin, connectorSecretStatus, type ConnectorInfo } from "./types";
 
 function prettyHost(url: string): string {
@@ -37,6 +44,7 @@ export function ProviderModal({
   onEnabledChange: (next: string[]) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const container = useStoreOverlayContainer();
 
   // Each fresh open starts grid-only (centered); no stale selection extends the modal.
   useEffect(() => {
@@ -59,17 +67,26 @@ export function ProviderModal({
     onOpenChange(next);
   };
 
+  // Scoped to the Store view's region; hold off until that container exists so we never briefly
+  // portal to document.body.
+  const visible = open && container != null;
+
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
+    <Dialog open={visible} onOpenChange={handleOpenChange} modal={false}>
+      <DialogScopedOverlay
+        open={visible}
+        container={container}
+        onClose={canClose ? () => onOpenChange(false) : undefined}
+      />
       <DialogContent
+        container={container}
         showCloseButton={canClose}
         onEscapeKeyDown={(e) => {
           if (!canClose) e.preventDefault();
         }}
-        onInteractOutside={(e) => {
-          if (!canClose) e.preventDefault();
-        }}
-        className="flex h-[560px] w-auto max-w-[calc(100%-2rem)] gap-0 overflow-hidden p-0 sm:max-w-[940px]"
+        onInteractOutside={(e) => e.preventDefault()}
+        onPointerDownOutside={(e) => e.preventDefault()}
+        className="absolute flex h-[560px] w-auto max-w-[calc(100%-2rem)] gap-0 overflow-hidden p-0 sm:max-w-[940px]"
       >
         <div className="flex w-[520px] shrink-0 flex-col p-6">
           <DialogTitle>

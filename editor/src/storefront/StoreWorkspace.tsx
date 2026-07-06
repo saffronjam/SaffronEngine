@@ -28,6 +28,7 @@ import { useEditorStore } from "../state/store";
 import { ProviderLogo } from "./connectorIcons";
 import { ProviderModal } from "./ProviderModal";
 import { StoreCredits } from "./StoreCredits";
+import { StoreOverlayProvider } from "./storeOverlay";
 import { StoreResultsGrid } from "./StoreResultsGrid";
 import {
   storeListConnectors,
@@ -54,13 +55,17 @@ function searchStateFor(text: string, kind: StoreKind | null): SearchState {
   return { chips: kind ? [{ keyword: "type", value: kind }] : [], freeText: text };
 }
 
-// `active` is false while the tab is mounted-but-hidden; we suppress the portaled provider
-// modal then so it can't float over whichever tab is showing.
+// `active` is false while the tab is mounted-but-hidden; it drives the auto-focus and landing-search
+// effects (the Store dialogs stay open across tab switches — they're hidden with the view, which is
+// `display:none` when inactive).
 export function StoreWorkspace({ active }: { active: boolean }) {
   const [connectors, setConnectors] = useState<ConnectorInfo[]>([]);
   const [enabled, setEnabled] = useState<string[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [providerModalOpen, setProviderModalOpen] = useState(false);
+  // The Store view's own region: the scoped dialogs (detail / providers) portal into it so they
+  // dim only this area and leave the main tab strip live, rather than covering the whole window.
+  const [overlayHost, setOverlayHost] = useState<HTMLElement | null>(null);
   const [showCredits, setShowCredits] = useState(false);
   // Seed the searchbar from the persisted query so a reopen shows where you left off.
   const [search, setSearch] = useState<SearchState>(() => {
@@ -188,100 +193,102 @@ export function StoreWorkspace({ active }: { active: boolean }) {
   }
 
   return (
-    <main className="flex min-h-0 flex-1 flex-col bg-background">
-      <div className="relative flex shrink-0 items-center border-b border-border p-2">
-        <div className="absolute inset-y-0 left-2 flex items-center">
-          <Select value={storeSelected ?? ""} onValueChange={selectStore}>
-            <SelectTrigger size="sm" className="w-48 gap-2" aria-label="Store">
-              {selectedConnector ? (
-                <span className="flex min-w-0 items-center gap-2">
-                  <ProviderLogo
-                    connectorId={selectedConnector.id}
-                    name={selectedConnector.displayName}
-                    className="size-4 shrink-0"
-                  />
-                  <span className="truncate">{selectedConnector.displayName}</span>
-                </span>
-              ) : (
-                <SelectValue placeholder="Select store" />
-              )}
-            </SelectTrigger>
-            <SelectContent position="popper" align="start">
-              {enabledConnectors.map((c) => (
-                <SelectItem key={c.id} value={c.id}>
-                  <span className="flex items-center gap-2">
+    <main ref={setOverlayHost} className="relative flex min-h-0 flex-1 flex-col bg-background">
+      <StoreOverlayProvider value={overlayHost}>
+        <div className="relative flex shrink-0 items-center border-b border-border p-2">
+          <div className="absolute inset-y-0 left-2 flex items-center">
+            <Select value={storeSelected ?? ""} onValueChange={selectStore} perfLabel="provider">
+              <SelectTrigger size="sm" className="w-48 gap-2" aria-label="Store">
+                {selectedConnector ? (
+                  <span className="flex min-w-0 items-center gap-2">
                     <ProviderLogo
-                      connectorId={c.id}
-                      name={c.displayName}
+                      connectorId={selectedConnector.id}
+                      name={selectedConnector.displayName}
                       className="size-4 shrink-0"
                     />
-                    {c.displayName}
+                    <span className="truncate">{selectedConnector.displayName}</span>
                   </span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+                ) : (
+                  <SelectValue placeholder="Select store" />
+                )}
+              </SelectTrigger>
+              <SelectContent align="start">
+                {enabledConnectors.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    <span className="flex items-center gap-2">
+                      <ProviderLogo
+                        connectorId={c.id}
+                        name={c.displayName}
+                        className="size-4 shrink-0"
+                      />
+                      {c.displayName}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="mx-auto w-[60%]">
+            <AnimaSearchbar
+              value={search}
+              onChange={runSearch}
+              chips={chips}
+              placeholder="Search assets — press Enter"
+              debounceMs={COMMIT_ONLY_DEBOUNCE_MS}
+              inputRef={searchRef}
+              busy={searching}
+            />
+          </div>
+          <div className="absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant={showCredits ? "secondary" : "ghost"}
+                  onClick={() => setShowCredits((c) => !c)}
+                  aria-label="Credits"
+                >
+                  <Award />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Asset credits</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  onClick={() => setProviderModalOpen(true)}
+                  aria-label="Manage providers"
+                >
+                  <Settings />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Manage providers</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
-        <div className="mx-auto w-[60%]">
-          <AnimaSearchbar
-            value={search}
-            onChange={runSearch}
-            chips={chips}
-            placeholder="Search assets — press Enter"
-            debounceMs={COMMIT_ONLY_DEBOUNCE_MS}
-            inputRef={searchRef}
-            busy={searching}
-          />
-        </div>
-        <div className="absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-1">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                size="icon-sm"
-                variant={showCredits ? "secondary" : "ghost"}
-                onClick={() => setShowCredits((c) => !c)}
-                aria-label="Credits"
-              >
-                <Award />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Asset credits</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                size="icon-sm"
-                variant="ghost"
-                onClick={() => setProviderModalOpen(true)}
-                aria-label="Manage providers"
-              >
-                <Settings />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Manage providers</TooltipContent>
-          </Tooltip>
-        </div>
-      </div>
 
-      {showCredits ? (
-        <StoreCredits />
-      ) : storeSession === null ? (
-        <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground italic">
-          Nothing here — search for any asset.
-        </div>
-      ) : (
-        <StoreResultsGrid session={storeSession} active={active} onLoadingChange={setSearching} />
-      )}
+        {showCredits ? (
+          <StoreCredits />
+        ) : storeSession === null ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground italic">
+            Nothing here — search for any asset.
+          </div>
+        ) : (
+          <StoreResultsGrid session={storeSession} onLoadingChange={setSearching} />
+        )}
 
-      <ProviderModal
-        open={providerModalOpen && active}
-        onOpenChange={setProviderModalOpen}
-        connectors={connectors}
-        enabled={enabled}
-        onEnabledChange={persistEnabled}
-      />
+        <ProviderModal
+          open={providerModalOpen}
+          onOpenChange={setProviderModalOpen}
+          connectors={connectors}
+          enabled={enabled}
+          onEnabledChange={persistEnabled}
+        />
+      </StoreOverlayProvider>
     </main>
   );
 }
