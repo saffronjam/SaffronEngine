@@ -1,50 +1,25 @@
-//! The off-thread thumbnail worker — the crate's one cross-thread shared-mutable site.
+//! Thumbnail resolution: classify an asset into a preview subject, resolve its content-addressed
+//! cache key, and either return a cache hit or enqueue a main-graph render.
 //!
-//! Thumbnails are generated off the frame loop so a cold cache-miss never blocks
-//! rendering. [`ThumbnailWorker`] owns a [`std::thread::JoinHandle`] plus the shared job
-//! / result state behind a [`Mutex`] + [`Condvar`] — the legitimate `Arc<Mutex<…>>` of
-//! the assets Ref-policy ledger (bucket 2), and *exactly* the marked GPU-queue-sharing
-//! thread. [`WorkerState`] holds the job [`VecDeque`], the `in_flight` / `failed` dedup
-//! sets (keyed by cache path), the two handback [`Vec`]s, and the `stop` flag.
-//!
-//! # The seam to the GPU (the worker decodes, then calls a [`ThumbnailGpu`])
-//!
-//! The worker **decodes the image bytes on its own thread**, then calls the GPU
-//! primitives through the [`ThumbnailGpu`] trait — the upload trio plus the three
-//! render-to-PNG entry points. A live implementation routes these to
-//! `saffron-rendering` (which takes the queue + bindless mutexes internally) bound to
-//! the worker's dedicated command pool via [`ThumbnailGpu::bind_worker_thread`]; the
-//! tests drive a counting stub. The finished `Arc<GpuTexture>` / `Arc<GpuMesh>` handles
-//! cross the thread boundary in the handback — the one place this crate relies on GPU
-//! `Arc`s crossing threads (they are `Send + Sync`).
-//!
-//! # Teardown ordering (idle-before-clear)
-//!
-//! [`AssetServer::stop_thumbnail_worker`] sets `stop`, notifies, and joins **before**
-//! `wait_gpu_idle` / renderer teardown, so the worker's last submit's fences have
-//! completed and its un-handed-back textures drop while the renderer is still alive.
-//! [`AssetServer::clear_thumbnail_queue`] (a project switch, GPU idle at the call site)
-//! abandons queued jobs + dedup state + un-drained handbacks; an already-running job
-//! finishes harmlessly and its single handback is dropped on the next switch.
+//! Every tile — material, texture map, mesh, model, HDRI — renders through the **main forward+
+//! graph** on the offscreen thumbnail view (the interactive previewer's path). [`request_thumbnail`]
+//! runs on the main thread: it resolves `{preview subject, content hash, cache path}` — a stored
+//! catalog hash for a mesh/texture/model (self-healing a legacy `0` from the source bytes), a live
+//! resolved hash for a material — then returns a cache hit or enqueues a [`PreviewRenderJob`] onto
+//! [`AssetServer::preview_render_queue`] and replies `pending`. The host drains that queue in
+//! `on_update` (build the preview scene → render → write the disk cache); the editor repolls and
+//! hits the written cache. No off-thread rendering: decode + upload happen lazily on the main thread
+//! during the render, through the scene's own asset loaders.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 
-use saffron_core::BlendMode;
 use saffron_core::Uuid;
-use saffron_geometry::glam::{Mat3, Mat4, Vec3, Vec4};
-use saffron_geometry::{
-    ChunkKind, Mesh, Submesh, Vertex, decode_image, decode_image_from_memory,
-    decode_image_from_memory_hdr, decode_image_hdr, load_mesh, load_mesh_from_bytes,
-};
-use saffron_rendering::{GpuMesh, GpuTexture, PngTransfer, SubmeshMaterial};
+use saffron_geometry::ChunkKind;
+use saffron_geometry::glam::Mat4;
 use saffron_scene::{AssetType, Colorspace, TextureRole};
 
-use crate::gpu::GpuUploader;
 use crate::material::MaterialAsset;
-use crate::render_material::build_submesh_material;
 use crate::{AssetServer, Error, Result};
 
 /// The thumbnail cache version. It prefixes every on-disk cache filename
@@ -52,7 +27,7 @@ use crate::{AssetServer, Error, Result};
 /// change retires the whole cache — every kind, not just materials — by bumping this one number:
 /// the new prefix simply never matches the old files (which age out via the size-cap eviction).
 /// Bump it whenever the rendered look of a tile changes.
-pub const THUMBNAIL_CACHE_VERSION: u32 = 5;
+pub const THUMBNAIL_CACHE_VERSION: u32 = 11;
 
 /// The FNV-1a 64-bit offset basis.
 const FNV_OFFSET: u64 = 1469598103934665603;
@@ -71,8 +46,8 @@ pub struct ThumbnailPng {
     pub height: u32,
 }
 
-/// A thumbnail request's reply: the PNG (a cache hit or freshly generated), or a
-/// `pending` flag telling the editor to retry while the worker generates it.
+/// A thumbnail request's reply: the PNG (a cache hit), or a `pending` flag telling the editor to
+/// retry while the enqueued main-graph render produces it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThumbnailReply {
     /// The PNG bytes (empty while `pending`).
@@ -94,89 +69,8 @@ pub struct ThumbnailCacheStats {
     pub bytes: u64,
 }
 
-/// The GPU seam the thumbnail worker drives: the upload trio (from [`GpuUploader`]) plus
-/// the three render-to-PNG entry points and the per-thread command-pool bind.
-///
-/// A live implementation routes these to `saffron-rendering`'s thumbnail primitives
-/// (`render_material_preview` / `encode_asset_thumbnail_png` / `encode_model_thumbnail_png`
-/// / `encode_texture_thumbnail_png` / `bind_thumbnail_worker_thread`), which take the
-/// queue + bindless mutexes internally; the tests implement a counting stub. The worker
-/// holds it as a `&dyn ThumbnailGpu`, so the worker logic is exercised without a Vulkan
-/// device while the production path performs the real render.
-pub trait ThumbnailGpu: GpuUploader {
-    /// Binds the calling thread to the renderer's dedicated thumbnail command pool (every
-    /// subsequent one-off upload/render/readback on this thread allocates from it). Called
-    /// once at the top of the worker loop; idempotent per thread.
-    fn bind_worker_thread(&self);
-
-    /// Renders `texture` downscaled to fit `size`×`size`, encoding the read-back to PNG.
-    /// `transfer` selects the HDR mapping (`Tonemap` for an HDR asset, `Clamp` otherwise).
-    ///
-    /// # Errors
-    ///
-    /// Propagates the renderer's render/read-back/encode failure.
-    fn encode_texture_thumbnail_png(
-        &self,
-        texture: &Arc<GpuTexture>,
-        size: u32,
-        transfer: PngTransfer,
-    ) -> saffron_rendering::Result<ThumbnailPng>;
-
-    /// Renders `mesh` framed by its AABB under fixed lighting, encoding the read-back to
-    /// PNG (the flat-mesh asset tile).
-    ///
-    /// # Errors
-    ///
-    /// Propagates the renderer's render/read-back/encode failure.
-    fn encode_asset_thumbnail_png(
-        &self,
-        mesh: &Arc<GpuMesh>,
-        size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng>;
-
-    /// Renders `mesh` shaded with its per-submesh materials (the textured model tile),
-    /// encoding the read-back to PNG.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the renderer's render/read-back/encode failure.
-    fn encode_model_thumbnail_png(
-        &self,
-        mesh: &Arc<GpuMesh>,
-        submesh_materials: &[SubmeshMaterial],
-        size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng>;
-
-    /// Renders a unit sphere with `material` under studio lighting into a `size`×`size`
-    /// texture (the material-preview pane + cached material thumbnails). `shader_spv` of
-    /// `None` uses the cached default studio preview pipeline; a non-foldable graph material
-    /// passes its compiled `_preview.spv` path for a per-call codegen pipeline.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the renderer's preview-render failure.
-    fn render_material_preview(
-        &self,
-        material: &SubmeshMaterial,
-        size: u32,
-        shader_spv: Option<&Path>,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>>;
-
-    /// Renders a static chrome sphere mirroring `hdri` (an equirectangular environment) into a
-    /// `size`×`size` texture — the HDRI asset tile (a direct reflection of the raw equirect, no
-    /// IBL prefilter; the interactive 3D tab renders lit balls in the prefiltered environment).
-    ///
-    /// # Errors
-    ///
-    /// Propagates the renderer's preview-render failure.
-    fn render_hdri_ball_preview(
-        &self,
-        hdri: &Arc<GpuTexture>,
-        size: u32,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>>;
-}
-
-/// One texture the worker must decode + upload, resolved from the catalog at enqueue.
+/// One texture source resolved from the catalog at enqueue; its bytes/path fold into the content
+/// hash, and (for a standalone texture) its role selects the preview subject.
 #[derive(Clone, Debug, Default)]
 pub struct ThumbnailTextureSource {
     /// The texture's catalog id.
@@ -196,31 +90,25 @@ pub struct ThumbnailTextureSource {
     pub bytes: Vec<u8>,
 }
 
-/// What kind of thumbnail a [`ThumbnailJob`] renders, carrying the type-specific inputs
-/// the worker needs, as a data-carrying enum.
+/// The asset kind a [`ThumbnailJob`] resolves to, carrying the source inputs the content hash folds
+/// (a legacy `0`-hash row self-heals from these bytes) plus the texture role the classifier reads.
+/// The main-graph render re-resolves everything from the catalog by id, so no render payload is
+/// carried here.
 #[derive(Clone, Debug)]
 pub enum ThumbnailContent {
-    /// A texture preview: decode + upload the source, then read it back.
+    /// A texture, hashed from its source bytes; the role selects its preview subject.
     Texture(ThumbnailTextureSource),
-    /// A standalone or embedded mesh: load (file path) or decode (`bytes`) then render.
+    /// A standalone or embedded mesh, hashed from its `.smesh` bytes.
     Mesh {
         /// The standalone `.smesh` path (empty for an embedded mesh).
         path: String,
         /// The embedded `.smesh` chunk image (empty for a standalone mesh).
         bytes: Vec<u8>,
     },
-    /// A material preview: upload the referenced textures, build the submesh material,
-    /// then render the studio sphere.
-    Material {
-        /// The parent-resolved material (boxed — it dwarfs the other variants).
-        material: Box<MaterialAsset>,
-        /// The material's referenced textures (decoded + uploaded on the worker thread).
-        textures: Vec<ThumbnailTextureSource>,
-    },
-    /// A model preview: every mesh-bearing node of the model's forest, each at its node world
-    /// transform, shaded with the container's per-submesh materials. The worker bakes the
-    /// transforms and merges the chunks into one mesh before rendering, so a multi-node model
-    /// previews as the assembled whole, not a single node's fragment.
+    /// A material, keyed on its live resolved params (via [`thumbnail_material_hash`]) rather than
+    /// source bytes — editing a parent reflows every instance.
+    Material,
+    /// A model, hashed from its merged mesh-chunk bytes + node transforms + per-slot material state.
     Model {
         /// One `.smesh` chunk per mesh-bearing forest node, with its node world transform
         /// (resolved on the main thread at enqueue).
@@ -232,8 +120,8 @@ pub enum ThumbnailContent {
     },
 }
 
-/// One mesh chunk of a model thumbnail: a node's `.smesh` image plus the node's world
-/// transform, which the worker bakes into the vertices when assembling the forest.
+/// One mesh chunk of a model thumbnail: a node's `.smesh` image plus the node's world transform,
+/// both folded into the model's content hash.
 #[derive(Clone, Debug)]
 pub struct ModelMeshChunk {
     /// The node's `.smesh` chunk image.
@@ -242,11 +130,9 @@ pub struct ModelMeshChunk {
     pub transform: Mat4,
 }
 
-/// One unit of work for the thumbnail worker: a resolved {asset, size} request.
-///
-/// The catalog/material/container resolution happens on the main thread at enqueue (the
-/// worker has no [`AssetServer`]); the job carries the resolved bytes/materials so the
-/// worker only decodes + uploads + renders.
+/// A resolved `{asset, size}` thumbnail request: the classified content + its content-addressed
+/// cache stamp. The content carries the source bytes the hash folds; the main-graph render
+/// re-resolves the asset from the catalog by id.
 #[derive(Clone, Debug)]
 pub struct ThumbnailJob {
     /// The asset id.
@@ -265,337 +151,55 @@ pub struct ThumbnailJob {
     pub content: ThumbnailContent,
 }
 
-/// The handback bucket the worker fills and the main thread drains: the freshly uploaded
-/// GPU resources, keyed by their asset id, to insert into the caches.
-type TextureHandback = Vec<(Uuid, Arc<GpuTexture>)>;
-type MeshHandback = Vec<(Uuid, Arc<GpuMesh>)>;
-
-/// The mutex-guarded shared state between the worker thread and the main thread.
-///
-/// Guarded by one [`Mutex`], woken by a [`Condvar`].
-#[derive(Default)]
-pub struct WorkerState {
-    /// Pending jobs, FIFO.
-    queue: VecDeque<ThumbnailJob>,
-    /// Cache paths queued or running — dedup retries.
-    in_flight: HashSet<String>,
-    /// Cache paths that failed — settle to the type icon, never retried.
-    failed: HashSet<String>,
-    /// Finished texture uploads to hand back to the main-thread cache.
-    texture_handback: TextureHandback,
-    /// Finished mesh uploads to hand back to the main-thread cache.
-    mesh_handback: MeshHandback,
-    /// Teardown / project-switch signal: the loop returns on its next wake.
-    stop: bool,
+/// A preview-render subject — every asset kind maps to one. Rendered through the main forward+ graph
+/// on the offscreen thumbnail view. The host maps this to the control crate's `PreviewSubject` when
+/// draining [`AssetServer::preview_render_queue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewRenderKind {
+    /// A material asset, shaded on the dense displacement sphere by its catalog id.
+    Material(Uuid),
+    /// A texture map, shown in its role through an ephemeral single-slot material.
+    TextureRole {
+        /// The texture's catalog id.
+        tid: Uuid,
+        /// The texture's semantic role (albedo lit, normal bumped, height displaced, …).
+        role: TextureRole,
+    },
+    /// A standalone / embedded mesh, shown with the default material.
+    Mesh(Uuid),
+    /// A model container, shown as its instantiated forest.
+    Model(Uuid),
+    /// An HDRI, shown as a chrome ball reflecting the equirect (which also backs the tile).
+    Hdri(Uuid),
 }
 
-/// The off-thread thumbnail worker: a [`JoinHandle`] plus the shared [`WorkerState`]
-/// behind a [`Mutex`] + [`Condvar`].
-///
-/// [`Drop`] does **not** join — joining must happen *before* `wait_gpu_idle` / renderer
-/// teardown, so [`AssetServer::stop_thumbnail_worker`] joins explicitly.
-pub struct ThumbnailWorker {
-    /// The worker thread's join handle (`None` after an explicit stop+join).
-    handle: Option<JoinHandle<()>>,
-    /// The shared state + its wake condvar.
-    shared: Arc<(Mutex<WorkerState>, Condvar)>,
+/// One queued main-graph preview render: the subject, the square size, and the content-addressed
+/// cache path the rendered PNG is written to (and deduped on).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewRenderJob {
+    /// What to render.
+    pub kind: PreviewRenderKind,
+    /// The requested square pixel size.
+    pub size: u32,
+    /// The content-addressed cache path the rendered PNG is written to.
+    pub cache_path: String,
 }
 
-impl ThumbnailWorker {
-    /// Spawns the worker over `gpu` (a `'static` GPU seam the worker owns for its life).
-    ///
-    /// The worker binds its thread to the dedicated command pool, then loops:
-    /// wait → pop → decode + upload + render → handback / mark-failed.
-    fn spawn(gpu: Box<dyn ThumbnailGpu + Send>) -> Self {
-        let shared = Arc::new((Mutex::new(WorkerState::default()), Condvar::new()));
-        let worker_shared = Arc::clone(&shared);
-        let handle = std::thread::Builder::new()
-            .name("thumbnail-worker".to_owned())
-            .spawn(move || worker_loop(&worker_shared, gpu.as_ref()))
-            .expect("spawn thumbnail worker");
-        Self {
-            handle: Some(handle),
-            shared,
+/// Classifies a built job's content as the main-graph preview subject that renders it. Every asset
+/// kind maps to one — an HDRI to a chrome ball, any other texture role to the sphere in that role,
+/// a material to the sphere by id, a mesh/model to itself.
+fn preview_render_kind(content: &ThumbnailContent, id: Uuid) -> PreviewRenderKind {
+    match content {
+        ThumbnailContent::Material => PreviewRenderKind::Material(id),
+        ThumbnailContent::Texture(src) if src.role == TextureRole::Hdri => {
+            PreviewRenderKind::Hdri(id)
         }
-    }
-}
-
-/// The worker thread body: bind the pool, then wait → pop → generate → handback forever
-/// until `stop`.
-fn worker_loop(shared: &Arc<(Mutex<WorkerState>, Condvar)>, gpu: &dyn ThumbnailGpu) {
-    gpu.bind_worker_thread();
-    let (lock, cv) = &**shared;
-    loop {
-        let job = {
-            let mut state = lock.lock().expect("worker state mutex");
-            state = cv
-                .wait_while(state, |s| !s.stop && s.queue.is_empty())
-                .expect("worker condvar wait");
-            if state.stop {
-                return; // teardown / project switch: abandon any queued jobs.
-            }
-            state.queue.pop_front().expect("queue non-empty after wait")
-        };
-
-        let mut texture_out: TextureHandback = Vec::new();
-        let mut mesh_out: MeshHandback = Vec::new();
-        let png = generate_thumbnail(gpu, &job, &mut texture_out, &mut mesh_out);
-
-        let mut state = lock.lock().expect("worker state mutex");
-        state.in_flight.remove(&job.cache_path);
-        match png {
-            Ok(png) => {
-                if let Err(err) = write_thumbnail_cache(Path::new(&job.cache_path), &png.bytes) {
-                    tracing::warn!("{err}");
-                }
-                state.texture_handback.append(&mut texture_out);
-                state.mesh_handback.append(&mut mesh_out);
-            }
-            Err(err) => {
-                tracing::warn!("thumbnail {}: {err}", job.id.value());
-                // A missing thumbnail settles to the type icon — never retried.
-                state.failed.insert(job.cache_path.clone());
-            }
-        }
-    }
-}
-
-/// Decodes + uploads one texture (worker or sync path), recording the `(id, Arc)` for the
-/// cache handback. Returns the live `Arc<GpuTexture>` or `None` on a decode/upload failure
-/// (logged warn).
-fn upload_thumbnail_texture(
-    gpu: &dyn ThumbnailGpu,
-    src: &ThumbnailTextureSource,
-    handback: &mut TextureHandback,
-) -> Option<Arc<GpuTexture>> {
-    if src.hdr {
-        let decoded = if src.bytes.is_empty() {
-            decode_image_hdr(&src.path)
-        } else {
-            decode_image_from_memory_hdr(&src.bytes)
-        };
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                tracing::warn!("{err}");
-                return None;
-            }
-        };
-        let tex = match gpu.upload_texture_float(&decoded.rgba, decoded.width, decoded.height) {
-            Ok(tex) => tex,
-            Err(err) => {
-                tracing::warn!("{err}");
-                return None;
-            }
-        };
-        handback.push((src.id, Arc::clone(&tex)));
-        return Some(tex);
-    }
-    let decoded = if src.bytes.is_empty() {
-        decode_image(&src.path)
-    } else {
-        decode_image_from_memory(&src.bytes)
-    };
-    let decoded = match decoded {
-        Ok(decoded) => decoded,
-        Err(err) => {
-            tracing::warn!("{err}");
-            return None;
-        }
-    };
-    let tex = match gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, src.srgb) {
-        Ok(tex) => tex,
-        Err(err) => {
-            tracing::warn!("{err}");
-            return None;
-        }
-    };
-    handback.push((src.id, Arc::clone(&tex)));
-    Some(tex)
-}
-
-/// Generates the PNG for a resolved job — no cache write, no catalog/map access.
-///
-/// Uploaded GPU resources are appended to `texture_out` / `mesh_out` for the caller to
-/// cache. Runs on the worker thread (worker command pool, queue/bindless mutexes) or, with
-/// no worker, inline on the main thread.
-///
-/// # Errors
-///
-/// [`Error::Thumbnail`] when the asset fails to load/decode/render, propagating the
-/// renderer's failure message.
-/// The studio-sphere preview material for a standalone texture of role `role`, placing it in the
-/// role's slot with neutral factors elsewhere (neutral albedo = mid-grey) so the tile reads the
-/// map the way a surface uses it. `None` for a role with no lit-sphere preview: `Hdri` renders as a
-/// chrome ball upstream, and `Unknown`/`Gloss` keep the flat swatch. The interactive tab (phase 3)
-/// shades the same synthesized material through the real scene pass instead.
-fn texture_preview_material(role: TextureRole, tex: &Arc<GpuTexture>) -> Option<SubmeshMaterial> {
-    let grey = |v: f32| Vec4::new(v, v, v, 1.0);
-    let tex = Arc::clone(tex);
-    let mut m = SubmeshMaterial::defaults();
-    m.metallic = 0.0;
-    m.roughness = 0.6;
-    match role {
-        TextureRole::Albedo => {
-            m.albedo_texture = Some(tex);
-            m.base_color = Vec4::ONE;
-        }
-        TextureRole::Normal => {
-            m.normal_texture = Some(tex);
-            m.base_color = grey(0.6);
-        }
-        TextureRole::Roughness => {
-            m.metallic_roughness_texture = Some(tex);
-            m.roughness = 1.0;
-            m.base_color = grey(0.55);
-        }
-        TextureRole::Metallic => {
-            m.metallic_roughness_texture = Some(tex);
-            m.metallic = 1.0;
-            m.roughness = 0.35;
-            m.base_color = grey(0.8);
-        }
-        TextureRole::Ao => {
-            m.occlusion_texture = Some(tex);
-            m.base_color = grey(0.6);
-        }
-        TextureRole::Orm => {
-            m.metallic_roughness_texture = Some(Arc::clone(&tex));
-            m.occlusion_texture = Some(tex);
-            m.metallic = 1.0;
-            m.roughness = 1.0;
-            m.base_color = grey(0.6);
-        }
-        TextureRole::Height => {
-            m.height_texture = Some(tex);
-            m.base_color = grey(0.6);
-        }
-        TextureRole::Emissive => {
-            m.emissive_texture = Some(tex);
-            m.emissive = Vec3::ONE;
-            m.emissive_strength = 2.0;
-            m.base_color = grey(0.02);
-        }
-        TextureRole::Opacity => {
-            m.albedo_texture = Some(tex);
-            m.blend_mode = BlendMode::Masked;
-            m.alpha_cutoff = 0.5;
-            m.base_color = Vec4::ONE;
-        }
-        TextureRole::Gloss | TextureRole::Hdri | TextureRole::Unknown => return None,
-    }
-    Some(m)
-}
-
-fn generate_thumbnail(
-    gpu: &dyn ThumbnailGpu,
-    job: &ThumbnailJob,
-    texture_out: &mut TextureHandback,
-    mesh_out: &mut MeshHandback,
-) -> Result<ThumbnailPng> {
-    match &job.content {
-        ThumbnailContent::Texture(src) => {
-            let tex = upload_thumbnail_texture(gpu, src, texture_out)
-                .ok_or_else(|| Error::Thumbnail("texture failed to load".to_owned()))?;
-            // An HDRI previews as a static chrome ball reflecting the environment — a real 3D
-            // tile, consistent with the material/texture spheres. The interactive tab renders lit
-            // balls in the prefiltered environment; this cheap tile mirrors the raw equirect.
-            if src.role == TextureRole::Hdri {
-                let ball = gpu
-                    .render_hdri_ball_preview(&tex, job.size)
-                    .map_err(|e| Error::Thumbnail(e.to_string()))?;
-                return gpu
-                    .encode_texture_thumbnail_png(&ball, job.size, PngTransfer::Clamp)
-                    .map_err(|e| Error::Thumbnail(e.to_string()));
-            }
-            match texture_preview_material(src.role, &tex) {
-                // A routable role renders on the studio sphere in that role (albedo lit, normal
-                // bumped, roughness's highlight, AO darkened, emissive glowing, opacity cut out).
-                Some(material) => {
-                    let preview = gpu
-                        .render_material_preview(&material, job.size, None)
-                        .map_err(|e| Error::Thumbnail(e.to_string()))?;
-                    Ok(gpu
-                        .encode_texture_thumbnail_png(&preview, job.size, PngTransfer::Clamp)
-                        .map_err(|e| Error::Thumbnail(e.to_string()))?)
-                }
-                // Unknown / gloss: the flat clamped swatch (no meaningful lit or reflective tile).
-                None => {
-                    let transfer = if src.hdr {
-                        PngTransfer::Tonemap
-                    } else {
-                        PngTransfer::Clamp
-                    };
-                    Ok(gpu
-                        .encode_texture_thumbnail_png(&tex, job.size, transfer)
-                        .map_err(|e| Error::Thumbnail(e.to_string()))?)
-                }
-            }
-        }
-        ThumbnailContent::Mesh { path, bytes } => {
-            let mesh = if bytes.is_empty() {
-                load_mesh(path)?
-            } else {
-                load_mesh_from_bytes(bytes)?
-            };
-            let mesh_ref = gpu
-                .upload_mesh(&mesh, &[], None, None)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?;
-            mesh_out.push((job.id, Arc::clone(&mesh_ref)));
-            Ok(gpu
-                .encode_asset_thumbnail_png(&mesh_ref, job.size)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?)
-        }
-        ThumbnailContent::Material { material, textures } => {
-            let mut local: std::collections::HashMap<u64, Arc<GpuTexture>> =
-                std::collections::HashMap::new();
-            for src in textures {
-                if let Some(tex) = upload_thumbnail_texture(gpu, src, texture_out) {
-                    local.insert(src.id.value(), tex);
-                }
-            }
-            let sm = build_submesh_material(material, &mut |tid| local.get(&tid.value()).cloned());
-            // The disk-cached material tile renders through the default studio preview; the
-            // codegen `_preview.spv` path is reserved for the live `preview-render` command,
-            // which
-            // has the `AssetServer` to compile it.
-            let tex = gpu
-                .render_material_preview(&sm, job.size, None)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?;
-            Ok(gpu
-                .encode_texture_thumbnail_png(&tex, job.size, PngTransfer::Clamp)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?)
-        }
-        ThumbnailContent::Model {
-            meshes,
-            materials,
-            textures,
-        } => {
-            let mut local: std::collections::HashMap<u64, Arc<GpuTexture>> =
-                std::collections::HashMap::new();
-            for src in textures {
-                if let Some(tex) = upload_thumbnail_texture(gpu, src, texture_out) {
-                    local.insert(src.id.value(), tex);
-                }
-            }
-            let submesh_materials: Vec<SubmeshMaterial> = materials
-                .iter()
-                .map(|mat| build_submesh_material(mat, &mut |tid| local.get(&tid.value()).cloned()))
-                .collect();
-            // Decode each node chunk, bake its world transform, and merge into one mesh so the
-            // single-mesh render path frames the assembled forest by its full bounds.
-            let mut chunks = Vec::with_capacity(meshes.len());
-            for chunk in meshes {
-                chunks.push((load_mesh_from_bytes(&chunk.bytes)?, chunk.transform));
-            }
-            let mesh = merge_model_meshes(&chunks);
-            let mesh_ref = gpu
-                .upload_mesh(&mesh, &[], None, None)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?;
-            Ok(gpu
-                .encode_model_thumbnail_png(&mesh_ref, &submesh_materials, job.size)
-                .map_err(|e| Error::Thumbnail(e.to_string()))?)
-        }
+        ThumbnailContent::Texture(src) => PreviewRenderKind::TextureRole {
+            tid: id,
+            role: src.role,
+        },
+        ThumbnailContent::Mesh { .. } => PreviewRenderKind::Mesh(id),
+        ThumbnailContent::Model { .. } => PreviewRenderKind::Model(id),
     }
 }
 
@@ -705,7 +309,7 @@ fn content_hash_from_content(content: &ThumbnailContent) -> u64 {
             }
             h.0
         }
-        ThumbnailContent::Material { .. } => 0,
+        ThumbnailContent::Material => 0,
     }
 }
 
@@ -740,14 +344,13 @@ const THUMBNAIL_CACHE_MAX_BYTES: u64 = 1 << 30; // 1 GiB
 /// full eviction on every file.
 const THUMBNAIL_CACHE_EVICT_BYTES: u64 = THUMBNAIL_CACHE_MAX_BYTES / 5 * 4; // 80%
 
-/// Writes a generated PNG into the cache dir, creating the parent dir, then bounds the
-/// shared cache. Runs on the worker thread in production, so the eviction scan never touches
-/// the main-thread frame budget.
+/// Writes a generated PNG into the cache dir, creating the parent dir, then bounds the shared cache
+/// with a size-cap eviction.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] if the parent dir cannot be created or the file cannot be written.
-fn write_thumbnail_cache(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_thumbnail_cache(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
     }
@@ -799,25 +402,27 @@ fn evict_thumbnail_cache(dir: &Path, max: u64, target: u64) {
     }
 }
 
-/// Inserts handed-back GPU resources into the caches, skipping uuids already cached.
-/// Main thread only.
-fn insert_thumbnail_handback(
-    assets: &mut AssetServer,
-    textures: TextureHandback,
-    meshes: MeshHandback,
-) {
-    for (id, tex) in textures {
-        assets
-            .texture_by_uuid
-            .entry(id.value())
-            .or_insert(Some(tex));
-    }
-    for (id, mesh) in meshes {
-        assets.mesh_by_uuid.entry(id.value()).or_insert(Some(mesh));
-    }
-}
-
 impl AssetServer {
+    /// Whether any main-graph preview render is queued. Drives the host's render-activity reason so
+    /// the loop keeps full cadence until the queue drains.
+    #[must_use]
+    pub fn preview_render_pending(&self) -> bool {
+        !self.preview_render_queue.is_empty()
+    }
+
+    /// Pops up to `max` queued preview-render jobs for the host to render this tick (a small budget
+    /// offsets the K-frame converge cost of each tile).
+    pub fn take_preview_render_jobs(&mut self, max: usize) -> Vec<PreviewRenderJob> {
+        let n = max.min(self.preview_render_queue.len());
+        self.preview_render_queue.drain(..n).collect()
+    }
+
+    /// Clears a job's in-flight marker after the host renders (or fails to render) it, so a later
+    /// re-request re-enqueues if the cache miss recurs (e.g. after an eviction).
+    pub fn finish_preview_render(&mut self, cache_path: &str) {
+        self.preview_render_in_flight.remove(cache_path);
+    }
+
     /// The cache path for a content hash + size (`v<VERSION>-<contentHash>-<size>.png` under the
     /// app-level thumbnail cache dir). The [`THUMBNAIL_CACHE_VERSION`] prefix makes a version bump
     /// retire every kind's tiles (mesh/texture/model key on the stored `content_hash`, which carries
@@ -858,76 +463,12 @@ impl AssetServer {
         }
         removed
     }
-
-    /// Starts the off-thread thumbnail worker over `gpu` (a `'static` GPU seam), if not
-    /// already running.
-    ///
-    /// The caller must have prewarmed the renderer's lazy preview pipelines on the main
-    /// thread first, so the worker never races their
-    /// first-use initialization. Idempotent: a second call while a worker runs is a no-op.
-    pub fn start_thumbnail_worker(&mut self, gpu: Box<dyn ThumbnailGpu + Send>) {
-        if self.thumbnail_worker.is_some() {
-            return;
-        }
-        self.thumbnail_worker = Some(ThumbnailWorker::spawn(gpu));
-    }
-
-    /// Sets `stop`, notifies, and joins the worker thread, then drops it.
-    ///
-    /// Called **before** `wait_gpu_idle` / renderer teardown: the worker's last submit's
-    /// fences have completed and its un-handed-back textures are referenced by no frame, so
-    /// dropping them here frees their GPU resources safely.
-    pub fn stop_thumbnail_worker(&mut self) {
-        let Some(mut worker) = self.thumbnail_worker.take() else {
-            return;
-        };
-        let (lock, cv) = &*worker.shared;
-        {
-            let mut state = lock.lock().expect("worker state mutex");
-            state.stop = true;
-        }
-        cv.notify_all();
-        if let Some(handle) = worker.handle.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// Drains the worker's finished uploads into the GPU caches. Call once per frame on the
-    /// main thread.
-    pub fn drain_thumbnail_completions(&mut self) {
-        let Some(worker) = self.thumbnail_worker.as_ref() else {
-            return;
-        };
-        let (lock, _cv) = &*worker.shared;
-        let (textures, meshes) = {
-            let mut state = lock.lock().expect("worker state mutex");
-            (
-                std::mem::take(&mut state.texture_handback),
-                std::mem::take(&mut state.mesh_handback),
-            )
-        };
-        insert_thumbnail_handback(self, textures, meshes);
-    }
 }
 
-/// Abandons the worker's queue + dedup/failed state + un-drained handbacks (a project
-/// switch, GPU idle at the call site). Standalone so [`AssetServer::clear_thumbnail_queue`]
-/// (defined in `lib.rs`, called by `clear_asset_caches`) can drive it without a borrow
-/// tangle.
-pub(crate) fn clear_worker_queue(worker: &ThumbnailWorker) {
-    let (lock, _cv) = &*worker.shared;
-    let mut state = lock.lock().expect("worker state mutex");
-    state.queue.clear();
-    state.in_flight.clear();
-    state.failed.clear();
-    state.texture_handback.clear();
-    state.mesh_handback.clear();
-}
-
-/// Builds the resolved [`ThumbnailJob`] for `{id, size}` from the catalog/material/
-/// container state, plus its cache stamp. Runs on the main thread (the worker has no
-/// [`AssetServer`]). Returns the job alone — the caller decides cache-hit vs. enqueue vs.
-/// sync. The catalog/material resolution half of the thumbnail request.
+/// Builds the resolved [`ThumbnailJob`] for `{id, size}` from the catalog/material/container state,
+/// plus its cache stamp. Returns the job alone — the caller decides cache-hit vs. enqueue. The
+/// catalog/material resolution half of the thumbnail request (a material's live hash, or a
+/// legacy-`0` mesh/model/texture row self-healed from its source bytes).
 ///
 /// # Errors
 ///
@@ -944,27 +485,12 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
     // stored catalog `content_hash`, so the arm returns `Some(hash)` only for a material.
     let (content, material_hash): (ThumbnailContent, Option<u64>) = match entry.asset_type {
         AssetType::Material => {
+            // The material only needs its live resolved hash; the main-graph render re-resolves the
+            // material + its textures from the catalog by id, so no payload is gathered here.
             let material = crate::material::load_catalog_material_asset(assets, id)?;
-            let hash = thumbnail_material_hash(&material);
-            let textures = if entry.container.value() == 0 {
-                resolve_material_textures(assets, &material)
-            } else {
-                let container = assets.load_model_asset(entry.container).ok_or_else(|| {
-                    Error::Thumbnail(format!("model {} is not loadable", entry.container.value()))
-                })?;
-                let mut textures = Vec::new();
-                let mut added = HashSet::new();
-                for tid in material_texture_ids(&material) {
-                    add_model_texture(assets, &container, tid, &mut added, &mut textures);
-                }
-                textures
-            };
             (
-                ThumbnailContent::Material {
-                    material: Box::new(material),
-                    textures,
-                },
-                Some(hash),
+                ThumbnailContent::Material,
+                Some(thumbnail_material_hash(&material)),
             )
         }
         // An embedded texture sub-asset lives inside its `.smodel`; read the chunk bytes
@@ -1061,9 +587,8 @@ fn build_thumbnail_job(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<
     })
 }
 
-/// Resolves an embedded mesh or a model's preview job: slice the primary mesh chunk on the
-/// main thread (the worker parses the bytes we hand it), and for a model resolve each
-/// material slot + its referenced textures.
+/// Resolves an embedded mesh or a model's preview job: slice the primary mesh chunk, and for a
+/// model resolve each material slot + its referenced textures — the inputs the content hash folds.
 fn build_embedded_job(
     assets: &mut AssetServer,
     id: Uuid,
@@ -1136,8 +661,8 @@ fn build_embedded_job(
         )));
     }
 
-    // Textured model preview: resolve each material slot (sub-asset order matches the
-    // submesh material slot) and hand the worker each referenced texture's bytes.
+    // Textured model preview: resolve each material slot (sub-asset order matches the submesh
+    // material slot) and gather each referenced texture's bytes for the content hash.
     let sub_assets = container.meta.sub_assets.clone();
     let mut materials = Vec::new();
     let mut textures = Vec::new();
@@ -1190,44 +715,6 @@ fn node_world_transforms(nodes: &[saffron_geometry::ImportedNode]) -> Vec<Mat4> 
         .collect()
 }
 
-/// Bakes each chunk's world transform into its vertices (normals through the inverse-transpose)
-/// and concatenates them into one mesh, rebasing every submesh's indices onto the shared vertex
-/// stream. Material slots are preserved (the container's material table is shared across nodes).
-fn merge_model_meshes(chunks: &[(Mesh, Mat4)]) -> Mesh {
-    let mut out = Mesh::default();
-    for (mesh, world) in chunks {
-        let linear = Mat3::from_mat4(*world);
-        let normal_mat = linear.inverse().transpose();
-        let base_vertex = out.vertices.len() as i64;
-        for v in &mesh.vertices {
-            let tangent =
-                (linear * Vec3::new(v.tangent[0], v.tangent[1], v.tangent[2])).normalize_or_zero();
-            out.vertices.push(Vertex {
-                position: world.transform_point3(v.position),
-                normal: (normal_mat * v.normal).normalize_or_zero(),
-                uv0: v.uv0,
-                tangent: [tangent.x, tangent.y, tangent.z, v.tangent[3]],
-            });
-        }
-        for sm in &mesh.submeshes {
-            let first_index = out.indices.len() as u32;
-            let start = sm.first_index as usize;
-            let end = start + sm.index_count as usize;
-            for &idx in &mesh.indices[start..end] {
-                let rebased = i64::from(idx) + i64::from(sm.vertex_offset) + base_vertex;
-                out.indices.push(rebased as u32);
-            }
-            out.submeshes.push(Submesh {
-                first_index,
-                index_count: sm.index_count,
-                vertex_offset: 0,
-                material_slot: sm.material_slot,
-            });
-        }
-    }
-    out
-}
-
 /// The five texture slot ids of a material, in slot order.
 fn material_texture_ids(m: &MaterialAsset) -> [Uuid; 5] {
     [
@@ -1237,33 +724,6 @@ fn material_texture_ids(m: &MaterialAsset) -> [Uuid; 5] {
         m.emissive_texture,
         m.height_texture,
     ]
-}
-
-/// Resolves a standalone material's referenced textures to [`ThumbnailTextureSource`]s
-/// (file paths + colorspace from the catalog rows).
-fn resolve_material_textures(
-    assets: &AssetServer,
-    material: &MaterialAsset,
-) -> Vec<ThumbnailTextureSource> {
-    let mut out = Vec::new();
-    for tid in material_texture_ids(material) {
-        if tid.value() == 0 {
-            continue;
-        }
-        if let Some(te) = assets.catalog.find(tid)
-            && te.asset_type == AssetType::Texture
-        {
-            out.push(ThumbnailTextureSource {
-                id: tid,
-                path: format!("{}/{}", assets.root.display(), te.path),
-                hdr: te.hdr,
-                srgb: !te.linear,
-                role: te.role,
-                bytes: Vec::new(),
-            });
-        }
-    }
-    out
 }
 
 /// Resolves one of a model's textures into `textures` (dedup via `added`): an embedded
@@ -1333,8 +793,8 @@ fn ready_reply(png: ThumbnailPng) -> ThumbnailReply {
     }
 }
 
-/// Resolves `{asset, size}` to a thumbnail over `gpu` — a cache hit returns the PNG, a
-/// miss generates it (sync when there is no worker, else enqueued with a `pending` reply).
+/// Resolves `{asset, size}` to a thumbnail — a cache hit returns the PNG; a miss enqueues a
+/// main-graph render and replies `pending` (the host drains the queue, the editor repolls).
 ///
 /// The cache is content-addressed: a mesh/texture/model keys on the catalog `content_hash`
 /// (checked before any container load), a material on its live resolved state.
@@ -1343,30 +803,33 @@ fn ready_reply(png: ThumbnailPng) -> ThumbnailReply {
 ///
 /// [`Error::NotInCatalog`] for a missing id, [`Error::Thumbnail`] for an asset with no
 /// thumbnail / a failed generation / a previously-failed cache key.
-pub fn request_thumbnail(
-    assets: &mut AssetServer,
-    gpu: &dyn ThumbnailGpu,
-    id: Uuid,
-    size: u32,
-) -> Result<ThumbnailReply> {
+pub fn request_thumbnail(assets: &mut AssetServer, id: Uuid, size: u32) -> Result<ThumbnailReply> {
     let entry = assets
         .catalog
         .find(id)
         .ok_or(Error::NotInCatalog(id.value()))?
         .clone();
 
-    // Cheap content-addressed hit: a mesh/texture/model carries a stored content hash, so the
-    // cache is checked WITHOUT loading the container — the boot-hitch fix. Materials key on
-    // their live resolved state, so they fall through to the job build (cheap for a standalone
-    // `.smat`, a container read for an embedded one).
+    // Texture / mesh / model carry a stored content hash: resolve the cache path + preview subject
+    // WITHOUT loading the container or building a render payload (the boot-hitch fix; it also skips
+    // the model-forest slice). A cache hit returns; a miss enqueues the main-graph render. A material
+    // keys on its live resolved state, so it falls through to the job build below.
     if matches!(
         entry.asset_type,
         AssetType::Texture | AssetType::Mesh | AssetType::Model
     ) && entry.content_hash != 0
-        && let Some(hit) =
-            read_thumbnail_cache(&assets.thumbnail_content_cache_path(entry.content_hash, size))
     {
-        return Ok(ready_reply(hit));
+        let cache_path = assets.thumbnail_content_cache_path(entry.content_hash, size);
+        if let Some(hit) = read_thumbnail_cache(&cache_path) {
+            return Ok(ready_reply(hit));
+        }
+        let kind = entry_preview_kind(&entry, id);
+        return Ok(enqueue_preview_render(
+            assets,
+            kind,
+            size,
+            cache_path.display().to_string(),
+        ));
     }
 
     let job = build_thumbnail_job(assets, id, size)?;
@@ -1386,260 +849,66 @@ pub fn request_thumbnail(
         return Ok(ready_reply(hit));
     }
 
-    // No worker, or no cache key to dedup/persist against: generate inline on the calling
-    // thread and return the result directly.
-    if assets.thumbnail_worker.is_none() || job.cache_path.is_empty() {
-        let mut texture_out = Vec::new();
-        let mut mesh_out = Vec::new();
-        let png = generate_thumbnail(gpu, &job, &mut texture_out, &mut mesh_out)?;
-        insert_thumbnail_handback(assets, texture_out, mesh_out);
-        if !job.cache_path.is_empty() {
-            if let Err(err) = write_thumbnail_cache(Path::new(&job.cache_path), &png.bytes) {
-                tracing::warn!("{err}");
-            }
-        }
-        return Ok(ready_reply(png));
+    if job.cache_path.is_empty() {
+        // No content hash to cache / dedup against (unreadable bytes) — settle to the type icon.
+        return Err(Error::Thumbnail(format!(
+            "asset {} has no cacheable thumbnail content",
+            id.value()
+        )));
     }
+    let kind = preview_render_kind(&job.content, job.id);
+    Ok(enqueue_preview_render(assets, kind, size, job.cache_path))
+}
 
-    // Worker path: dedup on the cache path, enqueue once, reply pending.
-    let worker = assets.thumbnail_worker.as_ref().expect("worker present");
-    let (lock, cv) = &*worker.shared;
-    let mut state = lock.lock().expect("worker state mutex");
-    if state.failed.contains(&job.cache_path) {
-        return Err(Error::Thumbnail("thumbnail generation failed".to_owned()));
+/// The preview subject a texture / mesh / model catalog entry renders as — classified from its type
+/// and role alone, no payload build.
+fn entry_preview_kind(entry: &saffron_scene::AssetEntry, id: Uuid) -> PreviewRenderKind {
+    match entry.asset_type {
+        AssetType::Mesh => PreviewRenderKind::Mesh(id),
+        AssetType::Model => PreviewRenderKind::Model(id),
+        AssetType::Texture if entry.role == TextureRole::Hdri => PreviewRenderKind::Hdri(id),
+        AssetType::Texture => PreviewRenderKind::TextureRole {
+            tid: id,
+            role: entry.role,
+        },
+        _ => unreachable!("only texture/mesh/model reach the stored-hash cheap path"),
     }
-    if !state.in_flight.contains(&job.cache_path) {
-        state.in_flight.insert(job.cache_path.clone());
-        state.queue.push_back(job);
-        cv.notify_one();
+}
+
+/// Enqueue a main-graph preview render, deduped on the cache path, and reply `pending`; the editor
+/// repolls and hits the written cache.
+fn enqueue_preview_render(
+    assets: &mut AssetServer,
+    kind: PreviewRenderKind,
+    size: u32,
+    cache_path: String,
+) -> ThumbnailReply {
+    if !assets.preview_render_in_flight.contains(&cache_path) {
+        assets.preview_render_in_flight.insert(cache_path.clone());
+        assets.preview_render_queue.push_back(PreviewRenderJob {
+            kind,
+            size,
+            cache_path,
+        });
     }
-    Ok(ThumbnailReply {
+    ThumbnailReply {
         png: Vec::new(),
         width: 0,
         height: 0,
         pending: true,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
 
     use saffron_geometry::glam::{Vec2, Vec3};
     use saffron_geometry::{
         ContainerChunk, Mesh, Submesh, Vertex, save_mesh_to_buffer, write_container,
     };
-    use saffron_rendering::{
-        BindlessFreeList, Descriptors, Device, GpuQueue, SurfaceSource, Uploader,
-    };
 
-    /// A counting GPU seam over a *real* headless device: the upload trio performs the
-    /// genuine upload (so the handback `Arc<GpuTexture>`/`Arc<GpuMesh>` are real GPU
-    /// resources that drop correctly), while the render-to-PNG primitives count their
-    /// calls and return a fixed PNG (no scene render needed to prove the worker mechanism).
-    /// Owns its `Uploader` + `Descriptors`, so it is `'static + Send` and the worker thread
-    /// can own it for its whole life (the production seam shape).
-    struct CountingThumbGpu {
-        uploader: Uploader,
-        descriptors: Descriptors,
-        binds: Arc<AtomicUsize>,
-        texture_uploads: Arc<AtomicUsize>,
-        mesh_uploads: Arc<AtomicUsize>,
-        renders: Arc<AtomicUsize>,
-        fail_render: bool,
-    }
-
-    impl GpuUploader for CountingThumbGpu {
-        fn upload_mesh(
-            &self,
-            mesh: &Mesh,
-            skin: &[saffron_geometry::VertexSkin],
-            morph: Option<&saffron_geometry::MorphData>,
-            sdf_bake: Option<&saffron_rendering::SdfBake>,
-        ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-            self.mesh_uploads.fetch_add(1, Ordering::SeqCst);
-            self.uploader
-                .upload_mesh(&self.descriptors, mesh, skin, morph, sdf_bake)
-        }
-
-        fn upload_texture(
-            &self,
-            rgba: &[u8],
-            width: u32,
-            height: u32,
-            srgb: bool,
-        ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-            self.texture_uploads.fetch_add(1, Ordering::SeqCst);
-            self.uploader
-                .upload_texture(&self.descriptors, rgba, width, height, srgb)
-        }
-
-        fn upload_texture_float(
-            &self,
-            rgba: &[f32],
-            width: u32,
-            height: u32,
-        ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-            self.texture_uploads.fetch_add(1, Ordering::SeqCst);
-            self.uploader
-                .upload_texture_float(&self.descriptors, rgba, width, height)
-        }
-
-        fn skinning_enabled(&self) -> bool {
-            false
-        }
-    }
-
-    impl ThumbnailGpu for CountingThumbGpu {
-        fn bind_worker_thread(&self) {
-            self.binds.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn encode_texture_thumbnail_png(
-            &self,
-            _texture: &Arc<GpuTexture>,
-            size: u32,
-            _transfer: PngTransfer,
-        ) -> saffron_rendering::Result<ThumbnailPng> {
-            self.renders.fetch_add(1, Ordering::SeqCst);
-            if self.fail_render {
-                return Err(saffron_rendering::Error::EmptyMesh);
-            }
-            Ok(test_png(size))
-        }
-
-        fn encode_asset_thumbnail_png(
-            &self,
-            _mesh: &Arc<GpuMesh>,
-            size: u32,
-        ) -> saffron_rendering::Result<ThumbnailPng> {
-            self.renders.fetch_add(1, Ordering::SeqCst);
-            if self.fail_render {
-                return Err(saffron_rendering::Error::EmptyMesh);
-            }
-            Ok(test_png(size))
-        }
-
-        fn encode_model_thumbnail_png(
-            &self,
-            _mesh: &Arc<GpuMesh>,
-            _submesh_materials: &[SubmeshMaterial],
-            size: u32,
-        ) -> saffron_rendering::Result<ThumbnailPng> {
-            self.renders.fetch_add(1, Ordering::SeqCst);
-            Ok(test_png(size))
-        }
-
-        fn render_material_preview(
-            &self,
-            _material: &SubmeshMaterial,
-            _size: u32,
-            _shader_spv: Option<&Path>,
-        ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-            self.renders.fetch_add(1, Ordering::SeqCst);
-            // A 1×1 white texture stands in for the rendered sphere.
-            self.uploader
-                .upload_texture(&self.descriptors, &[255, 255, 255, 255], 1, 1, true)
-        }
-
-        fn render_hdri_ball_preview(
-            &self,
-            _hdri: &Arc<GpuTexture>,
-            _size: u32,
-        ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-            self.renders.fetch_add(1, Ordering::SeqCst);
-            // A 1×1 white texture stands in for the rendered chrome ball.
-            self.uploader
-                .upload_texture(&self.descriptors, &[255, 255, 255, 255], 1, 1, true)
-        }
-    }
-
-    /// Serializes the GPU-backed worker tests: each spawns a thread that submits on its
-    /// own queue, and the software Vulkan stack (lavapipe) cannot have two devices + two
-    /// worker threads live and tearing down at once. Only one fixture exists at a time.
-    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A live headless device + the owning GPU seam, or `None` (no Vulkan ICD) so the
-    /// GPU-backed tests skip rather than fail off-hardware. Holds the `Device` so it
-    /// outlives the worker, plus the process-wide [`GPU_LOCK`] guard so no two fixtures
-    /// race the software Vulkan stack.
-    struct GpuFixture {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        device: Device,
-        free_list: BindlessFreeList,
-        queue: GpuQueue,
-        binds: Arc<AtomicUsize>,
-        texture_uploads: Arc<AtomicUsize>,
-        mesh_uploads: Arc<AtomicUsize>,
-        renders: Arc<AtomicUsize>,
-    }
-
-    fn gpu_or_skip() -> Option<GpuFixture> {
-        let guard = GPU_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let device = match Device::new(&SurfaceSource::Offscreen) {
-            Ok(device) => device,
-            Err(err) => {
-                eprintln!("skipping (no Vulkan device): {err}");
-                return None;
-            }
-        };
-        let free_list: BindlessFreeList = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let queue = GpuQueue::new(device.graphics_queue);
-        Some(GpuFixture {
-            _guard: guard,
-            device,
-            free_list,
-            queue,
-            binds: Arc::new(AtomicUsize::new(0)),
-            texture_uploads: Arc::new(AtomicUsize::new(0)),
-            mesh_uploads: Arc::new(AtomicUsize::new(0)),
-            renders: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    impl GpuFixture {
-        /// Builds an owning GPU seam sharing this fixture's counters + free-list.
-        fn seam(&self, fail_render: bool) -> CountingThumbGpu {
-            let descriptors = Descriptors::new(&self.device, &self.free_list).expect("descriptors");
-            let uploader = Uploader::new(&self.device, &self.queue).expect("uploader");
-            CountingThumbGpu {
-                uploader,
-                descriptors,
-                binds: Arc::clone(&self.binds),
-                texture_uploads: Arc::clone(&self.texture_uploads),
-                mesh_uploads: Arc::clone(&self.mesh_uploads),
-                renders: Arc::clone(&self.renders),
-                fail_render,
-            }
-        }
-
-        /// Idle the GPU, drop the caches, then the device — the README §3 discipline.
-        fn teardown(self, mut assets: AssetServer) {
-            self.device.wait_idle().expect("idle before teardown");
-            assets.clear_asset_caches();
-            drop(assets);
-            drop(self.device);
-        }
-    }
-
-    /// A minimal valid PNG of `size`×`size`, so a cache write + header read-back round-trip.
-    fn test_png(size: u32) -> ThumbnailPng {
-        let s = size.max(1);
-        let buffer = image::RgbaImage::from_pixel(s, s, image::Rgba([200, 100, 50, 255]));
-        let mut out = std::io::Cursor::new(Vec::new());
-        buffer
-            .write_to(&mut out, image::ImageFormat::Png)
-            .expect("encode png");
-        ThumbnailPng {
-            bytes: out.into_inner(),
-            width: s,
-            height: s,
-        }
-    }
-
-    /// A baked `.smesh` byte image (a single-triangle mesh) the worker decodes + uploads.
+    /// A baked `.smesh` byte image (a single-triangle mesh) used to seed catalog rows.
     fn smesh_bytes() -> Vec<u8> {
         let mesh = Mesh {
             vertices: vec![
@@ -1673,22 +942,6 @@ mod tests {
         save_mesh_to_buffer(&mesh, &[], None).unwrap()
     }
 
-    /// Blocks until `predicate(state)` holds or a deadline passes, polling the worker state
-    /// — a deterministic settle without a sleep race.
-    fn wait_until<F: Fn(&WorkerState) -> bool>(worker: &ThumbnailWorker, predicate: F) -> bool {
-        let (lock, _cv) = &*worker.shared;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            if predicate(&lock.lock().expect("mutex")) {
-                return true;
-            }
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            std::thread::yield_now();
-        }
-    }
-
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "saffron-thumb-{tag}-{}-{:?}",
@@ -1701,24 +954,12 @@ mod tests {
 
     /// An asset server whose content-addressed thumbnail cache is isolated to a unique temp
     /// dir. The production cache is app-level (shared), so tests must point it at their own
-    /// dir to get a cold miss and exercise the worker/generate path deterministically.
+    /// dir to get a cold miss and exercise the resolve/enqueue path deterministically.
     fn isolated_server(root: &Path) -> AssetServer {
         let mut assets = AssetServer::new(root);
         assets.thumbnail_cache_root = root.parent().unwrap_or(root).join("thumbnail-cache");
         let _ = std::fs::remove_dir_all(&assets.thumbnail_cache_root);
         assets
-    }
-
-    fn put_mesh_row(assets: &mut AssetServer, id: Uuid) {
-        std::fs::create_dir_all(assets.root.join("models")).expect("models dir");
-        std::fs::write(assets.root.join("models/m.smesh"), smesh_bytes()).expect("smesh");
-        assets.catalog.put(saffron_scene::AssetEntry {
-            id,
-            name: "m".to_owned(),
-            asset_type: AssetType::Mesh,
-            path: "models/m.smesh".to_owned(),
-            ..Default::default()
-        });
     }
 
     fn put_embedded_material_model(
@@ -1814,222 +1055,101 @@ mod tests {
         };
         put_embedded_material_model(&mut assets, Uuid(13_000), Uuid(13_002), &material);
 
-        let job = build_thumbnail_job(&mut assets, Uuid(13_002), 64).expect("job");
-        let ThumbnailContent::Material {
-            material: loaded, ..
-        } = job.content
-        else {
-            panic!("material thumbnail content");
-        };
+        // The embedded material resolves from its container chunk.
+        let loaded = crate::material::load_catalog_material_asset(&mut assets, Uuid(13_002))
+            .expect("embedded material resolves");
         assert_eq!(loaded.base_color, material.base_color);
         assert_eq!(loaded.unlit, material.unlit);
+
+        // The job classifies it as a material keyed on that live resolved state.
+        let job = build_thumbnail_job(&mut assets, Uuid(13_002), 64).expect("job");
+        assert!(matches!(job.content, ThumbnailContent::Material));
+        assert_eq!(job.content_hash, thumbnail_material_hash(&loaded));
     }
 
+    /// Every content kind classifies to a main-graph preview subject: material/texture on the sphere,
+    /// HDRI to the chrome ball, mesh/model to itself.
     #[test]
-    fn worker_decodes_uploads_and_drains_into_the_mesh_cache() {
-        let Some(gpu) = gpu_or_skip() else { return };
-        let root = temp_root("drain");
-        let mut assets = isolated_server(&root);
-        put_mesh_row(&mut assets, Uuid(5000));
-
-        assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
-        let reply = request_thumbnail(&mut assets, &gpu.seam(false), Uuid(5000), 64).expect("req");
-        assert!(reply.pending, "the worker path replies pending");
-
-        let worker = assets.thumbnail_worker.as_ref().expect("worker");
-        assert!(
-            wait_until(worker, |s| !s.mesh_handback.is_empty()),
-            "the worker uploads + hands back the mesh"
-        );
-        assert_eq!(gpu.binds.load(Ordering::SeqCst), 1, "bound its pool once");
-        assert!(gpu.mesh_uploads.load(Ordering::SeqCst) >= 1);
-        assert!(gpu.renders.load(Ordering::SeqCst) >= 1);
-
-        assets.drain_thumbnail_completions();
-        assert!(
-            assets.mesh_by_uuid.get(&5000).is_some_and(Option::is_some),
-            "the drained Arc lands in the mesh cache"
-        );
-
-        assets.stop_thumbnail_worker();
-        gpu.teardown(assets);
-    }
-
-    #[test]
-    fn enqueuing_the_same_cache_path_twice_yields_one_cache_file() {
-        let Some(gpu) = gpu_or_skip() else { return };
-        let root = temp_root("dedup");
-        let mut assets = isolated_server(&root);
-        put_mesh_row(&mut assets, Uuid(6000));
-
-        assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
-        let r1 = request_thumbnail(&mut assets, &gpu.seam(false), Uuid(6000), 64).expect("r1");
-        assert!(r1.pending);
-        let r2 = request_thumbnail(&mut assets, &gpu.seam(false), Uuid(6000), 64).expect("r2");
-        assert!(
-            r2.pending || !r2.png.is_empty(),
-            "deduped pending or already cached"
-        );
-
-        let worker = assets.thumbnail_worker.as_ref().expect("worker");
-        assert!(wait_until(worker, |s| s.in_flight.is_empty()));
-        // The two identical requests dedup to one job, which writes the one content-addressed
-        // file for that mesh's hash (backfilled onto the row by the self-heal on the miss).
-        let hash = assets.catalog.find(Uuid(6000)).expect("row").content_hash;
-        assert_ne!(hash, 0, "the self-heal backfilled the content hash");
-        assert!(
-            assets.thumbnail_content_cache_path(hash, 64).exists(),
-            "the dedup'd job produced its one content-addressed cache file"
-        );
-
-        assets.stop_thumbnail_worker();
-        gpu.teardown(assets);
-    }
-
-    #[test]
-    fn a_failing_job_marks_failed_and_is_not_retried() {
-        let Some(gpu) = gpu_or_skip() else { return };
-        let root = temp_root("fail");
-        let mut assets = isolated_server(&root);
-        put_mesh_row(&mut assets, Uuid(7000));
-
-        assets.start_thumbnail_worker(Box::new(gpu.seam(true)));
-        let r1 = request_thumbnail(&mut assets, &gpu.seam(true), Uuid(7000), 64).expect("r1");
-        assert!(r1.pending);
-
-        let worker = assets.thumbnail_worker.as_ref().expect("worker");
-        assert!(
-            wait_until(worker, |s| !s.failed.is_empty()),
-            "the failing job marks the cache path failed"
-        );
-        let renders_after_fail = gpu.renders.load(Ordering::SeqCst);
-
-        let r2 = request_thumbnail(&mut assets, &gpu.seam(true), Uuid(7000), 64);
-        assert!(r2.is_err(), "a failed cache key is not retried");
+    fn preview_render_kind_routes_every_content_to_the_main_graph() {
         assert_eq!(
-            gpu.renders.load(Ordering::SeqCst),
-            renders_after_fail,
-            "no re-render after the failure"
+            preview_render_kind(&ThumbnailContent::Material, Uuid(1)),
+            PreviewRenderKind::Material(Uuid(1))
         );
 
-        assets.stop_thumbnail_worker();
-        gpu.teardown(assets);
-    }
-
-    #[test]
-    fn stop_joins_before_a_recorded_wait_gpu_idle() {
-        let Some(gpu) = gpu_or_skip() else { return };
-        let root = temp_root("stop");
-        let mut assets = isolated_server(&root);
-        assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
-        assert!(assets.thumbnail_worker.is_some());
-
-        // The host teardown order: stop (join) BEFORE wait_gpu_idle. Record both.
-        let (tx, rx) = mpsc::channel::<&'static str>();
-        assets.stop_thumbnail_worker();
-        tx.send("stop").expect("send");
-        tx.send("wait_gpu_idle").expect("send");
-        assert_eq!(rx.recv().unwrap(), "stop");
-        assert_eq!(rx.recv().unwrap(), "wait_gpu_idle");
-        assert!(assets.thumbnail_worker.is_none(), "worker joined + dropped");
-
-        // A redundant stop is a no-op (no panic / deadlock).
-        assets.stop_thumbnail_worker();
-        gpu.teardown(assets);
-    }
-
-    #[test]
-    fn clear_thumbnail_queue_empties_queue_dedup_and_handbacks() {
-        let Some(gpu) = gpu_or_skip() else { return };
-        let root = temp_root("clear");
-        let mut assets = isolated_server(&root);
-        put_mesh_row(&mut assets, Uuid(9100));
-        assets.start_thumbnail_worker(Box::new(gpu.seam(false)));
-
-        // Produce a real handback Arc on the main thread (a single live seam, kept alive
-        // for the test), and a queued job — without ever waking the worker, so the worker
-        // thread never races a GPU submit. Then signal stop and let the worker exit before
-        // we seed/clear, so `clear_thumbnail_queue` operates against a quiescent worker.
-        let inline = gpu.seam(false);
-        let mut tex_out = Vec::new();
-        let mut mesh_out = Vec::new();
-        let job = build_thumbnail_job(&mut assets, Uuid(9100), 32).expect("job");
-        let _ = generate_thumbnail(&inline, &job, &mut tex_out, &mut mesh_out).expect("gen");
-
-        // Park the worker thread (stop without taking it from the server), then seed every
-        // bucket and clear — no live consumer, no GPU race.
-        let worker = assets.thumbnail_worker.as_ref().expect("worker");
-        {
-            let (lock, cv) = &*worker.shared;
-            lock.lock().expect("mutex").stop = true;
-            cv.notify_all();
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !worker.handle.as_ref().is_some_and(JoinHandle::is_finished) {
-            assert!(std::time::Instant::now() < deadline, "worker exits on stop");
-            std::thread::yield_now();
-        }
-        {
-            let (lock, _cv) = &*worker.shared;
-            let mut state = lock.lock().expect("mutex");
-            state.in_flight.insert("a".to_owned());
-            state.failed.insert("b".to_owned());
-            state.queue.push_back(job);
-            state.mesh_handback.append(&mut mesh_out);
-        }
-
-        assets.clear_thumbnail_queue();
-
-        {
-            let worker = assets.thumbnail_worker.as_ref().expect("worker");
-            let (lock, _cv) = &*worker.shared;
-            let state = lock.lock().expect("mutex");
-            assert!(state.queue.is_empty());
-            assert!(state.in_flight.is_empty());
-            assert!(state.failed.is_empty());
-            assert!(state.texture_handback.is_empty());
-            assert!(
-                state.mesh_handback.is_empty(),
-                "the un-drained handback is dropped"
+        let texture = |role| {
+            ThumbnailContent::Texture(ThumbnailTextureSource {
+                role,
+                ..ThumbnailTextureSource::default()
+            })
+        };
+        // A non-HDRI role (incl. gloss / unknown) shows in its role on the sphere.
+        for role in [
+            TextureRole::Normal,
+            TextureRole::Gloss,
+            TextureRole::Unknown,
+        ] {
+            assert_eq!(
+                preview_render_kind(&texture(role), Uuid(2)),
+                PreviewRenderKind::TextureRole { tid: Uuid(2), role }
             );
         }
-        drop(inline);
-
-        assets.stop_thumbnail_worker();
-        gpu.teardown(assets);
-    }
-
-    #[test]
-    fn sync_fallback_generates_inline_when_no_worker() {
-        let Some(gpu) = gpu_or_skip() else { return };
-        let root = temp_root("sync");
-        let mut assets = isolated_server(&root);
-        put_mesh_row(&mut assets, Uuid(8000));
-
-        // No worker started: the request generates inline and returns the PNG directly.
-        let reply = request_thumbnail(&mut assets, &gpu.seam(false), Uuid(8000), 32).expect("req");
-        assert!(
-            !reply.pending,
-            "the sync fallback returns the result directly"
+        // An HDRI is the chrome ball.
+        assert_eq!(
+            preview_render_kind(&texture(TextureRole::Hdri), Uuid(3)),
+            PreviewRenderKind::Hdri(Uuid(3))
         );
-        assert!(!reply.png.is_empty());
-        assert_eq!(reply.width, 32);
-        assert!(assets.mesh_by_uuid.get(&8000).is_some_and(Option::is_some));
-
-        gpu.teardown(assets);
+        // A mesh and a model render as themselves.
+        assert_eq!(
+            preview_render_kind(
+                &ThumbnailContent::Mesh {
+                    path: String::new(),
+                    bytes: Vec::new(),
+                },
+                Uuid(4)
+            ),
+            PreviewRenderKind::Mesh(Uuid(4))
+        );
+        assert_eq!(
+            preview_render_kind(
+                &ThumbnailContent::Model {
+                    meshes: Vec::new(),
+                    materials: Vec::new(),
+                    textures: Vec::new(),
+                },
+                Uuid(5)
+            ),
+            PreviewRenderKind::Model(Uuid(5))
+        );
     }
 
+    /// The preview-render queue reports pending, drains up to the budget, and dedups on the cache
+    /// path — the host-drain contract.
     #[test]
-    fn handback_arcs_are_send_and_shared_state_is_send_sync() {
-        // Compile-time assertions: the handback Arc types cross the thread boundary, and
-        // the shared worker state moves into the spawned thread (Send) + is reachable from
-        // both threads (Sync). These hold without a GPU.
-        fn assert_send<T: Send>() {}
-        fn assert_sync<T: Sync>() {}
-        assert_send::<Arc<GpuTexture>>();
-        assert_send::<Arc<GpuMesh>>();
-        assert_send::<Arc<(Mutex<WorkerState>, Condvar)>>();
-        assert_sync::<Arc<(Mutex<WorkerState>, Condvar)>>();
+    fn preview_render_queue_drains_and_clears_in_flight() {
+        let root = temp_root("preview-queue");
+        let mut assets = isolated_server(&root);
+        assert!(!assets.preview_render_pending());
+
+        assets
+            .preview_render_in_flight
+            .insert("v7-1-64.png".to_owned());
+        assets.preview_render_queue.push_back(PreviewRenderJob {
+            kind: PreviewRenderKind::Material(Uuid(1)),
+            size: 64,
+            cache_path: "v7-1-64.png".to_owned(),
+        });
+        assert!(assets.preview_render_pending());
+
+        let jobs = assets.take_preview_render_jobs(8);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, PreviewRenderKind::Material(Uuid(1)));
+        assert!(!assets.preview_render_pending(), "the queue drained");
+
+        assets.finish_preview_render("v7-1-64.png");
+        assert!(
+            !assets.preview_render_in_flight.contains("v7-1-64.png"),
+            "the in-flight marker cleared so a later miss re-enqueues"
+        );
     }
 
     #[test]

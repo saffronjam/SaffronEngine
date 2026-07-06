@@ -97,8 +97,9 @@ pub use scan::{
 };
 pub use spawn::{ModelSpawnInput, imported_nodes_from_json, imported_skin_from_json, spawn_model};
 pub use thumbnail::{
-    THUMBNAIL_CACHE_VERSION, ThumbnailCacheStats, ThumbnailContent, ThumbnailGpu, ThumbnailJob,
-    ThumbnailPng, ThumbnailReply, ThumbnailTextureSource, ThumbnailWorker, request_thumbnail,
+    PreviewRenderJob, PreviewRenderKind, THUMBNAIL_CACHE_VERSION, ThumbnailCacheStats,
+    ThumbnailContent, ThumbnailJob, ThumbnailPng, ThumbnailReply, ThumbnailTextureSource,
+    request_thumbnail, write_thumbnail_cache,
 };
 
 use std::path::{Path, PathBuf};
@@ -129,6 +130,12 @@ pub const BUILTIN_SPHERE_MESH_ID: Uuid = Uuid(5);
 /// into `material_by_uuid` to shade the preview sphere. Never a catalog row: it exists only
 /// while a standalone texture is open in the interactive preview and is rebuilt on each enter.
 pub const PREVIEW_MATERIAL_ID: Uuid = Uuid(6);
+
+/// The reserved (`< 1024`) id of the ephemeral single-slot material a **background thumbnail**
+/// render seeds for a texture-role subject — distinct from [`PREVIEW_MATERIAL_ID`] so a thumbnail
+/// rendered on the offscreen Thumbnail view can never overwrite the slot an interactive texture
+/// preview is using. Never a catalog row.
+pub const PREVIEW_THUMBNAIL_MATERIAL_ID: Uuid = Uuid(8);
 
 /// The densely-subdivided sphere the interactive material/texture preview shades on, in the
 /// reserved (`< 1024`) range. Its high tessellation lets a displacement-enabled `.smat` move real
@@ -252,13 +259,19 @@ pub struct AssetServer {
     pub material_shader_by_uuid: AssetCache<String>,
     /// The editor-camera gizmo's mesh visual.
     pub editor_camera_model: SystemMeshVisual,
-    /// Off-thread thumbnail generation (`None` until the worker is started).
-    pub thumbnail_worker: Option<ThumbnailWorker>,
     /// The app-level, content-addressed thumbnail cache dir, defaulted from
     /// [`app_data_root`] so it is shared across every project and survives a project switch
     /// (it is *not* repointed by [`Self::set_asset_root`]). Overridable so a test can isolate
     /// its cache to a temp dir.
     pub thumbnail_cache_root: PathBuf,
+    /// Every thumbnail renders through the **main forward+ graph**, which lives only on the render
+    /// thread: [`request_thumbnail`] classifies and enqueues each here, and the host drains them in
+    /// `on_update` (build the preview scene → render on the offscreen thumbnail view → write the disk
+    /// cache). FIFO.
+    pub preview_render_queue: std::collections::VecDeque<crate::thumbnail::PreviewRenderJob>,
+    /// The cache paths of preview-render jobs queued or rendering — dedups re-requests while the
+    /// editor repolls.
+    pub preview_render_in_flight: std::collections::HashSet<String>,
 }
 
 impl AssetServer {
@@ -276,8 +289,9 @@ impl AssetServer {
             material_by_uuid: AssetCache::new(),
             material_shader_by_uuid: AssetCache::new(),
             editor_camera_model: SystemMeshVisual::default(),
-            thumbnail_worker: None,
             thumbnail_cache_root: Path::new(&app_data_root()).join("thumbnail-cache"),
+            preview_render_queue: std::collections::VecDeque::new(),
+            preview_render_in_flight: std::collections::HashSet::new(),
         };
         assets.ensure_asset_directories();
         assets
@@ -347,16 +361,13 @@ impl AssetServer {
         self.material_shader_by_uuid.clear();
     }
 
-    /// Abandons the worker's queued/failed jobs and un-drained handbacks on a project
-    /// switch (the GPU is idle at the call site, so dropping the handback `Arc`s frees
-    /// them safely). A no-op when no worker is running.
+    /// Abandons queued main-graph preview renders + their dedup set on a project switch, so tiles
+    /// for the closed project never render into the new one.
     ///
-    /// It stays a method on `AssetServer` so [`AssetServer::clear_asset_caches`] calls one
-    /// stable seam.
+    /// It stays a method on `AssetServer` so [`AssetServer::clear_asset_caches`] calls one stable seam.
     pub fn clear_thumbnail_queue(&mut self) {
-        if let Some(worker) = self.thumbnail_worker.as_ref() {
-            thumbnail::clear_worker_queue(worker);
-        }
+        self.preview_render_queue.clear();
+        self.preview_render_in_flight.clear();
     }
 }
 
@@ -369,9 +380,11 @@ mod tests {
         assert!(DEFAULT_MATERIAL_ID.value() < 1024);
         assert!(PREVIEW_FLOOR_MESH_ID.value() < 1024);
         assert!(PREVIEW_MATERIAL_ID.value() < 1024);
+        assert!(PREVIEW_THUMBNAIL_MATERIAL_ID.value() < 1024);
         assert!(PREVIEW_DISPLACE_SPHERE_MESH_ID.value() < 1024);
         assert_ne!(DEFAULT_MATERIAL_ID, PREVIEW_FLOOR_MESH_ID);
         assert_ne!(PREVIEW_MATERIAL_ID, DEFAULT_MATERIAL_ID);
+        assert_ne!(PREVIEW_THUMBNAIL_MATERIAL_ID, PREVIEW_MATERIAL_ID);
         assert_ne!(PREVIEW_DISPLACE_SPHERE_MESH_ID, PREVIEW_MATERIAL_ID);
         for builtin in [BuiltinMesh::Cube, BuiltinMesh::Plane, BuiltinMesh::Sphere] {
             let id = builtin.reserved_id();
