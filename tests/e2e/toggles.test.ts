@@ -82,6 +82,24 @@ test("ray-tracing toggles round-trip when the device supports RT", async () => {
   await engine.call("set-restir", { args: [0] });
 });
 
+// set-sky-occlusion gates the Global SDF reflection-occlusion cone (the one remaining per-pixel SDF
+// consumer — it occludes the reflected skybox under overhangs; indirect diffuse occlusion is DDGI
+// ray-miss + contact GTAO). Validated by READ-BACK — the set-* command echoes its state and
+// render-stats reports the same `skyOcclusion` flag.
+test("set-sky-occlusion echoes the state it is given", async () => {
+  const on = await engine.call<{ skyOcclusion: boolean }>("set-sky-occlusion", { args: [1] });
+  expect(on.skyOcclusion).toBe(true);
+  const off = await engine.call<{ skyOcclusion: boolean }>("set-sky-occlusion", { args: [0] });
+  expect(off.skyOcclusion).toBe(false);
+});
+
+test("set-sky-occlusion round-trips through render-stats", async () => {
+  await engine.call("set-sky-occlusion", { args: [1] });
+  expect((await stats()).skyOcclusion).toBe(true);
+  await engine.call("set-sky-occlusion", { args: [0] });
+  expect((await stats()).skyOcclusion).toBe(false);
+});
+
 // Runs last: by now every toggle has recreated its GPU state at least once.
 test("exercising every toggle left no Vulkan validation errors", async () => {
   await engine.settle(400);
