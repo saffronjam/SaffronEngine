@@ -388,7 +388,8 @@ impl StoreConnector for PolyHaven {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| ConnectorError::Download(e.to_string()))?;
                 }
-                std::fs::write(dest, &bytes).map_err(|e| ConnectorError::Download(e.to_string()))?;
+                std::fs::write(dest, &bytes)
+                    .map_err(|e| ConnectorError::Download(e.to_string()))?;
                 done += size;
             }
             derived.commit()?;
@@ -450,9 +451,11 @@ impl StoreConnector for PolyHaven {
         };
         match self.cache.file(&url, ext, None).await {
             Ok(p) => Ok(p),
-            Err(_) if url != part.ref_ => {
-                self.cache.file(&part.ref_, ext, None).await.map_err(Into::into)
-            }
+            Err(_) if url != part.ref_ => self
+                .cache
+                .file(&part.ref_, ext, None)
+                .await
+                .map_err(Into::into),
             Err(e) => Err(e.into()),
         }
     }
