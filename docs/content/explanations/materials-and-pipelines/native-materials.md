@@ -67,13 +67,13 @@ bits in the params (`FEATURE_NORMAL`, `FEATURE_EMISSIVE_TEX`, `FEATURE_OCCLUSION
 
 ## PBR slots
 
-Beyond albedo, a material carries normal, packed ORM (occlusion-R, roughness-G, metallic-B), emissive, and height maps, plus `normalStrength`, `uvTiling`/`uvOffset`, `heightScale`, and the `blend` mode + `alphaCutoff`. The shader applies them feature-gated:
+Beyond albedo, a material carries normal, packed ORM (occlusion-R, roughness-G, metallic-B), emissive, and height maps, plus `normalStrength`, `uvTiling`/`uvOffset`, `heightScale`, a `heightMode`, and the `blend` mode + `alphaCutoff`. The shader applies them feature-gated:
 
 - a derivative-based (Schüler) tangent frame perturbs the normal — no per-vertex tangents needed (`perturbNormal`);
-- height drives **parallax occlusion mapping** (`parallaxUv`, a multi-step UV march) for silhouette-deepening relief;
+- the one grayscale **Height Map** is realized by the material's `heightMode` — the shape the major engines converge on (one map, a mode selector): **`bump`** (a height-gradient shading normal only — flat silhouette, the artifact-free default), **`parallax`** (parallax occlusion mapping, `parallaxUv`, a multi-step UV march that fakes depth), or **`displacement`** (real per-vertex geometry via the [compute displacement pre-pass](../../frame-and-render-graph/compute-displacement/) — a true silhouette that shadows and the ray-tracer see);
 - the `masked` blend mode alpha-tests against `alphaCutoff` — a hard `discard`, upgraded to derivative-sharpened [alpha-to-coverage](../ubershader-and-specialization/) under MSAA; `translucent` instead draws in the sorted blend pass.
 
-This is what lets an imported Poly-Haven-style texture set — diffuse + normal + roughness + displacement — render with depth rather than as a flat decal.
+This is what lets an imported Poly-Haven / ambientCG texture set — diffuse + normal + roughness + displacement — render with depth: a provider *Displacement* map imports in `displacement` mode (real relief), a *Height* map in `parallax`, and every other case falls back to the safe `bump`.
 
 ## Authoring
 

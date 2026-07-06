@@ -8,6 +8,7 @@
 mod base64;
 mod blend;
 mod error;
+mod height;
 mod time;
 mod uuid;
 
@@ -16,6 +17,7 @@ use std::sync::Arc;
 pub use base64::base64_encode;
 pub use blend::BlendMode;
 pub use error::{Error, Result};
+pub use height::HeightMode;
 pub use time::TimeSpan;
 pub use uuid::Uuid;
 

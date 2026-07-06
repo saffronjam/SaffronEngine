@@ -12,7 +12,7 @@
 //! Reseed with `UPDATE_GOLDEN=1` only on an intentional format change.
 
 use saffron_assets::{MaterialAsset, material_asset_to_json};
-use saffron_core::Uuid;
+use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3, Vec4};
 use saffron_test_support::assert_bytes_match_golden;
 
@@ -33,6 +33,7 @@ fn populated_material() -> MaterialAsset {
         normal_strength: 1.0,
         alpha_cutoff: 0.5,
         height_scale: 0.05,
+        height_mode: HeightMode::Bump,
         uv_tiling: Vec2::new(2.0, 2.0),
         uv_offset: Vec2::new(0.0, 0.0),
         albedo_texture: Uuid(4242),
@@ -40,6 +41,7 @@ fn populated_material() -> MaterialAsset {
         normal_texture: Uuid(4243),
         emissive_texture: Uuid(0),
         height_texture: Uuid(0),
+        vector_displacement_texture: Uuid(0),
         features: 0,
         graph: serde_json::Value::Null,
         parent: Uuid(1024),

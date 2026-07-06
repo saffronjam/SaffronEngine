@@ -29,6 +29,7 @@
     ]
   },
   "graph": {},
+  "heightMode": "bump",
   "normalConvention": "gl",
   "overrides": {},
   "parent": "1024",
@@ -38,7 +39,8 @@
     "emissive": "0",
     "height": "0",
     "normal": "4243",
-    "ormOrMr": "0"
+    "ormOrMr": "0",
+    "vectorDisplacement": "0"
   },
   "unlit": false,
   "version": 1

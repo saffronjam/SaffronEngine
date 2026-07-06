@@ -26,7 +26,7 @@
 //! result so the editor still sees an instance. [`DEFAULT_MATERIAL_ID`] short-circuits to
 //! [`default_material_asset`].
 
-use saffron_core::Uuid;
+use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::{
     ChunkKind,
     glam::{Vec2, Vec3, Vec4},
@@ -73,11 +73,13 @@ pub struct MaterialAsset {
     pub normal_strength: f32,
     /// The masked-blend alpha cutoff threshold.
     pub alpha_cutoff: f32,
-    /// The parallax/displacement height-map scale.
+    /// The height-map scale — parallax march depth ([`HeightMode::Parallax`]) or world-space
+    /// displacement amplitude ([`HeightMode::Displacement`]).
     pub height_scale: f32,
-    /// Route the height map through **vertex-shader displacement** (real geometry, true silhouette)
-    /// instead of parallax-occlusion mapping. Needs a densely-tessellated mesh to read well.
-    pub displacement: bool,
+    /// How the height map is realized: [`HeightMode::Bump`] (shading bump), [`HeightMode::Parallax`]
+    /// (parallax-occlusion mapping), or [`HeightMode::Displacement`] (real geometry — needs a
+    /// densely-tessellated mesh to read well).
+    pub height_mode: HeightMode,
     /// The UV tiling (scale) factor.
     pub uv_tiling: Vec2,
     /// The UV offset (translation).
@@ -92,6 +94,10 @@ pub struct MaterialAsset {
     pub emissive_texture: Uuid,
     /// The height/displacement texture id.
     pub height_texture: Uuid,
+    /// The vector-displacement (tangent-space XYZ) texture id (`0` = none). Under
+    /// [`HeightMode::Displacement`] it switches the displace pre-pass from scalar-along-normal to
+    /// tangent-space vector offset, so overhangs become real geometry.
+    pub vector_displacement_texture: Uuid,
     /// The authored normal convention: `gl` | `dx` (baked to `gl` at import; kept for
     /// provenance).
     pub normal_convention: String,
@@ -124,7 +130,7 @@ impl Default for MaterialAsset {
             normal_strength: 1.0,
             alpha_cutoff: 0.5,
             height_scale: 0.05,
-            displacement: false,
+            height_mode: HeightMode::Bump,
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             albedo_texture: Uuid(0),
@@ -132,6 +138,7 @@ impl Default for MaterialAsset {
             normal_texture: Uuid(0),
             emissive_texture: Uuid(0),
             height_texture: Uuid(0),
+            vector_displacement_texture: Uuid(0),
             normal_convention: "gl".to_owned(),
             features: 0,
             graph: empty_object(),
@@ -206,7 +213,7 @@ pub fn material_asset_to_json(material: &MaterialAsset) -> Value {
         "blend": material.blend,
         "unlit": material.unlit,
         "doubleSided": material.double_sided,
-        "displacement": material.displacement,
+        "heightMode": material.height_mode.as_wire(),
         "normalConvention": material.normal_convention,
         "factors": {
             "baseColor": [
@@ -231,6 +238,7 @@ pub fn material_asset_to_json(material: &MaterialAsset) -> Value {
             "normal": uuid_string(material.normal_texture),
             "emissive": uuid_string(material.emissive_texture),
             "height": uuid_string(material.height_texture),
+            "vectorDisplacement": uuid_string(material.vector_displacement_texture),
         },
         "graph": graph,
         "parent": uuid_string(material.parent),
@@ -250,7 +258,7 @@ pub fn material_asset_from_json(doc: &Value) -> MaterialAsset {
         blend: json_string_or(doc, "blend", "opaque".to_owned()),
         unlit: json_bool_or(doc, "unlit", false),
         double_sided: json_bool_or(doc, "doubleSided", false),
-        displacement: json_bool_or(doc, "displacement", false),
+        height_mode: HeightMode::from_wire(&json_string_or(doc, "heightMode", "bump".to_owned())),
         normal_convention: json_string_or(doc, "normalConvention", "gl".to_owned()),
         ..MaterialAsset::default()
     };
@@ -291,6 +299,9 @@ pub fn material_asset_from_json(doc: &Value) -> MaterialAsset {
         }
         if let Some(v) = textures.get("height") {
             material.height_texture = uuid_from_value(v);
+        }
+        if let Some(v) = textures.get("vectorDisplacement") {
+            material.vector_displacement_texture = uuid_from_value(v);
         }
     }
 
@@ -395,6 +406,9 @@ pub fn apply_overrides(material: &mut MaterialAsset, overrides: &Value) {
             "normalTexture" => material.normal_texture = uuid_from_value(value),
             "emissiveTexture" => material.emissive_texture = uuid_from_value(value),
             "heightTexture" => material.height_texture = uuid_from_value(value),
+            "vectorDisplacementTexture" => {
+                material.vector_displacement_texture = uuid_from_value(value)
+            }
             _ => {}
         }
     }
@@ -633,21 +647,31 @@ pub fn update_material_asset(
     id: Uuid,
     material: &MaterialAsset,
 ) -> Result<()> {
-    let entry = assets
-        .catalog
-        .find(id)
-        .ok_or(Error::NotInCatalog(id.value()))?;
-    if entry.asset_type != AssetType::Material {
-        return Err(Error::WrongAssetType {
-            id: id.value(),
-            wanted: "material",
-        });
-    }
-    let path = assets.root.join(&entry.path);
+    let (container, rel_path) = {
+        let entry = assets
+            .catalog
+            .find(id)
+            .ok_or(Error::NotInCatalog(id.value()))?;
+        if entry.asset_type != AssetType::Material {
+            return Err(Error::WrongAssetType {
+                id: id.value(),
+                wanted: "material",
+            });
+        }
+        (entry.container, entry.path.clone())
+    };
     let text = saffron_json::dump_json_sorted(&material_asset_to_json(material), 2);
-    std::fs::write(path, text).map_err(|e| Error::Io(e.to_string()))?;
-    // The edited `.smat` (and every instance that resolves through it) is now stale in the cache.
-    assets.invalidate_material_caches();
+    if container.value() == 0 {
+        // Standalone `.smat`: the whole file is the material JSON.
+        let path = assets.root.join(&rel_path);
+        std::fs::write(path, text).map_err(|e| Error::Io(e.to_string()))?;
+        // The edited material (and every instance that resolves through it) is now stale.
+        assets.invalidate_material_caches();
+    } else {
+        // Container-embedded (a `.smatx` self-container, or a model container): rewrite only the
+        // material chunk, preserving the META + every texture chunk. Invalidates caches internally.
+        crate::manage::rewrite_material_chunk(assets, id, text.into_bytes())?;
+    }
     Ok(())
 }
 
@@ -669,7 +693,7 @@ mod tests {
             normal_strength: 0.75,
             alpha_cutoff: 0.33,
             height_scale: 0.125,
-            displacement: true,
+            height_mode: HeightMode::Displacement,
             uv_tiling: Vec2::new(2.0, 3.0),
             uv_offset: Vec2::new(0.25, 0.5),
             albedo_texture: Uuid(1001),
@@ -677,6 +701,7 @@ mod tests {
             normal_texture: Uuid(1003),
             emissive_texture: Uuid(1004),
             height_texture: Uuid(1005),
+            vector_displacement_texture: Uuid(1006),
             normal_convention: "dx".to_owned(),
             features: 0,
             graph: empty_object(),
@@ -752,15 +777,15 @@ mod tests {
         // `heightScale` (f32 `0.05`) carries its f64-promoted long decimal (an
         // exactly-representable value like `0.5` stays short).
         let expected = concat!(
-            r#"{"blend":"opaque","displacement":false,"doubleSided":false,"#,
+            r#"{"blend":"opaque","doubleSided":false,"#,
             r#""factors":{"alphaCutoff":0.5,"baseColor":[1.0,1.0,1.0,1.0],"#,
             r#""emissive":[0.0,0.0,0.0],"emissiveStrength":1.0,"#,
             r#""heightScale":0.05000000074505806,"#,
             r#""metallic":0.0,"normalStrength":1.0,"roughness":1.0,"#,
             r#""uvOffset":[0.0,0.0],"uvTiling":[1.0,1.0]},"#,
-            r#""graph":{},"normalConvention":"gl","overrides":{},"parent":"0","#,
+            r#""graph":{},"heightMode":"bump","normalConvention":"gl","overrides":{},"parent":"0","#,
             r#""shader":"mesh","#,
-            r#""textures":{"albedo":"5","emissive":"0","height":"0","normal":"6","ormOrMr":"0"},"#,
+            r#""textures":{"albedo":"5","emissive":"0","height":"0","normal":"6","ormOrMr":"0","vectorDisplacement":"0"},"#,
             r#""unlit":false,"version":1}"#,
         );
         assert_eq!(serialized, expected);
