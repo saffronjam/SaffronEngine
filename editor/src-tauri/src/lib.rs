@@ -10,9 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, RunEvent, State, WindowEvent,
-};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, RunEvent, State, WindowEvent};
 
 mod connectors;
 mod wayland_viewport;
@@ -404,7 +402,10 @@ fn fill_current_monitor(window: &tauri::WebviewWindow) -> WindowState {
 /// maximized window reports the maximized bounds and we must remember the last normal geometry so
 /// un-maximize (and next launch's restore-then-maximize) return to the right size.
 fn capture_window_geometry(window: &tauri::WebviewWindow, tracker: &WindowStateTracker) {
-    let mut guard = tracker.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = tracker
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let maximized = window.is_maximized().unwrap_or(false);
     guard.maximized = maximized;
     // Monitor + scale are best-effort hints that reflect current reality regardless of maximized;
@@ -603,13 +604,6 @@ fn teardown(state: &EditorState) {
 // ONE generic passthrough: any `sa` command reaches the engine with zero Rust changes.
 // Async so the blocking socket round trip runs on a worker, never the main thread
 // driving the webview event loop (a sync command would stall the UI during edit streams).
-// [vp-dbg] TEMP: route a webview-side log line to the `just run` terminal (console.log does not
-// reach it). Delete with the probe once the tab-switch stall is diagnosed.
-#[tauri::command]
-fn dbg_log(msg: String) {
-    eprintln!("[vp-dbg] {msg}");
-}
-
 #[tauri::command]
 async fn control(
     state: State<'_, EditorState>,
@@ -723,10 +717,7 @@ async fn store_import(
             "material-import",
             json!({ "path": path, "name": result.name, "attribution": attribution }),
         ),
-        StoreKind::Hdri => (
-            "import-texture",
-            json!({ "path": path, "role": "hdri" }),
-        ),
+        StoreKind::Hdri => ("import-texture", json!({ "path": path, "role": "hdri" })),
     };
     let reply = control_request_with_params(&state.socket_path, cmd, params)?;
     Ok(ImportedAsset {
@@ -804,14 +795,8 @@ async fn store_import_part(
     let (cmd, params) = match part.import_kind {
         // The engine owns the role→colorspace policy: send the connector's map role and let
         // `import-texture` derive the upload space (and persist the semantic role for previews).
-        StoreKind::Texture => (
-            "import-texture",
-            json!({ "path": path, "role": part.role }),
-        ),
-        StoreKind::Hdri => (
-            "import-texture",
-            json!({ "path": path, "role": "hdri" }),
-        ),
+        StoreKind::Texture => ("import-texture", json!({ "path": path, "role": part.role })),
+        StoreKind::Hdri => ("import-texture", json!({ "path": path, "role": "hdri" })),
         StoreKind::Model => (
             "import-model",
             json!({ "path": path, "attribution": attribution }),
@@ -1286,21 +1271,6 @@ pub fn run() {
                 .to_string()
                 .split_once("u=")
                 .map(|(_, rest)| percent_decode(rest));
-            // [vp-dbg] TEMP: count + time every image request so a tab reveal that re-requests the
-            // whole grid (and the modal's gallery) shows up here as a burst. Delete with the probe.
-            static IMG_REQ_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let dbg_n = IMG_REQ_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let dbg_t0 = std::time::Instant::now();
-            let dbg_tail: String = target
-                .as_deref()
-                .unwrap_or("")
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(48)
-                .collect();
-            eprintln!("[vp-dbg] saffron-img #{dbg_n} start …{dbg_tail}");
             tauri::async_runtime::spawn(async move {
                 let response = match target {
                     Some(url) => match cache.bytes(&url).await {
@@ -1317,15 +1287,10 @@ pub fn run() {
                     },
                     None => img_scheme_error(),
                 };
-                eprintln!(
-                    "[vp-dbg] saffron-img #{dbg_n} done {:.1}ms",
-                    dbg_t0.elapsed().as_secs_f64() * 1000.0
-                );
                 responder.respond(response);
             });
         })
         .invoke_handler(tauri::generate_handler![
-            dbg_log,
             control,
             start_engine,
             set_viewport_bounds,

@@ -11,7 +11,6 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core"; // [vp-dbg] TEMP
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { client } from "../control/client";
 import { loadEditorSettings, startReconcile, useEditorStore } from "../state/store";
@@ -85,22 +84,6 @@ export function App() {
   // The Store tab stays mounted (hidden when inactive) while its tab exists, so the search
   // query and results survive switching to another tab and back.
   const storeTabExists = useEditorStore((s) => s.viewTabs.some((tab) => tab.kind === "store"));
-  // [vp-dbg] TEMP: time the reveal when the active main tab changes. t0 = this effect (after React
-  // has committed the display:none→visible flip); rAF1/rAF2 bracket the browser's layout+paint. A
-  // large commit→rAF1 gap means the reveal (layout/paint) is the ~1s block. Read alongside the
-  // saffron-img request counter in the same terminal. Delete with the probe.
-  useEffect(() => {
-    const t0 = performance.now();
-    requestAnimationFrame(() => {
-      const t1 = performance.now();
-      requestAnimationFrame(() => {
-        const t2 = performance.now();
-        void invoke("dbg_log", {
-          msg: `tab→${activeKind} reveal: commit→rAF1 ${(t1 - t0).toFixed(0)}ms rAF1→rAF2 ${(t2 - t1).toFixed(0)}ms`,
-        });
-      });
-    });
-  }, [activeKind]);
   // Keep one asset editor mounted across tab switches (like the scene dock) so returning is instant: it
   // suspends/resumes the engine preview on `active` rather than remounting + re-entering. We keep the
   // most-recently-active asset tab mounted, sticky until its tab closes; switching to a different asset
@@ -143,6 +126,13 @@ export function App() {
   const activeRenderView: ViewId = previewTabActive ? "assetPreview" : "scene";
   const sceneParked = viewportHidden || !sceneTabActive;
   const assetParked = viewportHidden || !previewTabActive;
+  // A live viewport pane is on screen only on the scene / preview tabs. On a no-viewport tab (Store,
+  // flame graph, image viewer) the host has nothing to show, so power-state occludes it — otherwise
+  // it keeps rendering the active view at full GPU cost behind the opaque tab, contending with the
+  // webview compositor (a stall on the tab reveal, worst right after a camera move while TAA/DDGI
+  // reconverge). `on_update` (the play-mode sim) still runs every loop iteration; only rendering is
+  // gated, so occluding a background tab never freezes a running simulation.
+  const viewportVisible = sceneTabActive || previewTabActive;
 
   // W/E/R → translate/rotate/scale, gated off while a text field is focused.
   useGizmoShortcuts();
@@ -209,8 +199,9 @@ export function App() {
   // loading view + owns load completion. Mounted once so it covers modal-, menu-, and bootstrap loads.
   useProjectLoadPoll();
 
-  // Report viewport visibility so the host idles a hidden/unfocused window (the engine suppresses
-  // rendering when occluded). Fire-and-forget on focus/blur + tab visibility; gated on readiness.
+  // Report viewport visibility so the host idles a hidden/unfocused/no-viewport window (the engine
+  // suppresses rendering when occluded, caps to 6 fps when unfocused). Re-sent on focus/blur + tab
+  // visibility events and whenever the active tab's viewport visibility changes; gated on readiness.
   //
   // A native HTML5 drag (dragging an asset onto the viewport) fires a window `blur` and clears
   // `document.hasFocus()`, which would otherwise report `unfocused` and pace the engine down to
@@ -223,13 +214,15 @@ export function App() {
     }
     let dragActive = false;
     const send = (): void => {
-      const state = dragActive
-        ? "focused"
-        : document.hidden
-          ? "occluded"
-          : document.hasFocus()
-            ? "focused"
-            : "unfocused";
+      const state = !viewportVisible
+        ? "occluded"
+        : dragActive
+          ? "focused"
+          : document.hidden
+            ? "occluded"
+            : document.hasFocus()
+              ? "focused"
+              : "unfocused";
       void client.setViewportPowerState(state).catch(() => {
         // Transient (engine briefly busy); the next focus/visibility event re-sends.
       });
@@ -259,7 +252,7 @@ export function App() {
       document.removeEventListener("dragend", onDragEnd);
       document.removeEventListener("drop", onDragEnd);
     };
-  }, [phase]);
+  }, [phase, viewportVisible]);
 
   // Hydrate the keybinding overrides from appdata/settings.json once at startup
   // (editor-wide state, independent of the engine phase).
@@ -333,14 +326,37 @@ export function App() {
     if (phase !== "ready") {
       return;
     }
-    void client.setViewportParked("scene", sceneParked).catch(() => {});
-    void client.setViewportParked("assetPreview", assetParked).catch(() => {});
+    // Unpark immediately — a revealed pane must re-attach its retained frame before its hole is
+    // shown — but DEFER parking until the incoming tab's opaque DOM has composited. Parking detaches
+    // the surface (its hole resolves to the black backdrop); doing it synchronously tears the
+    // outgoing view to black one webview frame before the new tab paints over it, which reads as a
+    // black flash on e.g. Scene→Store. Two rAFs (commit → compositor) let the new tab cover the area
+    // first; a rapid re-switch cancels the pending park in cleanup.
+    const parkAfterPaint: ViewId[] = [];
+    const setPark = (view: ViewId, parked: boolean) => {
+      if (parked) parkAfterPaint.push(view);
+      else void client.setViewportParked(view, false).catch(() => {});
+    };
+    setPark("scene", sceneParked);
+    setPark("assetPreview", assetParked);
+    let rafInner = 0;
+    const rafOuter = requestAnimationFrame(() => {
+      rafInner = requestAnimationFrame(() => {
+        for (const view of parkAfterPaint) {
+          void client.setViewportParked(view, true).catch(() => {});
+        }
+      });
+    });
     useEditorStore.getState().setSceneEntitiesLive(false);
     void client
       .setActiveView(activeRenderView)
       .catch(() => {})
       .finally(() => useEditorStore.getState().setSceneEntitiesLive(activeRenderView === "scene"));
     requestAnimationFrame(() => emitLayoutSettled({ force: true }));
+    return () => {
+      cancelAnimationFrame(rafOuter);
+      cancelAnimationFrame(rafInner);
+    };
   }, [phase, sceneParked, assetParked, activeRenderView]);
 
   // Startup bounds commit, decoupled from the push above: the host div has a 0-size rect until the
