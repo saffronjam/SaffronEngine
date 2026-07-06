@@ -25,3 +25,6 @@ saffron-scene = { path = "../scene" }
 saffron-assets = { path = "../assets" }
 saffron-protocol = { path = "../protocol" }
 serde_json.workspace = true
+
+[dev-dependencies]
+winit.workspace = true
