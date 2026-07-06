@@ -13,12 +13,12 @@ use saffron_scene::{Entity, Transform};
 use crate::context::SceneEditContext;
 
 /// The exponential smoothing time constant (seconds), shared by the gizmo pointer drag, the
-/// look-drain, and the edit-smoothing stepper.
+/// camera pose ease, and the edit-smoothing stepper.
 ///
 /// At ~25 ms a 60 Hz control sample is reached in roughly two frames' worth of lag while
-/// the sample staircase becomes continuous motion. The single named source; the camera
-/// look-drain ([`crate::camera`]) and the gizmo drag both step `alpha = 1 - exp(-dt/TAU)`
-/// against it.
+/// the sample staircase becomes continuous motion. The single named source; the camera's
+/// eye-toward-target ease ([`crate::camera`]) and the gizmo drag both step
+/// `alpha = 1 - exp(-dt/TAU)` against it.
 pub(crate) const SMOOTH_TAU: f32 = 0.025;
 
 /// The convergence epsilon: an edit snaps exactly and its entry drops once every smoothed

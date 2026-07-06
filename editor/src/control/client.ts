@@ -473,8 +473,20 @@ export const client = {
   getCamera(): Promise<EditorCamera> {
     return call("get-camera");
   },
+  /// A free-eye set that snaps to the pose (scripting / absolute framing).
   setCamera(camera: Partial<EditorCamera>): Promise<EditorCamera> {
     return call("set-camera", camera);
+  },
+  /// Drive the preview orbit camera: the engine eases the pivot / distance / angles toward this
+  /// each rendered frame and sweeps the eye along the arc, so a fast drag follows the circle
+  /// (never chords across it) and the ~60 Hz samples become continuous motion at render FPS.
+  setOrbit(orbit: {
+    pivot: Vec3;
+    distance: number;
+    yaw: number;
+    pitch: number;
+  }): Promise<EditorCamera> {
+    return call("set-camera", orbit);
   },
 
   listAssets(): Promise<AssetList> {
@@ -552,11 +564,14 @@ export const client = {
       emissive?: { x: number; y: number; z: number };
       emissiveStrength?: number;
       normalStrength?: number;
+      heightScale?: number;
+      heightMode?: string;
       albedoTexture?: string;
       ormTexture?: string;
       normalTexture?: string;
       emissiveTexture?: string;
       heightTexture?: string;
+      vectorDisplacementTexture?: string;
     },
   ): Promise<unknown> {
     return call("material-update", { material, ...patch });

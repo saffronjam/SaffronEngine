@@ -44,7 +44,7 @@ mod play;
 mod project;
 mod smoothing;
 
-pub use camera::{SceneEditCamera, SceneEditCameraInput, update_scene_edit_camera};
+pub use camera::{OrbitState, SceneEditCamera, SceneEditCameraInput, update_scene_edit_camera};
 pub use context::{AssetDragPayload, PlacementPreview, SceneEditContext};
 pub use error::{Error, Result};
 pub use gizmo::{

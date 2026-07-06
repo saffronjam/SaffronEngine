@@ -1,9 +1,12 @@
-/// The eased orbit camera shared by every preview pane that drives the `assetPreview` view — the
+/// The orbit camera shared by every preview pane that drives the `assetPreview` view — the
 /// asset editor (model / texture / HDRI subjects) and the material-graph editor's live sphere.
-/// Input moves a target; a rAF loop drains current→target with the engine's tau (refs only, no React
-/// re-render), so a slight lag reads as smooth motion, and one coalesced `set-camera` is in flight at
-/// a time (never one call per frame). `exit-asset-preview` restores the engine-stashed camera, so
-/// orbiting never dirties the saved `editorCamera`.
+/// Input moves an orbit target (pivot / distance / yaw / pitch); each change streams that pose to
+/// the engine, and the engine eases pivot / distance / angles toward it every rendered frame at
+/// tau=0.025 (the same ease the fly-cam look and gizmo drag use), sweeping the eye along the arc —
+/// so motion stays smooth at the engine's render FPS, not the ~60 Hz control rate, and a fast drag
+/// follows the circle instead of cutting a chord across it. One coalesced `set-camera` is in flight
+/// at a time (never one call per pointer sample). `exit-asset-preview` restores the engine-stashed
+/// camera, so orbiting never dirties the saved `editorCamera`.
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { client } from "../control/client";
@@ -12,12 +15,6 @@ import { makeCoalescer } from "../control/coalesce";
 /// Orbit drag sensitivity (degrees of yaw/pitch per CSS pixel) and zoom factor per wheel notch.
 const ORBIT_SENS_DEG_PER_PX = 0.4;
 const ZOOM_PER_WHEEL = 1.1;
-/// Orbit easing: drain current→target each frame at this time constant (mirrors the engine's tau=0.025
-/// gizmo/edit smoothing); stop when within the epsilons. The distance/target epsilon is a fraction of
-/// the live distance (an absolute epsilon would never settle a tiny model and would over-shoot a large one).
-const ORBIT_TAU_S = 0.025;
-const ORBIT_EPS_DEG = 0.01;
-const ORBIT_EPS_DIST_FRAC = 0.0005;
 /// Zoom bounds relative to the framed distance, so a small model can be dollied in close while a
 /// ceiling stops it flying away (scaling the floor to the model lets a tiny one zoom past a fixed limit).
 const ZOOM_MIN_FRAC = 0.02;
@@ -40,21 +37,6 @@ const INITIAL_ORBIT: OrbitState = {
   pitch: -29,
 };
 
-/// The engine's fly-cam forward basis from yaw/pitch (mirrors sceneEditCameraForward), so the editor's
-/// orbit reconstructs the eye as target - forward * distance.
-function forwardFromYawPitch(
-  yawDeg: number,
-  pitchDeg: number,
-): { x: number; y: number; z: number } {
-  const yaw = (yawDeg * Math.PI) / 180;
-  const pitch = (pitchDeg * Math.PI) / 180;
-  return {
-    x: Math.cos(pitch) * Math.sin(yaw),
-    y: Math.sin(pitch),
-    z: -Math.cos(pitch) * Math.cos(yaw),
-  };
-}
-
 export function cloneOrbit(o: OrbitState): OrbitState {
   return { target: { ...o.target }, distance: o.distance, yaw: o.yaw, pitch: o.pitch };
 }
@@ -64,11 +46,12 @@ export interface OrbitControls {
   onPointerMove: (e: ReactPointerEvent<HTMLDivElement>) => void;
   onPointerUp: (e: ReactPointerEvent<HTMLDivElement>) => void;
   onWheel: (e: ReactWheelEvent<HTMLDivElement>) => void;
-  /// Snap the orbit to a framed pose (on preview enter) — seeds both target and current, no ease, no push.
+  /// Snap the orbit to a framed pose (on preview enter) — seeds the local state, no push (the engine
+  /// already framed the preview camera on enter-asset-preview).
   setFramed: (o: OrbitState) => void;
 }
 
-/// Wire up the eased orbit for one preview pane. `enableZoom` gates the wheel dolly (a lone framed
+/// Wire up the orbit for one preview pane. `enableZoom` gates the wheel dolly (a lone framed
 /// sphere is orbit-only); `onClick(u, v)` fires on a click (negligible drag) with normalized pane
 /// coordinates — used by the asset editor to pick a skeleton joint, omitted where there is nothing to
 /// pick.
@@ -78,91 +61,36 @@ export function useOrbitCamera(opts: {
 }): OrbitControls {
   const { enableZoom, onClick } = opts;
 
-  // Both refs (the rAF loop must not re-render). framedDistance seeds the zoom bounds so they scale
-  // to the subject.
-  const targetOrbit = useRef<OrbitState>(cloneOrbit(INITIAL_ORBIT));
-  const currentOrbit = useRef<OrbitState>(cloneOrbit(INITIAL_ORBIT));
+  // The orbit target the engine eases toward (a ref — input mutates it, no React re-render).
+  // framedDistance seeds the zoom bounds so they scale to the subject.
+  const orbit = useRef<OrbitState>(cloneOrbit(INITIAL_ORBIT));
   const framedDistance = useRef(INITIAL_ORBIT.distance);
-  const rafId = useRef<number | null>(null);
-  const lastFrameTs = useRef(0);
   const dragging = useRef(false);
   const lastPointer = useRef({ x: 0, y: 0 });
   const downPos = useRef({ x: 0, y: 0 });
 
-  // One coalesced set-camera in flight at a time (the serialized wire — never one call per frame tick).
+  // One coalesced set-camera in flight at a time (the serialized wire — never one call per pointer
+  // sample). We stream the raw pose with `smooth`; the engine eases its eye toward it per rendered
+  // frame, so the ~60 Hz sample stream becomes continuous motion at render FPS.
   const cameraCoalescer = useMemo(
     () =>
       makeCoalescer<OrbitState>({
         throttleMs: 16,
-        send: (o) => {
-          const f = forwardFromYawPitch(o.yaw, o.pitch);
-          return client
-            .setCamera({
-              position: {
-                x: o.target.x - f.x * o.distance,
-                y: o.target.y - f.y * o.distance,
-                z: o.target.z - f.z * o.distance,
-              },
-              yaw: o.yaw,
-              pitch: o.pitch,
-            })
-            .then(() => {});
-        },
+        send: (o) =>
+          client
+            .setOrbit({ pivot: o.target, distance: o.distance, yaw: o.yaw, pitch: o.pitch })
+            .then(() => {}),
       }),
     [],
   );
 
-  // Ease current→target one frame, push the eased camera, and either re-arm or settle. Refs only.
-  const tickOrbit = useCallback(() => {
-    const now = performance.now();
-    const dt = lastFrameTs.current ? (now - lastFrameTs.current) / 1000 : 0;
-    lastFrameTs.current = now;
-    const t = targetOrbit.current;
-    const c = currentOrbit.current;
-    const alpha = 1 - Math.exp(-dt / ORBIT_TAU_S);
-    c.yaw += (t.yaw - c.yaw) * alpha;
-    c.pitch += (t.pitch - c.pitch) * alpha;
-    c.distance += (t.distance - c.distance) * alpha;
-    c.target.x += (t.target.x - c.target.x) * alpha;
-    c.target.y += (t.target.y - c.target.y) * alpha;
-    c.target.z += (t.target.z - c.target.z) * alpha;
-    cameraCoalescer.push(cloneOrbit(c));
+  // Drop any buffered pose when the pane unmounts, so a late set-camera can't nudge the restored
+  // scene camera after exit-asset-preview parks the preview.
+  useEffect(() => () => cameraCoalescer.reset(), [cameraCoalescer]);
 
-    const distEps = ORBIT_EPS_DIST_FRAC * Math.max(c.distance, 1e-4);
-    const settled =
-      Math.abs(t.yaw - c.yaw) < ORBIT_EPS_DEG &&
-      Math.abs(t.pitch - c.pitch) < ORBIT_EPS_DEG &&
-      Math.abs(t.distance - c.distance) < distEps &&
-      Math.abs(t.target.x - c.target.x) < distEps &&
-      Math.abs(t.target.y - c.target.y) < distEps &&
-      Math.abs(t.target.z - c.target.z) < distEps;
-    if (settled) {
-      currentOrbit.current = cloneOrbit(t);
-      cameraCoalescer.push(cloneOrbit(t)); // land exactly on the target
-      rafId.current = null;
-      lastFrameTs.current = 0;
-      return;
-    }
-    rafId.current = requestAnimationFrame(tickOrbit);
+  const pushOrbit = useCallback(() => {
+    cameraCoalescer.push(cloneOrbit(orbit.current));
   }, [cameraCoalescer]);
-
-  const ensureOrbitLoop = useCallback(() => {
-    if (rafId.current === null) {
-      lastFrameTs.current = 0;
-      rafId.current = requestAnimationFrame(tickOrbit);
-    }
-  }, [tickOrbit]);
-
-  // Cancel any in-flight ease when the pane unmounts.
-  useEffect(
-    () => () => {
-      if (rafId.current !== null) {
-        cancelAnimationFrame(rafId.current);
-        rafId.current = null;
-      }
-    },
-    [],
-  );
 
   const onPointerDown = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) {
@@ -182,12 +110,12 @@ export function useOrbitCamera(opts: {
       const dx = e.clientX - lastPointer.current.x;
       const dy = e.clientY - lastPointer.current.y;
       lastPointer.current = { x: e.clientX, y: e.clientY };
-      const o = targetOrbit.current;
+      const o = orbit.current;
       o.yaw += dx * ORBIT_SENS_DEG_PER_PX;
       o.pitch = Math.max(-89, Math.min(89, o.pitch - dy * ORBIT_SENS_DEG_PER_PX));
-      ensureOrbitLoop();
+      pushOrbit();
     },
-    [ensureOrbitLoop],
+    [pushOrbit],
   );
 
   const onPointerUp = useCallback(
@@ -221,19 +149,18 @@ export function useOrbitCamera(opts: {
       if (!enableZoom) {
         return;
       }
-      const o = targetOrbit.current;
+      const o = orbit.current;
       const minD = Math.max(ZOOM_MIN_ABS, framedDistance.current * ZOOM_MIN_FRAC);
       const maxD = framedDistance.current * ZOOM_MAX_FRAC;
       const next = o.distance * (e.deltaY > 0 ? ZOOM_PER_WHEEL : 1 / ZOOM_PER_WHEEL);
       o.distance = Math.min(maxD, Math.max(minD, next));
-      ensureOrbitLoop();
+      pushOrbit();
     },
-    [ensureOrbitLoop, enableZoom],
+    [pushOrbit, enableZoom],
   );
 
   const setFramed = useCallback((o: OrbitState) => {
-    targetOrbit.current = cloneOrbit(o);
-    currentOrbit.current = cloneOrbit(o);
+    orbit.current = cloneOrbit(o);
     framedDistance.current = o.distance;
   }, []);
 

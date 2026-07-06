@@ -37,8 +37,8 @@ use saffron_scene::{
     environment_from_json, environment_to_json,
 };
 use saffron_sceneedit::{
-    GizmoOp, GizmoSpace, NativeGizmoHandle, PlayState, SceneEditCamera, SceneEditContext,
-    viewport_project,
+    GizmoOp, GizmoSpace, NativeGizmoHandle, OrbitState, PlayState, SceneEditCamera,
+    SceneEditContext, viewport_project,
 };
 use serde_json::{Map, Value, json};
 
@@ -747,6 +747,8 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 None => (ctx.scene_edit.active_scene().world_translation(entity), 5.0),
             };
             ctx.scene_edit.camera.position = target - forward * distance;
+            // Framing an entity jumps the eye — snap the target so it does not ease back.
+            ctx.scene_edit.camera.sync_target();
             let scene = ctx.scene_edit.active_scene();
             Ok(entity_ref_dto(scene, entity))
         },
@@ -1320,18 +1322,11 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 
     reg.register::<SetCameraParams, EditorCamera>(
         "set-camera",
-        "set-camera {position?, yaw?, pitch?, fov?, near?, far?, moveSpeed?, lookSpeed?}",
+        "set-camera {position?, yaw?, pitch?, fov?, near?, far?, moveSpeed?, lookSpeed?, \
+         pivot?, distance?} — pivot+distance eases the preview orbit along the arc; else a \
+         free-eye set that snaps to position",
         |ctx, params| {
             let c = &mut ctx.scene_edit.camera;
-            if let Some(p) = params.position {
-                c.position = to_glam3(p);
-            }
-            if let Some(y) = params.yaw {
-                c.yaw = y;
-            }
-            if let Some(p) = params.pitch {
-                c.pitch = p;
-            }
             if let Some(f) = params.fov {
                 c.fov = f;
             }
@@ -1346,6 +1341,53 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             }
             if let Some(l) = params.look_speed {
                 c.look_speed = l;
+            }
+            match (params.pivot, params.distance) {
+                (Some(pivot), Some(distance)) => {
+                    // Orbit drive (the preview drag): ease pivot / distance / angles toward the
+                    // sample; the per-frame update sweeps the eye along the arc.
+                    let pivot = to_glam3(pivot);
+                    if let Some(y) = params.yaw {
+                        c.target_yaw = y;
+                    }
+                    if let Some(p) = params.pitch {
+                        c.target_pitch = p.clamp(-89.0, 89.0);
+                    }
+                    if let Some(orbit) = c.orbit.as_mut() {
+                        orbit.target_pivot = pivot;
+                        orbit.target_distance = distance;
+                    } else {
+                        // Not framed into orbit yet: snap into it at the sample.
+                        if let Some(y) = params.yaw {
+                            c.yaw = y;
+                        }
+                        if let Some(p) = params.pitch {
+                            c.pitch = p.clamp(-89.0, 89.0);
+                        }
+                        c.orbit = Some(OrbitState {
+                            pivot,
+                            distance,
+                            target_pivot: pivot,
+                            target_distance: distance,
+                        });
+                        c.position = pivot - c.forward() * distance;
+                    }
+                }
+                _ => {
+                    // Free-eye set (scripting, absolute framing restore): leave orbit mode and
+                    // snap to the pose so a scripted set lands at once.
+                    c.orbit = None;
+                    if let Some(p) = params.position {
+                        c.position = to_glam3(p);
+                    }
+                    if let Some(y) = params.yaw {
+                        c.yaw = y;
+                    }
+                    if let Some(p) = params.pitch {
+                        c.pitch = p;
+                    }
+                    c.sync_target();
+                }
             }
             Ok(camera_dto(c))
         },
@@ -1520,7 +1562,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 mod tests {
     use serde_json::json;
 
-    use crate::registry::{CommandRegistry, register_builtin_commands};
+    use crate::registry::{CommandRegistry, EngineContext, register_builtin_commands};
     use crate::test_support::{StubRenderer, with_stub};
 
     fn registry() -> CommandRegistry {
@@ -1651,6 +1693,164 @@ mod tests {
         });
     }
 
+    /// `set-component-field` with an array `index` merges an object value into just that
+    /// slot of a `MaterialSet` (leaving its siblings untouched) and rejects an out-of-range
+    /// index — the per-slot override edit the editor's material inspector drives.
+    #[test]
+    fn set_component_field_slot_index_merges_and_rejects_out_of_range() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let created = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Mesh" } }),
+            );
+            let id = created["result"]["id"].as_str().unwrap().to_owned();
+
+            reg.dispatch(
+                ctx,
+                &json!({ "cmd": "add-component", "params": { "entity": id, "component": "MaterialSet" } }),
+            );
+            // Seed two slots, each referencing a distinct material with empty overrides.
+            let seeded = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-component-field",
+                    "params": {
+                        "entity": id, "component": "MaterialSet", "field": "slots",
+                        "value": [
+                            { "material": "11", "overrides": {} },
+                            { "material": "22", "overrides": {} }
+                        ]
+                    }
+                }),
+            );
+            assert_eq!(seeded["ok"], json!(true));
+
+            // Merge an override into slot 1 only.
+            let edited = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-component-field",
+                    "params": {
+                        "entity": id, "component": "MaterialSet", "field": "slots", "index": 1,
+                        "value": { "overrides": { "roughness": 0.25 } }
+                    }
+                }),
+            );
+            assert_eq!(edited["ok"], json!(true));
+
+            let inspect = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "inspect", "params": { "entity": id } }),
+            );
+            let slots = &inspect["result"]["components"]["MaterialSet"]["slots"];
+            assert_eq!(slots[1]["overrides"]["roughness"], json!(0.25));
+            // Slot 0 is untouched — its overrides stay empty.
+            assert!(slots[0]["overrides"]["roughness"].is_null());
+
+            // An out-of-range index is a typed error, not a silent no-op.
+            let bad = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-component-field",
+                    "params": {
+                        "entity": id, "component": "MaterialSet", "field": "slots", "index": 9,
+                        "value": { "overrides": { "metallic": 0.5 } }
+                    }
+                }),
+            );
+            assert_eq!(bad["ok"], json!(false));
+        });
+    }
+
+    /// `set-transform` merges the provided fields onto the entity's `Transform` and the write
+    /// is observable through `inspect`.
+    #[test]
+    fn set_transform_is_observable_through_inspect() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let created = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Movable" } }),
+            );
+            let id = created["result"]["id"].as_str().unwrap().to_owned();
+
+            let set = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-transform",
+                    "params": { "entity": id, "translation": { "x": 1.5, "y": -2.0, "z": 3.25 } }
+                }),
+            );
+            assert_eq!(set["ok"], json!(true));
+
+            let inspect = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "inspect", "params": { "entity": id } }),
+            );
+            let translation = &inspect["result"]["components"]["Transform"]["translation"];
+            assert_eq!(translation["x"], json!(1.5));
+            assert_eq!(translation["y"], json!(-2.0));
+            assert_eq!(translation["z"], json!(3.25));
+        });
+    }
+
+    /// `add-component` appends at the bottom of the order, `set-component-order` reorders the
+    /// present set, and a list that drops or duplicates a present component is rejected.
+    #[test]
+    fn component_order_appends_reorders_and_validates() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let created = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Ordered" } }),
+            );
+            let id = created["result"]["id"].as_str().unwrap().to_owned();
+
+            // A new component appends at the bottom.
+            let added = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "add-component", "params": { "entity": id, "component": "Camera" } }),
+            );
+            assert_eq!(added["ok"], json!(true));
+            let inspect = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "inspect", "params": { "entity": id } }),
+            );
+            assert_eq!(
+                inspect["result"]["componentOrder"],
+                json!(["Name", "Transform", "Camera"])
+            );
+
+            // An explicit reorder of the present set applies verbatim.
+            let reordered = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-component-order",
+                    "params": { "entity": id, "components": ["Camera", "Name", "Transform"] }
+                }),
+            );
+            assert_eq!(reordered["ok"], json!(true));
+            assert_eq!(
+                reordered["result"]["components"],
+                json!(["Camera", "Name", "Transform"])
+            );
+
+            // A list that duplicates a component (and drops another) is rejected, not applied.
+            let bad = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-component-order",
+                    "params": { "entity": id, "components": ["Camera", "Name", "Camera"] }
+                }),
+            );
+            assert_eq!(bad["ok"], json!(false));
+        });
+    }
+
     /// `inspect` returns `{id, name, components, componentOrder}` with the order in registry
     /// order and the component blob as an opaque object.
     #[test]
@@ -1729,6 +1929,155 @@ mod tests {
             let get = reg.dispatch(ctx, &json!({ "cmd": "get-gizmo" }));
             assert_eq!(get["result"]["op"], json!("rotate"));
             assert_eq!(get["result"]["space"], json!("local"));
+        });
+    }
+
+    /// Every scene mutation strictly bumps `sceneVersion` (read through get-selection) — the
+    /// stamp the editor re-polls on. Covers add / copy / rename / destroy plus set-transform,
+    /// set-component, and set-environment, with the entity id surfacing as a decimal string.
+    #[test]
+    fn scene_mutations_bump_scene_version() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let scene_version = |ctx: &mut EngineContext| -> i64 {
+                reg.dispatch(ctx, &json!({ "cmd": "get-selection" }))["result"]["sceneVersion"]
+                    .as_i64()
+                    .expect("sceneVersion is an integer")
+            };
+
+            // A built-in primitive needs no project (reserved-id geometry).
+            let cube = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "add-entity", "params": { "preset": "cube" } }),
+            );
+            assert_eq!(cube["ok"], json!(true));
+            let id = cube["result"]["id"]
+                .as_str()
+                .expect("id is a string")
+                .to_owned();
+            assert!(
+                id.parse::<u64>().is_ok(),
+                "id round-trips as a decimal string"
+            );
+            let mut version = scene_version(ctx);
+
+            for command in [
+                json!({ "cmd": "copy-entity", "params": { "entity": id } }),
+                json!({ "cmd": "rename-entity", "params": { "entity": id, "name": "Renamed" } }),
+                json!({ "cmd": "set-transform",
+                        "params": { "entity": id, "translation": { "x": 1, "y": 2, "z": 3 } } }),
+                json!({ "cmd": "set-component",
+                        "params": { "entity": id, "component": "Name", "json": { "name": "Again" } } }),
+                json!({ "cmd": "set-environment", "params": { "skyIntensity": 2.0 } }),
+                json!({ "cmd": "destroy-entity", "params": { "entity": id } }),
+            ] {
+                let reply = reg.dispatch(ctx, &command);
+                assert_eq!(reply["ok"], json!(true), "{command}");
+                let next = scene_version(ctx);
+                assert!(next > version, "{command} bumps sceneVersion");
+                version = next;
+            }
+        });
+    }
+
+    /// `set-atmosphere` reflects every field it is given, a partial call merges over the current
+    /// atmosphere block (it does not reset), and the free-form `{json}` path merges arbitrary keys.
+    #[test]
+    fn set_atmosphere_echoes_fields_and_merges_over_state() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let env = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-atmosphere",
+                    "params": {
+                        "enabled": true,
+                        "planetRadius": 6360000.0,
+                        "rayleighScattering": { "x": 5.8, "y": 13.5, "z": 33.1 },
+                        "sunDiskIntensity": 20.0
+                    }
+                }),
+            );
+            assert_eq!(env["ok"], json!(true));
+            let atmos = &env["result"]["atmosphere"];
+            assert_eq!(atmos["enabled"], json!(true));
+            assert!((atmos["planetRadius"].as_f64().unwrap() - 6_360_000.0).abs() < 1.0);
+            assert!((atmos["rayleighScattering"]["y"].as_f64().unwrap() - 13.5).abs() < 1e-3);
+            assert!((atmos["sunDiskIntensity"].as_f64().unwrap() - 20.0).abs() < 1e-3);
+
+            // A partial call merges over the read-back — the earlier fields survive.
+            let merged = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "set-atmosphere", "params": { "mieAnisotropy": 0.8 } }),
+            );
+            let atmos = &merged["result"]["atmosphere"];
+            assert!((atmos["mieAnisotropy"].as_f64().unwrap() - 0.8).abs() < 1e-3);
+            assert_eq!(
+                atmos["enabled"],
+                json!(true),
+                "prior fields survive the merge"
+            );
+            assert!((atmos["sunDiskIntensity"].as_f64().unwrap() - 20.0).abs() < 1e-3);
+
+            // The free-form {json} path merges arbitrary keys over the same block.
+            let free = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "set-atmosphere", "params": { "json": { "mieScattering": 4.2 } } }),
+            );
+            let atmos = &free["result"]["atmosphere"];
+            assert!((atmos["mieScattering"].as_f64().unwrap() - 4.2).abs() < 1e-3);
+            assert_eq!(atmos["enabled"], json!(true));
+        });
+    }
+
+    /// A smooth `set-transform` registers a per-frame animation target instead of writing; a
+    /// following non-smooth write cancels that target and applies the exact value.
+    #[test]
+    fn set_transform_smooth_defers_then_exact_write_cancels() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let created = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Mover" } }),
+            );
+            let id = created["result"]["id"].as_str().unwrap().to_owned();
+
+            reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-transform",
+                    "params": { "entity": id, "translation": { "x": 10, "y": 0, "z": 0 }, "smooth": true }
+                }),
+            );
+            assert_eq!(
+                ctx.scene_edit.transform_smoothing.len(),
+                1,
+                "a smooth edit defers to a target instead of writing"
+            );
+
+            reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "set-transform",
+                    "params": { "entity": id, "translation": { "x": -1, "y": 2.5, "z": 0.75 } }
+                }),
+            );
+            assert!(
+                ctx.scene_edit.transform_smoothing.is_empty(),
+                "an exact write cancels the pending target"
+            );
+
+            let info = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "inspect", "params": { "entity": id } }),
+            );
+            let t = &info["result"]["components"]["Transform"]["translation"];
+            assert_eq!(t["x"], json!(-1.0));
+            assert_eq!(t["y"], json!(2.5));
+            assert_eq!(t["z"], json!(0.75));
         });
     }
 }

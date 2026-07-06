@@ -395,8 +395,9 @@ impl HostLayer {
         if !self.editor.transform_smoothing.is_empty() {
             reasons.push("smoothing");
         }
-        // The fly-cam look smoothing eases out over a few frames after the last input.
-        if self.editor.camera.controlling || self.editor.camera.look_pending != Vec2::ZERO {
+        // The camera eases toward its target over a few frames after the last input — the
+        // fly-cam look tail and the preview orbit's `set-camera smooth` samples both.
+        if self.editor.camera.controlling || self.editor.camera.is_easing() {
             reasons.push("camera");
         }
         // An active asset-placement preview drags a ghost that tracks the cursor; hold continuous
