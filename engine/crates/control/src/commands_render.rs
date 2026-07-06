@@ -1048,6 +1048,10 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use saffron_rendering::{
+        ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmSeverity, FrameHistoryStats,
+        FrameSample, PerfConfig,
+    };
     use serde_json::{Value, json};
 
     use crate::registry::{CommandRegistry, register_builtin_commands};
@@ -1376,5 +1380,177 @@ mod tests {
         assert_eq!(reply["result"]["platform"], json!("linux"));
         assert_eq!(reply["result"]["transport"], json!("wayland-subsurface"));
         assert_eq!(reply["result"]["width"], json!(1280));
+    }
+
+    #[test]
+    fn get_upscale_reports_the_ratio_and_derived_extents() {
+        // A non-native render scale reads back with the fixed display extent and an input
+        // extent scaled down from it (input = round(display × ratio), ratio in (0, 1]).
+        let mut stub = StubRenderer {
+            render_scale: 0.75,
+            ..StubRenderer::default()
+        };
+        let reply = run(&mut stub, "get-upscale", json!({}));
+        assert_eq!(reply["ok"], json!(true));
+        let up = &reply["result"]["upscale"];
+        assert_eq!(up["ratio"], json!(0.75));
+        assert_eq!(up["displayWidth"], json!(1280));
+        assert_eq!(up["displayHeight"], json!(720));
+        assert_eq!(up["inputWidth"], json!(960)); // round(1280 × 0.75)
+        assert_eq!(up["inputHeight"], json!(540)); // round(720 × 0.75)
+        assert!(up["inputWidth"].as_u64().unwrap() <= up["displayWidth"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn frame_history_maps_stats_and_samples_over_the_perf_budget() {
+        // A controlled percentile summary + raw ring maps field-for-field; the reported budget
+        // is the perf config's derived budget (1000 / target_fps), the one shared source.
+        let mut stub = StubRenderer {
+            perf_config: PerfConfig {
+                target_fps: 30.0, // budget ≈ 33.33ms
+                ..PerfConfig::default()
+            },
+            frame_stats: FrameHistoryStats {
+                p50_ms: 8.0,
+                p95_ms: 12.0,
+                p99_ms: 16.0,
+                p999_ms: 20.0,
+                max_ms: 24.0,
+                mean_ms: 9.0,
+                stddev_ms: 2.0,
+                stutter_count: 3,
+                sample_count: 128,
+            },
+            frame_history_samples: vec![
+                FrameSample {
+                    frame_index: 100,
+                    cpu_ms: 7.0,
+                    gpu_ms: 5.0,
+                    cpu_wait_ms: 1.0,
+                },
+                FrameSample {
+                    frame_index: 101,
+                    cpu_ms: 8.0,
+                    gpu_ms: 6.0,
+                    cpu_wait_ms: 2.0,
+                },
+            ],
+            ..StubRenderer::default()
+        };
+
+        // No samples requested → summary only, empty samples array.
+        let summary = run(&mut stub, "frame-history", json!({}));
+        let r = &summary["result"];
+        assert_eq!(r["p50Ms"], json!(8.0));
+        assert_eq!(r["p95Ms"], json!(12.0));
+        assert_eq!(r["p99Ms"], json!(16.0));
+        assert_eq!(r["p999Ms"], json!(20.0));
+        assert_eq!(r["maxMs"], json!(24.0));
+        assert_eq!(r["stutterCount"], json!(3));
+        assert_eq!(r["sampleCount"], json!(128));
+        assert!((r["budgetMs"].as_f64().unwrap() - 1000.0 / 30.0).abs() < 1e-2);
+        assert!(r["samples"].as_array().unwrap().is_empty());
+
+        // Percentiles come from a sorted distribution → monotone non-decreasing.
+        assert!(r["p50Ms"].as_f64().unwrap() <= r["p95Ms"].as_f64().unwrap());
+        assert!(r["p95Ms"].as_f64().unwrap() <= r["p99Ms"].as_f64().unwrap());
+        assert!(r["p99Ms"].as_f64().unwrap() <= r["p999Ms"].as_f64().unwrap());
+        assert!(r["p999Ms"].as_f64().unwrap() <= r["maxMs"].as_f64().unwrap());
+
+        // A samples request returns the recent raw frames (truncated to the request), each with
+        // a monotonic absolute frame index — the field the editor dedups windows on.
+        let with_samples = run(&mut stub, "frame-history", json!({ "samples": 32 }));
+        let samples = with_samples["result"]["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["frameIndex"], json!(100));
+        assert_eq!(samples[0]["cpuMs"], json!(7.0));
+        assert!(
+            samples[1]["frameIndex"].as_i64().unwrap() > samples[0]["frameIndex"].as_i64().unwrap()
+        );
+    }
+
+    #[test]
+    fn drain_alarms_maps_events_and_respects_the_since_cursor() {
+        // A firing event then its resolve map field-for-field — the firing/resolved state enum,
+        // the fingerprint as a decimal string, the resolve's duration — and the `since` cursor
+        // filters out everything at or below it (the never-double-count contract).
+        let mut stub = StubRenderer {
+            alarm_drain: AlarmDrain {
+                events: vec![
+                    AlarmEvent {
+                        seq: 1,
+                        fingerprint: 42,
+                        metric: "frame-budget".to_owned(),
+                        pass: String::new(),
+                        severity: AlarmSeverity::Warning,
+                        kind: AlarmEventKind::Firing,
+                        value: 20.0,
+                        threshold: 16.6,
+                        since_frame: 10,
+                        count: 4,
+                        duration_ms: 0.0,
+                    },
+                    AlarmEvent {
+                        seq: 2,
+                        fingerprint: 42,
+                        metric: "frame-budget".to_owned(),
+                        pass: String::new(),
+                        severity: AlarmSeverity::Warning,
+                        kind: AlarmEventKind::Resolved,
+                        value: 8.0,
+                        threshold: 16.6,
+                        since_frame: 10,
+                        count: 4,
+                        duration_ms: 250.0,
+                    },
+                ],
+                high_water_seq: 2,
+                oldest_seq: 1,
+                overflowed: false,
+            },
+            active_alarm_list: vec![ActiveAlarm {
+                fingerprint: 42,
+                metric: "frame-budget".to_owned(),
+                pass: String::new(),
+                severity: AlarmSeverity::Critical,
+                value: 20.0,
+                threshold: 16.6,
+                peak: 22.0,
+                since_frame: 10,
+                since_ns: 0,
+                last_seen_ns: 0,
+                count: 4,
+            }],
+            ..StubRenderer::default()
+        };
+
+        let drained = run(&mut stub, "drain-alarms", json!({ "since": 0 }));
+        let events = drained["result"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        // Seqs come back strictly increasing — the cursor's monotonic contract.
+        assert!(events[1]["seq"].as_i64().unwrap() > events[0]["seq"].as_i64().unwrap());
+        let firing = &events[0];
+        assert_eq!(firing["metric"], json!("frame-budget"));
+        assert_eq!(firing["state"], json!("firing"));
+        assert_eq!(firing["fingerprint"], json!("42"));
+        assert_eq!(firing["severity"], json!("warning"));
+        let resolved = &events[1];
+        assert_eq!(resolved["state"], json!("resolved"));
+        assert_eq!(resolved["fingerprint"], firing["fingerprint"]);
+        assert!(resolved["durationMs"].as_f64().unwrap() > 0.0);
+        assert_eq!(drained["result"]["highWaterSeq"], json!(2));
+        assert_eq!(drained["result"]["overflowed"], json!(false));
+
+        // A drain from the high-water cursor re-sends nothing at or below it.
+        let tail = run(&mut stub, "drain-alarms", json!({ "since": 2 }));
+        assert!(tail["result"]["events"].as_array().unwrap().is_empty());
+
+        // The active set is the badge source; it maps the coalesced entry.
+        let active = run(&mut stub, "list-active-alarms", json!({}));
+        let alarms = active["result"]["alarms"].as_array().unwrap();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(alarms[0]["metric"], json!("frame-budget"));
+        assert_eq!(alarms[0]["fingerprint"], json!("42"));
+        assert_eq!(alarms[0]["severity"], json!("critical"));
     }
 }

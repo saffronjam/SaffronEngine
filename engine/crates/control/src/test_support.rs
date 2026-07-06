@@ -10,9 +10,9 @@ use std::sync::Arc;
 use saffron_assets::{AssetServer, GpuUploader, ThumbnailGpu, ThumbnailPng};
 use saffron_geometry::{Mesh, VertexSkin};
 use saffron_rendering::{
-    ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, GpuMesh,
-    GpuTexture, PassTiming, PerfConfig, PngTransfer, ProfileCapture, ProfilerMode, ReflectionProbe,
-    RenderStatsFull, SubmeshMaterial, ViewId, ViewMode,
+    ActiveAlarm, AlarmDrain, AlarmEvent, CaptureMode, CaptureState, FrameHistoryStats, FrameSample,
+    GpuMesh, GpuTexture, PassTiming, PerfConfig, PngTransfer, ProfileCapture, ProfilerMode,
+    ReflectionProbe, RenderStatsFull, SubmeshMaterial, ViewId, ViewMode,
 };
 use saffron_sceneedit::SceneEditContext;
 use saffron_window::Window;
@@ -151,6 +151,14 @@ pub struct StubRenderer {
     pub pipeline_stats_supported: bool,
     pub software_gpu: bool,
     pub perf_config: PerfConfig,
+    /// The percentile/consistency summary [`frame_history_stats`] reports.
+    pub frame_stats: FrameHistoryStats,
+    /// The recent raw frames [`frame_samples`] returns (truncated to the request).
+    pub frame_history_samples: Vec<FrameSample>,
+    /// The alarm event ring [`drain_alarms`] filters by the `since` cursor.
+    pub alarm_drain: AlarmDrain,
+    /// The currently-firing alarms [`active_alarms`] reports.
+    pub active_alarm_list: Vec<ActiveAlarm>,
     pub capture_state: CaptureState,
     pub capture_mode: CaptureMode,
     pub capture_id: u32,
@@ -202,6 +210,10 @@ impl Default for StubRenderer {
             pipeline_stats_supported: false,
             software_gpu: true,
             perf_config: PerfConfig::default(),
+            frame_stats: FrameHistoryStats::default(),
+            frame_history_samples: Vec::new(),
+            alarm_drain: AlarmDrain::default(),
+            active_alarm_list: Vec::new(),
             capture_state: CaptureState::Idle,
             capture_mode: CaptureMode::Single,
             capture_id: 0,
@@ -492,10 +504,14 @@ impl ControlRenderer for StubRenderer {
     }
 
     fn frame_history_stats(&self) -> FrameHistoryStats {
-        FrameHistoryStats::default()
+        self.frame_stats
     }
-    fn frame_samples(&self, _max_samples: u32) -> Vec<FrameSample> {
-        Vec::new()
+    fn frame_samples(&self, max_samples: u32) -> Vec<FrameSample> {
+        self.frame_history_samples
+            .iter()
+            .take(max_samples as usize)
+            .copied()
+            .collect()
     }
     fn perf_config(&self) -> PerfConfig {
         self.perf_config
@@ -504,11 +520,24 @@ impl ControlRenderer for StubRenderer {
         self.perf_config = config.clamped();
     }
 
-    fn drain_alarms(&self, _since: u64) -> AlarmDrain {
-        AlarmDrain::default()
+    fn drain_alarms(&self, since: u64) -> AlarmDrain {
+        // Mirror the renderer's cursor contract: only events past `since` come back.
+        let events: Vec<AlarmEvent> = self
+            .alarm_drain
+            .events
+            .iter()
+            .filter(|event| event.seq > since)
+            .cloned()
+            .collect();
+        AlarmDrain {
+            events,
+            high_water_seq: self.alarm_drain.high_water_seq,
+            oldest_seq: self.alarm_drain.oldest_seq,
+            overflowed: self.alarm_drain.overflowed,
+        }
     }
     fn active_alarms(&self) -> Vec<ActiveAlarm> {
-        Vec::new()
+        self.active_alarm_list.clone()
     }
 
     fn viewport_width(&self) -> u32 {
