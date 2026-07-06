@@ -75,10 +75,10 @@ pub fn plane() -> Mesh {
 }
 
 /// A unit UV sphere centered at the origin, radius 1 (normals == positions), subdivided into
-/// `rings × sectors`. The wrap seam duplicates the `s = 0` / `s = sectors` column (same position,
-/// `u = 0` vs `u = 1`) so a tiling texture reads identically across it; the poles collapse a ring to
-/// a point.
-fn uv_sphere_with(rings: u32, sectors: u32) -> Mesh {
+/// `rings × sectors`. `uv_repeat` tiles the surface texture (`uv0` spans `0..uv_repeat`) — integer
+/// components keep a tiling texture seamless across the `s = 0` / `s = sectors` wrap seam and the
+/// poles. The poles collapse a ring to a point.
+fn uv_sphere_with(rings: u32, sectors: u32, uv_repeat: Vec2) -> Mesh {
     let mut mesh = Mesh::default();
     for r in 0..=rings {
         let phi = std::f32::consts::PI * (r as f32) / (rings as f32);
@@ -88,7 +88,10 @@ fn uv_sphere_with(rings: u32, sectors: u32) -> Mesh {
             mesh.vertices.push(Vertex {
                 position,
                 normal: position,
-                uv0: Vec2::new((s as f32) / (sectors as f32), (r as f32) / (rings as f32)),
+                uv0: Vec2::new(
+                    (s as f32) / (sectors as f32) * uv_repeat.x,
+                    (r as f32) / (rings as f32) * uv_repeat.y,
+                ),
                 ..Vertex::default()
             });
         }
@@ -108,17 +111,26 @@ fn uv_sphere_with(rings: u32, sectors: u32) -> Mesh {
 }
 
 /// A unit UV sphere centered at the origin, radius 1 (normals == positions). 32 rings ×
-/// 48 sectors. This is the geometry the material/asset thumbnail preview also renders on.
+/// 48 sectors, texture wrapping once.
 pub fn uv_sphere() -> Mesh {
-    uv_sphere_with(32, 48)
+    uv_sphere_with(32, 48, Vec2::ONE)
 }
+
+/// The preview sphere's surface-texture tiling. A once-wrapped sphere shows only ~half its texture
+/// across the visible hemisphere (and stretches it 2× wider than tall at the equator, since the
+/// equator arc is twice the pole-to-pole arc), so a material's detail reads far larger than in the
+/// provider's flat/preview reference. Tiling denser with a 2:1 `u:v` ratio fixes both: square texels
+/// at the equator, and roughly the reference's feature scale. Integer components keep it seamless.
+/// The displacement height map samples the same `uv0`, so the silhouette bumps tile in lockstep.
+const PREVIEW_SPHERE_UV_REPEAT: Vec2 = Vec2::new(4.0, 2.0);
 
 /// A densely-subdivided unit UV sphere (192 rings × 288 sectors, ~56k vertices) for **vertex-shader
 /// displacement previews**: at a fixed preview camera distance uniform subdivision is the correct
 /// amount of geometry, so a height map moves real vertices into a true silhouette. Not a spawnable
-/// primitive — it is seeded only for the interactive material/texture preview sphere.
+/// primitive — it is seeded only for the interactive material/texture preview sphere. Its texture
+/// tiles [`PREVIEW_SPHERE_UV_REPEAT`] so the material reads at the reference's scale, not stretched.
 pub fn preview_displacement_sphere() -> Mesh {
-    uv_sphere_with(192, 288)
+    uv_sphere_with(192, 288, PREVIEW_SPHERE_UV_REPEAT)
 }
 
 #[cfg(test)]
