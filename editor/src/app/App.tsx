@@ -11,6 +11,7 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core"; // [vp-dbg] TEMP
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { client } from "../control/client";
 import { loadEditorSettings, startReconcile, useEditorStore } from "../state/store";
@@ -29,7 +30,6 @@ import { SettingsModal } from "./SettingsModal";
 import { ExportModal } from "./ExportModal";
 import type { ViewId } from "../control/client";
 import { AssetPreview } from "../components/AssetViewer";
-import { Button } from "@/components/ui/button";
 import { CaptureFlame } from "../components/CaptureFlame";
 import { MaterialGraphEditor } from "../panels/MaterialGraphEditor";
 import { AssetEditorWorkspace } from "../panels/AssetEditorWorkspace";
@@ -85,6 +85,22 @@ export function App() {
   // The Store tab stays mounted (hidden when inactive) while its tab exists, so the search
   // query and results survive switching to another tab and back.
   const storeTabExists = useEditorStore((s) => s.viewTabs.some((tab) => tab.kind === "store"));
+  // [vp-dbg] TEMP: time the reveal when the active main tab changes. t0 = this effect (after React
+  // has committed the display:none→visible flip); rAF1/rAF2 bracket the browser's layout+paint. A
+  // large commit→rAF1 gap means the reveal (layout/paint) is the ~1s block. Read alongside the
+  // saffron-img request counter in the same terminal. Delete with the probe.
+  useEffect(() => {
+    const t0 = performance.now();
+    requestAnimationFrame(() => {
+      const t1 = performance.now();
+      requestAnimationFrame(() => {
+        const t2 = performance.now();
+        void invoke("dbg_log", {
+          msg: `tab→${activeKind} reveal: commit→rAF1 ${(t1 - t0).toFixed(0)}ms rAF1→rAF2 ${(t2 - t1).toFixed(0)}ms`,
+        });
+      });
+    });
+  }, [activeKind]);
   // Keep one asset editor mounted across tab switches (like the scene dock) so returning is instant: it
   // suspends/resumes the engine preview on `active` rather than remounting + re-entering. We keep the
   // most-recently-active asset tab mounted, sticky until its tab closes; switching to a different asset
@@ -351,7 +367,12 @@ export function App() {
             0x0 (computeBounds skips degenerate rects) while viewportHidden parks
             the subsurface. The key remounts the dock once per project so the
             persisted per-project layout applies. */}
-        <div className={cn("flex min-h-0 min-w-0 flex-1 flex-col", !sceneTabActive && "hidden")}>
+        <div
+          className={cn(
+            "contain-panel flex min-h-0 min-w-0 flex-1 flex-col",
+            !sceneTabActive && "hidden",
+          )}
+        >
           <Topbar />
           <Layout key={projectPath ?? ""} />
         </div>
@@ -370,7 +391,7 @@ export function App() {
         {storeTabExists && (
           <div
             className={cn(
-              "flex min-h-0 min-w-0 flex-1 flex-col",
+              "contain-panel flex min-h-0 min-w-0 flex-1 flex-col",
               activeKind !== "store" && "hidden",
             )}
           >
@@ -386,7 +407,7 @@ export function App() {
         {mountedAssetId !== null && (
           <div
             className={cn(
-              "flex min-h-0 min-w-0 flex-1 flex-col",
+              "contain-panel flex min-h-0 min-w-0 flex-1 flex-col",
               activeKind !== "assetEditor" && "hidden",
             )}
           >
@@ -520,7 +541,6 @@ function StatusFooter() {
 }
 
 function ImageViewerWorkspace({ asset }: { asset: AssetEntry | null }) {
-  const openAssetEditorForAsset = useEditorStore((s) => s.openAssetEditorForAsset);
   if (!asset) {
     return (
       <main className="flex min-h-0 flex-1 items-center justify-center bg-background text-xs italic text-muted-foreground">
@@ -528,29 +548,10 @@ function ImageViewerWorkspace({ asset }: { asset: AssetEntry | null }) {
       </main>
     );
   }
-  // Any texture can flip back to its 3D preview: a non-HDR map on the studio sphere, an HDRI as the
-  // lit environment.
-  const canApply = asset.type === "texture";
+  // The flat image view for non-previewable ("other") files — textures/HDRIs preview in 3D and never
+  // route here.
   return (
     <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
-      {canApply ? (
-        <div className="flex items-center gap-3 border-b border-border px-3 py-2">
-          <span className="text-sm font-medium text-foreground">{asset.name}</span>
-          <div className="ml-auto flex items-center overflow-hidden rounded-md border border-border">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="rounded-none"
-              onClick={() => openAssetEditorForAsset(asset.id, asset.name)}
-            >
-              Applied
-            </Button>
-            <Button variant="secondary" size="sm" className="rounded-none" disabled>
-              Flat
-            </Button>
-          </div>
-        </div>
-      ) : null}
       <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6">
         <AssetPreview entry={asset} className="h-full max-h-full w-auto max-w-full" />
       </div>

@@ -27,7 +27,9 @@ function hostFor(id: DockPanelId): HTMLDivElement {
   let host = panelHosts.get(id);
   if (!host) {
     host = document.createElement("div");
-    host.className = "flex h-full min-h-0 w-full min-w-0 flex-col";
+    // `contain-panel`: each panel is a layout/paint containment boundary, so a document-wide
+    // reflow/repaint (e.g. an overlay's scroll-lock body write) can't cascade into sibling panels.
+    host.className = "contain-panel flex h-full min-h-0 w-full min-w-0 flex-col";
     host.dataset.panelHost = id;
     panelHosts.set(id, host);
   }

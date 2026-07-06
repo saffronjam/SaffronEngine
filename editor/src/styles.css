@@ -105,6 +105,12 @@
   #root {
     height: 100%;
     margin: 0;
+    /* The shell is a fixed full-viewport desktop layout; only inner panes scroll (each is its own
+       `overflow-auto`). Pinning the root non-scrollable means an overlay's scroll-lock
+       (`react-remove-scroll`, pulled in by every Radix menu/select) measures a zero scrollbar gap
+       and writes no compensating body padding — so opening a menu no longer shifts/relayouts the
+       whole document. */
+    overflow: hidden;
   }
 
   body {
@@ -157,6 +163,15 @@
   position: absolute;
   inset: 0;
   background: transparent;
+}
+
+/* A panel / main-tab containment boundary. A dockable panel's internals never affect a sibling's
+   layout or paint, so declaring that lets the engine stop a document-wide layout/paint pass — the
+   kind an overlay's body-level scroll-lock triggers — from cascading a relayout/repaint into every
+   other panel. `size` is intentionally omitted (panels flex to their parent); overlays portal to
+   the app root, never inside a panel, so paint containment here never clips a menu or tooltip. */
+.contain-panel {
+  contain: layout paint;
 }
 
 /* Inspector/environment fields scrub by drag and type directly; the native
