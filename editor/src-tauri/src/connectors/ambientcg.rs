@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use super::{
     AssetPart, AuthKind, ConnectorError, ResourceCache, SearchPage, SearchQuery, StoreConnector,
-    StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult, extract_zip,
+    StoreCursor, StoreImportDescriptor, StoreKind, StoreLicense, StoreRef, StoreResult,
+    extract_zip,
 };
 
 const API_BASE: &str = "https://ambientcg.com/api/v2/full_json";
@@ -231,7 +232,9 @@ impl StoreConnector for AmbientCg {
         match descriptor.format.as_str() {
             // A material map set: extract into a cached folder the host's material importer scans.
             "texture-zip" => {
-                let derived = self.cache.derived(&format!("acg-set-{}", stable_id(&requested)));
+                let derived = self
+                    .cache
+                    .derived(&format!("acg-set-{}", stable_id(&requested)));
                 if derived.exists() {
                     progress(1.0);
                 } else {
@@ -246,7 +249,9 @@ impl StoreConnector for AmbientCg {
             }
             // An HDRI zipped: extract (cached) and return the single environment file inside.
             "hdri-zip" => {
-                let derived = self.cache.derived(&format!("acg-hdri-{}", stable_id(&requested)));
+                let derived = self
+                    .cache
+                    .derived(&format!("acg-hdri-{}", stable_id(&requested)));
                 if derived.exists() {
                     progress(1.0);
                 } else {
@@ -353,7 +358,9 @@ impl StoreConnector for AmbientCg {
         };
         // Extract the (cached) bundle zip into a cached folder, reused across every map picked
         // from the same bundle.
-        let derived = self.cache.derived(&format!("acg-bundle-{}", stable_id(&bundle)));
+        let derived = self
+            .cache
+            .derived(&format!("acg-bundle-{}", stable_id(&bundle)));
         if !derived.exists() {
             let bytes = std::fs::read(&zip).map_err(|e| ConnectorError::Download(e.to_string()))?;
             let dir = derived.begin()?;
