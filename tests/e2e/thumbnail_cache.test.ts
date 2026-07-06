@@ -1,9 +1,10 @@
 // Thumbnails are cached in an app-level, content-addressed store at
-// <appDataRoot>/thumbnail-cache/<contentHash>-<size>.png, shared across projects and surviving a
-// restart. The key is a hash of the asset's baked content, not a file stat — so a bare touch
-// (mtime bump) still hits, and only a real content change mints a new key and regenerates.
+// <appDataRoot>/thumbnail-cache/v<VERSION>-<contentHash>-<size>.png, shared across projects and
+// surviving a restart. The key is a hash of the asset's baked content, not a file stat — so a bare
+// touch (mtime bump) still hits, and only a real content change (or a version bump) mints a new key
+// and regenerates.
 
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdtempSync,
@@ -92,4 +93,76 @@ test("content-addressed thumbnails persist across a restart, survive a touch, an
   expect(cachePngs().length).toBeGreaterThanOrEqual(2); // a new content-key file was written
   expect(e2.validationErrors()).toEqual([]);
   await e2.shutdown();
+});
+
+// Content-addressed cache semantics: deleting an asset leaves the shared cache intact (another
+// asset/project may reference the same content bytes); editing a *parent* material reflows the
+// instance's resolved-state key so its thumbnail regenerates; and the thumbnail-cache control
+// command reports + empties the app-level cache.
+describe("cache invalidation semantics", () => {
+  let engine: Engine;
+  let invalRoot: string;
+
+  function invalCachePngs(): string[] {
+    const dir = join(engine.appdata, "thumbnail-cache");
+    return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".png")) : [];
+  }
+
+  beforeAll(async () => {
+    invalRoot = mkdtempSync(join(tmpdir(), "saffron-thumbinval-"));
+    engine = await Engine.boot();
+    await engine.newProject({ name: "inval", root: invalRoot });
+  });
+  afterAll(async () => {
+    await engine?.shutdown();
+    rmSync(invalRoot, { recursive: true, force: true });
+  });
+
+  test("delete-asset leaves the shared content-addressed cache intact", async () => {
+    writeFileSync(join(invalRoot, "tex.png"), makePng(256, 256, (x, y) => [x & 255, y & 255, 128]));
+    const { texture } = await engine.call<{ texture: string }>("import-texture", {
+      path: join(invalRoot, "tex.png"),
+    });
+    await engine.getThumbnail("get-thumbnail", { asset: texture, size: 128 });
+    const before = invalCachePngs();
+    expect(before.length).toBeGreaterThan(0); // the miss wrote a content-addressed file
+
+    await engine.call("delete-asset", { asset: texture });
+    // The cache is content-addressed and shared across assets/projects, so a delete must NOT purge
+    // the bytes — another asset may reference the same content; eviction bounds growth instead.
+    expect(invalCachePngs()).toEqual(before);
+    expect(engine.validationErrors()).toEqual([]);
+  });
+
+  test("editing a parent material regenerates the instance thumbnail", async () => {
+    const parent = await engine.call<{ id: string }>("material-create", { name: "Parent" });
+    const inst = await engine.call<{ id: string }>("material-create-instance", {
+      parent: parent.id,
+      name: "Inst",
+    });
+
+    const t1 = await engine.getThumbnail<{ base64: string }>("get-thumbnail", { asset: inst.id, size: 96 });
+    // Edit the PARENT — the instance's .smat is untouched, but its resolved state (and so its cache
+    // key) changes, so its thumbnail must regenerate rather than serve the stale white sphere.
+    await engine.call("material-update", { material: parent.id, baseColor: { x: 1, y: 0, z: 0, w: 1 } });
+    const t2 = await engine.getThumbnail<{ base64: string }>("get-thumbnail", { asset: inst.id, size: 96 });
+
+    expect(t2.base64).not.toBe(t1.base64);
+    expect(engine.validationErrors()).toEqual([]);
+  });
+
+  test("thumbnail-cache stats counts the app-level dir and clear empties it", async () => {
+    const stats = await engine.call<{ entries: number; bytes: number }>("thumbnail-cache", {
+      action: "stats",
+    });
+    expect(stats.entries).toBe(invalCachePngs().length);
+    expect(stats.bytes).toBeGreaterThan(0);
+
+    const cleared = await engine.call<{ entries: number; bytes: number }>("thumbnail-cache", {
+      action: "clear",
+    });
+    expect(cleared.entries).toBe(stats.entries);
+    expect(invalCachePngs().length).toBe(0);
+    expect(engine.validationErrors()).toEqual([]);
+  });
 });
