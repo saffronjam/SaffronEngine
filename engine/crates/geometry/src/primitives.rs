@@ -25,13 +25,15 @@ fn push_quad(mesh: &mut Mesh, center: Vec3, half_u: Vec3, half_v: Vec3, normal: 
             position: center + half_u * a + half_v * b,
             normal,
             uv0: Vec2::new((a + 1.0) * 0.5, 1.0 - (b + 1.0) * 0.5),
+            ..Vertex::default()
         });
     }
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// Closes a primitive with a single full-range submesh over its buffers.
+/// Closes a primitive with a single full-range submesh over its buffers, and computes its
+/// UV-aligned tangents (so a primitive carries the same frame an imported mesh does).
 fn one_submesh(mesh: &mut Mesh) {
     mesh.submeshes.push(Submesh {
         first_index: 0,
@@ -39,6 +41,7 @@ fn one_submesh(mesh: &mut Mesh) {
         vertex_offset: 0,
         material_slot: 0,
     });
+    crate::compute_tangents(mesh);
 }
 
 /// A unit cube centered at the origin, edge length 1 (`±0.5`), 24 vertices (hard normals
@@ -86,6 +89,7 @@ fn uv_sphere_with(rings: u32, sectors: u32) -> Mesh {
                 position,
                 normal: position,
                 uv0: Vec2::new((s as f32) / (sectors as f32), (r as f32) / (rings as f32)),
+                ..Vertex::default()
             });
         }
     }

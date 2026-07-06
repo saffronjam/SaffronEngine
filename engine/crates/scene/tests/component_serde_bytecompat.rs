@@ -66,6 +66,7 @@ impl RegistryExt for ComponentRegistry {
 const EXPECT_TRANSFORM_DEFAULT: &str = r#"{"rotation":{"x":0.0,"y":0.0,"z":0.0},"scale":{"x":1.0,"y":1.0,"z":1.0},"translation":{"x":0.0,"y":0.0,"z":0.0}}"#;
 const EXPECT_TRANSFORM_VALUES: &str = r#"{"rotation":{"x":0.10000000149011612,"y":0.20000000298023224,"z":0.30000001192092896},"scale":{"x":2.0,"y":2.0,"z":2.0},"translation":{"x":1.5,"y":-2.0,"z":3.25}}"#;
 const EXPECT_CAMERA_DEFAULT: &str = r#"{"far":100.0,"fov":45.0,"frustumMaxDistance":10.0,"near":0.10000000149011612,"primary":true,"showFrustum":true,"showModel":true}"#;
+const EXPECT_CAMERA_VALUES: &str = r#"{"far":100.0,"fov":45.0,"frustumMaxDistance":8.0,"near":0.10000000149011612,"primary":true,"showFrustum":false,"showModel":false}"#;
 const EXPECT_MATERIALSET: &str = r#"{"slots":[{"material":"4242","overrides":{}}]}"#;
 const EXPECT_MESH: &str = r#"{"mesh":"1024"}"#;
 const EXPECT_MODELINSTANCE: &str = r#"{"modelId":"9999"}"#;
@@ -85,6 +86,7 @@ const EXPECT_RIGIDBODY_DEFAULT: &str = r#"{"angularDamping":0.05000000074505806,
 const EXPECT_RIGIDBODY_KIN: &str = r#"{"angularDamping":0.20000000298023224,"collisionLayer":3,"gravityFactor":0.0,"linearDamping":0.10000000149011612,"lockPosition":{"x":true,"y":false,"z":true},"lockRotation":{"x":false,"y":true,"z":false},"mass":5.0,"motion":"kinematic"}"#;
 const EXPECT_COLLIDER_DEFAULT: &str = r#"{"halfExtents":{"x":0.5,"y":0.5,"z":0.5},"isSensor":false,"material":{"friction":0.5,"restitution":0.0},"offset":{"x":0.0,"y":0.0,"z":0.0},"shape":"box","sourceMesh":"0"}"#;
 const EXPECT_COLLIDER_CAPSULE: &str = r#"{"halfExtents":{"x":0.30000001192092896,"y":1.0,"z":0.30000001192092896},"isSensor":true,"material":{"friction":0.800000011920929,"restitution":0.4000000059604645},"offset":{"x":0.0,"y":0.5,"z":0.0},"shape":"capsule","sourceMesh":"77"}"#;
+const EXPECT_COLLIDER_SPHERE: &str = r#"{"halfExtents":{"x":0.5,"y":0.5,"z":0.5},"isSensor":false,"material":{"friction":0.8999999761581421,"restitution":0.5},"offset":{"x":0.0,"y":0.0,"z":0.0},"shape":"sphere","sourceMesh":"0"}"#;
 const EXPECT_KINBONES_DEFAULT: &str = r#"{"driven":[],"enabled":true}"#;
 const EXPECT_KINBONES_DRIVEN: &str = r#"{"driven":[0,3,7],"enabled":false}"#;
 const EXPECT_CHARCTRL_DEFAULT: &str = r#"{"gravityFactor":1.0,"maxSlopeAngle":0.785398006439209,"maxSpeed":4.0,"maxStepHeight":0.30000001192092896}"#;
@@ -129,6 +131,16 @@ fn camera_matches_cpp() {
         EXPECT_CAMERA_DEFAULT
     );
     assert_round_trips("Camera", EXPECT_CAMERA_DEFAULT);
+    // The editor helpers toggle off and the frustum extent scrubs — the non-default booleans
+    // and distance must survive the serde round-trip, not snap back to their defaults.
+    let c = Camera {
+        show_model: false,
+        show_frustum: false,
+        frustum_max_distance: 8.0,
+        ..Camera::default()
+    };
+    assert_eq!(serialize_via_registry("Camera", c), EXPECT_CAMERA_VALUES);
+    assert_round_trips("Camera", EXPECT_CAMERA_VALUES);
 }
 
 #[test]
@@ -144,6 +156,25 @@ fn material_set_matches_cpp() {
         EXPECT_MATERIALSET
     );
     assert_round_trips("MaterialSet", EXPECT_MATERIALSET);
+}
+
+#[test]
+fn material_slot_overrides_round_trip() {
+    // A per-object override map (a texture id string plus a scalar factor) is opaque JSON
+    // carried verbatim on the slot; a save/reload must preserve it intact.
+    let mut overrides = Map::new();
+    overrides.insert("normalTexture".to_string(), Value::from("7"));
+    overrides.insert("roughness".to_string(), Value::from(0.25));
+    let set = MaterialSet {
+        slots: vec![MaterialSlot {
+            material: Uuid(4242),
+            overrides: Value::Object(overrides),
+        }],
+    };
+    const EXPECT: &str =
+        r#"{"slots":[{"material":"4242","overrides":{"normalTexture":"7","roughness":0.25}}]}"#;
+    assert_eq!(serialize_via_registry("MaterialSet", set), EXPECT);
+    assert_round_trips("MaterialSet", EXPECT);
 }
 
 #[test]
@@ -338,8 +369,23 @@ fn collider_matches_cpp() {
         serialize_via_registry("Collider", c),
         EXPECT_COLLIDER_CAPSULE
     );
+    // The inspector's full-DTO write may swap the shape to `sphere` and carry a custom
+    // material — the enum stays a lowercase string and both material sub-fields survive.
+    let s = Collider {
+        shape: Shape::Sphere,
+        material: PhysicsMaterial {
+            friction: 0.9,
+            restitution: 0.5,
+        },
+        ..Collider::default()
+    };
+    assert_eq!(
+        serialize_via_registry("Collider", s),
+        EXPECT_COLLIDER_SPHERE
+    );
     assert_round_trips("Collider", EXPECT_COLLIDER_DEFAULT);
     assert_round_trips("Collider", EXPECT_COLLIDER_CAPSULE);
+    assert_round_trips("Collider", EXPECT_COLLIDER_SPHERE);
 }
 
 #[test]

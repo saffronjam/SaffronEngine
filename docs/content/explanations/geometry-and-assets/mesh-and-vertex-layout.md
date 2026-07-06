@@ -7,33 +7,40 @@ weight = 1
 
 A vertex layout is the fixed memory format of a single mesh vertex: which attributes it
 carries, in what order, and at what total stride. Anima uses one CPU-side mesh type,
-`Mesh`, and one 32-byte vertex struct for every importer.
+`Mesh`, and one 48-byte vertex struct for every importer.
 
 A single fixed layout lets one mesh pipeline, one `.smesh` on-disk stride, and one upload
 path serve glTF and OBJ alike. The format is the same in memory, on disk, and on the GPU.
 
 ## The vertex
 
-A vertex is position, normal, and one UV channel, nothing more:
+A vertex is position, normal, one UV channel, and a UV-aligned tangent:
 
 ```rust
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
-    pub position: Vec3,   // glam's 12-byte Vec3, never the 16-byte Vec3A
+    pub position: Vec3,     // glam's 12-byte Vec3, never the 16-byte Vec3A
     pub normal: Vec3,
     pub uv0: Vec2,
+    pub tangent: [f32; 4],  // xyz object-space tangent, w the ±1 bitangent handedness
 }
 ```
 
 The size is pinned at compile time. `saffron-geometry`'s `lib.rs` carries a
-`const _: () = assert!(size_of::<Vertex>() == 32, …)`, so a stray `Vec3A` or a glam bump
+`const _: () = assert!(size_of::<Vertex>() == 48, …)`, so a stray `Vec3A` or a glam bump
 that changed a layout fails the build, not at a torn-mesh runtime. The
 [`.smesh` format](../smesh-format/) writes the vertex array as one raw `bytemuck::cast_slice`
 blob and the loader reads it straight back, so the in-memory stride is the disk stride.
 Adding a member without bumping the format version would misalign every baked mesh on disk.
 
-Tangents are absent, deferred to material time. The `#[repr(C)]` Pod derive (the
+The **tangent** is UV-aligned (Lengyel's method, computed on import — or the glTF `TANGENT`
+accessor when present), with the ±1 bitangent handedness in `w` (glTF convention:
+`bitangent = w · cross(normal, tangent)`). It is a raw `[f32; 4]` rather than glam's
+SIMD-aligned `Vec4` so the struct stays tightly packed at 48 bytes. It lets a UV-space vector
+field — a normal map's frame, or tangent-space vector displacement — be transformed by a true
+TBN instead of a derivative-reconstructed one, and the skin/morph/displace compute kernels
+carry (and skinning rotates) it into the deformed buffer. The `#[repr(C)]` Pod derive (the
 `Pod`/`Zeroable` from `bytemuck`) is what lets the byte codec reinterpret the array safely
 under the crate's `#![deny(unsafe_code)]`.
 

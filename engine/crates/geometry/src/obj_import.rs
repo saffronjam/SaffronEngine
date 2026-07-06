@@ -99,6 +99,7 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
     if !any_normals_present(&mesh) {
         generate_normals(&mut mesh);
     }
+    crate::compute_tangents(&mut mesh);
 
     let mut out_materials: Vec<ImportedMaterial> =
         Vec::with_capacity(slots.slot_to_obj_material.len());
@@ -197,6 +198,8 @@ fn resolve_vertex(
         position: Vec3::new(m.positions[p], m.positions[p + 1], m.positions[p + 2]),
         normal: Vec3::ZERO,
         uv0: Vec2::ZERO,
+        // OBJ carries no tangents; the finalize computes them from the UVs (`compute_tangents`).
+        tangent: [0.0, 0.0, 0.0, 0.0],
     };
     if normal_index >= 0 && (3 * normal_index as usize + 2) < m.normals.len() {
         let n = 3 * normal_index as usize;

@@ -26,7 +26,7 @@ use crate::types::{
 
 /// The `.smesh` format version: a 64-byte header, three required sections (vertices,
 /// indices, submeshes), and two optional sections (skin, morph) behind the flags word.
-pub const MESH_FORMAT_VERSION: u32 = 3;
+pub const MESH_FORMAT_VERSION: u32 = 4;
 
 /// Header flag: a `VertexSkin` section (parallel to the vertices) follows the submeshes.
 const MESH_FLAG_SKIN: u32 = 1 << 0;
@@ -47,11 +47,11 @@ const MAGIC: [u8; 4] = *b"SMSH";
 struct SMeshHeader {
     /// `b"SMSH"`.
     magic: [u8; 4],
-    /// Format version; only [`MESH_FORMAT_VERSION`] (3) is accepted.
+    /// Format version; only [`MESH_FORMAT_VERSION`] (4) is accepted.
     version: u32,
     /// `MESH_FLAG_SKIN | MESH_FLAG_MORPH` selecting the optional sections.
     flags: u32,
-    /// Bytes per vertex; must equal `size_of::<Vertex>()` (32).
+    /// Bytes per vertex; must equal `size_of::<Vertex>()` (48).
     vertex_stride: u32,
     /// Number of vertices.
     vertex_count: u32,
@@ -382,16 +382,19 @@ mod tests {
                     position: Vec3::new(1.0, 2.0, 3.0),
                     normal: Vec3::Y,
                     uv0: Vec2::new(0.0, 0.0),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(-1.0, 0.5, 4.0),
                     normal: Vec3::X,
                     uv0: Vec2::new(0.25, 0.75),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(2.0, -3.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(1.0, 1.0),
+                    ..Vertex::default()
                 },
             ],
             indices: vec![0, 1, 2],
@@ -526,21 +529,21 @@ mod tests {
         let mesh = sample_mesh();
         let baked = save_mesh_to_buffer(&mesh, &[], None).unwrap();
 
-        // 64-byte header + 3*32 vertices + 3*4 indices + 1*16 submesh = 64+96+12+16.
-        assert_eq!(baked.len(), 64 + 3 * 32 + 3 * 4 + 16);
+        // 64-byte header + 3*48 vertices + 3*4 indices + 1*16 submesh = 64+144+12+16.
+        assert_eq!(baked.len(), 64 + 3 * 48 + 3 * 4 + 16);
 
         let header: &SMeshHeader = bytemuck::from_bytes(&baked[..64]);
         assert_eq!(&header.magic, b"SMSH");
-        assert_eq!(header.version, 3);
+        assert_eq!(header.version, 4);
         assert_eq!(header.flags, 0);
-        assert_eq!(header.vertex_stride, 32);
+        assert_eq!(header.vertex_stride, 48);
         assert_eq!(header.index_width, 4);
         assert_eq!(header.vertex_count, 3);
         assert_eq!(header.index_count, 3);
         assert_eq!(header.submesh_count, 1);
         assert_eq!(header.vertices_offset, 64);
-        assert_eq!(header.indices_offset, 64 + 3 * 32);
-        assert_eq!(header.submeshes_offset, 64 + 3 * 32 + 3 * 4);
+        assert_eq!(header.indices_offset, 64 + 3 * 48);
+        assert_eq!(header.submeshes_offset, 64 + 3 * 48 + 3 * 4);
         assert_eq!(header.morph_offset, 0);
 
         // A skinned image sets MESH_FLAG_SKIN and is one VertexSkin stride longer per vertex.
@@ -571,16 +574,16 @@ mod tests {
     fn unknown_version_is_rejected() {
         let mesh = sample_mesh();
         let mut baked = save_mesh_to_buffer(&mesh, &[], None).unwrap();
-        // Overwrite the version field (bytes 4..8) with a non-3 value.
+        // Overwrite the version field (bytes 4..8) with a non-4 value.
         baked[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(matches!(
             load_mesh_from_bytes(&baked),
             Err(Error::UnsupportedVersion(2))
         ));
-        baked[4..8].copy_from_slice(&4u32.to_le_bytes());
+        baked[4..8].copy_from_slice(&5u32.to_le_bytes());
         assert!(matches!(
             load_mesh_from_bytes(&baked),
-            Err(Error::UnsupportedVersion(4))
+            Err(Error::UnsupportedVersion(5))
         ));
     }
 

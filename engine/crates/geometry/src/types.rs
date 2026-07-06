@@ -10,10 +10,16 @@ use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 
 use crate::error::{Error, Result};
 
-/// One interleaved vertex stream entry: position, normal, and the first UV set.
+/// One interleaved vertex stream entry: position, normal, the first UV set, and a
+/// UV-aligned tangent.
 ///
-/// Exactly 32 bytes — the `.smesh` on-disk vertex stride and the GPU vertex buffer
-/// layout. Tangents are deferred to material time, so they are not stored here.
+/// Exactly 48 bytes — the `.smesh` on-disk vertex stride and the GPU vertex buffer layout.
+/// `tangent` is `[f32; 4]` (raw, like [`VertexSkin::weights`]) so the struct stays 4-byte
+/// aligned — `xyz` is the object-space tangent, `w` is the ±1 bitangent handedness (glTF
+/// convention: `bitangent = w · cross(normal, tangent)`). The importers compute it (or read
+/// the glTF `TANGENT` accessor) via [`compute_tangents`]; it lets a UV-space vector field —
+/// a normal map's frame or vector displacement — be transformed by a true, UV-aligned TBN
+/// rather than an arbitrary branchless basis.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
@@ -23,6 +29,8 @@ pub struct Vertex {
     pub normal: Vec3,
     /// First UV set.
     pub uv0: Vec2,
+    /// UV-aligned tangent: `xyz` object-space tangent, `w` the ±1 bitangent handedness.
+    pub tangent: [f32; 4],
 }
 
 /// One `drawIndexed` range over the shared vertex+index buffers.
@@ -73,6 +81,66 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     /// The draw ranges, each over a slice of the shared buffers.
     pub submeshes: Vec<Submesh>,
+}
+
+/// Computes per-vertex UV-aligned tangents (Lengyel's method) into [`Vertex::tangent`], with
+/// the ±1 bitangent handedness in `w`. Accumulates each triangle's UV-gradient tangent/bitangent
+/// into its vertices, then Gram-Schmidt-orthonormalizes the tangent against the normal. A
+/// degenerate vertex (no usable UVs, a zero-area triangle) falls back to a stable branchless
+/// basis from the normal so every tangent is finite and unit-length.
+///
+/// The importers call this after building positions/normals/uvs; the glTF importer instead keeps
+/// a provided `TANGENT` accessor (already UV-aligned with handedness) and only computes when the
+/// asset omits it.
+pub fn compute_tangents(mesh: &mut Mesh) {
+    let n = mesh.vertices.len();
+    let mut tan = vec![Vec3::ZERO; n];
+    let mut bit = vec![Vec3::ZERO; n];
+    for tri in mesh.indices.chunks_exact(3) {
+        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        if i0 >= n || i1 >= n || i2 >= n {
+            continue;
+        }
+        let p0 = mesh.vertices[i0].position;
+        let e1 = mesh.vertices[i1].position - p0;
+        let e2 = mesh.vertices[i2].position - p0;
+        let w0 = mesh.vertices[i0].uv0;
+        let d1 = mesh.vertices[i1].uv0 - w0;
+        let d2 = mesh.vertices[i2].uv0 - w0;
+        let denom = d1.x * d2.y - d2.x * d1.y;
+        if denom.abs() < 1e-12 {
+            continue;
+        }
+        let f = 1.0 / denom;
+        let t = (e1 * d2.y - e2 * d1.y) * f;
+        let b = (e2 * d1.x - e1 * d2.x) * f;
+        for &i in &[i0, i1, i2] {
+            tan[i] += t;
+            bit[i] += b;
+        }
+    }
+    for (i, v) in mesh.vertices.iter_mut().enumerate() {
+        let normal = v.normal.normalize_or_zero();
+        // Gram-Schmidt: drop the normal component, then normalize.
+        let mut tangent = (tan[i] - normal * normal.dot(tan[i])).normalize_or_zero();
+        if tangent.length_squared() < 1e-8 || !tangent.is_finite() {
+            // No usable UV gradient: any consistent perpendicular frame (Duff et al. 2017).
+            let s = if normal.z >= 0.0 { 1.0 } else { -1.0 };
+            let a = -1.0 / (s + normal.z);
+            tangent = Vec3::new(
+                1.0 + s * normal.x * normal.x * a,
+                s * normal.x * normal.y * a,
+                -s * normal.x,
+            );
+            tangent = tangent.normalize_or_zero();
+        }
+        let handed = if normal.cross(tangent).dot(bit[i]) < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        v.tangent = [tangent.x, tangent.y, tangent.z, handed];
+    }
 }
 
 /// One sparse per-vertex morph contribution: the position+normal delta applied at full

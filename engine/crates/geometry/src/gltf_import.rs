@@ -104,6 +104,15 @@ pub fn import_gltf_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
         if !any_normals_present(&local) {
             generate_normals(&mut local);
         }
+        // Recompute tangents when the source omitted the TANGENT accessor (any vertex left with a
+        // zero tangent), so every mesh has a UV-aligned frame for normal maps + vector displacement.
+        if local
+            .vertices
+            .iter()
+            .any(|v| v.tangent[0] == 0.0 && v.tangent[1] == 0.0 && v.tangent[2] == 0.0)
+        {
+            crate::compute_tangents(&mut local);
+        }
         if node.skin().is_some() {
             skin_streams.push((node.index(), std::mem::take(&mut local_skins)));
         }
@@ -295,6 +304,9 @@ fn append_primitive(
     let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|it| it.collect());
     let texcoords: Option<Vec<[f32; 2]>> =
         reader.read_tex_coords(0).map(|it| it.into_f32().collect());
+    // The glTF TANGENT accessor is already UV-aligned with the ±1 handedness in `w`; when absent
+    // (or partially present across primitives) the node-mesh finalize recomputes with `compute_tangents`.
+    let tangents: Option<Vec<[f32; 4]>> = reader.read_tangents().map(|it| it.collect());
     let joints: Option<Vec<[u16; 4]>> = reader.read_joints(0).map(|it| it.into_u16().collect());
     let weights: Option<Vec<[f32; 4]>> = reader.read_weights(0).map(|it| it.into_f32().collect());
 
@@ -320,10 +332,15 @@ fn append_primitive(
             Some(uvs) => Vec2::from_array(uvs[i]),
             None => Vec2::ZERO,
         };
+        let tangent = match &tangents {
+            Some(ts) => ts[i],
+            None => [0.0, 0.0, 0.0, 0.0],
+        };
         mesh.vertices.push(Vertex {
             position,
             normal,
             uv0,
+            tangent,
         });
 
         let mut influence = VertexSkin::default();

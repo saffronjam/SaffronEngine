@@ -24,6 +24,7 @@
 mod error;
 mod gltf_import;
 mod image_decode;
+mod meshlet;
 mod obj_import;
 mod picking;
 mod primitives;
@@ -39,6 +40,9 @@ pub use error::{Error, Result};
 pub use gltf_import::import_gltf_model;
 pub use image_decode::{
     decode_image, decode_image_from_memory, decode_image_from_memory_hdr, decode_image_hdr,
+};
+pub use meshlet::{
+    MESHLET_MAX_TRIANGLES, MESHLET_MAX_VERTICES, Meshlet, MeshletSet, build_meshlets,
 };
 pub use obj_import::import_obj_model;
 pub use picking::{
@@ -70,7 +74,7 @@ pub use types::{
     AlphaMode, AnimClip, AnimInterp, AnimPath, AnimTarget, AnimTrack, DecodedImage,
     DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedSkin,
     MaterialMapRole, Mesh, MeshCounts, MorphData, MorphDelta, MorphTarget, Ray, SkinPayload,
-    Submesh, TextureSource, Vertex, VertexSkin,
+    Submesh, TextureSource, Vertex, VertexSkin, compute_tangents,
 };
 
 // Re-export glam so downstream crates share this crate's pinned math vocabulary
@@ -79,7 +83,7 @@ pub use glam;
 
 /// The format-bearing strides, pinned at compile time. A stray `Vec3A` or a glam
 /// bump that changed a layout fails the build here, not at a torn-mesh runtime.
-const _: () = assert!(size_of::<Vertex>() == 32, "Vertex must stay 32 bytes");
+const _: () = assert!(size_of::<Vertex>() == 48, "Vertex must stay 48 bytes");
 const _: () = assert!(size_of::<Submesh>() == 16, "Submesh must stay 16 bytes");
 const _: () = assert!(
     size_of::<VertexSkin>() == 24,
@@ -97,7 +101,7 @@ mod tests {
 
     #[test]
     fn format_strides_are_pinned() {
-        assert_eq!(size_of::<Vertex>(), 32);
+        assert_eq!(size_of::<Vertex>(), 48);
         assert_eq!(size_of::<Submesh>(), 16);
         assert_eq!(size_of::<VertexSkin>(), 24);
     }
@@ -115,9 +119,10 @@ mod tests {
             position: Vec3::new(1.0, 2.0, 3.0),
             normal: Vec3::new(0.0, 1.0, 0.0),
             uv0: Vec2::new(0.25, 0.75),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         };
         let bytes = bytemuck::bytes_of(&vertex);
-        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes.len(), 48);
         let back: &Vertex = bytemuck::from_bytes(bytes);
         assert_eq!(*back, vertex);
     }
@@ -157,15 +162,17 @@ mod tests {
                 position: Vec3::X,
                 normal: Vec3::Y,
                 uv0: Vec2::ZERO,
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::Z,
                 normal: Vec3::X,
                 uv0: Vec2::ONE,
+                ..Vertex::default()
             },
         ];
         let bytes: &[u8] = bytemuck::cast_slice(&vertices);
-        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), 2 * 48);
         let back: &[Vertex] = bytemuck::cast_slice(bytes);
         assert_eq!(back, vertices.as_slice());
     }

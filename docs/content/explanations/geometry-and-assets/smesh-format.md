@@ -23,9 +23,9 @@ the header records:
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 struct SMeshHeader {
     magic: [u8; 4],        // b"SMSH"
-    version: u32,          // 3
+    version: u32,          // 4
     flags: u32,            // MESH_FLAG_SKIN | MESH_FLAG_MORPH bits
-    vertex_stride: u32,    // == size_of::<Vertex>() (32)
+    vertex_stride: u32,    // == size_of::<Vertex>() (48)
     vertex_count: u32,
     index_count: u32,
     index_width: u32,      // bytes per index (4)
@@ -39,13 +39,14 @@ const _: () = assert!(size_of::<SMeshHeader>() == 64, "SMeshHeader must be exact
 ```
 
 The arrays are written with `bytemuck::cast_slice`, no per-element serialization. `Vertex`
-and `Submesh` have [compile-time-pinned sizes](../mesh-and-vertex-layout/) (32 and 16 bytes),
+and `Submesh` have [compile-time-pinned sizes](../mesh-and-vertex-layout/) (48 and 16 bytes — the
+`Vertex` carries a UV-aligned tangent for normal maps + vector displacement),
 so the in-memory layout is the on-disk layout. The header records `vertex_stride` and
 `index_width` so the loader can reject a file written by an incompatible build. There is **one**
-version — `MESH_FORMAT_VERSION` = 3 — and two `flags` bits select the optional sections: `MESH_FLAG_SKIN`
+version — `MESH_FORMAT_VERSION` = 4 — and two `flags` bits select the optional sections: `MESH_FLAG_SKIN`
 appends a `VertexSkin` section, `MESH_FLAG_MORPH` appends a morph section (a `MorphSectionHeader`, then
 per-target `MorphTargetDesc` ranges, then the flat `MorphDelta` array) at `morph_offset`. The encoder
-sets each bit from whether the skin / morph stream is non-empty; the loader accepts version 3 and rejects
+sets each bit from whether the skin / morph stream is non-empty; the loader accepts version 4 and rejects
 any other. One write path — `save_mesh_to_buffer(mesh, skin, morph)` — covers every combination; there is
 no separate skinned encoder.
 
@@ -79,7 +80,7 @@ if header.vertices_offset != size_of::<SMeshHeader>() as u64
 ```
 
 The checks run in order: span at least header-sized (`Error::Truncated`), magic `SMSH`
-(`Error::BadMagic`), version 3, stride and index-width match, then the
+(`Error::BadMagic`), version 4, stride and index-width match, then the
 layout-consistency block. A malformed huge `vertex_count` would otherwise drive a giant
 allocation; rejecting the file as inconsistent or truncated first keeps a corrupt file from
 exhausting memory. The span length is the chunk length, not a file size, so an embedded

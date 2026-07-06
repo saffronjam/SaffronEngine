@@ -89,6 +89,7 @@ fn cube_mesh() -> Mesh {
                 position: corners[i],
                 normal,
                 uv0: uv[i],
+                ..Vertex::default()
             });
         }
         mesh.indices

@@ -32,16 +32,19 @@ fn tri_mesh() -> Mesh {
                 position: Vec3::ZERO,
                 normal: Vec3::Z,
                 uv0: saffron_geometry::glam::Vec2::ZERO,
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::X,
                 normal: Vec3::Z,
                 uv0: saffron_geometry::glam::Vec2::new(1.0, 0.0),
+                ..Vertex::default()
             },
             Vertex {
                 position: Vec3::Y,
                 normal: Vec3::Z,
                 uv0: saffron_geometry::glam::Vec2::new(0.0, 1.0),
+                ..Vertex::default()
             },
         ],
         indices: vec![0, 1, 2],
@@ -61,6 +64,7 @@ fn quad_mesh() -> Mesh {
         position: Vec3::ONE,
         normal: Vec3::Z,
         uv0: saffron_geometry::glam::Vec2::ONE,
+        ..Vertex::default()
     });
     mesh.indices = vec![0, 1, 2, 0, 2, 3];
     mesh.submeshes = vec![
