@@ -25,6 +25,7 @@ mod server;
 #[cfg(test)]
 mod test_support;
 
+pub use commands_asset::{PreviewSubject, build_preview_scene_for_thumbnail};
 pub use context::ControlContext;
 pub use error::{Error, Result};
 pub use registry::{

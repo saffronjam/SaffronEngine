@@ -53,7 +53,7 @@ use saffron_protocol::{
     ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailParams, ThumbnailResult, Uuid as WireUuid,
     Vec3, Vec4,
 };
-use saffron_rendering::{PngTransfer, ViewId};
+use saffron_rendering::ViewId;
 use saffron_scene::{
     AnimationPlayer, AssetEntry, AssetType, Attribution, Colorspace, DirectionalLight, Entity,
     IdComponent, MaterialSet, MaterialSlot, Mesh, Name, PreviewGhost, Scene, SkinnedMesh, SkyMode,
@@ -941,10 +941,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Resolves `{asset, size?}` to a base64-PNG thumbnail reply, driving
-/// [`request_thumbnail`] through the renderer's [`ThumbnailGpu`](saffron_assets::ThumbnailGpu)
-/// seam. A cache hit returns the PNG; a cold miss replies `pending`. Shared by
-/// `get-thumbnail` (128) + `view-asset` (512).
+/// Resolves `{asset, size?}` to a base64-PNG thumbnail reply. [`request_thumbnail`] classifies the
+/// asset and either returns a cache hit or enqueues a main-graph render (reply `pending`); the host
+/// drains the queue in `on_update`. Shared by `get-thumbnail` (128) + `view-asset` (512).
 fn thumbnail_result(
     ctx: &mut EngineContext<'_>,
     params: &ThumbnailParams,
@@ -952,14 +951,8 @@ fn thumbnail_result(
 ) -> Result<ThumbnailResult> {
     let id = resolve_asset(ctx, &params.asset)?;
     let size = u32::try_from(params.size.unwrap_or(default_size as i32)).unwrap_or(default_size);
-    let assets = &mut *ctx.assets;
-    let mut reply = None;
-    ctx.renderer.with_thumbnail_gpu(&mut |gpu| {
-        reply = Some(request_thumbnail(assets, gpu, id, size));
-    });
-    let reply = reply
-        .ok_or_else(|| Error::command("thumbnail seam unavailable"))?
-        .map_err(|e| Error::command(e.to_string()))?;
+    let reply =
+        request_thumbnail(&mut *ctx.assets, id, size).map_err(|e| Error::command(e.to_string()))?;
     if reply.pending {
         return Ok(ThumbnailResult {
             id: WireUuid(id.value()),
@@ -2218,27 +2211,17 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "preview-render {material} [size]",
         |ctx, params| {
             let id = resolve_asset(ctx, &params.material)?;
-            let loaded = load_catalog_material_asset(ctx.assets, id)
-                .map_err(|e| Error::command(e.to_string()))?;
             let size = params.size.unwrap_or(256);
-            // A non-foldable graph (procedural nodes) renders through a codegen'd preview
-            // shader; a foldable graph already folded into `loaded`, so the default studio
-            // preview shows it. Resolved here because the closure below borrows `assets`.
-            let codegen_spv = preview_codegen_spv(ctx.assets, id);
-            let assets = &mut *ctx.assets;
-            let mut png = None;
-            ctx.renderer.with_thumbnail_gpu(&mut |gpu| {
-                let sm = assets.resolve_material_asset(gpu, &loaded);
-                png = Some((|| {
-                    let tex = gpu.render_material_preview(&sm, size, codegen_spv.as_deref())?;
-                    gpu.encode_texture_thumbnail_png(&tex, size, PngTransfer::Clamp)
-                })());
-            });
-            let png = png
-                .ok_or_else(|| Error::command("thumbnail seam unavailable"))?
-                .map_err(|e| Error::command(e.to_string()))?;
+            // Rendered through the main forward+ graph on the offscreen thumbnail view — the same
+            // path the Assets tiles take — so the live preview pane matches a tile exactly
+            // (displacement, procedural sky, floor, key light). A non-foldable graph shades through
+            // its compiled `_mesh.spv` variant, a foldable one through its folded params.
+            let bytes = ctx
+                .renderer
+                .render_material_preview_png(ctx.assets, PreviewSubject::Material(id), size)
+                .map_err(Error::command)?;
             Ok(PreviewRenderResult {
-                png: base64_encode(&png.bytes),
+                png: base64_encode(&bytes),
             })
         },
     );
@@ -2610,24 +2593,6 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
     });
 }
 
-/// The codegen `_preview.spv` path for `preview-render`, or `None` for the default studio
-/// preview. A material whose raw graph is a non-empty object that *does not* fold into the
-/// flat params (a procedural node) gets a freshly compiled preview shader; a foldable or
-/// graph-less material renders through the cached default pipeline. A compile failure
-/// degrades to `None` (the default preview still renders the folded params), never an error.
-fn preview_codegen_spv(assets: &mut AssetServer, id: Uuid) -> Option<PathBuf> {
-    let raw = load_catalog_material_asset_raw(assets, id).ok()?;
-    let non_empty_graph = raw.graph.as_object().is_some_and(|obj| !obj.is_empty());
-    if !non_empty_graph {
-        return None;
-    }
-    let mut probe = raw.clone();
-    if lower_graph_to_params(&raw.graph, &mut probe) {
-        return None;
-    }
-    assets.compile_material_preview_shader(&raw.graph, id).ok()
-}
-
 /// Ensures the entity carries a [`MaterialSet`] with at least one slot before a slot write.
 fn ensure_material_slot(scene: &mut Scene, entity: Entity) {
     if scene.has_component::<MaterialSet>(entity) {
@@ -2798,34 +2763,32 @@ fn enter_asset_preview(
         }
     }
 
-    // Commit: stash camera + selection + overlay only on a fresh enter (a swap keeps the
-    // authored stash). A fresh enter makes the preview the active view.
-    if !ctx.scene_edit.previewing() {
-        ctx.scene_edit.saved_camera = ctx.scene_edit.camera;
-        ctx.scene_edit.saved_selection = ctx.scene_edit.selected;
-        ctx.scene_edit.saved_overlay = ctx.scene_edit.skeleton_overlay;
-        ctx.scene_edit.saved_exposure = ctx.renderer.exposure_ev();
-        ctx.scene_edit.preview_active_view = true;
-        let (w, h) = (
-            ctx.renderer.viewport_width(),
-            ctx.renderer.viewport_height(),
-        );
-        let _ = ctx
-            .renderer
-            .set_view_desired_size(ViewId::AssetPreview, w, h);
-        ctx.renderer.set_active_view(ViewId::AssetPreview);
-    }
-    ctx.scene_edit.preview_scene = Some(preview);
-    ctx.scene_edit.preview_asset = container_id;
-    ctx.scene_edit.preview_root_entity = root;
-    ctx.scene_edit.preview_bone_by_node = bone_by_node;
-    ctx.scene_edit.preview_floor_entity = Entity::NULL;
-    ctx.scene_edit.skeleton_overlay.show = true;
-    ctx.scene_edit.skeleton_overlay.highlight_joint = -1;
-    let framing = furnish_preview_scene(ctx, root, PreviewEnv::Procedural);
-    ctx.scene_edit.set_selection(root);
-    ctx.scene_edit.scene_version += 1;
-    ctx.scene_edit.animation_version += 1;
+    // Furnish the instantiated model scene through the shared builder (floor / key light /
+    // procedural sky / framed cam), then install it as the active preview (a rig keeps the bone
+    // overlay on). A fresh enter makes the preview the active view; a swap keeps the authored stash.
+    // A model is floor-standing geometry — default the floor on (the toggle still removes it).
+    ctx.scene_edit.preview_show_floor = true;
+    let spec = FurnishSpec {
+        base_cam: ctx.scene_edit.camera,
+        env: PreviewEnv::Procedural,
+        show_floor: ctx.scene_edit.preview_show_floor,
+        frame_margin: INTERACTIVE_FRAME_MARGIN,
+    };
+    let assets = &mut *ctx.assets;
+    let mut furnish = None;
+    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+        furnish = Some(furnish_preview_scene(&mut preview, assets, gpu, root, spec));
+    });
+    let furnish = furnish.expect("furnish ran");
+    let (_root_uuid, framing) = install_preview_scene(
+        ctx,
+        preview,
+        root,
+        container_id,
+        furnish,
+        bone_by_node,
+        true,
+    );
     Ok(AssetPreviewResultWrap(
         saffron_protocol::AssetPreviewResult {
             root_entity: WireUuid(root_uuid),
@@ -2859,6 +2822,8 @@ fn enter_builtin_preview(
             slots: vec![MaterialSlot::default()],
         },
     );
+    // A built-in primitive is floor-standing geometry — default the floor on.
+    ctx.scene_edit.preview_show_floor = true;
     Ok(commit_preview_subject(
         ctx,
         preview,
@@ -2879,43 +2844,44 @@ fn enter_texture_preview(
     tid: Uuid,
     role: TextureRole,
 ) -> Result<AssetPreviewResultWrap> {
-    let material = preview_material_for_texture(role, tid);
-    ctx.assets.material_by_uuid.insert(
-        PREVIEW_MATERIAL_ID.value(),
-        Some(std::sync::Arc::new(material)),
-    );
-
-    let name = ctx
-        .assets
-        .catalog
-        .find(tid)
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| "Texture".to_owned());
-    let mut preview = Scene::new();
-    preview.catalog = ctx.scene_edit.scene.catalog.clone();
-    let root = preview.create_entity(&name);
-    // The dense sphere so a height map's vertex displacement reads as a true silhouette.
-    let _ = preview.add_component(
-        root,
-        Mesh {
-            mesh: PREVIEW_DISPLACE_SPHERE_MESH_ID,
-        },
-    );
-    let _ = preview.add_component(
-        root,
-        MaterialSet {
-            slots: vec![MaterialSlot {
-                material: PREVIEW_MATERIAL_ID,
-                ..MaterialSlot::default()
-            }],
-        },
-    );
-    Ok(commit_preview_subject(
+    let catalog = ctx.scene_edit.scene.catalog.clone();
+    // A texture map previews on a floating surface sphere — default the floor off (non-model).
+    ctx.scene_edit.preview_show_floor = false;
+    let spec = FurnishSpec {
+        base_cam: ctx.scene_edit.camera,
+        env: PreviewEnv::Procedural,
+        show_floor: ctx.scene_edit.preview_show_floor,
+        frame_margin: INTERACTIVE_FRAME_MARGIN,
+    };
+    let assets = &mut *ctx.assets;
+    let mut build = None;
+    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+        build = Some(build_preview_scene(
+            assets,
+            gpu,
+            catalog.clone(),
+            PreviewSubject::TextureRole { tid, role },
+            PREVIEW_MATERIAL_ID,
+            spec,
+        ));
+    });
+    let build = build.expect("build ran");
+    let (root_uuid, framing) = install_preview_scene(
         ctx,
-        preview,
-        root,
+        build.scene,
+        build.root,
         tid,
-        PreviewEnv::Procedural,
+        build.furnish,
+        Vec::new(),
+        false,
+    );
+    Ok(AssetPreviewResultWrap(
+        saffron_protocol::AssetPreviewResult {
+            root_entity: WireUuid(root_uuid),
+            bones: Vec::new(),
+            target: vec3(framing.target),
+            distance: framing.distance,
+        },
     ))
 }
 
@@ -2979,6 +2945,8 @@ fn enter_hdri_preview(
     for &e in &[entities[0], entities[2]] {
         let _ = preview.set_parent(e, Some(root), true);
     }
+    // The HDRI env rig floats in its own equirect — no floor.
+    ctx.scene_edit.preview_show_floor = false;
     Ok(commit_preview_subject(
         ctx,
         preview,
@@ -2997,37 +2965,45 @@ fn enter_material_preview(
     ctx: &mut EngineContext<'_>,
     mid: Uuid,
 ) -> Result<AssetPreviewResultWrap> {
-    let name = ctx
-        .assets
-        .catalog
-        .find(mid)
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| "Material".to_owned());
-    let mut preview = Scene::new();
-    preview.catalog = ctx.scene_edit.scene.catalog.clone();
-    let root = preview.create_entity(&name);
-    // The dense sphere so a displacement-enabled `.smat` shows a true displaced silhouette.
-    let _ = preview.add_component(
-        root,
-        Mesh {
-            mesh: PREVIEW_DISPLACE_SPHERE_MESH_ID,
-        },
-    );
-    let _ = preview.add_component(
-        root,
-        MaterialSet {
-            slots: vec![MaterialSlot {
-                material: mid,
-                ..MaterialSlot::default()
-            }],
-        },
-    );
-    Ok(commit_preview_subject(
+    let catalog = ctx.scene_edit.scene.catalog.clone();
+    // A material previews on a floating surface sphere, not floor-standing geometry — default the
+    // floor off (the toggle still lets the user add one).
+    ctx.scene_edit.preview_show_floor = false;
+    let spec = FurnishSpec {
+        base_cam: ctx.scene_edit.camera,
+        env: PreviewEnv::Procedural,
+        show_floor: ctx.scene_edit.preview_show_floor,
+        frame_margin: INTERACTIVE_FRAME_MARGIN,
+    };
+    let assets = &mut *ctx.assets;
+    let mut build = None;
+    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+        build = Some(build_preview_scene(
+            assets,
+            gpu,
+            catalog.clone(),
+            PreviewSubject::Material(mid),
+            PREVIEW_MATERIAL_ID,
+            spec,
+        ));
+    });
+    let build = build.expect("build ran");
+    let (root_uuid, framing) = install_preview_scene(
         ctx,
-        preview,
-        root,
+        build.scene,
+        build.root,
         mid,
-        PreviewEnv::Procedural,
+        build.furnish,
+        Vec::new(),
+        false,
+    );
+    Ok(AssetPreviewResultWrap(
+        saffron_protocol::AssetPreviewResult {
+            root_entity: WireUuid(root_uuid),
+            bones: Vec::new(),
+            target: vec3(framing.target),
+            distance: framing.distance,
+        },
     ))
 }
 
@@ -3090,48 +3066,253 @@ fn preview_material_for_texture(role: TextureRole, tid: Uuid) -> MaterialAsset {
     m
 }
 
-/// Commits a container-less preview subject (a built-in primitive or a texture sphere): stashes
-/// the authored view on a fresh enter, installs `preview` as the active preview scene, furnishes
-/// it (floor / key light / procedural sky / framed cam), and returns the framing. Shared by
-/// [`enter_builtin_preview`] and [`enter_texture_preview`] — the rig-less commit tail of
-/// [`enter_asset_preview`].
+/// Make the asset-preview view the active one on a *fresh* enter: stash the authored camera /
+/// selection / overlay / exposure, size the preview view to the viewport, and switch the renderer's
+/// active view. A swap (already previewing) keeps the authored stash and the active view.
+fn activate_asset_preview_view(ctx: &mut EngineContext<'_>) {
+    if ctx.scene_edit.previewing() {
+        return;
+    }
+    ctx.scene_edit.saved_camera = ctx.scene_edit.camera;
+    ctx.scene_edit.saved_selection = ctx.scene_edit.selected;
+    ctx.scene_edit.saved_overlay = ctx.scene_edit.skeleton_overlay;
+    ctx.scene_edit.saved_exposure = ctx.renderer.exposure_ev();
+    ctx.scene_edit.preview_active_view = true;
+    let (w, h) = (
+        ctx.renderer.viewport_width(),
+        ctx.renderer.viewport_height(),
+    );
+    let _ = ctx
+        .renderer
+        .set_view_desired_size(ViewId::AssetPreview, w, h);
+    ctx.renderer.set_active_view(ViewId::AssetPreview);
+}
+
+/// Installs an already-furnished preview `scene` as the active preview subject: switch the view,
+/// store the scene + framed camera + floor + rig state, select the root, and bump the versions.
+/// Returns `(root uuid, framing)` for the wire result the caller assembles (with its own bones).
+fn install_preview_scene(
+    ctx: &mut EngineContext<'_>,
+    scene: Scene,
+    root: Entity,
+    preview_asset: Uuid,
+    furnish: PreviewFurnish,
+    bone_by_node: Vec<Uuid>,
+    overlay_show: bool,
+) -> (u64, PreviewFraming) {
+    let root_uuid = scene
+        .component::<IdComponent>(root)
+        .map(|c| c.id.value())
+        .unwrap_or(0);
+    activate_asset_preview_view(ctx);
+    ctx.scene_edit.preview_scene = Some(scene);
+    ctx.scene_edit.preview_asset = preview_asset;
+    ctx.scene_edit.preview_root_entity = root;
+    ctx.scene_edit.preview_bone_by_node = bone_by_node;
+    ctx.scene_edit.preview_floor_entity = furnish.floor;
+    ctx.scene_edit.skeleton_overlay.show = overlay_show;
+    ctx.scene_edit.skeleton_overlay.highlight_joint = -1;
+    ctx.scene_edit.camera = furnish.camera;
+    ctx.scene_edit.set_selection(root);
+    ctx.scene_edit.scene_version += 1;
+    ctx.scene_edit.animation_version += 1;
+    (root_uuid, furnish.framing)
+}
+
+/// Builds a furnished, renderable preview scene for a sphere subject (a material by id, or a texture
+/// map through an ephemeral single-slot material): the dense displacement sphere carrying the
+/// subject, plus floor / key light / procedural sky / framed camera. Pure of the edit context —
+/// the one builder shared by the interactive previewer and the background thumbnail render.
+fn build_preview_scene(
+    assets: &mut AssetServer,
+    gpu: &dyn saffron_assets::GpuUploader,
+    catalog: Option<std::sync::Arc<saffron_scene::AssetCatalog>>,
+    subject: PreviewSubject,
+    ephemeral_material_id: Uuid,
+    spec: FurnishSpec,
+) -> PreviewBuild {
+    let mut scene = Scene::new();
+    scene.catalog = catalog;
+    let root = match subject {
+        PreviewSubject::Material(mid) => {
+            let name = assets
+                .catalog
+                .find(mid)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| "Material".to_owned());
+            let root = scene.create_entity(&name);
+            attach_preview_sphere(&mut scene, root, mid);
+            root
+        }
+        PreviewSubject::TextureRole { tid, role } => {
+            let material = preview_material_for_texture(role, tid);
+            assets.material_by_uuid.insert(
+                ephemeral_material_id.value(),
+                Some(std::sync::Arc::new(material)),
+            );
+            let name = assets
+                .catalog
+                .find(tid)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| "Texture".to_owned());
+            let root = scene.create_entity(&name);
+            attach_preview_sphere(&mut scene, root, ephemeral_material_id);
+            root
+        }
+        PreviewSubject::Mesh(mesh_id) => {
+            let name = assets
+                .catalog
+                .find(mesh_id)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| "Mesh".to_owned());
+            let root = scene.create_entity(&name);
+            let _ = scene.add_component(root, Mesh { mesh: mesh_id });
+            // The default material slot (`material: Uuid(0)`) resolves to the built-in default material.
+            let _ = scene.add_component(
+                root,
+                MaterialSet {
+                    slots: vec![MaterialSlot::default()],
+                },
+            );
+            root
+        }
+        PreviewSubject::Model(model_id) => {
+            let name = assets
+                .catalog
+                .find(model_id)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| "Model".to_owned());
+            match assets.instantiate_model(&mut scene, model_id, name) {
+                Ok(root) => root,
+                Err(err) => {
+                    tracing::warn!("preview: model {model_id:?} failed to instantiate: {err}");
+                    Entity::NULL
+                }
+            }
+        }
+        PreviewSubject::Hdri(_) => {
+            // A mirror ball (metallic 1 / near-zero roughness) reflecting the HDRI env — the HDRI is
+            // set as the scene's sky in `furnish_preview_scene` (`PreviewEnv::Hdri`), which also
+            // backs the tile and drives the IBL prefilter the ball samples.
+            let root = scene.create_entity("HDRI");
+            let _ = scene.add_component(
+                root,
+                Mesh {
+                    mesh: BUILTIN_SPHERE_MESH_ID,
+                },
+            );
+            let _ = scene.add_component(
+                root,
+                MaterialSet {
+                    slots: vec![MaterialSlot {
+                        material: Uuid(0),
+                        overrides: json!({ "metallic": 1.0, "roughness": 0.04, "baseColor": [1.0, 1.0, 1.0, 1.0] }),
+                    }],
+                },
+            );
+            root
+        }
+    };
+    let furnish = furnish_preview_scene(&mut scene, assets, gpu, root, spec);
+    PreviewBuild {
+        scene,
+        root,
+        furnish,
+    }
+}
+
+/// Attach the dense displacement sphere + a single slot referencing `material_id`, so a
+/// displacement-enabled `.smat` (or a height map) shows a true silhouette.
+fn attach_preview_sphere(scene: &mut Scene, root: Entity, material_id: Uuid) {
+    let _ = scene.add_component(
+        root,
+        Mesh {
+            mesh: PREVIEW_DISPLACE_SPHERE_MESH_ID,
+        },
+    );
+    let _ = scene.add_component(
+        root,
+        MaterialSet {
+            slots: vec![MaterialSlot {
+                material: material_id,
+                ..MaterialSlot::default()
+            }],
+        },
+    );
+}
+
+/// Builds a furnished preview scene for an **offscreen thumbnail render** of `subject` — the public
+/// entry the host drives for both the async Assets tiles and the sync `preview-render` pane. Returns
+/// the scene, its root, and the framed orbit camera; the render goes through the main forward+ graph
+/// on the [`saffron_assets::ViewId::Thumbnail`]-equivalent offscreen view, so a tile looks identical
+/// to the interactive previewer (displacement + procedural sky + floor + key light). Frames from a
+/// default camera (a square tile) and seeds a texture subject's synthetic material under
+/// `ephemeral_material_id`, distinct from the interactive [`PREVIEW_MATERIAL_ID`] so a background
+/// tile can render while a texture preview is open.
+/// The environment + framing tightness a thumbnail subject furnishes with: a material / texture map
+/// frames tight over the procedural sky with a little displacement headroom; an HDRI ball frames a
+/// touch tighter (it is a smooth sphere) and backs itself with its own equirect; a model / mesh
+/// frames looser so a 3/4 view of its bounding box does not clip.
+fn thumbnail_subject_furnishing(subject: &PreviewSubject) -> (PreviewEnv, f32) {
+    match subject {
+        PreviewSubject::Material(_) | PreviewSubject::TextureRole { .. } => {
+            (PreviewEnv::Procedural, THUMBNAIL_MATERIAL_FRAME_MARGIN)
+        }
+        PreviewSubject::Mesh(_) | PreviewSubject::Model(_) => {
+            (PreviewEnv::Procedural, THUMBNAIL_MODEL_FRAME_MARGIN)
+        }
+        PreviewSubject::Hdri(tid) => (PreviewEnv::Hdri(*tid), THUMBNAIL_CHROME_BALL_FRAME_MARGIN),
+    }
+}
+
+pub fn build_preview_scene_for_thumbnail(
+    assets: &mut AssetServer,
+    gpu: &dyn saffron_assets::GpuUploader,
+    subject: PreviewSubject,
+    ephemeral_material_id: Uuid,
+) -> (Scene, Entity, SceneEditCamera) {
+    let (env, frame_margin) = thumbnail_subject_furnishing(&subject);
+    let spec = FurnishSpec {
+        base_cam: SceneEditCamera::default(),
+        env,
+        show_floor: false,
+        frame_margin,
+    };
+    let build = build_preview_scene(assets, gpu, None, subject, ephemeral_material_id, spec);
+    (build.scene, build.root, build.furnish.camera)
+}
+
+/// Commits a pre-built (unfurnished) container-less preview subject (a built-in primitive or the
+/// HDRI ball rig): furnishes the scene through the shared builder, then installs it. The rig-less
+/// commit tail of [`enter_asset_preview`].
 fn commit_preview_subject(
     ctx: &mut EngineContext<'_>,
-    preview: Scene,
+    mut preview: Scene,
     root: Entity,
     preview_asset: Uuid,
     env: PreviewEnv,
 ) -> AssetPreviewResultWrap {
-    let root_uuid = preview
-        .component::<IdComponent>(root)
-        .map(|c| c.id.value())
-        .unwrap_or(0);
-    if !ctx.scene_edit.previewing() {
-        ctx.scene_edit.saved_camera = ctx.scene_edit.camera;
-        ctx.scene_edit.saved_selection = ctx.scene_edit.selected;
-        ctx.scene_edit.saved_overlay = ctx.scene_edit.skeleton_overlay;
-        ctx.scene_edit.saved_exposure = ctx.renderer.exposure_ev();
-        ctx.scene_edit.preview_active_view = true;
-        let (w, h) = (
-            ctx.renderer.viewport_width(),
-            ctx.renderer.viewport_height(),
-        );
-        let _ = ctx
-            .renderer
-            .set_view_desired_size(ViewId::AssetPreview, w, h);
-        ctx.renderer.set_active_view(ViewId::AssetPreview);
-    }
-    ctx.scene_edit.preview_scene = Some(preview);
-    ctx.scene_edit.preview_asset = preview_asset;
-    ctx.scene_edit.preview_root_entity = root;
-    ctx.scene_edit.preview_bone_by_node = Vec::new();
-    ctx.scene_edit.preview_floor_entity = Entity::NULL;
-    ctx.scene_edit.skeleton_overlay.show = false;
-    ctx.scene_edit.skeleton_overlay.highlight_joint = -1;
-    let framing = furnish_preview_scene(ctx, root, env);
-    ctx.scene_edit.set_selection(root);
-    ctx.scene_edit.scene_version += 1;
-    ctx.scene_edit.animation_version += 1;
+    let spec = FurnishSpec {
+        base_cam: ctx.scene_edit.camera,
+        env,
+        show_floor: ctx.scene_edit.preview_show_floor,
+        frame_margin: INTERACTIVE_FRAME_MARGIN,
+    };
+    let assets = &mut *ctx.assets;
+    let mut furnish = None;
+    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+        furnish = Some(furnish_preview_scene(&mut preview, assets, gpu, root, spec));
+    });
+    let furnish = furnish.expect("furnish ran");
+    let (root_uuid, framing) = install_preview_scene(
+        ctx,
+        preview,
+        root,
+        preview_asset,
+        furnish,
+        Vec::new(),
+        false,
+    );
     AssetPreviewResultWrap(saffron_protocol::AssetPreviewResult {
         root_entity: WireUuid(root_uuid),
         bones: Vec::new(),
@@ -3148,9 +3329,70 @@ fn commit_preview_subject(
 pub struct AssetPreviewResultWrap(saffron_protocol::AssetPreviewResult);
 
 /// The preview framing pivot + orbit distance.
+#[derive(Clone, Copy)]
 struct PreviewFraming {
     target: saffron_geometry::glam::Vec3,
     distance: f32,
+}
+
+/// What [`furnish_preview_scene`] produced: the framed camera, the floor entity (or `NULL`), and
+/// the orbit framing — applied into the edit context by [`install_preview_scene`], or read directly
+/// by a background thumbnail render.
+struct PreviewFurnish {
+    framing: PreviewFraming,
+    camera: SceneEditCamera,
+    floor: Entity,
+}
+
+/// How to furnish a preview scene: the base camera to frame from, the environment, whether to lay a
+/// floor slab, and how tightly to frame the subject. One bundle shared by the interactive previewer
+/// and the thumbnail render.
+#[derive(Clone, Copy)]
+struct FurnishSpec {
+    base_cam: SceneEditCamera,
+    env: PreviewEnv,
+    show_floor: bool,
+    /// Camera framing margin: how far past a snug fit the camera sits (`1.0` ≈ the bounding sphere
+    /// touches the frame edge). The interactive previewer leaves generous room; a thumbnail pulls in
+    /// tight so the subject fills the tile.
+    frame_margin: f32,
+}
+
+/// The interactive previewer's framing margin — generous room around the subject for orbiting.
+const INTERACTIVE_FRAME_MARGIN: f32 = 1.3;
+/// A thumbnail's framing margin for a smooth chrome-ball subject (an HDRI reflection sphere): tight —
+/// the AABB half-diagonal radius already over-frames a sphere by √3 — but with a little breathing room
+/// so the ball does not touch the tile edges.
+const THUMBNAIL_CHROME_BALL_FRAME_MARGIN: f32 = 0.72;
+/// A thumbnail's framing margin for a displacement-sphere subject (a material or a texture role):
+/// looser than the smooth ball because displacement pushes the silhouette outward at render time,
+/// *after* the frame bounds are computed from the base mesh — so the base-sphere framing needs
+/// headroom for the bulge, or a displaced material spills past the tile edges.
+const THUMBNAIL_MATERIAL_FRAME_MARGIN: f32 = 0.85;
+/// A thumbnail's framing margin for a model / mesh subject: still tighter than interactive, but with
+/// enough room that a 3/4 view of an arbitrary bounding box does not clip its far corners.
+const THUMBNAIL_MODEL_FRAME_MARGIN: f32 = 1.05;
+
+/// A preview subject built into a throwaway scene and rendered through the main forward+ graph.
+/// Every asset kind maps to one of these — the single thumbnail render path:
+/// - `Material` / `TextureRole` shade the dense displacement sphere (a texture map through an
+///   ephemeral single-slot material);
+/// - `Mesh` shows a lone `.smesh` with the default material;
+/// - `Model` instantiates the container's whole forest;
+/// - `Hdri` is a chrome ball reflecting the HDRI, which also backs the scene.
+pub enum PreviewSubject {
+    Material(Uuid),
+    TextureRole { tid: Uuid, role: TextureRole },
+    Mesh(Uuid),
+    Model(Uuid),
+    Hdri(Uuid),
+}
+
+/// A furnished, renderable preview scene built by [`build_preview_scene`].
+struct PreviewBuild {
+    scene: Scene,
+    root: Entity,
+    furnish: PreviewFurnish,
 }
 
 /// The previewed model's world-space bounding sphere from its mesh's rest-pose AABB.
@@ -3170,31 +3412,30 @@ enum PreviewEnv {
 }
 
 /// Make the preview look like a preview: floor + key light + procedural sky, or the HDRI
-/// environment; framed fly-cam. Returns the orbit pivot + distance. Operates on the committed
-/// preview scene.
+/// environment; and frame the fly-cam. Pure of the edit context — operates on the passed `scene`
+/// and a base camera, so both the interactive previewer and a background thumbnail render share
+/// this one furnishing. Returns the framed camera, the floor entity, and the orbit framing.
 fn furnish_preview_scene(
-    ctx: &mut EngineContext<'_>,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+    gpu: &dyn saffron_assets::GpuUploader,
     root: Entity,
-    env: PreviewEnv,
-) -> PreviewFraming {
+    spec: FurnishSpec,
+) -> PreviewFurnish {
     use saffron_geometry::glam::Vec3 as GVec3;
 
-    let bounds = compute_preview_bounds(ctx, root);
+    let bounds = compute_preview_bounds(scene, assets, gpu, root);
     // The HDRI environment is its own backdrop — no floor slab under the rig.
-    if ctx.scene_edit.preview_show_floor && matches!(env, PreviewEnv::Procedural) {
-        let floor = spawn_preview_floor(ctx, &bounds);
-        ctx.scene_edit.preview_floor_entity = floor;
-    }
+    let floor = if spec.show_floor && matches!(spec.env, PreviewEnv::Procedural) {
+        spawn_preview_floor(scene, assets, gpu, &bounds)
+    } else {
+        Entity::NULL
+    };
 
-    let preview = ctx
-        .scene_edit
-        .preview_scene
-        .as_mut()
-        .expect("preview scene present");
-    match env {
+    match spec.env {
         PreviewEnv::Procedural => {
-            let light = preview.create_entity("PreviewLight");
-            let _ = preview.add_component(
+            let light = scene.create_entity("PreviewLight");
+            let _ = scene.add_component(
                 light,
                 DirectionalLight {
                     direction: GVec3::new(-0.4, -1.0, -0.5).normalize(),
@@ -3203,31 +3444,40 @@ fn furnish_preview_scene(
                     ambient: 0.25,
                 },
             );
-            preview.environment.sky_mode = SkyMode::Procedural;
-            preview.environment.use_sky_for_ambient = true;
-            preview.environment.ambient_intensity = 0.3;
+            scene.environment.sky_mode = SkyMode::Procedural;
+            scene.environment.use_sky_for_ambient = true;
+            scene.environment.ambient_intensity = 0.3;
         }
         PreviewEnv::Hdri(id) => {
             // The HDRI both lights (IBL prefilter of the equirect) and backs the scene — no
             // directional key light, so the balls read the environment's own illumination.
-            preview.environment.sky_mode = SkyMode::Texture;
-            preview.environment.sky_texture = id;
-            preview.environment.sky_intensity = 1.0;
-            preview.environment.use_sky_for_ambient = true;
-            preview.environment.ambient_intensity = 1.0;
+            scene.environment.sky_mode = SkyMode::Texture;
+            scene.environment.sky_texture = id;
+            scene.environment.sky_intensity = 1.0;
+            scene.environment.use_sky_for_ambient = true;
+            scene.environment.ambient_intensity = 1.0;
         }
     }
 
-    ctx.scene_edit.camera = frame_preview_camera(ctx.scene_edit.camera, &bounds);
-    let fovy = ctx.scene_edit.camera.fov.to_radians();
-    PreviewFraming {
-        target: bounds.center,
-        distance: bounds.radius / (fovy * 0.5).tan() * 1.3,
+    let camera = frame_preview_camera(spec.base_cam, &bounds, spec.frame_margin);
+    let fovy = camera.fov.to_radians();
+    PreviewFurnish {
+        framing: PreviewFraming {
+            target: bounds.center,
+            distance: bounds.radius / (fovy * 0.5).tan() * spec.frame_margin,
+        },
+        camera,
+        floor,
     }
 }
 
-/// The previewed model's world-space bounding sphere.
-pub(crate) fn compute_preview_bounds(ctx: &mut EngineContext<'_>, root: Entity) -> PreviewBounds {
+/// The previewed model's world-space bounding sphere. Pure of the edit context.
+pub(crate) fn compute_preview_bounds(
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+    gpu: &dyn saffron_assets::GpuUploader,
+    root: Entity,
+) -> PreviewBounds {
     use saffron_geometry::glam::Vec3 as GVec3;
 
     let mut out = PreviewBounds {
@@ -3237,23 +3487,12 @@ pub(crate) fn compute_preview_bounds(ctx: &mut EngineContext<'_>, root: Entity) 
     };
     // The whole forest's world AABB — every mesh-bearing node, skinned through the joint
     // palette — not a single resolved entity's box.
-    let preview = ctx
-        .scene_edit
-        .preview_scene
-        .as_mut()
-        .expect("preview scene present");
-    if !preview.valid(root) {
+    if !scene.valid(root) {
         return out;
     }
-    let assets = &mut *ctx.assets;
-    let mut bounds = None;
-    ctx.renderer.with_gpu_uploader(&mut |gpu| {
-        bounds = model_render_aabb(gpu, preview, assets, root);
-    });
-
-    let Some((lo, hi)) = bounds else {
+    let Some((lo, hi)) = model_render_aabb(gpu, scene, assets, root) else {
         // No resolvable mesh: fall back to the model root's position.
-        out.center = preview.world_translation(root);
+        out.center = scene.world_translation(root);
         out.min_y = out.center.y - 1.0;
         return out;
     };
@@ -3266,31 +3505,26 @@ pub(crate) fn compute_preview_bounds(ctx: &mut EngineContext<'_>, root: Entity) 
     out
 }
 
-/// A thin floor slab centered under the model's feet.
-pub(crate) fn spawn_preview_floor(ctx: &mut EngineContext<'_>, bounds: &PreviewBounds) -> Entity {
+/// A thin floor slab centered under the model's feet. Pure of the edit context.
+pub(crate) fn spawn_preview_floor(
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+    gpu: &dyn saffron_assets::GpuUploader,
+    bounds: &PreviewBounds,
+) -> Entity {
     use saffron_geometry::glam::Vec3 as GVec3;
 
-    let assets = &mut *ctx.assets;
-    let mut ensured = false;
-    ctx.renderer.with_gpu_uploader(&mut |gpu| {
-        ensured = assets.ensure_preview_floor_mesh(gpu);
-    });
-    if !ensured {
+    if !assets.ensure_preview_floor_mesh(gpu) {
         return Entity::NULL;
     }
-    let preview = ctx
-        .scene_edit
-        .preview_scene
-        .as_mut()
-        .expect("preview scene present");
-    let floor = preview.create_entity("PreviewFloor");
-    let _ = preview.add_component(
+    let floor = scene.create_entity("PreviewFloor");
+    let _ = scene.add_component(
         floor,
         Mesh {
             mesh: saffron_assets::PREVIEW_FLOOR_MESH_ID,
         },
     );
-    let _ = preview.add_component(
+    let _ = scene.add_component(
         floor,
         MaterialSet {
             slots: vec![MaterialSlot {
@@ -3305,7 +3539,7 @@ pub(crate) fn spawn_preview_floor(ctx: &mut EngineContext<'_>, bounds: &PreviewB
     );
     let span = (bounds.radius * 8.0).max(0.5);
     let thickness = (bounds.radius * 0.08).max(0.02);
-    let _ = preview.with_component_mut::<Transform, _>(floor, |t| {
+    let _ = scene.with_component_mut::<Transform, _>(floor, |t| {
         t.translation = GVec3::new(
             bounds.center.x,
             bounds.min_y - thickness * 0.5,
@@ -3316,13 +3550,17 @@ pub(crate) fn spawn_preview_floor(ctx: &mut EngineContext<'_>, bounds: &PreviewB
     floor
 }
 
-/// Aim a fly-cam at the model: a 3/4 view fit to its bounding sphere. Starts from the
-/// current camera so the user's fov/near/far survive.
-fn frame_preview_camera(mut cam: SceneEditCamera, bounds: &PreviewBounds) -> SceneEditCamera {
+/// Aim a fly-cam at the model: a 3/4 view fit to its bounding sphere, `margin` past a snug fit.
+/// Starts from the current camera so the user's fov/near/far survive.
+fn frame_preview_camera(
+    mut cam: SceneEditCamera,
+    bounds: &PreviewBounds,
+    margin: f32,
+) -> SceneEditCamera {
     use saffron_geometry::glam::Vec3 as GVec3;
 
     let fovy = cam.fov.to_radians();
-    let distance = bounds.radius / (fovy * 0.5).tan() * 1.3;
+    let distance = bounds.radius / (fovy * 0.5).tan() * margin;
     let eye = bounds.center + GVec3::new(1.0, 0.7, 1.0).normalize() * distance;
     let forward = (bounds.center - eye).normalize();
     cam.position = eye;
@@ -3389,8 +3627,6 @@ mod tests {
     use saffron_scene::{AssetEntry, AssetType, MaterialSet, Mesh};
     use saffron_sceneedit::ProjectPhase;
     use serde_json::json;
-
-    use super::preview_codegen_spv;
 
     use crate::registry::{CommandRegistry, EngineContext, register_builtin_commands};
     use crate::selector::entity_uuid;
@@ -3702,85 +3938,6 @@ mod tests {
             );
             assert_eq!(get["ok"], json!(true), "get: {get:?}");
             assert_eq!(get["result"]["graph"], graph, "graph round-trips opaque");
-        });
-    }
-
-    /// `preview_codegen_spv` decides the preview pipeline: a graph-less material and a
-    /// foldable graph both use the default studio preview (`None`); a non-foldable
-    /// (procedural) graph compiles the `_preview.spv` when `slangc` is present and the path
-    /// exists on disk (else degrades to `None` — never an error).
-    #[test]
-    fn preview_codegen_spv_picks_the_pipeline_per_graph() {
-        let reg = registry();
-        let mut renderer = StubRenderer::default();
-        with_stub(&mut renderer, |ctx| {
-            scratch_root(ctx, "preview-codegen");
-
-            // A freshly created material has no graph → the default preview.
-            let create = reg.dispatch(
-                ctx,
-                &json!({ "cmd": "material-create", "params": { "name": "Mat" } }),
-            );
-            let id_str = create["result"]["id"].as_str().unwrap().to_owned();
-            let id = saffron_core::Uuid(id_str.parse::<u64>().unwrap());
-            assert!(
-                preview_codegen_spv(ctx.assets, id).is_none(),
-                "a graph-less material uses the default preview"
-            );
-
-            // A foldable graph (a single constant into baseColor) folds into params → still
-            // the default preview, no codegen.
-            let foldable = json!({
-                "nodes": [
-                    { "id": "c1", "type": "constant", "props": { "value": [0.5, 0.25, 1.0, 1.0] } },
-                    { "id": "out", "type": "materialOutput" }
-                ],
-                "edges": [ { "from": ["c1", "out"], "to": ["out", "baseColor"] } ]
-            });
-            let set = reg.dispatch(
-                ctx,
-                &json!({ "cmd": "material-set-graph", "params": { "material": id_str, "graph": foldable } }),
-            );
-            assert_eq!(set["result"]["foldable"], json!(true), "set: {set:?}");
-            assert!(
-                preview_codegen_spv(ctx.assets, id).is_none(),
-                "a foldable graph uses the default preview"
-            );
-
-            // A non-foldable graph (a procedural multiply against a texture slot) needs the
-            // codegen preview shader.
-            let procedural = json!({
-                "nodes": [
-                    { "id": "c1", "type": "constant", "props": { "value": [0.5, 0.25, 1.0, 1.0] } },
-                    { "id": "tx", "type": "textureSlot", "props": { "slot": "normal" } },
-                    { "id": "mul", "type": "multiply" },
-                    { "id": "out", "type": "materialOutput" }
-                ],
-                "edges": [
-                    { "from": ["c1", "out"], "to": ["mul", "a"] },
-                    { "from": ["tx", "out"], "to": ["mul", "b"] },
-                    { "from": ["mul", "out"], "to": ["out", "baseColor"] }
-                ]
-            });
-            let set = reg.dispatch(
-                ctx,
-                &json!({ "cmd": "material-set-graph", "params": { "material": id_str, "graph": procedural } }),
-            );
-            assert_eq!(set["result"]["foldable"], json!(false), "set: {set:?}");
-            // The codegen path runs; with slangc present it yields an on-disk `_preview.spv`,
-            // else it degrades to None. Whatever it returns, a Some path must exist.
-            if let Some(spv) = preview_codegen_spv(ctx.assets, id) {
-                assert!(
-                    spv.exists(),
-                    "the compiled _preview.spv is on disk: {spv:?}"
-                );
-                assert!(
-                    spv.to_string_lossy().ends_with("_preview.spv"),
-                    "the codegen artifact is the preview variant: {spv:?}"
-                );
-            } else {
-                eprintln!("slangc not runnable: codegen preview degraded to the default");
-            }
         });
     }
 
