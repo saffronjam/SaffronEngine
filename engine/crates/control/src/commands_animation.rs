@@ -589,8 +589,15 @@ pub fn register_animation_commands(reg: &mut CommandRegistry) {
                 ctx.scene_edit.preview_show_floor = floor;
                 if floor {
                     let root = ctx.scene_edit.preview_root_entity;
-                    let bounds = crate::commands_asset::compute_preview_bounds(ctx, root);
-                    let entity = crate::commands_asset::spawn_preview_floor(ctx, &bounds);
+                    let assets = &mut *ctx.assets;
+                    let scene = ctx.scene_edit.preview_scene.as_mut().expect("previewing");
+                    let mut entity = Entity::NULL;
+                    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                        let bounds =
+                            crate::commands_asset::compute_preview_bounds(scene, assets, gpu, root);
+                        entity =
+                            crate::commands_asset::spawn_preview_floor(scene, assets, gpu, &bounds);
+                    });
                     ctx.scene_edit.preview_floor_entity = entity;
                 } else {
                     let floor_entity = ctx.scene_edit.preview_floor_entity;
