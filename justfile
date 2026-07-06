@@ -124,14 +124,46 @@ schema:
     cd "{{repo}}/tools/check-control-schema" && bun run check.ts
 
 # end-to-end tests driving a headless engine over the control plane (bun test)
-e2e:
+e2e: engine
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=e2e; {{reenter}}
+    {{nvidia_icd}}
+    rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
     # A generous per-test/hook timeout: boots wait for the non-blocking project load to reach
     # `ready`, and on the llvmpipe fallback the first content renders are slow, so the 5s default is
     # too tight for the heavier setup hooks (boot + multiple loads + import).
     cd "{{repo}}/tests/e2e" && bun test --timeout 30000
+
+# run one e2e file by name (`.test.ts` appended if omitted): `just e2e-file rendering`
+e2e-file NAME: engine
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=e2e-file; {{reenter}}
+    {{nvidia_icd}}
+    rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
+    name="{{NAME}}"
+    case "$name" in *.test.ts) ;; *) name="$name.test.ts";; esac
+    cd "{{repo}}/tests/e2e" && bun test --timeout 30000 "$name"
+
+# run the e2e files matching a filename glob: `just e2e-glob 'material_*'`
+e2e-glob PATTERN: engine
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=e2e-glob; {{reenter}}
+    {{nvidia_icd}}
+    rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
+    cd "{{repo}}/tests/e2e" && bun test --timeout 30000 "{{PATTERN}}"
+
+# fast representative e2e subset (<1 min): one scene, one play, one physics, one skinned proof
+e2e-smoke: engine
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RECIPE=e2e-smoke; {{reenter}}
+    {{nvidia_icd}}
+    rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
+    cd "{{repo}}/tests/e2e" && bun test --timeout 30000 \
+      rendering.test.ts play.test.ts physics-falling-box.test.ts skinned-rt.test.ts
 
 # run the Rust workspace unit + integration tests
 test:
