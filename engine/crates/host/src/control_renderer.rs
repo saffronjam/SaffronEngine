@@ -14,18 +14,14 @@
 //! it to the asset loaders (`import_texture`, `load_mesh_asset`, `resolve_material_asset`,
 //! `pick_entity`, …) for the call's duration.
 
-use std::cell::RefCell;
 use std::path::Path;
-use std::sync::Arc;
 
-use saffron_assets::{GpuUploader, RendererUploader, ThumbnailGpu, ThumbnailPng};
+use saffron_assets::{AssetServer, GpuUploader, PREVIEW_THUMBNAIL_MATERIAL_ID, RendererUploader};
 use saffron_control::ControlRenderer;
-use saffron_geometry::{Mesh, VertexSkin};
 use saffron_rendering::{
-    ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, Descriptors, Device, FrameHistoryStats,
-    FrameSample, GpuMesh, GpuQueue, GpuTexture, PassTiming, PerfConfig, PngTransfer,
-    ProfileCapture, ProfilerMode, ReflectionProbe, RenderStatsFull, Renderer, SubmeshMaterial,
-    ThumbnailRenderer, Uploader, ViewId, ViewMode,
+    ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, PassTiming,
+    PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe, RenderStatsFull, Renderer, Uploader,
+    ViewId, ViewMode,
 };
 use serde_json::Value;
 
@@ -405,13 +401,40 @@ impl ControlRenderer for HostControlRenderer<'_> {
         with(&gpu);
     }
 
-    fn with_thumbnail_gpu(&mut self, with: &mut dyn FnMut(&dyn ThumbnailGpu)) {
-        let gpu = HostThumbnailGpu {
-            renderer: RefCell::new(&mut *self.renderer),
-            uploader: self.uploader,
-            skinning_enabled: self.skinning_enabled,
+    fn render_material_preview_png(
+        &mut self,
+        assets: &mut AssetServer,
+        subject: saffron_control::PreviewSubject,
+        size: u32,
+    ) -> Result<Vec<u8>, String> {
+        // Build the furnished preview scene through a transient uploader over the renderer's
+        // descriptors, then render it through the main graph on the offscreen thumbnail view. The
+        // uploader borrow of the renderer ends with the block, freeing it for the render pass.
+        let (mut scene, _root, camera) = {
+            let gpu = RendererUploader::new(
+                self.uploader,
+                self.renderer.descriptors(),
+                self.skinning_enabled,
+            );
+            saffron_control::build_preview_scene_for_thumbnail(
+                assets,
+                &gpu,
+                subject,
+                PREVIEW_THUMBNAIL_MATERIAL_ID,
+            )
         };
-        with(&gpu);
+        let view = camera.view();
+        crate::layer::render_preview_scene_to_png(
+            self.renderer,
+            self.uploader,
+            self.skinning_enabled,
+            &mut scene,
+            assets,
+            &view,
+            size,
+        )
+        .map(|png| png.bytes)
+        .map_err(|e| e.to_string())
     }
 
     fn render_settings_to_json(&self) -> Value {
@@ -440,322 +463,3 @@ const SA_LUA_DEFS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../schemas/control/sa.generated.luau"
 ));
-
-/// The host's [`ThumbnailGpu`] seam: the live upload trio (the host-owned [`Uploader`] +
-/// the renderer's bindless descriptors) plus the live offscreen render-to-PNG /
-/// material-preview primitives ([`Renderer`]'s `encode_*_thumbnail_png` /
-/// `render_material_preview`). The material preview forwards the optional codegen
-/// `_preview.spv` path the `preview-render` command compiles for a non-foldable graph.
-///
-/// The render methods need `&mut Renderer` (they lazily build + cache the thumbnail /
-/// preview PSOs + the unit sphere), but the [`ThumbnailGpu`] trait is `&self` (the worker
-/// holds a `&dyn`). The Rust host runs `request_thumbnail` inline on the single control
-/// drain (no worker thread), so a [`RefCell`] gives the interior mutability without a
-/// data race: each method borrows the renderer for the call only and the borrows never
-/// nest (the upload trio runs before the render, and the upload trio takes a shared
-/// borrow while the render takes the mutable one — sequentially).
-struct HostThumbnailGpu<'a> {
-    renderer: RefCell<&'a mut Renderer>,
-    uploader: &'a Uploader,
-    skinning_enabled: bool,
-}
-
-impl GpuUploader for HostThumbnailGpu<'_> {
-    fn upload_mesh(
-        &self,
-        mesh: &Mesh,
-        skin: &[VertexSkin],
-        morph: Option<&saffron_geometry::MorphData>,
-        sdf_bake: Option<&saffron_rendering::SdfBake>,
-    ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader.upload_mesh(
-            self.renderer.borrow().descriptors(),
-            mesh,
-            skin,
-            morph,
-            sdf_bake,
-        )
-    }
-
-    fn upload_texture(
-        &self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-        srgb: bool,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.uploader.upload_texture(
-            self.renderer.borrow().descriptors(),
-            rgba,
-            width,
-            height,
-            srgb,
-        )
-    }
-
-    fn upload_texture_float(
-        &self,
-        rgba: &[f32],
-        width: u32,
-        height: u32,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.uploader.upload_texture_float(
-            self.renderer.borrow().descriptors(),
-            rgba,
-            width,
-            height,
-        )
-    }
-
-    fn skinning_enabled(&self) -> bool {
-        self.skinning_enabled
-    }
-}
-
-impl ThumbnailGpu for HostThumbnailGpu<'_> {
-    fn bind_worker_thread(&self) {}
-
-    fn encode_texture_thumbnail_png(
-        &self,
-        texture: &Arc<GpuTexture>,
-        size: u32,
-        transfer: PngTransfer,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        let png = self
-            .renderer
-            .borrow()
-            .encode_texture_thumbnail_png(texture, size, transfer)?;
-        Ok(into_assets_png(png))
-    }
-
-    fn encode_asset_thumbnail_png(
-        &self,
-        mesh: &Arc<GpuMesh>,
-        size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        let png = self
-            .renderer
-            .borrow_mut()
-            .encode_asset_thumbnail_png(mesh, size)?;
-        Ok(into_assets_png(png))
-    }
-
-    fn encode_model_thumbnail_png(
-        &self,
-        mesh: &Arc<GpuMesh>,
-        submesh_materials: &[SubmeshMaterial],
-        size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        let png =
-            self.renderer
-                .borrow_mut()
-                .encode_model_thumbnail_png(mesh, submesh_materials, size)?;
-        Ok(into_assets_png(png))
-    }
-
-    fn render_material_preview(
-        &self,
-        material: &SubmeshMaterial,
-        size: u32,
-        shader_spv: Option<&Path>,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        // `shader_spv` of `None` drives the cached default studio preview pipeline; a
-        // non-foldable graph material passes its compiled `_preview.spv` for a per-call
-        // codegen pipeline.
-        self.renderer
-            .borrow_mut()
-            .render_material_preview(material, size, shader_spv)
-    }
-
-    fn render_hdri_ball_preview(
-        &self,
-        hdri: &Arc<GpuTexture>,
-        size: u32,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.renderer
-            .borrow_mut()
-            .render_hdri_ball_preview(hdri, size)
-    }
-}
-
-/// Maps the renderer's [`saffron_rendering::ThumbnailPng`] to the assets-layer
-/// [`ThumbnailPng`] the worker / control reply consume (identical fields).
-fn into_assets_png(png: saffron_rendering::ThumbnailPng) -> ThumbnailPng {
-    ThumbnailPng {
-        bytes: png.bytes,
-        width: png.width,
-        height: png.height,
-    }
-}
-
-/// The off-frame-loop thumbnail worker's GPU seam.
-///
-/// The worker thread owns this `Send` object for its whole life and decodes the image bytes
-/// on its own thread, then drives the GPU through it. The renderer's `Device` + bindless
-/// `Descriptors` are `Send + Sync` and shared by `Arc` (every bindless slot claim + write
-/// serializes through the descriptor table's internal mutex, so a worker upload races no
-/// frame-loop one); the worker holds its **own** [`Uploader`] (a per-thread command pool, the
-/// queue shared behind its `Arc<Mutex>`) and its **own** [`ThumbnailRenderer`] (per-thread
-/// command pools + PSO cache, prewarmed on this thread so it never races a main-thread build).
-/// The render methods need `&mut ThumbnailRenderer`, so it sits behind a [`RefCell`] — the
-/// worker is single-threaded, so the borrows never alias.
-pub struct WorkerThumbnailGpu {
-    device: Arc<Device>,
-    descriptors: Arc<Descriptors>,
-    uploader: Uploader,
-    thumbnail: RefCell<ThumbnailRenderer>,
-    skinning_enabled: bool,
-}
-
-// SAFETY: every field is `Send` — `Arc<Device>`/`Arc<Descriptors>` over `Send + Sync` types,
-// the `Uploader` is `Send` (its pool is used only from the owning worker thread), and
-// `RefCell<ThumbnailRenderer>` is `Send` because `ThumbnailRenderer` is. The object is `!Sync`
-// (the `RefCell`), which is correct: only the one worker thread ever touches it.
-unsafe impl Send for WorkerThumbnailGpu {}
-
-impl WorkerThumbnailGpu {
-    /// Builds the worker GPU seam from the renderer's shared device + descriptors, with its own
-    /// uploader + thumbnail renderer prewarmed on the calling thread. Built on the **worker**
-    /// thread: each worker owns its own resources, so prewarming on the worker thread is
-    /// race-free.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rendering error if the uploader's command pool or the prewarm fails.
-    pub fn new(
-        device: Arc<Device>,
-        descriptors: Arc<Descriptors>,
-        queue: GpuQueue,
-        skinning_enabled: bool,
-    ) -> saffron_rendering::Result<Self> {
-        let uploader = Uploader::new(&device, &queue)?;
-        let mut thumbnail =
-            ThumbnailRenderer::new(device.resources(), device.surface_format.format);
-        thumbnail.prewarm(&device, &descriptors)?;
-        Ok(Self {
-            device,
-            descriptors,
-            uploader,
-            thumbnail: RefCell::new(thumbnail),
-            skinning_enabled,
-        })
-    }
-}
-
-impl GpuUploader for WorkerThumbnailGpu {
-    fn upload_mesh(
-        &self,
-        mesh: &Mesh,
-        skin: &[VertexSkin],
-        morph: Option<&saffron_geometry::MorphData>,
-        sdf_bake: Option<&saffron_rendering::SdfBake>,
-    ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader
-            .upload_mesh(&self.descriptors, mesh, skin, morph, sdf_bake)
-    }
-
-    fn upload_texture(
-        &self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-        srgb: bool,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.uploader
-            .upload_texture(&self.descriptors, rgba, width, height, srgb)
-    }
-
-    fn upload_texture_float(
-        &self,
-        rgba: &[f32],
-        width: u32,
-        height: u32,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.uploader
-            .upload_texture_float(&self.descriptors, rgba, width, height)
-    }
-
-    fn skinning_enabled(&self) -> bool {
-        self.skinning_enabled
-    }
-}
-
-impl ThumbnailGpu for WorkerThumbnailGpu {
-    fn bind_worker_thread(&self) {
-        // The worker's uploader + thumbnail renderer own their command pools, so there is no
-        // thread-local pool to bind.
-    }
-
-    fn encode_texture_thumbnail_png(
-        &self,
-        texture: &Arc<GpuTexture>,
-        size: u32,
-        transfer: PngTransfer,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        let png = self.thumbnail.borrow().encode_texture_thumbnail_png(
-            &self.device,
-            texture,
-            size,
-            transfer,
-        )?;
-        Ok(into_assets_png(png))
-    }
-
-    fn encode_asset_thumbnail_png(
-        &self,
-        mesh: &Arc<GpuMesh>,
-        size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        let png = self.thumbnail.borrow_mut().encode_asset_thumbnail_png(
-            &self.device,
-            &self.descriptors,
-            mesh,
-            size,
-        )?;
-        Ok(into_assets_png(png))
-    }
-
-    fn encode_model_thumbnail_png(
-        &self,
-        mesh: &Arc<GpuMesh>,
-        submesh_materials: &[SubmeshMaterial],
-        size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        let png = self.thumbnail.borrow_mut().encode_model_thumbnail_png(
-            &self.device,
-            &self.descriptors,
-            mesh,
-            submesh_materials,
-            size,
-        )?;
-        Ok(into_assets_png(png))
-    }
-
-    fn render_material_preview(
-        &self,
-        material: &SubmeshMaterial,
-        size: u32,
-        shader_spv: Option<&Path>,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.thumbnail.borrow_mut().render_material_preview(
-            &self.device,
-            &self.descriptors,
-            material,
-            size,
-            shader_spv,
-        )
-    }
-
-    fn render_hdri_ball_preview(
-        &self,
-        hdri: &Arc<GpuTexture>,
-        size: u32,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        self.thumbnail.borrow_mut().render_hdri_ball_preview(
-            &self.device,
-            &self.descriptors,
-            hdri,
-            size,
-        )
-    }
-}

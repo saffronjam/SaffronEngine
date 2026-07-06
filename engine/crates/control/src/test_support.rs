@@ -7,12 +7,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use saffron_assets::{AssetServer, GpuUploader, ThumbnailGpu, ThumbnailPng};
+use saffron_assets::{AssetServer, GpuUploader};
 use saffron_geometry::{Mesh, VertexSkin};
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, AlarmEvent, CaptureMode, CaptureState, FrameHistoryStats, FrameSample,
-    GpuMesh, GpuTexture, PassTiming, PerfConfig, PngTransfer, ProfileCapture, ProfilerMode,
-    ReflectionProbe, RenderStatsFull, SubmeshMaterial, ViewId, ViewMode,
+    GpuMesh, GpuTexture, PassTiming, PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe,
+    RenderStatsFull, ViewId, ViewMode,
 };
 use saffron_sceneedit::SceneEditContext;
 use saffron_window::Window;
@@ -20,10 +20,9 @@ use serde_json::{Value, json};
 
 use crate::registry::{ControlRenderer, EngineContext};
 
-/// A no-op upload + thumbnail seam the stub hands to [`ControlRenderer::with_gpu_uploader`]
-/// / [`ControlRenderer::with_thumbnail_gpu`]: the asset-domain unit tests resolve against an
-/// empty catalog (which negative-caches before reaching the GPU), so the upload / render
-/// entry points are never actually driven.
+/// A no-op upload seam the stub hands to [`ControlRenderer::with_gpu_uploader`]: the asset-domain
+/// unit tests resolve against an empty catalog (which negative-caches before reaching the GPU), so
+/// the upload entry points are never actually driven.
 struct StubGpu;
 
 impl GpuUploader for StubGpu {
@@ -58,53 +57,6 @@ impl GpuUploader for StubGpu {
 
     fn skinning_enabled(&self) -> bool {
         false
-    }
-}
-
-impl ThumbnailGpu for StubGpu {
-    fn bind_worker_thread(&self) {}
-
-    fn encode_texture_thumbnail_png(
-        &self,
-        _texture: &Arc<GpuTexture>,
-        _size: u32,
-        _transfer: PngTransfer,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        unreachable!("an empty catalog never reaches the stub render-to-PNG path")
-    }
-
-    fn encode_asset_thumbnail_png(
-        &self,
-        _mesh: &Arc<GpuMesh>,
-        _size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        unreachable!("an empty catalog never reaches the stub render-to-PNG path")
-    }
-
-    fn encode_model_thumbnail_png(
-        &self,
-        _mesh: &Arc<GpuMesh>,
-        _submesh_materials: &[SubmeshMaterial],
-        _size: u32,
-    ) -> saffron_rendering::Result<ThumbnailPng> {
-        unreachable!("an empty catalog never reaches the stub render-to-PNG path")
-    }
-
-    fn render_material_preview(
-        &self,
-        _material: &SubmeshMaterial,
-        _size: u32,
-        _shader_spv: Option<&Path>,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        unreachable!("an empty catalog never reaches the stub material-preview path")
-    }
-
-    fn render_hdri_ball_preview(
-        &self,
-        _hdri: &Arc<GpuTexture>,
-        _size: u32,
-    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
-        unreachable!("an empty catalog never reaches the stub HDRI-ball preview path")
     }
 }
 
@@ -591,8 +543,14 @@ impl ControlRenderer for StubRenderer {
         with(&StubGpu);
     }
 
-    fn with_thumbnail_gpu(&mut self, with: &mut dyn FnMut(&dyn ThumbnailGpu)) {
-        with(&StubGpu);
+    fn render_material_preview_png(
+        &mut self,
+        _assets: &mut AssetServer,
+        _subject: crate::commands_asset::PreviewSubject,
+        _size: u32,
+    ) -> std::result::Result<Vec<u8>, String> {
+        // The stub renders no scene; a fixed non-empty byte string proves the seam is wired.
+        Ok(b"stub-preview-png".to_vec())
     }
 
     fn render_settings_to_json(&self) -> Value {

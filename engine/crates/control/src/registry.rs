@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use std::path::Path;
 
-use saffron_assets::{AssetServer, GpuUploader, ThumbnailGpu};
+use saffron_assets::{AssetServer, GpuUploader};
 use saffron_physics::World;
 use saffron_protocol::{PingParams, PingResult};
 use saffron_rendering::{
@@ -299,13 +299,20 @@ pub trait ControlRenderer {
     /// for the ray-cast aspect).
     fn with_gpu_uploader(&mut self, with: &mut dyn FnMut(&dyn GpuUploader));
 
-    /// Runs `with` against a transient [`ThumbnailGpu`] over the live renderer — the
-    /// upload trio plus the render-to-PNG / material-preview primitives.
+    /// Renders a material or texture-role preview subject through the **main forward+ graph** on the
+    /// offscreen thumbnail view (displacement + procedural sky + floor + key light) and returns the
+    /// PNG bytes — the sync `preview-render` seam. Live/uncached, so it reflects unsaved edits. The
+    /// async Assets tiles use the same render primitive off a queue in the host, not this seam.
     ///
-    /// `get-thumbnail` / `view-asset` drive [`saffron_assets::request_thumbnail`] through
-    /// it, and `preview-render` drives [`ThumbnailGpu::render_material_preview`] +
-    /// [`ThumbnailGpu::encode_texture_thumbnail_png`]. The seam never escapes the closure.
-    fn with_thumbnail_gpu(&mut self, with: &mut dyn FnMut(&dyn ThumbnailGpu));
+    /// # Errors
+    ///
+    /// Returns the render/read-back/encode error message.
+    fn render_material_preview_png(
+        &mut self,
+        assets: &mut AssetServer,
+        subject: crate::commands_asset::PreviewSubject,
+        size: u32,
+    ) -> std::result::Result<Vec<u8>, String>;
 
     /// Serializes the renderer's settings as the project-file `renderSettings` block (the
     /// [`ProjectHost::render_settings_to_json`] seam the project lifecycle commands save).
