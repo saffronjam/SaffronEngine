@@ -1,8 +1,13 @@
-// Scene-hierarchy behaviour over the control plane: parenting composes world transforms
-// for rendering, picking, billboards, and focus; the gizmo drags a parented child in
-// world space while writing a rebased local transform; and the placement survives a
+// Scene-hierarchy interaction over the control plane, the legs that genuinely need a live host:
+// parenting composes world transforms so a child picks/focuses at its world position (incl. a
+// parented light's billboard), and the gizmo drags a parented child — or its parent under
+// preserve-children — in world space while writing a rebased local transform that survives a
 // scene save/load. Parenting is written through the generic set-component path (the raw
 // Relationship write relinks server-side).
+//
+// The two `set-parent` / `set-transform` reparent-math cases below are pure transform-compose
+// checks (keepWorld / preserve-children rebasing) that could move to a saffron-scene unit test;
+// they are kept here as e2e for now so no coverage is dropped.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
