@@ -1473,8 +1473,7 @@ export const useEditorStore = create<EditorState>((set) => ({
     set({ storeSearchText: text, storeKind: kind });
   },
   setStoreSession: (storeSession) => set({ storeSession }),
-  setStoreResults: (storeResults, session) =>
-    set({ storeResults, storeResultsSession: session }),
+  setStoreResults: (storeResults, session) => set({ storeResults, storeResultsSession: session }),
   appendStoreResults: (results, session) =>
     set((s) => ({ storeResults: [...s.storeResults, ...results], storeResultsSession: session })),
   setStoreExhausted: (storeExhausted) => set({ storeExhausted }),

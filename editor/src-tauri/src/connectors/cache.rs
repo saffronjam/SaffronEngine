@@ -16,8 +16,9 @@
 //! screenful of thumbnails drains through the gate instead of stampeding a provider (which is what
 //! made the CDN drop requests and show broken images).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,13 @@ use super::{ConnectorError, ProgressFn, user_agent};
 
 /// Max simultaneous upstream fetches. Cache hits don't take a permit.
 const MAX_CONCURRENT_FETCHES: usize = 6;
+
+/// Decoded-blob bytes kept hot in RAM for the image scheme. WebKitGTK does **not** cache
+/// custom-scheme (`saffron-img://`) responses, so it re-requests every visible thumbnail on each
+/// repaint (scroll, resize, an overlay opening over the grid). Serving those repeats from this
+/// in-memory LRU keeps a burst off the disk entirely; a miss still falls through to the on-disk
+/// blob. 64 MiB comfortably holds a screenful of thumbnails.
+const MEM_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// A resource-cache failure.
 #[derive(Debug, thiserror::Error)]
@@ -104,11 +112,29 @@ impl Derived {
     }
 }
 
+/// A decoded blob kept hot in RAM, with its last-access tick for LRU eviction.
+struct MemEntry {
+    bytes: Arc<Vec<u8>>,
+    content_type: String,
+    last: u64,
+}
+
+/// The bounded in-memory image cache: url → decoded bytes, evicted least-recently-used once over
+/// [`MEM_CACHE_BUDGET_BYTES`]. `total` tracks the summed byte length; `tick` is a monotonic access
+/// clock.
+#[derive(Default)]
+struct MemCache {
+    map: HashMap<String, MemEntry>,
+    total: usize,
+    tick: u64,
+}
+
 /// The bridge's one HTTP + disk-cache + throttle layer.
 pub struct ResourceCache {
     http: reqwest::Client,
     root: PathBuf,
     gate: Semaphore,
+    mem: Mutex<MemCache>,
 }
 
 impl ResourceCache {
@@ -124,6 +150,7 @@ impl ResourceCache {
             http,
             root,
             gate: Semaphore::new(MAX_CONCURRENT_FETCHES),
+            mem: Mutex::new(MemCache::default()),
         })
     }
 
@@ -148,11 +175,63 @@ impl ResourceCache {
     }
 
     /// A cached blob's bytes + content type, fetching once (throttled) on a miss. Backs the image
-    /// URI scheme.
+    /// URI scheme. A hot in-memory LRU serves repeat requests (the webview re-requests every visible
+    /// thumbnail on each repaint) without touching the disk.
     pub async fn bytes(&self, url: &str) -> Result<(Vec<u8>, String), CacheError> {
+        if let Some(hit) = self.mem_get(url) {
+            return Ok(hit);
+        }
         let blob = self.blob(url, url, None, None).await?;
         let data = std::fs::read(&blob.path).map_err(|e| CacheError::Io(e.to_string()))?;
-        Ok((data, blob.content_type))
+        let bytes = Arc::new(data);
+        self.mem_put(url, Arc::clone(&bytes), &blob.content_type);
+        Ok(((*bytes).clone(), blob.content_type))
+    }
+
+    /// Look the url up in the hot in-memory cache, refreshing its LRU recency on a hit.
+    fn mem_get(&self, url: &str) -> Option<(Vec<u8>, String)> {
+        let mut cache = self.mem.lock().expect("image mem-cache poisoned");
+        cache.tick += 1;
+        let tick = cache.tick;
+        let entry = cache.map.get_mut(url)?;
+        entry.last = tick;
+        Some(((*entry.bytes).clone(), entry.content_type.clone()))
+    }
+
+    /// Insert into the hot in-memory cache, evicting least-recently-used entries once over budget.
+    /// A blob larger than the whole budget is not cached (it would evict everything else).
+    fn mem_put(&self, url: &str, bytes: Arc<Vec<u8>>, content_type: &str) {
+        let len = bytes.len();
+        if len > MEM_CACHE_BUDGET_BYTES {
+            return;
+        }
+        let mut cache = self.mem.lock().expect("image mem-cache poisoned");
+        cache.tick += 1;
+        let tick = cache.tick;
+        if let Some(old) = cache.map.insert(
+            url.to_owned(),
+            MemEntry {
+                bytes,
+                content_type: content_type.to_owned(),
+                last: tick,
+            },
+        ) {
+            cache.total -= old.bytes.len();
+        }
+        cache.total += len;
+        while cache.total > MEM_CACHE_BUDGET_BYTES {
+            let Some(victim) = cache
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.last)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = cache.map.remove(&victim) {
+                cache.total -= evicted.bytes.len();
+            }
+        }
     }
 
     /// The on-disk path to a cached blob (fetch-once, keyed by the url). `ext` names the file for a

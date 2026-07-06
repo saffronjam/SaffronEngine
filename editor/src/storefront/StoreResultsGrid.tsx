@@ -5,7 +5,7 @@
 import * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import { ExternalLink, Loader2, Maximize2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -28,11 +28,9 @@ const BATCH = 48;
 
 export function StoreResultsGrid({
   session,
-  active,
   onLoadingChange,
 }: {
   session: string;
-  active: boolean;
   onLoadingChange?: (loading: boolean) => void;
 }) {
   const results = useEditorStore((s) => s.storeResults);
@@ -41,6 +39,17 @@ export function StoreResultsGrid({
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
+  // One shared truncation tooltip for the whole grid (the AGENTS.md "one shared overlay per surface,
+  // not a Radix root per row" rule): a single Tooltip anchored to a fixed-position box moved onto the
+  // hovered card title, shown only when that title is actually clipped.
+  const [tip, setTip] = useState<{
+    name: string;
+    left: number;
+    top: number;
+    w: number;
+    h: number;
+  } | null>(null);
+  const tipElRef = useRef<HTMLElement | null>(null);
   // Guards a refill against the session/state captured when it started.
   const loadingRef = useRef(false);
   // On a new session keep the old results visible until the first new batch arrives, then
@@ -81,7 +90,10 @@ export function StoreResultsGrid({
   // (e.g. reopening the Store tab) restores the scroll position and skips the refetch.
   useEffect(() => {
     const store = useEditorStore.getState();
-    if (store.storeResultsSession === session && (store.storeResults.length > 0 || store.storeExhausted)) {
+    if (
+      store.storeResultsSession === session &&
+      (store.storeResults.length > 0 || store.storeExhausted)
+    ) {
       if (scrollRef.current) scrollRef.current.scrollTop = store.storeScrollTop;
       return;
     }
@@ -126,6 +138,13 @@ export function StoreResultsGrid({
     getScrollElement: () => scrollRef.current,
     estimateSize: () => CELL_H,
     overscan: OVERSCAN_ROWS,
+    // While the Store tab is hidden (display:none) the scroll element measures 0×0; ignoring that
+    // keeps the window frozen at its last real size so cards aren't torn down and rebuilt on reveal
+    // — the page (and any open detail modal, whose state lives in a card) stays exactly as left.
+    observeElementRect: (instance, cb) =>
+      observeElementRect(instance, (rect) => {
+        if (rect.width > 0 && rect.height > 0) cb(rect);
+      }),
   });
   const totalHeight = rowVirtualizer.getTotalSize();
 
@@ -138,8 +157,30 @@ export function StoreResultsGrid({
     }
   }, [totalHeight, viewport.h, exhausted, loading, loadMore]);
 
+  const clearTip = () => {
+    tipElRef.current = null;
+    setTip(null);
+  };
+
+  // Resolve the hovered card title via one delegated handler; open the shared tooltip only if the
+  // title is truncated (a full name the user can't already read). getBoundingClientRect is read once
+  // per newly-entered title, not per frame.
+  const onPointerOver = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = (e.target as HTMLElement).closest<HTMLElement>("[data-card-title]");
+    if (el === tipElRef.current) return;
+    tipElRef.current = el;
+    if (!el || el.scrollWidth <= el.clientWidth) {
+      setTip(null);
+      return;
+    }
+    const r = el.getBoundingClientRect();
+    setTip({ name: el.dataset.cardTitle ?? "", left: r.left, top: r.top, w: r.width, h: r.height });
+  };
+
   const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
+    // A scroll invalidates the fixed-position tooltip anchor's rect; drop it.
+    if (tipElRef.current) clearTip();
     // Persist scroll for a reopen (no React state here → no per-event re-render; the virtualizer
     // owns visible-range updates). Pull the next batch as the end nears.
     useEditorStore.getState().setStoreScrollTop(el.scrollTop);
@@ -150,7 +191,13 @@ export function StoreResultsGrid({
 
   return (
     <div className="relative min-h-0 flex-1">
-      <div ref={scrollRef} onScroll={onScroll} className="absolute inset-0 overflow-auto p-2">
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        onPointerOver={onPointerOver}
+        onPointerLeave={clearTip}
+        className="absolute inset-0 overflow-auto p-2"
+      >
         {results.length === 0 && !loading ? (
           <p className="p-8 text-center text-sm text-muted-foreground italic">
             Nothing here — try a different search.
@@ -177,7 +224,6 @@ export function StoreResultsGrid({
                     <StoreCard
                       key={`${result.store.id}:${result.id}`}
                       result={result}
-                      active={active}
                       left={col * CELL_W}
                     />
                   );
@@ -197,17 +243,32 @@ export function StoreResultsGrid({
           <Loader2 className="size-8 animate-spin text-muted-foreground" />
         </div>
       ) : null}
+      {/* The one shared truncation tooltip: its trigger is a fixed-position, non-interactive anchor
+          moved onto the hovered card title. */}
+      <Tooltip open={tip !== null}>
+        <TooltipTrigger asChild>
+          <span
+            aria-hidden
+            className="pointer-events-none fixed"
+            style={{
+              left: tip?.left ?? 0,
+              top: tip?.top ?? 0,
+              width: tip?.w ?? 0,
+              height: tip?.h ?? 0,
+            }}
+          />
+        </TooltipTrigger>
+        <TooltipContent>{tip?.name}</TooltipContent>
+      </Tooltip>
     </div>
   );
 }
 
 const StoreCard = React.memo(function StoreCard({
   result,
-  active,
   left,
 }: {
   result: StoreResult;
-  active: boolean;
   left: number;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -243,14 +304,12 @@ const StoreCard = React.memo(function StoreCard({
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-1 p-2">
         <div className="flex items-start gap-1">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                {result.name}
-              </div>
-            </TooltipTrigger>
-            <TooltipContent>{result.name}</TooltipContent>
-          </Tooltip>
+          <div
+            data-card-title={result.name}
+            className="min-w-0 flex-1 truncate text-xs font-medium text-foreground"
+          >
+            {result.name}
+          </div>
           <button
             type="button"
             aria-label="Open on the provider's site"
@@ -283,7 +342,7 @@ const StoreCard = React.memo(function StoreCard({
         <AssetDetailModal
           result={result}
           images={images}
-          open={expanded && active}
+          open={expanded}
           onOpenChange={setExpanded}
         />
       ) : null}
