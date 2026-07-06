@@ -3,7 +3,18 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { ChevronDown } from "lucide-react";
+import {
+  ChevronDown,
+  FilePlus2,
+  FolderInput,
+  FolderOpen,
+  History,
+  LogOut,
+  Package,
+  RefreshCw,
+  Save,
+  SaveAll,
+} from "lucide-react";
 import { client, type RecentProject } from "../control/client";
 import { useEditorStore, withNativeDialog } from "../state/store";
 import { errorText, notify } from "../lib/flash";
@@ -122,6 +133,19 @@ export function ProjectMenu() {
     }
   };
 
+  // Reveals the project root (project.json, src/ scripts, assets/) in the OS file manager
+  // via the dedicated Rust command — the file manager lives on the host, not the toolbox.
+  const openProjectFolder = async (): Promise<void> => {
+    if (!project) {
+      return;
+    }
+    try {
+      await invoke("open_project_folder", { path: project.root });
+    } catch (err) {
+      notify(`Open project folder failed: ${errorText(err)}`);
+    }
+  };
+
   const reloadProject = (): void => {
     void startProjectLoad({ kind: "reload" });
   };
@@ -147,23 +171,28 @@ export function ProjectMenu() {
             <ChevronDown />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-52">
+        <DropdownMenuContent align="start" className="min-w-60">
           <DropdownMenuItem onSelect={() => newProject()} disabled={!editing}>
-            New Project...
+            <FilePlus2 />
+            <span>New Project...</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => void saveProject()} disabled={!editing}>
-            Save Project
+            <Save />
+            <span>Save Project</span>
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void saveProjectAs()} disabled={!editing}>
-            Save Project As...
+            <SaveAll />
+            <span>Save Project As...</span>
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void openProject()} disabled={!editing}>
-            Open Project...
+            <FolderInput />
+            <span>Open Project...</span>
           </DropdownMenuItem>
           <DropdownMenuSub>
             <DropdownMenuSubTrigger disabled={!editing || recents.length === 0}>
-              Open Recent
+              <History />
+              <span>Open Recent</span>
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent className="max-w-80">
               {recents.length === 0 ? (
@@ -183,16 +212,21 @@ export function ProjectMenu() {
               )}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          <DropdownMenuItem onSelect={() => void openProjectFolder()} disabled={!project}>
+            <FolderOpen />
+            <span>Open Project Folder</span>
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void openInVsCode()} disabled={!project}>
-            <span>Open in VS Code</span>
             <VsCodeIcon className="size-4" />
+            <span>Open in VS Code</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem
             onSelect={() => setExportModalOpen(true)}
             disabled={!editing || !project}
           >
-            Export App...
+            <Package />
+            <span>Export App...</span>
           </DropdownMenuItem>
           {devMode ? (
             <>
@@ -201,12 +235,16 @@ export function ProjectMenu() {
                 onSelect={() => void reloadProject()}
                 disabled={!project || !editing}
               >
-                Reload Project
+                <RefreshCw />
+                <span>Reload Project</span>
               </DropdownMenuItem>
             </>
           ) : null}
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => exitApp()}>Exit</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => exitApp()}>
+            <LogOut />
+            <span>Exit</span>
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

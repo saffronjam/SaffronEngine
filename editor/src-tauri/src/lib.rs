@@ -603,6 +603,13 @@ fn teardown(state: &EditorState) {
 // ONE generic passthrough: any `sa` command reaches the engine with zero Rust changes.
 // Async so the blocking socket round trip runs on a worker, never the main thread
 // driving the webview event loop (a sync command would stall the UI during edit streams).
+// [vp-dbg] TEMP: route a webview-side log line to the `just run` terminal (console.log does not
+// reach it). Delete with the probe once the tab-switch stall is diagnosed.
+#[tauri::command]
+fn dbg_log(msg: String) {
+    eprintln!("[vp-dbg] {msg}");
+}
+
 #[tauri::command]
 async fn control(
     state: State<'_, EditorState>,
@@ -1067,6 +1074,23 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     Err(format!("open {path} in vs code: {last_err}"))
 }
 
+// Open the project root in the OS file manager. Same opener chain as `open_external`
+// (xdg-open handles a directory path), but the engine-reported root is relative to the
+// engine's cwd (the repo root), so make it absolute before handing it off — the file
+// manager spawns with this process's cwd, not the engine's.
+#[tauri::command]
+fn open_project_folder(path: String) -> Result<(), String> {
+    let absolute = {
+        let p = PathBuf::from(&path);
+        if p.is_absolute() {
+            p
+        } else {
+            repo_root().join(p)
+        }
+    };
+    open_url_in_browser(&absolute.to_string_lossy())
+}
+
 // Open a URL in the OS default browser. `window.open`/postMessage do not work from the Tauri
 // webview, so "Open in Perfetto" hands ui.perfetto.dev to the desktop browser instead. No single
 // opener is guaranteed present — running inside a toolbox the container has no xdg-utils, so the
@@ -1262,6 +1286,21 @@ pub fn run() {
                 .to_string()
                 .split_once("u=")
                 .map(|(_, rest)| percent_decode(rest));
+            // [vp-dbg] TEMP: count + time every image request so a tab reveal that re-requests the
+            // whole grid (and the modal's gallery) shows up here as a burst. Delete with the probe.
+            static IMG_REQ_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dbg_n = IMG_REQ_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let dbg_t0 = std::time::Instant::now();
+            let dbg_tail: String = target
+                .as_deref()
+                .unwrap_or("")
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(48)
+                .collect();
+            eprintln!("[vp-dbg] saffron-img #{dbg_n} start …{dbg_tail}");
             tauri::async_runtime::spawn(async move {
                 let response = match target {
                     Some(url) => match cache.bytes(&url).await {
@@ -1278,10 +1317,15 @@ pub fn run() {
                     },
                     None => img_scheme_error(),
                 };
+                eprintln!(
+                    "[vp-dbg] saffron-img #{dbg_n} done {:.1}ms",
+                    dbg_t0.elapsed().as_secs_f64() * 1000.0
+                );
                 responder.respond(response);
             });
         })
         .invoke_handler(tauri::generate_handler![
+            dbg_log,
             control,
             start_engine,
             set_viewport_bounds,
@@ -1297,6 +1341,7 @@ pub fn run() {
             write_file,
             open_external,
             open_in_vscode,
+            open_project_folder,
             serve_trace,
             store_list_connectors,
             store_search_session,
