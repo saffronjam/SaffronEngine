@@ -1235,6 +1235,8 @@ export interface SetCameraParams {
   far?: number;
   moveSpeed?: number;
   lookSpeed?: number;
+  pivot?: Vec3;
+  distance?: number;
 }
 
 export interface GizmoState {
@@ -1714,11 +1716,14 @@ export interface MaterialGetResult {
   roughness: number;
   emissive: Vec3;
   emissiveStrength: number;
+  heightScale: number;
+  heightMode: string;
   albedoTexture: WireUuid;
   ormTexture: WireUuid;
   normalTexture: WireUuid;
   emissiveTexture: WireUuid;
   heightTexture: WireUuid;
+  vectorDisplacementTexture: WireUuid;
   graph: unknown;
 }
 
@@ -1751,11 +1756,14 @@ export interface MaterialUpdateParams {
   emissive?: Vec3;
   emissiveStrength?: number;
   normalStrength?: number;
+  heightScale?: number;
+  heightMode?: string;
   albedoTexture?: WireUuid;
   ormTexture?: WireUuid;
   normalTexture?: WireUuid;
   emissiveTexture?: WireUuid;
   heightTexture?: WireUuid;
+  vectorDisplacementTexture?: WireUuid;
 }
 
 export interface MaterialUpdateResult {

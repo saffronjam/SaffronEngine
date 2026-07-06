@@ -5715,6 +5715,12 @@
           "emissiveStrength": {
             "type": "number"
           },
+          "heightScale": {
+            "type": "number"
+          },
+          "heightMode": {
+            "type": "string"
+          },
           "albedoTexture": {
             "type": "string"
           },
@@ -5730,6 +5736,9 @@
           "heightTexture": {
             "type": "string"
           },
+          "vectorDisplacementTexture": {
+            "type": "string"
+          },
           "graph": {}
         },
         "required": [
@@ -5741,11 +5750,14 @@
           "roughness",
           "emissive",
           "emissiveStrength",
+          "heightScale",
+          "heightMode",
           "albedoTexture",
           "ormTexture",
           "normalTexture",
           "emissiveTexture",
           "heightTexture",
+          "vectorDisplacementTexture",
           "graph"
         ]
       },
@@ -5950,6 +5962,12 @@
           "normalStrength": {
             "type": "number"
           },
+          "heightScale": {
+            "type": "number"
+          },
+          "heightMode": {
+            "type": "string"
+          },
           "albedoTexture": {
             "type": "string"
           },
@@ -5963,6 +5981,9 @@
             "type": "string"
           },
           "heightTexture": {
+            "type": "string"
+          },
+          "vectorDisplacementTexture": {
             "type": "string"
           }
         },
@@ -7838,6 +7859,12 @@
             "type": "number"
           },
           "lookSpeed": {
+            "type": "number"
+          },
+          "pivot": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "distance": {
             "type": "number"
           }
         },

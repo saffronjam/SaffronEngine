@@ -1989,11 +1989,16 @@ pub struct MaterialGetResult {
     pub roughness: f32,
     pub emissive: Vec3,
     pub emissive_strength: f32,
+    pub height_scale: f32,
+    /// The height-map technique: `bump` | `parallax` | `displacement`.
+    pub height_mode: String,
     pub albedo_texture: Uuid,
     pub orm_texture: Uuid,
     pub normal_texture: Uuid,
     pub emissive_texture: Uuid,
     pub height_texture: Uuid,
+    /// The tangent-space vector-displacement map (`0` = scalar-only along the normal).
+    pub vector_displacement_texture: Uuid,
     pub graph: Value,
 }
 
@@ -2041,6 +2046,11 @@ pub struct MaterialUpdateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normal_strength: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_scale: Option<f32>,
+    /// The height-map technique: `bump` | `parallax` | `displacement`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub albedo_texture: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orm_texture: Option<Uuid>,
@@ -2050,6 +2060,9 @@ pub struct MaterialUpdateParams {
     pub emissive_texture: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height_texture: Option<Uuid>,
+    /// The tangent-space vector-displacement map (`0` = scalar-only along the normal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_displacement_texture: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -2982,6 +2995,15 @@ pub struct SetCameraParams {
     pub move_speed: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub look_speed: Option<f32>,
+    /// The point the eye orbits (world space). Present with `distance` selects the orbit mode:
+    /// the engine eases the pivot / distance / yaw / pitch toward the sample each rendered frame
+    /// and derives the eye on the arc, so a fast preview drag sweeps the circle instead of
+    /// cutting a chord across it. Absent, `set-camera` is a free-eye set that snaps to `position`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<Vec3>,
+    /// The eye's distance from `pivot`. Present with `pivot` selects the eased orbit mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
