@@ -13,6 +13,8 @@ import { Engine, REPO } from "./harness.ts";
 
 let engine: Engine;
 const LEG = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
+const STRIP = join(REPO, "tests", "e2e", "fixtures", "skinned-strip.gltf");
+const STATIC = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
 
 interface BoneEntity {
   index: number;
@@ -31,14 +33,32 @@ interface AnimState {
   playing: boolean;
   clip: string;
 }
+interface Capabilities {
+  meshCount: number;
+  materialCount: number;
+  nodeCount: number;
+  hasRig: boolean;
+  boneCount: number;
+  clipCount: number;
+}
+interface AssetModel {
+  mesh: string;
+  name: string;
+  capabilities: Capabilities;
+  bones: unknown[];
+  clips: unknown[];
+}
 
 let legModel = "";
+let stripModel = "";
+let staticModel = "";
 let projectPath = "";
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  const ref = await engine.call<{ id: string }>("import-model", { path: LEG });
-  legModel = ref.id;
+  legModel = (await engine.call<{ id: string }>("import-model", { path: LEG })).id;
+  stripModel = (await engine.call<{ id: string }>("import-model", { path: STRIP })).id;
+  staticModel = (await engine.call<{ id: string }>("import-model", { path: STATIC })).id;
   await engine.settle();
   // get-project reports an absolute project.json path under the harness's per-boot appdata temp dir.
   projectPath = (await engine.call<{ path: string }>("get-project")).path;
@@ -306,6 +326,82 @@ test("set-viewport-size targets independent per-view offscreen sizes", async () 
   } finally {
     await shm.shutdown();
   }
+});
+
+// A static (unskinned) model: the asset editor opens every model, not just rigged ones. get-asset-model
+// reports hasRig=false with empty bones/clips but a real mesh + material count; enter spawns a
+// MeshComponent root (no skeleton) with an empty bone table; a preview round-trip stays byte-identical.
+test("get-asset-model on a static model: hasRig=false, empty bones/clips, a real mesh + material count", async () => {
+  const model = await engine.call<AssetModel>("get-asset-model", { asset: staticModel });
+  expect(model.mesh).toBe(staticModel);
+  expect(model.capabilities.hasRig).toBe(false);
+  expect(model.capabilities.boneCount).toBe(0);
+  expect(model.bones).toEqual([]);
+  expect(model.capabilities.clipCount).toBe(0);
+  expect(model.clips).toEqual([]);
+  expect(model.capabilities.meshCount).toBeGreaterThanOrEqual(1);
+  expect(model.capabilities.materialCount).toBeGreaterThanOrEqual(1);
+});
+
+test("enter-asset-preview spawns a static model and returns a non-zero root with no bones", async () => {
+  await engine.call("exit-asset-preview");
+  const res = await engine.call<EnterResult>("enter-asset-preview", { asset: staticModel });
+  expect(res.rootEntity).not.toBe("0");
+  expect(res.bones).toEqual([]); // static → no skeleton, no bone-entity table
+  const ps = await engine.call<PlayStateResult>("get-play-state");
+  expect(ps.state).toBe("edit"); // preview stays in Edit for static models too
+  expect(ps.previewAsset).toBe(staticModel);
+  await engine.call("exit-asset-preview");
+});
+
+test("pick-skeleton-joint finds nothing on a static model (no skeleton)", async () => {
+  await engine.call("exit-asset-preview");
+  await engine.call("enter-asset-preview", { asset: staticModel });
+  await engine.settle(60);
+  const hit = await engine.call<{ found: boolean; nodeIndex: number }>("pick-skeleton-joint", {
+    u: 0.5,
+    v: 0.5,
+    radiusPx: 5000,
+  });
+  expect(hit.found).toBe(false);
+  expect(hit.nodeIndex).toBe(-1);
+  await engine.call("exit-asset-preview");
+});
+
+test("a static-model preview round-trip leaves project.json byte-identical", async () => {
+  await engine.call("exit-asset-preview");
+  await engine.call("save-project");
+  const before = readFileSync(projectPath, "utf8");
+
+  await engine.call("enter-asset-preview", { asset: staticModel });
+  await engine.call("exit-asset-preview");
+
+  await engine.call("save-project");
+  expect(readFileSync(projectPath, "utf8")).toBe(before);
+  expect((await engine.call<PlayStateResult>("get-play-state")).previewAsset).toBe("0");
+});
+
+// Switching to a SECOND, distinct model while entered is a swap: the new root differs, its bone table
+// reflects the new rig, and previewAsset tracks it. Exiting still lands the authored scene byte-identical
+// with the entity list unchanged.
+test("switching to a second model while entered swaps the preview and exits byte-identical", async () => {
+  await engine.call("exit-asset-preview");
+  await engine.call("save-project");
+  const before = readFileSync(projectPath, "utf8");
+  const entitiesBefore = await listEntityIds();
+
+  const leg = await engine.call<EnterResult>("enter-asset-preview", { asset: legModel });
+  expect(leg.bones.length).toBe(3);
+  const strip = await engine.call<EnterResult>("enter-asset-preview", { asset: stripModel });
+  expect(strip.rootEntity).not.toBe(leg.rootEntity);
+  expect(strip.bones.length).toBe(2);
+  expect((await engine.call<PlayStateResult>("get-play-state")).previewAsset).toBe(stripModel);
+  await engine.call("exit-asset-preview");
+
+  await engine.call("save-project");
+  expect(readFileSync(projectPath, "utf8")).toBe(before);
+  expect(await listEntityIds()).toEqual(entitiesBefore);
+  expect((await engine.call<PlayStateResult>("get-play-state")).previewAsset).toBe("0");
 });
 
 test("the engine logged no validation errors", async () => {
