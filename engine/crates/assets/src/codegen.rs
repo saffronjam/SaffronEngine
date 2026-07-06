@@ -1,14 +1,11 @@
 //! Node-graph → Slang codegen, compiled at runtime by invoking `slangc` through
 //! [`std::process::Command`].
 //!
-//! Three compile targets, each writing a generated `.slang` then running `slangc` to
+//! Two compile targets, each writing a generated `.slang` then running `slangc` to
 //! produce the matching `.spv`:
 //!
 //! - [`AssetServer::compile_material_graph`] — a self-contained fragment shader (the
 //!   proof that the graph emits compilable Slang) → `materials/<uuid>.spv`.
-//! - [`AssetServer::compile_material_preview_shader`] — the studio-lit sphere preview
-//!   (its `PreviewPush` + vertex layout match the renderer's preview pipeline) →
-//!   `materials/<uuid>_preview.spv`.
 //! - [`AssetServer::compile_material_mesh_shader`] — splices the emitted surface body
 //!   into the runtime `mesh.slang` übershader between the `// @graph-begin` /
 //!   `// @graph-end` markers, compiles with `-I <shaders dir>` so `import lighting`
@@ -179,32 +176,6 @@ fn graph_shader_source(surface_body: &str) -> String {
     )
 }
 
-/// The studio-lit sphere preview shader. Its `PreviewPush` and vertex layout match the
-/// renderer's preview pipeline so `render_material_preview` drives it with the same push
-/// and sphere.
-fn preview_shader_source(surface_body: &str) -> String {
-    format!(
-        "[[vk::binding(0, 0)]] Sampler2D textures[1024];\n\
-         struct PreviewPush {{ float4x4 viewProj; float4 baseColor; uint4 tex; float4 pbr; }};\n\
-         [[vk::push_constant]] PreviewPush push;\n\
-         struct SurfaceData {{ float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; }};\n\
-         struct Mat {{ float4 baseColor; uint4 tex; }};\n\
-         SurfaceData evalSurface(float2 uv)\n{{\n    Mat mat;\n    mat.baseColor = push.baseColor;\n\
-         \x20\x20\x20\x20mat.tex = push.tex;\n    SurfaceData s;\n\
-         {surface_body}\
-         \x20\x20\x20\x20return s;\n}}\n\
-         struct VIn {{ [[vk::location(0)]] float3 position; [[vk::location(1)]] float3 normal; [[vk::location(2)]] float2 uv0; }};\n\
-         struct VOut {{ float4 position : SV_Position; float3 normal : NORMAL; float2 uv : TEXCOORD0; }};\n\
-         [shader(\"vertex\")] VOut vertexMain(VIn input)\n{{\n    VOut o;\n\
-         \x20\x20\x20\x20o.position = mul(push.viewProj, float4(input.position, 1.0));\n    o.normal = input.normal;\n\
-         \x20\x20\x20\x20o.uv = input.uv0;\n    return o;\n}}\n\
-         [shader(\"fragment\")] float4 fragmentMain(VOut input) : SV_Target\n{{\n\
-         \x20\x20\x20\x20SurfaceData s = evalSurface(input.uv);\n    float3 N = normalize(input.normal);\n\
-         \x20\x20\x20\x20float3 L = normalize(float3(0.5, 0.6, 0.6));\n    float ndotl = max(dot(N, L), 0.0);\n\
-         \x20\x20\x20\x20float3 c = s.albedo * (ndotl + 0.25) + s.emissive;\n    return float4(c / (c + 1.0), 1.0);\n}}\n"
-    )
-}
-
 /// Splices the emitted surface `body` into the übershader `src` between the
 /// `// @graph-begin` / `// @graph-end` markers: keeps the begin-marker line, drops the
 /// default body, inserts `body`, then resumes at the end marker. Errors if either marker
@@ -251,24 +222,6 @@ impl AssetServer {
         )
     }
 
-    /// Emits the studio-lit sphere preview shader for a material's node graph and compiles
-    /// it to `materials/<uuid>_preview.spv`, returning the `.spv` path.
-    pub fn compile_material_preview_shader(&self, graph: &Value, id: Uuid) -> Result<PathBuf> {
-        let slangc = find_slangc();
-        let source = preview_shader_source(&emit_graph_surface(graph, false));
-        self.ensure_asset_directories();
-        let slang_path = self.material_artifact_path(id, "_preview.slang");
-        let spv_path = self.material_artifact_path(id, "_preview.spv");
-        write_and_compile(
-            &slangc,
-            &slang_path,
-            &spv_path,
-            &source,
-            None,
-            &format!("preview shader {}", id.value()),
-        )
-    }
-
     /// Splices the graph's emitted surface body into the runtime `mesh.slang` übershader
     /// and compiles a per-material variant (with `-I <shaders dir>` so `import lighting`
     /// resolves) to `materials/<uuid>_mesh.spv`, returning the `.spv` path. `render_scene`
@@ -304,8 +257,8 @@ impl AssetServer {
     /// directly: the renderer's shader loaders treat a relative path as relative to the
     /// engine's *shader* directory (joining `resolve_shader_dir()`), so a project-relative
     /// artifact root (`appdata/userdata/<project>/assets`) would mis-resolve to
-    /// `shaders/appdata/…`. An absolute path bypasses that join (both `load_thumbnail_shader`
-    /// and the scene loader take the `is_absolute` branch verbatim).
+    /// `shaders/appdata/…`. An absolute path bypasses that join (the scene loader takes the
+    /// `is_absolute` branch verbatim).
     fn material_artifact_path(&self, id: Uuid, suffix: &str) -> PathBuf {
         let relative = self
             .root
@@ -541,40 +494,6 @@ mod tests {
             "    SurfaceData s = evalSurface(uv);\n    return float4(s.albedo + s.emissive, 1.0);\n}\n",
         );
         assert_eq!(graph_shader_source(""), expected);
-    }
-
-    #[test]
-    fn preview_shader_source_wraps_the_surface_body() {
-        let body = emit_graph_surface(&small_graph(), false);
-        let source = preview_shader_source(&body);
-        assert!(source.contains("struct PreviewPush"));
-        assert!(source.contains("[shader(\"vertex\")] VOut vertexMain"));
-        assert!(source.contains("float4 n_mul = n_c1 * n_tx;"));
-    }
-
-    #[test]
-    fn preview_shader_source_is_byte_exact_with_an_empty_body() {
-        // Byte-for-byte the preview shader template (empty surfaceBody).
-        let expected = concat!(
-            "[[vk::binding(0, 0)]] Sampler2D textures[1024];\n",
-            "struct PreviewPush { float4x4 viewProj; float4 baseColor; uint4 tex; float4 pbr; };\n",
-            "[[vk::push_constant]] PreviewPush push;\n",
-            "struct SurfaceData { float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; };\n",
-            "struct Mat { float4 baseColor; uint4 tex; };\n",
-            "SurfaceData evalSurface(float2 uv)\n{\n    Mat mat;\n    mat.baseColor = push.baseColor;\n",
-            "    mat.tex = push.tex;\n    SurfaceData s;\n",
-            "    return s;\n}\n",
-            "struct VIn { [[vk::location(0)]] float3 position; [[vk::location(1)]] float3 normal; [[vk::location(2)]] float2 uv0; };\n",
-            "struct VOut { float4 position : SV_Position; float3 normal : NORMAL; float2 uv : TEXCOORD0; };\n",
-            "[shader(\"vertex\")] VOut vertexMain(VIn input)\n{\n    VOut o;\n",
-            "    o.position = mul(push.viewProj, float4(input.position, 1.0));\n    o.normal = input.normal;\n",
-            "    o.uv = input.uv0;\n    return o;\n}\n",
-            "[shader(\"fragment\")] float4 fragmentMain(VOut input) : SV_Target\n{\n",
-            "    SurfaceData s = evalSurface(input.uv);\n    float3 N = normalize(input.normal);\n",
-            "    float3 L = normalize(float3(0.5, 0.6, 0.6));\n    float ndotl = max(dot(N, L), 0.0);\n",
-            "    float3 c = s.albedo * (ndotl + 0.25) + s.emissive;\n    return float4(c / (c + 1.0), 1.0);\n}\n",
-        );
-        assert_eq!(preview_shader_source(""), expected);
     }
 
     /// The integration path: compile a folded graph end-to-end, gated on `slangc` being
