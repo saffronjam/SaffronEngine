@@ -1739,16 +1739,19 @@ mod tests {
                     position: Vec3::new(-1.0, -1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::ZERO,
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(1.0, -1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(0.0, 1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(0.5, 1.0),
+                    ..Vertex::default()
                 },
             ],
             indices: vec![0, 1, 2],
@@ -1901,6 +1904,27 @@ mod tests {
     }
 
     #[test]
+    fn viewport_ray_maps_upper_screen_to_world_up() {
+        // The pick convention (viewport UV 0,0 = top-left → y-down NDC): the projection's
+        // y is flipped, so an upper-screen point (ndc.y < 0) casts a ray pointing toward world
+        // +Y and a lower-screen point (ndc.y > 0) toward world -Y. Guards the double y-flip
+        // regression where clicking above an object hit below it (the ray mirrored about center).
+        let camera = test_camera(); // eye at +Z, looking down -Z, up +Y.
+        let viewport = (1024, 768);
+        let up = viewport_ray(viewport, &camera, Vec2::new(0.0, -0.5));
+        let center = viewport_ray(viewport, &camera, Vec2::ZERO);
+        let down = viewport_ray(viewport, &camera, Vec2::new(0.0, 0.5));
+        assert!(up.dir.y > 0.0, "upper screen (ndc.y<0) aims at world +Y");
+        assert!(down.dir.y < 0.0, "lower screen (ndc.y>0) aims at world -Y");
+        assert!(center.dir.y.abs() < 1e-4, "screen center aims level");
+        // The mirrored point about center is the exact opposite tilt, never the same hemisphere.
+        assert!(
+            up.dir.y > 0.0 && down.dir.y < 0.0 && (up.dir.y + down.dir.y).abs() < 1e-4,
+            "the ray is not mirrored about screen center"
+        );
+    }
+
+    #[test]
     fn pick_hits_a_mesh_through_its_center_and_misses_empty_space() {
         let Some(fx) = gpu_or_skip() else {
             return;
@@ -2000,16 +2024,19 @@ mod tests {
                     position: Vec3::new(-1.0, -1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::ZERO,
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(1.0, -1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
                 },
                 Vertex {
                     position: Vec3::new(0.0, 1.0, 0.0),
                     normal: Vec3::Z,
                     uv0: Vec2::new(0.5, 1.0),
+                    ..Vertex::default()
                 },
             ],
             indices: vec![0, 1, 2],

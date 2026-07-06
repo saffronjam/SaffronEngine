@@ -602,6 +602,7 @@ mod tests {
             position: p,
             normal: Vec3::ZERO,
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         }
     }
 
