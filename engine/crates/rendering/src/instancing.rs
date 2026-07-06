@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use ash::vk;
-use saffron_core::BlendMode;
+use saffron_core::{BlendMode, HeightMode};
 use saffron_geometry::glam::{Mat4, UVec4, Vec4};
 
 use crate::descriptors::Descriptors;
@@ -436,6 +436,7 @@ impl Instancing {
                         height_index: info.height_index,
                         height_scale: info.height_scale,
                         uv_transform: info.uv_transform,
+                        vector_index: info.vector_index,
                     });
                     displaced_rt.push(DeformedRtInstance {
                         entity: if rt_skinned { bucket.entity } else { 0 },
@@ -917,18 +918,24 @@ struct DisplaceInfo {
     height_index: u32,
     height_scale: f32,
     uv_transform: [f32; 4],
+    vector_index: u32,
 }
 
 /// The displacement info for an item, if any submesh material is displacement-enabled with a height
 /// map. A mesh-instance is displaced as a whole by the first such material (terrain/displaced planes
-/// carry a single material; multi-material displacement picks the first). `None` → not displaced.
+/// carry a single material; multi-material displacement picks the first). A bound vector-displacement
+/// map switches the kernel to tangent-space vector offset. `None` → not displaced.
 fn displace_info_for(item: &DrawItem) -> Option<DisplaceInfo> {
     item.submesh_materials.iter().find_map(|m| {
         let texture = m.height_texture.as_ref()?;
-        m.displacement.then(|| DisplaceInfo {
+        (m.height_mode == HeightMode::Displacement).then(|| DisplaceInfo {
             height_index: texture.bindless_index(),
             height_scale: m.height_scale,
             uv_transform: [m.uv_tiling.x, m.uv_tiling.y, m.uv_offset.x, m.uv_offset.y],
+            vector_index: m
+                .vector_displacement_texture
+                .as_ref()
+                .map_or(0, |t| t.bindless_index()),
         })
     })
 }
@@ -1026,13 +1033,14 @@ fn resolve_material(
         features |= FEATURE_OCCLUSION;
     }
     if pin(&material.height_texture, &mut height_index) {
-        // A displacement material moves real geometry in the `displace` compute pre-pass (true
-        // silhouette, consistent across passes, BLAS-able); the default height path is
-        // parallax-occlusion mapping in the fragment.
-        features |= if material.displacement {
-            FEATURE_DISPLACE
-        } else {
-            FEATURE_HEIGHT
+        // The mode selects the technique: `Bump` is a fragment shading-normal bump (safe, flat
+        // silhouette); `Parallax` is the fragment parallax-occlusion march; `Displacement` moves
+        // real geometry in the `displace` compute pre-pass (true silhouette, consistent across
+        // passes, BLAS-able) and keeps the shading bump.
+        features |= match material.height_mode {
+            HeightMode::Bump => FEATURE_HEIGHT_BUMP,
+            HeightMode::Parallax => FEATURE_HEIGHT,
+            HeightMode::Displacement => FEATURE_DISPLACE,
         };
     }
     if material.blend_mode == BlendMode::Masked {
@@ -1070,9 +1078,12 @@ const FEATURE_OCCLUSION: u32 = 4;
 const FEATURE_HEIGHT: u32 = 8;
 /// `ALPHACLIP` (masked) feature bit.
 const FEATURE_ALPHACLIP: u32 = 16;
-/// `DISPLACE` feature bit: the height map drives vertex-shader displacement (true geometry) rather
-/// than the fragment parallax march.
+/// `DISPLACE` feature bit: the height map drives real per-vertex displacement (the compute
+/// pre-pass moved the geometry) plus a fragment shading-normal bump.
 const FEATURE_DISPLACE: u32 = 32;
+/// `HEIGHT_BUMP` feature bit: the height map perturbs only the fragment shading normal — no
+/// parallax march, no geometry — the safe, artifact-free baseline.
+const FEATURE_HEIGHT_BUMP: u32 = 64;
 
 /// Interns a material into the frame's deduplicated table, hashing its raw bytes (the
 /// [`MaterialParamsData`] `Hash`/`Eq` are byte-exact), so identical materials collapse
@@ -1235,6 +1246,7 @@ mod tests {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         };
         Mesh {
             vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],
@@ -1254,6 +1266,7 @@ mod tests {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         };
         Mesh {
             vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0)],
@@ -1589,6 +1602,7 @@ mod tests {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         };
         let mesh = Mesh {
             vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],

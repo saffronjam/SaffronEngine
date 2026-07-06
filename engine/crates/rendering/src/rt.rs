@@ -1364,6 +1364,7 @@ mod tests {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         };
         let mesh = Mesh {
             vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],

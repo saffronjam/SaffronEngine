@@ -8,11 +8,12 @@
 //               thread order (required for the golden-buffer gate and the llvmpipe CI GPU). No float
 //               atomics anywhere.
 //   2 resolve — one thread per vertex: dequantize, add the base vertex, renormalize the normal, copy
-//               uv0, and Store the 32 B Vertex into the deformed buffer at the instance's offset.
+//               uv0 + tangent, and Store the 48 B Vertex into the deformed buffer at the instance's offset.
 //
-// Like skin.slang, the streams are raw byte buffers at the engine's tight strides (sa::Vertex 32 B,
+// Like skin.slang, the streams are raw byte buffers at the engine's tight strides (sa::Vertex 48 B,
 // sa::MorphDelta 28 B) read via ByteAddressBuffer scalar packing — a typed StructuredBuffer would impose
-// std430 padding that does not match the engine layout.
+// std430 padding that does not match the engine layout. Morph deltas carry no tangent, so the base
+// tangent is copied through unchanged (the fragment recovers fine detail from screen-space derivatives).
 
 struct ActiveTarget
 {
@@ -22,16 +23,17 @@ struct ActiveTarget
     float pad;
 };
 
-[[vk::binding(0, 0)]] ByteAddressBuffer inVertices;               // base bind-pose stream (32 B stride)
+[[vk::binding(0, 0)]] ByteAddressBuffer inVertices;               // base bind-pose stream (48 B stride)
 [[vk::binding(1, 0)]] ByteAddressBuffer inDeltas;                 // flat MorphDelta array (28 B stride)
 [[vk::binding(2, 0)]] StructuredBuffer<uint2> targetRanges;       // per-target {first_delta, delta_count}
 [[vk::binding(3, 0)]] StructuredBuffer<ActiveTarget> activeTargets; // per-frame compacted active list
 [[vk::binding(4, 0)]] RWByteAddressBuffer accum;                 // per-vertex fixed-point scratch (6 i32)
-[[vk::binding(5, 0)]] RWByteAddressBuffer outVertices;           // deformed output (32 B stride)
+[[vk::binding(5, 0)]] RWByteAddressBuffer outVertices;           // deformed output (48 B stride)
 
-static const uint VertexStride = 32u;     // sizeof(sa::Vertex)
+static const uint VertexStride = 48u;     // sizeof(sa::Vertex)
 static const uint NormalOffset = 12u;     // sa::Vertex.normal
 static const uint UvOffset = 24u;         // sa::Vertex.uv0
+static const uint TangentOffset = 32u;    // sa::Vertex.tangent (float4: xyz + w handedness)
 static const uint DeltaStride = 28u;      // sizeof(sa::MorphDelta)
 static const uint DeltaPosOffset = 4u;    // MorphDelta.d_position (after u32 vertex_index)
 static const uint DeltaNrmOffset = 16u;   // MorphDelta.d_normal
@@ -122,6 +124,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     const float3 basePos = inVertices.Load<float3>(vBase);
     const float3 baseNrm = inVertices.Load<float3>(vBase + NormalOffset);
     const float2 uv0 = inVertices.Load<float2>(vBase + UvOffset);
+    const float4 tangent = inVertices.Load<float4>(vBase + TangentOffset);
 
     const uint accBase = i * AccumStride;
     const float3 dPos = float3(accum.Load<int>(accBase), accum.Load<int>(accBase + 4u),
@@ -140,4 +143,5 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     outVertices.Store<float3>(oBase, morphedPos);
     outVertices.Store<float3>(oBase + NormalOffset, morphedNrm);
     outVertices.Store<float2>(oBase + UvOffset, uv0);
+    outVertices.Store<float4>(oBase + TangentOffset, tangent);
 }

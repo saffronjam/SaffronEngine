@@ -38,6 +38,8 @@ pub struct DisplaceBucket {
     pub height_scale: f32,
     /// `tiling.xy, offset.xy` (`MaterialParams.uv`).
     pub uv_transform: [f32; 4],
+    /// Bindless index of the vector-displacement map (`0` = scalar-only along the normal).
+    pub vector_index: u32,
 }
 
 struct FrameDisplace {
@@ -125,6 +127,7 @@ impl Displacement {
                         height_index: bucket.height_index,
                         height_scale: bucket.height_scale,
                         uv_transform: bucket.uv_transform,
+                        vector_index: bucket.vector_index,
                     }
                 })
             };
@@ -171,8 +174,10 @@ impl Displacement {
                 height_index: d.height_index,
                 height_scale: d.height_scale,
                 uv_transform: d.uv_transform,
+                vector_index: d.vector_index,
+                _pad: [0; 3],
             };
-            // SAFETY: the ash seam. As above; the push spans the declared 32-byte range and the
+            // SAFETY: the ash seam. As above; the push spans the declared 48-byte range and the
             // dispatch covers the vertex count (64 per group).
             unsafe {
                 raw.cmd_bind_descriptor_sets(
@@ -220,7 +225,7 @@ impl Drop for Displacement {
     }
 }
 
-/// The displace kernel's 32-byte push — matches `displace.slang`'s `Push`.
+/// The displace kernel's 48-byte push — matches `displace.slang`'s `Push`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DisplacePush {
@@ -229,6 +234,8 @@ struct DisplacePush {
     height_index: u32,
     height_scale: f32,
     uv_transform: [f32; 4],
+    vector_index: u32,
+    _pad: [u32; 3],
 }
 
 /// Allocates one displace set from `pool` and writes its two storage-buffer bindings: the mesh's

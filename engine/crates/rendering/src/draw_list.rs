@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use ash::vk;
-use saffron_core::BlendMode;
+use saffron_core::{BlendMode, HeightMode};
 use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::gpu_types::Material;
@@ -37,9 +37,13 @@ pub struct SubmeshMaterial {
     pub occlusion_texture: Option<Arc<GpuTexture>>,
     /// Emissive map (modulates the emissive factor; sets `EMISSIVE_TEX`).
     pub emissive_texture: Option<Arc<GpuTexture>>,
-    /// Height / displacement map (sets the `HEIGHT` feature bit for parallax, or `DISPLACE` when
-    /// [`SubmeshMaterial::displacement`] routes it through vertex-shader displacement instead).
+    /// Height map (the technique is [`SubmeshMaterial::height_mode`]: `HEIGHT_BUMP` shading bump,
+    /// `HEIGHT` parallax, or `DISPLACE` real geometry).
     pub height_texture: Option<Arc<GpuTexture>>,
+    /// Vector-displacement map (tangent-space XYZ). When set under [`HeightMode::Displacement`], the
+    /// `displace` pre-pass offsets each vertex through its TBN by this field instead of scalar height,
+    /// so overhangs/undercuts become real geometry. `None` → scalar displacement along the normal.
+    pub vector_displacement_texture: Option<Arc<GpuTexture>>,
     /// Base color (RGBA), multiplied with the albedo texture.
     pub base_color: Vec4,
     /// Metallic factor.
@@ -56,13 +60,14 @@ pub struct SubmeshMaterial {
     pub uv_tiling: Vec2,
     /// UV offset (added to the tiled UV).
     pub uv_offset: Vec2,
-    /// Height scale — parallax march depth, or the world-space displacement amplitude when
-    /// [`SubmeshMaterial::displacement`] is set.
+    /// Height scale — parallax march depth ([`HeightMode::Parallax`]), or the world-space
+    /// displacement amplitude ([`HeightMode::Displacement`]).
     pub height_scale: f32,
-    /// Route the height map through **vertex-shader displacement** (real geometry, true silhouette)
-    /// rather than parallax-occlusion mapping. Requires a densely-tessellated mesh to look right;
-    /// the interactive preview sphere is seeded dense for exactly this.
-    pub displacement: bool,
+    /// The height-map technique: [`HeightMode::Bump`] (shading bump), [`HeightMode::Parallax`]
+    /// (parallax-occlusion mapping), or [`HeightMode::Displacement`] (real per-vertex displacement
+    /// via the `displace` compute pre-pass — needs a densely-tessellated mesh; the interactive
+    /// preview sphere is seeded dense for exactly this).
+    pub height_mode: HeightMode,
     /// Alpha/blend mode: opaque, masked (alpha-clip discard below [`SubmeshMaterial::alpha_cutoff`]),
     /// or translucent (routed to the sorted, blended translucent draw list).
     pub blend_mode: BlendMode,
@@ -81,6 +86,7 @@ impl SubmeshMaterial {
             albedo_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
+            vector_displacement_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
             height_texture: None,
@@ -93,7 +99,7 @@ impl SubmeshMaterial {
             uv_tiling: Vec2::ONE,
             uv_offset: Vec2::ZERO,
             height_scale: 0.05,
-            displacement: false,
+            height_mode: HeightMode::Bump,
             blend_mode: BlendMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
@@ -233,6 +239,8 @@ pub struct DisplaceDispatch {
     pub height_scale: f32,
     /// `tiling.xy, offset.xy` (`MaterialParams.uv`).
     pub uv_transform: [f32; 4],
+    /// Bindless index of the vector-displacement map (`0` = scalar-only along the normal).
+    pub vector_index: u32,
 }
 
 /// One morph mesh-instance's compute work for the frame: the descriptor set wiring its

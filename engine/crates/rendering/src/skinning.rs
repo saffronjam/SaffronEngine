@@ -1170,6 +1170,7 @@ mod tests {
                 position: p,
                 normal: normals,
                 uv0: Vec2::new(0.25, 0.75),
+                ..Vertex::default()
             })
             .collect();
         let skins = vec![

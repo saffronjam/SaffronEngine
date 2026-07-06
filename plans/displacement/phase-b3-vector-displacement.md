@@ -1,22 +1,31 @@
 # Phase B3 — vector displacement (overhangs / undercuts)
 
-**Status:** BLOCKED on a prerequisite the engine's vertex stream lacks — a **UV-aligned tangent per
-vertex**. B2's `displace` compute pre-pass is one-thread-per-vertex over the 32-byte `saffron_geometry::Vertex`
-(position@0, normal@12, uv0@24) — **no tangent**. Correct vector displacement transforms the sampled
-tangent-space XYZ by the vertex's TBN; a single vertex thread cannot derive a *UV-aligned* tangent (that
-needs face adjacency / the neighbouring vertices' UVs), and any substitute frame (e.g. a branchless
-normal-only basis) points the X/Y offset in arbitrary directions — so the overhang would not match the
-authored map. Implementing a wrong-direction approximation would violate "always the modern, correct
-approach", so this phase is **deferred until a tangent stream exists** — a genuine, separate engine
-feature (widen `Vertex` to carry a tangent: the glTF/OBJ importers compute + store it, every shader's
-`VertexInput` grows a `[[vk::location]]` tangent, and the skin/morph/**displace** kernels + the deformed
-buffer stride widen to match). This is the same class of gate as C2's mesh-shader block: real
-infrastructure, out of this plan-set's displacement scope. **When the tangent stream lands**, B3 is small:
-add a vector-displacement texture ref on the material (additive to `height_texture`), a feature bit, and
-one `displace.slang` branch — `pos += mul(tbn, sampleVector(uv))` instead of `pos += normal * h`.
-**Scope:** `saffron-assets` (material/texture-ref set), `saffron-rendering` (compute path, shaders) +
-**a mesh tangent stream** (prerequisite)
-**Depends on:** phase-b2 (done) + **a per-vertex tangent stream** (not yet in `Vertex`)
+**Status:** IMPLEMENTED. The prerequisite **UV-aligned per-vertex tangent stream** was built first, then
+B3 rode on top of it.
+
+**Tangent stream (prerequisite, built):** `saffron_geometry::Vertex` widened 32→48 B to carry
+`tangent: [f32; 4]` (xyz tangent + w = ±1 bitangent handedness, glTF convention) at offset 32;
+`MESH_FORMAT_VERSION` 3→4. `compute_tangents(&mut Mesh)` (Lengyel's method + Gram-Schmidt, with a
+branchless fallback for degenerate/UV-less verts) runs on every import: glTF reads the TANGENT accessor
+when present and recomputes only when absent; OBJ + the built-in primitives always compute. Every base
+Vertex stride derives from `size_of::<Vertex>()` and every attribute offset from `offset_of!`, so the
+widening propagated automatically to the vertex buffers, the RT BLAS vertex stride, and the deformed
+buffer. The graphics vertex layout gains a `[[vk::location(3)]]` tangent on binding 0; the skinned stream
+renumbered to loc 4/5. The **skin / morph / displace** compute kernels read the tangent, rotate/carry it,
+and write the full 48-byte vertex to the deformed buffer, so a skinned/morphed/displaced mesh keeps a
+valid frame.
+
+**B3 proper (built):** `MaterialAsset.vector_displacement_texture` (additive to `height_texture`; a new
+`.smat` `textures.vectorDisplacement` key, `material-get`/`material-update` slot, a Material-editor slot
+shown in Displacement mode). It threads through `SubmeshMaterial → DisplaceInfo → DisplaceBucket →
+DisplaceDispatch → DisplacePush` as a bindless `vector_index`. `displace.slang` builds the true TBN from
+the stored tangent and branches: `vector_index != 0` → `pos += t·v.x + b·v.y + n·v.z` (tangent-space XYZ
+map, overhangs); else scalar-along-normal with the height-gradient bump computed in the real frame. No
+separate feature bit — the vector-map presence *is* the switch.
+
+**Scope:** `saffron-geometry` (tangent stream), `saffron-assets` (material/texture-ref set + import),
+`saffron-rendering` (compute path, shaders), `saffron-protocol`/`saffron-control` + editor (slot).
+**Depends on:** phase-b2 (done) + **a per-vertex tangent stream** (built as this phase's prerequisite).
 
 ## Goal
 

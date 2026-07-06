@@ -60,11 +60,12 @@ SurfaceData evalSurface(MaterialInput m)
         mapN.xy *= mat.pbr.z;  // normalStrength
         n = normalize(mul(mapN, tbn));
     }
-    else if ((features & FEATURE_DISPLACE) != 0u)
+    else if ((features & (FEATURE_DISPLACE | FEATURE_HEIGHT_BUMP)) != 0u)
     {
-        // The vertices are already displaced (vertex stage); derive the fine shading normal from the
-        // height gradient in the tangent frame so lighting matches the displaced microsurface (a
-        // height-to-normal bump — the per-vertex silhouette plus per-pixel normal detail).
+        // Height → shading normal: derive the fine normal from the height gradient in the tangent
+        // frame (a height-to-normal bump). FEATURE_HEIGHT_BUMP stops here (flat silhouette, no
+        // geometry); FEATURE_DISPLACE additionally had its vertices moved by the `displace` compute
+        // pre-pass, so this bump matches the already-displaced microsurface.
         const float eps = 1.0 / 512.0;
         uint hi = mat.tex1.x;
         float h0 = albedoTextures[NonUniformResourceIndex(hi)].SampleLevel(uv, 0.0).r;

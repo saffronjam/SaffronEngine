@@ -31,11 +31,19 @@ flowchart LR
 ```
 
 `displace.slang`'s `computeMain` runs one thread per vertex: it reads the static `Vertex`
-(position/normal/uv), samples the height map at the tiled UV, offsets the position along the normal by
-`height_scale`, derives a coarse normal from the height gradient, and writes a deformed `Vertex` —
-**without** the instance model matrix, so the graphics passes still apply `model` / `normalMatrix`
-exactly as for a static mesh. The height map is read straight from the bindless albedo array (set 0,
-shared with the übershader) by the index the push constant carries; no per-instance image descriptor.
+(position/normal/uv/**tangent**), builds a true UV-aligned TBN from the stored tangent, and branches on
+whether the material bound a vector-displacement map:
+
+- **Scalar** (a height map only) — samples the height at the tiled UV, offsets the position along the
+  normal by `height_scale`, and derives a coarse normal from the height gradient *in the real tangent
+  frame*.
+- **Vector** (a tangent-space XYZ map) — offsets the position by `t·v.x + b·v.y + n·v.z`, so the surface
+  can push sideways into overhangs and undercuts a scalar height cannot express.
+
+Either way it writes a deformed `Vertex` (carrying the tangent through) **without** the instance model
+matrix, so the graphics passes still apply `model` / `normalMatrix` exactly as for a static mesh. The
+maps are read straight from the bindless albedo array (set 0, shared with the übershader) by the indices
+the push constant carries; no per-instance image descriptor.
 
 ## One shared deformed buffer
 
@@ -92,9 +100,10 @@ dispatches (write-after-write); the disjoint offset slices make that ordering ha
 
 The pass displaces the **base** vertices — it does not subdivide. On a densely tessellated base (the
 preview sphere, a terrain grid) that reads well; screen-space adaptive tessellation and watertight seam
-welding are the layer above this baseline. Tangent-space **vector** displacement (overhangs/undercuts)
-needs a UV-aligned per-vertex tangent the engine's `Vertex` does not carry yet. Both are tracked in
-`plans/displacement/`.
+welding are the layer above this baseline, tracked in `plans/displacement/`. Tangent-space **vector**
+displacement (overhangs/undercuts) is now built — the engine's `Vertex` carries a UV-aligned per-vertex
+tangent (Lengyel's method on import), and a material's vector-displacement map switches the kernel's
+branch above.
 
 ## In the code
 

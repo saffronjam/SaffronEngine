@@ -3,11 +3,11 @@
 // — no skinned vertex-shader permutation. One thread per vertex.
 //
 // The vertex + skin streams are read/written as raw byte buffers at the engine's tightly-packed
-// strides: sa::Vertex is 32 B (position@0, normal@12, uv0@24) and sa::VertexSkin is 24 B (joints@0,
-// weights@8). A typed StructuredBuffer<Vertex> would impose std430 padding — float3 takes 16-byte
-// alignment, giving a 48 B Vertex stride and weights at offset 16 — which does NOT match the engine
-// layout and shatters the mesh. ByteAddressBuffer.Load/Store use scalar packing, so the strides match
-// exactly without a global scalar-block-layout flag (which would disturb every other shader's buffers).
+// strides: sa::Vertex is 48 B (position@0, normal@12, uv0@24, tangent@32) and sa::VertexSkin is 24 B
+// (joints@0, weights@8). ByteAddressBuffer.Load/Store use scalar packing, so these tight strides match
+// the engine layout exactly (a typed StructuredBuffer<Vertex> would impose std430's 16-byte float3
+// alignment and misplace the fields). The tangent (xyz + w handedness) is rotated by the skin matrix
+// and written through, so the deformed mesh keeps a valid UV-aligned frame.
 //
 // The deformed position is the skin-matrix applied to the bind pose WITHOUT the instance model matrix:
 // the graphics passes still apply `inst.model` / `inst.normalMatrix`, exactly as for a static mesh.
@@ -17,10 +17,11 @@
 [[vk::binding(2, 0)]] StructuredBuffer<float4x4> jointMatrices;  // the frame's joint palette (64 B, matches glm)
 [[vk::binding(3, 0)]] RWByteAddressBuffer outVertices;          // deformed output, this frame (32 B stride)
 
-static const uint VertexStride = 32u;      // sizeof(sa::Vertex)
+static const uint VertexStride = 48u;      // sizeof(sa::Vertex)
 static const uint SkinStride = 24u;        // sizeof(sa::VertexSkin)
 static const uint NormalOffset = 12u;      // sa::Vertex.normal
 static const uint UvOffset = 24u;          // sa::Vertex.uv0
+static const uint TangentOffset = 32u;     // sa::Vertex.tangent (float4: xyz + w handedness)
 static const uint WeightsOffset = 8u;      // sa::VertexSkin.weights (after u16x4 joints)
 
 struct Push
@@ -46,6 +47,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     const float3 position = inVertices.Load<float3>(vBase);
     const float3 normal = inVertices.Load<float3>(vBase + NormalOffset);
     const float2 uv0 = inVertices.Load<float2>(vBase + UvOffset);
+    const float4 tangent = inVertices.Load<float4>(vBase + TangentOffset);
 
     const uint sBase = i * SkinStride;
     const uint2 jointsPacked = inSkins.Load<uint2>(sBase);
@@ -60,7 +62,10 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
                         + weights.w * jointMatrices[base + joints.w];
 
     const uint oBase = (push.deformedOffset + i) * VertexStride;
+    const float3 skinnedTangent = normalize(mul((float3x3)skin, tangent.xyz));
     outVertices.Store<float3>(oBase, mul(skin, float4(position, 1.0)).xyz);
     outVertices.Store<float3>(oBase + NormalOffset, normalize(mul((float3x3)skin, normal)));
     outVertices.Store<float2>(oBase + UvOffset, uv0);
+    // Rotate the tangent by the skin matrix; the ±1 handedness (w) is invariant under the rotation.
+    outVertices.Store<float4>(oBase + TangentOffset, float4(skinnedTangent, tangent.w));
 }

@@ -30,8 +30,9 @@ public struct SkinnedVertexInput
     [[vk::location(0)]] public float3 position;
     [[vk::location(1)]] public float3 normal;
     [[vk::location(2)]] public float2 uv0;
-    [[vk::location(3)]] public uint4 joints;
-    [[vk::location(4)]] public float4 weights;
+    // Location 3 (binding 0) is the base tangent; the skin stream (binding 1) picks up at 4/5.
+    [[vk::location(4)]] public uint4 joints;
+    [[vk::location(5)]] public float4 weights;
 };
 
 public struct VertexOutput
@@ -159,17 +160,17 @@ float pcfShadow(Sampler2DShadow map, float4x4 viewProj, float3 worldPos)
     return sum / 9.0;
 }
 
-struct Instance
+public struct Instance
 {
-    float4x4 model;
-    float4x4 normalMatrix;
-    float4x4 prevModel;  // last frame's world matrix (TAA object-motion reprojection)
-    float4 baseColor;
-    uint4 texture;    // x = bindless albedo index
-    float4 pbr;       // x = metallic, y = roughness
-    float4 emissive;  // rgb = emissive radiance (strength baked in)
+    public float4x4 model;
+    public float4x4 normalMatrix;
+    public float4x4 prevModel;  // last frame's world matrix (TAA object-motion reprojection)
+    public float4 baseColor;
+    public uint4 texture;    // x = bindless albedo index
+    public float4 pbr;       // x = metallic, y = roughness
+    public float4 emissive;  // rgb = emissive radiance (strength baked in)
 };
-[[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;
+[[vk::binding(0, 2)]] public StructuredBuffer<Instance> instances;
 // The frame's joint palette (worldBone * inverseBind per joint); a skinned instance
 // indexes it at texture.y + vertex joint index.
 [[vk::binding(1, 2)]] StructuredBuffer<float4x4> jointMatrices;
@@ -509,8 +510,12 @@ public static const uint FEATURE_ALPHACLIP = 16u;
 // The height map drives real geometry displacement (a `displace` compute pre-pass bakes it into the
 // deformed vertex buffer — true silhouette, consistent across every pass, BLAS-able) rather than the
 // fragment parallax march. The fragment still reads it for a height-gradient shading normal. Mutually
-// exclusive with FEATURE_HEIGHT (the material sets one or neither).
+// exclusive with FEATURE_HEIGHT (the material sets exactly one height bit, or none).
 public static const uint FEATURE_DISPLACE = 32u;
+// The height map perturbs only the fragment shading normal (a height-to-normal bump) — no parallax
+// march, no geometry. The safe, flat-silhouette baseline; shares the gradient-normal fragment path
+// with FEATURE_DISPLACE (which additionally moves the vertices in the compute pre-pass).
+public static const uint FEATURE_HEIGHT_BUMP = 64u;
 
 // Per-fragment tangent frame from screen-space derivatives (no stored tangents needed). Schüler's
 // method: solve for the tangent/bitangent that map the UV gradients onto the world-position gradients.
@@ -537,17 +542,29 @@ public float3 perturbNormal(float3 N, float3 worldPos, float2 uv, float3 mapN)
 
 // Parallax occlusion mapping: march the tangent-space view ray through the height field and
 // return the offset UV. Height map: white = high; vt = tangent-space view dir (toward eye).
+//
+// Two robustness measures keep the surface from swimming at grazing angles (the artifact the naive
+// `vt.xy / vt.z` march produces as the view grazes the surface and vt.z → 0):
+//   * Offset limiting (Welsh 2003): march the *bounded* offset `v.xy * scale` — never divided by
+//     v.z — so the total UV travel stays ≤ scale regardless of angle. The trade is mild flattening
+//     at extreme grazing; a genuine silhouette is HeightMode::Displacement, not POM's job.
+//   * Dynamic sample count (Tatarchuk 2006): more layers at grazing (where the ray is longest),
+//     fewer head-on. N·V is v.z in the tangent frame.
 public float2 parallaxUv(float2 uv, float3 vt, uint heightIndex, float scale)
 {
-    const int steps = 24;
-    float layerDepth = 1.0 / float(steps);
-    float2 delta = (vt.xy / max(abs(vt.z), 0.1)) * scale / float(steps);
+    float3 v = normalize(vt);
+    const float MIN_STEPS = 8.0;
+    const float MAX_STEPS = 32.0;
+    const int MAX_LOOP = 32;
+    float steps = lerp(MAX_STEPS, MIN_STEPS, saturate(v.z));
+    float layerDepth = 1.0 / steps;
+    float2 delta = v.xy * scale * layerDepth;
     float curDepth = 0.0;
     float2 cur = uv;
     float h = 1.0 - albedoTextures[NonUniformResourceIndex(heightIndex)].SampleLevel(cur, 0.0).r;
-    for (int i = 0; i < steps; i = i + 1)
+    for (int i = 0; i < MAX_LOOP; i = i + 1)
     {
-        if (curDepth >= h)
+        if (float(i) >= steps || curDepth >= h)
         {
             break;
         }
@@ -558,8 +575,9 @@ public float2 parallaxUv(float2 uv, float3 vt, uint heightIndex, float scale)
     float2 prev = cur + delta;
     float afterH = h - curDepth;
     float beforeH = (1.0 - albedoTextures[NonUniformResourceIndex(heightIndex)].SampleLevel(prev, 0.0).r) - curDepth + layerDepth;
-    float w = afterH / (afterH - beforeH);
-    return lerp(cur, prev, w);
+    float denom = afterH - beforeH;
+    float w = abs(denom) > 1e-5 ? afterH / denom : 0.0;
+    return lerp(cur, prev, clamp(w, 0.0, 1.0));
 }
 
 
