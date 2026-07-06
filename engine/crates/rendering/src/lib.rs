@@ -29,6 +29,7 @@ mod gpu_types;
 mod ibl;
 mod instancing;
 mod lighting;
+mod meshlet_raster;
 mod nested_scopes;
 mod overlay;
 mod pipelines;

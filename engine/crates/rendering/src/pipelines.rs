@@ -26,6 +26,7 @@ use saffron_geometry::{Vertex, VertexSkin};
 
 use crate::descriptors::Descriptors;
 use crate::gpu_types::Material;
+use crate::meshlet_raster::MeshletPush;
 use crate::resources::{DeviceResources, Pipeline};
 use crate::{Device, Error, Result, checked};
 
@@ -120,6 +121,10 @@ pub struct Pipelines {
     /// The compute displacement PSO (bindless set 0 + the displace set 1, a 32-byte push),
     /// built lazily.
     displace: Option<Arc<Pipeline>>,
+
+    /// The `VK_EXT_mesh_shader` meshlet raster PSO (task+mesh+`fragmentMain`), built lazily when the
+    /// mesh-shader path is enabled. Bakes the MSAA sample count, so `set_sample_count` clears it.
+    meshlet: Option<Arc<Pipeline>>,
 
     /// The cluster compute set layout the cull PSO binds (set 0).
     cluster_set_layout: vk::DescriptorSetLayout,
@@ -268,6 +273,7 @@ impl Pipelines {
             skin: None,
             morph: None,
             displace: None,
+            meshlet: None,
             cluster_set_layout: descriptors.cluster_set_layout(),
             gbuffer: None,
             gtao: None,
@@ -322,6 +328,8 @@ impl Pipelines {
         // G-buffer / shadow / motion PSOs are always 1× (they feed post-resolve targets),
         // so they are untouched.
         self.depth_prepass = None;
+        // The meshlet raster PSO bakes the count in its multisample state — drop it to rebuild.
+        self.meshlet = None;
     }
 
     /// The MSAA sample count the sample-count-baked PSOs currently target.
@@ -524,7 +532,9 @@ impl Pipelines {
         match self.build_compute_multi(
             "shaders/displace.spv",
             &[bindless_set_layout, displace_set_layout],
-            32,
+            // The `DisplacePush` block: vertexCount+deformedOffset+heightIndex+heightScale (16) +
+            // uvTransform float4 (16) + vectorIndex + 3 scalar pads (16) = 48 bytes.
+            48,
         ) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
@@ -1260,16 +1270,21 @@ impl Pipelines {
                 .offset(offset_of_vertex_uv0()),
             vk::VertexInputAttributeDescription::default()
                 .location(3)
+                .binding(0)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(offset_of_vertex_tangent()),
+            vk::VertexInputAttributeDescription::default()
+                .location(4)
                 .binding(1)
                 .format(vk::Format::R16G16B16A16_UINT)
                 .offset(offset_of_skin_joints()),
             vk::VertexInputAttributeDescription::default()
-                .location(4)
+                .location(5)
                 .binding(1)
                 .format(vk::Format::R32G32B32A32_SFLOAT)
                 .offset(offset_of_skin_weights()),
         ];
-        let (binding_count, attribute_count) = if key.skinned { (2, 5) } else { (1, 3) };
+        let (binding_count, attribute_count) = if key.skinned { (2, 6) } else { (1, 4) };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings[..binding_count])
             .vertex_attribute_descriptions(&attributes[..attribute_count]);
@@ -1384,6 +1399,182 @@ impl Pipelines {
             }
         };
 
+        Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
+    }
+
+    /// The `VK_EXT_mesh_shader` meshlet raster PSO (task+mesh from `meshlet.spv`, the übershader
+    /// `fragmentMain` from `mesh.spv`), built lazily and cached. `meshlet_set_layout` is set 8 (the
+    /// meshlet decomposition + base vertex stream). Built only when the mesh-shader path is enabled;
+    /// `None` on a build failure (logged).
+    pub fn request_meshlet(
+        &mut self,
+        meshlet_set_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.meshlet {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_meshlet_pipeline(meshlet_set_layout) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.meshlet = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_meshlet: {err}");
+                None
+            }
+        }
+    }
+
+    fn build_meshlet_pipeline(
+        &self,
+        meshlet_set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Pipeline> {
+        let raw = self.resources.device();
+        // Two modules: the task/mesh stages from meshlet.spv, the fragment from the übershader.
+        let meshlet_module = self.load_shader_module("shaders/meshlet.spv")?;
+        let mesh_module = match self.load_shader_module("shaders/mesh.spv") {
+            Ok(m) => m,
+            Err(err) => {
+                // SAFETY: the ash seam. The meshlet module was created above; freed once here.
+                unsafe { raw.destroy_shader_module(meshlet_module, None) };
+                return Err(err);
+            }
+        };
+        let result = self.build_meshlet_pipeline_with_modules(
+            raw,
+            meshlet_module,
+            mesh_module,
+            meshlet_set_layout,
+        );
+        // SAFETY: the ash seam. Both modules are consumed by pipeline creation; freed after.
+        unsafe {
+            raw.destroy_shader_module(meshlet_module, None);
+            raw.destroy_shader_module(mesh_module, None);
+        }
+        result
+    }
+
+    fn build_meshlet_pipeline_with_modules(
+        &self,
+        raw: &ash::Device,
+        meshlet_module: vk::ShaderModule,
+        mesh_module: vk::ShaderModule,
+        meshlet_set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Pipeline> {
+        // The meshlet path is the opaque-lit permutation: unlit / a2c / translucent all off.
+        let spec_data = [0u8; 12];
+        let spec_entries = [
+            vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(1)
+                .offset(4)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(2)
+                .offset(8)
+                .size(4),
+        ];
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(&spec_data);
+
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::TASK_EXT)
+                .module(meshlet_module)
+                .name(c"taskMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(meshlet_module)
+                .name(c"meshMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(mesh_module)
+                .name(c"fragmentMain")
+                .specialization_info(&spec_info),
+        ];
+
+        // No vertex-input / input-assembly state: a mesh shader fetches its own geometry.
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(self.sample_count);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let color_formats = [OFFSCREEN_COLOR_FORMAT];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+
+        // Layout: the übershader sets 0–7 (identical, so the frame's sets rebind here) + set 8
+        // (meshlet geometry) + the mesh/task push (viewProj + instance/meshlet/vertex indices).
+        // `meshlet.slang` fixes the geometry set at index 8; when the device lacks RT (so the
+        // übershader list stops at set 5) sets 6/7 are padded with an unused layout so the geometry
+        // set still lands at 8. The übershader `fragmentMain` never references the padded sets.
+        let mut set_layouts = self.set_layouts.clone();
+        while set_layouts.len() < 8 {
+            set_layouts.push(self.set_layouts[0]);
+        }
+        set_layouts.push(meshlet_set_layout);
+        let push_constant = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT)
+            .offset(0)
+            .size(size_of::<MeshletPush>() as u32)];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant);
+        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by the Pipeline.
+        let layout = checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "create_pipeline_layout (meshlet)",
+        )?;
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(&stages)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout);
+        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the layout frees.
+        let created = unsafe {
+            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        let pipeline = match created {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => {
+                // SAFETY: the ash seam. The layout was created above; freed once on the error path.
+                unsafe { raw.destroy_pipeline_layout(layout, None) };
+                return Err(Error::Vk {
+                    context: "create_graphics_pipelines (meshlet)",
+                    result,
+                });
+            }
+        };
         Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
     }
 
@@ -2698,7 +2889,7 @@ fn alpha_blend_attachment() -> vk::PipelineColorBlendAttachmentState {
 
 /// The three base-[`Vertex`]-stream attributes (position/normal/uv0 on binding 0) the
 /// depth-only PSOs (depth-prepass, shadow, point-shadow) all declare.
-fn base_vertex_attributes() -> [vk::VertexInputAttributeDescription; 3] {
+fn base_vertex_attributes() -> [vk::VertexInputAttributeDescription; 4] {
     [
         vk::VertexInputAttributeDescription::default()
             .location(0)
@@ -2715,6 +2906,11 @@ fn base_vertex_attributes() -> [vk::VertexInputAttributeDescription; 3] {
             .binding(0)
             .format(vk::Format::R32G32_SFLOAT)
             .offset(offset_of_vertex_uv0()),
+        vk::VertexInputAttributeDescription::default()
+            .location(3)
+            .binding(0)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(offset_of_vertex_tangent()),
     ]
 }
 
@@ -2727,6 +2923,9 @@ fn offset_of_vertex_normal() -> u32 {
 }
 fn offset_of_vertex_uv0() -> u32 {
     std::mem::offset_of!(Vertex, uv0) as u32
+}
+fn offset_of_vertex_tangent() -> u32 {
+    std::mem::offset_of!(Vertex, tangent) as u32
 }
 fn offset_of_skin_joints() -> u32 {
     std::mem::offset_of!(VertexSkin, joints) as u32

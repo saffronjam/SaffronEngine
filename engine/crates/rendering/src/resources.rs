@@ -810,6 +810,8 @@ pub struct GpuMesh {
     skin: Option<(vk::Buffer, vk_mem::Allocation)>,
     /// The morph (blend-shape) buffers (`None` for a mesh without morph targets).
     morph: Option<MorphBuffers>,
+    /// The meshlet buffers (`None` unless built with mesh-shader support).
+    meshlets: Option<MeshletBuffers>,
     /// Number of indices across every submesh.
     pub index_count: u32,
     /// Number of vertices.
@@ -834,6 +836,23 @@ pub struct GpuMesh {
     /// a build without SDF support). Held here so the fields live exactly as long as the mesh
     /// that owns them; the lighting cone-trace indexes each by [`GpuSdf::bindless_index`].
     pub sdfs: Vec<Arc<GpuSdf>>,
+}
+
+/// The device-local meshlet buffers a [`GpuMesh`] carries when built with mesh-shader support: the
+/// [`saffron_geometry::Meshlet`] descriptor array, the flat meshlet-vertex indices, and the packed
+/// meshlet-triangle local indices (padded to `u32` for storage-buffer reads). The mesh shader binds
+/// all three; the draw records one `cmd_draw_mesh_tasks` per submesh over [`MeshletBuffers::submesh_ranges`].
+pub struct MeshletBuffers {
+    /// The `Meshlet` descriptor array buffer + allocation (32 B stride).
+    pub descriptors: (vk::Buffer, vk_mem::Allocation),
+    /// The flat global vertex-index buffer + allocation (`u32` per entry).
+    pub vertices: (vk::Buffer, vk_mem::Allocation),
+    /// The packed local triangle-index buffer + allocation (`u32` per byte-triple group; see upload).
+    pub triangles: (vk::Buffer, vk_mem::Allocation),
+    /// `(first_meshlet, meshlet_count)` per submesh, parallel to [`GpuMesh::submeshes`].
+    pub submesh_ranges: Vec<(u32, u32)>,
+    /// Total meshlet count across all submeshes.
+    pub meshlet_count: u32,
 }
 
 /// The device-local morph buffers a [`GpuMesh`] carries when it has blend shapes: the flat
@@ -876,6 +895,8 @@ pub struct GpuMeshParts {
     pub skin: Option<(vk::Buffer, vk_mem::Allocation)>,
     /// The optional device-local morph buffers.
     pub morph: Option<MorphBuffers>,
+    /// The optional device-local meshlet buffers (mesh-shader raster path).
+    pub meshlets: Option<MeshletBuffers>,
     /// Number of indices across every submesh.
     pub index_count: u32,
     /// Number of vertices.
@@ -910,6 +931,7 @@ impl GpuMesh {
             index_alloc: parts.index.1,
             skin: parts.skin,
             morph: parts.morph,
+            meshlets: parts.meshlets,
             index_count: parts.index_count,
             vertex_count: parts.vertex_count,
             submeshes: parts.submeshes,
@@ -948,6 +970,11 @@ impl GpuMesh {
     pub fn morph(&self) -> Option<&MorphBuffers> {
         self.morph.as_ref()
     }
+
+    /// The meshlet buffers, or `None` when the mesh was built without mesh-shader support.
+    pub fn meshlets(&self) -> Option<&MeshletBuffers> {
+        self.meshlets.as_ref()
+    }
 }
 
 impl Drop for GpuMesh {
@@ -964,6 +991,11 @@ impl Drop for GpuMesh {
             if let Some(morph) = self.morph.as_mut() {
                 allocator.destroy_buffer(morph.deltas.0, &mut morph.deltas.1);
                 allocator.destroy_buffer(morph.ranges.0, &mut morph.ranges.1);
+            }
+            if let Some(meshlets) = self.meshlets.as_mut() {
+                allocator.destroy_buffer(meshlets.descriptors.0, &mut meshlets.descriptors.1);
+                allocator.destroy_buffer(meshlets.vertices.0, &mut meshlets.vertices.1);
+                allocator.destroy_buffer(meshlets.triangles.0, &mut meshlets.triangles.1);
             }
         }
     }
@@ -1323,6 +1355,7 @@ mod tests {
                 index: make_buffer(48, vk::BufferUsageFlags::INDEX_BUFFER),
                 skin: None,
                 morph: None,
+                meshlets: None,
                 index_count: 12,
                 vertex_count: 3,
                 submeshes: Vec::new(),

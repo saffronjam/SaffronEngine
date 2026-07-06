@@ -80,6 +80,9 @@ impl<T: HasDisplayHandle + HasWindowHandle> WindowSurface for T {}
 pub struct Capabilities {
     /// KHR acceleration-structure + ray-query present and enabled.
     pub rt_supported: bool,
+    /// `VK_EXT_mesh_shader` present and both `meshShader` + `taskShader` enabled (the meshlet
+    /// raster front end). `false` on llvmpipe and any hardware without the extension.
+    pub mesh_shader_supported: bool,
     /// The device supports `PolygonMode::LINE` (the wireframe view mode).
     pub fill_mode_non_solid: bool,
     /// `VK_EXT_memory_budget` is enabled (driver-reported VRAM telemetry).
@@ -150,6 +153,10 @@ pub struct Device {
     // only when `capabilities.rt_supported` — the build path and the `AccelerationStructure`
     // Drop go through it; on a software device it stays `None` and every RT path is a no-op.
     accel: Option<accel::Device>,
+    // The `VK_EXT_mesh_shader` device dispatch (`cmd_draw_mesh_tasks`), present only when
+    // `capabilities.mesh_shader_supported`; `None` on llvmpipe / hardware without the extension,
+    // where the meshlet raster path never runs and the index-draw path serves every mesh.
+    mesh_shader: Option<ash::ext::mesh_shader::Device>,
     // The `VK_EXT_calibrated_timestamps` device dispatch,
     // present only when the extension is enabled and both the device and the
     // host `CLOCK_MONOTONIC` domains are calibrateable. The profiler's periodic
@@ -243,6 +250,13 @@ impl Device {
         } else {
             None
         };
+        // Resolve the mesh-shader dispatch (`cmd_draw_mesh_tasks`) only when the extension was
+        // enabled on the device.
+        let mesh_shader = if selection.capabilities.mesh_shader_supported {
+            Some(ash::ext::mesh_shader::Device::new(&instance, &device))
+        } else {
+            None
+        };
         // VK_EXT_calibrated_timestamps: only when the extension was enabled on the device AND
         // both a device domain and the host CLOCK_MONOTONIC domain are calibrateable can the
         // read-back project GPU spans onto the CPU clock. Otherwise correlation stays off
@@ -297,6 +311,7 @@ impl Device {
             resources: Some(resources),
             swapchain_loader,
             accel,
+            mesh_shader,
             calibrated_ts,
             surface_loader,
             surface,
@@ -357,6 +372,19 @@ impl Device {
     /// `Drop`. `None` on a software device.
     pub fn accel_dispatch(&self) -> Option<&accel::Device> {
         self.accel.as_ref()
+    }
+
+    /// The `VK_EXT_mesh_shader` device dispatch (`cmd_draw_mesh_tasks`), present only when
+    /// [`Capabilities::mesh_shader_supported`]. The meshlet raster path records its draws through
+    /// it; `None` on hardware/llvmpipe without the extension, where the index-draw path serves.
+    pub fn mesh_shader_dispatch(&self) -> Option<&ash::ext::mesh_shader::Device> {
+        self.mesh_shader.as_ref()
+    }
+
+    /// Whether `VK_EXT_mesh_shader` (meshShader + taskShader) is enabled. Shorthand for
+    /// [`Capabilities::mesh_shader_supported`].
+    pub fn mesh_shader_supported(&self) -> bool {
+        self.capabilities.mesh_shader_supported
     }
 
     /// Samples the device and host clocks together via `vkGetCalibratedTimestampsEXT`.
@@ -1049,6 +1077,16 @@ fn probe_optional_features(
         false
     };
 
+    let mesh_shader_supported = if has_ext(ash::ext::mesh_shader::NAME) {
+        let mut ms_feat = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut ms_feat);
+        // SAFETY: the ash seam. Fills the chained mesh-shader feature struct.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+        ms_feat.mesh_shader != 0 && ms_feat.task_shader != 0
+    } else {
+        false
+    };
+
     let lower = name.to_ascii_lowercase();
     let software_gpu = lower.contains("llvmpipe")
         || lower.contains("lavapipe")
@@ -1058,6 +1096,7 @@ fn probe_optional_features(
 
     Capabilities {
         rt_supported,
+        mesh_shader_supported,
         fill_mode_non_solid: core_features.fill_mode_non_solid != 0,
         memory_budget: has_ext(ash::ext::memory_budget::NAME),
         pipeline_stats: core_features.pipeline_statistics_query != 0,
@@ -1111,6 +1150,7 @@ fn create_logical_device(
     };
     let enable_rt =
         has_ext(ash::khr::acceleration_structure::NAME) && has_ext(ash::khr::ray_query::NAME);
+    let enable_mesh_shader = has_ext(ash::ext::mesh_shader::NAME);
 
     let mut device_extensions: Vec<*const c_char> = Vec::new();
     // The swapchain device extension requires the instance-level `VK_KHR_surface`,
@@ -1122,6 +1162,9 @@ fn create_logical_device(
         device_extensions.push(ash::khr::acceleration_structure::NAME.as_ptr());
         device_extensions.push(ash::khr::ray_query::NAME.as_ptr());
         device_extensions.push(ash::khr::deferred_host_operations::NAME.as_ptr());
+    }
+    if enable_mesh_shader {
+        device_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
     }
     if has_ext(ash::ext::memory_budget::NAME) {
         device_extensions.push(ash::ext::memory_budget::NAME.as_ptr());
@@ -1169,6 +1212,9 @@ fn create_logical_device(
     let mut as_feat =
         vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
     let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+    let mut ms_feat = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+        .mesh_shader(true)
+        .task_shader(true);
 
     let mut create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
@@ -1179,6 +1225,9 @@ fn create_logical_device(
         .push_next(&mut features13);
     if enable_rt {
         create_info = create_info.push_next(&mut as_feat).push_next(&mut rq_feat);
+    }
+    if enable_mesh_shader {
+        create_info = create_info.push_next(&mut ms_feat);
     }
 
     // SAFETY: the ash seam. The feature chain + extension pointers outlive the

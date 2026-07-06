@@ -24,6 +24,7 @@ use crate::ibl::{
 };
 use crate::instancing::Instancing;
 use crate::lighting::{ClusterCamera, Lighting, SceneLighting, point_shadow_face_matrices};
+use crate::meshlet_raster::MeshletRaster;
 use crate::nested_scopes::NestedScopeRecorder;
 use crate::overlay::{
     GridPush, OverlayDraw, OverlayState, OverlayVertex, TonemapMode, TonemapPush,
@@ -626,6 +627,11 @@ pub struct Renderer {
     instancing: Instancing,
     skinning: Skinning,
     displacement: Displacement,
+    /// The `VK_EXT_mesh_shader` meshlet raster path — `Some` only on a mesh-shader device, engaged
+    /// only when `SAFFRON_MESH_SHADER` opts in (else the index-draw path serves every mesh).
+    meshlet_raster: Option<MeshletRaster>,
+    /// Whether the meshlet raster path is enabled this run (`SAFFRON_MESH_SHADER` + device support).
+    meshlet_enabled: bool,
     transient: TransientResources,
     pipelines: Pipelines,
     ibl: Ibl,
@@ -760,6 +766,8 @@ impl Renderer {
             Instancing,
             Skinning,
             Displacement,
+            Option<MeshletRaster>,
+            bool,
             TransientResources,
             Ibl,
             Sky,
@@ -797,6 +805,16 @@ impl Renderer {
             let instancing = Instancing::new(&device, &descriptors)?;
             let skinning = Skinning::new(&device)?;
             let displacement = Displacement::new(&device)?;
+            // The meshlet raster path exists only on a mesh-shader device; it engages only when
+            // `SAFFRON_MESH_SHADER` opts in, so the validated index-draw path stays the default.
+            let meshlet_raster = MeshletRaster::new(&device)?;
+            let meshlet_enabled =
+                meshlet_raster.is_some() && std::env::var_os("SAFFRON_MESH_SHADER").is_some();
+            if meshlet_enabled {
+                tracing::info!(
+                    "meshlet raster path enabled (VK_EXT_mesh_shader + SAFFRON_MESH_SHADER)"
+                );
+            }
             let transient = TransientResources::new(device.resources().clone());
 
             // IBL: the cubes + LUT sampler + set 3, then the first (procedural) bake so set
@@ -863,6 +881,8 @@ impl Renderer {
                 instancing,
                 skinning,
                 displacement,
+                meshlet_raster,
+                meshlet_enabled,
                 transient,
                 ibl,
                 sky,
@@ -887,6 +907,8 @@ impl Renderer {
             instancing,
             skinning,
             displacement,
+            meshlet_raster,
+            meshlet_enabled,
             transient,
             ibl,
             sky,
@@ -1025,6 +1047,8 @@ impl Renderer {
             instancing,
             skinning,
             displacement,
+            meshlet_raster,
+            meshlet_enabled,
             transient,
             pipelines,
             ibl,
@@ -4433,6 +4457,28 @@ impl Renderer {
         } else {
             self.views[self.active_view.index()].restir.mesh_set()
         };
+        // The meshlet raster path (phase C2, env-gated + mesh-shader-only): when engaged, wire this
+        // frame's opaque meshlet draws + build the meshlet PSO. `wire` returns `None` (falling back to
+        // the index path for the whole opaque list) if any batch lacks a meshlet decomposition or a
+        // set allocation fails. `meshlet_raster` and `pipelines` are disjoint `self` fields, so the
+        // two mutable borrows split. The `(draws, dispatch, pipeline)` triple is captured by the scene
+        // body; the index path runs when it is `None`.
+        let meshlet_prep = if self.meshlet_enabled {
+            match self.meshlet_raster.as_mut() {
+                Some(mr) => {
+                    let set_layout = mr.set_layout();
+                    match self.pipelines.request_meshlet(set_layout) {
+                        Some(pipeline) => mr
+                            .wire(frame, &list, deformed_handle)
+                            .map(|draws| (draws, mr.dispatch(), pipeline)),
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         // The scene pass binds five descriptor-set operations (sets 0, {1,2}, 3, 4, 5) plus one
         // each for the RT sets 6/7 when present — constant in the batch count. Record it for
         // `render-stats` here, where the resolved sets are known, since the pass body runs inside
@@ -4447,20 +4493,41 @@ impl Renderer {
             .depth_attachment(depth_att)
             .body(move |_cmd, scopes: &mut NestedScopeRecorder| {
                 scopes.scope("scene-opaque", |cmd| {
-                    record_scene_draw_list(
-                        &raw_for_body,
-                        cmd,
-                        &list,
-                        bindless_set,
-                        light_set,
-                        instance_set,
-                        ibl_set,
-                        ssao_mesh_set,
-                        ddgi_mesh_set,
-                        rt_mesh_set,
-                        restir_mesh_set,
-                        deformed_handle,
-                    );
+                    // The meshlet raster path replaces the whole opaque index draw when it wired
+                    // this frame (env-gated + mesh-shader-only); otherwise the validated index path.
+                    if let Some((draws, dispatch, pipeline)) = &meshlet_prep {
+                        crate::meshlet_raster::record_meshlet_draws(
+                            &raw_for_body,
+                            cmd,
+                            dispatch,
+                            pipeline.handle(),
+                            pipeline.layout(),
+                            bindless_set,
+                            light_set,
+                            instance_set,
+                            ibl_set,
+                            ssao_mesh_set,
+                            ddgi_mesh_set,
+                            rt_mesh_set,
+                            restir_mesh_set,
+                            draws,
+                        );
+                    } else {
+                        record_scene_draw_list(
+                            &raw_for_body,
+                            cmd,
+                            &list,
+                            bindless_set,
+                            light_set,
+                            instance_set,
+                            ibl_set,
+                            ssao_mesh_set,
+                            ddgi_mesh_set,
+                            rt_mesh_set,
+                            restir_mesh_set,
+                            deformed_handle,
+                        );
+                    }
                 });
                 scopes.scope("scene-submissions", |cmd| {
                     for body in submissions {
@@ -7852,6 +7919,7 @@ mod tests {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         };
         let mesh = Mesh {
             vertices: vec![v(-3.0, -3.0), v(3.0, -3.0), v(0.0, 3.0)],

@@ -909,7 +909,9 @@ fn create_bindless_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> 
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(MAX_BINDLESS_TEXTURES)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // FRAGMENT for the übershader's material sampling + COMPUTE for the `displace` pre-pass,
+            // which samples the height (and vector-displacement) map from this same bindless array.
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
         vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)

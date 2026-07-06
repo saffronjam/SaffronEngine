@@ -21,15 +21,15 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use saffron_geometry::glam::Vec3;
 use saffron_geometry::{
-    GridDesc, Mesh, MorphData, MorphDelta, Sdf, Submesh, VertexSkin, bake_grid, sdf_chunk_cores,
-    sdf_set_from_bytes, sdf_set_to_bytes,
+    GridDesc, Mesh, Meshlet, MorphData, MorphDelta, Sdf, Submesh, VertexSkin, bake_grid,
+    build_meshlets, sdf_chunk_cores, sdf_set_from_bytes, sdf_set_to_bytes,
 };
 use vk_mem::Alloc;
 
 use crate::descriptors::Descriptors;
 use crate::resources::{
     DeviceResources, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts,
-    Image3D, MorphBuffers,
+    Image3D, MeshletBuffers, MorphBuffers,
 };
 use crate::{Device, Error, Result, checked};
 
@@ -107,6 +107,10 @@ pub struct Uploader {
     /// RT is supported. `None` on a software device —
     /// the mesh's `blas` then stays `None` and the engine renders via the shadow-map path.
     accel: Option<ash::khr::acceleration_structure::Device>,
+    /// Whether `VK_EXT_mesh_shader` is enabled, so each mesh also builds + uploads its meshlet
+    /// buffers (the mesh-shader raster front end). `false` on llvmpipe / unsupported hardware —
+    /// meshes then carry no meshlets and render via the index-draw path.
+    mesh_shader: bool,
     /// The two GPU jump-flood bake compute pipelines (voxelize → JFA) the SDF bake dispatches
     /// on the one-off command buffer; the sign pass is on the host. Owned here (not the
     /// renderer's frame PSO cache) because the bake runs on the upload path — including the
@@ -150,6 +154,7 @@ impl Uploader {
             queue: queue.clone(),
             command_pool,
             accel: device.accel_dispatch().cloned(),
+            mesh_shader: device.mesh_shader_supported(),
             bake,
         })
     }
@@ -372,13 +377,12 @@ impl Uploader {
             vk::BufferUsageFlags::empty()
         };
 
-        // A skinned OR morph-target mesh's vertex stream is also read as a storage buffer by the
-        // compute skinning / morph prepass (the morph kernel reads the base positions + normals),
-        // so it carries STORAGE usage too.
-        let mut vertex_usage = vk::BufferUsageFlags::VERTEX_BUFFER | rt_usage;
-        if !skin.is_empty() || morph.is_some() {
-            vertex_usage |= vk::BufferUsageFlags::STORAGE_BUFFER;
-        }
+        // The base vertex stream is also read as a storage buffer by the compute deform pre-passes:
+        // skinning + morph (skinned/morph meshes), and the `displace` pre-pass, which reads the base
+        // positions/normals/tangents of *any* mesh carrying a displacement material — displacement is
+        // a per-material choice, not a mesh property, so every mesh's vertex buffer carries STORAGE.
+        let vertex_usage =
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER | rt_usage;
 
         // Allocate the device-local buffers; on a later failure free the
         // already-allocated ones (a `GpuMesh` never partially owns the set). Each
@@ -522,11 +526,27 @@ impl Uploader {
             None => Vec::new(),
         };
 
+        // Cluster + upload the meshlet buffers for the mesh-shader raster front end when the device
+        // supports `VK_EXT_mesh_shader`. A failure is logged, not fatal — the mesh then carries no
+        // meshlets and renders via the index-draw path.
+        let meshlet_buffers = if self.mesh_shader {
+            match self.upload_meshlet_buffers(mesh) {
+                Ok(buffers) => buffers,
+                Err(err) => {
+                    tracing::warn!("meshlet upload failed: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let parts = GpuMeshParts {
             vertex,
             index,
             skin: skin_buf,
             morph: morph_buffers,
+            meshlets: meshlet_buffers,
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertices.len() as u32,
             submeshes: mesh.submeshes.clone(),
@@ -1455,6 +1475,113 @@ impl Uploader {
             target_count,
             delta_count,
         })
+    }
+
+    /// Clusters a mesh into meshlets ([`build_meshlets`]) and uploads the three device buffers the
+    /// mesh shader binds: the [`Meshlet`] descriptor array, the flat global vertex indices, and the
+    /// packed local triangle indices (the `u8` array padded to a 4-byte multiple so the shader reads
+    /// it as a raw byte-address buffer). Returns `None` when the mesh produced no meshlets.
+    fn upload_meshlet_buffers(&self, mesh: &Mesh) -> Result<Option<MeshletBuffers>> {
+        let set = build_meshlets(mesh);
+        if set.is_empty() {
+            return Ok(None);
+        }
+
+        // The triangle bytes are read via `ByteAddressBuffer.Load<uint>`, which fetches 4 bytes at
+        // a 4-aligned offset — pad the tail so the last triangle's group is fully backed.
+        let mut triangles = set.triangles.clone();
+        while triangles.len() % 4 != 0 {
+            triangles.push(0);
+        }
+
+        let desc_bytes = std::mem::size_of_val(set.meshlets.as_slice());
+        let vert_bytes = std::mem::size_of_val(set.vertices.as_slice());
+        let tri_bytes = triangles.len();
+        let desc_size = desc_bytes.max(std::mem::size_of::<Meshlet>()) as vk::DeviceSize;
+        let vert_size = vert_bytes.max(std::mem::size_of::<u32>()) as vk::DeviceSize;
+        let tri_size = tri_bytes.max(4) as vk::DeviceSize;
+
+        let mut staging = StagingBuffer::new(self.allocator(), desc_size + vert_size + tri_size)?;
+        {
+            let bytes = staging.mapped_slice();
+            let d = desc_size as usize;
+            let v = vert_size as usize;
+            bytes[..desc_bytes].copy_from_slice(bytemuck::cast_slice(&set.meshlets));
+            if vert_bytes > 0 {
+                bytes[d..d + vert_bytes].copy_from_slice(bytemuck::cast_slice(&set.vertices));
+            }
+            if tri_bytes > 0 {
+                bytes[d + v..d + v + tri_bytes].copy_from_slice(&triangles);
+            }
+        }
+        staging.flush();
+
+        let allocator = self.allocator();
+        let desc_buf =
+            make_device_buffer(allocator, desc_size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        let vert_buf =
+            match make_device_buffer(allocator, vert_size, vk::BufferUsageFlags::STORAGE_BUFFER) {
+                Ok(buf) => buf,
+                Err(err) => {
+                    free_one(allocator, desc_buf);
+                    return Err(err);
+                }
+            };
+        let tri_buf =
+            match make_device_buffer(allocator, tri_size, vk::BufferUsageFlags::STORAGE_BUFFER) {
+                Ok(buf) => buf,
+                Err(err) => {
+                    free_one(allocator, desc_buf);
+                    free_one(allocator, vert_buf);
+                    return Err(err);
+                }
+            };
+
+        let copy = self.with_one_off_commands(|cmd| {
+            // SAFETY: the ash seam. All three device buffers outlive the submit-wait; the staging
+            // buffer is the source for each contiguous slice.
+            unsafe {
+                let raw = self.raw();
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    desc_buf.0,
+                    &[vk::BufferCopy::default().size(desc_size)],
+                );
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    vert_buf.0,
+                    &[vk::BufferCopy::default()
+                        .src_offset(desc_size)
+                        .size(vert_size)],
+                );
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    tri_buf.0,
+                    &[vk::BufferCopy::default()
+                        .src_offset(desc_size + vert_size)
+                        .size(tri_size)],
+                );
+            }
+        });
+        drop(staging);
+        if let Err(err) = copy {
+            free_one(allocator, desc_buf);
+            free_one(allocator, vert_buf);
+            free_one(allocator, tri_buf);
+            return Err(err);
+        }
+
+        let meshlet_count = set.len() as u32;
+        Ok(Some(MeshletBuffers {
+            descriptors: desc_buf,
+            vertices: vert_buf,
+            triangles: tri_buf,
+            submesh_ranges: set.submesh_ranges,
+            meshlet_count,
+        }))
     }
 
     /// Uploads tightly packed RGBA8 pixels as a sampled, mipmapped texture in the
@@ -2770,6 +2897,7 @@ mod tests {
             position: Vec3::new(x, y, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             uv0: Vec2::ZERO,
+            ..Vertex::default()
         };
         Mesh {
             vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],

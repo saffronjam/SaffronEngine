@@ -37,6 +37,12 @@ const OCTAHEDRAL_STEM: &str = "octahedral";
 /// screen-space GI resolve) `import giprobe` for the one `ddgiSampleIrradiance` implementation.
 const GIPROBE_STEM: &str = "giprobe";
 
+/// The resource-free tonemap-operator module — like `octahedral`, no entry points, no `.spv`.
+/// Imported from source (via `-I`) by `tonemap.slang` and the offscreen thumbnail/preview shaders
+/// so scene + thumbnails encode identically. No runtime codegen splices it, so it needs no
+/// precompiled `.slang-module`; it is only excluded from the entry-point `.spv` compile.
+const TONEMAP_OPS_STEM: &str = "tonemap_ops";
+
 /// The pinned Slang version the toolbox provides (the `SAFFRON_SLANG_VERSION` pin). Used only
 /// to point at the conventional toolbox cache location when `slangc` is not otherwise found.
 const SLANG_VERSION: &str = "2026.10";
@@ -57,9 +63,10 @@ pub const SLANGC_SPV_FLAGS: &[&str] = &[
 
 /// Capabilities the shaders actually use that `glsl_450` does not imply (bindless non-uniform
 /// indexing, sparse residency + min-LOD texture sampling, fragment-fully-covered, inline ray query,
-/// and the SPIR-V debug-info extensions). Declared up front so Slang does not implicitly upgrade the
-/// profile and emit an informational warning per entry point.
-const SLANGC_CAPABILITIES: &str = "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR";
+/// the `VK_EXT_mesh_shader` task/mesh stages, and the SPIR-V debug-info extensions). Declared up
+/// front so Slang does not implicitly upgrade the profile and emit an informational warning per
+/// entry point.
+const SLANGC_CAPABILITIES: &str = "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR+spvMeshShadingEXT+spvGroupNonUniform+spvGroupNonUniformBallot";
 
 /// Inputs to one shader-pipeline run, resolved from the workspace layout + the build profile.
 pub struct Config {
@@ -147,6 +154,14 @@ pub fn run(config: &Config) -> Result<Report> {
         bail!("shared giprobe source not found: {}", giprobe_src.display());
     }
 
+    let tonemap_ops_src = config.shader_src_dir.join("tonemap_ops.slang");
+    if !tonemap_ops_src.is_file() {
+        bail!(
+            "shared tonemap_ops source not found: {}",
+            tonemap_ops_src.display()
+        );
+    }
+
     let mut report = Report::default();
 
     // The `octahedral` module (no imports) compiles first; `sdf` re-exports it and `lighting`
@@ -212,6 +227,7 @@ pub fn run(config: &Config) -> Result<Report> {
             || stem == MDF_BRICK_STEM
             || stem == OCTAHEDRAL_STEM
             || stem == GIPROBE_STEM
+            || stem == TONEMAP_OPS_STEM
         {
             continue;
         }
@@ -230,6 +246,7 @@ pub fn run(config: &Config) -> Result<Report> {
                 &mdf_brick_src,
                 &octahedral_src,
                 &giprobe_src,
+                &tonemap_ops_src,
             ],
         )? {
             compile_spv(&config.slangc, &path, &config.shader_src_dir, &spv)?;
