@@ -25,3 +25,8 @@ testscenes/
 
 # OS
 .DS_Store
+
+# Editor runtime dumps — the host writes viewport frame recordings next to the
+# Tauri bridge (named <control-address>-recording.json); they are huge and must
+# never be committed.
+editor/src-tauri/*-recording.json
