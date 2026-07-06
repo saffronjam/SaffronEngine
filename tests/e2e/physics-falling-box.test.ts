@@ -1,7 +1,11 @@
-// Phase 2 of the physics plan: the component -> body -> step -> write-back loop. A dynamic box is
-// dropped above a static floor; physics steps inside the simTick seam and writes the body's world
-// transform back into the entity TransformComponent every frame. The box falls under gravity and
-// comes to rest on the floor. A collider with no Rigidbody is an implicit static body (the floor).
+// The physics lifecycle end to end on a single booted host: the per-play-session Jolt world
+// (built on the Edit->Playing edge, discarded on ->Edit), the component -> body -> step ->
+// write-back loop (a dynamic box falls under gravity and settles on a static floor), and the
+// telemetry contract the Physics panel depends on (physics-state / drain-contacts / physics-bodies
+// are Edit-safe, then report the live world while playing; apply-impulse pushes a dynamic body).
+//
+// One boot: the empty-world lifecycle runs first (no bodies), then the falling-box scene is
+// authored and reused for the live-telemetry cases so the box's landing feeds a real contact.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
@@ -19,6 +23,15 @@ interface PhysicsState {
   bodyCount: number;
   dynamicCount: number;
 }
+interface ContactDrain {
+  events: { kind: string; entityA: string; entityB: string; sensor: boolean }[];
+  highWaterSeq: number;
+  oldestSeq: number;
+  overflowed: boolean;
+}
+interface PhysicsBodies {
+  bodies: { entity: string; motion: string; active: boolean; position: { y: number } }[];
+}
 
 const boxY = async (): Promise<number> =>
   (await engine.call<WorldTransform>("get-world-transform", { entity: box })).translation.y;
@@ -30,8 +43,52 @@ const REST_Y = FLOOR_TOP + BOX_HALF; // ~0.6
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
+});
+afterAll(async () => {
+  await engine?.shutdown();
+});
 
-  // Static floor: a thin wide collider with no rigidbody (implicitly static).
+test("no physics world exists in Edit", async () => {
+  const state = await engine.call<PhysicsState>("physics-state");
+  expect(state.active).toBe(false);
+  expect(state.bodyCount).toBe(0);
+  expect(state.dynamicCount).toBe(0);
+});
+
+test("physics-state, drain-contacts, and physics-bodies are Edit-safe (inactive / empty)", async () => {
+  const drain = await engine.call<ContactDrain>("drain-contacts", { since: 0 });
+  expect(drain.events).toEqual([]);
+  expect(drain.overflowed).toBe(false);
+  const bodies = await engine.call<PhysicsBodies>("physics-bodies");
+  expect(bodies.bodies).toEqual([]);
+});
+
+test("entering play allocates a Jolt world; stopping frees it", async () => {
+  await engine.call("play");
+  await engine.settle();
+  const playing = await engine.call<PhysicsState>("physics-state");
+  expect(playing.active).toBe(true);
+  expect(playing.bodyCount).toBe(0); // no components author bodies yet
+  expect(playing.dynamicCount).toBe(0);
+
+  await engine.call("stop");
+  await engine.settle();
+  const stopped = await engine.call<PhysicsState>("physics-state");
+  expect(stopped.active).toBe(false);
+});
+
+test("a second play/stop cycle re-allocates a fresh world (no leak across the edge)", async () => {
+  await engine.call("play");
+  await engine.settle();
+  expect((await engine.call<PhysicsState>("physics-state")).active).toBe(true);
+  await engine.call("stop");
+  await engine.settle();
+  expect((await engine.call<PhysicsState>("physics-state")).active).toBe(false);
+});
+
+test("no world in Edit; the box sits at its authored height", async () => {
+  // Author the falling-box scene: a static floor (a collider with no rigidbody is implicitly
+  // static) + a dynamic box dropped from y=5. Reused by the live-telemetry cases below.
   floor = (await engine.call<{ id: string }>("create-entity", { name: "Floor" })).id;
   await engine.call("set-transform", { entity: floor, translation: { x: 0, y: 0, z: 0 } });
   await engine.call("add-component", { entity: floor, component: "Collider" });
@@ -42,17 +99,11 @@ beforeAll(async () => {
     value: { x: 10, y: 0.1, z: 10 },
   });
 
-  // Dynamic box dropped from y=5 (default 0.5 half-extent box, default Dynamic rigidbody).
   box = (await engine.call<{ id: string }>("create-entity", { name: "Box" })).id;
   await engine.call("set-transform", { entity: box, translation: { x: 0, y: 5, z: 0 } });
   await engine.call("add-component", { entity: box, component: "Collider" });
   await engine.call("add-component", { entity: box, component: "Rigidbody" });
-});
-afterAll(async () => {
-  await engine?.shutdown();
-});
 
-test("no world in Edit; the box sits at its authored height", async () => {
   const state = await engine.call<PhysicsState>("physics-state");
   expect(state.active).toBe(false);
   expect(await boxY()).toBeCloseTo(5, 3);
@@ -90,6 +141,42 @@ test("stopping discards the world; the authored box height is untouched", async 
   expect(await boxY()).toBeCloseTo(5, 3);
 });
 
-test("the falling-box run is validation-clean", () => {
+test("while Playing, physics-state reports the live world and contacts drain", async () => {
+  await engine.call("play");
+  await engine.settle(2000); // let the box fall and land
+
+  const state = await engine.call<PhysicsState>("physics-state");
+  expect(state.active).toBe(true);
+  expect(state.bodyCount).toBe(2);
+  expect(state.dynamicCount).toBe(1);
+
+  // The box landing on the floor fires at least one contact begin event.
+  const drain = await engine.call<ContactDrain>("drain-contacts", { since: 0 });
+  expect(drain.events.some((e) => e.kind === "begin")).toBe(true);
+  expect(drain.highWaterSeq).toBeGreaterThan(0);
+
+  // physics-bodies lists every live body (the floor + the box) with motion + position.
+  const bodies = await engine.call<PhysicsBodies>("physics-bodies");
+  expect(bodies.bodies.length).toBe(2);
+  expect(bodies.bodies.some((b) => b.motion === "dynamic")).toBe(true);
+  expect(bodies.bodies.every((b) => typeof b.position.y === "number")).toBe(true);
+});
+
+test("apply-impulse pushes a Dynamic body and returns its new velocity", async () => {
+  // The box is still dynamic + active in the world (we are mid-play from the prior test).
+  const result = await engine.call<{ velocity: { x: number; y: number; z: number } }>("apply-impulse", {
+    entity: box,
+    impulse: { x: 0, y: 0, z: 5 },
+  });
+  expect(result.velocity.z).toBeGreaterThan(0); // the impulse imparted +Z velocity
+});
+
+test("stopping returns physics-state to inactive", async () => {
+  await engine.call("stop");
+  await engine.settle();
+  expect((await engine.call<PhysicsState>("physics-state")).active).toBe(false);
+});
+
+test("the physics lifecycle run is validation-clean", () => {
   expect(engine.validationErrors()).toEqual([]);
 });
