@@ -20,9 +20,10 @@ use glam::Vec2;
 use saffron_animation::{AnimMode, AnimationRuntime};
 use saffron_app::{App, Layer};
 use saffron_assets::{
-    AssetServer, RenderSceneOptions, RendererScene, RendererUploader, render_scene,
+    AssetServer, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind, RenderSceneOptions,
+    RendererScene, RendererUploader, render_scene, write_thumbnail_cache,
 };
-use saffron_control::ControlContext;
+use saffron_control::{ControlContext, PreviewSubject, build_preview_scene_for_thumbnail};
 use saffron_runtime::RuntimeSession;
 
 use crate::control_renderer::HostControlRenderer;
@@ -98,8 +99,6 @@ pub enum ParentWatch {
 /// record a test reads to assert the order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TeardownStep {
-    /// Drain + join the thumbnail worker (it borrows the renderer, still alive here).
-    WorkerJoined,
     /// Close the control socket.
     ControlClosed,
     /// Stop the script VM (it never touches the scene, so it tears down before the world).
@@ -411,6 +410,11 @@ impl HostLayer {
         if self.any_animation_active() {
             reasons.push("animation");
         }
+        // Queued main-graph preview tiles (material / texture) drain a small budget per tick; hold
+        // full cadence until the queue empties so tiles fill in promptly instead of at idle latency.
+        if self.assets.preview_render_pending() {
+            reasons.push("thumbnails");
+        }
         reasons
     }
 
@@ -546,6 +550,66 @@ impl HostLayer {
             .advance_project_load(&mut control_renderer, &mut self.editor, &mut self.assets)
     }
 
+    /// Renders a small budget of queued material / texture preview tiles through the main forward+
+    /// graph (the interactive previewer's path) on the offscreen thumbnail view, writing each to the
+    /// disk cache the editor repolls for. The worker cannot drive the main graph (it lives on the
+    /// render thread), so [`saffron_assets::request_thumbnail`] enqueues these and this drains them.
+    /// A small per-tick budget offsets the multi-frame converge cost of each tile.
+    fn drive_preview_render_queue(&mut self, renderer: &mut Renderer) {
+        /// Tiles rendered per `on_update` tick — each converges several frames, so keep it small.
+        const MAX_PREVIEW_RENDERS_PER_TICK: usize = 2;
+
+        if !self.assets.preview_render_pending() {
+            return;
+        }
+        self.ensure_uploader(renderer);
+        if self.uploader.is_none() {
+            return;
+        }
+        let skinning = renderer.skinning_enabled();
+        let jobs = self
+            .assets
+            .take_preview_render_jobs(MAX_PREVIEW_RENDERS_PER_TICK);
+        let uploader = self.uploader.as_ref().expect("uploader present");
+        let assets = &mut self.assets;
+        for job in &jobs {
+            let subject = match job.kind {
+                PreviewRenderKind::Material(id) => PreviewSubject::Material(id),
+                PreviewRenderKind::TextureRole { tid, role } => {
+                    PreviewSubject::TextureRole { tid, role }
+                }
+                PreviewRenderKind::Mesh(id) => PreviewSubject::Mesh(id),
+                PreviewRenderKind::Model(id) => PreviewSubject::Model(id),
+                PreviewRenderKind::Hdri(tid) => PreviewSubject::Hdri(tid),
+            };
+            // Build the furnished scene (transient uploader over the renderer's descriptors), then
+            // render it (the uploader borrow ends with the block, freeing the renderer).
+            let (mut scene, _root, camera) = {
+                let gpu = RendererUploader::new(uploader, renderer.descriptors(), skinning);
+                build_preview_scene_for_thumbnail(
+                    assets,
+                    &gpu,
+                    subject,
+                    PREVIEW_THUMBNAIL_MATERIAL_ID,
+                )
+            };
+            let view = camera.view();
+            match render_preview_scene_to_png(
+                renderer, uploader, skinning, &mut scene, assets, &view, job.size,
+            ) {
+                Ok(png) => {
+                    if let Err(err) =
+                        write_thumbnail_cache(std::path::Path::new(&job.cache_path), &png.bytes)
+                    {
+                        tracing::warn!("preview thumbnail cache write: {err}");
+                    }
+                }
+                Err(err) => tracing::error!("preview thumbnail render: {err}"),
+            }
+            assets.finish_preview_render(&job.cache_path);
+        }
+    }
+
     /// Renders the scene through the active camera and submits the native gizmo overlay: track
     /// the viewport size in present mode, sync the gizmo, render the scene, then build + submit
     /// the edit overlay geometry.
@@ -626,6 +690,9 @@ impl HostLayer {
         let view = match view_id {
             saffron_rendering::ViewId::Scene => ShmView::Scene,
             saffron_rendering::ViewId::AssetPreview => ShmView::AssetPreview,
+            // The Thumbnail view is never shm-published — its readback goes straight to a PNG, so
+            // it never stages a pipelined slot here.
+            saffron_rendering::ViewId::Thumbnail => return,
         };
         if !self.shm.is_enabled(view) {
             return;
@@ -665,36 +732,6 @@ impl HostLayer {
         renderer.submit_overlay(depth_tested, on_top);
     }
 
-    /// Starts the off-frame-loop thumbnail worker over a [`WorkerThumbnailGpu`] sharing the
-    /// renderer's device + bindless table.
-    ///
-    /// The renderer prewarms its own thumbnail pipelines first (the synchronous control-drain
-    /// path still uses them); the worker then builds + prewarms its **own** thumbnail renderer
-    /// on the worker thread. A cold-cache `get-thumbnail`/`view-asset` then enqueues + replies
-    /// `pending` instead of blocking the frame loop on the decode + upload + render. A prewarm /
-    /// worker-build failure is logged and the worker simply stays unstarted (the synchronous
-    /// fallback still serves thumbnails), never fatal.
-    fn start_thumbnail_worker(&mut self, renderer: &mut Renderer) {
-        if let Err(err) = renderer.prewarm_thumbnail_resources() {
-            tracing::error!("thumbnail worker not started: prewarm failed: {err}");
-            return;
-        }
-        let queue = GpuQueue::new(renderer.device().graphics_queue);
-        let worker_gpu = match crate::control_renderer::WorkerThumbnailGpu::new(
-            renderer.device_arc(),
-            renderer.descriptors_arc(),
-            queue,
-            renderer.skinning_enabled(),
-        ) {
-            Ok(gpu) => gpu,
-            Err(err) => {
-                tracing::error!("thumbnail worker not started: {err}");
-                return;
-            }
-        };
-        self.assets.start_thumbnail_worker(Box::new(worker_gpu));
-    }
-
     /// Lazily builds the host-owned one-off [`Uploader`] from the renderer's device + queue.
     /// The uploader is `Arc`-rooted in the device resources, so it outlives any single-frame
     /// `&mut Renderer` borrow.
@@ -723,24 +760,18 @@ impl HostLayer {
     /// `steps`. The production [`HostLayer::teardown`] passes a throwaway vec.
     ///
     /// The order:
-    /// 1. Drain + join the thumbnail worker first — it borrows the renderer, which is still
-    ///    alive (the run loop drops the renderer only after `on_detach` returns), so it MUST
-    ///    join before `wait_gpu_idle`/the renderer drop.
-    /// 2. Close the control socket.
-    /// 3. Quit can land mid-play: stop the script VM (it never touches the scene), drop the
+    /// 1. Close the control socket.
+    /// 2. Quit can land mid-play: stop the script VM (it never touches the scene), drop the
     ///    physics world (RAII frees its Jolt bodies + detaches ragdolls before they destruct),
     ///    then shut down the Jolt globals **after** that last world is gone (the
     ///    `Factory`/registered types outlive every body), then unsubscribe the two play-state
     ///    hooks. The first three steps delegate to the runtime, which owns the VM + world +
     ///    globals.
-    /// 4. Drop the host's one-off uploader + clear every cached GPU `Ref` **before** the renderer
+    /// 3. Drop the host's one-off uploader + clear every cached GPU `Ref` **before** the renderer
     ///    frees the device/allocator — otherwise the last `Arc<GpuMesh>`/`Arc<GpuTexture>` drop
     ///    would free a GPU resource after its allocator is gone (UAF). The loop already idled the
     ///    GPU, so clearing under an idle device is safe.
     fn teardown_recording(&mut self, steps: &mut Vec<TeardownStep>) {
-        self.assets.stop_thumbnail_worker();
-        steps.push(TeardownStep::WorkerJoined);
-
         self.control.shutdown();
         steps.push(TeardownStep::ControlClosed);
 
@@ -782,9 +813,6 @@ impl Layer for HostLayer {
         // starts with something selected. Both need the renderer; the GPU-free test host skips
         // them and drives the session spine alone.
         self.bootstrap_project();
-        if let Some(renderer) = app.frame_host.renderer_mut() {
-            self.start_thumbnail_worker(renderer);
-        }
         self.auto_select_first_mesh();
         // The bootstrap scene loads here, not via a control command, so it raises no mutation
         // signal — seed one redraw so the initial scene paints (and the temporal effects converge
@@ -807,8 +835,9 @@ impl Layer for HostLayer {
             let mut headless = Window::headless();
             let window = app.window.as_mut().unwrap_or(&mut headless);
             mutated = self.poll_control(window, renderer);
-            // Insert any thumbnails the worker finished this interval into the GPU caches.
-            self.assets.drain_thumbnail_completions();
+            // Render a small budget of queued preview tiles through the main graph on the offscreen
+            // thumbnail view, writing each to the disk cache for the editor's repoll.
+            self.drive_preview_render_queue(renderer);
             // Advance a non-blocking project load one bounded step (doc-worker poll / install /
             // residency), so a load never stalls the drain + publish loop.
             if self.advance_project_load(renderer) {
@@ -877,6 +906,43 @@ impl Layer for HostLayer {
     fn on_detach(&mut self, _app: &mut App) {
         self.teardown();
     }
+}
+
+/// Renders a throwaway preview `scene` through the main forward+ graph on the offscreen
+/// [`saffron_rendering::ViewId::Thumbnail`] view and returns the encoded PNG — the one render
+/// primitive both the async Assets-tile queue and the sync `preview-render` seam drive. Converges a
+/// few frames so TAA / SSAO / GI settle to match the interactive previewer's look, then reads the
+/// offscreen back. Restores the prior active view *without* resetting its temporal state, so a
+/// `Scene → Thumbnail → Scene` excursion never wipes the live viewport's accumulated history.
+pub(crate) fn render_preview_scene_to_png(
+    renderer: &mut Renderer,
+    uploader: &Uploader,
+    skinning: bool,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+    camera: &CameraView,
+    size: u32,
+) -> saffron_rendering::Result<saffron_rendering::ThumbnailPng> {
+    /// Frames rendered before read-back so temporal effects converge to the previewer's look.
+    const CONVERGE_FRAMES: u32 = 8;
+
+    let prev_view = renderer.active_view_id();
+    renderer.set_active_view(saffron_rendering::ViewId::Thumbnail);
+    renderer.set_viewport_desired_size(saffron_rendering::ViewId::Thumbnail, size, size)?;
+    let options = RenderSceneOptions {
+        show_editor_camera_models: false,
+        show_grid: false,
+    };
+    for _ in 0..CONVERGE_FRAMES {
+        {
+            let mut driver = RendererScene::new(renderer, uploader, skinning);
+            render_scene(&mut driver, scene, assets, camera, options);
+        }
+        renderer.render_scene_offscreen()?;
+    }
+    let png = renderer.encode_active_offscreen_png()?;
+    renderer.restore_active_view_no_reset(prev_view);
+    Ok(png)
 }
 
 #[cfg(test)]
@@ -1200,7 +1266,6 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                TeardownStep::WorkerJoined,
                 TeardownStep::ControlClosed,
                 TeardownStep::ScriptsStopped,
                 TeardownStep::PhysicsWorldDropped,
