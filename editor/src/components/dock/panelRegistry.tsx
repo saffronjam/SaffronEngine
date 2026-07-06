@@ -8,6 +8,7 @@ import type { ComponentType } from "react";
 import type { AssetEditorDockPanelId, DockPanelId, SceneDockPanelId } from "../../state/dockLayout";
 import {
   AssetClipsPanel,
+  AssetMaterialPanel,
   AssetPreviewPanel,
   AssetSkeletonPanel,
   AssetTimelinePanel,
@@ -169,6 +170,22 @@ export const ASSET_EDITOR_PANEL_REGISTRY: Record<AssetEditorDockPanelId, DockPan
     closable: true,
     renderer: "onlyWhenVisible",
     component: AssetTimelinePanel,
+  },
+  materialEdit: {
+    id: "materialEdit",
+    title: "Material",
+    closable: true,
+    // Live GPU preview inside — keep it mounted (hidden) when the tab isn't active, like the
+    // Scene dock's Material panel.
+    renderer: "always",
+    component: AssetMaterialPanel,
+  },
+  assetStats: {
+    id: "assetStats",
+    title: "Stats",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: RenderStatsPanel,
   },
 };
 

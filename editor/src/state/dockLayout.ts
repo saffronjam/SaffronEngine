@@ -28,7 +28,14 @@ export const SCENE_PANEL_IDS = [
 ] as const;
 
 /// The asset-editor island's panels (disjoint from the Scene set).
-export const ASSET_EDITOR_PANEL_IDS = ["skeleton", "preview", "clips", "assetTimeline"] as const;
+export const ASSET_EDITOR_PANEL_IDS = [
+  "skeleton",
+  "preview",
+  "clips",
+  "assetTimeline",
+  "materialEdit",
+  "assetStats",
+] as const;
 
 export type SceneDockPanelId = (typeof SCENE_PANEL_IDS)[number];
 export type AssetEditorDockPanelId = (typeof ASSET_EDITOR_PANEL_IDS)[number];
@@ -863,6 +870,8 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   preview: "leaf:preview",
   clips: "leaf:clips",
   assetTimeline: "leaf:assetTimeline",
+  materialEdit: "leaf:aeRight",
+  assetStats: "leaf:aeLeft",
 };
 
 /// Reset a kind's tree to its default positions WITHOUT closing the panels currently open:

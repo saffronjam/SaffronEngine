@@ -15,13 +15,19 @@
 /// previewing A under B's panels. enter-asset-preview / exit-asset-preview stash + restore the camera
 /// engine-side, so orbiting never dirties the saved editorCamera.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Axis3d, Bone, Box, Grid2x2 } from "lucide-react";
+import { Axis3d, Bone, Box, Grid2x2, Wrench } from "lucide-react";
 import { client } from "../control/client";
 import { useSubsurfaceBounds } from "../lib/useSubsurfaceBounds";
 import { useOrbitCamera, type OrbitState } from "../lib/useOrbitCamera";
 import { errorText, notifyError } from "../lib/flash";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { DockRoot } from "@/components/dock/DockRoot";
 import { DockPanelsHost } from "@/components/dock/DockPanelsHost";
 import { RevealBands, type RevealBand } from "@/components/dock/RevealBands";
@@ -54,15 +60,17 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // The bone the tree has highlighted (a get-asset-model node index); local view state, not selection.
   const [highlightJoint, setHighlightJoint] = useState(-1);
 
-  // The catalog row (for a texture subject: drives the pan-only orbit + the Applied/Flat picker).
+  // The catalog row (for a texture subject: drives the pan-only orbit).
   const asset = useEditorStore(
     useCallback((s) => s.assets.find((a) => a.id === assetId), [assetId]),
   );
-  const openImageViewerTab = useEditorStore((s) => s.openImageViewerTab);
   // A texture previews as its map on the studio sphere: orbit-only (no dolly — the framed sphere is
-  // the subject) and offers a Flat-image representation alongside the Applied 3D one. An HDRI is the
-  // exception: a full environment scene (three balls) that keeps dolly + gains an exposure sweep.
+  // the subject). An HDRI is the exception: a full environment scene (three balls) that keeps dolly
+  // + gains an exposure sweep.
   const isTexture = asset?.type === "texture";
+  // A material subject gets the Material editor pinned to it in the right dock (no selector). For a
+  // self-container material the catalog id IS the material id, so `assetId` is what the panel edits.
+  const isMaterial = asset?.type === "material";
   const isHdr = asset?.role === "hdri" || asset?.colorspace === "hdr";
   const panOnly = isTexture && !isHdr;
   // The HDRI preview's exposure sweep (EV, exp2). Restored engine-side on exit-asset-preview, so it
@@ -197,7 +205,12 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       closePanel("clips");
       closePanel("assetTimeline");
     }
-  }, [ready, hasRig, hasClips]);
+    if (isMaterial) {
+      openPanel("materialEdit");
+    } else {
+      closePanel("materialEdit");
+    }
+  }, [ready, hasRig, hasClips, isMaterial]);
 
   // Space = play/pause while THIS tab is active (the workspace stays mounted-but-hidden when parked, so
   // the window listener must no-op unless active) and no text field is focused.
@@ -277,8 +290,9 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       },
       active,
       ready,
+      materialSubject: isMaterial ? assetId : null,
     }),
-    [model, rootEntity, highlightJoint, onBoneSelect, orbit, active, ready],
+    [model, rootEntity, highlightJoint, onBoneSelect, orbit, active, ready, isMaterial, assetId],
   );
 
   if (status === "error") {
@@ -301,7 +315,10 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // subsurface frame is already at the final pane width — no panel pop-in, no resize stretch.
   return (
     <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="flex items-center gap-3 border-b border-border bg-background px-3 py-2">
+      {/* min-h-12 reserves the ready-state toolbar height (a 32px icon-sm button row + py-2) from the
+          first frame, so the header does not grow — and the title below shift down — when the async
+          preview load flips `ready` and mounts the toolbar. */}
+      <div className="flex min-h-12 items-center gap-3 border-b border-border bg-background px-3 py-2">
         <Box className="size-4 text-muted-foreground" />
         <span className="text-sm font-medium text-foreground">
           {asset?.name ?? model?.name ?? "Asset"}
@@ -325,23 +342,6 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
                 <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">
                   {exposureEv > 0 ? `+${exposureEv.toFixed(1)}` : exposureEv.toFixed(1)}
                 </span>
-              </div>
-            ) : null}
-            {isTexture ? (
-              // Representation: Applied (the lit sphere / HDRI environment) vs Flat (the raw texture
-              // / equirect). Applied is active here; Flat opens the flat image view of the same map.
-              <div className="mr-1 flex items-center overflow-hidden rounded-md border border-border">
-                <Button variant="secondary" size="sm" className="rounded-none" disabled>
-                  {isHdr ? "3D" : "Applied"}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="rounded-none"
-                  onClick={() => asset && openImageViewerTab(asset)}
-                >
-                  Flat
-                </Button>
               </div>
             ) : null}
             {hasRig ? (
@@ -372,6 +372,18 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
             >
               <Grid2x2 className="size-4" />
             </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" variant="ghost" size="icon-sm" aria-label="Tools">
+                  <Wrench className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-32">
+                <DropdownMenuItem onSelect={() => useEditorStore.getState().openPanel("assetStats")}>
+                  Stats
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         ) : null}
       </div>

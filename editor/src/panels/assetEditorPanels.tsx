@@ -8,6 +8,7 @@ import { Loader2 } from "lucide-react";
 import type { PointerEvent, ReactNode, RefObject, WheelEvent } from "react";
 import { SkeletonTree } from "./SkeletonTree";
 import { ClipList } from "./ClipList";
+import { MaterialEditorPanel } from "./MaterialEditorPanel";
 import { TimelineTransport } from "../components/timeline/TimelineTransport";
 import { TimelineSurface } from "../components/timeline/TimelineSurface";
 import type { TimelineTarget } from "../components/timeline/shared";
@@ -32,6 +33,9 @@ export interface AssetPreviewContextValue {
   active: boolean;
   /// Whether the model's capabilities are known and the preview is entered.
   ready: boolean;
+  /// The previewed material's id when the subject is a material (else `null`) — pins the
+  /// Material panel's sidebar to this subject.
+  materialSubject: string | null;
 }
 
 const AssetPreviewContext = createContext<AssetPreviewContextValue | null>(null);
@@ -99,6 +103,16 @@ export function AssetSkeletonPanel() {
 export function AssetClipsPanel() {
   const { model, rootEntity } = useAssetPreview();
   return <ClipList model={model} rootEntity={rootEntity} />;
+}
+
+/// The Material editor pinned to the previewed material (asset-editor right dock): the scene
+/// dock's panel minus its selector row — the subject is fixed to the asset being previewed.
+export function AssetMaterialPanel() {
+  const { materialSubject } = useAssetPreview();
+  // No inline preview sphere: the previewer already shows the material full-size in the viewport.
+  return (
+    <MaterialEditorPanel pinnedMaterialId={materialSubject ?? undefined} hideSelector hidePreview />
+  );
 }
 
 export function AssetTimelinePanel() {

@@ -64,7 +64,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-
 /// Stable, order-insensitive equality of two graphs (nodes/edges sorted by id/endpoints),
 /// so a settle that only reorders the arrays or rounds a position back records no entry.
 export function graphsEqual(a: MaterialGraph, b: MaterialGraph): boolean {
