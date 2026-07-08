@@ -1,6 +1,25 @@
 # Phase 7 — RT BLAS portable floor: indirect / worst-case build, scratch pool, instance bucketing, distinct skinned vs tessellated policies
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — the portable **correctness floor** is landed and gated (workspace clippy clean,
+191 rendering tests + 3 new Phase-7 CPU tests pass, headless RT build validation-clean on the RTX 3070 Ti):
+- `DeformedRtInstance.tess: Option<TessRtSlice>` carries the amplified transient VB/IB slice + worst-case
+  counts; `record_tess_prep` fills it (matched by entity) alongside the raster `DrawBatch.tessellated`.
+- `rt.rs`: a `TessellatedBlas` cache (per-entity in v1) + `plan_tessellated_blas_builds` does a full
+  `MODE_BUILD` over the worst-case range every frame, reusing the AS only on an unchanged worst-case bound
+  (`tess_blas_reuse`). `plan_skinned_blas_refits` skips tessellated instances (`skinned_refit_skips`), and
+  the TLAS places each tessellated instance via `tessellated_blas`. Split `skinned`/`tessellated_blas_count`
+  inspect counters.
+- The emit kernel degenerate-pads the index tail (a zero-fill of the transient IB before the dispatch), so
+  the worst-case BUILD range is watertight with **no GPU-count readback** — the portable floor.
+- CPU gate tests: reuse policy, worst-case build-range arithmetic, and the skinned-vs-build path selector.
+
+The NO-LEGACY 1:1 displace-path deletion (Phase 4/6 §10) is **done** — RT now traces only the tessellated
+buffers (a displaced instance is handled structurally identically to a morph instance: a non-skinned
+deformed instance placed via `deformed_rt_instances` with a per-frame BLAS).
+
+**Remaining (documented optimizations over the floor, GPU-with-eyes):** the `accel_indirect_build`
+GPU-count fast lane (vs the worst-case build); a per-build scratch pool (vs the shared serialized scratch);
+`(mesh, lod_bucket)` instance bucketing (vs per-entity); the hard displaced-instance budget.
 
 Make the ray-traced surface **identical to the rasterized one**, cross-vendor, with nothing NV-only
 load-bearing. Phase 4 writes the diced, welded, displaced geometry into the per-frame
