@@ -21,6 +21,7 @@
 
 #![deny(unsafe_code)]
 
+mod conditioning;
 mod error;
 mod gltf_import;
 mod image_decode;
@@ -36,6 +37,10 @@ mod sub_id;
 mod translate;
 mod types;
 
+pub use conditioning::{
+    EDGE_BOUNDARY, EDGE_NON_MANIFOLD, EDGE_SEAM, EDGE_SEAM_OBJECT_SPACE, Edge, MeshConditioning,
+    MinMaxLevel, TriEdges, WeldedVertex, build_min_max_pyramid,
+};
 pub use error::{Error, Result};
 pub use gltf_import::import_gltf_model;
 pub use image_decode::{
@@ -49,7 +54,7 @@ pub use picking::{
     MeshBvh, closest_point_on_triangle, generate_normals, ray_aabb_slab, ray_triangle,
     world_aabb_from_corners,
 };
-pub use primitives::{cube, plane, preview_displacement_sphere, uv_sphere};
+pub use primitives::{cube, plane, uv_sphere};
 pub use sanim::{
     ANIM_FORMAT_VERSION, load_animation, load_animation_from_bytes, save_animation,
     save_animation_to_buffer,
@@ -60,9 +65,9 @@ pub use sdf::{
     Sdf, SdfHeader, bake_grid, sdf_chunk_cores, sdf_set_from_bytes, sdf_set_to_bytes,
 };
 pub use smesh::{
-    MESH_FORMAT_VERSION, load_mesh, load_mesh_from_bytes, load_mesh_morph_from_bytes,
-    load_mesh_skin, load_mesh_skin_from_bytes, mesh_counts_from_bytes, mesh_file_counts, save_mesh,
-    save_mesh_to_buffer,
+    MESH_FORMAT_VERSION, load_mesh, load_mesh_conditioning_from_bytes, load_mesh_from_bytes,
+    load_mesh_morph_from_bytes, load_mesh_skin, load_mesh_skin_from_bytes, mesh_counts_from_bytes,
+    mesh_file_counts, save_mesh, save_mesh_to_buffer,
 };
 pub use smodel::{
     CONTAINER_FORMAT_VERSION, ChunkKind, ContainerChunk, ContainerReader, METADATA_SCHEMA_VERSION,
