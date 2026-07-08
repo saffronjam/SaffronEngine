@@ -1,6 +1,19 @@
 # Real in-scene displacement — the tessellating, RT-correct mechanism
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS.
+- **Phases 1–4, 6, 7 COMPLETED (code-complete)**: graph/indirect foundations + keyed transient; import-time
+  watertight conditioning; edge factors + worst-case allocation + the factor/scan/finalize/args prep chain;
+  the amplifying emit kernel (`tessellate.slang`) with degenerate-padded index tail; all seven raster passes
+  drawing the tessellated VB/IB via the portable indirect-draw floor; and the RT BLAS built over those exact
+  buffers (per-entity `TessellatedBlas`, full `MODE_BUILD`, worst-case-sized). **The NO-LEGACY cutover is
+  done**: adaptive tessellation is the sole displacement mechanism — `displace.slang`, the `Displacement`
+  subsystem, `DisplaceDispatch`, and the displaced deformed-ring reservation are deleted.
+- **Phase 5 next**: temporal motion vectors (emit writes prev-clip-position into a double-buffered prev
+  slice; the motion pass binds it) + geomorph across integer factor transitions.
+- **Phases 8 (NV CLAS), 9 (editor prism + polish + retire the old `plans/displacement/` planset)** remain.
+- Gated green throughout (workspace clippy `-D warnings` clean, 191 rendering tests + CPU tess/RT tests
+  pass, shaders compile, headless validation-clean on the RTX 3070 Ti). The crack/silhouette look, RT
+  parity, and the remaining Phase-7 build optimizations are GPU-with-eyes checks on presenting hardware.
 
 One in-scene displacement mechanism: a compute **adaptive-tessellation** stage that *amplifies* base
 triangles — adds vertices **and** emits a generated index stream — into per-frame `TransientResources`
