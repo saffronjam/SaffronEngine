@@ -131,6 +131,16 @@ pub trait ControlRenderer {
     fn displacement_enabled(&self) -> bool;
     /// Toggles GPU displacement.
     fn set_displacement(&mut self, enabled: bool);
+    /// Sets the displacement-tessellation budget (dice cap / minimum factor / target edge length in
+    /// pixels); `None` leaves a field unchanged, and the values are clamped to a sane range (cap ≤ 2048, integer).
+    fn set_tessellation_quality(
+        &mut self,
+        factor_cap: Option<f32>,
+        min_factor: Option<f32>,
+        edge_length_target: Option<f32>,
+    );
+    /// The current tessellation-quality budget `(factor_cap, min_factor, edge_length_target)`.
+    fn tessellation_quality(&self) -> (f32, f32, f32);
 
     /// Whether the device supports hardware ray tracing.
     fn rt_supported(&self) -> bool;

@@ -186,6 +186,18 @@ impl ControlRenderer for HostControlRenderer<'_> {
     fn set_displacement(&mut self, enabled: bool) {
         self.renderer.set_displacement(enabled);
     }
+    fn set_tessellation_quality(
+        &mut self,
+        factor_cap: Option<f32>,
+        min_factor: Option<f32>,
+        edge_length_target: Option<f32>,
+    ) {
+        self.renderer
+            .set_tessellation_quality(factor_cap, min_factor, edge_length_target);
+    }
+    fn tessellation_quality(&self) -> (f32, f32, f32) {
+        self.renderer.tessellation_quality()
+    }
 
     fn rt_supported(&self) -> bool {
         self.renderer.rt_supported()

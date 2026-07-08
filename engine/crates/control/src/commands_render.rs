@@ -25,7 +25,8 @@ use saffron_protocol::{
     SetGdfResult, SetGiParams, SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams,
     SetProbesResult, SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult,
     SetRtShadowsResult, SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult,
-    SetTaaParamsParams, SetTaaParamsResult, SetTonemapParams, SetUpscaleParams, SetUpscaleResult,
+    SetTaaParamsParams, SetTaaParamsResult, SetTessellationQualityParams,
+    SetTessellationQualityResult, SetTonemapParams, SetUpscaleParams, SetUpscaleResult,
     SetViewModeParams, SetViewModeResult, SetViewportPowerStateParams, SetViewportSizeParams,
     SetViewportSizeResult, ToggleParams, TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto,
     ViewportNativeInfoResult, ViewportPowerStateResult,
@@ -920,6 +921,24 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
         },
     );
 
+    reg.register::<SetTessellationQualityParams, SetTessellationQualityResult>(
+        "set-tessellation-quality",
+        "set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget] — displacement dice budget",
+        |ctx, params| {
+            ctx.renderer.set_tessellation_quality(
+                params.factor_cap,
+                params.min_factor,
+                params.edge_length_target,
+            );
+            let (factor_cap, min_factor, edge_length_target) = ctx.renderer.tessellation_quality();
+            Ok(SetTessellationQualityResult {
+                factor_cap,
+                min_factor,
+                edge_length_target,
+            })
+        },
+    );
+
     reg.register::<ToggleParams, SetDepthPrepassResult>(
         "set-depth-prepass",
         "set-depth-prepass {0|1} — toggle the depth pre-pass",
@@ -1239,6 +1258,44 @@ mod tests {
         assert_eq!(reply["ok"], json!(true));
         assert_eq!(reply["result"]["exposureEv"], json!(2.5));
         assert_eq!(stub.exposure_ev, 2.5);
+    }
+
+    #[test]
+    fn set_tessellation_quality_clamps_and_reads_back_the_applied_budget() {
+        // A partial request tunes only the named knobs and echoes the full clamped budget.
+        let mut stub = StubRenderer::default();
+        let reply = run(
+            &mut stub,
+            "set-tessellation-quality",
+            json!({ "factorCap": 32.0, "edgeLengthTarget": 6.0 }),
+        );
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["result"]["factorCap"], json!(32.0));
+        assert_eq!(reply["result"]["edgeLengthTarget"], json!(6.0));
+        // min_factor was not sent → unchanged at the default.
+        assert_eq!(reply["result"]["minFactor"], json!(1.0));
+        assert_eq!(stub.tess_factor_cap, 32.0);
+
+        // Out-of-range values are clamped, not rejected: cap to [1,2048], edge target to ≥1.
+        let mut stub = StubRenderer::default();
+        let reply = run(
+            &mut stub,
+            "set-tessellation-quality",
+            json!({ "factorCap": 9999.0, "minFactor": 0.1, "edgeLengthTarget": 0.0 }),
+        );
+        assert_eq!(reply["result"]["factorCap"], json!(2048.0));
+        assert_eq!(reply["result"]["minFactor"], json!(1.0));
+        assert_eq!(reply["result"]["edgeLengthTarget"], json!(1.0));
+
+        // A min_factor above the cap is pinned down to the cap (min ≤ cap invariant).
+        let mut stub = StubRenderer::default();
+        let reply = run(
+            &mut stub,
+            "set-tessellation-quality",
+            json!({ "factorCap": 4.0, "minFactor": 10.0 }),
+        );
+        assert_eq!(reply["result"]["factorCap"], json!(4.0));
+        assert_eq!(reply["result"]["minFactor"], json!(4.0));
     }
 
     #[test]

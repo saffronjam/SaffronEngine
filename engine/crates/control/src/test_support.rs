@@ -87,6 +87,9 @@ pub struct StubRenderer {
     pub reflection_probes: bool,
     pub skinning: bool,
     pub displacement: bool,
+    pub tess_factor_cap: f32,
+    pub tess_min_factor: f32,
+    pub tess_edge_length_target: f32,
     pub rt_supported: bool,
     pub rt_shadows: bool,
     pub restir: bool,
@@ -140,6 +143,9 @@ impl Default for StubRenderer {
             reflection_probes: true,
             skinning: true,
             displacement: true,
+            tess_factor_cap: 16.0,
+            tess_min_factor: 1.0,
+            tess_edge_length_target: 12.0,
             rt_supported: false,
             rt_shadows: false,
             restir: false,
@@ -319,6 +325,30 @@ impl ControlRenderer for StubRenderer {
     }
     fn set_displacement(&mut self, enabled: bool) {
         self.displacement = enabled;
+    }
+    fn set_tessellation_quality(
+        &mut self,
+        factor_cap: Option<f32>,
+        min_factor: Option<f32>,
+        edge_length_target: Option<f32>,
+    ) {
+        if let Some(cap) = factor_cap {
+            self.tess_factor_cap = cap.round().clamp(1.0, 2048.0);
+        }
+        if let Some(min) = min_factor {
+            self.tess_min_factor = min.clamp(1.0, self.tess_factor_cap);
+        }
+        self.tess_min_factor = self.tess_min_factor.min(self.tess_factor_cap);
+        if let Some(target) = edge_length_target {
+            self.tess_edge_length_target = target.max(1.0);
+        }
+    }
+    fn tessellation_quality(&self) -> (f32, f32, f32) {
+        (
+            self.tess_factor_cap,
+            self.tess_min_factor,
+            self.tess_edge_length_target,
+        )
     }
 
     fn rt_supported(&self) -> bool {
