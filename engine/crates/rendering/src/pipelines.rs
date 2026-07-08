@@ -118,9 +118,17 @@ pub struct Pipelines {
     /// The compute morph PSO (morph set layout, a 20-byte push), built lazily.
     morph: Option<Arc<Pipeline>>,
 
-    /// The compute displacement PSO (bindless set 0 + the displace set 1, a 32-byte push),
-    /// built lazily.
-    displace: Option<Arc<Pipeline>>,
+    /// The adaptive-tessellation Phase-3 compute PSOs (factor / scan / finalize / args), built lazily.
+    /// `tess_factor` binds the shared bindless set 0 (its min/max pyramid tap) + the edge storage set 1;
+    /// scan / finalize / args each take a single storage-buffer set.
+    tess_factor: Option<Arc<Pipeline>>,
+    tess_scan: Option<Arc<Pipeline>>,
+    tess_finalize: Option<Arc<Pipeline>>,
+    tess_args: Option<Arc<Pipeline>>,
+
+    /// The Phase-4 amplifying emit PSO (`tessellate.slang`, bindless set 0 + the emit set 1, a 64-byte
+    /// push), built lazily.
+    tessellate: Option<Arc<Pipeline>>,
 
     /// The `VK_EXT_mesh_shader` meshlet raster PSO (task+mesh+`fragmentMain`), built lazily when the
     /// mesh-shader path is enabled. Bakes the MSAA sample count, so `set_sample_count` clears it.
@@ -272,7 +280,11 @@ impl Pipelines {
             light_cull: None,
             skin: None,
             morph: None,
-            displace: None,
+            tess_factor: None,
+            tess_scan: None,
+            tess_finalize: None,
+            tess_args: None,
+            tessellate: None,
             meshlet: None,
             cluster_set_layout: descriptors.cluster_set_layout(),
             gbuffer: None,
@@ -517,33 +529,110 @@ impl Pipelines {
         }
     }
 
-    /// The compute displacement PSO, built and cached on first request. A two-set pipeline: set 0 is
-    /// the shared bindless albedo array (`bindless_set_layout`, owned by [`crate::Descriptors`]) so
-    /// the kernel samples the height map by index, set 1 is the displace buffers (`displace_set_layout`,
-    /// owned by [`crate::displacement::Displacement`]); a 32-byte push. `None` on a build failure.
-    pub fn request_displace(
+    /// The adaptive-tessellation factor PSO (bindless set 0 for the min/max pyramid + the edge
+    /// storage-buffer set 1, a 128-byte push: mvp(64) + camPosLocal(16) + viewport(8) + 10 scalars(40)),
+    /// built + cached. `None` on failure.
+    pub fn request_tess_factor(
         &mut self,
-        bindless_set_layout: vk::DescriptorSetLayout,
-        displace_set_layout: vk::DescriptorSetLayout,
+        bindless: vk::DescriptorSetLayout,
+        factor: vk::DescriptorSetLayout,
     ) -> Option<Arc<Pipeline>> {
-        if let Some(pipeline) = &self.displace {
+        if let Some(pipeline) = &self.tess_factor {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_compute_multi(
-            "shaders/displace.spv",
-            &[bindless_set_layout, displace_set_layout],
-            // The `DisplacePush` block: vertexCount+deformedOffset+heightIndex+heightScale (16) +
-            // uvTransform float4 (16) + vectorIndex + 3 scalar pads (16) = 48 bytes.
-            48,
-        ) {
+        match self.build_compute_multi("shaders/tess_factor.spv", &[bindless, factor], 128) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
-                self.displace = Some(Arc::clone(&pipeline));
+                self.tess_factor = Some(Arc::clone(&pipeline));
                 self.pipelines_created += 1;
                 Some(pipeline)
             }
             Err(err) => {
-                tracing::error!("request_displace: {err}");
+                tracing::error!("request_tess_factor: {err}");
+                None
+            }
+        }
+    }
+
+    /// The predict/scan PSO (5 storage buffers, a 32-byte push), built + cached.
+    pub fn request_tess_scan(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.tess_scan {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute_multi("shaders/tess_scan.spv", &[layout], 32) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.tess_scan = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_tess_scan: {err}");
+                None
+            }
+        }
+    }
+
+    /// The per-instance finalize PSO (3 storage buffers, a 32-byte push), built + cached.
+    pub fn request_tess_finalize(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.tess_finalize {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute_multi("shaders/tess_finalize.spv", &[layout], 32) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.tess_finalize = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_tess_finalize: {err}");
+                None
+            }
+        }
+    }
+
+    /// The global dispatch-args PSO (2 storage buffers, no push), built + cached.
+    pub fn request_tess_args(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.tess_args {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute_multi("shaders/tess_args.spv", &[layout], 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.tess_args = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_tess_args: {err}");
+                None
+            }
+        }
+    }
+
+    /// The Phase-4 amplifying emit PSO (`tessellate.spv`, bindless set 0 + the emit set 1, a 64-byte
+    /// push), built + cached.
+    pub fn request_tessellate(
+        &mut self,
+        bindless: vk::DescriptorSetLayout,
+        emit: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.tessellate {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute_multi("shaders/tessellate.spv", &[bindless, emit], 64) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.tessellate = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_tessellate: {err}");
                 None
             }
         }
