@@ -813,20 +813,17 @@ pub fn detect_material_role(filename: &str) -> &'static str {
     }
 }
 
-/// The height technique an imported map's filename implies (the material-import routing): a
-/// provider **Displacement** map (ambientCG `*_Displacement`, Poly Haven `*_disp`) → real
-/// per-vertex [`HeightMode::Displacement`] — the library authoring intent (these maps are cut for
-/// real mesh displacement, the same default three.js applies to a `displacementMap`); an explicit
-/// **bump** map → the shading-only [`HeightMode::Bump`]; any other height map → [`HeightMode::Parallax`]
-/// (parallax-occlusion mapping). Only meaningful for a map whose role is `height`; a per-material
-/// `heightMode` in the editor overrides it.
+/// The height technique an imported map's filename implies (the material-import routing): an explicit
+/// **bump** map → the shading-only [`HeightMode::Bump`]; every other height map → [`HeightMode::Parallax`]
+/// (parallax-occlusion mapping). An imported map is **never** auto-routed to
+/// [`HeightMode::Displacement`]: real tessellating displacement costs a per-frame amplification + BLAS
+/// build, so it is a deliberate authored choice through the editor's material `heightMode` dropdown, not
+/// an import inference — the flat / low-poly common case never silently pays for it. Only meaningful for
+/// a map whose role is `height`; a per-material `heightMode` in the editor overrides it.
 #[must_use]
 pub fn detect_height_mode(filename: &str) -> HeightMode {
     let lower = filename.to_ascii_lowercase();
-    let has = |token: &str| lower.contains(token);
-    if has("displace") || has("_disp") {
-        HeightMode::Displacement
-    } else if has("bump") {
+    if lower.contains("bump") {
         HeightMode::Bump
     } else {
         HeightMode::Parallax

@@ -421,21 +421,19 @@ fn detect_material_role_classifies_filenames() {
     assert_eq!(detect_material_role("random_texture.png"), "");
 }
 
-/// The height-map technique routing (D2): a provider Displacement map → real displacement (library
-/// intent), an explicit bump map → shading bump, any other height map → parallax.
+/// The height-map technique routing: an imported map is **never** auto-routed to Displacement (that
+/// costs tessellation + a per-frame BLAS, so it is a deliberate editor choice); an explicit bump map →
+/// shading bump, every other height map → parallax.
 #[test]
-fn detect_height_mode_routes_by_provider_label() {
+fn detect_height_mode_never_auto_routes_displacement() {
     use saffron_core::HeightMode;
+    // A provider Displacement map imports as Parallax — the user promotes it in the editor's dropdown.
     assert_eq!(
         detect_height_mode("Rock063_2K-PNG_Displacement.png"),
-        HeightMode::Displacement
+        HeightMode::Parallax
     );
-    assert_eq!(
-        detect_height_mode("wood_disp.png"),
-        HeightMode::Displacement
-    );
+    assert_eq!(detect_height_mode("wood_disp.png"), HeightMode::Parallax);
     assert_eq!(detect_height_mode("brick_bump.png"), HeightMode::Bump);
-    // A generic "Height"-named map is parallax (POM) — the user can promote it in the editor.
     assert_eq!(detect_height_mode("stone_height.png"), HeightMode::Parallax);
 }
 
