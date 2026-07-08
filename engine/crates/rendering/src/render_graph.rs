@@ -54,6 +54,10 @@ pub enum RgUsage {
     VertexInputRead,
     /// Buffer read as acceleration-structure-build input (the deformed buffer, by a BLAS refit).
     AccelStructBuildRead,
+    /// Buffer read as the index stream by an (indirect) indexed draw.
+    IndexInputRead,
+    /// Buffer read as indirect dispatch/draw arguments (or a draw-count).
+    IndirectCommandRead,
 }
 
 /// Whether a pass records graphics commands (opens a rendering scope) or compute
@@ -322,6 +326,20 @@ fn usage_info(usage: RgUsage) -> RgUsageInfo {
         RgUsage::AccelStructBuildRead => RgUsageInfo {
             stage: vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
             access: vk::AccessFlags2::SHADER_READ,
+            layout: vk::ImageLayout::UNDEFINED,
+            is_write: false,
+        },
+        RgUsage::IndexInputRead => RgUsageInfo {
+            stage: vk::PipelineStageFlags2::INDEX_INPUT,
+            access: vk::AccessFlags2::INDEX_READ,
+            layout: vk::ImageLayout::UNDEFINED,
+            is_write: false,
+        },
+        // `DRAW_INDIRECT` is the stage where both indirect draw *and* indirect dispatch parameters
+        // are consumed, per `VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT`.
+        RgUsage::IndirectCommandRead => RgUsageInfo {
+            stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
+            access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
             layout: vk::ImageLayout::UNDEFINED,
             is_write: false,
         },
@@ -839,6 +857,20 @@ mod tests {
                 vk::ImageLayout::UNDEFINED,
                 false,
             ),
+            (
+                RgUsage::IndexInputRead,
+                vk::PipelineStageFlags2::INDEX_INPUT,
+                vk::AccessFlags2::INDEX_READ,
+                vk::ImageLayout::UNDEFINED,
+                false,
+            ),
+            (
+                RgUsage::IndirectCommandRead,
+                vk::PipelineStageFlags2::DRAW_INDIRECT,
+                vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                vk::ImageLayout::UNDEFINED,
+                false,
+            ),
         ];
         for (usage, stage, access, layout, is_write) in cases {
             let info = usage_info(usage);
@@ -977,6 +1009,71 @@ mod tests {
             vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
         );
         assert_eq!(b.dst_access_mask, vk::AccessFlags2::VERTEX_ATTRIBUTE_READ);
+    }
+
+    #[test]
+    fn index_input_read_after_compute_write_is_one_memory_barrier() {
+        // The tessellator's generated index buffer: a compute write ordered ahead of the
+        // indexed draw's index-input read — exactly one memory barrier, no image barrier.
+        let mut r = buffer_state();
+        let mut barriers = DerivedBarriers::default();
+        apply_access(
+            &mut r,
+            usage_info(RgUsage::StorageWriteCompute),
+            &mut barriers,
+        );
+        assert!(barriers.is_empty(), "first buffer write is no hazard");
+
+        apply_access(&mut r, usage_info(RgUsage::IndexInputRead), &mut barriers);
+        assert_eq!(
+            barriers.memory.len(),
+            1,
+            "index read after write is a hazard"
+        );
+        assert!(
+            barriers.image.is_empty(),
+            "buffers never emit image barriers"
+        );
+        let b = barriers.memory[0];
+        assert_eq!(b.src_stage_mask, vk::PipelineStageFlags2::COMPUTE_SHADER);
+        assert_eq!(b.src_access_mask, vk::AccessFlags2::SHADER_STORAGE_WRITE);
+        assert_eq!(b.dst_stage_mask, vk::PipelineStageFlags2::INDEX_INPUT);
+        assert_eq!(b.dst_access_mask, vk::AccessFlags2::INDEX_READ);
+    }
+
+    #[test]
+    fn indirect_command_read_after_compute_write_is_one_memory_barrier() {
+        // The no-op indirect round-trip: the args/count buffer a compute pass writes, ordered
+        // ahead of the indirect dispatch/draw that consumes it — proven at the derivation layer,
+        // no device.
+        let mut r = buffer_state();
+        let mut barriers = DerivedBarriers::default();
+        apply_access(
+            &mut r,
+            usage_info(RgUsage::StorageWriteCompute),
+            &mut barriers,
+        );
+        assert!(barriers.is_empty(), "first buffer write is no hazard");
+
+        apply_access(
+            &mut r,
+            usage_info(RgUsage::IndirectCommandRead),
+            &mut barriers,
+        );
+        assert_eq!(
+            barriers.memory.len(),
+            1,
+            "indirect-args read after write is a hazard"
+        );
+        assert!(
+            barriers.image.is_empty(),
+            "buffers never emit image barriers"
+        );
+        let b = barriers.memory[0];
+        assert_eq!(b.src_stage_mask, vk::PipelineStageFlags2::COMPUTE_SHADER);
+        assert_eq!(b.src_access_mask, vk::AccessFlags2::SHADER_STORAGE_WRITE);
+        assert_eq!(b.dst_stage_mask, vk::PipelineStageFlags2::DRAW_INDIRECT);
+        assert_eq!(b.dst_access_mask, vk::AccessFlags2::INDIRECT_COMMAND_READ);
     }
 
     #[test]
