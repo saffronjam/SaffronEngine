@@ -73,8 +73,8 @@ pub struct MaterialAsset {
     pub normal_strength: f32,
     /// The masked-blend alpha cutoff threshold.
     pub alpha_cutoff: f32,
-    /// The height-map scale — parallax march depth ([`HeightMode::Parallax`]) or world-space
-    /// displacement amplitude ([`HeightMode::Displacement`]).
+    /// The height-map scale — parallax march depth ([`HeightMode::Parallax`]) or OBJECT-space
+    /// displacement amplitude ([`HeightMode::Displacement`]; scales with the object like its geometry).
     pub height_scale: f32,
     /// How the height map is realized: [`HeightMode::Bump`] (shading bump), [`HeightMode::Parallax`]
     /// (parallax-occlusion mapping), or [`HeightMode::Displacement`] (real geometry — needs a
@@ -95,7 +95,7 @@ pub struct MaterialAsset {
     /// The height/displacement texture id.
     pub height_texture: Uuid,
     /// The vector-displacement (tangent-space XYZ) texture id (`0` = none). Under
-    /// [`HeightMode::Displacement`] it switches the displace pre-pass from scalar-along-normal to
+    /// [`HeightMode::Displacement`] it switches the tessellation dice from scalar-along-normal to
     /// tangent-space vector offset, so overhangs become real geometry.
     pub vector_displacement_texture: Uuid,
     /// The authored normal convention: `gl` | `dx` (baked to `gl` at import; kept for

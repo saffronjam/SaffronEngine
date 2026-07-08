@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use saffron_core::BlendMode;
+use saffron_core::HeightMode;
 use saffron_core::Uuid;
 use saffron_geometry::Submesh;
 use saffron_geometry::glam::Vec3;
@@ -90,12 +91,14 @@ impl Default for ResolvedMaterials {
 /// packed `orm_texture` feeds **both** the metallic-roughness and the occlusion slot, and
 /// `blend_mode` parses the `.smat` `blend` string.
 ///
-/// The loader is `FnMut`: the main path's closure fills the texture cache as it resolves,
-/// so a borrowed mutable closure is the allocation-free shape — no trait object for a
-/// single call site.
+/// The loader is `FnMut(id, as_height)`: the main path's closure fills the texture cache as it
+/// resolves, so a borrowed mutable closure is the allocation-free shape — no trait object for a single
+/// call site. The `as_height` flag (set only for a [`HeightMode::Displacement`] material's height slot)
+/// routes that texture through the pyramid-building height loader; one closure keeps a single `&mut
+/// self` borrow (two self-capturing closures would conflict).
 pub fn build_submesh_material(
     material: &MaterialAsset,
-    load_tex: &mut dyn FnMut(saffron_core::Uuid) -> Option<Arc<GpuTexture>>,
+    load_tex: &mut dyn FnMut(saffron_core::Uuid, bool) -> Option<Arc<GpuTexture>>,
 ) -> SubmeshMaterial {
     let mut sm = SubmeshMaterial {
         base_color: material.base_color,
@@ -114,23 +117,26 @@ pub fn build_submesh_material(
         ..SubmeshMaterial::defaults()
     };
     if material.albedo_texture.value() != 0 {
-        sm.albedo_texture = load_tex(material.albedo_texture);
+        sm.albedo_texture = load_tex(material.albedo_texture, false);
     }
     if material.orm_texture.value() != 0 {
-        sm.metallic_roughness_texture = load_tex(material.orm_texture);
-        sm.occlusion_texture = load_tex(material.orm_texture);
+        sm.metallic_roughness_texture = load_tex(material.orm_texture, false);
+        sm.occlusion_texture = load_tex(material.orm_texture, false);
     }
     if material.normal_texture.value() != 0 {
-        sm.normal_texture = load_tex(material.normal_texture);
+        sm.normal_texture = load_tex(material.normal_texture, false);
     }
     if material.emissive_texture.value() != 0 {
-        sm.emissive_texture = load_tex(material.emissive_texture);
+        sm.emissive_texture = load_tex(material.emissive_texture, false);
     }
     if material.height_texture.value() != 0 {
-        sm.height_texture = load_tex(material.height_texture);
+        // A displacement material's height map carries the min/max pyramid (built by the height loader)
+        // that the tessellation factor kernel samples for per-region LOD; bump/parallax need no pyramid.
+        let as_height = material.height_mode == HeightMode::Displacement;
+        sm.height_texture = load_tex(material.height_texture, as_height);
     }
     if material.vector_displacement_texture.value() != 0 {
-        sm.vector_displacement_texture = load_tex(material.vector_displacement_texture);
+        sm.vector_displacement_texture = load_tex(material.vector_displacement_texture, false);
     }
     sm
 }
@@ -147,7 +153,13 @@ impl AssetServer {
         gpu: &dyn GpuUploader,
         material: &MaterialAsset,
     ) -> SubmeshMaterial {
-        build_submesh_material(material, &mut |id| self.load_texture_asset(gpu, id))
+        build_submesh_material(material, &mut |id, as_height| {
+            if as_height {
+                self.load_height_texture_asset(gpu, id)
+            } else {
+                self.load_texture_asset(gpu, id)
+            }
+        })
     }
 
     /// Resolves a single renderable's whole submesh-material table from the entity's
@@ -345,7 +357,7 @@ mod tests {
         // A loader that records which ids it was asked for, returning `None` (no GPU);
         // the test asserts on the *requests*, not the handles.
         let mut requests = Vec::<u64>::new();
-        let mut load = |id: saffron_core::Uuid| -> Option<Arc<GpuTexture>> {
+        let mut load = |id: saffron_core::Uuid, _as_height: bool| -> Option<Arc<GpuTexture>> {
             requests.push(id.value());
             None
         };
@@ -392,9 +404,36 @@ mod tests {
                 blend: blend.to_owned(),
                 ..MaterialAsset::default()
             };
-            let sm = build_submesh_material(&material, &mut |_| None);
+            let sm = build_submesh_material(&material, &mut |_, _| None);
             assert_eq!(sm.blend_mode, expect, "blend {blend}");
         }
+    }
+
+    #[test]
+    fn displacement_material_requests_its_height_slot_as_a_height_map() {
+        use saffron_geometry::glam::Vec4;
+        // Two materials sharing a height texture id: one Displacement (pyramid), one Bump (plain). The
+        // loader records the `as_height` flag it was asked for per id.
+        let mut asks: Vec<(u64, bool)> = Vec::new();
+        for mode in [HeightMode::Displacement, HeightMode::Bump] {
+            let material = MaterialAsset {
+                base_color: Vec4::ONE,
+                height_texture: saffron_core::Uuid(777),
+                height_mode: mode,
+                ..MaterialAsset::default()
+            };
+            let _ = build_submesh_material(&material, &mut |id, as_height| {
+                asks.push((id.value(), as_height));
+                None
+            });
+        }
+        // The height slot is requested `as_height = true` only for the Displacement material; every
+        // non-height slot is always plain.
+        assert!(
+            asks.contains(&(777, true)),
+            "displacement height → pyramid load"
+        );
+        assert!(asks.contains(&(777, false)), "bump height → plain load");
     }
 
     #[test]
@@ -402,7 +441,7 @@ mod tests {
         // The default material has every texture id at zero.
         let material = MaterialAsset::default();
         let mut asked = 0u32;
-        let sm = build_submesh_material(&material, &mut |_| {
+        let sm = build_submesh_material(&material, &mut |_, _| {
             asked += 1;
             None
         });
