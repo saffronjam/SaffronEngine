@@ -1,6 +1,49 @@
 # Phase 4 — dice + displace + weld + emit (the amplifying kernel) + retire the 1:1 path
 
-**Status:** NOT STARTED
+**Status:** COMPLETED (code-complete; the crack-free/silhouette GPU verification is a GPU-with-eyes check
+on presenting hardware, per the acceptance criteria). The amplifying emit kernel is implemented + wired
+end-to-end, and the **NO-LEGACY cutover is done**: `displace.slang`, the `Displacement` subsystem,
+`DisplaceDispatch`/`displace_dispatches`, `request_displace`, and the displaced deformed-ring reservation
+are all deleted — adaptive tessellation is the sole displacement mechanism (raster + RT both read the
+amplified transient VB/IB). Gated green: shaders compile (no `displace.spv`), workspace clippy `-D
+warnings` clean, 191 rendering tests pass, headless validation-clean on the RTX 3070 Ti.
+
+> Landed (build/shader-compile/CPU-test/validation-clean-headless gated):
+> - **`assets/shaders/tessellate.slang`** — one workgroup per base triangle: reads its Phase-3 dice
+>   record (`perTri[triBase+t]` → vertOffset/indexOffset/`L`) + the three base corners (via the base
+>   index+vertex streams), builds the barycentric micro-grid at `L`, evaluates a **Phong-smoothed** base
+>   position (endpoint-only edge curve → watertight base), displaces **scalar-along-normal or
+>   tangent-space vector** with the **world-space amplitude** convention (`heightScale / worldScale`),
+>   re-derives normal+tangent from the **full displaced-surface Jacobian** (finite differences over the
+>   displaced position — base curvature *and* displacement derivative, not a scalar height gradient),
+>   **welds** boundary micro-vertices by snapping to each edge's shared `round(factor)` segment grid
+>   (bit-identical from both incident triangles → gapless), and writes the micro-vertices + generated
+>   index stream at the reserved offsets. Compiles to SPIR-V.
+> - **`Tessellation` emit set layout (7 storage buffers)** + `TessEmitPush` (64 B, byte-size asserted) +
+>   `Pipelines::request_tessellate` (bindless set 0 + emit set 1).
+> - **`Renderer::record_tess_prep` emit pass** — acquires the worst-case transient VB (`tess.vb`,
+>   48 B micro-verts) + IB (`tess.ib`, u32) with VERTEX/INDEX/device-address usage for the Phase-6/7
+>   consumers, wires one emit set per instance (base VB/IB + perTri + triEdges + factors + out VB/IB),
+>   and records the `tess-emit` graph pass (`StorageReadCompute` on perTri+factors → ordered after scan;
+>   `StorageWriteCompute` on the out VB/IB; bindless set 0 for height/vector sampling), one workgroup per
+>   base triangle dispatched per instance.
+>
+> Remaining:
+> - **Crack-free GPU-readback verification** (the headline test): a two-triangle patch with mismatched
+>   per-side edge factors must emit bit-identical boundary micro-vertices — needs a displaced+conditioned
+>   instance + a buffer readback, and GPU-with-eyes silhouette/seam inspection on presenting hardware.
+> - **The NO-LEGACY cutover** (delete `displace.slang` + the `Displacement` Displacement-mode path + the
+>   displaced-bucket ring reservation + the displaced `DeformedRtInstance`) is sequenced to land with
+>   **Phase 6**, per this plan's own directive *"the tessellating path must be wired end-to-end before the
+>   1:1 path is removed"* — the raster half (scene_pass consuming the transient VB/IB via indirect draw)
+>   is Phase 6. Until then the 1:1 `displace` path still renders so displaced meshes are never blank; the
+>   emit pass runs in parallel, producing the amplified geometry that Phase 6 will switch raster onto.
+> - **Prev-position producer** (§6, identity-free motion sample) folds into **Phase 5** (motion vectors),
+>   which owns the geomorph + the prev-transform double-buffering it reconstructs from.
+> - **Refinements over the watertight-by-snapping v1**: the fan/staircase matched-gap stitch (no
+>   degenerate slivers), the analytic Phong Jacobian (vs. finite differences), the welded-direction
+>   normal-seam agreement, and non-uniform-scale amplitude (inverse-transpose direction) — all noted in
+>   `tessellate.slang` + the Risks below.
 
 The load-bearing phase: the compute kernel that *amplifies* base triangles into new micro-vertices and a
 generated index stream, and the NO-LEGACY cutover that deletes the 1:1 `displace.slang` kernel in the same
