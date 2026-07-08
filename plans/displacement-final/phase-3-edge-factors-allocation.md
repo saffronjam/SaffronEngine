@@ -1,6 +1,50 @@
 # Phase 3 — Visibility-robust fractional per-edge factors + worst-case allocation + budget & LOD bucketing
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
+
+> Verification basis (per the working agreement): workspace `cargo build` + `clippy -D warnings` clean,
+> all four shaders compile to SPIR-V, the subsystem's CPU logic is unit-tested (dice worst-case sizing,
+> push-block byte sizes vs. the shader `Push` structs, `factor_push` camera derivation), and a headless
+> boot on the NVIDIA RTX 3070 Ti runs 30 frames **validation-clean** with the prep chain wired into the
+> deform scope. The passes are inert until a displaced+conditioned instance is present and until Phase 4
+> emits from their offsets; runtime GPU-with-eyes verification of the amplified geometry is deferred to
+> Phase 6 (raster consumption) on hardware that can present.
+
+> Landed (all build/compile/CPU-verified):
+> - **Dice contract pinned** (the load-bearing Phase-3↔Phase-4 agreement): per triangle
+>   `L = clamp(round(max(f0,f1,f2)), 1, cap)`, grid `verts = (L+1)(L+2)/2`, `tris = L²`, boundary
+>   vertices snapped to each edge's shared per-edge factor ⇒ watertight by construction, count a closed
+>   form of `L` (so prediction can never diverge from emission).
+> - **`WeldedVertex` extended with `position`** (48 B) so the factor kernel reads endpoint positions by
+>   welded id (goldens reseeded, conditioning test extended).
+> - **Four compute shaders written + compiling to SPIR-V**: `tess_factor.slang` (visibility-robust
+>   per-edge fractional factor, local-space angular arc + near-plane fallback, stores the full fractional
+>   value for Phase-5 geomorph), `tess_scan.slang` (predict + atomic-carry prefix sum → packed per-triangle
+>   offsets + global micro totals), `tess_finalize.slang` (per-instance `VkDrawIndexedIndirectCommand` seed
+>   + RT prim count), `tess_args.slang` (global `VkDispatchIndirectCommand`).
+> - **`TransientResources` shrink/reclaim** (grow-mostly, fence-safe, rolling `RECLAIM_WINDOW`) with a
+>   passing unit test.
+> - **`tessellation.rs` `Tessellation` subsystem** — the four set layouts (3/5/3/2 compute storage
+>   buffers), per-frame descriptor pools, the `#[repr(C)]` push structs (`TessFactorPush` 128 B /
+>   `TessScanPush` 32 B / `TessFinalizePush` 32 B), `TessBucket` / `TessInstanceLayout` / `TessCamera`,
+>   `tess_worst_case(base_prims, cap)` reservation sizing, `factor_push` CPU builder, and the
+>   `wire_storage_set` helper — clippy-clean.
+> - **`Pipelines::request_tess_{factor,scan,finalize,args}`** compute-PSO builders (cached), clippy-clean.
+> - **`instancing.rs` `TessBucket` gather** — one bucket per displaced instance that carries Phase-2
+>   conditioning, gathered parallel to `DisplaceBucket`, clamped to `TESS_MAX_INSTANCES`, handed to the
+>   deform scope on `SceneDrawList::tess_buckets`. The 1:1 `displace` path still renders until Phase 4.
+> - **`renderer.rs` deform-scope wiring** — `Renderer::record_tess_prep` mirrors the cluster camera into
+>   a `TessCamera`, lifts the per-instance inputs out of the draw list, computes the worst-case slice
+>   layout (prefix sums), acquires the seven keyed transient buffers (`tess.{factors,pertri,counters,
+>   global,seeds,prims,dispatch}`), wires one factor/scan/finalize descriptor set per instance + the
+>   global args set, and records the four graph passes with derived barriers. The scan pass zeroes its
+>   atomic accumulators with `cmd_fill_buffer` + one hand-written transfer→compute barrier (the GDF-cull
+>   precedent — the graph has no fill primitive). Called after the deform scope on the same graph.
+>
+> Deferred to later phases (as the plan intends): the LOD-bucket key on `DeformedRtInstance` folds in with
+> Phase 7's RT keying; the material-tunable factor budget lands with Phase 9's control command (compiled
+> defaults `TESS_DEFAULT_*` for now); and observing the emitted micro-geometry needs Phase 4's emit kernel
+> + Phase 6's raster consumption on presenting hardware.
 
 ## Goal
 
