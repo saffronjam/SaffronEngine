@@ -1,6 +1,34 @@
 # Phase 5 — Temporal correctness — identity-free motion vectors + geomorph continuity
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — the CPU-gate-able contract and the static-displacement motion floor are landed
+and gated (workspace clippy `-D warnings` clean, tessellation tests pass, headless validation-clean):
+- **`geomorph_weight(remainder, levels_since_birth)` + `smoothstep01`** in `tessellation.rs` — the shared
+  numeric contract for §3/§4, unit-tested for the birth→resolve ramp (0→1), full resolution of older
+  vertices, monotonicity, and **C0 across an integer factor boundary**. This is the one definition the
+  emit kernel and the CPU test must agree on bit-for-bit.
+- **The motion pass consumes the tessellated stream** (`aa.rs:365`): a tessellated batch binds its
+  amplified transient VB as *both* the current and previous position stream (+ the generated index
+  buffer), so `motion.slang` emits pure object+camera motion of each mesh-local surface point. For a
+  **static** height field the surface is fixed in mesh-local space, so `prev == cur` is exact — this is
+  the correct floor (identical to the retired displace prev-set semantics), not an approximation.
+
+**The geomorph blend (§3) is landed** on the shared cur stream for BOTH boundary and interior
+micro-vertices (`tessellate.slang`): boundary verts blend floor→ceil shared-edge segment placements
+(`snapEdgeParam`, watertight by the shared per-edge factor); interior verts morph from the coarser `L-1`
+approximation to the fine `L` displaced surface by `smoothstep01(frac)` via the exact coarse-parent
+barycentric lookup (`coarseParentPosition`; the FD normal is recomputed from the geomorphed positions).
+Both write the single shared VB the raster passes and the RT BLAS read, so raster and ray-traced
+silhouettes stay bit-identical through a factor transition. (Documented limitation: interior continuity is
+sub-facet-exact, not bit-exact — successive integer dice levels are distinct grids, not nested
+refinements; see Phase 10.)
+
+**Remaining — GPU-with-eyes refinements (need a presenting GPU to verify no-smear):** (A) the
+**identity-free reconstruction** — a separate prev VB written by the emit kernel from the *previous*
+frame's inputs (double-buffered per-edge factors + per-instance height/uv/transform), needed only when the
+height field **animates**; (B) **capturing the geomorph's per-frame motion for TAA** — re-run the same
+blend against the *previous* frame's `remainder` into that prev VB so a dolly across a factor transition
+reads as a small, continuous cur/prev delta rather than being unmodeled (today the geomorph moves the
+surface on the cur stream but the prev stream still binds the cur VB, so its motion is not yet captured).
 
 **Scope:** `saffron-rendering` (the motion-vector pass in `aa.rs`, the Phase-4 emit kernel, the
 double-buffered per-instance / per-edge factor records, the Phase-1 keyed transient acquire)
