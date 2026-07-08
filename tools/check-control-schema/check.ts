@@ -314,6 +314,8 @@ async function paramsForFixture(
       return { view: "scene" };
     case "exposure-zero":
       return { ev: 0 };
+    case "tess-quality":
+      return { factorCap: 16, minFactor: 1, edgeLengthTarget: 12 };
     case "new-project":
       return { name: `contract-second-${process.pid}`, displayName: "Contract Second Project" };
     case "project-name":
