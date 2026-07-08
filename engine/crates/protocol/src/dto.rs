@@ -3195,6 +3195,31 @@ pub struct SetExposureResult {
     pub exposure_ev: f32,
 }
 
+/// Params for `set-tessellation-quality` — the runtime displacement-tessellation budget. Every field is
+/// optional so a caller can tune one knob without disturbing the others; omitted fields are unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetTessellationQualityParams {
+    /// Hard per-instance dice cap (max subdivision factor, integer-rounded). Clamped to `[1, 2048]`;
+    /// the split pass expresses it and the micro-vertex budget coarsens dense scenes.
+    pub factor_cap: Option<f32>,
+    /// Minimum per-edge factor (never dice coarser than this). Clamped to `[1, factor_cap]`.
+    pub min_factor: Option<f32>,
+    /// Target screen-space edge length in pixels (smaller ⇒ denser tessellation). Clamped to `≥ 1`.
+    pub edge_length_target: Option<f32>,
+}
+
+/// The tessellation-quality budget after applying (and clamping) a `set-tessellation-quality` request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetTessellationQualityResult {
+    pub factor_cap: f32,
+    pub min_factor: f32,
+    pub edge_length_target: f32,
+}
+
 #[cfg(test)]
 mod coerce_tests {
     use super::{SetAnimationPlayingParams, ToggleParams};

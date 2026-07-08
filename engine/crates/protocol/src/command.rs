@@ -719,6 +719,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         result: "SetExposureResult",
     },
     CommandSpec {
+        name: "set-tessellation-quality",
+        summary: "set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget]",
+        params: "SetTessellationQualityParams",
+        result: "SetTessellationQualityResult",
+    },
+    CommandSpec {
         name: "get-project",
         summary: "active project metadata",
         params: "EmptyParams",
@@ -1170,6 +1176,7 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("recapture-probes", "empty"),
     ("list-probes", "empty"),
     ("set-exposure", "exposure-zero"),
+    ("set-tessellation-quality", "tess-quality"),
     ("get-project", "empty"),
     ("project-status", "empty"),
     ("cancel-load", "empty"),
@@ -1669,6 +1676,8 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "ListProbesResult",
     "SetExposureParams",
     "SetExposureResult",
+    "SetTessellationQualityParams",
+    "SetTessellationQualityResult",
 ];
 
 /// Looks up the fixture name for a command, if it has one.
@@ -1850,6 +1859,7 @@ mod tests {
             "set-skinning",
             "set-displacement",
             "set-exposure",
+            "set-tessellation-quality",
             "set-depth-prepass",
             "viewport-native-info",
             "set-viewport-power-state",

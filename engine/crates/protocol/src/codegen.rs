@@ -318,6 +318,8 @@ pub fn ts_decls() -> Vec<(&'static str, String)> {
         decl_entry!(ListProbesResult),
         decl_entry!(SetExposureParams),
         decl_entry!(SetExposureResult),
+        decl_entry!(SetTessellationQualityParams),
+        decl_entry!(SetTessellationQualityResult),
     ]
 }
 
@@ -602,6 +604,8 @@ pub fn struct_fragments() -> Vec<(&'static str, Value)> {
         frag_entry!(ListProbesResult),
         frag_entry!(SetExposureParams),
         frag_entry!(SetExposureResult),
+        frag_entry!(SetTessellationQualityParams),
+        frag_entry!(SetTessellationQualityResult),
     ]
 }
 
