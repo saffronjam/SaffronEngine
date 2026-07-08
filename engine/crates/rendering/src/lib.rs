@@ -20,7 +20,6 @@ mod budget;
 mod ddgi;
 mod descriptors;
 mod device;
-mod displacement;
 mod draw_list;
 mod frame;
 mod frame_history;
@@ -49,6 +48,7 @@ mod skinning;
 mod ssao;
 mod swapchain;
 mod targets;
+mod tessellation;
 mod thumbnail;
 mod transient;
 mod upload;
@@ -68,12 +68,9 @@ pub use descriptors::{
     DEFAULT_WHITE_SLOT, Descriptors, MAX_BINDLESS_SDF, MAX_BINDLESS_TEXTURES, MAX_REFLECTION_PROBES,
 };
 pub use device::{Capabilities, Device, ProfilerFacts, SurfaceSource, validation_issue_count};
-pub use displacement::{
-    DISPLACE_MAX_SETS_PER_FRAME, DisplaceBucket, Displacement, request_displace_pipeline,
-};
 pub use draw_list::{
-    DeformedRtInstance, DisplaceDispatch, DrawBatch, DrawItem, MorphDispatch, RenderStats,
-    SceneDrawList, SkinDispatch, SubmeshMaterial, normal_matrix,
+    DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
+    SkinDispatch, SubmeshMaterial, TessDraw, TessRtSlice, normal_matrix,
 };
 pub use frame::MAX_FRAMES_IN_FLIGHT;
 pub use frame_history::{
@@ -118,8 +115,9 @@ pub use render_graph::{
 };
 pub use renderer::{RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
 pub use resources::{
-    AccelerationStructure, BindlessFreeList, Buffer, DeviceResources, GpuMesh, GpuMeshParts,
-    GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, Pipeline,
+    AccelerationStructure, BindlessFreeList, Buffer, DefaultHeightMinMax, DeviceResources, GpuMesh,
+    GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc,
+    MinMaxPyramid, Pipeline,
 };
 pub use restir::{
     InitialPush as RestirInitialPush, RESTIR_CANDIDATE_COUNT, RESTIR_INITIAL_PUSH_SIZE,
@@ -149,6 +147,14 @@ pub use ssao::{
 };
 pub use swapchain::Swapchain;
 pub use targets::{PointShadowCube, Targets};
+pub use tessellation::{
+    TESS_CLAS_MAX_TRIS, TESS_CLAS_MAX_VERTS, TESS_DEFAULT_EDGE_LENGTH_TARGET,
+    TESS_DEFAULT_FACTOR_CAP, TESS_DEFAULT_MIN_FACTOR, TESS_MAX_DICE_FACTOR, TESS_MAX_INSTANCES,
+    TESS_MICRO_VERTEX_BUDGET, TessBucket, TessCamera, TessEmitPush, TessFactorPush,
+    TessFinalizePush, TessInstanceLayout, TessScanPush, Tessellation, budget_scaled_caps,
+    coarse_parent_bary, displacement_aware_factor, factor_push, geomorph_weight,
+    project_world_to_pixels, smoothstep01, split_recursion, tess_worst_case, wire_storage_set,
+};
 pub use thumbnail::{
     PngTransfer, ThumbnailPng, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
