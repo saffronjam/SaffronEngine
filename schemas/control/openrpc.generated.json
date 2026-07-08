@@ -2058,6 +2058,24 @@
       }
     },
     {
+      "name": "set-tessellation-quality",
+      "summary": "set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget]",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetTessellationQualityParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetTessellationQualityResult"
+        }
+      }
+    },
+    {
       "name": "get-project",
       "summary": "active project metadata",
       "params": [
@@ -8572,6 +8590,42 @@
         },
         "required": [
           "params"
+        ]
+      },
+      "SetTessellationQualityParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "factorCap": {
+            "type": "number"
+          },
+          "minFactor": {
+            "type": "number"
+          },
+          "edgeLengthTarget": {
+            "type": "number"
+          }
+        },
+        "required": []
+      },
+      "SetTessellationQualityResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "factorCap": {
+            "type": "number"
+          },
+          "minFactor": {
+            "type": "number"
+          },
+          "edgeLengthTarget": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "factorCap",
+          "minFactor",
+          "edgeLengthTarget"
         ]
       },
       "SetTonemapParams": {

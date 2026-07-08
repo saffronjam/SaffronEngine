@@ -800,6 +800,13 @@
       "fixture": "exposure-zero"
     },
     {
+      "name": "set-tessellation-quality",
+      "params": "SetTessellationQualityParams",
+      "result": "SetTessellationQualityResult",
+      "status": "typed",
+      "fixture": "tess-quality"
+    },
+    {
       "name": "get-project",
       "params": "EmptyParams",
       "result": "ProjectInfoDto",
