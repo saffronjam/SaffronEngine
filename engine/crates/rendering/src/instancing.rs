@@ -27,7 +27,6 @@ use saffron_core::{BlendMode, HeightMode};
 use saffron_geometry::glam::{Mat4, UVec4, Vec4};
 
 use crate::descriptors::Descriptors;
-use crate::displacement::{DISPLACE_MAX_SETS_PER_FRAME, DisplaceBucket, Displacement};
 use crate::draw_list::{
     DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
     SkinDispatch, SubmeshMaterial,
@@ -37,6 +36,7 @@ use crate::gpu_types::{InstanceData, Material, MaterialParamsData};
 use crate::pipelines::Pipelines;
 use crate::resources::{Buffer, DeviceResources, GpuMesh};
 use crate::skinning::{SkinBucket, SkinBufferSet, Skinning, clamp_to_set_budget};
+use crate::tessellation::{TESS_MAX_INSTANCES, TessBucket};
 use crate::{Device, Result};
 
 use std::sync::Arc;
@@ -57,9 +57,15 @@ pub struct DrawListInputs {
     /// Whether an RT consumer is armed this frame — gates building the skinned RT-instance
     /// list (a non-RT scene pays nothing).
     pub rt_skinned: bool,
-    /// Whether the GPU compute-displacement path runs. Off leaves displacement-enabled meshes at
-    /// their base geometry (no displace prepass, no deformed-buffer routing).
+    /// Whether the GPU displacement path runs. Off leaves displacement-enabled meshes at their base
+    /// geometry (no tessellation prep gathered, so no amplified transient geometry to draw).
     pub displace_enabled: bool,
+    /// The tessellation-quality budget applied to each displaced instance's [`TessBucket`]: the hard
+    /// dice cap, the minimum per-edge factor, and the target screen-space edge length. Runtime-tunable
+    /// via the `set-tessellation-quality` control command; defaults to the `TESS_DEFAULT_*` consts.
+    pub tess_factor_cap: f32,
+    pub tess_min_factor: f32,
+    pub tess_edge_length_target: f32,
 }
 
 /// Initial instance-buffer capacity (in [`InstanceData`] elements).
@@ -182,7 +188,6 @@ impl Instancing {
         descriptors: &Descriptors,
         pipelines: &mut Pipelines,
         skinning: &mut Skinning,
-        displacement: &mut Displacement,
         items: &[DrawItem],
         joints: &[Mat4],
         inputs: DrawListInputs,
@@ -194,6 +199,9 @@ impl Instancing {
             default_texture_index,
             rt_skinned,
             displace_enabled,
+            tess_factor_cap,
+            tess_min_factor,
+            tess_edge_length_target,
         } = inputs;
         let pipelines_before = pipelines.pipelines_created();
         let mut list = SceneDrawList {
@@ -219,8 +227,8 @@ impl Instancing {
             // deforms into its own slice (before skin), so it never merges either.
             let is_morph = !item.morph_weights.is_empty() && item.mesh.morph().is_some();
 
-            // A displacement-enabled item is deformed by the `displace` prepass into its own slice,
-            // so — like skin/morph — it never merges. Gated off leaves it as base geometry.
+            // A displacement-enabled item rides the adaptive-tessellation path (amplified transient
+            // geometry), so — like skin/morph — it never merges. Gated off leaves it as base geometry.
             let displace = if displace_enabled {
                 displace_info_for(item)
             } else {
@@ -308,10 +316,14 @@ impl Instancing {
         let mut transparent: Vec<(f32, DrawBatch)> = Vec::new();
         let mut skin_buckets: Vec<SkinBucket> = Vec::new();
         let mut skinned_rt: Vec<DeformedRtInstance> = Vec::new();
-        // The displacement deform work: one bucket per displaced instance (writing its slice of the
-        // shared deformed buffer), plus its TLAS instance (mesh-local displaced vertices).
-        let mut displace_buckets: Vec<DisplaceBucket> = Vec::new();
+        // The displaced instances' TLAS entries (mesh-local displaced geometry). Their `tess` slice is
+        // filled mid-render by `record_tess_prep` from the amplified transient buffers.
         let mut displaced_rt: Vec<DeformedRtInstance> = Vec::new();
+        // The adaptive-tessellation prep work: one bucket per displaced instance, carrying its base
+        // mesh (+ Phase-2 conditioning) and world transform for the factor/scan/finalize passes the
+        // deform scope records. The amplified geometry it emits is what every raster + RT consumer
+        // reads for a displaced mesh.
+        let mut tess_buckets: Vec<TessBucket> = Vec::new();
         // The morph deform work: one cur + one prev dispatch + mesh per morph-active bucket,
         // and the frame's concatenated active-target list (each dispatch reads its
         // `active_base` slice — cur and prev both index the same buffer, differing only in
@@ -342,7 +354,9 @@ impl Instancing {
                 _ => (Vec::new(), 0),
             };
             let has_morph = !morph_active.is_empty();
-            let deformed = bucket.skinned || has_morph || bucket.displace.is_some();
+            // The deformed ring is skin/morph only; a displaced mesh rides the transient
+            // tessellation buffers instead (gathered below, outside this gate).
+            let deformed = bucket.skinned || has_morph;
 
             let base_instance = instances.len() as u32;
             let instance_count = bucket.instances.len() as u32;
@@ -366,6 +380,7 @@ impl Instancing {
                         mesh: Arc::clone(&bucket.mesh),
                         // Skinned (and skin+morph) deformed vertices are already world-space.
                         world_transform: Mat4::IDENTITY,
+                        tess: None,
                     });
                     // Replace this bucket's slice in the prev palette with the entity's
                     // cached last-frame slice (or leave the current copy → no frame-1 ghost).
@@ -423,31 +438,44 @@ impl Instancing {
                             index_count: bucket.mesh.index_count,
                             mesh: Arc::clone(&bucket.mesh),
                             world_transform: bucket.model,
+                            tess: None,
                         });
                     }
                 }
-                // A displaced (non-skinned, non-morph) instance: the `displace` prepass writes this
-                // slice from the height field; its deformed vertices are mesh-local, so the TLAS
-                // places it at the node world matrix.
-                if let Some(info) = bucket.displace {
-                    displace_buckets.push(DisplaceBucket {
+                deformed_cursor += vertex_count;
+            }
+            // A displaced instance rides the adaptive-tessellation path: the prep passes gathered here
+            // amplify its base geometry into the per-frame transient buffers that every raster pass and
+            // its RT BLAS read. It claims no deformed-ring slice (that ring is skin/morph only); its
+            // `tess` RT slice is filled mid-render by `record_tess_prep`.
+            if let Some(info) = bucket.displace {
+                // Only meshes carrying Phase-2 conditioning (watertight base topology) can be tessellated.
+                if bucket.mesh.conditioning().is_some() {
+                    tess_buckets.push(TessBucket {
                         mesh: Arc::clone(&bucket.mesh),
-                        deformed_offset: deformed_cursor,
+                        base_instance,
+                        entity: if rt_skinned { bucket.entity } else { 0 },
+                        model: bucket.model,
                         height_index: info.height_index,
                         height_scale: info.height_scale,
                         uv_transform: info.uv_transform,
                         vector_index: info.vector_index,
-                    });
-                    displaced_rt.push(DeformedRtInstance {
-                        entity: if rt_skinned { bucket.entity } else { 0 },
-                        deformed_offset: deformed_cursor,
-                        vertex_count,
-                        index_count: bucket.mesh.index_count,
-                        mesh: Arc::clone(&bucket.mesh),
-                        world_transform: bucket.model,
+                        factor_cap: tess_factor_cap,
+                        min_factor: tess_min_factor,
+                        edge_length_target: tess_edge_length_target,
                     });
                 }
-                deformed_cursor += vertex_count;
+                // Its TLAS entry (mesh-local displaced geometry at the node world matrix); the tess slice
+                // `record_tess_prep` fills drives the full per-frame BLAS BUILD over the amplified geometry.
+                displaced_rt.push(DeformedRtInstance {
+                    entity: if rt_skinned { bucket.entity } else { 0 },
+                    deformed_offset: 0,
+                    vertex_count: bucket.mesh.vertex_count,
+                    index_count: bucket.mesh.index_count,
+                    mesh: Arc::clone(&bucket.mesh),
+                    world_transform: bucket.model,
+                    tess: None,
+                });
             }
             for s in 0..submesh_count as usize {
                 for rows in &bucket.instances {
@@ -501,6 +529,9 @@ impl Instancing {
                     } else {
                         submesh_indices
                     },
+                    // Resolved mid-render by `record_tess_prep` (the transients don't exist yet),
+                    // matched to this batch by `base_instance`.
+                    tessellated: None,
                 };
                 if is_blend {
                     // Depth key: the object's world-space origin projected to clip `w`. For a
@@ -624,23 +655,22 @@ impl Instancing {
                 .extend(morph_rt.into_iter().filter(|s| s.entity != 0));
         }
 
-        // Wire the displacement dispatches: they write the same deformed / prev-deformed buffers at
-        // their own cursor slices, so size those buffers to the full deform cursor (idempotent when
-        // skin/morph already grew them), then build one cur + one prev dispatch per displaced bucket.
-        if !displace_buckets.is_empty() {
-            let kept = clamp_to_set_budget(displace_buckets.len())
-                .min(DISPLACE_MAX_SETS_PER_FRAME as usize);
-            displace_buckets.truncate(kept);
-            displaced_rt.truncate(kept);
-            let (deformed, prev_deformed) =
-                skinning.ensure_deformed_buffers(frame, deformed_cursor)?;
-            let (cur, prev) =
-                displacement.wire_dispatches(frame, deformed, prev_deformed, &displace_buckets);
-            list.displace_dispatches = cur;
-            list.prev_displace_dispatches = prev;
+        // Feed the displaced instances' RT entries into the draw list. They ride the transient
+        // tessellation buffers (their `tess` slice is filled mid-render by `record_tess_prep`), not
+        // the deformed ring — but the deformed buffers must exist for any deform work this frame, so
+        // size them to the deform cursor (idempotent; skin/morph already sized them). Clamp to the
+        // tessellation instance budget, matching how `tess_buckets` is truncated below.
+        if !displaced_rt.is_empty() {
+            skinning.ensure_deformed_buffers(frame, deformed_cursor)?;
+            displaced_rt.truncate(TESS_MAX_INSTANCES as usize);
             list.deformed_rt_instances
                 .extend(displaced_rt.into_iter().filter(|s| s.entity != 0));
         }
+
+        // Hand the deform scope the adaptive-tessellation buckets, clamped to the per-frame descriptor
+        // budget (the subsystem's pool holds `TESS_MAX_INSTANCES` set trios).
+        tess_buckets.truncate(TESS_MAX_INSTANCES as usize);
+        list.tess_buckets = tess_buckets;
 
         let stats = compute_stats(
             &batches,
@@ -884,9 +914,9 @@ struct Bucket {
     /// Per-geometry-submesh backface-cull mode, from the bucket's first item's submesh materials
     /// (a bucket is one mesh, so its submesh two-sidedness is shared). Copied onto every batch.
     submesh_cull: Vec<vk::CullModeFlags>,
-    /// Set when the mesh-instance is displacement-enabled: the `displace` compute prepass writes its
-    /// height-displaced vertices into the shared deformed buffer (like a skinned bucket, it never
-    /// merges and carries a `deformed_offset`). `None` for a normal bucket.
+    /// Set when the mesh-instance is displacement-enabled: the adaptive-tessellation prep passes
+    /// amplify its base geometry into the per-frame transient buffers every consumer reads (like a
+    /// skinned bucket, it never merges). `None` for a normal bucket.
     displace: Option<DisplaceInfo>,
     instances: Vec<Vec<InstanceData>>,
 }
@@ -910,9 +940,9 @@ fn submesh_blend_modes(item: &DrawItem) -> Vec<BlendMode> {
 /// Per-geometry-submesh backface-cull mode from the item's submesh materials (clamped to the last
 /// material like the instance-row build): a two-sided submesh disables culling (`NONE`), otherwise
 /// cull `BACK`. Length matches the geometry submesh count (>= 1 for the no-submesh single-draw path).
-/// The height-map index + amplitude + uv transform a displaced mesh-instance's `displace` compute
-/// dispatch needs, derived from a submesh material. The whole mesh-instance is displaced by one
-/// height field (its first displacement-enabled submesh material).
+/// The height-map index + amplitude + uv transform a displaced mesh-instance's adaptive-tessellation
+/// prep needs, derived from a submesh material. The whole mesh-instance is displaced by one height
+/// field (its first displacement-enabled submesh material).
 #[derive(Clone, Copy)]
 struct DisplaceInfo {
     height_index: u32,
@@ -1035,7 +1065,7 @@ fn resolve_material(
     if pin(&material.height_texture, &mut height_index) {
         // The mode selects the technique: `Bump` is a fragment shading-normal bump (safe, flat
         // silhouette); `Parallax` is the fragment parallax-occlusion march; `Displacement` moves
-        // real geometry in the `displace` compute pre-pass (true silhouette, consistent across
+        // real geometry via the adaptive-tessellation passes (true silhouette, consistent across
         // passes, BLAS-able) and keeps the shading bump.
         features |= match material.height_mode {
             HeightMode::Bump => FEATURE_HEIGHT_BUMP,
@@ -1198,7 +1228,6 @@ mod tests {
         Pipelines,
         Instancing,
         Skinning,
-        Displacement,
         Uploader,
     )> {
         let device = match Device::new(&SurfaceSource::Offscreen) {
@@ -1213,7 +1242,6 @@ mod tests {
         let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let instancing = Instancing::new(&device, &descriptors).expect("Instancing::new");
         let skinning = Skinning::new(&device).expect("Skinning::new");
-        let displacement = Displacement::new(&device).expect("Displacement::new");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         Some((
@@ -1222,7 +1250,6 @@ mod tests {
             pipelines,
             instancing,
             skinning,
-            displacement,
             uploader,
         ))
     }
@@ -1237,6 +1264,9 @@ mod tests {
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
             rt_skinned: false,
             displace_enabled: true,
+            tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
+            tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
+            tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
         }
     }
 
@@ -1294,15 +1324,8 @@ mod tests {
     /// actually blend instead of taking slot 0's mode for the whole mesh.
     #[test]
     fn submit_draw_list_splits_submeshes_by_blend_mode() {
-        let Some((
-            device,
-            descriptors,
-            mut pipelines,
-            mut instancing,
-            mut skinning,
-            mut displacement,
-            uploader,
-        )) = fixture_or_skip()
+        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
+            fixture_or_skip()
         else {
             return;
         };
@@ -1324,7 +1347,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[item],
                 &[],
                 inputs(0),
@@ -1358,7 +1380,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1370,15 +1391,8 @@ mod tests {
     /// the stats report 2 batches / 3 instances — the phase's named batching gate.
     #[test]
     fn submit_draw_list_batches_by_pipeline_and_mesh() {
-        let Some((
-            device,
-            descriptors,
-            mut pipelines,
-            mut instancing,
-            mut skinning,
-            mut displacement,
-            uploader,
-        )) = fixture_or_skip()
+        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
+            fixture_or_skip()
         else {
             return;
         };
@@ -1403,7 +1417,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &items,
                 &[],
                 inputs(0),
@@ -1442,7 +1455,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1454,15 +1466,8 @@ mod tests {
     /// dedup case), then asserted by the resulting instance rows' `texture.w` indices.
     #[test]
     fn submit_draw_list_dedups_identical_materials() {
-        let Some((
-            device,
-            descriptors,
-            mut pipelines,
-            mut instancing,
-            mut skinning,
-            mut displacement,
-            uploader,
-        )) = fixture_or_skip()
+        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
+            fixture_or_skip()
         else {
             return;
         };
@@ -1498,7 +1503,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &same,
                 &[],
                 inputs(0),
@@ -1513,7 +1517,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &distinct,
                 &[],
                 inputs(1),
@@ -1543,7 +1546,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1641,15 +1643,8 @@ mod tests {
     /// is armed only when `skin_dispatches` is non-empty — the phase's named gate.
     #[test]
     fn skin_dispatch_appears_only_for_skinned_draws() {
-        let Some((
-            device,
-            descriptors,
-            mut pipelines,
-            mut instancing,
-            mut skinning,
-            mut displacement,
-            uploader,
-        )) = fixture_or_skip()
+        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
+            fixture_or_skip()
         else {
             return;
         };
@@ -1667,7 +1662,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[static_item],
                 &palette,
                 inputs(0),
@@ -1686,7 +1680,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[item],
                 &palette,
                 inputs(1),
@@ -1724,7 +1717,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -1736,15 +1728,8 @@ mod tests {
     /// second frame reflects last frame's pose — the phase's named cross-frame gate.
     #[test]
     fn cross_frame_motion_caches_track_the_entity() {
-        let Some((
-            device,
-            descriptors,
-            mut pipelines,
-            mut instancing,
-            mut skinning,
-            mut displacement,
-            uploader,
-        )) = fixture_or_skip()
+        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
+            fixture_or_skip()
         else {
             return;
         };
@@ -1758,7 +1743,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[skinned_item(&mesh, first, 7)],
                 &[Mat4::IDENTITY],
                 inputs(0),
@@ -1778,7 +1762,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[skinned_item(&mesh, second, 7)],
                 &[Mat4::IDENTITY],
                 inputs(1),
@@ -1797,7 +1780,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
