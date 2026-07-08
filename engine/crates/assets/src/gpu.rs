@@ -70,6 +70,26 @@ pub trait GpuUploader {
         height: u32,
     ) -> saffron_rendering::Result<Arc<GpuTexture>>;
 
+    /// Uploads tightly packed RGBA8 as an unorm sampled texture (like
+    /// [`Self::upload_texture`] with `srgb = false` — a height map is linear data) *and* builds its
+    /// per-height min/max pyramid into the parallel bindless array, so the adaptive-tessellation factor
+    /// kernel refines per-region. Called for a displacement material's height slot.
+    ///
+    /// The default delegates to [`Self::upload_texture`] and builds no pyramid — the fallback for a test
+    /// stub without a real GPU. The live uploader overrides it to build the pyramid.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the renderer's upload failure (zero extent or a failing Vulkan/VMA call).
+    fn upload_height_texture(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        self.upload_texture(rgba, width, height, false)
+    }
+
     /// Whether the compute-skinning path is built and on. The skinned draw list is
     /// gathered only when this is true, so a build with skinning off is byte-identical
     /// to one without the skinned path.
@@ -134,6 +154,16 @@ impl GpuUploader for RendererUploader<'_> {
     ) -> saffron_rendering::Result<Arc<GpuTexture>> {
         self.uploader
             .upload_texture_float(self.descriptors, rgba, width, height)
+    }
+
+    fn upload_height_texture(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        self.uploader
+            .upload_height_texture(self.descriptors, rgba, width, height)
     }
 
     fn skinning_enabled(&self) -> bool {

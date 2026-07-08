@@ -196,6 +196,16 @@ impl GpuUploader for RendererScene<'_> {
             .upload_texture_float(self.renderer.descriptors(), rgba, width, height)
     }
 
+    fn upload_height_texture(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuTexture>> {
+        self.uploader
+            .upload_height_texture(self.renderer.descriptors(), rgba, width, height)
+    }
+
     fn skinning_enabled(&self) -> bool {
         self.skinning_enabled
     }
