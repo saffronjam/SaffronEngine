@@ -75,6 +75,11 @@ pub struct Descriptors {
     /// Linear, clamp-to-edge sampler the per-mesh SDF cone-trace reads its `Texture3D`
     /// with (a repeat wrap would alias the field's positive shell at the grid border).
     sdf_sampler: vk::Sampler,
+    /// Point (nearest) sampler the tessellation factor kernel reads the per-height min/max pyramid
+    /// with. Nearest min/mag/mip so a level's `(min, max)` texel is read without blending min into max
+    /// (linear filtering would break the conservative bound); clamp-to-edge so an edge UV reads the
+    /// boundary texel rather than wrapping.
+    minmax_sampler: vk::Sampler,
 
     bindless_set_layout: vk::DescriptorSetLayout,
     light_set_layout: vk::DescriptorSetLayout,
@@ -165,6 +170,7 @@ impl Descriptors {
         )?);
         partial.shadow_sampler = Some(create_shadow_sampler(raw)?);
         partial.sdf_sampler = Some(create_sdf_sampler(raw)?);
+        partial.minmax_sampler = Some(create_minmax_sampler(raw)?);
 
         partial.bindless_set_layout = Some(create_bindless_layout(raw)?);
         partial.light_set_layout = Some(create_light_layout(raw)?);
@@ -223,6 +229,7 @@ impl Descriptors {
             linear_sampler: partial.take_linear_sampler(),
             shadow_sampler: partial.take_shadow_sampler(),
             sdf_sampler: partial.take_sdf_sampler(),
+            minmax_sampler: partial.take_minmax_sampler(),
             bindless_set_layout: partial.take_bindless_set_layout(),
             light_set_layout: partial.take_light_set_layout(),
             instance_set_layout: partial.take_instance_set_layout(),
@@ -565,6 +572,63 @@ impl Descriptors {
         }
     }
 
+    /// Writes the per-height min/max pyramid `view` into bindless slot `index` of binding 4 (the
+    /// parallel `heightMinMaxTextures` array) with the point sampler, under the bindless mutex. The
+    /// slot is the height texture's own albedo slot, so the factor kernel's `heightIndex` addresses
+    /// both the texture (binding 0) and its pyramid here. The image must be in
+    /// `SHADER_READ_ONLY_OPTIMAL` (the upload transitions it there).
+    pub fn write_height_minmax(&self, view: vk::ImageView, index: u32) {
+        let image_info = [vk::DescriptorImageInfo {
+            sampler: self.minmax_sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(4)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info);
+        let _guard = self.slots.lock().expect("bindless slot allocator lock");
+        // SAFETY: the ash seam. The set + layout outlive this; the view is valid for the call. The
+        // lock serializes concurrent worker/main writes to the set.
+        unsafe {
+            self.resources
+                .device()
+                .update_descriptor_sets(&[write], &[]);
+        }
+    }
+
+    /// Seeds a default 1×1 pyramid `view` into *every* slot of binding 4 in one
+    /// `vkUpdateDescriptorSets`. Called once at init so the partially-bound array is never sampled
+    /// while unbound (lavapipe faults on an unbound slot even one the shader never reads, and it is UB
+    /// on real hardware). A non-displacement texture keeps this default (zero local range → no extra
+    /// refinement); a displacement height map overwrites its slot with its real pyramid.
+    pub fn seed_all_height_minmax(&self, view: vk::ImageView) {
+        let image_info = vec![
+            vk::DescriptorImageInfo {
+                sampler: self.minmax_sampler,
+                image_view: view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            MAX_BINDLESS_TEXTURES as usize
+        ];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(4)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info);
+        let _guard = self.slots.lock().expect("bindless slot allocator lock");
+        // SAFETY: the ash seam. The set + layout outlive this; `view` is valid and `image_info` lives
+        // until the call returns; the array length equals the layout's count.
+        unsafe {
+            self.resources
+                .device()
+                .update_descriptor_sets(&[write], &[]);
+        }
+    }
+
     /// The number of per-mesh SDF bindless slots ever handed out (the high-water mark).
     pub fn sdf_count(&self) -> u32 {
         self.sdf_slots
@@ -701,6 +765,7 @@ impl Drop for Descriptors {
             raw.destroy_sampler(self.linear_sampler, None);
             raw.destroy_sampler(self.shadow_sampler, None);
             raw.destroy_sampler(self.sdf_sampler, None);
+            raw.destroy_sampler(self.minmax_sampler, None);
         }
     }
 }
@@ -714,6 +779,7 @@ struct Partial<'a> {
     linear_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
     sdf_sampler: Option<vk::Sampler>,
+    minmax_sampler: Option<vk::Sampler>,
     bindless_set_layout: Option<vk::DescriptorSetLayout>,
     light_set_layout: Option<vk::DescriptorSetLayout>,
     instance_set_layout: Option<vk::DescriptorSetLayout>,
@@ -750,6 +816,7 @@ impl<'a> Partial<'a> {
             linear_sampler: None,
             shadow_sampler: None,
             sdf_sampler: None,
+            minmax_sampler: None,
             bindless_set_layout: None,
             light_set_layout: None,
             instance_set_layout: None,
@@ -772,6 +839,7 @@ impl<'a> Partial<'a> {
         take_linear_sampler => linear_sampler: vk::Sampler,
         take_shadow_sampler => shadow_sampler: vk::Sampler,
         take_sdf_sampler => sdf_sampler: vk::Sampler,
+        take_minmax_sampler => minmax_sampler: vk::Sampler,
         take_bindless_set_layout => bindless_set_layout: vk::DescriptorSetLayout,
         take_light_set_layout => light_set_layout: vk::DescriptorSetLayout,
         take_instance_set_layout => instance_set_layout: vk::DescriptorSetLayout,
@@ -821,6 +889,9 @@ impl Drop for Partial<'_> {
             .flatten()
             {
                 raw.destroy_descriptor_set_layout(layout, None);
+            }
+            if let Some(sampler) = self.minmax_sampler {
+                raw.destroy_sampler(sampler, None);
             }
             if let Some(sampler) = self.sdf_sampler {
                 raw.destroy_sampler(sampler, None);
@@ -877,6 +948,25 @@ fn create_shadow_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
     )
 }
 
+/// The per-height min/max pyramid sampler: **nearest** min/mag/mip and clamp-to-edge, no LOD clamp.
+/// The pyramid is a conservative `(min, max)` bound the factor kernel point-samples with explicit LOD —
+/// linear filtering would blend `min` into `max` and break the bound, so every axis is nearest.
+fn create_minmax_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
+    let info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::NEAREST)
+        .min_filter(vk::Filter::NEAREST)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .max_lod(vk::LOD_CLAMP_NONE);
+    // SAFETY: the ash seam. As [`create_linear_sampler`].
+    checked(
+        unsafe { raw.create_sampler(&info, None) },
+        "createSampler (minmax)",
+    )
+}
+
 /// The per-mesh SDF sampler: linear filtering for the trilinear field lookup, **linear**
 /// mipmap mode so a fractional `SampleLevel` LOD blends across the prefiltered mip pair
 /// (quadrilinear — the cone-footprint mip-select's anti-alias depends on it), clamp-to-edge
@@ -901,8 +991,9 @@ fn create_sdf_sampler(raw: &ash::Device) -> Result<vk::Sampler> {
 /// Set 0: the bindless arrays — binding 0 is the albedo combined-image-sampler array,
 /// binding 1 the per-mesh SDST brick-atlas `Texture3D` array (combined image sampler, mipped),
 /// binding 2 the per-mesh brick-indirection `Texture3D<uint>` array (a sampled image read by
-/// integer `Load`, no sampler), and binding 3 the coarse coverage `Texture3D` array (combined
-/// image sampler). All runtime-sized, partially bound + update-after-bind.
+/// integer `Load`, no sampler), binding 3 the coarse coverage `Texture3D` array (combined
+/// image sampler), and binding 4 the per-height min/max pyramid array (`R32G32_SFLOAT`, sharing
+/// the albedo slot space). All runtime-sized, partially bound + update-after-bind.
 fn create_bindless_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let bindings = [
         vk::DescriptorSetLayoutBinding::default()
@@ -935,8 +1026,19 @@ fn create_bindless_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> 
             // The coarse coverage volume (one texel per brick), sampled for the empty-space
             // march leap + early-out — same two compute consumers as the atlas.
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(4)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_BINDLESS_TEXTURES)
+            // The per-height min/max pyramid array (`R32G32_SFLOAT`, min in R / max in G, one mip per
+            // pyramid level), sharing the albedo slot space so a height map's `heightIndex` addresses
+            // both its texture (binding 0) and its pyramid (here). COMPUTE-only: the adaptive-
+            // tessellation factor kernel is the sole consumer, sampling it point-filtered with explicit
+            // LOD for a per-region detail-adaptive edge factor.
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let binding_flags = [
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
         vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
         vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
         vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
@@ -1273,8 +1375,9 @@ fn create_bindless_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
     let pool_sizes = [
         pool_size(
             vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            // Albedo (binding 0) + brick atlas (binding 1) + coverage (binding 3).
-            MAX_BINDLESS_TEXTURES + 2 * MAX_BINDLESS_SDF,
+            // Albedo (binding 0) + brick atlas (binding 1) + coverage (binding 3) + the per-height
+            // min/max pyramid (binding 4, another `MAX_BINDLESS_TEXTURES` slots).
+            2 * MAX_BINDLESS_TEXTURES + 2 * MAX_BINDLESS_SDF,
         ),
         // The brick-indirection array is a separate sampled-image (no sampler) binding.
         pool_size(vk::DescriptorType::SAMPLED_IMAGE, MAX_BINDLESS_SDF),
