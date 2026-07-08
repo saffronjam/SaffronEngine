@@ -1327,6 +1327,18 @@ export interface SetExposureResult {
   exposureEv: number;
 }
 
+export interface SetTessellationQualityParams {
+  factorCap?: number;
+  minFactor?: number;
+  edgeLengthTarget?: number;
+}
+
+export interface SetTessellationQualityResult {
+  factorCap: number;
+  minFactor: number;
+  edgeLengthTarget: number;
+}
+
 export interface ProjectInfoDto {
   loaded: boolean;
   root: string;
@@ -2001,6 +2013,7 @@ export interface CommandParamsMap {
   "recapture-probes": EmptyParams;
   "list-probes": EmptyParams;
   "set-exposure": SetExposureParams;
+  "set-tessellation-quality": SetTessellationQualityParams;
   "get-project": EmptyParams;
   "project-status": EmptyParams;
   "cancel-load": EmptyParams;
@@ -2176,6 +2189,7 @@ export interface CommandResultMap {
   "recapture-probes": RecaptureProbesResult;
   "list-probes": ListProbesResult;
   "set-exposure": SetExposureResult;
+  "set-tessellation-quality": SetTessellationQualityResult;
   "get-project": ProjectInfoDto;
   "project-status": ProjectStatusDto;
   "cancel-load": ProjectStatusDto;
