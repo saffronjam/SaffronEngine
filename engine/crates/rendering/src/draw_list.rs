@@ -60,13 +60,13 @@ pub struct SubmeshMaterial {
     pub uv_tiling: Vec2,
     /// UV offset (added to the tiled UV).
     pub uv_offset: Vec2,
-    /// Height scale — parallax march depth ([`HeightMode::Parallax`]), or the world-space
-    /// displacement amplitude ([`HeightMode::Displacement`]).
+    /// Height scale — parallax march depth ([`HeightMode::Parallax`]), or the OBJECT-space
+    /// displacement amplitude ([`HeightMode::Displacement`]): the relief rides the instance's
+    /// transform like its geometry, so scaling the object scales the bumps proportionally.
     pub height_scale: f32,
     /// The height-map technique: [`HeightMode::Bump`] (shading bump), [`HeightMode::Parallax`]
-    /// (parallax-occlusion mapping), or [`HeightMode::Displacement`] (real per-vertex displacement
-    /// via the `displace` compute pre-pass — needs a densely-tessellated mesh; the interactive
-    /// preview sphere is seeded dense for exactly this).
+    /// (parallax-occlusion mapping), or [`HeightMode::Displacement`] (real displaced geometry via the
+    /// adaptive-tessellation passes, which amplify each base triangle into a displaced micro-grid).
     pub height_mode: HeightMode,
     /// Alpha/blend mode: opaque, masked (alpha-clip discard below [`SubmeshMaterial::alpha_cutoff`]),
     /// or translucent (routed to the sorted, blended translucent draw list).
@@ -172,6 +172,26 @@ pub fn normal_matrix(model: Mat4) -> Mat4 {
     Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose())
 }
 
+/// The per-frame handles a tessellated (`HeightMode::Displacement`) batch draws through — the
+/// amplified geometry the Phase-4 emit kernel wrote into `TransientResources`. Filled by
+/// [`crate::Renderer`]'s `record_tess_prep` once the per-frame transients are acquired (the base
+/// instance links a batch to its tessellated slice), then read by the raster passes' indirect draw.
+#[derive(Clone, Copy)]
+pub struct TessDraw {
+    /// The transient VB holding this frame's amplified micro-vertices (48 B stride).
+    pub vertex_buffer: vk::Buffer,
+    /// The transient VB holding the PREVIOUS frame's micro-vertex positions (same layout + stride), for
+    /// the motion prepass's prev-position stream — the geomorph slide the emit kernel wrote with last
+    /// frame's per-edge factors. Equal to `vertex_buffer` only when the two carry identical positions.
+    pub prev_vertex_buffer: vk::Buffer,
+    /// The transient IB holding the generated index stream (u32).
+    pub index_buffer: vk::Buffer,
+    /// The indirect-args buffer (one `VkDrawIndexedIndirectCommand` per instance, 20 B stride).
+    pub args_buffer: vk::Buffer,
+    /// Byte offset of this batch's command in `args_buffer` (= `instance_row * 20`).
+    pub args_offset: u64,
+}
+
 /// A batch of instances sharing a pipeline + mesh, drawn as one instanced draw per
 /// submesh. Bindless means the per-instance texture indices live in the instance SSBO,
 /// not a per-batch descriptor — so texture differences never split a batch.
@@ -203,6 +223,11 @@ pub struct DrawBatch {
     /// from the same mesh shares one submesh-major instance block (`base_instance`), so a subset
     /// just picks its `s` slices. Empty for a submesh-less mesh (the whole index buffer draws once).
     pub submeshes: Vec<u32>,
+    /// When set the batch is a Phase-4 tessellated (`HeightMode::Displacement`) instance: it draws
+    /// the amplified transient VB/IB via one indirect draw sourced from [`TessDraw::args_buffer`]
+    /// instead of the fixed-count `cmd_draw_indexed`. Filled mid-render (the transients don't exist at
+    /// draw-list build time); `None` for a static / skinned / morph batch.
+    pub tessellated: Option<TessDraw>,
 }
 
 /// One skinned mesh-instance's compute work for the frame: the descriptor set wiring its
@@ -219,28 +244,6 @@ pub struct SkinDispatch {
     pub joint_offset: u32,
     /// The base of this instance's vertices in the deformed output buffer.
     pub deformed_offset: u32,
-}
-
-/// One displaced mesh-instance's compute work for the frame: the descriptor set wiring its base
-/// vertices (in) + the shared deformed buffer (out), plus the height-map index / amplitude / uv
-/// transform the `displace` kernel pushes. Built by [`crate::Instancing::submit_draw_list`] and
-/// replayed in the `displace` pass (which writes the same deformed buffer as skin/morph).
-#[derive(Clone, Copy)]
-pub struct DisplaceDispatch {
-    /// The per-dispatch descriptor set (base vertices in, deformed out).
-    pub set: vk::DescriptorSet,
-    /// The displaced mesh-instance's vertex count (one compute invocation each).
-    pub vertex_count: u32,
-    /// The base of this instance's vertices in the deformed output buffer.
-    pub deformed_offset: u32,
-    /// Bindless index of the height map (sampled from the shared set-0 albedo array).
-    pub height_index: u32,
-    /// Local-space displacement amplitude (`MaterialParams.emissive.w`).
-    pub height_scale: f32,
-    /// `tiling.xy, offset.xy` (`MaterialParams.uv`).
-    pub uv_transform: [f32; 4],
-    /// Bindless index of the vector-displacement map (`0` = scalar-only along the normal).
-    pub vector_index: u32,
 }
 
 /// One morph mesh-instance's compute work for the frame: the descriptor set wiring its
@@ -269,9 +272,34 @@ pub struct MorphDispatch {
 /// in world space (the palette is `worldBone * inverseBind` and the skin kernel omits the
 /// model matrix), so `world_transform` is identity; for an unskinned-morph instance the
 /// deformed vertices are in mesh-local space, so `world_transform` is the node world matrix.
+/// A tessellated (`HeightMode::Displacement`) instance's per-frame slice into the amplified transient
+/// VB/IB, for building its BLAS. Unlike the skinned path (a 1:1 remap of the base mesh, refit in place),
+/// a tessellated instance mints variable topology every frame, so its BLAS is a full rebuild over these
+/// buffers. Filled mid-render by `record_tess_prep` (the transients don't exist at draw-list build time).
+///
+/// These point at the **coarse** (secondary-ray) amplified geometry — a separate, lower-density run of the
+/// tessellation chain (Phase 10, Q2 RT coarsening: coarser LOD target + smaller dice cap) — not the fine
+/// buffers the raster passes draw. The coarse mesh is still Phong-smoothed, displaced, and watertight; the
+/// smaller worst case makes the per-frame BLAS BUILD far cheaper for shadow / GI / reflection rays.
+#[derive(Clone, Copy)]
+pub struct TessRtSlice {
+    /// The transient VB holding this frame's amplified micro-vertices (48 B stride).
+    pub vertex_buffer: vk::Buffer,
+    /// The transient IB holding the generated index stream (u32), degenerate-padded past the real tail.
+    pub index_buffer: vk::Buffer,
+    /// This instance's reserved vertex slice base (micro-vertices).
+    pub vertex_base: u32,
+    /// This instance's reserved index slice base (indices).
+    pub index_base: u32,
+    /// Worst-case reserved vertices (`max_vertex + 1` for the BLAS size query + build).
+    pub worst_case_verts: u32,
+    /// Worst-case reserved triangles (the CPU `maxPrimitiveCount` for the portable BUILD floor).
+    pub worst_case_prims: u32,
+}
+
 #[derive(Clone)]
 pub struct DeformedRtInstance {
-    /// Keys the grow-only per-instance refit BLAS (built once, then updated).
+    /// Keys the grow-only per-instance refit / rebuild BLAS.
     pub entity: u64,
     /// The instance's base vertex in the frame's deformed buffer.
     pub deformed_offset: u32,
@@ -282,8 +310,12 @@ pub struct DeformedRtInstance {
     /// The mesh supplying the index stream for the BLAS geometry.
     pub mesh: Arc<GpuMesh>,
     /// The TLAS placement: identity for a skinned / skin+morph instance (already
-    /// world-space), the node world matrix for an unskinned-morph instance.
+    /// world-space), the node world matrix for an unskinned-morph / tessellated instance.
     pub world_transform: Mat4,
+    /// When set the instance is tessellated: its BLAS is a full per-frame `MODE_BUILD` over the
+    /// amplified transient VB/IB (variable topology forbids the skinned in-place `UPDATE`). `None` for a
+    /// skinned / morph instance, which keeps the create-once-then-refit fast path.
+    pub tess: Option<TessRtSlice>,
 }
 
 /// The frame's structured draw list, built by `submit_draw_list` and recorded by the
@@ -310,16 +342,13 @@ pub struct SceneDrawList {
     /// The parallel prev-pose morph dispatches (prev weights → prev-deformed), read only
     /// by the motion pass. Wired in Phase 5; the field lands here so the shape is complete.
     pub prev_morph_dispatches: Vec<MorphDispatch>,
-    /// Per displaced mesh-instance: the compute work the `displace` pass dispatches (in the same
-    /// deform scope as skin/morph) to write the height-displaced base into the deformed buffer.
-    /// Empty when no displacement-enabled instances exist.
-    pub displace_dispatches: Vec<DisplaceDispatch>,
-    /// The parallel displace dispatches writing the prev-deformed buffer (identical displacement —
-    /// a zero deformation delta), read only by the motion pass. Empty when no displaced instances.
-    pub prev_displace_dispatches: Vec<DisplaceDispatch>,
     /// Per deforming instance (skin or morph): the entity + deformed offset the RT refit
     /// BLAS reads + the TLAS placement. Empty unless an RT consumer is armed.
     pub deformed_rt_instances: Vec<DeformedRtInstance>,
+    /// Per displaced mesh-instance: the base mesh + transform + budget the adaptive-tessellation
+    /// prep passes (factor/scan/finalize) consume in the deform scope. The amplified transient
+    /// geometry they emit is what every raster + RT consumer reads for a displaced mesh.
+    pub tess_buckets: Vec<crate::tessellation::TessBucket>,
     /// Textures pinned live for the frame (their bindless indices are referenced by
     /// the instance SSBO, so the `Arc`s must outlive the GPU read).
     pub live_textures: Vec<Arc<GpuTexture>>,
@@ -341,9 +370,9 @@ impl SceneDrawList {
             prev_skin_dispatches: self.prev_skin_dispatches.clone(),
             morph_dispatches: self.morph_dispatches.clone(),
             prev_morph_dispatches: self.prev_morph_dispatches.clone(),
-            displace_dispatches: self.displace_dispatches.clone(),
-            prev_displace_dispatches: self.prev_displace_dispatches.clone(),
             deformed_rt_instances: self.deformed_rt_instances.clone(),
+            // The prep passes run in the deform scope off the owning list, never a recording copy.
+            tess_buckets: Vec::new(),
             live_textures: Vec::new(),
             valid: self.valid,
         }
