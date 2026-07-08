@@ -1,6 +1,19 @@
 # Phase 2 — Import-time watertight conditioning + min-max pyramid (self-verifiable)
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
+
+> Landed: `saffron-geometry` `conditioning.rs` (edge adjacency, spatial-hash weld with per-welded
+> direction + seam-consistent tangent, UV-seam detection, `MeshConditioning`, `build_min_max_pyramid`);
+> `.smesh` **v5** with an always-present conditioning section (`MESH_FLAG_CONDITIONING`,
+> `load_mesh_conditioning_from_bytes`, golden fixtures reseeded); `saffron-rendering`
+> `ConditioningBuffers` built + uploaded at mesh upload (mirroring `MeshletBuffers`, freed in
+> `GpuMesh::Drop`); `saffron-assets` `seam.rs` (dilation with conflict detection + object-space
+> fallback). All five required CPU tests pass; workspace `clippy -D warnings` + `fmt` clean.
+>
+> **Deferred to Phase 9 (with its consumer):** the min-max **pyramid GPU upload** (companion
+> point-sampled `R16G16` bindless image). The testable core `build_min_max_pyramid` is done + tested;
+> the bindless companion slot is unconsumed until the Phase-9 prism march, so it is built alongside its
+> reader there (where its point-sampled-LOD access can be verified) rather than as dead plumbing now.
 
 Produce, entirely offline, the data the watertightness chain needs — edge adjacency, a welded
 base mesh with per-welded-vertex displacement directions and a seam-consistent tangent seed, UV-seam
