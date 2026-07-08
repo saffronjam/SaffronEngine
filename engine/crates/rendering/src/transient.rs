@@ -39,13 +39,28 @@ fn grow_bytes(current: u64, needed: u64) -> u64 {
     capacity
 }
 
+/// How many frames of acquire history the reclaim window tracks: a slot is only shrunk when its
+/// capacity has exceeded the peak request across this many consecutive frames.
+const RECLAIM_WINDOW: usize = 8;
+/// A slot is shrunk only when its capacity exceeds the recent peak request by this factor — hysteresis
+/// so a slot at (or just above) its working size is never churned.
+const RECLAIM_MARGIN: u64 = 2;
+
 struct TransientBuffer {
+    key: &'static str,
     buffer: Buffer,
     capacity: u64,
     usage: vk::BufferUsageFlags,
+    /// Ring of the peak size requested in each of the last [`RECLAIM_WINDOW`] recycle cycles.
+    window: [u64; RECLAIM_WINDOW],
+    /// Next write position in `window`.
+    window_pos: usize,
+    /// Peak size requested since the last recycle (folded into `window` at `begin_frame`).
+    requested_this_cycle: u64,
 }
 
 struct TransientImage {
+    key: &'static str,
     image: Image,
     desc: ImageDesc,
 }
@@ -53,9 +68,7 @@ struct TransientImage {
 #[derive(Default)]
 struct FrameTransient {
     buffers: Vec<TransientBuffer>,
-    buffer_cursor: usize,
     images: Vec<TransientImage>,
-    image_cursor: usize,
 }
 
 /// The render graph's scratch-resource allocator, one growable pool per frame-in-flight.
@@ -73,80 +86,237 @@ impl TransientResources {
         Self { resources, frames }
     }
 
-    /// Recycle a frame slot's transients — call at frame begin **after** the slot's in-flight fence
-    /// has been waited on, so a prior frame's still-in-flight transients are only reused once its GPU
-    /// work has completed. Rewinds the acquire cursors; the allocations are kept (grow-only).
+    /// The per-frame recycle hook — call at frame begin **after** the slot's in-flight fence has been
+    /// waited on, so this frame slot's transients are done on the GPU and safe to reallocate. With
+    /// keyed slots there is no acquire cursor to rewind (a skipped consumer simply does not touch its
+    /// key). This is the **shrink/reclaim** point: each key folds its peak request for the cycle into a
+    /// rolling window, and a slot whose capacity has exceeded the window's peak by [`RECLAIM_MARGIN`]×
+    /// for the whole window is reallocated down to fit that peak (grow-only becomes grow-mostly). The
+    /// reclaim is fence-safe because it only frees this slot's allocations, whose fence has signalled.
     pub fn begin_frame(&mut self, frame: usize) {
-        let f = &mut self.frames[frame];
-        f.buffer_cursor = 0;
-        f.image_cursor = 0;
-    }
+        let resources = Arc::clone(&self.resources);
+        for buf in &mut self.frames[frame].buffers {
+            buf.window[buf.window_pos] = buf.requested_this_cycle;
+            buf.window_pos = (buf.window_pos + 1) % RECLAIM_WINDOW;
+            buf.requested_this_cycle = 0;
 
-    /// Acquire a transient buffer of at least `size` bytes carrying `usage`, for `frame`. Passes must
-    /// acquire in the same order every frame (a fixed graph does): each acquire advances a cursor and
-    /// reuses the allocation parked there when it already fits + covers the usage, else reallocates
-    /// it. Returns the raw handle to hand to [`crate::render_graph::RenderGraph::import_buffer`].
-    pub fn acquire_buffer(
-        &mut self,
-        frame: usize,
-        size: u64,
-        usage: vk::BufferUsageFlags,
-    ) -> crate::Result<vk::Buffer> {
-        let f = &mut self.frames[frame];
-        let i = f.buffer_cursor;
-        f.buffer_cursor += 1;
-        let fits =
-            matches!(f.buffers.get(i), Some(b) if b.capacity >= size && b.usage.contains(usage));
-        if !fits {
-            let capacity = grow_bytes(f.buffers.get(i).map_or(0, |b| b.capacity), size.max(1));
+            let peak = buf.window.iter().copied().max().unwrap_or(0);
+            if peak == 0 || buf.capacity <= peak.saturating_mul(RECLAIM_MARGIN) {
+                continue;
+            }
+            // The slot has run far under its capacity for a full window — shrink it to fit the peak.
+            let target = grow_bytes(0, peak);
+            if target >= buf.capacity {
+                continue;
+            }
             let alloc = vk_mem::AllocationCreateInfo {
                 usage: vk_mem::MemoryUsage::AutoPreferDevice,
                 ..Default::default()
             };
-            let buffer = Buffer::new(&self.resources, capacity, usage, &alloc)?;
-            let entry = TransientBuffer {
-                buffer,
-                capacity,
-                usage,
-            };
-            if i < f.buffers.len() {
-                f.buffers[i] = entry;
-            } else {
-                f.buffers.push(entry);
+            match Buffer::new(&resources, target, buf.usage, &alloc) {
+                Ok(smaller) => {
+                    buf.buffer = smaller; // drops (frees) the old, fence-cleared allocation
+                    buf.capacity = target;
+                }
+                Err(err) => tracing::warn!("transient reclaim of '{}' failed: {err}", buf.key),
             }
         }
+    }
+
+    /// Acquire a transient buffer of at least `size` bytes carrying `usage`, for `frame`, under a
+    /// stable `&'static str` `key` (one key = one logical transient, e.g. `"tess-vb"`). The same key
+    /// returns the same grow-only allocation every frame — order-independent, so a conditionally-present
+    /// pass that skips its acquire cannot desync any other key's slot. Returns the raw handle to hand
+    /// to [`crate::render_graph::RenderGraph::import_buffer`].
+    pub fn acquire_buffer(
+        &mut self,
+        frame: usize,
+        key: &'static str,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> crate::Result<vk::Buffer> {
+        let f = &mut self.frames[frame];
+        let existing = f.buffers.iter().position(|b| b.key == key);
+        if let Some(i) = existing {
+            // Record the request for the reclaim window whether or not the slot already fits.
+            f.buffers[i].requested_this_cycle = f.buffers[i].requested_this_cycle.max(size);
+            if f.buffers[i].capacity >= size && f.buffers[i].usage.contains(usage) {
+                return Ok(f.buffers[i].buffer.handle());
+            }
+        }
+        // Grow from the key's current high-water (not the floor) and union the usage so a later
+        // acquire with a subset of the flags still reuses the allocation.
+        let current_cap = existing.map_or(0, |i| f.buffers[i].capacity);
+        let usage = existing.map_or(usage, |i| f.buffers[i].usage | usage);
+        let window = existing.map_or([0; RECLAIM_WINDOW], |i| f.buffers[i].window);
+        let window_pos = existing.map_or(0, |i| f.buffers[i].window_pos);
+        let capacity = grow_bytes(current_cap, size.max(1));
+        let alloc = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+        let buffer = Buffer::new(&self.resources, capacity, usage, &alloc)?;
+        let entry = TransientBuffer {
+            key,
+            buffer,
+            capacity,
+            usage,
+            window,
+            window_pos,
+            requested_this_cycle: size,
+        };
+        let i = match existing {
+            Some(i) => {
+                f.buffers[i] = entry;
+                i
+            }
+            None => {
+                f.buffers.push(entry);
+                f.buffers.len() - 1
+            }
+        };
         Ok(f.buffers[i].buffer.handle())
     }
 
-    /// Acquire a transient image matching `desc`, for `frame` (same cursor discipline as
-    /// [`TransientResources::acquire_buffer`]). Returns `(image, view)` handles for
-    /// [`crate::render_graph::RenderGraph::import_image`] (its initial layout is `UNDEFINED`).
+    /// Acquire a transient image matching `desc`, for `frame`, under a stable `&'static str` `key`
+    /// (same keyed discipline as [`TransientResources::acquire_buffer`]). Returns `(image, view)`
+    /// handles for [`crate::render_graph::RenderGraph::import_image`] (its initial layout is
+    /// `UNDEFINED`).
     pub fn acquire_image(
         &mut self,
         frame: usize,
+        key: &'static str,
         desc: &ImageDesc,
     ) -> crate::Result<(vk::Image, vk::ImageView)> {
         let f = &mut self.frames[frame];
-        let i = f.image_cursor;
-        f.image_cursor += 1;
-        let fits = matches!(f.images.get(i), Some(im) if im.desc == *desc);
-        if !fits {
-            let image = Image::new(&self.resources, desc)?;
-            let entry = TransientImage { image, desc: *desc };
-            if i < f.images.len() {
-                f.images[i] = entry;
-            } else {
-                f.images.push(entry);
-            }
+        let existing = f.images.iter().position(|im| im.key == key);
+        if let Some(i) = existing
+            && f.images[i].desc == *desc
+        {
+            let im = &f.images[i];
+            return Ok((im.image.handle(), im.image.view()));
         }
+        let image = Image::new(&self.resources, desc)?;
+        let entry = TransientImage {
+            key,
+            image,
+            desc: *desc,
+        };
+        let i = match existing {
+            Some(i) => {
+                f.images[i] = entry;
+                i
+            }
+            None => {
+                f.images.push(entry);
+                f.images.len() - 1
+            }
+        };
         let im = &f.images[i];
         Ok((im.image.handle(), im.image.view()))
+    }
+
+    /// The current grow-only capacity of a keyed buffer slot, for reclaim assertions.
+    #[cfg(test)]
+    fn capacity_of(&self, frame: usize, key: &'static str) -> Option<u64> {
+        self.frames[frame]
+            .buffers
+            .iter()
+            .find(|b| b.key == key)
+            .map(|b| b.capacity)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ash::vk;
+
     use super::*;
+
+    /// Keyed acquire is order- and skip-independent: a key maps to its own grow-only slot, so a
+    /// conditionally-present pass reordering or skipping its acquire cannot hand another key the wrong
+    /// allocation (the desync the positional cursor risked). Also exercises `INDIRECT_BUFFER` flowing
+    /// through `Buffer::new` and reuse on re-acquire (§2). Device-backed; skips with no GPU.
+    /// One high-water frame pins a large capacity; after a full window of small-request cycles the
+    /// slot is reclaimed below the session peak. Reclaim happens only in `begin_frame` (post-fence by
+    /// contract), so it can never free an allocation the GPU is still reading. Device-backed; skips
+    /// with no GPU.
+    #[test]
+    fn keyed_slot_reclaims_after_a_window_of_small_frames() {
+        let device = match crate::Device::new(&crate::SurfaceSource::Offscreen) {
+            Ok(device) => device,
+            Err(err) => {
+                eprintln!("skipping: no Vulkan device obtainable ({err})");
+                return;
+            }
+        };
+        let mut pool = TransientResources::new(Arc::clone(device.resources()));
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+
+        let big = 4 * 1024 * 1024;
+        pool.acquire_buffer(0, "vb", big, usage).expect("big");
+        pool.begin_frame(0); // fold the big request into the window
+        let peak = pool.capacity_of(0, "vb").unwrap();
+        assert!(peak >= big);
+
+        // A full window of small requests pushes the big request out of the ring, then the slot shrinks.
+        for _ in 0..RECLAIM_WINDOW {
+            pool.acquire_buffer(0, "vb", 1024, usage).expect("small");
+            pool.begin_frame(0);
+        }
+        let after = pool.capacity_of(0, "vb").unwrap();
+        assert!(
+            after < peak,
+            "capacity reclaimed below the session peak ({after} < {peak})"
+        );
+        // A re-acquire at the small size still hits the (shrunken) slot.
+        let h1 = pool.acquire_buffer(0, "vb", 1024, usage).expect("reuse");
+        let h2 = pool.acquire_buffer(0, "vb", 1024, usage).expect("reuse");
+        assert_eq!(h1, h2, "the reclaimed slot is stable across re-acquires");
+    }
+
+    #[test]
+    fn keyed_acquire_is_order_and_skip_independent() {
+        let device = match crate::Device::new(&crate::SurfaceSource::Offscreen) {
+            Ok(device) => device,
+            Err(err) => {
+                eprintln!("skipping: no Vulkan device obtainable ({err})");
+                return;
+            }
+        };
+        let mut pool = TransientResources::new(Arc::clone(device.resources()));
+        let stor = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let args = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER;
+
+        let a1 = pool.acquire_buffer(0, "a", 1000, stor).expect("a");
+        let b1 = pool.acquire_buffer(0, "b", 2000, args).expect("b");
+        assert_ne!(a1, b1, "distinct keys are distinct allocations");
+
+        // Reversed acquire order next cycle: keys map to their own slots, not positions.
+        pool.begin_frame(0);
+        let b2 = pool.acquire_buffer(0, "b", 2000, args).expect("b");
+        let a2 = pool.acquire_buffer(0, "a", 1000, stor).expect("a");
+        assert_eq!(
+            a1, a2,
+            "same key, same allocation regardless of acquire order"
+        );
+        assert_eq!(
+            b1, b2,
+            "same key, same allocation regardless of acquire order"
+        );
+
+        // Skip "b" entirely this cycle: "a" is still stable (a skipped consumer cannot desync).
+        pool.begin_frame(0);
+        let a3 = pool.acquire_buffer(0, "a", 1000, stor).expect("a");
+        assert_eq!(a1, a3, "skipping b does not desync a");
+
+        // The INDIRECT_BUFFER-usage buffer reuses its allocation on a same-key re-acquire.
+        let b3 = pool.acquire_buffer(0, "b", 2000, args).expect("b");
+        assert_eq!(
+            b1, b3,
+            "indirect-args buffer reuses on re-acquire of equal size + usage"
+        );
+    }
 
     #[test]
     fn grow_bytes_doubles_and_never_shrinks() {
