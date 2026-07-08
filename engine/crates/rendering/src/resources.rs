@@ -513,13 +513,77 @@ impl Drop for Image3D {
     }
 }
 
+/// A per-height min/max pyramid image (`R32G32_SFLOAT`, min in R / max in G, one mip per pyramid
+/// level), owned by the [`GpuTexture`] it was built for and freed with it.
+///
+/// Written into the parallel `heightMinMaxTextures` bindless array (binding 4) at the owning
+/// texture's own slot, so the tessellation factor kernel's `heightIndex` addresses both the texture
+/// and its pyramid. Only a displacement height map carries one; every other texture leaves it `None`.
+pub struct MinMaxPyramid {
+    /// The pyramid image.
+    pub image: vk::Image,
+    /// The view over every pyramid mip.
+    pub view: vk::ImageView,
+    /// The pyramid image's VMA allocation.
+    pub allocation: vk_mem::Allocation,
+}
+
+/// The default 1×1 min/max pyramid (`(0, 0)` → zero local range) seeded into every unbound
+/// `heightMinMaxTextures` slot at init, held by the renderer for its lifetime.
+///
+/// Its own RAII teardown (freed on [`Drop`]), so a non-displacement texture's slot keeps a valid view
+/// pointing here (partially-bound arrays fault on an unbound slot on some drivers). A displacement
+/// height map overwrites its slot with its real [`MinMaxPyramid`].
+pub struct DefaultHeightMinMax {
+    resources: Arc<DeviceResources>,
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: vk_mem::Allocation,
+}
+
+impl DefaultHeightMinMax {
+    /// Wraps the created default image/view/allocation, owning their teardown.
+    pub fn from_parts(
+        resources: &Arc<DeviceResources>,
+        image: vk::Image,
+        view: vk::ImageView,
+        allocation: vk_mem::Allocation,
+    ) -> Self {
+        Self {
+            resources: Arc::clone(resources),
+            image,
+            view,
+            allocation,
+        }
+    }
+
+    /// The default pyramid view seeded into every `heightMinMaxTextures` slot.
+    pub fn view(&self) -> vk::ImageView {
+        self.view
+    }
+}
+
+impl Drop for DefaultHeightMinMax {
+    fn drop(&mut self) {
+        // SAFETY: the ash/VMA seam. The bundle keeps device + allocator alive; view then image, each
+        // freed exactly once. Every displacement slot that overwrote its descriptor has already freed
+        // its own pyramid with its `GpuTexture`, so this frees only the default.
+        unsafe {
+            self.resources.device().destroy_image_view(self.view, None);
+            self.resources
+                .allocator()
+                .destroy_image(self.image, &mut self.allocation);
+        }
+    }
+}
+
 /// A device-local sampled texture (image + view) that also owns a bindless slot.
 ///
 /// [`Drop`] returns the bindless slot to the shared free-list under the mutex (so a
 /// worker-uploaded texture
 /// destroyed off the main thread is safe — README §5), then frees the view and
 /// image. The sampler is shared (the renderer's linear sampler), so it is not owned
-/// here.
+/// here. A displacement height map additionally owns its [`MinMaxPyramid`] (freed here).
 pub struct GpuTexture {
     resources: Arc<DeviceResources>,
     image: vk::Image,
@@ -527,6 +591,8 @@ pub struct GpuTexture {
     allocation: vk_mem::Allocation,
     bindless_index: u32,
     free_list: Option<BindlessFreeList>,
+    /// The per-height min/max pyramid, present only for a displacement height map.
+    min_max: Option<MinMaxPyramid>,
     /// The texture extent.
     pub extent: vk::Extent2D,
     /// The texture format.
@@ -560,6 +626,8 @@ pub struct GpuTextureParts {
     pub extent: vk::Extent2D,
     /// The image format.
     pub format: vk::Format,
+    /// The per-height min/max pyramid, for a displacement height map only (else `None`).
+    pub min_max: Option<MinMaxPyramid>,
 }
 
 impl GpuTexture {
@@ -581,6 +649,7 @@ impl GpuTexture {
             allocation: parts.allocation,
             bindless_index: parts.bindless_index,
             free_list: Some(Arc::clone(free_list)),
+            min_max: parts.min_max,
             extent: parts.extent,
             format: parts.format,
         }
@@ -594,6 +663,11 @@ impl GpuTexture {
     /// The sampled image view.
     pub fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    /// The per-height min/max pyramid view, if this texture is a displacement height map.
+    pub fn min_max_view(&self) -> Option<vk::ImageView> {
+        self.min_max.as_ref().map(|p| p.view)
     }
 
     /// This texture's slot in the bindless array (set 0).
@@ -614,12 +688,22 @@ impl Drop for GpuTexture {
             slots.push(self.bindless_index);
         }
         // SAFETY: the ash/VMA seam. The bundle keeps device + allocator alive; view
-        // then image, each freed exactly once.
+        // then image, each freed exactly once. The min/max pyramid (if any) frees the same way; the
+        // heightMinMax descriptor still points at the destroyed view, but no live displacement material
+        // references the slot (its `Arc<GpuTexture>` is gone), and the next upload overwrites it.
         unsafe {
             self.resources.device().destroy_image_view(self.view, None);
             self.resources
                 .allocator()
                 .destroy_image(self.image, &mut self.allocation);
+            if let Some(mut pyramid) = self.min_max.take() {
+                self.resources
+                    .device()
+                    .destroy_image_view(pyramid.view, None);
+                self.resources
+                    .allocator()
+                    .destroy_image(pyramid.image, &mut pyramid.allocation);
+            }
         }
     }
 }
@@ -812,6 +896,8 @@ pub struct GpuMesh {
     morph: Option<MorphBuffers>,
     /// The meshlet buffers (`None` unless built with mesh-shader support).
     meshlets: Option<MeshletBuffers>,
+    /// The watertight-conditioning buffers (`None` for an empty mesh).
+    conditioning: Option<ConditioningBuffers>,
     /// Number of indices across every submesh.
     pub index_count: u32,
     /// Number of vertices.
@@ -873,6 +959,25 @@ pub struct MorphBuffers {
     pub delta_count: u32,
 }
 
+/// The device-local watertight-conditioning buffers a [`GpuMesh`] carries: the unique-edge list, the
+/// per-triangle edge indices, the per-welded-vertex direction/tangent basis, and the base→welded map
+/// ([`saffron_geometry::MeshConditioning`]). All four are plain `STORAGE_BUFFER`s (compute-read by the
+/// Phase-3 factor pass + Phase-4 dicer); nothing binds them yet in Phase 2.
+pub struct ConditioningBuffers {
+    /// The `Edge` array buffer + allocation (16 B stride).
+    pub edges: (vk::Buffer, vk_mem::Allocation),
+    /// The `TriEdges` array buffer + allocation (16 B stride, one per triangle).
+    pub tri_edges: (vk::Buffer, vk_mem::Allocation),
+    /// The `WeldedVertex` array buffer + allocation (48 B stride).
+    pub welded: (vk::Buffer, vk_mem::Allocation),
+    /// The `weld_id` array buffer + allocation (`u32` per base vertex).
+    pub weld_id: (vk::Buffer, vk_mem::Allocation),
+    /// Number of unique edges.
+    pub edge_count: u32,
+    /// Number of welded vertices.
+    pub welded_count: u32,
+}
+
 // SAFETY: the buffers/allocations carry no thread-affine state; the CPU-side
 // vectors and `Arc<AccelerationStructure>` are `Send`. Meshes are shared as
 // `Arc<GpuMesh>` and may be dropped from the worker thread.
@@ -897,6 +1002,8 @@ pub struct GpuMeshParts {
     pub morph: Option<MorphBuffers>,
     /// The optional device-local meshlet buffers (mesh-shader raster path).
     pub meshlets: Option<MeshletBuffers>,
+    /// The optional device-local watertight-conditioning buffers.
+    pub conditioning: Option<ConditioningBuffers>,
     /// Number of indices across every submesh.
     pub index_count: u32,
     /// Number of vertices.
@@ -932,6 +1039,7 @@ impl GpuMesh {
             skin: parts.skin,
             morph: parts.morph,
             meshlets: parts.meshlets,
+            conditioning: parts.conditioning,
             index_count: parts.index_count,
             vertex_count: parts.vertex_count,
             submeshes: parts.submeshes,
@@ -975,6 +1083,11 @@ impl GpuMesh {
     pub fn meshlets(&self) -> Option<&MeshletBuffers> {
         self.meshlets.as_ref()
     }
+
+    /// The watertight-conditioning buffers, or `None` for an empty mesh.
+    pub fn conditioning(&self) -> Option<&ConditioningBuffers> {
+        self.conditioning.as_ref()
+    }
 }
 
 impl Drop for GpuMesh {
@@ -996,6 +1109,12 @@ impl Drop for GpuMesh {
                 allocator.destroy_buffer(meshlets.descriptors.0, &mut meshlets.descriptors.1);
                 allocator.destroy_buffer(meshlets.vertices.0, &mut meshlets.vertices.1);
                 allocator.destroy_buffer(meshlets.triangles.0, &mut meshlets.triangles.1);
+            }
+            if let Some(c) = self.conditioning.as_mut() {
+                allocator.destroy_buffer(c.edges.0, &mut c.edges.1);
+                allocator.destroy_buffer(c.tri_edges.0, &mut c.tri_edges.1);
+                allocator.destroy_buffer(c.welded.0, &mut c.welded.1);
+                allocator.destroy_buffer(c.weld_id.0, &mut c.weld_id.1);
             }
         }
     }
@@ -1259,6 +1378,7 @@ mod tests {
                     height: 1,
                 },
                 format: vk::Format::R8G8B8A8_UNORM,
+                min_max: None,
             },
             free_list,
         )
@@ -1356,6 +1476,7 @@ mod tests {
                 skin: None,
                 morph: None,
                 meshlets: None,
+                conditioning: None,
                 index_count: 12,
                 vertex_count: 3,
                 submeshes: Vec::new(),
