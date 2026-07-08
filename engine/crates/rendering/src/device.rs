@@ -97,6 +97,17 @@ pub struct Capabilities {
     /// The effective anisotropic-filtering cap for the material sampler: `1.0` when the
     /// device lacks `samplerAnisotropy`, else `min(16, maxSamplerAnisotropy)`.
     pub max_anisotropy: f32,
+    /// Core `multiDrawIndirect`: one `cmd_draw_indexed_indirect` can issue `drawCount > 1` draws
+    /// (Phase 6 batches many displaced instances per call). `false` degrades to `drawCount == 1`.
+    pub multi_draw_indirect: bool,
+    /// `VK_KHR_draw_indirect_count` (core in Vulkan 1.2): the GPU-written draw count drives the
+    /// draw via `cmd_draw_indexed_indirect_count` with no CPU readback (Phase 6).
+    pub draw_indirect_count: bool,
+    /// `PhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructureIndirectBuild`: a BLAS
+    /// can be built with a GPU-provided primitive count via `vkCmdBuildAccelerationStructuresIndirectKHR`
+    /// (Phase 7's preferred path). Only meaningful when [`Capabilities::rt_supported`]. `false` forces
+    /// the CPU worst-case / degenerate-pad build.
+    pub acceleration_structure_indirect_build: bool,
 }
 
 /// The GPU-timestamp profiler facts read once from the physical device at init,
@@ -1064,7 +1075,7 @@ fn probe_optional_features(
 
     let has_as = has_ext(ash::khr::acceleration_structure::NAME);
     let has_rq = has_ext(ash::khr::ray_query::NAME);
-    let rt_supported = if has_as && has_rq {
+    let (rt_supported, acceleration_structure_indirect_build) = if has_as && has_rq {
         let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
         let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
@@ -1072,9 +1083,22 @@ fn probe_optional_features(
             .push_next(&mut rq_feat);
         // SAFETY: the ash seam. Fills the chained RT feature structs.
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
-        as_feat.acceleration_structure != 0 && rq_feat.ray_query != 0
+        let rt = as_feat.acceleration_structure != 0 && rq_feat.ray_query != 0;
+        // The indirect-build path (Phase 7) is only meaningful when RT is actually enabled.
+        (rt, rt && as_feat.acceleration_structure_indirect_build != 0)
     } else {
-        false
+        (false, false)
+    };
+
+    // Indirect draw/dispatch capability (Phases 6/7): `multiDrawIndirect` is core; `drawIndirectCount`
+    // is a Vulkan 1.2 feature read through a chained query.
+    let multi_draw_indirect = core_features.multi_draw_indirect != 0;
+    let draw_indirect_count = {
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
+        // SAFETY: the ash seam. Fills the chained Vulkan 1.2 feature struct.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+        v12.draw_indirect_count != 0
     };
 
     let mesh_shader_supported = if has_ext(ash::ext::mesh_shader::NAME) {
@@ -1107,6 +1131,9 @@ fn probe_optional_features(
         } else {
             1.0
         },
+        multi_draw_indirect,
+        draw_indirect_count,
+        acceleration_structure_indirect_build,
     }
 }
 
@@ -1196,6 +1223,28 @@ fn create_logical_device(
     if core_features.sampler_anisotropy != 0 {
         enabled_core = enabled_core.sampler_anisotropy(true);
     }
+    // `multiDrawIndirect` (core) lets one indirect draw issue `drawCount > 1` — Phase 6 batches many
+    // displaced instances per call. Enabling an advertised optional feature is free; guard it so a
+    // device lacking it (llvmpipe) still creates cleanly.
+    if core_features.multi_draw_indirect != 0 {
+        enabled_core = enabled_core.multi_draw_indirect(true);
+    }
+    // Advertised support for `drawIndirectCount` (Vulkan 1.2) + `accelerationStructureIndirectBuild`
+    // (Phases 6/7). Probed through a chained query; the AS struct is only chained when RT is enabled.
+    let (adv_draw_indirect_count, adv_as_indirect_build) = {
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut as_probe = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
+        if enable_rt {
+            feat2 = feat2.push_next(&mut as_probe);
+        }
+        // SAFETY: the ash seam. Fills the chained indirect-capability feature structs.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+        (
+            v12.draw_indirect_count != 0,
+            enable_rt && as_probe.acceleration_structure_indirect_build != 0,
+        )
+    };
 
     // Slang's `SV_VertexID` fullscreen-triangle shaders (the sky / post passes) emit the
     // SPIR-V `DrawParameters` capability, so the device must enable `shaderDrawParameters`.
@@ -1206,11 +1255,20 @@ fn create_logical_device(
         .descriptor_binding_sampled_image_update_after_bind(true)
         .shader_sampled_image_array_non_uniform_indexing(true)
         .buffer_device_address(true);
+    // The GPU-written-draw-count path (Phase 6) — enabled only when advertised.
+    if adv_draw_indirect_count {
+        features12 = features12.draw_indirect_count(true);
+    }
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
     let mut as_feat =
         vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
+    // The indirect BLAS-build path (Phase 7) — enabled only when advertised (and only pushed under
+    // the `enable_rt` guard below).
+    if adv_as_indirect_build {
+        as_feat = as_feat.acceleration_structure_indirect_build(true);
+    }
     let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
     let mut ms_feat = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
         .mesh_shader(true)
@@ -1426,6 +1484,23 @@ mod tests {
             device.surface().is_none(),
             "the offscreen device creates no surface"
         );
+        // The indirect-build capability is only ever set when RT itself is enabled — the invariant
+        // Phase 7 relies on (the flag is meaningless without an acceleration structure).
+        assert!(
+            !device.capabilities.acceleration_structure_indirect_build
+                || device.capabilities.rt_supported,
+            "accel-struct indirect build is never reported without RT support"
+        );
         device.wait_idle().expect("an idle device waits cleanly");
+    }
+
+    /// The three indirect-capability fields default off and never gate selection — a device lacking
+    /// them (llvmpipe reports them however its driver does) is still selected and used.
+    #[test]
+    fn indirect_capability_fields_default_off() {
+        let caps = Capabilities::default();
+        assert!(!caps.multi_draw_indirect);
+        assert!(!caps.draw_indirect_count);
+        assert!(!caps.acceleration_structure_indirect_build);
     }
 }
