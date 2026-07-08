@@ -32,6 +32,22 @@ pub(crate) fn record_batch_submeshes(
     batch: &DrawBatch,
     cull_modes: Option<&[vk::CullModeFlags]>,
 ) {
+    // A tessellated (`HeightMode::Displacement`) batch draws its amplified transient VB/IB as one
+    // indirect draw sourced from the GPU-seeded `VkDrawIndexedIndirectCommand` (index/first-index/
+    // vertex-offset/first-instance are all in the buffer). The floor form (`drawCount = 1`) needs no
+    // device feature, so it draws on every implementation.
+    if let Some(t) = &batch.tessellated {
+        if let Some(&mode) = cull_modes.and_then(|m| m.first()) {
+            // SAFETY: the ash seam. The scene PSO declares dynamic cull state.
+            unsafe { raw.cmd_set_cull_mode(cmd, mode) };
+        }
+        // SAFETY: the ash seam. `args_buffer` was allocated with `INDIRECT_BUFFER` usage and holds one
+        // `VkDrawIndexedIndirectCommand` (20 B) at `args_offset`; the tessellated VB/IB are bound.
+        unsafe {
+            raw.cmd_draw_indexed_indirect(cmd, t.args_buffer, t.args_offset, 1, 20);
+        }
+        return;
+    }
     if batch.mesh.submeshes.is_empty() {
         if let Some(&mode) = cull_modes.and_then(|m| m.first()) {
             // SAFETY: the ash seam. The scene PSO declares dynamic cull state.
@@ -91,6 +107,17 @@ fn bind_batch_vertices(
     batch: &DrawBatch,
     deformed: Option<vk::Buffer>,
 ) {
+    // A tessellated batch binds the frame's amplified transient VB (binding 0) + generated index
+    // stream (both 48 B `Vertex` / u32, matching the static attribute + index state).
+    if let Some(t) = &batch.tessellated {
+        // SAFETY: the ash seam. The transient VB/IB are pinned by the frame's `TransientResources`
+        // until this slot's fence; `cmd` is recording inside the pass.
+        unsafe {
+            raw.cmd_bind_vertex_buffers(cmd, 0, &[t.vertex_buffer], &[0]);
+            raw.cmd_bind_index_buffer(cmd, t.index_buffer, 0, vk::IndexType::UINT32);
+        }
+        return;
+    }
     let vertex_buffer = match (batch.deformed, deformed) {
         (true, Some(deformed)) => deformed,
         _ => batch.mesh.vertex_buffer(),
@@ -889,7 +916,6 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
-        let mut displacement = crate::Displacement::new(&device).expect("Displacement");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
@@ -904,7 +930,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[item],
                 &[],
                 DrawListInputs {
@@ -914,6 +939,9 @@ mod tests {
                     default_texture_index: crate::DEFAULT_WHITE_SLOT,
                     rt_skinned: false,
                     displace_enabled: true,
+                    tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
+                    tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
+                    tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
                 },
             )
             .expect("submit_draw_list");
@@ -932,7 +960,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(_lighting);

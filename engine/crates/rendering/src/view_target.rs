@@ -1712,7 +1712,6 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
-        let mut displacement = crate::Displacement::new(&device).expect("Displacement");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
@@ -1753,7 +1752,6 @@ mod tests {
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[item],
                 &[],
                 DrawListInputs {
@@ -1763,6 +1761,9 @@ mod tests {
                     default_texture_index: crate::DEFAULT_WHITE_SLOT,
                     rt_skinned: false,
                     displace_enabled: true,
+                    tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
+                    tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
+                    tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
                 },
             )
             .expect("submit_draw_list");
@@ -2042,7 +2043,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(ssao);

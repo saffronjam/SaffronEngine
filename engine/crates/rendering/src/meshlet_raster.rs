@@ -4,10 +4,10 @@
 //!
 //! Capability- **and** opt-in-gated: the renderer engages it only when the device advertises
 //! `VK_EXT_mesh_shader` *and* `SAFFRON_MESH_SHADER` is set, so the validated index-draw path stays the
-//! default. It mirrors [`crate::displacement::Displacement`]'s per-frame descriptor-pool discipline: one
+//! default. It mirrors [`crate::skinning::Skinning`]'s per-frame descriptor-pool discipline: one
 //! pool per frame-in-flight, reset at wire time, one set-8 (meshlet geometry + base vertex stream) per
 //! (submesh, instance) draw. A batch's meshlet vertices are global indices into the mesh's own vertex
-//! buffer; a skinned/displaced batch reads the shared deformed buffer instead, with `vertex_base`
+//! buffer; a skinned/morph batch reads the shared deformed buffer instead, with `vertex_base`
 //! shifting each index into that batch's deformed slice — exactly the buffer choice the index path makes.
 
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub struct MeshletPush {
     pub meshlet_base: u32,
     /// Meshlets in this submesh (the task dispatch size).
     pub meshlet_count: u32,
-    /// Added to each global vertex index — the deformed slice for a skinned/displaced batch, else 0.
+    /// Added to each global vertex index — the deformed slice for a skinned/morph batch, else 0.
     pub vertex_base: u32,
 }
 
@@ -105,7 +105,7 @@ impl MeshletRaster {
 
     /// Wires the opaque meshlet draws for `frame`: resets the pool, then per opaque batch → submesh →
     /// instance allocates a set 8 (the mesh's meshlet buffers + its vertex stream — the deformed
-    /// buffer for a skinned/displaced batch) and records the push. Returns the wired draws, or `None`
+    /// buffer for a skinned/morph batch) and records the push. Returns the wired draws, or `None`
     /// when **any** opaque batch lacks a meshlet decomposition (upload built none) or a set allocation
     /// fails, so the renderer falls back to the whole-list index path rather than dropping a batch.
     pub fn wire(
