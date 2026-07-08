@@ -21,15 +21,16 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use saffron_geometry::glam::Vec3;
 use saffron_geometry::{
-    GridDesc, Mesh, Meshlet, MorphData, MorphDelta, Sdf, Submesh, VertexSkin, bake_grid,
-    build_meshlets, sdf_chunk_cores, sdf_set_from_bytes, sdf_set_to_bytes,
+    GridDesc, Mesh, MeshConditioning, Meshlet, MorphData, MorphDelta, Sdf, Submesh, VertexSkin,
+    bake_grid, build_meshlets, build_min_max_pyramid, sdf_chunk_cores, sdf_set_from_bytes,
+    sdf_set_to_bytes,
 };
 use vk_mem::Alloc;
 
 use crate::descriptors::Descriptors;
 use crate::resources::{
-    DeviceResources, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts,
-    Image3D, MeshletBuffers, MorphBuffers,
+    ConditioningBuffers, DeviceResources, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture,
+    GpuTextureParts, Image3D, MeshletBuffers, MinMaxPyramid, MorphBuffers,
 };
 use crate::{Device, Error, Result, checked};
 
@@ -390,10 +391,13 @@ impl Uploader {
         // freed directly here rather than tracked by a copied handle.
         let allocator = self.allocator();
         let vertex = make_device_buffer(allocator, vertex_bytes, vertex_usage)?;
+        // STORAGE too: the tessellation emit kernel reads the base index stream as a `ByteAddressBuffer`
+        // (`baseIndices`) to fetch each base triangle's corners, so a displaced mesh's index buffer is
+        // bound as a storage buffer — the same per-material reason the vertex buffer carries STORAGE.
         let index = match make_device_buffer(
             allocator,
             index_bytes,
-            vk::BufferUsageFlags::INDEX_BUFFER | rt_usage,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER | rt_usage,
         ) {
             Ok(buf) => buf,
             Err(err) => {
@@ -541,12 +545,23 @@ impl Uploader {
             None
         };
 
+        // Build + upload the watertight-conditioning buffers (edges/weld/basis). A failure is logged,
+        // not fatal — nothing consumes them until Phase 3, so the mesh simply carries none.
+        let conditioning_buffers = match self.upload_conditioning_buffers(mesh) {
+            Ok(buffers) => buffers,
+            Err(err) => {
+                tracing::warn!("conditioning upload failed: {err}");
+                None
+            }
+        };
+
         let parts = GpuMeshParts {
             vertex,
             index,
             skin: skin_buf,
             morph: morph_buffers,
             meshlets: meshlet_buffers,
+            conditioning: conditioning_buffers,
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertices.len() as u32,
             submeshes: mesh.submeshes.clone(),
@@ -1584,6 +1599,136 @@ impl Uploader {
         }))
     }
 
+    /// Builds the watertight-conditioning data ([`MeshConditioning`], a pure function of the mesh, as
+    /// the meshlet clusterer is) and uploads its four arrays as device-local `STORAGE_BUFFER`s: the
+    /// unique edges, the per-triangle edge indices, the per-welded-vertex basis, and the base→welded
+    /// map. One staging buffer with four contiguous slices, one `cmd_copy_buffer` per slice.
+    /// Non-fatal on failure (the mesh then carries no conditioning), mirroring the meshlet path.
+    fn upload_conditioning_buffers(&self, mesh: &Mesh) -> Result<Option<ConditioningBuffers>> {
+        if mesh.vertices.is_empty() {
+            return Ok(None);
+        }
+        let cond = MeshConditioning::build(mesh);
+
+        let edges_bytes = std::mem::size_of_val(cond.edges.as_slice());
+        let tri_bytes = std::mem::size_of_val(cond.tri_edges.as_slice());
+        let welded_bytes = std::mem::size_of_val(cond.welded.as_slice());
+        let weld_id_bytes = std::mem::size_of_val(cond.weld_id.as_slice());
+        // Grow-to-stride so an empty array (a mesh with no triangles) still backs a valid buffer.
+        let edges_size = edges_bytes.max(16) as vk::DeviceSize;
+        let tri_size = tri_bytes.max(16) as vk::DeviceSize;
+        let welded_size =
+            welded_bytes.max(size_of::<saffron_geometry::WeldedVertex>()) as vk::DeviceSize;
+        let weld_id_size = weld_id_bytes.max(4) as vk::DeviceSize;
+
+        let mut staging = StagingBuffer::new(
+            self.allocator(),
+            edges_size + tri_size + welded_size + weld_id_size,
+        )?;
+        {
+            let bytes = staging.mapped_slice();
+            let (e, t, w) = (edges_size as usize, tri_size as usize, welded_size as usize);
+            if edges_bytes > 0 {
+                bytes[..edges_bytes].copy_from_slice(bytemuck::cast_slice(&cond.edges));
+            }
+            if tri_bytes > 0 {
+                bytes[e..e + tri_bytes].copy_from_slice(bytemuck::cast_slice(&cond.tri_edges));
+            }
+            if welded_bytes > 0 {
+                bytes[e + t..e + t + welded_bytes]
+                    .copy_from_slice(bytemuck::cast_slice(&cond.welded));
+            }
+            if weld_id_bytes > 0 {
+                bytes[e + t + w..e + t + w + weld_id_bytes]
+                    .copy_from_slice(bytemuck::cast_slice(&cond.weld_id));
+            }
+        }
+        staging.flush();
+
+        let allocator = self.allocator();
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let edges_buf = make_device_buffer(allocator, edges_size, usage)?;
+        let tri_buf = match make_device_buffer(allocator, tri_size, usage) {
+            Ok(buf) => buf,
+            Err(err) => {
+                free_one(allocator, edges_buf);
+                return Err(err);
+            }
+        };
+        let welded_buf = match make_device_buffer(allocator, welded_size, usage) {
+            Ok(buf) => buf,
+            Err(err) => {
+                free_one(allocator, edges_buf);
+                free_one(allocator, tri_buf);
+                return Err(err);
+            }
+        };
+        let weld_id_buf = match make_device_buffer(allocator, weld_id_size, usage) {
+            Ok(buf) => buf,
+            Err(err) => {
+                free_one(allocator, edges_buf);
+                free_one(allocator, tri_buf);
+                free_one(allocator, welded_buf);
+                return Err(err);
+            }
+        };
+
+        let copy = self.with_one_off_commands(|cmd| {
+            // SAFETY: the ash seam. All four device buffers outlive the submit-wait; the staging
+            // buffer is the source for each contiguous slice.
+            unsafe {
+                let raw = self.raw();
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    edges_buf.0,
+                    &[vk::BufferCopy::default().size(edges_size)],
+                );
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    tri_buf.0,
+                    &[vk::BufferCopy::default()
+                        .src_offset(edges_size)
+                        .size(tri_size)],
+                );
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    welded_buf.0,
+                    &[vk::BufferCopy::default()
+                        .src_offset(edges_size + tri_size)
+                        .size(welded_size)],
+                );
+                raw.cmd_copy_buffer(
+                    cmd,
+                    staging.handle(),
+                    weld_id_buf.0,
+                    &[vk::BufferCopy::default()
+                        .src_offset(edges_size + tri_size + welded_size)
+                        .size(weld_id_size)],
+                );
+            }
+        });
+        drop(staging);
+        if let Err(err) = copy {
+            free_one(allocator, edges_buf);
+            free_one(allocator, tri_buf);
+            free_one(allocator, welded_buf);
+            free_one(allocator, weld_id_buf);
+            return Err(err);
+        }
+
+        Ok(Some(ConditioningBuffers {
+            edges: edges_buf,
+            tri_edges: tri_buf,
+            welded: welded_buf,
+            weld_id: weld_id_buf,
+            edge_count: cond.edges.len() as u32,
+            welded_count: cond.welded.len() as u32,
+        }))
+    }
+
     /// Uploads tightly packed RGBA8 pixels as a sampled, mipmapped texture in the
     /// bindless array, claiming a slot in `descriptors` and writing the view into it.
     ///
@@ -1641,7 +1786,7 @@ impl Uploader {
             return Err(err);
         }
 
-        self.finish_texture(descriptors, uploaded)
+        self.finish_texture(descriptors, uploaded, None)
     }
 
     /// Uploads the 1×1 white RGBA8 texture and seeds it into *every* bindless slot,
@@ -1765,7 +1910,298 @@ impl Uploader {
             return Err(err);
         }
 
-        self.finish_texture(descriptors, uploaded)
+        self.finish_texture(descriptors, uploaded, None)
+    }
+
+    /// Uploads an RGBA8 image as a sampled, mipmapped **displacement height** texture *and* builds its
+    /// per-height min/max pyramid, writing both into the same bindless slot (the texture at binding 0,
+    /// the pyramid at binding 4). Mirrors [`Uploader::upload_texture`] with `srgb = false` (height is
+    /// linear data), then attaches the pyramid so the tessellation factor kernel refines per-region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ZeroSizedImage`] for a zero extent or [`Error::Vk`] for a failing Vulkan/VMA
+    /// call; allocated resources are freed before return on error.
+    pub fn upload_height_texture(
+        &self,
+        descriptors: &Descriptors,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Arc<GpuTexture>> {
+        if width == 0 || height == 0 {
+            return Err(Error::ZeroSizedImage);
+        }
+        // The min/max pyramid over the height channel (R), built + uploaded first; freed on the texture
+        // failure path below (finish_texture takes ownership on success).
+        let pyramid = self.build_and_upload_pyramid(rgba, width, height)?;
+
+        let bytes = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
+        let mut staging = match StagingBuffer::new(self.allocator(), bytes) {
+            Ok(staging) => staging,
+            Err(err) => {
+                self.free_pyramid(pyramid);
+                return Err(err);
+            }
+        };
+        staging.mapped_slice()[..bytes as usize].copy_from_slice(&rgba[..bytes as usize]);
+        staging.flush();
+
+        let mip_levels = mip_count(width, height);
+        let uploaded = match self.create_sampled_image(
+            width,
+            height,
+            mip_levels,
+            vk::Format::R8G8B8A8_UNORM,
+        ) {
+            Ok(uploaded) => uploaded,
+            Err(err) => {
+                drop(staging);
+                self.free_pyramid(pyramid);
+                return Err(err);
+            }
+        };
+        let image = uploaded.image;
+        let recorded = self.with_one_off_commands(|cmd| {
+            // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
+            unsafe {
+                record_texture_upload(
+                    self.raw(),
+                    cmd,
+                    image,
+                    staging.handle(),
+                    width,
+                    height,
+                    mip_levels,
+                )
+            };
+        });
+        drop(staging);
+        if let Err(err) = recorded {
+            self.destroy_image(uploaded.image, uploaded.allocation);
+            self.free_pyramid(pyramid);
+            return Err(err);
+        }
+
+        self.finish_texture(descriptors, uploaded, Some(pyramid))
+    }
+
+    /// Builds the min/max pyramid over the height channel (R, normalized `[0, 1]`) on the CPU and
+    /// uploads it into an `R32G32_SFLOAT` image (min in R / max in G, one mip per pyramid level). Each
+    /// level is written directly (no blit — a blit would linearly filter, breaking the conservative
+    /// bound); the CPU levels are the exact per-texel `(min, max)`.
+    fn build_and_upload_pyramid(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<MinMaxPyramid> {
+        let texel_count = (width as usize) * (height as usize);
+        let heights: Vec<f32> = (0..texel_count)
+            .map(|i| f32::from(rgba[i * 4]) / 255.0)
+            .collect();
+        let levels = build_min_max_pyramid(&heights, width, height);
+        // A degenerate input yields no levels; fall back to a single 1×1 `(min, max)` over the image so
+        // the slot always holds a valid pyramid (the factor kernel clamps the LOD).
+        let mip_levels = levels.len().max(1) as u32;
+
+        // Stage every level's `[min, max]` texels contiguously; each level starts 8-byte aligned (the
+        // texel block size), satisfying the buffer-image copy offset alignment.
+        let mut packed: Vec<[f32; 2]> = Vec::new();
+        let mut level_offsets: Vec<vk::DeviceSize> = Vec::with_capacity(levels.len());
+        for level in &levels {
+            level_offsets.push((packed.len() * std::mem::size_of::<[f32; 2]>()) as vk::DeviceSize);
+            packed.extend_from_slice(&level.texels);
+        }
+        if packed.is_empty() {
+            packed.push([0.0, 0.0]);
+            level_offsets.push(0);
+        }
+        let bytes = (packed.len() * std::mem::size_of::<[f32; 2]>()) as vk::DeviceSize;
+        let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
+        staging.mapped_slice()[..bytes as usize].copy_from_slice(bytemuck::cast_slice(&packed));
+        staging.flush();
+
+        let uploaded =
+            self.create_sampled_image(width, height, mip_levels, vk::Format::R32G32_SFLOAT)?;
+        let image = uploaded.image;
+        let dims: Vec<(u32, u32)> = if levels.is_empty() {
+            vec![(1, 1)]
+        } else {
+            levels.iter().map(|l| (l.width, l.height)).collect()
+        };
+        let recorded = self.with_one_off_commands(|cmd| {
+            // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
+            unsafe {
+                let raw = self.raw();
+                transition_image(
+                    raw,
+                    cmd,
+                    image,
+                    mip_levels,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+                for (mip, &(w, h)) in dims.iter().enumerate() {
+                    copy_buffer_to_image_mip(
+                        raw,
+                        cmd,
+                        staging.handle(),
+                        image,
+                        level_offsets[mip],
+                        mip as u32,
+                        vk::Extent2D {
+                            width: w,
+                            height: h,
+                        },
+                    );
+                }
+                transition_image(
+                    raw,
+                    cmd,
+                    image,
+                    mip_levels,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                );
+            }
+        });
+        drop(staging);
+        if let Err(err) = recorded {
+            self.destroy_image(uploaded.image, uploaded.allocation);
+            return Err(err);
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R32G32_SFLOAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: mip_levels,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        // SAFETY: the ash seam. The view references the pyramid image just uploaded.
+        let view = match unsafe { self.raw().create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(result) => {
+                self.destroy_image(uploaded.image, uploaded.allocation);
+                return Err(Error::Vk {
+                    context: "create_image_view (min/max pyramid)",
+                    result,
+                });
+            }
+        };
+        Ok(MinMaxPyramid {
+            image,
+            view,
+            allocation: uploaded.allocation,
+        })
+    }
+
+    /// Frees a not-yet-owned [`MinMaxPyramid`] on an upload error path (before a `GpuTexture` takes it).
+    fn free_pyramid(&self, pyramid: MinMaxPyramid) {
+        // SAFETY: the ash/VMA seam. The view/image were created here and not yet owned; freed once.
+        unsafe { self.raw().destroy_image_view(pyramid.view, None) };
+        self.destroy_image(pyramid.image, pyramid.allocation);
+    }
+
+    /// Uploads the default 1×1 `(0, 0)` min/max pyramid and seeds it into *every*
+    /// `heightMinMaxTextures` slot (binding 4), returning the holder the renderer keeps for its
+    /// lifetime. A non-displacement texture's slot keeps this default (zero local range → no extra
+    /// tessellation refinement); a displacement height map overwrites its slot with its real pyramid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Vk`]/[`Error::ZeroSizedImage`] for a failing Vulkan/VMA call.
+    pub fn upload_default_height_minmax(
+        &self,
+        descriptors: &Descriptors,
+    ) -> Result<crate::resources::DefaultHeightMinMax> {
+        let bytes = std::mem::size_of::<[f32; 2]>() as vk::DeviceSize;
+        let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
+        staging.mapped_slice()[..bytes as usize]
+            .copy_from_slice(bytemuck::cast_slice(&[0.0f32, 0.0]));
+        staging.flush();
+
+        let uploaded = self.create_sampled_image(1, 1, 1, vk::Format::R32G32_SFLOAT)?;
+        let image = uploaded.image;
+        let recorded = self.with_one_off_commands(|cmd| {
+            // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
+            unsafe {
+                let raw = self.raw();
+                transition_image(
+                    raw,
+                    cmd,
+                    image,
+                    1,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+                copy_buffer_to_image(raw, cmd, staging.handle(), image, 1, 1);
+                transition_image(
+                    raw,
+                    cmd,
+                    image,
+                    1,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                );
+            }
+        });
+        drop(staging);
+        if let Err(err) = recorded {
+            self.destroy_image(uploaded.image, uploaded.allocation);
+            return Err(err);
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R32G32_SFLOAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        // SAFETY: the ash seam. The view references the default image just uploaded.
+        let view = match unsafe { self.raw().create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(result) => {
+                self.destroy_image(uploaded.image, uploaded.allocation);
+                return Err(Error::Vk {
+                    context: "create_image_view (default min/max)",
+                    result,
+                });
+            }
+        };
+        descriptors.seed_all_height_minmax(view);
+        Ok(crate::resources::DefaultHeightMinMax::from_parts(
+            &self.resources,
+            image,
+            view,
+            uploaded.allocation,
+        ))
     }
 
     /// Creates a device-local sampled image (`TRANSFER_DST | TRANSFER_SRC | SAMPLED`,
@@ -1817,11 +2253,14 @@ impl Uploader {
     }
 
     /// Creates the sampled view, claims a bindless slot, writes the texture into the
-    /// global set, and wraps the image as a [`GpuTexture`] owning that slot.
+    /// global set, and wraps the image as a [`GpuTexture`] owning that slot. When `min_max` is
+    /// present (a displacement height map) the pyramid is written into binding 4 at the same slot, so
+    /// the factor kernel's `heightIndex` addresses both, and the [`GpuTexture`] owns it.
     fn finish_texture(
         &self,
         descriptors: &Descriptors,
         uploaded: UploadedImage,
+        min_max: Option<MinMaxPyramid>,
     ) -> Result<Arc<GpuTexture>> {
         let UploadedImage {
             image,
@@ -1855,7 +2294,7 @@ impl Uploader {
         };
 
         // Claim a bindless slot (reusing a reclaimed one) and write the texture in. A full
-        // array skips the upload (freeing the image) rather than writing out of range.
+        // array skips the upload (freeing the image + any pyramid) rather than writing out of range.
         let Some(index) = descriptors.claim_slot() else {
             tracing::warn!(
                 "albedo bindless array full ({}), texture skipped",
@@ -1865,9 +2304,15 @@ impl Uploader {
             // `GpuTexture`; free it once on this array-full path before the image.
             unsafe { self.raw().destroy_image_view(view, None) };
             self.destroy_image(image, allocation);
+            if let Some(pyramid) = min_max {
+                self.free_pyramid(pyramid);
+            }
             return Err(Error::BindlessFull("albedo texture"));
         };
         descriptors.write_texture(view, index);
+        if let Some(pyramid) = &min_max {
+            descriptors.write_height_minmax(pyramid.view, index);
+        }
 
         let texture = GpuTexture::from_parts(
             &self.resources,
@@ -1878,6 +2323,7 @@ impl Uploader {
                 bindless_index: index,
                 extent: vk::Extent2D { width, height },
                 format,
+                min_max,
             },
             descriptors.free_list(),
         );
@@ -2639,6 +3085,47 @@ unsafe fn copy_buffer_to_image(
         .image_extent(vk::Extent3D {
             width,
             height,
+            depth: 1,
+        });
+    // SAFETY: the caller's recording contract.
+    unsafe {
+        raw.cmd_copy_buffer_to_image(
+            cmd,
+            src,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
+}
+
+/// Copies `mip_level`'s `width`×`height` texels from `src` at `buffer_offset` into `image` (in
+/// `TRANSFER_DST`) — the per-level path the min/max pyramid uses (each level is exact CPU data, so it
+/// is copied directly rather than blitted).
+///
+/// # Safety
+///
+/// `cmd` recording; `src`/`image` outlive the submit; `buffer_offset` is aligned to the texel block.
+unsafe fn copy_buffer_to_image_mip(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: vk::Buffer,
+    image: vk::Image,
+    buffer_offset: vk::DeviceSize,
+    mip_level: u32,
+    extent: vk::Extent2D,
+) {
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(buffer_offset)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
             depth: 1,
         });
     // SAFETY: the caller's recording contract.
