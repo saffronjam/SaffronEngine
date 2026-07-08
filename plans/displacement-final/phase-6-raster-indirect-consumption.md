@@ -1,6 +1,45 @@
 # Phase 6 — Raster consumption across all seven passes + height-mode routing default + delete the preview-sphere crutch
 
-**Status:** NOT STARTED
+**Status:** COMPLETED (code-complete; the displaced-surface look is a GPU-with-eyes check on presenting
+hardware). All seven raster passes draw the tessellated VB/IB via the portable indirect-draw floor form;
+`detect_height_mode` re-pinned to Parallax; the preview-sphere crutch deleted; the RT half landed in
+Phase 7; and the final 1:1-path deletion is done (see Phase 4). Gated green (workspace clippy clean, 191
+rendering tests pass, headless validation-clean on the RTX 3070 Ti).
+
+> Landed (build/shader-compile/CPU-test/validation-clean-headless gated):
+> - **`TessDraw` + `DrawBatch.tessellated`** — a displaced batch carries the per-frame transient VB/IB +
+>   indirect-args handles, filled mid-render by `Renderer::record_tess_prep` (matched to the batch by
+>   `base_instance`, since the transients don't exist at draw-list build time).
+> - **Shared draw pair (`scene_pass.rs`)** — `bind_batch_vertices` binds the tessellated VB (binding 0) +
+>   generated IB; `record_batch_submeshes` draws it with `cmd_draw_indexed_indirect(args, offset, 1, 20)`
+>   (the **floor form**, `drawCount = 1`, valid on every implementation incl. llvmpipe — no feature
+>   probe). This reaches all seven passes because they all route through this pair.
+> - **Motion pass (`aa.rs record_motion`)** — a tessellated branch binds the tessellated VB as both
+>   current + previous streams (zero motion for a static instance until Phase 5's prev slice) + the
+>   generated IB, then the shared indirect draw.
+> - **`firstInstance` seeding** — `tess_finalize.slang` + `TessFinalizePush` now seed the draw's
+>   `firstInstance = base_instance` (the submesh-major instance row the vertex shader indexes), passed
+>   from the draw list through `record_tess_prep`.
+> - **Emit→fetch barrier** — one memory barrier at the `tess-emit` pass tail (compute-write →
+>   vertex/index/indirect read) makes the amplified geometry visible to the fixed-function fetch across
+>   all consumers (the graph runs passes in add order; emit precedes every raster pass).
+> - **`detect_height_mode` re-pinned to Parallax** (`scan.rs`) — an imported height map is **never**
+>   auto-routed to Displacement (that costs tessellation + a BLAS); it is a deliberate editor choice.
+>   Tests updated (`scan_tests.rs`, `manage.rs`).
+> - **Preview-sphere crutch deleted (NO-LEGACY)** — `preview_displacement_sphere` + its UV const
+>   (`primitives.rs`), `PREVIEW_DISPLACE_SPHERE_MESH_ID` + its reserved-id test rows (`assets/lib.rs`),
+>   the `load.rs` seeding branch, and the geometry export are gone; `attach_preview_sphere` repoints to
+>   the ordinary `BUILTIN_SPHERE_MESH_ID`, and `preview_material_for_texture`'s Height branch previews as
+>   Parallax (no forced Displacement + magic `0.08`). Preview == scene through the real tessellating path.
+>
+> Deferred (sequenced so the tree never regresses RT):
+> - **The feature-gated draw ladder** (`_count` + multi-draw fast forms) over the portable floor — a
+>   perf refinement; the floor is correct + universal now.
+> - **The final 1:1-path deletion** (`displace.slang` + the `Displacement` Displacement-mode subsystem +
+>   the displaced ring reservation + the displaced `DeformedRtInstance`) lands **after Phase 7** rebuilds
+>   the RT BLAS from the tessellated VB/IB — so RT is never left without a displaced source. Until then
+>   the 1:1 displace compute still runs (dead work for raster, still feeding the coarse RT BLAS); the
+>   tessellated path is what the seven raster passes draw.
 
 ## Goal
 
