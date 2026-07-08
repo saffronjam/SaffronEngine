@@ -316,6 +316,7 @@ pub fn extract_sub_asset(
     assets.model_by_uuid.remove(&model_id.value());
     assets.mesh_by_uuid.remove(&sub_id.value());
     assets.texture_by_uuid.remove(&sub_id.value());
+    assets.height_texture_by_uuid.remove(&sub_id.value());
     assets.invalidate_material_caches();
     Ok(sub_id)
 }
@@ -378,6 +379,7 @@ pub fn clear_extraction(assets: &mut AssetServer, model_id: Uuid, sub_id: Uuid) 
     assets.model_by_uuid.remove(&model_id.value());
     assets.mesh_by_uuid.remove(&sub_id.value());
     assets.texture_by_uuid.remove(&sub_id.value());
+    assets.height_texture_by_uuid.remove(&sub_id.value());
     // The sub-asset resolves from the embedded chunk again; drop its memoized material resolution.
     assets.invalidate_material_caches();
     Ok(())
@@ -494,6 +496,7 @@ pub fn reimport_model(assets: &mut AssetServer, model_id: Uuid) -> Result<Reimpo
     for sid in new_subs.union(&old_subs) {
         assets.mesh_by_uuid.remove(sid);
         assets.texture_by_uuid.remove(sid);
+        assets.height_texture_by_uuid.remove(sid);
     }
     // Embedded material chunks were re-baked under stable ids, so their cached resolutions are stale.
     assets.invalidate_material_caches();
@@ -1507,9 +1510,10 @@ mod tests {
         assert_ne!(material.normal_texture.value(), 0);
         assert_ne!(material.orm_texture.value(), 0);
         assert_ne!(material.height_texture.value(), 0);
-        // The ambientCG `*_Displacement` map imports in real-displacement mode (D2 routing) so the
-        // preview shows a true silhouette, not swimming POM.
-        assert_eq!(material.height_mode, saffron_core::HeightMode::Displacement);
+        // An imported height map is never auto-routed to Displacement (that costs tessellation + a
+        // per-frame BLAS) — it imports as Parallax; the user promotes it in the editor's `heightMode`
+        // dropdown when a true displaced silhouette is wanted.
+        assert_eq!(material.height_mode, saffron_core::HeightMode::Parallax);
         assert!(
             subs.iter().any(|e| e.id == material.normal_texture),
             "the normal slot points at an embedded sub-texture"

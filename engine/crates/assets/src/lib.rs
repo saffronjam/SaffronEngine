@@ -41,6 +41,10 @@ mod project_load;
 mod render_material;
 mod render_scene;
 mod scan;
+// The UV-seam height-value reconciler: a foundation consumed by the Phase-4 dicer (which reads the
+// per-seam sampling mode) and the optional material-import dilation. Dead until then.
+#[allow(dead_code)]
+mod seam;
 mod spawn;
 mod thumbnail;
 
@@ -136,12 +140,6 @@ pub const PREVIEW_MATERIAL_ID: Uuid = Uuid(6);
 /// rendered on the offscreen Thumbnail view can never overwrite the slot an interactive texture
 /// preview is using. Never a catalog row.
 pub const PREVIEW_THUMBNAIL_MATERIAL_ID: Uuid = Uuid(8);
-
-/// The densely-subdivided sphere the interactive material/texture preview shades on, in the
-/// reserved (`< 1024`) range. Its high tessellation lets a displacement-enabled `.smat` move real
-/// vertices under vertex-shader displacement (a true silhouette). Seeded into the GPU mesh cache on
-/// demand — never a catalog row, and not a spawnable primitive.
-pub const PREVIEW_DISPLACE_SPHERE_MESH_ID: Uuid = Uuid(7);
 
 /// A native built-in primitive mesh — geometry the engine generates itself, referenced by
 /// a reserved id and seeded into the GPU cache on demand. Never a catalog asset: a
@@ -244,6 +242,11 @@ pub struct AssetServer {
     pub mesh_bvh_by_uuid: AssetCache<saffron_geometry::MeshBvh>,
     /// GPU texture cache, keyed by texture / sub-id. `None` = negative marker.
     pub texture_by_uuid: AssetCache<GpuTexture>,
+    /// GPU cache of textures resolved as **displacement height maps**, keyed by texture / sub-id. A
+    /// separate map so a height map carries its per-height min/max pyramid (built at upload for the
+    /// tessellation factor kernel), independent of the same image used as a plain albedo/data texture.
+    /// `None` = negative marker.
+    pub height_texture_by_uuid: AssetCache<GpuTexture>,
     /// Opened `.smodel` containers, keyed by model id. `None` = negative marker.
     pub model_by_uuid: AssetCache<ModelAsset>,
     /// Parent-resolved material assets (parent chain walked, instance overrides baked, *before*
@@ -285,6 +288,7 @@ impl AssetServer {
             mesh_by_uuid: AssetCache::new(),
             mesh_bvh_by_uuid: AssetCache::new(),
             texture_by_uuid: AssetCache::new(),
+            height_texture_by_uuid: AssetCache::new(),
             model_by_uuid: AssetCache::new(),
             material_by_uuid: AssetCache::new(),
             material_shader_by_uuid: AssetCache::new(),
@@ -340,6 +344,7 @@ impl AssetServer {
         self.mesh_by_uuid.clear();
         self.mesh_bvh_by_uuid.clear();
         self.texture_by_uuid.clear();
+        self.height_texture_by_uuid.clear();
         self.model_by_uuid.clear();
         self.invalidate_material_caches();
         // The editor-camera gizmo visual is a cached GPU `Ref` too (its `Arc<GpuMesh>` +
@@ -381,25 +386,17 @@ mod tests {
         assert!(PREVIEW_FLOOR_MESH_ID.value() < 1024);
         assert!(PREVIEW_MATERIAL_ID.value() < 1024);
         assert!(PREVIEW_THUMBNAIL_MATERIAL_ID.value() < 1024);
-        assert!(PREVIEW_DISPLACE_SPHERE_MESH_ID.value() < 1024);
         assert_ne!(DEFAULT_MATERIAL_ID, PREVIEW_FLOOR_MESH_ID);
         assert_ne!(PREVIEW_MATERIAL_ID, DEFAULT_MATERIAL_ID);
         assert_ne!(PREVIEW_THUMBNAIL_MATERIAL_ID, PREVIEW_MATERIAL_ID);
-        assert_ne!(PREVIEW_DISPLACE_SPHERE_MESH_ID, PREVIEW_MATERIAL_ID);
         for builtin in [BuiltinMesh::Cube, BuiltinMesh::Plane, BuiltinMesh::Sphere] {
             let id = builtin.reserved_id();
             assert!(id.value() < 1024);
             assert_ne!(id, DEFAULT_MATERIAL_ID);
             assert_ne!(id, PREVIEW_FLOOR_MESH_ID);
             assert_ne!(id, PREVIEW_MATERIAL_ID);
-            assert_ne!(id, PREVIEW_DISPLACE_SPHERE_MESH_ID);
             assert_eq!(BuiltinMesh::from_reserved_id(id), Some(builtin));
         }
-        // The dense preview sphere is a reserved mesh but not a spawnable `BuiltinMesh`.
-        assert_eq!(
-            BuiltinMesh::from_reserved_id(PREVIEW_DISPLACE_SPHERE_MESH_ID),
-            None
-        );
         assert_eq!(BuiltinMesh::from_reserved_id(DEFAULT_MATERIAL_ID), None);
         assert_eq!(BuiltinMesh::from_reserved_id(Uuid(4096)), None);
     }

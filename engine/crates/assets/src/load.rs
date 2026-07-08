@@ -156,12 +156,47 @@ impl AssetServer {
         source: &ByteSource,
         space: Colorspace,
     ) -> Option<Arc<GpuTexture>> {
-        if let Some(cached) = self.texture_by_uuid.get(&sub_id.value()) {
+        self.load_texture_from_source_role(gpu, sub_id, source, space, false)
+    }
+
+    /// The role-aware core behind [`Self::load_texture_from_source`]: `as_height` routes the upload
+    /// through [`GpuUploader::upload_height_texture`] (building the min/max pyramid) and caches into the
+    /// separate `height_texture_by_uuid` map, so a displacement height map is a distinct GPU resource
+    /// from the same image used as a plain texture.
+    fn load_texture_from_source_role(
+        &mut self,
+        gpu: &dyn GpuUploader,
+        sub_id: Uuid,
+        source: &ByteSource,
+        space: Colorspace,
+        as_height: bool,
+    ) -> Option<Arc<GpuTexture>> {
+        if let Some(cached) = self.texture_cache(as_height).get(&sub_id.value()) {
             return cached.clone();
         }
-        let result = upload_texture_from_source(gpu, sub_id, source, space);
-        self.texture_by_uuid.insert(sub_id.value(), result.clone());
+        let result = upload_texture_from_source(gpu, sub_id, source, space, as_height);
+        self.texture_cache_mut(as_height)
+            .insert(sub_id.value(), result.clone());
         result
+    }
+
+    /// The texture GPU cache for the role: the plain `texture_by_uuid`, or the pyramid-carrying
+    /// `height_texture_by_uuid` when resolving a displacement height map.
+    fn texture_cache(&self, as_height: bool) -> &crate::cache::AssetCache<GpuTexture> {
+        if as_height {
+            &self.height_texture_by_uuid
+        } else {
+            &self.texture_by_uuid
+        }
+    }
+
+    /// The mutable texture GPU cache for the role (see [`Self::texture_cache`]).
+    fn texture_cache_mut(&mut self, as_height: bool) -> &mut crate::cache::AssetCache<GpuTexture> {
+        if as_height {
+            &mut self.height_texture_by_uuid
+        } else {
+            &mut self.texture_by_uuid
+        }
     }
 
     /// Resolves an embedded mesh sub-asset to a live GPU mesh, honoring the remap table;
@@ -202,11 +237,24 @@ impl AssetServer {
         model_id: Uuid,
         sub_id: Uuid,
     ) -> Option<Arc<GpuTexture>> {
-        if let Some(cached) = self.texture_by_uuid.get(&sub_id.value()) {
+        self.resolve_texture_role(gpu, model_id, sub_id, false)
+    }
+
+    /// The role-aware core behind [`Self::resolve_texture`]: `as_height` resolves the embedded texture
+    /// as a displacement height map (building its min/max pyramid, caching separately).
+    fn resolve_texture_role(
+        &mut self,
+        gpu: &dyn GpuUploader,
+        model_id: Uuid,
+        sub_id: Uuid,
+        as_height: bool,
+    ) -> Option<Arc<GpuTexture>> {
+        if let Some(cached) = self.texture_cache(as_height).get(&sub_id.value()) {
             return cached.clone();
         }
         let Some(model) = self.load_model_asset(model_id) else {
-            self.texture_by_uuid.insert(sub_id.value(), None);
+            self.texture_cache_mut(as_height)
+                .insert(sub_id.value(), None);
             return None;
         };
         let space = model
@@ -220,10 +268,11 @@ impl AssetServer {
                 model_id.value(),
                 sub_id.value()
             );
-            self.texture_by_uuid.insert(sub_id.value(), None);
+            self.texture_cache_mut(as_height)
+                .insert(sub_id.value(), None);
             return None;
         }
-        self.load_texture_from_source(gpu, sub_id, &source, space)
+        self.load_texture_from_source_role(gpu, sub_id, &source, space, as_height)
     }
 
     /// Resolves a mesh id to a GPU mesh, loading + uploading the baked `.smesh` on a
@@ -249,27 +298,6 @@ impl AssetServer {
         // clear, so a primitive survives project switches with no eager bookkeeping.
         if let Some(builtin) = crate::BuiltinMesh::from_reserved_id(id) {
             return self.seed_builtin_mesh(gpu, builtin);
-        }
-        // The dense preview-displacement sphere is a reserved mesh with no `BuiltinMesh` (it is not
-        // spawnable) — seed its generated geometry the same on-demand, cache-first way.
-        if id == crate::PREVIEW_DISPLACE_SPHERE_MESH_ID {
-            let key = id.value();
-            return match gpu.upload_mesh(
-                &saffron_geometry::preview_displacement_sphere(),
-                &[],
-                None,
-                None,
-            ) {
-                Ok(mesh_ref) => {
-                    self.mesh_by_uuid.insert(key, Some(mesh_ref.clone()));
-                    Some(mesh_ref)
-                }
-                Err(err) => {
-                    tracing::warn!("preview displacement sphere mesh: {err}");
-                    self.mesh_by_uuid.insert(key, None);
-                    None
-                }
-            };
         }
         // Extract the owned row fields, dropping the catalog borrow before the `&mut self`
         // resolve/upload calls below.
@@ -302,7 +330,32 @@ impl AssetServer {
         gpu: &dyn GpuUploader,
         id: Uuid,
     ) -> Option<Arc<GpuTexture>> {
-        if let Some(cached) = self.texture_by_uuid.get(&id.value()) {
+        self.load_texture_asset_role(gpu, id, false)
+    }
+
+    /// Resolves a texture id as a **displacement height map**: identical resolution to
+    /// [`Self::load_texture_asset`], but the upload builds the per-height min/max pyramid (for the
+    /// tessellation factor kernel) and the result is cached separately. The draw path calls this for a
+    /// [`saffron_core::HeightMode::Displacement`] material's height slot; a `None` falls back to
+    /// default-white (no displacement).
+    pub fn load_height_texture_asset(
+        &mut self,
+        gpu: &dyn GpuUploader,
+        id: Uuid,
+    ) -> Option<Arc<GpuTexture>> {
+        self.load_texture_asset_role(gpu, id, true)
+    }
+
+    /// The role-aware core behind [`Self::load_texture_asset`] / [`Self::load_height_texture_asset`]:
+    /// one resolution (catalog → embedded/standalone fork, colorspace), with `as_height` selecting the
+    /// pyramid-building upload + the separate height cache.
+    fn load_texture_asset_role(
+        &mut self,
+        gpu: &dyn GpuUploader,
+        id: Uuid,
+        as_height: bool,
+    ) -> Option<Arc<GpuTexture>> {
+        if let Some(cached) = self.texture_cache(as_height).get(&id.value()) {
             return cached.clone();
         }
         let entry = match self.catalog.find(id) {
@@ -312,13 +365,13 @@ impl AssetServer {
                 // catalog. Warn once and negative-cache; the draw path falls back to the
                 // default-white slot (it does not retry).
                 tracing::warn!("texture {} not in catalog; using default", id.value());
-                self.texture_by_uuid.insert(id.value(), None);
+                self.texture_cache_mut(as_height).insert(id.value(), None);
                 return None;
             }
         };
         let container = entry.container;
         if container.value() != 0 {
-            return self.resolve_texture(gpu, container, id);
+            return self.resolve_texture_role(gpu, container, id, as_height);
         }
         // A standalone image file: an explicit `.smeta` colorspace wins; else the row's
         // hdr/linear provenance (engine-written textures set those at registration).
@@ -335,7 +388,7 @@ impl AssetServer {
             path: format!("{}/{}", self.root.display(), entry.path),
             ..ByteSource::default()
         };
-        self.load_texture_from_source(gpu, id, &source, space)
+        self.load_texture_from_source_role(gpu, id, &source, space, as_height)
     }
 
     /// Warms one catalog asset into its GPU cache (mesh or texture), for the project loader's
@@ -582,11 +635,16 @@ fn editor_camera_material() -> saffron_rendering::SubmeshMaterial {
 
 /// Reads + decodes + uploads the texture (the colorspace selects the uploader), or
 /// returns `None` (with a warn) on any failure. The caller caches the outcome.
+///
+/// `as_height` uploads the decoded RGBA8 through [`GpuUploader::upload_height_texture`], which builds
+/// the per-height min/max pyramid alongside the texture. A displacement height map is linear data, so
+/// the `Hdr` float path is skipped for it (a height map is never an HDR panorama).
 fn upload_texture_from_source(
     gpu: &dyn GpuUploader,
     sub_id: Uuid,
     source: &ByteSource,
     space: Colorspace,
+    as_height: bool,
 ) -> Option<Arc<GpuTexture>> {
     let bytes = match source.read() {
         Ok(bytes) => bytes,
@@ -595,7 +653,7 @@ fn upload_texture_from_source(
             return None;
         }
     };
-    if space == Colorspace::Hdr {
+    if space == Colorspace::Hdr && !as_height {
         return match decode_image_from_memory_hdr(&bytes) {
             Ok(decoded) => {
                 match gpu.upload_texture_float(&decoded.rgba, decoded.width, decoded.height) {
@@ -614,8 +672,13 @@ fn upload_texture_from_source(
     }
     match decode_image_from_memory(&bytes) {
         Ok(decoded) => {
-            let srgb = space != Colorspace::Linear;
-            match gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, srgb) {
+            let result = if as_height {
+                gpu.upload_height_texture(&decoded.rgba, decoded.width, decoded.height)
+            } else {
+                let srgb = space != Colorspace::Linear;
+                gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, srgb)
+            };
+            match result {
                 Ok(texture) => Some(texture),
                 Err(err) => {
                     tracing::warn!("texture {}: {err}", sub_id.value());
