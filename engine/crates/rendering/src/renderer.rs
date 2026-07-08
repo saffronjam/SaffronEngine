@@ -12,7 +12,6 @@ use crate::budget::{BudgetController, BudgetStep};
 use crate::ddgi::DDGI_RAYS_PER_PROBE;
 use crate::descriptors::Descriptors;
 use crate::device::SurfaceSource;
-use crate::displacement::Displacement;
 use crate::draw_list::{DrawItem, RenderStats, SceneDrawList};
 use crate::frame::FrameRing;
 use crate::frame_history::{
@@ -46,6 +45,7 @@ use crate::scene_pass::{
 use crate::skinning::Skinning;
 use crate::ssao::Ssao;
 use crate::targets::Targets;
+use crate::tessellation::Tessellation;
 use crate::transient::TransientResources;
 use crate::view_target::ViewTarget;
 use crate::{Device, Error, Result, Swapchain, checked};
@@ -251,8 +251,6 @@ struct FramePipelines {
     skin: Option<Arc<crate::Pipeline>>,
     /// The compute morph PSO, resolved when the frame has morph dispatches.
     morph: Option<Arc<crate::Pipeline>>,
-    /// The compute displacement PSO, resolved when the frame has displace dispatches.
-    displace: Option<Arc<crate::Pipeline>>,
     shadow: Option<Arc<crate::Pipeline>>,
     point_shadow: Option<Arc<crate::Pipeline>>,
     /// Whether the **static** point-shadow cube needs re-rendering this frame (its content key or
@@ -514,6 +512,13 @@ pub struct Renderer {
     /// undisplaced (the base geometry). Defaults on.
     displacement_enabled: bool,
 
+    /// The runtime-tunable tessellation-quality budget fed to each displaced instance's `TessBucket`
+    /// (hard dice cap, minimum per-edge factor, target screen-space edge length in pixels). Driven by
+    /// the `set-tessellation-quality` control command; defaults to the `TESS_DEFAULT_*` consts.
+    tess_factor_cap: f32,
+    tess_min_factor: f32,
+    tess_edge_length_target: f32,
+
     /// Whether the device is a software rasterizer (llvmpipe/lavapipe): GPU timings are
     /// CPU rasterization time. Mirrored from the device capabilities.
     software_gpu: bool,
@@ -613,6 +618,9 @@ pub struct Renderer {
     /// The active camera's `(near, far)` planes, mirrored from the last [`Renderer::set_cluster_camera`]
     /// so the TAA resolve can linearize `motionDepth` for its disocclusion test.
     camera_near_far: (f32, f32),
+    /// The last camera the host set, mirrored so the adaptive-tessellation factor pass can derive its
+    /// screen-space metric (world position via `inverse(view)`, `tan(½fov)` from the projection).
+    cluster_camera: ClusterCamera,
 
     /// The per-editor-pane render targets, indexed by [`ViewId::index`] (`Scene` = 0,
     /// `AssetPreview` = 1). Always [`VIEW_COUNT`] entries.
@@ -635,7 +643,10 @@ pub struct Renderer {
     targets: Targets,
     instancing: Instancing,
     skinning: Skinning,
-    displacement: Displacement,
+    /// The adaptive-tessellation prep subsystem (factor/scan/finalize/args descriptor infra); records
+    /// the Phase-3 prep passes in the deform scope and emits the amplified transient geometry every
+    /// raster + RT consumer reads for a displaced mesh.
+    tessellation: Tessellation,
     /// The `VK_EXT_mesh_shader` meshlet raster path — `Some` only on a mesh-shader device, engaged
     /// only when `SAFFRON_MESH_SHADER` opts in (else the index-draw path serves every mesh).
     meshlet_raster: Option<MeshletRaster>,
@@ -688,6 +699,12 @@ pub struct Renderer {
     /// this field, which reads as "far from any surface" (no occlusion); held here so the
     /// seeded views stay valid for the renderer's lifetime.
     default_sdf: Arc<crate::GpuSdf>,
+
+    /// The 1×1 `(0, 0)` default min/max pyramid seeded into every slot of the bindless
+    /// `heightMinMaxTextures` array (binding 4). A non-displacement texture's slot keeps this
+    /// (zero local range → no extra tessellation refinement); held here so the seeded view stays
+    /// valid for the renderer's lifetime.
+    default_height_minmax: crate::resources::DefaultHeightMinMax,
 
     /// A pending window/composited-output screenshot path, armed by
     /// [`Renderer::request_window_capture`] and consumed at the next present (the swapchain
@@ -774,7 +791,7 @@ impl Renderer {
             Pipelines,
             Instancing,
             Skinning,
-            Displacement,
+            Tessellation,
             Option<MeshletRaster>,
             bool,
             TransientResources,
@@ -792,6 +809,7 @@ impl Renderer {
             crate::Aa,
             Arc<crate::GpuTexture>,
             Arc<crate::GpuSdf>,
+            crate::resources::DefaultHeightMinMax,
         );
         let build = || -> Result<BuildParts> {
             let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
@@ -808,13 +826,18 @@ impl Renderer {
             // sky-occlusion cone-trace (a lavapipe fault / UB on real hardware). Real
             // per-mesh SDFs overwrite their own slot as their `GpuMesh` is built.
             let default_sdf = uploader.upload_default_sdf(&descriptors)?;
+            // The per-height min/max pyramid array (binding 4) is partially bound; seed every slot
+            // with a 1×1 `(0, 0)` default so a non-displacement texture's slot is a valid descriptor
+            // (unbound slots fault on lavapipe / are UB on real hardware). A displacement height map
+            // overwrites its own slot with its real pyramid at upload.
+            let default_height_minmax = uploader.upload_default_height_minmax(&descriptors)?;
 
             let targets = Targets::new(&device)?;
             let lighting = Lighting::new(&device, &descriptors, &targets)?;
             let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
             let instancing = Instancing::new(&device, &descriptors)?;
             let skinning = Skinning::new(&device)?;
-            let displacement = Displacement::new(&device)?;
+            let tessellation = Tessellation::new(&device)?;
             // The meshlet raster path exists only on a mesh-shader device; it engages only when
             // `SAFFRON_MESH_SHADER` opts in, so the validated index-draw path stays the default.
             let meshlet_raster = MeshletRaster::new(&device)?;
@@ -898,7 +921,7 @@ impl Renderer {
                 pipelines,
                 instancing,
                 skinning,
-                displacement,
+                tessellation,
                 meshlet_raster,
                 meshlet_enabled,
                 transient,
@@ -916,6 +939,7 @@ impl Renderer {
                 aa,
                 default_white,
                 default_sdf,
+                default_height_minmax,
             ))
         };
         let (
@@ -925,7 +949,7 @@ impl Renderer {
             pipelines,
             instancing,
             skinning,
-            displacement,
+            tessellation,
             meshlet_raster,
             meshlet_enabled,
             transient,
@@ -943,6 +967,7 @@ impl Renderer {
             aa,
             default_white,
             default_sdf,
+            default_height_minmax,
         ) = match build() {
             Ok(parts) => parts,
             Err(err) => {
@@ -1021,6 +1046,9 @@ impl Renderer {
             view_mode: ViewMode::Lit,
             skinning_enabled: true,
             displacement_enabled: true,
+            tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
+            tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
+            tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
             software_gpu,
             frame_ms: 0.0,
             cpu_frame_ms: 0.0,
@@ -1058,6 +1086,14 @@ impl Renderer {
             aa,
             taa_params: crate::TaaParams::default(),
             camera_near_far: (0.1, 100.0),
+            cluster_camera: ClusterCamera {
+                view: Mat4::IDENTITY,
+                projection: Mat4::IDENTITY,
+                width,
+                height,
+                near: 0.1,
+                far: 100.0,
+            },
             views,
             active_view: ViewId::Scene,
             shm_publish_enabled: [false; VIEW_COUNT],
@@ -1066,7 +1102,7 @@ impl Renderer {
             targets,
             instancing,
             skinning,
-            displacement,
+            tessellation,
             meshlet_raster,
             meshlet_enabled,
             transient,
@@ -1088,6 +1124,7 @@ impl Renderer {
             bindless_free_list,
             default_white,
             default_sdf,
+            default_height_minmax,
             capture_next_window_path: None,
             frames,
             swapchain,
@@ -1145,6 +1182,13 @@ impl Renderer {
     /// slot reading "far from any surface".
     pub fn default_sdf(&self) -> &Arc<crate::GpuSdf> {
         &self.default_sdf
+    }
+
+    /// The 1×1 `(0, 0)` default min/max pyramid seeded into every slot of the bindless
+    /// `heightMinMaxTextures` array (binding 4) — a non-displacement texture's slot keeps it (zero
+    /// local range → no extra tessellation refinement).
+    pub fn default_height_minmax(&self) -> &crate::resources::DefaultHeightMinMax {
+        &self.default_height_minmax
     }
 
     /// The shared bindless free-list every uploaded texture clones (README §5).
@@ -1574,7 +1618,1109 @@ impl Renderer {
         let frame = self.frames.index();
         // Mirror the camera planes for the TAA resolve's depth linearization (disocclusion test).
         self.camera_near_far = (camera.near, camera.far);
+        // Mirror the whole camera for the adaptive-tessellation factor metric.
+        self.cluster_camera = camera;
         self.lighting.set_cluster_camera(frame, camera);
+    }
+
+    /// Records the Phase-3 adaptive-tessellation prep passes for this frame's displaced instances:
+    /// **factor** (one fractional factor per unique base edge) → **scan** (predict + atomic-carry
+    /// prefix-sum the exact dice output into packed per-instance offsets) → **finalize** (the indirect
+    /// draw seed + RT prim count) → **args** (the global emit-dispatch size). Each writes a per-frame
+    /// transient buffer; nothing consumes them yet (Phase 4 emit / Phase 6 raster / Phase 7 RT), so the
+    /// pass chain is inert beyond its own scratch. No-op unless a displaced instance carries watertight
+    /// conditioning and all four PSOs build.
+    /// Records the adaptive-tessellation prep + emit passes for the frame's displaced instances. Returns
+    /// the coarse RT VB/IB graph resources (Phase 10, Q2 secondary-ray coarsening) when a tessellated
+    /// instance is RT-consumed this frame, so `begin_frame_graph` can declare them `AccelStructBuildRead`
+    /// on the `tlas-build` pass (the emit→build barrier is then graph-derived); `None` otherwise.
+    fn record_tess_prep(
+        &mut self,
+        graph: &mut crate::RenderGraph,
+        frame: usize,
+        raw: &ash::Device,
+    ) -> Option<(RgResource, RgResource)> {
+        if self.scene_draw_list.tess_buckets.is_empty() {
+            return None;
+        }
+
+        // The per-instance inputs (Copy handles + owned params) lifted out of the draw list up front,
+        // so the transient + pipeline borrows below never alias the draw-list borrow.
+        struct Inst {
+            welded: vk::Buffer,
+            edges: vk::Buffer,
+            tri_edges: vk::Buffer,
+            base_vertices: vk::Buffer,
+            base_indices: vk::Buffer,
+            base_instance: u32,
+            entity: u64,
+            edge_count: u32,
+            tri_count: u32,
+            model: Mat4,
+            factor_cap: f32,
+            min_factor: f32,
+            edge_length_target: f32,
+            height_index: u32,
+            height_scale: f32,
+            vector_index: u32,
+            uv_transform: [f32; 4],
+        }
+        let mut insts: Vec<Inst> = Vec::with_capacity(self.scene_draw_list.tess_buckets.len());
+        for bucket in &self.scene_draw_list.tess_buckets {
+            let Some(cond) = bucket.mesh.conditioning() else {
+                continue;
+            };
+            insts.push(Inst {
+                welded: cond.welded.0,
+                edges: cond.edges.0,
+                tri_edges: cond.tri_edges.0,
+                base_vertices: bucket.mesh.vertex_buffer(),
+                base_indices: bucket.mesh.index_buffer(),
+                base_instance: bucket.base_instance,
+                entity: bucket.entity,
+                edge_count: cond.edge_count,
+                tri_count: bucket.mesh.index_count / 3,
+                model: bucket.model,
+                factor_cap: bucket.factor_cap,
+                min_factor: bucket.min_factor,
+                edge_length_target: bucket.edge_length_target,
+                height_index: bucket.height_index,
+                height_scale: bucket.height_scale,
+                vector_index: bucket.vector_index,
+                uv_transform: bucket.uv_transform,
+            });
+        }
+        if insts.is_empty() {
+            return None;
+        }
+
+        // Hard triangle budget (Phase 10): coarsen each instance's factor cap so the *summed* worst-case
+        // reservation fits `TESS_MICRO_VERTEX_BUDGET`. The reservation, scan, and emit all read the
+        // adjusted `factor_cap` below, so the GPU can never write past the reserved transient arena even
+        // under a dense scene — bounded VRAM without a per-instance manual cap.
+        {
+            let budget_input: Vec<(u32, f32, f32)> = insts
+                .iter()
+                .map(|i| (i.tri_count, i.factor_cap, i.min_factor))
+                .collect();
+            let scaled = crate::tessellation::budget_scaled_caps(
+                &budget_input,
+                crate::tessellation::TESS_MICRO_VERTEX_BUDGET,
+            );
+            for (inst, &cap) in insts.iter_mut().zip(&scaled) {
+                inst.factor_cap = cap;
+            }
+        }
+
+        // The tessellation camera, derived from the mirrored cluster camera (world position via the
+        // inverse view; `tan(½fov)` from the projection's `y` scale).
+        let view = self.cluster_camera.view;
+        let proj = self.cluster_camera.projection;
+        let cam = crate::TessCamera {
+            view_proj: proj * view,
+            cam_pos: view.inverse().w_axis.truncate(),
+            viewport: [
+                self.cluster_camera.width as f32,
+                self.cluster_camera.height as f32,
+            ],
+            tan_half_fov_y: 1.0 / proj.y_axis.y.abs().max(1e-4),
+            near: self.cluster_camera.near.max(1e-4),
+        };
+
+        // Per-instance placement (prefix sums) into the shared buffers, reserved worst-case at the cap.
+        let mut layouts: Vec<crate::TessInstanceLayout> = Vec::with_capacity(insts.len());
+        let (mut edge_cur, mut tri_cur, mut vb_cur, mut ib_cur) = (0u32, 0u32, 0u32, 0u32);
+        for (row, inst) in insts.iter().enumerate() {
+            let (verts, indices) =
+                crate::tessellation::tess_worst_case(inst.tri_count, inst.factor_cap as u32);
+            layouts.push(crate::TessInstanceLayout {
+                factor_base: edge_cur,
+                tri_base: tri_cur,
+                instance_row: row as u32,
+                vertex_base: vb_cur,
+                index_base: ib_cur,
+            });
+            edge_cur += inst.edge_count;
+            tri_cur += inst.tri_count;
+            vb_cur = vb_cur.saturating_add(verts as u32);
+            ib_cur = ib_cur.saturating_add(indices as u32);
+        }
+        let instance_rows = insts.len() as u32;
+
+        // The Phase-5 temporal factor ping-pong (owned by `Tessellation`, not the rewound transient pool):
+        // write this frame's factors into `slot[frame % 2]`, read last frame's from `slot[(frame + 1) % 2]`.
+        // The prev slot serves the emit kernel's prev-position stream only when its surviving factors are
+        // laid out identically to this frame's (the per-instance edge-count sequence); on frame 0 / a layout
+        // change the prev binding falls back to the cur slot, so prev == cur ⇒ zero geomorph delta (no ghost).
+        let edge_layout: Vec<u32> = insts.iter().map(|inst| inst.edge_count).collect();
+        let cur_slot = frame % 2;
+        let prev_slot = (frame + 1) % 2;
+        let factors = match self.tessellation.ensure_factor_slot(cur_slot, edge_cur) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                tracing::error!("tess prep: ensure factor slot {cur_slot}: {err}");
+                return None;
+            }
+        };
+        let prev_factors = if self
+            .tessellation
+            .factor_layout_matches(prev_slot, &edge_layout)
+        {
+            self.tessellation.factor_slot(prev_slot).unwrap_or(factors)
+        } else {
+            factors
+        };
+
+        // The four PSOs (set-0 layouts are Copy handles, so no `self.tessellation` borrow spans the
+        // `&mut self.pipelines` request).
+        let factor_layout = self.tessellation.factor_layout();
+        let scan_layout = self.tessellation.scan_layout();
+        let finalize_layout = self.tessellation.finalize_layout();
+        let args_layout = self.tessellation.args_layout();
+        let emit_layout = self.tessellation.emit_layout();
+        let bindless_layout = self.descriptors.bindless_set_layout();
+        let bindless_set = self.descriptors.bindless_set();
+        let (Some(factor_pso), Some(scan_pso), Some(finalize_pso), Some(args_pso), Some(emit_pso)) = (
+            self.pipelines
+                .request_tess_factor(bindless_layout, factor_layout),
+            self.pipelines.request_tess_scan(scan_layout),
+            self.pipelines.request_tess_finalize(finalize_layout),
+            self.pipelines.request_tess_args(args_layout),
+            self.pipelines
+                .request_tessellate(bindless_layout, emit_layout),
+        ) else {
+            return None;
+        };
+
+        // The per-frame transient scratch (grow-only, keyed). All are storage buffers; the indirect
+        // seed + emit-args also carry `INDIRECT_BUFFER` for their Phase-4/6 consumers.
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let indirect = storage | vk::BufferUsageFlags::INDIRECT_BUFFER;
+        // Storage buffers additionally cleared each frame via `cmd_fill_buffer` (a transfer op) need
+        // TRANSFER_DST: the scan's per-instance counters + global totals, and the emit's degenerate-pad
+        // clear of the index stream.
+        let storage_cleared = storage | vk::BufferUsageFlags::TRANSFER_DST;
+        // The AS-build-input flag the RT BLAS requires on the geometry buffers it references by device
+        // address (Phase 7 builds the tessellated BLAS from the transient VB/IB).
+        let accel_input = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        let acquire = |t: &mut TransientResources,
+                       key: &'static str,
+                       bytes: u64,
+                       usage|
+         -> Option<vk::Buffer> {
+            match t.acquire_buffer(frame, key, bytes.max(16), usage) {
+                Ok(buffer) => Some(buffer),
+                Err(err) => {
+                    tracing::error!("tess prep: acquire {key}: {err}");
+                    None
+                }
+            }
+        };
+        let counters_bytes = instance_rows as u64 * 8;
+        let (Some(pertri), Some(counters), Some(global), Some(seeds), Some(prims), Some(dispatch)) = (
+            acquire(
+                &mut self.transient,
+                "tess.pertri",
+                tri_cur as u64 * 16,
+                storage,
+            ),
+            acquire(
+                &mut self.transient,
+                "tess.counters",
+                counters_bytes,
+                storage_cleared,
+            ),
+            acquire(&mut self.transient, "tess.global", 8, storage_cleared),
+            acquire(
+                &mut self.transient,
+                "tess.seeds",
+                instance_rows as u64 * 20,
+                indirect,
+            ),
+            acquire(
+                &mut self.transient,
+                "tess.prims",
+                instance_rows as u64 * 4,
+                storage,
+            ),
+            acquire(&mut self.transient, "tess.dispatch", 12, indirect),
+        ) else {
+            return None;
+        };
+        // The amplified geometry stream: the worst-case-reserved transient VB (48 B micro-vertices) +
+        // IB (u32). These are the buffers Phase 6 rasterizes and Phase 7 builds the BLAS from; here they
+        // are storage-written by the emit kernel and additionally flagged VERTEX/INDEX/indirect-friendly
+        // so the same handle serves those consumers without re-acquire.
+        let vb_usage = storage
+            | vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | accel_input;
+        // The index stream is also degenerate-pad cleared (`cmd_fill_buffer` → TRANSFER_DST) and, like
+        // the VB, is a BLAS build input (ACCEL_BUILD_INPUT) — the emit writes it, the raster draws it,
+        // and the RT BLAS builds from it.
+        let ib_usage = storage
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | accel_input
+            | vk::BufferUsageFlags::TRANSFER_DST;
+        // The prev-position stream (Phase 5): same worst-case size as `tess.vb`, storage-written by the
+        // emit kernel and bound by the motion prepass as the prev vertex stream. Motion-only (no RT / no
+        // indirect), so it needs neither a device address nor index usage.
+        let prev_vb_usage = storage | vk::BufferUsageFlags::VERTEX_BUFFER;
+        let (Some(out_vb), Some(out_ib), Some(out_prev_vb)) = (
+            acquire(&mut self.transient, "tess.vb", vb_cur as u64 * 48, vb_usage),
+            acquire(&mut self.transient, "tess.ib", ib_cur as u64 * 4, ib_usage),
+            acquire(
+                &mut self.transient,
+                "tess.vb.prev",
+                vb_cur as u64 * 48,
+                prev_vb_usage,
+            ),
+        ) else {
+            return None;
+        };
+
+        // Resolve each displaced batch's `tessellated` handles now that the per-frame transients exist,
+        // matched to its tess instance by `base_instance` (unique per single-instance displaced bucket).
+        // The finalize seed for row `r` lives at byte `r * 20` in the `seeds` args buffer. Done before
+        // the raster passes shallow-clone the draw list, so they pick up the indirect-draw handles.
+        for (row, inst) in insts.iter().enumerate() {
+            for batch in self.scene_draw_list.batches.iter_mut() {
+                if batch.base_instance == inst.base_instance {
+                    batch.tessellated = Some(crate::TessDraw {
+                        vertex_buffer: out_vb,
+                        prev_vertex_buffer: out_prev_vb,
+                        index_buffer: out_ib,
+                        args_buffer: seeds,
+                        args_offset: row as u64 * 20,
+                    });
+                }
+            }
+        }
+
+        // The tessellated RT instances' slices are filled from the SEPARATE coarse (secondary-ray) chain
+        // below (Phase 10, Q2), not these fine raster buffers, so the RT BLAS builds from lower-density
+        // geometry than the raster passes rasterize.
+
+        // Wire one factor + scan + finalize + emit descriptor set per instance (shared buffers bound at
+        // whole range; the pushes carry each instance's slice bases), plus the one global args set.
+        let pool = self.tessellation.pool(frame);
+        let mut factor_calls: Vec<(vk::DescriptorSet, crate::TessFactorPush, u32)> = Vec::new();
+        let mut scan_calls: Vec<(vk::DescriptorSet, crate::TessScanPush, u32)> = Vec::new();
+        let mut finalize_calls: Vec<(vk::DescriptorSet, crate::TessFinalizePush)> = Vec::new();
+        let mut emit_calls: Vec<(vk::DescriptorSet, crate::TessEmitPush, u32)> = Vec::new();
+        for (row, inst) in insts.iter().enumerate() {
+            let layout = layouts[row];
+            let (Some(factor_set), Some(scan_set), Some(finalize_set), Some(emit_set)) = (
+                crate::tessellation::wire_storage_set(
+                    raw,
+                    pool,
+                    factor_layout,
+                    &[inst.welded, inst.edges, factors],
+                ),
+                crate::tessellation::wire_storage_set(
+                    raw,
+                    pool,
+                    scan_layout,
+                    &[inst.tri_edges, factors, pertri, counters, global],
+                ),
+                crate::tessellation::wire_storage_set(
+                    raw,
+                    pool,
+                    finalize_layout,
+                    &[counters, seeds, prims],
+                ),
+                crate::tessellation::wire_storage_set(
+                    raw,
+                    pool,
+                    emit_layout,
+                    &[
+                        inst.base_vertices,
+                        inst.base_indices,
+                        pertri,
+                        inst.tri_edges,
+                        factors,
+                        out_vb,
+                        out_ib,
+                        prev_factors,
+                        out_prev_vb,
+                    ],
+                ),
+            ) else {
+                continue;
+            };
+            factor_calls.push((
+                factor_set,
+                crate::tessellation::factor_push(
+                    &cam,
+                    inst.model,
+                    inst.factor_cap,
+                    inst.min_factor,
+                    inst.edge_length_target,
+                    layout.factor_base,
+                    inst.edge_count,
+                    // Full local-space displacement amplitude (world `height_scale` mapped to local by
+                    // the uniform world scale); the kernel scales it by the per-edge local height range
+                    // sampled from the min/max pyramid at `height_index` (Phase 10 per-region factor).
+                    inst.height_scale,
+                    inst.height_index,
+                    [inst.uv_transform[0], inst.uv_transform[1]],
+                ),
+                inst.edge_count.div_ceil(64).max(1),
+            ));
+            scan_calls.push((
+                scan_set,
+                crate::TessScanPush {
+                    tri_count: inst.tri_count,
+                    tri_base: layout.tri_base,
+                    counter_base: layout.instance_row * 2,
+                    factor_cap: inst.factor_cap,
+                    _pad: [0; 4],
+                },
+                inst.tri_count.div_ceil(64).max(1),
+            ));
+            finalize_calls.push((
+                finalize_set,
+                crate::TessFinalizePush {
+                    counter_base: layout.instance_row * 2,
+                    seed_base: layout.instance_row * 5,
+                    vertex_base: layout.vertex_base,
+                    index_base: layout.index_base,
+                    instance_row: layout.instance_row,
+                    first_instance: inst.base_instance,
+                    _pad: [0; 2],
+                },
+            ));
+            emit_calls.push((
+                emit_set,
+                crate::TessEmitPush {
+                    tri_base: layout.tri_base,
+                    vertex_base: layout.vertex_base,
+                    index_base: layout.index_base,
+                    height_index: inst.height_index,
+                    height_scale: inst.height_scale,
+                    factor_cap: inst.factor_cap,
+                    vector_index: inst.vector_index,
+                    _pad0: 0,
+                    uv_transform: inst.uv_transform,
+                    factor_base: layout.factor_base,
+                    _pad: [0; 3],
+                },
+                inst.tri_count,
+            ));
+        }
+        let args_set =
+            crate::tessellation::wire_storage_set(raw, pool, args_layout, &[global, dispatch])?;
+
+        let factors_res = graph.import_buffer(factors);
+        let pertri_res = graph.import_buffer(pertri);
+        let counters_res = graph.import_buffer(counters);
+        let global_res = graph.import_buffer(global);
+        let seeds_res = graph.import_buffer(seeds);
+        let prims_res = graph.import_buffer(prims);
+        let dispatch_res = graph.import_buffer(dispatch);
+        let out_vb_res = graph.import_buffer(out_vb);
+        let out_ib_res = graph.import_buffer(out_ib);
+        let out_prev_vb_res = graph.import_buffer(out_prev_vb);
+
+        // Factor: one thread per unique base edge writes its shared fractional factor. Bindless set 0
+        // (the min/max pyramid tap) is bound once; each instance binds its edge set (set 1) + push.
+        {
+            let pso = factor_pso;
+            let handle = pso.handle();
+            let layout = pso.layout();
+            let raw_body = raw.clone();
+            let calls = factor_calls;
+            let pass = crate::RgPass::compute("tess-factor")
+                .access(factors_res, crate::RgUsage::StorageWriteCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam. PSO + sets are valid this frame; each dispatch covers one
+                    // instance's edges.
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            layout,
+                            0,
+                            &[bindless_set],
+                            &[],
+                        );
+                        for (set, push, groups) in &calls {
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                1,
+                                &[*set],
+                                &[],
+                            );
+                            raw_body.cmd_push_constants(
+                                cmd,
+                                layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                0,
+                                bytemuck::bytes_of(push),
+                            );
+                            raw_body.cmd_dispatch(cmd, *groups, 1, 1);
+                        }
+                    }
+                    drop(pso);
+                });
+            graph.add_pass(pass);
+        }
+
+        // Scan: clear the atomic accumulators (transfer write → the one hand-written transfer→compute
+        // barrier, as the graph has no fill primitive), then one thread per base triangle predicts +
+        // prefix-sums the exact dice counts.
+        {
+            let pso = scan_pso;
+            let handle = pso.handle();
+            let layout = pso.layout();
+            let raw_body = raw.clone();
+            let calls = scan_calls;
+            let counters_buf = counters;
+            let global_buf = global;
+            let clear_bytes = counters_bytes.max(8);
+            let pass = crate::RgPass::compute("tess-scan")
+                .access(factors_res, crate::RgUsage::StorageReadCompute)
+                .access(pertri_res, crate::RgUsage::StorageWriteCompute)
+                .access(counters_res, crate::RgUsage::StorageWriteCompute)
+                .access(global_res, crate::RgUsage::StorageWriteCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam. The fills zero the atomic accumulators; the barrier orders
+                    // them before the scan's atomic reads/writes.
+                    unsafe {
+                        raw_body.cmd_fill_buffer(cmd, counters_buf, 0, clear_bytes, 0);
+                        raw_body.cmd_fill_buffer(cmd, global_buf, 0, 8, 0);
+                        let barrier = |buffer, size| {
+                            vk::BufferMemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                .dst_access_mask(
+                                    vk::AccessFlags2::SHADER_STORAGE_READ
+                                        | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                                )
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .buffer(buffer)
+                                .offset(0)
+                                .size(size)
+                        };
+                        let barriers = [barrier(counters_buf, clear_bytes), barrier(global_buf, 8)];
+                        let dep = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+                        raw_body.cmd_pipeline_barrier2(cmd, &dep);
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        for (set, push, groups) in &calls {
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[*set],
+                                &[],
+                            );
+                            raw_body.cmd_push_constants(
+                                cmd,
+                                layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                0,
+                                bytemuck::bytes_of(push),
+                            );
+                            raw_body.cmd_dispatch(cmd, *groups, 1, 1);
+                        }
+                    }
+                    drop(pso);
+                });
+            graph.add_pass(pass);
+        }
+
+        // Finalize: one thread per instance writes the indirect draw seed + RT prim count.
+        {
+            let pso = finalize_pso;
+            let handle = pso.handle();
+            let layout = pso.layout();
+            let raw_body = raw.clone();
+            let calls = finalize_calls;
+            let pass = crate::RgPass::compute("tess-finalize")
+                .access(counters_res, crate::RgUsage::StorageReadCompute)
+                .access(seeds_res, crate::RgUsage::StorageWriteCompute)
+                .access(prims_res, crate::RgUsage::StorageWriteCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam.
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        for (set, push) in &calls {
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[*set],
+                                &[],
+                            );
+                            raw_body.cmd_push_constants(
+                                cmd,
+                                layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                0,
+                                bytemuck::bytes_of(push),
+                            );
+                            raw_body.cmd_dispatch(cmd, 1, 1, 1);
+                        }
+                    }
+                    drop(pso);
+                });
+            graph.add_pass(pass);
+        }
+
+        // Args: one thread turns the global micro-vertex total into the Phase-4 emit dispatch size.
+        {
+            let pso = args_pso;
+            let handle = pso.handle();
+            let layout = pso.layout();
+            let raw_body = raw.clone();
+            let pass = crate::RgPass::compute("tess-args")
+                .access(global_res, crate::RgUsage::StorageReadCompute)
+                .access(dispatch_res, crate::RgUsage::StorageWriteCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam.
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            layout,
+                            0,
+                            &[args_set],
+                            &[],
+                        );
+                        raw_body.cmd_dispatch(cmd, 1, 1, 1);
+                    }
+                    drop(pso);
+                });
+            graph.add_pass(pass);
+        }
+
+        // Emit: one workgroup per base triangle (dispatched per instance) dices + displaces + welds +
+        // writes the amplified micro-vertices + generated index stream into the transient VB/IB at the
+        // scan's predicted offsets. Reads perTri + factors (ordered after scan) + the static base
+        // stream via bindless set 0's height/vector maps.
+        {
+            let pso = emit_pso;
+            let handle = pso.handle();
+            let layout = pso.layout();
+            let raw_body = raw.clone();
+            let calls = emit_calls;
+            let ib_clear_bytes = ib_cur as u64 * 4;
+            let out_ib_buf = out_ib;
+            let pass = crate::RgPass::compute("tess-emit")
+                .access(pertri_res, crate::RgUsage::StorageReadCompute)
+                .access(factors_res, crate::RgUsage::StorageReadCompute)
+                .access(out_vb_res, crate::RgUsage::StorageWriteCompute)
+                .access(out_ib_res, crate::RgUsage::StorageWriteCompute)
+                .access(out_prev_vb_res, crate::RgUsage::StorageWriteCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam. Bindless set 0 is bound once; each instance binds its emit
+                    // set (set 1) + push and dispatches one workgroup per base triangle.
+                    unsafe {
+                        // Zero the whole index slice first so every index past the real (GPU-packed)
+                        // triangles is a degenerate `(0,0,0)` triangle — the worst-case RT BUILD floor
+                        // (Phase 7) reads the full reserved range and the AS builder discards degenerates.
+                        // Ordered transfer→compute before the emit dispatches overwrite the real triangles.
+                        if ib_clear_bytes > 0 {
+                            raw_body.cmd_fill_buffer(cmd, out_ib_buf, 0, ib_clear_bytes, 0);
+                            let clear_barrier = vk::MemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE);
+                            let cb = [clear_barrier];
+                            let dep = vk::DependencyInfo::default().memory_barriers(&cb);
+                            raw_body.cmd_pipeline_barrier2(cmd, &dep);
+                        }
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            layout,
+                            0,
+                            &[bindless_set],
+                            &[],
+                        );
+                        for (set, push, workgroups) in &calls {
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                1,
+                                &[*set],
+                                &[],
+                            );
+                            raw_body.cmd_push_constants(
+                                cmd,
+                                layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                0,
+                                bytemuck::bytes_of(push),
+                            );
+                            raw_body.cmd_dispatch(cmd, *workgroups, 1, 1);
+                        }
+                        // The emit output (VB/IB) + the finalize-written indirect args are consumed by
+                        // the later raster passes as vertex/index/indirect input. The graph runs passes
+                        // in add order (emit precedes every raster pass), but those passes don't declare
+                        // these transient handles, so make the compute writes visible to the fixed-
+                        // function fetch here with one global barrier (the graph has no cross-pass
+                        // primitive without threading the resources into all seven consumers).
+                        let to_fetch = vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                            .dst_stage_mask(
+                                vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
+                                    | vk::PipelineStageFlags2::INDEX_INPUT
+                                    | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                            )
+                            .dst_access_mask(
+                                vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
+                                    | vk::AccessFlags2::INDEX_READ
+                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                            );
+                        let barriers = [to_fetch];
+                        let dep = vk::DependencyInfo::default().memory_barriers(&barriers);
+                        raw_body.cmd_pipeline_barrier2(cmd, &dep);
+                    }
+                    drop(pso);
+                });
+            graph.add_pass(pass);
+        }
+
+        // RT secondary-ray coarsening (Phase 10, Q2): the RT BLAS is built from a SEPARATE, coarser run
+        // of the same factor→scan→emit chain — a larger per-edge LOD target (fewer micro-edges) + a
+        // smaller dice cap (a ~1/COARSEN² worst-case reservation → a far cheaper per-frame BUILD). The
+        // coarse geometry is still Phong-smoothed, displaced, and watertight (the same shared-edge factor
+        // snap), only lower-density; the raster path keeps the fine buffers above. Skipped entirely unless
+        // a displaced instance is actually RT-consumed this frame.
+        let rt_entities: std::collections::HashSet<u64> = self
+            .scene_draw_list
+            .deformed_rt_instances
+            .iter()
+            .map(|rt| rt.entity)
+            .collect();
+        let rt_active = insts
+            .iter()
+            .any(|inst| inst.entity != 0 && rt_entities.contains(&inst.entity));
+        let mut tess_rt_res: Option<(RgResource, RgResource)> = None;
+        if rt_active {
+            // Coarse per-instance placement: identical edge/tri prefix sums (same base topology), but the
+            // vertex/index reservations use the coarse cap, so the coarse arena is ~1/COARSEN² of the fine.
+            let mut rt_layouts: Vec<crate::TessInstanceLayout> = Vec::with_capacity(insts.len());
+            let mut rt_caps: Vec<f32> = Vec::with_capacity(insts.len());
+            let (mut r_edge, mut r_tri, mut r_vb, mut r_ib) = (0u32, 0u32, 0u32, 0u32);
+            for (row, inst) in insts.iter().enumerate() {
+                let cap = crate::tessellation::rt_coarsen_cap(inst.factor_cap, inst.min_factor);
+                rt_caps.push(cap);
+                let (verts, indices) =
+                    crate::tessellation::tess_worst_case(inst.tri_count, cap as u32);
+                rt_layouts.push(crate::TessInstanceLayout {
+                    factor_base: r_edge,
+                    tri_base: r_tri,
+                    instance_row: row as u32,
+                    vertex_base: r_vb,
+                    index_base: r_ib,
+                });
+                r_edge += inst.edge_count;
+                r_tri += inst.tri_count;
+                r_vb = r_vb.saturating_add(verts as u32);
+                r_ib = r_ib.saturating_add(indices as u32);
+            }
+
+            // Coarse transient scratch (grow-only, keyed, distinct from the fine buffers). The coarse VB/IB
+            // feed only the RT BLAS build (via device address), so they carry SHADER_DEVICE_ADDRESS +
+            // ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY (never VERTEX/INDEX — no raster fetch). The
+            // emit→build barrier is graph-derived: StorageWrite here + AccelStructBuildRead on `tlas-build`.
+            // `tess.vb.rt.prev` backs the emit kernel's mandatory prev-stream write (RT has no motion
+            // vectors; prev factors == cur ⇒ prev pos == cur pos) — a throwaway the BLAS never reads.
+            let rt_ib_bytes = r_ib as u64 * 4;
+            let rt_as_usage = storage
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+            let (
+                Some(factors_rt),
+                Some(pertri_rt),
+                Some(counters_rt),
+                Some(global_rt),
+                Some(out_vb_rt),
+                Some(out_ib_rt),
+                Some(out_prev_vb_rt),
+            ) = (
+                acquire(
+                    &mut self.transient,
+                    "tess.factor.rt",
+                    r_edge as u64 * 4,
+                    storage,
+                ),
+                acquire(
+                    &mut self.transient,
+                    "tess.pertri.rt",
+                    r_tri as u64 * 16,
+                    storage,
+                ),
+                acquire(
+                    &mut self.transient,
+                    "tess.counters.rt",
+                    counters_bytes,
+                    storage_cleared,
+                ),
+                acquire(&mut self.transient, "tess.global.rt", 8, storage_cleared),
+                acquire(
+                    &mut self.transient,
+                    "tess.vb.rt",
+                    r_vb as u64 * 48,
+                    rt_as_usage,
+                ),
+                acquire(
+                    &mut self.transient,
+                    "tess.ib.rt",
+                    rt_ib_bytes,
+                    rt_as_usage | vk::BufferUsageFlags::TRANSFER_DST,
+                ),
+                acquire(
+                    &mut self.transient,
+                    "tess.vb.rt.prev",
+                    r_vb as u64 * 48,
+                    storage,
+                ),
+            )
+            else {
+                return None;
+            };
+
+            // Point each RT-consumed instance's slice at the coarse geometry + coarse worst case, so
+            // Phase-7's `plan_tessellated_blas_builds` reads the coarse VB/IB (the IB tail is
+            // degenerate-padded, so the worst-case BUILD range discards the unused triangles).
+            for (row, inst) in insts.iter().enumerate() {
+                if inst.entity == 0 {
+                    continue;
+                }
+                let layout = rt_layouts[row];
+                let (wc_verts, wc_indices) =
+                    crate::tessellation::tess_worst_case(inst.tri_count, rt_caps[row] as u32);
+                for rt in self.scene_draw_list.deformed_rt_instances.iter_mut() {
+                    if rt.entity == inst.entity {
+                        rt.tess = Some(crate::TessRtSlice {
+                            vertex_buffer: out_vb_rt,
+                            index_buffer: out_ib_rt,
+                            vertex_base: layout.vertex_base,
+                            index_base: layout.index_base,
+                            worst_case_verts: wc_verts as u32,
+                            worst_case_prims: (wc_indices / 3) as u32,
+                        });
+                    }
+                }
+            }
+
+            // The coarse chain reuses the fine PSOs (cached; the request clones the Arc) — factor + scan +
+            // emit only (RT needs neither the raster indirect-draw finalize nor the emit-dispatch args).
+            let (Some(factor_pso_rt), Some(scan_pso_rt), Some(emit_pso_rt)) = (
+                self.pipelines
+                    .request_tess_factor(bindless_layout, factor_layout),
+                self.pipelines.request_tess_scan(scan_layout),
+                self.pipelines
+                    .request_tessellate(bindless_layout, emit_layout),
+            ) else {
+                return None;
+            };
+
+            let mut factor_calls_rt: Vec<(vk::DescriptorSet, crate::TessFactorPush, u32)> =
+                Vec::new();
+            let mut scan_calls_rt: Vec<(vk::DescriptorSet, crate::TessScanPush, u32)> = Vec::new();
+            let mut emit_calls_rt: Vec<(vk::DescriptorSet, crate::TessEmitPush, u32)> = Vec::new();
+            for (row, inst) in insts.iter().enumerate() {
+                let layout = rt_layouts[row];
+                let cap = rt_caps[row];
+                let (Some(factor_set), Some(scan_set), Some(emit_set)) = (
+                    crate::tessellation::wire_storage_set(
+                        raw,
+                        pool,
+                        factor_layout,
+                        &[inst.welded, inst.edges, factors_rt],
+                    ),
+                    crate::tessellation::wire_storage_set(
+                        raw,
+                        pool,
+                        scan_layout,
+                        &[
+                            inst.tri_edges,
+                            factors_rt,
+                            pertri_rt,
+                            counters_rt,
+                            global_rt,
+                        ],
+                    ),
+                    crate::tessellation::wire_storage_set(
+                        raw,
+                        pool,
+                        emit_layout,
+                        &[
+                            inst.base_vertices,
+                            inst.base_indices,
+                            pertri_rt,
+                            inst.tri_edges,
+                            factors_rt,
+                            out_vb_rt,
+                            out_ib_rt,
+                            // RT has no temporal history: prev factors == cur ⇒ zero geomorph motion.
+                            factors_rt,
+                            out_prev_vb_rt,
+                        ],
+                    ),
+                ) else {
+                    continue;
+                };
+                factor_calls_rt.push((
+                    factor_set,
+                    crate::tessellation::factor_push(
+                        &cam,
+                        inst.model,
+                        cap,
+                        inst.min_factor,
+                        // The coarsened LOD target — the sole per-edge coarsening lever (the factor kernel
+                        // is otherwise identical, so a shared edge stays bit-identical → crack-free).
+                        crate::tessellation::rt_coarsen_target(inst.edge_length_target),
+                        layout.factor_base,
+                        inst.edge_count,
+                        inst.height_scale,
+                        inst.height_index,
+                        [inst.uv_transform[0], inst.uv_transform[1]],
+                    ),
+                    inst.edge_count.div_ceil(64).max(1),
+                ));
+                scan_calls_rt.push((
+                    scan_set,
+                    crate::TessScanPush {
+                        tri_count: inst.tri_count,
+                        tri_base: layout.tri_base,
+                        counter_base: layout.instance_row * 2,
+                        factor_cap: cap,
+                        _pad: [0; 4],
+                    },
+                    inst.tri_count.div_ceil(64).max(1),
+                ));
+                emit_calls_rt.push((
+                    emit_set,
+                    crate::TessEmitPush {
+                        tri_base: layout.tri_base,
+                        vertex_base: layout.vertex_base,
+                        index_base: layout.index_base,
+                        height_index: inst.height_index,
+                        height_scale: inst.height_scale,
+                        factor_cap: cap,
+                        vector_index: inst.vector_index,
+                        _pad0: 0,
+                        uv_transform: inst.uv_transform,
+                        factor_base: layout.factor_base,
+                        _pad: [0; 3],
+                    },
+                    inst.tri_count,
+                ));
+            }
+
+            let factors_rt_res = graph.import_buffer(factors_rt);
+            let pertri_rt_res = graph.import_buffer(pertri_rt);
+            let counters_rt_res = graph.import_buffer(counters_rt);
+            let global_rt_res = graph.import_buffer(global_rt);
+            let out_vb_rt_res = graph.import_buffer(out_vb_rt);
+            let out_ib_rt_res = graph.import_buffer(out_ib_rt);
+            let out_prev_vb_rt_res = graph.import_buffer(out_prev_vb_rt);
+
+            // Coarse factor: one thread per unique base edge, coarse LOD target + coarse cap.
+            {
+                let pso = factor_pso_rt;
+                let handle = pso.handle();
+                let layout = pso.layout();
+                let raw_body = raw.clone();
+                let calls = factor_calls_rt;
+                let pass = crate::RgPass::compute("tess-factor-rt")
+                    .access(factors_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        // SAFETY: the ash seam. PSO + sets are valid this frame; one dispatch per instance.
+                        unsafe {
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[bindless_set],
+                                &[],
+                            );
+                            for (set, push, groups) in &calls {
+                                raw_body.cmd_bind_descriptor_sets(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    layout,
+                                    1,
+                                    &[*set],
+                                    &[],
+                                );
+                                raw_body.cmd_push_constants(
+                                    cmd,
+                                    layout,
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    bytemuck::bytes_of(push),
+                                );
+                                raw_body.cmd_dispatch(cmd, *groups, 1, 1);
+                            }
+                        }
+                        drop(pso);
+                    });
+                graph.add_pass(pass);
+            }
+
+            // Coarse scan: clear the atomic accumulators, then predict + prefix-sum the coarse dice counts.
+            {
+                let pso = scan_pso_rt;
+                let handle = pso.handle();
+                let layout = pso.layout();
+                let raw_body = raw.clone();
+                let calls = scan_calls_rt;
+                let counters_buf = counters_rt;
+                let global_buf = global_rt;
+                let clear_bytes = counters_bytes.max(8);
+                let pass = crate::RgPass::compute("tess-scan-rt")
+                    .access(factors_rt_res, crate::RgUsage::StorageReadCompute)
+                    .access(pertri_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .access(counters_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .access(global_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        // SAFETY: the ash seam. The fills zero the atomic accumulators; the barrier orders
+                        // them before the scan's atomic reads/writes.
+                        unsafe {
+                            raw_body.cmd_fill_buffer(cmd, counters_buf, 0, clear_bytes, 0);
+                            raw_body.cmd_fill_buffer(cmd, global_buf, 0, 8, 0);
+                            let barrier = |buffer, size| {
+                                vk::BufferMemoryBarrier2::default()
+                                    .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                    .dst_access_mask(
+                                        vk::AccessFlags2::SHADER_STORAGE_READ
+                                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                                    )
+                                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                    .buffer(buffer)
+                                    .offset(0)
+                                    .size(size)
+                            };
+                            let barriers =
+                                [barrier(counters_buf, clear_bytes), barrier(global_buf, 8)];
+                            let dep =
+                                vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+                            raw_body.cmd_pipeline_barrier2(cmd, &dep);
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            for (set, push, groups) in &calls {
+                                raw_body.cmd_bind_descriptor_sets(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    layout,
+                                    0,
+                                    &[*set],
+                                    &[],
+                                );
+                                raw_body.cmd_push_constants(
+                                    cmd,
+                                    layout,
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    bytemuck::bytes_of(push),
+                                );
+                                raw_body.cmd_dispatch(cmd, *groups, 1, 1);
+                            }
+                        }
+                        drop(pso);
+                    });
+                graph.add_pass(pass);
+            }
+
+            // Coarse emit: degenerate-pad the whole coarse IB, then dice + displace + weld into the coarse
+            // VB/IB. No vertex/index/indirect fetch barrier — the coarse output feeds only the RT BLAS
+            // build, whose emit→build barrier the graph derives from the StorageWrite accesses declared
+            // here + the `AccelStructBuildRead` on `tlas-build`.
+            {
+                let pso = emit_pso_rt;
+                let handle = pso.handle();
+                let layout = pso.layout();
+                let raw_body = raw.clone();
+                let calls = emit_calls_rt;
+                let ib_clear_bytes = rt_ib_bytes;
+                let out_ib_buf = out_ib_rt;
+                let pass = crate::RgPass::compute("tess-emit-rt")
+                    .access(pertri_rt_res, crate::RgUsage::StorageReadCompute)
+                    .access(factors_rt_res, crate::RgUsage::StorageReadCompute)
+                    .access(out_vb_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .access(out_ib_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .access(out_prev_vb_rt_res, crate::RgUsage::StorageWriteCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        // SAFETY: the ash seam. Bindless set 0 is bound once; each instance binds its emit
+                        // set (set 1) + push and dispatches one workgroup per base triangle.
+                        unsafe {
+                            // Zero the whole coarse index slice so every index past the GPU-packed tail is
+                            // a degenerate `(0,0,0)` triangle — the worst-case RT BUILD range reads the full
+                            // reserved span and the AS builder discards the degenerates (watertight floor).
+                            if ib_clear_bytes > 0 {
+                                raw_body.cmd_fill_buffer(cmd, out_ib_buf, 0, ib_clear_bytes, 0);
+                                let clear_barrier = vk::MemoryBarrier2::default()
+                                    .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                    .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE);
+                                let cb = [clear_barrier];
+                                let dep = vk::DependencyInfo::default().memory_barriers(&cb);
+                                raw_body.cmd_pipeline_barrier2(cmd, &dep);
+                            }
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[bindless_set],
+                                &[],
+                            );
+                            for (set, push, workgroups) in &calls {
+                                raw_body.cmd_bind_descriptor_sets(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    layout,
+                                    1,
+                                    &[*set],
+                                    &[],
+                                );
+                                raw_body.cmd_push_constants(
+                                    cmd,
+                                    layout,
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    bytemuck::bytes_of(push),
+                                );
+                                raw_body.cmd_dispatch(cmd, *workgroups, 1, 1);
+                            }
+                        }
+                        drop(pso);
+                    });
+                graph.add_pass(pass);
+            }
+
+            tess_rt_res = Some((out_vb_rt_res, out_ib_rt_res));
+        }
+
+        // The factor pass above is committed to write `slot[cur_slot]` this frame with `edge_layout`;
+        // stamp that so next frame's prev-stream lookup can tell whether the slot is layout-aligned.
+        self.tessellation.set_factor_layout(cur_slot, edge_layout);
+        tess_rt_res
     }
 
     /// Arms the directional shadow pass with the light-space transform; `casting` (gated
@@ -2627,6 +3773,39 @@ impl Renderer {
         self.displacement_enabled
     }
 
+    /// Sets the tessellation-quality budget for displaced instances. `None` for a field leaves it
+    /// unchanged; the values are clamped to a sane range (cap ∈ [1, 64], min ∈ [1, cap], edge target
+    /// ≥ 1 px) so a control caller cannot drive the tessellator into a degenerate or runaway state.
+    pub fn set_tessellation_quality(
+        &mut self,
+        factor_cap: Option<f32>,
+        min_factor: Option<f32>,
+        edge_length_target: Option<f32>,
+    ) {
+        if let Some(cap) = factor_cap {
+            // Integer cap (the snap/scan clamp grids on it) with the split pass's expressible ceiling;
+            // the micro-vertex budget — not this — is the real bound on dense scenes.
+            self.tess_factor_cap = cap.round().clamp(1.0, 2048.0);
+        }
+        if let Some(min) = min_factor {
+            self.tess_min_factor = min.clamp(1.0, self.tess_factor_cap);
+        }
+        // A cap change can leave the min above it — re-clamp so `min ≤ cap` always holds.
+        self.tess_min_factor = self.tess_min_factor.min(self.tess_factor_cap);
+        if let Some(target) = edge_length_target {
+            self.tess_edge_length_target = target.max(1.0);
+        }
+    }
+
+    /// The current tessellation-quality budget `(factor_cap, min_factor, edge_length_target)`.
+    pub fn tessellation_quality(&self) -> (f32, f32, f32) {
+        (
+            self.tess_factor_cap,
+            self.tess_min_factor,
+            self.tess_edge_length_target,
+        )
+    }
+
     /// Whether the device is a software rasterizer.
     pub fn software_gpu(&self) -> bool {
         self.software_gpu
@@ -3005,12 +4184,14 @@ impl Renderer {
             // `tlas-build` reads.
             rt_skinned: self.rt.use_rt_shadows() || self.rt.use_rt_reflections(),
             displace_enabled: self.displacement_enabled,
+            tess_factor_cap: self.tess_factor_cap,
+            tess_min_factor: self.tess_min_factor,
+            tess_edge_length_target: self.tess_edge_length_target,
         };
         let (list, stats) = self.instancing.submit_draw_list(
             &self.descriptors,
             &mut self.pipelines,
             &mut self.skinning,
-            &mut self.displacement,
             items,
             joints,
             inputs,
@@ -3055,6 +4236,9 @@ impl Renderer {
         // The slot's prior GPU work is done, so its transient scratch allocations are free to
         // recycle: rewind the pool's acquire cursors for this frame index.
         self.transient.begin_frame(self.frames.index());
+        // The tessellation prep descriptor pool recycles on the same fence: reset this slot's sets
+        // before the deform scope wires the frame's factor/scan/finalize passes.
+        self.tessellation.begin_frame(self.frames.index());
         // This slot's GPU work (from MAX_FRAMES_IN_FLIGHT frames ago) is now complete, so its
         // timestamp pool reads back without blocking: fold the prior frame's per-pass GPU spans
         // into `gpu_frame_ms` + `last_timings` at the begin-frame fence wait. A no-op when the
@@ -3199,18 +4383,6 @@ impl Renderer {
         // morph pass deforms each morph instance into the deformed buffer before skin.
         let morph_pipeline = if !self.scene_draw_list.morph_dispatches.is_empty() {
             crate::skinning::request_morph_pipeline(&mut self.pipelines, &self.skinning)
-        } else {
-            None
-        };
-        // The displacement compute PSO, resolved only when the frame built displace dispatches.
-        // The displace pass writes each displacement-enabled instance's height-displaced vertices
-        // into the same deformed buffer as skin/morph, before every geometry pass reads it.
-        let displace_pipeline = if !self.scene_draw_list.displace_dispatches.is_empty() {
-            crate::request_displace_pipeline(
-                &mut self.pipelines,
-                &self.descriptors,
-                &self.displacement,
-            )
         } else {
             None
         };
@@ -3548,7 +4720,6 @@ impl Renderer {
             cull: cull_pipeline,
             skin: skin_pipeline,
             morph: morph_pipeline,
-            displace: displace_pipeline,
             shadow: shadow_pipeline,
             point_shadow: point_shadow_pipeline,
             static_point_shadow_dirty,
@@ -3773,13 +4944,7 @@ impl Renderer {
             && !self.scene_draw_list.morph_dispatches.is_empty()
             && self.skinning.deformed_buffer(frame).is_some()
             && self.skinning.prev_deformed_buffer(frame).is_some();
-        // Displacement writes the same deformed / prev-deformed buffers (its wiring sized them), so
-        // it joins the deform scope on the same terms as skin/morph.
-        let do_displace = pipelines.displace.is_some()
-            && !self.scene_draw_list.displace_dispatches.is_empty()
-            && self.skinning.deformed_buffer(frame).is_some()
-            && self.skinning.prev_deformed_buffer(frame).is_some();
-        let do_deform = do_skin || do_morph || do_displace;
+        let do_deform = do_skin || do_morph;
         let deformed_handle = if do_deform {
             self.skinning.deformed_buffer(frame)
         } else {
@@ -3854,47 +5019,17 @@ impl Renderer {
                 graph.add_pass(pass);
             }
 
-            // Displacement pre-pass: displace each displacement-enabled instance's base vertices by
-            // its height field into the deformed (current) + prev-deformed (previous — identical, a
-            // static field) buffers. It writes the same resources as skin/morph, so the graph orders
-            // it in the deform scope (WAW) and every geometry consumer's `VertexInputRead` already
-            // covers it. The bindless set (0) lets the kernel sample the height map by index.
-            if do_displace {
-                let displace = pipelines.displace.as_ref().expect("displace PSO");
-                let displace = Arc::clone(displace);
-                let displace_handle = displace.handle();
-                let displace_layout = displace.layout();
-                let bindless_set = self.descriptors.bindless_set();
-                let raw_displace = raw.clone();
-                let displace_list = self.scene_draw_list.shallow_clone();
-                let pass = RgPass::compute("displace")
-                    .access(deformed, RgUsage::StorageWriteCompute)
-                    .access(prev_deformed, RgUsage::StorageWriteCompute)
-                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                        crate::Displacement::record_displace(
-                            &raw_displace,
-                            cmd,
-                            displace_handle,
-                            displace_layout,
-                            bindless_set,
-                            &displace_list.displace_dispatches,
-                        );
-                        crate::Displacement::record_displace(
-                            &raw_displace,
-                            cmd,
-                            displace_handle,
-                            displace_layout,
-                            bindless_set,
-                            &displace_list.prev_displace_dispatches,
-                        );
-                        drop(displace);
-                    });
-                graph.add_pass(pass);
-            }
             (Some(deformed), Some(prev_deformed))
         } else {
             (None, None)
         };
+
+        // Adaptive-tessellation prep (factor/scan/finalize/args): independent of the deform buffers
+        // above (it writes its own transient scratch), so it records after the deform scope on the
+        // same graph. Inert until Phase 4 emits from its predicted offsets. Returns the coarse RT VB/IB
+        // graph resources (Phase 10, Q2) — declared `AccelStructBuildRead` on `tlas-build` below so the
+        // graph derives the coarse-emit → BLAS-build barrier — when a displaced instance is RT-consumed.
+        let tess_rt_res = self.record_tess_prep(&mut graph, frame, &raw);
 
         // RT: build the per-frame TLAS over the scene's mesh instances (a compute-kind pass;
         // the recorded plan self-manages the AS-build → fragment ray-query barrier). Skinned
@@ -3923,6 +5058,14 @@ impl Renderer {
                     if let Some(deformed) = deformed_res {
                         tlas_pass = tlas_pass.access(deformed, RgUsage::AccelStructBuildRead);
                     }
+                }
+                // The tessellated BLAS builds over the coarse (secondary-ray) VB/IB the tess-emit-rt pass
+                // wrote; declaring the read here lets the graph derive the compute-write → AS-build-read
+                // barrier and orders this pass after the coarse emit.
+                if let Some((vb_rt, ib_rt)) = tess_rt_res {
+                    tlas_pass = tlas_pass
+                        .access(vb_rt, RgUsage::AccelStructBuildRead)
+                        .access(ib_rt, RgUsage::AccelStructBuildRead);
                 }
                 graph.add_pass(tlas_pass);
             }
@@ -6755,6 +7898,59 @@ impl Renderer {
         graph.add_pass(pass);
     }
 
+    /// Appends a compute pass whose group count is read from `args_buffer` at `args_offset` (a
+    /// `VkDispatchIndirectCommand {x,y,z}`) rather than known on the CPU — the sibling of
+    /// [`Renderer::add_compute_pass`] for a GPU-determined dispatch (the Phase-4 tessellator's per-frame
+    /// output size). The caller lists `args_buffer`'s resource as [`RgUsage::IndirectCommandRead`] in
+    /// `accesses` so the graph derives the producer→dispatch barrier.
+    #[allow(dead_code, clippy::too_many_arguments)] // wired by Phase 4 (the amplifying tessellator)
+    fn add_indirect_compute_pass(
+        &self,
+        graph: &mut RenderGraph,
+        name: &'static str,
+        pipeline: &Arc<crate::Pipeline>,
+        set: vk::DescriptorSet,
+        accesses: &[(RgResource, RgUsage)],
+        push: Option<Vec<u8>>,
+        args_buffer: vk::Buffer,
+        args_offset: vk::DeviceSize,
+    ) {
+        let raw_body = self.device.raw().clone();
+        let pipeline = Arc::clone(pipeline);
+        let handle = pipeline.handle();
+        let layout = pipeline.layout();
+        let mut pass = RgPass::compute(name).body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+            // SAFETY: the ash seam. The PSO/set are valid this frame; the group count is read from
+            // the args buffer, whose producing write the graph ordered ahead via IndirectCommandRead.
+            unsafe {
+                raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                raw_body.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                if let Some(push) = &push {
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        push,
+                    );
+                }
+                raw_body.cmd_dispatch_indirect(cmd, args_buffer, args_offset);
+            }
+            drop(pipeline);
+        });
+        for &(resource, usage) in accesses {
+            pass = pass.access(resource, usage);
+        }
+        graph.add_pass(pass);
+    }
+
     /// Appends a depth-only shadow pass clearing + storing the map and recording the
     /// vertex-only, depth-biased draw list under `light_view_proj`.
     #[allow(clippy::too_many_arguments)]
@@ -7866,7 +9062,6 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
-        let mut displacement = Displacement::new(&device).expect("Displacement");
         let view = ViewTarget::new(&device, 16, 16).expect("ViewTarget");
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
@@ -7904,13 +9099,15 @@ mod tests {
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
             rt_skinned: false,
             displace_enabled: true,
+            tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
+            tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
+            tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
         };
         let (list, stats) = instancing
             .submit_draw_list(
                 &descriptors,
                 &mut pipelines,
                 &mut skinning,
-                &mut displacement,
                 &[item],
                 &[],
                 inputs,
@@ -7968,7 +9165,6 @@ mod tests {
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
-        drop(displacement);
         drop(uploader);
         drop(pipelines);
         drop(descriptors);
@@ -9019,6 +10215,115 @@ mod tests {
             before,
             after,
             "the present blit must be validation-clean (saw {} new issue(s))",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// A displaced (`HeightMode::Displacement`) instance driven through `render_scene_offscreen`
+    /// exercises the FULL adaptive-tessellation path — the factor/scan/finalize/args/emit compute chain,
+    /// the transient VB/IB + their `cmd_fill_buffer` clears + storage descriptor bindings, the boundary +
+    /// interior geomorph, the prev-stream, and (RT armed) the coarse RT dice + `TessellatedBlas` build.
+    /// The default headless smoke has NO displaced mesh, so this is the ONLY automated coverage of the
+    /// tess buffers' usage flags — the exact Vulkan-validation class (`vkCmdFillBuffer` needs
+    /// `TRANSFER_DST`; a storage `ByteAddressBuffer` binding needs `STORAGE_BUFFER`; a BLAS-input buffer
+    /// needs `ACCEL_BUILD_INPUT`) that a non-displaced scene cannot surface. Two frames so the prev-stream
+    /// ping-pong runs with real previous factors. Asserts the whole displaced frame is validation-clean.
+    #[test]
+    fn displaced_instance_tessellation_frame_is_validation_clean() {
+        use crate::draw_list::{DrawItem, SubmeshMaterial};
+        use crate::upload::{GpuQueue, Uploader};
+        use saffron_core::HeightMode;
+        use saffron_geometry::glam::{Mat4, Vec2, Vec3};
+        use saffron_geometry::{Mesh, Submesh, Vertex};
+        use std::sync::Arc;
+
+        let mut renderer = match Renderer::new(&SurfaceSource::Offscreen, 128, 128) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("skipping: no Vulkan device obtainable ({err})");
+                return;
+            }
+        };
+        let before = validation_issue_count();
+
+        // Arm RT so the coarse RT dice + `TessellatedBlas` build run too (the `.rt` transient buffers),
+        // exercising both tess paths when the device supports ray tracing.
+        if renderer.rt_supported() {
+            renderer.set_rt_shadows(true);
+        }
+
+        // Upload a UV'd quad (watertight conditioning is built at upload) + a non-flat height map (whose
+        // min/max pyramid drives the per-region factor) into the renderer's bindless descriptors.
+        let queue = GpuQueue::new(renderer.device().graphics_queue);
+        let uploader = Uploader::new(renderer.device(), &queue).expect("Uploader");
+        let vert = |x: f32, z: f32, u: f32, w: f32| Vertex {
+            position: Vec3::new(x, 0.0, z),
+            normal: Vec3::new(0.0, 1.0, 0.0),
+            uv0: Vec2::new(u, w),
+            ..Vertex::default()
+        };
+        let mesh = Mesh {
+            vertices: vec![
+                vert(-1.0, -1.0, 0.0, 0.0),
+                vert(1.0, -1.0, 1.0, 0.0),
+                vert(1.0, 1.0, 1.0, 1.0),
+                vert(-1.0, 1.0, 0.0, 1.0),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: 6,
+                vertex_offset: 0,
+                material_slot: 0,
+            }],
+        };
+        let mesh = uploader
+            .upload_mesh(renderer.descriptors(), &mesh, &[], None, None)
+            .expect("upload_mesh");
+        let mut rgba = vec![0u8; 8 * 8 * 4];
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            px[0] = ((i * 37) % 256) as u8; // a busy height in R so the per-region factor refines
+            px[3] = 255;
+        }
+        let height = uploader
+            .upload_height_texture(renderer.descriptors(), &rgba, 8, 8)
+            .expect("upload_height_texture");
+
+        let displaced_item = || {
+            let mut material = SubmeshMaterial::defaults();
+            material.height_texture = Some(Arc::clone(&height));
+            material.height_mode = HeightMode::Displacement;
+            material.height_scale = 0.2;
+            DrawItem::new(Arc::clone(&mesh), Mat4::IDENTITY, vec![material])
+        };
+
+        // A close camera so the projected factor exceeds 1 and the dice/emit actually amplify (and, at
+        // the default cap, may split — exercising the subpatch path).
+        let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.05, 100.0);
+        let view = Mat4::look_at_rh(Vec3::new(0.0, 1.5, 1.5), Vec3::ZERO, Vec3::Y);
+        let view_proj = proj * view;
+        for frame in 0..2 {
+            renderer.submit_sky(&SkyRenderSettings::default());
+            renderer
+                .set_scene_lighting(&SceneLighting::default())
+                .expect("set_scene_lighting");
+            renderer
+                .submit_draw_list(view_proj, &[displaced_item()])
+                .expect("submit_draw_list");
+            renderer
+                .render_scene_offscreen()
+                .unwrap_or_else(|err| panic!("render_scene_offscreen frame {frame}: {err}"));
+        }
+        renderer
+            .device()
+            .wait_idle()
+            .expect("idle after the displaced frames");
+
+        let after = validation_issue_count();
+        assert_eq!(
+            before,
+            after,
+            "the displaced tessellation frame must be validation-clean (saw {} new issue(s))",
             after.saturating_sub(before)
         );
     }
