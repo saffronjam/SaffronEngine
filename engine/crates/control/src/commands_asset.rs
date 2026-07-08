@@ -16,14 +16,14 @@ use std::path::{Path, PathBuf};
 
 use saffron_assets::{
     AssetServer, BUILTIN_SPHERE_MESH_ID, BuiltinMesh, ContainerMetadata, MaterialAsset,
-    PREVIEW_DISPLACE_SPHERE_MESH_ID, PREVIEW_MATERIAL_ID, ProjectHost, ProjectInfo, analyze_clean,
-    asset_bytes, asset_type_name, build_dependency_graph, clear_extraction,
-    colorspace_for_role_explicit, colorspace_name, create_project_script, default_display_name,
-    default_material_asset, delete_unused, exposed_parameter, extract_sub_asset,
-    import_material_folder, load_catalog_material_asset, load_catalog_material_asset_raw,
-    lower_graph_to_params, model_render_aabb, pbr_exposed_parameters, pick_scene_surface,
-    reimport_model, request_thumbnail, save_material_asset, texture_role_from_hint,
-    texture_role_name, update_material_asset, valid_project_name, viewport_ray,
+    PREVIEW_MATERIAL_ID, ProjectHost, ProjectInfo, analyze_clean, asset_bytes, asset_type_name,
+    build_dependency_graph, clear_extraction, colorspace_for_role_explicit, colorspace_name,
+    create_project_script, default_display_name, default_material_asset, delete_unused,
+    exposed_parameter, extract_sub_asset, import_material_folder, load_catalog_material_asset,
+    load_catalog_material_asset_raw, lower_graph_to_params, model_render_aabb,
+    pbr_exposed_parameters, pick_scene_surface, reimport_model, request_thumbnail,
+    save_material_asset, texture_role_from_hint, texture_role_name, update_material_asset,
+    valid_project_name, viewport_ray,
 };
 use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3 as MathVec3};
@@ -3044,12 +3044,13 @@ fn preview_material_for_texture(role: TextureRole, tid: Uuid) -> MaterialAsset {
             m.base_color = grey(0.6);
         }
         TextureRole::Height => {
-            // Real per-vertex displacement on the dense preview sphere — a true deformed silhouette
-            // (not parallax). `height_scale` is the world-space amplitude on the unit sphere; keep
-            // it modest so the surface bulges without turning inside-out.
+            // A bare height texture previews as parallax-occlusion mapping on the ordinary sphere —
+            // never auto-routed to real displacement (that is a deliberate authored `.smat` choice
+            // carrying a tessellation + BLAS cost). A Displacement-authored material bulges the same
+            // sphere through the real tessellating path, so preview matches scene either way.
             m.height_texture = tid;
-            m.height_scale = 0.08;
-            m.height_mode = HeightMode::Displacement;
+            m.height_scale = 0.05;
+            m.height_mode = HeightMode::Parallax;
             m.base_color = grey(0.6);
         }
         TextureRole::Emissive => {
@@ -3221,13 +3222,14 @@ fn build_preview_scene(
     }
 }
 
-/// Attach the dense displacement sphere + a single slot referencing `material_id`, so a
-/// displacement-enabled `.smat` (or a height map) shows a true silhouette.
+/// Attach the ordinary low-poly builtin sphere + a single slot referencing `material_id`. A
+/// displacement-enabled `.smat` gets its true bulged silhouette from the real tessellating path — the
+/// same path a scene mesh uses — so no dense stand-in is needed and preview matches scene.
 fn attach_preview_sphere(scene: &mut Scene, root: Entity, material_id: Uuid) {
     let _ = scene.add_component(
         root,
         Mesh {
-            mesh: PREVIEW_DISPLACE_SPHERE_MESH_ID,
+            mesh: BUILTIN_SPHERE_MESH_ID,
         },
     );
     let _ = scene.add_component(

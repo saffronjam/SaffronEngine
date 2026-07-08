@@ -117,22 +117,6 @@ pub fn uv_sphere() -> Mesh {
 }
 
 /// The preview sphere's surface-texture tiling. A once-wrapped sphere shows only ~half its texture
-/// across the visible hemisphere (and stretches it 2× wider than tall at the equator, since the
-/// equator arc is twice the pole-to-pole arc), so a material's detail reads far larger than in the
-/// provider's flat/preview reference. Tiling denser with a 2:1 `u:v` ratio fixes both: square texels
-/// at the equator, and roughly the reference's feature scale. Integer components keep it seamless.
-/// The displacement height map samples the same `uv0`, so the silhouette bumps tile in lockstep.
-const PREVIEW_SPHERE_UV_REPEAT: Vec2 = Vec2::new(4.0, 2.0);
-
-/// A densely-subdivided unit UV sphere (192 rings × 288 sectors, ~56k vertices) for **vertex-shader
-/// displacement previews**: at a fixed preview camera distance uniform subdivision is the correct
-/// amount of geometry, so a height map moves real vertices into a true silhouette. Not a spawnable
-/// primitive — it is seeded only for the interactive material/texture preview sphere. Its texture
-/// tiles [`PREVIEW_SPHERE_UV_REPEAT`] so the material reads at the reference's scale, not stretched.
-pub fn preview_displacement_sphere() -> Mesh {
-    uv_sphere_with(192, 288, PREVIEW_SPHERE_UV_REPEAT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
