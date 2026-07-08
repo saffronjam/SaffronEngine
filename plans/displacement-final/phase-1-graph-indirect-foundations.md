@@ -1,6 +1,6 @@
 # Phase 1 — Graph vocabulary + indirect plumbing + capability probes + keyed transient acquire
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 ## Goal
 
