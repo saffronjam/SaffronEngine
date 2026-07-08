@@ -358,17 +358,27 @@ pub fn record_motion(
         );
     }
     for batch in &list.batches {
-        let (cur, prev) = select_motion_streams(
-            batch.deformed,
-            deformed,
-            prev_deformed,
-            batch.mesh.vertex_buffer(),
-        );
+        // A tessellated batch binds its amplified transient VB as the current position stream and its
+        // double-buffered prev micro-vertex VB as the previous stream (the emit kernel wrote the latter
+        // with last frame's per-edge factors, so the geomorph slide reprojects), plus its generated index
+        // stream; `record_batch_submeshes` then takes the shared indirect branch.
+        let (cur, prev, index_buffer) = if let Some(t) = &batch.tessellated {
+            (t.vertex_buffer, t.prev_vertex_buffer, t.index_buffer)
+        } else {
+            let (cur, prev) = select_motion_streams(
+                batch.deformed,
+                deformed,
+                prev_deformed,
+                batch.mesh.vertex_buffer(),
+            );
+            (cur, prev, batch.mesh.index_buffer())
+        };
         // SAFETY: the ash seam. The bound streams outlive the recorded command (pinned by
-        // the batch `Arc` / the frame's `Skinning`); the index buffer + draw cover the batch.
+        // the batch `Arc` / the frame's `Skinning` / `TransientResources`); the index buffer + draw
+        // cover the batch.
         unsafe {
             raw.cmd_bind_vertex_buffers(cmd, 0, &[cur, prev], &[0, 0]);
-            raw.cmd_bind_index_buffer(cmd, batch.mesh.index_buffer(), 0, vk::IndexType::UINT32);
+            raw.cmd_bind_index_buffer(cmd, index_buffer, 0, vk::IndexType::UINT32);
         }
         record_batch_submeshes(raw, cmd, batch, None);
     }
