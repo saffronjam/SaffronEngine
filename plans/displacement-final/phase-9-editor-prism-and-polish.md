@@ -1,6 +1,26 @@
 # Phase 9 — Editor analytic-prism RT preview (approximate, exact-on-commit) + control surface + docs + retire old planset
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — the CPU/wire/docs keep-current obligations are landed and gated (workspace
+clippy `-D warnings` clean; 322 protocol + 69 control tests pass; headless validation-clean on the RTX
+3070 Ti):
+- **§2 tessellation-quality control command** — `set-tessellation-quality [factorCap] [minFactor]
+  [edgeLengthTarget]` (`SetTessellationQualityParams`/`Result` DTOs, `codegen`/`COMMANDS`/`DTO_TYPE_NAMES`/
+  `render_domain`/`COMMAND_FIXTURES` wired + regenerated). Threads a runtime-tunable budget through
+  `Renderer::set_tessellation_quality` → `DrawListInputs` → each `TessBucket` (replacing the hardcoded
+  `TESS_DEFAULT_*`), clamped to `cap∈[1,64]`, `min∈[1,cap]`, `edge≥1`. Reachable from `sa` immediately
+  (external-subcommand passthrough); the `tess-quality` schema-contract fixture covers the wire. Control
+  unit test asserts the clamp + partial-update + readback; an e2e test (`tessellation-quality.test.ts`)
+  drives it over the control plane.
+- **§3 docs** — `compute-displacement.md` rewritten from the deleted 1:1 path to the shipped tessellation
+  mechanism (dice→displace→weld→emit; raster indirect + `TessellatedBlas`; the quality command; the
+  approximate prism satellite), and the frame-and-render-graph hub row updated.
+
+**§5 DONE — `plans/displacement/` retired:** every phase of the old planset was verified against the
+current tree (feature end-state present, or superseded by the strictly stronger tessellation spine),
+marked COMPLETED, and the folder deleted.
+
+**Remaining (GPU-visual / editor, need presenting hardware):** §1 the analytic-prism AABB-BLAS +
+inline-ray-query march + editor live-edit preview mode; §4 the optional opacity-micromap companion.
 
 **Scope:** `saffron-rendering` (a second AABB-geometry BLAS path + an inline-ray-query prism march + an
 editor-preview render mode), `saffron-control` + `saffron-protocol` (the tessellation-quality command +
