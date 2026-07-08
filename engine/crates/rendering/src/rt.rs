@@ -44,6 +44,15 @@ struct SkinnedBlas {
     built: bool,
 }
 
+/// One tessellated instance's per-slot BLAS: variable topology every frame forbids `MODE_UPDATE`, so
+/// this is always a full `MODE_BUILD` over the amplified transient VB/IB. The AS backing store is sized
+/// to the worst-case primitive count and recreated **only** when that bound changes (never on per-frame
+/// count wobble), so `worst_case_prims` is the reuse key.
+struct TessellatedBlas {
+    accel: Arc<AccelerationStructure>,
+    worst_case_prims: u32,
+}
+
 /// One frame-in-flight's TLAS state: the structure itself, the instance count it is sized
 /// for, the host-visible instance buffer (one `VkAccelerationStructureInstanceKHR` per
 /// referenced mesh instance), the build scratch, and the set-6 descriptor set the mesh
@@ -57,6 +66,9 @@ struct FrameRt {
     scratch_capacity: u32,
     mesh_set: vk::DescriptorSet,
     skinned_blas: HashMap<u64, SkinnedBlas>,
+    /// Per-entity tessellated BLAS (full rebuild each frame; keyed by entity in this v1, by
+    /// `(mesh, lod_bucket)` once Phase-7 bucketing collapses same-bucket instances onto one).
+    tessellated_blas: HashMap<u64, TessellatedBlas>,
     blas_scratch: Option<Buffer>,
     blas_scratch_capacity: u32,
 }
@@ -109,6 +121,8 @@ pub struct Rt {
     blas_count: u32,
     /// Skinned refit BLAS active this frame (rt-stats).
     skinned_blas_count: u32,
+    /// Tessellated full-rebuild BLAS active this frame (rt-stats).
+    tessellated_blas_count: u32,
 }
 
 // SAFETY: every handle (layout / sets / `AccelerationStructure` / `Buffer`) carries no
@@ -144,6 +158,7 @@ impl Rt {
             frame_instance_count: 0,
             blas_count: 0,
             skinned_blas_count: 0,
+            tessellated_blas_count: 0,
         };
         if !rt.supported {
             return Ok(rt);
@@ -205,6 +220,11 @@ impl Rt {
     /// The skinned refit BLAS active this frame (rt-stats).
     pub fn skinned_blas_count(&self) -> u32 {
         self.skinned_blas_count
+    }
+
+    /// The tessellated full-rebuild BLAS active this frame (rt-stats).
+    pub fn tessellated_blas_count(&self) -> u32 {
+        self.tessellated_blas_count
     }
 
     /// The TLAS instance count produced by this frame's build (static + skinned).
@@ -282,6 +302,7 @@ impl Rt {
     pub fn clear_skinned_blas(&mut self) {
         for frame in &mut self.frames {
             frame.skinned_blas.clear();
+            frame.tessellated_blas.clear();
         }
     }
 
@@ -304,14 +325,20 @@ impl Rt {
     ) -> Option<TlasBuildPlan> {
         self.tlas_ready = false;
         self.skinned_blas_count = 0;
+        self.tessellated_blas_count = 0;
         if !self.supported || (self.scene.models.is_empty() && deformed.is_empty()) {
             return None;
         }
         let dispatch = self.dispatch.clone()?;
 
-        // Plan each deforming BLAS refit (create on first sight), sizing the shared scratch.
-        let blas_ops =
+        // Plan each deforming BLAS: skinned/morph refit (create-once then in-place `UPDATE`) +
+        // tessellated full `BUILD` (variable topology), both sizing the shared build scratch.
+        let mut blas_ops =
             self.plan_skinned_blas_refits(device, &dispatch, frame, deformed, deformed_buffer);
+        let skinned_op_count = blas_ops.len() as u32;
+        let tess_ops = self.plan_tessellated_blas_builds(device, &dispatch, frame, deformed);
+        let tess_op_count = tess_ops.len() as u32;
+        blas_ops.extend(tess_ops);
 
         // Pack one instance per static mesh that has a BLAS, then one per deforming instance.
         let mut instances: Vec<vk::AccelerationStructureInstanceKHR> =
@@ -325,21 +352,33 @@ impl Rt {
             instances.push(make_instance(transform_rows(model), index, blas.address));
             retained.push(Arc::clone(blas));
         }
-        // A deforming instance references its refit BLAS at its `world_transform`: identity
-        // for a skinned (or skin+morph) instance — the deformed vertices are already in world
-        // space — and the node world matrix for an unskinned-morph instance, whose deformed
-        // vertices are mesh-local.
+        // A deforming instance references its BLAS at its `world_transform`: identity for a skinned
+        // (or skin+morph) instance — the deformed vertices are already in world space — and the node
+        // world matrix for an unskinned-morph / tessellated instance, whose vertices are mesh-local.
+        // A tessellated instance resolves to its full-rebuild `tessellated_blas`; every other to its
+        // refit `skinned_blas`.
         for inst in deformed {
-            let Some(slot) = self.frames[frame].skinned_blas.get(&inst.entity) else {
+            let accel = if inst.tess.is_some() {
+                self.frames[frame]
+                    .tessellated_blas
+                    .get(&inst.entity)
+                    .map(|slot| Arc::clone(&slot.accel))
+            } else {
+                self.frames[frame]
+                    .skinned_blas
+                    .get(&inst.entity)
+                    .map(|slot| Arc::clone(&slot.accel))
+            };
+            let Some(accel) = accel else {
                 continue;
             };
             let index = instances.len() as u32;
             instances.push(make_instance(
                 transform_rows(&inst.world_transform),
                 index,
-                slot.accel.address,
+                accel.address,
             ));
-            retained.push(Arc::clone(&slot.accel));
+            retained.push(accel);
         }
 
         let count = instances.len() as u32;
@@ -380,7 +419,8 @@ impl Rt {
             .unwrap_or(0);
 
         self.frame_instance_count = count;
-        self.skinned_blas_count = blas_ops.len() as u32;
+        self.skinned_blas_count = skinned_op_count;
+        self.tessellated_blas_count = tess_op_count;
         self.tlas_ready = true;
         // Retain the TLAS too (it is referenced only through `self` otherwise, but holding
         // it in the plan keeps the replay self-contained).
@@ -421,7 +461,14 @@ impl Rt {
         let mut ops: Vec<BlasRefitOp> = Vec::with_capacity(instances.len());
         let mut scratch_needed: vk::DeviceSize = 0;
         for inst in instances {
-            if inst.vertex_count == 0 || inst.index_count < 3 || inst.entity == 0 {
+            // A tessellated instance takes the full-BUILD path (`plan_tessellated_blas_builds`);
+            // variable topology every frame forbids the in-place `UPDATE` this refit path uses.
+            if skinned_refit_skips(
+                inst.vertex_count,
+                inst.index_count,
+                inst.entity,
+                inst.tess.is_some(),
+            ) {
                 continue;
             }
             let triangle_count = inst.index_count / 3;
@@ -504,6 +551,109 @@ impl Rt {
         if let Err(err) = self.ensure_blas_scratch(frame, scratch_needed) {
             tracing::error!("rt: skinned BLAS scratch grow failed: {err}");
             // Roll back the "built" flags so a later frame retries the build cleanly.
+            return Vec::new();
+        }
+        ops
+    }
+
+    /// Plans a full `MODE_BUILD` for each tessellated instance's BLAS over its slice of the amplified
+    /// transient VB/IB. Unlike the skinned refit there is no create-once/`UPDATE` gate: variable topology
+    /// every frame demands a full rebuild, so the AS is sized to the worst-case primitive count and
+    /// recreated only when that bound changes (never on the per-frame GPU-packed count). The build range
+    /// runs the worst-case count too — the emit kernel degenerate-pads the index tail, so the extra
+    /// triangles collapse to points the builder discards, giving a watertight, portable floor with no
+    /// GPU-count readback. Shares the frame's build scratch (grown to the max, serialized by the recorder).
+    fn plan_tessellated_blas_builds(
+        &mut self,
+        device: &Device,
+        dispatch: &accel::Device,
+        frame: usize,
+        instances: &[DeformedRtInstance],
+    ) -> Vec<BlasRefitOp> {
+        let vertex_stride = size_of::<Vertex>() as vk::DeviceSize;
+        let mut ops: Vec<BlasRefitOp> = Vec::new();
+        let mut scratch_needed: vk::DeviceSize = 0;
+        for inst in instances {
+            let Some(tess) = inst.tess else {
+                continue;
+            };
+            if inst.entity == 0 || tess.worst_case_prims == 0 || tess.worst_case_verts == 0 {
+                continue;
+            }
+            let vertex_data = device.buffer_device_address(tess.vertex_buffer)
+                + vk::DeviceAddress::from(tess.vertex_base) * vertex_stride;
+            let index_data = device.buffer_device_address(tess.index_buffer)
+                + vk::DeviceAddress::from(tess.index_base) * size_of::<u32>() as vk::DeviceSize;
+
+            let geom = triangle_geometry(
+                vertex_data,
+                vertex_stride,
+                tess.worst_case_verts,
+                index_data,
+            );
+            let geoms = [geom];
+            let size_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .geometries(&geoms);
+            let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+            // SAFETY: the ash seam. `geometry_count == max_primitive_counts.len()` (1).
+            unsafe {
+                dispatch.get_acceleration_structure_build_sizes(
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &size_info,
+                    &[tess.worst_case_prims],
+                    &mut sizes,
+                );
+            }
+
+            // Reuse the AS while its worst-case bound holds; recreate it (never `UPDATE`) otherwise.
+            let accel = match self.frames[frame].tessellated_blas.get(&inst.entity) {
+                Some(slot)
+                    if tess_blas_reuse(Some(slot.worst_case_prims), tess.worst_case_prims) =>
+                {
+                    Arc::clone(&slot.accel)
+                }
+                _ => match AccelerationStructure::create(
+                    &self.resources,
+                    dispatch,
+                    sizes.acceleration_structure_size,
+                    vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                ) {
+                    Ok(accel) => {
+                        let accel = Arc::new(accel);
+                        self.frames[frame].tessellated_blas.insert(
+                            inst.entity,
+                            TessellatedBlas {
+                                accel: Arc::clone(&accel),
+                                worst_case_prims: tess.worst_case_prims,
+                            },
+                        );
+                        accel
+                    }
+                    Err(err) => {
+                        tracing::error!("rt: tessellated BLAS create failed: {err}");
+                        continue;
+                    }
+                },
+            };
+            scratch_needed = scratch_needed.max(sizes.build_scratch_size);
+            ops.push(BlasRefitOp {
+                dst: accel.handle(),
+                vertex_data,
+                vertex_stride,
+                max_vertex: tess.worst_case_verts - 1,
+                index_data,
+                triangle_count: tess.worst_case_prims,
+                update: false,
+            });
+        }
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        if let Err(err) = self.ensure_blas_scratch(frame, scratch_needed) {
+            tracing::error!("rt: tessellated BLAS scratch grow failed: {err}");
             return Vec::new();
         }
         ops
@@ -882,6 +1032,7 @@ impl FrameRt {
             scratch_capacity: 0,
             mesh_set: vk::DescriptorSet::null(),
             skinned_blas: HashMap::new(),
+            tessellated_blas: HashMap::new(),
             blas_scratch: None,
             blas_scratch_capacity: 0,
         }
@@ -964,6 +1115,28 @@ pub fn record_mesh_blas_build(
         dispatch.cmd_build_acceleration_structures(cmd, &[build_info], &[&ranges]);
     }
     Ok(MeshBlasBuild { blas, scratch })
+}
+
+/// Whether a cached tessellated BLAS whose backing store fits `cached_prims` worst-case triangles can be
+/// reused for a build wanting `wanted_prims`. A tessellated BLAS is a full `MODE_BUILD` every frame, so
+/// the *contents* never persist — only the AS backing-store *capacity* does. Reuse exactly when the
+/// worst-case bound is unchanged; a bound change (a new factor cap / LOD) forces a fresh, larger AS.
+/// `None` (no cached AS) is never reusable.
+fn tess_blas_reuse(cached_prims: Option<u32>, wanted_prims: u32) -> bool {
+    cached_prims == Some(wanted_prims)
+}
+
+/// Whether the skinned-refit planner skips an instance: a degenerate / untracked instance (no
+/// geometry, no triangle, or entity 0), or a **tessellated** one — the latter takes the full-BUILD
+/// path (`plan_tessellated_blas_builds`) because variable topology forbids the in-place `UPDATE` the
+/// refit relies on. This is the sole discriminator between the two BLAS paths.
+fn skinned_refit_skips(
+    vertex_count: u32,
+    index_count: u32,
+    entity: u64,
+    tessellated: bool,
+) -> bool {
+    vertex_count == 0 || index_count < 3 || entity == 0 || tessellated
 }
 
 /// A triangle-geometry descriptor over a device-address vertex + index stream
@@ -1182,6 +1355,61 @@ mod tests {
         let before = validation_issue_count();
         let rt = Rt::new(&device, &descriptors).expect("Rt::new");
         Some((device, descriptors, rt, before))
+    }
+
+    /// A tessellated BLAS reuses its backing store only when the worst-case bound is unchanged: a full
+    /// `MODE_BUILD` refills the geometry every frame, so nothing but the AS *capacity* persists. A first
+    /// sight (no cache) and any bound change both force a fresh AS; never an in-place `UPDATE`.
+    #[test]
+    fn tessellated_blas_reuses_only_on_unchanged_worst_case() {
+        assert!(!tess_blas_reuse(None, 100), "no cache is never reusable");
+        assert!(tess_blas_reuse(Some(100), 100), "same bound reuses the AS");
+        assert!(
+            !tess_blas_reuse(Some(64), 256),
+            "a grown bound (higher factor cap) forces a fresh AS"
+        );
+        assert!(
+            !tess_blas_reuse(Some(256), 64),
+            "a shrunk bound also recreates (never keep an oversized AS around)"
+        );
+    }
+
+    /// The tessellated BUILD's CPU range is the worst-case closed form: `worst_case_prims` triangles and
+    /// `max_vertex = worst_case_verts - 1`, matching the dice contract the emit kernel reserves. The IB
+    /// tail past the GPU-packed triangles is degenerate-padded, so building the full range is watertight.
+    #[test]
+    fn tessellated_blas_build_range_matches_worst_case_reservation() {
+        use crate::tessellation::tess_worst_case;
+        // Two base triangles at a factor cap of 8: L=8 ⇒ verts=(9)(10)/2=45, tris=64 per triangle.
+        let (verts, indices) = tess_worst_case(2, 8);
+        assert_eq!(verts, 2 * 45);
+        assert_eq!(indices, 2 * 64 * 3);
+        // The planner's BUILD range: primitive_count = indices/3, max_vertex = verts - 1.
+        let worst_case_prims = (indices / 3) as u32;
+        let max_vertex = verts as u32 - 1;
+        assert_eq!(worst_case_prims, 2 * 64);
+        assert_eq!(max_vertex, 2 * 45 - 1);
+    }
+
+    /// A tessellated instance (`tess: Some`) takes the full-BUILD path, never the skinned in-place refit:
+    /// `tessellated` is the sole discriminator, so a healthy instance marked tessellated is skipped by the
+    /// refit and planned once by the BUILD planner. Degenerate / untracked instances are skipped by both.
+    #[test]
+    fn tess_flag_selects_the_build_path_over_the_skinned_refit() {
+        // A healthy, non-tessellated instance takes the skinned refit (not skipped).
+        assert!(!skinned_refit_skips(100, 300, 7, false));
+        // The same instance marked tessellated is skipped by the refit → the BUILD planner claims it.
+        assert!(skinned_refit_skips(100, 300, 7, true));
+        // Degenerate / untracked instances are skipped regardless of the tessellation flag.
+        assert!(skinned_refit_skips(0, 300, 7, false), "no vertices");
+        assert!(
+            skinned_refit_skips(100, 2, 7, false),
+            "sub-triangle index count"
+        );
+        assert!(
+            skinned_refit_skips(100, 300, 0, false),
+            "untracked (entity 0)"
+        );
     }
 
     /// `transform_rows` transposes a column-major world transform into the row-major 3×4
