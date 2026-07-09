@@ -20,9 +20,9 @@ modal or another tab owns it — is driven from `App` per view.
 ## Bounds-sync
 
 `useSubsurfaceBounds(hostRef, "scene")` reports the panel's logical CSS rect plus the window
-scale factor through one Tauri command, `set_viewport_bounds(view, …)`. Rust fans it out for
-that view: the logical rect (plus the webview's CSD-aware offset within the toplevel, tracked
-GTK-side) positions and sizes the Scene subsurface, and the device-pixel size goes to the
+scale factor through one shell command, `set_viewport_bounds(view, …)`. Rust fans it out for
+that view: the logical rect (the UI *is* the toplevel surface in the CEF shell, so its offset
+within the toplevel is zero) positions and sizes the Scene subsurface, and the device-pixel size goes to the
 engine as `set-viewport-size {scene}` so the render matches the panel one-to-one. The
 asset-editor preview drives the same hook with `"assetPreview"`, so the two surfaces are sized
 independently.
@@ -85,14 +85,14 @@ key code).
 | The panel | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `eventToUv` |
 | Per-view two-tier bounds-sync hook | `editor/src/lib/useSubsurfaceBounds.ts` | `useSubsurfaceBounds`, `computeBounds`, `liveSync`, `scheduleEndCommit` |
 | Pointer-lock fly streaming | `editor/src/panels/ViewportPanel.tsx` | the fly `useEffect`, `FLY_STREAM_MS` |
-| Per-view rect + park bridge (Rust) | `editor/src-tauri/src/lib.rs` | `set_viewport_bounds`, `set_viewport_parked` |
-| Subsurface side | `editor/src-tauri/src/wayland_viewport.rs` | `Viewports`, `ViewportShared`, `ViewSurface`, `install` |
+| Per-view rect + park bridge (Rust) | `editor/shell/src/commands.rs` | `set_viewport_bounds`, `set_viewport_parked` |
+| Subsurface side | `editor/shell/src/presenter.rs` | `Viewports`, `ViewportShared`, `ViewSurface`, `install` |
 | Render size + active view (engine) | `engine/crates/control/src/commands_render.rs` · `commands_asset.rs` | `set-viewport-size`, `viewport-native-info`, `set-active-view` |
 
 ## Related
 
 - [Viewport compositing](../viewport-compositing/) — the transport this panel positions
-- [Tauri editor and the viewport bridge](../tauri-editor-and-viewport-bridge/) — the shell and lifecycle around it
+- [Editor shell and the viewport bridge](../editor-shell-and-viewport-bridge/) — the shell and lifecycle around it
 - [Gizmo](../gizmo/) — the pointer phases this panel forwards
 - [Selection](../selection/) — click-pick from a non-drag press
 - [Editor camera](../editor-camera/) — the fly input this panel streams
