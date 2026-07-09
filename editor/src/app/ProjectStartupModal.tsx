@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "../shell";
 import { FolderOpen, Loader2, Plus, RefreshCcw } from "lucide-react";
 import { client, type AppDataInfo, type RecentProject } from "../control/client";
 import { useEditorStore, withNativeDialog } from "../state/store";

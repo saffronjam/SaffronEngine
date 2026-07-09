@@ -2,7 +2,7 @@
 /// output folder, then drives the engine's `export-app` cook over the control plane. The engine
 /// pre-bakes shaders and stages the standalone `saffron-player` + project data into the folder.
 import { useEffect, useMemo, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "../shell";
 import { FolderOpen, Package } from "lucide-react";
 import { client } from "../control/client";
 import { useEditorStore, withNativeDialog } from "../state/store";
