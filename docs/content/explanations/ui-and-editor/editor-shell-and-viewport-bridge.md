@@ -1,16 +1,18 @@
 +++
-title = 'Tauri editor and the viewport bridge'
+title = 'Editor shell and the viewport bridge'
 weight = 1
 +++
 
-# Tauri editor and the viewport bridge
+# Editor shell and the viewport bridge
 
-The editor is a Tauri desktop application: a React/TypeScript front-end in a webview, a
-thin Rust backend, and the engine running as a separate process. The webview never renders
-the 3D scene. The engine renders headless and the editor composites its frames below the
-transparent UI ([viewport compositing](../viewport-compositing/)), so the viewport shows
-the live render while the webview owns all chrome — including chrome blended over the
-scene itself.
+The editor is a CEF (Chromium) application: a React/TypeScript front-end rendered through
+**windowless OSR**, a purpose-built Rust shell (`editor/shell`) that owns a winit Wayland
+toplevel, and the engine running as a separate process. The webview never renders the 3D
+scene. The engine renders headless and the shell composites its frames below the transparent
+UI ([viewport compositing](../viewport-compositing/)), so the viewport shows the live render
+while the UI owns all chrome — including chrome blended over the scene itself. CEF paints the
+UI off-screen (`on_paint`) and the shell uploads each frame to the toplevel surface at the
+monitor's refresh.
 
 Every editor operation that touches the scene rides the same JSON-over-unix-socket
 [control protocol](../../tooling-and-control/control-plane-architecture/) the `sa` CLI
@@ -20,18 +22,18 @@ its own.
 
 ## Two processes, one socket
 
-The Rust backend spawns `saffron-host` with `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` (hidden
-window), a per-instance `SAFFRON_CONTROL_SOCK` (pid-scoped, so two editor windows do not
-collide), **two** shared-memory segment names — `SAFFRON_VIEWPORT_SHM_SCENE` and
+The shell spawns `saffron-host` with `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` (hidden window), a
+per-instance `SAFFRON_CONTROL_SOCK` (pid-scoped, so two editor windows do not collide),
+**two** shared-memory segment names — `SAFFRON_VIEWPORT_SHM_SCENE` and
 `SAFFRON_VIEWPORT_SHM_ASSET`, one ring per [view](../viewport-compositing/) so each pane's
-subsurface has frames even while parked — and a `SAFFRON_MAX_FPS` cap. The engine is then the
-renderer and the webview is the UI, talking only over that socket.
+subsurface has frames even while parked. The engine is then the renderer and the webview is
+the UI, talking only over that socket.
 
-The TypeScript side is a typed client over one generic Rust passthrough. Every scene,
-asset, and render command is `invoke('control', { cmd, params })`; the Rust layer forwards
-it verbatim, turns an engine `ok:false` into a rejected promise, and otherwise resolves
-the result JSON. Adding a new `sa` command needs no Rust change — the typed wrapper in
-`client.ts` and a DTO entry are all that move.
+The TypeScript side is a typed client over one generic passthrough. Every scene, asset, and
+render command is `invoke('control', { cmd, params })` — where `invoke` is the shell bridge's
+`cefQuery` round-trip; the Rust layer forwards it verbatim, turns an engine `ok:false` into a
+rejected promise, and otherwise resolves the result JSON. Adding a new `sa` command needs no
+Rust change — the typed wrapper in `client.ts` and a DTO entry are all that move.
 
 ```ts
 async function call<C extends keyof CommandResultMap>(
@@ -48,13 +50,14 @@ Rust handles only the lifecycle and presenter commands directly — `start_engin
 the scene.
 
 > [!NOTE]
-> The presenter is a Wayland subsurface, so the editor requires a Wayland session.
+> The presenter is a Wayland subsurface and the UI is composited on winit's `wl_display`, so
+> the editor requires a Wayland session.
 
 ## Auto-start and the loading overlay
 
-On boot the Rust `.setup()` hook installs the presenter on the GTK window, spawns the
-engine, then polls `viewport-native-info` with a child-liveness-aware bounded retry that
-distinguishes "socket not bound yet" from "process crashed". React drives an
+On boot the shell spawns the engine (`auto_start`), installs the presenter worker
+(`presenter::install`), then polls `viewport-native-info` with a child-liveness-aware bounded
+retry that distinguishes "socket not bound yet" from "process crashed". React drives an
 `engineStatus.phase` state machine — `idle → starting → attaching → ready` — and the
 [viewport panel](../viewport-panel/) probes the same command before flipping to `ready`.
 A `<LoadingOverlay/>` covers the viewport region until then; it paints an opaque
@@ -73,7 +76,7 @@ and it offers **Retry** (re-probe) and **Restart** (quit, re-spawn, re-probe).
 |---|---|---|
 | Typed passthrough client | `editor/src/control/client.ts` | `call`, `callRaw`, `client` |
 | Lifecycle + presenter commands | `editor/src/control/client.ts` | `startEngine`, `setViewportBounds` (view), `setViewportParked` (view), `setActiveView`, `quitEngine`, `engineAlive` |
-| Engine spawn + env | `editor/src-tauri/src/lib.rs` | `spawn_engine`, `auto_start`, `nvidia_present` |
+| Engine spawn + supervision | `editor/shell/src/engine.rs` | `spawn_engine`, `auto_start`, watchdog |
 | App shell + lifecycle events | `editor/src/app/App.tsx` | `App`, `engine-phase` / `viewport-error` listeners |
 | Phase state machine | `editor/src/state/store.ts` | `EngineStatus`, `setPhase` |
 | Loading + crash overlay | `editor/src/app/LoadingOverlay.tsx` | `LoadingOverlay`, Retry / Restart |
