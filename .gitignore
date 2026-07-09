@@ -26,7 +26,6 @@ testscenes/
 # OS
 .DS_Store
 
-# Editor runtime dumps — the host writes viewport frame recordings next to the
-# Tauri bridge (named <control-address>-recording.json); they are huge and must
-# never be committed.
-editor/src-tauri/*-recording.json
+# The CEF editor shell's build output (a sibling crate outside the engine workspace; it links
+# libcef.so + its resource pack, so its target dir is many GB — never commit it).
+editor/shell/target/

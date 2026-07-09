@@ -2,5 +2,5 @@
 dist/
 node_modules/
 src/protocol/
-src-tauri/
+shell/target/
 *.css
