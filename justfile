@@ -172,8 +172,11 @@ test:
     RECIPE=test; {{reenter}}
     cd "{{engine}}" && cargo test --workspace
 
-# start the Tauri editor (it spawns the engine host as a native child)
-run:
+# start the editor: build the engine host + the CEF shell, link CEF's runtime resources next to the
+# shell binary, start Vite, then launch the shell pointed at it (the shell spawns the host as a child).
+# `just run inspect` additionally opens Chrome DevTools remote debugging on :9222 (Console, Network,
+# Performance tracing) — then open http://localhost:9222 in Chrome and click the page.
+run mode="":
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=run; {{reenter}}
@@ -181,9 +184,30 @@ run:
     cargo build --bin saffron-host
     cargo run -p xtask -- shaders
     {{nvidia_icd}}
-    export SAFFRON_WEBVIEW_HW=1
     export SAFFRON_ANIMA_BIN="{{engine_bin}}"
-    cd "{{editor}}" && bun run tauri dev
+    # The shell is a standalone crate (its own target dir), outside the engine workspace.
+    cd "{{editor}}/shell"
+    cargo build
+    # CEF loads libcef.so + its resources (icu / *.pak / snapshot / locales) from next to the binary.
+    DIST="$(cd "$(dirname "$(find target/debug/build -name libcef.so | head -1)")" && pwd)"
+    for f in "$DIST"/icudtl.dat "$DIST"/*.pak "$DIST"/v8_context_snapshot.bin "$DIST"/locales; do
+      ln -sfn "$f" "target/debug/$(basename "$f")"
+    done
+    export LD_LIBRARY_PATH="$DIST:${LD_LIBRARY_PATH:-}"
+    export SAFFRON_CEF_SWITCHES="ozone-platform=x11"
+    # `just run inspect` also exposes Chrome DevTools over remote debugging. `remote-allow-origins`
+    # is mandatory on Chromium 149 or the DevTools websocket is refused.
+    if [ "{{mode}}" = "inspect" ]; then
+      export SAFFRON_CEF_SWITCHES="${SAFFRON_CEF_SWITCHES},remote-debugging-port=9222,remote-allow-origins=*"
+      echo "[run] remote debugging: Chrome -> chrome://inspect -> Configure -> add localhost:9222 -> inspect the editor page."
+    fi
+    # Start Vite in the background, wait for it, run the shell; Vite dies with the recipe.
+    cd "{{editor}}"
+    bun run dev >/tmp/saffron-vite.log 2>&1 &
+    trap 'kill %1 2>/dev/null || true' EXIT
+    for _ in $(seq 1 100); do curl -sf http://127.0.0.1:1420 >/dev/null 2>&1 && break; sleep 0.1; done
+    export SAFFRON_DEV_URL="http://127.0.0.1:1420"
+    exec "{{editor}}/shell/target/debug/saffron-editor-shell"
 
 # like `run`, but with the editor's developer mode pre-enabled
 run-debug:
@@ -194,11 +218,24 @@ run-debug:
     cargo build --bin saffron-host
     cargo run -p xtask -- shaders
     {{nvidia_icd}}
-    export SAFFRON_WEBVIEW_HW=1 VITE_SAFFRON_DEV_MODE=1
-    export SAFFRON_ANIMA_BIN="{{engine_bin}}"
-    cd "{{editor}}" && bun run tauri dev
+    export SAFFRON_ANIMA_BIN="{{engine_bin}}" VITE_SAFFRON_DEV_MODE=1
+    cd "{{editor}}/shell"
+    cargo build
+    DIST="$(cd "$(dirname "$(find target/debug/build -name libcef.so | head -1)")" && pwd)"
+    for f in "$DIST"/icudtl.dat "$DIST"/*.pak "$DIST"/v8_context_snapshot.bin "$DIST"/locales; do
+      ln -sfn "$f" "target/debug/$(basename "$f")"
+    done
+    export LD_LIBRARY_PATH="$DIST:${LD_LIBRARY_PATH:-}"
+    export SAFFRON_CEF_SWITCHES="ozone-platform=x11"
+    cd "{{editor}}"
+    bun run dev >/tmp/saffron-vite.log 2>&1 &
+    trap 'kill %1 2>/dev/null || true' EXIT
+    for _ in $(seq 1 100); do curl -sf http://127.0.0.1:1420 >/dev/null 2>&1 && break; sleep 0.1; done
+    export SAFFRON_DEV_URL="http://127.0.0.1:1420"
+    exec "{{editor}}/shell/target/debug/saffron-editor-shell"
 
-# run the editor on the llvmpipe software GPU (no NVIDIA ICD)
+# run the editor with the engine on the llvmpipe software GPU (no NVIDIA ICD) and CEF's GPU process
+# on software (`disable-gpu`) — the two independent "software" halves.
 run-software:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -207,7 +244,20 @@ run-software:
     cargo build --bin saffron-host
     cargo run -p xtask -- shaders
     export SAFFRON_ANIMA_BIN="{{engine_bin}}"
-    cd "{{editor}}" && bun run tauri dev
+    cd "{{editor}}/shell"
+    cargo build
+    DIST="$(cd "$(dirname "$(find target/debug/build -name libcef.so | head -1)")" && pwd)"
+    for f in "$DIST"/icudtl.dat "$DIST"/*.pak "$DIST"/v8_context_snapshot.bin "$DIST"/locales; do
+      ln -sfn "$f" "target/debug/$(basename "$f")"
+    done
+    export LD_LIBRARY_PATH="$DIST:${LD_LIBRARY_PATH:-}"
+    export SAFFRON_CEF_SWITCHES="ozone-platform=x11,disable-gpu"
+    cd "{{editor}}"
+    bun run dev >/tmp/saffron-vite.log 2>&1 &
+    trap 'kill %1 2>/dev/null || true' EXIT
+    for _ in $(seq 1 100); do curl -sf http://127.0.0.1:1420 >/dev/null 2>&1 && break; sleep 0.1; done
+    export SAFFRON_DEV_URL="http://127.0.0.1:1420"
+    exec "{{editor}}/shell/target/debug/saffron-editor-shell"
 
 # start only the present-only host (loads a default content project so it shows a scene)
 run-engine:
