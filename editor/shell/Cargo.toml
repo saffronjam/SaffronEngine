@@ -1,0 +1,53 @@
+[package]
+name = "saffron-editor-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "saffron-editor-shell"
+path = "src/main.rs"
+
+# The CEF/Chromium 149 line, pinned exactly (pre-1.0 binding; the `<crate-semver>+<cef-version>`
+# scheme means the exact CEF build is reproducible). cef-dll-sys is the FFI crate pulled by `cef`;
+# pinned explicitly per the Phase 1 provisioning decision. Its build.rs downloads the version-locked
+# CEF binary distribution (or reuses `CEF_PATH` when set).
+[dependencies]
+cef = "=149.3.0"
+cef-dll-sys = "=149.3.0"
+# The host toplevel: winit owns one Wayland toplevel and the event loop that pumps CEF. Phase 3
+# reaches the toplevel's wl_surface via raw-window-handle to composite CEF's OSR buffer with wl_shm.
+winit = "0.30"
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Compositing CEF's OSR buffer onto the toplevel wl_surface via wl_shm, sharing winit's wl_display
+# through libwayland (`client_system` → `Backend::from_foreign_display`), the same path the engine
+# viewport presenter uses.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+# The viewport present loop: `wp_viewporter` scales the engine's device-pixel frame to the pane rect,
+# `wp_presentation` reports the true monitor refresh of the presented surface.
+wayland-protocols = { version = "0.32", features = ["client"] }
+libc = "0.2"
+
+# The Asset Store connectors (editor-only outbound HTTP): the async connector trait, per-provider
+# clients, the OS-keyring credential store, and zip extraction for material map sets. A tokio runtime
+# runs the async connector methods from the sync command dispatch (`block_on`). Identical crate set to
+# the connector backend; the provider code is unchanged.
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tracing = "0.1"
+# Native file/folder pickers over the XDG desktop portal (no GTK, thread-flexible), replacing
+# the native dialog plugin. Run on the shared tokio runtime from an IPC worker thread.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# Unified logging: the shell emits through the engine's `saffron-log` compact formatter
+# (timestamp · level · subsystem), so the shell's own lines and the spawned host's lines share one
+# format in the combined stdout instead of the shell using ad-hoc `eprintln!`. `tracing` above is the
+# facade; `saffron-log::init_logging` installs the subscriber. Path dep across the editor/engine
+# boundary — a deliberate, sanctioned coupling for one consistent log format.
+saffron-log = { path = "../../engine/crates/log" }
