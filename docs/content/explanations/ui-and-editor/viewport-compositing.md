@@ -73,16 +73,17 @@ fixed-capacity 4-slot ring: frame `s` lands in slot `s % 4`, the header is writt
 pixels-first with `seq` bumped last behind a release fence, so a reader that sees a new `seq`
 is guaranteed matching dimensions and pixels.
 
-The editor side runs one worker thread that wraps GTK's own `wl_display` connection with a
-private event queue, binds `wl_compositor`/`wl_subcompositor`/`wl_shm`/`wp_viewporter`,
-and creates **two desync subsurfaces placed below** the toplevel (one per view), plus a
-shared opaque backdrop subsurface below both. One `wl_shm_pool` per view wraps that view's
+The editor side runs one worker thread that wraps winit's `wl_display` connection (via
+`from_foreign_display`) with a private event queue, binds
+`wl_compositor`/`wl_subcompositor`/`wl_shm`/`wp_viewporter`/`wp_presentation`, and creates
+**two desync subsurfaces placed below** the toplevel (one per view). The shell's compositor
+owns a shared opaque backdrop subsurface below both. One `wl_shm_pool` per view wraps that view's
 segment directly — the compositor reads the very memory the engine wrote, one copy end to
 end. The single loop polls both segments and, for each *unparked* view, attaches its newest
 ring slot, damages, and commits, paced by frame callbacks (one per monitor refresh) with a
 bounded self-paced fallback for the spans when callbacks are withheld. `wp_viewport` scales
 each view's buffer to its pane's logical rect and `set_position` pins it, both fed per-view
-from the [viewport panel](../viewport-panel/)'s bounds through a Tauri command
+from the [viewport panel](../viewport-panel/)'s bounds through a shell command
 (`set_viewport_bounds(view, …)`); a parked view's surface is left untouched, freezing its
 last frame.
 
@@ -92,23 +93,15 @@ Each of these is the difference between a working viewport and one that is froze
 seamed, or absent — none of them fails with an error.
 
 - **Subsurface state is double-buffered on the parent.** Creation and `set_position` only
-  take effect when the *toplevel* commits. A static transparent window may not be
-  committing at all, so the presenter nudges `queue_draw` on bounds changes and while the
-  worker comes up.
-- **A fully transparent toplevel freezes GTK.** The compositor stops presenting a window
-  with nothing visible, which starves GTK3's frame clock of callbacks and halts its paint
-  loop — and with it the parent commits the subsurface needs. The window paints one
-  near-invisible 2×2 dot in its draw handler so it always counts as visible, and clears
-  its opaque region so the compositor blends below it.
+  take effect when the *toplevel* commits. The CEF UI commits the toplevel every frame it
+  paints, so the subsurfaces are adopted and re-positioned on the next UI frame.
 - **The page must resolve against a backdrop, not the desktop.** The page is transparent,
   and not every pixel of it is opaque — panel borders are 10%-alpha hairlines, and a
-  webview repaint lags an interactive resize by a frame. A backdrop subsurface below *both*
-  viewport subsurfaces stretches a single opaque theme-colored pixel (`wp_viewport` again)
-  over the whole window — including a parked view's frozen hole — so every translucent or
-  unpainted page pixel blends against
-  theme-dark exactly as it would in an opaque app. Painting that backdrop from GTK under
-  the webview does not work: WebKit's GL blit *replaces* the pixels beneath its
-  allocation rather than blending over them.
+  UI repaint lags an interactive resize by a frame. A backdrop subsurface below *both*
+  viewport subsurfaces (created by the shell's compositor, stretched to the whole window with
+  a single opaque theme-colored pixel via `wp_viewport`) — including under a parked view's
+  frozen hole — so every translucent or unpainted page pixel blends against theme-dark exactly
+  as it would in an opaque app.
 - **A segment can be replaced under the reader.** The engine recreates a view's shm segment
   if a frame ever outgrows the slot capacity, and a restarted engine makes a fresh one —
   same name, new inode. A mapping is per-inode, so a reader that keeps its old `mmap`
@@ -152,11 +145,11 @@ whole offscreen chain behind a device idle — until it is next activated, so a 
 stalls the visible one.
 
 > [!NOTE]
-> On NVIDIA, WebKitGTK's default DMABUF renderer draws nothing under Wayland and its
-> fallback loses transparency. The editor steers WebKit onto Mesa's software EGL
-> (`__EGL_VENDOR_LIBRARY_FILENAMES` + `LIBGL_ALWAYS_SOFTWARE=1`), gated on NVIDIA being
-> present so AMD/Intel keep the fast path. The engine itself still renders on the
-> hardware ICD.
+> CEF renders the UI windowless and the shell uploads each `on_paint` frame to the toplevel
+> `wl_surface` via `wl_shm` — there is no GPU dma-buf handoff for the UI (CEF's ANGLE-Vulkan
+> dma-buf can't be imported by Mutter's GL backend on NVIDIA). The engine's viewport frames,
+> shown on the subsurfaces here, likewise arrive over `wl_shm`. Both are CPU-shared-memory
+> paths; the engine itself still renders on the hardware ICD.
 
 ## Input rides the control plane
 
@@ -182,14 +175,15 @@ engine smooths gizmo drag samples toward their target each rendered frame
 | Recorded readback + fence-only submit | `engine/crates/rendering/src/renderer.rs` | `record_shm_copy`, `read_active_view_bgra8`, the active-view shm branch in `end_frame` |
 | Host shm wiring (per-view configs) | `engine/crates/host/src/viewport_shm.rs` | `ViewportShmPublisher`, `ShmViewConfig`, `configs_from_env` |
 | Loop cap | `engine/crates/app/src/lib.rs` | `max_fps_from_env`, `pace_loop` |
-| Two subsurfaces + one loop | `editor/src-tauri/src/wayland_viewport.rs` | `install`, `run`, `Viewports`, `ViewportShared`, `ViewSurface`, `PresentationStats` |
-| Backdrop + per-view segment remap | `editor/src-tauri/src/wayland_viewport.rs` | `backdrop_pixel_fd`, `stat_shm` |
-| Rect + park bridge (per view) | `editor/src-tauri/src/lib.rs` | `set_viewport_bounds`, `set_viewport_parked`, `viewport_shm_name`, `spawn_engine` |
+| Two subsurfaces + one loop | `editor/shell/src/presenter.rs` | `install`, `run`, `Viewports`, `ViewportShared`, `ViewSurface`, `PresentationStats` |
+| Opaque backdrop (below both views) | `editor/shell/src/compositor.rs` | `ensure_backdrop` |
+| Per-view segment remap | `editor/shell/src/presenter.rs` | `stat_shm`, `open_shm` |
+| Rect + park bridge (per view) | `editor/shell/src/{commands,state,engine}.rs` | `set_viewport_bounds`, `set_viewport_parked`, `viewport_shm_name`, `spawn_engine` |
 | Render size + active-view commands | `engine/crates/control/src/commands_render.rs` · `commands_asset.rs` | `set-viewport-size`, `set-active-view` |
 
 ## Related
 
-- [Tauri editor and the viewport bridge](../tauri-editor-and-viewport-bridge/) — the shell and control passthrough around this transport
+- [Editor shell and the viewport bridge](../editor-shell-and-viewport-bridge/) — the shell and control passthrough around this transport
 - [Viewport panel](../viewport-panel/) — the rect, input forwarding, and parking
 - [Editor camera](../editor-camera/) — the fly input streamed over `fly-input`
 - [Control plane](../../tooling-and-control/control-plane-architecture/) — the socket the input and size commands ride
