@@ -6,8 +6,7 @@
 /// a reset affordance that clears it back to the declared default.
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, FileCode, FilePlus2, FolderOpen, RotateCcw, X } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { invoke, open } from "../shell";
 import { client } from "../control/client";
 import { useEditorStore, withNativeDialog } from "../state/store";
 import { errorText, notifyError } from "../lib/flash";

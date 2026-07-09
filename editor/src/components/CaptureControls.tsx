@@ -5,8 +5,7 @@
 /// `capture-status` while recording; draining (`capture-stop`) happens only once ready.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, Download, ExternalLink, Flame } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { invoke, save } from "../shell";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
 import { captureToChromeTrace } from "../lib/chromeTrace";
@@ -173,7 +172,7 @@ export function CaptureControls() {
     }
   };
 
-  // Save trace bytes to a user-chosen path via the Tauri save dialog + bridge write (the webview
+  // Save trace bytes to a user-chosen path via the native save dialog + bridge write (the webview
   // cannot `<a download>` a blob). Bytes go over the bridge as a plain number array.
   const saveTrace = async (
     defaultName: string,

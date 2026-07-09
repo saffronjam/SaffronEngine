@@ -139,7 +139,7 @@ export function toPerfettoTrace(capture: ProfileCaptureDto): Uint8Array<ArrayBuf
   return bytes;
 }
 
-/// The hosted Perfetto UI. Opened in the OS browser via the Tauri bridge — the postMessage
+/// The hosted Perfetto UI. Opened in the OS browser via the shell bridge — the postMessage
 /// trace-handoff Perfetto documents only works between two windows in one browser context, which
-/// the Tauri webview → desktop browser boundary is not, so the user loads a downloaded trace there.
+/// the webview → desktop browser boundary is not, so the user loads a downloaded trace there.
 export const PERFETTO_URL = "https://ui.perfetto.dev";
