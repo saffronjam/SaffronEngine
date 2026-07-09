@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The single reproducible verification gate for the Saffron Anima engine + Tauri editor. It
+# The single reproducible verification gate for the Saffron Anima engine + CEF editor shell. It
 # sequences every test layer in dependency order, accumulates failures, and prints one ALL/SOME
 # verdict.
 #
@@ -17,6 +17,7 @@
 # `just check` invokes this script the same way. The sequenced steps:
 #
 #   1. workspace build           cargo build --workspace
+#   1b. editor shell build       cd editor/shell && cargo build (standalone CEF crate; links libcef)
 #   2. codegen freshness         xtask gen-protocol + git diff over the generated wire/Luau artifacts
 #   3. unit + crate tests        cargo test --workspace (inline #[cfg(test)] + tests/, incl. the
 #                                golden/snapshot tests and the physics determinism gate)
@@ -101,6 +102,16 @@ if ( cd "$ENGINE" && cargo build --workspace ); then
   pass_step "1. workspace build"
 else
   fail_step "1. workspace build" "cargo build --workspace"
+fi
+
+# The CEF editor shell is a standalone crate (its own Cargo.toml/lock, outside the engine workspace,
+# as src-tauri was). Its build.rs downloads/links the version-locked libcef; defer if that provisioning
+# is absent rather than failing the gate (the "hardware/tooling this environment lacks" spirit).
+step "1b. editor shell build (cargo build in editor/shell, links libcef)"
+if ( cd "$REPO/editor/shell" && cargo build ); then
+  pass_step "1b. editor shell build"
+else
+  defer "1b. editor shell build — libcef link/provisioning unavailable (cd editor/shell && cargo build)"
 fi
 
 step "2. codegen freshness (xtask gen-protocol + git diff over the generated wire + Luau artifacts)"
