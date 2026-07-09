@@ -3,7 +3,7 @@
 // it — enabling happens in the detail pane, gated on any credential the provider needs. Opens
 // automatically on first use (nothing enabled) and from the Store's gear button.
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../shell";
 import { Check } from "lucide-react";
 
 import { Button } from "@/components/ui/button";

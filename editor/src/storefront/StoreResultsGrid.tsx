@@ -4,7 +4,7 @@
 // the active session, so reopening the Store restores them without refetching.
 import * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../shell";
 import { observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import { ExternalLink, Loader2, Maximize2 } from "lucide-react";
 

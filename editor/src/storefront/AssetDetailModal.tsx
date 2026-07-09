@@ -1,6 +1,6 @@
 // The asset detail modal opened by a card's expand button: a large gallery on the left and
 // the asset's metadata + import controls on the right, mirroring the provider modal's layout.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../shell";
 import { ExternalLink } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";

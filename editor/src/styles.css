@@ -3,7 +3,7 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* Keep local font files available for offline Tauri builds. The theme uses system
+/* Keep local font files available for offline builds. The theme uses system
    fonts by default, but these faces remain available to component-level styles. */
 @font-face {
   font-family: "Roboto";

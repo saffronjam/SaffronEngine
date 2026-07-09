@@ -1,5 +1,5 @@
 // Route a provider image URL through the bridge's shared resource cache — the `saffron-img://`
-// custom scheme served in src-tauri. The bytes are fetched once (throttled), kept on disk across
+// custom scheme served by the shell. The bytes are fetched once (throttled), kept on disk across
 // restarts, and served locally, so a screenful of thumbnails never stampedes a provider CDN (which
 // was surfacing as broken-image tiles). Non-remote sources (data:/blob:, already-wrapped) pass
 // through untouched.

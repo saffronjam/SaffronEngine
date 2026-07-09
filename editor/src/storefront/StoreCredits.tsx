@@ -2,7 +2,7 @@
 // catalog (where import recorded it). This is the project's one-stop credits surface for
 // CC-BY / Sketchfab content — author, license, source, and the originating store.
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../shell";
 
 import { Badge } from "@/components/ui/badge";
 

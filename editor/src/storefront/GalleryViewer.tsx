@@ -1,6 +1,8 @@
 // A preview image with left/right navigation. Arrow nav slides the images across on a
 // bezier track; a thumbnail jump (driven from the modal) cross-fades instead. Arrows and the
 // slide label appear only when the asset has more than one image.
+import { useState } from "react";
+
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -9,6 +11,47 @@ import { cn } from "@/lib/utils";
 import { cachedImage } from "./cachedImage";
 import type { GalleryImage } from "./types";
 import type { GalleryNav } from "./useGallery";
+
+// One slide, owning its own load state so a pulsing skeleton covers it until the bytes arrive
+// (through the async `saffron-img://` handler) and it fades in — never a blank frame on navigate.
+function Slide({
+  img,
+  alt,
+  large,
+  active,
+  fade,
+  tick,
+}: {
+  img: GalleryImage;
+  alt: string;
+  large: boolean;
+  active: boolean;
+  /** The active slide arrived via a thumbnail jump — re-key the `<img>` so its fade-in replays. */
+  fade: boolean;
+  tick: number;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  return (
+    <div className="relative h-full w-full shrink-0">
+      {loaded ? null : <div className="absolute inset-0 animate-pulse bg-muted" />}
+      {/* No `loading="lazy"`: the gallery is a handful of images and the user navigates them, so
+          preload every slide concurrently — a slid-to image is already there. The skeleton state
+          lives on the Slide, so a fade re-key of the inner <img> doesn't flash it for a cached image. */}
+      <img
+        key={fade ? `fade-${tick}` : "slide"}
+        src={cachedImage(large ? (img.fullUrl ?? img.url) : img.url)}
+        alt={active ? alt : ""}
+        onLoad={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+        className={cn(
+          "h-full w-full object-contain transition-opacity duration-200",
+          loaded ? "opacity-100" : "opacity-0",
+          fade && "animate-in fade-in",
+        )}
+      />
+    </div>
+  );
+}
 
 export function GalleryViewer({
   images,
@@ -48,20 +91,15 @@ export function GalleryViewer({
         style={{ transform: `translateX(-${index * 100}%)` }}
       >
         {images.map((img, i) => (
-          <div key={img.url} className="relative h-full w-full shrink-0">
-            {/* Provider thumbnails are remote URLs; the webview has no CSP restriction here. */}
-            <img
-              // Re-key the active slide on a fade so its fade-in animation replays.
-              key={mode === "fade" && i === index ? `fade-${tick}` : "slide"}
-              src={cachedImage(large ? (img.fullUrl ?? img.url) : img.url)}
-              alt={i === index ? alt : ""}
-              loading="lazy"
-              className={cn(
-                "h-full w-full object-contain",
-                mode === "fade" && i === index && "animate-in fade-in duration-200",
-              )}
-            />
-          </div>
+          <Slide
+            key={img.url}
+            img={img}
+            alt={alt}
+            large={large}
+            active={i === index}
+            fade={mode === "fade" && i === index}
+            tick={tick}
+          />
         ))}
       </div>
 
@@ -73,13 +111,16 @@ export function GalleryViewer({
           {current.label}
         </Badge>
       ) : null}
+      {/* Nav reveals on hover of the gallery (`group/gallery`, for the standalone detail modal) OR the
+          enclosing card (`group`) — the latter so a card control overlaying the gallery (the expand
+          button, a sibling of this viewer) doesn't steal the hover and hide the arrows. */}
       {multi ? (
         <>
           <button
             type="button"
             aria-label="Previous image"
             onClick={stop(prev)}
-            className="absolute top-1/2 left-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 group-hover/gallery:opacity-100 hover:bg-background"
+            className="absolute top-1/2 left-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 group-hover/gallery:opacity-100 group-hover:opacity-100 hover:bg-background"
           >
             <ChevronLeft className="size-4" />
           </button>
@@ -87,11 +128,11 @@ export function GalleryViewer({
             type="button"
             aria-label="Next image"
             onClick={stop(next)}
-            className="absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 group-hover/gallery:opacity-100 hover:bg-background"
+            className="absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground opacity-0 group-hover/gallery:opacity-100 group-hover:opacity-100 hover:bg-background"
           >
             <ChevronRight className="size-4" />
           </button>
-          <div className="absolute right-1 bottom-1 rounded bg-background/70 px-1 text-[9px] text-muted-foreground opacity-0 group-hover/gallery:opacity-100">
+          <div className="absolute right-1 bottom-1 rounded bg-background/70 px-1 text-[9px] text-muted-foreground opacity-0 group-hover/gallery:opacity-100 group-hover:opacity-100">
             {index + 1}/{count}
           </div>
         </>

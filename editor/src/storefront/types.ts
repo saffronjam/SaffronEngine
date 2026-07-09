@@ -1,7 +1,7 @@
-// The Store connector surface lives in `src-tauri` (editor-local Tauri commands), not the
+// The Store connector surface lives in the shell (editor-local `store_*`/`connector_*` commands), not the
 // engine control plane — these mirror the Rust `connectors` module's camelCase wire types.
 // Only the eventual *import* crosses to the host (via the typed control client).
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "../shell";
 
 export type AuthKind = "none" | "apiKey" | "oauthLoopback";
 export type StoreKind = "model" | "hdri" | "material" | "texture";
