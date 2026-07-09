@@ -1,65 +1,0 @@
-
-БCPU render threadP
-Б	GPU queueP
-@─╦Цв©дZHX╨shadowP
-@─ФДв©дZHXP
-@─ФДв©дZHX╨motionP
-@─ФЕв©дZHXP
-@─ФЕв©дZHX╨gbufferP
-@─√Фв©дZHXP
-@─·Фв©дZHX╨gtaoP
-@─НИв©дZHXP
-@─НИв©дZHX╨ao-blurP
-@─╤Ьв©дZHXP
-"@─╤Ьв©дZHX╨contact-shadowsP
-@─·Зв©дZHXP
-@─·Зв©дZHX╨ssgiP
-@─▌Ъв©дZHXP
-@─▌Ъв©дZHX╨	ssgi-blurP
-@─╝■ь©дZHXP
-@─╝■ь©дZHX╨
-ssgi-accumP
-@─Ф≤ь©дZHXP
-@─Ф≤ь©дZ
-HX╨skyP
-@─ж ь©дZHXP
-@─ж ь©дZHX╨sceneP
-@─Н║ь©дZHXP
-@─Н║ь©дZHX╨ssgi-historyP
-@─Фёь©дZHXP
-'@─Фёь©дZHX╨ssgi-history-restoreP
-@─Фёь©дZHX╨tonemapP
-@│Фёь©дZHXP
-@─╤╔ь©дZHXP
-'@░╝╡▐юдZHX╨execute-render-graphP
-@ь╫╡▐юдZHX╨shadowP
-@┼╤╨▐юдZHXP
-@┐╬╨▐юдZHX╨motionP
-@²к╫▐юдZHXP
-@ём╫▐юдZHX╨gbufferP
-@╘ц©▐юдZHXP
-@≤д©▐юдZHX╨gtaoP
-@паа▐юдZHXP
-@жца▐юдZHX╨ao-blurP
-@─Аб▐юдZHXP
-"@┼Бб▐юдZHX╨contact-shadowsP
-@║ыц▐юдZHXP
-@║зц▐юдZHX╨ssgiP
-@╪жд▐юдZHXP
-@╥вд▐юдZHX╨	ssgi-blurP
-@╒ме▐юдZHXP
-@ёне▐юдZHX╨
-ssgi-accumP
-@Г∙г▐юдZHXP
-@░≤г▐юдZ
-HX╨skyP
-@├┴и▐юдZHXP
-@┌┼и▐юдZHX╨sceneP
-@╥┐н▐юдZHXP
-@╕┘н▐юдZHX╨ssgi-historyP
-@═Зн▐юдZHXP
-'@┤Эн▐юдZHX╨ssgi-history-restoreP
-@╙╒о▐юдZHXP
-@ё╓о▐юдZHX╨tonemapP
-@■┼п▐юдZHXP
-@╜≈п▐юдZHXP
