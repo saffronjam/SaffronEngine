@@ -36,7 +36,7 @@ behaves identically from a host shell or inside the container:
 just engine    # cargo build --workspace, then cargo run -p xtask -- shaders
 just test      # cargo test --workspace
 just lint      # cargo fmt --check + cargo clippy --workspace -- -D warnings + editor oxlint
-just run       # build the host, compile shaders, start the Tauri editor
+just run       # build the host, compile shaders, start the CEF editor shell
 just check     # the full reproducible gate
 ```
 

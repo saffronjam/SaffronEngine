@@ -6,13 +6,13 @@ math = false
 
 # Build and run
 
-Build the Rust engine host and the Tauri editor, then run both.
+Build the Rust engine host and the CEF editor shell, then run both.
 
-The editor is a Tauri/React app that drives the engine over the control socket. The engine is the Rust `saffron-host` binary — a headless, present-only viewport host built from the Cargo workspace in `engine/`. `just` is the task runner; its recipes auto-enter the `saffron-build` toolbox when run from a host shell, so the same `just engine` works on the Silverblue host or inside the container. The home directory is shared into the toolbox, which carries the Rust toolchain, the Vulkan SDK, SDL3, Slang, and the host's `bun` on PATH.
+The editor is a CEF/React app that drives the engine over the control socket. The engine is the Rust `saffron-host` binary — a headless, present-only viewport host built from the Cargo workspace in `engine/`. `just` is the task runner; its recipes auto-enter the `saffron-build` toolbox when run from a host shell, so the same `just engine` works on the Silverblue host or inside the container. The home directory is shared into the toolbox, which carries the Rust toolchain, the Vulkan SDK, SDL3, Slang, and the host's `bun` on PATH.
 
 ## Build the engine host
 
-`just engine` builds the workspace and compiles the shaders next to the host binary. The Tauri app spawns that binary on launch, so build it first.
+`just engine` builds the workspace and compiles the shaders next to the host binary. The shell spawns that binary on launch, so build it first.
 
 ```sh
 just engine
@@ -39,7 +39,7 @@ To run the host on its own — useful for a headless check or for driving it fro
 just run-engine
 ```
 
-## Run the Tauri editor
+## Run the CEF editor shell
 
 `just run` starts the editor, which spawns the `saffron-host` binary as a native child and composites its frames under the webview. Build the host first.
 
@@ -54,7 +54,7 @@ To build and typecheck the frontend on its own, `just editor` runs `bun run buil
 ## Verify
 
 - **Engine host alone**: the viewport presents the scene; drive it with the `sa` CLI over its control socket.
-- **Tauri editor**: the shell opens with the Hierarchy / tabbed Inspector·Environment·Stats / Assets / Viewport dock; a "Preparing renderer…" overlay clears once the embedded scene attaches.
+- **CEF editor shell**: the shell opens with the Hierarchy / tabbed Inspector·Environment·Stats / Assets / Viewport dock; a "Preparing renderer…" overlay clears once the embedded scene attaches.
 - **Headless check**: with no display attached, `just run-engine-headless` boots the host under a private headless `weston`, bounded to a few frames:
   ```sh
   just run-engine-headless 5
@@ -62,7 +62,7 @@ To build and typecheck the frontend on its own, `just editor` runs `bun run buil
   It sets `SAFFRON_EXIT_AFTER_FRAMES=5` and a per-run `SAFFRON_CONTROL_SOCK`. `SAFFRON_EXIT_AFTER_FRAMES=N` exits after `N` frames; the offscreen image is captured over the control plane via the screenshot command (`capture_viewport`).
 
 > [!NOTE]
-> The Tauri editor is the only editor. Undo/redo, multi-viewport, and native Wayland are non-goals for now.
+> The CEF editor shell is the only editor. Undo/redo, multi-viewport, and native Wayland are non-goals for now.
 
 ## In the code
 
@@ -73,11 +73,11 @@ To build and typecheck the frontend on its own, `just editor` runs `bun run buil
 | The loop + frame limit | `engine/crates/app/src/lib.rs` | `run`, `frame_limit_from_env` |
 | Shader + protocol build steps | `engine/xtask/src/main.rs` | `run_shaders`, `run_gen_protocol` |
 | Viewport screenshot | `engine/crates/rendering/src/renderer.rs` | `Renderer::capture_viewport` |
-| Frontend scripts | `editor/package.json` | `dev`, `check`, `tauri:dev`, `gen:protocol` |
+| Frontend scripts | `editor/package.json` | `dev`, `check`, `gen:protocol` |
 
 ## Related
 
-- [Tauri editor and the viewport bridge](../../explanations/ui-and-editor/tauri-editor-and-viewport-bridge/) — how the editor drives the host
+- [Editor shell and the viewport bridge](../../explanations/ui-and-editor/editor-shell-and-viewport-bridge/) — how the editor drives the host
 - [Main loop](../../explanations/app-lifecycle-and-window/main-loop-and-run/)
 - [Headless runs and capture](../../explanations/app-lifecycle-and-window/headless-and-capture/)
 </content>
