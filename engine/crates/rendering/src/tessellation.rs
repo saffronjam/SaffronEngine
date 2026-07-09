@@ -543,7 +543,7 @@ impl Tessellation {
         let handle = buffer.handle();
         self.factor_slots[slot] = Some(buffer);
         self.factor_capacity[slot] = capacity;
-        tracing::info!(
+        tracing::debug!(
             "tessellation: factor slot {slot} grew to {capacity} edges ({} KiB)",
             size / 1024
         );

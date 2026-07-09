@@ -381,7 +381,7 @@ impl Skinning {
         self.frames[frame].deformed_capacity = capacity;
         if capacity > self.peak_vertices {
             self.peak_vertices = capacity;
-            tracing::info!(
+            tracing::debug!(
                 "skinning: deformed-vertex buffer grew to {} vertices ({} KiB)",
                 capacity,
                 u64::from(capacity) * size_of::<Vertex>() as u64 / 1024

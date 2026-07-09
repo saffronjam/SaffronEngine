@@ -966,7 +966,7 @@ impl Ibl {
             self.write_mesh_set(&raw);
             self.ready = true;
         }
-        tracing::info!(
+        tracing::debug!(
             "ibl baked — env {IBL_ENV_SIZE}^2, irradiance {IBL_IRRADIANCE_SIZE}^2, prefiltered \
              {IBL_PREFILTER_SIZE}^2 x{mips} mips, lut {IBL_LUT_SIZE}^2{}",
             if use_atmosphere { " (atmosphere)" } else { "" }
