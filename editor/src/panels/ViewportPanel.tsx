@@ -164,7 +164,7 @@ export function ViewportPanel() {
 
   // Readiness: probe the control plane until the engine has booted + bound its
   // socket, then flip the phase. The `engine-phase` events are emitted from the Rust
-  // `.setup()` hook BEFORE this webview registers its listener (Tauri does not buffer
+  // `.setup()` hook BEFORE this webview registers its listener (the shell does not buffer
   // pre-listen events), so the probe — not the event — is the gate. (`cancelled`
   // makes any pending retry a no-op after unmount.)
   useLayoutEffect(() => {

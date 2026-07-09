@@ -5,7 +5,7 @@
 /// rect no-ops via the computeBounds null guard, so a host that is `display:none` (its tab inactive)
 /// emits nothing; `enabled: false` disables the hook outright.
 import { useEffect, type RefObject } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "../shell";
 import { client, type ViewId, type ViewportBounds } from "../control/client";
 import { onLayoutSettled } from "../app/layoutBus";
 

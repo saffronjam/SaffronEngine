@@ -6,7 +6,7 @@
 ///
 /// Ids are `string` end-to-end (engine Uuids are u64 and can exceed 2^53). NEVER
 /// `Number()` an id.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../shell";
 import type { MaterialGraph } from "../materials/graph";
 import type {
   ActiveAlarmsDto,
@@ -149,7 +149,7 @@ export function isBusyLoading(err: unknown): boolean {
 }
 
 /// Coerce whatever `invoke` rejected with (the serialized bridge `{ message, code }`, or a bare
-/// string when the Tauri layer itself failed) into a `ControlError`.
+/// string when the bridge layer itself failed) into a `ControlError`.
 function toControlError(raw: unknown): ControlError {
   if (raw instanceof ControlError) {
     return raw;

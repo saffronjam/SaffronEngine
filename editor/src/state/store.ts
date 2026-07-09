@@ -360,7 +360,7 @@ export interface EditorState {
   /// child always paints on top otherwise. The ViewportPanel reads this and skips
   /// gluing the native window to its div until it clears.
   viewportHidden: boolean;
-  /// True while a native OS file dialog (Tauri `open`/`save`) is showing. These
+  /// True while a native OS file dialog (`open`/`save`) is showing. These
   /// dialogs are not window-modal under the reparented-viewport setup, so the
   /// webview stays live; this flag is the app-side lock that stops a second dialog
   /// from being opened and greys the controls that would open one.
