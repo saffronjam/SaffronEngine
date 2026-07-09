@@ -41,7 +41,7 @@ Add a new ECS component type. A single `register_component!` line wires up seria
    ```rust
    register_component!(reg, Health, "Health");
    ```
-   There is no per-type UI draw hook: the engine renders no UI. The Inspector is the React/Tauri frontend, which builds each field from the DTO catalog over the control plane. The macro defaults the serde to the type's `SceneSerialize` impl and synthesizes the structural fn-pointers (`has` / `add_default` / `remove` / `copy_to` / `serialize` / `deserialize`) into a `ComponentTraits` row. An optional trailing `bool` is `removable`, which is `false` for always-present types like `Name`, `Transform`, and `Relationship` (it defaults to `true`).
+   There is no per-type UI draw hook: the engine renders no UI. The Inspector is the React/CEF frontend, which builds each field from the DTO catalog over the control plane. The macro defaults the serde to the type's `SceneSerialize` impl and synthesizes the structural fn-pointers (`has` / `add_default` / `remove` / `copy_to` / `serialize` / `deserialize`) into a `ComponentTraits` row. An optional trailing `bool` is `removable`, which is `false` for always-present types like `Name`, `Transform`, and `Relationship` (it defaults to `true`).
 4. Rebuild with `cargo build --workspace`.
 
 The stable name is the JSON key, the Inspector header, and the CLI token. Keep it consistent across all three.

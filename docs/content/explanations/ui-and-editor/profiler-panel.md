@@ -69,5 +69,5 @@ for a per-pass alarm (and to Stats for a frame-wide one), opening the matching t
 | Flame graph (main tab) | `editor/src/components/CaptureFlame.tsx` · `editor/src/app/App.tsx` | `FlameGraphWorkspace`, `openFlameTab` |
 | Capture controls + export | `editor/src/components/CaptureControls.tsx` | ButtonGroup capture, Download menu, open-in-Perfetto, Flame button |
 | Capture store slice + transforms | `editor/src/state/store.ts` · `editor/src/lib/captureTree.ts` · `editor/src/lib/perfettoExport.ts` | `captureState`, `spansToFlameTree`, `toPerfettoTrace` |
-| Perfetto auto-import (loopback trace server) | `editor/src-tauri/src/lib.rs` | `serve_trace`, `start_trace_server`, `open_external` |
+| Perfetto auto-import (loopback trace server) | `editor/shell/src/commands.rs` | `serve_trace`, `start_trace_server`, `open_external` |
 | Alarm deep-link | `editor/src/components/AlarmBadge.tsx` | `openPanel("profiler")` for per-pass alarms |

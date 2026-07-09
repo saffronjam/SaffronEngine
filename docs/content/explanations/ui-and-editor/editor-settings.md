@@ -48,7 +48,7 @@ While the modal is open, the global shortcut hook is gated off (the dialog holds
 | The settings modal | `editor/src/app/SettingsModal.tsx` | `SettingsModal`, `KeyboardSection`, `BindingRow` |
 | Gear button | `editor/src/app/WindowTitlebar.tsx` | the `Settings` `TitlebarButton` |
 | Store slice + hydration | `editor/src/state/store.ts` | `keyBindings`, `settingsOpen`, `setKeyBinding`, `resetKeyBinding`, `loadEditorSettings` |
-| Persistence bridge | `editor/src-tauri/src/lib.rs` | `load_editor_settings`, `save_editor_settings`, `EditorSettings`, `settings_path` |
+| Persistence bridge | `editor/shell/src/settings.rs` | `load_editor_settings`, `save_editor_settings`, `EditorSettings`, `settings_path` |
 | Client wrappers | `editor/src/control/client.ts` | `loadEditorSettings`, `saveEditorSettings`, `EditorSettings` |
 
 ## Related

@@ -109,7 +109,7 @@ rediscovered and a deleted file's row is dropped.
 
 ## Startup and commands
 
-The Tauri editor owns startup project choice. If `SAFFRON_PROJECT` is set, the engine opens
+The editor shell owns startup project choice. If `SAFFRON_PROJECT` is set, the engine opens
 (or creates) that project immediately — a project name under userdata, a project directory, or
 a direct `project.json` path. `SAFFRON_SCRATCH_PROJECT` creates a per-shell scratch project
 without showing the startup modal.

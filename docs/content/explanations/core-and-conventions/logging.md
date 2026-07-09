@@ -72,7 +72,7 @@ it did not move — that is the e2e oracle. The harness also greps the log for a
 `saffron_log::init_logging()` is called once at process start — the host's `run_host`, the player's
 `main`, and the editor bridge's `run`. It is idempotent (a second call is a no-op, never a panic),
 and it is the single seam where a future file sink (`tracing-appender`) or an editor-channel sink is
-added as one more `.with(layer)`. The editor's Tauri bridge — a separate process outside the engine
+added as one more `.with(layer)`. The editor shell — a separate process outside the engine
 workspace — depends only on the leaf `saffron-log` crate, so it shares this exact format without
 pulling the engine into its build.
 

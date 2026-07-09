@@ -79,7 +79,7 @@ void client.renameAsset(entry.id, next).then(() => refreshAssets());
 
 ## Import and drag-drop
 
-The **Import** button opens the Tauri file dialog (`tauri-plugin-dialog`); the panel is also an **OS file-drop** target via the webview drag-drop event. Both route by extension: images go to `import-texture` (catalog-only, no spawn), everything else to `import-model`, matching the engine's `importToCatalog`. The OS file-drop is hit-tested against the panel's rect, scaled by `devicePixelRatio` because the drop position is in physical pixels. Dropping a model on the *viewport* therefore does not trigger a catalog import here.
+The **Import** button opens the native file dialog (`rfd` XDG portal); the panel is also an **OS file-drop** target via the webview drag-drop event. Both route by extension: images go to `import-texture` (catalog-only, no spawn), everything else to `import-model`, matching the engine's `importToCatalog`. The OS file-drop is hit-tested against the panel's rect, scaled by `devicePixelRatio` because the drop position is in physical pixels. Dropping a model on the *viewport* therefore does not trigger a catalog import here.
 
 Each tile is also an HTML5 drag *source* on a distinct channel, `application/x-se-asset`, separate from the OS file drop. It carries `{id, type}` so an inspector [picker](../asset-pickers-and-drag-drop/) can type-gate the drop. Folder tiles, tree rows, breadcrumb segments, and the current folder background accept the same payload and call `move-asset`.
 

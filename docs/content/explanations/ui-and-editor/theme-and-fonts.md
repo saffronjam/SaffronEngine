@@ -62,6 +62,6 @@ leaf, never a sibling panel.
 ## Related
 
 - [Dock system](../dock-system/) — the resizable split-and-tab layout these tokens dress
-- [Tauri editor and the viewport bridge](../tauri-editor-and-viewport-bridge/) — the shell the theme dresses
+- [Editor shell and the viewport bridge](../editor-shell-and-viewport-bridge/) — the shell the theme dresses
 - [Viewport panel](../viewport-panel/) — the panel that fills the dock center
 - [Inspector](../inspector/) — uses the mono font for its data fields

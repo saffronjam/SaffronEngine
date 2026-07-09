@@ -93,4 +93,4 @@ threshold: 🟢 `< 0.8 × budget` and consistent; 🟡 near budget or `1.5–2 �
 
 - [Performance telemetry](../../frame-and-render-graph/performance-telemetry/) — the engine signals the dashboard reads
 - [Performance alarms](../../frame-and-render-graph/performance-alarms/) — the alarm engine behind the toasts + badge
-- [Tauri editor + viewport bridge](../tauri-editor-and-viewport-bridge/) — the control passthrough + reconcile poll
+- [Editor shell + viewport bridge](../editor-shell-and-viewport-bridge/) — the control passthrough + reconcile poll
