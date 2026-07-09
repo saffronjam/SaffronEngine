@@ -8,18 +8,18 @@ weight = 1
 A connector is one external asset service the editor can search and import from. The framework
 that holds them has three jobs: present every service through one normalized result shape, search
 the one store you pick from the Store's dropdown, and turn a chosen result into a catalog asset. It
-lives in `editor/src-tauri/src/connectors/` because service calls are HTTP from native Rust (no
+lives in `editor/shell/src/connectors/` because service calls are HTTP from native Rust (no
 browser CORS), any credentials stay out of the renderer, and provider thumbnails are just URLs
 the webview loads directly.
 
 | What | File | Symbols |
 |---|---|---|
-| Trait + normalized types | `editor/src-tauri/src/connectors/mod.rs` | `StoreConnector`, `StoreResult`, `StoreLicense`, `AuthKind` |
-| First connector (keyless, CC0) | `editor/src-tauri/src/connectors/polyhaven.rs` | `PolyHaven` |
-| Search session (one store) | `editor/src-tauri/src/connectors/session.rs` | `SearchSession` |
-| Registry | `editor/src-tauri/src/connectors/registry.rs` | `ConnectorRegistry` |
-| API-key connector | `editor/src-tauri/src/connectors/polypizza.rs` | `PolyPizza` |
-| Credentials (keyring) | `editor/src-tauri/src/connectors/credentials.rs` | `Credentials` |
+| Trait + normalized types | `editor/shell/src/connectors/mod.rs` | `StoreConnector`, `StoreResult`, `StoreLicense`, `AuthKind` |
+| First connector (keyless, CC0) | `editor/shell/src/connectors/polyhaven.rs` | `PolyHaven` |
+| Search session (one store) | `editor/shell/src/connectors/session.rs` | `SearchSession` |
+| Registry | `editor/shell/src/connectors/registry.rs` | `ConnectorRegistry` |
+| API-key connector | `editor/shell/src/connectors/polypizza.rs` | `PolyPizza` |
+| Credentials (keyring) | `editor/shell/src/connectors/credentials.rs` | `Credentials` |
 | Per-project enablement | `engine/crates/assets/src/project.rs` | `ProjectSidecar.stores`, `get-stores`, `set-stores` |
 | Import (host side) | `engine/crates/control/src/commands_asset.rs` | `import-model` |
 
@@ -94,7 +94,7 @@ A result can also expose its individual files. The card's split button — `[ Im
 whole asset on the main action; the dropdown lists the asset's parts (the PBR maps) and imports just
 the chosen one as a standalone, colorspace-correct texture. This is a connector capability, not a
 provider special case: a connector sets `has_parts` and implements `parts()` / `download_part()`
-(`editor/src-tauri/src/connectors/mod.rs`), and the rest of the pipeline stays uniform.
+(`editor/shell/src/connectors/mod.rs`), and the rest of the pipeline stays uniform.
 
 How each provider fills it: **Poly Haven** lists every map as its own file over REST, so it fetches
 only the picked file; **ambientCG** knows the map roles over REST but ships a per-resolution zip, so
@@ -126,8 +126,8 @@ about it crosses to the host until an import.
 
 | What | File | Symbols |
 |---|---|---|
-| Resource cache | `editor/src-tauri/src/connectors/cache.rs` | `ResourceCache` |
-| Image scheme | `editor/src-tauri/src/lib.rs` | `saffron-img://` |
+| Resource cache | `editor/shell/src/connectors/cache.rs` | `ResourceCache` |
+| Image scheme | `editor/shell/src/scheme.rs` | `saffron-img://` |
 
 Every remote fetch — thumbnails, gallery previews, deliverable downloads, extracted map bundles —
 goes through one `ResourceCache`, not a per-connector client or directory. It keeps bytes on disk

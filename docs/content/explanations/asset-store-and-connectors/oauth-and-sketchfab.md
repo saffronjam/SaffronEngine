@@ -11,9 +11,9 @@ provider-agnostic; a connector supplies a descriptor and the capability does the
 
 | What | File | Symbols |
 |---|---|---|
-| Loopback flow + landing page | `editor/src-tauri/src/connectors/oauth_loopback.rs` | `run_loopback_login`, `OAuthLoopbackConfig` |
-| Sketchfab connector | `editor/src-tauri/src/connectors/sketchfab.rs` | `Sketchfab` |
-| Login command | `editor/src-tauri/src/lib.rs` | `connector_login` |
+| Loopback flow + landing page | `editor/shell/src/connectors/oauth_loopback.rs` | `run_loopback_login`, `OAuthLoopbackConfig` |
+| Sketchfab connector | `editor/shell/src/connectors/sketchfab.rs` | `Sketchfab` |
+| Login command | `editor/shell/src/store_commands.rs` | `connector_login` |
 | Attribution surface | `engine/crates/protocol/src/dto.rs` | `AssetEntryDto.attribution` |
 
 ## Why implicit flow over a loopback redirect
