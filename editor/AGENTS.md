@@ -1,10 +1,13 @@
-# editor — Tauri/React editor
+# editor — CEF/React editor shell
 
-The editor is a **Tauri 2 / React 19 / TypeScript** app. It spawns the Rust `saffron-host`
-present-only viewport host headless, presents the host's shared-memory frames on a Wayland subsurface below its
-transparent window (the viewport panel is a hole the render shows through), and drives
-every operation over the JSON-over-unix-socket control plane. The engine renders; this
-app is the UI shell composited over the live viewport.
+The editor is a **CEF (Chromium) / React 19 / TypeScript** app: a purpose-built Rust shell
+(`editor/shell`, the `saffron-editor-shell` binary) that owns a winit Wayland toplevel and renders the
+React UI through CEF **windowless OSR** (`on_paint` BGRA → the toplevel `wl_surface`, alpha preserved),
+transparently over the engine's frames. It spawns the Rust `saffron-host` present-only viewport host
+headless, presents the host's shared-memory frames on Wayland subsurfaces below the transparent UI (the
+viewport panel is a hole the render shows through), paced at the monitor's refresh, and drives every
+operation over the JSON-over-unix-socket control plane. The engine renders; this app is the UI shell
+composited over the live viewport.
 
 ## Layout
 
@@ -17,21 +20,24 @@ src/
   components/  shadcn/ui (ui/) + field renderers (NumberDrag, ColorField, VectorEditor, …); plus
                reusable subsystems: dock/ (the docking model), timeline/ (animation timeline surface
                + transport), anima/ (a generic keyword:value chip-search — *not* animation)
-  control/     typed control client over the Tauri bridge (client.ts)
+  control/     typed control client over the shell bridge (client.ts)
   state/       Zustand store + the reconcile poll (store.ts)
   materials/   material node-graph model shared with the engine wire format (graph.ts) — backs the React Flow editor
   storefront/  the in-editor Asset Store: browse/import models/textures/HDRIs/materials from external
-               providers, a `store` ViewTab; talks to editor-local `store_*`/`connector_*` Tauri
+               providers, a `store` ViewTab; talks to editor-local `store_*`/`connector_*` shell
                commands (its own AGENTS.md), NOT the control plane
   protocol/    GENERATED TypeScript types — do not edit by hand
+  shell/       the CEF bridge (index.ts): `invoke`/`listen`/window/webview/dialog/Channel over `cefQuery`
   lib/         utilities
   assets/      static assets (fonts + storefront provider logos)
 scripts/gen-protocol.ts   re-runs `cargo run -p xtask -- gen-protocol` → src/protocol/sa-types.ts
-src-tauri/     Rust bridge (lib.rs + wayland_viewport.rs + connectors/): engine spawn, control passthrough,
-               subsurface presenter, and the Asset Store connector backend (connectors/, its own AGENTS.md)
+shell/         the CEF/Rust editor shell (`saffron-editor-shell`): a winit Wayland toplevel hosting CEF
+               windowless OSR, the IPC bridge (`cefQuery` → command dispatch), the subsurface presenter
+               (presenter.rs), engine supervision (engine.rs), native dialogs/drag-drop, the connector
+               backend (connectors/, its own AGENTS.md), and the `saffron-img://` scheme (scheme.rs)
 ```
 
-Stack (see `package.json`): React 19, Tauri 2, Zustand 5, Vite 7, Tailwind v4
+Stack (see `package.json` + `shell/Cargo.toml`): CEF (Chromium 149) OSR shell, React 19, Zustand 5, Vite 7, Tailwind v4
 (`@tailwindcss/vite`), shadcn/ui (Radix), `react-resizable-panels` (docking), `@xyflow/react`
 (material node graph), `flame-chart-js` + `uplot` (profiler / frame-time stats), `react-colorful`,
 `lucide-react` (icons), and `sonner` (toasts). Lint/format via **oxc** (`oxlint` + `oxfmt`, configs in
@@ -43,7 +49,7 @@ Stack (see `package.json`): React 19, Tauri 2, Zustand 5, Vite 7, Tailwind v4
 bun install
 bun run check    # gen:protocol + tsc --noEmit
 bun run build    # gen:protocol + tsc + vite build
-bun run tauri:dev  # launches the app; needs a Wayland session for the subsurface presenter
+just run         # from the repo root: builds the host + the CEF shell, starts Vite, launches the shell
 ```
 
 `bun run gen:protocol` regenerates `src/protocol/sa-types.ts` from the `saffron-protocol` DTOs
@@ -61,9 +67,9 @@ alone, **instrument first, then ask the user to capture data:**
    to disambiguate the competing hypotheses, not a firehose. Route it to **one stream the user can paste**:
    the terminal where `just run` prints. Rust bridge / engine logs already go there via `eprintln!` /
    stdout; for **React state** (effect firing order, `phase`/`revealed`, a computed rect, a store flag)
-   add a temporary Tauri command that `eprintln!`s and call it from React via `invoke` — webview
-   `console.log` does **not** reach the `tauri dev` terminal. Log **transitions**, not per-frame state,
-   in hot loops, and delete the command + its calls once the bug is found.
+   add a temporary shell command that `eprintln!`s and call it from React via `invoke` — the CEF
+   renderer's `console.log` lands in the CEF subprocess, not the `just run` terminal. Log
+   **transitions**, not per-frame state, in hot loops, and delete the command + its calls once found.
 2. Tell the user exactly what to do: restart `just run` (a full restart — **Vite HMR does not reliably
    apply Zustand store-shape changes or new commands to a live session**), reproduce the bug, and paste
    the `[vp-dbg]` lines (and/or a screenshot). State which questions the log answers.
@@ -92,17 +98,18 @@ user confirms it against real output — say "this should fix it, please verify 
   `control(cmd, params)` command (it rejects on `ok:false`); the ~120 typed wrappers in
   `client.ts` layer on top. Dedicated lifecycle/presenter commands (`start_engine`,
   `set_viewport_bounds`, `set_viewport_parked`, `viewport_refresh_hz`, `quit_engine`,
-  `engine_alive`) are their own Tauri commands, separate from the passthrough. There is **no**
+  `engine_alive`) are their own dedicated shell commands, separate from the passthrough. There is **no**
   runtime escape hatch for an untyped command: to add one, add its DTO in
   `engine/crates/protocol/src/dto.rs`, run `bun run gen:protocol`, then add a typed wrapper in
   `client.ts` — every dispatched name is checked against the generated `CommandName` union.
-- **Browser file/URL APIs don't work in the webview — go through the bridge.** WebKitGTK
-  ignores `<a download>`/blob downloads and `window.open` to an external URL. To save
-  client-generated bytes (e.g. a profiler trace), pick a path with `save()` from
-  `@tauri-apps/plugin-dialog` and write it with the `write_file(path, bytes)` Rust command;
-  to open an external site (e.g. ui.perfetto.dev) use the `open_external(url)` command (which
-  tries `flatpak-spawn --host xdg-open` first, since the toolbox has no `xdg-utils`). Perfetto's
-  `postMessage` trace handoff can't cross the webview → desktop-browser boundary, so auto-import
+- **File save / external-URL open go through the bridge, not the DOM.** Chromium honours
+  `<a download>`/`window.open`, but the editor still routes these through native so it can pick a real
+  path and reach the desktop from inside the toolbox. To save client-generated bytes (e.g. a profiler
+  trace), pick a path with `save()` from the shell bridge (`src/shell`) and write it with the
+  `write_file(path, bytes)` command; to open an external site (e.g. ui.perfetto.dev) use the
+  `open_external(url)` command (which tries `flatpak-spawn --host xdg-open` first, since the toolbox
+  has no `xdg-utils`). Perfetto's `postMessage` trace handoff can't cross the webview → desktop-browser
+  boundary, so auto-import
   instead serves the trace from a loopback CORS server (`serve_trace`/`start_trace_server`) and
   opens `ui.perfetto.dev/#!/?url=…` pointing back at it — the response must carry
   `Access-Control-Allow-Private-Network: true` or Chromium's PNA blocks the loopback fetch.
@@ -206,14 +213,14 @@ user confirms it against real output — say "this should fix it, please verify 
   on each 0↔1 selection crossing).
 - **The Asset Store is editor-local, not the control plane.** `storefront/` (the `store` ViewTab,
   `openStoreTab`) browses and imports assets from external providers through `store_*`/`connector_*`
-  Tauri commands implemented in `src-tauri/` (`connectors/`) — the **only** outbound HTTP in the
+  shell commands implemented in `shell/` (`connectors/`) — the **only** outbound HTTP in the
   product; the engine crates make none. Only the final import crosses to the host (into the catalog).
   The *enabled provider list* is control-plane, per-project state (`get-stores`/`set-stores`, saved in
   `project.json`, team-shared); API keys / OAuth tokens live only in the OS keyring (a presence boolean
   reaches the webview, never the secret). `storefront/types.ts` is **hand-authored** and must mirror the
   Rust `connectors` camelCase wire types — the generated-types rule (first bullet) is scoped to
   `src/protocol/sa-types.ts` and does **not** reach it. Full contract: `storefront/AGENTS.md` +
-  `src-tauri/src/connectors/AGENTS.md`.
+  `shell/src/connectors/AGENTS.md`.
 - **Panel bodies render once and are re-parented, never remounted.** Each dockable panel body renders a
   single time at the app root (`components/dock/DockPanelsHost.tsx` `LeafBody`) and is moved into its leaf
   via `appendChild`; **never** render a panel body inside the leaf tree, or a dock move remounts it and
@@ -255,23 +262,28 @@ user confirms it against real output — say "this should fix it, please verify 
   event (else an always-maximized window keeps a stale monitor); `outer_position()` may `Err` on
   Wayland, so it keeps the last-known x/y rather than dropping the snapshot.
 
-The Rust bridge sets a per-PID socket under `$XDG_RUNTIME_DIR` and a per-PID, per-view shm
-segment for each viewport (scene + asset preview), spawns `$SAFFRON_ANIMA_BIN` (default
-`engine/target/debug/saffron-host`) with `SAFFRON_VIEWPORT_SHM_SCENE` +
-`SAFFRON_VIEWPORT_SHM_ASSET` (and the NVIDIA `VK_ICD_FILENAMES` guard), and presents via
-`wayland_viewport.rs` — one subsurface per view, each glued to its pane,
-plus a shared opaque backdrop below both. A watchdog flips the UI to an error overlay if the
-engine dies.
+## The CEF shell (`shell/`)
 
-The bridge also picks the **webview render path** in `run()` (`lib.rs`), logging it at startup
-(`[saffron] webview render path: …`). On NVIDIA it defaults to the **software** (Mesa llvmpipe) path,
-because the hardware DMABUF path hits the `wp_linux_drm_syncobj_surface_v1` "unsupported buffer" crash
-(WebKit enables explicit sync on its EGL surface, then a non-dmabuf buffer reaches it and Mutter fatally
-rejects it — a driver/WebKit/Mutter interaction *not* fixed by newer drivers, only sidestepped). AMD and
-Intel always take the hardware path. `SAFFRON_WEBVIEW_HW` opts *into* hardware on NVIDIA — it is
-**presence-checked** (`var_os(…).is_some()`), so *any* value including `0` selects hardware; to force
-software you must **unset** it, not set it to `0`. The hardware path then sets
-`__NV_DISABLE_EXPLICIT_SYNC=1` to dodge that crash (the lone tradeoff is possible stale-frame ghosting).
-The `just run` recipe `export`s `SAFFRON_WEBVIEW_HW=1` inside the toolbox-bound recipe, so just-run
-launches are hardware; a host-side `SAFFRON_WEBVIEW_HW=1 just run` would **not** cross the toolbox
-boundary into the recipe (see the root `AGENTS.md` toolbox-env rule).
+`editor/shell` owns a winit Wayland toplevel and hosts CEF **windowless OSR**: CEF renders the React UI
+off-screen and hands each frame to `on_paint` (BGRA, pre-multiplied), which `compositor.rs` uploads to
+the toplevel `wl_surface` via `wl_shm` (`Argb8888`, alpha preserved), sharing winit's `wl_display`
+through `from_foreign_display`. CEF self-drives at `windowless_frame_rate` = the monitor's refresh
+(picked up from winit's `current_monitor`), so the UI repaints at 144/240 Hz — the whole point of the
+migration off WebKitGTK, which was pinned to ~62.5 Hz on NVIDIA. `on_paint` damages only CEF's dirty
+rects (a full-surface damage every frame stalled Mutter's shm upload at high refresh × large surface).
+
+The shell sets a per-PID socket under `$XDG_RUNTIME_DIR` and a per-PID, per-view shm segment for each
+viewport (scene + asset preview), spawns `$SAFFRON_ANIMA_BIN` (default `engine/target/debug/saffron-host`)
+with `SAFFRON_VIEWPORT_SHM_SCENE` + `SAFFRON_VIEWPORT_SHM_ASSET` (and the NVIDIA `VK_ICD_FILENAMES`
+guard), and presents via `presenter.rs` — a worker thread on its own `from_foreign_display` connection
+creates one `wl_subsurface` per view below the toplevel (above `compositor.rs`'s opaque backdrop, below
+the UI), maps the engine's shm ring, `wp_viewport`-scales each frame to the pane rect, and paces on
+`wl_surface.frame` callbacks with `wp_presentation` feedback. A watchdog flips the UI to an error
+overlay if the engine dies.
+
+Input is forwarded winit → CEF: pointer (`send_mouse_*`, with the held-button flag on moves so drags
+register) and keyboard (`send_key_event`: `RAWKEYDOWN` + a `CHAR` per produced UTF-16 unit + `KEYUP`,
+with a VK-code map and `ModifiersChanged`-tracked modifiers). There is no `SAFFRON_WEBVIEW_HW` render
+path and no dma-buf accelerated OSR — CEF's ANGLE-Vulkan dma-buf can't be imported by Mutter's GL
+backend on NVIDIA, so the CPU `on_paint` path (which already sustains the monitor refresh) is the one
+path.

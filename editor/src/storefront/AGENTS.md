@@ -2,12 +2,12 @@
 
 The React half of the in-editor **Asset Store**: a `store` `ViewTab` (`StoreWorkspace`) that
 browses, searches, previews, and imports assets from external providers. The HTTP backend and the
-provider contract live in `editor/src-tauri/src/connectors/` (its own `AGENTS.md`); read that first
+provider contract live in `editor/shell/src/connectors/` (its own `AGENTS.md`); read that first
 for the wire shapes and auth model.
 
 ## What talks to what
 
-- This UI calls **editor-local `store_*` / `connector_*` Tauri commands** wrapped in `types.ts`
+- This UI calls **editor-local `store_*` / `connector_*` shell commands** wrapped in `types.ts`
   (`invoke(...)`), **not** the generated control client and **not** the engine. Only the final
   *import* crosses to the host: `store_import` / `store_import_part` download the deliverable, hand
   it to the host importer, and the imported asset lands in the catalog (which the control plane then
