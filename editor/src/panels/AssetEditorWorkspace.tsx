@@ -379,7 +379,9 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="min-w-32">
-                <DropdownMenuItem onSelect={() => useEditorStore.getState().openPanel("assetStats")}>
+                <DropdownMenuItem
+                  onSelect={() => useEditorStore.getState().openPanel("assetStats")}
+                >
                   Stats
                 </DropdownMenuItem>
               </DropdownMenuContent>

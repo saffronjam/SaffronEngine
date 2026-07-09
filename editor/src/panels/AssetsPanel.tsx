@@ -1,6 +1,6 @@
 /// The Assets panel: a folder tree sidebar plus a responsive tile grid over
 /// `store.assets`, navigated through a back/forward history and clickable
-/// breadcrumbs, with an Import button (Tauri file dialog), an OS file-drop target,
+/// breadcrumbs, with an Import button (native file dialog), an OS file-drop target,
 /// and the View modal. Imports route by extension: images → import-texture (no
 /// spawn), everything else → import-model (spawns + selects an entity, like
 /// `sa import-model`).
@@ -11,8 +11,7 @@ import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWebview, open } from "../shell";
 import {
   ArrowLeft,
   ArrowRight,
@@ -35,7 +34,6 @@ import {
   FOLDER_DND_MIME,
   assetIdsFromPayload,
   catalogDragEffectAllowed,
-  firstModelAssetId,
   hideNativeDragImage,
   isCatalogDrag,
   readAssetPayload,
@@ -427,7 +425,7 @@ export function AssetsPanel() {
     [currentFolder, refreshAssets],
   );
 
-  // OS file-drop: Tauri delivers native file drops via the webview drag-drop event
+  // OS file-drop: the shell delivers native file drops via the webview drag-drop event
   // (a distinct channel from the HTML5 `application/x-sa-asset` tile DnD). We only
   // import when the drop position is inside this panel's rect, so dropping a model
   // on the viewport doesn't trigger a catalog import here.
@@ -709,7 +707,9 @@ export function AssetsPanel() {
       }
       state.setCatalogDrag({ assetIds, folderPaths });
       event.dataTransfer.effectAllowed = catalogDragEffectAllowed(assetIds);
-      if (firstModelAssetId(assetIds, state.assets)) {
+      // The DOM drag ghost (`CatalogDragGhost` in App.tsx) is the one drag preview for every asset
+      // type, so always suppress the browser's native ghost (which CEF OSR would not render anyway).
+      if (assetIds.length > 0) {
         hideNativeDragImage(event.dataTransfer);
       }
     },
@@ -1049,6 +1049,21 @@ export function AssetsPanel() {
                     : folderPath
                       ? { kind: "folder", path: folderPath }
                       : null;
+                  // Right-clicking a tile that is NOT already selected replaces the selection with
+                  // just it, so the menu's action (View/Delete) targets the clicked tile rather than
+                  // a previously-selected one. Right-clicking within an existing multi-selection
+                  // leaves it intact so a batch action still applies to the whole set.
+                  const state = useEditorStore.getState();
+                  if (assetId && !state.selectedAssetIds.has(assetId)) {
+                    selectAssetGridItem("asset", assetId, { shift: false, toggle: false }, gridOrder);
+                  } else if (folderPath && !state.selectedFolderPaths.has(folderPath)) {
+                    selectAssetGridItem(
+                      "folder",
+                      folderPath,
+                      { shift: false, toggle: false },
+                      gridOrder,
+                    );
+                  }
                 }}
               >
                 <AssetPanelBody
