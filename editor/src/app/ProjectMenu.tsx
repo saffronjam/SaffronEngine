@@ -1,8 +1,6 @@
 /// Project-level file operations exposed from the topbar project selector.
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow, invoke, open, save } from "../shell";
 import {
   ChevronDown,
   FilePlus2,
@@ -58,7 +56,7 @@ export function ProjectMenu() {
     setProjectModalOpen(true);
   };
 
-  // "Exit" closes the window; Tauri's ExitRequested handler tears the engine down — the same path
+  // "Exit" closes the window; the shell's exit handler tears the engine down — the same path
   // as the titlebar close button.
   const exitApp = (): void => {
     void getCurrentWindow().close();

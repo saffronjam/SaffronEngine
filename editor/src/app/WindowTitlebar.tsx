@@ -1,7 +1,7 @@
-/// Custom Tauri titlebar with editor view tabs. The tab strip and its drag mechanics are
+/// Custom titlebar with editor view tabs. The tab strip and its drag mechanics are
 /// the shared `TabStrip` (size "main"); this file keeps only the titlebar-local layers:
 /// the window drag region + buttons and the per-kind tab icon.
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "../shell";
 import {
   Box,
   File,
@@ -98,7 +98,7 @@ export function WindowTitlebar() {
   return (
     <header
       className="flex h-9 flex-none items-center border-b border-border bg-card"
-      data-tauri-drag-region
+
       onMouseDown={beginTitlebarDrag}
     >
       <TabStrip
@@ -112,10 +112,10 @@ export function WindowTitlebar() {
         onTabHover={setHoveredTabId}
         drag={{ domain: "view", pinnedIds: ["scene"], onReorder: moveViewTab }}
       />
-      <div className="min-w-0 flex-1 self-stretch" data-tauri-drag-region />
+      <div className="min-w-0 flex-1 self-stretch"  />
       <div
         className="flex w-33 flex-none justify-end"
-        data-tauri-drag-region="false"
+       
         data-titlebar-control="true"
       >
         <TitlebarButton label="Minimize" onClick={minimize}>
