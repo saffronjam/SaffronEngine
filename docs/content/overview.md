@@ -110,7 +110,7 @@ layout and the build.
 | Screen-space & post | thin G-buffer, GTAO, motion vectors, TAA, tonemap | [link](../explanations/screen-space-and-post/) |
 | Global illumination & ray tracing | DDGI probes, voxel trace, BLAS/TLAS, ray-query shadows, ReSTIR | [link](../explanations/global-illumination-and-raytracing/) |
 | Anti-aliasing | MSAA, FXAA, mode switching | [link](../explanations/anti-aliasing/) |
-| UI & editor | the Tauri/React editor, the in-webview canvas + shm frame transport, the gizmo, the inspector, thumbnails | [link](../explanations/ui-and-editor/) |
+| UI & editor | the CEF/React editor shell, the windowless-OSR UI + shm frame transport, the gizmo, the inspector, thumbnails | [link](../explanations/ui-and-editor/) |
 | Tooling & control | the unix-socket control plane and the `sa` CLI | [link](../explanations/tooling-and-control/) |
 | Scripting | the embedded Luau VM, sandboxing, script errors as values | [link](../explanations/scripting/) |
 | Architecture | the crate DAG, the build, the coding conventions | [link](../explanations/architecture-and-conventions/) |
