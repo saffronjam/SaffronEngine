@@ -9,7 +9,7 @@
 /// Same-scope conflicts are advisory, VS Code-style: the rebind is accepted and
 /// every row whose effective binding collides inside its scope shows a warning.
 import { useEffect, useMemo, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "../shell";
 import { RotateCcw, TriangleAlert } from "lucide-react";
 import {
   COMMANDS,
