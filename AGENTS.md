@@ -3,8 +3,9 @@
 A from-scratch **Vulkan** renderer / **Rust** game engine. The workspace (`engine/`, a Cargo
 workspace) builds **`saffron-host`**, a *present-only viewport host*: it renders the scene plus a
 native gizmo overlay offscreen, publishes frames into shared memory, and serves the control plane —
-**no UI panels of its own**. The **editor is the Tauri/React/TypeScript app in `editor/`**; it spawns
-the host, presents its frames on a Wayland subsurface below the transparent webview (UI composites
+**no UI panels of its own**. The **editor is the CEF/React/TypeScript app in `editor/`** — a Rust shell
+(`editor/shell`) owning a winit Wayland toplevel that renders the React UI through CEF windowless OSR; it
+spawns the host, presents its frames on Wayland subsurfaces below the transparent UI (UI composites
 over the live viewport), and drives every operation over a JSON-over-unix-socket control plane. The
 engine keeps the API *shape* that works — an `App`/`Layer` lifecycle, a deferred `submit(closure)`
 render seam, a frame graph, a hecs scene, signal/slot events.
@@ -39,7 +40,12 @@ render seam, a frame graph, a hecs scene, signal/slot events.
   Comments are minimal: brief `///` on public items saying what it is (and *why* if non-obvious), **no
   section/banner dividers ever**, and **never** a change-journey note ("previously/used to/now
   that…") — the code is what it is; its mere presence needs no justification. Say what the code does
-  now, never by contrast with the past.
+  now, never by contrast with the past. The same restraint governs **user-facing strings** — recipe
+  `echo`s, log lines, CLI/help text, toasts: say what to do or what happened, never the implementation
+  quirk that motivated it, the environment/version detail behind it, or a justification for the wording
+  (a `just run inspect` hint says "open chrome://inspect …", not "the plain URL renders blank on
+  Chromium 149, so use chrome://inspect"). The caller wants the action, not the reason it's phrased that
+  way.
 - **Git is READ-ONLY by default — NEVER run a git command that writes, in ANY form, on your own
   initiative. This is absolute.** Prohibited unless the user gives explicit, specific, one-time
   clarity that it is OK *for that single action*: `commit`, `push` (incl. force-push), `add` / `rm` /
@@ -138,18 +144,19 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
   TypeScript; `just lint` runs `cargo fmt --check` + `cargo clippy --workspace -- -D warnings` + oxlint
   (`editor/.oxlintrc.json`); `just prepare-for-commit` does format then lint.
 
-### The editor (Tauri/React)
+### The editor (CEF/React shell)
 
-With `bun` on PATH inside the toolbox:
+With `bun` on PATH inside the toolbox, `just run` builds the host + the CEF shell (`editor/shell`),
+starts Vite, and launches the shell. For frontend-only work:
 
 ```sh
-cd editor && bun install && bun run check && bun run tauri dev
+cd editor && bun install && bun run check
 ```
 
 `bun run check` regenerates `@saffron/protocol` (via `xtask gen-protocol`) from the `saffron-protocol`
-DTOs and typechecks; `bun run format` (oxfmt) and `bun run lint` (oxlint) cover style. `tauri dev`
-spawns `engine/target/debug/saffron-host` (override with `SAFFRON_ANIMA_BIN`) and needs a Wayland
-session for the subsurface presenter.
+DTOs and typechecks; `bun run format` (oxfmt) and `bun run lint` (oxlint) cover style. The shell spawns
+`engine/target/debug/saffron-host` (override with `SAFFRON_ANIMA_BIN`) and needs a Wayland session for
+the OSR compositing + subsurface presenter.
 
 ## Architecture
 
@@ -207,7 +214,7 @@ sa                  → {saffron-protocol, saffron-control-client}         the c
   `tests/e2e` driver; `xtask` is the build-task runner (shaders, protocol codegen).
 - There is no engine UI toolkit: the in-viewport gizmo is a **native overlay** (`OverlayVertex` /
   `submit_overlay` in `saffron-rendering`; `build_scene_edit_overlay` in `saffron-host`), and the full
-  editor UI is the React/Tauri frontend.
+  editor UI is the React/CEF frontend.
 
 ## Layout
 
@@ -217,7 +224,7 @@ engine/crates/<crate>/  one crate per entry above (core, rendering, host, scenee
 engine/crates/host/     the saffron-host present-only viewport binary
 engine/xtask/           the build-task runner: `cargo run -p xtask -- {shaders,gen-protocol}`
 engine/assets/          shaders (*.slang → SPIR-V via xtask), models, fonts, icons (copied next to the exe)
-editor/                 Tauri/React/TS editor — src/ (React + Zustand + typed control client), src-tauri/ (Rust bridge)
+editor/                 CEF/React/TS editor — src/ (React + Zustand + typed control client), shell/ (the CEF/Rust shell)
 schemas/control/        DTO-first wire contract → @saffron/protocol: hand-authored envelope.schema.json + generated openrpc/command-manifest JSON (from the saffron-protocol DTOs via xtask gen-protocol)
 tools/ci/, tools/check-control-schema/, tools/check-projects/   the reproducible gate, the live-vs-schema contract test, the project-feature smoke
 tests/e2e/              end-to-end tests (bun) driving a headless host over the control plane
@@ -244,7 +251,7 @@ gen-protocol` over `saffron-protocol`.
 | Serialization | `serde` + `serde_json` (`preserve_order`) + `serde_with` + `schemars` + `ts-rs` | scene/project save/load; wire DTOs + codegen |
 | Import / images | `gltf`, `tobj`, `image`, `resvg`/`usvg`/`tiny-skia` | glTF/OBJ → `.smesh`; texture decode; SVG icons |
 | Errors | `thiserror` (per-crate enums), `anyhow` at edges | `bytemuck` for GPU struct casts |
-| Editor | Tauri 2 + React 19 + Vite + shadcn/ui + Tailwind v4, Bun | |
+| Editor | CEF (Chromium 149) OSR shell + React 19 + Vite + shadcn/ui + Tailwind v4, Bun | `editor/shell` Rust binary hosts the windowless webview |
 
 ## Keep current (part of "done")
 
@@ -303,7 +310,7 @@ a feature — follow and update a matching plan rather than starting cold.
   behind `saffron-animation` (glTF clip import, an animation-player runtime with transitions/blending, a
   compute-skinning prepass feeding motion vectors + skinned-BLAS rebuild, foot IK, a native skeleton
   overlay, animation control commands, and the editor timeline panel); the control plane + `sa` CLI; the
-  Tauri editor (with editor-only per-tab undo/redo reconstructed from inverse control calls, and an
+  CEF editor shell (with editor-only per-tab undo/redo reconstructed from inverse control calls, and an
   in-editor Asset Store that imports models/textures/HDRIs/materials from external providers — Poly Haven,
   ambientCG, Poly Pizza, Sketchfab — over an editor-local connector backend with OS-keyring credentials
   and OAuth loopback); per-entity Luau scripting (behind `saffron-script`: ScriptComponent slots,
