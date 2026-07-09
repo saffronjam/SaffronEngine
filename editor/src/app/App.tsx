@@ -1,4 +1,4 @@
-/// Top-level editor shell. Wires the Tauri lifecycle events to the store, starts
+/// Top-level editor shell. Wires the shell lifecycle events to the store, starts
 /// the reconcile poll + the global W/E/R gizmo shortcuts, and composes the chrome
 /// above the Scene dock `Layout` and a status bar below.
 /// Each main tab that owns a dockspace is its own island: the Scene tree (Hierarchy,
@@ -10,13 +10,13 @@
 /// viewport survive tab navigation; each remounts on the per-project key.
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, listen, type UnlistenFn } from "../shell";
 import { client } from "../control/client";
 import { loadEditorSettings, startReconcile, useEditorStore } from "../state/store";
 import type { AssetEntry } from "../protocol";
 import { Topbar } from "../panels/Topbar";
 import { Layout } from "./Layout";
+import { WindowResizeFrame } from "./WindowResizeFrame";
 import { WindowTitlebar } from "./WindowTitlebar";
 import { useGizmoShortcuts } from "./useGizmoShortcuts";
 import { useUndoRedoShortcuts } from "./useUndoRedoShortcuts";
@@ -35,7 +35,7 @@ import { AssetEditorWorkspace } from "../panels/AssetEditorWorkspace";
 import { StoreWorkspace } from "../storefront/StoreWorkspace";
 import { DockPanelsHost } from "../components/dock/DockPanelsHost";
 import { DockDropOverlay } from "../components/dock/DockDropOverlay";
-import { AssetDragPreviewTile, firstModelAssetId } from "../components/AssetTile";
+import { AssetDragPreviewTile } from "../components/AssetTile";
 import { emitLayoutSettled } from "./layoutBus";
 import { logRender } from "../lib/renderLog";
 import { Toaster } from "@/components/ui/sonner";
@@ -378,6 +378,7 @@ export function App() {
         style={{ opacity: revealed ? 1 : 0 }}
       >
         <WindowTitlebar />
+        <WindowResizeFrame />
         {/* The dock is hidden, never unmounted, while an asset tab is active: its
             in-memory layout state survives, and the ViewportPanel's host rect goes
             0x0 (computeBounds skips degenerate rects) while viewportHidden parks
@@ -450,8 +451,16 @@ function CatalogDragGhost() {
     if (!s.catalogDrag) {
       return null;
     }
-    const id = firstModelAssetId(s.catalogDrag.assetIds, s.assets);
-    return id ? (s.assets.find((entry) => entry.id === id) ?? null) : null;
+    // The primary dragged asset of ANY type (model / material / texture / HDRI / …) — the ghost is a
+    // "what you're holding" indicator, distinct from `firstModelAssetId`, which drives the
+    // model-into-viewport placement affordance. First resolvable id in drag order.
+    for (const id of s.catalogDrag.assetIds) {
+      const entry = s.assets.find((a) => a.id === id);
+      if (entry) {
+        return entry;
+      }
+    }
+    return null;
   });
   const [pointer, setPointer] = useState<{
     x: number;
@@ -485,7 +494,9 @@ function CatalogDragGhost() {
     };
   }, [asset, catalogDrag]);
 
-  if (!asset || !pointer || pointer.overViewport) {
+  // Over the viewport a model shows its 3D placement ghost instead, so suppress the DOM ghost there;
+  // other asset types have no viewport ghost, so keep showing "what you're holding" everywhere.
+  if (!asset || !pointer || (pointer.overViewport && asset.type === "model")) {
     return null;
   }
 
