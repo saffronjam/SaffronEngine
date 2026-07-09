@@ -11,15 +11,11 @@
     "format": "oxfmt --write src scripts",
     "format:check": "oxfmt --check src scripts",
     "lint": "oxlint src scripts",
-    "test": "bun test",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev"
+    "test": "bun test"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
     "@tanstack/react-virtual": "^3.13.0",
-    "@tauri-apps/api": "^2.8.0",
-    "@tauri-apps/plugin-dialog": "^2.7.1",
     "@xyflow/react": "^12.11.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -39,7 +35,6 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.8.0",
     "@types/node": "^25.9.1",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

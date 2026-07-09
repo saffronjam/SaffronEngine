@@ -17,12 +17,12 @@ export default defineConfig({
     watch: {
       // Rust's incremental build dir contains special tmp files that trigger EINVAL
       // on Linux when chokidar/fs.watch tries to watch them.
-      ignored: ["**/src-tauri/target/**"],
+      ignored: ["**/shell/target/**"],
     },
   },
-  envPrefix: ["VITE_", "TAURI_"],
+  envPrefix: ["VITE_"],
   build: {
-    // Tauri targets one known-modern webview (webkit2gtk), so build for the newest
+    // The CEF shell targets one known-modern webview (Chromium), so build for the newest
     // syntax with no down-levelling rather than pinning an ECMAScript year.
     target: "esnext",
     minify: false,
