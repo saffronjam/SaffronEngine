@@ -38,7 +38,7 @@ around this spine.
 | [Screen-space & post](screen-space-and-post/) | G-buffer, GTAO, motion vectors, TAA, tonemap |
 | [Global illumination & ray tracing](global-illumination-and-raytracing/) | DDGI probes, voxel trace, BLAS/TLAS, ray-query shadows, ReSTIR |
 | [Anti-aliasing](anti-aliasing/) | MSAA, FXAA, mode switching |
-| [UI & editor](ui-and-editor/) | the Tauri/React editor, viewport compositing, gizmo, inspector, thumbnails |
+| [UI & editor](ui-and-editor/) | the CEF/React editor shell, viewport compositing, gizmo, inspector, thumbnails |
 | [Asset store & connectors](asset-store-and-connectors/) | the editor Store tab, connectors to external asset services, download → import |
 | [Tooling & control](tooling-and-control/) | control plane and the `sa` CLI |
 | [Scripting](scripting/) | the embedded Lua 5.5 VM, sandboxing, script errors as values |
