@@ -142,7 +142,7 @@ extension is needed for the march itself.
   displaced subject through the prism BLAS + inline march instead of the Phase-4 dice + `TessellatedBlas`.
   It is only ever set by the editor for the live-edit preview and is a no-op on the scene view and in
   `saffron-player`.
-- **Reuse the completed live-preview host path.** `plans/material-graph-live-preview/` (COMPLETED) already
+- **Reuse the shipped live-preview host path.** The material-graph live preview already
   renders the edited `.smat` on the orbitable sphere via `enter-asset-preview` + the modal `preview_scene`
   on `ViewId::AssetPreview`. This phase engages the prism mode on that exact subject while an amplitude /
   displacement-node value is being dragged, and disengages (falling back to the baked `TessellatedBlas`)
@@ -226,7 +226,7 @@ Only after everything above lands and the gate is green:
 - `saffron-protocol` + `saffron-control`: the `set-tessellation-quality` command, its DTOs, the manifest
   entry, and the `RenderStatsDto` read-back fields; `xtask gen-protocol`.
 - `editor`: engage/disengage the prism preview mode on `ViewId::AssetPreview` across a live displacement
-  drag (begin-drag → prism, commit → baked swap), on the completed `material-graph-live-preview` host path.
+  drag (begin-drag → prism, commit → baked swap), on the shipped material-graph live-preview host path.
 - `tests/e2e`: `tessellation-budget.test.ts`.
 - `docs/`: rewrite `frame-and-render-graph/compute-displacement.md`; update its hub `_index.md` row.
 - `plans/`: delete `plans/displacement/`; mark this planset `COMPLETED`.
