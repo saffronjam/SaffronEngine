@@ -44,29 +44,37 @@ they are the cheapest way to unblock the most features.
 | [cloth-and-soft-body](cloth-and-soft-body.md) | S–M | none | Jolt soft bodies + existing compute-skinning ingestion. |
 | [gpu-particle-vfx](gpu-particle-vfx.md) | L | indirect-args/persistent buffers | keystone enabler for all VFX. |
 | [smoke-fire-and-fluids](smoke-fire-and-fluids.md) | M–XL | gpu-particle-vfx (FLIP) | Eulerian gas solver + volumetric render. |
-| [sky-atmosphere-and-volumetrics](sky-atmosphere-and-volumetrics.md) | S–XL | none (clouds want sky first) | biggest "AAA look" jump per effort. |
+| [sky-atmosphere-and-volumetrics](sky-atmosphere-and-volumetrics.md) | S–XL | none (clouds want sky first) | dynamic sky + aerial perspective + clouds + time-of-day (fog → volumetric-fog). |
+| [volumetric-fog](volumetric-fog.md) | S–M | none (clustered lights/shadows present) | height + froxel fog + god-rays; no fog of any kind today. |
 | [heightfield-terrain](heightfield-terrain.md) | L | none | enabler for foliage/water/sculpting. |
 | [foliage-and-vegetation](foliage-and-vegetation.md) | M–XL | heightfield-terrain (canonical use) | painting, wind, interactive bending, PCG. |
+| [wind](wind.md) | S–M | none | a shared wind field foliage/cloth/particles all read. |
 | [water-and-ocean](water-and-ocean.md) | S–L | gpu-fft (ocean), terrain (rivers) | Gerstner buoyancy is the cheap gameplay win. |
 | [destruction-and-fracture](destruction-and-fracture.md) | L–XL | parenting, gpu-particle-vfx (dust) | Voronoi fracture + strain runtime on Jolt. |
 | [procedural-cameras-and-cinematics](procedural-cameras-and-cinematics.md) | S–XL | parenting (sequencer) | vcam/brain, collision, shake, cinematic DoF. |
 | [ai-navigation-and-behavior](ai-navigation-and-behavior.md) | S–XL | cxx vendoring (navmesh) | perception + behavior trees are the cheap start. |
 | [audio-system](audio-system.md) | M–XL | none (greenfield crate) | spatial audio, occlusion, reverb, music. |
-| [surface-detail-and-screen-fx](surface-detail-and-screen-fx.md) | S–XL | gpu-particle-vfx (precipitation) | decals, bloom/CA/vignette, weather material nodes. |
+| [surface-detail-and-screen-fx](surface-detail-and-screen-fx.md) | S–L | none | decals + lens artifacts (CA/vignette/grain/lens-flare). |
+| [weather-precipitation](weather-precipitation.md) | S–XL | gpu-particle-vfx + wind | snow/rain particles + snow/wetness accumulation. |
 | [gameplay-framework](gameplay-framework.md) | S–XL | parenting + GUIDs (prefabs/save) | input mapping, tags, prefabs, save/load, GAS. |
 | [networking-multiplayer](networking-multiplayer.md) | L–XL | GUIDs + parenting | rollback is the determinism-differentiated option. |
 | [large-worlds-streaming](large-worlds-streaming.md) | L–XL | GUIDs + parenting | defer unless target worlds demand it. |
 
+**Graduated to a planset:** bloom + color grading → [`../post-processing/`](../post-processing/README.md) — energy-conserving pre-tonemap bloom + a scene-linear grade folded into the tonemap pass + a creative LUT slot.
+
 ## Suggested tiers
 
-- **Tier 0 — self-contained quick wins:** wheeled-vehicles, cloth-and-soft-body, sky/fog/time-of-day,
-  lens/post FX + AI perception + gameplay tags + input mapping, **scene-graph parenting** (the gap).
+- **Tier 0 — self-contained quick wins:** wheeled-vehicles, cloth-and-soft-body, **lens FX** (the post
+  look; bloom + color grading are now the [`post-processing`](../post-processing/README.md) planset),
+  **height fog** + time-of-day, the **wind field**, decals, AI perception +
+  gameplay tags + input mapping, **scene-graph parenting** (the gap).
 - **Tier 1 — foundational enablers:** GPU particle runtime, heightfield terrain + collision, GPU-FFT
   utility, curve-editor widget, procedural camera, navmesh + pathfinding + behavior trees.
-- **Tier 2 — built on Tier 1:** smoke/fire, FFT ocean + water shading + buoyancy, foliage + wind,
-  terrain sculpting, destruction, prefabs + save/load, cinematic Sequencer, audio engine.
-- **Tier 3 — large programs (defer):** volumetric clouds, FLIP/weather, SpeedTree/PCG/virtual
-  heightfield (need GPU culling), full GAS, networking program, world streaming.
+- **Tier 2 — built on Tier 1:** froxel volumetric fog + aerial perspective, smoke/fire, FFT ocean + water
+  shading + buoyancy, foliage (samples the wind field), terrain sculpting, destruction, prefabs +
+  save/load, cinematic Sequencer, audio engine.
+- **Tier 3 — large programs (defer):** volumetric clouds, FLIP liquids + weather precipitation,
+  SpeedTree/PCG/virtual heightfield (need GPU culling), full GAS, networking program, world streaming.
 
 ## Conventions
 

@@ -20,8 +20,9 @@ painting/instancing core works on any mesh today; the canonical "scatter across 
 A **brush raycasts the surface**, **Poisson-disk samples** positions inside the brush, snaps each to the
 hit point and orients to the surface normal (with random yaw/scale jitter), and appends per-instance
 transforms. Rendering is **one indexed-instanced draw per (mesh, LOD)** with per-cell frustum culling.
-**Wind** is procedural vertex animation in the material (a Slang node) using baked per-vertex stiffness
-weights so trunks stay rigid and leaves flutter — motion vectors keep TAA clean. **Interactive bending**
+**Wind** is procedural vertex animation in the material (a Slang node) sampling the shared
+[wind](wind.md) field, using baked per-vertex stiffness weights so trunks stay rigid and leaves flutter —
+motion vectors keep TAA clean. **Interactive bending**
 (grass trampled by characters) keeps a camera-following "trample" render-target updated by a decay/splat
 compute pass, sampled by the grass material — the *Ghost of Tsushima* model. **Procedural placement**
 (PCG) is a node graph of scatter/filter/transform rules.
@@ -29,7 +30,7 @@ compute pass, sampled by the grass material — the *Ghost of Tsushima* model. *
 ## Build size
 
 - **M** foliage painting + instancing (the brush + instance buffers).
-- **M** procedural vertex wind (Slang node + baked weights).
+- **M** procedural vertex wind (Slang node + baked weights, sampling the [wind](wind.md) field).
 - **M** interactive grass bending (trample RT + decay compute + Jolt pushers).
 - **L** SpeedTree-style LOD/impostor trees — introduces the engine's first **LOD-group** + octahedral
   **impostor** bake (reuses the offscreen thumbnail-capture path).
