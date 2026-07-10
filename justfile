@@ -30,6 +30,31 @@ nvidia_icd := '''
     [ -n "$NVIDIA_ICD" ] && export VK_ADD_DRIVER_FILES="$NVIDIA_ICD"
 '''
 
+# Guard the CEF runtime cef-dll-sys stages next to the shell binary, and point the loader at it. An
+# interrupted extraction leaves 0-byte icudtl.dat/*.pak, which cef-dll-sys never repairs on its own
+# (it only downloads when the dir is absent, never re-checking an existing one) and CEF then aborts at
+# startup with "Couldn't mmap icu data file". On a truncated resource, purge cef-dll-sys and rebuild
+# once to force a clean re-provision, and fail loudly if it recurs. Requires cwd = editor/shell after
+# its cargo build, and $cef_profile (debug|release).
+cef_gate := '''
+    cef_dir="target/${cef_profile:-debug}"
+    _cef_intact() {
+      for f in icudtl.dat resources.pak v8_context_snapshot.bin chrome_100_percent.pak; do
+        [ -s "$cef_dir/$f" ] || return 1
+      done
+      [ "$(stat -Lc%s "$cef_dir/icudtl.dat")" -ge 1000000 ]
+    }
+    if ! _cef_intact; then
+      echo "cef: runtime resources in $cef_dir are truncated (interrupted extraction) — re-provisioning cef-dll-sys" >&2
+      rm -f "$cef_dir"/icudtl.dat "$cef_dir"/*.pak "$cef_dir"/v8_context_snapshot.bin
+      cargo clean -p cef-dll-sys
+      if [ "${cef_profile:-debug}" = release ]; then cargo build --release; else cargo build; fi
+      _cef_intact || { echo "cef: re-provision left $cef_dir still truncated — aborting" >&2; exit 1; }
+      echo "cef: re-provisioned intact CEF resources in $cef_dir" >&2
+    fi
+    export LD_LIBRARY_PATH="$PWD/$cef_dir:${LD_LIBRARY_PATH:-}"
+'''
+
 # Pick a default content project (most-recent with meshes) for the editor-less run-engine; a preset SAFFRON_PROJECT wins.
 default_project := '''
     export SAFFRON_APPDATA_DIR="''' + repo + '''/appdata"
@@ -172,8 +197,8 @@ test:
     RECIPE=test; {{reenter}}
     cd "{{engine}}" && cargo test --workspace
 
-# start the editor: build the engine host + the CEF shell, link CEF's runtime resources next to the
-# shell binary, start Vite, then launch the shell pointed at it (the shell spawns the host as a child).
+# start the editor: build the engine host + the CEF shell, verify CEF's staged runtime, start Vite,
+# then launch the shell pointed at it (the shell spawns the host as a child).
 # `just run inspect` additionally opens Chrome DevTools remote debugging on :9222 (Console, Network,
 # Performance tracing) — then open http://localhost:9222 in Chrome and click the page.
 run mode="":
@@ -185,15 +210,11 @@ run mode="":
     cargo run -p xtask -- shaders
     {{nvidia_icd}}
     export SAFFRON_ANIMA_BIN="{{engine_bin}}"
+    export SAFFRON_APPDATA_DIR="{{repo}}/appdata"
     # The shell is a standalone crate (its own target dir), outside the engine workspace.
     cd "{{editor}}/shell"
     cargo build
-    # CEF loads libcef.so + its resources (icu / *.pak / snapshot / locales) from next to the binary.
-    DIST="$(cd "$(dirname "$(find target/debug/build -name libcef.so | head -1)")" && pwd)"
-    for f in "$DIST"/icudtl.dat "$DIST"/*.pak "$DIST"/v8_context_snapshot.bin "$DIST"/locales; do
-      ln -sfn "$f" "target/debug/$(basename "$f")"
-    done
-    export LD_LIBRARY_PATH="$DIST:${LD_LIBRARY_PATH:-}"
+    cef_profile=debug; {{cef_gate}}
     export SAFFRON_CEF_SWITCHES="ozone-platform=x11"
     # `just run inspect` also exposes Chrome DevTools over remote debugging. `remote-allow-origins`
     # is mandatory on Chromium 149 or the DevTools websocket is refused.
@@ -219,13 +240,10 @@ run-debug:
     cargo run -p xtask -- shaders
     {{nvidia_icd}}
     export SAFFRON_ANIMA_BIN="{{engine_bin}}" VITE_SAFFRON_DEV_MODE=1
+    export SAFFRON_APPDATA_DIR="{{repo}}/appdata"
     cd "{{editor}}/shell"
     cargo build
-    DIST="$(cd "$(dirname "$(find target/debug/build -name libcef.so | head -1)")" && pwd)"
-    for f in "$DIST"/icudtl.dat "$DIST"/*.pak "$DIST"/v8_context_snapshot.bin "$DIST"/locales; do
-      ln -sfn "$f" "target/debug/$(basename "$f")"
-    done
-    export LD_LIBRARY_PATH="$DIST:${LD_LIBRARY_PATH:-}"
+    cef_profile=debug; {{cef_gate}}
     export SAFFRON_CEF_SWITCHES="ozone-platform=x11"
     cd "{{editor}}"
     bun run dev >/tmp/saffron-vite.log 2>&1 &
@@ -244,13 +262,10 @@ run-software:
     cargo build --bin saffron-host
     cargo run -p xtask -- shaders
     export SAFFRON_ANIMA_BIN="{{engine_bin}}"
+    export SAFFRON_APPDATA_DIR="{{repo}}/appdata"
     cd "{{editor}}/shell"
     cargo build
-    DIST="$(cd "$(dirname "$(find target/debug/build -name libcef.so | head -1)")" && pwd)"
-    for f in "$DIST"/icudtl.dat "$DIST"/*.pak "$DIST"/v8_context_snapshot.bin "$DIST"/locales; do
-      ln -sfn "$f" "target/debug/$(basename "$f")"
-    done
-    export LD_LIBRARY_PATH="$DIST:${LD_LIBRARY_PATH:-}"
+    cef_profile=debug; {{cef_gate}}
     export SAFFRON_CEF_SWITCHES="ozone-platform=x11,disable-gpu"
     cd "{{editor}}"
     bun run dev >/tmp/saffron-vite.log 2>&1 &
@@ -326,75 +341,15 @@ capture out="engine/target/capture.png":
     "$SA" quit >/dev/null 2>&1 || true
     echo "capture: wrote $out"
 
-# package the editor as a distributable for a target: `just package linux` builds an AppImage
-# (windows/macos are not yet implemented). Output lands in build/dist/.
+# package the editor as a distributable: `just package linux` builds an AppImage; no arg prompts for a
+# target. The Bun + clack packager under packager/ drives the pipeline. Output lands in build/dist/.
 package target="":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{target}}" in
-      linux) ;;
-      windows|macos) echo "package {{target}}: not yet implemented" >&2; exit 1 ;;
-      "") echo "usage: just package <linux|windows|macos>" >&2; exit 2 ;;
-      *) echo "package: unknown target '{{target}}' (expected linux, windows, or macos)" >&2; exit 2 ;;
-    esac
     RECIPE=package; {{reenter}}
-    # Release artifacts: the host + its shaders, the frontend bundle, then the CEF shell.
-    cd "{{engine}}"
-    cargo build --release --bin saffron-host
-    cargo run -p xtask -- shaders --profile release
-    cd "{{editor}}"
-    bun install
-    bun run build
-    cd "{{editor}}/shell"
-    cargo build --release
-
-    stage="{{repo}}/build/appimage"; appdir="$stage/AppDir"
-    out="{{repo}}/build/dist"; tools="{{repo}}/build/tools"
-    rm -rf "$appdir"
-    mkdir -p "$appdir/usr/bin" "$appdir/usr/share/saffron-anima/assets" \
-             "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor/scalable/apps" \
-             "$out" "$tools"
-
-    install -m755 "{{engine}}/target/release/saffron-host" "$appdir/usr/bin/"
-    install -m755 "{{editor}}/shell/target/release/saffron-editor-shell" "$appdir/usr/bin/"
-
-    # CEF resolves libcef.so + its resource packs beside the shell binary, so the whole runtime dir
-    # goes into usr/bin next to the exe (LD_LIBRARY_PATH covers the .so lookups).
-    dist="$(dirname "$(find "{{editor}}/shell/target/release" -name libcef.so | head -1)")"
-    [ -n "$dist" ] && [ -d "$dist" ] || { echo "package: libcef.so not found under the shell build" >&2; exit 1; }
-    shopt -s nullglob
-    for f in "$dist"/*.so "$dist"/*.so.* "$dist"/*.pak "$dist"/*.bin "$dist"/*.dat "$dist"/*.json; do
-      cp -a "$f" "$appdir/usr/bin/"
-    done
-    shopt -u nullglob
-    [ -d "$dist/locales" ] && cp -a "$dist/locales" "$appdir/usr/bin/"
-    [ -f "$dist/chrome_crashpad_handler" ] && cp -a "$dist/chrome_crashpad_handler" "$appdir/usr/bin/"
-
-    # Engine data: source models/fonts/icons + the compiled SPIR-V, and the built React UI.
-    cp -a "{{engine}}/assets/models" "{{engine}}/assets/fonts" "{{engine}}/assets/icons" \
-          "$appdir/usr/share/saffron-anima/assets/"
-    cp -a "{{engine}}/target/release/shaders" "$appdir/usr/share/saffron-anima/assets/"
-    cp -a "{{editor}}/dist" "$appdir/usr/share/saffron-anima/ui"
-
-    # Entrypoint + desktop integration + icon.
-    install -m755 "{{repo}}/packaging/linux/AppRun" "$appdir/AppRun"
-    cp "{{repo}}/packaging/linux/saffron-anima.desktop" "$appdir/saffron-anima.desktop"
-    cp "{{repo}}/packaging/linux/saffron-anima.desktop" "$appdir/usr/share/applications/"
-    cp "{{repo}}/packaging/linux/saffron-anima.svg" "$appdir/saffron-anima.svg"
-    cp "{{repo}}/packaging/linux/saffron-anima.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/"
-    ln -sf saffron-anima.svg "$appdir/.DirIcon"
-
-    # appimagetool: PATH first, else fetch it (extract-and-run needs no FUSE, so it works in the toolbox).
-    if command -v appimagetool >/dev/null 2>&1; then
-      ait=(appimagetool)
-    else
-      ait_bin="$tools/appimagetool-x86_64.AppImage"
-      [ -f "$ait_bin" ] || { echo "package: fetching appimagetool"; curl -fL -o "$ait_bin" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage; chmod +x "$ait_bin"; }
-      ait=("$ait_bin" --appimage-extract-and-run)
-    fi
-    ARCH=x86_64 "${ait[@]}" "$appdir" "$out/Saffron_Anima-x86_64.AppImage"
-    echo "package linux: wrote $out/Saffron_Anima-x86_64.AppImage"
-    echo "package linux: the bundled UI needs the app:// scheme (not yet wired); it launches to a placeholder until then" >&2
+    cd "{{repo}}/packager"
+    bun install --silent
+    exec bun run index.ts {{target}}
 
 # the host-runnable control CLI; `just sa ping`, `just sa help`
 sa *args:
