@@ -3,7 +3,7 @@
 SVGs vendored from [Lucide](https://lucide.dev/icons/). `cargo run -p xtask -- shaders` copies the
 whole `icons/` directory next to the host binary on every build (alongside `models/` and `fonts/`,
 via `copy_asset_tree` in `engine/xtask/src/shaders.rs`), but **nothing currently consumes them**.
-The Tauri/React editor ships its own icons via the `lucide-react` package, and the host's
+The CEF/React editor ships its own icons via the `lucide-react` package, and the host's
 in-viewport billboards are native flat-colored glyphs built as overlay geometry
 (`build_scene_edit_billboards` in `engine/crates/host/src/overlay.rs`) — no textures, and the
 renderer has no SVG-icon upload path.

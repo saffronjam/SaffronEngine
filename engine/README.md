@@ -4,8 +4,8 @@ The Rust engine: a Cargo workspace ([`Cargo.toml`](Cargo.toml), edition 2024) wh
 crates live under [`crates/`](crates/), with the [`xtask`](xtask/) helper for build tasks. The
 workspace builds **`saffron-host`** — the present-only viewport host that renders the scene plus a
 native gizmo overlay offscreen, publishes frames into shared memory, and serves the JSON-over-unix-socket
-control plane. The editor (the Tauri/React app in [`../editor/`](../editor/)) spawns it, presenting
-its frames on a Wayland subsurface below the transparent webview, and points `SAFFRON_ANIMA_BIN` at
+control plane. The editor (the CEF/React app in [`../editor/`](../editor/)) spawns it, presenting
+its frames on Wayland subsurfaces below its transparent UI, and points `SAFFRON_ANIMA_BIN` at
 this binary.
 
 ## Crates

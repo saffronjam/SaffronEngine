@@ -1,19 +1,19 @@
 <h1 align="center">Saffron Anima</h1>
 
 <p align="center">
-  A from-scratch Vulkan renderer and Rust game engine, driven by a Tauri editor.
+  A from-scratch Vulkan renderer and Rust game engine, driven by a CEF/React editor.
 </p>
 
 <p align="center">
   <a href="https://github.com/saffronjam/saffron-anima/actions/workflows/ci.yml"><img src="https://github.com/saffronjam/saffron-anima/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/Rust-2024-CE412B.svg?logo=rust&logoColor=white" alt="Rust 2024" />
   <img src="https://img.shields.io/badge/Vulkan-1.4-A41E22.svg?logo=vulkan&logoColor=white" alt="Vulkan 1.4" />
-  <img src="https://img.shields.io/badge/Tauri-2-24C8DB.svg?logo=tauri&logoColor=white" alt="Tauri 2" />
+  <img src="https://img.shields.io/badge/CEF-149-4285F4.svg?logo=googlechrome&logoColor=white" alt="CEF 149" />
 </p>
 
 ---
 
-A Cargo workspace (`engine/`) that builds its own present-only viewport host (`saffron-host`). The editor is a separate Tauri/React app that presents the host's offscreen frames on a Wayland subsurface below its transparent webview and drives it over a JSON-over-socket control plane.
+A Cargo workspace (`engine/`) that builds its own present-only viewport host (`saffron-host`). The editor is a separate CEF/React app — a Rust shell (`editor/shell`) that renders the React UI through CEF windowless OSR, presents the host's offscreen frames on Wayland subsurfaces below its transparent UI, and drives it over a JSON-over-socket control plane.
 
 ## Features
 

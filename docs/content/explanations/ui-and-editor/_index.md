@@ -15,7 +15,7 @@ Every editor operation rides the JSON-over-unix-socket [control protocol](../too
 | Page | Covers | Code |
 |---|---|---|
 | `editor-shell-and-viewport-bridge` | CEF/React shell, the one generic control passthrough, engine spawn env (two per-view shm segments), auto-start + crash recovery | `editor/src/control/client.ts` · `App.tsx` · `LoadingOverlay.tsx` |
-| `viewport-compositing` | shm/seqlock/subsurface/dma-buf foundations, offscreen render → pipelined shm ring → wl_subsurface below the transparent toplevel, two views / two subsurfaces + shared backdrop, per-view park, segment-remap traps | `rendering/src/shm_publish.rs` · `wayland_viewport.rs` |
+| `viewport-compositing` | shm/seqlock/subsurface/dma-buf foundations, offscreen render → pipelined shm ring → wl_subsurface below the transparent toplevel, two views / two subsurfaces + shared backdrop, per-view park, segment-remap traps | `rendering/src/shm_publish.rs` · `editor/shell/src/presenter.rs` |
 | `viewport-panel` | the transparent host div, per-view two-tier bounds-sync over `set_viewport_bounds {view}`, per-view parking, gizmo + pointer-lock fly forwarding | `ViewportPanel.tsx` · `useSubsurfaceBounds.ts` |
 | `editor-camera` | the engine `SceneEditCamera`, fly input streamed over `fly-input`, driven by `get-/set-camera` | `sceneedit/src/camera.rs` |
 | `gizmo` | the engine-rendered overlay gizmo, `gizmo-pointer`, the Topbar T/R/S + world/local | `Topbar.tsx` · `useGizmoShortcuts.ts` |

@@ -1,6 +1,6 @@
 //! Presents the engine's shared-memory frames on Wayland subsurfaces placed BELOW the toplevel's
-//! `wl_surface`, adapted from the reference `wayland_viewport.rs` presenter. The transparent CEF UI
-//! composites over them, so the viewport presents at the monitor's refresh — independent of the UI
+//! `wl_surface`. The transparent CEF UI composites over them, so the viewport presents at the
+//! monitor's refresh — independent of the UI
 //! paint loop. A worker thread owns the subsurfaces on its own `from_foreign_display` connection
 //! (the same foreign-display integration `compositor.rs` uses), paced by `wl_surface.frame`
 //! callbacks with `wp_presentation` feedback learning the true refresh.

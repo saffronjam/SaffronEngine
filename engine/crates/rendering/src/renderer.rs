@@ -188,7 +188,7 @@ impl ViewId {
     }
 
     /// The control-plane / shm wire token, FROZEN end-to-end with the presenter's reader
-    /// (`editor/src-tauri/src/wayland_viewport.rs`). Exactly `"scene"` / `"assetPreview"`; the
+    /// (`editor/shell/src/presenter.rs`). Exactly `"scene"` / `"assetPreview"`; the
     /// `Thumbnail` view is offscreen-only (`"thumbnail"`) and never reaches the presenter.
     pub fn wire(self) -> &'static str {
         match self {

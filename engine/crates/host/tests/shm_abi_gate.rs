@@ -1,7 +1,7 @@
 //! The shm-ABI go/no-go gate.
 //!
 //! Proves the frozen frame transport: the producer publishes BGRA8 frames that the editor
-//! reader `editor/src-tauri/src/wayland_viewport.rs` accepts byte-for-byte. The acceptance is
+//! reader `editor/shell/src/presenter.rs` accepts byte-for-byte. The acceptance is
 //! byte-level agreement with the *actual* reader's read / accept / reject rules, so this test
 //! embeds an oracle reader ([`OracleReader`]) that replicates `step_view` / `open_shm` /
 //! `stat_shm` field-for-field (the same header words, the same magic + capacity + ring-fits
@@ -57,7 +57,7 @@ fn bgra_frame(width: u32, height: u32, seed: u8) -> Vec<u8> {
 }
 
 /// The in-test reader oracle: a faithful, read-only replica of
-/// `wayland_viewport.rs::step_view`'s field reads + accept/reject logic, carrying the
+/// `presenter.rs::step_view`'s field reads + accept/reject logic, carrying the
 /// per-view state the editor's `ViewSurface` carries between ticks (`last_seq`,
 /// `buffer_dims`). It reads the producer's mapped bytes the same way the editor reads its
 /// `MAP_SHARED` view — native-endian `u32` header words, then the ring slot `seq % slots`.

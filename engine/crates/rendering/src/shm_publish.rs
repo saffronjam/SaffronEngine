@@ -6,7 +6,7 @@
 //! `ring_slots` fixed-capacity BGRA8 frames. Frame `s` lands in ring slot
 //! `s % ring_slots`; `seq` is bumped last under a [`Ordering::Release`] fence so a
 //! reader that observes the new `seq` is guaranteed the matching width/height + pixels
-//! (the seqlock). The reader oracle is `editor/src-tauri/src/wayland_viewport.rs`,
+//! (the seqlock). The reader oracle is `editor/shell/src/presenter.rs`,
 //! which reads slot `seq % ring_slots` after checking `magic` and a `seq` change.
 //!
 //! # The `unsafe` seam
@@ -43,7 +43,7 @@ pub const MIN_SHM_SLOT_CAPACITY: usize = 3840 * 2160 * 4;
 
 /// Pins the frozen byte layout at compile time: the header is exactly eight `u32`s (32
 /// bytes) and the floor is the 4K-RGBA constant the reader assumes. A drift here is a
-/// wire-break with the unchanged `wayland_viewport.rs` reader, so it must fail the build.
+/// wire-break with the unchanged `presenter.rs` reader, so it must fail the build.
 const _: () = {
     const HEADER_FIELDS: usize = 8;
     assert!(SHM_HEADER_BYTES == HEADER_FIELDS * size_of::<u32>());

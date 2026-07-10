@@ -3,7 +3,7 @@
 //! The editor sets a per-view shm-segment environment variable
 //! (`SAFFRON_VIEWPORT_SHM_SCENE` / `SAFFRON_VIEWPORT_SHM_ASSET`); each named view publishes
 //! its rendered frames into its own POSIX-shm segment for the compositor-side presenter
-//! (`wayland_viewport.rs`) instead of presenting to the hidden swapchain. Both segments are
+//! (`editor/shell/src/presenter.rs`) instead of presenting to the hidden swapchain. Both segments are
 //! created at startup so both panes have a ring the presenter can block-open; only the
 //! active view bumps a new sequence each frame.
 //!
@@ -22,7 +22,7 @@ pub const ENV_SHM_SCENE: &str = "SAFFRON_VIEWPORT_SHM_SCENE";
 pub const ENV_SHM_ASSET: &str = "SAFFRON_VIEWPORT_SHM_ASSET";
 
 /// The two views the editor presents. The wire token is FROZEN end-to-end with the
-/// reader's `View::from_wire` (`editor/src-tauri/src/wayland_viewport.rs`).
+/// reader's `View::from_wire` (`editor/shell/src/presenter.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShmView {
     /// The main scene viewport.
