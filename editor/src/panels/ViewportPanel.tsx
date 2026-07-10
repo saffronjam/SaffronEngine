@@ -17,6 +17,7 @@ import {
   readAssetPayload,
 } from "../components/AssetTile";
 import { errorText, notify, notifyError } from "../lib/flash";
+import { getCurrentWindow, listen } from "../shell";
 
 /// Pointer travel (CSS px) below which a press-release is treated as a click
 /// (ray-pick) rather than a gizmo drag.
@@ -82,6 +83,9 @@ function targetOwnsTextInput(target: EventTarget | null): boolean {
 export function ViewportPanel() {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const attachedRef = useRef(false);
+  // RMB fly-cam active: the shell has the cursor natively locked (CEF OSR can't do DOM pointer lock).
+  // Shared between the fly effect (owner) and the gizmo effect (which stands down while it's set).
+  const flyingRef = useRef(false);
   const setPhase = useEditorStore((s) => s.setPhase);
   const setSelectedId = useEditorStore((s) => s.setSelectedId);
   const setDragActive = useEditorStore((s) => s.setDragActive);
@@ -270,20 +274,23 @@ export function ViewportPanel() {
     };
   }, [playState]);
 
-  // RMB fly-cam: hold RMB over the viewport to fly. Pointer lock gives relative
-  // mouse deltas (movementX/Y), which accumulate and stream with the WASD/Space/
-  // Shift key state over `fly-input`. ESC exits pointer lock natively → fly ends.
+  // RMB fly-cam: hold RMB over the viewport to fly. CEF's windowless OSR can't do DOM pointer lock, so
+  // the shell locks the cursor natively (`setPointerLock`) and streams relative look motion back as
+  // `fly-look` events; the WASD/Space/Shift key state + accumulated look stream to the engine over
+  // `fly-input`. Release RMB or press Esc (or lose focus) to end.
   useEffect(() => {
     const el = hostRef.current;
     if (!el) {
       return;
     }
+    const appWindow = getCurrentWindow();
 
     const keys = { forward: false, back: false, left: false, right: false, up: false, down: false };
     let lookDx = 0;
     let lookDy = 0;
-    let flying = false;
     let sendTimer: ReturnType<typeof setTimeout> | null = null;
+    let flyLookUnlisten: (() => void) | null = null;
+    let disposed = false;
 
     const sendState = (active: boolean): void => {
       const dx = lookDx;
@@ -299,17 +306,17 @@ export function ViewportPanel() {
       }
       sendTimer = setTimeout(() => {
         sendTimer = null;
-        if (flying) {
+        if (flyingRef.current) {
           sendState(true);
         }
       }, FLY_STREAM_MS);
     };
 
     const endFly = (): void => {
-      if (!flying) {
+      if (!flyingRef.current) {
         return;
       }
-      flying = false;
+      flyingRef.current = false;
       if (sendTimer !== null) {
         clearTimeout(sendTimer);
         sendTimer = null;
@@ -319,19 +326,17 @@ export function ViewportPanel() {
       }
       lookDx = 0;
       lookDy = 0;
-      if (document.pointerLockElement === el) {
-        document.exitPointerLock();
-      }
+      void appWindow.setPointerLock(false).catch(() => {});
       sendState(false);
     };
 
     const onPointerDown = (event: PointerEvent): void => {
-      if (event.button !== 2 || flying) {
+      if (event.button !== 2 || flyingRef.current) {
         return;
       }
       event.preventDefault();
-      flying = true;
-      el.requestPointerLock();
+      flyingRef.current = true;
+      void appWindow.setPointerLock(true).catch(() => {});
       sendState(true);
     };
 
@@ -341,18 +346,26 @@ export function ViewportPanel() {
       }
     };
 
-    const onPointerMove = (event: PointerEvent): void => {
-      if (!flying) {
+    // Relative look motion arrives from the shell's locked cursor (`DeviceEvent::MouseMotion`), not the
+    // DOM — CEF OSR delivers no mouse moves while the pointer is grabbed.
+    void listen<{ dx: number; dy: number }>("fly-look", (event) => {
+      if (!flyingRef.current) {
         return;
       }
-      lookDx += event.movementX;
-      lookDy += event.movementY;
+      lookDx += event.payload.dx;
+      lookDy += event.payload.dy;
       scheduleSend();
-    };
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        flyLookUnlisten = fn;
+      }
+    });
 
     // Map a physical key code to a fly direction via the configured (hold-kind)
     // bindings. Read live from the store so a rebind in settings applies without
-    // re-running this pointer-lock effect.
+    // re-running this effect.
     const keyFor = (code: string): keyof typeof keys | null => {
       const overrides = useEditorStore.getState().keyBindings;
       if (code === bindingFor("camera.flyForward", overrides)) {
@@ -379,7 +392,13 @@ export function ViewportPanel() {
     const onKey =
       (down: boolean) =>
       (event: KeyboardEvent): void => {
-        if (!flying) {
+        if (!flyingRef.current) {
+          return;
+        }
+        // Esc ends the fly (replacing the native pointer-lock exit).
+        if (down && event.code === "Escape") {
+          event.preventDefault();
+          endFly();
           return;
         }
         const key = keyFor(event.code);
@@ -393,32 +412,27 @@ export function ViewportPanel() {
         }
       };
 
-    const onLockChange = (): void => {
-      if (flying && document.pointerLockElement !== el) {
-        endFly();
-      }
-    };
-
     const onContextMenu = (event: Event): void => event.preventDefault();
 
     const keyDown = onKey(true);
     const keyUp = onKey(false);
     el.addEventListener("pointerdown", onPointerDown);
     window.addEventListener("pointerup", onPointerUp);
-    window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("keydown", keyDown);
     window.addEventListener("keyup", keyUp);
-    document.addEventListener("pointerlockchange", onLockChange);
+    // Losing focus mid-fly would otherwise strand held keys and the locked cursor.
+    window.addEventListener("blur", endFly);
     el.addEventListener("contextmenu", onContextMenu);
 
     return () => {
+      disposed = true;
       endFly();
+      flyLookUnlisten?.();
       el.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("pointerup", onPointerUp);
-      window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("keydown", keyDown);
       window.removeEventListener("keyup", keyUp);
-      document.removeEventListener("pointerlockchange", onLockChange);
+      window.removeEventListener("blur", endFly);
       el.removeEventListener("contextmenu", onContextMenu);
     };
   }, []);
@@ -453,8 +467,8 @@ export function ViewportPanel() {
       // lingering-focused control (a just-clicked toolbar button, an open text field)
       // can't swallow the next Space/Enter — e.g. Space re-toggling Play/Pause.
       (document.activeElement as HTMLElement | null)?.blur();
-      // Left button only; RMB is the fly-cam (pointer lock) gesture.
-      if (event.button !== 0 || pointerId !== null || document.pointerLockElement === el) {
+      // Left button only; RMB is the fly-cam gesture, which owns the (natively locked) pointer.
+      if (event.button !== 0 || pointerId !== null || flyingRef.current) {
         return;
       }
       pointerId = event.pointerId;
@@ -483,8 +497,8 @@ export function ViewportPanel() {
     };
 
     const onPointerMove = (event: PointerEvent): void => {
-      // While pointer lock is held the fly-cam owns the pointer; client coords are stale.
-      if (document.pointerLockElement === el) {
+      // While the fly-cam owns the (locked) pointer, DOM client coords are stale — stand down.
+      if (flyingRef.current) {
         return;
       }
       const uv = eventToUv(el, event);

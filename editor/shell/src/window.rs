@@ -83,6 +83,30 @@ impl ShellWindow {
         let _ = self.window.drag_resize_window(direction);
     }
 
+    /// Grab + hide the pointer for the RMB fly-cam (`true`), or release + show it (`false`). CEF's
+    /// windowless OSR can't service DOM pointer lock, so the shell locks the cursor at the winit level:
+    /// `Locked` freezes it in place and routes relative motion through `DeviceEvent::MouseMotion`
+    /// (falling back to `Confined` if the compositor won't lock).
+    pub fn set_pointer_lock(&self, locked: bool) {
+        if locked {
+            if self
+                .window
+                .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                .is_err()
+            {
+                let _ = self
+                    .window
+                    .set_cursor_grab(winit::window::CursorGrabMode::Confined);
+            }
+            self.window.set_cursor_visible(false);
+        } else {
+            let _ = self
+                .window
+                .set_cursor_grab(winit::window::CursorGrabMode::None);
+            self.window.set_cursor_visible(true);
+        }
+    }
+
     pub fn scale_factor(&self) -> f64 {
         self.window.scale_factor()
     }

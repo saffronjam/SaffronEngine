@@ -29,6 +29,9 @@ pub enum WindowAction {
     StartDrag,
     /// Begin an interactive resize from the grabbed edge/corner (the frontend's window-frame strips).
     StartResize(ResizeEdge),
+    /// Grab/release the pointer for the RMB fly-cam (native cursor lock + hide; CEF OSR can't do DOM
+    /// pointer lock). `true` locks, `false` releases.
+    SetPointerLock(bool),
     Show,
 }
 

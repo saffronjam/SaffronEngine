@@ -102,6 +102,11 @@ pub fn dispatch(
             state.post(ShellRequest::Window(WindowAction::StartResize(edge)));
             Ok(Value::Null)
         }
+        "set_pointer_lock" => {
+            let locked = args.get("locked").and_then(Value::as_bool).unwrap_or(false);
+            state.post(ShellRequest::Window(WindowAction::SetPointerLock(locked)));
+            Ok(Value::Null)
+        }
         "window_show" => {
             state.post(ShellRequest::Window(WindowAction::Show));
             Ok(Value::Null)
