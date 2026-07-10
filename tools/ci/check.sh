@@ -104,8 +104,8 @@ else
   fail_step "1. workspace build" "cargo build --workspace"
 fi
 
-# The CEF editor shell is a standalone crate (its own Cargo.toml/lock, outside the engine workspace,
-# as src-tauri was). Its build.rs downloads/links the version-locked libcef; defer if that provisioning
+# The CEF editor shell is a standalone crate (its own Cargo.toml/lock, outside the engine workspace).
+# Its build.rs downloads/links the version-locked libcef; defer if that provisioning
 # is absent rather than failing the gate (the "hardware/tooling this environment lacks" spirit).
 step "1b. editor shell build (cargo build in editor/shell, links libcef)"
 if ( cd "$REPO/editor/shell" && cargo build ); then

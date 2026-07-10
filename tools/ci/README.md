@@ -1,6 +1,6 @@
 # CI / reproducible gate
 
-`tools/ci/check.sh` is the single reproducible gate for the engine + Tauri editor. It runs ten
+`tools/ci/check.sh` is the single reproducible gate for the engine + CEF editor. It runs ten
 steps in dependency order, accumulates
 failures (a failure in any one turns the whole gate red), and prints a per-step pass/fail
 summary ending in a clear `ALL GATES PASSED` / `SOME GATES FAILED` verdict.
