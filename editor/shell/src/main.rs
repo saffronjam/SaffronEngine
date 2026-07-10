@@ -7,6 +7,7 @@
 //! `wl_subsurface`s below (Phase 6). The `RenderHandler` here still only counts paints — the
 //! `wl_shm` upload lands in Phase 3.
 
+mod appscheme;
 mod async_rt;
 mod commands;
 mod compositor;
@@ -132,6 +133,10 @@ wrap_app! {
                 registrar.add_custom_scheme(
                     Some(&scheme::SCHEME_NAME.into()),
                     scheme::SCHEME_OPTIONS,
+                );
+                registrar.add_custom_scheme(
+                    Some(&appscheme::SCHEME_NAME.into()),
+                    appscheme::SCHEME_OPTIONS,
                 );
             }
         }
@@ -1269,6 +1274,17 @@ fn main() -> std::process::ExitCode {
         Some(&mut scheme::factory(state.connectors.cache())),
     );
 
+    // Serve the bundled React UI over `saffron-app://` in a packaged build. `SAFFRON_UI_DIR` is set by
+    // the AppImage's AppRun; it is empty in dev, where the UI loads from Vite via `SAFFRON_DEV_URL`.
+    let ui_dir = std::env::var_os("SAFFRON_UI_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    register_scheme_handler_factory(
+        Some(&appscheme::SCHEME_NAME.into()),
+        None,
+        Some(&mut appscheme::factory(ui_dir.clone())),
+    );
+
     // The browser-side IPC router (created after `initialize`, on the UI thread) that carries
     // `cefQuery` requests to the control passthrough.
     let router = ipc::browser_router(Arc::clone(&state));
@@ -1287,17 +1303,21 @@ fn main() -> std::process::ExitCode {
         size: Rc::new(RefCell::new((1600, 900))),
         compositor: Rc::new(RefCell::new(None)),
         paints: Arc::clone(&paints),
-        // The React UI URL. The dev loop sets `SAFFRON_DEV_URL` (Vite); the prod app scheme lands
-        // later. If neither is present the shell is misconfigured — show a plain theme-colored notice
-        // rather than a blank window.
+        // The React UI URL. The dev loop sets `SAFFRON_DEV_URL` (Vite); a packaged build has
+        // `SAFFRON_UI_DIR` set and loads the bundle over the `saffron-app://` scheme. With neither the
+        // shell is misconfigured — show a plain theme-colored notice rather than a blank window.
         url: std::env::var("SAFFRON_DEV_URL").unwrap_or_else(|_| {
-            concat!(
-                "data:text/html,",
-                "<html><body style='margin:0;background:%230a0a0a;color:%23888;",
-                "font:14px sans-serif;display:grid;place-items:center;height:100vh'>",
-                "SAFFRON_DEV_URL not set — run via `just run`</body></html>"
-            )
-            .to_string()
+            if ui_dir.as_os_str().is_empty() {
+                concat!(
+                    "data:text/html,",
+                    "<html><body style='margin:0;background:%230a0a0a;color:%23888;",
+                    "font:14px sans-serif;display:grid;place-items:center;height:100vh'>",
+                    "no UI source: run via `just run` or a packaged build</body></html>"
+                )
+                .to_string()
+            } else {
+                appscheme::INDEX_URL.to_string()
+            }
         }),
         state: Arc::clone(&state),
         revealed: false,

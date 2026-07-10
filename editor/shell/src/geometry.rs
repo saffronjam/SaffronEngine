@@ -69,8 +69,23 @@ pub(crate) fn repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The app-data root (CEF cache, settings, window state, recent projects). `$SAFFRON_APPDATA_DIR`
+/// when set and non-empty — dev points it at the repo's `appdata/` so its state stays in-tree and
+/// isolated from an installed build; otherwise the XDG data directory (`$XDG_DATA_HOME`, else
+/// `~/.local/share`) under `saffron-anima`, the location an installed build uses. The shell forwards
+/// this to the spawned host via `SAFFRON_APPDATA_DIR`, so both agree on one directory.
 pub fn app_data_dir() -> PathBuf {
-    repo_root().join("appdata")
+    if let Some(dir) = std::env::var_os("SAFFRON_APPDATA_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("saffron-anima")
 }
 
 pub(crate) fn userdata_dir() -> PathBuf {
