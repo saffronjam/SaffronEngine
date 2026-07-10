@@ -326,6 +326,76 @@ capture out="engine/target/capture.png":
     "$SA" quit >/dev/null 2>&1 || true
     echo "capture: wrote $out"
 
+# package the editor as a distributable for a target: `just package linux` builds an AppImage
+# (windows/macos are not yet implemented). Output lands in build/dist/.
+package target="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{target}}" in
+      linux) ;;
+      windows|macos) echo "package {{target}}: not yet implemented" >&2; exit 1 ;;
+      "") echo "usage: just package <linux|windows|macos>" >&2; exit 2 ;;
+      *) echo "package: unknown target '{{target}}' (expected linux, windows, or macos)" >&2; exit 2 ;;
+    esac
+    RECIPE=package; {{reenter}}
+    # Release artifacts: the host + its shaders, the frontend bundle, then the CEF shell.
+    cd "{{engine}}"
+    cargo build --release --bin saffron-host
+    cargo run -p xtask -- shaders --profile release
+    cd "{{editor}}"
+    bun install
+    bun run build
+    cd "{{editor}}/shell"
+    cargo build --release
+
+    stage="{{repo}}/build/appimage"; appdir="$stage/AppDir"
+    out="{{repo}}/build/dist"; tools="{{repo}}/build/tools"
+    rm -rf "$appdir"
+    mkdir -p "$appdir/usr/bin" "$appdir/usr/share/saffron-anima/assets" \
+             "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor/scalable/apps" \
+             "$out" "$tools"
+
+    install -m755 "{{engine}}/target/release/saffron-host" "$appdir/usr/bin/"
+    install -m755 "{{editor}}/shell/target/release/saffron-editor-shell" "$appdir/usr/bin/"
+
+    # CEF resolves libcef.so + its resource packs beside the shell binary, so the whole runtime dir
+    # goes into usr/bin next to the exe (LD_LIBRARY_PATH covers the .so lookups).
+    dist="$(dirname "$(find "{{editor}}/shell/target/release" -name libcef.so | head -1)")"
+    [ -n "$dist" ] && [ -d "$dist" ] || { echo "package: libcef.so not found under the shell build" >&2; exit 1; }
+    shopt -s nullglob
+    for f in "$dist"/*.so "$dist"/*.so.* "$dist"/*.pak "$dist"/*.bin "$dist"/*.dat "$dist"/*.json; do
+      cp -a "$f" "$appdir/usr/bin/"
+    done
+    shopt -u nullglob
+    [ -d "$dist/locales" ] && cp -a "$dist/locales" "$appdir/usr/bin/"
+    [ -f "$dist/chrome_crashpad_handler" ] && cp -a "$dist/chrome_crashpad_handler" "$appdir/usr/bin/"
+
+    # Engine data: source models/fonts/icons + the compiled SPIR-V, and the built React UI.
+    cp -a "{{engine}}/assets/models" "{{engine}}/assets/fonts" "{{engine}}/assets/icons" \
+          "$appdir/usr/share/saffron-anima/assets/"
+    cp -a "{{engine}}/target/release/shaders" "$appdir/usr/share/saffron-anima/assets/"
+    cp -a "{{editor}}/dist" "$appdir/usr/share/saffron-anima/ui"
+
+    # Entrypoint + desktop integration + icon.
+    install -m755 "{{repo}}/packaging/linux/AppRun" "$appdir/AppRun"
+    cp "{{repo}}/packaging/linux/saffron-anima.desktop" "$appdir/saffron-anima.desktop"
+    cp "{{repo}}/packaging/linux/saffron-anima.desktop" "$appdir/usr/share/applications/"
+    cp "{{repo}}/packaging/linux/saffron-anima.svg" "$appdir/saffron-anima.svg"
+    cp "{{repo}}/packaging/linux/saffron-anima.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/"
+    ln -sf saffron-anima.svg "$appdir/.DirIcon"
+
+    # appimagetool: PATH first, else fetch it (extract-and-run needs no FUSE, so it works in the toolbox).
+    if command -v appimagetool >/dev/null 2>&1; then
+      ait=(appimagetool)
+    else
+      ait_bin="$tools/appimagetool-x86_64.AppImage"
+      [ -f "$ait_bin" ] || { echo "package: fetching appimagetool"; curl -fL -o "$ait_bin" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage; chmod +x "$ait_bin"; }
+      ait=("$ait_bin" --appimage-extract-and-run)
+    fi
+    ARCH=x86_64 "${ait[@]}" "$appdir" "$out/Saffron_Anima-x86_64.AppImage"
+    echo "package linux: wrote $out/Saffron_Anima-x86_64.AppImage"
+    echo "package linux: the bundled UI needs the app:// scheme (not yet wired); it launches to a placeholder until then" >&2
+
 # the host-runnable control CLI; `just sa ping`, `just sa help`
 sa *args:
     #!/usr/bin/env bash
