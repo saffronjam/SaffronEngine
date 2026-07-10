@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Saffron Anima
+Comment=Vulkan renderer and Rust game engine editor
+Exec=saffron-editor-shell
+Icon=saffron-anima
+Categories=Development;Graphics;
+Terminal=false
