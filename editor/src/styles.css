@@ -40,6 +40,7 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
+  --scrollbar-thumb: oklch(0.75 0 0);
   --radius: 0.5rem;
 }
 
@@ -63,6 +64,7 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
+  --scrollbar-thumb: oklch(0.45 0 0);
 }
 
 @theme inline {
@@ -98,6 +100,17 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+  }
+
+  /* Dark, overlay scrollbars for every inner `overflow-auto` pane. `scrollbar-color` is inherited, so
+     setting it on the root tints all native scrollbars to the theme — and unlike `::-webkit-scrollbar`
+     it does NOT force a classic space-reserving scrollbar, so paired with the `OverlayScrollbar` CEF
+     feature the scrollbars paint over content with no layout gutter. `color-scheme: dark` is
+     deliberately NOT used: on the transparent root it would make Chromium paint an opaque dark canvas
+     and cover the viewport hole. */
+  html {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
   }
 
   html,
