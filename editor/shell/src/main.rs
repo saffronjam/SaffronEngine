@@ -28,7 +28,7 @@ pub(crate) use os::open_url_in_browser;
 
 use cef::wrapper::message_router::BrowserSideRouter;
 use cef::{args::Args, *};
-use compositor::ToplevelCompositor;
+use compositor::{DndEvent, ToplevelCompositor};
 use state::{ResizeEdge, ShellRequest, ShellState, WindowAction};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -41,7 +41,7 @@ use window::ShellWindow;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     platform::pump_events::{EventLoopExtPumpEvents, PumpStatus},
@@ -86,6 +86,13 @@ wrap_app! {
             };
             cl.append_switch(Some(&"no-sandbox".into()));
             cl.append_switch(Some(&"noerrdialogs".into()));
+            // Overlay scrollbars: draw scrollbars on top of content (auto-hiding, no reserved layout
+            // gutter) instead of the classic space-reserving bar. The theme tint comes from
+            // `scrollbar-color` in the frontend `styles.css`; this feature makes them overlay.
+            cl.append_switch_with_value(
+                Some(&"enable-features".into()),
+                Some(&"OverlayScrollbar".into()),
+            );
             // Windowless OSR reports no hover-capable pointer, so Blink evaluates `(hover: none)` /
             // `(pointer: coarse)` and disables every hover media query — and Tailwind v4 gates `hover:`
             // / `group-hover:` behind `@media (hover: hover)`, so all hover styling silently dies. The
@@ -487,6 +494,13 @@ struct Shell {
     /// The in-flight OSR drag, shared with the `RenderHandler` so its `start_dragging` opens the drag
     /// and the winit pointer handlers drive `drag_target_drag_over`/`drag_target_drop` to completion.
     drag: Rc<RefCell<DragState>>,
+    /// Whether the RMB fly-cam has grabbed the pointer (CEF's windowless OSR can't do DOM pointer lock,
+    /// so the shell locks the cursor natively). While set, `CursorMoved` stops and the relative motion
+    /// arrives as `DeviceEvent::MouseMotion`, accumulated in `look_accum` and streamed to the frontend
+    /// as a `fly-look` event.
+    pointer_locked: bool,
+    /// Raw relative-motion delta accumulated since the last `fly-look` emit (only while `pointer_locked`).
+    look_accum: (f64, f64),
 }
 
 /// CEF `cef_event_flags_t` modifier bits carried in `KeyEvent`/`MouseEvent.modifiers`.
@@ -603,6 +617,11 @@ impl Shell {
                 };
                 shell_window.drag_resize(direction);
             }
+            WindowAction::SetPointerLock(locked) => {
+                shell_window.set_pointer_lock(locked);
+                self.pointer_locked = locked;
+                self.look_accum = (0.0, 0.0);
+            }
             WindowAction::Show => {
                 shell_window.reveal();
                 self.revealed = true;
@@ -610,16 +629,22 @@ impl Shell {
         }
     }
 
-    /// Emit a `drag-drop` event in the frontend's drag-drop payload union. `paths` carries the
-    /// one hovered/dropped file; `position` is the last pointer position (winit gives none).
-    fn emit_drag_drop(&self, kind: &str, path: Option<&std::path::Path>) {
-        let payload = match path {
-            Some(path) => serde_json::json!({
-                "type": kind,
-                "paths": [path.to_string_lossy()],
-                "position": { "x": self.cursor.0, "y": self.cursor.1 },
+    /// Re-emit a compositor file-drag step as the frontend's `drag-drop` event. The payload discriminant
+    /// (`over`/`leave`/`drop`) + `paths` + `position` match the union the frontend already consumes; the
+    /// positions are the drag's own surface-local device pixels.
+    fn emit_dnd(&self, ev: &DndEvent) {
+        let payload = match ev {
+            DndEvent::Over { x, y } => serde_json::json!({
+                "type": "over",
+                "paths": serde_json::Value::Array(Vec::new()),
+                "position": { "x": x, "y": y },
             }),
-            None => serde_json::json!({ "type": kind }),
+            DndEvent::Leave => serde_json::json!({ "type": "leave" }),
+            DndEvent::Drop { paths, x, y } => serde_json::json!({
+                "type": "drop",
+                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                "position": { "x": x, "y": y },
+            }),
         };
         self.state.emit("drag-drop", payload);
     }
@@ -1160,14 +1185,22 @@ impl ApplicationHandler for Shell {
                 is_synthetic: false,
                 ..
             } => self.send_key(&event),
-            // Native file drag-drop → the frontend's `getCurrentWebview().onDragDropEvent`. winit
-            // delivers one path per event and no drop position, so we report the last pointer
-            // position (`isInsidePanel` needs *a* position); a multi-file drop arrives as separate
-            // `drop`s, which `importMany([path])` handles.
-            WindowEvent::HoveredFile(path) => self.emit_drag_drop("over", Some(path.as_path())),
-            WindowEvent::HoveredFileCancelled => self.emit_drag_drop("leave", None),
-            WindowEvent::DroppedFile(path) => self.emit_drag_drop("drop", Some(path.as_path())),
+            // OS file drag-drop is not a winit `WindowEvent` on Wayland (winit's Wayland backend has no
+            // `wl_data_device`); it's received on the compositor's connection and drained in the pump
+            // loop (`emit_dnd`).
             _ => {}
+        }
+    }
+
+    /// Raw relative pointer motion (delivered while the fly-cam has the cursor locked). Accumulate it;
+    /// the pump loop streams it to the frontend as a `fly-look` event. Ignored when not locked (a
+    /// normal mouse move rides `WindowEvent::CursorMoved` → CEF instead).
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if self.pointer_locked
+            && let DeviceEvent::MouseMotion { delta } = event
+        {
+            self.look_accum.0 += delta.0;
+            self.look_accum.1 += delta.1;
         }
     }
 }
@@ -1276,6 +1309,8 @@ fn main() -> std::process::ExitCode {
         last_press: None,
         click_count: 0,
         drag: Rc::new(RefCell::new(DragState::default())),
+        pointer_locked: false,
+        look_accum: (0.0, 0.0),
     };
 
     let mut event_loop = EventLoop::new().unwrap();
@@ -1327,6 +1362,27 @@ fn main() -> std::process::ExitCode {
                 ShellRequest::Emit { event, payload } => shell.emit_to_js(&event, &payload),
             }
         }
+
+        // Drain the compositor's OS file drag-drop steps (received on its Wayland connection) and
+        // re-emit them to the frontend. Owned `Vec` so the compositor borrow ends before `emit_dnd`.
+        let dnd = shell
+            .compositor
+            .borrow_mut()
+            .as_mut()
+            .map(ToplevelCompositor::pump_dnd)
+            .unwrap_or_default();
+        for ev in &dnd {
+            shell.emit_dnd(ev);
+        }
+
+        // Stream accumulated fly-cam look motion (from locked-pointer `DeviceEvent::MouseMotion`) to the
+        // frontend as one `fly-look` per iteration. Frame-paced, and only while the pointer is locked.
+        if shell.pointer_locked && shell.look_accum != (0.0, 0.0) {
+            let (dx, dy) = shell.look_accum;
+            shell.look_accum = (0.0, 0.0);
+            shell.emit_to_js("fly-look", &format!("{{\"dx\":{dx},\"dy\":{dy}}}"));
+        }
+
         if state.exit_requested.load(Ordering::Relaxed) {
             break 0;
         }

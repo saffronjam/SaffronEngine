@@ -148,6 +148,11 @@ export function getCurrentWindow() {
     startDragging: (): Promise<void> => invoke<void>("window_start_drag"),
     startResizeDragging: (direction: ResizeDirection): Promise<void> =>
       invoke<void>("window_start_resize", { direction }),
+    /// Grab + hide the cursor for the RMB fly-cam (`true`), or release it (`false`). CEF's windowless
+    /// OSR can't service DOM pointer lock, so the shell locks the cursor natively and streams relative
+    /// motion back as `fly-look` events.
+    setPointerLock: (locked: boolean): Promise<void> =>
+      invoke<void>("set_pointer_lock", { locked }),
     show: (): Promise<void> => invoke<void>("window_show"),
     onResized: (callback: () => void): Promise<UnlistenFn> =>
       listen<unknown>("window-resized", () => callback()),
@@ -160,8 +165,8 @@ export type DragDropPayload =
   | { type: "leave" }
   | { type: "drop"; paths: string[]; position: { x: number; y: number } };
 
-/// The window's drag-drop surface. The shell emits `drag-drop` events from its native
-/// (winit) drag-drop, exposed as `getCurrentWebview().onDragDropEvent`.
+/// The window's drag-drop surface. The shell emits `drag-drop` events from its Wayland
+/// `wl_data_device` file-drop receiver, exposed as `getCurrentWebview().onDragDropEvent`.
 export function getCurrentWebview() {
   return {
     onDragDropEvent: (
