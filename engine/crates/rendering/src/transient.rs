@@ -18,8 +18,34 @@ use std::sync::Arc;
 
 use ash::vk;
 
+use crate::descriptors::MAX_BLOOM_MIPS;
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
-use crate::resources::{Buffer, DeviceResources, Image, ImageDesc};
+use crate::resources::{Buffer, DeviceResources, Image, Image3D, ImageDesc};
+
+/// The stable transient keys for the bloom mip pyramid — one keyed image per level so each level's
+/// barriers stay independent (the transient pool returns one view per key). Sized to
+/// [`MAX_BLOOM_MIPS`]; the live level count is chosen per frame off the display extent.
+pub(crate) const BLOOM_MIP_KEYS: [&str; MAX_BLOOM_MIPS] = [
+    "bloom-mip-0",
+    "bloom-mip-1",
+    "bloom-mip-2",
+    "bloom-mip-3",
+    "bloom-mip-4",
+    "bloom-mip-5",
+    "bloom-mip-6",
+];
+
+/// The two ping-pong buffers for the anamorphic streak: a horizontally-squeezed blur of the bright
+/// pyramid widened across two passes. Keyed like the mip chain so each buffer's barriers stay
+/// independent and nothing outlives the frame.
+pub(crate) const BLOOM_STREAK_KEYS: [&str; 2] = ["bloom-streak-0", "bloom-streak-1"];
+
+/// The stable transient keys for the froxel-volume 3D scratch — one keyed [`Image3D`] per logical
+/// volume so each keeps an independent grow-only slot and independent barriers, the same discipline
+/// as [`BLOOM_MIP_KEYS`]. Reserved for a transient froxel scratch volume; the volumetric-fog stage
+/// (`froxel_fog::FroxelFog`) owns its scatter + integration volumes as fixed-size persistent images,
+/// so the transient 3D path stays available for later local-fog / aerial-perspective scratch.
+pub const FROXEL_VOLUME_KEYS: [&str; 1] = ["froxel-integration"];
 
 /// Initial transient-buffer capacity (bytes) — the first allocation of any acquire slot rounds up to
 /// at least this, and doubles from there, so a hot slot stops reallocating quickly.
@@ -65,10 +91,22 @@ struct TransientImage {
     desc: ImageDesc,
 }
 
+/// A keyed transient 3D volume — the [`Image3D`] analog of [`TransientImage`]. The extent (depth
+/// included), format, and usage together form the key's match test: a re-acquire that changes any of
+/// them rebuilds the slot, exactly as the 2D path rebuilds on an [`ImageDesc`] mismatch.
+struct TransientImage3D {
+    key: &'static str,
+    image: Image3D,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+}
+
 #[derive(Default)]
 struct FrameTransient {
     buffers: Vec<TransientBuffer>,
     images: Vec<TransientImage>,
+    images_3d: Vec<TransientImage3D>,
 }
 
 /// The render graph's scratch-resource allocator, one growable pool per frame-in-flight.
@@ -213,6 +251,51 @@ impl TransientResources {
             }
         };
         let im = &f.images[i];
+        Ok((im.image.handle(), im.image.view()))
+    }
+
+    /// Acquire a transient 3D image under a stable `&'static str` `key`, keyed exactly like
+    /// [`acquire_image`] — the same grow-only, order- and skip-independent discipline, one key per
+    /// logical volume (see [`FROXEL_VOLUME_KEYS`]). Returns `(image, view)` handles for
+    /// [`crate::render_graph::RenderGraph::import_image_3d`] (initial layout `UNDEFINED`); the view
+    /// is `TYPE_3D`. Backed by the existing [`Image3D`] wrapper — one 3D image type, one 3D acquire.
+    /// A re-acquire whose `extent`/`format`/`usage` all match reuses the allocation; any change
+    /// rebuilds the slot (fence-safe: a slot is only touched after its frame's fence has signalled).
+    pub fn acquire_image_3d(
+        &mut self,
+        frame: usize,
+        key: &'static str,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> crate::Result<(vk::Image, vk::ImageView)> {
+        let f = &mut self.frames[frame];
+        let existing = f.images_3d.iter().position(|im| im.key == key);
+        if let Some(i) = existing {
+            let im = &f.images_3d[i];
+            if im.extent == extent && im.format == format && im.usage == usage {
+                return Ok((im.image.handle(), im.image.view()));
+            }
+        }
+        let image = Image3D::new(&self.resources, extent, format, 1, usage)?;
+        let entry = TransientImage3D {
+            key,
+            image,
+            extent,
+            format,
+            usage,
+        };
+        let i = match existing {
+            Some(i) => {
+                f.images_3d[i] = entry;
+                i
+            }
+            None => {
+                f.images_3d.push(entry);
+                f.images_3d.len() - 1
+            }
+        };
+        let im = &f.images_3d[i];
         Ok((im.image.handle(), im.image.view()))
     }
 
