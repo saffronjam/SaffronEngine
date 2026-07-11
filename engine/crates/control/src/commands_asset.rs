@@ -104,6 +104,7 @@ fn asset_type_dto(asset_type: AssetType) -> AssetTypeDto {
         AssetType::Material => AssetTypeDto::Material,
         AssetType::Model => AssetTypeDto::Model,
         AssetType::Mesh => AssetTypeDto::Mesh,
+        AssetType::Lut => AssetTypeDto::Lut,
     }
 }
 
@@ -1334,6 +1335,29 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 .map_err(|e| Error::command(e.to_string()))?;
             Ok(ImportTextureResult {
                 texture: WireUuid(id.value()),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::ImportLutParams, saffron_protocol::ImportLutResult>(
+        "import-lut",
+        "import-lut {path} — import a creative .cube look as a LUT asset",
+        |ctx, params| {
+            if params.path.is_empty() {
+                return Err(Error::command("missing 'path'"));
+            }
+            require_project_loaded(ctx)?;
+            let assets = &mut *ctx.assets;
+            let path = params.path.clone();
+            let mut result = None;
+            ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                result = Some(assets.import_cube_lut(gpu, &path));
+            });
+            let id = result
+                .ok_or_else(|| Error::command("upload seam unavailable"))?
+                .map_err(|e| Error::command(e.to_string()))?;
+            Ok(saffron_protocol::ImportLutResult {
+                lut: WireUuid(id.value()),
             })
         },
     );
@@ -3444,6 +3468,7 @@ fn furnish_preview_scene(
                     color: GVec3::ONE,
                     intensity: 3.0,
                     ambient: 0.25,
+                    ..Default::default()
                 },
             );
             scene.environment.sky_mode = SkyMode::Procedural;
