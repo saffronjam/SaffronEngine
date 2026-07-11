@@ -156,6 +156,7 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(ExtractSubAssetParams, "ExtractSubAssetParams");
     check!(ClearExtractionParams, "ClearExtractionParams");
     check!(ImportTextureResult, "ImportTextureResult");
+    check!(ImportLutResult, "ImportLutResult");
     check!(AssetEntryDto, "AssetEntryDto");
     check!(AssetList, "AssetList");
     check!(ScanAssetsResult, "ScanAssetsResult");
@@ -241,6 +242,7 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(EnvironmentDto, "EnvironmentDto");
     check!(SetEnvironmentParams, "SetEnvironmentParams");
     check!(SetAtmosphereParams, "SetAtmosphereParams");
+    check!(SetFogParams, "SetFogParams");
     check!(SelectionResult, "SelectionResult");
     check!(PlayStateResult, "PlayStateResult");
     check!(AnimationClipDto, "AnimationClipDto");
@@ -295,4 +297,14 @@ fn every_dto_fragment_matches_committed_openrpc() {
     check!(ListProbesResult, "ListProbesResult");
     check!(SetExposureParams, "SetExposureParams");
     check!(SetExposureResult, "SetExposureResult");
+    check!(AnamorphicParams, "AnamorphicParams");
+    check!(SetBloomParams, "SetBloomParams");
+    check!(SetBloomResult, "SetBloomResult");
+    check!(GradeRangeDto, "GradeRangeDto");
+    check!(SplitToneDto, "SplitToneDto");
+    check!(SetColorGradingParams, "SetColorGradingParams");
+    check!(SetColorGradingResult, "SetColorGradingResult");
+    check!(CreativeLutStat, "CreativeLutStat");
+    check!(BakeLookParams, "BakeLookParams");
+    check!(BakeLookResult, "BakeLookResult");
 }
