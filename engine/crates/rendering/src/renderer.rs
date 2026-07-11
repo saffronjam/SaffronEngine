@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
-use saffron_geometry::glam::Mat4;
+use saffron_geometry::glam::{Mat4, Vec3};
 
 use crate::budget::{BudgetController, BudgetStep};
 use crate::ddgi::DDGI_RAYS_PER_PROBE;
@@ -26,7 +26,8 @@ use crate::lighting::{ClusterCamera, Lighting, SceneLighting, point_shadow_face_
 use crate::meshlet_raster::MeshletRaster;
 use crate::nested_scopes::NestedScopeRecorder;
 use crate::overlay::{
-    GridPush, OverlayDraw, OverlayState, OverlayVertex, TonemapMode, TonemapPush,
+    ColorGrade, GradeUniform, GridPush, OverlayDraw, OverlayState, OverlayVertex, TonemapMode,
+    TonemapPush,
 };
 use crate::pipelines::Pipelines;
 use crate::present::PresentSync;
@@ -100,19 +101,24 @@ pub enum ViewMode {
     LightComplexity,
     /// Motion vectors, colorized by a dedicated fullscreen pass.
     MotionVectors,
+    /// The froxel volumetric-fog volume: the integrated in-scatter + fog opacity, visualized by the
+    /// fog composite pass (requires `fog.mode == volumetric`, where the froxel grid is populated).
+    Fog,
 }
 
 impl ViewMode {
     /// The debug-shading channel the mesh fragment outputs instead of full shading;
     /// folded into the light UBO's `point_shadow_meta.w`. `0` is full shading
-    /// (`Lit`, `Wireframe`, `LitWireframe`, and `MotionVectors`, the last two being
-    /// produced by dedicated passes).
+    /// (`Lit`, `Wireframe`, `LitWireframe`, `MotionVectors`, and `Fog` — the last three
+    /// being produced by dedicated passes).
     fn debug_channel(self) -> u32 {
         match self {
             ViewMode::Lit
             | ViewMode::Wireframe
             | ViewMode::LitWireframe
-            | ViewMode::MotionVectors => 0,
+            | ViewMode::MotionVectors
+            // Fog is visualized by the fog composite pass, not the mesh debug channel.
+            | ViewMode::Fog => 0,
             ViewMode::Albedo => 1,
             ViewMode::Normal => 2,
             ViewMode::Roughness => 3,
@@ -239,6 +245,33 @@ pub struct RenderStatsFull {
     pub view_mode: ViewMode,
     /// The tonemap exposure in stops.
     pub exposure_ev: f32,
+    /// The scene-linear color grade folded into the tonemap pass (white balance, contrast,
+    /// saturation, ASC-CDL).
+    pub color_grade: ColorGrade,
+    /// Whether the pre-tonemap bloom pyramid is enabled.
+    pub bloom_enabled: bool,
+    /// The energy-conserving bloom composite weight.
+    pub bloom_intensity: f32,
+    /// The bloom tent-upsample scatter radius (UV units).
+    pub bloom_scatter: f32,
+    /// The bloom tint (multiplies the composited bloom).
+    pub bloom_tint: [f32; 3],
+    /// The bloom soft-knee prefilter threshold (`0.0` = thresholdless).
+    pub bloom_threshold: f32,
+    /// The lens-dirt mask asset id (`0` = none).
+    pub bloom_dirt_texture: u64,
+    /// The lens-dirt mix fraction.
+    pub bloom_dirt_intensity: f32,
+    /// The lens-dirt tint.
+    pub bloom_dirt_tint: [f32; 3],
+    /// Whether the anamorphic streak runs.
+    pub bloom_anamorphic_enabled: bool,
+    /// The anamorphic horizontal squeeze.
+    pub bloom_anamorphic_ratio: f32,
+    /// The anamorphic streak tint.
+    pub bloom_anamorphic_tint: [f32; 3],
+    /// The anamorphic streak add weight.
+    pub bloom_anamorphic_intensity: f32,
 }
 
 /// The PSOs one offscreen frame needs, resolved up front (each request borrows
@@ -315,8 +348,18 @@ struct FramePipelines {
     taa: Option<Arc<crate::Pipeline>>,
     /// The FXAA edge-blur compute PSO, resolved when FXAA is the active AA mode.
     fxaa: Option<Arc<crate::Pipeline>>,
+    /// The bloom pyramid compute PSO, resolved only when bloom is enabled this frame.
+    bloom: Option<Arc<crate::Pipeline>>,
     /// The mandatory tonemap compute PSO (always resolved unless its build fails).
     tonemap: Option<Arc<crate::Pipeline>>,
+    /// The analytic height-fog composite compute PSO, resolved only while fog is enabled this frame.
+    fog: Option<Arc<crate::Pipeline>>,
+    /// The froxel fog-inject / fog-integrate compute PSOs, resolved only while volumetric fog is on.
+    fog_inject: Option<Arc<crate::Pipeline>>,
+    fog_integrate: Option<Arc<crate::Pipeline>>,
+    /// The aerial-perspective fill compute PSO, resolved only while an active atmosphere + authored AP
+    /// arm the fill this frame.
+    aerial: Option<Arc<crate::Pipeline>>,
     /// The scene-resolve copy PSO (copy_color-shaped): normalized-UV upscale of the input-extent
     /// scene scratch into the display-extent offscreen, used on the no-AA / MSAA paths (FXAA/TAA
     /// resolve to the offscreen themselves). Resolved whenever neither FXAA nor TAA is active.
@@ -352,6 +395,14 @@ struct DdgiPipelines {
     blend_irr: Arc<crate::Pipeline>,
     blend_dist: Arc<crate::Pipeline>,
     border: Arc<crate::Pipeline>,
+}
+
+/// One level of the transient bloom mip pyramid: its graph resource (barrier tracking), its image
+/// view (bound into the per-pass descriptor sets), and its extent (the dispatch group count).
+struct BloomMip {
+    res: RgResource,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
 }
 
 /// The two Global-SDF compute PSOs, resolved together — the GDF gate requires both (a partial set
@@ -459,6 +510,125 @@ struct TaaResolveSlots {
     lock: TaaHistorySlots,
 }
 
+/// The authored analytic height/distance fog, resolved from `scene.environment.fog` and pushed to
+/// the renderer each frame. A plain mirror of the scene [`saffron_scene::FogSettings`] block (the
+/// rendering crate does not depend on the scene, so the conversion lives in the assets layer). The
+/// broad layer plus an optional ground layer sum into one closed-form optical depth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FogRenderSettings {
+    /// Whether the fog composite runs this frame.
+    pub enabled: bool,
+    /// Broad-layer sigma at `height`.
+    pub density: f32,
+    /// In-scatter tint (multiplied by the sky-view LUT when the atmosphere is live).
+    pub albedo: Vec3,
+    /// World-up reference height of the broad layer.
+    pub height: f32,
+    /// Exponential density falloff with world-up distance.
+    pub height_falloff: f32,
+    /// Fog begins this far from the eye.
+    pub start_distance: f32,
+    /// Clamps `1 - transmittance`.
+    pub max_opacity: f32,
+    /// Constant in-medium emission.
+    pub emissive: Vec3,
+    /// Sun-through-haze lobe color.
+    pub directional_color: Vec3,
+    /// Lobe sharpness.
+    pub directional_exponent: f32,
+    /// Ground-haze layer sigma; `0` disables it.
+    pub layer2_density: f32,
+    /// Ground-haze exponential density falloff.
+    pub layer2_falloff: f32,
+    /// Ground-haze world-up reference height.
+    pub layer2_height: f32,
+    /// The froxel volumetric path runs instead of the analytic closed form. The analytic height
+    /// density is injected as the froxel base medium — never applied twice.
+    pub volumetric: bool,
+    /// Constant scattering-medium extinction floor (added to the analytic height density).
+    pub base_density: f32,
+    /// Single-scattering albedo (`sigma_s = albedo * sigma_t`).
+    pub scatter_albedo: f32,
+    /// Henyey-Greenstein phase anisotropy (`g`), forward-scattering for `g > 0`.
+    pub phase_g: f32,
+    /// The froxel-grid quality tier (grid dimensions) for the volumetric path.
+    pub quality: crate::FroxelQuality,
+    /// Temporal reprojection blend: the fresh-sample weight per frame (`0.05` default).
+    pub history_blend: f32,
+    /// Clamp the reprojected history to a band of the fresh sample (firefly / ghost suppression).
+    pub neighborhood_clamp: bool,
+    /// Cap each light's per-froxel in-scatter before accumulation (`0` = off).
+    pub light_clamp: f32,
+    /// Fill + composite the Hillaire-2020 aerial-perspective volume (needs a live atmosphere; the
+    /// renderer gates the AP fill on the baked atmosphere, so this is a no-op without one).
+    pub aerial_perspective: bool,
+    /// Aerial-perspective in-scatter strength multiplier.
+    pub aerial_intensity: f32,
+}
+
+impl Default for FogRenderSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            density: 0.02,
+            albedo: Vec3::new(0.5, 0.6, 0.7),
+            height: 0.0,
+            height_falloff: 0.2,
+            start_distance: 0.0,
+            max_opacity: 1.0,
+            emissive: Vec3::ZERO,
+            directional_color: Vec3::new(1.0, 0.9, 0.7),
+            directional_exponent: 8.0,
+            layer2_density: 0.0,
+            layer2_falloff: 0.5,
+            layer2_height: 0.0,
+            volumetric: false,
+            base_density: 0.02,
+            scatter_albedo: 0.9,
+            phase_g: 0.6,
+            quality: crate::FroxelQuality::Medium,
+            history_blend: 0.05,
+            neighborhood_clamp: false,
+            light_clamp: 0.0,
+            aerial_perspective: false,
+            aerial_intensity: 1.0,
+        }
+    }
+}
+
+/// The height-fog compute pass's uniform, matching `height_fog.slang`'s `FogParams`. `layer0` /
+/// `layer1` pack `(density, heightFalloff, height, pad)`; the trailing `_pad0` keeps the 16-byte
+/// std140 rows aligned.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct FogParams {
+    inv_view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 3],
+    max_opacity: f32,
+    albedo: [f32; 3],
+    start_distance: f32,
+    emissive: [f32; 3],
+    dir_exponent: f32,
+    sun_dir: [f32; 3],
+    use_sky_lut: f32,
+    dir_color: [f32; 3],
+    _pad0: f32,
+    layer0: [f32; 4],
+    layer1: [f32; 4],
+    /// `x` = mode (0 analytic, 1 volumetric), `y` = froxel near, `z` = froxel far (the Z
+    /// distribution the composite W mapping inverts), `w` = fog debug view (1 = output the froxel
+    /// in-scatter + opacity directly).
+    froxel: [f32; 4],
+    /// The camera view direction (world), for the froxel W depth projection.
+    cam_forward: [f32; 3],
+    /// `1` when the analytic/volumetric fog contributes this frame, `0` when the composite runs only
+    /// to apply aerial perspective (fog is disabled but AP is live) — then `T_fog = 1`, `inScatter_fog = 0`.
+    fog_enabled: f32,
+    /// Aerial perspective: `x` = enabled (atmosphere live + AP authored), `y` = AP near, `z` = AP far
+    /// (the exponential-Z distribution the composite's AP W mapping inverts), `w` unused.
+    aerial: [f32; 4],
+}
+
 /// The renderer: device, swapchain, frame ring, and the clear color.
 ///
 /// Drop order is load-bearing — the frame ring and swapchain are destroyed (their
@@ -479,6 +649,55 @@ pub struct Renderer {
     /// The tonemap exposure in stops; the mandatory tonemap pass applies `exp2(this)`.
     /// Defaults to 0 (a 1× multiplier).
     exposure_ev: f32,
+    /// Whether the scene-linear bloom pyramid runs before the tonemap pass. Off by default.
+    bloom_enabled: bool,
+    /// The energy-conserving bloom composite weight (`lerp(hdr, bloom, this)`). Default `0.05`.
+    bloom_intensity: f32,
+    /// The bloom tent-upsample scatter radius in UV units. Default `0.005`.
+    bloom_scatter: f32,
+    /// The bloom tint (multiplies the composited bloom). Default white.
+    bloom_tint: [f32; 3],
+    /// The soft-knee prefilter threshold; `0.0` (default) leaves bloom thresholdless.
+    bloom_threshold: f32,
+    /// The lens-dirt mask texture bound into the bloom composite set. `None` binds the 1×1 white
+    /// fallback (mask = 1 ⇒ identity), so an absent dirt asset is not a special code path.
+    bloom_dirt_texture: Option<Arc<crate::GpuTexture>>,
+    /// The lens-dirt asset id for read-back (`0` = none), mirroring `bloom_dirt_texture`.
+    bloom_dirt_texture_id: u64,
+    /// The lens-dirt mix (`0.0` = no dirt); the composite lerps the mask in by this fraction.
+    bloom_dirt_intensity: f32,
+    /// The lens-dirt tint (multiplies the sampled mask). Default white.
+    bloom_dirt_tint: [f32; 3],
+    /// Whether the anamorphic streak (a horizontally-squeezed blur, added over the radial bloom)
+    /// runs. Off by default.
+    bloom_anamorphic_enabled: bool,
+    /// The anamorphic horizontal squeeze (`~2.0`). Default `2.0`.
+    bloom_anamorphic_ratio: f32,
+    /// The anamorphic streak tint (cool by default).
+    bloom_anamorphic_tint: [f32; 3],
+    /// The anamorphic streak add weight (`0.0` = no streak). Default `0.0`.
+    bloom_anamorphic_intensity: f32,
+    /// The optional per-upsample-step tint stack (identity `1,1,1` when off). Fanned out one tint
+    /// per progressive upsample pass on the CPU, so the push carries one at a time.
+    bloom_mip_tint: Vec<[f32; 3]>,
+    /// The authored analytic height/distance fog, resolved from `scene.environment.fog` each frame
+    /// and composited into the scene-linear HDR offscreen before bloom. Off by default.
+    fog: FogRenderSettings,
+    /// The froxel volumetric-fog volumes + compute sets. Filled by the inject/integrate passes and
+    /// sampled by the composite when `fog.mode == Volumetric`.
+    froxel: crate::FroxelFog,
+    /// The Hillaire-2020 aerial-perspective volume + fill set. Filled from the atmosphere LUTs and
+    /// folded into the fog composite on the shared transmittance ledger while AP is live.
+    aerial: crate::AerialPerspective,
+    /// This frame's local `FogVolume` records, baked from the scene's `submit_fog_volumes`, uploaded
+    /// into the inject SSBO and looped per froxel during injection.
+    fog_volumes: Vec<crate::FogVolumeGpu>,
+    /// A wrapping scene clock (seconds) driving the fog-volume noise wind advection, accumulated in
+    /// [`Renderer::observe_frame_delta`].
+    fog_time: f32,
+    /// The directional light's travel direction (normalized; the way the sun's light goes), captured
+    /// on the scene-lighting write so the fog pass can point its sun-inscatter lobe toward the sun.
+    sun_direction: Vec3,
     /// The infinite analytic ground grid debug overlay toggle.
     show_grid: bool,
     /// Native-viewport host mode: present blits the post-processed offscreen straight to
@@ -594,6 +813,24 @@ pub struct Renderer {
 
     /// The active tonemap operator (default ACES), applied in the tonemap pass + reported in stats.
     tonemap_mode: TonemapMode,
+
+    /// The scene-linear color grade (default neutral identity), folded into the tonemap pass before
+    /// the view/display transform and reported in stats.
+    color_grade: ColorGrade,
+
+    /// The always-bound neutral identity creative LUT (2×2×2 ramp) bound at binding 2 of every view's
+    /// tonemap set when no creative look is assigned.
+    default_lut: Arc<crate::GpuLut>,
+    /// The assigned display-space creative look-up table, sampled tetrahedrally after the view
+    /// transform. `None` binds [`Renderer::default_lut`] (the identity ramp).
+    creative_lut: Option<Arc<crate::GpuLut>>,
+    /// The creative-LUT asset id for read-back (`0` = none), mirroring [`Renderer::creative_lut`].
+    creative_lut_id: u64,
+    /// The creative-LUT look intensity in `[0, 1]` (`0` = neutral), carried in the grade UBO.
+    creative_lut_intensity: f32,
+    /// The bound creative LUT's resolution per axis (`2` when none), carried in the grade UBO so the
+    /// tetrahedral sample scales `[0,1] → [0, n-1]` correctly.
+    creative_lut_size: u32,
 
     /// The reactive-loop observability mirror: the host pushes the idle/converged/reasons snapshot
     /// each frame (the verdict lives above this crate), and the editor sets the power state; both
@@ -804,12 +1041,15 @@ impl Renderer {
             crate::GlobalSdf,
             crate::Rt,
             crate::Restir,
+            crate::FroxelFog,
+            crate::AerialPerspective,
             Vec<ViewTarget>,
             BindlessFreeList,
             crate::Aa,
             Arc<crate::GpuTexture>,
             Arc<crate::GpuSdf>,
             crate::resources::DefaultHeightMinMax,
+            Arc<crate::GpuLut>,
         );
         let build = || -> Result<BuildParts> {
             let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
@@ -831,6 +1071,10 @@ impl Renderer {
             // (unbound slots fault on lavapipe / are UB on real hardware). A displacement height map
             // overwrites its own slot with its real pyramid at upload.
             let default_height_minmax = uploader.upload_default_height_minmax(&descriptors)?;
+            // The neutral identity creative LUT (a 2×2×2 ramp), the always-bound default at binding 2
+            // of every view's tonemap set so the tonemap shader never samples an unbound descriptor and
+            // never branches on look presence (intensity 0 is the neutral).
+            let default_lut = uploader.upload_identity_lut()?;
 
             let targets = Targets::new(&device)?;
             let lighting = Lighting::new(&device, &descriptors, &targets)?;
@@ -893,6 +1137,22 @@ impl Renderer {
             // sets are allocated + built per view below (sized to its viewport).
             let restir = crate::Restir::new(&device, &descriptors)?;
 
+            // The froxel volumetric-fog volumes + compute sets. Created eagerly so the composite's
+            // integration sampler (fog set binding 4) is always bound — the height-fog shader
+            // statically references it even in analytic mode.
+            let froxel = crate::FroxelFog::new(&device)?;
+
+            // The Hillaire-2020 aerial-perspective volume. Created eagerly so the composite's AP
+            // sampler (fog set binding 5) is always bound; its LUT bindings point at the reused
+            // atmosphere LUT images so they persist across bakes (the fill is gated on a live atmosphere).
+            let aerial = crate::AerialPerspective::new(&device)?;
+            aerial.bind_luts(
+                &device,
+                ibl.sampler(),
+                ibl.transmittance_view(),
+                ibl.multi_scatter_view(),
+            );
+
             // The two editor views (Scene + AssetPreview), each with its own offscreen +
             // screen-space + AA + ReSTIR targets and per-view sets, so a view switch never
             // aliases another view's images. Both are sized to the initial extent; the
@@ -905,6 +1165,20 @@ impl Renderer {
                 let mut view = ViewTarget::new(&device, width, height)?;
                 view.allocate_screen_space_sets(&descriptors, &ssao)?;
                 view.build_screen_space(&device, &descriptors, &ssao)?;
+                // Bind the identity creative LUT at binding 2 of the tonemap set. The set is allocated
+                // once per view and never reallocated (resizes rewrite bindings 0/1 only), so this write
+                // persists; only assigning a creative look rewrites binding 2 (idled, `set_creative_lut`).
+                view.write_tonemap_lut(&device, descriptors.linear_sampler(), default_lut.view());
+                // Bind the atmosphere sky-view LUT at binding 3 of the fog set. The LUT image is
+                // allocated once and reused across bakes, and the fog set is never reallocated, so
+                // this write persists across resizes (the fog pass gates its use by `useSkyLut`).
+                view.write_fog_sky_lut(&device, ibl.sampler(), ibl.sky_view_lut_view());
+                // Bind the froxel integration volume at binding 4 of the fog set (the volumetric
+                // composite sample). Rewritten by `set_fog` when a quality switch reallocates it.
+                view.write_fog_integration(&device, froxel.sampler(), froxel.integration_view());
+                // Bind the aerial-perspective volume at binding 5 of the fog set (the AP composite
+                // sample). The volume is fixed-size and never reallocated, so this write persists.
+                view.write_fog_aerial(&device, aerial.sampler(), aerial.volume_view());
                 // The AA targets (motion / history / scratch / MSAA), built after the
                 // screen-space chain (it reads the SSGI maps).
                 view.build_aa_targets(&device, &descriptors, aa)?;
@@ -934,12 +1208,15 @@ impl Renderer {
                 global_sdf,
                 rt,
                 restir,
+                froxel,
+                aerial,
                 views,
                 free_list,
                 aa,
                 default_white,
                 default_sdf,
                 default_height_minmax,
+                default_lut,
             ))
         };
         let (
@@ -962,12 +1239,15 @@ impl Renderer {
             global_sdf,
             rt,
             restir,
+            froxel,
+            aerial,
             views,
             bindless_free_list,
             aa,
             default_white,
             default_sdf,
             default_height_minmax,
+            default_lut,
         ) = match build() {
             Ok(parts) => parts,
             Err(err) => {
@@ -1030,6 +1310,10 @@ impl Renderer {
         // light set (the consumers' far-field tap). Both are persistent (one-time wire-up).
         global_sdf.bind_scene(sdf_instances.handle(), sdf_instances.size());
         lighting.bind_gdf(&global_sdf);
+        // Wire the froxel integration volume into binding 11 of every light set (set 1) so the
+        // forward transparent path samples the same volumetric fog the composite applies to opaque.
+        // Persistent (the volume is fixed-size, never reallocated) — a one-time wire-up.
+        lighting.bind_froxel_integration(&device, froxel.integration_view(), froxel.sampler());
         // Wire the GDF lite albedo cache (+ its repeat sampler) into the DDGI trace set (set 2,
         // binding 0); the trace reads it as the hit radiance's per-cell base color. Persistent.
         ddgi.bind_gdf_albedo(&global_sdf);
@@ -1039,6 +1323,26 @@ impl Renderer {
             wireframe: false,
             use_depth_prepass: true,
             exposure_ev: 0.0,
+            bloom_enabled: false,
+            bloom_intensity: 0.05,
+            bloom_scatter: 0.005,
+            bloom_tint: [1.0, 1.0, 1.0],
+            bloom_threshold: 0.0,
+            bloom_dirt_texture: None,
+            bloom_dirt_texture_id: 0,
+            bloom_dirt_intensity: 0.0,
+            bloom_dirt_tint: [1.0, 1.0, 1.0],
+            bloom_anamorphic_enabled: false,
+            bloom_anamorphic_ratio: 2.0,
+            bloom_anamorphic_tint: [0.6, 0.8, 1.0],
+            bloom_anamorphic_intensity: 0.0,
+            bloom_mip_tint: Vec::new(),
+            fog: FogRenderSettings::default(),
+            froxel,
+            aerial,
+            fog_volumes: Vec::new(),
+            fog_time: 0.0,
+            sun_direction: Vec3::new(0.0, -1.0, 0.0),
             show_grid: false,
             present_viewport_only: false,
             frame_begun: false,
@@ -1076,6 +1380,12 @@ impl Renderer {
             budget_controller: BudgetController::new(),
             pending_render_scale: None,
             tonemap_mode: TonemapMode::default(),
+            color_grade: ColorGrade::default(),
+            default_lut,
+            creative_lut: None,
+            creative_lut_id: 0,
+            creative_lut_intensity: 0.0,
+            creative_lut_size: 2,
             reactive: ReactiveState::default(),
             stats: RenderStats::default(),
             // The shadow maps are init-transitioned to ShaderReadOnly by `Targets::new`,
@@ -1288,6 +1598,31 @@ impl Renderer {
         self.sky.submit(settings);
     }
 
+    /// Folds this frame's analytic height/distance fog in. Resolved from `scene.environment.fog`
+    /// each frame (the same shape as [`Renderer::submit_sky`]); the composite pass runs before the
+    /// bloom pyramid only while `settings.enabled`.
+    pub fn set_fog(&mut self, settings: &FogRenderSettings) {
+        self.fog = *settings;
+        // Switch the froxel-grid quality tier when it changed: reallocate the ping-pong history +
+        // integration volumes, then rebind BOTH consumers of the integration volume to the new view —
+        // every view's composite fog set (binding 4) and every light set's binding 11 (the forward
+        // mesh/transparent path samples the same volume). The history reset rides inside `set_quality`.
+        // A no-op when the tier is unchanged.
+        match self.froxel.set_quality(&self.device, settings.quality) {
+            Ok(true) => {
+                let sampler = self.froxel.sampler();
+                let view = self.froxel.integration_view();
+                for v in &mut self.views {
+                    v.write_fog_integration(&self.device, sampler, view);
+                }
+                self.lighting
+                    .bind_froxel_integration(&self.device, view, sampler);
+            }
+            Ok(false) => {}
+            Err(err) => tracing::error!("froxel fog set_quality: {err}"),
+        }
+    }
+
     /// The IBL the scene pass binds for the active view: the fixed procedural [`Renderer::preview_ibl`]
     /// on the offscreen [`ViewId::Thumbnail`] view, else the project [`Renderer::ibl`].
     fn scene_ibl(&self) -> &Ibl {
@@ -1340,6 +1675,20 @@ impl Renderer {
         self.reflection.submit(probes);
     }
 
+    /// Folds this frame's local fog volumes in: bakes each [`crate::FogVolumeUpload`] into its std430
+    /// record for the inject pass to loop (capped at [`crate::MAX_FOG_VOLUMES`]). Resolved from the
+    /// scene each frame, like [`Renderer::submit_reflection_probes`].
+    pub fn submit_fog_volumes(&mut self, volumes: &[crate::FogVolumeUpload]) {
+        let cap = crate::MAX_FOG_VOLUMES as usize;
+        self.fog_volumes.clear();
+        self.fog_volumes.extend(
+            volumes
+                .iter()
+                .take(cap)
+                .map(crate::FogVolumeGpu::from_upload),
+        );
+    }
+
     /// Whether reflection probes contribute.
     pub fn reflection_probes_enabled(&self) -> bool {
         self.reflection.use_probes
@@ -1376,6 +1725,101 @@ impl Renderer {
     /// Selects the tonemap operator (applied in the tonemap pass next frame).
     pub fn set_tonemap_mode(&mut self, mode: TonemapMode) {
         self.tonemap_mode = mode;
+    }
+
+    /// The scene-linear color grade folded into the tonemap pass.
+    pub fn color_grading(&self) -> ColorGrade {
+        self.color_grade
+    }
+
+    /// Sets the scene-linear color grade (applied in the tonemap pass next frame).
+    pub fn set_color_grading(&mut self, grade: ColorGrade) {
+        self.color_grade = grade;
+    }
+
+    /// The assigned creative-LUT read-back: `(asset id, size, intensity)`, or `None` when no look is
+    /// assigned (id `0`).
+    pub fn creative_lut(&self) -> Option<(u64, u32, f32)> {
+        (self.creative_lut_id != 0).then_some((
+            self.creative_lut_id,
+            self.creative_lut_size,
+            self.creative_lut_intensity,
+        ))
+    }
+
+    /// Assigns the display-space creative look-up table and its look intensity. `lut` is the resolved
+    /// GPU table (the host looks the asset up in the catalog) or `None` to clear to the identity
+    /// default; `id` is the asset id (`0` clears). The intensity rides the grade UBO (a per-frame
+    /// write, cheap on a drag); only an asset *change* rebinds the descriptor — idled, so the
+    /// tonemap set is never rewritten while an earlier frame that bound it is in flight.
+    pub fn set_creative_lut_texture(
+        &mut self,
+        id: u64,
+        lut: Option<Arc<crate::GpuLut>>,
+        intensity: f32,
+    ) {
+        self.creative_lut_intensity = intensity.clamp(0.0, 1.0);
+        if id == self.creative_lut_id {
+            return;
+        }
+        self.creative_lut_id = id;
+        self.creative_lut = lut;
+        self.creative_lut_size = self.creative_lut.as_ref().map_or(2, |l| l.size());
+        let _ = self.device.wait_idle();
+        let view = self
+            .creative_lut
+            .as_ref()
+            .map_or_else(|| self.default_lut.view(), |l| l.view());
+        let sampler = self.descriptors.linear_sampler();
+        for v in &self.views {
+            v.write_tonemap_lut(&self.device, sampler, view);
+        }
+    }
+
+    /// Bakes the folded look — the current grade + view transform + creative LUT — into one
+    /// `33³` display-referred table over the log2 shaper (EV `[-14, +11]`), on the GPU, reusing the
+    /// same shared helpers as the live tonemap pass. Returns `(size, ev_min, ev_max, rgb)` where `rgb`
+    /// is red-fastest `[r, g, b]` f16 bits the host serializes into a `.slut`. Idles around the one-off
+    /// dispatch (the bake is a rare, explicit `bake-look`).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error`] if the bake PSO is unavailable or a Vulkan/VMA call fails.
+    pub fn bake_look_lut(
+        &mut self,
+        uploader: &crate::Uploader,
+    ) -> Result<(u32, f32, f32, Vec<[u16; 3]>)> {
+        let pipeline = self
+            .pipelines
+            .request_lut_bake()
+            .ok_or_else(|| crate::Error::LutBake("lut_bake PSO unavailable".to_owned()))?;
+        let grade = GradeUniform::from(&self.color_grade).with_look(
+            self.creative_lut_intensity,
+            self.creative_lut_size,
+            false,
+        );
+        let view = self
+            .creative_lut
+            .as_ref()
+            .map_or_else(|| self.default_lut.view(), |l| l.view());
+        let sampler = self.descriptors.linear_sampler();
+        let mode = self.tonemap_mode as u32;
+        self.device.wait_idle()?;
+        let rgb = uploader.bake_look_lut(
+            &self.descriptors,
+            &pipeline,
+            &grade,
+            view,
+            sampler,
+            crate::LUT_BAKE_SIZE,
+            mode,
+        )?;
+        Ok((
+            crate::LUT_BAKE_SIZE,
+            crate::LUT_SHAPER_EV_MIN,
+            crate::LUT_SHAPER_EV_MAX,
+            rgb,
+        ))
     }
 
     /// Pushes the per-frame reactive-loop snapshot (idle / converged / active reasons) the host
@@ -1558,6 +2002,9 @@ impl Renderer {
     /// Returns [`Error`] if growing the punctual SSBO fails.
     pub fn set_scene_lighting(&mut self, scene: &SceneLighting) -> Result<()> {
         let frame = self.frames.index();
+        // Capture the directional-light travel direction for the fog pass's sun-inscatter lobe (it
+        // points its lobe toward the sun, i.e. `-direction`).
+        self.sun_direction = scene.direction.normalize_or_zero();
         // Fold the IBL-ambient flag + the reflection-probe count into the UBO write.
         // Probes contribute only when IBL is baked + their toggle is on.
         let ibl = self.scene_ibl();
@@ -1597,6 +2044,13 @@ impl Renderer {
         let rt_refl = self.rt.use_rt_reflections() && self.ssao.ready && view.prev_view_proj_valid;
         let prev_vp = view.prev_view_proj;
         self.lighting.set_frame_rt_reflections(rt_refl, prev_vp);
+        // Fold this frame's froxel volumetric-fog params so the forward transparent path samples the
+        // integration volume only when volumetric fog is authored (matching the composite's gate).
+        self.lighting.set_frame_froxel_fog(
+            self.fog.enabled && self.fog.volumetric,
+            crate::froxel_fog::FROXEL_NEAR,
+            crate::FROXEL_FAR,
+        );
         self.lighting
             .set_scene_lighting(&self.descriptors, frame, scene)
     }
@@ -3739,6 +4193,124 @@ impl Renderer {
         self.exposure_ev
     }
 
+    /// Sets the bloom parameters: the enable flag, the energy-conserving composite `intensity`,
+    /// the tent-upsample `scatter` radius (UV units), the `tint`, and the soft-knee `threshold`
+    /// (`0.0` = thresholdless). Applied to the next frame's pre-tonemap bloom pass.
+    pub fn set_bloom(
+        &mut self,
+        enabled: bool,
+        intensity: f32,
+        scatter: f32,
+        tint: [f32; 3],
+        threshold: f32,
+    ) {
+        self.bloom_enabled = enabled;
+        self.bloom_intensity = intensity.max(0.0);
+        self.bloom_scatter = scatter.clamp(0.0, 1.0);
+        self.bloom_tint = tint;
+        self.bloom_threshold = threshold.max(0.0);
+    }
+
+    /// Whether the scene-linear bloom pyramid runs before the tonemap.
+    pub fn bloom_enabled(&self) -> bool {
+        self.bloom_enabled
+    }
+
+    /// The energy-conserving bloom composite weight.
+    pub fn bloom_intensity(&self) -> f32 {
+        self.bloom_intensity
+    }
+
+    /// The bloom tent-upsample scatter radius in UV units.
+    pub fn bloom_scatter(&self) -> f32 {
+        self.bloom_scatter
+    }
+
+    /// The bloom tint (multiplies the composited bloom).
+    pub fn bloom_tint(&self) -> [f32; 3] {
+        self.bloom_tint
+    }
+
+    /// The bloom soft-knee prefilter threshold (`0.0` = thresholdless).
+    pub fn bloom_threshold(&self) -> f32 {
+        self.bloom_threshold
+    }
+
+    /// Sets the lens-dirt mask texture (`id`/`texture` together; `id == 0` + `None` clears it) that
+    /// the bloom composite multiplies the accumulated pyramid by. An absent texture binds the 1×1
+    /// white fallback (mask = 1 ⇒ identity).
+    pub fn set_bloom_dirt_texture(&mut self, id: u64, texture: Option<Arc<crate::GpuTexture>>) {
+        self.bloom_dirt_texture_id = id;
+        self.bloom_dirt_texture = texture;
+    }
+
+    /// Sets the lens-dirt mix (`0.0` = no dirt, clamped to `[0, 1]`) and its tint.
+    pub fn set_bloom_dirt_params(&mut self, intensity: f32, tint: [f32; 3]) {
+        self.bloom_dirt_intensity = intensity.clamp(0.0, 1.0);
+        self.bloom_dirt_tint = tint;
+    }
+
+    /// The lens-dirt mask asset id (`0` = none).
+    pub fn bloom_dirt_texture(&self) -> u64 {
+        self.bloom_dirt_texture_id
+    }
+
+    /// The lens-dirt mix fraction.
+    pub fn bloom_dirt_intensity(&self) -> f32 {
+        self.bloom_dirt_intensity
+    }
+
+    /// The lens-dirt tint.
+    pub fn bloom_dirt_tint(&self) -> [f32; 3] {
+        self.bloom_dirt_tint
+    }
+
+    /// Sets the anamorphic streak: the `enabled` toggle, the horizontal `ratio` squeeze (`~2`), the
+    /// streak `tint`, and the `intensity` add weight. `ratio` is clamped `≥ 1`, `intensity ≥ 0`.
+    pub fn set_bloom_anamorphic(
+        &mut self,
+        enabled: bool,
+        ratio: f32,
+        tint: [f32; 3],
+        intensity: f32,
+    ) {
+        self.bloom_anamorphic_enabled = enabled;
+        self.bloom_anamorphic_ratio = ratio.max(1.0);
+        self.bloom_anamorphic_tint = tint;
+        self.bloom_anamorphic_intensity = intensity.max(0.0);
+    }
+
+    /// Whether the anamorphic streak runs.
+    pub fn bloom_anamorphic_enabled(&self) -> bool {
+        self.bloom_anamorphic_enabled
+    }
+
+    /// The anamorphic horizontal squeeze.
+    pub fn bloom_anamorphic_ratio(&self) -> f32 {
+        self.bloom_anamorphic_ratio
+    }
+
+    /// The anamorphic streak tint.
+    pub fn bloom_anamorphic_tint(&self) -> [f32; 3] {
+        self.bloom_anamorphic_tint
+    }
+
+    /// The anamorphic streak add weight.
+    pub fn bloom_anamorphic_intensity(&self) -> f32 {
+        self.bloom_anamorphic_intensity
+    }
+
+    /// Sets the per-upsample-step tint stack (identity `1,1,1` when a level is absent). An empty
+    /// vector disables per-mip tinting entirely.
+    pub fn set_bloom_mip_tint(&mut self, tint: Vec<[f32; 3]>) {
+        self.bloom_mip_tint = tint;
+    }
+
+    /// The per-upsample-step tint stack.
+    pub fn bloom_mip_tint(&self) -> Vec<[f32; 3]> {
+        self.bloom_mip_tint.clone()
+    }
+
     /// Selects the debug render-output mode. `Wireframe` arms
     /// the wireframe PSO permutation; the channel modes fold a debug-output index into
     /// the light UBO's `point_shadow_meta.w`.
@@ -3863,6 +4435,19 @@ impl Renderer {
             profiler_mode: self.gpu_profiler.mode,
             view_mode: self.view_mode,
             exposure_ev: self.exposure_ev,
+            color_grade: self.color_grade,
+            bloom_enabled: self.bloom_enabled,
+            bloom_intensity: self.bloom_intensity,
+            bloom_scatter: self.bloom_scatter,
+            bloom_tint: self.bloom_tint,
+            bloom_threshold: self.bloom_threshold,
+            bloom_dirt_texture: self.bloom_dirt_texture_id,
+            bloom_dirt_intensity: self.bloom_dirt_intensity,
+            bloom_dirt_tint: self.bloom_dirt_tint,
+            bloom_anamorphic_enabled: self.bloom_anamorphic_enabled,
+            bloom_anamorphic_ratio: self.bloom_anamorphic_ratio,
+            bloom_anamorphic_tint: self.bloom_anamorphic_tint,
+            bloom_anamorphic_intensity: self.bloom_anamorphic_intensity,
         }
     }
 
@@ -3887,6 +4472,9 @@ impl Renderer {
         } else {
             self.frame_ms * 0.9 + delta_ms * 0.1
         };
+        // Accumulate a wrapping scene clock (seconds) for the fog-volume noise wind advection. The
+        // 3600 s wrap keeps the float precise while the drift stays continuous across the seam.
+        self.fog_time = (self.fog_time + dt_seconds) % 3600.0;
     }
 
     /// Folds one frame's CPU split (busy + fence-wait, in ms) into the smoothed `cpu_frame_ms`
@@ -4656,6 +5244,14 @@ impl Renderer {
         } else {
             None
         };
+        // Bloom composites into scene-linear `color` before the tonemap; resolve its PSO only when
+        // enabled so a disabled bloom pays nothing.
+        let bloom = if self.bloom_enabled {
+            self.pipelines
+                .request_bloom(self.descriptors.bloom_set_layout())
+        } else {
+            None
+        };
         // The scene-resolve copy (input scratch -> display offscreen, normalized-UV upscale) runs
         // on the no-AA / MSAA paths; FXAA / TAA resolve to the offscreen themselves. Memoized, so
         // requesting it unconditionally is cheap.
@@ -4678,6 +5274,34 @@ impl Renderer {
         // overlay's per-frame vertex buffer is prepared (grown + uploaded) here, before the
         // graph build, so the pass captures only the resolved handle (README §2).
         let tonemap = self.pipelines.request_tonemap();
+        // Aerial perspective fills + composites only when authored AND the atmosphere baked its LUTs
+        // (no LUTs → nothing to march); that gate is the atmosphere's own `enabled`, not a second flag.
+        let ap_active = self.fog.aerial_perspective && self.scene_ibl().atmosphere_live();
+        // The fog composite arms while fog is authored this frame OR aerial perspective is live — the
+        // same pass applies AP on the shared ledger, so it must run even when fog itself is disabled.
+        let fog = if self.fog.enabled || ap_active {
+            self.pipelines.request_fog()
+        } else {
+            None
+        };
+        // The froxel inject/integrate PSOs arm only when volumetric fog is authored this frame.
+        let (fog_inject, fog_integrate) = if self.fog.enabled && self.fog.volumetric {
+            let volume_layout = self.froxel.inject_volume_layout();
+            let integrate_layout = self.froxel.integrate_layout();
+            (
+                self.pipelines.request_fog_inject(volume_layout),
+                self.pipelines.request_fog_integrate(integrate_layout),
+            )
+        } else {
+            (None, None)
+        };
+        // The aerial-perspective fill PSO arms only while AP is live this frame.
+        let aerial = if ap_active {
+            let fill_layout = self.aerial.fill_layout();
+            self.pipelines.request_aerial(fill_layout)
+        } else {
+            None
+        };
         let grid = if self.show_grid {
             self.pipelines.request_grid()
         } else {
@@ -4748,7 +5372,12 @@ impl Renderer {
             motion,
             taa,
             fxaa,
+            bloom,
             tonemap,
+            fog,
+            fog_inject,
+            fog_integrate,
+            aerial,
             scene_resolve,
             depth_upscale,
             reactive_coverage,
@@ -5776,12 +6405,53 @@ impl Renderer {
             graph.add_pass(restore);
         }
 
+        // Froxel volumetric fog: inject the shadowed per-froxel in-scatter + extinction over the
+        // clustered light list, then front-to-back energy-conserving integration into the volume the
+        // composite samples. Runs only in `fog.mode == volumetric` (the PSOs are resolved then).
+        let froxel_slots = self.add_froxel_fog_passes(&mut graph, &pipelines, frame);
+
+        // Aerial perspective: ray-march the atmosphere LUTs into the 32³ AP volume the composite folds
+        // onto the shared ledger. Independent of the fog inject/integrate (it only reads the LUTs and
+        // writes its own volume), scheduled here so it completes before the composite reads it. Runs
+        // only while the atmosphere is live + AP is authored (the PSO is resolved then).
+        let aerial_slot = self.add_aerial_perspective_pass(&mut graph, &pipelines);
+
+        // Analytic height & distance fog: a fullscreen compute over the scene depth that composites
+        // the closed-form exponential-density fog into `color` in place, while it is still
+        // unbounded scene-linear HDR and BEFORE the bloom pyramid — distant bright emitters are
+        // fogged first, so bloom reads already-attenuated highlights (bloom-first would punch
+        // physically wrong halos through the fog). In volumetric mode the same pass instead samples
+        // the integrated froxel volume. Runs only while the PSO is resolved (fog enabled).
+        self.add_fog_pass(&mut graph, &pipelines, color, depth, frame);
+
+        // Scene-linear bloom: an energy-conserving mip pyramid composited into `color` while it is
+        // still unbounded HDR radiance, immediately before the tonemap so the chosen view transform
+        // rolls the bloomed highlights off for free. The mip chain comes from the per-frame-in-flight
+        // transient pool, so nothing outlives the frame; skipped entirely when bloom is disabled.
+        if pipelines.bloom.is_some() {
+            let mips = self.acquire_bloom_mips(&mut graph, frame);
+            if !mips.is_empty() {
+                let streak = self.acquire_bloom_streak(&mut graph, frame, mips[0].extent);
+                self.add_bloom_pass(
+                    &mut graph, &pipelines, color, color_view, frame, &mips, &streak,
+                );
+            }
+        }
+
         // The final post chain on the DISPLAY-extent resolved offscreen color: the mandatory
         // HDR → display tonemap (in-place compute), then the optional ground grid + editor
         // overlay (graphics, over the display-referred color, depth-tested against the
         // display-extent overlay depth). By here `color` is always the display offscreen —
         // present / shm publish consume it identically in editor and present-only mode.
-        self.add_tonemap_pass(&mut graph, &pipelines, color);
+        // Write this frame's scene-linear grade into the view's grade UBO slice; the tonemap pass
+        // binds it by the matching dynamic offset (neutral grade → mathematical identity).
+        let grade = GradeUniform::from(&self.color_grade).with_look(
+            self.creative_lut_intensity,
+            self.creative_lut_size,
+            false,
+        );
+        self.views[self.active_view.index()].write_grade(frame, &grade);
+        self.add_tonemap_pass(&mut graph, &pipelines, color, frame);
         // The overlays draw at display extent, so they depth-test the display-extent overlay
         // depth — a point-upscale of the input scene depth. When the upscale PSO / target is
         // unavailable, fall back to the input depth (valid at render scale 1, where they match).
@@ -5895,6 +6565,26 @@ impl Renderer {
                     .set_albedo_layout(graph.external_layout(slot));
             }
             self.global_sdf.advance_frame();
+        }
+
+        // Read back the froxel fog volumes' resolved exit layouts (the ping-pong write ends GENERAL,
+        // the history ends ShaderReadOnly after its sampled read; the integration volume ends
+        // ShaderReadOnly for the composite sample) and advance the ping-pong write index for next
+        // frame — the just-written volume becomes next frame's reprojection history.
+        if let Some((write_slot, history_slot, integration_slot)) = froxel_slots {
+            self.froxel
+                .set_scatter_write_layout(graph.external_layout(write_slot));
+            self.froxel
+                .set_scatter_history_layout(graph.external_layout(history_slot));
+            self.froxel
+                .set_integration_layout(graph.external_layout(integration_slot));
+            self.froxel.advance_frame();
+        }
+
+        // Read back the aerial-perspective volume's resolved exit layout (it rode an external slot,
+        // ending ShaderReadOnly after the composite's sampled read).
+        if let Some(slot) = aerial_slot {
+            self.aerial.set_volume_layout(graph.external_layout(slot));
         }
 
         // Read back the ReSTIR radiance image's resolved exit layout (it rode an external
@@ -6670,6 +7360,7 @@ impl Renderer {
                 Some(bytemuck::bytes_of(&self.ssao.gtao_push()).to_vec()),
                 groups(half_extent.width),
                 groups(half_extent.height),
+                1,
             );
             self.add_compute_pass(
                 graph,
@@ -6684,6 +7375,7 @@ impl Renderer {
                 None,
                 groups(extent.width),
                 groups(extent.height),
+                1,
             );
             result.scene_sampled.push(ao_map);
         }
@@ -6715,6 +7407,7 @@ impl Renderer {
                 Some(bytemuck::bytes_of(&self.ssao.contact_push()).to_vec()),
                 groups(extent.width),
                 groups(extent.height),
+                1,
             );
             result.scene_sampled.push(contact_map);
         }
@@ -6785,6 +7478,7 @@ impl Renderer {
                 Some(bytemuck::bytes_of(&pipelines.ssgi_push).to_vec()),
                 groups(half_extent.width),
                 groups(half_extent.height),
+                1,
             );
             self.add_compute_pass(
                 graph,
@@ -6799,6 +7493,7 @@ impl Renderer {
                 None,
                 groups(extent.width),
                 groups(extent.height),
+                1,
             );
             // SSGI temporal accumulation (when motion ran): reproject the SSGI history
             // through motion, neighborhood-clamp, EMA into the stable ssgi_resolved map.
@@ -6856,6 +7551,7 @@ impl Renderer {
                     Some(bytemuck::bytes_of(&push).to_vec()),
                     groups(extent.width),
                     groups(extent.height),
+                    1,
                 );
                 // The scene SampledReads the resolved map (the accum's output). The mesh
                 // set-4 SSGI sampler points at it under TAA, else the denoised map.
@@ -6972,6 +7668,7 @@ impl Renderer {
                     None,
                     groups(extent.width),
                     groups(extent.height),
+                    1,
                 );
             }
 
@@ -7030,6 +7727,7 @@ impl Renderer {
                     Some(bytemuck::bytes_of(&push).to_vec()),
                     groups(extent.width),
                     groups(extent.height),
+                    1,
                 );
                 result.scene_sampled.push(dfao_resolved);
                 result.dfao_resolved_slot = Some(dfao_resolved_slot);
@@ -7082,6 +7780,7 @@ impl Renderer {
                 None,
                 groups(half_extent.width),
                 groups(half_extent.height),
+                1,
             );
             // The scene fragment samples gi_indirect (set 4 binding 7), so declare it — the graph
             // barriers it ShaderReadOnly before the scene pass.
@@ -7186,6 +7885,7 @@ impl Renderer {
                     None,
                     groups(extent.width),
                     groups(extent.height),
+                    1,
                 );
             }
 
@@ -7222,6 +7922,7 @@ impl Renderer {
                 Some(bytemuck::bytes_of(&pipelines.ssr_push).to_vec()),
                 groups(extent.width),
                 groups(extent.height),
+                1,
             );
             result.scene_sampled.push(ssr_map);
             result.ssr_map_slot = Some(ssr_slot);
@@ -7366,6 +8067,7 @@ impl Renderer {
             None,
             groups(extent.width),
             groups(extent.height),
+            1,
         );
     }
 
@@ -7398,6 +8100,7 @@ impl Renderer {
             None,
             groups(extent.width),
             groups(extent.height),
+            1,
         );
     }
 
@@ -7662,6 +8365,7 @@ impl Renderer {
             Some(bytemuck::bytes_of(&push).to_vec()),
             groups(extent.width),
             groups(extent.height),
+            1,
         );
         Some(TaaResolveSlots {
             history: TaaHistorySlots {
@@ -7675,6 +8379,684 @@ impl Renderer {
         })
     }
 
+    /// Acquires this frame's transient bloom mip chain (half-res first, halving each level) sized
+    /// off the display-extent `published_extent`, and imports each level into `graph`. The live
+    /// level count is `floor(log2(min(w, h))) - 3` clamped to `[1, MAX_BLOOM_MIPS]` (≈6 at 1080p, 7
+    /// at 1440p+). Returns empty (bloom skipped) when the viewport is too small to pyramid or an
+    /// allocation fails.
+    fn acquire_bloom_mips(&mut self, graph: &mut RenderGraph, frame: usize) -> Vec<BloomMip> {
+        let published = self.views[self.active_view.index()].published_extent();
+        let min_dim = published.width.min(published.height);
+        if min_dim < 8 {
+            return Vec::new();
+        }
+        let levels = ((min_dim as f32).log2().floor() as i32 - 3)
+            .clamp(1, crate::descriptors::MAX_BLOOM_MIPS as i32) as usize;
+        let mut mips = Vec::with_capacity(levels);
+        for i in 0..levels {
+            let extent = vk::Extent2D {
+                width: (published.width >> (i + 1)).max(1),
+                height: (published.height >> (i + 1)).max(1),
+            };
+            let desc = crate::resources::ImageDesc::color_2d(
+                extent,
+                crate::OFFSCREEN_COLOR_FORMAT,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            );
+            let (image, view) = match self.transient.acquire_image(
+                frame,
+                crate::transient::BLOOM_MIP_KEYS[i],
+                &desc,
+            ) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    tracing::error!("bloom mip {i} acquire failed: {err}");
+                    return Vec::new();
+                }
+            };
+            let res = graph.import_image(
+                image,
+                view,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+                None,
+            );
+            mips.push(BloomMip { res, view, extent });
+        }
+        mips
+    }
+
+    /// Acquires the two ping-pong anamorphic streak buffers at `extent` (the bloom mip0 resolution)
+    /// and imports each into `graph`. Returns empty (streak skipped) when anamorphic is off or an
+    /// allocation fails, so the composite falls back to the white streak view (no added energy).
+    fn acquire_bloom_streak(
+        &mut self,
+        graph: &mut RenderGraph,
+        frame: usize,
+        extent: vk::Extent2D,
+    ) -> Vec<BloomMip> {
+        if !self.bloom_anamorphic_enabled {
+            return Vec::new();
+        }
+        let mut buffers = Vec::with_capacity(crate::transient::BLOOM_STREAK_KEYS.len());
+        for key in crate::transient::BLOOM_STREAK_KEYS {
+            let desc = crate::resources::ImageDesc::color_2d(
+                extent,
+                crate::OFFSCREEN_COLOR_FORMAT,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            );
+            let (image, view) = match self.transient.acquire_image(frame, key, &desc) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    tracing::error!("bloom streak '{key}' acquire failed: {err}");
+                    return Vec::new();
+                }
+            };
+            let res = graph.import_image(
+                image,
+                view,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+                None,
+            );
+            buffers.push(BloomMip { res, view, extent });
+        }
+        buffers
+    }
+
+    /// Appends the scene-linear bloom pyramid on `color`, in place, before the tonemap: a Karis-
+    /// averaged 13-tap downsample chain (`color → mip0 → … → mipN`, Karis only on the first step), a
+    /// progressive 9-tap tent upsample-add back down to `mip0`, then an energy-conserving
+    /// `lerp(hdr, bloom * tint, intensity)` composite into `color`. Each pass declares its
+    /// `(resource, usage)` so the graph derives every `GENERAL ↔ SHADER_READ_ONLY` transition; the
+    /// per-pass descriptor sets are rewritten for this frame slot first (they bind the transient
+    /// mip views). One PSO drives all four pass kinds via the push `pass`/`karis` fields.
+    #[allow(clippy::too_many_arguments)]
+    fn add_bloom_pass(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        color: RgResource,
+        color_view: vk::ImageView,
+        frame: usize,
+        mips: &[BloomMip],
+        streak: &[BloomMip],
+    ) {
+        let Some(bloom) = &pipelines.bloom else {
+            return;
+        };
+        const DOWN: [&str; crate::descriptors::MAX_BLOOM_MIPS] = [
+            "bloom-downsample-0",
+            "bloom-downsample-1",
+            "bloom-downsample-2",
+            "bloom-downsample-3",
+            "bloom-downsample-4",
+            "bloom-downsample-5",
+            "bloom-downsample-6",
+        ];
+        const UP: [&str; crate::descriptors::MAX_BLOOM_MIPS] = [
+            "bloom-upsample-0",
+            "bloom-upsample-1",
+            "bloom-upsample-2",
+            "bloom-upsample-3",
+            "bloom-upsample-4",
+            "bloom-upsample-5",
+            "bloom-upsample-6",
+        ];
+        let view = &self.views[self.active_view.index()];
+        let published = view.published_extent();
+        let levels = mips.len();
+        // The streak buffer the composite adds — its last ping-pong stage when armed, else nothing.
+        let streak_buffer = streak.last();
+
+        // The source/target view pairs in graph order (downsamples, upsamples, streak, composite),
+        // rewritten into this frame slot's sets before the passes reference them. Only the last
+        // (composite) pass samples the dirt + streak; the earlier passes get the white fallback.
+        let white = self.default_white.view();
+        let mut pairs: Vec<(vk::ImageView, vk::ImageView)> = Vec::with_capacity(2 * levels + 3);
+        for i in 0..levels {
+            let src = if i == 0 { color_view } else { mips[i - 1].view };
+            pairs.push((src, mips[i].view));
+        }
+        for j in (0..levels.saturating_sub(1)).rev() {
+            pairs.push((mips[j + 1].view, mips[j].view));
+        }
+        // Streak ping-pong: mip0 → streak0, streak0 → streak1 (each a wider horizontal blur).
+        for (s, buffer) in streak.iter().enumerate() {
+            let src = if s == 0 {
+                mips[0].view
+            } else {
+                streak[s - 1].view
+            };
+            pairs.push((src, buffer.view));
+        }
+        pairs.push((mips[0].view, color_view));
+        let dirt_view = self.bloom_dirt_texture.as_ref().map_or(white, |t| t.view());
+        let streak_view = streak_buffer.map_or(white, |b| b.view);
+        view.write_bloom_sets(
+            &self.device,
+            &self.descriptors,
+            frame,
+            &pairs,
+            crate::view_target::BloomCompositeBindings {
+                dirt: dirt_view,
+                streak: streak_view,
+                fallback: white,
+            },
+        );
+
+        let groups = |n: u32| n.div_ceil(8);
+        let scatter = self.bloom_scatter;
+        let mut pass_idx = 0usize;
+
+        // Downsample: color → mip0 (Karis), then mip[i-1] → mip[i].
+        for i in 0..levels {
+            let src_res = if i == 0 { color } else { mips[i - 1].res };
+            let push = crate::BloomPush {
+                filter_radius: scatter,
+                intensity: self.bloom_intensity,
+                threshold: self.bloom_threshold,
+                pass: 0,
+                karis: u32::from(i == 0),
+                ..crate::BloomPush::identity()
+            };
+            self.add_compute_pass(
+                graph,
+                DOWN[i],
+                bloom,
+                view.bloom_set(frame, pass_idx),
+                &[
+                    (src_res, RgUsage::SampledReadCompute),
+                    (mips[i].res, RgUsage::StorageImageRwCompute),
+                ],
+                Some(bytemuck::bytes_of(&push).to_vec()),
+                groups(mips[i].extent.width),
+                groups(mips[i].extent.height),
+                1,
+            );
+            pass_idx += 1;
+        }
+
+        // Tent upsample-add: mip[j+1] → mip[j], coarse to fine. The added contribution carries the
+        // per-mip tint for level `j` (identity when the stack is off or shorter than the pyramid).
+        for j in (0..levels.saturating_sub(1)).rev() {
+            let push = crate::BloomPush {
+                filter_radius: scatter,
+                intensity: self.bloom_intensity,
+                threshold: self.bloom_threshold,
+                pass: 1,
+                mip_tint: self.bloom_mip_tint.get(j).copied().unwrap_or([1.0; 3]),
+                ..crate::BloomPush::identity()
+            };
+            self.add_compute_pass(
+                graph,
+                UP[j],
+                bloom,
+                view.bloom_set(frame, pass_idx),
+                &[
+                    (mips[j + 1].res, RgUsage::SampledReadCompute),
+                    (mips[j].res, RgUsage::StorageImageRwCompute),
+                ],
+                Some(bytemuck::bytes_of(&push).to_vec()),
+                groups(mips[j].extent.width),
+                groups(mips[j].extent.height),
+                1,
+            );
+            pass_idx += 1;
+        }
+
+        // Anamorphic streak ping-pong: a horizontally-squeezed blur widened across two passes.
+        for (s, buffer) in streak.iter().enumerate() {
+            let src_res = if s == 0 {
+                mips[0].res
+            } else {
+                streak[s - 1].res
+            };
+            let push = crate::BloomPush {
+                pass: 3,
+                filter_radius: scatter,
+                anamorphic_ratio: self.bloom_anamorphic_ratio,
+                ..crate::BloomPush::identity()
+            };
+            self.add_compute_pass(
+                graph,
+                crate::transient::BLOOM_STREAK_KEYS[s],
+                bloom,
+                view.bloom_set(frame, pass_idx),
+                &[
+                    (src_res, RgUsage::SampledReadCompute),
+                    (buffer.res, RgUsage::StorageImageRwCompute),
+                ],
+                Some(bytemuck::bytes_of(&push).to_vec()),
+                groups(buffer.extent.width),
+                groups(buffer.extent.height),
+                1,
+            );
+            pass_idx += 1;
+        }
+
+        // Energy-conserving composite: attenuate mip0 by the dirt mask, add the streak, then
+        // lerp(hdr, bloom * tint, intensity) in place on color. When the streak is off, the streak
+        // binding is the white fallback and `anamorphic_intensity` is 0, so no streak energy adds.
+        let mut inputs: Vec<(RgResource, RgUsage)> = vec![
+            (mips[0].res, RgUsage::SampledReadCompute),
+            (color, RgUsage::StorageImageRwCompute),
+        ];
+        if let Some(buffer) = streak_buffer {
+            inputs.push((buffer.res, RgUsage::SampledReadCompute));
+        }
+        let push = crate::BloomPush {
+            tint: self.bloom_tint,
+            filter_radius: scatter,
+            intensity: self.bloom_intensity,
+            threshold: self.bloom_threshold,
+            pass: 2,
+            dirt_intensity: self.bloom_dirt_intensity,
+            dirt_tint: self.bloom_dirt_tint,
+            anamorphic_intensity: if streak_buffer.is_some() {
+                self.bloom_anamorphic_intensity
+            } else {
+                0.0
+            },
+            anamorphic_tint: self.bloom_anamorphic_tint,
+            ..crate::BloomPush::identity()
+        };
+        self.add_compute_pass(
+            graph,
+            "bloom-composite",
+            bloom,
+            view.bloom_set(frame, pass_idx),
+            &inputs,
+            Some(bytemuck::bytes_of(&push).to_vec()),
+            groups(published.width),
+            groups(published.height),
+            1,
+        );
+    }
+
+    /// Appends the froxel volumetric-fog inject + integrate compute passes: `fog_inject` fills the
+    /// scatter volume (per-froxel extinction + shadowed in-scatter over the clustered light list, HG
+    /// phase), `fog_integrate` marches it front-to-back into the integration volume the composite
+    /// samples, and a barrier-only pass rests the integration volume in ShaderReadOnly. Runs only in
+    /// volumetric mode (the PSOs are resolved then). Returns the scatter + integration external slots
+    /// for the post-execute layout write-back, or `None` when the passes did not run.
+    fn add_froxel_fog_passes(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        frame: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let (Some(inject), Some(integrate)) = (&pipelines.fog_inject, &pipelines.fog_integrate)
+        else {
+            return None;
+        };
+
+        // This frame's froxel-grid UBO: the froxel-center reconstruction matrices + the active-tier
+        // grid dims + the exponential-Z near/far the composite's W mapping inverts, plus the temporal
+        // reprojection state (previous view-proj, the shared TAA jitter, the blend + clamp knobs).
+        let view_m = self.ssao.view();
+        let inv_view = view_m.inverse();
+        let inv_proj = (self.scene_view_proj_unjittered() * inv_view).inverse();
+        let extent = self.views[self.active_view.index()].scaled_render_extent();
+        let (gx, gy, gz) = self.froxel.grid();
+        let active_view = &self.views[self.active_view.index()];
+        let prev_view_proj = active_view.prev_view_proj;
+        let jitter_index = active_view.jitter_index;
+        // History is reusable only once the previous frame's camera transform is valid (no cut) AND
+        // the history volume carries content (not the first frame after a reset / quality switch).
+        let history_valid = active_view.prev_view_proj_valid && self.froxel.history_ready();
+        let jitter = self.active_view_jitter();
+        let f = self.fog;
+        let grid_params = crate::FogGridParams {
+            inverse_projection: inv_proj,
+            inverse_view: inv_view,
+            prev_view_proj,
+            grid_size: saffron_geometry::glam::UVec4::new(gx, gy, gz, 0),
+            screen_size: saffron_geometry::glam::Vec4::new(
+                extent.width as f32,
+                extent.height as f32,
+                0.0,
+                0.0,
+            ),
+            z_planes: saffron_geometry::glam::Vec4::new(
+                crate::froxel_fog::FROXEL_NEAR,
+                crate::FROXEL_FAR,
+                crate::FROXEL_FAR,
+                0.0,
+            ),
+            temporal: saffron_geometry::glam::Vec4::new(
+                f.history_blend,
+                if history_valid { 1.0 } else { 0.0 },
+                if f.neighborhood_clamp { 1.0 } else { 0.0 },
+                f.light_clamp,
+            ),
+            jitter: saffron_geometry::glam::Vec4::new(
+                jitter.x,
+                jitter.y,
+                jitter_index as f32,
+                self.fog_time,
+            ),
+        };
+        self.froxel.update_grid(&grid_params);
+
+        // Upload this frame's local fog volumes into the inject SSBO; the count rides the push so the
+        // injection loop bounds itself without a separate uniform.
+        let volume_count = self.froxel.update_fog_volumes(&self.fog_volumes);
+
+        // The medium push: the analytic height density (injected as the froxel base medium — never
+        // applied twice at composite), the scattering albedo/phase, and the constant emission.
+        let eye = inv_view.col(3).truncate();
+        let push_vals: [f32; 16] = [
+            eye.x,
+            eye.y,
+            eye.z,
+            f.base_density,
+            f.emissive.x,
+            f.emissive.y,
+            f.emissive.z,
+            f.scatter_albedo,
+            f.density,
+            f.height_falloff,
+            f.height,
+            f.phase_g,
+            f.layer2_density,
+            f.layer2_falloff,
+            f.layer2_height,
+            f32::from_bits(volume_count),
+        ];
+
+        // This frame's inject target (written in GENERAL) and last frame's history (sampled in
+        // ShaderReadOnly). Both scatter volumes ride external slots so their per-volume GENERAL ↔
+        // ShaderReadOnly layouts survive the frame boundary (the ping-pong swaps their roles).
+        let (write_img, write_view, write_layout) = self.froxel.scatter_write_import();
+        let write_slot = graph.alloc_external_layout(write_layout);
+        let write_res =
+            graph.import_image_3d(write_img, write_view, write_layout, Some(write_slot));
+        let (hist_img, hist_view, hist_layout) = self.froxel.scatter_history_import();
+        let hist_slot = graph.alloc_external_layout(hist_layout);
+        let hist_res = graph.import_image_3d(hist_img, hist_view, hist_layout, Some(hist_slot));
+        let (integ_img, integ_view, integ_layout) = self.froxel.integration_import();
+        let integ_slot = graph.alloc_external_layout(integ_layout);
+        let integ_res =
+            graph.import_image_3d(integ_img, integ_view, integ_layout, Some(integ_slot));
+        let cluster_res = graph.import_buffer(self.lighting.cluster_buffer(frame));
+        let (light_buf, _) = self.lighting.light_list_buffer(frame);
+        let light_res = graph.import_buffer(light_buf);
+
+        let light_set = self.lighting.light_set(frame);
+        let volume_set = self.froxel.inject_set();
+        {
+            let inject = Arc::clone(inject);
+            let handle = inject.handle();
+            let layout = inject.layout();
+            let raw_body = self.device.raw().clone();
+            let dispatch = (gx.div_ceil(8), gy.div_ceil(8), gz.div_ceil(4));
+            let pass = RgPass::compute("fog-inject")
+                .access(write_res, RgUsage::StorageImageRwCompute)
+                .access(hist_res, RgUsage::SampledReadCompute)
+                .access(cluster_res, RgUsage::StorageReadCompute)
+                .access(light_res, RgUsage::StorageReadCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam. The PSO/sets are valid this frame; the dispatch covers the
+                    // froxel grid (8×8×4 per group). Set 0 is the reused mesh light set, set 1 the fog
+                    // volume; the 64-byte push carries the authored medium.
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            layout,
+                            0,
+                            &[light_set, volume_set],
+                            &[],
+                        );
+                        raw_body.cmd_push_constants(
+                            cmd,
+                            layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            bytemuck::cast_slice(&push_vals),
+                        );
+                        raw_body.cmd_dispatch(cmd, dispatch.0, dispatch.1, dispatch.2);
+                    }
+                    drop(inject);
+                });
+            graph.add_pass(pass);
+        }
+        {
+            let integrate = Arc::clone(integrate);
+            let handle = integrate.handle();
+            let layout = integrate.layout();
+            let integrate_set = self.froxel.integrate_set();
+            let raw_body = self.device.raw().clone();
+            let dispatch = (gx.div_ceil(8), gy.div_ceil(8), 1);
+            let pass = RgPass::compute("fog-integrate")
+                .access(write_res, RgUsage::StorageImageRwCompute)
+                .access(integ_res, RgUsage::StorageImageRwCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam. One thread per froxel column, serial over Z.
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            layout,
+                            0,
+                            &[integrate_set],
+                            &[],
+                        );
+                        raw_body.cmd_dispatch(cmd, dispatch.0, dispatch.1, dispatch.2);
+                    }
+                    drop(integrate);
+                });
+            graph.add_pass(pass);
+        }
+        // Rest the integration volume in ShaderReadOnly for the composite's trilinear sample (the fog
+        // set binds it at binding 4 with that layout).
+        let read_pass = RgPass::compute("fog-integration-read")
+            .access(integ_res, RgUsage::SampledReadCompute)
+            .body(|_cmd, _scopes: &mut NestedScopeRecorder| {});
+        graph.add_pass(read_pass);
+
+        Some((write_slot, hist_slot, integ_slot))
+    }
+
+    /// Appends the aerial-perspective fill pass: one compute dispatch ray-marches the atmosphere
+    /// transmittance + multiscatter LUTs into the `32³` AP volume, bounded at each froxel center's
+    /// distance (Hillaire 2020). Writes the volume as a storage image (`StorageImageRwCompute`, GENERAL)
+    /// then rests it in ShaderReadOnly for the composite's binding-5 sample. No-op unless the atmosphere
+    /// is live + AP is authored (the PSO is `None` otherwise). Returns the volume's external slot for the
+    /// post-execute layout write-back, or `None` when the pass did not run.
+    fn add_aerial_perspective_pass(
+        &self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+    ) -> Option<usize> {
+        let pipeline = pipelines.aerial.as_ref()?;
+
+        // The froxel-center reconstruction matrices (mirroring the fog inject) + the baked atmosphere
+        // physical params the LUTs were computed from, so the AP volume agrees with the sky.
+        let inv_view = self.ssao.view().inverse();
+        let inv_proj = (self.scene_view_proj_unjittered() * inv_view).inverse();
+        let atmos = self.scene_ibl().baked_atmosphere();
+        let (sun_dir, sun_intensity) = self.scene_ibl().baked_sun();
+        let sun_dir = sun_dir.normalize_or_zero();
+        use saffron_geometry::glam::Vec4;
+        let params = crate::AerialParamsUbo {
+            inverse_projection: inv_proj,
+            inverse_view: inv_view,
+            sun_dir: sun_dir.extend(sun_intensity),
+            rayleigh: atmos
+                .rayleigh_scattering
+                .extend(atmos.rayleigh_scale_height),
+            ozone: atmos.ozone_absorption.extend(atmos.mie_scattering),
+            params0: Vec4::new(
+                atmos.planet_radius,
+                atmos.atmosphere_height,
+                atmos.mie_scale_height,
+                atmos.mie_anisotropy,
+            ),
+            params1: Vec4::new(
+                atmos.sun_disk_angular_radius,
+                atmos.sun_disk_intensity,
+                0.0,
+                self.fog.aerial_intensity,
+            ),
+            ap_planes: Vec4::new(
+                crate::froxel_fog::FROXEL_NEAR,
+                crate::AP_FAR_M,
+                crate::AP_GRID as f32,
+                1.0e-3,
+            ),
+        };
+        self.aerial.update_params(&params);
+
+        let (vol_img, vol_view, vol_layout) = self.aerial.volume_import();
+        let vol_slot = graph.alloc_external_layout(vol_layout);
+        let vol_res = graph.import_image_3d(vol_img, vol_view, vol_layout, Some(vol_slot));
+
+        let fill_set = self.aerial.fill_set();
+        {
+            let pipeline = Arc::clone(pipeline);
+            let handle = pipeline.handle();
+            let layout = pipeline.layout();
+            let raw_body = self.device.raw().clone();
+            let groups = crate::AP_GRID.div_ceil(4);
+            let pass = RgPass::compute("aerial-perspective")
+                .access(vol_res, RgUsage::StorageImageRwCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    // SAFETY: the ash seam. The PSO/set are valid this frame; one thread per froxel over
+                    // the 32³ grid (4×4×4 per group).
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            layout,
+                            0,
+                            &[fill_set],
+                            &[],
+                        );
+                        raw_body.cmd_dispatch(cmd, groups, groups, groups);
+                    }
+                    drop(pipeline);
+                });
+            graph.add_pass(pass);
+        }
+        // Rest the AP volume in ShaderReadOnly for the composite's trilinear sample (fog set binding 5).
+        let read_pass = RgPass::compute("aerial-perspective-read")
+            .access(vol_res, RgUsage::SampledReadCompute)
+            .body(|_cmd, _scopes: &mut NestedScopeRecorder| {});
+        graph.add_pass(read_pass);
+
+        Some(vol_slot)
+    }
+
+    /// Appends the analytic height & distance fog composite: an in-place compute pass over the scene
+    /// depth that blends `scene*T + inscatter*(1-T)` into the offscreen `color` before bloom. Reads
+    /// `color` (`StorageImageRwCompute`, GENERAL) and `depth` (`SampledReadCompute`, DEPTH aspect →
+    /// ShaderReadOnly); the sky-view LUT is bound directly on the per-view fog set. No-op unless fog
+    /// is enabled this frame (the PSO is `None` otherwise). Resolves the per-frame `FogParams` UBO
+    /// slice from the camera + directional light + authored settings before recording.
+    fn add_fog_pass(
+        &mut self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        color: RgResource,
+        depth: RgResource,
+        frame: usize,
+    ) {
+        let Some(pipeline) = &pipelines.fog else {
+            return;
+        };
+        let pipeline = Arc::clone(pipeline);
+        let handle = pipeline.handle();
+        let layout = pipeline.layout();
+
+        // Resolve the per-frame fog params from the camera + directional light + authored settings.
+        let inv_view_proj = self.scene_view_proj_unjittered().inverse();
+        let inv_view = self.ssao.view().inverse();
+        let eye = inv_view.col(3).truncate();
+        let cam_forward = inv_view.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
+        // The sun-inscatter lobe points TOWARD the sun: the directional light's travel direction
+        // negated (falls back to straight down when there is no directional light).
+        let sun_dir = (-self.sun_direction).normalize_or_zero();
+        let atmosphere_live = self.scene_ibl().atmosphere_live();
+        let use_sky_lut = if atmosphere_live { 1.0 } else { 0.0 };
+        let f = self.fog;
+        // Aerial perspective folds into this composite only when authored + the atmosphere baked its
+        // LUTs; the fog term is neutral (`T_fog = 1`, `inScatter_fog = 0`) when fog itself is off but AP
+        // keeps the composite alive.
+        let ap_active = f.aerial_perspective && atmosphere_live;
+        let params = FogParams {
+            inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            camera_pos: eye.to_array(),
+            max_opacity: f.max_opacity,
+            albedo: f.albedo.to_array(),
+            start_distance: f.start_distance,
+            emissive: f.emissive.to_array(),
+            dir_exponent: f.directional_exponent,
+            sun_dir: sun_dir.to_array(),
+            use_sky_lut,
+            dir_color: f.directional_color.to_array(),
+            _pad0: 0.0,
+            layer0: [f.density, f.height_falloff, f.height, 0.0],
+            layer1: [f.layer2_density, f.layer2_falloff, f.layer2_height, 0.0],
+            froxel: [
+                if f.volumetric { 1.0 } else { 0.0 },
+                crate::froxel_fog::FROXEL_NEAR,
+                crate::FROXEL_FAR,
+                // `.w` = the fog debug view mode: the composite outputs the froxel in-scatter +
+                // opacity directly instead of compositing (volumetric mode only).
+                if self.view_mode == ViewMode::Fog {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
+            cam_forward: cam_forward.to_array(),
+            fog_enabled: if f.enabled { 1.0 } else { 0.0 },
+            aerial: [
+                if ap_active { 1.0 } else { 0.0 },
+                crate::froxel_fog::FROXEL_NEAR,
+                crate::AP_FAR_M,
+                0.0,
+            ],
+        };
+
+        let vi = self.active_view.index();
+        self.views[vi].write_fog(frame, &params);
+        let set = self.views[vi].fog_set;
+        let offset = self.views[vi].fog_ubo_offset(frame);
+        let extent = self.views[vi].published_extent();
+        let groups = |n: u32| n.div_ceil(8);
+        let groups_x = groups(extent.width);
+        let groups_y = groups(extent.height);
+
+        let raw_body = self.device.raw().clone();
+        let pass = RgPass::compute("height-fog")
+            .access(color, RgUsage::StorageImageRwCompute)
+            .access(depth, RgUsage::SampledReadCompute)
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch covers the
+                // viewport (8×8 per group); the dynamic offset addresses this frame's `FogParams` slice.
+                unsafe {
+                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                    raw_body.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        layout,
+                        0,
+                        &[set],
+                        &[offset],
+                    );
+                    raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                }
+                drop(pipeline);
+            });
+        graph.add_pass(pass);
+    }
+
     /// Appends the mandatory HDR → display tonemap: an in-place compute pass on the
     /// offscreen `color` (`StorageImageRwCompute`, GENERAL layout) binding the per-view
     /// tonemap set + the `exp2(exposure_ev)` push, dispatched 8×8 over the viewport. The
@@ -7686,6 +9068,7 @@ impl Renderer {
         graph: &mut RenderGraph,
         pipelines: &FramePipelines,
         color: RgResource,
+        frame: usize,
     ) {
         let Some(tonemap) = &pipelines.tonemap else {
             return;
@@ -7695,16 +9078,42 @@ impl Renderer {
         let extent = view.published_extent();
         let push = TonemapPush::new(self.exposure_ev, self.tonemap_mode);
         let groups = |n: u32| n.div_ceil(8);
-        self.add_compute_pass(
-            graph,
-            "tonemap",
-            tonemap,
-            view.tonemap_set,
-            &[(color, RgUsage::StorageImageRwCompute)],
-            Some(bytemuck::bytes_of(&push).to_vec()),
-            groups(extent.width),
-            groups(extent.height),
-        );
+        let groups_x = groups(extent.width);
+        let groups_y = groups(extent.height);
+        // The grade UBO (binding 1) is a dynamic-offset UBO — the dispatch selects this frame's slice.
+        let grade_offset = view.grade_ubo_offset(frame);
+        let set = view.tonemap_set;
+        let raw_body = self.device.raw().clone();
+        let pipeline = Arc::clone(tonemap);
+        let handle = pipeline.handle();
+        let layout = pipeline.layout();
+        let pass = RgPass::compute("tonemap")
+            .access(color, RgUsage::StorageImageRwCompute)
+            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch covers the
+                // viewport; the dynamic offset addresses this frame's grade slice within the bound UBO.
+                unsafe {
+                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                    raw_body.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        layout,
+                        0,
+                        &[set],
+                        &[grade_offset],
+                    );
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::bytes_of(&push),
+                    );
+                    raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                }
+                drop(pipeline);
+            });
+        graph.add_pass(pass);
     }
 
     /// Appends the optional ground grid + editor overlay (both graphics passes drawing on
@@ -7796,6 +9205,7 @@ impl Renderer {
             Some(push),
             groups(extent.width),
             groups(extent.height),
+            1,
         );
     }
 
@@ -7847,9 +9257,10 @@ impl Renderer {
         graph.add_pass(pass);
     }
 
-    /// Appends one screen-space compute pass: declare the `(resource, usage)` accesses
-    /// (the graph derives the GENERAL ↔ ShaderReadOnly transitions), bind the per-view
-    /// set, optionally push `push`, and dispatch `(groups_x, groups_y, 1)`.
+    /// Appends one compute pass: declare the `(resource, usage)` accesses (the graph
+    /// derives the GENERAL ↔ ShaderReadOnly transitions), bind the set, optionally push
+    /// `push`, and dispatch `(groups_x, groups_y, groups_z)`. Screen-space passes pass
+    /// `groups_z = 1`; a 3D-grid pass (the froxel volume) passes the Z group count.
     #[allow(clippy::too_many_arguments)]
     fn add_compute_pass(
         &self,
@@ -7861,6 +9272,7 @@ impl Renderer {
         push: Option<Vec<u8>>,
         groups_x: u32,
         groups_y: u32,
+        groups_z: u32,
     ) {
         let raw_body = self.device.raw().clone();
         let pipeline = Arc::clone(pipeline);
@@ -7888,7 +9300,7 @@ impl Renderer {
                         push,
                     );
                 }
-                raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                raw_body.cmd_dispatch(cmd, groups_x, groups_y, groups_z);
             }
             drop(pipeline);
         });
