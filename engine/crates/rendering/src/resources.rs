@@ -708,6 +708,69 @@ impl Drop for GpuTexture {
     }
 }
 
+/// A device-local creative look-up table: one `R16G16B16A16_SFLOAT` `N×N×N` 3D image sampled by the
+/// tonemap pass's tetrahedral LUT stage (binding 2). Unlike [`GpuTexture`] it occupies no bindless
+/// slot — it binds directly to the per-view tonemap set — so its [`Drop`] just frees the view + image.
+/// Held as an `Arc<GpuLut>` on the renderer (the assigned creative look) or on the asset catalog's LUT
+/// cache; the identity default LUT the renderer keeps is one of these too.
+pub struct GpuLut {
+    resources: Arc<DeviceResources>,
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: vk_mem::Allocation,
+    /// The table resolution per axis (`2` identity, `17`/`33`/`65` imported, `33` baked).
+    size: u32,
+}
+
+// SAFETY: as [`GpuTexture`] — the image/view/allocation carry no thread-affine state; a `GpuLut` is
+// held behind an `Arc` shared read-only after construction.
+unsafe impl Send for GpuLut {}
+unsafe impl Sync for GpuLut {}
+
+impl GpuLut {
+    /// Wraps an already-created `TYPE_3D` image + view as a creative LUT of `size` per axis. The
+    /// upload path creates the device-local image, records the staging copy, then hands the pieces
+    /// here; this wrapper owns the teardown.
+    pub fn from_parts(
+        resources: &Arc<DeviceResources>,
+        image: vk::Image,
+        view: vk::ImageView,
+        allocation: vk_mem::Allocation,
+        size: u32,
+    ) -> Self {
+        Self {
+            resources: Arc::clone(resources),
+            image,
+            view,
+            allocation,
+            size,
+        }
+    }
+
+    /// The `TYPE_3D` sampled image view (bound at binding 2 of the tonemap set).
+    pub fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    /// The table resolution per axis.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+impl Drop for GpuLut {
+    fn drop(&mut self) {
+        // SAFETY: the ash/VMA seam. The bundle keeps device + allocator alive for this call; view then
+        // image, each freed exactly once. Idled before teardown (README §4).
+        unsafe {
+            self.resources.device().destroy_image_view(self.view, None);
+            self.resources
+                .allocator()
+                .destroy_image(self.image, &mut self.allocation);
+        }
+    }
+}
+
 /// A device-local per-mesh signed distance field (sparse SDST v2): two 3D images — the
 /// `R16_SNORM` brick *atlas* (occupied 8³ bricks) and the `R32_UINT` brick *indirection*
 /// volume — sharing one bindless slot (the cone-trace indexes both at the same index), plus
