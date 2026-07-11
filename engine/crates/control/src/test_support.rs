@@ -101,6 +101,23 @@ pub struct StubRenderer {
     pub aa_taa: bool,
     pub taa_params: saffron_protocol::TaaParamsDto,
     pub exposure_ev: f32,
+    pub color_grading: saffron_protocol::SetColorGradingParams,
+    pub creative_lut_id: u64,
+    pub creative_lut_intensity: f32,
+    pub creative_lut_size: u32,
+    pub bloom_enabled: bool,
+    pub bloom_intensity: f32,
+    pub bloom_scatter: f32,
+    pub bloom_tint: [f32; 3],
+    pub bloom_threshold: f32,
+    pub bloom_dirt_texture: u64,
+    pub bloom_dirt_intensity: f32,
+    pub bloom_dirt_tint: [f32; 3],
+    pub bloom_anamorphic_enabled: bool,
+    pub bloom_anamorphic_ratio: f32,
+    pub bloom_anamorphic_tint: [f32; 3],
+    pub bloom_anamorphic_intensity: f32,
+    pub bloom_mip_tint: Vec<[f32; 3]>,
     pub profiler_mode: ProfilerMode,
     pub timestamps_supported: bool,
     pub pipeline_stats_supported: bool,
@@ -163,6 +180,23 @@ impl Default for StubRenderer {
                 sharpness: 0.0,
             },
             exposure_ev: 0.0,
+            color_grading: saffron_protocol::SetColorGradingParams::default(),
+            creative_lut_id: 0,
+            creative_lut_intensity: 0.0,
+            creative_lut_size: 2,
+            bloom_enabled: false,
+            bloom_intensity: 0.05,
+            bloom_scatter: 0.005,
+            bloom_tint: [1.0, 1.0, 1.0],
+            bloom_threshold: 0.0,
+            bloom_dirt_texture: 0,
+            bloom_dirt_intensity: 0.0,
+            bloom_dirt_tint: [1.0, 1.0, 1.0],
+            bloom_anamorphic_enabled: false,
+            bloom_anamorphic_ratio: 2.0,
+            bloom_anamorphic_tint: [0.6, 0.8, 1.0],
+            bloom_anamorphic_intensity: 0.0,
+            bloom_mip_tint: Vec::new(),
             profiler_mode: ProfilerMode::Off,
             timestamps_supported: false,
             pipeline_stats_supported: false,
@@ -429,6 +463,105 @@ impl ControlRenderer for StubRenderer {
     }
     fn set_exposure(&mut self, ev: f32) {
         self.exposure_ev = ev;
+    }
+    fn set_color_grading(&mut self, params: saffron_protocol::SetColorGradingParams) {
+        self.color_grading = params;
+    }
+    fn color_grading(&self) -> saffron_protocol::SetColorGradingParams {
+        let mut params = self.color_grading.clone();
+        params.creative_lut_asset = saffron_protocol::Uuid(self.creative_lut_id);
+        params.creative_lut_intensity = self.creative_lut_intensity;
+        params
+    }
+    fn set_creative_lut_texture(
+        &mut self,
+        id: u64,
+        _lut: Option<std::sync::Arc<saffron_rendering::GpuLut>>,
+        intensity: f32,
+    ) {
+        self.creative_lut_id = id;
+        self.creative_lut_intensity = intensity;
+        self.creative_lut_size = if id == 0 { 2 } else { 33 };
+    }
+    fn creative_lut(&self) -> Option<(u64, u32, f32)> {
+        (self.creative_lut_id != 0).then_some((
+            self.creative_lut_id,
+            self.creative_lut_size,
+            self.creative_lut_intensity,
+        ))
+    }
+    fn bake_look_lut(&mut self) -> std::result::Result<(u32, Vec<[u16; 3]>), String> {
+        Ok((33, vec![[0, 0, 0]; 33usize.pow(3)]))
+    }
+
+    fn set_bloom(
+        &mut self,
+        enabled: bool,
+        intensity: f32,
+        scatter: f32,
+        tint: [f32; 3],
+        threshold: f32,
+    ) {
+        self.bloom_enabled = enabled;
+        self.bloom_intensity = intensity;
+        self.bloom_scatter = scatter;
+        self.bloom_tint = tint;
+        self.bloom_threshold = threshold;
+    }
+    fn bloom_enabled(&self) -> bool {
+        self.bloom_enabled
+    }
+    fn bloom_intensity(&self) -> f32 {
+        self.bloom_intensity
+    }
+    fn bloom_scatter(&self) -> f32 {
+        self.bloom_scatter
+    }
+    fn bloom_tint(&self) -> [f32; 3] {
+        self.bloom_tint
+    }
+    fn bloom_threshold(&self) -> f32 {
+        self.bloom_threshold
+    }
+    fn set_bloom_dirt_texture(&mut self, id: u64, _texture: Option<std::sync::Arc<GpuTexture>>) {
+        self.bloom_dirt_texture = id;
+    }
+    fn set_bloom_dirt_params(&mut self, intensity: f32, tint: [f32; 3]) {
+        self.bloom_dirt_intensity = intensity;
+        self.bloom_dirt_tint = tint;
+    }
+    fn bloom_dirt_texture(&self) -> u64 {
+        self.bloom_dirt_texture
+    }
+    fn bloom_dirt_intensity(&self) -> f32 {
+        self.bloom_dirt_intensity
+    }
+    fn bloom_dirt_tint(&self) -> [f32; 3] {
+        self.bloom_dirt_tint
+    }
+    fn set_bloom_anamorphic(&mut self, enabled: bool, ratio: f32, tint: [f32; 3], intensity: f32) {
+        self.bloom_anamorphic_enabled = enabled;
+        self.bloom_anamorphic_ratio = ratio;
+        self.bloom_anamorphic_tint = tint;
+        self.bloom_anamorphic_intensity = intensity;
+    }
+    fn bloom_anamorphic_enabled(&self) -> bool {
+        self.bloom_anamorphic_enabled
+    }
+    fn bloom_anamorphic_ratio(&self) -> f32 {
+        self.bloom_anamorphic_ratio
+    }
+    fn bloom_anamorphic_tint(&self) -> [f32; 3] {
+        self.bloom_anamorphic_tint
+    }
+    fn bloom_anamorphic_intensity(&self) -> f32 {
+        self.bloom_anamorphic_intensity
+    }
+    fn set_bloom_mip_tint(&mut self, tint: Vec<[f32; 3]>) {
+        self.bloom_mip_tint = tint;
+    }
+    fn bloom_mip_tint(&self) -> Vec<[f32; 3]> {
+        self.bloom_mip_tint.clone()
     }
 
     fn profiler_mode(&self) -> ProfilerMode {
