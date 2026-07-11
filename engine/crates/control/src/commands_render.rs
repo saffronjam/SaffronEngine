@@ -14,22 +14,23 @@ use std::io::Write;
 
 use saffron_protocol::{
     AaModeDto, ActiveAlarmDto, ActiveAlarmsDto, AlarmEventDto, AlarmSeverityDto, AlarmStateDto,
-    CaptureModeDto, CaptureStartParams, CaptureStartResult, CaptureStateDto, CaptureStatusResult,
-    CaptureStopResult, DrainAlarmsParams, DrainAlarmsResult, EmptyParams, FrameHistoryDto,
-    FrameHistoryParams, FrameSampleDto, GetTaaParamsResult, GetUpscaleResult, GiModeDto,
-    ListProbesResult, PerfConfigDto, PipelineStatsDto, ProbeRef, ProfileCaptureDto,
+    AnamorphicParams, CaptureModeDto, CaptureStartParams, CaptureStartResult, CaptureStateDto,
+    CaptureStatusResult, CaptureStopResult, DrainAlarmsParams, DrainAlarmsResult, EmptyParams,
+    FrameHistoryDto, FrameHistoryParams, FrameSampleDto, GetTaaParamsResult, GetUpscaleResult,
+    GiModeDto, ListProbesResult, PerfConfigDto, PipelineStatsDto, ProbeRef, ProfileCaptureDto,
     ProfileCaptureMetadataDto, ProfileLaneDto, ProfileSpanDto, ProfilerModeDto, ProfilerModeResult,
     ProfilerSetModeParams, RecaptureProbesResult, RenderPassTimingDto, RenderPassTimingsDto,
-    RenderQualityResult, RenderStatsDto, SetAaParams, SetAaResult, SetClusteredResult,
-    SetDepthPrepassResult, SetDisplacementResult, SetExposureParams, SetExposureResult,
-    SetGdfResult, SetGiParams, SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams,
-    SetProbesResult, SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult,
-    SetRtShadowsResult, SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult,
-    SetTaaParamsParams, SetTaaParamsResult, SetTessellationQualityParams,
-    SetTessellationQualityResult, SetTonemapParams, SetUpscaleParams, SetUpscaleResult,
-    SetViewModeParams, SetViewModeResult, SetViewportPowerStateParams, SetViewportSizeParams,
-    SetViewportSizeResult, ToggleParams, TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto,
-    ViewportNativeInfoResult, ViewportPowerStateResult,
+    RenderQualityResult, RenderStatsDto, SetAaParams, SetAaResult, SetBloomParams, SetBloomResult,
+    SetClusteredResult, SetColorGradingParams, SetColorGradingResult, SetDepthPrepassResult,
+    SetDisplacementResult, SetExposureParams, SetExposureResult, SetGdfResult, SetGiParams,
+    SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams, SetProbesResult,
+    SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult, SetRtShadowsResult,
+    SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult, SetTaaParamsParams,
+    SetTaaParamsResult, SetTessellationQualityParams, SetTessellationQualityResult,
+    SetTonemapParams, SetUpscaleParams, SetUpscaleResult, SetViewModeParams, SetViewModeResult,
+    SetViewportPowerStateParams, SetViewportSizeParams, SetViewportSizeResult, ToggleParams,
+    TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto, ViewportNativeInfoResult,
+    ViewportPowerStateResult,
 };
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmSeverity, CaptureMode, CaptureState,
@@ -105,6 +106,7 @@ fn view_mode_to_dto(mode: ViewMode) -> ViewModeDto {
         ViewMode::Gi => ViewModeDto::Gi,
         ViewMode::LightComplexity => ViewModeDto::LightComplexity,
         ViewMode::MotionVectors => ViewModeDto::MotionVectors,
+        ViewMode::Fog => ViewModeDto::Fog,
     }
 }
 
@@ -127,6 +129,7 @@ fn view_mode_from_dto(mode: ViewModeDto) -> ViewMode {
         ViewModeDto::Gi => ViewMode::Gi,
         ViewModeDto::LightComplexity => ViewMode::LightComplexity,
         ViewModeDto::MotionVectors => ViewMode::MotionVectors,
+        ViewModeDto::Fog => ViewMode::Fog,
     }
 }
 
@@ -188,6 +191,30 @@ fn alarm_severity_to_dto(severity: AlarmSeverity) -> AlarmSeverityDto {
 
 /// Builds the `render-stats` DTO from the renderer's full snapshot plus its individual
 /// toggle queries.
+/// Echoes the applied grade back as the flat `set-color-grading` result (the same shape the panel
+/// reads from `render-stats`).
+fn result_from_grading(p: SetColorGradingParams) -> SetColorGradingResult {
+    SetColorGradingResult {
+        temperature: p.temperature,
+        tint: p.tint,
+        contrast: p.contrast,
+        pivot: p.pivot,
+        saturation: p.saturation,
+        slope: p.slope,
+        offset: p.offset,
+        power: p.power,
+        shadows: p.shadows,
+        midtones: p.midtones,
+        highlights: p.highlights,
+        shadows_max: p.shadows_max,
+        highlights_min: p.highlights_min,
+        channel_mixer: p.channel_mixer,
+        split_tone: p.split_tone,
+        creative_lut_asset: p.creative_lut_asset,
+        creative_lut_intensity: p.creative_lut_intensity,
+    }
+}
+
 fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
     let stats: RenderStatsFull = renderer.render_stats();
     RenderStatsDto {
@@ -237,6 +264,29 @@ fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
         bindless_free: renderer.bindless_free_count() as i32,
         hdr: true,
         exposure_ev: stats.exposure_ev,
+        color_grading: renderer.color_grading(),
+        creative_lut: renderer.creative_lut().map(|(asset, size, intensity)| {
+            saffron_protocol::CreativeLutStat {
+                asset: Uuid(asset),
+                intensity,
+                size,
+            }
+        }),
+        bloom_enabled: renderer.bloom_enabled(),
+        bloom_intensity: renderer.bloom_intensity(),
+        bloom_scatter: renderer.bloom_scatter(),
+        bloom_tint: renderer.bloom_tint(),
+        bloom_threshold: renderer.bloom_threshold(),
+        bloom_dirt_texture: Uuid(renderer.bloom_dirt_texture()),
+        bloom_dirt_intensity: renderer.bloom_dirt_intensity(),
+        bloom_dirt_tint: renderer.bloom_dirt_tint(),
+        bloom_anamorphic: AnamorphicParams {
+            enabled: renderer.bloom_anamorphic_enabled(),
+            ratio: renderer.bloom_anamorphic_ratio(),
+            tint: renderer.bloom_anamorphic_tint(),
+            intensity: renderer.bloom_anamorphic_intensity(),
+        },
+        bloom_per_mip_tint: renderer.bloom_mip_tint(),
         aa: aa_mode_from_name(&renderer.aa_mode()),
         view_mode: view_mode_to_dto(stats.view_mode),
     }
@@ -917,6 +967,151 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
             ctx.renderer.set_exposure(params.ev);
             Ok(SetExposureResult {
                 exposure_ev: ctx.renderer.exposure_ev(),
+            })
+        },
+    );
+
+    reg.register::<SetBloomParams, SetBloomResult>(
+        "set-bloom",
+        "set-bloom {enabled} {intensity} {scatter} {tint} {threshold} [dirtTexture] [dirtIntensity] \
+         [dirtTint] [anamorphic] [perMipTint] — pre-tonemap bloom pyramid + art direction",
+        |ctx, p| {
+            if !(p.intensity >= 0.0 && (0.0..=1.0).contains(&p.scatter) && p.threshold >= 0.0) {
+                return Err(Error::command("bloom parameters out of range"));
+            }
+            ctx.renderer
+                .set_bloom(p.enabled, p.intensity, p.scatter, p.tint, p.threshold);
+            // Lens dirt: a supplied `dirtTexture` resolves (id 0 clears) and rebinds the mask; the
+            // mix + tint are a separate patch so a caller can tune them without re-sending the asset.
+            if let Some(id) = p.dirt_texture {
+                let mut resolved = None;
+                if id.value() != 0 {
+                    let assets = &mut *ctx.assets;
+                    let core_id = saffron_core::Uuid(id.value());
+                    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                        resolved = assets.load_texture_asset(gpu, core_id);
+                    });
+                }
+                ctx.renderer.set_bloom_dirt_texture(id.value(), resolved);
+            }
+            if p.dirt_intensity.is_some() || p.dirt_tint.is_some() {
+                let intensity = p
+                    .dirt_intensity
+                    .unwrap_or_else(|| ctx.renderer.bloom_dirt_intensity());
+                let tint = p.dirt_tint.unwrap_or_else(|| ctx.renderer.bloom_dirt_tint());
+                ctx.renderer.set_bloom_dirt_params(intensity, tint);
+            }
+            if let Some(a) = &p.anamorphic {
+                ctx.renderer
+                    .set_bloom_anamorphic(a.enabled, a.ratio, a.tint, a.intensity);
+            }
+            if let Some(stack) = p.per_mip_tint {
+                ctx.renderer.set_bloom_mip_tint(stack);
+            }
+            Ok(SetBloomResult {
+                enabled: ctx.renderer.bloom_enabled(),
+                intensity: ctx.renderer.bloom_intensity(),
+                scatter: ctx.renderer.bloom_scatter(),
+                tint: ctx.renderer.bloom_tint(),
+                threshold: ctx.renderer.bloom_threshold(),
+                dirt_texture: Uuid(ctx.renderer.bloom_dirt_texture()),
+                dirt_intensity: ctx.renderer.bloom_dirt_intensity(),
+                dirt_tint: ctx.renderer.bloom_dirt_tint(),
+                anamorphic: AnamorphicParams {
+                    enabled: ctx.renderer.bloom_anamorphic_enabled(),
+                    ratio: ctx.renderer.bloom_anamorphic_ratio(),
+                    tint: ctx.renderer.bloom_anamorphic_tint(),
+                    intensity: ctx.renderer.bloom_anamorphic_intensity(),
+                },
+                per_mip_tint: ctx.renderer.bloom_mip_tint(),
+            })
+        },
+    );
+
+    reg.register::<SetColorGradingParams, SetColorGradingResult>(
+        "set-color-grading",
+        "set-color-grading {temperature} {tint} {contrast} {pivot} {saturation} {slope} {offset} \
+         {power} — the scene-linear grade (white balance, contrast, saturation, ASC-CDL)",
+        |ctx, params| {
+            let finite3 = |v: [f32; 3]| v.iter().all(|c| c.is_finite());
+            let range_valid = |r: &saffron_protocol::GradeRangeDto| {
+                finite3(r.slope)
+                    && finite3(r.offset)
+                    && finite3(r.power)
+                    && r.power.iter().all(|c| *c > 0.0)
+                    && r.saturation.is_finite()
+                    && r.saturation >= 0.0
+                    && r.contrast.is_finite()
+                    && r.contrast >= 0.0
+            };
+            let valid = params.temperature.is_finite()
+                && params.tint.is_finite()
+                && params.contrast.is_finite()
+                && params.contrast >= 0.0
+                && params.saturation.is_finite()
+                && params.saturation >= 0.0
+                && params.pivot.is_finite()
+                && params.pivot > 0.0
+                && finite3(params.slope)
+                && finite3(params.offset)
+                && finite3(params.power)
+                && params.power.iter().all(|c| *c > 0.0)
+                && range_valid(&params.shadows)
+                && range_valid(&params.midtones)
+                && range_valid(&params.highlights)
+                && params.shadows_max.is_finite()
+                && params.highlights_min.is_finite()
+                && params.channel_mixer.iter().all(|c| c.is_finite())
+                && finite3(params.split_tone.shadow)
+                && finite3(params.split_tone.highlight)
+                && params.split_tone.balance.is_finite();
+            if !valid {
+                return Err(Error::command(
+                    "color grade out of range (pivot/power > 0, contrast/saturation ≥ 0, all finite)",
+                ));
+            }
+            if !((0.0..=1.0).contains(&params.creative_lut_intensity)) {
+                return Err(Error::command("creativeLutIntensity out of range (expected 0..=1)"));
+            }
+            let lut_id = params.creative_lut_asset.value();
+            let lut_intensity = params.creative_lut_intensity;
+            ctx.renderer.set_color_grading(params);
+            // The creative-LUT slot rides the same command: resolve the asset (id 0 clears to the
+            // identity default) and rebind, mirroring the lens-dirt mask. The intensity rides the grade
+            // UBO, so an intensity-only change re-resolves the (cached) asset without a descriptor rewrite.
+            let mut resolved = None;
+            if lut_id != 0 {
+                let assets = &mut *ctx.assets;
+                let core_id = saffron_core::Uuid(lut_id);
+                ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                    resolved = assets.load_cube_lut_asset(gpu, core_id);
+                });
+                if resolved.is_none() {
+                    return Err(Error::command(format!(
+                        "creative lut asset {lut_id} could not be resolved"
+                    )));
+                }
+            }
+            ctx.renderer
+                .set_creative_lut_texture(lut_id, resolved, lut_intensity);
+            Ok(result_from_grading(ctx.renderer.color_grading()))
+        },
+    );
+
+    reg.register::<saffron_protocol::BakeLookParams, saffron_protocol::BakeLookResult>(
+        "bake-look",
+        "bake-look [name] — fold grade + view transform + creative LUT into a 33³ log2-shaper .slut",
+        |ctx, params| {
+            let name = params.name.unwrap_or_else(|| "Baked Look".to_owned());
+            let (size, rgb) = ctx.renderer.bake_look_lut().map_err(Error::command)?;
+            let (asset, path) = ctx
+                .assets
+                .import_baked_lut(&name, size, rgb)
+                .map_err(|e| Error::command(e.to_string()))?;
+            Ok(saffron_protocol::BakeLookResult {
+                asset: Uuid(asset.value()),
+                path,
+                size,
             })
         },
     );
