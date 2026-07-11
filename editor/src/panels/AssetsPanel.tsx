@@ -1055,7 +1055,12 @@ export function AssetsPanel() {
                   // leaves it intact so a batch action still applies to the whole set.
                   const state = useEditorStore.getState();
                   if (assetId && !state.selectedAssetIds.has(assetId)) {
-                    selectAssetGridItem("asset", assetId, { shift: false, toggle: false }, gridOrder);
+                    selectAssetGridItem(
+                      "asset",
+                      assetId,
+                      { shift: false, toggle: false },
+                      gridOrder,
+                    );
                   } else if (folderPath && !state.selectedFolderPaths.has(folderPath)) {
                     selectAssetGridItem(
                       "folder",

@@ -98,7 +98,6 @@ export function WindowTitlebar() {
   return (
     <header
       className="flex h-9 flex-none items-center border-b border-border bg-card"
-
       onMouseDown={beginTitlebarDrag}
     >
       <TabStrip
@@ -112,12 +111,8 @@ export function WindowTitlebar() {
         onTabHover={setHoveredTabId}
         drag={{ domain: "view", pinnedIds: ["scene"], onReorder: moveViewTab }}
       />
-      <div className="min-w-0 flex-1 self-stretch"  />
-      <div
-        className="flex w-33 flex-none justify-end"
-       
-        data-titlebar-control="true"
-      >
+      <div className="min-w-0 flex-1 self-stretch" />
+      <div className="flex w-33 flex-none justify-end" data-titlebar-control="true">
         <TitlebarButton label="Minimize" onClick={minimize}>
           <Minus />
         </TitlebarButton>
