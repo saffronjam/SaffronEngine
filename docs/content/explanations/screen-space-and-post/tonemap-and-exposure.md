@@ -40,6 +40,10 @@ is the simplest operator that does the job, and the pass leaves a clean seam to 
 **Gamma** raises the result to $1/2.2$ to encode it for an sRGB-ish display, since everything upstream
 lives in linear light. Alpha is passed through untouched.
 
+Between exposure and the transform the pass folds a scene-linear [color grade](../color-grading/) —
+white balance, contrast, saturation, and ASC-CDL — so the operator is the **view/display transform**,
+not the place look is injected. A neutral grade is a mathematical identity, leaving the frame unchanged.
+
 ## A compute pass, in place
 
 The offscreen is an `rgba16f` storage image. The tonemap shader binds it as an `RWTexture2D` (set 0,
