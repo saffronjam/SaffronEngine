@@ -300,6 +300,22 @@ fn install_doc(
 
     if let Some(settings) = &doc.render_settings {
         renderer.apply_render_settings(settings);
+        // Rebind the persisted lens-dirt mask: the renderer's `apply_render_settings` applies every
+        // bloom field but the mask asset, which only the asset catalog here can resolve to a live
+        // texture. A `0`/absent id (or a dangling one) clears it back to the white fallback.
+        let dirt_id = settings
+            .get("bloomDirtTexture")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let mut resolved = None;
+        if dirt_id != 0 {
+            let assets = &mut *assets;
+            let core_id = Uuid(dirt_id);
+            renderer.with_gpu_uploader(&mut |gpu| {
+                resolved = assets.load_texture_asset(gpu, core_id);
+            });
+        }
+        renderer.set_bloom_dirt_texture(dirt_id, resolved);
     }
 
     // Project identity + sidecar (phase stays `Loading`; the loader owns the flip to `Ready`).
