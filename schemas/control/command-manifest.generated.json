@@ -394,6 +394,13 @@
       "fixture": "atmosphere-disabled"
     },
     {
+      "name": "set-fog",
+      "params": "SetFogParams",
+      "result": "EnvironmentDto",
+      "status": "typed",
+      "fixture": "fog-disabled"
+    },
+    {
       "name": "get-selection",
       "params": "EmptyParams",
       "result": "SelectionResult",
@@ -800,6 +807,27 @@
       "fixture": "exposure-zero"
     },
     {
+      "name": "set-bloom",
+      "params": "SetBloomParams",
+      "result": "SetBloomResult",
+      "status": "typed",
+      "fixture": "bloom"
+    },
+    {
+      "name": "set-color-grading",
+      "params": "SetColorGradingParams",
+      "result": "SetColorGradingResult",
+      "status": "typed",
+      "fixture": "color-grading"
+    },
+    {
+      "name": "bake-look",
+      "params": "BakeLookParams",
+      "result": "BakeLookResult",
+      "status": "typed",
+      "fixture": "bake-look"
+    },
+    {
       "name": "set-tessellation-quality",
       "params": "SetTessellationQualityParams",
       "result": "SetTessellationQualityResult",
@@ -875,6 +903,13 @@
       "result": "ImportTextureResult",
       "status": "typed",
       "skip": "requires an external texture fixture path"
+    },
+    {
+      "name": "import-lut",
+      "params": "ImportLutParams",
+      "result": "ImportLutResult",
+      "status": "typed",
+      "skip": "requires an external .cube fixture path"
     },
     {
       "name": "list-assets",

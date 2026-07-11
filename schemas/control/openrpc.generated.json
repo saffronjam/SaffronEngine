@@ -1014,6 +1014,24 @@
       }
     },
     {
+      "name": "set-fog",
+      "summary": "set analytic height & distance fog settings",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetFogParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentDto"
+        }
+      }
+    },
+    {
       "name": "get-selection",
       "summary": "get current selection",
       "params": [
@@ -2058,6 +2076,60 @@
       }
     },
     {
+      "name": "set-bloom",
+      "summary": "set-bloom {enabled} {intensity} {scatter} {tint} {threshold}",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetBloomParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetBloomResult"
+        }
+      }
+    },
+    {
+      "name": "set-color-grading",
+      "summary": "set-color-grading {temperature} {tint} {contrast} {pivot} {saturation} {slope} {offset} {power}",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetColorGradingParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SetColorGradingResult"
+        }
+      }
+    },
+    {
+      "name": "bake-look",
+      "summary": "bake-look [name] — fold grade + view transform + creative LUT into a 33³ .slut",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/BakeLookParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/BakeLookResult"
+        }
+      }
+    },
+    {
       "name": "set-tessellation-quality",
       "summary": "set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget]",
       "params": [
@@ -2252,6 +2324,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/ImportTextureResult"
+        }
+      }
+    },
+    {
+      "name": "import-lut",
+      "summary": "import-lut {path} — import a creative .cube look as a LUT asset",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ImportLutParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ImportLutResult"
         }
       }
     },
@@ -3209,7 +3299,8 @@
               "spot-light",
               "directional-light",
               "camera",
-              "reflection-probe"
+              "reflection-probe",
+              "fog-volume"
             ]
           }
         },
@@ -3274,6 +3365,35 @@
           "sinceFrame",
           "count",
           "durationMs"
+        ]
+      },
+      "AnamorphicParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "ratio": {
+            "type": "number"
+          },
+          "tint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "intensity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "enabled",
+          "ratio",
+          "tint",
+          "intensity"
         ]
       },
       "AnimationChannelDto": {
@@ -3550,7 +3670,8 @@
               "other",
               "animation",
               "material",
-              "model"
+              "model",
+              "lut"
             ]
           },
           "path": {
@@ -3629,7 +3750,8 @@
               "other",
               "animation",
               "material",
-              "model"
+              "model",
+              "lut"
             ]
           },
           "path": {
@@ -3997,6 +4119,37 @@
           "id",
           "name",
           "slot"
+        ]
+      },
+      "BakeLookParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": []
+      },
+      "BakeLookResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "asset",
+          "path",
+          "size"
         ]
       },
       "BoneDto": {
@@ -4391,6 +4544,26 @@
         },
         "required": [
           "path"
+        ]
+      },
+      "CreativeLutStat": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "size": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "asset",
+          "intensity",
+          "size"
         ]
       },
       "DebugOverlaysParams": {
@@ -5339,6 +5512,73 @@
           "op",
           "space",
           "preserveChildren"
+        ]
+      },
+      "GradeRangeDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "slope": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "offset": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "power": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "saturation": {
+            "type": "number"
+          },
+          "contrast": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "slope",
+          "offset",
+          "power",
+          "saturation",
+          "contrast"
+        ]
+      },
+      "ImportLutParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "ImportLutResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "lut": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "lut"
         ]
       },
       "ImportModelParams": {
@@ -7345,6 +7585,60 @@
           "exposureEv": {
             "type": "number"
           },
+          "colorGrading": {
+            "$ref": "#/components/schemas/SetColorGradingParams"
+          },
+          "creativeLut": {
+            "$ref": "#/components/schemas/CreativeLutStat"
+          },
+          "bloomEnabled": {
+            "type": "boolean"
+          },
+          "bloomIntensity": {
+            "type": "number"
+          },
+          "bloomScatter": {
+            "type": "number"
+          },
+          "bloomTint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "bloomThreshold": {
+            "type": "number"
+          },
+          "bloomDirtTexture": {
+            "type": "string"
+          },
+          "bloomDirtIntensity": {
+            "type": "number"
+          },
+          "bloomDirtTint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "bloomAnamorphic": {
+            "$ref": "#/components/schemas/AnamorphicParams"
+          },
+          "bloomPerMipTint": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            }
+          },
           "aa": {
             "type": "string",
             "enum": [
@@ -7375,7 +7669,8 @@
               "ambient-occlusion",
               "gi",
               "light-complexity",
-              "motion-vectors"
+              "motion-vectors",
+              "fog"
             ]
           }
         },
@@ -7426,6 +7721,17 @@
           "bindlessFree",
           "hdr",
           "exposureEv",
+          "colorGrading",
+          "bloomEnabled",
+          "bloomIntensity",
+          "bloomScatter",
+          "bloomTint",
+          "bloomThreshold",
+          "bloomDirtTexture",
+          "bloomDirtIntensity",
+          "bloomDirtTint",
+          "bloomAnamorphic",
+          "bloomPerMipTint",
           "aa",
           "viewMode"
         ]
@@ -7851,6 +8157,133 @@
         },
         "required": []
       },
+      "SetBloomParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "scatter": {
+            "type": "number"
+          },
+          "tint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "dirtTexture": {
+            "type": "string"
+          },
+          "dirtIntensity": {
+            "type": "number"
+          },
+          "dirtTint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "anamorphic": {
+            "$ref": "#/components/schemas/AnamorphicParams"
+          },
+          "perMipTint": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            }
+          }
+        },
+        "required": [
+          "enabled",
+          "intensity",
+          "scatter",
+          "tint",
+          "threshold"
+        ]
+      },
+      "SetBloomResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "scatter": {
+            "type": "number"
+          },
+          "tint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "dirtTexture": {
+            "type": "string"
+          },
+          "dirtIntensity": {
+            "type": "number"
+          },
+          "dirtTint": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "anamorphic": {
+            "$ref": "#/components/schemas/AnamorphicParams"
+          },
+          "perMipTint": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            }
+          }
+        },
+        "required": [
+          "enabled",
+          "intensity",
+          "scatter",
+          "tint",
+          "threshold",
+          "dirtTexture",
+          "dirtIntensity",
+          "dirtTint",
+          "anamorphic",
+          "perMipTint"
+        ]
+      },
       "SetCameraParams": {
         "type": "object",
         "additionalProperties": false,
@@ -7898,6 +8331,215 @@
         },
         "required": [
           "clustered"
+        ]
+      },
+      "SetColorGradingParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "temperature": {
+            "type": "number",
+            "default": 6500.0
+          },
+          "tint": {
+            "type": "number",
+            "default": 0.0
+          },
+          "contrast": {
+            "type": "number",
+            "default": 1.0
+          },
+          "pivot": {
+            "type": "number",
+            "default": 0.18000000715255737
+          },
+          "saturation": {
+            "type": "number",
+            "default": 1.0
+          },
+          "slope": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "default": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          "offset": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "default": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "power": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "default": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          "shadows": {
+            "$ref": "#/components/schemas/GradeRangeDto"
+          },
+          "midtones": {
+            "$ref": "#/components/schemas/GradeRangeDto"
+          },
+          "highlights": {
+            "$ref": "#/components/schemas/GradeRangeDto"
+          },
+          "shadowsMax": {
+            "type": "number",
+            "default": 0.09000000357627869
+          },
+          "highlightsMin": {
+            "type": "number",
+            "default": 0.5
+          },
+          "channelMixer": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 9,
+            "maxItems": 9,
+            "default": [
+              1.0,
+              0.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
+          },
+          "splitTone": {
+            "$ref": "#/components/schemas/SplitToneDto"
+          },
+          "creativeLutAsset": {
+            "type": "string",
+            "default": "0"
+          },
+          "creativeLutIntensity": {
+            "type": "number",
+            "default": 0.0
+          }
+        },
+        "required": []
+      },
+      "SetColorGradingResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "temperature": {
+            "type": "number"
+          },
+          "tint": {
+            "type": "number"
+          },
+          "contrast": {
+            "type": "number"
+          },
+          "pivot": {
+            "type": "number"
+          },
+          "saturation": {
+            "type": "number"
+          },
+          "slope": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "offset": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "power": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "shadows": {
+            "$ref": "#/components/schemas/GradeRangeDto"
+          },
+          "midtones": {
+            "$ref": "#/components/schemas/GradeRangeDto"
+          },
+          "highlights": {
+            "$ref": "#/components/schemas/GradeRangeDto"
+          },
+          "shadowsMax": {
+            "type": "number"
+          },
+          "highlightsMin": {
+            "type": "number"
+          },
+          "channelMixer": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 9,
+            "maxItems": 9
+          },
+          "splitTone": {
+            "$ref": "#/components/schemas/SplitToneDto"
+          },
+          "creativeLutAsset": {
+            "type": "string"
+          },
+          "creativeLutIntensity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "temperature",
+          "tint",
+          "contrast",
+          "pivot",
+          "saturation",
+          "slope",
+          "offset",
+          "power",
+          "shadows",
+          "midtones",
+          "highlights",
+          "shadowsMax",
+          "highlightsMin",
+          "channelMixer",
+          "splitTone",
+          "creativeLutAsset",
+          "creativeLutIntensity"
         ]
       },
       "SetComponentFieldParams": {
@@ -8113,6 +8755,92 @@
         "required": [
           "exposureEv"
         ]
+      },
+      "SetFogParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "json": {},
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "analytic",
+              "volumetric"
+            ]
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "historyBlend": {
+            "type": "number"
+          },
+          "neighborhoodClamp": {
+            "type": "boolean"
+          },
+          "lightClamp": {
+            "type": "number"
+          },
+          "baseDensity": {
+            "type": "number"
+          },
+          "scatterAlbedo": {
+            "type": "number"
+          },
+          "phaseG": {
+            "type": "number"
+          },
+          "density": {
+            "type": "number"
+          },
+          "albedo": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "height": {
+            "type": "number"
+          },
+          "heightFalloff": {
+            "type": "number"
+          },
+          "startDistance": {
+            "type": "number"
+          },
+          "maxOpacity": {
+            "type": "number"
+          },
+          "emissive": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "directionalColor": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "directionalExponent": {
+            "type": "number"
+          },
+          "layer2Density": {
+            "type": "number"
+          },
+          "layer2Falloff": {
+            "type": "number"
+          },
+          "layer2Height": {
+            "type": "number"
+          },
+          "aerialPerspective": {
+            "type": "boolean"
+          },
+          "aerialIntensity": {
+            "type": "number"
+          }
+        },
+        "required": []
       },
       "SetFootIkParams": {
         "type": "object",
@@ -8722,7 +9450,8 @@
               "ambient-occlusion",
               "gi",
               "light-complexity",
-              "motion-vectors"
+              "motion-vectors",
+              "fog"
             ]
           }
         },
@@ -8751,7 +9480,8 @@
               "ambient-occlusion",
               "gi",
               "light-complexity",
-              "motion-vectors"
+              "motion-vectors",
+              "fog"
             ]
           }
         },
@@ -8848,6 +9578,36 @@
           "axes",
           "jointSize",
           "highlightJoint"
+        ]
+      },
+      "SplitToneDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "shadow": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "highlight": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "balance": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "shadow",
+          "highlight",
+          "balance"
         ]
       },
       "StepParams": {
@@ -9384,6 +10144,74 @@
           "boxExtent"
         ]
       },
+      "FogVolume": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "shape": {
+            "type": "string",
+            "enum": [
+              "box",
+              "sphere"
+            ]
+          },
+          "extents": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "radius": {
+            "type": "number"
+          },
+          "edgeFalloff": {
+            "type": "number"
+          },
+          "density": {
+            "type": "number"
+          },
+          "albedo": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "emissive": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "phaseG": {
+            "type": "number"
+          },
+          "heightFalloff": {
+            "type": "number"
+          },
+          "noiseScale": {
+            "type": "number"
+          },
+          "noiseIntensity": {
+            "type": "number"
+          },
+          "noiseDetail": {
+            "type": "number"
+          },
+          "wind": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "speed": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "shape",
+          "extents",
+          "radius",
+          "edgeFalloff",
+          "density",
+          "albedo",
+          "emissive",
+          "phaseG",
+          "heightFalloff",
+          "noiseScale",
+          "noiseIntensity",
+          "noiseDetail",
+          "wind",
+          "speed"
+        ]
+      },
       "Relationship": {
         "type": "object",
         "additionalProperties": false,
@@ -9772,6 +10600,115 @@
           "sunDiskIntensity"
         ]
       },
+      "FogSettingsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "analytic",
+              "volumetric"
+            ]
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "historyBlend": {
+            "type": "number"
+          },
+          "neighborhoodClamp": {
+            "type": "boolean"
+          },
+          "lightClamp": {
+            "type": "number"
+          },
+          "baseDensity": {
+            "type": "number"
+          },
+          "scatterAlbedo": {
+            "type": "number"
+          },
+          "phaseG": {
+            "type": "number"
+          },
+          "density": {
+            "type": "number"
+          },
+          "albedo": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "height": {
+            "type": "number"
+          },
+          "heightFalloff": {
+            "type": "number"
+          },
+          "startDistance": {
+            "type": "number"
+          },
+          "maxOpacity": {
+            "type": "number"
+          },
+          "emissive": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "directionalColor": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "directionalExponent": {
+            "type": "number"
+          },
+          "layer2Density": {
+            "type": "number"
+          },
+          "layer2Falloff": {
+            "type": "number"
+          },
+          "layer2Height": {
+            "type": "number"
+          },
+          "aerialPerspective": {
+            "type": "boolean"
+          },
+          "aerialIntensity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "enabled",
+          "mode",
+          "quality",
+          "historyBlend",
+          "neighborhoodClamp",
+          "lightClamp",
+          "baseDensity",
+          "scatterAlbedo",
+          "phaseG",
+          "density",
+          "albedo",
+          "height",
+          "heightFalloff",
+          "startDistance",
+          "maxOpacity",
+          "emissive",
+          "directionalColor",
+          "directionalExponent",
+          "layer2Density",
+          "layer2Falloff",
+          "layer2Height",
+          "aerialPerspective",
+          "aerialIntensity"
+        ]
+      },
       "Components": {
         "type": "object",
         "additionalProperties": false,
@@ -9805,6 +10742,9 @@
           },
           "ReflectionProbe": {
             "$ref": "#/components/schemas/ReflectionProbe"
+          },
+          "FogVolume": {
+            "$ref": "#/components/schemas/FogVolume"
           },
           "Relationship": {
             "$ref": "#/components/schemas/Relationship"
@@ -9869,6 +10809,9 @@
           },
           {
             "$ref": "#/components/schemas/ReflectionProbe"
+          },
+          {
+            "$ref": "#/components/schemas/FogVolume"
           },
           {
             "$ref": "#/components/schemas/Relationship"
@@ -9943,6 +10886,9 @@
           },
           "atmosphere": {
             "$ref": "#/components/schemas/AtmosphereSettingsDto"
+          },
+          "fog": {
+            "$ref": "#/components/schemas/FogSettingsDto"
           }
         },
         "required": [
@@ -9956,7 +10902,8 @@
           "useSkyForAmbient",
           "ambientColor",
           "ambientIntensity",
-          "atmosphere"
+          "atmosphere",
+          "fog"
         ]
       }
     }
