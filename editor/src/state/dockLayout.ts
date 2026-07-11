@@ -16,6 +16,7 @@ export const SCENE_PANEL_IDS = [
   "inspector",
   "environment",
   "render",
+  "postProcess",
   "stats",
   "profiler",
   "physics",
@@ -719,7 +720,7 @@ export function defaultSceneLayout(): DockLayout {
       "leaf:leftBottom": {
         type: "leaf",
         id: "leaf:leftBottom",
-        tabs: ["inspector", "environment", "render"],
+        tabs: ["inspector", "environment", "render", "postProcess"],
         activeTab: "inspector",
         persistent: true,
       },
@@ -857,6 +858,7 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   inspector: "leaf:leftBottom",
   environment: "leaf:leftBottom",
   render: "leaf:leftBottom",
+  postProcess: "leaf:leftBottom",
   stats: "leaf:right",
   profiler: "leaf:right",
   physics: "leaf:right",
@@ -908,7 +910,7 @@ export function knownPanelIds(kind: DockSpaceKind): ReadonlySet<string> {
 /// locked subsurface leaf. A loaded layout missing any is incompatible; it is discarded for the
 /// default factory, since there is no layout migration.
 const REQUIRED_PANELS: Record<DockSpaceKind, DockPanelId[]> = {
-  scene: ["inspector", "environment", "render", "hierarchy", "viewport"],
+  scene: ["inspector", "environment", "render", "postProcess", "hierarchy", "viewport"],
   assetEditor: ["preview"],
 };
 

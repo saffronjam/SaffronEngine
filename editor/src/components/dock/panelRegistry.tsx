@@ -16,6 +16,7 @@ import {
 import { InspectorPanel } from "../../panels/InspectorPanel";
 import { EnvironmentPanel } from "../../panels/EnvironmentPanel";
 import { RenderPanel } from "../../panels/RenderPanel";
+import { PostProcessPanel } from "../../panels/PostProcessPanel";
 import { RenderStatsPanel } from "../../panels/RenderStatsPanel";
 import { ProfilerPanel } from "../../panels/ProfilerPanel";
 import { PhysicsPanel } from "../../panels/PhysicsPanel";
@@ -65,6 +66,13 @@ export const SCENE_PANEL_REGISTRY: Record<SceneDockPanelId, DockPanelDef> = {
     closable: false,
     renderer: "onlyWhenVisible",
     component: RenderPanel,
+  },
+  postProcess: {
+    id: "postProcess",
+    title: "Post",
+    closable: false,
+    renderer: "onlyWhenVisible",
+    component: PostProcessPanel,
   },
   stats: {
     id: "stats",
