@@ -73,6 +73,281 @@ public float3 tonemapPbrNeutral(float3 color)
     return lerp(color, float3(newPeak), g);
 }
 
+// One masked correction range (Shadows / Midtones / Highlights): an ASC-CDL SOP triplet plus a
+// saturation and a contrast, blended into the frame by a smooth luma weight. Neutral is slope 1,
+// offset 0, power 1, saturation 1, contrast 1 — an identity that leaves the range untouched.
+public struct GradeBlockParams
+{
+    public float3 slope;      // ASC-CDL S
+    public float3 offset;     // ASC-CDL O
+    public float3 power;      // ASC-CDL P
+    public float saturation;  // around Rec.709 luma
+    public float contrast;    // gain around GRADE_PIVOT in log2
+};
+
+// The scene-linear grade parameters, unpacked from the per-view grade uniform by the tonemap pass.
+// A pure value struct — `grade` is resource-free, so thumbnail/preview shaders that import this
+// module without binding the grade uniform are unaffected (they never call it).
+public struct GradeParams
+{
+    public float3x3 whiteBalance; // Bradford chromatic-adaptation matrix (built CPU-side from Temp/Tint)
+    public float3 slope;          // ASC-CDL S
+    public float3 offset;         // ASC-CDL O
+    public float3 power;          // ASC-CDL P
+    public float contrast;        // gain around the log2 pivot
+    public float pivot;           // 0.18 middle grey
+    public float saturation;      // around Rec.709 luma
+    public GradeBlockParams shadows;    // masked correction: darks
+    public GradeBlockParams midtones;   // masked correction: mids
+    public GradeBlockParams highlights; // masked correction: brights
+    public float shadowsMax;      // luma where the shadow mask reaches zero (~0.09)
+    public float highlightsMin;   // luma where the highlight mask starts to rise (~0.5)
+    public float3x3 channelMixer; // row-major 3x3, identity by default
+    public float3 splitShadow;    // split-tone shadow tint (0.5 neutral)
+    public float3 splitHighlight; // split-tone highlight tint (0.5 neutral)
+    public float splitBalance;    // split-tone luma pivot bias (0 neutral)
+};
+
+static const float3 kRec709Luma = float3(0.2126, 0.7152, 0.0722);
+static const float GRADE_PIVOT = 0.18; // the per-range contrast pivot (middle grey)
+
+float lumaRec709(float3 c)
+{
+    return dot(c, kRec709Luma);
+}
+
+float3 applyContrast(float3 c, float contrast, float pivot)
+{
+    float3 lg = log2(max(c, 1e-5));
+    lg = (lg - log2(pivot)) * contrast + log2(pivot);
+    return exp2(lg);
+}
+
+float3 applySaturation(float3 c, float saturation)
+{
+    float luma = lumaRec709(c);
+    return lerp(float3(luma, luma, luma), c, saturation);
+}
+
+float3 applyCdl(float3 c, float3 slope, float3 offset, float3 power)
+{
+    return pow(max(slope * c + offset, 0.0), power);
+}
+
+// UE Shadows/Midtones/Highlights mask: shadows fall to zero by `shadowsMax`, highlights rise from
+// `highlightsMin`, midtones are the smooth remainder. A `smoothstep` overlap (never a hard branch)
+// so a pixel near a boundary receives a blend of the two neighbouring corrections and gradients
+// never band.
+float3 rangeWeights(float l, float shadowsMax, float highlightsMin)
+{
+    float ws = 1.0 - smoothstep(0.0, shadowsMax, l);
+    float wh = smoothstep(highlightsMin, 1.0, l);
+    return float3(ws, saturate(1.0 - ws - wh), wh); // shadows, midtones, highlights
+}
+
+// One range's correction, reusing the global leaves in the same ASC-CDL order.
+float3 gradeTrio(float3 c, GradeBlockParams b)
+{
+    c = applyCdl(c, b.slope, b.offset, b.power);
+    c = applySaturation(c, b.saturation);
+    c = applyContrast(c, b.contrast, GRADE_PIVOT);
+    return c;
+}
+
+// A shadow tint + a highlight tint blended by luma, biased by `balance`. The 0.5-neutral tints are
+// doubled so an untinted split (0.5, 0.5) multiplies by 1 (identity).
+float3 splitTone(float3 c, float3 shadowTint, float3 highlightTint, float balance)
+{
+    float t = saturate(lumaRec709(c) + balance);
+    return c * (lerp(shadowTint, highlightTint, t) * 2.0);
+}
+
+// The scene-linear grade, applied AFTER exposure and BEFORE the view/display transform: the global
+// ops in ASC-CDL order (white balance -> contrast around the 0.18 pivot -> saturation -> global
+// ASC-CDL SOP), then three luma-masked Shadows/Midtones/Highlights corrections, a 3x3 channel mixer,
+// and split-toning. The neutral grade (identity white balance, contrast/saturation 1, slope/power 1,
+// offset 0, identity ranges + mixer, 0.5 split tints) is a mathematical identity, so an ungraded
+// frame is unchanged.
+public float3 grade(float3 c, GradeParams g)
+{
+    c = mul(g.whiteBalance, c);
+    c = applyContrast(c, g.contrast, g.pivot);
+    c = applySaturation(c, g.saturation);
+    c = applyCdl(c, g.slope, g.offset, g.power);
+    float3 w = rangeWeights(lumaRec709(c), g.shadowsMax, g.highlightsMin);
+    c = lerp(c, gradeTrio(c, g.shadows), w.x);
+    c = lerp(c, gradeTrio(c, g.midtones), w.y);
+    c = lerp(c, gradeTrio(c, g.highlights), w.z);
+    c = mul(g.channelMixer, c); // 3x3 row-major
+    c = splitTone(c, g.splitShadow, g.splitHighlight, g.splitBalance);
+    return c;
+}
+
+// The log2 shaper the creative-LUT bake maps its `33³` grid against: cube coordinate `t ∈ [0,1]`
+// spans scene-linear radiance across EV `[-14, +11]` anchored at 18% grey, so a bounded table can
+// hold the whole unbounded HDR→display tail. Shared by the bake (lut_bake.slang), the player's
+// frozen-look branch (tonemap.slang), and the `.slut` header the CPU writes.
+public static const float LUT_SHAPER_EV_MIN = -14.0;
+public static const float LUT_SHAPER_EV_MAX = 11.0;
+public static const float LUT_SHAPER_GREY = 0.18;
+
+// Scene-linear radiance -> the `[0,1]` shaper coordinate (per channel), the encode the player runs to
+// index the baked full-tail LUT.
+public float3 lutShaperEncode(float3 lin)
+{
+    float3 ev = log2(max(lin, 1e-8) / LUT_SHAPER_GREY);
+    return saturate((ev - LUT_SHAPER_EV_MIN) / (LUT_SHAPER_EV_MAX - LUT_SHAPER_EV_MIN));
+}
+
+// The `[0,1]` shaper coordinate -> scene-linear radiance, the decode the bake runs per grid cell.
+public float3 lutShaperDecode(float3 t)
+{
+    return LUT_SHAPER_GREY * exp2(lerp(LUT_SHAPER_EV_MIN, LUT_SHAPER_EV_MAX, t));
+}
+
+// One clamped integer corner fetch of a 3D LUT (nominal sampler — the tetrahedral blend reads corners
+// with `Load`, so clamp-to-edge at the cube faces is all the addressing that matters).
+float3 lutLoad(Texture3D<float3> lut, int3 idx, uint n)
+{
+    int hi = int(n) - 1;
+    idx = clamp(idx, int3(0, 0, 0), int3(hi, hi, hi));
+    return lut.Load(int4(idx, 0));
+}
+
+// Tetrahedral 3D-LUT interpolation on `c ∈ [0,1]` for an `n×n×n` table (the Resolve / hardware-LUT
+// blend, not trilinear). The unit cube splits into six tetrahedra by the ordering of the fractional
+// coordinates; the sample is the barycentric blend of the four corners of the tetrahedron it lands in,
+// which avoids the hue skew trilinear box interpolation shows along the cube diagonal.
+public float3 sampleCubeTetrahedral(Texture3D<float3> lut, float3 c, uint n)
+{
+    float3 p = saturate(c) * float(n - 1);
+    int hi = int(n) - 2;
+    int3 b = clamp(int3(floor(p)), int3(0, 0, 0), int3(hi, hi, hi));
+    float3 f = p - float3(b);
+    float3 v000 = lutLoad(lut, b, n);
+    float3 v111 = lutLoad(lut, b + int3(1, 1, 1), n);
+    if (f.x >= f.y)
+    {
+        if (f.y >= f.z)
+        {
+            float3 v100 = lutLoad(lut, b + int3(1, 0, 0), n);
+            float3 v110 = lutLoad(lut, b + int3(1, 1, 0), n);
+            return (1.0 - f.x) * v000 + (f.x - f.y) * v100 + (f.y - f.z) * v110 + f.z * v111;
+        }
+        else if (f.x >= f.z)
+        {
+            float3 v100 = lutLoad(lut, b + int3(1, 0, 0), n);
+            float3 v101 = lutLoad(lut, b + int3(1, 0, 1), n);
+            return (1.0 - f.x) * v000 + (f.x - f.z) * v100 + (f.z - f.y) * v101 + f.y * v111;
+        }
+        else
+        {
+            float3 v001 = lutLoad(lut, b + int3(0, 0, 1), n);
+            float3 v101 = lutLoad(lut, b + int3(1, 0, 1), n);
+            return (1.0 - f.z) * v000 + (f.z - f.x) * v001 + (f.x - f.y) * v101 + f.y * v111;
+        }
+    }
+    else
+    {
+        if (f.z >= f.y)
+        {
+            float3 v001 = lutLoad(lut, b + int3(0, 0, 1), n);
+            float3 v011 = lutLoad(lut, b + int3(0, 1, 1), n);
+            return (1.0 - f.z) * v000 + (f.z - f.y) * v001 + (f.y - f.x) * v011 + f.x * v111;
+        }
+        else if (f.z >= f.x)
+        {
+            float3 v010 = lutLoad(lut, b + int3(0, 1, 0), n);
+            float3 v011 = lutLoad(lut, b + int3(0, 1, 1), n);
+            return (1.0 - f.y) * v000 + (f.y - f.z) * v010 + (f.z - f.x) * v011 + f.x * v111;
+        }
+        else
+        {
+            float3 v010 = lutLoad(lut, b + int3(0, 1, 0), n);
+            float3 v110 = lutLoad(lut, b + int3(1, 1, 0), n);
+            return (1.0 - f.y) * v000 + (f.y - f.x) * v010 + (f.x - f.z) * v110 + f.z * v111;
+        }
+    }
+}
+
+// The std140 image of the per-view grade uniform (matches `GradeUniform` on the CPU): the Bradford
+// white balance as three vec4 rows, the global slope/offset/power, the contrast/pivot/saturation
+// scalars, the three masked ranges (SOP with saturation in slope.w + contrast in offset.w), the 3x3
+// channel mixer, the two split-tone tints, the range knobs, and the creative-look block
+// (`look` = intensity, size, frozen-look flag). Bound at binding 1 of the tonemap set; shared by
+// tonemap.slang and lut_bake.slang so both unpack it identically.
+public struct GradeUniform
+{
+    public float4 whiteBalance0;
+    public float4 whiteBalance1;
+    public float4 whiteBalance2;
+    public float4 slope;
+    public float4 offset;
+    public float4 power;
+    public float4 tonal; // contrast, pivot, saturation, pad
+    public float4 shadowsSlope;      // xyz slope, w saturation
+    public float4 shadowsOffset;     // xyz offset, w contrast
+    public float4 shadowsPower;      // xyz power, w pad
+    public float4 midtonesSlope;
+    public float4 midtonesOffset;
+    public float4 midtonesPower;
+    public float4 highlightsSlope;
+    public float4 highlightsOffset;
+    public float4 highlightsPower;
+    public float4 mixer0; // channel-mixer row 0
+    public float4 mixer1; // channel-mixer row 1
+    public float4 mixer2; // channel-mixer row 2
+    public float4 splitShadow;    // xyz tint
+    public float4 splitHighlight; // xyz tint
+    public float4 rangeKnobs;     // x shadowsMax, y highlightsMin, z splitBalance, w pad
+    public float4 look;           // x creativeLutIntensity, y creativeLutSize, z frozenLook, w pad
+};
+
+// Unpacks the std140 grade uniform into the resource-free `GradeParams` the pure `grade` takes.
+public GradeParams unpackGradeParams(GradeUniform u)
+{
+    GradeParams g;
+    g.whiteBalance = float3x3(u.whiteBalance0.xyz, u.whiteBalance1.xyz, u.whiteBalance2.xyz);
+    g.slope = u.slope.xyz;
+    g.offset = u.offset.xyz;
+    g.power = u.power.xyz;
+    g.contrast = u.tonal.x;
+    g.pivot = u.tonal.y;
+    g.saturation = u.tonal.z;
+
+    GradeBlockParams shadows;
+    shadows.slope = u.shadowsSlope.xyz;
+    shadows.saturation = u.shadowsSlope.w;
+    shadows.offset = u.shadowsOffset.xyz;
+    shadows.contrast = u.shadowsOffset.w;
+    shadows.power = u.shadowsPower.xyz;
+    g.shadows = shadows;
+
+    GradeBlockParams midtones;
+    midtones.slope = u.midtonesSlope.xyz;
+    midtones.saturation = u.midtonesSlope.w;
+    midtones.offset = u.midtonesOffset.xyz;
+    midtones.contrast = u.midtonesOffset.w;
+    midtones.power = u.midtonesPower.xyz;
+    g.midtones = midtones;
+
+    GradeBlockParams highlights;
+    highlights.slope = u.highlightsSlope.xyz;
+    highlights.saturation = u.highlightsSlope.w;
+    highlights.offset = u.highlightsOffset.xyz;
+    highlights.contrast = u.highlightsOffset.w;
+    highlights.power = u.highlightsPower.xyz;
+    g.highlights = highlights;
+
+    g.shadowsMax = u.rangeKnobs.x;
+    g.highlightsMin = u.rangeKnobs.y;
+    g.channelMixer = float3x3(u.mixer0.xyz, u.mixer1.xyz, u.mixer2.xyz);
+    g.splitShadow = u.splitShadow.xyz;
+    g.splitHighlight = u.splitHighlight.xyz;
+    g.splitBalance = u.rangeKnobs.z;
+    return g;
+}
+
 // Apply the selected operator, then the display transfer: AgX already bakes its own transfer, so
 // the others get the 2.2 gamma. `mode` matches TonemapMode (0 Reinhard, 1 ACES, 2 AgX, 3 PBR-Neutral).
 // The single point every surface (scene + thumbnails) shares so they encode identically.
