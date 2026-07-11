@@ -90,6 +90,23 @@ pub trait GpuUploader {
         self.upload_texture(rgba, width, height, false)
     }
 
+    /// Uploads a creative look-up table — `size³` red-fastest `[r, g, b]` triples — as an
+    /// `R16G16B16A16_SFLOAT` `TYPE_3D` sampled image, returning the [`GpuLut`] the tonemap pass binds.
+    ///
+    /// The default errors ([`saffron_rendering::Error::ZeroSizedImage`]) — a non-GPU test stub never
+    /// imports a LUT. The live uploaders override it with the real 3D upload.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the renderer's upload failure (zero size or a failing Vulkan/VMA call).
+    fn upload_lut_3d(
+        &self,
+        _rgb: &[[f32; 3]],
+        _size: u32,
+    ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuLut>> {
+        Err(saffron_rendering::Error::ZeroSizedImage)
+    }
+
     /// Whether the compute-skinning path is built and on. The skinned draw list is
     /// gathered only when this is true, so a build with skinning off is byte-identical
     /// to one without the skinned path.
@@ -164,6 +181,14 @@ impl GpuUploader for RendererUploader<'_> {
     ) -> saffron_rendering::Result<Arc<GpuTexture>> {
         self.uploader
             .upload_height_texture(self.descriptors, rgba, width, height)
+    }
+
+    fn upload_lut_3d(
+        &self,
+        rgb: &[[f32; 3]],
+        size: u32,
+    ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuLut>> {
+        self.uploader.upload_lut_3d(rgb, size)
     }
 
     fn skinning_enabled(&self) -> bool {

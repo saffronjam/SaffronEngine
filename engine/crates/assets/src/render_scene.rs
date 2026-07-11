@@ -28,13 +28,14 @@ use std::sync::Arc;
 use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use saffron_geometry::{Ray, ray_aabb_slab, ray_triangle, world_aabb_from_corners};
 use saffron_rendering::{
-    ClusterCamera, DrawItem, EnvSource, GpuLight, GpuMesh, MAX_REFLECTION_PROBES, Material,
+    ClusterCamera, DrawItem, EnvSource, FOG_SHAPE_BOX, FOG_SHAPE_SPHERE, FogRenderSettings,
+    FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES, MAX_REFLECTION_PROBES, Material,
     ReflectionProbeUpload, SceneLighting, SdfInstance, SkyRenderSettings, SkygenParams,
 };
 use saffron_scene::{
-    Camera, CameraView, DirectionalLight, Entity, Mesh as MeshComponent, MorphComponent,
-    MorphWeightOverride, PointLight, PreviewGhost, ReflectionProbe, Scene, SkinnedMesh, SkyMode,
-    SpotLight, Transform, camera_projection,
+    Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, Mesh as MeshComponent,
+    MorphComponent, MorphWeightOverride, PointLight, PreviewGhost, ReflectionProbe, Scene,
+    SkinnedMesh, SkyMode, SpotLight, Transform, camera_projection,
 };
 
 use crate::gpu::GpuUploader;
@@ -89,6 +90,8 @@ pub trait SceneRenderer: GpuUploader {
     fn set_sdf_scene(&mut self, instances: &[SdfInstance]);
     /// Folds the frame's reflection-probe uploads in.
     fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]);
+    /// Folds the frame's local fog-volume uploads in (injected into the froxel grid).
+    fn submit_fog_volumes(&mut self, volumes: &[FogVolumeUpload]);
     /// Writes the per-frame light UBO/SSBO.
     ///
     /// # Errors
@@ -121,6 +124,8 @@ pub trait SceneRenderer: GpuUploader {
     ) -> saffron_rendering::Result<()>;
     /// Folds the visible-sky settings in.
     fn submit_sky(&mut self, settings: &SkyRenderSettings);
+    /// Folds the analytic height/distance fog settings in.
+    fn submit_fog(&mut self, settings: &FogRenderSettings);
 }
 
 /// The nearest rendered-surface hit for a viewport ray.
@@ -206,6 +211,14 @@ impl GpuUploader for RendererScene<'_> {
             .upload_height_texture(self.renderer.descriptors(), rgba, width, height)
     }
 
+    fn upload_lut_3d(
+        &self,
+        rgb: &[[f32; 3]],
+        size: u32,
+    ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuLut>> {
+        self.uploader.upload_lut_3d(rgb, size)
+    }
+
     fn skinning_enabled(&self) -> bool {
         self.skinning_enabled
     }
@@ -271,6 +284,10 @@ impl SceneRenderer for RendererScene<'_> {
         self.renderer.submit_reflection_probes(probes);
     }
 
+    fn submit_fog_volumes(&mut self, volumes: &[FogVolumeUpload]) {
+        self.renderer.submit_fog_volumes(volumes);
+    }
+
     fn set_scene_lighting(&mut self, scene: &SceneLighting) -> saffron_rendering::Result<()> {
         self.renderer.set_scene_lighting(scene)
     }
@@ -309,6 +326,10 @@ impl SceneRenderer for RendererScene<'_> {
 
     fn submit_sky(&mut self, settings: &SkyRenderSettings) {
         self.renderer.submit_sky(settings);
+    }
+
+    fn submit_fog(&mut self, settings: &FogRenderSettings) {
+        self.renderer.set_fog(settings);
     }
 }
 
@@ -571,7 +592,14 @@ pub fn render_scene<R: SceneRenderer>(
     // transform cache this writes.
     scene.update_world_transforms();
 
-    let (light_dir, light_color, light_intensity, light_ambient) = gather_directional_light(scene);
+    let (
+        light_dir,
+        light_color,
+        light_intensity,
+        light_ambient,
+        light_volumetric,
+        light_cast_volumetric_shadow,
+    ) = gather_directional_light(scene);
     let (lights, point_shadow, spot_shadow) = gather_punctual_lights(scene);
 
     renderer.set_spot_shadow(
@@ -666,6 +694,9 @@ pub fn render_scene<R: SceneRenderer>(
     let probe_uploads = gather_reflection_probes(scene);
     renderer.submit_reflection_probes(&probe_uploads);
 
+    let fog_volume_uploads = gather_fog_volumes(scene);
+    renderer.submit_fog_volumes(&fog_volume_uploads);
+
     // Fallback ambient (used when IBL is off): the scene environment's ambient color when
     // use_sky_for_ambient, else the directional light's scalar ambient (grayscale).
     let ambient = if scene.environment.use_sky_for_ambient {
@@ -679,6 +710,8 @@ pub fn render_scene<R: SceneRenderer>(
         intensity: light_intensity,
         ambient,
         eye_position,
+        directional_volumetric: light_volumetric,
+        directional_cast_volumetric_shadow: light_cast_volumetric_shadow,
         lights,
     }) {
         tracing::error!("set_scene_lighting: {err}");
@@ -733,13 +766,46 @@ pub fn render_scene<R: SceneRenderer>(
         }
     }
     renderer.submit_sky(&sky);
+
+    // Resolve the scene environment into the analytic height/distance fog settings (one frame push,
+    // the same shape as the sky).
+    let f = env.fog;
+    renderer.submit_fog(&FogRenderSettings {
+        enabled: f.enabled,
+        density: f.density,
+        albedo: f.albedo,
+        height: f.height,
+        height_falloff: f.height_falloff,
+        start_distance: f.start_distance,
+        max_opacity: f.max_opacity,
+        emissive: f.emissive,
+        directional_color: f.directional_color,
+        directional_exponent: f.directional_exponent,
+        layer2_density: f.layer2_density,
+        layer2_falloff: f.layer2_falloff,
+        layer2_height: f.layer2_height,
+        volumetric: matches!(f.mode, saffron_scene::FogMode::Volumetric),
+        base_density: f.base_density,
+        scatter_albedo: f.scatter_albedo,
+        phase_g: f.phase_g,
+        quality: match f.quality {
+            saffron_scene::FogQuality::Low => saffron_rendering::FroxelQuality::Low,
+            saffron_scene::FogQuality::Medium => saffron_rendering::FroxelQuality::Medium,
+            saffron_scene::FogQuality::High => saffron_rendering::FroxelQuality::High,
+        },
+        history_blend: f.history_blend,
+        neighborhood_clamp: f.neighborhood_clamp,
+        light_clamp: f.light_clamp,
+        aerial_perspective: f.aerial_perspective,
+        aerial_intensity: f.aerial_intensity,
+    });
 }
 
 /// The directional light's resolved direction / color / intensity / ambient, re-aimed by the
 /// entity's world rotation when it carries a [`Transform`]. The first one wins; a scene with
 /// no directional light keeps the default `(-0.5, -1, -0.3)`, white, intensity 1,
 /// ambient 0.15.
-fn gather_directional_light(scene: &mut Scene) -> (Vec3, Vec3, f32, f32) {
+fn gather_directional_light(scene: &mut Scene) -> (Vec3, Vec3, f32, f32, f32, bool) {
     let mut found: Option<(Entity, DirectionalLight)> = None;
     scene.for_each::<&DirectionalLight, _>(|entity, light| {
         if found.is_none() {
@@ -747,14 +813,21 @@ fn gather_directional_light(scene: &mut Scene) -> (Vec3, Vec3, f32, f32) {
         }
     });
     let Some((entity, light)) = found else {
-        return (Vec3::new(-0.5, -1.0, -0.3), Vec3::ONE, 1.0, 0.15);
+        return (Vec3::new(-0.5, -1.0, -0.3), Vec3::ONE, 1.0, 0.15, 1.0, true);
     };
     let dir = if scene.has_component::<Transform>(entity) {
         scene.world_rotation(entity) * light.direction
     } else {
         light.direction
     };
-    (dir, light.color, light.intensity, light.ambient)
+    (
+        dir,
+        light.color,
+        light.intensity,
+        light.ambient,
+        light.volumetric_scattering,
+        light.cast_volumetric_shadow,
+    )
 }
 
 /// The first point light's shadow inputs (the single shadowed point in v1).
@@ -794,7 +867,17 @@ fn gather_punctual_lights(
             position_range: pos.extend(light.range),
             color_intensity: light.color.extend(light.intensity),
             direction_type: Vec4::ZERO, // type 0 = point
-            spot_cos: Vec4::ZERO,
+            // point: inner/outer cos = 0; z = volumetric-scatter mult, w = cast-volumetric-shadow gate.
+            spot_cos: Vec4::new(
+                0.0,
+                0.0,
+                light.volumetric_scattering,
+                if light.cast_volumetric_shadow {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
         });
         if point_shadow.is_none() {
             point_shadow = Some(PointShadow {
@@ -814,11 +897,16 @@ fn gather_punctual_lights(
             position_range: pos.extend(light.range),
             color_intensity: light.color.extend(light.intensity),
             direction_type: dir.extend(1.0), // type 1 = spot
+            // z = volumetric-scatter mult, w = cast-volumetric-shadow gate.
             spot_cos: Vec4::new(
                 light.inner_angle.to_radians().cos(),
                 light.outer_angle.to_radians().cos(),
-                0.0,
-                0.0,
+                light.volumetric_scattering,
+                if light.cast_volumetric_shadow {
+                    1.0
+                } else {
+                    0.0
+                },
             ),
         });
         if spot_shadow.is_none() {
@@ -1044,6 +1132,45 @@ fn gather_reflection_probes(scene: &mut Scene) -> Vec<ReflectionProbeUpload> {
             box_projection: probe.box_projection,
             box_extent: probe.box_extent,
             dirty: probe.dirty,
+        })
+        .collect()
+}
+
+/// Snapshots each [`FogVolume`] (positioned by its [`Transform`]) into a per-frame upload list, its
+/// world transform baked for the froxel injection bounds test + noise frame (capped at
+/// [`MAX_FOG_VOLUMES`]).
+fn gather_fog_volumes(scene: &mut Scene) -> Vec<FogVolumeUpload> {
+    let mut volumes: Vec<(Entity, FogVolume)> = Vec::new();
+    scene.for_each::<(&Transform, &FogVolume), _>(|entity, (_, volume)| {
+        if volumes.len() < MAX_FOG_VOLUMES as usize {
+            volumes.push((entity, *volume));
+        }
+    });
+    volumes
+        .into_iter()
+        .map(|(entity, volume)| {
+            let world_from_local = scene.world_matrix(entity);
+            FogVolumeUpload {
+                world_from_local,
+                center: world_from_local.col(3).truncate(),
+                shape: match volume.shape {
+                    FogShape::Box => FOG_SHAPE_BOX,
+                    FogShape::Sphere => FOG_SHAPE_SPHERE,
+                },
+                extents: volume.extents,
+                radius: volume.radius,
+                edge_falloff: volume.edge_falloff,
+                density: volume.density,
+                albedo: volume.albedo,
+                emissive: volume.emissive,
+                phase_g: volume.phase_g,
+                height_falloff: volume.height_falloff,
+                noise_scale: volume.noise_scale,
+                noise_intensity: volume.noise_intensity,
+                noise_detail: volume.noise_detail,
+                wind: volume.wind,
+                speed: volume.speed,
+            }
         })
         .collect()
 }
@@ -1308,7 +1435,8 @@ mod tests {
     use std::path::PathBuf;
 
     use saffron_rendering::{
-        BindlessFreeList, Descriptors, Device, GpuQueue, GpuTexture, SurfaceSource, Uploader,
+        BindlessFreeList, Descriptors, Device, FogRenderSettings, GpuQueue, GpuTexture,
+        SurfaceSource, Uploader,
     };
     use saffron_scene::{AssetEntry, AssetType};
 
@@ -1333,6 +1461,7 @@ mod tests {
         },
         DdgiScene,
         ReflectionProbes(usize),
+        FogVolumes(usize),
         SceneLighting {
             light_count: usize,
         },
@@ -1346,6 +1475,9 @@ mod tests {
         },
         Sky {
             mode: u32,
+        },
+        Fog {
+            enabled: bool,
         },
     }
 
@@ -1483,6 +1615,11 @@ mod tests {
                 .borrow_mut()
                 .push(Call::ReflectionProbes(probes.len()));
         }
+        fn submit_fog_volumes(&mut self, volumes: &[FogVolumeUpload]) {
+            self.calls
+                .borrow_mut()
+                .push(Call::FogVolumes(volumes.len()));
+        }
         fn set_scene_lighting(&mut self, scene: &SceneLighting) -> saffron_rendering::Result<()> {
             self.calls.borrow_mut().push(Call::SceneLighting {
                 light_count: scene.lights.len(),
@@ -1522,6 +1659,11 @@ mod tests {
         fn submit_sky(&mut self, settings: &SkyRenderSettings) {
             self.calls.borrow_mut().push(Call::Sky {
                 mode: settings.mode,
+            });
+        }
+        fn submit_fog(&mut self, settings: &FogRenderSettings) {
+            self.calls.borrow_mut().push(Call::Fog {
+                enabled: settings.enabled,
             });
         }
     }
@@ -1595,6 +1737,7 @@ mod tests {
                 Call::RtScene { static_count: 0 },
                 Call::DdgiScene,
                 Call::ReflectionProbes(0),
+                Call::FogVolumes(0),
                 Call::SceneLighting { light_count: 0 },
                 Call::EnvBake(EnvSource::Procedural),
                 Call::ClusterCamera,
@@ -1605,6 +1748,7 @@ mod tests {
                     joint_count: 0
                 },
                 Call::Sky { mode: 2 },
+                Call::Fog { enabled: false },
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
