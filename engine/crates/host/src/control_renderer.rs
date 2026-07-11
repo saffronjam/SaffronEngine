@@ -25,6 +25,28 @@ use saffron_rendering::{
 };
 use serde_json::Value;
 
+/// Maps a wire grade range onto the renderer's [`saffron_rendering::GradeRange`].
+fn range_to_grade(r: &saffron_protocol::GradeRangeDto) -> saffron_rendering::GradeRange {
+    saffron_rendering::GradeRange {
+        slope: r.slope,
+        offset: r.offset,
+        power: r.power,
+        saturation: r.saturation,
+        contrast: r.contrast,
+    }
+}
+
+/// Maps a renderer grade range back onto the wire [`saffron_protocol::GradeRangeDto`].
+fn grade_to_range(r: &saffron_rendering::GradeRange) -> saffron_protocol::GradeRangeDto {
+    saffron_protocol::GradeRangeDto {
+        slope: r.slope,
+        offset: r.offset,
+        power: r.power,
+        saturation: r.saturation,
+        contrast: r.contrast,
+    }
+}
+
 /// The host's live renderer seam: the renderer plus the host-owned uploader, bundled for
 /// one control-plane drain.
 ///
@@ -284,6 +306,147 @@ impl ControlRenderer for HostControlRenderer<'_> {
     }
     fn set_exposure(&mut self, ev: f32) {
         self.renderer.set_exposure(ev);
+    }
+
+    fn set_color_grading(&mut self, params: saffron_protocol::SetColorGradingParams) {
+        self.renderer
+            .set_color_grading(saffron_rendering::ColorGrade {
+                temperature: params.temperature,
+                tint: params.tint,
+                contrast: params.contrast,
+                pivot: params.pivot,
+                saturation: params.saturation,
+                slope: params.slope,
+                offset: params.offset,
+                power: params.power,
+                shadows: range_to_grade(&params.shadows),
+                midtones: range_to_grade(&params.midtones),
+                highlights: range_to_grade(&params.highlights),
+                shadows_max: params.shadows_max,
+                highlights_min: params.highlights_min,
+                channel_mixer: params.channel_mixer,
+                split_shadow: params.split_tone.shadow,
+                split_highlight: params.split_tone.highlight,
+                split_balance: params.split_tone.balance,
+            });
+    }
+    fn color_grading(&self) -> saffron_protocol::SetColorGradingParams {
+        let g = self.renderer.color_grading();
+        saffron_protocol::SetColorGradingParams {
+            temperature: g.temperature,
+            tint: g.tint,
+            contrast: g.contrast,
+            pivot: g.pivot,
+            saturation: g.saturation,
+            slope: g.slope,
+            offset: g.offset,
+            power: g.power,
+            shadows: grade_to_range(&g.shadows),
+            midtones: grade_to_range(&g.midtones),
+            highlights: grade_to_range(&g.highlights),
+            shadows_max: g.shadows_max,
+            highlights_min: g.highlights_min,
+            channel_mixer: g.channel_mixer,
+            split_tone: saffron_protocol::SplitToneDto {
+                shadow: g.split_shadow,
+                highlight: g.split_highlight,
+                balance: g.split_balance,
+            },
+            creative_lut_asset: saffron_protocol::Uuid(
+                self.renderer.creative_lut().map_or(0, |(id, _, _)| id),
+            ),
+            creative_lut_intensity: self
+                .renderer
+                .creative_lut()
+                .map_or(0.0, |(_, _, intensity)| intensity),
+        }
+    }
+
+    fn set_creative_lut_texture(
+        &mut self,
+        id: u64,
+        lut: Option<std::sync::Arc<saffron_rendering::GpuLut>>,
+        intensity: f32,
+    ) {
+        self.renderer.set_creative_lut_texture(id, lut, intensity);
+    }
+    fn creative_lut(&self) -> Option<(u64, u32, f32)> {
+        self.renderer.creative_lut()
+    }
+    fn bake_look_lut(&mut self) -> std::result::Result<(u32, Vec<[u16; 3]>), String> {
+        self.renderer
+            .bake_look_lut(self.uploader)
+            .map(|(size, _ev_min, _ev_max, rgb)| (size, rgb))
+            .map_err(|e| e.to_string())
+    }
+
+    fn set_bloom(
+        &mut self,
+        enabled: bool,
+        intensity: f32,
+        scatter: f32,
+        tint: [f32; 3],
+        threshold: f32,
+    ) {
+        self.renderer
+            .set_bloom(enabled, intensity, scatter, tint, threshold);
+    }
+    fn bloom_enabled(&self) -> bool {
+        self.renderer.bloom_enabled()
+    }
+    fn bloom_intensity(&self) -> f32 {
+        self.renderer.bloom_intensity()
+    }
+    fn bloom_scatter(&self) -> f32 {
+        self.renderer.bloom_scatter()
+    }
+    fn bloom_tint(&self) -> [f32; 3] {
+        self.renderer.bloom_tint()
+    }
+    fn bloom_threshold(&self) -> f32 {
+        self.renderer.bloom_threshold()
+    }
+
+    fn set_bloom_dirt_texture(
+        &mut self,
+        id: u64,
+        texture: Option<std::sync::Arc<saffron_rendering::GpuTexture>>,
+    ) {
+        self.renderer.set_bloom_dirt_texture(id, texture);
+    }
+    fn set_bloom_dirt_params(&mut self, intensity: f32, tint: [f32; 3]) {
+        self.renderer.set_bloom_dirt_params(intensity, tint);
+    }
+    fn bloom_dirt_texture(&self) -> u64 {
+        self.renderer.bloom_dirt_texture()
+    }
+    fn bloom_dirt_intensity(&self) -> f32 {
+        self.renderer.bloom_dirt_intensity()
+    }
+    fn bloom_dirt_tint(&self) -> [f32; 3] {
+        self.renderer.bloom_dirt_tint()
+    }
+    fn set_bloom_anamorphic(&mut self, enabled: bool, ratio: f32, tint: [f32; 3], intensity: f32) {
+        self.renderer
+            .set_bloom_anamorphic(enabled, ratio, tint, intensity);
+    }
+    fn bloom_anamorphic_enabled(&self) -> bool {
+        self.renderer.bloom_anamorphic_enabled()
+    }
+    fn bloom_anamorphic_ratio(&self) -> f32 {
+        self.renderer.bloom_anamorphic_ratio()
+    }
+    fn bloom_anamorphic_tint(&self) -> [f32; 3] {
+        self.renderer.bloom_anamorphic_tint()
+    }
+    fn bloom_anamorphic_intensity(&self) -> f32 {
+        self.renderer.bloom_anamorphic_intensity()
+    }
+    fn set_bloom_mip_tint(&mut self, tint: Vec<[f32; 3]>) {
+        self.renderer.set_bloom_mip_tint(tint);
+    }
+    fn bloom_mip_tint(&self) -> Vec<[f32; 3]> {
+        self.renderer.bloom_mip_tint()
     }
 
     fn profiler_mode(&self) -> ProfilerMode {
