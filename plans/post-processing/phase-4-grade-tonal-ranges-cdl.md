@@ -1,6 +1,6 @@
 # Phase 4 — Per-range grade, channel mixer, split-toning
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of `plans/post-processing/` (scene-linear color grade folded into the tonemap pass). This is the
 fourth phase; it builds directly on the Phase 3 grade stage. Phase 3 landed the *global* grade —

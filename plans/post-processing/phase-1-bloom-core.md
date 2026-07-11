@@ -1,6 +1,6 @@
 # Phase 1 — Bloom core: energy-conserving mip-pyramid
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of `plans/post-processing/` (bloom + color grading as one post-processing subsystem). This is the first, self-contained phase — it stands entirely alone (no dependency on the grading phases) and ships a full vertical slice: a thresholdless 13-tap Karis-averaged downsample + 9-tap tent upsample compute pyramid composited by an energy-conserving `lerp` into the scene-linear `color` target **before** the tonemap pass, plus its PSO, per-view descriptor sets, transient mip chain, render-graph passes, protocol DTO, control command, persistence, `sa` reachability, `RenderPanel` rows, and docs page. It does not touch the tonemap shader, does not add grading, and does not block any later phase.
 

@@ -1,6 +1,6 @@
 # Phase 6 — Editor Post panel: color wheels + tone-curve widgets
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of `plans/post-processing/` (bloom + color grading as one pre-tonemap post subsystem). This is the sixth and final phase, and the only editor-native one — no engine, shader, protocol, or control-plane change lands here (`just engine` is unchanged; the DTOs and commands all shipped in phases 1–5). It builds a dedicated **Post** panel and the two widgets the editor is missing today — a Resolve-style `GradingWheel` trackball and an SVG `ToneCurve` spline — then migrates *every* bloom and grade control off `RenderPanel` into it, deleting the temporary rows phases 1–5 parked there in the same change (NO-LEGACY). It does not block any earlier phase: bloom and grading are already fully functional from the CLI and the interim RenderPanel rows before this phase runs; Phase 6 only re-homes and upgrades the UI.
 

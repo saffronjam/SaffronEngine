@@ -1,6 +1,6 @@
 # Phase 5 — Creative 3D LUT: `.cube` import, post-tonemap apply, bake
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of `plans/post-processing/` (bloom + color grading as one post subsystem). This is the fifth phase, built directly on Phase 3's folded grade — it depends on the per-view grade uniform buffer and the `set-color-grading` / `SetColorGradingParams` seam Phase 3 lands, and does **not** depend on the tonal-range work in Phase 4. It adds the industry-standard *creative look* stage that shipping engines put **after** the view transform: a display-referred `.cube` 3D LUT sampled tetrahedrally on the bounded `[0,1]` output and dialled in by intensity, imported into the asset catalog. It then adds the **bake** — a GPU pass that folds the view transform + creative LUT + a frozen grade into a single `33³` log2-shaper LUT for the exported `saffron-player` and for ingesting external full-tail `.cube` looks. This is the classic game color-LUT (Unity `Color Lookup`, Godot `adjustment_*`, UE color-grading LUT) done correctly: the grade stays scene-referred ALU (Phase 3), the *look* is a bounded display-space table.
 

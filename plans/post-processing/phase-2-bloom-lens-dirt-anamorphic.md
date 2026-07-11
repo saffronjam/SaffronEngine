@@ -1,6 +1,6 @@
 # Phase 2 — Bloom polish: lens dirt, anamorphic streaks, per-mip tint
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of `plans/post-processing/` (an energy-conserving bloom pyramid + a scene-referred grade on the display-extent `color` target). This is the second phase, layered directly on Phase 1's core pyramid. It adds three art-direction controls over the *same* pre/post compositing — a lens-dirt mask multiplied into the accumulated bloom, horizontally-squeezed anamorphic streaks added over the radial result, and an optional per-mip tint applied during upsample — without introducing a second bloom command, a second push struct, or a second persistence block. It does **not** touch the color grade (Phases 3–5), and it explicitly leaves the blur stage swappable so FFT convolution bloom can replace it later (Future) with no compositing rewrite.
 

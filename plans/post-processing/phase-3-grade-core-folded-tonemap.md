@@ -1,6 +1,6 @@
 # Phase 3 — Color grade core, folded into the tonemap pass
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Part of `plans/post-processing/` (an energy-conserving bloom pyramid + a scene-referred color grade on the display-extent `color` target). This is the grade-core phase; like the bloom core it **stands alone and ships independently** — it folds into the tonemap compute pass that already exists, so it needs none of the bloom passes. It adds a scene-linear grade (white balance, contrast-around-pivot, saturation, global ASC-CDL) that runs immediately before `tonemapAndEncode`, driven by a **per-view grade uniform buffer** bound to the tonemap descriptor set, and relabels the tonemap operator selector as a **view/display transform**. Phases 4 (per-range CDL, channel mixer, split-tone) and 5 (creative `.cube` LUT) extend the same stage and the same UBO; nothing here blocks them, and the UBO transport is chosen up front precisely so Phase 4 needs no push-size rewrite.
 

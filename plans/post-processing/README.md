@@ -1,6 +1,6 @@
 # Post-processing (bloom & color grading)
 
-**Status:** NOT STARTED
+**Status:** COMPLETED
 
 Emissive materials, speculars, and the sun already write unbounded radiance into the linear-HDR scene target, but nothing spreads that energy — a bright pixel stays a pinpoint, and the only tone control the image gets is a single exposure multiply plus a fixed display operator. This planset adds a **post-processing subsystem** — an energy-conserving bloom mip-pyramid and a scene-referred color grade — inserted into the existing post chain on the display-extent `color` target. Bloom runs as new compute passes strictly *before* the tonemap pass so the glow lives in scene-linear radiance; the grade folds *into* the existing tonemap compute pass ahead of the display transform, with a post-tonemap creative `.cube` LUT slot for looks. The anti-pattern being removed is "the tonemap operator is the whole tone stage": the operator selector is reframed as a **view/display transform**, and look decisions move to a proper grade in front of it — one scene-linear grade feeds SDR and any future HDR view identically.
 
