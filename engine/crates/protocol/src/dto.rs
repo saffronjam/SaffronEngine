@@ -165,6 +165,7 @@ pub enum AddEntityPreset {
     DirectionalLight,
     Camera,
     ReflectionProbe,
+    FogVolume,
 }
 
 /// What a viewport pick resolved to.
@@ -204,6 +205,27 @@ pub enum GizmoPointerPhase {
     Begin,
     Drag,
     End,
+}
+
+/// The fog backend: the analytic closed form, or the froxel volumetric pipeline. In `Volumetric` the
+/// analytic height density becomes the froxel base medium — it is never applied twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum FogMode {
+    Analytic,
+    Volumetric,
+}
+
+/// The froxel-grid quality tier for volumetric fog: how many froxels the volume carries. Z is the
+/// expensive axis, so `low`/`medium` share the Z count and only `high` doubles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum FogQuality {
+    Low,
+    Medium,
+    High,
 }
 
 /// The anti-aliasing mode.
@@ -250,6 +272,7 @@ pub enum ViewModeDto {
     Gi,
     LightComplexity,
     MotionVectors,
+    Fog,
 }
 
 /// The asset slot an `assign-asset` targets.
@@ -286,6 +309,7 @@ pub enum AssetTypeDto {
     Animation,
     Material,
     Model,
+    Lut,
 }
 
 /// The profiler capture mode.
@@ -428,6 +452,32 @@ pub struct RenderStatsDto {
     pub bindless_free: i32,
     pub hdr: bool,
     pub exposure_ev: f32,
+    /// The scene-linear color grade folded into the tonemap pass (the panel reads live grade state
+    /// from here, not the `set-color-grading` echo).
+    pub color_grading: SetColorGradingParams,
+    /// The resolved creative look-up table state (asset + intensity + size), `None` when no look is
+    /// assigned. The panel's size/interp readout resolves from here.
+    pub creative_lut: Option<CreativeLutStat>,
+    /// Whether the pre-tonemap scene-linear bloom pyramid is enabled.
+    pub bloom_enabled: bool,
+    /// The energy-conserving bloom composite weight.
+    pub bloom_intensity: f32,
+    /// The bloom tent-upsample scatter radius (UV units).
+    pub bloom_scatter: f32,
+    /// The bloom tint (multiplies the composited bloom).
+    pub bloom_tint: [f32; 3],
+    /// The bloom soft-knee prefilter threshold (`0.0` = thresholdless).
+    pub bloom_threshold: f32,
+    /// The lens-dirt mask asset id (`0` = none).
+    pub bloom_dirt_texture: Uuid,
+    /// The lens-dirt mix fraction.
+    pub bloom_dirt_intensity: f32,
+    /// The lens-dirt tint.
+    pub bloom_dirt_tint: [f32; 3],
+    /// The anamorphic streak block (a horizontally-squeezed blur added over the radial bloom).
+    pub bloom_anamorphic: AnamorphicParams,
+    /// The per-upsample-step tint stack (empty when off).
+    pub bloom_per_mip_tint: Vec<[f32; 3]>,
     pub aa: AaModeDto,
     pub view_mode: ViewModeDto,
 }
@@ -1612,6 +1662,22 @@ pub struct ImportTextureResult {
     pub texture: Uuid,
 }
 
+/// Params for `import-lut`: the path to a creative `.cube` look to import as a LUT asset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ImportLutParams {
+    pub path: String,
+}
+
+/// The `import-lut` result: the registered creative-LUT asset id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ImportLutResult {
+    pub lut: Uuid,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2488,6 +2554,74 @@ pub struct SetAtmosphereParams {
     pub sun_disk_intensity: Option<f32>,
 }
 
+/// A partial merge onto `environment.fog` — the analytic height & distance fog. Each `Some` field
+/// overwrites its key; `json` is an escape hatch merged first. Reply is the opaque [`EnvironmentDto`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetFogParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<FogMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<FogQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_blend: Option<f32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub neighborhood_clamp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_clamp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_density: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scatter_albedo: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_g: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub density: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub albedo: Option<Vec3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_falloff: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_opacity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emissive: Option<Vec3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directional_color: Option<Vec3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directional_exponent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer2_density: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer2_falloff: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer2_height: Option<f32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub aerial_perspective: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aerial_intensity: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -3193,6 +3327,258 @@ pub struct SetExposureParams {
 #[ts(export)]
 pub struct SetExposureResult {
     pub exposure_ev: f32,
+}
+
+/// One masked correction range (Shadows / Midtones / Highlights) of the grade: an ASC-CDL SOP triplet
+/// plus a saturation and a contrast, blended by a smooth luma mask. Neutral is slope `[1, 1, 1]`,
+/// offset `[0, 0, 0]`, power `[1, 1, 1]`, saturation/contrast `1.0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GradeRangeDto {
+    /// ASC-CDL slope (S); `[1, 1, 1]` neutral.
+    pub slope: [f32; 3],
+    /// ASC-CDL offset (O); `[0, 0, 0]` neutral.
+    pub offset: [f32; 3],
+    /// ASC-CDL power (P); `[1, 1, 1]` neutral.
+    pub power: [f32; 3],
+    /// Saturation around Rec.709 luma; `1.0` neutral.
+    pub saturation: f32,
+    /// Contrast gain around the middle-grey pivot; `1.0` neutral.
+    pub contrast: f32,
+}
+
+impl Default for GradeRangeDto {
+    /// The identity range (a zeroed derive would crush the range to black).
+    fn default() -> Self {
+        Self {
+            slope: [1.0, 1.0, 1.0],
+            offset: [0.0, 0.0, 0.0],
+            power: [1.0, 1.0, 1.0],
+            saturation: 1.0,
+            contrast: 1.0,
+        }
+    }
+}
+
+/// The split-tone block of the grade: a shadow tint + a highlight tint blended by luma, biased by a
+/// balance knob. Neutral tints are `[0.5, 0.5, 0.5]` (a 1× multiply) with balance `0.0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SplitToneDto {
+    /// Shadow tint; `[0.5, 0.5, 0.5]` neutral.
+    pub shadow: [f32; 3],
+    /// Highlight tint; `[0.5, 0.5, 0.5]` neutral.
+    pub highlight: [f32; 3],
+    /// Luma pivot bias; `0.0` neutral.
+    pub balance: f32,
+}
+
+impl Default for SplitToneDto {
+    /// The neutral split (0.5 tints multiply by 1).
+    fn default() -> Self {
+        Self {
+            shadow: [0.5, 0.5, 0.5],
+            highlight: [0.5, 0.5, 0.5],
+            balance: 0.0,
+        }
+    }
+}
+
+/// Params for `set-color-grading`: the scene-linear grade folded into the tonemap pass before the
+/// view/display transform. Flat (so `sa` positional/named folding works) and `#[serde(default)]` over
+/// a neutral identity, so a partial `sa` call leaves unspecified fields neutral. Slope/offset/power is
+/// the canonical ASC-CDL SOP; the editor surfaces it as Lift/Gamma/Gain (a display reparametrization).
+/// The global ops are followed by three masked Shadows/Midtones/Highlights ranges, a row-major 3×3
+/// channel mixer, and split-toning — one grade, one command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct SetColorGradingParams {
+    /// White-balance temperature in Kelvin; `6500` neutral.
+    pub temperature: f32,
+    /// White-balance tint: green (`-`) / magenta (`+`).
+    pub tint: f32,
+    /// Contrast gain around the log2 pivot; `1.0` neutral.
+    pub contrast: f32,
+    /// The middle-grey contrast pivot (`0.18`).
+    pub pivot: f32,
+    /// Saturation around Rec.709 luma; `1.0` neutral.
+    pub saturation: f32,
+    /// ASC-CDL slope (S); `[1, 1, 1]` neutral.
+    pub slope: [f32; 3],
+    /// ASC-CDL offset (O); `[0, 0, 0]` neutral.
+    pub offset: [f32; 3],
+    /// ASC-CDL power (P); `[1, 1, 1]` neutral.
+    pub power: [f32; 3],
+    /// The shadows correction range.
+    pub shadows: GradeRangeDto,
+    /// The midtones correction range.
+    pub midtones: GradeRangeDto,
+    /// The highlights correction range.
+    pub highlights: GradeRangeDto,
+    /// Luma where the shadow mask reaches zero (`~0.09`).
+    pub shadows_max: f32,
+    /// Luma where the highlight mask begins to rise (`~0.5`).
+    pub highlights_min: f32,
+    /// Row-major 3×3 channel mixer; identity by default.
+    pub channel_mixer: [f32; 9],
+    /// The split-tone block.
+    pub split_tone: SplitToneDto,
+    /// The display-space creative `.cube` look asset (`0` = none), sampled tetrahedrally after the
+    /// view transform. Matches the bloom-dirt convention (`0` clears).
+    pub creative_lut_asset: Uuid,
+    /// The creative-look intensity in `[0, 1]` (`0` = neutral).
+    pub creative_lut_intensity: f32,
+}
+
+impl Default for SetColorGradingParams {
+    /// The neutral identity grade — the passthrough that renders an ungraded frame unchanged.
+    fn default() -> Self {
+        Self {
+            temperature: 6500.0,
+            tint: 0.0,
+            contrast: 1.0,
+            pivot: 0.18,
+            saturation: 1.0,
+            slope: [1.0, 1.0, 1.0],
+            offset: [0.0, 0.0, 0.0],
+            power: [1.0, 1.0, 1.0],
+            shadows: GradeRangeDto::default(),
+            midtones: GradeRangeDto::default(),
+            highlights: GradeRangeDto::default(),
+            shadows_max: 0.09,
+            highlights_min: 0.5,
+            channel_mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            split_tone: SplitToneDto::default(),
+            creative_lut_asset: Uuid(0),
+            creative_lut_intensity: 0.0,
+        }
+    }
+}
+
+/// The applied color grade, echoed by `set-color-grading` (the same flat fields the panel reads back
+/// from `render-stats`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetColorGradingResult {
+    pub temperature: f32,
+    pub tint: f32,
+    pub contrast: f32,
+    pub pivot: f32,
+    pub saturation: f32,
+    pub slope: [f32; 3],
+    pub offset: [f32; 3],
+    pub power: [f32; 3],
+    pub shadows: GradeRangeDto,
+    pub midtones: GradeRangeDto,
+    pub highlights: GradeRangeDto,
+    pub shadows_max: f32,
+    pub highlights_min: f32,
+    pub channel_mixer: [f32; 9],
+    pub split_tone: SplitToneDto,
+    pub creative_lut_asset: Uuid,
+    pub creative_lut_intensity: f32,
+}
+
+/// The resolved creative-look read-back on `render-stats`: the assigned `.cube`/`.slut` asset, its
+/// look intensity, and the table resolution the tonemap pass samples (`17`/`33`/`65`). `None` when no
+/// look is assigned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CreativeLutStat {
+    /// The creative-LUT asset id.
+    pub asset: Uuid,
+    /// The look intensity in `[0, 1]`.
+    pub intensity: f32,
+    /// The table resolution per axis.
+    pub size: u32,
+}
+
+/// Params for `bake-look`: fold the current grade + view transform + creative LUT into one `33³`
+/// log2-shaper `.slut` for the exported player. Optional `name` for the baked asset row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct BakeLookParams {
+    /// The baked LUT asset's display name (defaults to `"Baked Look"`).
+    pub name: Option<String>,
+}
+
+/// The `bake-look` result: the written `.slut`'s asset id, project-relative path, and resolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BakeLookResult {
+    /// The baked LUT asset id.
+    pub asset: Uuid,
+    /// The project-relative `.slut` path.
+    pub path: String,
+    /// The baked table resolution per axis (`33`).
+    pub size: u32,
+}
+
+/// The anamorphic-streak block of `set-bloom` / its read-back: a horizontally-squeezed blur of the
+/// bright pyramid (Bart Wronski) added over the radial bloom. `enabled` gates the streak passes;
+/// `ratio` is the horizontal squeeze (`~2`); `tint` colours it (cool by default); `intensity` is the
+/// add weight.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AnamorphicParams {
+    pub enabled: bool,
+    pub ratio: f32,
+    pub tint: [f32; 3],
+    pub intensity: f32,
+}
+
+/// Params for `set-bloom`: the pre-tonemap energy-conserving bloom pyramid plus its art-direction
+/// layers. `enabled` toggles the pass; `intensity` is the `lerp(hdr, bloom, intensity)` mix fraction
+/// (≈0.05); `scatter` is the tent-upsample radius in UV units (≈0.005); `tint` colours the bloom;
+/// `threshold` is a non-physical soft-knee prefilter (`0.0` = off, the thresholdless default). The
+/// optional art-direction fields are a patch — an absent field is unchanged: `dirtTexture` is the
+/// lens-dirt mask asset (id `0` clears it), `dirtIntensity`/`dirtTint` its mix + colour,
+/// `anamorphic` the streak block, and `perMipTint` the per-upsample-step tint stack.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetBloomParams {
+    pub enabled: bool,
+    pub intensity: f32,
+    pub scatter: f32,
+    pub tint: [f32; 3],
+    pub threshold: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirt_texture: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirt_intensity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirt_tint: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anamorphic: Option<AnamorphicParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_mip_tint: Option<Vec<[f32; 3]>>,
+}
+
+/// The applied bloom state, echoed by `set-bloom`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetBloomResult {
+    pub enabled: bool,
+    pub intensity: f32,
+    pub scatter: f32,
+    pub tint: [f32; 3],
+    pub threshold: f32,
+    /// The lens-dirt mask asset id (`0` = none).
+    pub dirt_texture: Uuid,
+    pub dirt_intensity: f32,
+    pub dirt_tint: [f32; 3],
+    pub anamorphic: AnamorphicParams,
+    pub per_mip_tint: Vec<[f32; 3]>,
 }
 
 /// Params for `set-tessellation-quality` — the runtime displacement-tessellation budget. Every field is
