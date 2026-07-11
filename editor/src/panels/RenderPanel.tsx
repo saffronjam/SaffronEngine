@@ -1,13 +1,13 @@
-/// The Render panel: the project's render configuration — anti-aliasing, the feature
-/// toggles, and tonemap exposure. These persist with the project (the engine serializes
-/// them into the `renderSettings` block and reapplies them on load), so they sit beside
-/// Environment as scene-presentation config, not in the Stats telemetry tool.
+/// The Render panel: the project's render configuration — anti-aliasing, quality, resolution, the
+/// view transform, target FPS, the feature toggles, exposure, and debug overlays. These persist with
+/// the project (the engine serializes them into the `renderSettings` block and reapplies them on
+/// load), so they sit beside Environment as scene-presentation config, not in the Stats telemetry
+/// tool. Bloom and the color grade live in the dedicated Post panel.
 ///
-/// Values are read with a shallow-selected subset of `renderStats` so the panel only
-/// re-renders when a config field actually changes — not on the 20 Hz render-stats poll
-/// that rewrites the full bag. A write optimistically folds the new value in (and the
-/// echoed result) so the control reflects the change at once; the reconcile poll re-reads
-/// the full bag right after.
+/// Values are read with a shallow-selected subset of `renderStats` so the panel only re-renders when
+/// a config field actually changes — not on the 20 Hz render-stats poll that rewrites the full bag. A
+/// write optimistically folds the new value in (and the echoed result) so the control reflects the
+/// change at once; the reconcile poll re-reads the full bag right after.
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { client } from "../control/client";
@@ -529,7 +529,7 @@ export function RenderPanel() {
 
           <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
             <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              Tonemap
+              View transform
             </Label>
             <Select value={cfg.tonemap} disabled={!ready} onValueChange={(v) => onTonemap(v)}>
               <SelectTrigger size="sm" className="h-7 w-[112px] font-mono text-[11px]">
