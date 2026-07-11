@@ -50,6 +50,16 @@ pub const DEFAULT_WHITE_SLOT: u32 = 0;
 /// Hard cap on reflection probes. The IBL set's probe-cube arrays are sized to it.
 pub const MAX_REFLECTION_PROBES: u32 = 8;
 
+/// The maximum bloom mip-pyramid depth (≈6 levels at 1080p, 7 at 1440p+). The transient chain,
+/// the per-view bloom descriptor sets, and the mip-key table are all sized against this.
+pub(crate) const MAX_BLOOM_MIPS: usize = 7;
+
+/// The per-frame-in-flight bloom descriptor-set count: one set per pyramid pass —
+/// `MAX_BLOOM_MIPS` downsamples + `MAX_BLOOM_MIPS - 1` upsamples + one composite (`2 *
+/// MAX_BLOOM_MIPS - 1`) plus the two anamorphic streak ping-pong passes. The set stride, the pool
+/// budget, and the per-view allocation are all sized against it.
+pub(crate) const BLOOM_PASSES_PER_FRAME: usize = 2 * MAX_BLOOM_MIPS + 2;
+
 /// The number of editor render views (scene + asset-preview + offscreen thumbnail). The
 /// general descriptor pool sizes its per-view post-process headroom against this.
 const VIEW_COUNT: u32 = 3;
@@ -91,7 +101,9 @@ pub struct Descriptors {
     restir_mesh_set_layout: Option<vk::DescriptorSetLayout>,
     cluster_set_layout: vk::DescriptorSetLayout,
     tonemap_set_layout: vk::DescriptorSetLayout,
+    fog_set_layout: vk::DescriptorSetLayout,
     fxaa_set_layout: vk::DescriptorSetLayout,
+    bloom_set_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
     depth_upscale_set_layout: vk::DescriptorSetLayout,
 
@@ -186,7 +198,9 @@ impl Descriptors {
         }
         partial.cluster_set_layout = Some(create_cluster_layout(raw)?);
         partial.tonemap_set_layout = Some(create_tonemap_layout(raw)?);
+        partial.fog_set_layout = Some(create_fog_layout(raw)?);
         partial.fxaa_set_layout = Some(create_fxaa_layout(raw)?);
+        partial.bloom_set_layout = Some(create_bloom_layout(raw)?);
         partial.taa_set_layout = Some(create_taa_layout(raw)?);
         partial.depth_upscale_set_layout = Some(create_depth_upscale_layout(raw)?);
 
@@ -240,7 +254,9 @@ impl Descriptors {
             restir_mesh_set_layout: partial.restir_mesh_set_layout.take(),
             cluster_set_layout: partial.take_cluster_set_layout(),
             tonemap_set_layout: partial.take_tonemap_set_layout(),
+            fog_set_layout: partial.take_fog_set_layout(),
             fxaa_set_layout: partial.take_fxaa_set_layout(),
+            bloom_set_layout: partial.take_bloom_set_layout(),
             taa_set_layout: partial.take_taa_set_layout(),
             depth_upscale_set_layout: partial.take_depth_upscale_set_layout(),
             descriptor_pool: partial.take_descriptor_pool(),
@@ -318,9 +334,20 @@ impl Descriptors {
         self.tonemap_set_layout
     }
 
+    /// The height-fog compute layout: offscreen storage image (0), the fog params UBO (1, a
+    /// dynamic-offset UBO), the scene depth (2), and the sky-view LUT (3).
+    pub fn fog_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.fog_set_layout
+    }
+
     /// The FXAA compute layout (sampler source + storage-image target).
     pub fn fxaa_set_layout(&self) -> vk::DescriptorSetLayout {
         self.fxaa_set_layout
+    }
+
+    /// The bloom compute layout (sampler source + storage-image target), one set per pyramid pass.
+    pub fn bloom_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.bloom_set_layout
     }
 
     /// The TAA resolve compute layout (current/history/motion samplers + offscreen/
@@ -719,6 +746,36 @@ impl Descriptors {
         }
     }
 
+    /// Writes a `UNIFORM_BUFFER_DYNAMIC` binding into `(set, binding)` over one `range`-byte slice —
+    /// the per-view grade UBO on the tonemap set. `range` is the aligned size of one element; the
+    /// dispatch supplies the per-frame `frame * range` dynamic offset at bind time, so one set serves
+    /// every frame-in-flight without a per-frame rewrite. Written once at view build (single-threaded).
+    pub fn write_dynamic_uniform_buffer(
+        &self,
+        set: vk::DescriptorSet,
+        binding: u32,
+        buffer: vk::Buffer,
+        range: vk::DeviceSize,
+    ) {
+        let buffer_info = [vk::DescriptorBufferInfo {
+            buffer,
+            offset: 0,
+            range,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(binding)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .buffer_info(&buffer_info);
+        // SAFETY: the ash seam. The set + buffer outlive the call; the write targets a single binding
+        // the set's layout declares.
+        unsafe {
+            self.resources
+                .device()
+                .update_descriptor_sets(&[write], &[]);
+        }
+    }
+
     /// The number of bindless slots ever handed out (the high-water mark). Slot 0 (the
     /// default white) is counted, so this is `>= 1` after init.
     pub fn texture_count(&self) -> u32 {
@@ -759,7 +816,9 @@ impl Drop for Descriptors {
             }
             raw.destroy_descriptor_set_layout(self.cluster_set_layout, None);
             raw.destroy_descriptor_set_layout(self.tonemap_set_layout, None);
+            raw.destroy_descriptor_set_layout(self.fog_set_layout, None);
             raw.destroy_descriptor_set_layout(self.fxaa_set_layout, None);
+            raw.destroy_descriptor_set_layout(self.bloom_set_layout, None);
             raw.destroy_descriptor_set_layout(self.taa_set_layout, None);
             raw.destroy_descriptor_set_layout(self.depth_upscale_set_layout, None);
             raw.destroy_sampler(self.linear_sampler, None);
@@ -790,7 +849,9 @@ struct Partial<'a> {
     restir_mesh_set_layout: Option<vk::DescriptorSetLayout>,
     cluster_set_layout: Option<vk::DescriptorSetLayout>,
     tonemap_set_layout: Option<vk::DescriptorSetLayout>,
+    fog_set_layout: Option<vk::DescriptorSetLayout>,
     fxaa_set_layout: Option<vk::DescriptorSetLayout>,
+    bloom_set_layout: Option<vk::DescriptorSetLayout>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
     depth_upscale_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
@@ -827,7 +888,9 @@ impl<'a> Partial<'a> {
             restir_mesh_set_layout: None,
             cluster_set_layout: None,
             tonemap_set_layout: None,
+            fog_set_layout: None,
             fxaa_set_layout: None,
+            bloom_set_layout: None,
             taa_set_layout: None,
             depth_upscale_set_layout: None,
             descriptor_pool: None,
@@ -848,7 +911,9 @@ impl<'a> Partial<'a> {
         take_ddgi_mesh_set_layout => ddgi_mesh_set_layout: vk::DescriptorSetLayout,
         take_cluster_set_layout => cluster_set_layout: vk::DescriptorSetLayout,
         take_tonemap_set_layout => tonemap_set_layout: vk::DescriptorSetLayout,
+        take_fog_set_layout => fog_set_layout: vk::DescriptorSetLayout,
         take_fxaa_set_layout => fxaa_set_layout: vk::DescriptorSetLayout,
+        take_bloom_set_layout => bloom_set_layout: vk::DescriptorSetLayout,
         take_taa_set_layout => taa_set_layout: vk::DescriptorSetLayout,
         take_depth_upscale_set_layout => depth_upscale_set_layout: vk::DescriptorSetLayout,
         take_descriptor_pool => descriptor_pool: vk::DescriptorPool,
@@ -881,7 +946,9 @@ impl Drop for Partial<'_> {
                 self.restir_mesh_set_layout,
                 self.cluster_set_layout,
                 self.tonemap_set_layout,
+                self.fog_set_layout,
                 self.fxaa_set_layout,
+                self.bloom_set_layout,
                 self.taa_set_layout,
                 self.depth_upscale_set_layout,
             ]
@@ -1094,6 +1161,15 @@ fn create_light_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
             .descriptor_type(uniform)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+        // Froxel volumetric-fog integration volume (binding 11): the integrated `(inScatter,
+        // transmittance)` grid, sampled trilinearly by the forward transparent path so translucent
+        // surfaces receive the same volumetric fog the composite applies to opaque geometry. FRAGMENT
+        // only — the fog-inject compute pass reuses this layout for its light set but never reads it.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(11)
+            .descriptor_type(sampler)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1103,13 +1179,15 @@ fn create_light_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     )
 }
 
-/// One fragment-stage binding of `kind` at `slot`, count 1 — the light set's shape.
+/// One binding of `kind` at `slot`, count 1 — the light set's shape. FRAGMENT for the mesh forward
+/// shade, plus COMPUTE so the froxel fog-inject pass can bind the same per-frame light set (globals,
+/// lights, clusters, cluster params, and the four shadow maps) into its compute pipeline.
 fn light_binding(slot: u32, kind: vk::DescriptorType) -> vk::DescriptorSetLayoutBinding<'static> {
     vk::DescriptorSetLayoutBinding::default()
         .binding(slot)
         .descriptor_type(kind)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE)
 }
 
 /// Set 2: per-instance array (vertex) + joint palette (vertex) + per-material params
@@ -1253,14 +1331,47 @@ fn create_cluster_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     )
 }
 
-/// The tonemap compute set: one storage image (the offscreen color) bound in GENERAL.
+/// The tonemap compute set: the offscreen color as a storage image in GENERAL (0), the per-view grade
+/// uniform as a dynamic-offset UBO (1) whose per-frame slice the dispatch selects, and the creative
+/// look 3D LUT (2) sampled tetrahedrally after the view transform (an always-bound identity ramp when
+/// no look is assigned, so the shader never branches on presence).
 fn create_tonemap_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    let bindings = [compute_binding(0, vk::DescriptorType::STORAGE_IMAGE)];
+    let bindings = [
+        compute_binding(0, vk::DescriptorType::STORAGE_IMAGE),
+        compute_binding(1, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC),
+        compute_binding(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+    ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
     checked(
         unsafe { raw.create_descriptor_set_layout(&info, None) },
         "tonemapSetLayout",
+    )
+}
+
+/// The height-fog compute set: the offscreen storage image (0), the fog params UBO (1, a
+/// dynamic-offset slice), the scene depth (2), and the sky-view LUT (3) — both combined image
+/// samplers.
+fn create_fog_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [
+        compute_binding(0, vk::DescriptorType::STORAGE_IMAGE),
+        compute_binding(1, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC),
+        compute_binding(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        // The integrated froxel volume, sampled trilinearly in `fog.mode == volumetric`. Bound to the
+        // fog module's fixed-size integration volume, so this descriptor is always valid (the shader
+        // statically references it even in analytic mode, where the branch never samples it).
+        compute_binding(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        // The aerial-perspective volume (Hillaire 2020), sampled trilinearly when the atmosphere is
+        // live + AP is authored. Bound to the fixed-size AP volume, always a valid descriptor (the
+        // shader gates the sample on `aerial.x`, so it is untouched when AP is off).
+        compute_binding(5, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+    ];
+    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: the ash seam.
+    checked(
+        unsafe { raw.create_descriptor_set_layout(&info, None) },
+        "fogSetLayout",
     )
 }
 
@@ -1275,6 +1386,26 @@ fn create_fxaa_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     checked(
         unsafe { raw.create_descriptor_set_layout(&info, None) },
         "fxaaSetLayout",
+    )
+}
+
+/// The bloom compute set: a linear-sampled source (0) + a storage-image target (1), plus the
+/// lens-dirt mask (2) and the anamorphic streak buffer (3) the composite pass samples. Every
+/// pyramid pass — downsample, tent upsample, streak, composite — binds one such set; the
+/// non-composite passes point 2/3 at a harmless fallback view (the mask/streak are only sampled in
+/// the composite branch), so a single layout serves the whole chain.
+fn create_bloom_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [
+        compute_binding(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(1, vk::DescriptorType::STORAGE_IMAGE),
+        compute_binding(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+    ];
+    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: the ash seam.
+    checked(
+        unsafe { raw.create_descriptor_set_layout(&info, None) },
+        "bloomSetLayout",
     )
 }
 
@@ -1336,10 +1467,28 @@ fn compute_binding(slot: u32, kind: vk::DescriptorType) -> vk::DescriptorSetLayo
 fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
     let frames = crate::frame::MAX_FRAMES_IN_FLIGHT as u32;
     let views = VIEW_COUNT;
+    // Bloom binds one set per pyramid pass (up to `BLOOM_PASSES_PER_FRAME` per view), and its mip
+    // images come from the per-frame-in-flight transient pool, so the sets are allocated per frame
+    // slot too — `BLOOM_PASSES_PER_FRAME * frames * views` sets. Each set has three combined-image
+    // samplers (source + dirt mask + streak) and one storage image (target).
+    let bloom_sets = BLOOM_PASSES_PER_FRAME as u32 * frames * views;
     let pool_sizes = [
-        pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1024),
+        pool_size(
+            // +views for the creative-look 3D LUT (binding 2 of each per-view tonemap set), +1 for the
+            // transient look-bake set (a tonemap-layout set allocated + freed per `bake-look`), +3*views
+            // for the per-view fog set's depth + sky-view-LUT + froxel-integration samplers (2 + 3 + 4),
+            // +frames for the froxel-integration sampler (binding 11) on each frame's light set.
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            1024 + 3 * bloom_sets + views + 1 + 3 * views + frames,
+        ),
         // +frames for the GDF cascade-params UBO (binding 10) on each frame's light set.
         pool_size(vk::DescriptorType::UNIFORM_BUFFER, 5 * frames + 8),
+        // One dynamic-offset grade UBO per view (binding 1 of the tonemap set), +1 for the transient
+        // look-bake set, +views for the per-view fog params UBO (binding 1 of the fog set).
+        pool_size(
+            vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+            views + 1 + views,
+        ),
         // +8 for the device-shared GDF cull + composite sets (two storage buffers each).
         pool_size(
             vk::DescriptorType::STORAGE_BUFFER,
@@ -1350,8 +1499,10 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
         // storage images (each: trace out + blur out + two accum sets = 6, so 12 total) on top of
         // the SSGI/AA sets, plus the TAA lock-write storage image (binding 8).
         pool_size(
+            // +1 for the transient look-bake set's storage output image (binding 0), +views for the
+            // per-view fog set's offscreen storage image (binding 0).
             vk::DescriptorType::STORAGE_IMAGE,
-            48 + 29 * views + (crate::GDF_CASCADES + 1) * frames,
+            48 + 29 * views + bloom_sets + (crate::GDF_CASCADES + 1) * frames + 1 + views,
         ),
         pool_size(
             vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -1360,7 +1511,7 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
     ];
     let info = vk::DescriptorPoolCreateInfo::default()
         .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-        .max_sets(1024 + 8 * frames + 64 + 21 * views)
+        .max_sets(1024 + 8 * frames + 64 + 21 * views + bloom_sets + 1 + views)
         .pool_sizes(&pool_sizes);
     // SAFETY: the ash seam. The pool is owned and freed in teardown.
     checked(
