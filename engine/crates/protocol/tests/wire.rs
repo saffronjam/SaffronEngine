@@ -60,6 +60,7 @@ fn enum_wire_spellings_match_cpp_table() {
     check!(ViewModeDto::Roughness, "roughness");
     check!(ViewModeDto::Metallic, "metallic");
     check!(ViewModeDto::Emissive, "emissive");
+    check!(ViewModeDto::Fog, "fog");
 
     check!(AssetSlotDto::Mesh, "mesh");
     check!(AssetSlotDto::Albedo, "albedo");
@@ -78,6 +79,7 @@ fn enum_wire_spellings_match_cpp_table() {
     check!(AssetTypeDto::Animation, "animation");
     check!(AssetTypeDto::Material, "material");
     check!(AssetTypeDto::Model, "model");
+    check!(AssetTypeDto::Lut, "lut");
 
     check!(ProfilerModeDto::Off, "off");
     check!(ProfilerModeDto::Timestamps, "timestamps");
