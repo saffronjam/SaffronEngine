@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use ash::vk;
-use saffron_geometry::glam::{Mat4, Vec2, Vec4};
+use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::Result;
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
@@ -91,6 +91,342 @@ pub struct TonemapPush {
 }
 
 const _: () = assert!(size_of::<TonemapPush>() == 8);
+
+/// One masked correction range (Shadows / Midtones / Highlights): an ASC-CDL SOP triplet plus a
+/// saturation and a contrast, blended into the frame by a smooth luma weight. Neutral is slope
+/// `[1, 1, 1]`, offset `[0, 0, 0]`, power `[1, 1, 1]`, saturation/contrast `1.0` — an identity that
+/// leaves the range untouched.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradeRange {
+    /// ASC-CDL slope (S); `[1, 1, 1]` neutral.
+    pub slope: [f32; 3],
+    /// ASC-CDL offset (O); `[0, 0, 0]` neutral.
+    pub offset: [f32; 3],
+    /// ASC-CDL power (P); `[1, 1, 1]` neutral.
+    pub power: [f32; 3],
+    /// Saturation around Rec.709 luma; `1.0` neutral.
+    pub saturation: f32,
+    /// Contrast gain around the middle-grey pivot; `1.0` neutral.
+    pub contrast: f32,
+}
+
+impl Default for GradeRange {
+    /// The identity range. Hand-written because a zeroed `power`/`slope` would crush the range to
+    /// black; this passthrough leaves a pixel in the range unchanged.
+    fn default() -> Self {
+        Self {
+            slope: [1.0; 3],
+            offset: [0.0; 3],
+            power: [1.0; 3],
+            saturation: 1.0,
+            contrast: 1.0,
+        }
+    }
+}
+
+/// Scene-linear grade state (canonical ASC-CDL SOP+Sat + white balance, three masked ranges, a 3×3
+/// channel mixer, and split-toning), applied in the tonemap pass after exposure and before the
+/// view/display transform. Exposure is *not* here — it stays the existing [`TonemapPush::exposure`]
+/// multiply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorGrade {
+    /// White-balance temperature in Kelvin; `6500` = neutral (identity).
+    pub temperature: f32,
+    /// White-balance tint: green (`-`) / magenta (`+`); `0` = neutral.
+    pub tint: f32,
+    /// Contrast gain around the log2 pivot; `1.0` neutral.
+    pub contrast: f32,
+    /// The middle-grey contrast pivot (`0.18`).
+    pub pivot: f32,
+    /// Saturation around Rec.709 luma; `1.0` neutral.
+    pub saturation: f32,
+    /// ASC-CDL slope (S); `[1, 1, 1]` neutral.
+    pub slope: [f32; 3],
+    /// ASC-CDL offset (O); `[0, 0, 0]` neutral.
+    pub offset: [f32; 3],
+    /// ASC-CDL power (P); `[1, 1, 1]` neutral.
+    pub power: [f32; 3],
+    /// The shadows correction range.
+    pub shadows: GradeRange,
+    /// The midtones correction range.
+    pub midtones: GradeRange,
+    /// The highlights correction range.
+    pub highlights: GradeRange,
+    /// Luma where the shadow mask reaches zero (`~0.09`).
+    pub shadows_max: f32,
+    /// Luma where the highlight mask begins to rise (`~0.5`).
+    pub highlights_min: f32,
+    /// Row-major 3×3 channel mixer; identity by default.
+    pub channel_mixer: [f32; 9],
+    /// Split-tone shadow tint; `[0.5, 0.5, 0.5]` neutral.
+    pub split_shadow: [f32; 3],
+    /// Split-tone highlight tint; `[0.5, 0.5, 0.5]` neutral.
+    pub split_highlight: [f32; 3],
+    /// Split-tone luma pivot bias; `0.0` neutral.
+    pub split_balance: f32,
+}
+
+impl Default for ColorGrade {
+    /// The neutral identity grade. Hand-written (not a `derive`) because a zeroed `pivot`/`power`
+    /// would render a black frame — this is the passthrough that keeps an ungraded project unchanged.
+    fn default() -> Self {
+        Self {
+            temperature: 6500.0,
+            tint: 0.0,
+            contrast: 1.0,
+            pivot: 0.18,
+            saturation: 1.0,
+            slope: [1.0; 3],
+            offset: [0.0; 3],
+            power: [1.0; 3],
+            shadows: GradeRange::default(),
+            midtones: GradeRange::default(),
+            highlights: GradeRange::default(),
+            shadows_max: 0.09,
+            highlights_min: 0.5,
+            channel_mixer: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            split_shadow: [0.5; 3],
+            split_highlight: [0.5; 3],
+            split_balance: 0.0,
+        }
+    }
+}
+
+/// One masked range as three std140 `vec4` rows: `slope.xyz` + saturation in `.w`, `offset.xyz` +
+/// contrast in `.w`, `power.xyz` + pad. Matches the `GradeBlockParams` unpack in `tonemap.slang`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GradeBlock {
+    slope: [f32; 4],
+    offset: [f32; 4],
+    power: [f32; 4],
+}
+
+impl From<&GradeRange> for GradeBlock {
+    fn from(r: &GradeRange) -> Self {
+        Self {
+            slope: [r.slope[0], r.slope[1], r.slope[2], r.saturation],
+            offset: [r.offset[0], r.offset[1], r.offset[2], r.contrast],
+            power: [r.power[0], r.power[1], r.power[2], 0.0],
+        }
+    }
+}
+
+/// The std140 image of the shader's grade uniform (`GradeUniform` in `tonemap.slang`): the Bradford
+/// white-balance matrix as three `vec4` rows, the global slope/offset/power as `xyz` + pad, the
+/// contrast/pivot/saturation scalars in one `vec4`, then the three masked ranges, the row-major 3×3
+/// channel mixer as three `vec4` rows, the two split-tone tints, and the range knobs. Bound at
+/// binding 1 of the tonemap set.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GradeUniform {
+    white_balance: [[f32; 4]; 3],
+    slope: [f32; 4],
+    offset: [f32; 4],
+    power: [f32; 4],
+    tonal: [f32; 4],
+    shadows: GradeBlock,
+    midtones: GradeBlock,
+    highlights: GradeBlock,
+    channel_mixer: [[f32; 4]; 3],
+    split_shadow: [f32; 4],
+    split_highlight: [f32; 4],
+    range_knobs: [f32; 4],
+    /// The creative-look block: `x` intensity, `y` LUT size (as `f32`, an exact `2/17/33/65`), `z` the
+    /// frozen-look view-mode flag (`0` live ALU host, `1` baked full-tail player), `w` pad.
+    look: [f32; 4],
+}
+
+const _: () = assert!(size_of::<GradeUniform>() == 368);
+
+impl From<&ColorGrade> for GradeUniform {
+    fn from(g: &ColorGrade) -> Self {
+        let m = bradford_white_balance(g.temperature, g.tint);
+        // The shader reconstructs `float3x3(row0, row1, row2)` (row-major) and does `mul(M, c)`, so
+        // each `vec4` here is a matrix row. glam `Mat3` is column-major, so row `i` gathers component
+        // `i` of the three column axes.
+        let row = |i: usize| [m.x_axis[i], m.y_axis[i], m.z_axis[i], 0.0];
+        // The channel mixer travels row-major; each `vec4` here is one output row (`out = M · rgb`).
+        let mixer_row = |i: usize| {
+            [
+                g.channel_mixer[i * 3],
+                g.channel_mixer[i * 3 + 1],
+                g.channel_mixer[i * 3 + 2],
+                0.0,
+            ]
+        };
+        Self {
+            white_balance: [row(0), row(1), row(2)],
+            slope: [g.slope[0], g.slope[1], g.slope[2], 0.0],
+            offset: [g.offset[0], g.offset[1], g.offset[2], 0.0],
+            power: [g.power[0], g.power[1], g.power[2], 0.0],
+            tonal: [g.contrast, g.pivot, g.saturation, 0.0],
+            shadows: GradeBlock::from(&g.shadows),
+            midtones: GradeBlock::from(&g.midtones),
+            highlights: GradeBlock::from(&g.highlights),
+            channel_mixer: [mixer_row(0), mixer_row(1), mixer_row(2)],
+            split_shadow: [g.split_shadow[0], g.split_shadow[1], g.split_shadow[2], 0.0],
+            split_highlight: [
+                g.split_highlight[0],
+                g.split_highlight[1],
+                g.split_highlight[2],
+                0.0,
+            ],
+            range_knobs: [g.shadows_max, g.highlights_min, g.split_balance, 0.0],
+            look: [0.0, 2.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// The baked look table resolution per axis (`33³`), matching the `lut_bake.slang` dispatch and the
+/// player's frozen-look fetch.
+pub const LUT_BAKE_SIZE: u32 = 33;
+/// The log2-shaper EV span the bake maps its grid against (anchored at 18% grey), shared with
+/// `tonemap_ops.slang` and written into the `.slut` header.
+pub const LUT_SHAPER_EV_MIN: f32 = -14.0;
+/// The upper end of the bake's log2-shaper EV span. See [`LUT_SHAPER_EV_MIN`].
+pub const LUT_SHAPER_EV_MAX: f32 = 11.0;
+
+impl GradeUniform {
+    /// Fills the creative-look block: the display-space LUT `intensity`, the LUT `size` (`2/17/33/65`),
+    /// and the `frozen_look` view-mode flag (`false` = the live ALU host, `true` = the baked full-tail
+    /// player). Applied after [`GradeUniform::from`] builds the grade rows, once the renderer has
+    /// resolved the bound LUT.
+    #[must_use]
+    pub fn with_look(mut self, intensity: f32, size: u32, frozen_look: bool) -> Self {
+        self.look = [intensity, size as f32, u32::from(frozen_look) as f32, 0.0];
+        self
+    }
+}
+
+/// The Bradford chromatic-adaptation matrix in linear Rec.709 that white-balances the scene: it
+/// adapts the working white (the `6500 K` reference on the Planckian locus) to the target white set
+/// by `temperature` + `tint`, so lowering the temperature warms the image. Neutral
+/// (`6500 K`, tint `0`) returns exactly [`Mat3::IDENTITY`] so the default grade is bit-identity.
+fn bradford_white_balance(temperature: f32, tint: f32) -> Mat3 {
+    if temperature == 6500.0 && tint == 0.0 {
+        return Mat3::IDENTITY;
+    }
+    // Bradford cone-response matrix (XYZ → LMS) and its inverse.
+    let bradford = Mat3::from_cols_array(&[
+        0.8951, -0.7502, 0.0389, // column 0
+        0.2664, 1.7135, -0.0685, // column 1
+        -0.1614, 0.0367, 1.0296, // column 2
+    ]);
+    // Linear sRGB (Rec.709, D65) ⇄ XYZ.
+    let xyz_from_rgb = Mat3::from_cols_array(&[
+        0.412_456_4,
+        0.212_672_9,
+        0.019_333_9, // column 0
+        0.357_576_1,
+        0.715_152_2,
+        0.119_192, // column 1
+        0.180_437_5,
+        0.072_175,
+        0.950_304_1, // column 2
+    ]);
+    let src = planckian_white_xyz(6500.0, 0.0);
+    let dst = planckian_white_xyz(temperature, tint);
+    let lms_src = bradford * src;
+    let lms_dst = bradford * dst;
+    let ratio = Mat3::from_diagonal(Vec3::new(
+        lms_dst.x / lms_src.x,
+        lms_dst.y / lms_src.y,
+        lms_dst.z / lms_src.z,
+    ));
+    let adapt_xyz = bradford.inverse() * ratio * bradford;
+    xyz_from_rgb.inverse() * adapt_xyz * xyz_from_rgb
+}
+
+/// The XYZ (Y = 1) of the white point at colour temperature `temp` (Kelvin) with a green/magenta
+/// `tint` offset. `temp` follows the Planckian-locus approximation (Kim et al.); `tint` shifts the
+/// chromaticity along the green(+)/magenta(−) axis.
+fn planckian_white_xyz(temp: f32, tint: f32) -> Vec3 {
+    let t = temp.clamp(1667.0, 25000.0) as f64;
+    let inv = 1.0 / t;
+    let x = if t < 4000.0 {
+        -0.266_123_9e9 * inv * inv * inv - 0.234_358_9e6 * inv * inv
+            + 0.877_695_6e3 * inv
+            + 0.179_910
+    } else {
+        -3.025_846_9e9 * inv * inv * inv
+            + 2.107_037_9e6 * inv * inv
+            + 0.222_634_7e3 * inv
+            + 0.240_390
+    };
+    let y = if t < 2222.0 {
+        -1.106_381_4 * x * x * x - 1.348_110_2 * x * x + 2.185_558_32 * x - 0.202_196_83
+    } else if t < 4000.0 {
+        -0.954_947_6 * x * x * x - 1.374_185_93 * x * x + 2.091_370_15 * x - 0.167_488_67
+    } else {
+        3.081_758_0 * x * x * x - 5.873_386_7 * x * x + 3.751_129_97 * x - 0.370_014_83
+    };
+    // Tint shifts the y chromaticity toward green (+) / magenta (−). A modest, bounded slope keeps
+    // the ±1 range within the perceptual green-magenta span.
+    let y = (y + f64::from(tint) * 0.05).clamp(1e-4, 0.9);
+    let x = x as f32;
+    let y = y as f32;
+    Vec3::new(x / y, 1.0, (1.0 - x - y) / y)
+}
+
+/// The bloom compute push, matching `bloom.slang`'s `Push`. One struct drives all four passes;
+/// `pass`/`karis` select the branch, so a single PSO covers the whole pyramid. Fields are grouped
+/// so every `float3` sits on a 16-byte boundary followed by its trailing scalar — that packs
+/// identically under `#[repr(C)]` here and Slang's std140 push-constant layout (five vec4 rows, 80
+/// bytes, no padding either way).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BloomPush {
+    /// The bloom tint (composite pass only).
+    pub tint: [f32; 3],
+    /// The tent-upsample scatter radius in UV units.
+    pub filter_radius: f32,
+    /// The energy-conserving lerp weight (composite pass only).
+    pub intensity: f32,
+    /// The soft-knee prefilter threshold; `0.0` = off (the default, thresholdless).
+    pub threshold: f32,
+    /// The pass selector: `0` downsample, `1` upsample-add, `2` composite, `3` anamorphic streak.
+    pub pass: u32,
+    /// `1` on the first downsample only (Karis firefly average), `0` otherwise.
+    pub karis: u32,
+    /// The lens-dirt tint; composite pass only.
+    pub dirt_tint: [f32; 3],
+    /// The lens-dirt mix (`0.0` = no dirt); composite pass only.
+    pub dirt_intensity: f32,
+    /// The per-mip contribution tint (identity `1,1,1` when the stack is off); upsample pass only.
+    pub mip_tint: [f32; 3],
+    /// The anamorphic streak add weight (`0.0` = no streak); composite pass only.
+    pub anamorphic_intensity: f32,
+    /// The anamorphic streak tint (cool by default); composite pass only.
+    pub anamorphic_tint: [f32; 3],
+    /// The anamorphic horizontal squeeze (`~2.0`); streak pass only.
+    pub anamorphic_ratio: f32,
+}
+
+const _: () = assert!(size_of::<BloomPush>() == 80);
+
+impl BloomPush {
+    /// A push with identity art-direction: white tints, no dirt/streak, `pass`/`karis` zero. The
+    /// per-pass construction in [`crate::Renderer::add_bloom_pass`] fills it via struct-update
+    /// syntax, setting only the fields the selected branch reads.
+    #[must_use]
+    pub fn identity() -> Self {
+        Self {
+            tint: [1.0; 3],
+            filter_radius: 0.0,
+            intensity: 0.0,
+            threshold: 0.0,
+            pass: 0,
+            karis: 0,
+            dirt_tint: [1.0; 3],
+            dirt_intensity: 0.0,
+            mip_tint: [1.0; 3],
+            anamorphic_intensity: 0.0,
+            anamorphic_tint: [1.0; 3],
+            anamorphic_ratio: 1.0,
+        }
+    }
+}
 
 impl TonemapPush {
     /// The tonemap push for `exposure_ev` stops + operator `mode`.
@@ -283,6 +619,7 @@ impl OverlayState {
 /// [`crate::Renderer::add_grid_overlay_passes`].
 #[cfg(test)]
 pub(crate) fn final_post_pass_names(
+    bloom_armed: bool,
     tonemap_built: bool,
     show_grid: bool,
     grid_built: bool,
@@ -290,6 +627,11 @@ pub(crate) fn final_post_pass_names(
     overlay_built: bool,
 ) -> Vec<&'static str> {
     let mut names = Vec::new();
+    // Bloom composites into scene-linear `color` immediately before the tonemap pass, so it leads
+    // the final-post chain when enabled.
+    if bloom_armed {
+        names.push("bloom-composite");
+    }
     if tonemap_built {
         names.push("tonemap");
     }
@@ -417,33 +759,42 @@ mod tests {
     fn final_post_chain_arms_tonemap_always_grid_and_overlay_conditionally() {
         // Tonemap only: nothing else armed.
         assert_eq!(
-            final_post_pass_names(true, false, false, false, false),
+            final_post_pass_names(false, true, false, false, false, false),
             vec!["tonemap"]
         );
         // Grid shown + built arms it after the tonemap.
         assert_eq!(
-            final_post_pass_names(true, true, true, false, false),
+            final_post_pass_names(false, true, true, true, false, false),
             vec!["tonemap", "grid"]
         );
         // Grid shown but its PSO failed to build → not armed (degrades, no panic).
         assert_eq!(
-            final_post_pass_names(true, true, false, false, false),
+            final_post_pass_names(false, true, true, false, false, false),
             vec!["tonemap"]
         );
         // Overlay geometry queued + built arms it last.
         assert_eq!(
-            final_post_pass_names(true, false, false, true, true),
+            final_post_pass_names(false, true, false, false, true, true),
             vec!["tonemap", "editor-overlay"]
         );
         // All three armed, in graph order.
         assert_eq!(
-            final_post_pass_names(true, true, true, true, true),
+            final_post_pass_names(false, true, true, true, true, true),
             vec!["tonemap", "grid", "editor-overlay"]
         );
         // Overlay geometry present but no PSO → not armed.
         assert_eq!(
-            final_post_pass_names(true, false, false, true, false),
+            final_post_pass_names(false, true, false, false, true, false),
             vec!["tonemap"]
+        );
+        // Bloom enabled leads the chain, ahead of the tonemap.
+        assert_eq!(
+            final_post_pass_names(true, true, false, false, false, false),
+            vec!["bloom-composite", "tonemap"]
+        );
+        assert_eq!(
+            final_post_pass_names(true, true, true, true, true, true),
+            vec!["bloom-composite", "tonemap", "grid", "editor-overlay"]
         );
     }
 
