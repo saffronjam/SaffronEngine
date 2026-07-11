@@ -108,6 +108,9 @@ pub struct Capabilities {
     /// (Phase 7's preferred path). Only meaningful when [`Capabilities::rt_supported`]. `false` forces
     /// the CPU worst-case / degenerate-pad build.
     pub acceleration_structure_indirect_build: bool,
+    /// `minUniformBufferOffsetAlignment` — the required alignment of a dynamic-UBO offset. The
+    /// per-view grade UBO packs one aligned `GradeUniform` per frame-in-flight against it.
+    pub min_uniform_buffer_offset_alignment: u64,
 }
 
 /// The GPU-timestamp profiler facts read once from the physical device at init,
@@ -1134,6 +1137,7 @@ fn probe_optional_features(
         multi_draw_indirect,
         draw_indirect_count,
         acceleration_structure_indirect_build,
+        min_uniform_buffer_offset_alignment: props.limits.min_uniform_buffer_offset_alignment,
     }
 }
 
