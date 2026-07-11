@@ -77,6 +77,122 @@ impl Default for AtmosphereSettings {
     }
 }
 
+/// The fog backend: the always-on analytic closed form, or the frustum-aligned froxel volumetric
+/// pipeline. In `Volumetric` the analytic height density is injected as the froxel base medium — it
+/// is never applied twice (the two backends share one transmittance ledger, no double-count).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FogMode {
+    /// The Phase-1 closed-form exponential height/distance integral (the default).
+    #[default]
+    Analytic,
+    /// The Wronski/Hillaire froxel inject → integrate → composite path (shadowed god-rays).
+    Volumetric,
+}
+
+/// The froxel-grid quality tier for volumetric fog: how many froxels the volume carries. Z is the
+/// expensive axis (per-slice light eval), so `low`/`medium` share the Z count and only `high` doubles
+/// it; XY steps up for tile density.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FogQuality {
+    /// `128×72×64` — the coarse tier.
+    Low,
+    /// `160×90×64` — the default.
+    #[default]
+    Medium,
+    /// `160×90×128` — the full-resolution grid.
+    High,
+}
+
+/// Scene-wide analytic height & distance fog (exponential-density closed form).
+///
+/// Composites into scene-linear HDR before bloom. The broad layer plus an optional
+/// ground layer sum into one optical depth; `directional_*` adds a sun-through-haze lobe.
+/// The world up axis is `+Y`, so height is measured along `worldPos.y`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FogSettings {
+    /// Whether the fog composite runs.
+    pub enabled: bool,
+    /// The fog backend (analytic closed form vs. froxel volumetric).
+    pub mode: FogMode,
+    /// The froxel-grid quality tier for the volumetric path (grid dimensions).
+    pub quality: FogQuality,
+    /// Temporal history blend: the fresh-sample weight per frame for the froxel reprojection
+    /// (`0.05` default — 95% carried from last frame's linear scatter). `0` freezes the volume.
+    pub history_blend: f32,
+    /// Clamp the reprojected history to a band of the fresh sample (firefly / ghost suppression for
+    /// fast-moving lights). Off by default.
+    pub neighborhood_clamp: bool,
+    /// Cap each light's per-froxel in-scatter before accumulation (`0` = off) — kills the
+    /// single-froxel spike a bright light grazing a shadow edge injects.
+    pub light_clamp: f32,
+    /// Constant scattering-medium extinction floor for the volumetric path (`sigma_t` base).
+    pub base_density: f32,
+    /// Single-scattering albedo for the volumetric path (`sigma_s = albedo * sigma_t`).
+    pub scatter_albedo: f32,
+    /// Henyey-Greenstein phase anisotropy `g` for the volumetric path (forward-scattering `g > 0`).
+    pub phase_g: f32,
+    /// Broad-layer sigma at `height`.
+    pub density: f32,
+    /// In-scatter tint (multiplied by the sky-view LUT when the atmosphere is live).
+    pub albedo: Vec3,
+    /// World-up reference height of the broad layer.
+    pub height: f32,
+    /// Exponential density falloff with world-up distance.
+    pub height_falloff: f32,
+    /// Fog begins this far from the eye.
+    pub start_distance: f32,
+    /// Clamps `1 - transmittance`.
+    pub max_opacity: f32,
+    /// Constant in-medium emission.
+    pub emissive: Vec3,
+    /// Sun-through-haze lobe color.
+    pub directional_color: Vec3,
+    /// Lobe sharpness (~4..64).
+    pub directional_exponent: f32,
+    /// Ground-haze layer sigma; `0` disables it.
+    pub layer2_density: f32,
+    /// Ground-haze exponential density falloff.
+    pub layer2_falloff: f32,
+    /// Ground-haze world-up reference height.
+    pub layer2_height: f32,
+    /// Tint distant geometry with Hillaire-2020 aerial perspective (needs an active atmosphere; the
+    /// atmosphere's `enabled` gates whether the LUTs exist, so this is a no-op without one).
+    pub aerial_perspective: bool,
+    /// Aerial-perspective strength multiplier (scales the atmosphere in-scatter written to the AP
+    /// volume; a coherence knob, not an exposure control).
+    pub aerial_intensity: f32,
+}
+
+impl Default for FogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: FogMode::Analytic,
+            quality: FogQuality::Medium,
+            history_blend: 0.05,
+            neighborhood_clamp: false,
+            light_clamp: 0.0,
+            base_density: 0.02,
+            scatter_albedo: 0.9,
+            phase_g: 0.6,
+            density: 0.02,
+            albedo: Vec3::new(0.5, 0.6, 0.7),
+            height: 0.0,
+            height_falloff: 0.2,
+            start_distance: 0.0,
+            max_opacity: 1.0,
+            emissive: Vec3::ZERO,
+            directional_color: Vec3::new(1.0, 0.9, 0.7),
+            directional_exponent: 8.0,
+            layer2_density: 0.0,
+            layer2_falloff: 0.5,
+            layer2_height: 0.0,
+            aerial_perspective: false,
+            aerial_intensity: 1.0,
+        }
+    }
+}
+
 /// Scene-wide environment / sky state.
 ///
 /// The renderer resolves it into sky render settings each frame.
@@ -104,6 +220,8 @@ pub struct SceneEnvironment {
     pub ambient_intensity: f32,
     /// Physically based env-cube source (off = gradient).
     pub atmosphere: AtmosphereSettings,
+    /// Analytic height & distance fog composited into scene-linear HDR before bloom.
+    pub fog: FogSettings,
 }
 
 impl Default for SceneEnvironment {
@@ -120,6 +238,7 @@ impl Default for SceneEnvironment {
             ambient_color: Vec3::ONE,
             ambient_intensity: 0.15,
             atmosphere: AtmosphereSettings::default(),
+            fog: FogSettings::default(),
         }
     }
 }
@@ -143,6 +262,8 @@ pub enum AssetType {
     Material,
     /// A `.smodel` container (parent of its embedded mesh/material/texture sub-assets).
     Model,
+    /// A creative 3D look-up table (`.cube` import or a baked `.slut`).
+    Lut,
 }
 
 /// How a texture's bytes are interpreted on upload.
@@ -401,6 +522,30 @@ mod tests {
     }
 
     #[test]
+    fn fog_defaults() {
+        let f = FogSettings::default();
+        assert!(!f.enabled);
+        assert_eq!(f.quality, FogQuality::Medium);
+        assert_eq!(f.history_blend, 0.05);
+        assert!(!f.neighborhood_clamp);
+        assert_eq!(f.light_clamp, 0.0);
+        assert_eq!(f.density, 0.02);
+        assert_eq!(f.albedo, Vec3::new(0.5, 0.6, 0.7));
+        assert_eq!(f.height, 0.0);
+        assert_eq!(f.height_falloff, 0.2);
+        assert_eq!(f.start_distance, 0.0);
+        assert_eq!(f.max_opacity, 1.0);
+        assert_eq!(f.emissive, Vec3::ZERO);
+        assert_eq!(f.directional_color, Vec3::new(1.0, 0.9, 0.7));
+        assert_eq!(f.directional_exponent, 8.0);
+        assert_eq!(f.layer2_density, 0.0);
+        assert_eq!(f.layer2_falloff, 0.5);
+        assert_eq!(f.layer2_height, 0.0);
+        assert!(!f.aerial_perspective);
+        assert_eq!(f.aerial_intensity, 1.0);
+    }
+
+    #[test]
     fn scene_environment_defaults() {
         let e = SceneEnvironment::default();
         assert_eq!(e.sky_mode, SkyMode::Procedural);
@@ -414,6 +559,7 @@ mod tests {
         assert_eq!(e.ambient_color, Vec3::ONE);
         assert_eq!(e.ambient_intensity, 0.15);
         assert!(!e.atmosphere.enabled);
+        assert!(!e.fog.enabled);
     }
 
     #[test]
