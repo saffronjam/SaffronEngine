@@ -9,7 +9,7 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -22,8 +22,9 @@ use saffron_assets::{AssetServer, GpuUploader};
 use saffron_physics::World;
 use saffron_protocol::{PingParams, PingResult};
 use saffron_rendering::{
-    ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, PassTiming,
-    PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe, RenderStatsFull, ViewId, ViewMode,
+    ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, GpuLut,
+    GpuTexture, PassTiming, PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe,
+    RenderStatsFull, ViewId, ViewMode,
 };
 use saffron_sceneedit::SceneEditContext;
 use saffron_window::Window;
@@ -195,6 +196,72 @@ pub trait ControlRenderer {
     fn exposure_ev(&self) -> f32;
     /// Sets the tonemap exposure in stops.
     fn set_exposure(&mut self, ev: f32);
+
+    /// Sets the scene-linear color grade (white balance, contrast, saturation, ASC-CDL) folded into
+    /// the tonemap pass. Carries the wire DTO directly; the host maps it to the renderer's grade type.
+    fn set_color_grading(&mut self, params: saffron_protocol::SetColorGradingParams);
+    /// The current scene-linear color grade.
+    fn color_grading(&self) -> saffron_protocol::SetColorGradingParams;
+
+    /// Sets the display-space creative look-up table the tonemap pass samples after the view transform
+    /// (`id`/`lut` together; `id == 0` + `None` clears it to the identity default). The caller resolves
+    /// the asset id to a live [`GpuLut`]; `intensity` (in `[0, 1]`) rides the grade UBO.
+    fn set_creative_lut_texture(&mut self, id: u64, lut: Option<Arc<GpuLut>>, intensity: f32);
+    /// The resolved creative-LUT read-back: `(asset id, size, intensity)`, or `None` when none.
+    fn creative_lut(&self) -> Option<(u64, u32, f32)>;
+    /// Bakes the current grade + view transform + creative LUT into a `33³` display-referred table on
+    /// the GPU, returning `(size, red-fastest [r, g, b] f16 bits)` the caller serializes into a `.slut`.
+    fn bake_look_lut(&mut self) -> std::result::Result<(u32, Vec<[u16; 3]>), String>;
+
+    /// Sets the pre-tonemap bloom parameters (primitive-typed so the trait keeps no dependency on
+    /// rendering internals): the enable flag, the composite `intensity`, the tent-upsample
+    /// `scatter` radius, the `tint`, and the soft-knee `threshold`.
+    fn set_bloom(
+        &mut self,
+        enabled: bool,
+        intensity: f32,
+        scatter: f32,
+        tint: [f32; 3],
+        threshold: f32,
+    );
+    /// Whether the scene-linear bloom pyramid runs before the tonemap.
+    fn bloom_enabled(&self) -> bool;
+    /// The energy-conserving bloom composite weight.
+    fn bloom_intensity(&self) -> f32;
+    /// The bloom tent-upsample scatter radius (UV units).
+    fn bloom_scatter(&self) -> f32;
+    /// The bloom tint (multiplies the composited bloom).
+    fn bloom_tint(&self) -> [f32; 3];
+    /// The bloom soft-knee prefilter threshold (`0.0` = thresholdless).
+    fn bloom_threshold(&self) -> f32;
+
+    /// Sets the lens-dirt mask texture the bloom composite multiplies the pyramid by (`id`/`texture`
+    /// together; `id == 0` + `None` clears it). The caller resolves the asset id to a live GPU
+    /// texture; an absent texture binds the renderer's 1×1 white fallback (mask = 1 ⇒ identity).
+    fn set_bloom_dirt_texture(&mut self, id: u64, texture: Option<Arc<GpuTexture>>);
+    /// Sets the lens-dirt mix (`0.0` = no dirt) and its tint.
+    fn set_bloom_dirt_params(&mut self, intensity: f32, tint: [f32; 3]);
+    /// The lens-dirt mask asset id (`0` = none).
+    fn bloom_dirt_texture(&self) -> u64;
+    /// The lens-dirt mix fraction.
+    fn bloom_dirt_intensity(&self) -> f32;
+    /// The lens-dirt tint.
+    fn bloom_dirt_tint(&self) -> [f32; 3];
+    /// Sets the anamorphic streak: the `enabled` toggle, the horizontal `ratio` squeeze, the streak
+    /// `tint`, and the `intensity` add weight.
+    fn set_bloom_anamorphic(&mut self, enabled: bool, ratio: f32, tint: [f32; 3], intensity: f32);
+    /// Whether the anamorphic streak runs.
+    fn bloom_anamorphic_enabled(&self) -> bool;
+    /// The anamorphic horizontal squeeze.
+    fn bloom_anamorphic_ratio(&self) -> f32;
+    /// The anamorphic streak tint.
+    fn bloom_anamorphic_tint(&self) -> [f32; 3];
+    /// The anamorphic streak add weight.
+    fn bloom_anamorphic_intensity(&self) -> f32;
+    /// Sets the per-upsample-step tint stack (empty disables per-mip tinting).
+    fn set_bloom_mip_tint(&mut self, tint: Vec<[f32; 3]>);
+    /// The per-upsample-step tint stack.
+    fn bloom_mip_tint(&self) -> Vec<[f32; 3]>;
 
     /// The current GPU profiler mode.
     fn profiler_mode(&self) -> ProfilerMode;
