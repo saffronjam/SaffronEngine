@@ -82,6 +82,8 @@ export type {
   GizmoState,
   ImportModelResult,
   ImportTextureResult,
+  ImportLutParams,
+  ImportLutResult,
   InspectResult,
   ListClipsResult,
   ClipBindingsResult,
@@ -141,6 +143,15 @@ export type {
   SetEnvironmentParams,
   SetExposureParams,
   SetExposureResult,
+  SetBloomParams,
+  SetBloomResult,
+  GradeRangeDto,
+  SplitToneDto,
+  SetColorGradingParams,
+  SetColorGradingResult,
+  CreativeLutStat,
+  BakeLookParams,
+  BakeLookResult,
   SetGiParams,
   SetGiResult,
   SetGizmoParams,
@@ -214,6 +225,31 @@ export interface Environment {
     sunDiskAngularRadius: number;
     sunDiskIntensity: number;
   };
+  fog: {
+    enabled: boolean;
+    mode: "analytic" | "volumetric";
+    quality: "low" | "medium" | "high";
+    historyBlend: number;
+    neighborhoodClamp: boolean;
+    lightClamp: number;
+    baseDensity: number;
+    scatterAlbedo: number;
+    phaseG: number;
+    density: number;
+    albedo: Vec3;
+    height: number;
+    heightFalloff: number;
+    startDistance: number;
+    maxOpacity: number;
+    emissive: Vec3;
+    directionalColor: Vec3;
+    directionalExponent: number;
+    layer2Density: number;
+    layer2Falloff: number;
+    layer2Height: number;
+    aerialPerspective: boolean;
+    aerialIntensity: number;
+  };
 }
 
 export interface Selection {
@@ -229,6 +265,7 @@ type CompatCommandResultOverrides = {
   "get-environment": Environment;
   "set-environment": Environment;
   "set-atmosphere": Environment;
+  "set-fog": Environment;
   "get-selection": Selection;
   "get-thumbnail": Thumbnail;
   "view-asset": Thumbnail;
