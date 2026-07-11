@@ -11,7 +11,7 @@
 
 use ash::vk;
 
-use crate::descriptors::Descriptors;
+use crate::descriptors::{BLOOM_PASSES_PER_FRAME, Descriptors};
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::pipelines::{DEPTH_FORMAT, OFFSCREEN_COLOR_FORMAT};
 use crate::resources::{Buffer, Image, ImageDesc};
@@ -210,8 +210,35 @@ pub struct ViewTarget {
     /// set 4 in the mesh pipeline: ao_map + contact_map + resolved SSGI.
     pub mesh_set: vk::DescriptorSet,
     /// The mandatory tonemap set: binding 0 = the offscreen color as a storage image
-    /// (GENERAL). Rewritten when the offscreen recreates.
+    /// (GENERAL), binding 1 = the per-view grade UBO (a dynamic-offset UBO). Rewritten when the
+    /// offscreen recreates.
     pub tonemap_set: vk::DescriptorSet,
+    /// The per-view grade uniform: `MAX_FRAMES_IN_FLIGHT` `GradeUniform` slices, each aligned to
+    /// [`grade_ubo_stride`](ViewTarget::grade_ubo_stride), host-visible + persistently mapped. The
+    /// renderer memcpy's this frame's slice each frame; the tonemap dispatch selects it by a dynamic
+    /// offset, so binding 1 is written once (no per-frame descriptor rewrite). Allocated in
+    /// [`ViewTarget::new`], outlives resizes.
+    pub grade_ubo: Buffer,
+    /// The aligned byte stride of one `GradeUniform` slice in [`ViewTarget::grade_ubo`] — the
+    /// dynamic offset for frame `f` is `f * grade_ubo_stride`.
+    pub grade_ubo_stride: u64,
+    /// The height-fog composite set: binding 0 = the offscreen color as a storage image (GENERAL),
+    /// binding 1 = the per-view `FogParams` UBO (a dynamic-offset slice), binding 2 = the scene
+    /// depth, binding 3 = the sky-view LUT. Rewritten (bindings 0/2) when the targets recreate; the
+    /// LUT (3) is written once by the renderer.
+    pub fog_set: vk::DescriptorSet,
+    /// The per-view fog uniform: `MAX_FRAMES_IN_FLIGHT` `FogParams` slices, each aligned to
+    /// [`fog_ubo_stride`](ViewTarget::fog_ubo_stride), host-visible + persistently mapped. The
+    /// renderer writes this frame's slice each frame; the fog dispatch selects it by a dynamic
+    /// offset. Allocated in [`ViewTarget::new`], outlives resizes.
+    pub fog_ubo: Buffer,
+    /// The aligned byte stride of one `FogParams` slice in [`ViewTarget::fog_ubo`].
+    pub fog_ubo_stride: u64,
+    /// The bloom pyramid sets — one per pass, allocated per frame-in-flight because the bloom mip
+    /// images come from the per-slot transient pool. Indexed `slot * BLOOM_PASSES_PER_FRAME + pass`
+    /// and rewritten each frame in [`ViewTarget::write_bloom_sets`] once that frame's transient mips
+    /// are acquired.
+    pub bloom_sets: Vec<vk::DescriptorSet>,
     /// motion-vector visualization: motion sampler + offscreen storage (compute2-shape).
     /// Bound by `write_aa_sets`; the visualize pass runs only when the motion target exists.
     pub motion_vis_set: vk::DescriptorSet,
@@ -282,6 +309,50 @@ impl ViewTarget {
         };
         let depth = Image::new(resources, &depth_desc)?;
 
+        // The per-view grade UBO: one aligned `GradeUniform` slice per frame-in-flight, host-visible
+        // + persistently mapped. Bound once as a dynamic-offset UBO; the renderer writes this frame's
+        // slice each frame and the dispatch selects it by `frame * stride`.
+        let grade_ubo_stride = align_up(
+            size_of::<crate::GradeUniform>() as u64,
+            device
+                .capabilities
+                .min_uniform_buffer_offset_alignment
+                .max(1),
+        );
+        let grade_ubo = Buffer::new(
+            resources,
+            grade_ubo_stride * MAX_FRAMES_IN_FLIGHT as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+        )?;
+
+        // The per-view fog UBO: one aligned `FogParams` slice per frame-in-flight, host-visible +
+        // persistently mapped. Bound once as a dynamic-offset UBO; the renderer writes this frame's
+        // slice each frame and the dispatch selects it by `frame * stride`.
+        let fog_ubo_stride = align_up(
+            size_of::<crate::renderer::FogParams>() as u64,
+            device
+                .capabilities
+                .min_uniform_buffer_offset_alignment
+                .max(1),
+        );
+        let fog_ubo = Buffer::new(
+            resources,
+            fog_ubo_stride * MAX_FRAMES_IN_FLIGHT as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+        )?;
+
         Ok(Self {
             offscreen,
             depth,
@@ -339,9 +410,15 @@ impl ViewTarget {
             motion_vis_set: vk::DescriptorSet::null(),
             ssgi_accum_sets: [vk::DescriptorSet::null(); 2],
             fxaa_set: vk::DescriptorSet::null(),
+            bloom_sets: Vec::new(),
             taa_sets: [vk::DescriptorSet::null(); 2],
             mesh_set: vk::DescriptorSet::null(),
             tonemap_set: vk::DescriptorSet::null(),
+            grade_ubo,
+            grade_ubo_stride,
+            fog_set: vk::DescriptorSet::null(),
+            fog_ubo,
+            fog_ubo_stride,
             restir: RestirView::new(),
             desired_width: width,
             desired_height: height,
@@ -462,6 +539,15 @@ impl ViewTarget {
         ];
         self.mesh_set = descriptors.allocate_set(mesh_set_layout(descriptors))?;
         self.tonemap_set = descriptors.allocate_set(descriptors.tonemap_set_layout())?;
+        self.fog_set = descriptors.allocate_set(descriptors.fog_set_layout())?;
+        // Bloom binds one source/target pair per pyramid pass, allocated per frame-in-flight so a
+        // slot's sets are only rewritten `MAX_FRAMES_IN_FLIGHT` frames after their last GPU use
+        // (the transient mip images they bind are themselves per-slot).
+        self.bloom_sets.clear();
+        for _ in 0..(BLOOM_PASSES_PER_FRAME * MAX_FRAMES_IN_FLIGHT) {
+            self.bloom_sets
+                .push(descriptors.allocate_set(descriptors.bloom_set_layout())?);
+        }
         Ok(())
     }
 
@@ -1052,6 +1138,62 @@ impl ViewTarget {
         unsafe { raw.update_descriptor_sets(&writes, &[]) };
     }
 
+    /// Rewrites this frame slot's bloom sets to bind the passed `(source, target)` view pairs — one
+    /// pair per pyramid pass, in graph order (downsamples, then upsamples, then the composite). The
+    /// bloom mip images come from the per-frame-in-flight transient pool, so only slot `frame`'s
+    /// sets are touched; that slot's previous GPU use finished `MAX_FRAMES_IN_FLIGHT` frames ago
+    /// (its fence was waited at frame begin), so the update is hazard-free. The source binds through
+    /// the linear clamp sampler (binding 0, `SHADER_READ_ONLY`), the target as a storage image
+    /// (binding 1, `GENERAL`).
+    pub fn write_bloom_sets(
+        &self,
+        device: &Device,
+        descriptors: &Descriptors,
+        frame: usize,
+        pairs: &[(vk::ImageView, vk::ImageView)],
+        composite: BloomCompositeBindings,
+    ) {
+        let raw = device.raw();
+        let linear = descriptors.linear_sampler();
+        let base = frame * BLOOM_PASSES_PER_FRAME;
+        let last = pairs.len().saturating_sub(1);
+        let mut plan: Vec<Binding> = Vec::with_capacity(pairs.len() * 4);
+        for (i, &(source, target)) in pairs.iter().enumerate() {
+            let set = self.bloom_sets[base + i];
+            plan.push(Binding::sampled(set, 0, linear, source));
+            plan.push(Binding::storage(set, 1, target));
+            // Only the composite (last) pass samples the dirt mask + streak; the earlier passes bind
+            // the harmless fallback so every set is complete (the shader statically references both).
+            let (dirt, streak) = if i == last {
+                (composite.dirt, composite.streak)
+            } else {
+                (composite.fallback, composite.fallback)
+            };
+            plan.push(Binding::sampled(set, 2, linear, dirt));
+            plan.push(Binding::sampled(set, 3, linear, streak));
+        }
+        let infos: Vec<vk::DescriptorImageInfo> = plan.iter().map(Binding::info).collect();
+        let writes: Vec<vk::WriteDescriptorSet> = plan
+            .iter()
+            .zip(infos.iter())
+            .map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(binding.set)
+                    .dst_binding(binding.binding)
+                    .descriptor_type(binding.kind())
+                    .image_info(std::slice::from_ref(info))
+            })
+            .collect();
+        // SAFETY: the ash seam. Only slot `frame`'s sets are written; that slot's prior use has
+        // signalled its fence, so no in-flight command buffer references these sets.
+        unsafe { raw.update_descriptor_sets(&writes, &[]) };
+    }
+
+    /// The bloom set for pass `pass` in this frame slot (`slot * BLOOM_PASSES_PER_FRAME + pass`).
+    pub fn bloom_set(&self, frame: usize, pass: usize) -> vk::DescriptorSet {
+        self.bloom_sets[frame * BLOOM_PASSES_PER_FRAME + pass]
+    }
+
     /// The view handle of a built AA `Option<Image>` (motion), or — when not built (the
     /// mode is off) — the offscreen as a valid placeholder so the set is complete.
     fn aa_view(&self, image: &Option<Image>) -> vk::ImageView {
@@ -1131,6 +1273,7 @@ impl ViewTarget {
         let gi_indirect = self.view_of(&self.gi_indirect);
         let prev_color = self.view_of(&self.prev_color);
         let offscreen = self.offscreen.view();
+        let depth = self.depth.view();
 
         // Each binding is a `(set, binding, kind)`. A sampler binding pairs a sampler +
         // a view (ShaderReadOnly); a storage binding is a view only (GENERAL). The whole
@@ -1204,6 +1347,12 @@ impl ViewTarget {
             // The mandatory tonemap set: binding 0 = the offscreen color as a storage
             // image (GENERAL).
             Binding::storage(self.tonemap_set, 0, offscreen),
+            // The height-fog set: binding 0 = the offscreen color (storage, GENERAL), binding 2 =
+            // the scene depth (point-sampled; the graph transitions it to ShaderReadOnly). Binding 1
+            // (the fog params UBO) is a dynamic-offset write below; binding 3 (the sky-view LUT) is
+            // written once by the renderer.
+            Binding::storage(self.fog_set, 0, offscreen),
+            Binding::sampled(self.fog_set, 2, nearest, depth),
         ];
         // gi-resolve view-local image bindings, into every per-frame set (the shared IBL cube +
         // DDGI atlases at b3/b5/b6 are written from the renderer, which owns those sub-states; the
@@ -1268,6 +1417,137 @@ impl ViewTarget {
         // SAFETY: the ash seam. The sets/views/samplers outlive the renderer; host
         // access to these per-view sets is single-threaded at the (idle) build point.
         unsafe { raw.update_descriptor_sets(&writes, &[]) };
+
+        // The tonemap set's binding 1: the grade UBO as one dynamic-offset slice (the per-frame slice
+        // is chosen by the dispatch's dynamic offset, so this is written once and reused every frame).
+        descriptors.write_dynamic_uniform_buffer(
+            self.tonemap_set,
+            1,
+            self.grade_ubo.handle(),
+            self.grade_ubo_stride,
+        );
+
+        // The fog set's binding 1: the fog params UBO as one dynamic-offset slice (the per-frame
+        // slice is chosen by the dispatch's dynamic offset, so this is written once and reused).
+        descriptors.write_dynamic_uniform_buffer(
+            self.fog_set,
+            1,
+            self.fog_ubo.handle(),
+            self.fog_ubo_stride,
+        );
+    }
+
+    /// Writes `uniform` into frame slot `frame`'s slice of the grade UBO (persistently mapped). The
+    /// tonemap dispatch then binds the set with a `frame * grade_ubo_stride` dynamic offset, so this
+    /// frame's grade is read without a descriptor rewrite. Called each frame before the tonemap pass.
+    pub fn write_grade(&mut self, frame: usize, uniform: &crate::GradeUniform) {
+        let offset = self.grade_ubo_stride as usize * frame;
+        let src = bytemuck::bytes_of(uniform);
+        let dst = self.grade_ubo.mapped_bytes().expect("grade UBO is MAPPED");
+        dst[offset..offset + src.len()].copy_from_slice(src);
+    }
+
+    /// The dynamic offset for frame slot `frame`'s grade-UBO slice — supplied to the tonemap set bind.
+    #[must_use]
+    pub fn grade_ubo_offset(&self, frame: usize) -> u32 {
+        (self.grade_ubo_stride * frame as u64) as u32
+    }
+
+    /// Writes `params` into frame slot `frame`'s slice of the fog UBO (persistently mapped). The fog
+    /// dispatch then binds the set with a `frame * fog_ubo_stride` dynamic offset. Called each frame
+    /// before the fog pass.
+    pub(crate) fn write_fog(&mut self, frame: usize, params: &crate::renderer::FogParams) {
+        let offset = self.fog_ubo_stride as usize * frame;
+        let src = bytemuck::bytes_of(params);
+        let dst = self.fog_ubo.mapped_bytes().expect("fog UBO is MAPPED");
+        dst[offset..offset + src.len()].copy_from_slice(src);
+    }
+
+    /// The dynamic offset for frame slot `frame`'s fog-UBO slice — supplied to the fog set bind.
+    #[must_use]
+    pub fn fog_ubo_offset(&self, frame: usize) -> u32 {
+        (self.fog_ubo_stride * frame as u64) as u32
+    }
+
+    /// Writes the sky-view LUT `view` into binding 3 of the fog set with `sampler`. Called once at
+    /// renderer init (the LUT image is allocated once and reused across bakes), so this binding
+    /// persists across resizes (the fog set is allocated once, never reallocated).
+    pub fn write_fog_sky_lut(&self, device: &Device, sampler: vk::Sampler, view: vk::ImageView) {
+        let info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.fog_set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&info);
+        // SAFETY: the ash seam. The set + view + sampler outlive the call; single-threaded at the
+        // (idle) build point, so no in-flight command buffer references this set.
+        unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
+    }
+
+    /// Writes the froxel integration volume `view` into binding 4 of the fog set with `sampler` (the
+    /// volumetric composite's trilinear sample). The volume is fixed-size and never reallocated, so
+    /// this binding persists across resizes; the composite reads it only in `fog.mode == volumetric`.
+    pub fn write_fog_integration(
+        &self,
+        device: &Device,
+        sampler: vk::Sampler,
+        view: vk::ImageView,
+    ) {
+        let info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.fog_set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&info);
+        // SAFETY: the ash seam. The set + view + sampler outlive the call; single-threaded at the
+        // (idle) build point, so no in-flight command buffer references this set.
+        unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
+    }
+
+    /// Writes the aerial-perspective volume `view` into binding 5 of the fog set with `sampler` (the
+    /// composite's trilinear AP sample). The volume is fixed-size and never reallocated, so this binding
+    /// persists across resizes; the composite reads it only when the atmosphere is live + AP authored.
+    pub fn write_fog_aerial(&self, device: &Device, sampler: vk::Sampler, view: vk::ImageView) {
+        let info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.fog_set)
+            .dst_binding(5)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&info);
+        // SAFETY: the ash seam. The set + view + sampler outlive the call; single-threaded at the
+        // (idle) build point, so no in-flight command buffer references this set.
+        unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
+    }
+
+    /// Writes the creative-look 3D LUT `view` into binding 2 of the tonemap set with `sampler`. Called
+    /// at view build with the identity default and rewritten (idled) when a creative look is assigned.
+    /// The set is allocated once and never reallocated, so this binding persists across resizes.
+    pub fn write_tonemap_lut(&self, device: &Device, sampler: vk::Sampler, view: vk::ImageView) {
+        let info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.tonemap_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&info);
+        // SAFETY: the ash seam. The set + view + sampler outlive the call; single-threaded at the
+        // (idle) build/assign point, so no in-flight command buffer references this set.
+        unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
     }
 
     /// Writes the *shared* gi-resolve bindings into every per-frame set — b3 the IBL diffuse
@@ -1421,6 +1701,25 @@ impl ViewTarget {
             height: ((self.desired_height as f32 * scale).round() as u32).max(1),
         }
     }
+}
+
+/// The composite pass's extra sampled inputs written into every bloom set (bindings 2/3): the
+/// lens-dirt `mask` and the anamorphic `streak` buffer bind on the composite (last) pass, and the
+/// `fallback` (the renderer's 1×1 white) binds on the earlier passes that never sample them.
+#[derive(Clone, Copy)]
+pub struct BloomCompositeBindings {
+    /// The lens-dirt mask view (a texture asset, or the white fallback when no dirt is set).
+    pub dirt: vk::ImageView,
+    /// The anamorphic streak buffer view (transient, or the white fallback when streaks are off).
+    pub streak: vk::ImageView,
+    /// The harmless fallback for the non-composite passes' bindings 2/3 (the 1×1 white view).
+    pub fallback: vk::ImageView,
+}
+
+/// Rounds `value` up to the next multiple of `align` (a power of two ≥ 1) — the dynamic-UBO slice
+/// stride against `minUniformBufferOffsetAlignment`.
+fn align_up(value: u64, align: u64) -> u64 {
+    value.div_ceil(align) * align
 }
 
 /// One descriptor-set image binding for the screen-space set writes: a sampled image
