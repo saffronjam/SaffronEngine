@@ -64,6 +64,12 @@ import type {
   ProjectStatus,
   AppManifest,
   ExportAppResult,
+  SetBloomParams,
+  SetBloomResult,
+  SetColorGradingParams,
+  SetColorGradingResult,
+  BakeLookParams,
+  BakeLookResult,
 } from "../protocol";
 
 /// The GPU profiler depth (off keeps the present-only host at baseline cost).
@@ -606,6 +612,11 @@ export const client = {
   importTexture(path: string): Promise<{ texture: string }> {
     return call("import-texture", { path });
   },
+  /// Import a creative `.cube` look as a LUT asset into the catalog; returns the LUT asset ref that
+  /// the `set-color-grading` `creativeLutAsset` slot references.
+  importLut(path: string): Promise<CommandResultMap["import-lut"]> {
+    return call("import-lut", { path });
+  },
   /// Expand a model asset's stored hierarchy into the scene; returns the new root entity.
   instantiateModel(asset: string, name?: string): Promise<EntityRef> {
     return name === undefined
@@ -777,6 +788,11 @@ export const client = {
   setAtmosphere(atmosphere: Partial<Environment["atmosphere"]>): Promise<Environment> {
     return call("set-atmosphere", atmosphere);
   },
+  /// Merge fog fields over the current environment's `fog` block; the height-fog composite picks
+  /// them up next frame. Returns the full updated environment.
+  setFog(fog: Partial<Environment["fog"]>): Promise<Environment> {
+    return call("set-fog", fog);
+  },
 
   /// Anti-aliasing mode. Echoes `{ aa }`.
   setAa(mode: RenderStats["aa"]): Promise<{ aa: RenderStats["aa"] }> {
@@ -847,6 +863,22 @@ export const client = {
   /// `exposure` field is reserved on the wire. Echoes `{ exposureEv }`.
   setExposure(ev: number): Promise<{ exposureEv: number }> {
     return call("set-exposure", { ev });
+  },
+  /// Pre-tonemap scene-linear bloom pyramid: enable + energy-conserving intensity, tent scatter,
+  /// tint, and the (default-off) soft-knee threshold. Echoes the applied state.
+  setBloom(params: SetBloomParams): Promise<SetBloomResult> {
+    return call("set-bloom", params);
+  },
+  /// Scene-linear color grade folded into the tonemap pass before the view/display transform: white
+  /// balance (Temp/Tint), contrast around the 0.18 pivot, saturation, and the canonical ASC-CDL
+  /// slope/offset/power. Echoes the applied grade.
+  setColorGrading(params: SetColorGradingParams): Promise<SetColorGradingResult> {
+    return call("set-color-grading", params);
+  },
+  /// Bake the current grade + view transform + creative LUT into one 33³ log2-shaper `.slut` for the
+  /// exported player, registering it as a LUT asset. Returns the baked asset id / path / size.
+  bakeLook(params: BakeLookParams = {}): Promise<BakeLookResult> {
+    return call("bake-look", params);
   },
 
   /// Write catalog + scene to `path` (engine default `project.json` when omitted).
