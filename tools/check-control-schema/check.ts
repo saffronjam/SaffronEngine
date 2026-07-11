@@ -292,6 +292,17 @@ async function paramsForFixture(
       return { skyIntensity: 1 };
     case "atmosphere-disabled":
       return { enabled: false };
+    case "fog-disabled":
+      return {
+        enabled: false,
+        mode: "volumetric",
+        quality: "high",
+        historyBlend: 0.05,
+        neighborhoodClamp: true,
+        lightClamp: 4,
+        aerialPerspective: true,
+        aerialIntensity: 1.2,
+      };
     case "cube-preset":
       return { preset: "cube" };
     case "cube-rename":
@@ -314,6 +325,33 @@ async function paramsForFixture(
       return { view: "scene" };
     case "exposure-zero":
       return { ev: 0 };
+    case "bloom":
+      return {
+        enabled: true,
+        intensity: 0.08,
+        scatter: 0.005,
+        tint: [1, 1, 1],
+        threshold: 0,
+        dirtIntensity: 0.5,
+        dirtTint: [1, 0.9, 0.8],
+        anamorphic: { enabled: true, ratio: 2, tint: [0.6, 0.8, 1], intensity: 0.3 },
+        perMipTint: [[1, 0.5, 0.5]],
+      };
+    case "color-grading":
+      return {
+        temperature: 5000,
+        tint: 0,
+        contrast: 1.2,
+        pivot: 0.18,
+        saturation: 1,
+        slope: [1, 1, 1],
+        offset: [0, 0, 0],
+        power: [1, 1, 1],
+        creativeLutAsset: 0,
+        creativeLutIntensity: 0,
+      };
+    case "bake-look":
+      return { name: "Contract Baked Look" };
     case "tess-quality":
       return { factorCap: 16, minFactor: 1, edgeLengthTarget: 12 };
     case "new-project":
