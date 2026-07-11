@@ -23,6 +23,7 @@ mod device;
 mod draw_list;
 mod frame;
 mod frame_history;
+mod froxel_fog;
 mod global_sdf;
 mod gpu_types;
 mod ibl;
@@ -78,6 +79,12 @@ pub use frame_history::{
     AlarmEventKind, AlarmInputs, AlarmSeverity, AlarmState, FRAME_HISTORY_CAPACITY, FrameHistory,
     FrameHistoryStats, FrameSample, PerfConfig,
 };
+pub use froxel_fog::{
+    AP_FAR_M, AP_GRID, AerialParamsUbo, AerialPerspective, FOG_SHAPE_BOX, FOG_SHAPE_SPHERE,
+    FROXEL_FAR, FROXEL_FORMAT, FROXEL_GRID_X, FROXEL_GRID_Y, FROXEL_GRID_Z, FogGridParams,
+    FogVolumeGpu, FogVolumeUpload, FroxelFog, FroxelQuality, MAX_FOG_VOLUMES, ap_slice_view_z,
+    froxel_slice_view_z, froxel_to_cluster,
+};
 pub use global_sdf::{
     GDF_BAND_FRACTION, GDF_CASCADE0_EXTENT, GDF_CASCADES, GDF_EXPONENT, GDF_FORMAT, GDF_MAX_CULLED,
     GDF_NEAR_HANDOFF, GDF_RES, GdfCompositePush, GdfCullPush, GdfParamsUbo, GdfRegion, GlobalSdf,
@@ -97,8 +104,9 @@ pub use lighting::{
     cull_clusters_cpu, point_shadow_face_matrices,
 };
 pub use overlay::{
-    GridPush, OverlayDraw, OverlayState, OverlayVertex, TonemapMode, TonemapPush, record_grid,
-    record_overlay,
+    BloomPush, ColorGrade, GradeRange, GradeUniform, GridPush, LUT_BAKE_SIZE, LUT_SHAPER_EV_MAX,
+    LUT_SHAPER_EV_MIN, OverlayDraw, OverlayState, OverlayVertex, TonemapMode, TonemapPush,
+    record_grid, record_overlay,
 };
 pub use pipelines::{DEPTH_FORMAT, OFFSCREEN_COLOR_FORMAT, Pipelines, PsoKey};
 pub use profiler::{
@@ -113,11 +121,11 @@ pub use reactive::{PowerState, ReactiveState};
 pub use render_graph::{
     ProfileRecorders, RenderGraph, RgAccess, RgAttachment, RgPass, RgPassKind, RgResource, RgUsage,
 };
-pub use renderer::{RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
+pub use renderer::{FogRenderSettings, RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
 pub use resources::{
-    AccelerationStructure, BindlessFreeList, Buffer, DefaultHeightMinMax, DeviceResources, GpuMesh,
-    GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc,
-    MinMaxPyramid, Pipeline,
+    AccelerationStructure, BindlessFreeList, Buffer, DefaultHeightMinMax, DeviceResources, GpuLut,
+    GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D,
+    ImageDesc, MinMaxPyramid, Pipeline,
 };
 pub use restir::{
     InitialPush as RestirInitialPush, RESTIR_CANDIDATE_COUNT, RESTIR_INITIAL_PUSH_SIZE,
@@ -158,7 +166,7 @@ pub use tessellation::{
 pub use thumbnail::{
     PngTransfer, ThumbnailPng, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
-pub use transient::TransientResources;
+pub use transient::{FROXEL_VOLUME_KEYS, TransientResources};
 pub use upload::{GpuQueue, SdfBake, Uploader};
 pub use view_target::ViewTarget;
 
@@ -229,6 +237,11 @@ pub enum Error {
     /// out-of-range `dstArrayElement`.
     #[error("bindless array full: {0}")]
     BindlessFull(&'static str),
+
+    /// The creative-look bake could not run (its compute PSO was unavailable, or a Vulkan/VMA call
+    /// on the one-off dispatch/readback failed).
+    #[error("look bake failed: {0}")]
+    LutBake(String),
 }
 
 /// A `Result` whose error is this crate's [`Error`].
