@@ -70,12 +70,16 @@ export interface DirectionalLight {
   color: Vec3;
   intensity: number;
   ambient: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
 }
 
 export interface PointLight {
   color: Vec3;
   intensity: number;
   range: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
 }
 
 export interface SpotLight {
@@ -85,6 +89,8 @@ export interface SpotLight {
   range: number;
   innerAngle: number;
   outerAngle: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
 }
 
 export interface ReflectionProbe {
@@ -92,6 +98,23 @@ export interface ReflectionProbe {
   intensity: number;
   boxProjection: boolean;
   boxExtent: Vec3;
+}
+
+export interface FogVolume {
+  shape: "box" | "sphere";
+  extents: Vec3;
+  radius: number;
+  edgeFalloff: number;
+  density: number;
+  albedo: Vec3;
+  emissive: Vec3;
+  phaseG: number;
+  heightFalloff: number;
+  noiseScale: number;
+  noiseIntensity: number;
+  noiseDetail: number;
+  wind: Vec3;
+  speed: number;
 }
 
 export interface Relationship {
@@ -195,6 +218,36 @@ export interface AtmosphereSettingsDto {
   sunDiskIntensity: number;
 }
 
+export type FogMode = "analytic" | "volumetric";
+
+export type FogQuality = "low" | "medium" | "high";
+
+export interface FogSettingsDto {
+  enabled: boolean;
+  mode: FogMode;
+  quality: FogQuality;
+  historyBlend: number;
+  neighborhoodClamp: boolean;
+  lightClamp: number;
+  baseDensity: number;
+  scatterAlbedo: number;
+  phaseG: number;
+  density: number;
+  albedo: Vec3;
+  height: number;
+  heightFalloff: number;
+  startDistance: number;
+  maxOpacity: number;
+  emissive: Vec3;
+  directionalColor: Vec3;
+  directionalExponent: number;
+  layer2Density: number;
+  layer2Falloff: number;
+  layer2Height: number;
+  aerialPerspective: boolean;
+  aerialIntensity: number;
+}
+
 export interface Components {
   Name?: Name;
   Transform?: Transform;
@@ -207,6 +260,7 @@ export interface Components {
   PointLight?: PointLight;
   SpotLight?: SpotLight;
   ReflectionProbe?: ReflectionProbe;
+  FogVolume?: FogVolume;
   Relationship?: Relationship;
   SkinnedMesh?: SkinnedMesh;
   Bone?: Bone;
@@ -230,6 +284,7 @@ export type ComponentBody =
   | PointLight
   | SpotLight
   | ReflectionProbe
+  | FogVolume
   | Relationship
   | SkinnedMesh
   | Bone
@@ -309,8 +364,67 @@ export interface RenderStatsDto {
   bindlessFree: number;
   hdr: boolean;
   exposureEv: number;
+  colorGrading: SetColorGradingParams;
+  creativeLut?: CreativeLutStat;
+  bloomEnabled: boolean;
+  bloomIntensity: number;
+  bloomScatter: number;
+  bloomTint: [number, number, number];
+  bloomThreshold: number;
+  bloomDirtTexture: WireUuid;
+  bloomDirtIntensity: number;
+  bloomDirtTint: [number, number, number];
+  bloomAnamorphic: AnamorphicParams;
+  bloomPerMipTint: [number, number, number][];
   aa: "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
-  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors";
+  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog";
+}
+
+export interface SetColorGradingParams {
+  temperature: number;
+  tint: number;
+  contrast: number;
+  pivot: number;
+  saturation: number;
+  slope: [number, number, number];
+  offset: [number, number, number];
+  power: [number, number, number];
+  shadows: GradeRangeDto;
+  midtones: GradeRangeDto;
+  highlights: GradeRangeDto;
+  shadowsMax: number;
+  highlightsMin: number;
+  channelMixer: [number, number, number, number, number, number, number, number, number];
+  splitTone: SplitToneDto;
+  creativeLutAsset: WireUuid;
+  creativeLutIntensity: number;
+}
+
+export interface GradeRangeDto {
+  slope: [number, number, number];
+  offset: [number, number, number];
+  power: [number, number, number];
+  saturation: number;
+  contrast: number;
+}
+
+export interface SplitToneDto {
+  shadow: [number, number, number];
+  highlight: [number, number, number];
+  balance: number;
+}
+
+export interface CreativeLutStat {
+  asset: WireUuid;
+  intensity: number;
+  size: number;
+}
+
+export interface AnamorphicParams {
+  enabled: boolean;
+  ratio: number;
+  tint: [number, number, number];
+  intensity: number;
 }
 
 export interface ProfilerSetModeParams {
@@ -547,11 +661,11 @@ export interface SetTaaParamsResult {
 }
 
 export interface SetViewModeParams {
-  mode?: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors";
+  mode?: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog";
 }
 
 export interface SetViewModeResult {
-  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors";
+  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog";
 }
 
 export interface ToggleParams {
@@ -784,6 +898,7 @@ export interface EnvironmentDto {
   ambientColor: Vec3;
   ambientIntensity: number;
   atmosphere: AtmosphereSettingsDto;
+  fog: FogSettingsDto;
 }
 
 export interface SetEnvironmentParams {
@@ -813,6 +928,33 @@ export interface SetAtmosphereParams {
   ozoneAbsorption?: Vec3;
   sunDiskAngularRadius?: number;
   sunDiskIntensity?: number;
+}
+
+export interface SetFogParams {
+  json?: unknown;
+  enabled?: boolean;
+  mode?: "analytic" | "volumetric";
+  quality?: "low" | "medium" | "high";
+  historyBlend?: number;
+  neighborhoodClamp?: boolean;
+  lightClamp?: number;
+  baseDensity?: number;
+  scatterAlbedo?: number;
+  phaseG?: number;
+  density?: number;
+  albedo?: Vec3;
+  height?: number;
+  heightFalloff?: number;
+  startDistance?: number;
+  maxOpacity?: number;
+  emissive?: Vec3;
+  directionalColor?: Vec3;
+  directionalExponent?: number;
+  layer2Density?: number;
+  layer2Falloff?: number;
+  layer2Height?: number;
+  aerialPerspective?: boolean;
+  aerialIntensity?: number;
 }
 
 export interface SelectionResult {
@@ -1194,7 +1336,7 @@ export interface SetScriptOverrideResult {
 }
 
 export interface AddEntityParams {
-  preset?: "empty" | "cube" | "plane" | "sphere" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe";
+  preset?: "empty" | "cube" | "plane" | "sphere" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe" | "fog-volume";
 }
 
 export interface RenameEntityParams {
@@ -1327,6 +1469,62 @@ export interface SetExposureResult {
   exposureEv: number;
 }
 
+export interface SetBloomParams {
+  enabled: boolean;
+  intensity: number;
+  scatter: number;
+  tint: [number, number, number];
+  threshold: number;
+  dirtTexture?: WireUuid;
+  dirtIntensity?: number;
+  dirtTint?: [number, number, number];
+  anamorphic?: AnamorphicParams;
+  perMipTint?: [number, number, number][];
+}
+
+export interface SetBloomResult {
+  enabled: boolean;
+  intensity: number;
+  scatter: number;
+  tint: [number, number, number];
+  threshold: number;
+  dirtTexture: WireUuid;
+  dirtIntensity: number;
+  dirtTint: [number, number, number];
+  anamorphic: AnamorphicParams;
+  perMipTint: [number, number, number][];
+}
+
+export interface SetColorGradingResult {
+  temperature: number;
+  tint: number;
+  contrast: number;
+  pivot: number;
+  saturation: number;
+  slope: [number, number, number];
+  offset: [number, number, number];
+  power: [number, number, number];
+  shadows: GradeRangeDto;
+  midtones: GradeRangeDto;
+  highlights: GradeRangeDto;
+  shadowsMax: number;
+  highlightsMin: number;
+  channelMixer: [number, number, number, number, number, number, number, number, number];
+  splitTone: SplitToneDto;
+  creativeLutAsset: WireUuid;
+  creativeLutIntensity: number;
+}
+
+export interface BakeLookParams {
+  name?: string;
+}
+
+export interface BakeLookResult {
+  asset: WireUuid;
+  path: string;
+  size: number;
+}
+
 export interface SetTessellationQualityParams {
   factorCap?: number;
   minFactor?: number;
@@ -1434,6 +1632,14 @@ export interface ImportTextureResult {
   texture: WireUuid;
 }
 
+export interface ImportLutParams {
+  path: string;
+}
+
+export interface ImportLutResult {
+  lut: WireUuid;
+}
+
 export interface AssetList {
   assets: AssetEntryDto[];
   folders: string[];
@@ -1442,7 +1648,7 @@ export interface AssetList {
 export interface AssetEntryDto {
   id: WireUuid;
   name: string;
-  type: "mesh" | "texture" | "other" | "animation" | "material" | "model";
+  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut";
   path: string;
   folder?: string;
   container?: WireUuid;
@@ -1644,7 +1850,7 @@ export interface AssetMetadataParams {
 export interface AssetMetadataDto {
   id: WireUuid;
   name: string;
-  type: "mesh" | "texture" | "other" | "animation" | "material" | "model";
+  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut";
   path: string;
   folder?: string;
   sizeBytes: number;
@@ -1955,6 +2161,7 @@ export interface CommandParamsMap {
   "get-environment": EmptyParams;
   "set-environment": SetEnvironmentParams;
   "set-atmosphere": SetAtmosphereParams;
+  "set-fog": SetFogParams;
   "get-selection": EmptyParams;
   "deselect": EmptyParams;
   "play": EmptyParams;
@@ -2013,6 +2220,9 @@ export interface CommandParamsMap {
   "recapture-probes": EmptyParams;
   "list-probes": EmptyParams;
   "set-exposure": SetExposureParams;
+  "set-bloom": SetBloomParams;
+  "set-color-grading": SetColorGradingParams;
+  "bake-look": BakeLookParams;
   "set-tessellation-quality": SetTessellationQualityParams;
   "get-project": EmptyParams;
   "project-status": EmptyParams;
@@ -2024,6 +2234,7 @@ export interface CommandParamsMap {
   "instantiate-model": InstantiateModelParams;
   "asset-placement": AssetPlacementParams;
   "import-texture": ImportTextureParams;
+  "import-lut": ImportLutParams;
   "list-assets": EmptyParams;
   "scan-assets": EmptyParams;
   "extract-subasset": ExtractSubAssetParams;
@@ -2131,6 +2342,7 @@ export interface CommandResultMap {
   "get-environment": EnvironmentDto;
   "set-environment": EnvironmentDto;
   "set-atmosphere": EnvironmentDto;
+  "set-fog": EnvironmentDto;
   "get-selection": SelectionResult;
   "deselect": DeselectResult;
   "play": PlayStateResult;
@@ -2189,6 +2401,9 @@ export interface CommandResultMap {
   "recapture-probes": RecaptureProbesResult;
   "list-probes": ListProbesResult;
   "set-exposure": SetExposureResult;
+  "set-bloom": SetBloomResult;
+  "set-color-grading": SetColorGradingResult;
+  "bake-look": BakeLookResult;
   "set-tessellation-quality": SetTessellationQualityResult;
   "get-project": ProjectInfoDto;
   "project-status": ProjectStatusDto;
@@ -2200,6 +2415,7 @@ export interface CommandResultMap {
   "instantiate-model": EntityRef;
   "asset-placement": AssetPlacementResult;
   "import-texture": ImportTextureResult;
+  "import-lut": ImportLutResult;
   "list-assets": AssetList;
   "scan-assets": ScanAssetsResult;
   "extract-subasset": AssetRef;
