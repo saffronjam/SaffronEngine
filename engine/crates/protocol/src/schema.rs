@@ -410,6 +410,34 @@ pub fn component_schemas() -> Map<String, Value> {
         }),
     );
     schemas.insert(
+        "FogVolume".into(),
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "shape": { "type": "string", "enum": ["box", "sphere"] },
+                "extents": vec3,
+                "radius": { "type": "number" },
+                "edgeFalloff": { "type": "number" },
+                "density": { "type": "number" },
+                "albedo": vec3,
+                "emissive": vec3,
+                "phaseG": { "type": "number" },
+                "heightFalloff": { "type": "number" },
+                "noiseScale": { "type": "number" },
+                "noiseIntensity": { "type": "number" },
+                "noiseDetail": { "type": "number" },
+                "wind": vec3,
+                "speed": { "type": "number" },
+            },
+            "required": [
+                "shape", "extents", "radius", "edgeFalloff", "density", "albedo", "emissive",
+                "phaseG", "heightFalloff", "noiseScale", "noiseIntensity", "noiseDetail", "wind",
+                "speed",
+            ],
+        }),
+    );
+    schemas.insert(
         "Relationship".into(),
         json!({
             "type": "object",
@@ -597,6 +625,45 @@ pub fn component_schemas() -> Map<String, Value> {
             ],
         }),
     );
+    schemas.insert(
+        "FogSettingsDto".into(),
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "enabled": { "type": "boolean" },
+                "mode": { "type": "string", "enum": ["analytic", "volumetric"] },
+                "quality": { "type": "string", "enum": ["low", "medium", "high"] },
+                "historyBlend": { "type": "number" },
+                "neighborhoodClamp": { "type": "boolean" },
+                "lightClamp": { "type": "number" },
+                "baseDensity": { "type": "number" },
+                "scatterAlbedo": { "type": "number" },
+                "phaseG": { "type": "number" },
+                "density": { "type": "number" },
+                "albedo": vec3,
+                "height": { "type": "number" },
+                "heightFalloff": { "type": "number" },
+                "startDistance": { "type": "number" },
+                "maxOpacity": { "type": "number" },
+                "emissive": vec3,
+                "directionalColor": vec3,
+                "directionalExponent": { "type": "number" },
+                "layer2Density": { "type": "number" },
+                "layer2Falloff": { "type": "number" },
+                "layer2Height": { "type": "number" },
+                "aerialPerspective": { "type": "boolean" },
+                "aerialIntensity": { "type": "number" },
+            },
+            "required": [
+                "enabled", "mode", "quality", "historyBlend", "neighborhoodClamp", "lightClamp",
+                "baseDensity", "scatterAlbedo", "phaseG", "density", "albedo",
+                "height", "heightFalloff", "startDistance", "maxOpacity", "emissive",
+                "directionalColor", "directionalExponent", "layer2Density", "layer2Falloff",
+                "layer2Height", "aerialPerspective", "aerialIntensity",
+            ],
+        }),
+    );
 
     let mut aggregate_props = Map::new();
     for name in component_names {
@@ -635,10 +702,12 @@ pub fn component_schemas() -> Map<String, Value> {
                 "ambientColor": vec3,
                 "ambientIntensity": { "type": "number" },
                 "atmosphere": { "$ref": "#/components/schemas/AtmosphereSettingsDto" },
+                "fog": { "$ref": "#/components/schemas/FogSettingsDto" },
             },
             "required": [
                 "skyMode", "clearColor", "skyTexture", "skyIntensity", "skyRotation", "exposure",
                 "visible", "useSkyForAmbient", "ambientColor", "ambientIntensity", "atmosphere",
+                "fog",
             ],
         }),
     );
@@ -659,6 +728,7 @@ pub const COMPONENT_NAMES: &[&str] = &[
     "PointLight",
     "SpotLight",
     "ReflectionProbe",
+    "FogVolume",
     "Relationship",
     "SkinnedMesh",
     "Bone",
@@ -722,6 +792,30 @@ mod tests {
         // A single-field params (the `create-entity {name}` / `set-exposure {ev}` shape).
         assert_eq!(positional_field_order::<CreateEntityParams>(), ["name"]);
         assert_eq!(positional_field_order::<SetExposureParams>(), ["ev"]);
+        // The grade params fold positionally in ASC-CDL order (Temp/Tint first, then the global SOP
+        // triplets, then the per-range/mixer/split fields in declaration order).
+        assert_eq!(
+            positional_field_order::<SetColorGradingParams>(),
+            [
+                "temperature",
+                "tint",
+                "contrast",
+                "pivot",
+                "saturation",
+                "slope",
+                "offset",
+                "power",
+                "shadows",
+                "midtones",
+                "highlights",
+                "shadowsMax",
+                "highlightsMin",
+                "channelMixer",
+                "splitTone",
+                "creativeLutAsset",
+                "creativeLutIntensity"
+            ]
+        );
         // A lone-optional params (`set-aa {mode?}`): the field still occupies index 0.
         assert_eq!(positional_field_order::<SetAaParams>(), ["mode"]);
         // A multi-field params with a non-trivial order (`set-component {entity, component, json}`).
@@ -872,7 +966,8 @@ mod tests {
         assert!(schemas.contains_key("ComponentBody"));
         assert!(schemas.contains_key("Environment"));
         assert!(schemas.contains_key("AtmosphereSettingsDto"));
-        assert_eq!(COMPONENT_NAMES.len(), 20);
+        assert!(schemas.contains_key("FogSettingsDto"));
+        assert_eq!(COMPONENT_NAMES.len(), 21);
     }
 
     #[test]
