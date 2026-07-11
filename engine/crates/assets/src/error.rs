@@ -74,6 +74,10 @@ pub enum Error {
     /// to load/decode, or the renderer's render/encode failed. The payload is the cause.
     #[error("thumbnail error: {0}")]
     Thumbnail(String),
+
+    /// A creative LUT could not be parsed (a malformed `.cube` / `.slut`). The payload is the cause.
+    #[error("lut error: {0}")]
+    Lut(String),
 }
 
 /// The crate `Result` alias bound to the typed [`Error`].

@@ -26,6 +26,7 @@
 mod cache;
 mod catalog;
 mod codegen;
+mod cube;
 mod error;
 mod gpu;
 mod graph;
@@ -53,6 +54,7 @@ pub use catalog::{
     catalog_folders_from_json, catalog_folders_to_json, catalog_from_json, catalog_to_json,
 };
 pub use codegen::find_slangc;
+pub use cube::{BakedLut, CubeError, CubeLut, parse_cube};
 pub use error::{Error, Result};
 pub use gpu::{GpuUploader, RendererUploader};
 pub use graph::{emit_graph_surface, lower_graph_to_params};
@@ -247,6 +249,9 @@ pub struct AssetServer {
     /// tessellation factor kernel), independent of the same image used as a plain albedo/data texture.
     /// `None` = negative marker.
     pub height_texture_by_uuid: AssetCache<GpuTexture>,
+    /// GPU creative-LUT cache, keyed by LUT asset id. `None` = negative marker. Holds the `GpuLut`
+    /// (a 3D image, no bindless slot) a `.cube` import or baked `.slut` resolves to.
+    pub lut_by_uuid: AssetCache<saffron_rendering::GpuLut>,
     /// Opened `.smodel` containers, keyed by model id. `None` = negative marker.
     pub model_by_uuid: AssetCache<ModelAsset>,
     /// Parent-resolved material assets (parent chain walked, instance overrides baked, *before*
@@ -289,6 +294,7 @@ impl AssetServer {
             mesh_bvh_by_uuid: AssetCache::new(),
             texture_by_uuid: AssetCache::new(),
             height_texture_by_uuid: AssetCache::new(),
+            lut_by_uuid: AssetCache::new(),
             model_by_uuid: AssetCache::new(),
             material_by_uuid: AssetCache::new(),
             material_shader_by_uuid: AssetCache::new(),
@@ -314,7 +320,7 @@ impl AssetServer {
     /// creation errors are swallowed: a missing dir surfaces later as the real I/O failure
     /// that needs it.
     pub fn ensure_asset_directories(&self) {
-        for sub in ["models", "textures", "materials"] {
+        for sub in ["models", "textures", "materials", "luts"] {
             let _ = std::fs::create_dir_all(self.root.join(sub));
         }
     }
@@ -345,6 +351,7 @@ impl AssetServer {
         self.mesh_bvh_by_uuid.clear();
         self.texture_by_uuid.clear();
         self.height_texture_by_uuid.clear();
+        self.lut_by_uuid.clear();
         self.model_by_uuid.clear();
         self.invalidate_material_caches();
         // The editor-camera gizmo visual is a cached GPU `Ref` too (its `Arc<GpuMesh>` +
