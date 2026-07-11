@@ -204,11 +204,31 @@ pub struct Pipelines {
     /// The FXAA edge-blur compute PSO (fxaa set layout, no push), built lazily.
     fxaa: Option<Arc<Pipeline>>,
 
+    /// The bloom pyramid compute PSO (bloom set layout, a 32-byte push). One PSO drives all three
+    /// passes — downsample / tent-upsample / composite — via the push `pass`/`karis` fields.
+    bloom: Option<Arc<Pipeline>>,
+
     /// The mandatory tonemap compute PSO (tonemap set layout, an 8-byte exposure+mode push),
     /// built lazily.
     tonemap: Option<Arc<Pipeline>>,
+    /// The look-bake compute PSO (reuses the tonemap set layout — a `STORAGE_IMAGE`/UBO/sampler triple
+    /// binds a 3D output image the same as the 2D tonemap target — with an 8-byte size+mode push),
+    /// built lazily on the first `bake-look`.
+    lut_bake: Option<Arc<Pipeline>>,
     /// The tonemap compute set layout (one storage image) the tonemap PSO binds (set 0).
     tonemap_set_layout: vk::DescriptorSetLayout,
+    /// The analytic height-fog composite compute PSO (fog set layout, no push), built lazily.
+    fog: Option<Arc<Pipeline>>,
+    /// The froxel volumetric-fog injection compute PSO (mesh light set 0 + fog volume set 1 + a
+    /// 64-byte medium push), built lazily.
+    fog_inject: Option<Arc<Pipeline>>,
+    /// The froxel volumetric-fog integration compute PSO (fog integrate set, no push), built lazily.
+    fog_integrate: Option<Arc<Pipeline>>,
+    /// The aerial-perspective fill compute PSO (AP fill set: atmosphere LUTs + params + storage volume,
+    /// no push), built lazily.
+    aerial: Option<Arc<Pipeline>>,
+    /// The fog compute set layout (offscreen storage + params UBO + depth + sky-view LUT).
+    fog_set_layout: vk::DescriptorSetLayout,
     /// The depth-upscale graphics PSO (fullscreen triangle, depth-write-always, one fragment
     /// sampler + an 8-byte inputSize push): point-upscales the input-extent scene depth into the
     /// display-extent overlay depth so the grid / gizmo occlude correctly under upsampling.
@@ -312,8 +332,15 @@ impl Pipelines {
             motion: None,
             taa: None,
             fxaa: None,
+            bloom: None,
             tonemap: None,
+            lut_bake: None,
             tonemap_set_layout: descriptors.tonemap_set_layout(),
+            fog: None,
+            fog_inject: None,
+            fog_integrate: None,
+            aerial: None,
+            fog_set_layout: descriptors.fog_set_layout(),
             depth_upscale: None,
             reactive_coverage: None,
             grid: None,
@@ -1004,6 +1031,30 @@ impl Pipelines {
         }
     }
 
+    /// The bloom pyramid compute PSO (bloom set layout, a 32-byte [`crate::BloomPush`]), built and
+    /// cached on first request. One PSO covers the downsample / upsample / composite passes.
+    pub fn request_bloom(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.bloom {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/bloom.spv",
+            layout,
+            size_of::<crate::BloomPush>() as u32,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.bloom = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_bloom: {err}");
+                None
+            }
+        }
+    }
+
     /// The mandatory tonemap compute PSO (tonemap set layout, an 8-byte exposure+mode push),
     /// built and cached on first request. Returns `None`
     /// only on a build failure (logged) — the tonemap is otherwise always present.
@@ -1020,6 +1071,118 @@ impl Pipelines {
             }
             Err(err) => {
                 tracing::error!("request_tonemap: {err}");
+                None
+            }
+        }
+    }
+
+    /// The analytic height-fog composite compute PSO (`height_fog.spv`, the fog set layout, no
+    /// push), built and cached on first use. Returns `None` on a build failure (logged).
+    pub fn request_fog(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.fog {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/height_fog.spv", self.fog_set_layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.fog = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_fog: {err}");
+                None
+            }
+        }
+    }
+
+    /// The froxel fog-injection compute PSO (`fog_inject.spv`): set 0 is the mesh light set layout
+    /// (globals/lights/clusters/cluster params + shadow maps, reused verbatim), set 1 is the fog
+    /// volume set (scatter storage image + grid UBO), plus a 64-byte medium push. Built and cached on
+    /// first use. Returns `None` on a build failure (logged).
+    pub fn request_fog_inject(
+        &mut self,
+        volume_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.fog_inject {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [self.set_layouts[1], volume_layout];
+        match self.build_compute_multi("shaders/fog_inject.spv", &set_layouts, 64) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.fog_inject = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_fog_inject: {err}");
+                None
+            }
+        }
+    }
+
+    /// The froxel fog-integration compute PSO (`fog_integrate.spv`, the integrate set layout, no
+    /// push), built and cached on first use. Returns `None` on a build failure (logged).
+    pub fn request_fog_integrate(
+        &mut self,
+        integrate_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.fog_integrate {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/fog_integrate.spv", integrate_layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.fog_integrate = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_fog_integrate: {err}");
+                None
+            }
+        }
+    }
+
+    /// The aerial-perspective fill compute PSO (`aerial_perspective.spv`, the AP fill set, no push),
+    /// built lazily and resolved only while an active atmosphere + authored AP arm the fill.
+    pub fn request_aerial(
+        &mut self,
+        fill_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.aerial {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/aerial_perspective.spv", fill_layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.aerial = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_aerial: {err}");
+                None
+            }
+        }
+    }
+
+    /// The look-bake compute PSO (folds grade + view transform + creative LUT into a `33³` table),
+    /// built and cached on the first `bake-look`. Returns `None` on a build failure (logged).
+    pub fn request_lut_bake(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.lut_bake {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/lut_bake.spv", self.tonemap_set_layout, 8) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.lut_bake = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_lut_bake: {err}");
                 None
             }
         }
