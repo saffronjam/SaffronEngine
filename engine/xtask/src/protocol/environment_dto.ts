@@ -10,4 +10,5 @@ export interface EnvironmentDto {
   ambientColor: Vec3;
   ambientIntensity: number;
   atmosphere: AtmosphereSettingsDto;
+  fog: FogSettingsDto;
 }
