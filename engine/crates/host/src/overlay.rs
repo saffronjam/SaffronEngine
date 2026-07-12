@@ -20,8 +20,8 @@ use saffron_assets::{AssetServer, GpuUploader};
 use saffron_geometry::world_aabb_from_corners;
 use saffron_rendering::OverlayVertex;
 use saffron_scene::{
-    Bone, Camera, CameraView, Collider, Entity, IdComponent, Mesh, PointLight, Relationship, Scene,
-    Shape, SkinnedMesh, SpotLight, Transform, camera_projection,
+    Bone, Camera, CameraView, Collider, Entity, FogShape, FogVolume, IdComponent, Mesh, PointLight,
+    Relationship, Scene, Shape, SkinnedMesh, SpotLight, Transform, camera_projection,
 };
 use saffron_sceneedit::{
     NativeGizmoHandle, NativeGizmoMode, SceneEditContext, axis_color, camera_position, gizmo_axes,
@@ -39,6 +39,8 @@ enum BillboardKind {
     SpotLight,
     /// A camera glyph.
     Camera,
+    /// A fog-volume cloud glyph.
+    FogVolume,
 }
 
 /// Pushes a flat-colored triangle. Edge + depth are zero (no feather, on top).
@@ -316,6 +318,49 @@ fn add_camera_icon(
     add_line_flat(vertices, c, d, 2.0, color, width, height);
 }
 
+/// Pushes a fog cloud glyph (three overlapping puff circles + a flat base) at `center_px`.
+fn add_fog_icon(
+    vertices: &mut Vec<OverlayVertex>,
+    center_px: Vec2,
+    color: Vec4,
+    width: u32,
+    height: u32,
+) {
+    add_circle_outline(
+        vertices,
+        center_px + Vec2::new(-5.0, 1.0),
+        5.0,
+        color,
+        width,
+        height,
+    );
+    add_circle_outline(
+        vertices,
+        center_px + Vec2::new(5.0, 1.0),
+        5.0,
+        color,
+        width,
+        height,
+    );
+    add_circle_outline(
+        vertices,
+        center_px + Vec2::new(0.0, -3.0),
+        6.0,
+        color,
+        width,
+        height,
+    );
+    add_line_flat(
+        vertices,
+        center_px + Vec2::new(-8.0, 5.5),
+        center_px + Vec2::new(8.0, 5.5),
+        2.0,
+        color,
+        width,
+        height,
+    );
+}
+
 /// The billboard glyph an entity is drawn with: none for a mesh, otherwise by its light /
 /// camera component.
 fn billboard_kind(scene: &Scene, entity: Entity) -> BillboardKind {
@@ -330,6 +375,9 @@ fn billboard_kind(scene: &Scene, entity: Entity) -> BillboardKind {
     }
     if scene.has_component::<Camera>(entity) {
         return BillboardKind::Camera;
+    }
+    if scene.has_component::<FogVolume>(entity) {
+        return BillboardKind::FogVolume;
     }
     BillboardKind::None
 }
@@ -657,6 +705,14 @@ fn build_scene_edit_billboards(
                     Vec4::new(0.85, 0.87, 0.92, 0.95)
                 };
                 add_camera_icon(vertices, p.pixel, color, width, height);
+            }
+            BillboardKind::FogVolume => {
+                let color = if sel {
+                    selected_color
+                } else {
+                    Vec4::new(0.7, 0.8, 0.92, 0.9)
+                };
+                add_fog_icon(vertices, p.pixel, color, width, height);
             }
             BillboardKind::None => {}
         }
@@ -1087,6 +1143,48 @@ fn build_debug_overlays(
             width,
             height,
         );
+    }
+
+    // Local fog volumes: a passive box/sphere wireframe of the injected bounds, in the depth-tested
+    // overlay range so scene geometry occludes it. Reuses the mesh-bounds toggle.
+    if opts.bounds {
+        const FOG_VOLUME_COLOR: Vec4 = Vec4::new(0.6, 0.75, 0.95, 0.85);
+        let mut fog_volumes: Vec<(Entity, FogVolume)> = Vec::new();
+        scene.for_each::<(&Transform, &FogVolume), _>(|entity, (_, volume)| {
+            fog_volumes.push((entity, *volume));
+        });
+        for (entity, volume) in fog_volumes {
+            let model = scene.world_matrix(entity);
+            match volume.shape {
+                FogShape::Box => {
+                    add_world_oriented_box(
+                        vertices,
+                        &view_projection,
+                        &model,
+                        volume.extents,
+                        FOG_VOLUME_COLOR,
+                        width,
+                        height,
+                    );
+                }
+                FogShape::Sphere => {
+                    let center = model.col(3).truncate();
+                    for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::X, Vec3::Z)] {
+                        add_world_ring(
+                            vertices,
+                            &view_projection,
+                            center,
+                            a,
+                            b,
+                            volume.radius,
+                            FOG_VOLUME_COLOR,
+                            width,
+                            height,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     if opts.light_volumes {
