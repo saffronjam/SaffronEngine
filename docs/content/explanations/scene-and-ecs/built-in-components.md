@@ -136,8 +136,9 @@ pub struct SpotLight {
 }
 ```
 
-The directional light is the sun; the scene shades through the first one and carries a flat
-`ambient` floor. Point and spot lights sit at the entity's `Transform` translation, since the
+The directional light is the sun; the scene shades through the first one, which carries a flat
+`ambient` floor (a scene with no directional light has no direct sun and no such floor). Point
+and spot lights sit at the entity's `Transform` translation, since the
 components hold no position of their own, and are
 [culled into clusters](../../shadows-and-culling/clustered-light-culling/) by the light system. See
 [light components](../../lighting-and-brdf/light-components/) for how `render_scene` packs these into
