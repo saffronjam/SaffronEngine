@@ -10,6 +10,12 @@ A directional light is a parallel light source with a direction but no position 
 modelling the sun. It is the first term the fragment shader accumulates, evaluated through the
 same [BRDF](../cook-torrance-brdf/) as every punctual light, then attenuated by its shadow.
 
+It is an ordinary scene entity — a `DirectionalLight` component you add, edit, and delete like
+any other. The scene shades through the **first** one; a scene with no directional light has **no
+direct sun** at all (only the sky and [IBL ambient](../ibl-ambient-term/) light it, so it can go
+genuinely dark). A freshly created scene seeds a real "Sun" entity so there is something to light
+it by default — delete it and the direct sun is gone; there is no hidden fallback sun behind it.
+
 ## A single direction, no attenuation
 
 A directional light has no distance, so it has no attenuation and no cone. The incoming radiance
@@ -58,7 +64,8 @@ Contact shadows are directional-only in v1; the map and ray paths are mutually e
 The directional component is the only one carrying an `ambient` scalar
 (`directionAmbient.w`). When [IBL](../ibl-ambient-term/) is off, that scalar is the flat
 indirect fallback: a constant fill so unlit surfaces are not pure black. It is not part of the
-direct term above; it is added later with the rest of the ambient.
+direct term above; it is added later with the rest of the ambient. With no directional light in
+the scene, there is no scalar fallback either — the ambient comes only from the sky/IBL.
 
 ## In the code
 
@@ -68,7 +75,8 @@ direct term above; it is added later with the rest of the ambient.
 | Shadow map PCF | `engine/assets/shaders/lighting.slang` | `pcfShadow`, `globals.shadowViewProj` |
 | Contact + RT shadow | `engine/assets/shaders/lighting.slang` | `contactMap`, `rayQueryShadow` |
 | Direction + ambient upload | `engine/crates/rendering/src/lighting.rs` | `Lighting::set_scene_lighting` — `LightUbo::direction_ambient`, `LightUbo::color_intensity` |
-| Gather the sun from the scene | `engine/crates/assets/src/render_scene.rs` | `gather_directional_light` |
+| Gather the sun from the scene (`None` = no sun) | `engine/crates/assets/src/render_scene.rs` | `gather_directional_light`, `DirectionalResolved` |
+| Seed the starter Sun on a fresh scene | `engine/crates/scene/src/starter.rs` | `seed_starter_scene` |
 
 > [!TIP]
 > `globals.directionAmbient.xyz` is the direction the light travels, not the direction toward
