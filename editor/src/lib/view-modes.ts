@@ -6,6 +6,7 @@
 import {
   Activity,
   Axis3d,
+  CloudFog,
   Contrast,
   Flame,
   Flashlight,
@@ -56,6 +57,7 @@ export const VIEW_MODES: ViewModeDef[] = [
   { value: "gi", label: "Global Illumination", icon: Globe, group: "buffer" },
   { value: "motion-vectors", label: "Motion Vectors", icon: Wind, group: "buffer" },
   { value: "light-complexity", label: "Light Complexity", icon: Activity, group: "analysis" },
+  { value: "fog", label: "Fog", icon: CloudFog, group: "analysis" },
 ];
 
 /// The mode metadata keyed by wire value, for the trigger icon + label lookup.
