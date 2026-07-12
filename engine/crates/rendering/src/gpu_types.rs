@@ -227,7 +227,8 @@ pub struct GpuLight {
     pub color_intensity: Vec4,
     /// `xyz` world direction (spot), `w` type (0 = point, 1 = spot).
     pub direction_type: Vec4,
-    /// `x` cos(inner angle), `y` cos(outer angle).
+    /// `x` cos(inner angle), `y` cos(outer angle), `z` volumetric-scattering multiplier (per-light
+    /// fog in-scatter), `w` cast-volumetric-shadow gate (`0`/`1`).
     pub spot_cos: Vec4,
 }
 
