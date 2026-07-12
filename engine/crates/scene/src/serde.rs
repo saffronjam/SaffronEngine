@@ -36,12 +36,14 @@ use saffron_json::{json_bool_or, json_f32_or, json_string_or, json_u64_or, uuid_
 
 use crate::component::{
     AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
-    Collider, DirectionalLight, FootChain, FootIk, Joint, KinematicBones, MaterialSet,
-    MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name, PhysicsMaterial, PointLight,
-    ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh, SpotLight,
-    Transform, Transition, Wrap,
+    Collider, DirectionalLight, FogShape, FogVolume, FootChain, FootIk, Joint, KinematicBones,
+    MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name, PhysicsMaterial,
+    PointLight, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh,
+    SpotLight, Transform, Transition, Wrap,
 };
-use crate::environment::{AtmosphereSettings, SceneEnvironment, SkyMode};
+use crate::environment::{
+    AtmosphereSettings, FogMode, FogQuality, FogSettings, SceneEnvironment, SkyMode,
+};
 use crate::error::Result;
 use crate::registry::SceneSerialize;
 
@@ -115,6 +117,44 @@ fn sky_mode_name(mode: SkyMode) -> &'static str {
         SkyMode::Color => "color",
         SkyMode::Texture => "texture",
         SkyMode::Procedural => "procedural",
+    }
+}
+
+/// The wire name for a [`FogMode`].
+fn fog_mode_name(mode: FogMode) -> &'static str {
+    match mode {
+        FogMode::Analytic => "analytic",
+        FogMode::Volumetric => "volumetric",
+    }
+}
+
+/// The wire name for a [`FogQuality`].
+fn fog_quality_name(quality: FogQuality) -> &'static str {
+    match quality {
+        FogQuality::Low => "low",
+        FogQuality::Medium => "medium",
+        FogQuality::High => "high",
+    }
+}
+
+/// Reads a [`FogQuality`] from its wire name, defaulting to `Medium` on an unknown spelling.
+fn fog_quality_from_name(name: &str) -> FogQuality {
+    match name {
+        "low" => FogQuality::Low,
+        "high" => FogQuality::High,
+        _ => FogQuality::Medium,
+    }
+}
+
+/// Reads a [`FogMode`] from its wire name, warning and defaulting to `Analytic` on an unknown spelling.
+fn fog_mode_from_name(name: &str) -> FogMode {
+    match name {
+        "analytic" => FogMode::Analytic,
+        "volumetric" => FogMode::Volumetric,
+        other => {
+            tracing::warn!("unknown fog mode '{other}', defaulting to analytic");
+            FogMode::Analytic
+        }
     }
 }
 
@@ -343,6 +383,14 @@ impl SceneSerialize for DirectionalLight {
             ("color", vec3_to_json(self.color)),
             ("intensity", f32_value(self.intensity)),
             ("ambient", f32_value(self.ambient)),
+            (
+                "volumetricScattering",
+                f32_value(self.volumetric_scattering),
+            ),
+            (
+                "castVolumetricShadow",
+                Value::Bool(self.cast_volumetric_shadow),
+            ),
         ])
     }
 
@@ -351,6 +399,8 @@ impl SceneSerialize for DirectionalLight {
         self.color = vec3_from_json(&object_field(value, "color"));
         self.intensity = json_f32_or(value, "intensity", 1.0);
         self.ambient = json_f32_or(value, "ambient", 0.15);
+        self.volumetric_scattering = json_f32_or(value, "volumetricScattering", 1.0);
+        self.cast_volumetric_shadow = json_bool_or(value, "castVolumetricShadow", true);
         Ok(())
     }
 }
@@ -361,6 +411,14 @@ impl SceneSerialize for PointLight {
             ("color", vec3_to_json(self.color)),
             ("intensity", f32_value(self.intensity)),
             ("range", f32_value(self.range)),
+            (
+                "volumetricScattering",
+                f32_value(self.volumetric_scattering),
+            ),
+            (
+                "castVolumetricShadow",
+                Value::Bool(self.cast_volumetric_shadow),
+            ),
         ])
     }
 
@@ -368,6 +426,8 @@ impl SceneSerialize for PointLight {
         self.color = vec3_from_json(&object_field(value, "color"));
         self.intensity = json_f32_or(value, "intensity", 5.0);
         self.range = json_f32_or(value, "range", 10.0);
+        self.volumetric_scattering = json_f32_or(value, "volumetricScattering", 1.0);
+        self.cast_volumetric_shadow = json_bool_or(value, "castVolumetricShadow", true);
         Ok(())
     }
 }
@@ -381,6 +441,14 @@ impl SceneSerialize for SpotLight {
             ("range", f32_value(self.range)),
             ("innerAngle", f32_value(self.inner_angle)),
             ("outerAngle", f32_value(self.outer_angle)),
+            (
+                "volumetricScattering",
+                f32_value(self.volumetric_scattering),
+            ),
+            (
+                "castVolumetricShadow",
+                Value::Bool(self.cast_volumetric_shadow),
+            ),
         ])
     }
 
@@ -391,6 +459,8 @@ impl SceneSerialize for SpotLight {
         self.range = json_f32_or(value, "range", 10.0);
         self.inner_angle = json_f32_or(value, "innerAngle", 20.0);
         self.outer_angle = json_f32_or(value, "outerAngle", 30.0);
+        self.volumetric_scattering = json_f32_or(value, "volumetricScattering", 1.0);
+        self.cast_volumetric_shadow = json_bool_or(value, "castVolumetricShadow", true);
         Ok(())
     }
 }
@@ -412,6 +482,59 @@ impl SceneSerialize for ReflectionProbe {
         self.box_extent = vec3_from_json(&object_field(value, "boxExtent"));
         // Capture pending on every read.
         self.dirty = true;
+        Ok(())
+    }
+}
+
+/// The lowercase wire name for a [`FogShape`].
+fn fog_shape_name(shape: FogShape) -> &'static str {
+    match shape {
+        FogShape::Box => "box",
+        FogShape::Sphere => "sphere",
+    }
+}
+
+impl SceneSerialize for FogVolume {
+    fn to_json(&self) -> Value {
+        object([
+            (
+                "shape",
+                Value::String(fog_shape_name(self.shape).to_string()),
+            ),
+            ("extents", vec3_to_json(self.extents)),
+            ("radius", f32_value(self.radius)),
+            ("edgeFalloff", f32_value(self.edge_falloff)),
+            ("density", f32_value(self.density)),
+            ("albedo", vec3_to_json(self.albedo)),
+            ("emissive", vec3_to_json(self.emissive)),
+            ("phaseG", f32_value(self.phase_g)),
+            ("heightFalloff", f32_value(self.height_falloff)),
+            ("noiseScale", f32_value(self.noise_scale)),
+            ("noiseIntensity", f32_value(self.noise_intensity)),
+            ("noiseDetail", f32_value(self.noise_detail)),
+            ("wind", vec3_to_json(self.wind)),
+            ("speed", f32_value(self.speed)),
+        ])
+    }
+
+    fn load_json(&mut self, value: &Value) -> Result<()> {
+        self.shape = match json_string_or(value, "shape", "box".to_string()).as_str() {
+            "sphere" => FogShape::Sphere,
+            _ => FogShape::Box,
+        };
+        self.extents = vec3_from_json(&object_field(value, "extents"));
+        self.radius = json_f32_or(value, "radius", 5.0);
+        self.edge_falloff = json_f32_or(value, "edgeFalloff", 1.0);
+        self.density = json_f32_or(value, "density", 0.5);
+        self.albedo = vec3_from_json(&object_field(value, "albedo"));
+        self.emissive = vec3_from_json(&object_field(value, "emissive"));
+        self.phase_g = json_f32_or(value, "phaseG", 0.0);
+        self.height_falloff = json_f32_or(value, "heightFalloff", 0.0);
+        self.noise_scale = json_f32_or(value, "noiseScale", 0.2);
+        self.noise_intensity = json_f32_or(value, "noiseIntensity", 0.0);
+        self.noise_detail = json_f32_or(value, "noiseDetail", 0.5);
+        self.wind = vec3_from_json(&object_field(value, "wind"));
+        self.speed = json_f32_or(value, "speed", 0.1);
         Ok(())
     }
 }
@@ -824,6 +947,81 @@ fn atmosphere_from_json(j: &Value) -> AtmosphereSettings {
     a
 }
 
+/// The `FogSettings` block, nested inside the environment.
+fn fog_to_json(f: &FogSettings) -> Value {
+    object([
+        ("enabled", Value::Bool(f.enabled)),
+        ("mode", Value::String(fog_mode_name(f.mode).to_string())),
+        (
+            "quality",
+            Value::String(fog_quality_name(f.quality).to_string()),
+        ),
+        ("historyBlend", f32_value(f.history_blend)),
+        ("neighborhoodClamp", Value::Bool(f.neighborhood_clamp)),
+        ("lightClamp", f32_value(f.light_clamp)),
+        ("baseDensity", f32_value(f.base_density)),
+        ("scatterAlbedo", f32_value(f.scatter_albedo)),
+        ("phaseG", f32_value(f.phase_g)),
+        ("density", f32_value(f.density)),
+        ("albedo", vec3_to_json(f.albedo)),
+        ("height", f32_value(f.height)),
+        ("heightFalloff", f32_value(f.height_falloff)),
+        ("startDistance", f32_value(f.start_distance)),
+        ("maxOpacity", f32_value(f.max_opacity)),
+        ("emissive", vec3_to_json(f.emissive)),
+        ("directionalColor", vec3_to_json(f.directional_color)),
+        ("directionalExponent", f32_value(f.directional_exponent)),
+        ("layer2Density", f32_value(f.layer2_density)),
+        ("layer2Falloff", f32_value(f.layer2_falloff)),
+        ("layer2Height", f32_value(f.layer2_height)),
+        ("aerialPerspective", Value::Bool(f.aerial_perspective)),
+        ("aerialIntensity", f32_value(f.aerial_intensity)),
+    ])
+}
+
+/// Reads a [`FogSettings`] block, defaulting per field and leaving the vector fields at
+/// their struct defaults when absent.
+fn fog_from_json(j: &Value) -> FogSettings {
+    let mut f = FogSettings::default();
+    if !j.is_object() {
+        return f;
+    }
+    f.enabled = json_bool_or(j, "enabled", false);
+    if let Some(Value::String(s)) = field(j, "mode") {
+        f.mode = fog_mode_from_name(s);
+    }
+    if let Some(Value::String(s)) = field(j, "quality") {
+        f.quality = fog_quality_from_name(s);
+    }
+    f.history_blend = json_f32_or(j, "historyBlend", 0.05);
+    f.neighborhood_clamp = json_bool_or(j, "neighborhoodClamp", false);
+    f.light_clamp = json_f32_or(j, "lightClamp", 0.0);
+    f.base_density = json_f32_or(j, "baseDensity", 0.02);
+    f.scatter_albedo = json_f32_or(j, "scatterAlbedo", 0.9);
+    f.phase_g = json_f32_or(j, "phaseG", 0.6);
+    f.density = json_f32_or(j, "density", 0.02);
+    if let Some(v) = field(j, "albedo") {
+        f.albedo = vec3_from_json(v);
+    }
+    f.height = json_f32_or(j, "height", 0.0);
+    f.height_falloff = json_f32_or(j, "heightFalloff", 0.2);
+    f.start_distance = json_f32_or(j, "startDistance", 0.0);
+    f.max_opacity = json_f32_or(j, "maxOpacity", 1.0);
+    if let Some(v) = field(j, "emissive") {
+        f.emissive = vec3_from_json(v);
+    }
+    if let Some(v) = field(j, "directionalColor") {
+        f.directional_color = vec3_from_json(v);
+    }
+    f.directional_exponent = json_f32_or(j, "directionalExponent", 8.0);
+    f.layer2_density = json_f32_or(j, "layer2Density", 0.0);
+    f.layer2_falloff = json_f32_or(j, "layer2Falloff", 0.5);
+    f.layer2_height = json_f32_or(j, "layer2Height", 0.0);
+    f.aerial_perspective = json_bool_or(j, "aerialPerspective", false);
+    f.aerial_intensity = json_f32_or(j, "aerialIntensity", 1.0);
+    f
+}
+
 /// Serializes the [`SceneEnvironment`] block.
 ///
 /// The scene-document phase writes this under the document's `environment` key; it is a
@@ -846,6 +1044,7 @@ pub fn environment_to_json(env: &SceneEnvironment) -> Value {
         ("ambientColor", vec3_to_json(env.ambient_color)),
         ("ambientIntensity", f32_value(env.ambient_intensity)),
         ("atmosphere", atmosphere_to_json(&env.atmosphere)),
+        ("fog", fog_to_json(&env.fog)),
     ])
 }
 
@@ -873,6 +1072,9 @@ pub fn environment_from_json(j: &Value) -> SceneEnvironment {
     env.ambient_intensity = json_f32_or(j, "ambientIntensity", 0.15);
     if let Some(v) = field(j, "atmosphere") {
         env.atmosphere = atmosphere_from_json(v);
+    }
+    if let Some(v) = field(j, "fog") {
+        env.fog = fog_from_json(v);
     }
     env
 }
