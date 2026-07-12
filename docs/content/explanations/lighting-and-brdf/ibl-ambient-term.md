@@ -29,7 +29,8 @@ else
 
 The fallback is the [directional light's](../directional-light/) `ambient` scalar
 (`directionAmbient.w`) times the diffuse albedo — a constant fill so unlit surfaces are not pure
-black. It carries no directionality and no specular.
+black. It carries no directionality and no specular. With no directional light in the scene the
+scalar is zero, so this fallback contributes nothing and the sky/IBL is the only ambient.
 
 ## Split-sum IBL
 
