@@ -44,8 +44,7 @@ they are the cheapest way to unblock the most features.
 | [cloth-and-soft-body](cloth-and-soft-body.md) | S–M | none | Jolt soft bodies + existing compute-skinning ingestion. |
 | [gpu-particle-vfx](gpu-particle-vfx.md) | L | indirect-args/persistent buffers | keystone enabler for all VFX. |
 | [smoke-fire-and-fluids](smoke-fire-and-fluids.md) | M–XL | gpu-particle-vfx (FLIP) | Eulerian gas solver + volumetric render. |
-| [sky-atmosphere-and-volumetrics](sky-atmosphere-and-volumetrics.md) | S–XL | none (clouds want sky first) | dynamic sky + aerial perspective + clouds + time-of-day (fog → volumetric-fog). |
-| [volumetric-fog](volumetric-fog.md) | S–M | none (clustered lights/shadows present) | height + froxel fog + god-rays; no fog of any kind today. |
+| [sky-atmosphere-and-volumetrics](sky-atmosphere-and-volumetrics.md) | S–XL | none (clouds want sky first) | dynamic sky + aerial perspective + clouds + time-of-day (fog → [`../volumetric/`](../volumetric/README.md)). |
 | [heightfield-terrain](heightfield-terrain.md) | L | none | enabler for foliage/water/sculpting. |
 | [foliage-and-vegetation](foliage-and-vegetation.md) | M–XL | heightfield-terrain (canonical use) | painting, wind, interactive bending, PCG. |
 | [wind](wind.md) | S–M | none | a shared wind field foliage/cloth/particles all read. |
@@ -60,7 +59,7 @@ they are the cheapest way to unblock the most features.
 | [networking-multiplayer](networking-multiplayer.md) | L–XL | GUIDs + parenting | rollback is the determinism-differentiated option. |
 | [large-worlds-streaming](large-worlds-streaming.md) | L–XL | GUIDs + parenting | defer unless target worlds demand it. |
 
-**Graduated to a planset:** bloom + color grading → [`../post-processing/`](../post-processing/README.md) — energy-conserving pre-tonemap bloom + a scene-linear grade folded into the tonemap pass + a creative LUT slot.
+**Graduated to a planset:** bloom + color grading → [`../post-processing/`](../post-processing/README.md) — energy-conserving pre-tonemap bloom + a scene-linear grade folded into the tonemap pass + a creative LUT slot. Volumetric & height fog → [`../volumetric/`](../volumetric/README.md) — analytic height fog + a Wronski/Hillaire froxel grid (reusing clustered lights + shadows + TAA) + local fog volumes + aerial perspective.
 
 ## Suggested tiers
 
@@ -70,7 +69,7 @@ they are the cheapest way to unblock the most features.
   gameplay tags + input mapping, **scene-graph parenting** (the gap).
 - **Tier 1 — foundational enablers:** GPU particle runtime, heightfield terrain + collision, GPU-FFT
   utility, curve-editor widget, procedural camera, navmesh + pathfinding + behavior trees.
-- **Tier 2 — built on Tier 1:** froxel volumetric fog + aerial perspective, smoke/fire, FFT ocean + water
+- **Tier 2 — built on Tier 1:** froxel volumetric fog + aerial perspective (now the [`volumetric`](../volumetric/README.md) planset), smoke/fire, FFT ocean + water
   shading + buoyancy, foliage (samples the wind field), terrain sculpting, destruction, prefabs +
   save/load, cinematic Sequencer, audio engine.
 - **Tier 3 — large programs (defer):** volumetric clouds, FLIP liquids + weather precipitation,
