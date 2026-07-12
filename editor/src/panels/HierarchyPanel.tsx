@@ -1,9 +1,8 @@
 /// The Hierarchy panel: a tree outliner over the scene entities, built client-side
 /// from the flat `store.entities` slice plus each entry's `parentId` (refreshed by
 /// the reconcile poll only when sceneVersion changes — this component never fetches).
-/// A pinned Environment sentinel sits above the entity rows. Left-click selects
-/// (optimistic + `select`); double-click renames inline (Enter commits via
-/// `rename-entity`, Esc cancels); right-click opens Focus / Rename / Copy /
+/// Left-click selects (optimistic + `select`); double-click renames inline (Enter
+/// commits via `rename-entity`, Esc cancels); right-click opens Focus / Rename / Copy /
 /// Parent to… / Unparent / Delete; dragging a row onto another reparents via
 /// `set-parent`.
 ///
