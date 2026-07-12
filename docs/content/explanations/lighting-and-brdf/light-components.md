@@ -43,8 +43,9 @@ pub struct SpotLight {
 
 `DirectionalLight::default()` aims at `(-0.5, -1.0, -0.3)` with `ambient = 0.15`; `SpotLight`
 defaults to a `20°`/`30°` cone with `range = 10.0`. The scene shades through the first
-directional light it finds and ignores the rest. It is the only light carrying an `ambient`
-scalar, which feeds the flat-ambient fallback when [IBL](../ibl-ambient-term/) is off. Point and
+directional light it finds and ignores the rest; with no directional light there is no direct
+sun. It is the only light carrying an `ambient` scalar, which feeds the flat-ambient fallback
+when [IBL](../ibl-ambient-term/) is off (and only while a directional light exists). Point and
 spot lights are the punctual lights: a position and an inverse-square falloff with a hard
 `range`. A spot adds a cone aimed by `direction`, with a soft edge between `inner_angle` and
 `outer_angle`.
@@ -96,9 +97,9 @@ feature flags ([directional shadow](../directional-light/), IBL, SSAO).
 | The upload | `engine/crates/rendering/src/lighting.rs` | `Lighting::set_scene_lighting`, `Lighting::ensure_light_capacity`, `LightUbo` |
 
 > [!NOTE]
-> Only the first directional light shades the scene; extra ones are silently ignored. The light
-> buffer grows by powers of two and never shrinks within a session, so a scene that briefly
-> spikes to many lights keeps the larger allocation.
+> Only the first directional light shades the scene; extra ones are silently ignored, and a
+> scene with none has no direct sun. The light buffer grows by powers of two and never shrinks
+> within a session, so a scene that briefly spikes to many lights keeps the larger allocation.
 
 ## Related
 
