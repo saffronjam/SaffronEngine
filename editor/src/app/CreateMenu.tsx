@@ -14,6 +14,7 @@ import {
   Camera,
   Circle,
   CircleDashed,
+  CloudFog,
   Flashlight,
   Lightbulb,
   Orbit,
@@ -50,6 +51,7 @@ export const CREATE_PRESETS: { label: string; preset: EntityPreset; icon: Lucide
   { label: "Directional Light", preset: "directional-light", icon: Sun },
   { label: "Camera", preset: "camera", icon: Camera },
   { label: "Reflection Probe", preset: "reflection-probe", icon: Orbit },
+  { label: "Fog Volume", preset: "fog-volume", icon: CloudFog },
 ];
 
 export function CreateMenu() {
