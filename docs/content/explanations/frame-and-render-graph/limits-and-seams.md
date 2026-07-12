@@ -43,6 +43,21 @@ and the resource table is a plain `Vec`. A transient would be a resource the gra
 and frees at end of frame, slotting into the same table. The right-sized targets that exist today
 are the first candidates to alias.
 
+## Volumes are dimension-agnostic
+
+Barrier derivation reasons about a whole image and never about its dimensionality, so a 3D image is
+tracked exactly like a 2D one. `import_image_3d` delegates straight to `import_image` with a `COLOR`
+aspect, and the `GENERAL` ↔ `SHADER_READ_ONLY` transitions the compute usages derive apply to a
+`TYPE_3D` image with no special case. On top of that, the transient pool serves 3D volumes:
+`acquire_image_3d` returns a keyed, grow-only `TYPE_3D` image (backed by `Image3D`) the same way
+`acquire_image` returns a 2D one, and a compute pass dispatches over it in three dimensions through
+the `groups_z` argument on `add_compute_pass`. The froxel-fog grid uses all three — a per-frame
+`rgba16f` frustum volume acquired transiently, written and sampled by a 3D compute grid, imported
+each frame for the graph to barrier.
+
+This is the pool side of the transient story, not graph-created aliasing (still absent, above): the
+allocation is renderer-owned and imported, only now it can be a `depth > 1` volume.
+
 ## No pass culling
 
 The graph records every pass it is given; there is no reachability analysis that drops a pass whose
@@ -95,6 +110,8 @@ the data they would require already declared.
 |---|---|---|
 | Single-queue execution | `render_graph.rs` | `RenderGraph::execute`, `execute_profiled` |
 | Import-only resources | `render_graph.rs` | `RenderGraph::import_image`, `import_buffer` |
+| 3D transient volumes | `transient.rs`, `render_graph.rs` | `acquire_image_3d`, `TransientImage3D`, `import_image_3d` |
+| 3D compute dispatch | `renderer.rs`, `froxel_fog.rs` | `add_compute_pass` (`groups_z`), `FROXEL_GRID_X`, `FogGridParams`, `froxel_grid_matches_shader` |
 | Full-image subresource | `render_graph.rs` | `apply_access`, `RgResourceState` |
 | Pass kind (the async seam) | `render_graph.rs` | `RgPass::kind`, `RgPassKind` |
 | Conditional construction | `renderer.rs` | `Renderer::record_scene_graph` (the `do_*` gates) |
