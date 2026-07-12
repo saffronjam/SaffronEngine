@@ -28,7 +28,7 @@ let mappedAsset: string | undefined;
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   await engine.call("set-ibl", { args: ["on"] }).catch(() => {});
-  await engine.call("add-entity", { args: ["directional-light"] }).catch(() => {});
+  // The scratch project's starter scene already carries a Sun directional light.
 });
 afterAll(async () => {
   await engine?.shutdown();
