@@ -40,11 +40,23 @@ import {
 
 type SkyMode = Environment["skyMode"];
 type Atmosphere = Environment["atmosphere"];
+type Fog = Environment["fog"];
 
 const SKY_MODES: { value: SkyMode; label: string }[] = [
   { value: "color", label: "Color" },
   { value: "texture", label: "Texture" },
   { value: "procedural", label: "Procedural" },
+];
+
+const FOG_MODES: { value: Fog["mode"]; label: string }[] = [
+  { value: "analytic", label: "Analytic" },
+  { value: "volumetric", label: "Volumetric" },
+];
+
+const FOG_QUALITIES: { value: Fog["quality"]; label: string }[] = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
 ];
 
 /// A labelled row: a left caption + the widget, matching the inspector's grid.
@@ -135,12 +147,40 @@ export function EnvironmentPanel() {
     [],
   );
 
+  // Fog fields route through `set-fog` (a server-side merge over the current `fog` block)
+  // rather than `set-environment`, for the same reason as atmosphere. The merged
+  // environment is folded back like above.
+  const fogCoalescers = useRef(new Map<keyof Fog, Coalescer<Partial<Fog>>>());
+  const fogCoalescerFor = useMemo(
+    () =>
+      (field: keyof Fog): Coalescer<Partial<Fog>> => {
+        let c = fogCoalescers.current.get(field);
+        if (!c) {
+          c = makeCoalescer<Partial<Fog>>({
+            send: async (patch) => {
+              const merged = await client.setFog(patch);
+              if (!useEditorStore.getState().dragActive) {
+                useEditorStore.getState().setEnvironment(merged);
+              }
+            },
+          });
+          fogCoalescers.current.set(field, c);
+        }
+        return c;
+      },
+    [],
+  );
+
   // Undo capture: a gesture touches exactly one field, captured on its first tick and
   // recorded as one entry at drag end; a discrete edit records inline. The shared drag
-  // bracket needs no per-field binding because `patch`/`patchAtmos` carry the field.
-  // Declared before the early return so the hook count never changes between renders.
+  // bracket needs no per-field binding because `patch`/`patchAtmos`/`patchFog` carry the
+  // field. Declared before the early return so the hook count never changes between renders.
   const gesturing = useRef(false);
-  const envGesture = useRef<{ atmos: boolean; field: string; prior: unknown } | null>(null);
+  const envGesture = useRef<{
+    block: "env" | "atmos" | "fog";
+    field: string;
+    prior: unknown;
+  } | null>(null);
 
   if (!environment) {
     return (
@@ -182,13 +222,26 @@ export function EnvironmentPanel() {
       "scene",
     );
   };
+  const recordFogEdit = (field: keyof Fog, prior: unknown, after: unknown): void => {
+    if (JSON.stringify(prior) === JSON.stringify(after)) {
+      return;
+    }
+    useEditorStore.getState().pushEdit(
+      {
+        label: humanizeFieldName(field),
+        undo: () => client.setFog({ [field]: prior } as Partial<Fog>),
+        redo: () => client.setFog({ [field]: after } as Partial<Fog>),
+      },
+      "scene",
+    );
+  };
 
   // Optimistic local write + coalesced send of the one changed field. A discrete edit
   // records immediately; a gesture captures its field + prior on the first tick.
   const patch = (field: keyof Environment, value: Environment[keyof Environment]): void => {
     if (gesturing.current) {
       if (envGesture.current === null) {
-        envGesture.current = { atmos: false, field, prior: structuredClone(env[field]) };
+        envGesture.current = { block: "env", field, prior: structuredClone(env[field]) };
       }
     } else {
       recordEnvEdit(field, structuredClone(env[field]), structuredClone(value));
@@ -211,12 +264,14 @@ export function EnvironmentPanel() {
     if (!g || !live) {
       return;
     }
-    if (g.atmos) {
+    if (g.block === "atmos") {
       recordAtmosEdit(
         g.field as keyof Atmosphere,
         g.prior,
         structuredClone(live.atmosphere[g.field as keyof Atmosphere]),
       );
+    } else if (g.block === "fog") {
+      recordFogEdit(g.field as keyof Fog, g.prior, structuredClone(live.fog[g.field as keyof Fog]));
     } else {
       recordEnvEdit(
         g.field as keyof Environment,
@@ -240,7 +295,7 @@ export function EnvironmentPanel() {
   const patchAtmos = <K extends keyof Atmosphere>(field: K, value: Atmosphere[K]): void => {
     if (gesturing.current) {
       if (envGesture.current === null) {
-        envGesture.current = { atmos: true, field, prior: structuredClone(atmos[field]) };
+        envGesture.current = { block: "atmos", field, prior: structuredClone(atmos[field]) };
       }
     } else {
       recordAtmosEdit(field, structuredClone(atmos[field]), structuredClone(value));
@@ -252,6 +307,26 @@ export function EnvironmentPanel() {
     (field: "rayleighScattering" | "ozoneAbsorption") =>
     (channels: Record<string, number>): void => {
       patchAtmos(field, { ...(atmos[field] as Vec3), ...channels } as Atmosphere[typeof field]);
+    };
+
+  // Optimistic local write of one fog field + a coalesced `set-fog` merge (a Partial<Fog>).
+  // The server folds it over the current block; the height-fog composite picks it up next frame.
+  const fog = env.fog;
+  const patchFog = <K extends keyof Fog>(field: K, value: Fog[K]): void => {
+    if (gesturing.current) {
+      if (envGesture.current === null) {
+        envGesture.current = { block: "fog", field, prior: structuredClone(fog[field]) };
+      }
+    } else {
+      recordFogEdit(field, structuredClone(fog[field]), structuredClone(value));
+    }
+    setEnvironment({ ...env, fog: { ...fog, [field]: value } } as Environment);
+    fogCoalescerFor(field).push({ [field]: value } as Partial<Fog>);
+  };
+  const onFogVec =
+    (field: "albedo" | "emissive" | "directionalColor") =>
+    (channels: Record<string, number>): void => {
+      patchFog(field, { ...(fog[field] as Vec3), ...channels } as Fog[typeof field]);
     };
 
   return (
@@ -456,6 +531,289 @@ export function EnvironmentPanel() {
                   onDragEnd={onDragEnd}
                 />
               </Row>
+            </>
+          ) : null}
+
+          <Separator className="my-1" />
+
+          <Row label="Fog">
+            <Switch
+              checked={fog.enabled}
+              onCheckedChange={(checked) => patchFog("enabled", checked)}
+            />
+          </Row>
+
+          {fog.enabled ? (
+            <>
+              <Row label="Mode">
+                <Select
+                  value={fog.mode}
+                  onValueChange={(value) => patchFog("mode", value as Fog["mode"])}
+                >
+                  <SelectTrigger size="sm" className="h-7 w-full font-mono text-[11px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FOG_MODES.map((m) => (
+                      <SelectItem key={m.value} value={m.value} className="text-[11px]">
+                        {m.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Row>
+
+              {fog.mode === "volumetric" ? (
+                <>
+                  <Row label="Quality">
+                    <Select
+                      value={fog.quality}
+                      onValueChange={(value) => patchFog("quality", value as Fog["quality"])}
+                    >
+                      <SelectTrigger size="sm" className="h-7 w-full font-mono text-[11px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {FOG_QUALITIES.map((q) => (
+                          <SelectItem key={q.value} value={q.value} className="text-[11px]">
+                            {q.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Row>
+
+                  <Row label="History Blend">
+                    <NumberDrag
+                      value={fog.historyBlend}
+                      min={0}
+                      max={1}
+                      step={0.005}
+                      onChange={(v) => patchFog("historyBlend", v)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+
+                  <Row label="Nbhd Clamp">
+                    <Switch
+                      checked={fog.neighborhoodClamp}
+                      onCheckedChange={(checked) => patchFog("neighborhoodClamp", checked)}
+                    />
+                  </Row>
+
+                  <Row label="Light Clamp">
+                    <NumberDrag
+                      value={fog.lightClamp}
+                      min={0}
+                      max={50}
+                      step={0.1}
+                      onChange={(v) => patchFog("lightClamp", v)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+
+                  <Row label="Base Density">
+                    <NumberDrag
+                      value={fog.baseDensity}
+                      min={0}
+                      max={2}
+                      step={0.001}
+                      onChange={(v) => patchFog("baseDensity", v)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+
+                  <Row label="Scatter Albedo">
+                    <NumberDrag
+                      value={fog.scatterAlbedo}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      onChange={(v) => patchFog("scatterAlbedo", v)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+
+                  <Row label="Phase g">
+                    <NumberDrag
+                      value={fog.phaseG}
+                      min={-0.99}
+                      max={0.99}
+                      step={0.01}
+                      onChange={(v) => patchFog("phaseG", v)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+                </>
+              ) : null}
+
+              <Row label="Density">
+                <NumberDrag
+                  value={fog.density}
+                  min={0}
+                  max={2}
+                  step={0.001}
+                  onChange={(v) => patchFog("density", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Albedo">
+                <ColorField
+                  kind="color3"
+                  value={fog.albedo as unknown as Record<string, number>}
+                  onChange={onFogVec("albedo")}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Height">
+                <NumberDrag
+                  value={fog.height}
+                  min={-1000}
+                  max={1000}
+                  step={0.1}
+                  onChange={(v) => patchFog("height", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Height Falloff">
+                <NumberDrag
+                  value={fog.heightFalloff}
+                  min={0}
+                  max={5}
+                  step={0.005}
+                  onChange={(v) => patchFog("heightFalloff", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Start Dist.">
+                <NumberDrag
+                  value={fog.startDistance}
+                  min={0}
+                  max={1000}
+                  step={0.1}
+                  onChange={(v) => patchFog("startDistance", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Max Opacity">
+                <NumberDrag
+                  value={fog.maxOpacity}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(v) => patchFog("maxOpacity", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Emissive">
+                <ColorField
+                  kind="color3"
+                  value={fog.emissive as unknown as Record<string, number>}
+                  onChange={onFogVec("emissive")}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Sun Color">
+                <ColorField
+                  kind="color3"
+                  value={fog.directionalColor as unknown as Record<string, number>}
+                  onChange={onFogVec("directionalColor")}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Sun Exp.">
+                <NumberDrag
+                  value={fog.directionalExponent}
+                  min={1}
+                  max={64}
+                  step={0.1}
+                  onChange={(v) => patchFog("directionalExponent", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Separator className="my-1" />
+
+              <Row label="Ground Density">
+                <NumberDrag
+                  value={fog.layer2Density}
+                  min={0}
+                  max={2}
+                  step={0.001}
+                  onChange={(v) => patchFog("layer2Density", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Ground Falloff">
+                <NumberDrag
+                  value={fog.layer2Falloff}
+                  min={0}
+                  max={5}
+                  step={0.005}
+                  onChange={(v) => patchFog("layer2Falloff", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Ground Height">
+                <NumberDrag
+                  value={fog.layer2Height}
+                  min={-1000}
+                  max={1000}
+                  step={0.1}
+                  onChange={(v) => patchFog("layer2Height", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Separator className="my-1" />
+
+              <Row label="Aerial Persp.">
+                <Switch
+                  checked={fog.aerialPerspective}
+                  onCheckedChange={(checked) => patchFog("aerialPerspective", checked)}
+                />
+              </Row>
+
+              {fog.aerialPerspective ? (
+                <Row label="AP Intensity">
+                  <NumberDrag
+                    value={fog.aerialIntensity}
+                    min={0}
+                    max={8}
+                    step={0.05}
+                    onChange={(v) => patchFog("aerialIntensity", v)}
+                    onDragStart={onDragStart}
+                    onDragEnd={onDragEnd}
+                  />
+                </Row>
+              ) : null}
             </>
           ) : null}
         </div>
