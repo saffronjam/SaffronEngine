@@ -17,7 +17,7 @@ use saffron_assets::{
     AssetServer, LoadInput, LoadedDoc, NewProject, ProjectDocWorker, ProjectSidecar,
 };
 use saffron_core::Uuid;
-use saffron_scene::{Entity, Mesh, Scene, ScriptInputState};
+use saffron_scene::{Entity, Mesh, Scene, ScriptInputState, seed_starter_scene};
 use saffron_sceneedit::{
     BootStage, ProjectLoadRequest, ProjectPhase, SceneEditContext, debug_overlays_from_json,
 };
@@ -283,9 +283,11 @@ fn install_doc(
         "Installing project",
         "",
     );
-    // A freshly created project carries an empty scene doc (`{}`); leave it `Scene::default()`
-    // rather than running `scene_from_json`, which rejects a versionless object. An opened project's
-    // saved scene block always carries a version and is deserialized.
+    // A freshly created project carries an empty scene doc (`{}`); seed the shared starter
+    // scene (a framed camera and a sun) rather than running `scene_from_json`, which rejects a
+    // versionless object — the save below persists the seed into the new project. An opened
+    // project's saved scene block always carries a version and is deserialized as-is, so a
+    // deliberately-emptied project is never re-seeded.
     let mut scene = Scene::default();
     if doc
         .scene_json
@@ -295,6 +297,8 @@ fn install_doc(
         if let Err(err) = scene.scene_from_json(&scene_edit.registry, &doc.scene_json) {
             tracing::error!("scene load: {err}");
         }
+    } else if doc.save_after_install {
+        seed_starter_scene(&mut scene);
     }
     scene_edit.scene = scene;
 
