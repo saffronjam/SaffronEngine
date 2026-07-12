@@ -683,7 +683,8 @@ impl Default for Camera {
     }
 }
 
-/// A directional light; the scene shades through the first one.
+/// A directional light — the scene's sun. The first one shades the scene; with no
+/// directional light the scene has no direct sun (sky and IBL ambient still apply).
 ///
 /// `direction` points the way the light travels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -696,15 +697,28 @@ pub struct DirectionalLight {
     pub intensity: f32,
     /// Ambient contribution.
     pub ambient: f32,
+    /// Per-light fog in-scatter multiplier (the light's shaft brightness in volumetric fog).
+    pub volumetric_scattering: f32,
+    /// Whether the light's shadow gates its in-scatter in volumetric fog (god-rays).
+    pub cast_volumetric_shadow: bool,
+}
+
+impl DirectionalLight {
+    /// The canonical sun aim: the default light's travel direction, and the placeholder
+    /// direction the renderer uses to keep sky/LUT math finite when a scene has no
+    /// directional light (at zero intensity it contributes nothing).
+    pub const DEFAULT_DIRECTION: Vec3 = Vec3::new(-0.5, -1.0, -0.3);
 }
 
 impl Default for DirectionalLight {
     fn default() -> Self {
         Self {
-            direction: Vec3::new(-0.5, -1.0, -0.3),
+            direction: Self::DEFAULT_DIRECTION,
             color: Vec3::ONE,
             intensity: 1.0,
             ambient: 0.15,
+            volumetric_scattering: 1.0,
+            cast_volumetric_shadow: true,
         }
     }
 }
@@ -719,6 +733,10 @@ pub struct PointLight {
     pub intensity: f32,
     /// Falloff range.
     pub range: f32,
+    /// Per-light fog in-scatter multiplier (the light's shaft brightness in volumetric fog).
+    pub volumetric_scattering: f32,
+    /// Whether the light's shadow gates its in-scatter in volumetric fog (god-rays).
+    pub cast_volumetric_shadow: bool,
 }
 
 impl Default for PointLight {
@@ -727,6 +745,8 @@ impl Default for PointLight {
             color: Vec3::ONE,
             intensity: 5.0,
             range: 10.0,
+            volumetric_scattering: 1.0,
+            cast_volumetric_shadow: true,
         }
     }
 }
@@ -749,6 +769,10 @@ pub struct SpotLight {
     pub inner_angle: f32,
     /// Zero past this half-angle (degrees).
     pub outer_angle: f32,
+    /// Per-light fog in-scatter multiplier (the light's shaft brightness in volumetric fog).
+    pub volumetric_scattering: f32,
+    /// Whether the light's shadow gates its in-scatter in volumetric fog (god-rays).
+    pub cast_volumetric_shadow: bool,
 }
 
 impl Default for SpotLight {
@@ -760,6 +784,8 @@ impl Default for SpotLight {
             range: 10.0,
             inner_angle: 20.0,
             outer_angle: 30.0,
+            volumetric_scattering: 1.0,
+            cast_volumetric_shadow: true,
         }
     }
 }
@@ -792,6 +818,77 @@ impl Default for ReflectionProbe {
             box_projection: false,
             box_extent: Vec3::splat(10.0),
             dirty: true,
+        }
+    }
+}
+
+/// The bounds primitive a [`FogVolume`] injects density within. Deliberately just the two closed
+/// primitives the froxel injection can evaluate — a box (oriented half-extents) or a sphere — so the
+/// Inspector picker and the injection loop stay exhaustive with no unsupported case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FogShape {
+    /// Oriented box, bounded by `extents` (local-space half-extents).
+    #[default]
+    Box,
+    /// Sphere of `radius` around the entity origin.
+    Sphere,
+}
+
+/// A placeable box/sphere of local participating media, injected into the froxel fog grid during
+/// density evaluation. Positioned by the entity's [`Transform`]; `extents` are box half-extents in
+/// local space, `radius` is the sphere radius. It contributes to the *same* `sigma_t`/`sigma_s` the
+/// analytic height base and global density write, so a local volume is lit, shadowed, temporally
+/// reprojected, and integrated by the identical stages — there is no special-case local-fog path.
+/// All optical fields default to a light, drifting-off (`noise_intensity: 0`) static haze.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FogVolume {
+    /// Box or sphere bounds.
+    pub shape: FogShape,
+    /// Box half-extents (local space).
+    pub extents: Vec3,
+    /// Sphere radius.
+    pub radius: f32,
+    /// Soft-edge width (world units) — density smoothsteps to zero over this margin inside the bound.
+    pub edge_falloff: f32,
+    /// `sigma_t` at the full interior.
+    pub density: f32,
+    /// Single-scatter albedo (`sigma_s = albedo * sigma_t`).
+    pub albedo: Vec3,
+    /// Added in-scatter radiance.
+    pub emissive: Vec3,
+    /// Henyey-Greenstein anisotropy (-1..1).
+    pub phase_g: f32,
+    /// Per-volume exponential height slab (0 = uniform).
+    pub height_falloff: f32,
+    /// World→noise frequency.
+    pub noise_scale: f32,
+    /// Erosion strength (0 = off, 1 = full).
+    pub noise_intensity: f32,
+    /// Detail-octave weight (subtractive erosion).
+    pub noise_detail: f32,
+    /// Advection direction.
+    pub wind: Vec3,
+    /// Advection speed (`wind * speed * time`).
+    pub speed: f32,
+}
+
+impl Default for FogVolume {
+    fn default() -> Self {
+        Self {
+            shape: FogShape::Box,
+            extents: Vec3::splat(5.0),
+            radius: 5.0,
+            edge_falloff: 1.0,
+            density: 0.5,
+            albedo: Vec3::splat(0.9),
+            emissive: Vec3::ZERO,
+            phase_g: 0.0,
+            height_falloff: 0.0,
+            noise_scale: 0.2,
+            noise_intensity: 0.0,
+            noise_detail: 0.5,
+            wind: Vec3::ZERO,
+            speed: 0.1,
         }
     }
 }
