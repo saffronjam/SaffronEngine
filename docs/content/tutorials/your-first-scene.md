@@ -5,10 +5,10 @@ weight = 1
 
 # Your first scene
 
-Start from an empty editor, add a cube, light it, give it a camera, and save the result to a
-project file you can reload. Every step is a real `sa` command with a menu equivalent, so you
-can follow either path. You end with a `project.json` that draws a lit cube through a scene
-camera.
+A fresh scene already ships a **Camera** and a **Sun** (the starter scene). Add a cube, tune the
+light and camera, and save the result to a project file you can reload. Every step is a real `sa`
+command with a menu equivalent, so you can follow either path. You end with a `project.json` that
+draws a lit cube through a scene camera.
 
 ## Start the editor and the control CLI
 
@@ -44,7 +44,7 @@ entity carrying it, already selected. The reply gives you the entity id and the 
 id. List what you have so far:
 
 ```sh
-just sa list-entities      # one entity named "Mesh"
+just sa list-entities      # the starter Camera and Sun, plus the new "Mesh"
 just sa list-assets        # the cube mesh in the catalog
 ```
 
@@ -65,12 +65,10 @@ just sa set-transform Mesh --translation '{"x":0,"y":0,"z":0}'
 
 ## Light it
 
-An unlit cube renders flat. Add a directional light; the engine shades through the first one
-in the scene:
+The starter scene's **Sun** already lights the cube; the engine shades through the first
+directional light in the scene. Aim and brighten it:
 
 ```sh
-just sa create-entity Sun
-just sa add-component Sun DirectionalLight
 just sa set-light Sun --direction '{"x":-0.5,"y":-1,"z":-0.3}' --intensity 3 --color '{"x":1,"y":0.95,"z":0.9}'
 ```
 
@@ -81,31 +79,33 @@ just sa set-light Sun --direction '{"x":-0.5,"y":-1,"z":-0.3}' --intensity 3 --c
 just sa set-light Sun --ambient 0.2
 ```
 
-In the editor this is **Create ▸ Directional Light**, then editing Direction / Color /
-Intensity / Ambient in the Inspector. For a local look, **Create ▸ Point Light** drops a
-`PointLight`; point and spot lights are dynamic and get
+Delete the Sun (`just sa destroy-entity Sun`) and the scene has no direct sun at all — only the
+sky and IBL light it, so it can go genuinely dark. To add one back, **Create ▸ Directional
+Light** in the editor (or `create-entity` + `add-component … DirectionalLight`), then edit
+Direction / Color / Intensity / Ambient in the Inspector. For a local look, **Create ▸ Point
+Light** drops a `PointLight`; point and spot lights are dynamic and get
 [clustered](../../explanations/lighting-and-brdf/clustered-forward/) automatically.
 
-## Give it a camera
+## Frame it with the camera
 
-The viewport draws through a fly-camera by default. A scene needs its own camera so the
-render is reproducible. Add one back from the cube, looking down -Z:
+The starter scene's **Camera** already frames the origin, so the render is reproducible without
+a fly-camera. Move it straight back to look down -Z at the cube (reset the rotation too, since
+the starter camera is aimed from an angle):
 
 ```sh
-just sa create-entity Main Camera
-just sa add-component "Main Camera" Camera
-just sa set-transform "Main Camera" --translation '{"x":0,"y":1,"z":5}'
+just sa set-transform Camera --translation '{"x":0,"y":1,"z":5}' --rotation '{"x":0,"y":0,"z":0}'
 ```
 
 The scene renders through the first camera whose `primary` flag is set, which a new
 `Camera` is by default. Confirm it:
 
 ```sh
-just sa inspect "Main Camera"     # dumps every component as JSON
+just sa inspect Camera     # dumps every component as JSON
 ```
 
-In the editor: **Create ▸ Camera**, then aim it with the gizmo. In edit mode, a camera shows
-as a small camera model plus its frustum; both helpers are hidden while playing.
+To add another camera, **Create ▸ Camera** (or `create-entity` + `add-component … Camera`),
+then aim it with the gizmo. In edit mode, a camera shows as a small camera model plus its
+frustum; both helpers are hidden while playing.
 
 ## Check it's drawing
 
