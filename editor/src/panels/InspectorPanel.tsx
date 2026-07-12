@@ -14,7 +14,7 @@
 /// reconcile poll won't clobber the optimistic value mid-drag.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent } from "react";
-import { ArrowDownAZ, GripVertical, X } from "lucide-react";
+import { ArrowDownAZ, GripVertical, TriangleAlert, X } from "lucide-react";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
 import { makeCoalescer, type Coalescer } from "../control/coalesce";
@@ -151,6 +151,10 @@ export function InspectorPanel() {
   const openMaterialGraphTab = useEditorStore((s) => s.openMaterialGraphTab);
   const focusComponent = useEditorStore((s) => s.focusComponent);
   const setFocusComponent = useEditorStore((s) => s.setFocusComponent);
+  // A FogVolume only contributes density to the froxel grid, which runs only while scene fog is
+  // enabled in volumetric mode — otherwise the volume renders nothing. Drives the header warning.
+  const fog = useEditorStore((s) => s.environment?.fog);
+  const fogVolumetric = !!fog?.enabled && fog.mode === "volumetric";
   // Catalog + entity list, used to resolve the read-only id references in the rig bodies
   // (SkinnedMesh mesh/rootBone/joints, FootIk chains, KinematicBones driven) to names.
   const assets = useEditorStore((s) => s.assets);
@@ -1158,6 +1162,16 @@ export function InspectorPanel() {
                     <span className="truncate text-xs font-semibold tracking-wide text-foreground">
                       {humanizeComponentName(component)}
                     </span>
+                    {component === "FogVolume" && !fogVolumetric ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <TriangleAlert className="size-3.5 shrink-0 text-amber-400" />
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          Inactive — enable Fog (Volumetric) in the Environment panel.
+                        </TooltipContent>
+                      </Tooltip>
+                    ) : null}
                   </div>
                   {removable ? (
                     <Tooltip>
