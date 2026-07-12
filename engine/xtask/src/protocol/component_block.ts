@@ -62,12 +62,16 @@ export interface DirectionalLight {
   color: Vec3;
   intensity: number;
   ambient: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
 }
 
 export interface PointLight {
   color: Vec3;
   intensity: number;
   range: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
 }
 
 export interface SpotLight {
@@ -77,6 +81,8 @@ export interface SpotLight {
   range: number;
   innerAngle: number;
   outerAngle: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
 }
 
 export interface ReflectionProbe {
@@ -84,6 +90,23 @@ export interface ReflectionProbe {
   intensity: number;
   boxProjection: boolean;
   boxExtent: Vec3;
+}
+
+export interface FogVolume {
+  shape: "box" | "sphere";
+  extents: Vec3;
+  radius: number;
+  edgeFalloff: number;
+  density: number;
+  albedo: Vec3;
+  emissive: Vec3;
+  phaseG: number;
+  heightFalloff: number;
+  noiseScale: number;
+  noiseIntensity: number;
+  noiseDetail: number;
+  wind: Vec3;
+  speed: number;
 }
 
 export interface Relationship {
@@ -187,6 +210,36 @@ export interface AtmosphereSettingsDto {
   sunDiskIntensity: number;
 }
 
+export type FogMode = "analytic" | "volumetric";
+
+export type FogQuality = "low" | "medium" | "high";
+
+export interface FogSettingsDto {
+  enabled: boolean;
+  mode: FogMode;
+  quality: FogQuality;
+  historyBlend: number;
+  neighborhoodClamp: boolean;
+  lightClamp: number;
+  baseDensity: number;
+  scatterAlbedo: number;
+  phaseG: number;
+  density: number;
+  albedo: Vec3;
+  height: number;
+  heightFalloff: number;
+  startDistance: number;
+  maxOpacity: number;
+  emissive: Vec3;
+  directionalColor: Vec3;
+  directionalExponent: number;
+  layer2Density: number;
+  layer2Falloff: number;
+  layer2Height: number;
+  aerialPerspective: boolean;
+  aerialIntensity: number;
+}
+
 export interface Components {
   Name?: Name;
   Transform?: Transform;
@@ -199,6 +252,7 @@ export interface Components {
   PointLight?: PointLight;
   SpotLight?: SpotLight;
   ReflectionProbe?: ReflectionProbe;
+  FogVolume?: FogVolume;
   Relationship?: Relationship;
   SkinnedMesh?: SkinnedMesh;
   Bone?: Bone;
@@ -222,6 +276,7 @@ export type ComponentBody =
   | PointLight
   | SpotLight
   | ReflectionProbe
+  | FogVolume
   | Relationship
   | SkinnedMesh
   | Bone
