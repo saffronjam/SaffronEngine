@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use saffron_json::{Value, dump_json, json_string_or, json_u64_or, parse_json};
-use saffron_scene::{ComponentRegistry, Scene};
+use saffron_scene::{ComponentRegistry, Scene, seed_starter_scene};
 
 use crate::AssetServer;
 use crate::catalog::{
@@ -526,9 +526,9 @@ impl AssetServer {
         Ok(sidecar)
     }
 
-    /// Creates a fresh, empty project: resets the scene + catalog, idles + clears the GPU
-    /// caches, sets the asset root, ensures the script `src/` + library, then saves
-    /// `project.json`.
+    /// Creates a fresh project: resets the scene to the shared starter scene (a framed camera
+    /// and a sun) + clears the catalog, idles + clears the GPU caches, sets the asset root,
+    /// ensures the script `src/` + library, then saves `project.json`.
     ///
     /// `spec.root` empty resolves the root to `<userdata>/<name>`; `spec.display_name`
     /// empty falls back to [`default_display_name`].
@@ -568,6 +568,7 @@ impl AssetServer {
 
         host.wait_gpu_idle();
         *scene = Scene::default();
+        seed_starter_scene(scene);
         self.catalog.entries.clear();
         self.catalog.folders.clear();
         self.catalog.by_id.clear();
