@@ -50,6 +50,7 @@ pub const REGISTERED: &[&str] = &[
     "PointLight",
     "SpotLight",
     "ReflectionProbe",
+    "FogVolume",
     "Relationship",
     "SkinnedMesh",
     "Bone",

@@ -30,7 +30,7 @@ function Vec3:lerp(other, t) end ---@param other sa.Vec3 @param t number @return
 ---@field body_weight number
 ---@field bones integer
 
----@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"Camera"|"Material"|"MaterialSet"|"MaterialAsset"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"Relationship"|"SkinnedMesh"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
+---@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"Camera"|"Material"|"MaterialSet"|"MaterialAsset"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"Relationship"|"SkinnedMesh"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
 
 ---@class sa.Entity
 local Entity = {}
@@ -159,6 +159,24 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field color { x: number, y: number, z: number }
 ---@field intensity number
 ---@field ambient number
+---@field volumetricScattering number
+---@field castVolumetricShadow boolean
+
+---@class sa.FogVolume
+---@field shape "box"|"sphere"
+---@field extents { x: number, y: number, z: number }
+---@field radius number
+---@field edgeFalloff number
+---@field density number
+---@field albedo { x: number, y: number, z: number }
+---@field emissive { x: number, y: number, z: number }
+---@field phaseG number
+---@field heightFalloff number
+---@field noiseScale number
+---@field noiseIntensity number
+---@field noiseDetail number
+---@field wind { x: number, y: number, z: number }
+---@field speed number
 
 ---@class sa.FootChainDto
 ---@field upper number
@@ -216,6 +234,8 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field color { x: number, y: number, z: number }
 ---@field intensity number
 ---@field range number
+---@field volumetricScattering number
+---@field castVolumetricShadow boolean
 
 ---@class sa.ReflectionProbe
 ---@field influenceRadius number
@@ -256,6 +276,8 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field range number
 ---@field innerAngle number
 ---@field outerAngle number
+---@field volumetricScattering number
+---@field castVolumetricShadow boolean
 
 ---@class sa.Transform
 ---@field translation { x: number, y: number, z: number }
@@ -269,6 +291,7 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@overload fun(self: sa.Entity, name: "CharacterController"): sa.CharacterController?
 ---@overload fun(self: sa.Entity, name: "Collider"): sa.Collider?
 ---@overload fun(self: sa.Entity, name: "DirectionalLight"): sa.DirectionalLight?
+---@overload fun(self: sa.Entity, name: "FogVolume"): sa.FogVolume?
 ---@overload fun(self: sa.Entity, name: "FootIk"): sa.FootIk?
 ---@overload fun(self: sa.Entity, name: "KinematicBones"): sa.KinematicBones?
 ---@overload fun(self: sa.Entity, name: "Material"): sa.Material?
