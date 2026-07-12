@@ -118,10 +118,14 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "DirectionalLight.color": { kind: "color3" },
   "DirectionalLight.intensity": { kind: "number", min: 0, max: 50, step: 0.05 },
   "DirectionalLight.ambient": { kind: "slider", min: 0, max: 1, step: 0.01 },
+  "DirectionalLight.volumetricScattering": { kind: "slider", min: 0, max: 4, step: 0.01 },
+  "DirectionalLight.castVolumetricShadow": { kind: "bool" },
 
   "PointLight.color": { kind: "color3" },
   "PointLight.intensity": { kind: "number", min: 0, max: 100, step: 0.05 },
   "PointLight.range": { kind: "number", min: 0, max: 200, step: 0.1 },
+  "PointLight.volumetricScattering": { kind: "slider", min: 0, max: 4, step: 0.01 },
+  "PointLight.castVolumetricShadow": { kind: "bool" },
 
   "SpotLight.direction": { kind: "vec3", step: 0.01 },
   "SpotLight.color": { kind: "color3" },
@@ -130,11 +134,36 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   // Degrees on BOTH sides — unit:"deg" is label/clamp only, NO conversion.
   "SpotLight.innerAngle": { kind: "number", min: 0, max: 89, step: 0.1, unit: "deg" },
   "SpotLight.outerAngle": { kind: "number", min: 0, max: 89, step: 0.1, unit: "deg" },
+  "SpotLight.volumetricScattering": { kind: "slider", min: 0, max: 4, step: 0.01 },
+  "SpotLight.castVolumetricShadow": { kind: "bool" },
 
   "ReflectionProbe.influenceRadius": { kind: "number", min: 0.1, max: 500, step: 0.1 },
   "ReflectionProbe.intensity": { kind: "slider", min: 0, max: 8, step: 0.01 },
   "ReflectionProbe.boxProjection": { kind: "bool" },
   "ReflectionProbe.boxExtent": { kind: "vec3", step: 0.1 },
+
+  // FogVolume — box/sphere bounds injected into the froxel fog grid. Extents are numeric vec3 fields
+  // (there is no box-resize gizmo); the rest ride sliders/colours.
+  "FogVolume.shape": {
+    kind: "enum",
+    options: [
+      { value: "box", label: "Box" },
+      { value: "sphere", label: "Sphere" },
+    ],
+  },
+  "FogVolume.extents": { kind: "vec3", min: 0, step: 0.1 },
+  "FogVolume.radius": { kind: "number", min: 0, step: 0.1 },
+  "FogVolume.edgeFalloff": { kind: "slider", min: 0, max: 10, step: 0.05 },
+  "FogVolume.density": { kind: "slider", min: 0, max: 8, step: 0.01 },
+  "FogVolume.albedo": { kind: "color3" },
+  "FogVolume.emissive": { kind: "color3" },
+  "FogVolume.phaseG": { kind: "slider", min: -0.99, max: 0.99, step: 0.01 },
+  "FogVolume.heightFalloff": { kind: "slider", min: 0, max: 4, step: 0.01 },
+  "FogVolume.noiseScale": { kind: "number", min: 0, step: 0.01 },
+  "FogVolume.noiseIntensity": { kind: "slider", min: 0, max: 1, step: 0.01 },
+  "FogVolume.noiseDetail": { kind: "slider", min: 0, max: 1, step: 0.01 },
+  "FogVolume.wind": { kind: "vec3", step: 0.05 },
+  "FogVolume.speed": { kind: "number", min: 0, step: 0.01 },
 
   // Rigidbody — motion is solver-relevant only for Dynamic (documented; all fields rendered).
   "Rigidbody.motion": {
