@@ -111,23 +111,28 @@ pub struct LightUbo {
     pub sdf_occlusion: UVec4,
     /// `rgb` scene-environment ambient (the non-IBL fallback), `a` reflection-probe count.
     pub ambient_color: Vec4,
-    /// `x` screen-space-reflection flag, `y` ray-traced-reflection flag; `zw` reserved.
+    /// `x` screen-space-reflection flag, `y` ray-traced-reflection flag, `z` directional
+    /// volumetric-scatter multiplier (float bits), `w` directional cast-volumetric-shadow gate (0/1).
     pub extra_flags: UVec4,
     /// Previous frame's view-proj (world → clip), reprojecting an RT reflection hit into
     /// `prev_color` for its reflected radiance.
     pub prev_view_proj: Mat4,
+    /// Froxel volumetric-fog composite params for the forward transparent path: `x` = enabled (1
+    /// when `fog.mode == volumetric` this frame, else 0), `y` = froxel near, `z` = froxel far (the
+    /// exponential-Z distribution the transparent W mapping inverts), `w` reserved.
+    pub froxel_fog: Vec4,
 }
 
 const _: () = assert!(
-    size_of::<LightUbo>() == 432,
-    "LightUbo must match the std140 shader layout (5 vec4 + 2 mat4 + 10 vec4 + 1 mat4)"
+    size_of::<LightUbo>() == 448,
+    "LightUbo must match the std140 shader layout (5 vec4 + 2 mat4 + 10 vec4 + 1 mat4 + 1 vec4)"
 );
 
 impl Default for LightUbo {
     fn default() -> Self {
         Self {
-            direction_ambient: Vec4::new(0.0, 1.0, 0.0, 0.0),
-            color_intensity: Vec4::new(1.0, 1.0, 1.0, 1.0),
+            direction_ambient: Vec4::new(0.0, -1.0, 0.0, 0.0),
+            color_intensity: Vec4::new(1.0, 1.0, 1.0, 0.0),
             counts: UVec4::ZERO,
             eye_position: Vec4::ZERO,
             shadow_view_proj: Mat4::IDENTITY,
@@ -144,6 +149,7 @@ impl Default for LightUbo {
             ambient_color: Vec4::ZERO,
             extra_flags: UVec4::ZERO,
             prev_view_proj: Mat4::IDENTITY,
+            froxel_fog: Vec4::ZERO,
         }
     }
 }
@@ -215,18 +221,27 @@ pub struct SceneLighting {
     pub ambient: Vec3,
     /// The world-space camera position.
     pub eye_position: Vec3,
+    /// The directional light's per-light fog in-scatter multiplier (its shaft brightness).
+    pub directional_volumetric: f32,
+    /// Whether the directional light's shadow gates its in-scatter in volumetric fog.
+    pub directional_cast_volumetric_shadow: bool,
     /// The punctual (point/spot) lights uploaded into the per-frame storage buffer.
     pub lights: Vec<GpuLight>,
 }
 
 impl Default for SceneLighting {
     fn default() -> Self {
+        // The reset container carries no sun: zero intensity and zero ambient (a valid
+        // down direction keeps the write's `normalize` finite). A scene supplies its own
+        // directional light explicitly; this default asserts none.
         Self {
-            direction: Vec3::new(0.0, -1.0, 0.0),
+            direction: Vec3::NEG_Y,
             color: Vec3::ONE,
-            intensity: 1.0,
-            ambient: Vec3::splat(0.03),
+            intensity: 0.0,
+            ambient: Vec3::ZERO,
             eye_position: Vec3::ZERO,
+            directional_volumetric: 0.0,
+            directional_cast_volumetric_shadow: false,
             lights: Vec::new(),
         }
     }
@@ -268,6 +283,7 @@ pub struct Lighting {
     frame_ssr_flag: bool,
     frame_rt_reflections_flag: bool,
     frame_prev_view_proj: Mat4,
+    frame_froxel_fog: Vec4,
     frame_ddgi_volume_min: Vec4,
     frame_ddgi_volume_extent: Vec4,
     frame_ddgi_probe_count: UVec4,
@@ -321,6 +337,7 @@ impl Lighting {
             frame_ssr_flag: false,
             frame_rt_reflections_flag: false,
             frame_prev_view_proj: Mat4::IDENTITY,
+            frame_froxel_fog: Vec4::ZERO,
             frame_ddgi_volume_min: Vec4::ZERO,
             frame_ddgi_volume_extent: Vec4::ZERO,
             frame_ddgi_probe_count: UVec4::ZERO,
@@ -366,6 +383,34 @@ impl Lighting {
     ) {
         for frame in &self.frames {
             descriptors.write_storage_buffer(frame.light_set, 8, buffer, size);
+        }
+    }
+
+    /// Writes the froxel volumetric-fog integration volume (binding 11) into every frame slot's
+    /// light set (set 1) with `sampler`. Bound at construction and rewritten whenever a fog quality
+    /// switch reallocates the volume; its contents are rewritten each frame by the integrate pass. The
+    /// forward transparent path gates its sample on `froxel_fog.x`, so the binding is valid even with
+    /// fog off (the volume rests in `SHADER_READ_ONLY_OPTIMAL`).
+    pub fn bind_froxel_integration(
+        &self,
+        device: &Device,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) {
+        let info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        for frame in &self.frames {
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(frame.light_set)
+                .dst_binding(11)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            // SAFETY: the ash seam. The set + view + sampler outlive the call; single-threaded at the
+            // (idle) build point, so no in-flight command buffer references the light set.
+            unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
         }
     }
 
@@ -527,10 +572,11 @@ impl Lighting {
             extra_flags: UVec4::new(
                 u32::from(self.frame_ssr_flag),
                 u32::from(self.frame_rt_reflections_flag),
-                0,
-                0,
+                scene.directional_volumetric.to_bits(),
+                u32::from(scene.directional_cast_volumetric_shadow),
             ),
             prev_view_proj: self.frame_prev_view_proj,
+            froxel_fog: self.frame_froxel_fog,
         };
         let dst = self.frames[frame]
             .light_ubo
@@ -591,6 +637,14 @@ impl Lighting {
     pub fn set_frame_rt_reflections(&mut self, enabled: bool, prev_view_proj: Mat4) {
         self.frame_rt_reflections_flag = enabled;
         self.frame_prev_view_proj = prev_view_proj;
+    }
+
+    /// Folds this frame's froxel volumetric-fog params (`froxel_fog`) into the next
+    /// [`Lighting::set_scene_lighting`] write, so the forward transparent path samples the
+    /// integration volume only when volumetric fog is authored this frame. `near`/`far` are the
+    /// froxel grid's exponential-Z extent (the transparent W mapping inverts them).
+    pub fn set_frame_froxel_fog(&mut self, enabled: bool, near: f32, far: f32) {
+        self.frame_froxel_fog = Vec4::new(if enabled { 1.0 } else { 0.0 }, near, far, 0.0);
     }
 
     /// Writes the current frame's cluster params from the camera + viewport, and arms
@@ -870,9 +924,10 @@ fn make_device_storage_buffer(
 /// with `far_plane`. A 90° perspective per face with the Vulkan Y-flip, in the +X, −X,
 /// +Y, −Y, +Z, −Z face order.
 pub fn point_shadow_face_matrices(pos: Vec3, far_plane: f32) -> [Mat4; 6] {
-    let mut proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, far_plane.max(0.1));
-    // Vulkan framebuffer Y is down; flip so faces match cube sampling.
-    proj.y_axis.y *= -1.0;
+    // Cube faces render in the fixed cube-map sampling convention (GL-standard look-at directions +
+    // up vectors), which is origin-agnostic — so, unlike the screen and 2D shadow-map projections,
+    // the point-shadow projection takes no window Y-flip. Adding one vertically mirrors every face.
+    let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, far_plane.max(0.1));
     let fwd = [
         Vec3::new(1.0, 0.0, 0.0),
         Vec3::new(-1.0, 0.0, 0.0),
@@ -1011,7 +1066,7 @@ mod tests {
     /// fragment reads — the contract the shaded path reads by raw bytes.
     #[test]
     fn light_ubo_byte_layout_matches_std140() {
-        assert_eq!(size_of::<LightUbo>(), 432);
+        assert_eq!(size_of::<LightUbo>(), 448);
         assert_eq!(align_of::<LightUbo>(), 16);
         assert_eq!(offset_of!(LightUbo, direction_ambient), 0);
         assert_eq!(offset_of!(LightUbo, color_intensity), 16);
@@ -1031,6 +1086,7 @@ mod tests {
         assert_eq!(offset_of!(LightUbo, ambient_color), 336);
         assert_eq!(offset_of!(LightUbo, extra_flags), 352);
         assert_eq!(offset_of!(LightUbo, prev_view_proj), 368);
+        assert_eq!(offset_of!(LightUbo, froxel_fog), 432);
     }
 
     /// `ClusterParams` is exactly 192 bytes with each field at the std140 offset both
@@ -1195,6 +1251,63 @@ mod tests {
                     "faces {i} and {j} look different directions"
                 );
             }
+        }
+    }
+
+    /// A world direction from the light must render onto the *same* cube texel the sampler later
+    /// reads for that direction — otherwise shadows land on the wrong side. This pins the face
+    /// orientation against the fixed cube-map `(s, t)` selection (Vulkan spec 16.5.4), so a stray
+    /// window Y-flip on the projection (which vertically mirrors every face) fails here. Pure math.
+    #[test]
+    fn point_shadow_faces_match_the_cube_sampling_convention() {
+        // The cube-map face + `(s, t)` for a sample direction: major axis picks the face, then
+        // `s = (sc/|ma| + 1)/2`, `t = (tc/|ma| + 1)/2`, with `t = 0` at the top of the face image.
+        fn cube_st(d: Vec3) -> (usize, f32, f32) {
+            let a = d.abs();
+            let (face, sc, tc, ma) = if a.x >= a.y && a.x >= a.z {
+                if d.x > 0.0 {
+                    (0, -d.z, -d.y, d.x)
+                } else {
+                    (1, d.z, -d.y, -d.x)
+                }
+            } else if a.y >= a.z {
+                if d.y > 0.0 {
+                    (2, d.x, d.z, d.y)
+                } else {
+                    (3, d.x, -d.z, -d.y)
+                }
+            } else if d.z > 0.0 {
+                (4, d.x, -d.y, d.z)
+            } else {
+                (5, -d.x, -d.y, -d.z)
+            };
+            (face, (sc / ma + 1.0) * 0.5, (tc / ma + 1.0) * 0.5)
+        }
+
+        let faces = point_shadow_face_matrices(Vec3::ZERO, 50.0);
+        // One off-centre direction per face (so a mirror is visible), incl. the `-Y` face an
+        // overhead light's shadow uses — the exact case that rendered on the wrong side.
+        let dirs = [
+            Vec3::new(1.0, 0.3, -0.4),
+            Vec3::new(-1.0, 0.3, 0.4),
+            Vec3::new(0.2, 1.0, 0.5),
+            Vec3::new(0.2, -1.0, 0.5),
+            Vec3::new(0.3, -0.4, 1.0),
+            Vec3::new(0.3, -0.4, -1.0),
+        ];
+        for dir in dirs {
+            let d = dir.normalize();
+            let (face, s, t) = cube_st(d);
+            // Render a point one unit out from the light along `d` through its face.
+            let clip = faces[face] * d.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            // Vulkan framebuffer: NDC `(-1, -1)` is the top-left texel, so `u = (x+1)/2`, `v = (y+1)/2`.
+            let u = (ndc.x + 1.0) * 0.5;
+            let v = (ndc.y + 1.0) * 0.5;
+            assert!(
+                (u - s).abs() < 1e-3 && (v - t).abs() < 1e-3,
+                "face {face}: rendered texel ({u:.3}, {v:.3}) must match the cube sample ({s:.3}, {t:.3})"
+            );
         }
     }
 
