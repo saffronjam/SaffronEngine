@@ -592,14 +592,16 @@ pub fn render_scene<R: SceneRenderer>(
     // transform cache this writes.
     scene.update_world_transforms();
 
-    let (
-        light_dir,
-        light_color,
-        light_intensity,
-        light_ambient,
-        light_volumetric,
-        light_cast_volumetric_shadow,
-    ) = gather_directional_light(scene);
+    let directional = gather_directional_light(scene);
+    let has_sun = directional.is_some();
+    let DirectionalResolved {
+        direction: light_dir,
+        color: light_color,
+        intensity: light_intensity,
+        ambient: light_ambient,
+        volumetric_scattering: light_volumetric,
+        cast_volumetric_shadow: light_cast_volumetric_shadow,
+    } = directional.unwrap_or_else(DirectionalResolved::none);
     let (lights, point_shadow, spot_shadow) = gather_punctual_lights(scene);
 
     renderer.set_spot_shadow(
@@ -637,8 +639,9 @@ pub fn render_scene<R: SceneRenderer>(
     } = build;
 
     // Fit an orthographic shadow frustum to the scene's world AABB, looking down the
-    // directional light. A bounding sphere keeps the fit rotation-stable.
-    let cast_shadow = !items.is_empty() && scene_max.x >= scene_min.x;
+    // directional light. A bounding sphere keeps the fit rotation-stable. With no sun in
+    // the scene there is nothing to cast, so the directional shadow pass is skipped.
+    let cast_shadow = has_sun && !items.is_empty() && scene_max.x >= scene_min.x;
     let shadow_view_proj = if cast_shadow {
         let center = (scene_min + scene_max) * 0.5;
         let radius = (scene_max - scene_min).length() * 0.5 + 0.5;
@@ -801,33 +804,64 @@ pub fn render_scene<R: SceneRenderer>(
     });
 }
 
-/// The directional light's resolved direction / color / intensity / ambient, re-aimed by the
-/// entity's world rotation when it carries a [`Transform`]. The first one wins; a scene with
-/// no directional light keeps the default `(-0.5, -1, -0.3)`, white, intensity 1,
-/// ambient 0.15.
-fn gather_directional_light(scene: &mut Scene) -> (Vec3, Vec3, f32, f32, f32, bool) {
+/// A scene's directional light resolved for one frame.
+///
+/// `direction` is the world-space travel direction, guaranteed non-zero so every downstream
+/// `normalize` stays finite. Absent (see [`gather_directional_light`]) when the scene carries
+/// no directional light, in which case the scene has no direct sun.
+struct DirectionalResolved {
+    direction: Vec3,
+    color: Vec3,
+    intensity: f32,
+    ambient: f32,
+    volumetric_scattering: f32,
+    cast_volumetric_shadow: bool,
+}
+
+impl DirectionalResolved {
+    /// The dark placeholder for a scene with no directional light: zero intensity and zero
+    /// ambient (no direct sun), a valid direction so the sky/LUT math stays finite.
+    fn none() -> Self {
+        Self {
+            direction: DirectionalLight::DEFAULT_DIRECTION.normalize(),
+            color: Vec3::ONE,
+            intensity: 0.0,
+            ambient: 0.0,
+            volumetric_scattering: 0.0,
+            cast_volumetric_shadow: false,
+        }
+    }
+}
+
+/// The scene's directional light for the frame — the first `DirectionalLight` wins, re-aimed
+/// by its entity's world rotation when it carries a [`Transform`]. `None` when the scene has
+/// no directional light: the caller then shades with no direct sun.
+fn gather_directional_light(scene: &mut Scene) -> Option<DirectionalResolved> {
     let mut found: Option<(Entity, DirectionalLight)> = None;
     scene.for_each::<&DirectionalLight, _>(|entity, light| {
         if found.is_none() {
             found = Some((entity, *light));
         }
     });
-    let Some((entity, light)) = found else {
-        return (Vec3::new(-0.5, -1.0, -0.3), Vec3::ONE, 1.0, 0.15, 1.0, true);
-    };
-    let dir = if scene.has_component::<Transform>(entity) {
+    let (entity, light) = found?;
+    let aimed = if scene.has_component::<Transform>(entity) {
         scene.world_rotation(entity) * light.direction
     } else {
         light.direction
     };
-    (
-        dir,
-        light.color,
-        light.intensity,
-        light.ambient,
-        light.volumetric_scattering,
-        light.cast_volumetric_shadow,
-    )
+    // A degenerate authored direction would `normalize` to NaN downstream; fall back to the
+    // canonical aim so the sun stays finite regardless of what the user typed.
+    let direction = aimed
+        .try_normalize()
+        .unwrap_or_else(|| DirectionalLight::DEFAULT_DIRECTION.normalize());
+    Some(DirectionalResolved {
+        direction,
+        color: light.color,
+        intensity: light.intensity,
+        ambient: light.ambient,
+        volumetric_scattering: light.volumetric_scattering,
+        cast_volumetric_shadow: light.cast_volumetric_shadow,
+    })
 }
 
 /// The first point light's shadow inputs (the single shadowed point in v1).
@@ -1752,6 +1786,48 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn no_directional_light_resolves_to_none() {
+        let mut scene = Scene::new();
+        assert!(gather_directional_light(&mut scene).is_none());
+    }
+
+    #[test]
+    fn directional_light_resolves_with_a_normalized_direction() {
+        let mut scene = Scene::new();
+        let sun = scene.create_entity("Sun");
+        scene
+            .add_component(
+                sun,
+                DirectionalLight {
+                    direction: Vec3::new(0.0, -2.0, 0.0),
+                    ..DirectionalLight::default()
+                },
+            )
+            .unwrap();
+        let resolved = gather_directional_light(&mut scene).expect("a sun");
+        assert_eq!(resolved.direction, Vec3::new(0.0, -1.0, 0.0));
+        assert_eq!(resolved.intensity, 1.0);
+    }
+
+    #[test]
+    fn degenerate_direction_falls_back_to_a_finite_unit_aim() {
+        let mut scene = Scene::new();
+        let sun = scene.create_entity("Sun");
+        scene
+            .add_component(
+                sun,
+                DirectionalLight {
+                    direction: Vec3::ZERO,
+                    ..DirectionalLight::default()
+                },
+            )
+            .unwrap();
+        let resolved = gather_directional_light(&mut scene).expect("a sun");
+        assert!(resolved.direction.is_finite());
+        assert!((resolved.direction.length() - 1.0).abs() < 1e-5);
     }
 
     #[test]
