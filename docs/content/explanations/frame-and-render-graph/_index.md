@@ -20,7 +20,7 @@ layers add their own passes to the cull → scene → UI frame.
 | [Barrier derivation](usage-and-barrier-derivation/) | `RgUsage`, `usage_info`, `apply_access`, hazard + layout logic | `render_graph.rs` |
 | [Cross-frame layouts](cross-frame-layouts/) | the external-layout slot write-back, imported images, seeded source scope | `render_graph.rs` |
 | [Adding passes](who-can-add-passes/) | engine passes in `begin_frame_graph` vs. layer `on_render_graph` | `app/src/lib.rs`, `renderer.rs` |
-| [Limits](limits-and-seams/) | single queue, no transient aliasing, no async compute, the seams left | `render_graph.rs` |
+| [Limits](limits-and-seams/) | single queue, no transient aliasing, no async compute, 3D transient volumes + 3D dispatch, the seams left | `render_graph.rs`, `transient.rs`, `froxel_fog.rs` |
 | [Performance telemetry](performance-telemetry/) | CPU/GPU split, per-pass GPU timestamps, throughput counters, VRAM budget, the profiler mode gate | `renderer.rs`, `profiler.rs` |
 | [Performance alarms](performance-alarms/) | EMA + hysteresis + debounce, MAD-spike / burn-rate detectors, severity, the non-blocking `drain-alarms` seq cursor | `frame_history.rs`, `renderer.rs` |
 | [Renderer profiling](renderer-profiling/) | the capture model (merged CPU+GPU spans, nesting, calibration), timestamp caveats, capture modes, Chrome-Trace + Perfetto export, pipeline statistics, software-GPU honesty | `profiler.rs`, `render_graph.rs` |
