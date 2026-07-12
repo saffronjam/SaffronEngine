@@ -640,6 +640,44 @@ impl Ibl {
         self.prefiltered_cube.view
     }
 
+    /// The Hillaire sky-view LUT's sampling view (the height-fog in-scatter tint). Always in
+    /// `SHADER_READ_ONLY_OPTIMAL` after the first bake; carries the atmosphere in-scatter only when
+    /// [`Ibl::atmosphere_live`] is true (else it holds a stale/undefined tint the fog pass gates out).
+    pub fn sky_view_lut_view(&self) -> vk::ImageView {
+        self.sky_view_lut.view
+    }
+
+    /// The transmittance LUT view (Hillaire 2020), bound into the aerial-perspective pass's descriptor
+    /// set with the shared clamp [`Ibl::sampler`]. `SHADER_READ_ONLY_OPTIMAL` after the first bake;
+    /// carries the atmosphere transmittance only when [`Ibl::atmosphere_live`] (else stale contents the
+    /// AP pass never dispatches over).
+    pub fn transmittance_view(&self) -> vk::ImageView {
+        self.transmittance_lut.view
+    }
+
+    /// The multiscatter LUT view (Hillaire 2020), the AP pass's isotropic multiple-scattering source.
+    pub fn multi_scatter_view(&self) -> vk::ImageView {
+        self.multi_scatter_lut.view
+    }
+
+    /// The atmosphere physical params the baked LUTs were computed from — the AP march reuses them so
+    /// the froxel volume agrees with the sky the same LUTs shade.
+    pub fn baked_atmosphere(&self) -> AtmosphereParams {
+        self.baked_params.atmosphere
+    }
+
+    /// The baked sun direction (to sun) + intensity, so the AP march samples the same solar transmittance
+    /// the sky-view LUT bakes.
+    pub fn baked_sun(&self) -> (Vec3, f32) {
+        (self.baked_params.sun_dir, self.baked_params.sun_intensity)
+    }
+
+    /// Whether the baked env source is the Hillaire atmosphere, so the sky-view LUT holds a live
+    /// in-scatter tint the height-fog pass may sample (`useSkyLut = 1`).
+    pub fn atmosphere_live(&self) -> bool {
+        self.baked_source == EnvSource::Atmosphere
+    }
+
     /// Re-arms the environment bake when the source / panorama / params change. An exact
     /// `!=` over the POD params flags only real user changes —
     /// no per-frame float drift, no churn. The bake fires at the next idle point.
@@ -942,6 +980,25 @@ impl Ibl {
                 0,
                 1,
             );
+
+            // Procedural / equirect leave the atmosphere sky-view LUT unwritten, so put it in a
+            // readable layout regardless — the height-fog pass binds it every frame (gated to a flat
+            // tint by `useSkyLut = 0`), and a bound-but-unwritten image must not sit in UNDEFINED.
+            if !use_atmosphere {
+                cube_barrier(
+                    &raw,
+                    scratch.cmd,
+                    self.sky_view_lut.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    0,
+                    1,
+                );
+            }
 
             checked(raw.end_command_buffer(scratch.cmd), "ibl end")?;
             let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(scratch.cmd)];
