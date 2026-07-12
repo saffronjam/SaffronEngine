@@ -28,7 +28,7 @@ use saffron_protocol::{
     ScriptInputResult, ScriptLogDto, ScriptStatusResult, SelectionResult, SetAtmosphereParams,
     SetCameraParams, SetComponentFieldParams, SetComponentFieldResult, SetComponentOrderParams,
     SetComponentOrderResult, SetComponentParams, SetComponentResult, SetEnvironmentParams,
-    SetGizmoParams, SetLightParams, SetParentParams, SetScriptOverrideParams,
+    SetFogParams, SetGizmoParams, SetLightParams, SetParentParams, SetScriptOverrideParams,
     SetScriptOverrideResult, SetTransformParams, StepParams, Uuid as WireUuid, Vec3,
 };
 use saffron_scene::{
@@ -884,6 +884,107 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
         },
     );
 
+    reg.register::<SetFogParams, EnvironmentDto>(
+        "set-fog",
+        "set-fog {--json {...} | enabled?:bool, mode?:analytic|volumetric, \
+         quality?:low|medium|high, historyBlend?, neighborhoodClamp?:bool, lightClamp?, \
+         baseDensity?, scatterAlbedo?, phaseG?, density?, albedo?:{x,y,z}, height?, \
+         heightFalloff?, startDistance?, maxOpacity?, emissive?:{x,y,z}, \
+         directionalColor?:{x,y,z}, directionalExponent?, layer2Density?, layer2Falloff?, \
+         layer2Height?, aerialPerspective?:bool, aerialIntensity?}",
+        |ctx, params| {
+            let mut body = environment_to_json(&ctx.scene_edit.active_scene().environment);
+            let mut fog = body.get("fog").cloned().unwrap_or_else(|| json!({}));
+            if let Some(Value::Object(map)) = &params.json {
+                for (key, value) in map {
+                    fog[key] = value.clone();
+                }
+            }
+            if let Some(v) = params.enabled {
+                fog["enabled"] = json!(v);
+            }
+            if let Some(v) = params.mode {
+                fog["mode"] = json!(v);
+            }
+            if let Some(v) = params.quality {
+                fog["quality"] = json!(v);
+            }
+            if let Some(v) = params.history_blend {
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(Error::command("historyBlend must be in [0, 1]"));
+                }
+                fog["historyBlend"] = json!(v);
+            }
+            if let Some(v) = params.neighborhood_clamp {
+                fog["neighborhoodClamp"] = json!(v);
+            }
+            if let Some(v) = params.light_clamp {
+                if v < 0.0 {
+                    return Err(Error::command("lightClamp must be >= 0"));
+                }
+                fog["lightClamp"] = json!(v);
+            }
+            if let Some(v) = params.base_density {
+                fog["baseDensity"] = json!(v);
+            }
+            if let Some(v) = params.scatter_albedo {
+                fog["scatterAlbedo"] = json!(v);
+            }
+            if let Some(v) = params.phase_g {
+                fog["phaseG"] = json!(v);
+            }
+            if let Some(v) = params.density {
+                fog["density"] = json!(v);
+            }
+            if let Some(v) = &params.albedo {
+                fog["albedo"] = vec3_json(v);
+            }
+            if let Some(v) = params.height {
+                fog["height"] = json!(v);
+            }
+            if let Some(v) = params.height_falloff {
+                fog["heightFalloff"] = json!(v);
+            }
+            if let Some(v) = params.start_distance {
+                fog["startDistance"] = json!(v);
+            }
+            if let Some(v) = params.max_opacity {
+                fog["maxOpacity"] = json!(v);
+            }
+            if let Some(v) = &params.emissive {
+                fog["emissive"] = vec3_json(v);
+            }
+            if let Some(v) = &params.directional_color {
+                fog["directionalColor"] = vec3_json(v);
+            }
+            if let Some(v) = params.directional_exponent {
+                fog["directionalExponent"] = json!(v);
+            }
+            if let Some(v) = params.layer2_density {
+                fog["layer2Density"] = json!(v);
+            }
+            if let Some(v) = params.layer2_falloff {
+                fog["layer2Falloff"] = json!(v);
+            }
+            if let Some(v) = params.layer2_height {
+                fog["layer2Height"] = json!(v);
+            }
+            if let Some(v) = params.aerial_perspective {
+                fog["aerialPerspective"] = json!(v);
+            }
+            if let Some(v) = params.aerial_intensity {
+                if v < 0.0 {
+                    return Err(Error::command("aerialIntensity must be >= 0"));
+                }
+                fog["aerialIntensity"] = json!(v);
+            }
+            body["fog"] = fog;
+            ctx.scene_edit.active_scene().environment = environment_from_json(&body);
+            ctx.scene_edit.scene_version += 1;
+            Ok(environment_dto(ctx))
+        },
+    );
+
     reg.register::<EmptyParams, SelectionResult>(
         "get-selection",
         "get-selection — the current editor selection + scene/selection version stamps",
@@ -1095,7 +1196,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 
     reg.register::<AddEntityParams, EntityRef>(
         "add-entity",
-        "add-entity {preset=empty|cube|plane|sphere|point-light|spot-light|directional-light|camera|reflection-probe}",
+        "add-entity {preset=empty|cube|plane|sphere|point-light|spot-light|directional-light|camera|reflection-probe|fog-volume}",
         |ctx, params| {
             let preset = params.preset.unwrap_or(AddEntityPreset::Empty);
             let entity = match preset {
@@ -1169,6 +1270,15 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                         .create_entity("Reflection Probe");
                     let scene = ctx.scene_edit.active_scene();
                     let _ = scene.add_component(e, saffron_scene::ReflectionProbe::default());
+                    let _ = scene.with_component_mut::<Transform, _>(e, |t| {
+                        t.translation = GlamVec3::new(0.0, 2.0, 0.0);
+                    });
+                    e
+                }
+                AddEntityPreset::FogVolume => {
+                    let e = ctx.scene_edit.active_scene().create_entity("Fog Volume");
+                    let scene = ctx.scene_edit.active_scene();
+                    let _ = scene.add_component(e, saffron_scene::FogVolume::default());
                     let _ = scene.with_component_mut::<Transform, _>(e, |t| {
                         t.translation = GlamVec3::new(0.0, 2.0, 0.0);
                     });
