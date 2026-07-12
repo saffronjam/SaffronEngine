@@ -20,6 +20,7 @@ export const COMPONENT_ORDER = [
   "PointLight",
   "SpotLight",
   "ReflectionProbe",
+  "FogVolume",
   "Rigidbody",
   "Collider",
   "CharacterController",
