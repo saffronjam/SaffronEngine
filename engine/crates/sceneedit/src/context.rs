@@ -3,12 +3,11 @@
 //! An owned struct constructed with [`SceneEditContext::new`] and torn down by its automatic
 //! `Drop`.
 
-use glam::{Mat3, Quat, Vec3};
+use glam::Vec3;
 
 use saffron_core::Uuid;
 use saffron_scene::{
-    AssetType, Camera, ComponentRegistry, DirectionalLight, Entity, Scene, Transform,
-    register_builtin_components,
+    AssetType, ComponentRegistry, Entity, Scene, register_builtin_components, seed_starter_scene,
 };
 use saffron_signal::SubscriberList;
 
@@ -238,20 +237,7 @@ impl SceneEditContext {
     #[must_use]
     pub fn new() -> Self {
         let mut ctx = Self::default();
-
-        // Seed a camera looking at the origin so a freshly spawned mesh is visible.
-        let camera = ctx.scene.create_entity("Camera");
-        let _ = ctx.scene.add_component(camera, Camera::default());
-        let translation = Vec3::new(3.0, 2.5, 4.0);
-        let rotation = euler_angles(quat_look_at(-translation.normalize(), Vec3::Y));
-        let _ = ctx.scene.with_component_mut::<Transform, _>(camera, |t| {
-            t.translation = translation;
-            t.rotation = rotation;
-        });
-
-        let sun = ctx.scene.create_entity("Sun");
-        let _ = ctx.scene.add_component(sun, DirectionalLight::default());
-
+        let camera = seed_starter_scene(&mut ctx.scene);
         ctx.set_selection(camera);
         ctx
     }
@@ -352,31 +338,10 @@ impl SceneEditContext {
     }
 }
 
-/// A quaternion looking in `direction` with the given `up`, in the right-handed
-/// convention where the camera's forward maps to `-Z`.
-fn quat_look_at(direction: Vec3, up: Vec3) -> Quat {
-    let z = -direction;
-    let x = up.cross(z).normalize();
-    let y = z.cross(x);
-    Quat::from_mat3(&Mat3::from_cols(x, y, z))
-}
-
-/// The Euler-XYZ angles of `q`.
-///
-/// This is the inverse of [`saffron_scene::quat_from_euler_xyz`] up to the gimbal pole, so
-/// feeding the result back through the engine's `Transform` rotation rebuilds `q`.
-fn euler_angles(q: Quat) -> Vec3 {
-    let (x, y, z, w) = (q.x, q.y, q.z, q.w);
-    let pitch = (2.0 * (y * z + w * x)).atan2(w * w - x * x - y * y + z * z);
-    let yaw = f32::asin((-2.0 * (x * z - w * y)).clamp(-1.0, 1.0));
-    let roll = (2.0 * (x * y + w * z)).atan2(w * w + x * x - y * y - z * z);
-    Vec3::new(pitch, yaw, roll)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saffron_scene::{IdComponent, quat_from_euler_xyz};
+    use saffron_scene::{Camera, DirectionalLight, IdComponent, Transform, quat_from_euler_xyz};
     use std::cell::Cell;
     use std::rc::Rc;
 
