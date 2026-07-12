@@ -5,7 +5,7 @@
 > Inspiration backlog — not yet implementable as written. Needs a codebase pass (the aerial-perspective
 > froxel, a "sun" directional-light tag, and sky-light re-bake into the existing IBL).
 
-> **Split out (own file):** height + froxel + local fog → [volumetric-fog](volumetric-fog.md). This file
+> **Split out (graduated to a planset):** height + froxel + local fog → [`../volumetric/`](../volumetric/README.md). This file
 > covers the **sky atmosphere**, **aerial perspective**, **volumetric clouds**, and the **time-of-day**
 > driver. A physically based sky already exists (the Hillaire LUT chain drives the env cube + IBL); what
 > is missing here is dynamism + aerial perspective + clouds.
@@ -38,7 +38,7 @@ shadow map and ~16-frame temporal reconstruction.
 ## Build size
 
 - The **4-LUT sky is done**; the remaining sky work is **dynamism + a sun tag + sky-light re-bake**.
-- **S** aerial-perspective froxel (shares the volumetric-fog froxel infrastructure).
+- **S** aerial-perspective froxel (shares the [`volumetric`](../volumetric/README.md) froxel infrastructure).
 - **S** time-of-day driver (controller + `sa` scrub command + sky-light re-capture) — near-free once the
   sky is dynamic.
 - **L–XL** volumetric clouds (gated on the sky atmosphere).
@@ -47,7 +47,7 @@ shadow map and ~16-frame temporal reconstruction.
 
 - A **"sun" directional-light tag** + a **sky-light re-bake** from the LUT into the existing IBL/ReSTIR
   environment so GI follows the time of day. Voxel-GI / DDGI reconvergence already exists.
-- **Aerial perspective** shares the froxel infrastructure with [volumetric-fog](volumetric-fog.md) — build
+- **Aerial perspective** shares the froxel infrastructure with the [`volumetric`](../volumetric/README.md) planset — build
   the froxel resource once.
 - *Clouds:* transient 3D resources help (a known render-graph gap), not required.
 
@@ -64,7 +64,7 @@ for TOD ramps (shared enabler), and cloud density authoring (a "volume" material
 
 The atmosphere is already scriptable (`set-atmosphere` / `set-environment`). Time-of-day adds a **sun
 angle / time scrubber** in the environment panel that re-bakes the sky-light live; clouds add coverage/
-density controls. Aerial perspective is automatic once on. Cross-links to [volumetric-fog](volumetric-fog.md)
+density controls. Aerial perspective is automatic once on. Cross-links to the [`volumetric`](../volumetric/README.md) planset
 for ground haze.
 
 ## Notes & references
