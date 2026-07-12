@@ -74,10 +74,9 @@ const EXPECT_RELATIONSHIP: &str = r#"{"parent":"7"}"#;
 const EXPECT_BONE: &str = r#"{}"#;
 const EXPECT_ANIM_DEFAULT: &str = r#"{"autoplay":false,"clip":"0","loopBlend":0.0,"speed":1.0,"transitionMode":"inertialize","wrap":"loop"}"#;
 const EXPECT_ANIM_VALUES: &str = r#"{"autoplay":true,"clip":"555","loopBlend":0.5,"speed":2.0,"transitionMode":"crossfade","wrap":"once"}"#;
-const EXPECT_DIRLIGHT_DEFAULT: &str = r#"{"ambient":0.15000000596046448,"color":{"x":1.0,"y":1.0,"z":1.0},"direction":{"x":-0.5,"y":-1.0,"z":-0.30000001192092896},"intensity":1.0}"#;
-const EXPECT_POINTLIGHT_DEFAULT: &str =
-    r#"{"color":{"x":1.0,"y":1.0,"z":1.0},"intensity":5.0,"range":10.0}"#;
-const EXPECT_SPOTLIGHT_DEFAULT: &str = r#"{"color":{"x":1.0,"y":1.0,"z":1.0},"direction":{"x":0.0,"y":-1.0,"z":0.0},"innerAngle":20.0,"intensity":5.0,"outerAngle":30.0,"range":10.0}"#;
+const EXPECT_DIRLIGHT_DEFAULT: &str = r#"{"ambient":0.15000000596046448,"castVolumetricShadow":true,"color":{"x":1.0,"y":1.0,"z":1.0},"direction":{"x":-0.5,"y":-1.0,"z":-0.30000001192092896},"intensity":1.0,"volumetricScattering":1.0}"#;
+const EXPECT_POINTLIGHT_DEFAULT: &str = r#"{"castVolumetricShadow":true,"color":{"x":1.0,"y":1.0,"z":1.0},"intensity":5.0,"range":10.0,"volumetricScattering":1.0}"#;
+const EXPECT_SPOTLIGHT_DEFAULT: &str = r#"{"castVolumetricShadow":true,"color":{"x":1.0,"y":1.0,"z":1.0},"direction":{"x":0.0,"y":-1.0,"z":0.0},"innerAngle":20.0,"intensity":5.0,"outerAngle":30.0,"range":10.0,"volumetricScattering":1.0}"#;
 const EXPECT_REFPROBE_DEFAULT: &str = r#"{"boxExtent":{"x":10.0,"y":10.0,"z":10.0},"boxProjection":false,"influenceRadius":10.0,"intensity":1.0}"#;
 const EXPECT_SKINNED: &str = r#"{"bones":["100","200"],"inverseBind":[[1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]],"mesh":"11","rootBone":"22"}"#;
 const EXPECT_FOOTIK: &str = r#"{"chains":[{"end":2,"mid":1,"poleVector":{"x":0.0,"y":0.0,"z":1.0},"upper":0}],"enabled":true,"groundHeight":0.5}"#;
@@ -93,7 +92,7 @@ const EXPECT_CHARCTRL_DEFAULT: &str = r#"{"gravityFactor":1.0,"maxSlopeAngle":0.
 const EXPECT_SCRIPT: &str =
     r#"{"scripts":[{"overrides":{"health":100,"name":"hero"},"scriptPath":"player.lua"}]}"#;
 const EXPECT_NAME: &str = r#"{"name":"Hello"}"#;
-const EXPECT_ENV_DEFAULT: &str = r#"{"ambientColor":{"x":1.0,"y":1.0,"z":1.0},"ambientIntensity":0.15000000596046448,"atmosphere":{"atmosphereHeight":100.0,"enabled":false,"mieAnisotropy":0.800000011920929,"mieScaleHeight":1.2000000476837158,"mieScattering":3.996000051498413,"ozoneAbsorption":{"x":0.6499999761581421,"y":1.88100004196167,"z":0.08500000089406967},"planetRadius":6360.0,"rayleighScaleHeight":8.0,"rayleighScattering":{"x":5.802000045776367,"y":13.557999610900879,"z":33.099998474121094},"sunDiskAngularRadius":0.004650000017136335,"sunDiskIntensity":20.0},"clearColor":{"x":0.05000000074505806,"y":0.05999999865889549,"z":0.07999999821186066},"exposure":1.0,"skyIntensity":1.0,"skyMode":"procedural","skyRotation":0.0,"skyTexture":"0","useSkyForAmbient":true,"visible":true}"#;
+const EXPECT_ENV_DEFAULT: &str = r#"{"ambientColor":{"x":1.0,"y":1.0,"z":1.0},"ambientIntensity":0.15000000596046448,"atmosphere":{"atmosphereHeight":100.0,"enabled":false,"mieAnisotropy":0.800000011920929,"mieScaleHeight":1.2000000476837158,"mieScattering":3.996000051498413,"ozoneAbsorption":{"x":0.6499999761581421,"y":1.88100004196167,"z":0.08500000089406967},"planetRadius":6360.0,"rayleighScaleHeight":8.0,"rayleighScattering":{"x":5.802000045776367,"y":13.557999610900879,"z":33.099998474121094},"sunDiskAngularRadius":0.004650000017136335,"sunDiskIntensity":20.0},"clearColor":{"x":0.05000000074505806,"y":0.05999999865889549,"z":0.07999999821186066},"exposure":1.0,"fog":{"aerialIntensity":1.0,"aerialPerspective":false,"albedo":{"x":0.5,"y":0.6000000238418579,"z":0.699999988079071},"baseDensity":0.019999999552965164,"density":0.019999999552965164,"directionalColor":{"x":1.0,"y":0.8999999761581421,"z":0.699999988079071},"directionalExponent":8.0,"emissive":{"x":0.0,"y":0.0,"z":0.0},"enabled":false,"height":0.0,"heightFalloff":0.20000000298023224,"historyBlend":0.05000000074505806,"layer2Density":0.0,"layer2Falloff":0.5,"layer2Height":0.0,"lightClamp":0.0,"maxOpacity":1.0,"mode":"analytic","neighborhoodClamp":false,"phaseG":0.6000000238418579,"quality":"medium","scatterAlbedo":0.8999999761581421,"startDistance":0.0},"skyIntensity":1.0,"skyMode":"procedural","skyRotation":0.0,"skyTexture":"0","useSkyForAmbient":true,"visible":true}"#;
 
 #[test]
 fn name_matches_cpp() {
