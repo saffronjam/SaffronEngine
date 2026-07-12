@@ -22,9 +22,9 @@ use serde_json::{Map, Value};
 
 use crate::component::{
     AnimationPlayer, Bone, BonePhysicsComponent, Camera, CharacterController, Collider,
-    ComponentOrder, DirectionalLight, FootIk, KinematicBones, MaterialSet, Mesh, ModelInstance,
-    MorphComponent, Name, PointLight, ReflectionProbe, Relationship, Rigidbody, Script,
-    SkinnedMesh, SpotLight, Transform,
+    ComponentOrder, DirectionalLight, FogVolume, FootIk, KinematicBones, MaterialSet, Mesh,
+    ModelInstance, MorphComponent, Name, PointLight, ReflectionProbe, Relationship, Rigidbody,
+    Script, SkinnedMesh, SpotLight, Transform,
 };
 use crate::error::Result;
 use crate::scene::{Component, Entity, Scene};
@@ -399,6 +399,7 @@ pub fn register_builtin_components() -> ComponentRegistry {
     register_component!(reg, PointLight, "PointLight");
     register_component!(reg, SpotLight, "SpotLight");
     register_component!(reg, ReflectionProbe, "ReflectionProbe");
+    register_component!(reg, FogVolume, "FogVolume");
     register_component!(reg, Relationship, "Relationship", false);
     register_component!(reg, SkinnedMesh, "SkinnedMesh");
     register_component!(reg, MorphComponent, "Morph");
@@ -431,6 +432,7 @@ pub const BUILTIN_COMPONENT_NAMES: &[&str] = &[
     "PointLight",
     "SpotLight",
     "ReflectionProbe",
+    "FogVolume",
     "Relationship",
     "SkinnedMesh",
     "Morph",
