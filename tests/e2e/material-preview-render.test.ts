@@ -23,10 +23,9 @@ const placed: string[] = [];
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  // Only the normal-map case renders the scene; IBL + a light are harmless to the preview cases,
-  // which render their own studio-lit sphere offscreen.
+  // Only the normal-map case renders the scene; IBL + the starter scene's Sun are harmless to the
+  // preview cases, which render their own studio-lit sphere offscreen.
   await engine.call("set-ibl", { args: ["on"] }).catch(() => {});
-  await engine.call("add-entity", { args: ["directional-light"] }).catch(() => {});
 });
 afterAll(async () => {
   await engine?.shutdown();
