@@ -22,19 +22,20 @@ mod registry;
 mod scene;
 mod script_input;
 mod serde;
+mod starter;
 
 pub use component::{
     AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
-    Collider, ComponentOrder, DirectionalLight, FootChain, FootIk, IdComponent, Joint,
-    KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent,
-    MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight, PoseOverride, PreviewGhost,
-    ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh, SpotLight,
-    Transform, Transition, WorldTransform, Wrap,
+    Collider, ComponentOrder, DirectionalLight, FogShape, FogVolume, FootChain, FootIk,
+    IdComponent, Joint, KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance,
+    MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight, PoseOverride,
+    PreviewGhost, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh,
+    SpotLight, Transform, Transition, WorldTransform, Wrap,
 };
 pub use document::SCENE_VERSION;
 pub use environment::{
-    AssetCatalog, AssetEntry, AssetType, AtmosphereSettings, Attribution, Colorspace,
-    SceneEnvironment, SkyMode, TextureRole,
+    AssetCatalog, AssetEntry, AssetType, AtmosphereSettings, Attribution, Colorspace, FogMode,
+    FogQuality, FogSettings, SceneEnvironment, SkyMode, TextureRole,
 };
 pub use error::{Error, Result};
 pub use hierarchy::{
@@ -47,3 +48,4 @@ pub use registry::{
 pub use scene::{Component, Entity, Query, Scene};
 pub use script_input::{ScriptInputState, derive_script_input_edges};
 pub use serde::{environment_from_json, environment_to_json};
+pub use starter::seed_starter_scene;
