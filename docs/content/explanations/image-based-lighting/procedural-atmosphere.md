@@ -63,3 +63,4 @@ The whole chain lives inside `Ibl::bake` — a one-shot transient command buffer
 - [Procedural sky](../procedural-sky/) — the analytic gradient this replaces as the cube source
 - [Baking](../ibl-bake-pass/) — runs the cube fill first, then the convolutions
 - [Diffuse irradiance](../diffuse-irradiance/) — convolves the resulting cube for diffuse ambient
+- [Aerial perspective](../../screen-space-and-post/aerial-perspective/) — applies these transmittance + multiscatter LUTs to scene geometry, which the sky-view lookup does not
