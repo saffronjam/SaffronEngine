@@ -5,78 +5,87 @@ weight = 3
 
 # Descriptor sets
 
-A descriptor set is a group of GPU resource bindings — textures, buffers, samplers — that a shader reads through a single bound object. Vulkan numbers the sets, and a pipeline declares a layout for each one. A shader and the pipeline that hosts it must agree on that layout exactly.
+A Vulkan [`VkDescriptorSet`](https://registry.khronos.org/vulkan/specs/latest/man/html/VkDescriptorSet.html) groups shader-visible buffers, images, samplers, and acceleration structures under one pipeline-layout slot. A shader declaration and its Rust descriptor-set layout must agree on binding number, descriptor type, array count, and shader stages.
 
-The convention is to give each set one class of resource and to order the sets by how often the data changes. Binding a low-numbered set rarely and a high-numbered set per draw lets the driver keep more descriptor state resident across draws within a frame.
+Anima groups the mesh resources by ownership. The resulting layout remains compatible across every material PSO, so scene recording can bind the shared sets before replaying batches.
 
-## The mesh layout
+## Mesh pipeline contract
 
-The mesh übershader reads from a fixed set layout. The `vk::binding` attributes in `lighting.slang` (the shared lighting module `mesh.slang` imports) and the set-layout list `Pipelines::new` assembles are two views of the same contract, and they must agree.
+The mesh shader uses sets 0 through 5 on every device. Ray-tracing devices add sets 6 and 7. `Pipelines::new` assembles the Rust layout in the same order that Slang's `vk::binding(binding, set)` attributes declare.
 
-Sets 0–5 are always present in a mesh PSO. Sets 6–7 exist only when the device supports ray tracing, because their layouts need the acceleration-structure extension.
+| Set | Owner | Bindings |
+|---:|---|---|
+| 0 | Global bindless images | `0` material 2D textures; `1-3` mesh-SDF atlas, indirection, and coverage; `4` height min/max pyramids |
+| 1 | Frame lighting | `0` globals; `1` punctual lights; `2` cluster lists; `3` cluster params; `4-7` shadow maps; `8-10` SDF/GDF data; `11` froxel integration |
+| 2 | Frame geometry data | `0` instances; `1` current joint palette; `2` deduplicated material params |
+| 3 | IBL and reflection probes | `0-2` global irradiance, prefiltered environment, and BRDF LUT; `3-4` probe cube arrays; `5` probe metadata |
+| 4 | Screen-space lighting | `0` AO; `1` contact shadows; `2` SSGI; `3` SSR; `4` previous color; `5` DFAO; `6` specular occlusion; `7` resolved indirect diffuse |
+| 5 | DDGI | `0` irradiance atlas; `1` distance atlas |
+| 6 | Ray tracing | `0` TLAS |
+| 7 | ReSTIR | `0` resolved direct-light radiance |
 
-| Set | Contents | Bindings | Why it's here |
-|---|---|---|---|
-| 0 | Bindless albedo array | `0` combined-image-sampler `[1024]` | one global texture array, indexed per-instance |
-| 1 | Lighting | `0` directional UBO · `1` punctual list · `2` cluster list · `3` cluster params · `4`–`6` shadow maps | per-frame light state |
-| 2 | Instances | `0` per-instance storage buffer · `1` joint matrices · `2` material params | model + normal matrix + base color + texture index |
-| 3 | IBL | `0` irradiance cube · `1` prefiltered cube · `2` BRDF LUT | the ambient term |
-| 4 | Screen-space | `0` AO · `1` contact shadows · `2` SSGI | per-pixel maps sampled by screen UV |
-| 5 | DDGI | `0` irradiance atlas · `1` distance atlas | world-space multi-bounce indirect |
-| 6 | RT TLAS | `0` acceleration structure | inline ray-query shadows (RT only) |
-| 7 | ReSTIR | `0` resolved radiance | stochastic many-light direct (RT only) |
+Set 0 is device-global. Sets 1 and 2 select the frame-in-flight resources. Sets 3 through 5 belong to lighting subsystems and the active renderer view. Set 6 selects the current frame's TLAS, while set 7 selects the active view's ReSTIR result.
 
-In the shader these read as `vk::binding(binding, set)`:
+## Shader declarations
+
+The shared `lighting` module supplies the descriptor interface imported by `mesh.slang`:
 
 ```hlsl
-[[vk::binding(0, 0)]] public Sampler2D albedoTextures[1024];     // set 0: bindless albedo
-[[vk::binding(0, 1)]] ConstantBuffer<LightGlobals> globals;      // set 1: directional + counts
-[[vk::binding(1, 1)]] StructuredBuffer<GpuLight> lights;         //        punctual list
-[[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;      // set 2: per-instance data
+[[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
+[[vk::binding(0, 1)]] ConstantBuffer<LightGlobals> globals;
+[[vk::binding(1, 1)]] StructuredBuffer<GpuLight> lights;
+[[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;
 [[vk::binding(2, 2)]] StructuredBuffer<MaterialParams> materialParams;
-[[vk::binding(0, 3)]] SamplerCube irradianceMap;                 // set 3: IBL
+[[vk::binding(0, 3)]] SamplerCube irradianceMap;
+[[vk::binding(7, 4)]] Sampler2D giIndirectMap;
+[[vk::binding(0, 5)]] Sampler2D ddgiIrradiance;
 ```
 
-`Pipelines::new` assembles the matching `vk::DescriptorSetLayout` list from the device-global layouts and appends 6 and 7 only when both `rt_mesh_set_layout` and `restir_mesh_set_layout` are present. The set-6 and set-7 bindings still compile into the shader unconditionally; they are only *accessed* under a runtime flag (`globals.pointShadowMeta.z` for RT shadows, `globals.screenFlags.w` for ReSTIR), so the unused bindings cost nothing on a device without RT.
+The Rust layout builders mirror those declarations. For example, `create_instance_layout` exposes three storage-buffer bindings with vertex or fragment visibility matching their consumers. `create_ibl_layout` gives each reflection-probe array eight descriptors, matching `MAX_REFLECTION_PROBES` and the shader array declarations.
 
-## Numbered by change frequency
+## Ray-tracing variant
 
-The mesh layout follows the change-frequency ordering throughout:
+Sets 6 and 7 require ray-tracing descriptor types and resources. When the device supports the path, `Pipelines` appends both layouts and loads the normal mesh shader variant.
 
-- **Set 0** is bound once and never rebound — the bindless array is a single set for every draw. See [bindless textures](../bindless-textures/).
-- **Sets 1–2** are per-frame: light state and the instance buffer are rewritten each frame (double-buffered so a host write never races a frame still reading on the GPU).
-- **Sets 3–7** are feature state, stable across frames once their feature is on.
+The RT-off shader is compiled with `SAFFRON_NO_RT`. Preprocessor guards remove `rtScene`, `restirRadiance`, and the ray-query helpers from its interface. Its pipeline layout therefore ends at set 5, which is required for strict shader-layout matching on MoltenVK as well as Vulkan validation.
 
-## Flags decoupled from bindings
+## Recording cost
 
-Most of these features are optional and gated by a flag in the light UBO (`globals.counts`, `globals.screenFlags`) rather than by a different pipeline. The übershader checks the flag, then samples the matching set:
+`bind_mesh_descriptor_sets` binds the shared descriptor state once for an opaque or translucent scope:
 
-```hlsl
-if (globals.counts.z != 0)        // IBL enabled
-{
-    float3 irradiance = irradianceMap.SampleLevel(n, 0.0).rgb;   // set 3
-    // ... split-sum specular ...
-}
-if (globals.counts.w != 0)        // AO enabled
-{
-    ambient *= aoMap.SampleLevel(screenUv, 0.0).r;               // set 4
-}
+```text
+call 1: set 0
+call 2: sets 1 and 2 together
+call 3: set 3
+call 4: set 4
+call 5: set 5
+call 6: set 6, on an RT device
+call 7: set 7, on an RT device
 ```
 
-A feature toggling on or off is a UBO write, not a pipeline switch. The sets are always bound; the flag decides whether the shader reads them.
+Batch replay changes pipelines and vertex/index streams but does not rebind these sets. `scene_draw_list_bind_count` reports five descriptor-binding calls for a non-RT scope and adds one for each RT set. This count is independent of the number of mesh batches.
+
+Depth and shadow pipelines use compatible prefixes of the same layout. The alpha-tested depth prepass binds set 0 for the albedo alpha and set 2 for instances and material params. Vertex-only shadow drawing needs set 2 and its light-space push constant.
+
+## Feature flags and valid fallbacks
+
+Optional lighting effects use flags in `LightGlobals` to decide whether to sample their resources. The layouts do not change when AO, SSR, DDGI, or another runtime effect is toggled.
+
+Resource owners initialize neutral images and valid descriptor sets before drawing. Disabled screen-space effects therefore keep set 4 bound to neutral maps, and the shader branch skips or harmlessly samples them. This avoids pipeline churn while satisfying Vulkan's requirement that statically used descriptors be bound.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Binding declarations | `lighting.slang` | `vk::binding(b, s)` across sets 0–7 |
-| Runtime feature flags | `lighting.slang` | `LightGlobals::counts`, `screenFlags` |
-| PSO set-layout list | `pipelines.rs` | `Pipelines::new` — `set_layouts` |
-| Set 0/1/2 layout accessors | `descriptors.rs` | `Descriptors::bindless_set_layout`, `light_set_layout`, `instance_set_layout` |
-| RT set accessors (gate 6/7) | `descriptors.rs` | `rt_mesh_set_layout`, `restir_mesh_set_layout` |
+| Device-global layout builders | `engine/crates/rendering/src/descriptors.rs` | `create_bindless_layout`, `create_light_layout`, `create_instance_layout`, `create_ibl_layout`, `create_ssao_mesh_layout` |
+| Pipeline layout assembly | `engine/crates/rendering/src/pipelines.rs` | `Pipelines::new`, `set_layouts`, `rt_enabled` |
+| Mesh descriptor declarations | `engine/assets/shaders/lighting.slang` | `vk::binding`, `LightGlobals`, `MaterialParams`, `SAFFRON_NO_RT` |
+| Scope-level descriptor binding | `engine/crates/rendering/src/scene_pass.rs` | `bind_mesh_descriptor_sets`, `scene_draw_list_bind_count`, `record_scene_draw_list` |
+| Frame sets 1 and 2 | `engine/crates/rendering/src/lighting.rs` · `instancing.rs` | `Lighting::light_set`, `Instancing::instance_set` |
 
 ## Related
 
-- [Bindless textures](../bindless-textures/) — set 0 in detail
-- [Materials & PSOs](../material-and-pso-selection/) — where the layout list is baked into the PSO
-- [Cook-Torrance BRDF](../../lighting-and-brdf/cook-torrance-brdf/) — what set 1's light data feeds
+- [Bindless textures](../bindless-textures/) - set 0 arrays, slot allocation, and non-uniform indexing
+- [Material and PSO selection](../material-and-pso-selection/) - the compatible pipeline variants that share this layout
+- [Clustered forward+](../../lighting-and-brdf/clustered-forward/) - data supplied by the light and cluster bindings
+- [ReSTIR overview](../../global-illumination-and-raytracing/restir-overview/) - the RT-only set 7 consumer
