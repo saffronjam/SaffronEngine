@@ -5,81 +5,119 @@ weight = 2
 
 # Model import
 
-Model import reads a 3D model file and converts it into the engine's own geometry: a
-[`Mesh`](../mesh-and-vertex-layout/) plus a table of `ImportedMaterial`s, one per source
-material. Two source formats are supported — glTF and OBJ — and each has its own parser, but
-both produce the same `ImportedModel`.
+Model import reads a 3D model file and translates it into the engine's in-memory import graph,
+`ImportedModel`. Two source formats are supported:
+[glTF](https://github.com/KhronosGroup/glTF) through the [`gltf`](https://docs.rs/gltf) crate and
+[Wavefront OBJ](https://paulbourke.net/dataformats/obj/) through [`tobj`](https://docs.rs/tobj).
+Each format has its own parser, and both produce the same graph shape.
 
-The format is chosen by file extension, and the caller never sees which parser ran. glTF
-goes through the `gltf` crate, OBJ through `tobj`. Every fallible step returns
-`Result<_, Error>`, so a parse failure becomes an `Err` rather than a panic, matching the
-engine's [error-as-value rule](../../core-and-conventions/error-handling/).
+That shape is uniform: a node forest (`Vec<ImportedNode>` with name, parent index, and local TRS
+per node) whose mesh-bearing nodes carry a node-local [`Mesh`](../mesh-and-vertex-layout/), a
+table of `ImportedMaterial`s, the decoded `AnimClip`s, and optional skin and morph payloads.
+There is no top-level mesh; an OBJ rides a single identity root node. Every fallible step
+returns `Result<_, Error>`, per the engine's
+[error-as-value rule](../../core-and-conventions/error-handling/).
 
 ## Dispatch by extension
 
-`translate_model` parses a model file and returns an `ImportedModel` (mesh + material table,
-plus an optional skin payload). It branches on a case-insensitive suffix check: `.gltf`/`.glb`
-route to the glTF importer, `.obj` to the OBJ importer; any other extension returns an `Err`.
+`translate_model` branches on a case-insensitive suffix: `.gltf` and `.glb` route to the glTF
+importer, `.obj` to the OBJ importer, and any other extension returns an `Err`. The caller
+never sees which parser ran.
 
-## glTF through the `gltf` crate
+## glTF into a node forest
 
-`gltf::import` parses the JSON and loads the buffers; a failure returns `Err`. The importer
-walks every mesh's triangle primitives and reads each into a fresh submesh via
-`append_primitive`. Attributes are looked up by semantic:
+`gltf::Gltf::open` parses the document and `gltf::import_buffers` loads its binary buffers.
+The crate's `Node` exposes children but no parent, so `build_parents` inverts every node's
+child list into a parent index (`-1` for a root). `build_node_forest` then records each node's
+name, parent, and local TRS in document order; a matrix transform is decomposed to TRS through
+`Affine3A`. Geometry stays node-local with no world-transform bake, so a node an animation
+track drives keeps its drivable local transform.
 
-- `POSITION` is required; a primitive without it is skipped.
-- `NORMAL` and `TEXCOORD_0` are optional.
+For each mesh-bearing node, `append_primitive` reads every triangle primitive into that node's
+local mesh. A non-triangle primitive, or one without `POSITION`, is skipped. `NORMAL`,
+`TEXCOORD_0`, `TANGENT`, and the `JOINTS_0`/`WEIGHTS_0` skin pair are optional; absent
+attributes fill with zeros.
 
-Each primitive gets a `vertex_offset` equal to the current vertex count, so its indices stay
-zero-based against its own block. A primitive with no index buffer gets a synthesized
-`0..vertex_count` sequence. One source mesh with several primitives becomes several submeshes
-over the shared buffers, and each submesh's `material_slot` is set to the slot of its glTF
-material (deduplicated in first-seen order).
+Each primitive gets a `vertex_offset` equal to the node mesh's current vertex count, so its
+indices stay zero-based against its own block. A primitive with no index buffer gets a
+synthesized `0..vertex_count` sequence, and an out-of-range index is an `Err`. One glTF mesh
+with several primitives becomes several submeshes over the node's shared buffers, each tagged
+with a `material_slot` assigned in first-seen order (keyed by the material's document index;
+a primitive with no material gets a default slot).
 
-## OBJ through `tobj`
+## Normals and tangents
 
-`tobj::load_obj` resolves the `.mtl` and its textures relative to the OBJ's own directory.
-OBJ stores position, normal, and texcoord as three independent index streams, so the same
-`(v, vn, vt)` triple can recur; a `BTreeMap` keyed on the `[i32; 3]` triple collapses
-duplicates into unique vertices. The ordered map is deliberate, not a `HashMap`: it emits
-the deduplicated vertices in a deterministic order across runs, so the subsequent
-[`.smesh`](../smesh-format/) bake is byte-stable.
+Both paths share a normal fallback. `any_normals_present` scans the assembled mesh, and if
+every normal is near-zero, `generate_normals` recomputes smooth per-vertex normals by summing
+cross-product face normals and normalizing. A vertex with no contributing face falls back
+to `+Y`.
+
+Tangents follow the same keep-or-compute policy. A glTF `TANGENT` accessor is already
+UV-aligned with a ±1 handedness in `w`, so it is kept; when any vertex lacks one,
+`compute_tangents` rebuilds the frame with
+[Lengyel's method](https://terathon.com/blog/tangent-space.html) — UV-gradient accumulation,
+then Gram-Schmidt against the normal. A degenerate vertex (no usable UVs, zero-area triangles)
+gets a branchless basis from the normal
+([Duff et al. 2017](https://jcgt.org/published/0006/01/01/paper.pdf)), so every tangent is
+finite and unit-length. OBJ carries no tangents, so its importer always computes them.
+
+## Skin and clips
+
+A skin payload is decoded only when the document's first skin covers every triangle primitive.
+A model mixing skinned and unskinned primitives would deform its unweighted vertices to the
+origin, so it imports as plain geometry with a warning. `build_skin_desc` reads the joint node
+indices (in `jointMatrices[]` order), the inverse-bind matrices, the skeleton root, and the
+skinned mesh node into an `ImportedSkin`; `SkinPayload` pairs it with the per-vertex
+joint/weight stream.
+
+`decode_clips` turns each glTF animation into an `AnimClip` of heterogeneous tracks, skinned
+or not — the clips are top-level on `ImportedModel::animations`. A channel targeting a skin
+joint becomes a bone track keyed by its position in the joint list; any other node becomes a
+node track bound by name; a morph-weights channel becomes a weights track carrying the N-wide
+weight stream. Sampler keyframes land in flat `times`/`values` arrays (a cubic-spline sampler
+stores three values per key), and the clip's duration is the latest track end. The track and
+clip types themselves are the [animation data model](../../animation/animation-data-model/).
+
+## Morph targets
+
+Each primitive's morph targets are read as dense position/normal delta streams, then compacted:
+a delta below a squared magnitude of `1e-12` is dropped, and the survivors are stored sparsely
+with their vertex index shifted by the primitive's base. One mesh-global `MorphData` is kept,
+from the first mesh-bearing node that has targets. `finalize_morph` reconciles the target count
+against the mesh-level rest weights, seeds each target's `rest_weight`, and synthesizes the
+names as `morph_{k}`. [Morph targets](../../animation/morph-targets/) covers what the deltas
+drive at runtime.
+
+## OBJ through tobj
+
+`tobj::load_obj` runs with explicit `LoadOptions { triangulate: true, single_index: false }`
+and resolves the `.mtl` next to the OBJ; a missing or broken `.mtl` does not fail the geometry
+load. OBJ stores position, normal, and texcoord as three independent index streams, so the
+same `(v, vn, vt)` triple can recur across faces. `resolve_vertex` collapses duplicates
+through a `BTreeMap` keyed on the triple:
 
 ```rust
-let key = [index.vertex_index, index.normal_index, index.texcoord_index];
-let slot = unique_vertices.entry(key).or_insert_with(|| /* push a new vertex */);
+let key = [vertex_index, normal_index, texcoord_index];
+if let Some(&existing) = unique_vertices.get(&key) {
+    return Ok(existing);
+}
 ```
 
-An OBJ shape can mix materials across its faces, so the importer groups faces by their
-`material_id` (`tobj` triangulates by default, giving one id per triangle) and emits one
-submesh per material, each tagged with its slot. Because the indices already point into the
-shared array, OBJ submeshes leave `vertex_offset` at 0, the opposite choice from glTF. OBJ's
-texture V origin is bottom-left while Vulkan samples top-left, so the importer flips V on
-read (`1.0 - v`). glTF needs no flip.
+The ordered map is deliberate: unlike a `HashMap`, it emits the deduplicated vertices in the
+same order on every run, so the bytes of the subsequent [`.smesh`](../smesh-format/) bake stay
+stable. A re-import-determinism test pins that choice. OBJ's texture V origin is bottom-left
+while Vulkan samples top-left, so the importer flips V on read (`1.0 - v`); glTF needs no flip.
 
-## Missing normals
-
-Both paths share a fallback. `any_normals_present` scans the assembled mesh, and if every
-normal is near-zero, `generate_normals` recomputes smooth per-vertex normals by summing the
-cross-product face normals of each triangle and normalizing. A vertex with no contributing
-face falls back to `+Y`.
-
-## Skeletal clips
-
-When a glTF declares a skin, the importer also walks its animations through `decode_clips`.
-Each animation becomes an `AnimClip`, and each of its channels an `AnimTrack`: the channel's
-target node is matched to a joint by its position in the skin's joint list, and its sampler's
-keyframe times and values are read into the flat `times`/`values` arrays the sampler expects.
-A track records both that joint index and the node's name, so a later reimport can re-resolve
-a stale index. The decoded clips ride on the skin payload (`SkinPayload.animations`); the
-[import pipeline](../import-pipeline/) bakes each to a [`.sanim`](../sanim-format/) chunk and
-registers it as an `AssetType::Animation` catalog entry. The mechanics of the clip and track
-types are the [animation data model](../../animation/animation-data-model/).
+Faces are grouped into first-seen material slots by a `SlotMap` keyed on the tobj material id
+(`-1` for none), so the same material in two shapes merges into one slot and one submesh.
+Because the indices already point into the shared vertex array, OBJ submeshes leave
+`vertex_offset` at 0, the opposite choice from glTF. The finished mesh rides a single identity
+root `ImportedNode` named after the file stem, so it spawns exactly like a single-node glTF.
 
 ## The material table
 
-Both importers build a `Vec<ImportedMaterial>`, one entry per distinct source material, in
-first-seen order. Each `Submesh::material_slot` indexes the table.
+Both importers build a `Vec<ImportedMaterial>` in first-seen order, always at least one entry
+(a default material when the source declares none). Each `Submesh::material_slot` indexes it.
 
 ```rust
 pub struct ImportedMaterial {
@@ -94,42 +132,49 @@ pub struct ImportedMaterial {
     pub normal: Option<TextureSource>,             // linear
     pub occlusion: Option<TextureSource>,          // AO in R; linear
     pub emissive_tex: Option<TextureSource>,       // sRGB
+    pub alpha_mode: AlphaMode,                     // Opaque | Mask | Blend
+    pub alpha_cutoff: f32,
+    pub double_sided: bool,
 }
 ```
 
-Each optional texture is one `Option<TextureSource>` — the encoded (png/jpg) bytes plus their
-extension — so a presence flag can never disagree with the bytes. `extract_gltf_material`
-reads each material's base-color/metallic/roughness/emissive factors (with the
-`KHR_materials_emissive_strength` multiplier) and the base-color, metallic-roughness, normal,
-occlusion, and emissive textures via `read_texture_bytes` (from an embedded buffer view or an
-external file resolved next to the glTF, percent-decoding the URI). `extract_obj_material`
-reads `diffuse`, the `Pm`/`Pr` MTL keys, `emissive`, and `diffuse_texture` per material. The
-encoded texture bytes are carried as-is; decoding happens later, in
-[image decoding](../image-decoding/).
+Each optional texture is one `Option<TextureSource>`, the encoded png/jpg bytes plus their
+extension, so a presence flag can never disagree with the bytes. `extract_gltf_material` reads
+the PBR factors, the `KHR_materials_emissive_strength` multiplier, the `alphaMode`/
+`alphaCutoff`/`doubleSided` flags, and five textures via `read_texture_bytes`, which pulls from
+an embedded buffer view or an external file resolved next to the glTF (percent-decoding the
+URI).
 
-The downstream [import pipeline](../import-pipeline/) bakes each material into the `.smodel` as an
-`SMAT` chunk (textures colorspace-tagged per role) and lowers the table into the scene as a
-[`MaterialSet`](../../scene-and-ecs/built-in-components/) whose slots **reference** those baked
-`.smat` chunks — one slot per source material, so editing a baked material re-renders every instance.
+`extract_obj_material` reads `diffuse`, `emissive`, and `diffuse_texture`, plus the `Pm`/`Pr`
+PBR keys out of tobj's unrecognized-parameter map. An OBJ material seeds metallic and
+roughness to 0, matching what tinyobjloader reports when the `.mtl` omits them. Texture bytes
+are carried as-is on both paths; decoding happens later, in
+[image decoding](../image-decoding/). The [import pipeline](../import-pipeline/) bakes the
+whole graph into a [`.smodel` container](../smodel-container/): the mesh, one `.smat` chunk
+per material, the texture chunks, and one `.sanim` chunk per clip.
+
+> [!NOTE]
+> A glTF texture embedded as a `data:` URI is logged and skipped; the importer keeps the
+> geometry without that texture. Embedded buffer-view images and external files both load.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Extension dispatch | `geometry/src/translate.rs` | `translate_model` |
-| glTF parse + walk | `geometry/src/gltf_import.rs` | `import_gltf_model`, `append_primitive` |
-| Skeletal clip decode | `geometry/src/gltf_import.rs` | `decode_clips`, `build_skin` |
-| OBJ parse + dedup | `geometry/src/obj_import.rs` | `import_obj_model` |
-| Missing-normal fallback | `geometry/src/picking.rs`; `geometry/src/gltf_import.rs` | `generate_normals`, `any_normals_present` |
-| Material extraction | `geometry/src/gltf_import.rs`; `geometry/src/obj_import.rs` | `ImportedMaterial`, `extract_gltf_material`, `read_texture_bytes`, `extract_obj_material` |
-
-> [!NOTE]
-> A glTF texture embedded as a `data:` URI is logged and skipped; the importer imports the
-> geometry without that texture. Embedded buffer-view images and external files both work.
+| glTF parse + node forest | `geometry/src/gltf_import.rs` | `import_gltf_model`, `build_parents`, `build_node_forest`, `append_primitive` |
+| Skin + clip decode | `geometry/src/gltf_import.rs` | `build_skin_desc`, `decode_clips` |
+| Morph compaction | `geometry/src/gltf_import.rs` | `finalize_morph`, `MORPH_DELTA_EPSILON_SQ` |
+| OBJ parse + dedup | `geometry/src/obj_import.rs` | `import_obj_model`, `resolve_vertex`, `SlotMap` |
+| Normal + tangent fallbacks | `geometry/src/picking.rs`; `geometry/src/types.rs` | `generate_normals`, `compute_tangents` |
+| Material extraction | `geometry/src/gltf_import.rs`; `geometry/src/obj_import.rs` | `extract_gltf_material`, `read_texture_bytes`, `extract_obj_material` |
+| Output graph types | `geometry/src/types.rs` | `ImportedModel`, `ImportedNode`, `ImportedMaterial`, `SkinPayload`, `MorphData` |
 
 ## Related
 
-- [Vertex layout](../mesh-and-vertex-layout/) — the common output
+- [Vertex layout](../mesh-and-vertex-layout/) — the `Mesh`/`Submesh` the importers fill
 - [Image decoding](../image-decoding/) — where the texture bytes get decoded
-- [Import pipeline](../import-pipeline/) — what calls these and bakes the result
+- [Import pipeline](../import-pipeline/) — what calls this and bakes the result
+- [The .smodel container](../smodel-container/) — where the baked chunks land
+- [Animation data model](../../animation/animation-data-model/) — the clip and track types
 - [Error handling](../../core-and-conventions/error-handling/) — the error-as-value boundary

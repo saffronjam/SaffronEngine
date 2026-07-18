@@ -5,44 +5,49 @@ weight = 9
 
 # Project files
 
-A project is a folder with one `project.json` and a project-local `assets/` directory. A
-scene refers to meshes and textures by UUID; the catalog in `project.json` maps those UUIDs
-to files under the project's asset root. Keeping both in one project folder means the editor
-can copy or archive a project without depending on engine-bundled runtime assets.
+A project is one folder: a `project.json` document plus everything it references — asset files
+under `assets/`, Lua scripts under `src/`. Scene components name meshes, textures, and materials
+by asset id (a 64-bit `Uuid`); the catalog block inside `project.json` maps each id to a file
+under the project's asset root. Copying or archiving the folder moves the whole project, since
+nothing in it depends on the engine's bundled assets.
 
-During local development, app data lives under a userdata root, with user projects under
-`<userdata>/<project-name>/`. Packaged builds swap the base directory behind the same
-`app_data_root` / `project_userdata_root` helpers.
+## Layout
 
 ```text
-<userdata>/<project-name>/
-  project.json
+<root>/
+  project.json      the one document: catalog + scene + render settings (+ editor blocks)
   assets/
-    models/
-    textures/
-    materials/
-  src/            Lua scripts (Script component slot paths resolve here)
-  cache/          regenerable scan + thumbnail caches
+    models/         baked .smodel containers, extracted .smesh / .sanim
+    textures/       imported images, textures/<uuid>.<ext>
+    materials/      .smat / .smatx material assets
+    .cache/         regenerable catalog scan cache (catalog.json)
+  src/              Lua scripts; Script component slot paths resolve here
+  library/sa.lua    generated LuaLS type defs for the live `sa` API
+  .luarc.json       LuaLS settings, seeded once and never overwritten
 ```
 
-The `src/` folder is ensured on create and on load (with a starter script when absent) by
-`ensure_script_src`; its contents are plain files, never catalog entries — see
-[Script components](../../scripting/script-components-and-runtime/).
+`ensure_script_src` creates `src/` on create *and* on load, seeding `src/example.lua` only when
+absent. `ensure_script_library` rewrites `library/sa.lua` on every open, since it is an
+engine-generated artifact for the [Lua Language Server](https://luals.github.io/) and must track
+the engine; `.luarc.json` holds user-editable settings and is written only when missing. Script
+files are plain
+files, never catalog entries; see [Script components](../../scripting/script-components-and-runtime/).
 
-The project name is the stable folder-safe id (validated by `valid_project_name`).
-`display_name` is stored separately in the project file and is what the editor shows users.
+Thumbnails are not project files. The thumbnail cache is app-level
+(`<appDataRoot>/thumbnail-cache/`), content-addressed, and shared across projects, so the catalog
+scan and project save never see it.
 
-## How it works
+## Names and roots
 
-`AssetServer::save_project` serializes one JSON document: a version, the project name, the
-display name, the asset catalog, the scene, the renderer settings, and (when present) the
-editor camera and debug overlays. The renderer-touching parts go through a `ProjectHost`
-trait, so the asset crate stays decoupled from the live renderer: the host implements
-`render_settings_to_json` / `apply_render_settings` over its `Renderer`, and `wait_gpu_idle`
-over `device.wait_idle`. `load_project` reverses this, after first idling the GPU so the
-previous project's resources release safely.
+The project name is the folder-safe id, validated by `valid_project_name`: non-empty, at most 63
+bytes, lowercase ASCII letters, digits, and `-`, with no leading or trailing hyphen. The stored
+`displayName` is what the editor shows; when empty it derives from the name (`my-cool-game` →
+`My Cool Game`). User projects default to `<appDataRoot>/userdata/<name>/`, where the app-data
+root is `$SAFFRON_APPDATA_DIR` when set and `appdata` under the working directory otherwise.
 
 ## One document
+
+`AssetServer::save_project` writes a single pretty-printed JSON file, keys in write order:
 
 ```json
 {
@@ -54,102 +59,134 @@ previous project's resources release safely.
       "id": 3862017159553017004,
       "name": "cube",
       "type": "model",
-      "path": "models/3862017159553017004.smodel"
+      "path": "models/3862017159553017004.smodel",
+      "folder": "",
+      "hdr": false,
+      "linear": false
     }
   ],
-  "scene": { "version": 2, "entities": [] },
-  "renderSettings": { "aa": "msaa4", "exposureEv": 0.0, "clustered": true, "shadows": true },
+  "assetFolders": [],
+  "scene": { "version": 4, "environment": {}, "entities": [] },
+  "renderSettings": {
+    "aa": "taa", "exposureEv": 0.0, "clustered": true, "depthPrepass": true,
+    "shadows": true, "ibl": true, "quality": "high", "tonemap": "agx",
+    "ddgi": true, "gdf": true, "skyOcclusion": true, "rtShadows": false, "restir": false
+  },
   "editorCamera": { "position": { "x": 3.0, "y": 2.5, "z": 4.0 }, "yaw": -37.0, "pitch": -29.0, "fov": 45.0 },
-  "debugOverlays": { "bounds": false, "sceneAabb": false, "lightVolumes": false, "grid": true }
+  "debugOverlays": { "bounds": false, "sceneAabb": false, "lightVolumes": false, "grid": true, "colliders": false }
 }
 ```
 
-`catalog_to_json` serializes every `AssetEntry`; the type is written as a string
-(`asset_type_name`), so the file stays readable and stable across enum reordering. The scene
-half is the registry-driven `Scene::scene_to_json`. The `version` field is checked on load; a
-mismatch is a typed `Error::BadProjectVersion` rather than a best-effort parse.
+`catalog_to_json` writes one row per `AssetEntry`. Every row carries
+`id`/`name`/`type`/`path`/`folder`/`hdr`/`linear`; the container linkage (`container`/`chunk`),
+texture `colorspace` and `role`, animation `duration`/`tracks`, the `rigged` flag, store
+`attribution`, and `contentHash` appear only when non-default, so a standalone row stays minimal.
+The type is a string via `asset_type_name`, readable and stable across enum reordering.
+`assetFolders` persists the user-created catalog folders as a string array.
 
-Two things are deliberately not saved: the GPU caches and the absolute asset root. The catalog
-stores paths relative to `<project-root>/assets`, and the root is set when the project opens.
+The `scene` block (shown empty above) is the registry-driven `Scene::scene_to_json` document —
+its own `version` and migrations are described in
+[scene serialization](../../scene-and-ecs/scene-serialization/). The top-level `version` is gated
+on load: any value other than `PROJECT_VERSION` is a typed `Error::BadProjectVersion`, never a
+best-effort parse. The reader is otherwise lenient; unknown keys are ignored and missing keys
+take defaults.
 
-## Render settings, camera, and overlays ride along
+Catalog paths are relative to `<root>/assets`, and the absolute root is set when the project
+opens. GPU caches are not saved; the new scene's ids re-resolve against the new catalog and
+[upload lazily](../asset-server-and-catalog/) as they are first drawn.
 
-`renderSettings` captures the renderer state the editor's render panel drives — the
-[AA mode](../../anti-aliasing/aa-modes/), tonemap exposure, and the feature toggles
-(clustered, depth prepass, shadows, IBL, SSAO, contact shadows, SSGI, DDGI, RT shadows,
-ReSTIR) — so a project reopens looking the way it was saved. Missing fields keep their current
-value, and the RT toggles only apply on a device that reports ray-tracing support.
+## Render settings and the sidecar blocks
 
-The [editor camera](../../ui-and-editor/editor-camera/) and the
-[debug overlays](../../ui-and-editor/debug-visualization/) ride along as opaque `editorCamera`
-/ `debugOverlays` blocks carried in a `ProjectSidecar`. They belong to `saffron-sceneedit`, so
-the asset crate never owns or interprets them — it writes each only when it is a JSON object on
-save and hands them back (or JSON null when absent) on load; callers in the control commands
-and the host startup path apply them.
+`renderSettings` snapshots the renderer state the editor's render panel drives: the
+[AA mode](../../anti-aliasing/aa-modes/), exposure, the
+[quality tier](../../screen-space-and-post/render-quality-tiers/), the tonemap operator, and the
+feature toggles (clustered, depth prepass, shadows, IBL, DDGI, GDF, sky occlusion, RT shadows,
+ReSTIR). On load each field is a patch: a missing or mistyped field keeps the current value, and
+the RT toggles apply only on a device that reports ray-tracing support.
 
-## Loading replaces both, after a device idle
+The [editor camera](../../ui-and-editor/editor-camera/), the
+[debug overlays](../../ui-and-editor/debug-visualization/), and the enabled
+[asset-store connectors](../../asset-store-and-connectors/connector-framework/) travel as opaque
+`editorCamera` / `debugOverlays` / `stores` blocks in a `ProjectSidecar`. They belong to
+`saffron-sceneedit` and the editor, so the asset crate never interprets them: each is written only
+when it is a JSON object and handed back (or JSON null) on load for the caller to apply.
 
-```rust
-host.wait_gpu_idle();              // every in-flight frame finished
-self.clear_asset_caches();         // drop the cached Arc<GpuMesh>/Arc<GpuTexture>
-self.set_asset_root(/* <root>/assets */);
-catalog_from_json(&mut self.catalog, doc.get("assets") ...);
-self.load_catalog();               // reconcile against the disk scan
-scene.scene_from_json(reg, &scene_doc)?;
-```
+## Save and load through a seam
 
-The ordering matters. The GPU caches hold `Arc`s to meshes and textures the old project
-uploaded; loading a new one must drop them. Dropping the last `Arc` frees a `GpuMesh`, which
-frees Vulkan buffers a frame in flight may still reference. So `load_project` calls
-`wait_gpu_idle` first, then clears the caches, then swaps the catalog and scene. With the
-caches empty, the new scene's UUIDs re-resolve from the new catalog on the next `render_scene`,
-[uploading lazily](../asset-server-and-catalog/) as they are first drawn. The load also
-reconciles the doc's catalog against the disk scan (`load_catalog`), so a never-saved import is
-rediscovered and a deleted file's row is dropped.
+The renderer-touching steps go through one trait, `ProjectHost`: `wait_gpu_idle`,
+`render_settings_to_json`, and `apply_render_settings`. It keeps `saffron-assets` decoupled from
+the live renderer. The control plane implements it as `RendererProjectHost` over the real `Renderer`;
+tests implement a recording stub and assert the ordering without a Vulkan device.
+
+`AssetServer::load_project` keeps a strict order: parse and version-gate, `wait_gpu_idle`, clear
+the GPU asset caches, set the asset root, ensure `src/` + `library/`, rebuild the catalog from the
+doc, reconcile it against the disk scan, apply render settings, then `scene_from_json`. The
+reconcile (`load_catalog`) treats the filesystem as the source of truth, so a never-saved import
+is rediscovered and a deleted file's row is dropped.
+
+> [!WARNING]
+> The GPU idle must come before the cache clear. The caches hold the last `Arc` to uploaded
+> `GpuMesh`/`GpuTexture` resources; dropping one while an in-flight frame reads its Vulkan
+> buffers is a use-after-free. The idle is the ordering guarantee.
+
+This synchronous path boots `saffron-player`, where blocking is correct because there is no
+control plane to keep responsive. The host instead brings projects up through the non-blocking
+per-frame loader described in [project loading](../../tooling-and-control/project-loading/): an
+off-thread `ProjectDocWorker` runs the parse and disk scan, and a bounded main-thread install step
+applies the same idle → clear → swap discipline.
 
 ## Startup and commands
 
-The editor shell owns startup project choice. If `SAFFRON_PROJECT` is set, the engine opens
-(or creates) that project immediately — a project name under userdata, a project directory, or
-a direct `project.json` path. `SAFFRON_SCRATCH_PROJECT` creates a per-shell scratch project
-without showing the startup modal.
+`bootstrap_project_from_env` seeds the loader from the environment the editor sets. `SAFFRON_PROJECT`
+opens the named project, or creates it when the name is valid and no such project exists;
+`SAFFRON_SCRATCH_PROJECT` creates a deterministic per-shell scratch project, named `scratch-<hash>`
+by an [FNV-1a](https://www.rfc-editor.org/rfc/rfc9923) fold of the working directory and control
+socket. With neither set, a `project.json` in the working directory is opened; otherwise the host
+waits for the editor's project picker.
 
-The control plane exposes project-aware commands (in `commands_asset.rs`):
+| Command | Does |
+|---|---|
+| `get-project` | returns the active project identity (name, paths, display name) |
+| `project-status` | returns the live load phase, boot stage, and progress |
+| `cancel-load` | aborts the in-flight project load |
+| `new-project` | creates and opens a project (seeds the loader, returns a status snapshot) |
+| `open-project` | opens by name, project root, or `project.json` path (via the loader) |
+| `load-project` | opens like `open-project`, defaulting to `./project.json` |
+| `reload-project` | closes and re-opens the active project |
+| `save-project` | writes the document synchronously; the path defaults to the active project |
+| `create-script` | writes a boilerplate `.lua` under the project `src/` |
 
-- `get-project` returns the active project state.
-- `new-project` creates and opens a project.
-- `open-project` opens an existing project folder or file.
-- `save-project` saves the active project when no path is passed.
-- `load-project` loads a project from an explicit `project.json` path.
+`save-project` on a host with no active project adopts the target path as the project identity,
+deriving the name from the parent directory. The load-side commands answer immediately with a
+`ProjectStatusDto` and refuse to run during play mode or an asset preview.
 
 ## Project-local assets and the path fixup
 
-Imported models are baked under `assets/models/<uuid>.smodel`; imported textures are copied
-under `assets/textures/<uuid>.<ext>`. `import-model`, `import-texture`, and the cube/model
-entity preset require an active project so imports cannot write into the engine's bundled asset
-directory. A standalone-mesh row whose file is absent under its recorded path but begins
-`meshes/` is retried under `assets/models/`, so a catalog path written with the old `meshes/`
-prefix still resolves.
+`import-model` bakes into `assets/models/<uuid>.smodel` and `import-texture` copies into
+`assets/textures/<uuid>.<ext>`; both require a loaded project, so an import can never write into
+the engine's bundled asset directory. A standalone-mesh row whose file is absent under its
+recorded `meshes/` path is retried under `assets/models/`, where the importer writes baked
+`.smesh` siblings (`standalone_mesh_path`).
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Save / load / create | `assets/src/project.rs` | `save_project`, `load_project`, `create_project`, `PROJECT_VERSION` |
-| Renderer seam | `assets/src/project.rs` | `ProjectHost`, `ProjectSidecar` |
-| Path + name helpers | `assets/src/project.rs` | `project_json_path`, `valid_project_name`, `app_data_root`, `project_userdata_root`, `ensure_script_src` |
-| Catalog ↔ JSON | `assets/src/catalog.rs`; `assets/src/names.rs` | `catalog_to_json`, `catalog_from_json`, `asset_type_name` |
-| Scene half | `scene/src/document.rs` | `Scene::scene_to_json`, `Scene::scene_from_json` |
-| Project commands | `control/src/commands_asset.rs` | `get-project`, `new-project`, `open-project`, `save-project`, `load-project` |
-
-> [!WARNING]
-> `load_project` must `wait_gpu_idle` before clearing the caches. Clearing drops the last
-> `Arc` to in-flight GPU meshes/textures, freeing their Vulkan buffers; doing that while a
-> frame still uses them is a use-after-free. The idle is the ordering guarantee.
+| Save / load / create | `assets/src/project.rs` | `AssetServer::save_project`, `AssetServer::load_project`, `AssetServer::create_project`, `PROJECT_VERSION` |
+| Renderer seam + sidecar | `assets/src/project.rs` | `ProjectHost`, `ProjectSidecar` |
+| Names + roots | `assets/src/project.rs` | `valid_project_name`, `default_display_name`, `project_json_path`, `app_data_root`, `project_userdata_root` |
+| Script scaffold | `assets/src/project.rs` | `ensure_script_src`, `ensure_script_library`, `create_project_script` |
+| Scratch projects | `assets/src/project.rs` | `scratch_project_name`, `AssetServer::create_scratch_project` |
+| Catalog ↔ JSON | `assets/src/catalog.rs`; `assets/src/names.rs` | `catalog_to_json`, `catalog_from_json`, `catalog_folders_to_json`, `asset_type_name` |
+| Render settings block | `rendering/src/render_settings.rs` | `Renderer::render_settings_to_json`, `Renderer::apply_render_settings` |
+| Scene half | `scene/src/document.rs` | `Scene::scene_to_json`, `Scene::scene_from_json`, `SCENE_VERSION` |
+| Bootstrap + commands | `control/src/commands_asset.rs` | `bootstrap_project_from_env`, `register_asset_commands`, `RendererProjectHost` |
+| Path fixup | `assets/src/load.rs` | `standalone_mesh_path` |
 
 ## Related
 
-- [Asset catalog](../asset-server-and-catalog/) — what gets serialized
-- [Import pipeline](../import-pipeline/) — fills the catalog this persists
-- [Scene serialization](../../scene-and-ecs/scene-serialization/) — the `scene_to_json` half
-- [Asset commands](../../tooling-and-control/asset-commands/) — `save-project`/`load-project` over the CLI
+- [Asset catalog](../asset-server-and-catalog/) — the caches and catalog this document persists
+- [Project loading](../../tooling-and-control/project-loading/) — the host's non-blocking bring-up of this file
+- [Scene serialization](../../scene-and-ecs/scene-serialization/) — the `scene` block's format and migrations
+- [Import pipeline](../import-pipeline/) — fills `assets/` and the catalog
+- [Asset commands](../../tooling-and-control/asset-commands/) — the project commands over the CLI
