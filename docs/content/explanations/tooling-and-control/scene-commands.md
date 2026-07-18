@@ -5,118 +5,122 @@ weight = 3
 
 # Scene commands
 
-The scene commands are the control-plane verbs that list, create, and edit entities in the running
-editor's scene. Each edit routes through the target component's registered serialize/deserialize, so
-the wire shape is identical to a scene file. There is no separate code path for editing from the CLI.
+Scene commands expose authored entities, play state, selection, environment settings, and editor viewport controls through the [control plane](../control-plane-architecture/). The React editor and `sa` CLI use the same handlers, so an edit has one engine-side meaning regardless of its caller.
 
-Most commands take an `{entity}` argument. `resolve_entity` accepts a UUID (number or numeric string)
-or a name, and tries the UUID first because it is stable across reloads and resolves against the
-**active** scene, so it finds runtime entities during play. A miss returns an error, not a null
-entity.
+This page explains the behavior shared across those commands. The [control-command reference](../../../reference/control-commands/) lists every parameter and result DTO.
 
-## The commands
+## Active-scene routing
 
-| Command | Params | Effect |
-|---|---|---|
-| `list-entities` | — | Returns every entity as `{id, name, parentId}`. |
-| `list-components` | — | Returns the names of all registered component types. |
-| `create-entity` | `{name?}` | Creates an entity (default name `Entity`); returns its `{id, name}`. |
-| `destroy-entity` | `{entity}` | Destroys the entity; clears selection if it was selected. Returns `{destroyed: id}`. |
-| `set-parent` | `{entity, parent?}` | Reparents the entity; an absent or `0` parent detaches it to root. |
-| `add-component` | `{entity, component}` | Adds the named component with its default value. Errors if unknown or already present. |
-| `remove-component` | `{entity, component}` | Removes the named component. Errors if unknown or marked non-removable. |
-| `set-component` | `{entity, component, json}` | Applies a serialized component body via the registry's deserialize. |
-| `set-component-order` | `{entity, components}` | Reorders the entity's components (inspector ordering). |
-| `set-transform` | `{entity, translation?, rotation?, scale?}` | Merges the given fields over the current transform. Rotation is Euler XYZ radians. |
-| `set-light` | `{entity?, direction?, color?, intensity?, ambient?}` | Edits the directional light (the given entity, else the first one found). |
-| `select` | `{entity}` | Sets editor selection; returns `{id, name}`. |
-| `get-selection` | — | Returns the current selection plus the `selectionVersion`/`sceneVersion` counters. |
-| `deselect` | — | Clears the editor selection. |
-| `add-entity` | `{preset?}` | Creates an entity from a preset (default `empty`); selects it; returns `{id, name}`. |
-| `copy-entity` | `{entity}` | Deep-duplicates the entity (all components, new UUID); selects the copy; returns `{id, name}`. |
-| `rename-entity` | `{entity, name}` | Sets the entity's Name component; returns its `{id, name}`. |
-| `set-component-field` | `{entity, component, field, value, index?}` | Merges a single field into a component (generic; adds the component if missing). With `index`, addresses one element of an array field — an object `value` merges into that element, e.g. one `MaterialSet` slot. |
-| `pick` | `{u=0.5, v=0.5}` | Ray-picks at a viewport UV (`0,0` = top-left) and selects the hit. Returns `{hit, id?, name?}`. |
-| `inspect` | `{entity}` | Dumps every present component as JSON under `components`. |
-| `focus` | `{entity}` | Moves the editor camera to look at the entity's transform. |
-| `get-world-transform` | `{entity}` | Returns the entity's composed world translation + scale. |
+Most handlers call `SceneEditContext::active_scene` rather than selecting a world themselves. It routes to the asset preview when that view is active, the play duplicate during Play or Pause, and the authored scene in Edit.
 
-## Presets
+Entity selectors accept a decimal UUID number, a numeric UUID string, or an exact entity name. UUID lookup runs first. A selector resolves inside the active scene, so the same command can inspect runtime entities that exist only in the play duplicate.
 
-`add-entity` takes a `preset` naming what to spawn, matching the editor's **Create** menu (the set is
-the `AddEntityPreset` enum). Examples: `empty` (Transform only), `cube` (the built-in cube mesh +
-default material), `point-light`, `spot-light`, `directional-light`, `camera`. An unknown preset is
-an error, not a silent fall-through to `empty`. Spawning a *catalog* model is the
-[asset command](../asset-commands/) `instantiate-model`, not a preset.
+Edits made to the play duplicate disappear on Stop. Edits intended for the project belong in Edit mode.
 
-## The editor camera and gizmo
+## Entity structure
 
-| Command | Params | Effect |
-|---|---|---|
-| `get-camera` | — | Returns the editor fly-cam as `{position, yaw, pitch, fov, near, far}`. |
-| `set-camera` | `{position?, yaw?, pitch?, fov?, near?, far?}` | Merges the given fields into the editor fly-cam. |
-| `get-gizmo` | — | Returns the shared gizmo state `{op, space}`. |
-| `set-gizmo` | `{op?, space?}` | Sets the gizmo `op` (`translate\|rotate\|scale`) and/or `space` (`world\|local`). |
-| `get-debug-overlays` | — | Returns the viewport debug-overlay toggles `{bounds, sceneAabb, lightVolumes, grid, colliders}`. |
-| `set-debug-overlays` | `{bounds?, sceneAabb?, lightVolumes?, grid?, colliders?}` | Toggles the [debug overlays](../../ui-and-editor/debug-visualization/); omitted fields stay unchanged. |
-| `fly-input` | `{active, lookDx, lookDy, forward, …}` | Streams editor fly-cam input (look deltas in pixels accumulate until the next frame). |
+The structural commands use scene and registry primitives rather than modifying `hecs` storage directly:
 
-`get-camera`/`set-camera` drive the same editor [fly-camera](../../ui-and-editor/) (`SceneEditCamera`)
-the viewport uses — the scene-view eye, not an ECS `CameraComponent`. `set-camera` merges fields the
-same way the transform commands do.
-
-`get-gizmo`/`set-gizmo` read and write a single gizmo state. The engine's native overlay gizmo and the
-editor's T/R/S shortcut both read it, so the gizmo mode stays consistent regardless of who set it.
-
-Component and environment shapes are the DTO catalog; see [Shared types](../shared-types/) for the
-DTO-first pipeline.
-
-## Polling counters
-
-`SceneEditContext` carries monotonically increasing counters a UI can poll to diff cheaply instead of
-re-listing the whole scene each frame:
-
-| Counter | Bumped when |
+| Operation | Behavior |
 |---|---|
-| `scene_version` | every scene-mutating command: `create-entity`, `destroy-entity`, `set-parent`, `add-component`, `remove-component`, `set-component`, `set-component-field`, `set-transform`, `set-light`, `set-environment`, `set-atmosphere`, `add-entity`, `copy-entity`, `rename-entity`, plus the [asset commands](../asset-commands/) that touch the scene (`instantiate-model`, `assign-asset`, `load-scene`/`load-project`, `new-project`/`open-project`). |
-| `selection_version` | every `set_selection` (including `select`, `deselect`, `pick`, the auto-select on `add-entity`/`copy-entity`/`instantiate-model`, and an entity destroy or scene/project load that clears it). |
+| List | `list-entities` omits placement ghosts and reports parent IDs and bone tags. |
+| Create | `create-entity` seeds identity, name, transform, relationship, and component order. |
+| Destroy | `destroy-entity` removes the selected entity's full subtree and clears selection if it points inside that subtree. |
+| Parent | `set-parent` rejects self-parenting and cycles, preserves world placement, and accepts an absent or zero parent as the root. |
+| Copy | `copy-entity` creates a new ID, copies every registered component and component order, and places the copy beside the source under the same parent. It does not traverse child entities. |
+| Rename | `rename-entity` updates the `Name` component. |
 
-A client reads a counter once, then re-fetches the entity list or the selection only when the number
-changes. The counters live on the context, not the wire, so any command that mutates the scene bumps
-the right one regardless of who invoked it.
+`add-entity` builds editor presets: empty, cube, plane, sphere, three light types, camera, reflection probe, and fog volume. Primitive meshes use native reserved IDs and need no catalog entry. Model assets use `instantiate-model` from the asset command group.
 
-## Merge, don't reset
+```sh
+CUBE_ID=$(sa -o json add-entity cube | jq -r '.id')
+sa set-transform "$CUBE_ID" --translation '{"x":0,"y":1,"z":0}'
+sa inspect "$CUBE_ID"
+```
 
-`set-transform`, `set-light`, and `set-component-field` first serialize the current value, copy the
-provided field(s) over it, then deserialize the merged body. Setting only the translation therefore
-leaves scale untouched. Vectors are `{x,y,z}` objects (`baseColor` is `{x,y,z,w}`), matching the
-scene-file encoding.
+`add-entity` and `copy-entity` select the result. Structural successes increment `scene_version`; selection changes increment `selection_version`.
 
-## Picking and focus
+## Component edits
 
-`pick` builds a ray from the editor camera through the given viewport UV (converted to NDC `u*2-1,
-v*2-1`) and calls `pick_entity`, which hits the nearest entity by world-space mesh AABB; the picker
-flips the projection's `y` to match the renderer's clip space. Empty space returns `{hit:false}` and
-deselects. `focus` reads the entity's `Transform.translation` and pulls the editor camera back along
-its forward axis so the target sits in view. Both use the same editor
-[fly-camera](../../ui-and-editor/) the viewport uses.
+The component registry supplies stable names, default construction, JSON conversion, removal policy, and authored row order.
 
-## In the code
+`add-component` rejects duplicates and appends the new row to component order. Adding `Collider` fits its shape to the entity mesh when possible; adding `KinematicBones` fits bone capsules. `remove-component` rejects the non-removable `Name`, `Transform`, and `Relationship` rows.
+
+`set-component` treats its `json` value as the component's serialized body. Missing fields follow that component serializer's defaults, so callers use it when they intend to supply the complete shape.
+
+Partial commands preserve omitted state:
+
+- `set-transform` serializes the current transform, replaces supplied translation, rotation, or scale fields, and deserializes the merged body.
+- `set-light` performs the same merge for the selected directional light, or the first directional light when no entity is supplied.
+- `set-component-field` replaces one top-level field. With `index`, it addresses an array element and merges an object value into that element.
+
+`set-transform` accepts `smooth: true` to approach targets over rendered frames. When gizmo state has `preserveChildren` enabled, the command instead applies the parent transform exactly and rebases direct child locals so their world placements stay fixed.
+
+Raw writes to `Relationship` trigger a hierarchy relink. `set-parent` remains the structural operation that rejects cycles before changing authored data.
+
+## Selection and framing
+
+`select`, `deselect`, and `get-selection` manage editor selection. The selection result also carries scene, selection, play, and animation versions, making it the editor's lightweight reconciliation poll.
+
+`pick` tests meshless light and camera billboards before mesh surfaces. Static meshes use cached BVHs; skinned meshes use the current deformed pose. A mesh hit inside a `ModelInstance` selects the model root, while a miss clears selection. See [Picking](../../scene-and-ecs/picking/) for the geometric path.
+
+`focus` frames the selected entity's full renderable subtree. It uses the model bounds center and field of view to choose a distance, falling back to the entity's world translation when no mesh bounds resolve.
+
+`inspect` returns all present registered components plus their authored order. `get-world-transform` returns composed world translation and scale for tooling that needs a hierarchy-resolved position.
+
+## Environment and play
+
+`get-environment` returns the scene-wide sky, ambient, atmosphere, and fog settings. `set-environment`, `set-atmosphere`, and `set-fog` merge either individual optional fields or an inline JSON object over the current state.
+
+The same registration group carries the play-state commands:
+
+| Command | Transition |
+|---|---|
+| `play` | Edit to Play, or Pause to Play |
+| `pause` | Play to Pause |
+| `step` | Advance a paused session by a bounded frame count |
+| `stop` | Discard the play duplicate and return to Edit |
+| `get-play-state` | Read state and version counters |
+
+Script commands set per-slot overrides, forward gameplay input, report runtime status, and drain sequenced log and error rings. Their lifecycle is covered by [Script components and the play runtime](../../scripting/script-components-and-runtime/).
+
+## Editor viewport state
+
+The editor camera is independent of ECS `Camera` components. `get-camera` reads its free-eye or orbit state. `set-camera` applies a free-eye pose, or eases an orbit target when both `pivot` and `distance` are present.
+
+`get-gizmo` and `set-gizmo` share translate, rotate, scale, world/local, and preserve-children state with the native overlay. `gizmo-pointer` sends hover, begin, drag, and end phases in normalized device coordinates. Gizmo commands reject interaction outside Edit.
+
+`fly-input` accumulates look deltas and held movement directions for the editor camera. `script-input` updates the gameplay input snapshot consumed by the next simulation tick. Keeping these streams separate prevents editor navigation from becoming game input implicitly.
+
+## Version counters
+
+Commands bump the counter for the state they change:
+
+| Counter | Meaning |
+|---|---|
+| `scene_version` | Authored structure, components, transforms, environment, or restored edit state changed |
+| `selection_version` | The selected entity changed or became invalid |
+| `play_version` | Play-state transition occurred |
+| `animation_version` | Animation or timeline state changed |
+
+The editor compares these values before issuing heavier list and inspection requests. The counters describe authoritative engine state, so CLI edits and editor edits invalidate the same views.
+
+## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| Registration | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands` |
-| Entity resolution | `engine/crates/control/src/selector.rs` | `resolve_entity`, `entity_ref_dto`, `entity_uuid` |
-| Component edits | `engine/crates/control/src/commands_scene.rs` | the `set-transform`, `set-light`, `set-component`, `set-component-field` rows |
-| Presets + duplicate + rename | `engine/crates/control/src/commands_scene.rs` | the `add-entity`, `copy-entity`, `rename-entity` rows |
-| Selection + picking | `engine/crates/control/src/commands_scene.rs` | the `select`/`get-selection`/`deselect`/`pick`/`focus` rows; `camera_dto` |
-| Picker | `engine/crates/assets/src/render_scene.rs` | `pick_entity` |
-| Editor camera + gizmo | `engine/crates/control/src/commands_scene.rs` | the `get-camera`/`set-camera`, `get-gizmo`/`set-gizmo`, `fly-input` rows |
-| Poll counters | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::scene_version`, `selection_version`, `set_selection`, `active_scene` |
-| The ECS behind the edits | `engine/crates/scene/src/scene.rs` | `Scene::for_each`, `find_entity_by_uuid`; `Name`, `IdComponent`, `Transform` |
+| Scene-domain registrations | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands` |
+| Entity selectors and DTO conversion | `engine/crates/control/src/selector.rs` | `resolve_entity`, `entity_ref_dto` |
+| Active-scene and version state | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::active_scene`, `SceneEditContext::set_selection` |
+| Registry-backed component behavior | `engine/crates/scene/src/registry.rs` | `ComponentRegistry`, `ComponentTraits` |
+| Hierarchy-safe structural edits | `engine/crates/scene/src/hierarchy.rs` | `Scene::set_parent`, `Scene::relink_hierarchy` |
+| Surface picking and framing bounds | `engine/crates/assets/src/render_scene.rs` | `pick_entity`, `model_render_aabb` |
+| Protocol shapes | `engine/crates/protocol/src/dto.rs` | `EntitySelector`, `SetTransformParams`, `SelectionResult` |
 
 ## Related
-- [Asset commands](../asset-commands/) — assigning meshes and textures, and `instantiate-model`
-- [Shared types](../shared-types/) — the DTO-first wire contract these commands use
-- [Scene & ECS](../../scene-and-ecs/) — the `hecs` world and component registry these commands drive
-- [Control plane](../control-plane-architecture/) — how a command is registered and dispatched
+
+- [Control-command reference](../../../reference/control-commands/)
+- [Asset commands](../asset-commands/)
+- [Shared types](../shared-types/)
+- [Scene and ECS](../../scene-and-ecs/)
+- [Control plane](../control-plane-architecture/)

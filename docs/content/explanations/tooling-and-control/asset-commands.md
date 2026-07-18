@@ -5,119 +5,129 @@ weight = 5
 
 # Asset commands
 
-The asset commands are the control-plane verbs that manage a project's assets: importing models and
-textures, browsing and organizing the catalog, binding assets onto entities, and saving or loading the
-project. They act on both the `AssetServer` — the catalog and its GPU caches — and the scene. The
-`screenshot` and `quit` commands sit alongside them to complete a scriptable session.
+Asset commands expose the project catalog, import pipeline, material assets, preview scenes, and
+project lifecycle through the control plane. Most selectors accept either a decimal UUID or an exact
+catalog name. Commands that need project storage reject the request until a project is ready.
 
-## Import and catalog
+## Command families
 
-| Command | Params | Effect |
+`register_asset_commands` contains several related surfaces rather than one flat import API:
+
+| Family | Representative commands | Purpose |
 |---|---|---|
-| `import-model` | `{path}` | Imports + bakes a model into the catalog as a `.smodel` container. Returns the model `{id, name, …}`. |
-| `instantiate-model` | `{asset, name?}` | Spawns an entity from a catalog model (selected). Returns `{id, name}`. |
-| `import-texture` | `{path}` | Imports an image into the asset dir; returns `{texture: id}` to assign later. |
-| `list-assets` | — | Returns every catalog entry as `{id, name, type, path, folder?}` plus `folders`. |
-| `scan-assets` | — | Rescans the `assets/` dir and reconciles the catalog from disk. |
-| `rename-asset` | `{asset, name}` | Renames a catalog entry (selected by id or current name). |
-| `create-asset-folder` | `{folder}` | Creates a project-saved virtual folder. |
-| `rename-asset-folder` | `{folder, name}` | Renames a virtual folder and updates assets assigned to it. |
-| `delete-asset-folder` | `{folder}` | Deletes a virtual folder and moves assigned assets back to root. |
-| `move-asset` | `{asset, folder?}` | Moves an asset into a virtual folder, or back to root when `folder` is omitted. |
-| `asset-usages` | `{asset}` | Lists scene/environment slots that reference an asset. |
-| `delete-asset` | `{asset}` | Deletes the catalog entry and imported file, clears usages, and returns what was cleared. |
-| `assign-asset` | `{entity, slot, asset}` | Sets the entity's mesh, or writes a texture into its material slot 0's overrides. |
+| Project | `get-project`, `new-project`, `open-project`, `save-project`, `reload-project` | Project identity, persistence, and lifecycle |
+| Load progress | `project-status`, `cancel-load` | Poll or cancel asynchronous project loading |
+| Import | `import-model`, `import-texture`, `import-lut`, `reimport-model` | Add or refresh baked assets |
+| Model containers | `model-info`, `get-asset-model`, `extract-subasset`, `clear-extraction` | Inspect and manage embedded model data |
+| Scene placement | `instantiate-model`, `asset-placement`, `assign-asset` | Create entities and bind catalog assets |
+| Catalog | `list-assets`, `scan-assets`, `probe-asset`, `asset-references` | Browse metadata and dependency edges |
+| Organization | `rename-asset`, `move-asset`, `create-asset-folder` | Maintain names and virtual folders |
+| Cleanup | `asset-usages`, `clean-assets`, `delete-unused`, `delete-asset` | Find references and remove data |
+| Materials | `material-create`, `material-update`, `material-set-graph`, `material-cook` | Author, assign, preview, and compile materials |
+| Preview | `enter-asset-preview`, `exit-asset-preview`, `get-thumbnail`, `view-asset` | Interactive and tile-sized asset views |
+| Output | `save-scene`, `load-scene`, `export-app`, `screenshot`, `quit` | Scene files, app export, capture, and shutdown |
 
-`import-model` bakes the source into a `.smodel` container in the catalog; `instantiate-model` is the
-command that spawns — it resolves the catalog model and creates a selected entity carrying it.
-`import-texture` adds to the catalog alone; the result is attached later with `assign-asset` or by
-writing the texture id into a `MaterialSet` slot override with `set-component-field`. `assign-asset`
-takes `slot` (one of `mesh`, `albedo`, `metallicRoughness`, `normal`, `occlusion`, `emissive`,
-`height`), resolves the asset by id or name, and — for a texture slot — writes the id as an override
-on the entity's material slot 0 (the packed ORM means `metallicRoughness` and `occlusion` share
-`ormTexture`); `mesh` writes `Mesh.mesh`, adding the component if the entity lacks it.
+For example, importing a model and placing an instance are separate operations:
 
-Folders are catalog metadata, not filesystem directories. They are saved next to the asset list so
-empty folders survive a reload. Renaming a folder updates the folder list and each catalog entry
-assigned to the old name. Deleting a folder only removes that virtual folder; assigned assets move
-back to root. `delete-asset` clears the scene references (mesh, material textures, sky texture) before
-removing the entry and cache records.
+```sh
+sa import-model ./assets-source/Robot.glb
+sa instantiate-model Robot
+sa model-info Robot
+```
 
-`import-texture`, `rename-asset`, and `move-asset` persist an asset's name / folder / colorspace to a
-co-located [`.smeta` sidecar](../../geometry-and-assets/asset-server-and-catalog/#the-smeta-sidecar)
-the moment they run, so those edits survive a cold catalog scan even if you never save the project —
-`delete-asset` removes the sidecar alongside the file.
+`import-model` bakes a `.smodel` container and adds its model and embedded sub-assets to the catalog.
+`instantiate-model` resolves that catalog entry, creates its entity forest in the active scene,
+selects the root, and increments the scene version. `asset-placement` uses a three-phase
+preview/commit/clear protocol for drag placement; its temporary subtree carries `PreviewGhost` and
+does not serialize.
 
-## Thumbnails and previews
+`import-texture` accepts optional colorspace and semantic-role hints, then uploads through the
+renderer-owned `GpuUploader`. `import-lut` imports a `.cube` creative look. Model reimport preserves
+the container identity while reporting updated, added, removed-from-source, and skipped sub-assets.
+An embedded sub-asset can be promoted to a standalone file with `extract-subasset` and returned to
+container ownership with `clear-extraction`.
 
-| Command | Params | Effect |
-|---|---|---|
-| `get-thumbnail` | `{asset, size=128}` | Renders a small preview of a catalog asset; returns the PNG as base64. |
-| `view-asset` | `{asset, size=512}` | Same as `get-thumbnail` at a larger default size, for a full-asset look. |
-| `thumbnail-cache` | `{action: stats\|clear}` | Inspects (`{entries, bytes}`) or empties the project's thumbnail disk cache. |
+## Catalog durability and references
 
-Both resolve the `asset` by id or name and return `{format: "png", width, height, base64, pending}`:
-the encoded image bytes inline in the JSON result, so a remote UI can show a preview without sharing a
-filesystem. The asset's type selects the path. A **mesh** is drawn as a framed 3D render through the
-renderer's `render_mesh_thumbnail`, the same preview the Assets panel tiles use. A **texture** is the
-image itself, GPU-downscaled to fit the requested size before being read back, so the cost is bounded
-by `size`, not the source resolution; an HDR texture is tonemapped on the way out. The command reaches
-the renderer through the `ControlRenderer::with_thumbnail_gpu` seam, which hands a transient
-`ThumbnailGpu` to `request_thumbnail`.
+Catalog folders are virtual paths stored as metadata. Renaming a folder rewrites that prefix for its
+descendant folders and assigned assets. Deleting a folder removes its descendant folder rows and
+moves affected assets to the catalog root. `rename-asset`, `move-asset`, and folder operations write
+`.smeta` sidecars for the affected standalone assets, so a filesystem scan can recover those names
+and folders.
 
-A generated PNG is written to a persistent **disk cache** at `<projectRoot>/cache/thumbnails/`, keyed
-on the asset uuid, the requested size, and a stamp of the source. A hit reads the PNG straight off
-disk — no GPU work — so a warm start is disk reads, not regeneration. Edits self-invalidate through
-the stamp; `delete-asset` purges an asset's cached PNGs, and `thumbnail-cache clear` empties the dir on
-demand.
+`scan-assets` idles the GPU, clears asset caches, reconciles the catalog with the assets directory,
+and writes the catalog cache. `probe-asset` returns file size and type-specific counts such as mesh
+vertices and triangles. `model-info` reads container import metadata and sub-asset sizes, while
+`get-asset-model` returns the capabilities, bone tree, and animation clips used by the asset editor.
 
-A cold miss does the real work — decode, upload, render, readback — on the asset crate's
-**thumbnail worker thread**, not the per-frame control drain, since a 4k HDR is ~1 s of it. The
-command enqueues a job and replies `pending: true` immediately; the worker writes the PNG to the disk
-cache and the client retries (with backoff) until the retry is a cache hit. Uploaded textures/meshes
-are handed back to the main thread and folded into the in-session caches. The worker is the asset
-crate's sole cross-thread site.
+Two reference queries answer different questions. `asset-usages` scans the active scene for mesh,
+material, and environment-sky assignments. `asset-references` builds the wider asset dependency graph,
+including container and material relationships, and reports both directions plus recursive footprint.
 
-## Save and load
+`clean-assets` analyzes that graph without deleting anything. `delete-unused` accepts explicit IDs
+from the report and requires `confirm: true`; it deletes only entries still classified as unused.
+`delete-asset` clears direct scene usages, removes the catalog row and owned file, drops its `.smeta`
+sidecar, and invalidates relevant caches. Content-addressed thumbnail PNGs remain available for other
+assets with identical content and age out through cache eviction.
 
-| Command | Params | Effect |
-|---|---|---|
-| `save-scene` | `{path}` | Writes the scene (entities + components) to `path`. |
-| `load-scene` | `{path}` | Reads a scene file; clears selection. |
-| `save-project` | `{path?}` | Writes the asset catalog + scene + render settings for the active project. |
-| `load-project` | `{path?}` | Reads catalog + scene; clears selection. |
-| `open-project` | `{path}` | Opens a project by path. |
-| `new-project` | `{name}` | Creates a fresh project. |
+## Assignment and materials
 
-The project commands hold the catalog and scene together, which is what `load-project` needs so that
-mesh and texture UUIDs in the scene resolve against the catalog it just loaded. A project load idles
-the GPU and clears the thumbnail-worker queue before swapping the caches, so dropping a cached GPU
-resource never frees one a frame still reads.
+`assign-asset` writes a mesh reference or a texture override on material slot 0. The texture slots
+are `albedo`, `metallic-roughness`, `normal`, `occlusion`, `emissive`, and `height`; metallic-roughness
+and occlusion both target the packed `ormTexture` field. Passing `0` clears the assignment.
 
-## Session control
+The `material-*` commands operate on native `.smat` assets. They cover creation, folder import,
+catalog listing, parameter updates, entity assignment, graph replacement, instances, typed
+overrides, shader compilation, and project-wide cooking. `preview-render` renders one material to an
+inline PNG. See [native materials](../../materials-and-pipelines/native-materials/) and
+[node-graph code generation](../../materials-and-pipelines/node-graph-codegen/) for the data and
+shader paths behind these commands.
 
-| Command | Params | Effect |
-|---|---|---|
-| `screenshot` | `{target: viewport\|window, path}` | Writes a PNG. `viewport` is captured immediately; `window` is deferred to end-of-frame. |
-| `quit` | — | Sets the window's should-close flag, ending the run loop. |
+## Interactive previews and thumbnails
 
-`screenshot` reports `pending`: `false` for a viewport grab, done synchronously, and `true` for a
-window grab, written when the current frame presents. The [capture](../screenshots-and-capture/) path
-has its own page.
+`enter-asset-preview` builds an isolated scene and switches the renderer to the `assetPreview` view.
+Models use their full entity forest; materials and ordinary textures use a furnished sphere; HDRIs
+light a three-sphere environment rig. Built-in primitives use their reserved mesh IDs. The command
+stores the authored camera, selection, overlay, and exposure so `exit-asset-preview` can restore them.
+
+`get-thumbnail` and `view-asset` share `request_thumbnail`, with default sizes of 128 and 512 pixels.
+A cache hit returns an inline base64 PNG. A miss returns `pending: true` and enqueues a preview render;
+the host drains up to two jobs per update through the main forward+ graph, writes their PNGs, and the
+client polls again.
+
+The cache is app-wide at `<appDataRoot>/thumbnail-cache`. Its key combines cache version, resolved
+content hash, and requested size, so identical content can share a tile across assets and projects.
+Material keys include resolved parameter state. The cache evicts oldest files after exceeding 1 GiB
+until usage falls to 80 percent. `thumbnail-cache` reports its entry/byte totals or clears it.
+
+## Project and session boundaries
+
+`new-project`, `open-project`, `load-project`, and `reload-project` seed the non-blocking
+[project loader](../project-loading/) and return its status. They require Edit mode and an exited
+asset preview. `save-project` writes the catalog, scene, renderer settings, editor camera, debug
+overlays, and enabled store connectors to the chosen project path.
+
+`save-scene` and `load-scene` operate on the scene document alone. `export-app` cooks graph materials
+and stages the player, project data, scripts, shaders, manifest, and required runtime libraries in an
+application folder. `screenshot` and `quit` complete scriptable sessions; the
+[capture page](../screenshots-and-capture/) covers viewport and window readback timing.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Registration | `engine/crates/control/src/commands_asset.rs` | `register_asset_commands` |
-| Import + spawn | `engine/crates/control/src/commands_asset.rs` | the `import-model`, `instantiate-model`, `import-texture` rows; `AssetServer::instantiate_model` |
-| Catalog | `engine/crates/control/src/commands_asset.rs` | the `list-assets`, `scan-assets`, `rename-asset`, folder, `move-asset`, `asset-usages`, `delete-asset`, `assign-asset` rows; `AssetSlotDto` |
-| Thumbnails | `engine/crates/control/src/commands_asset.rs`, `engine/crates/assets/src/lib.rs` | `get-thumbnail`/`view-asset`/`thumbnail-cache`; `request_thumbnail`, `ThumbnailWorker`, the disk-cache helpers |
-| Project IO | `engine/crates/control/src/commands_asset.rs` | the `save-project`/`load-project`, `save-scene`/`load-scene`, `open-project`/`new-project` rows |
-| Capture + quit | `engine/crates/control/src/commands_asset.rs` | the `screenshot` and `quit` rows; `ControlRenderer::capture_viewport`, `request_window_capture` |
+| Command registration | `control/src/commands_asset.rs` | `register_asset_commands`, `resolve_asset` |
+| Model and dependency management | `assets/src/manage.rs` | `reimport_model`, `extract_sub_asset`, `build_dependency_graph`, `analyze_clean` |
+| Import pipeline | `assets/src/import.rs` | `AssetServer::import_model`, `AssetServer::import_texture` |
+| Interactive preview | `control/src/commands_asset.rs` | `enter_asset_preview`, `install_preview_scene`, `PreviewSubject` |
+| Thumbnail request | `assets/src/thumbnail.rs` | `request_thumbnail`, `PreviewRenderJob`, `write_thumbnail_cache` |
+| Thumbnail render drain | `host/src/layer.rs` | `drive_preview_render_queue` |
+| Project load requests | `sceneedit/src/context.rs` | `ProjectLoadRequest`, `ProjectLoadProgress` |
 
 ## Related
-- [Capture](../screenshots-and-capture/) — the PNG capture path behind `screenshot` and the thumbnail readback
-- [Shared types](../shared-types/) — the base64-PNG result shape and the wire contract
-- [Scene commands](../scene-commands/) — `set-component-field` is the other way to set albedo
-- [Geometry & assets](../../geometry-and-assets/) — import and the asset catalog
+
+- [Project loading](../project-loading/) — worker preparation, installation, and progress polling.
+- [Capture](../screenshots-and-capture/) — screenshot targets and frame-boundary readback.
+- [Shared types](../shared-types/) — command DTOs and UUID wire encoding.
+- [Asset editor](../../ui-and-editor/asset-editor/) — the UI built on model and preview commands.
+- [Asset server and catalog](../../geometry-and-assets/asset-server-and-catalog/) — catalog storage and sidecars.

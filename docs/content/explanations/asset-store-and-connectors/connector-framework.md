@@ -1,145 +1,174 @@
 +++
-title = 'The connector framework'
+title = 'Connector framework'
 weight = 1
 +++
 
-# The connector framework
+# Connector framework
 
-A connector is one external asset service the editor can search and import from. The framework
-that holds them has three jobs: present every service through one normalized result shape, search
-the one store you pick from the Store's dropdown, and turn a chosen result into a catalog asset. It
-lives in `editor/shell/src/connectors/` because service calls are HTTP from native Rust (no
-browser CORS), any credentials stay out of the renderer, and provider thumbnails are just URLs
-the webview loads directly.
+A connector is one external asset service the editor's Store tab can search and import from. The
+framework behind them has three jobs: present every service through one normalized result shape,
+search the single store picked from the Store's dropdown, and turn a chosen result into a catalog
+asset via the host's import commands.
 
-| What | File | Symbols |
+Connectors live in the editor shell (`editor/shell/src/connectors/`), not the webview and not
+the engine. Native HTTP avoids browser CORS, credentials stay out of the renderer, and this module
+is the product's only outbound-HTTP surface — the engine crates make no network requests. Only the
+final import crosses to the host, over the control plane.
+
+## One trait, one result shape
+
+A connector implements `StoreConnector` and joins the fixed list in `ConnectorRegistry::new`:
+[Poly Haven](https://polyhaven.com), [ambientCG](https://ambientcg.com),
+[Poly Pizza](https://poly.pizza), and [Sketchfab](https://sketchfab.com).
+
+```rust
+#[async_trait]
+pub trait StoreConnector: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn auth_kind(&self) -> AuthKind;
+    async fn search(&self, query: &SearchQuery, cursor: Option<StoreCursor>)
+        -> Result<SearchPage, ConnectorError>;
+    async fn download(&self, descriptor: &StoreImportDescriptor, progress: &ProgressFn)
+        -> Result<PathBuf, ConnectorError>;
+    // Defaulted capabilities: gallery(), parts(), download_part().
+}
+```
+
+Every provider response maps onto the canonical `StoreResult`; no provider-shaped struct leaks
+past the trait. Two fields do most of the work. `kind` (`model` / `hdri` / `material` / `texture`)
+selects the host importer, and `license` is structured (`StoreLicense { id,
+requiresAttribution, url }`, never a free string), so
+[CC0](https://creativecommons.org/publicdomain/zero/1.0/) versus
+[CC-BY](https://creativecommons.org/licenses/by/4.0/) is machine-readable and attribution can be
+enforced at import.
+
+`auth_kind` is the one switch the rest of the framework branches on:
+
+| `AuthKind` | Credential | Connectors |
 |---|---|---|
-| Trait + normalized types | `editor/shell/src/connectors/mod.rs` | `StoreConnector`, `StoreResult`, `StoreLicense`, `AuthKind` |
-| First connector (keyless, CC0) | `editor/shell/src/connectors/polyhaven.rs` | `PolyHaven` |
-| Search session (one store) | `editor/shell/src/connectors/session.rs` | `SearchSession` |
-| Registry | `editor/shell/src/connectors/registry.rs` | `ConnectorRegistry` |
-| API-key connector | `editor/shell/src/connectors/polypizza.rs` | `PolyPizza` |
-| Credentials (keyring) | `editor/shell/src/connectors/credentials.rs` | `Credentials` |
-| Per-project enablement | `engine/crates/assets/src/project.rs` | `ProjectSidecar.stores`, `get-stores`, `set-stores` |
-| Import (host side) | `engine/crates/control/src/commands_asset.rs` | `import-model` |
+| `none` | a unique `User-Agent` header only | Poly Haven, ambientCG |
+| `api_key` | a pasted key in the OS keyring | Poly Pizza |
+| `oauth_loopback` | a browser sign-in token | Sketchfab |
 
-## One normalized result
+## Enablement is project state, secrets are machine state
 
-Every connector maps its provider's response onto a single `StoreResult`. Two fields carry
-weight. `kind` (`model` / `hdri` / `material` / `texture`) decides which importer the result runs
-through. `license` is structured — `{ id, requiresAttribution, url }`, never a free string — so
-attribution can be enforced at import: CC-BY and similar licenses set `requiresAttribution`, and
-that, with the author and source URL, is written onto the catalog asset so it travels with the
-asset everywhere.
+Which connectors a project uses is shared, committed state: a `stores` block in `project.json`
+(the `ProjectSidecar.stores` value), read and written over the control plane. A teammate who opens
+the project sees the same enabled stores.
 
-A connector also declares an `auth_kind`: `none` (a `User-Agent` header only, like Poly Haven),
-`api_key` (Poly Pizza), or `oauth_loopback`. It is the one switch the rest of the framework
-branches on.
+```sh
+sa get-stores -o json
+# { "enabled": ["polyhaven", "ambientcg"] }
+sa set-stores --enabled '["polyhaven", "poly-pizza"]'
+```
 
-## Credentials and per-project enablement
+A connector's secret is the opposite: machine-local and never committed. It lives in the OS
+keyring under service `saffron-anima` with the connector id as the account, readable only in the
+bridge; the webview can set, clear, or query the presence of a key, never its value. So the
+enabled set travels with the project while each teammate enters their own key.
 
-These are deliberately split. **Which connectors a project uses** is shared, committed state: it
-lives in `project.json` as a `stores` block (a list of enabled connector ids), travels with the
-project through the existing `save-project` / `open-project` path, and is read or written over the
-control plane via `get-stores` / `set-stores`. A teammate who opens the project sees the same
-enabled stores.
+When `SAFFRON_NO_KEYRING` is set or no Secret Service answers (the toolbox and CI case), the
+credential store degrades to an in-memory map, and `SAFFRON_SECRET_<ID>` injects a secret for
+tests, so a headless run boots without a daemon. Opening the Store with nothing enabled auto-opens
+the provider modal, which cannot be dismissed until one provider is enabled.
 
-**A connector's secret** (an API key, later an OAuth token) is the opposite: machine-local and never
-committed. It lives in the OS keyring (service `saffron-anima`, account = connector id), read only in
-the bridge — the webview sets or clears a key and learns only whether one is present, never its value.
-So a teammate inherits the enabled set but enters their own key. The keyring degrades to an in-memory
-backend when no Secret Service is reachable (`SAFFRON_NO_KEYRING`, or the CI/toolbox case), and a test
-can inject a key with `SAFFRON_SECRET_<ID>`, so a headless host boots without a daemon.
+## One store at a time
 
-Opening the Store with nothing enabled shows an onboarding panel: enabling a `none` connector is
-instant; an `api_key` connector wants its key first.
+Services rank their catalogs differently, so a merged grid has no principled global order. The
+Store does not merge: a dropdown left of the search bar picks which enabled connector to search,
+and results arrive in that store's own order. Switching the dropdown re-runs the query against the
+new store. The selected store and last query persist in localStorage, and disabling the store
+being viewed auto-selects another enabled one.
 
-## Search one store at a time
-
-Different services rank and weight their catalogs differently, so mixing them into one grid has no
-principled global order. The Store sidesteps that: a store dropdown (left of the search bar) picks
-which enabled connector to search, and results come back in that store's own order. Switching the
-dropdown re-runs the current query against the newly-selected store.
-
-Heterogeneous services also cannot share a page number, so the Store does not paginate — it
-scrolls. A `SearchSession` holds the store's own cursor and exhaustion flag and pulls the next page
-when its buffer runs low; the grid's scroll position drives how many batches are pulled, and the
-session stops once the store is exhausted. A search that errors marks the session exhausted rather
-than leaving the Store spinning. The selected store and last query persist per machine, so
-reopening the Store returns you to where you left off; disabling the store you're viewing
-auto-selects another enabled one.
-
-Search runs only on a committed query — Enter or a chip commit in the shared `AnimaSearchbar` —
-never on each keystroke, so typing does not fire a request per character.
+Paging is scroll-driven rather than numbered, because heterogeneous services cannot share a page
+number. A `SearchSession` holds the connector's opaque cursor and exhaustion flag and refills a
+small buffer as the grid's scroll nears the end; a failed fetch marks the session exhausted rather
+than leaving the grid spinning. A search fires only on a committed query (Enter or a chip commit
+in the shared searchbar), never per keystroke.
 
 ## Import
 
-Importing downloads the deliverable to a local file, then calls the engine's existing import command
-for that asset `kind` with the file path plus the result's attribution. There is one command per
-deliverable shape, reused for every connector — no connector-specific import path:
+Importing downloads the deliverable to a local file, then calls one host import command per
+deliverable shape, shared by every connector:
 
 | `kind` | Deliverable | Host command | Engine path |
 |---|---|---|---|
-| `model` | one `.glb` / `.gltf` | `import-model` | `bake_model` → `.smodel` |
-| `material`, `texture` | a zip of PBR maps (extracted to a folder) | `material-import` | `import_material_folder` → `.smat` |
-| `hdri` | one `.hdr` | `import-texture` | `import_texture` → a texture |
+| `model` | a glTF file set | `import-model` | `import_model` → `.smodel` container |
+| `material`, `texture` | a folder of role-named PBR maps | `material-import` | `import_material_folder` → `.smatx` container |
+| `hdri` | one `.hdr` | `import-texture` with role `hdri` | `import_texture`, uploaded as HDR |
 
-`material-import` is the existing local-folder material importer, extended in place with the optional
-attribution — the connector path is the same command, not a duplicate. Each command records the
-license/author/source on the catalog entry, so attribution travels with the asset regardless of kind.
+`import-model` and `material-import` take an optional `attribution` (an `AssetAttributionDto`:
+license id and URL, the requires-attribution flag, author, source URL, store id), recorded on
+the catalog entry so a CC-BY credit travels with the asset. `import-texture` takes a
+`role` hint instead of attribution; the engine derives the upload colorspace from it
+(`colorspace_for_role_explicit`: albedo and emissive as sRGB, HDRI as HDR, every data map linear).
 
-## Selective import (per-part)
+## Per-part import
 
-A result can also expose its individual files. The card's split button — `[ Import ▾ ]` — imports the
-whole asset on the main action; the dropdown lists the asset's parts (the PBR maps) and imports just
-the chosen one as a standalone, colorspace-correct texture. This is a connector capability, not a
-provider special case: a connector sets `has_parts` and implements `parts()` / `download_part()`
-(`editor/shell/src/connectors/mod.rs`), and the rest of the pipeline stays uniform.
+A result whose `has_parts` is set exposes its constituent files through `parts()`, and the card's
+Import button becomes a split button: the main action imports the whole asset, the dropdown lists
+the individual maps and `download_part()` fetches one at the chosen resolution. A single map then
+imports through `import-texture` with the part's role, so a normal map uploads linear and an
+albedo uploads sRGB.
 
-How each provider fills it: **Poly Haven** lists every map as its own file over REST, so it fetches
-only the picked file; **ambientCG** knows the map roles over REST but ships a per-resolution zip, so
-`download_part` fetches the zip once (cached by hash) and extracts the chosen map; **Poly Pizza /
-Sketchfab** expose no parts, so they show a plain Import button. A single map imports through
-`import-texture` with a colorspace derived from its role — color/albedo as sRGB, every data map
-(normal/roughness/metallic/AO) as linear — matching how UE5 treats texture imports.
+Each provider fills the capability from what its API offers. Poly Haven's `/files` endpoint lists
+every map as its own URL, so a part is a direct fetch. ambientCG knows the map roles but ships a
+per-resolution zip, so a part carries a `bundle`: `download_part` fetches the zip once (cached)
+and extracts it into a cached folder reused by every map picked from it. Poly Pizza and Sketchfab
+expose no parts and show a plain Import button.
 
-## Gallery and the detail view
+## Gallery
 
-A result card shows one thumbnail, but an asset usually has more to look at. `gallery()` is the
-connector method that returns an asset's preview images — lazily, the same as `parts()` — defaulting
-to just the card thumbnail. **Poly Haven** overrides it to return the hero render, the site's
-gallery renders (the textured `orth_front`/`orth_side`/`orth_top` angles and the `clay` pass — these
-live at predictable `asset_img/renders/<slug>/` CDN paths that the JSON API does not list, so each is
-HEAD-probed and included only if present), and one image per map (the `/files` listing it already
-reads for parts). So a model's gallery shows the angle renders plus its diffuse, normal, and roughness
-maps; the providers whose APIs expose a single render (ambientCG, Poly Pizza, Sketchfab) keep the default. The result is fetched only once the card is hovered or its detail modal opens, so
-scrolling a hundred cards does not fire a hundred requests.
+`gallery()` returns an asset's preview images and defaults to the card thumbnail. Like `parts()`
+it resolves lazily: the webview calls `store_asset_gallery` only when a card is hovered or its
+detail modal opens, so scrolling a hundred cards fires no gallery requests. The card and the modal
+share one `useGallery` fetch but keep separate slide indices, so navigating the modal does not
+move the card behind it.
 
-The webview drives this through one bridge command, `store_asset_gallery`, and shows it two ways: the
-card thumbnail gets prev/next arrows when the gallery has more than one image, and an **expand** button
-opens a two-pane detail modal — the gallery (with a thumbnail strip) on the left, the asset's
-metadata, license, and the same Import split button on the right. Both views share one `useGallery`
-fetch so they stay on the same image. Like every store call, `gallery()` is editor-side only; nothing
-about it crosses to the host until an import.
+Poly Haven overrides the default with the hero render (plus a 1024 px `full_url` for the modal),
+the site's orthographic and clay renders, and one image per map. The renders live at predictable
+CDN paths the JSON API does not list, so each is HEAD-probed and included only when it exists.
 
 ## One cache for every fetch
 
+Every remote fetch, from thumbnails to deliverable downloads, goes through the shared
+`ResourceCache`, rooted at `appdata/cache/` so it survives restarts. Single files are blobs keyed
+by a hash of the URL, or by an explicit key when the URL is signed and ephemeral (a Sketchfab
+archive, keyed by model uid). Each blob carries a `{key}.meta.json` sidecar recording its source
+URL, content type, and fetch time. Multi-file deliverables materialize as `derived/` directories
+built in a `.partial` sibling and atomically renamed into place, so a crashed build never looks
+cached.
+
+A bounded semaphore (6 permits) caps upstream fetches; cache hits take no permit. Thumbnails ride
+the same path: the webview loads `saffron-img://fetch/?u=<provider-url>`, a custom scheme the
+shell serves from the cache, so a screenful of tiles drains through the gate instead of
+stampeding a provider CDN. An in-RAM LRU in front of the disk blobs answers repeat requests
+without touching disk, and responses carry `Cache-Control: immutable` so Chromium's own cache
+absorbs repaints.
+
+A connector never owns storage of its own: it holds an `Arc<ResourceCache>` and uses `client()`
+for dynamic API calls (search listings, manifests, HEAD probes) or the cache's fetch and store
+methods for anything cacheable.
+
+## In the code
+
 | What | File | Symbols |
 |---|---|---|
-| Resource cache | `editor/shell/src/connectors/cache.rs` | `ResourceCache` |
-| Image scheme | `editor/shell/src/scheme.rs` | `saffron-img://` |
+| Trait + normalized types | `editor/shell/src/connectors/mod.rs` | `StoreConnector`, `StoreResult`, `StoreLicense`, `AuthKind`, `ConnectorRuntime` |
+| Registry | `registry.rs` | `ConnectorRegistry`, `ConnectorInfo` |
+| Search session | `session.rs` | `SearchSession`, `next_batch` |
+| Credentials | `credentials.rs` | `Credentials` |
+| Resource cache | `cache.rs` | `ResourceCache`, `Derived` |
+| Shell commands | `editor/shell/src/store_commands.rs` | `store_import`, `store_import_part`, `store_asset_gallery` |
+| Image scheme | `editor/shell/src/scheme.rs` | the `saffron-img` scheme |
+| Store tab + gallery hook | `StoreWorkspace.tsx`, `useGallery.ts` | `StoreWorkspace`, `useGallery` |
+| Per-project enablement | `engine/crates/assets/src/project.rs`, `commands_asset.rs` | `ProjectSidecar`, `get-stores`, `set-stores` |
+| Import commands | `engine/crates/control/src/commands_asset.rs` | `import-model`, `material-import`, `import-texture` |
 
-Every remote fetch — thumbnails, gallery previews, deliverable downloads, extracted map bundles —
-goes through one `ResourceCache`, not a per-connector client or directory. It keeps bytes on disk
-under `appdata/cache/` (a persistent location, so the cache is **not** wiped on reboot), stores
-each blob content-addressed with a small metadata sidecar (source url, content type, fetched-at),
-and materializes multi-file deliverables (a glTF file set, an extracted map folder) into a
-directory built once and atomically renamed into place. A bounded semaphore caps how many upstream
-fetches run at once, so a burst never stampedes a provider.
+## Related
 
-Thumbnails are the reason this matters. The webview does not load a provider CDN URL directly;
-it loads `saffron-img://fetch/?u=<provider-url>`, a custom scheme the bridge serves from the cache
-(fetching once, throttled). A screenful of tiles that used to fire a hundred simultaneous resize
-requests at the CDN — and get some dropped as broken images — now draws from disk after the first
-visit. A connector never touches the cache's storage itself: it holds an `Arc<ResourceCache>` and
-calls `client()` for dynamic API calls, or the fetch/store methods for anything cacheable.
+- [OAuth loopback and Sketchfab](../oauth-and-sketchfab/) — the browser-login capability and the Credits view
+- [Asset server and catalog](../../geometry-and-assets/asset-server-and-catalog/) — where an import lands
+- [Import pipeline](../../geometry-and-assets/import-pipeline/) — the host-side model bake
+- [Native materials](../../materials-and-pipelines/native-materials/) — the material assets a map folder becomes
+- [Editor shell and viewport bridge](../../ui-and-editor/editor-shell-and-viewport-bridge/) — the shell process the connectors run in

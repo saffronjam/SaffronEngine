@@ -5,111 +5,121 @@ weight = 2
 
 # sa CLI
 
-`sa` is a standalone command-line client that translates one shell invocation into one JSON request,
-sends it over the [control socket](../control-plane-architecture/), and prints the reply. It is a
-small Rust binary that links only `saffron-protocol` (the DTOs and the static command table) and
-`saffron-control-client` (the shared wire client) — no renderer, no Jolt, no engine subsystem — so it
-runs on the host outside the build toolbox and can drive a running editor it knows nothing about.
+`sa` is Anima's shell client. A forwarded command becomes one JSON request over the [control socket](../control-plane-architecture/), and the decoded result becomes text or JSON on standard output.
 
-## How a command becomes a request
+The binary depends on `saffron-protocol`, `saffron-control-client`, Clap, and JSON support. It does not link the renderer, scene, assets, physics, or host crates, so command scripts remain separate from the engine process they drive.
 
-`sa <command> [positionals...] [--flag value] [-o text|json]` becomes a single line of JSON:
+## Command routes
 
-```json
-{"cmd": "set-transform", "params": {"args": [123], "translation": {"x": 0, "y": 1, "z": 0}}, "id": 1}
-```
+Clap handles four top-level routes:
 
-`sa` parses its own surface with `clap`: a global `-o/--output`, the two built-in subcommands
-(`start`, `completions`), and a free-form external arm that captures the control command and its
-arguments verbatim. Because the control command flows through the external arm rather than a
-per-command `clap` subcommand, a command is reachable the moment the engine registers it — `sa` never
-needs a code change to forward a new command.
+| Form | Action |
+|---|---|
+| `sa start [--build] [--attach]` | Launches `saffron-host`; no control request |
+| `sa completions <shell>` | Writes a completion script |
+| `sa export <output-dir> [flags]` | Builds typed `export-app` parameters and forwards them |
+| `sa <command> [arguments]` | Forwards an arbitrary control command |
 
-`build_params` then splits the captured tokens: bare tokens go into a `params["args"]` array;
-`--key value` and `--key=value` become `params["key"]`; a bare `--key` with no value becomes
-`params["key"] = true`. The shared `saffron-control-client` wraps the result in the request envelope.
+The external command arm does not validate names. A command can be forwarded as soon as the running host registers it, even if the CLI's compiled command table does not contain it.
 
-The engine side folds positionals onto named fields. Every typed command knows its params DTO's
-declaration order, so `args[i]` fills the `i`-th declared field when the named key is absent. The same
-command therefore accepts either form:
+## Arguments to parameters
+
+`build_params` separates positional tokens from double-dash flags:
+
+| Shell token | JSON parameter |
+|---|---|
+| `value` | Appended to `params.args` |
+| `--key value` | `params.key = value` |
+| `--key=value` | `params.key = value` |
+| `--key` | `params.key = true` |
+
+For example:
 
 ```sh
-sa set-aa msaa4          # positional → params["args"][0] → folds onto `mode`
-sa set-aa --mode msaa4   # flag       → params["mode"]
+sa set-transform 123 --translation '{"x":0,"y":1,"z":0}'
+```
+
+produces this request on a new client:
+
+```json
+{"cmd":"set-transform","params":{"args":[123],"translation":{"x":0,"y":1,"z":0}},"id":1}
+```
+
+The host maps `args` onto the parameter DTO's declaration-ordered fields. A named key wins over its corresponding positional value. These forms are therefore equivalent:
+
+```sh
+sa set-aa msaa4
+sa set-aa --mode msaa4
 ```
 
 ## Token coercion
 
-The client types each bare token before it reaches the engine, in this order:
+Each value token becomes a JSON value through a fixed precedence order:
 
-1. `true` / `false` / `null` → the JSON literal;
-2. a token starting with `{`, `[`, or `"` → parsed as JSON, so an object can be passed inline;
-3. an unsigned integer (unless the token opens with `-`), then a signed integer, then a float;
-4. otherwise a plain string.
+1. `true`, `false`, and `null` become JSON literals.
+2. A token beginning with `{`, `[`, or `"` is parsed as inline JSON.
+3. A non-negative integer is parsed as `u64`.
+4. Other integers are parsed as `i64`.
+5. A finite decimal is parsed as `f64`.
+6. Everything else remains a string.
 
-The unsigned-first ordering is load-bearing: it keeps a large positive id (up to `u64::MAX`) an
-unsigned number rather than lossily widening it to a float. So `sa create-entity 42` sends the number
-`42` and `sa create-entity Box` sends the string `"Box"`. The typed DTO deserialize on the engine
-side then validates each field against its declared type.
+Parsing unsigned integers before floating-point values preserves positive IDs through `u64::MAX`. Invalid inline JSON falls through the remaining steps and normally becomes a string, leaving typed DTO deserialization to report the mismatch.
 
-## The reply and output modes
+## Wire round trip
 
-The engine answers with one line: `{"ok": true, "result": {...}, "id": 1}` or `{"ok": false, "error":
-"...", "id": 1}`. On `ok:true` the CLI prints the result and exits 0; on `ok:false` it prints the
-error to stderr and exits 1; a usage error from `clap` exits 2. The non-zero exit lets a shell script
-branch on a failed command.
+`saffron-control-client::Client` owns a socket path and a monotonic request ID. Each call opens a Unix stream, writes one request line, reads one reply line, then closes the connection.
 
-| Mode | Behaviour |
-|---|---|
-| `text` (default) | Human-readable. A `match` over the command name gives many replies (`help`, `ping`, `list-entities`, `render-stats`, `raycast`, the profiler captures, …) a one-line/table formatter; everything else falls through to UTF-8-unescaped pretty JSON (so an em dash renders as `—`). |
-| `json` (`-o json`) | `serde_json` pretty JSON, made for piping to `jq`. |
+`Client::call_raw` returns the reply's `result` value. An `ok: false` envelope becomes `Error::Engine`; connection, malformed JSON, and typed-result failures use distinct error variants. The Rust end-to-end harness uses the same client and can deserialize results directly into protocol DTOs.
 
-The output flag is an `sa`-level concern, stripped before `params` is built, so the engine never sees
-it. Each text formatter is a pure function of the reply `Value`, so the arms are unit-tested directly.
+The client and server share the same socket-path precedence: `SAFFRON_CONTROL_SOCK`, then `$XDG_RUNTIME_DIR/saffron-control.sock`, then the per-user `/tmp` path.
 
-## Discoverability and forwarding
+## Output and exit status
 
-`sa` never gates a command: an unknown name is still forwarded, and the engine answers `unknown
-command '<name>'`. The CLI enriches that path two ways, both offline from the static
-`saffron_protocol::COMMANDS` table:
+`-o text` is the default. Command-specific formatters render common results such as `ping`, entity and asset lists, render statistics, play state, physics queries, and profiler captures. Unmatched results use readable pretty JSON.
 
-- the long `--help` lists every registered command name and points at `sa help` for the live list, so
-  the CLI is discoverable with no engine running;
-- `sa completions <shell>` emits a shell-completion script whose candidate command list is the same
-  static table; and when a forwarded command is absent from the table, the rendered engine error
-  gains a nearest-name `did you mean '…'?` hint (Levenshtein-scored).
+`-o json` prints pretty JSON for reliable use with `jq`:
 
-Because the table is the single source the runtime dispatch and the codegen both read, the static
-help/completions cannot drift from what the engine actually serves.
+```sh
+sa -o json get-selection | jq -r '.id // empty'
+```
 
-## Launching the host
+A successful engine result exits `0`. Transport and engine errors print an `sa:`-prefixed message to standard error and exit `1`. A missing command or Clap usage failure exits `2`.
 
-`sa start` is the one command that is not a socket round-trip: it launches the present-only host
-(`saffron-host`) inside the `saffron-build` toolbox, detached by default or foreground under
-`--attach`, optionally building it first with `--build` (`cargo build --bin saffron-host`). It skips
-the launch when the engine is already up (unlinking a stale socket) and polls the socket for
-readiness. The binary path is the workspace `target/<profile>/saffron-host`, overridable with
-`SAFFRON_ANIMA_BIN` (the same parallel-binary knob the editor and e2e honor).
+## Discovery
 
-## In the code
+`sa --help` appends the static names from `saffron_protocol::COMMANDS`. `sa help` is forwarded to the running host and returns its live registry, including the reflective `help` row and host-owned commands.
+
+Completion scripts use the same static table. A registry test checks set equality between that table and runtime handlers, with explicit exceptions for reflective and host-owned rows.
+
+When the engine rejects an unknown name, the CLI compares it with known names using [Levenshtein distance](https://en.wikipedia.org/wiki/Levenshtein_distance) and appends a suggestion when the nearest candidate is close enough. The original command still reaches the host.
+
+## Host launcher
+
+`sa start` checks whether the resolved socket accepts a connection. If the path exists but refuses connections, the launcher removes the stale socket before starting a host.
+
+The launcher resolves `saffron-host` beside the `sa` executable unless `SAFFRON_ANIMA_BIN` names another binary. `--build` runs `cargo build --bin saffron-host` inside the `saffron-build` toolbox. Launch also uses that toolbox.
+
+Detached mode discards host standard streams and polls the socket for five seconds. `--attach` keeps the host in the foreground. A readiness timeout reports that initialization may still be in progress rather than terminating the launched process.
+
+`sa export` is different from a local file conversion: it forwards `export-app` to a running host with the loaded project and supplies a typed app-manifest patch.
+
+## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| Arg surface + dispatch | `engine/crates/sa/src/main.rs` | `Cli`, `Subcmd`, `main`, `forward` |
-| argv → params | `engine/crates/sa/src/main.rs` | `build_params`, `coerce` |
-| Reply printing | `engine/crates/sa/src/main.rs` | `print_result`, `format_text`, `OutputMode` |
-| Help / completions / hints | `engine/crates/sa/src/main.rs` | `enriched_command`, `completion_command`, `did_you_mean` |
-| Launcher | `engine/crates/sa/src/main.rs` | `start`, `engine_binary_path`, `poll_for_readiness` |
-| Shared wire client | `engine/crates/control-client/src/lib.rs` | `Client`, `request_envelope`, `socket_path` |
-| Positional-fold, engine side | `engine/crates/control/src/registry.rs` | `positional_or`, `fold_positional_args` |
-| Static command table | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
-
-> [!NOTE]
-> The wire framing (the `<json>\n` request, the one reply line, the socket-path rule) lives in
-> `saffron-control-client`, shared by the CLI and the e2e harness, so there is exactly one wire
-> implementation in the tree. The CLI owns only its argument coercion and its text formatters.
+| Clap surface and route selection | `engine/crates/sa/src/main.rs` | `Cli`, `Subcmd`, `main` |
+| Argument mapping and coercion | `engine/crates/sa/src/main.rs` | `build_params`, `coerce`, `forward` |
+| Text and JSON presentation | `engine/crates/sa/src/main.rs` | `print_result`, `format_text`, `OutputMode` |
+| Help, completions, and suggestions | `engine/crates/sa/src/main.rs` | `enriched_command`, `completion_command`, `did_you_mean` |
+| Start and export routes | `engine/crates/sa/src/main.rs` | `start`, `export`, `engine_binary_path` |
+| Shared wire implementation | `engine/crates/control-client/src/lib.rs` | `Client`, `request_envelope`, `socket_path` |
+| Position-to-DTO folding | `engine/crates/control/src/registry.rs` | `fold_positional_args` |
+| Static command metadata | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
 
 ## Related
-- [Control plane](../control-plane-architecture/) — the server side of this protocol
-- [Shared types](../shared-types/) — the DTO table the CLI links and the wire encoding it round-trips
-- [Scene commands](../scene-commands/) · [Render commands](../render-commands/) · [Asset commands](../asset-commands/) — what you can ask it to do
+
+- [Control plane](../control-plane-architecture/)
+- [Shared types](../shared-types/)
+- [Scene commands](../scene-commands/)
+- [Render commands](../render-commands/)
+- [Asset commands](../asset-commands/)
