@@ -1,77 +1,87 @@
 +++
-title = 'Rust house style'
+title = 'Go-flavored design'
 weight = 1
 +++
 
-# Rust house style
+# Go-flavored design
 
-The house style is idiomatic Rust with the conventional Rust answers to design questions:
-plain data structs, free functions and inherent methods over them, errors as typed values,
-traits for behaviour, and ownership tracked by the borrow checker rather than by hand. When a
-question has a clear idiomatic Rust answer, that is the answer Anima takes.
+The engine's API design borrows the ethos [Effective Go](https://go.dev/doc/effective_go)
+describes: plain data, small interfaces, and composition instead of subclassing. Anima expresses
+that ethos in idiomatic Rust, so a design question resolves to a visible-field struct, a small
+trait, or a table of function pointers — never a class hierarchy.
 
-Knowing the style first makes the later pages easier to read: the rendering, scene, and control
-code all lean on it.
+## The vocabulary
 
-## What the style uses
+The whole codebase is built from a handful of shapes:
 
-The vocabulary is small and built from plain data:
+- **Structs with public fields.** Data stays visible rather than hidden behind accessors. A
+  constructor is an associated `fn new(..) -> Self` (or `-> Result<Self>` when it can fail), and
+  most logic is an inherent method or a free function over the data, which keeps it testable.
+  [`TimeSpan`](../type-aliases-and-primitives/) is a duration built this way, and
+  [`SubscriberList`](../signals-and-slots/) an event channel: a struct plus a small method set.
+- **Traits as interfaces.** A behaviour boundary is a trait, dispatched statically through
+  generics where possible and behind `Box<dyn Trait>` where a loop must hold a heterogeneous set.
+  [`Layer`](../../app-lifecycle-and-window/layer-system/) (the lifecycle hooks) and `FrameHost`
+  (the loop's GPU seam) are the two the main loop runs on.
+- **Fn-pointer tables where dispatch must be data.**
+  [`ComponentTraits`](../../scene-and-ecs/component-registry/) is a struct of plain `fn`
+  pointers, one per structural operation: the itable a Go interface would generate, built by
+  hand so the rows can live in a runtime registry keyed by `TypeId` or name.
+- **Enums for sum types**, and a typed [`Result<T>`](../error-handling/) for anything that can
+  fail.
+- **Closures for the deferred-work seams.** `Renderer::submit` records an
+  `FnOnce(vk::CommandBuffer)` into the current frame; `AppConfig` carries boxed
+  `on_create` / `on_exit` closures so the config is a plain owned value.
+- **`Drop` for cleanup, `Arc<T>` for sharing.** The [ownership page](../ownership-and-raii/)
+  has the rules.
 
-- Structs with public fields plus inherent methods (a method is a function with a `self`
-  receiver). Most logic is a free function or an associated function over plain data, which
-  keeps it testable.
-- Traits as interfaces — `Layer` (the lifecycle hook bundle) and `FrameHost` (the loop's GPU
-  seam) are both traits. A boxed `dyn Trait` is the runtime-polymorphic form; closures
-  (`Box<dyn FnOnce(..)>`, `impl FnMut(..)`) are the lightweight one.
-- `enum` for sum types and the typed error model — and `Result<T>` (each crate's alias over its
-  own `Error`) for anything that can fail.
-- `Drop` for resource cleanup; ownership and `Arc<T>` for sharing (the [ownership
-  page](../ownership-and-raii/) covers the rules).
+One signature per shape shows how uniform the pattern is across crates:
 
-## Clippy is law
-
-The workspace turns the whole Clippy `all` group on as a warning and denies `unsafe_code`
-crate-wide; the leaf crates (`saffron-core`, `saffron-signal`, `saffron-json`) re-deny
-`unsafe_code` at the crate root for good measure. The lint gate is part of "done": a change that
-trips a Clippy lint is not finished until the lint is clean. Where `unsafe` is genuinely
-required — the VMA and shared-memory seams in `saffron-rendering` — it is local, documented with
-a `// SAFETY:` note, and confined to the crate that owns the FFI boundary.
-
-```toml
-[workspace.lints.rust]
-unsafe_code = "deny"
-
-[workspace.lints.clippy]
-all = "warn"
+```rust
+pub trait FrameHost { fn begin_frame(&mut self) -> Result<bool>; /* … */ }  // interface = trait
+pub struct ComponentTraits { pub has: fn(&Scene, Entity) -> bool, /* … */ } // itable = fn table
+pub fn submit(&mut self, body: impl FnOnce(vk::CommandBuffer) + 'static)    // deferral = closure
+pub type Ref<T> = Arc<T>;                                                    // sharing = Arc
 ```
 
-## Errors are typed values
+## Composition, not inheritance
 
-No panics on the fallible path. Each library crate declares its own error `enum` with
-[`thiserror`](../error-handling/) and exports a `Result<T>` alias over it; callers compose
-errors with `#[from]` and propagate with `?`. Panics are reserved for genuine invariants the
-type system can't express, and `#[should_panic]` tests pin those.
+Nothing in the tree extends a base class, because nothing is a class. A type that wants behaviour
+from another type holds it as a field and delegates; a subsystem that wants to accept many types
+takes a trait bound or a `Box<dyn Trait>`. The `Layer` trait defaults every hook to a no-op, so
+an implementation overrides only the hooks it uses — the trait-with-provided-methods answer to
+Go's small-interface habit.
 
 ## Why it holds up in a renderer
 
-Graphics code is where engines usually grow the deepest class hierarchies — a `Resource` base, a
-`RenderPass` base, a `Material` base. Anima has none. A GPU buffer is a plain struct
-(`Buffer`) whose `Drop` frees its Vulkan handle; a render pass is data the [render
-graph](../../frame-and-render-graph/render-graph-overview/) walks; a component is a plain struct
-the [registry](../../scene-and-ecs/component-registry/) knows how to serialize. The data is
-visible, the control flow is explicit, and the borrow checker — not a hand-audited teardown
-order — proves the lifetimes.
+Graphics code is where engines usually grow the deepest hierarchies: a `Resource` base, a
+`RenderPass` base, a `Material` base. Anima has none. A GPU buffer is a plain `Buffer` struct
+whose `Drop` frees the allocation; a render pass is an
+[`RgPass`](../../frame-and-render-graph/render-graph-overview/) the render graph walks; a
+component is a plain struct the registry serializes through its fn-pointer row.
+
+When something breaks, nothing stands between the data and the call site. The fields are public,
+the control flow is explicit, and the borrow checker proves the lifetimes instead of a
+hand-audited teardown order.
+
+The style is enforced rather than aspirational: the Clippy gate, the `unsafe` policy, and the
+comment rules live on the [Rust house style](../../architecture-and-conventions/rust-house-style/)
+page.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The lint gate | `engine/Cargo.toml` | `[workspace.lints.rust]` (`unsafe_code = "deny"`), `[workspace.lints.clippy]` (`all = "warn"`) |
-| The lifecycle trait | `engine/crates/app/src/lib.rs` | `Layer`, `attach_layer` |
-| Drop-based GPU wrappers | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `GpuMesh`, `GpuTexture`, `Pipeline` |
+| Traits as interfaces | `engine/crates/app/src/lib.rs` | `Layer`, `FrameHost`, `attach_layer` |
+| The deferred-work closure seam | `engine/crates/rendering/src/renderer.rs` | `Renderer::submit` |
+| The hand-built itable | `engine/crates/scene/src/registry.rs` | `ComponentTraits`, `ComponentRegistry` |
+| Plain-data GPU wrappers | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `GpuMesh`, `GpuTexture`, `Pipeline` |
+| The sharing alias | `engine/crates/core/src/lib.rs` | `Ref` |
 
 ## Related
 
-- [Error handling](../error-handling/) — the typed `Result<T>` / `thiserror` half of the style
-- [Ownership](../ownership-and-raii/) — `Drop`, ownership, and `Arc<T>`
-- [Main loop and run](../../app-lifecycle-and-window/main-loop-and-run/) — the `Layer` trait in action
+- [Rust house style](../../architecture-and-conventions/rust-house-style/) — the lint gate and conventions that enforce this style
+- [Component registry](../../scene-and-ecs/component-registry/) — the fn-pointer itable in full
+- [Layers](../../app-lifecycle-and-window/layer-system/) — the trait-of-default-hooks pattern in action
+- [Error handling](../error-handling/) — the typed `Result<T>` half of the vocabulary
+- [Ownership](../ownership-and-raii/) — `Drop`, `Arc<T>`, and teardown order

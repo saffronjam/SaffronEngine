@@ -1,24 +1,25 @@
 +++
-title = 'Ownership'
+title = 'Ownership and RAII'
 weight = 4
 +++
 
-# Ownership
+# Ownership and RAII
 
-Ownership is the question of which value is responsible for freeing a resource, and when. Rust
-answers it with the borrow checker: every value has one owner, and when the owner goes out of
-scope its `Drop` runs. A GPU resource in Anima is a small struct that owns its Vulkan handles
-and frees them in `Drop`; when several places need to read the same resource, it is shared
-through an `Arc<T>` and the last clone to drop runs the destructor.
+A GPU resource must be freed exactly once, after the GPU has finished with it and before the
+device that created it is destroyed. The engine encodes those rules in Rust ownership: each
+resource is a struct that frees its Vulkan handles in `Drop` (the
+[RAII](https://en.wikipedia.org/wiki/Resource_acquisition_is_initialization) idiom), and shared
+access goes through `Arc<T>`.
 
-There are no opaque integer handles into a manager and no GPU-resource base class. The scheme
-rests on `Drop` for cleanup, `Arc` for sharing, and one ordering rule at shutdown that the borrow
-checker enforces for free.
+There are no integer handles into a manager and no GPU-resource base class. Four rules cover the
+whole scheme: `Drop` frees the handle, an `Arc<DeviceResources>` clone keeps the device alive,
+`Arc<T>` shares reads, and `run` idles the GPU before teardown.
 
 ## Drop frees the handle
 
-A logical resource — a pipeline, a mesh, a texture — is a move-only struct that holds its Vulkan
-handles and frees them in `Drop`. `Pipeline` is the simplest:
+A logical resource (a pipeline, a mesh, a texture) is a move-only struct that holds its Vulkan
+handles and frees them in [`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html).
+`Pipeline` is the simplest:
 
 ```rust
 pub struct Pipeline {
@@ -37,43 +38,56 @@ impl Drop for Pipeline {
 }
 ```
 
-The struct is not `Clone`: ownership of the handle is unique, and a move transfers it. There is no
-"freed twice" hazard and no moved-from cleanup to write — Rust does not run `Drop` on a moved-from
-value. `Buffer`, `Image`, `Image3D`, `GpuMesh`, `GpuTexture`, and `AccelerationStructure` all
-follow this shape.
+The struct is not `Clone`: ownership of the handle is unique, and a move transfers it. Rust does
+not run `Drop` on a moved-from value, so there is no double-free hazard and no moved-from
+cleanup to write. `Buffer`, `Image`, `Image3D`, `GpuTexture`, `GpuMesh`, `GpuSdf`, and
+`AccelerationStructure` all follow this shape.
 
 ## The device outlives every resource
 
-Each wrapper holds an `Arc<DeviceResources>` — the reference-counted bundle of the `ash::Device`
-and the VMA allocator. Holding that clone is the lifetime guarantee: a resource cannot free its
-handle through a dead allocator, because keeping the resource alive keeps the bundle alive. The
-allocator and device are torn down only when the last `Arc<DeviceResources>` drops, which is after
-every resource that referenced them is already gone.
+Every wrapper holds an `Arc<DeviceResources>`, the reference-counted bundle of the `ash::Device`
+and the [VMA](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) allocator. A
+resource clones the `Arc` at construction, so keeping the resource alive keeps the bundle alive
+and it can never free its handle through a dead allocator. The guarantee is structural, not a
+field-ordering convention.
 
-## Arc<T> is the shared-read default
+The bundle's own `Drop` runs only after every resource that referenced it has dropped. It destroys
+the allocator first and the device second, because VMA frees its `VkDeviceMemory` through the
+live device.
 
-When a resource only needs to be *read* through many handles — a loaded mesh, a cached PSO,
-a material — it is shared as `Arc<T>`. `saffron-core` names this the `Ref` policy alias:
+## Arc is the shared-read default
+
+When a value is built once and then only read through many handles (a loaded mesh, a cached PSO,
+a material), it is shared as
+[`Arc<T>`](https://doc.rust-lang.org/std/sync/struct.Arc.html). `saffron-core` names this the
+`Ref` policy alias:
 
 ```rust
 /// A shared, read-only reference to a logical resource.
 pub type Ref<T> = Arc<T>;
 ```
 
-`Ref<T>` is a *readability* alias only: it marks "value built once, then read through every clone".
-A shared-*mutable* site does not use `Ref` — it spells `Arc<Mutex<T>>` (or `Arc<RwLock<T>>`)
-explicitly at its declaration, so the exception is visible where it occurs. The bindless free list
-in `saffron-rendering` is one such site (`Arc<Mutex<Vec<u32>>>`). The renderer caches PSOs as
-`Arc<Pipeline>` and clones the `Arc` across the upload and render threads; the resource lives until
-the last clone drops.
+`Ref` is a readability alias only, marking "constructed once, read through every clone". A
+shared-*mutable* site does not use `Ref`; it spells `Arc<Mutex<T>>` (or `Arc<RwLock<T>>`)
+explicitly at its declaration, so the exception is visible where it occurs.
 
-## Teardown rule
+Both sides of the policy appear in the renderer. The read side is the PSO cache: `Pipelines`
+keeps a `HashMap<PsoKey, Arc<Pipeline>>`, clones cross the upload and render threads, and the
+pipeline lives until the last clone drops. The mutable side is the bindless texture free list,
+`BindlessFreeList = Arc<Mutex<Vec<u32>>>`, which collects returned slot indices for reuse.
 
-A GPU resource cannot be freed while an in-flight command buffer still references it, and it must
-not outlive the allocator or device. Those constraints define the shutdown order, which `run`
-enforces: `wait_gpu_idle` blocks on the device first, then `on_detach` runs and `on_exit` lets a
-host drop the handles it held — safe, because the GPU is idle. The `Arc<DeviceResources>` bundle,
-the last owner of the allocator and device, drops only once every resource referencing it is gone.
+The two meet in `GpuTexture`. A texture uploaded on a worker thread may drop on that thread; its
+`Drop` locks the free list, pushes its bindless slot back for the next upload, then frees the
+view and image. The mutex makes the off-thread slot return safe, and the wrapper's
+`Arc<DeviceResources>` clone makes the off-thread free legal.
+
+## Teardown order
+
+A GPU resource cannot be freed while an in-flight command buffer still references it, and it
+must not outlive the allocator or device. `run`'s shared teardown half, `finish`, enforces the
+order: `FrameHost::wait_gpu_idle` blocks on the device, each layer's `on_detach` runs, then
+`AppConfig::on_exit` lets the host drop the handles it held. Every wrapper `Drop` after that
+point frees against an idle GPU.
 
 ```mermaid
 flowchart TD
@@ -84,21 +98,22 @@ flowchart TD
     E --> F[last Arc&lt;DeviceResources&gt; drops: allocator, then device]
 ```
 
+> [!NOTE]
+> An `Arc` clone stashed outside the engine (a layer field, a closure capture) keeps the
+> resource alive and can outlive the device. Release host-held clones in `on_detach` /
+> `on_exit`; `run` has already idled the GPU by then.
+
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The `Ref` policy alias | `engine/crates/core/src/lib.rs` | `Ref` |
-| The shared device bundle | `engine/crates/rendering/src/resources.rs` | `DeviceResources` |
-| Drop-based wrappers | `engine/crates/rendering/src/resources.rs` | `Pipeline`, `Buffer`, `Image`, `GpuMesh`, `GpuTexture` |
-| A shared-mutable site | `engine/crates/rendering/src/resources.rs` | `BindlessFreeList` (`Arc<Mutex<…>>`) |
-| The idle barrier | `engine/crates/app/src/lib.rs` | `FrameHost::wait_gpu_idle` |
-| The teardown order | `engine/crates/app/src/lib.rs` | `run` — `wait_gpu_idle` before `on_detach` / `on_exit` |
-
-> [!NOTE]
-> An `Arc` clone you stash outside the engine (a layer field, a closure capture) keeps the
-> resource alive. If you don't drop it in `on_detach` / `on_exit`, it can outlive the device.
-> Release host-held clones at shutdown; `run` already did the `wait_gpu_idle` for you.
+| The `Ref` policy alias | `crates/core/src/lib.rs` | `Ref` |
+| The shared device bundle | `crates/rendering/src/resources.rs` | `DeviceResources` |
+| Drop-based wrappers | `crates/rendering/src/resources.rs` | `Pipeline`, `Buffer`, `Image`, `GpuTexture`, `GpuMesh`, `AccelerationStructure` |
+| The shared-mutable site | `crates/rendering/src/resources.rs` | `BindlessFreeList`, `GpuTexture::drop` |
+| The PSO cache | `crates/rendering/src/pipelines.rs` | `Pipelines`, `PsoKey` |
+| The idle barrier | `crates/app/src/lib.rs` | `FrameHost::wait_gpu_idle` |
+| The teardown order | `crates/app/src/lib.rs` | `run`, `finish` |
 
 ## Related
 
