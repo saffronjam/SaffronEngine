@@ -1,5 +1,5 @@
 baseURL = 'https://saffronjam.github.io/saffron-anima/'
-title = 'saffron-anima'
+title = 'Anima'
 theme = 'hugo-book'
 
 enableGitInfo = false
