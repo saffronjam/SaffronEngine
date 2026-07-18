@@ -5,87 +5,80 @@ weight = 6
 
 # Asset catalog
 
-An asset catalog maps each asset's stable id to a human name and a file path. Components reference
-assets by [`Uuid`](../scene-serialization/) rather than by name, so the catalog is what turns a
-stored id into something a person can read and a loader can open.
+Anima components identify assets with stable [`Uuid`](../scene-serialization/) values. The asset catalog resolves each ID to the metadata needed by loaders, tools, and the editor: a display name, asset kind, project-relative path, and type-specific details.
 
-The mapping lets the registry-driven inspector show asset names instead of raw ids. The catalog type
-is defined in the scene crate and owned by the
-[asset server](../../geometry-and-assets/asset-server-and-catalog/); the `Scene` holds a shared,
-read-only handle to it.
+The catalog is project data rather than entity data. `AssetServer` owns the live catalog and the GPU caches keyed by the same IDs. A `Scene` can hold an `Option<Arc<AssetCatalog>>` for read-only lookup, but the ECS world does not own or serialize catalog entries.
 
-## What the catalog holds
+## Catalog rows
 
-Each entry maps an asset's stable id to a display name, a kind, and the relative path of its baked
-`.smesh` or copied texture under the project's asset root. The catalog is a list of these entries
-plus an id index.
+`AssetCatalog` stores ordered `entries`, user-created `folders`, and a `by_id` index. Each `AssetEntry` has an ID, name, `AssetType`, folder, and path below the project's `assets/` directory.
 
-```rust
-pub enum AssetType { Mesh, Texture, Other, Animation, Material, Model }
+The asset type is one of `Mesh`, `Texture`, `Other`, `Animation`, `Material`, `Model`, or `Lut`. Extra fields describe only the kinds that need them:
 
-pub struct AssetEntry {
-    pub id: Uuid,
-    pub name: String,            // UTF-8, renameable
-    pub asset_type: AssetType,
-    pub path: String,            // relative to the asset root
-    pub folder: String,
-    // ... texture colorspace, animation duration/tracks, container/chunk bookkeeping
-}
+| Asset kind | Additional catalog data |
+|---|---|
+| Texture | HDR and linear flags, colorspace, semantic role |
+| Animation | Duration and animated-track count |
+| Model sub-asset | Container ID and chunk index |
+| Rigged model | Rigged flag |
+| Store import | Author, source, license, and attribution requirement |
+| Thumbnail source | Content hash |
 
-pub struct AssetCatalog {
-    pub entries: Vec<AssetEntry>,
-    pub folders: Vec<String>,
-    pub by_id: HashMap<u64, usize>,  // id -> index into entries
-}
-```
+A model container and its embedded meshes, materials, textures, and clips each have catalog IDs. Sub-asset rows share the container path and use `container` plus `chunk` to locate their payload inside the `.smodel` file.
 
-This is a catalog, not a filesystem view. Names are arbitrary, renameable UTF-8 labels, and two
-assets can share a base name; `unique_name` disambiguates with " (2)", " (3)", and so on.
+## Stable lookup
 
-## The helpers
-
-The catalog has a small method surface, the same shape as the rest of the scene:
+`AssetCatalog::find` performs an indexed ID lookup. `put` replaces an existing row in place or appends a new row and records its index. `rename`, `set_attribution`, and `set_content_hash` update a row when the ID exists. `unique_name` adds ` (2)`, ` (3)`, and higher suffixes when a display name is already in use.
 
 ```rust
-impl AssetCatalog {
-    pub fn find(&self, id: Uuid) -> Option<&AssetEntry>;     // None on miss
-    pub fn put(&mut self, entry: AssetEntry);                // insert or replace by id
-    pub fn rename(&mut self, id: Uuid, name: impl Into<String>) -> bool;
-    pub fn unique_name(&self, base: &str) -> String;
-}
+use saffron_core::Uuid;
+use saffron_scene::{AssetCatalog, AssetEntry, AssetType};
+
+let mut catalog = AssetCatalog::default();
+let mesh_id = Uuid::new();
+catalog.put(AssetEntry {
+    id: mesh_id,
+    name: catalog.unique_name("Crate"),
+    asset_type: AssetType::Mesh,
+    path: format!("meshes/{}.smesh", mesh_id.value()),
+    ..AssetEntry::default()
+});
+
+assert_eq!(catalog.find(mesh_id).map(|row| row.name.as_str()), Some("Crate"));
 ```
 
-`put` is an upsert: an existing id overwrites that entry in place, otherwise it appends and records
-the index in `by_id`. `find` returns `None` on a miss, the usual optional-lookup convention.
+Names are labels, not identities. Two source files may have the same stem, while component references remain unambiguous because they store IDs.
 
-## Why the scene only borrows it
+## Persistence and recovery
 
-The scene holds an `Option<Arc<AssetCatalog>>` — a shared, read-only handle, not the owned catalog.
-The `AssetServer` owns the real catalog and the GPU caches keyed by the same ids; the editor sets
-`scene.catalog` to point at it before drawing the inspector. The inspector's mesh and material
-pickers read the catalog through this handle to turn a stored `Uuid` into a name in a combo box.
-Because the scene only borrows it, the catalog is not part of scene serialization. It is serialized
-separately and travels with the scene inside the one
-[`project.json`](../../geometry-and-assets/project-serialization/).
+`project.json` stores catalog rows in `assets` and folders in `assetFolders`. The JSON reader ignores unknown keys, defaults omitted optional fields, and skips rows with an ID of zero.
 
-> [!NOTE]
-> The handle is set per-frame and can be `None`. A scene loaded headlessly (the serialization tests)
-> leaves it unset and never touches it. Keeping it out of the ECS is deliberate: the world is entity
-> data, the catalog is project data, and conflating them would drag asset bookkeeping into every
-> `for_each`.
+The `assets/` tree remains sufficient to rebuild the catalog. Engine-authored files encode identity in their filename or container metadata; foreign files receive a neighboring `.smeta` sidecar. A load reuses `assets/.cache/catalog.json` only when its asset signature matches. Otherwise, Anima scans the directory and writes a fresh cache.
 
-## In the code
+This split gives each layer one job:
+
+| Layer | Responsibility |
+|---|---|
+| Scene component | Stores an asset ID. |
+| `AssetCatalog` | Maps the ID to project metadata. |
+| `AssetServer` | Owns the catalog and resolves CPU/GPU resources. |
+| Control plane | Returns catalog DTOs to the editor and applies asset operations. |
+| React editor | Presents names, folders, previews, and pickers. |
+
+## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| Catalog types | `scene/src/environment.rs` | `AssetEntry`, `AssetType`, `AssetCatalog` |
-| Catalog helpers | `scene/src/environment.rs` | `AssetCatalog::find`, `put`, `rename`, `unique_name` |
-| The handle | `scene/src/scene.rs` | `Scene::catalog` |
-| Who owns it | `assets/src/lib.rs` | `AssetServer::catalog` |
-| To/from JSON | `assets/src/catalog.rs` | `catalog_to_json`, `catalog_from_json` |
+| Catalog types and lookup helpers | `engine/crates/scene/src/environment.rs` | `AssetCatalog`, `AssetEntry`, `AssetType` |
+| Optional scene handle | `engine/crates/scene/src/scene.rs` | `Scene::catalog` |
+| Live owner and resource caches | `engine/crates/assets/src/lib.rs` | `AssetServer` |
+| Project JSON shape | `engine/crates/assets/src/catalog.rs` | `catalog_to_json`, `catalog_from_json` |
+| Disk reconciliation and cache | `engine/crates/assets/src/scan.rs` | `reconcile_catalog_from_disk`, `resolve_catalog_from_disk` |
+| Editor-facing catalog commands | `engine/crates/control/src/commands_asset.rs` | `list-assets`, `rename-asset`, `move-asset` |
 
 ## Related
-- [Asset server and catalog](../../geometry-and-assets/asset-server-and-catalog/) — the owner and the GPU caches
-- [Project serialization](../../geometry-and-assets/project-serialization/) — catalog + scene in one file
-- [Asset pickers and drag-drop](../../ui-and-editor/asset-pickers-and-drag-drop/) — what reads the handle
-- [Components](../built-in-components/) — the components that reference catalog ids
+
+- [Asset server and catalog](../../geometry-and-assets/asset-server-and-catalog/)
+- [Project serialization](../../geometry-and-assets/project-serialization/)
+- [Asset pickers and drag-drop](../../ui-and-editor/asset-pickers-and-drag-drop/)
+- [Built-in components](../built-in-components/)

@@ -5,30 +5,29 @@ weight = 5
 
 # Serialization
 
-Scene serialization converts a live scene into a JSON document and back, preserving every entity, its
-components, and its stable identity. The save and load paths are registry-driven: they hold no
-per-component code, instead walking the [component registry](../component-registry/) rows and asking
-each one what to write and how to read it.
+Scene serialization converts the ECS world into a JSON value without depending on `hecs` storage
+introspection. A component registry supplies the per-type operations, while the scene document owns
+entity identity, environment state, component display order, and cross-entity relinking.
 
-This keeps the format open to extension. Adding a component to the registry makes it serializable
-without touching the save/load path, and the round-trip is byte-stable — a document written by one
-build reads back into an equivalent scene, and re-serializes to the same bytes.
+## Document shape
 
-## The document shape
-
-`scene_to_json` produces a `{ version, environment, entities: [...] }` document. Each entity is its
-`Uuid`, its components, and the authored component order:
+`scene_to_json` returns a value that can be written as a standalone scene or embedded under the
+`scene` key in `project.json`. The scene schema version is `4`:
 
 ```json
 {
   "version": 4,
-  "environment": { "skyMode": "procedural", "exposure": 1.0, ... },
+  "environment": {},
   "entities": [
     {
       "id": "1024",
       "components": {
         "Name": { "name": "Cube" },
-        "Transform": { "translation": {"x":1,"y":2,"z":3}, "scale": {...}, "rotation": {...} },
+        "Transform": {
+          "translation": { "x": 1.0, "y": 2.0, "z": 3.0 },
+          "rotation": { "x": 0.0, "y": 0.0, "z": 0.0 },
+          "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+        },
         "Relationship": { "parent": "0" }
       },
       "componentOrder": ["Name", "Transform"]
@@ -37,104 +36,84 @@ build reads back into an equivalent scene, and re-serializes to the same bytes.
 }
 ```
 
-Ids are written as decimal strings (a `u64` does not fit a JSON number safely), and keys are emitted
-sorted, so the document is byte-stable. `scene_to_json` returns the document without file IO, so it
-can be embedded inside the larger `project.json` (see
-[project serialization](../../geometry-and-assets/project-serialization/)). `write_scene` and
-`read_scene` add the file layer on top.
+Entity IDs and component UUID fields are decimal strings. A `u64` can exceed JavaScript's safe
+integer range, so the reader accepts either strings or numbers but the writer always emits strings.
+The entity's `IdComponent` is represented by the top-level `id` field.
 
-## Serialize: walk rows, emit by name
+`componentOrder` preserves the Inspector's authored component order. Before writing, the registry
+reconciles it with the components actually present: removed names drop out, duplicates collapse, and
+newly present components append in canonical registry order. `Relationship` and `Bone` do not appear
+in this display order even though their durable data can serialize.
 
-`serialize_entity` walks the registry rows and, for each one whose `has` reports the component present
-on the entity, calls that row's `serialize` pointer:
+## Registry dispatch
+
+`ComponentRegistry::serialize_entity` walks its rows and calls the stored `has` and `serialize`
+function pointers. The result is a JSON object keyed by registered component name. Each built-in row
+dispatches to that type's `SceneSerialize::to_json` implementation.
 
 ```rust
 for traits in &self.rows {
     if (traits.has)(scene, entity) {
-        components.insert(traits.name.to_string(), (traits.serialize)(scene, entity));
+        components.insert(
+            traits.name.to_string(),
+            (traits.serialize)(scene, entity),
+        );
     }
 }
 ```
 
-Walking rows (rather than introspecting ECS storage, which `hecs` does not expose) is how
-`IdComponent` stays out of the `components` map — it has no registry row, and is written as the
-top-level `id` instead. `WorldTransform`, `PoseOverride`, and `ComponentOrder` are unregistered for
-the same reason; `componentOrder` is written separately by the document assembler.
+Runtime data has no registry row. `WorldTransform`, `PoseOverride`, `MorphWeightOverride`, and
+`ComponentOrder` therefore stay out of the component object. `Relationship` and `SkinnedMesh` do
+have rows, but their `SceneSerialize` implementations emit only durable UUID data and omit resolved
+handle caches.
 
-## Deserialize: look up by name, add then fill
+Asset-placement previews are another explicit exclusion. `scene_to_json` skips every entity tagged
+with `PreviewGhost`, so saving during a drag does not persist the temporary model subtree.
 
-`deserialize_entity` reads each JSON key, finds the row by name, and runs its `deserialize` pointer.
-That pointer adds the component with defaults if missing, then fills it from JSON. An unknown key
-warns and is skipped rather than failing the load, so a file from a build with an extra component
-still opens. A parse failure inside a known component propagates as an
-[`Error`](../../core-and-conventions/error-handling/) with the component name prefixed.
+## Loading a scene
 
-```rust
-let Some(&index) = self.by_name.get(name.as_str()) else {
-    tracing::warn!("unknown component '{name}', skipping");
-    continue;
-};
-(self.rows[index].deserialize)(scene, entity, value)
-    .map_err(|e| Error::Deserialize(format!("{name}: {e}")))?;
-```
+`scene_from_json` validates the root, schema version, entity array, and entity IDs before rebuilding
+the world. It clears the ECS, creates each entity with `spawn_with_id`, then asks the registry to
+deserialize every named component. The stored UUID survives even though the live `hecs` handle does
+not.
 
-## UUID stability
+An unknown component name logs a warning and is skipped. A malformed body for a known component
+returns `Error::Deserialize` with that component's name. Versions outside the accepted `1..=4`
+range, a missing entity array, and an entry without an ID are errors.
 
-ECS handles are recycled and not stable across runs, so they cannot serve as the on-disk identity.
-Every serialized entity instead carries a [`Uuid`](../built-in-components/) in its `IdComponent`, and
-that is what gets written. The load path does not call `create_entity`, which would mint fresh uuids;
-it uses `spawn_with_id` to preserve the stored ids:
+Cross-entity references resolve after every entity has been created. `relink_hierarchy` maps parent
+and skin-joint UUIDs to live handles, which permits a child to appear before its parent in the JSON
+array. It also supplies root relationships where absent and sanitizes invalid parent links. See
+[scene hierarchy](../scene-hierarchy/) for those invariants.
 
-```rust
-self.clear();
-for entry in entries {
-    let uuid = json_u64_or(entry, "id", 0);
-    let entity = self.spawn_with_id(Uuid(uuid));
-    // ... deserialize components, then componentOrder ...
-}
-self.relink_hierarchy();
-```
+The reader supplies defaults for fields omitted by an accepted document. A missing environment uses
+the default environment, an absent relationship makes the entity a root, and an absent
+`componentOrder` derives the canonical registry order.
 
-> [!NOTE]
-> Cross-entity references resolve only after the loop. The [scene hierarchy](../scene-hierarchy/)
-> stores each entity's parent as a uuid, and a child's entry may precede its parent in the array, so
-> `relink_hierarchy` maps every stored parent uuid to a live handle once all entities exist. A
-> pre-hierarchy document simply has no Relationship keys, and every entity loads as a root.
+## File boundary
 
-## Versioning
+`write_scene` passes `scene_to_json` through `dump_json_sorted` and writes two-space-indented JSON;
+every object key is sorted recursively. `read_scene` reads the file with `parse_json` and hands the
+value to `scene_from_json`.
 
-The document carries `version` (`SCENE_VERSION`, currently `4`: 1 = entities only, 2 = adds the
-top-level environment block, 3 = adds the per-entity Relationship component, 4 = adds the per-entity
-`componentOrder` array). `scene_from_json` rejects anything outside `[1, SCENE_VERSION]` up front
-rather than guessing at an unknown layout, and migrates older documents by defaulting what they lack —
-a pre-v2 scene gets a default environment, a pre-v3 scene roots every entity, a pre-v4 scene derives
-the canonical component order. Bumping the version announces a breaking layout change.
-
-A `document_bytes_match_captured_block` test pins the whole-document shape (key order, decimal-string
-ids, the environment block) to the frozen `project.json` scene block: it asserts byte-equality
-against a hand-assembled document, then re-parses and re-serializes it to confirm the reader is
-byte-stable. The other tests cover the migration cases — parent uuids survive the round trip, a child
-entry before its parent still resolves, a v2 document migrates every entity to root, and a dangling
-parent downgrades to root with a warning.
-
-> [!WARNING]
-> The load path validates before it indexes — checking `is_object` / `as_array` and reading scalar
-> fields through `json_u64_or`-style helpers that default rather than fault. A malformed file returns
-> an `Err`, it does not crash.
+Project saving uses the same `scene_to_json` value but embeds it in the wider project document. The
+[project serialization](../../geometry-and-assets/project-serialization/) page covers the catalog,
+render settings, and editor sidecars around that scene block.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Per-entity to/from JSON | `scene/src/registry.rs` | `serialize_entity`, `deserialize_entity` |
-| Whole scene to/from JSON | `scene/src/document.rs` | `scene_to_json`, `scene_from_json` |
-| File layer | `scene/src/document.rs` | `write_scene`, `read_scene` |
-| Version + migration | `scene/src/document.rs` | `SCENE_VERSION` |
-| JSON helpers | `json/src/lib.rs` | `parse_json`, `dump_json_sorted`, `json_u64_or`, `uuid_to_json` |
-| Stable identity | `core/src/uuid.rs` | `Uuid`, `Uuid::new` |
+| Whole-scene conversion | `scene/src/document.rs` | `scene_to_json`, `scene_from_json`, `SCENE_VERSION` |
+| Standalone file I/O | `scene/src/document.rs` | `write_scene`, `read_scene` |
+| Registry dispatch | `scene/src/registry.rs` | `serialize_entity`, `deserialize_entity`, `component_order` |
+| Component bodies | `scene/src/serde.rs` | `SceneSerialize` implementations |
+| UUID JSON encoding | `json/src/lib.rs` | `uuid_to_json`, `json_u64_or`, `WireUuid` |
+| Project embedding | `assets/src/project.rs` | `save_project`, `load_project` |
 
 ## Related
-- [Component registry](../component-registry/) — what `serialize`/`deserialize` dispatch through
-- [Project serialization](../../geometry-and-assets/project-serialization/) — where this scene doc is embedded
-- [JSON gateway](../../core-and-conventions/json-gateway/) — the no-fault parse/access helpers
-- [Error handling](../../core-and-conventions/error-handling/) — the `Result` the load path returns
+
+- [Component registry](../component-registry/) — registry rows and per-type operations.
+- [Scene hierarchy](../scene-hierarchy/) — durable parent UUIDs and runtime handle caches.
+- [Project serialization](../../geometry-and-assets/project-serialization/) — the surrounding project document.
+- [JSON gateway](../../core-and-conventions/json-gateway/) — parsing, dumping, and typed readers.

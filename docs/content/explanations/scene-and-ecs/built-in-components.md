@@ -5,159 +5,88 @@ weight = 2
 
 # Components
 
-A component is a plain value struct: no base type, no methods, no attached behavior — only data the
-[systems](../ecs-architecture/) read with `for_each`. Behavior such as serialize, deserialize, add,
-remove, and clone is attached separately through the [component registry](../component-registry/),
-so the struct depends on nothing but `glam` and `serde_json`.
+Anima represents entity state as plain Rust components stored in a [`hecs`](https://docs.rs/hecs/0.11/hecs/) world. Components carry data; systems in the scene, rendering, animation, scripting, and physics crates decide what that data means each frame.
 
-Keeping a component pure data lets one entity be serialized, inspected, cloned, and rendered by
-several unrelated subsystems, none aware of the others. The per-component serde lives in the
-[registry](../component-registry/) instead, as one `impl` per component.
+Serialization and editor operations do not live on a common base class. The [component registry](../component-registry/) associates each authored component type with a stable name, JSON conversion, copy operations, and a removability flag.
 
-## Identity
+## Entity foundation
 
-Every entity from `create_entity` carries an id, a name, a transform, and a root relationship
-automatically.
+`Scene::create_entity` seeds five pieces of state:
+
+| Component | Purpose | Persistence |
+|---|---|---|
+| `IdComponent` | Stable `Uuid` used outside the current ECS world | Top-level entity `id` |
+| `Name` | Human-readable hierarchy label | Registered as `Name` |
+| `Transform` | Local translation, Euler XYZ rotation in radians, and scale | Registered as `Transform` |
+| `Relationship` | Parent ID plus resolved hierarchy caches | Only the parent ID persists |
+| `ComponentOrder` | Authored Inspector and JSON row order | Top-level `componentOrder` |
+
+`Name`, `Transform`, and `Relationship` are non-removable registry rows. An entity can lose every optional capability without losing its identity or place in the scene tree.
+
+## Authored component families
+
+The built-in registry contains these component rows:
+
+| Family | Components | Role |
+|---|---|---|
+| Geometry | `Mesh`, `MaterialSet`, `ModelInstance` | Mesh asset, submesh material bindings, and source model identity |
+| View | `Camera` | Perspective projection and editor camera helpers |
+| Lighting | `DirectionalLight`, `PointLight`, `SpotLight`, `ReflectionProbe`, `FogVolume` | Direct lights, local reflection capture, and bounded participating media |
+| Animation | `AnimationPlayer`, `SkinnedMesh`, `Morph`, `Bone`, `FootIk`, `BonePhysics`, `KinematicBones` | Clip playback, deformation, skeleton metadata, IK, and bone/physics coupling |
+| Physics | `Rigidbody`, `Collider`, `CharacterController` | Motion, collision shape and material, and virtual-character state |
+| Scripting | `Script` | Ordered `.lua` attachments and per-entity field overrides |
+
+The canonical registry order and names live in `BUILTIN_COMPONENT_NAMES`. This list is also a completeness check: every listed name must resolve to one registry row, and every row must appear in the list.
+
+## Asset references
+
+Components store asset IDs rather than GPU handles or filesystem paths. `Mesh` has one mesh `Uuid`; `ModelInstance` records its `.smodel` ID; animation and material components follow the same rule. The [asset catalog](../asset-catalog-in-scene/) resolves those IDs after a project load rebuilds its caches.
+
+`MaterialSet` contains one `MaterialSlot` per submesh binding. Each slot references a `.smat` asset and carries a sparse JSON object of per-entity overrides. A material ID of zero selects the built-in default material.
 
 ```rust
-pub struct Name { pub name: String }
-pub struct IdComponent { pub id: Uuid }
-```
+use saffron_core::Uuid;
+use saffron_scene::{MaterialSet, MaterialSlot, Mesh, Scene};
 
-`IdComponent` is the entity's stable [`Uuid`](../scene-serialization/). ECS handles are not stable
-across runs and can alias between worlds, so every cross-entity reference keys off the `Uuid`. It is
-left unregistered and skipped during serialization — written as the entity's top-level `id`, not
-inside `components`. `Name` is the label shown in the hierarchy.
-
-## Transform
-
-Rotation is stored as Euler XYZ in radians. The inspector edits these values directly, avoiding the
-gimbal clipping that arises when the UI decomposes a quaternion. Matrix composition is its own page;
-see [Transforms](../transform-and-matrices/).
-
-```rust
-pub struct Transform {
-    pub translation: Vec3,
-    pub scale: Vec3,
-    pub rotation: Vec3,  // Euler XYZ radians
+fn make_renderable(scene: &mut Scene, mesh_id: Uuid) -> saffron_scene::Result<()> {
+    let entity = scene.create_entity("Crate");
+    scene.add_component(entity, Mesh { mesh: mesh_id })?;
+    scene.add_component(
+        entity,
+        MaterialSet {
+            slots: vec![MaterialSlot::default()],
+        },
+    )?;
+    Ok(())
 }
 ```
 
-## Hierarchy
+Changing a `.smat` updates every entity that references it. An override changes only that slot on that entity.
 
-`Relationship` makes the entity a node in the [scene tree](../scene-hierarchy/): a durable parent
-`Uuid` (`0` means root) plus runtime `parent_handle`/`children` caches that never serialize. Every
-entity gets a root one from `create_entity`. It is registered non-removable, and parenting is edited
-through `set_parent` rather than as a raw field.
+## Transform-owned placement
 
-```rust
-pub struct Relationship {
-    pub parent: Uuid,                       // Uuid(0) == root
-    pub parent_handle: Option<Entity>,      // resolved cache, never serialized
-    pub children: Vec<Entity>,              // derived cache, never serialized
-}
-```
+Several components deliberately omit position. Cameras derive their view from the entity's world transform. Point lights, reflection probes, fog volumes, rigid bodies, and character controllers use the entity translation; spot and directional lights add an authored direction.
 
-## Mesh and material
+This keeps placement in one component and lets parenting affect every spatial subsystem through the same [world-matrix update](../transform-and-matrices/).
 
-`Mesh` references a mesh asset by [`Uuid`](../asset-catalog-in-scene/); the
-[asset server](../../geometry-and-assets/asset-server-and-catalog/) resolves it to a GPU mesh at
-draw time. The component holds no GPU handle, so it survives a project reload that rebuilds the
-caches.
+## Runtime-only state
 
-```rust
-pub struct Mesh { pub mesh: Uuid }
-```
+Some ECS values exist only to make frame processing efficient. `WorldTransform` caches the composed matrix. `PoseOverride` and `MorphWeightOverride` carry evaluated deformation state. `PreviewGhost` marks transient asset placement. `Relationship::parent_handle`, `Relationship::children`, and `SkinnedMesh::bone_handles` cache resolved entity handles.
 
-An entity's material is one component, `MaterialSet`: an ordered list of `MaterialSlot`s, one per
-submesh. A slot is a **reference plus overrides** — a `.smat`
-[material asset](../../materials-and-pipelines/native-materials/) id and a sparse per-object override
-map applied over that material's resolved parameters. A single-material mesh is a `MaterialSet` with
-one slot.
+These values are absent from the component registry or omitted by their serializers. A load reconstructs them from durable IDs and authored values, so serialized scenes never depend on unstable `hecs::Entity` handles.
 
-```rust
-pub struct MaterialSlot {
-    pub material: Uuid,   // the referenced .smat asset; 0 == the built-in default
-    pub overrides: Value, // sparse { paramName: value }, {} when nothing is overridden
-}
-pub struct MaterialSet { pub slots: Vec<MaterialSlot> }
-```
-
-Each [`Submesh.material_slot`](../../geometry-and-assets/mesh-and-vertex-layout/) indexes the list
-(clamped to the last slot), so each submesh draws with its own slot. `material == 0` binds the
-built-in default. `overrides` is opaque editor-shaped JSON; the engine applies only the recognized
-exposed PBR parameters — `baseColor`, `metallic`, `roughness`, `emissive`, the texture ids
-(`albedoTexture`, the packed `ormTexture`, …), and the rest of the exposed set — at resolve time.
-Because a slot references the `.smat` rather than copying its factors, editing that material
-re-renders every entity that points at it; the override map carries only the per-object deviations.
-The [draw list](../../geometry-and-assets/draw-list/) resolves the set into one material per submesh.
-
-## Camera
-
-```rust
-pub struct Camera {
-    pub fov: f32,                    // vertical, degrees
-    pub near_plane: f32,
-    pub far_plane: f32,
-    pub primary: bool,               // scene renders through the first primary camera
-    pub show_model: bool,
-    pub show_frustum: bool,
-    pub frustum_max_distance: f32,
-}
-```
-
-The camera's view comes from the entity's `Transform`, not the component itself: `primary_camera`
-inverts the entity's world matrix. The component carries only projection parameters. The scene
-renders through the first camera flagged `primary`.
-
-`show_model`, `show_frustum`, and `frustum_max_distance` control editor helpers only. In edit mode
-the host draws the camera placeholder model and a frustum capped by `frustum_max_distance`. Play
-mode renders neither helper.
-
-## Light types
-
-```rust
-pub struct DirectionalLight {
-    pub direction: Vec3,  // way the light travels; default (-0.5, -1.0, -0.3)
-    pub color: Vec3,
-    pub intensity: f32,
-    pub ambient: f32,     // default 0.15
-}
-
-pub struct PointLight { pub color: Vec3, pub intensity: f32, pub range: f32 }
-
-pub struct SpotLight {
-    pub direction: Vec3,
-    pub color: Vec3,
-    pub intensity: f32,
-    pub range: f32,
-    pub inner_angle: f32,  // full intensity inside this half-angle (deg)
-    pub outer_angle: f32,  // zero past this half-angle (deg)
-}
-```
-
-The directional light is the sun; the scene shades through the first one, which carries a flat
-`ambient` floor (a scene with no directional light has no direct sun and no such floor). Point
-and spot lights sit at the entity's `Transform` translation, since the
-components hold no position of their own, and are
-[culled into clusters](../../shadows-and-culling/clustered-light-culling/) by the light system. See
-[light components](../../lighting-and-brdf/light-components/) for how `render_scene` packs these into
-the GPU light buffer.
-
-## In the code
+## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| Identity + transform | `scene/src/component.rs` | `IdComponent`, `Name`, `Transform` |
-| Hierarchy | `scene/src/component.rs` | `Relationship`, `WorldTransform` |
-| Skeleton | `scene/src/component.rs` | `SkinnedMesh`, `Bone` |
-| Renderables | `scene/src/component.rs` | `Mesh`, `MaterialSet`, `MaterialSlot` |
-| Camera | `scene/src/component.rs` | `Camera` |
-| Lights + probe | `scene/src/component.rs` | `DirectionalLight`, `PointLight`, `SpotLight`, `ReflectionProbe` |
-| Camera resolve | `scene/src/hierarchy.rs` | `primary_camera` |
-| Where each is registered | `scene/src/registry.rs` | `register_builtin_components` |
+| Component data types and defaults | `engine/crates/scene/src/component.rs` | `Transform`, `MaterialSet`, `Camera`, `Rigidbody`, `Script` |
+| Entity creation and typed component access | `engine/crates/scene/src/scene.rs` | `Scene::create_entity`, `Scene::add_component`, `Scene::with_component` |
+| Built-in row set | `engine/crates/scene/src/registry.rs` | `register_builtin_components`, `BUILTIN_COMPONENT_NAMES` |
+| Registry macro | `engine/crates/scene/src/macros.rs` | `register_component!` |
 
 ## Related
-- [Component registry](../component-registry/) — how serde is attached to these structs
-- [Transforms](../transform-and-matrices/) — the transform's matrix composition
-- [Light components](../../lighting-and-brdf/light-components/) — how lights reach the GPU
+
+- [Component registry](../component-registry/)
+- [Transforms](../transform-and-matrices/)
+- [Scene hierarchy](../scene-hierarchy/)
+- [Light components](../../lighting-and-brdf/light-components/)
