@@ -26,7 +26,6 @@ pub enum ShellRequest {
 pub enum WindowAction {
     Minimize,
     ToggleMaximize,
-    StartDrag,
     /// Begin an interactive resize from the grabbed edge/corner (the frontend's window-frame strips).
     StartResize(ResizeEdge),
     /// Grab/release the pointer for the RMB fly-cam (native cursor lock + hide; CEF OSR can't do DOM
@@ -86,7 +85,7 @@ pub struct ShellState {
     /// Raised by `window_close`; the main loop breaks its pump when set.
     pub exit_requested: AtomicBool,
     /// Per-view viewport geometry the lifecycle commands write and the present loop reads.
-    pub viewports: crate::presenter::Viewports,
+    pub viewports: crate::viewport::Viewports,
     /// The Asset Store connector runtime (registry + resource cache + live search sessions).
     pub connectors: crate::connectors::ConnectorRuntime,
 }
@@ -103,7 +102,7 @@ impl Default for ShellState {
             window: Arc::default(),
             inbox: Mutex::new(Vec::new()),
             exit_requested: AtomicBool::new(false),
-            viewports: crate::presenter::Viewports::default(),
+            viewports: crate::viewport::Viewports::default(),
             connectors: crate::connectors::ConnectorRuntime::new(),
         }
     }
@@ -159,17 +158,26 @@ impl ShellState {
     }
 }
 
-/// Per-PID socket in `XDG_RUNTIME_DIR` so two editor instances get distinct engines/sockets.
+/// Per-PID socket in the backend's runtime dir so two editor instances get distinct
+/// engines/sockets.
 pub fn socket_path() -> String {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{dir}/saffron-editor-{}.sock", std::process::id())
+    crate::backend::env::runtime_socket_dir()
+        .join(format!("saffron-editor-{}.sock", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
 }
 
-/// Per-PID, per-view shm segment the engine publishes that view's viewport frames into. The token
-/// MUST be the engine's wire name ("scene" / "assetPreview"). Consumed by the Phase-6 engine spawn.
-#[allow(dead_code)]
+/// Per-PID, per-view shm segment the engine publishes that view's viewport frames into. The name
+/// is opaque end-to-end (the engine reads it from `SAFFRON_VIEWPORT_SHM_*` env, never parses it);
+/// the two-letter view code keeps it within macOS's ~31-char `shm_open` name limit while staying
+/// unique per view + PID. `view` is the engine wire token ("scene" / "assetPreview").
 pub fn viewport_shm_name(view: &str) -> String {
-    format!("/saffron-viewport-{}-{}", view, std::process::id())
+    let code = match view {
+        "scene" => "s",
+        "assetPreview" => "a",
+        other => &other[..other.len().min(1)],
+    };
+    format!("/sfv-{}-{}", code, std::process::id())
 }
 
 const TRACE_PATH: &str = "/trace.perfetto-trace";
