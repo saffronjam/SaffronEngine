@@ -13,9 +13,9 @@
 use crate::control::{ControlError, control_request_with_params};
 use crate::engine;
 use crate::geometry::{app_data_dir, ensure_app_dirs, userdata_dir};
-use crate::presenter;
 use crate::settings;
 use crate::state::{ResizeEdge, ShellRequest, ShellState, WindowAction};
+use crate::viewport;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -86,10 +86,6 @@ pub fn dispatch(
         }
         "window_toggle_maximize" => {
             state.post(ShellRequest::Window(WindowAction::ToggleMaximize));
-            Ok(Value::Null)
-        }
-        "window_start_drag" => {
-            state.post(ShellRequest::Window(WindowAction::StartDrag));
             Ok(Value::Null)
         }
         "window_start_resize" => {
@@ -222,8 +218,8 @@ fn to_value<T: Serialize>(value: &T) -> Result<Value, ControlError> {
 }
 
 /// Resolve a wire view token (`scene` / `assetPreview`) to a `View`, rejecting anything else.
-fn viewport_view(view: &str) -> Result<presenter::View, ControlError> {
-    presenter::View::from_wire(view)
+fn viewport_view(view: &str) -> Result<viewport::View, ControlError> {
+    viewport::View::from_wire(view)
         .ok_or_else(|| ControlError::from(format!("unknown viewport view '{view}'")))
 }
 
