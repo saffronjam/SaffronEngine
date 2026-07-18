@@ -6,63 +6,164 @@ math = false
 
 # Export a standalone app
 
-Turn the open project into a folder you can hand to someone who does not have the editor: a
-`saffron-player` runtime binary plus your cooked project data. It is the *template + data* split
-Godot and Unreal use — a precompiled runtime beside packed content — so the shipped app needs no
-editor, no control plane, and no shader toolchain (`slangc`). v1 targets Linux (x86_64) and stages
-loose files (no single-file packing yet).
+Export the loaded project as a Linux x86_64 folder containing `saffron-player`, the saved project,
+runtime data, and pre-baked material shaders.
 
-## What you get
+## Prerequisites
 
-```text
-MyApp/
-  saffron-player          the runtime binary
-  app.json  project.json  the manifest + the cooked project
-  assets/  src/  shaders/  cooked assets (incl. pre-baked material SPIR-V), Luau scripts, engine shaders
-```
+- A Linux x86_64 build environment with `just`, the `saffron-build` toolbox, and `jq`.
+- A running host that `sa` can reach.
+- A loaded project with a primary camera.
+- A new or empty destination directory. Export copies into the destination without removing stale files.
 
-Run it with `./MyApp/saffron-player`: it loads the `project.json` beside itself, opens a window, and
-runs the scene live — animation, physics, and scripts — through the same runtime the editor's play
-mode uses.
+The target machine needs a Vulkan-capable driver and the window-system libraries required by the
+player. The export bundles `libc++.so.1` and `libc++abi.so.1` beside the binary.
 
-## In the editor
+## Steps
 
-1. Save the project — export stages the saved `project.json`.
-2. Open the project menu (top-left) ▸ **Export App…**.
-3. Set the **App title**, pick an **Output folder**, set the window **Width × Height**, and toggle
-   **Start fullscreen** / **VSync**.
-4. Click **Export**. The engine pre-bakes the materials, copies the player + data, and writes
-   `app.json`. A toast reports the staged path (and any non-fatal warnings).
+1. Build the workspace and engine shaders so `saffron-player` and `shaders/` exist beside the host
+   binary:
 
-## From the CLI
+   ```sh
+   just engine
+   ```
 
-The same cook is scriptable against a running engine over the [`sa` CLI](../drive-the-editor-from-the-cli/):
+   Expected output ends with a successful workspace build and shader compilation. Keep the host and
+   player in the same Cargo target directory when starting the engine.
 
-```sh
-sa export ~/MyApp --title "My App" --width 1280 --height 720
-sa export ~/MyApp --fullscreen --no-vsync   # omitted flags fall back to defaults
-```
+2. Save the active project:
 
-`sa export <dir>` invokes the same `export-app` command the editor's dialog does.
+   ```sh
+   sa -o json save-project
+   ```
 
-## What the cook does
+   Export copies the `project.json` on disk, so this step is required after scene or project changes.
 
-- **Pre-bakes material shaders.** Each material's node graph compiles to SPIR-V *now*, into the
-  staged `assets/`, so the player loads `.spv` and never runs `slangc`. (See
-  [node-graph codegen](../../explanations/materials-and-pipelines/node-graph-codegen/).)
-- **Stages the runtime + data.** The `saffron-player` binary and the engine `shaders/` (both built
-  beside the host), plus the project's `project.json`, `assets/`, and `src/`.
-- **Writes `app.json`** from your settings — the manifest the player reads at startup.
+3. Export to the destination directory:
 
-## v1 limits
+   ```sh
+   sa -o json export "$HOME/MyApp" \
+     --title "My App" \
+     --width 1280 \
+     --height 720 \
+     > /tmp/saffron-export.json
+   ```
 
-Linux x86_64 only; loose-folder staging (no single-file pack); the whole asset catalog is copied
-(no dead-asset stripping); and `fullscreen` / `vsync` are recorded in `app.json` but not yet applied
-by the player's window backend (it presents windowed, FIFO/vsync-on).
+   Omitted options use title `Saffron App`, size `1280x720`, windowed mode, and VSync enabled. Add
+   `--fullscreen` or `--no-vsync` to write those values to `app.json`.
+
+4. Inspect the export result:
+
+   ```sh
+   jq . /tmp/saffron-export.json
+   ```
+
+   A complete export reports the destination and an empty warning list:
+
+   ```json
+   {
+     "path": "/home/user/MyApp",
+     "warnings": []
+   }
+   ```
+
+   Resolve every warning before distributing the folder. Warnings identify failed material shader
+   bakes or missing player, shader directory, or C++ runtime libraries.
+
+5. Check the staged files:
+
+   ```sh
+   APP_DIR="$HOME/MyApp"
+   test -x "$APP_DIR/saffron-player"
+   test -f "$APP_DIR/app.json"
+   test -f "$APP_DIR/project.json"
+   test -f "$APP_DIR/libc++.so.1"
+   test -f "$APP_DIR/libc++abi.so.1"
+   test -d "$APP_DIR/assets"
+   test -d "$APP_DIR/shaders"
+   ```
+
+   A project with scripts also contains `src/`.
+
+6. Confirm the runtime manifest:
+
+   ```sh
+   jq '{title, width, height, fullscreen, vsync}' "$APP_DIR/app.json"
+   ```
+
+   For the command above, expect:
+
+   ```json
+   {
+     "title": "My App",
+     "width": 1280,
+     "height": 720,
+     "fullscreen": false,
+     "vsync": true
+   }
+   ```
+
+7. Check the binary's dynamic library resolution:
+
+   ```sh
+   ldd "$APP_DIR/saffron-player"
+   ```
+
+   The output must not contain `not found`. The bundled C++ libraries should resolve from the export
+   directory through the player's `$ORIGIN` runtime path.
+
+## Verify
+
+1. Run the exported application without the editor or host:
+
+   ```sh
+   "$APP_DIR/saffron-player"
+   ```
+
+2. Confirm that the configured window opens and the primary camera renders the scene.
+
+3. Exercise animation, physics, keyboard and mouse input, and Luau behavior used by the project.
+
+4. Close the player and confirm it exits without Vulkan validation or asset-load errors in the log.
+
+The player applies the manifest title, width, and height. A requested fullscreen mode is logged but the
+window remains windowed. `vsync: false` is also logged while presentation continues in FIFO mode.
+
+## Export from the editor
+
+1. Save the project.
+2. Open the project menu and choose **Export App**.
+3. Enter the app title, choose a parent directory, and set the window dimensions and options.
+4. Select **Export**.
+5. Resolve every `Export warning` notification, then perform the file and runtime checks above.
+
+The editor creates a sanitized child folder below the chosen parent directory. The CLI uses the exact
+destination passed to `sa export`.
+
+## What export stages
+
+Material node graphs that require generated shader code are compiled to mesh SPIR-V in the project
+assets before copying. Factor-only materials and graphs that lower entirely to material parameters do
+not require generated shaders. The player loads the staged SPIR-V and does not invoke `slangc`.
+
+The output includes the full project asset directory, saved `project.json`, optional `src/`, engine
+`shaders/`, player binary, C++ runtime libraries, and `app.json`. The exporter does not remove unused
+catalog assets. `saffron-player` loads the project beside its executable and advances the shared
+`RuntimeSession` for animation, physics, contacts, and scripts.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The export cook + staging | `engine/crates/control/src/commands_asset.rs` | `export-app` handler · `export_app` |
-| The standalone runtime | `engine/crates/player/src/main.rs` | `saffron-player` · `PlayerLayer` |
-| The shared play spine the player runs | `engine/crates/runtime/src/session.rs` | `RuntimeSession` |
-| The app manifest | `engine/crates/protocol/src/dto.rs` | `AppManifest` · `ExportAppParams` |
+| Export cook and staging | `control/src/commands_asset.rs` | `export_app`, `find_runtime_lib`, `copy_file`, `copy_dir_recursive` |
+| Typed CLI command | `sa/src/main.rs` | `Subcmd::Export`, `export` |
+| App manifest and result | `protocol/src/dto.rs` | `AppManifest`, `ExportAppParams`, `ExportAppResult` |
+| Standalone startup | `player/src/main.rs` | `main`, `resolve_project_dir`, `load_manifest`, `PlayerLayer` |
+| Shared simulation | `runtime/src/session.rs` | `RuntimeSession`, `start`, `advance`, `stop_scripts` |
+| Export dialog | `editor/src/app/ExportModal.tsx` | `ExportModal`, `sanitizeFolderName` |
+
+## Related
+
+- [Drive the editor from the CLI](../drive-the-editor-from-the-cli/)
+- [Node-graph code generation](../../explanations/materials-and-pipelines/node-graph-codegen/)
+- [Script components and the play runtime](../../explanations/scripting/script-components-and-runtime/)

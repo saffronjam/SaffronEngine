@@ -6,49 +6,72 @@ math = false
 
 # Author a material graph
 
-Build a material's surface from a node graph — the way Unreal's material editor works — and watch a
-preview sphere update as you wire it. For *how* a graph becomes a shader, see
-[node-graph codegen](../../explanations/materials-and-pipelines/node-graph-codegen/).
+Create a material, build a procedural base-color graph, and verify it on the live preview sphere.
 
-## In the editor
+## Prerequisites
 
-1. Open the **Material** tool in the right sidebar. Pick a material from the dropdown, or click **New**.
-2. Click **Graph**. A full-screen node canvas opens over a live preview sphere.
-3. Add nodes from the left palette, grouped **input** (`Constant`, `Texture Slot`, `UV`), **math**
-   (`Multiply`, `Add`, `Lerp`, `Saturate`, `Frac`, `Sin`, …), and **output** (`Material Output`).
-4. Drag from a node's right (output) handle to another node's left (input) handle to wire them. Edit a
-   `Constant`'s four values or a `Texture Slot`'s slot inline on the node.
-5. Wire your result into **Material Output**'s `baseColor` (or `metallic`/`roughness`/`emissive`). Edits
-   **auto-apply** (debounced) and re-render the preview — the surface morphs as you work.
-6. **Compile** forces shader codegen for a procedural graph; **Close** returns to the panel.
+- Run the editor with a project open.
+- Show the **Material** panel in the right dock.
+- Keep the viewport visible so the asset-preview surface can render.
 
-A graph that is only constants and textures feeding the output **folds to params** and draws on the
-shared übershader — no compile. A graph with math or procedural nodes **codegens** a per-material shader
-that renders on the preview *and* on any entity the material is assigned to.
+## Build the graph
 
-## From the CLI
+1. Open the **Material** panel and click **New**. The material selector changes to **Material**, and a preview sphere appears.
 
-The same operations are scriptable over the [`sa` CLI](../drive-the-editor-from-the-cli/):
+2. Click **Graph**. A **Material graph** main tab opens with a node canvas and a live **Preview** pane.
+
+3. Right-click an empty part of the canvas and add these nodes from the context menu:
+
+   - **Input > Constant**
+   - **Input > Texture Slot**
+   - **Math > Multiply**
+   - **Output > Material Output**
+
+4. Set the **Constant** value to `[0.6, 0.3, 0.1, 1.0]`. Leave **Texture Slot** set to `albedo`.
+
+5. Connect the pins in this order:
+
+   - **Constant rgba** to **Multiply a**
+   - **Texture Slot rgba** to **Multiply b**
+   - **Multiply rgba** to **Material Output baseColor**
+
+   After the 500 ms apply delay, the toolbar reports `applied (codegen)`. The preview sphere updates with the graph output.
+
+6. Click **Compile**. The toolbar reports `compiled OK`. A notification and `compile failed` status indicate a shader compiler error instead.
+
+7. Close the **Material graph** main tab, select the same material again, and click **Graph**. The four nodes and their connections reappear.
+
+## CLI equivalent
+
+The same graph can be written through [`sa`](../drive-the-editor-from-the-cli/). Run these commands while the editor project is open:
 
 ```sh
-sa material-create --name Rock
-sa material-set-graph --material Rock \
-  --graph '{"nodes":[{"id":"c","type":"constant","props":{"value":[0.6,0.3,0.1,1]}},
-                     {"id":"t","type":"textureSlot","props":{"slot":"albedo"}},
-                     {"id":"m","type":"multiply"},{"id":"out","type":"materialOutput"}],
-            "edges":[{"from":["c","rgba"],"to":["m","a"]},
-                     {"from":["t","rgba"],"to":["m","b"]},
-                     {"from":["m","rgba"],"to":["out","baseColor"]}]}'
-sa material-compile-graph --material Rock   # force codegen; { ok: true }
-sa material-assign --entity 12345 --material Rock
-sa material-cook                            # bake every codegen variant to disk
+material_id="$(sa -o json material-create --name Rock | jq -r .id)"
+echo "$material_id"
+# 1844674407370955161
+
+graph='{"nodes":[{"id":"c","type":"constant","props":{"value":[0.6,0.3,0.1,1]}},{"id":"t","type":"textureSlot","props":{"slot":"albedo"}},{"id":"m","type":"multiply"},{"id":"out","type":"materialOutput"}],"edges":[{"from":["c","rgba"],"to":["m","a"]},{"from":["t","rgba"],"to":["m","b"]},{"from":["m","rgba"],"to":["out","baseColor"]}]}'
+
+sa -o json material-set-graph --material "$material_id" --graph "$graph"
+# {"id":"1844674407370955161","foldable":false}
+
+sa -o json material-compile-graph --material "$material_id"
+# {"id":"1844674407370955161","ok":true}
 ```
 
-`material-set-graph` reports `foldable` (whether it avoided codegen). `material-cook` precompiles every
-codegen material's übershader variant — run it after editing `mesh.slang` or before shipping.
+The displayed ID varies by project. A graph containing the **Multiply** node reports `foldable: false`; a graph made only from foldable constants or texture assets can report `true`.
+
+## Verify
+
+Confirm all of the following:
+
+- the graph toolbar reports `compiled OK`;
+- reopening the graph restores its nodes and edges;
+- the preview sphere shows the multiplied base color;
+- the CLI form reports `foldable: false` and `ok: true` when used.
 
 ## Related
 
-- [Node-graph codegen](../../explanations/materials-and-pipelines/node-graph-codegen/) — fold vs codegen, the emitter, slangc
-- [Native materials](../../explanations/materials-and-pipelines/native-materials/) — the `.smat` asset the graph lives on
-- [Drive the editor from the CLI](../drive-the-editor-from-the-cli/) — the `sa` command basics
+- [Node-graph codegen](../../explanations/materials-and-pipelines/node-graph-codegen/) — graph folding, Slang emission, and compilation
+- [Native materials](../../explanations/materials-and-pipelines/native-materials/) — the `.smat` asset that stores the graph
+- [Material graph live preview](../../explanations/ui-and-editor/material-graph-live-preview/) — the preview surface and editor state flow

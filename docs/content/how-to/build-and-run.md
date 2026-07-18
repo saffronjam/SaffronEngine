@@ -6,79 +6,110 @@ math = false
 
 # Build and run
 
-Build the Rust engine host and the CEF editor shell, then run both.
+Build the Rust workspace and shaders, run a bounded host smoke test, then launch the CEF editor.
 
-The editor is a CEF/React app that drives the engine over the control socket. The engine is the Rust `saffron-host` binary — a headless, present-only viewport host built from the Cargo workspace in `engine/`. `just` is the task runner; its recipes auto-enter the `saffron-build` toolbox when run from a host shell, so the same `just engine` works on the Silverblue host or inside the container. The home directory is shared into the toolbox, which carries the Rust toolchain, the Vulkan SDK, SDL3, Slang, and the host's `bun` on PATH.
+## Prerequisites
 
-## Build the engine host
+- Run every command from the repository root.
+- Install `just` and Bun.
+- On Linux, create the `saffron-build` toolbox. The recipes enter it automatically and use its Rust, Vulkan, SDL3, and Slang tools.
+- On macOS, install the Rust 1.96 toolchain selected by `rust-toolchain.toml` and a Vulkan loader with MoltenVK.
+- Use a Wayland desktop session on Linux when launching the editor.
 
-`just engine` builds the workspace and compiles the shaders next to the host binary. The shell spawns that binary on launch, so build it first.
-
-```sh
-just engine
-```
-
-That runs `cargo build --workspace` then `cargo run -p xtask -- shaders` inside the toolbox. To use the host toolchain directly instead of the container, set `SAFFRON_NO_TOOLBOX=true`:
+On macOS, provision the pinned CEF 149.0.6 distribution once:
 
 ```sh
-SAFFRON_NO_TOOLBOX=true just engine
+cargo install export-cef-dir
+export-cef-dir --version 149.0.6 "$HOME/.local/share/cef/149.0.6"
 ```
 
-You can also drive the underlying commands by hand:
+The second command creates `$HOME/.local/share/cef/149.0.6/Chromium Embedded Framework.framework`.
 
-```sh
-toolbox run -c saffron-build bash -lc '
-  cd /var/home/saffronjam/repos/saffron-anima/engine
-  cargo build --workspace
-  cargo run -p xtask -- shaders'
-```
+## Steps
 
-To run the host on its own — useful for a headless check or for driving it from the `sa` CLI without the editor — use `just run-engine`, which loads a default content project so the viewport shows a scene:
+1. Confirm that the repository recipes are available:
 
-```sh
-just run-engine
-```
+   ```sh
+   just help
+   # Available recipes:
+   #     engine
+   #     editor
+   #     run
+   #     run-engine-headless frames="5"
+   ```
 
-## Run the CEF editor shell
+2. Build the Cargo workspace and compile the Slang shaders:
 
-`just run` starts the editor, which spawns the `saffron-host` binary as a native child and composites its frames under the webview. Build the host first.
+   ```sh
+   just engine
+   # Finished `dev` profile ...
+   # xtask shaders: <compiled> compiled, <cached> up to date, ... -> .../target/debug/shaders
+   ```
 
-```sh
-just run
-```
+   Check the runtime artifacts:
 
-The editor resolves its engine binary from `SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`. The dev launch needs a Wayland session because the viewport presents on a `wl_subsurface`; use a real desktop session.
+   ```sh
+   test -x engine/target/debug/saffron-host \
+     && test -x engine/target/debug/sa \
+     && test -s engine/target/debug/shaders/triangle.spv \
+     && echo 'engine artifacts OK'
+   # engine artifacts OK
+   ```
 
-To build and typecheck the frontend on its own, `just editor` runs `bun run build`, which regenerates `editor/src/protocol/` from the [control schemas](../../explanations/tooling-and-control/shared-types/) via `xtask gen-protocol` and then runs `tsc` + `vite build`.
+3. Run the host for five offscreen frames. This smoke test uses a no-surface renderer and exits on its own:
+
+   ```sh
+   just run-engine-headless 5 && echo 'headless host OK'
+   # ... vulkan ready - gpu '<device>' (<type>)
+   # headless host OK
+   ```
+
+4. Generate the editor protocol types, typecheck TypeScript, and build the Vite frontend:
+
+   ```sh
+   just editor
+   # ... built in <time>
+   ```
+
+   A successful command leaves `editor/dist/index.html`:
+
+   ```sh
+   test -s editor/dist/index.html && echo 'editor frontend OK'
+   # editor frontend OK
+   ```
+
+5. Launch the complete editor:
+
+   ```sh
+   just run
+   ```
+
+   The recipe rebuilds `saffron-host` and its shaders, builds the CEF shell, starts Vite on `127.0.0.1:1420`, and launches the native shell. The shell then starts the host as its child.
+
+6. Keep `just run` open and verify the control socket from a second terminal:
+
+   ```sh
+   just sa ping
+   # pong  engine=SaffronAnima  version=<version>  pid=<pid>
+   ```
 
 ## Verify
 
-- **Engine host alone**: the viewport presents the scene; drive it with the `sa` CLI over its control socket.
-- **CEF editor shell**: the shell opens with the Hierarchy / tabbed Inspector·Environment·Stats / Assets / Viewport dock; a "Preparing renderer…" overlay clears once the embedded scene attaches.
-- **Headless check**: with no display attached, `just run-engine-headless` boots the host under a private headless `weston`, bounded to a few frames:
-  ```sh
-  just run-engine-headless 5
-  ```
-  It sets `SAFFRON_EXIT_AFTER_FRAMES=5` and a per-run `SAFFRON_CONTROL_SOCK`. `SAFFRON_EXIT_AFTER_FRAMES=N` exits after `N` frames; the offscreen image is captured over the control plane via the screenshot command (`capture_viewport`).
+The editor window should show the **Hierarchy**, **Inspector**, **Assets**, and **Viewport** panels. The **Preparing renderer...** overlay disappears after the host attaches, and `just sa ping` returns exit status 0.
 
-> [!NOTE]
-> The CEF editor shell is the only editor. Undo/redo, multi-viewport, and native Wayland are non-goals for now.
+Run the full project gate when the smoke checks pass:
 
-## In the code
+```sh
+just check
+# ...
+# ALL GATES PASSED
+```
 
-| What | File | Symbols |
-|---|---|---|
-| Task runner + toolbox auto-enter | `justfile` | `engine`, `run`, `run-engine-headless` |
-| Host entry point | `engine/crates/host/src/main.rs` | `main`, `saffron_host::run_host` |
-| The loop + frame limit | `engine/crates/app/src/lib.rs` | `run`, `frame_limit_from_env` |
-| Shader + protocol build steps | `engine/xtask/src/main.rs` | `run_shaders`, `run_gen_protocol` |
-| Viewport screenshot | `engine/crates/rendering/src/renderer.rs` | `Renderer::capture_viewport` |
-| Frontend scripts | `editor/package.json` | `dev`, `check`, `gen:protocol` |
+`just check` runs the workspace build, shader pipeline, tests, present-only smoke, schema contract, project checks, end-to-end suite, frontend build, and lint gate.
 
 ## Related
 
-- [Editor shell and the viewport bridge](../../explanations/ui-and-editor/editor-shell-and-viewport-bridge/) — how the editor drives the host
-- [Main loop](../../explanations/app-lifecycle-and-window/main-loop-and-run/)
-- [Headless runs and capture](../../explanations/app-lifecycle-and-window/headless-and-capture/)
-</content>
-</invoke>
+- [Build environment](../../explanations/architecture-and-conventions/build-environment/) — toolbox entry, task recipes, and the project gate
+- [Shader compilation](../../explanations/architecture-and-conventions/shader-compilation/) — Slang inputs and runtime SPIR-V outputs
+- [Editor shell and viewport bridge](../../explanations/ui-and-editor/editor-shell-and-viewport-bridge/) — the shell, host child, and CEF composition
+- [Headless runs and capture](../../explanations/app-lifecycle-and-window/headless-and-capture/) — offscreen host mode and bounded frames

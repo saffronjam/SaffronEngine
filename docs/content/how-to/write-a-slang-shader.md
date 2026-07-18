@@ -6,43 +6,99 @@ math = false
 
 # Write a Slang shader
 
-Add a `.slang` file, have the `xtask` shader pipeline compile it to SPIR-V, and load it at runtime.
+Add a [Slang](https://shader-slang.org/) vertex/fragment module and compile it into the runtime shader directory.
+
+## Prerequisites
+
+- Run commands from the repository root.
+- Complete [Build and run](../build-and-run/) so the `saffron-build` toolbox or macOS Slang toolchain is available.
+- Use the debug Cargo profile for this procedure.
 
 ## Steps
 
-1. Drop a `.slang` into `engine/assets/shaders/`. Tag entry points with `[shader("vertex")]`, `[shader("fragment")]`, or `[shader("compute")]`; all tagged entry points land in one SPIR-V module. Use `mesh.slang` as a reference for binding layout: set 0 bindless albedo, set 1 lighting, push-constant camera.
-2. Run the shader pipeline. It scans every `*.slang` under `engine/assets/shaders/` and compiles each to `<name>.spv` next to the host binary:
-   ```sh
-   toolbox run -c saffron-build bash -lc '
-     cd /var/home/saffronjam/repos/saffron-anima/engine && cargo run -p xtask -- shaders'
+1. Create `engine/assets/shaders/diagnostic_triangle.slang` with two tagged entry points:
+
+   ```hlsl
+   struct VertexOutput
+   {
+       float4 position : SV_Position;
+       float3 color : COLOR0;
+   };
+
+   [shader("vertex")]
+   VertexOutput vertexMain(uint vertexId : SV_VertexID)
+   {
+       float2 positions[3] = {
+           float2(0.0, -0.5),
+           float2(0.5, 0.5),
+           float2(-0.5, 0.5),
+       };
+       float3 colors[3] = {
+           float3(1.0, 0.0, 0.0),
+           float3(0.0, 1.0, 0.0),
+           float3(0.0, 0.0, 1.0),
+       };
+
+       VertexOutput output;
+       output.position = float4(positions[vertexId], 0.0, 1.0);
+       output.color = colors[vertexId];
+       return output;
+   }
+
+   [shader("fragment")]
+   float4 fragmentMain(VertexOutput input) : SV_Target
+   {
+       return float4(input.color, 1.0);
+   }
    ```
-   `xtask shaders` compiles each entry-point shader with `slangc <shader>.slang -profile glsl_450 -target spirv -emit-spirv-directly -fvk-use-entrypoint-name -matrix-layout-column-major -I <shader_dir> -o <out>`. The shared `lighting.slang` is precompiled once to `lighting.slang-module` (`slangc … -emit-ir`, no `.spv`) and every other shader `import lighting` against it. Staleness is mtime-tracked, so a re-run recompiles nothing untouched.
-3. The full engine build runs the same pipeline after the Cargo build, so a plain build picks up the new file too:
+
+2. Run the shader pipeline:
+
    ```sh
-   toolbox run -c saffron-build bash -lc '
-     cd /var/home/saffronjam/repos/saffron-anima/engine && cargo build --workspace && cargo run -p xtask -- shaders'
+   just shaders
+   # xtask shaders: using slangc <path>
+   # xtask shaders: <compiled> compiled, <cached> up to date, ... -> .../target/debug/shaders
    ```
-   (`just engine` wraps both steps.)
-4. Reference the `.spv` by its runtime-relative path when building a pipeline. A `Material` names its shader (default `"shaders/mesh.spv"`); the renderer loads it via `load_shader_module(...)` and caches the PSO with `request_mesh_pipeline`.
+
+   The command scans `engine/assets/shaders/*.slang`, preserves the entry-point names, and writes one SPIR-V module per entry-point source file.
+
+3. Verify that the compiler staged both the binary and the source copy:
+
+   ```sh
+   test -s engine/target/debug/shaders/diagnostic_triangle.spv \
+     && cmp -s \
+       engine/assets/shaders/diagnostic_triangle.slang \
+       engine/target/debug/shaders/diagnostic_triangle.slang \
+     && echo 'shader outputs OK'
+   # shader outputs OK
+   ```
+
+4. Run the pipeline again without editing the source:
+
+   ```sh
+   just shaders
+   # xtask shaders: 0 compiled, <cached> up to date, lighting module up to date -> .../target/debug/shaders
+   ```
+
+   A nonzero compile count on the second run means a source or shared-module dependency changed between runs.
+
+5. Run the complete engine build to confirm the same module survives the normal build path:
+
+   ```sh
+   just engine
+   test -s engine/target/debug/shaders/diagnostic_triangle.spv \
+     && echo 'engine shader stage OK'
+   # engine shader stage OK
+   ```
 
 ## Verify
 
-- The run prints `xtask shaders: N compiled, …`, and the new `<name>.slang -> <name>.spv` is among them on the first run.
-- The compiled module lands at `engine/target/debug/shaders/<name>.spv` (the `release` profile lands under `engine/target/release/shaders/`).
-- A pipeline using it builds without a `load_shader_module` error, and `sa render-stats` reports the `pipelines` count growing as a new PSO is cached.
+The task is complete when both output checks print `OK` and the immediate no-change `just shaders` run reports `0 compiled`.
 
-## In the code
-
-| What | File | Symbols |
-|---|---|---|
-| The shader scan + slangc invocation | `engine/xtask/src/shaders.rs` | `run`, `compile_spv`, `SLANGC_SPV_FLAGS`, `Config::resolve` |
-| The `xtask shaders` task | `engine/xtask/src/main.rs` | `run_shaders` |
-| Reference shader | `engine/assets/shaders/mesh.slang` | `[shader(...)]` entry points, set/binding layout |
-| Load + cache the PSO | `engine/crates/rendering/src/pipelines.rs` | `load_shader_module`, `request_mesh_pipeline` |
-| Material → shader path | `engine/crates/rendering/src/gpu_types.rs` | `Material::shader` (`"shaders/mesh.spv"`) |
+Compiling a module does not schedule it for rendering. A render pass must create a compatible pipeline, bind every declared resource, and name `vertexMain` and `fragmentMain` as its entry points. Follow the [render graph API](../../reference/render-graph-api/) and [material and PSO selection](../../explanations/materials-and-pipelines/material-and-pso-selection/) before connecting a custom module to a frame.
 
 ## Related
 
-- [Material and PSO selection](../../explanations/materials-and-pipelines/material-and-pso-selection/)
-- [Übershader and specialization](../../explanations/materials-and-pipelines/ubershader-and-specialization/)
-- [Descriptor sets](../../explanations/materials-and-pipelines/descriptor-sets/)
+- [Shader compilation](../../explanations/architecture-and-conventions/shader-compilation/) — flags, shared modules, staleness, and profile directories
+- [Shader descriptor sets](../../reference/shader-descriptor-sets/) — binding layouts used by engine pipelines
+- [Ubershader and specialization](../../explanations/materials-and-pipelines/ubershader-and-specialization/) — the mesh shader entry-point contract

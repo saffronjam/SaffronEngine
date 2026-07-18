@@ -6,69 +6,99 @@ math = false
 
 # Import a model
 
-Bring a glTF or OBJ model into the project. Importing **bakes** the source into one
-[`.smodel` container](../../explanations/geometry-and-assets/smodel-container/) asset — the mesh,
-materials, textures, and animations as chunks of a single file — and adds the catalog rows. It does
-not spawn an entity: placing the model in the scene is a separate, repeatable step, so one import
-becomes many instances.
+Import the repository's cube glTF into an open project, instantiate it in the scene, and verify the baked `.smodel` container.
 
-You need an active project first. The editor startup modal creates or opens one, and tests can
-select one with `SAFFRON_PROJECT=<project-name>`.
+## Prerequisites
 
-## Import (bake the asset)
+- Run the editor with a project open and stay in Edit mode.
+- Run commands from the repository root with `sa` and `jq` available.
+- Build the engine so `engine/assets/models/cube.gltf` exists beside the shader assets.
 
-Any of these bakes one `.smodel` tile and nothing else:
+## Steps
 
-1. **Drag-and-drop** — drop a `.gltf` / `.glb` / `.obj` onto the editor window.
-2. **File ▸ Import** — the editor menu.
-3. **From the CLI**:
+1. Confirm the source model is present:
+
    ```sh
-   sa import-model /path/to/model.gltf
+   test -s engine/assets/models/cube.gltf && echo 'source model OK'
+   # source model OK
    ```
 
-To import a standalone texture (a loose texture asset, e.g. to assign to a material later):
-```sh
-sa import-texture /path/to/albedo.png
-```
+2. Import the glTF and capture the new model asset ID:
 
-## Place it in the scene
-
-The baked model is a catalog asset; instantiate it to add entities:
-
-1. **Drag the model tile onto the viewport** (or onto the Hierarchy) — instantiates it into the scene.
-2. **Right-click the tile ▸ Add to scene**.
-3. **From the CLI**:
    ```sh
-   sa instantiate-model <model-id-or-name>
+   import_reply="$(sa -o json import-model --path "$PWD/engine/assets/models/cube.gltf")"
+   echo "$import_reply" | jq '{id, name, type}'
+   # {"id":"...","name":"cube","type":"model"}
+
+   model_id="$(echo "$import_reply" | jq -r .id)"
    ```
 
-Each instantiate expands the container's stored hierarchy into fresh entities (the mesh, its
-materials, and — for a rig — its bones and a stopped `AnimationPlayer`), and the new root is selected.
+   The **Assets** panel adds one model tile. Importing updates the catalog but does not place an entity in the scene.
+
+3. Check the baked container metadata:
+
+   ```sh
+   sa -o json model-info --asset "$model_id" \
+     | jq '{name, nodeCount, materialCount, hasSkin, totalBytes}'
+   # {"name":"cube","nodeCount":1,"materialCount":1,"hasSkin":false,"totalBytes":...}
+   ```
+
+4. Read the container path from the catalog and verify the file on disk:
+
+   ```sh
+   model_path="$(sa -o json list-assets \
+     | jq -r --arg id "$model_id" '.assets[] | select(.id == $id) | .path')"
+   project_root="$(sa -o json get-project | jq -r .root)"
+
+   echo "$model_path"
+   # models/<model-id>.smodel
+
+   test -s "$project_root/assets/$model_path" && echo 'model container OK'
+   # model container OK
+   ```
+
+5. Instantiate the model with a stable scene name:
+
+   ```sh
+   root_id="$(sa -o json instantiate-model --asset "$model_id" --name ImportedCube | jq -r .id)"
+   sa -o json inspect --entity "$root_id" | jq '{name, componentOrder}'
+   # {"name":"ImportedCube","componentOrder":[...]}
+   ```
+
+   The new root appears in the **Hierarchy** and becomes the editor selection.
+
+6. Focus the viewport on the instance and save the project:
+
+   ```sh
+   sa -o json focus --entity "$root_id" | jq '{id, name}'
+   # {"id":"...","name":"ImportedCube"}
+
+   sa -o json save-project | jq '{loaded, name, path}'
+   # {"loaded":true,"name":"my-project","path":".../project.json"}
+   ```
 
 ## Verify
 
-- List the catalog: `sa list-assets` — the model appears as one `"type": "model"` row (its embedded
-  mesh/material/texture sub-assets link back to it by `container`).
-- Check the project folder: one `.smodel` under `assets/models`; no loose mesh or texture files for it.
-- The **Assets** panel shows one tile, its thumbnail the textured model.
-- After `instantiate-model` the new entity is selected. Screenshot it:
-  ```sh
-  sa screenshot viewport /tmp/import.png
-  ```
+Capture the viewport and confirm the instance and PNG exist:
 
-## In the code
+```sh
+sa -o json list-entities \
+  | jq -e '.entities | any(.name == "ImportedCube")' \
+  && echo 'scene instance OK'
+# true
+# scene instance OK
 
-| What | File | Symbols |
-|---|---|---|
-| `sa import-model` / `import-texture` / `instantiate-model` | `control/src/commands_asset.rs` | `import-model`, `import-texture`, `instantiate-model` |
-| Bake the `.smodel` | `assets/src/import.rs` | `import_model`, `bake_model` |
-| Import a loose texture | `assets/src/scan.rs` | `import_texture`, `register_texture_bytes` |
-| Place it in the scene | `assets/src/spawn.rs` | `instantiate_model`, `spawn_model`, `spawn_skinned_model` |
-| Catalog listing | `control/src/commands_asset.rs` | `list-assets` |
+sa -o json screenshot --target viewport --path /tmp/imported-cube.png
+# {"target":"viewport","path":"/tmp/imported-cube.png","pending":false}
+
+test -s /tmp/imported-cube.png && echo 'import screenshot OK'
+# import screenshot OK
+```
+
+For the editor-only path, click **Import** in the **Assets** panel, choose a glTF, GLB, OBJ, or SMESH file, then right-click its model tile and choose **Add to scene**.
 
 ## Related
 
-- [Import pipeline](../../explanations/geometry-and-assets/import-pipeline/)
-- [glTF and OBJ import](../../explanations/geometry-and-assets/gltf-and-obj-import/)
-- [Asset catalog](../../explanations/geometry-and-assets/asset-server-and-catalog/)
-- [Project files](../../explanations/geometry-and-assets/project-serialization/)
+- [Import pipeline](../../explanations/geometry-and-assets/import-pipeline/) — source parsing, baking, and catalog registration
+- [The .smodel container](../../explanations/geometry-and-assets/smodel-container/) — container chunks and sub-assets
+- [glTF and OBJ import](../../explanations/geometry-and-assets/gltf-and-obj-import/) — format mapping

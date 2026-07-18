@@ -6,55 +6,87 @@ math = false
 
 # Signals
 
-A signal is a list of subscribers that a publisher invokes. This page covers the signal/slot primitive in `saffron-signal` and the typed signals `saffron-window`'s `Window` exposes.
+`saffron-signal` provides the single-threaded publish-and-subscribe primitive used throughout Anima. `saffron-window` exposes typed instances for window lifecycle and input events.
 
-## `SubscriberList<Args>`
+## Subscriber list
 
-The engine-wide event list. A handler is any `FnMut(Args) -> bool`; returning `true` stops propagation to later subscribers. `publish` iterates a *snapshot* of the subscriber set, so a handler may subscribe or unsubscribe (itself included) mid-dispatch without disturbing the in-flight iteration. The list is single-thread (`!Send`) — every consumer dispatches on the main thread — and every method takes `&self` through interior mutability.
+`SubscriberList<Args>` stores handlers of type `FnMut(Args) -> bool`. A `false` return continues dispatch; `true` stops propagation before later subscribers run. Every method takes `&self` through interior mutability.
+
+| Member | Result |
+|---|---|
+| `SubscriberList::new()` | Creates an empty list. `Default` has the same result. |
+| `subscribe(handler) -> SubscriptionId` | Appends a handler and returns its removal token. |
+| `unsubscribe(id)` | Removes the matching handler. An unknown or inactive ID is a no-op. |
+| `publish(args)` | Calls handlers in subscription order until one returns `true`. Requires `Args: Clone + 'static`. |
+| `len()` | Returns the current handler count. |
+| `is_empty()` | Reports whether the list has no handlers. |
+
+`SubscriptionId(pub u64)` values start at `1`, increase for the lifetime of a list, and are not reused. The payload can be one value or a tuple such as `(u32, u32)`.
+
+```rust
+use saffron_signal::SubscriberList;
+
+let resized = SubscriberList::<(u32, u32)>::new();
+let subscription = resized.subscribe(|(width, height)| {
+    println!("{width}x{height}");
+    false
+});
+
+resized.publish((1280, 720));
+resized.unsubscribe(subscription);
+```
+
+### Dispatch behavior
+
+`publish` snapshots the subscription IDs before it begins and releases its internal borrow around each handler call. The resulting behavior is:
+
+| Change during dispatch | Current publish | Next publish |
+|---|---|---|
+| Subscribe a handler | The new handler does not run. | The new handler runs in order. |
+| Unsubscribe a later handler | The removed handler is skipped. | The removed handler stays absent. |
+| Unsubscribe the active handler | The active call finishes. | The handler stays absent. |
+
+Handlers and storage are not `Send`; publishers dispatch on the main thread.
+
+## Window signals
+
+`Window::dispatch_window_event` publishes `on_raw_event` first, then translates a [winit 0.30](https://docs.rs/winit/0.30/winit/) `WindowEvent` into the matching typed signal.
+
+| Signal | Payload | Source event and effect |
+|---|---|---|
+| `on_raw_event` | `WindowEvent` | Every event, before typed dispatch. |
+| `on_close` | `()` | `CloseRequested`; also sets the close latch. |
+| `on_resize` | `(u32, u32)` | `Resized`; updates the stored pixel width and height first. |
+| `on_key_pressed` | `(KeyCode, bool)` | A pressed `KeyboardInput`; the Boolean reports key repeat. |
+| `on_key_released` | `KeyCode` | A released `KeyboardInput`. |
+| `on_file_dropped` | `PathBuf` | `DroppedFile`. |
+
+`KeyCode` aliases `winit::keyboard::PhysicalKey`, so subscribers receive the physical key position rather than a layout-dependent character.
+
+## Window construction and state
+
+| Member | Result |
+|---|---|
+| `Window::new(&ActiveEventLoop, &WindowConfig) -> Result<Window>` | Creates a resizable OS window. An OS creation failure is `Error::Create`. |
+| `Window::headless()` | Creates a signal facade with no OS window and an initial size of `0x0`. |
+| `is_windowed()` | Reports whether an OS window exists. |
+| `width()` / `height()` | Return the current physical-pixel dimensions. |
+| `should_close()` | Returns the close latch. |
+| `request_close()` | Sets the close latch without publishing `on_close`. |
+| `winit_window()` | Returns the underlying winit window in windowed mode, or `None` in headless mode. |
+
+`WindowConfig` contains `title: String`, `width: u32`, `height: u32`, and `hidden: bool`. Its defaults are the literal title `"Saffron"`, `1600x900`, and `hidden: false`.
+
+Headless windows still accept `dispatch_window_event`, which makes the translation path testable without an active event loop. Their raw window and display handle implementations return `HandleError::NotSupported`.
+
+## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| The signal/slot list | `lib.rs` | `SubscriberList`, `SubscriptionId` |
-
-| Member | Effect |
-|---|---|
-| `subscribe(handler: impl FnMut(Args) -> bool + 'static) -> SubscriptionId` | append a handler, return its token |
-| `unsubscribe(id: SubscriptionId)` | remove the handler with that id (no-op if gone) |
-| `publish(args: Args)` | dispatch over a snapshot until a handler returns `true` (`Args: Clone`) |
-| `len() -> usize` / `is_empty() -> bool` | the live handler count |
-
-`SubscriptionId(pub u64)` is the subscription token; ids are monotonic and never reused for the life of the list. `Args` is the payload — a single value, or a tuple for several (`SubscriberList<(u32, u32)>`).
-
-## `Window` typed signals
-
-`Window` is a thin facade over `winit` 0.30 that translates each `WindowEvent` into typed signals. It holds the current pixel size, a `should_close` latch, and (when windowed) the underlying winit window. Two construction modes exist: `Window::new(event_loop, config)` builds a real OS window (the standalone present-only host), and `Window::headless()` builds the windowless facade the editor host takes — the signals are fully usable with no OS window behind them.
-
-| What | File | Symbols |
-|---|---|---|
-| The window facade and its signals | `lib.rs` | `Window`, `WindowConfig`, `Window::new`, `Window::headless`, `Window::dispatch_window_event` |
-
-| Signal | Type | Args | Fired on |
-|---|---|---|---|
-| `on_close` | `SubscriberList<()>` | — | `WindowEvent::CloseRequested` (also latches `should_close`) |
-| `on_resize` | `SubscriberList<(u32, u32)>` | width, height (pixels) | `WindowEvent::Resized` |
-| `on_key_pressed` | `SubscriberList<(KeyCode, bool)>` | keycode, is_repeat | `WindowEvent::KeyboardInput` pressed |
-| `on_key_released` | `SubscriberList<KeyCode>` | keycode | `WindowEvent::KeyboardInput` released |
-| `on_file_dropped` | `SubscriberList<std::path::PathBuf>` | dropped file path | `WindowEvent::DroppedFile` |
-| `on_raw_event` | `SubscriberList<WindowEvent>` | the raw winit event | every event, before typed dispatch (the gizmo/camera input feeds off this) |
-
-`KeyCode` is `winit::keyboard::PhysicalKey` — the location-stable physical key, exhaustively matchable downstream (`PhysicalKey::Code(KeyCode::Escape)`). `dispatch_window_event` publishes to `on_raw_event` first, then maps the event to the typed signals; it runs without a live event loop, so it is testable headless.
-
-## Window accessors and config
-
-| Symbol | Effect |
-|---|---|
-| `width() -> u32` / `height() -> u32` | current pixel size |
-| `should_close() -> bool` / `request_close()` | the close latch (read / set) |
-| `is_windowed() -> bool` | `true` on the standalone host path |
-| `winit_window() -> Option<&Window>` | the underlying winit window, when windowed |
-
-`WindowConfig` is `{ title: String, width: u32, height: u32, hidden: bool }`, defaulting to `"Saffron"`, 1600×900, not hidden. The `winit` event loop that drives `poll → on_update → … → present` lives in `saffron-host`; this crate provides the signals it publishes into.
+| Subscription storage and dispatch | `engine/crates/signal/src/lib.rs` | `SubscriberList`, `SubscriptionId` |
+| Window signals and event translation | `engine/crates/window/src/lib.rs` | `Window`, `Window::dispatch_window_event`, `KeyCode` |
+| Window configuration and construction | `engine/crates/window/src/lib.rs` | `WindowConfig`, `Window::new`, `Window::headless`, `Error`, `Result` |
 
 ## Related
 
-- [Window and events](../../explanations/app-lifecycle-and-window/window-and-events/) — how winit events become typed signals
+- [Window and events](../../explanations/app-lifecycle-and-window/window-and-events/)
