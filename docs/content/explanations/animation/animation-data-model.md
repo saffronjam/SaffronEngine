@@ -6,28 +6,29 @@ math = true
 
 # Animation data model
 
-An animation clip is a bundle of per-joint curves; sampling one at a time produces a *pose* —
-a local transform for every joint — that the skeleton then composes into world matrices. This
-page describes the three things that layer is built from: the clip/track keyframe model, the
-decomposed joint pose plus its blend layer, and the sampler that turns one into the other.
+An animation clip is a bundle of keyframe curves. Sampling every curve at one time yields a
+*pose*, a local transform for every joint, and the scene composes that pose into world
+matrices. This page covers the layer under playback: the clip/track keyframe model, the
+decomposed pose types with their blend primitives, and the samplers that evaluate a curve.
 
-These are pure data and pure math: no scene mutation, no GPU, no playback state. The `saffron-animation`
-crate is FFI-free and has no GPU concept — it consumes the clip types from `saffron-geometry`, reads
-and writes `saffron-scene` components, and emits a per-bone pose override. The runtime that advances a
-clip over time and writes the pose onto a rigged entity is a separate layer built on top of this one.
+Everything here is pure data and math with no playback state. The clip types live in
+`saffron-geometry` beside the mesh formats; the pose types, samplers, and pose algebra live in
+`saffron-animation`, an FFI-free crate whose only output toward rendering is a per-bone pose
+override that scene composition consumes. The evaluator that advances clips over time is the
+[playback runtime](../playback-runtime/).
 
 ## Clips, tracks, keyframes
 
-A clip mirrors a glTF animation faithfully and losslessly. glTF models an animation as a set of
-*channels*, each pairing a *sampler* (a keyframe curve: input times, output values, an
-interpolation mode) with a *target* (a node and one of its translation / rotation / scale
-properties). Anima's `AnimTrack` is exactly one such channel:
+A clip mirrors a [glTF 2.0](https://github.com/KhronosGroup/glTF/tree/main/specification/2.0)
+animation losslessly. glTF models an animation as a set of *channels*, each pairing a *sampler*
+(input times, output values, an interpolation mode) with a *target* (a node and one of its
+animatable properties). `AnimTrack` is exactly one such channel:
 
 ```rust
 pub struct AnimTrack {
     pub target: AnimTarget,     // Bone | Node — what the track drives
-    pub index: i32,             // stable bone index for a Bone track; -1 until resolved
-    pub target_name: String,    // the glTF node / morph target name — the durable binding key
+    pub index: i32,             // bone index for a Bone track; -1 for Node/Weights
+    pub target_name: String,    // the glTF node name — the durable binding key
     pub path: AnimPath,         // Translation | Rotation | Scale | Weights
     pub interp: AnimInterp,     // Step | Linear | CubicSpline
     pub morph_count: u32,       // weights per keyframe for a Weights track, else 0
@@ -36,30 +37,34 @@ pub struct AnimTrack {
 }
 ```
 
-One generalized track model carries all three channel kinds. `target` selects a skinned-mesh joint or
-a plain scene-graph node; `path = Weights` (with `morph_count` weights per keyframe) is a morph-weight
-channel. A track binds by **stable index plus name** (a `Bone` track) or by **durable name** (a `Node`
-or morph track), never by a live ECS handle (handles are a post-load cache rebuilt by the hierarchy
-relink and are not stable across a reload). The name is the durable key the importer or runtime resolves
-from, so a clip survives a reimport and — later — retargeting. The
-[node-TRS]({{< relref "node-trs-animation" >}}) and [morph-target]({{< relref "morph-targets" >}}) pages
-cover the node and weight kinds; this page's sampler math is shared by all three.
+One track model carries all three channel kinds. `target` selects a skinned-mesh joint or a
+plain scene-graph node, and `path = Weights` marks a morph-weight channel carrying
+`morph_count` weights per keyframe. A `Bone` track binds by stable bone index (resolved by
+name at import) plus the name itself; a `Node` or morph track binds by durable name alone and
+keeps `index = -1`. The [node-TRS](../node-trs-animation/) and
+[morph-target](../morph-targets/) pages cover the node and weight kinds.
 
-The `values` array is flat and its stride depends on the path and interpolation: a `Vec3` per key
-for translation and scale, a quaternion (`xyzw`) per key for rotation, and — for `CubicSpline` —
-three elements per key in the order *in-tangent, value, out-tangent*. An `AnimClip` is just a name,
-the list of tracks, and the duration (the maximum track end time).
+Entity handles never appear in a track. They are a post-load cache, not stable across a
+reload, so the durable name is the key that lets a clip survive a reimport that reorders
+joints.
 
-The clip types live in **`saffron-geometry`**, next to `Vertex` and `Mesh`, because Geometry owns
-the engine's mesh and file formats — the glTF walk that fills these tracks and the `.sanim` byte
-format (a `SANM` chunk in the `.smodel` container) that persists them belong there. `saffron-animation`
-only consumes them.
+The `values` array is flat, and its stride follows the path: a `Vec3` per key for translation
+and scale, a quaternion (`xyzw`) per key for rotation, `morph_count` floats per key for
+weights. `CubicSpline` triples the stride, storing *in-tangent, value, out-tangent* per key.
+An `AnimClip` is a name, the track list, and the duration (the maximum track end time).
 
-## The pose and the blend layer
+The clip types sit in `saffron-geometry` next to `Vertex` and `Mesh` because Geometry owns the
+engine's mesh and file formats: the glTF import fills the tracks, and the
+[`.sanim` byte format](../../geometry-and-assets/sanim-format/) (a `SANM` chunk in the
+`.smodel` container) persists them. The `AnimPath` / `AnimTarget` / `AnimInterp` discriminants
+are pinned `u8` values shared with that format; each `from_u8` maps a byte back through an
+explicit `match` and rejects anything out of range.
 
-A pose is the skeleton's transforms for one instant, kept *decomposed* — translation, rotation,
-scale held separately — because that is the form clips sample into and that blends cleanly
-(rotations slerp; a composed matrix does not):
+## Pose types
+
+A pose holds the skeleton's transforms for one instant, kept decomposed with translation,
+rotation, and scale as separate fields. That is the form clips sample into, and it blends
+cleanly — rotations slerp, where a composed matrix does not.
 
 ```rust
 pub struct JointPose {
@@ -67,70 +72,92 @@ pub struct JointPose {
     pub rotation: Quat,    // unit quaternion, glam xyzw order
     pub scale: Vec3,
 }
-
-pub struct PoseBuffer {
-    pub local: Vec<JointPose>,     // the sampled/animated TRS, one per joint
-    pub override_: Vec<JointPose>, // external producers (IK/physics) write here
-    pub weight: Vec<f32>,          // 0 = use local, 1 = use override_; per joint
-}
 ```
 
-`PoseBuffer` is indexed 1:1 with `SkinnedMesh.bones`. The `override_` and `weight` vectors are the
-**blend layer**: the seam later pose producers write through. The intended composition is
-`blend_joint(local[i], override_[i], weight[i])` with a slerp on the rotation, so a foot-IK solver
-or a powered ragdoll becomes *just another producer* writing `override_[i]` and raising `weight[i]`
-— no change to the sampling code. In v1 the `override_`/`weight` vectors stay empty/zero, so the
-layer is inert and the pose is pure animation, but the shape is fixed now so the physics-ahead path
-needs no rewrite. This is UE5's Physics Blend Weight model.
+`PoseBuffer` is the skeleton-sized container: its `local` vector holds one sampled `JointPose`
+per joint, indexed 1:1 with `SkinnedMesh.bones`. The evaluator seeds it with each bone's rest
+transform, samples the clip over it, and writes the result onto each driven bone as a
+`PoseOverride` component that [world composition](../../scene-and-ecs/transform-and-matrices/)
+prefers over the bone's authored `Transform`.
 
-The load-bearing decision is that the pose lives **beside** the scene, not in it. The authored bone
-`Transform`s keep the rest pose and are never overwritten; the animated pose is a separate runtime
-buffer, written onto each driven bone as a `PoseOverride` component that world composition prefers.
-That makes previewing a clip non-destructive — no scene dirtying, no snapshot/restore — which is
-exactly what scrubbing a clip in Edit mode needs.
+The pose therefore lives beside the scene, not in it. The authored bone `Transform`s keep the
+rest pose and are never overwritten, so previewing a clip dirties nothing and needs no
+snapshot/restore; removing the override reverts the bone to rest. Scrubbing a clip in Edit
+mode relies on exactly this.
+
+`PoseDelta` is the offset form of a pose pair: an additive translation, a delta quaternion
+(`from * inverse(to)`), and a multiplicative scale ratio. `pose_diff` builds one from two
+poses and `apply_delta` re-applies it scaled by a weight.
+
+## Blend primitives
+
+`blend_joint(base, over, weight)` mixes two poses per joint: translation and scale lerp
+componentwise, rotation slerps and renormalizes. The runtime's cross-fade transition is this
+blend under a `smoothstep01` alpha; its inertialize mode instead decays a captured `PoseDelta`
+under `quintic_decay`, a quintic that reaches zero value, slope, and acceleration together at
+the end of the window.
+
+External pose producers write through the same pose seam rather than adding one. Foot IK
+solves a leg chain and rewrites its joint rotations in the frame's final pose before the
+`PoseOverride` write, and the ragdoll in `saffron-physics` blends its simulated bone
+transforms into each bone's `PoseOverride` by an eased per-bone weight after the physics step.
+[Foot IK and physics-ahead](../foot-ik-and-physics-ahead/) covers both producers.
 
 ## Sampling
 
-`sample_track(track, t)` evaluates one curve at time `t`, returning a `Vec4` (a `Vec3` in `xyz` for
-translation/scale, a normalized quaternion as `xyzw` for rotation). It binary-searches the keys
-(`partition_point`) for the segment bracketing `t`, then interpolates per the track's mode:
+`sample_track(track, t)` evaluates one T/R/S curve, returning a `Vec4`: `xyz` holds a
+translation or scale, and all four lanes hold a normalized quaternion for rotation.
+`locate_keys` binary-searches the strictly increasing times (`partition_point`) for the
+segment bracketing `t`, clamping `t` to the first and last key — clips never extrapolate past
+their ends. The bracket then interpolates per the track's mode:
 
-- **Step** holds the previous key's value across the segment.
-- **Linear** lerps translation and scale componentwise. Rotation is **never** a component lerp — it
-  uses `Quat::slerp` between the two quaternion keys and normalizes, which keeps constant angular
-  velocity and a unit result.
-- **CubicSpline** is a Hermite spline. With $u = (t - t_0)/(t_1 - t_0)$ and segment length
-  $\Delta = t_1 - t_0$, the value is
-  $$p(u) = h_{00}\,p_0 + h_{10}\,\Delta m_0 + h_{01}\,p_1 + h_{11}\,\Delta m_1$$
-  using the standard Hermite basis. The tangents are **scaled by $\Delta$** (the glTF requirement);
-  the in/out tangents come from the surrounding keys' tangent elements. Rotation interpolates the
-  four quaternion components this way and then normalizes.
+- **Step** holds the earlier key's value across the segment.
+- **Linear** lerps translation and scale componentwise. Rotation instead uses
+  [slerp](https://en.wikipedia.org/wiki/Slerp) between the two quaternion keys and
+  normalizes, which keeps constant angular velocity and a unit result.
+- **CubicSpline** is a
+  [cubic Hermite spline](https://en.wikipedia.org/wiki/Cubic_Hermite_spline). With
+  $u = (t - t_0)/(t_1 - t_0)$ and $\Delta = t_1 - t_0$, the value is
+  $$p(u) = h_{00}(u)\,p_0 + h_{10}(u)\,\Delta m_0 + h_{01}(u)\,p_1 + h_{11}(u)\,\Delta m_1$$
+  with the standard Hermite basis. $m_0$ is the earlier key's out-tangent and $m_1$ the later
+  key's in-tangent, both scaled by $\Delta$ as glTF requires; a rotation interpolates its four
+  components this way and then normalizes.
 
-`t` is **clamped** to the first and last key — clips do not extrapolate past their ends.
+An empty track returns the path's identity: a zero translation, an identity quaternion, or a
+unit scale. Quaternions ride straight through the whole pipeline — glTF stores `[x, y, z, w]`
+and glam's `Vec4` and `Quat` share that lane order, so `Quat::from_vec4` reads a sampled
+rotation with no reorder.
 
-`sample_clip(clip, t, out)` samples every track into `out.local`. The caller sizes and pre-fills
-`out.local` with the rest pose first; `sample_clip` only writes the joints a track targets, so a
-joint with no track keeps its rest value, and a joint animated on only one channel keeps the rest
-value on the others.
+`sample_weights(track, t, out)` is the N-wide twin for morph-weight tracks: the same bracket
+and the same three modes, run per lane over `morph_count` scalars. Weights are independent
+values, so there is no slerp and no normalization; an empty track leaves `out` as the caller
+seeded it (the rest weights).
 
-Quaternions ride straight through: glTF stores `[x, y, z, w]` and glam's `Vec4` and `Quat` share
-that lane order, so `Quat::from_vec4` reads a sampled rotation with no reorder — the swizzle the
-older toolchains needed is gone.
+Clip-level sampling belongs to the runtime. `sample_clip_resolved` seeds a `PoseBuffer` with
+the rest pose, walks the clip's bone tracks, and re-binds a track by `target_name` whenever
+its stored index is stale. Only tracked joints are written, so a joint with no track keeps its
+rest value, and a joint animated on one channel keeps the rest value on the others.
 
-The crate's unit tests sample known Step / Linear / CubicSpline keys and assert endpoints are exact
-and midpoints match — a slerp midpoint for rotation, and an asymmetric-tangent cubic bent to `0.75`
-to prove the Hermite path actually runs.
+The crate's unit tests pin the math with worked numbers: linear endpoints and midpoints are
+exact, a 0°→90° rotation samples to 45° at the midpoint, and an asymmetric-tangent cubic bends
+its midpoint to $0.75$ where a lerp would give $0.5$.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Clip + track types | `engine/crates/geometry/src/types.rs` | `AnimClip`, `AnimTrack`, `AnimPath`, `AnimInterp` |
-| Pose + blend layer | `engine/crates/animation/src/pose.rs` | `JointPose`, `PoseBuffer` |
-| Sampling | `engine/crates/animation/src/sample.rs` | `sample_track`, `sample_clip` |
-| `.sanim` byte format | `engine/crates/geometry/src/sanim.rs` | `encode`, `decode` |
+| Clip + track types | `engine/crates/geometry/src/types.rs` | `AnimClip`, `AnimTrack`, `AnimPath`, `AnimInterp`, `AnimTarget` |
+| Pose types | `engine/crates/animation/src/pose.rs` | `JointPose`, `PoseBuffer`, `PoseDelta` |
+| Pose algebra | `engine/crates/animation/src/algebra.rs` | `blend_joint`, `pose_diff`, `apply_delta`, `smoothstep01`, `quintic_decay` |
+| Track samplers | `engine/crates/animation/src/sample.rs` | `sample_track`, `sample_weights`, `locate_keys` |
+| Clip-level sampling | `engine/crates/animation/src/runtime.rs` | `sample_clip_resolved`, `sample_into` |
+| `.sanim` byte format | `engine/crates/geometry/src/sanim.rs` | `save_animation_to_buffer`, `load_animation_from_bytes` |
+| Pose-override component | `engine/crates/scene/src/component.rs` | `PoseOverride` |
 
 ## Related
 
-- [Vertex layout](../../geometry-and-assets/mesh-and-vertex-layout/) — the `VertexSkin` stream the palette skins
-- [Scene & ECS](../../scene-and-ecs/) — `SkinnedMesh`, the bone entities, `joint_matrices`
+- [Playback runtime](../playback-runtime/) — the evaluator that advances clips and writes the overrides
+- [Node-TRS animation](../node-trs-animation/) — the `Node` track kind on this same model
+- [Morph targets](../morph-targets/) — the `Weights` track kind and the GPU deform it feeds
+- [Foot IK and physics-ahead](../foot-ik-and-physics-ahead/) — the external producers on the pose seam
+- [.sanim format](../../geometry-and-assets/sanim-format/) — how clips persist on disk
