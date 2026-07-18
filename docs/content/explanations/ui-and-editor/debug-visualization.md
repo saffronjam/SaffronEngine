@@ -5,87 +5,88 @@ weight = 18
 
 # Debug visualization
 
-Debug visualization draws the volumes the engine reasons about but never normally shows — the
-boxes mouse picking tests, the box the shadow fit covers, the reach of each light. The picker
-(`pick_entity`) is AABB-only: it transforms a mesh's local AABB by its world matrix, re-encloses
-the eight corners axis-aligned in world space, and ray-tests that box. For a rotated mesh or one
-with a thin protrusion (an antenna, a rig limb) that box bulges well past the silhouette, so a
-click in empty space can still land — and skinned meshes are skipped entirely. Turning on the
-**bounding-box** overlay makes that box visible, so the over-select is something you see rather
-than guess at.
+Debug visualization exposes spatial bounds, lighting volumes, physics shapes, and intermediate render outputs inside the viewport. Line overlays preserve the normal shaded scene; view modes replace or augment its final output.
 
-These are **editor view state**: they live on the `SceneEditContext` and are not on the undo stack
-(toggling one is not an undo entry, unlike the [Render panel's](../metrics-dashboard/) feature
-toggles). They do persist with the project, though — the project save carries a `debugOverlays` block
-(`debug_overlays_to_json`), so a reopened project restores them, the way the
-[editor camera](../../geometry-and-assets/project-serialization/) rides along. They render as
-world-space lines in the editor overlay pass, into the depth-tested bucket so scene geometry occludes
-them. Most are Edit-only; the **collider** overlay is the exception — it reads the authored
-`Collider` component (present in Edit and Play), so it also draws during simulation, tracking the bodies
-as they move.
+## World-space overlays
 
-## Overlays
+Five project settings control the overlay geometry. `DebugOverlayOptions` is part of the scene-edit context and serializes into the project's `debugOverlays` object. These settings describe the editor view, so toggling them does not create an undo entry.
 
-| Overlay | Draws | Notes |
+| Toggle | Geometry | Rendering behavior |
 |---|---|---|
-| **Bounding Boxes** | The world AABB per mesh — the exact box `pickEntity` tests | Static meshes: the per-draw box (green). Skinned meshes: the joint-union box (magenta), since the picker would need the same union to hit a rig. |
-| **Scene AABB** | The whole-scene box the directional-shadow / DDGI fit derives each frame (yellow) | `render_scene` recomputes and discards this every frame; the overlay recomputes the same union for display. |
-| **Light Volumes** | Point-light range as three great-circle rings; spot-light cone from apex to base ring | The spot direction matches the lighting upload (`normalize(worldRotation · direction)`), so the cone shows where the light actually shines. Directional lights are skipped (their position is arbitrary). |
-| **Grid** | An infinite ground-plane reference grid with red (X) / blue (Z) axis lines | Not a line overlay — a fullscreen analytic render-graph pass (`grid.slang`): the fragment reconstructs the world ray from the inverse view-projection, intersects `y = 0`, anti-aliases the lines with `fwidth`, fades with distance, and writes `SV_Depth` so geometry occludes it. Runs at 1× after tonemap, before the line overlay. |
-| **Colliders** | The physics collision shape per `Collider` component — an oriented box / sphere / capsule wireframe (cook-source AABB for hull/mesh) | Drawn **scale-free** to match the simulated Jolt body (world position + rotation, the collider offset rotated-only — never the entity's world matrix, which carries scale). Cyan for solid colliders, **green** for sensors (triggers), **orange** for the selected one. Draws in Edit *and* Play. The per-bone ragdoll capsules and the character-controller capsule are not entity colliders, so they are not drawn. |
+| Bounding Boxes | Green world AABBs for static meshes; magenta joint-union AABBs for skinned meshes; pale box or sphere bounds for fog volumes | Depth-tested and visible in Edit |
+| Scene AABB | Yellow union of static and skinned mesh bounds | Matches the bounds used to fit directional shadows and DDGI |
+| Light Volumes | Three range rings for a point light; a base ring and four edge lines for a spot light | Uses each light's world position, range, rotation, and outer angle |
+| Grid | Analytic ground grid on the `y = 0` plane | Fullscreen render-graph pass with distance fade and depth output |
+| Colliders | Box, sphere, capsule, or cook-source bounds for each `Collider` | Depth-tested in Edit and Play; hidden in an asset preview |
 
-## Driving it
+The mesh boxes are conservative spatial bounds. Static picking uses the same world AABB as a broad phase, then traverses the mesh BVH for an exact triangle hit. Skinned picking tests the joint-union box before CPU-skinning the vertices and testing the deformed triangles. The overlay therefore explains the broad-phase volume without implying that empty space inside it is selectable.
 
-One grouped command toggles any subset; omitted fields stay unchanged (the
-[`set-skeleton-overlay`](../asset-editor/) shape). The Render panel's **Debug** section mirrors the
-state through a render-panel-gated poll, so an external `sa` toggle shows up there too.
+Collider geometry follows the physics body's position and rotation without entity scale. Solid colliders are cyan, sensors are green, and the selected collider is orange. A convex hull or triangle-mesh collider displays the source mesh bounds; ragdoll and character-controller shapes are separate runtime structures and do not appear in this overlay.
+
+The grid is not line geometry. Its fragment shader reconstructs a world ray from the inverse view-projection matrix, intersects the ground plane, anti-aliases cell lines with `fwidth`, and writes depth. It runs after tonemapping and before the native line overlay.
+
+## Controlling overlays
+
+The Render panel's Debug section sends partial `set-debug-overlays` updates. Omitted fields keep their values, and the panel polls `get-debug-overlays` while open so command-line changes appear in the controls.
 
 ```sh
 sa set-debug-overlays --bounds true --lightVolumes true
-sa set-debug-overlays --bounds false      # the others stay as they were
-sa get-debug-overlays
+sa set-debug-overlays --colliders true
+sa get-debug-overlays -o json
+```
+
+The final command returns all five values:
+
+```json
+{
+  "bounds": true,
+  "sceneAabb": false,
+  "lightVolumes": true,
+  "grid": false,
+  "colliders": true
+}
 ```
 
 ## View modes
 
-Where the overlays *add* lines on top of the normal render, the **view mode** *replaces* what the
-scene pass outputs. It is mutually exclusive — one mode at a time — so it is a single enum verb
-(`set-view-mode {lit|wireframe|albedo|normal|roughness|metallic|emissive}`), the
-[`set-aa`](../../tooling-and-control/render-commands/) shape, read back through `render-stats.viewMode`
-(there is no `get-view-mode`). The Render panel's **View Mode** dropdown drives it. Like the overlays
-it is transient — it lives on the `Renderer` (`view_mode`), never serializes into the project, resets to **Lit** on
-load, and is not undoable. The enum lists only implemented modes, so the dropdown never offers a value
-the engine would ignore.
+The Topbar view-mode menu selects one `ViewMode` over `set-view-mode`. The choice is transient renderer state: it does not serialize into the project and does not participate in undo. `render-stats.viewMode` supplies the value shown by the menu.
 
-- **Lit** — the normal forward+ PBR render.
-- **Wireframe** — the mesh PSO drawn with `PolygonMode::LINE`. A per-draw PSO variant selected by
-  the view mode, gated on the `fill_mode_non_solid` device feature; a GPU lacking it stays Lit. (Mesa
-  llvmpipe — the software path — supports it, so a headless run wireframes for real.)
-- **Albedo / Normal / Roughness / Metallic / Emissive** — surface channels the mesh fragment outputs
-  directly instead of lighting. The active channel rides a spare light-globals slot
-  (`pointShadowMeta.w`) the fragment reads (`debugViewChannel()`), so no new render targets or passes
-  are involved. These still pass through the tonemap, so the values are display-referred (exposure +
-  Reinhard + gamma), not raw — fine for eyeballing, not for sampling exact values.
+| Group | Modes | Output |
+|---|---|---|
+| Shading | Lit, Unlit | Full PBR shading, or albedo plus emissive without lighting |
+| Geometry | Wireframe, Lit Wireframe | Line rasterization alone, or line edges over the shaded scene |
+| Lighting | Detail Lighting, Lighting Only, Reflections | Neutral material lighting, flat diffuse lighting, or IBL specular |
+| Surface buffers | Albedo, Normal, Roughness, Metallic, Emissive | One evaluated material channel |
+| Screen buffers | Depth, Ambient Occlusion, Motion Vectors | Linear view depth, screen-space AO, or colorized velocity |
+| Analysis | Global Illumination, Light Complexity, Fog | Indirect light, punctual-light count, or integrated volumetric fog |
 
-Screen-space channels that need a producing pass to be enabled — Depth, Motion Vectors, AO (GTAO),
-Overdraw, Light Complexity — are not implemented yet; they are a fullscreen-blit follow-up gated on
-their producer (the G-buffer / TAA / SSAO targets exist only when those features are on).
+Wireframe uses [`vk::PolygonMode::LINE`](https://registry.khronos.org/vulkan/specs/latest/man/html/VkPolygonMode.html) and requires the device's `fillModeNonSolid` feature. An unsupported device resolves Wireframe to the filled mesh pipeline and omits the Lit Wireframe edge pass.
+
+Most modes use a debug-channel index packed into the light uniform buffer and interpreted by `evalViewMode`. Motion Vectors has a fullscreen visualization pass, Lit Wireframe adds a line-overlay pass, and Fog asks the volumetric composite pass to show integrated in-scatter and opacity. Ambient Occlusion returns white when its producing pass is disabled; Fog is meaningful when volumetric fog populates the froxel volume.
 
 ```sh
-sa set-view-mode --mode wireframe
-sa set-view-mode --mode normal
-sa render-stats -o json | jq .viewMode    # "normal"
+sa set-view-mode --mode light-complexity
+sa render-stats -o json | jq .viewMode
+# "light-complexity"
 ```
 
-## Code
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Overlay state + project serde | `engine/crates/sceneedit/src/overlay.rs` · `context.rs` | `DebugOverlayOptions`, `SceneEditContext::debug_overlays`, `debug_overlays_to_json`/`debug_overlays_from_json` |
-| View-mode state + device feature | `engine/crates/rendering/src/renderer.rs` · `device.rs` | `ViewMode`, `Renderer::view_mode`, `set_view_mode`/`view_mode`, `Capabilities::fill_mode_non_solid` |
-| Wireframe PSO variant | `engine/crates/rendering/src/pipelines.rs` | `request_mesh_pipeline` (wireframe), `PsoKey::wireframe` |
-| Buffer-channel output | `engine/assets/shaders/mesh.slang` · `lighting.slang` · `engine/crates/rendering/src/lighting.rs` | the fragment debug branch, `debugViewChannel()`, the `pointShadowMeta.w` pack |
-| Control commands | `engine/crates/control/src/commands_animation.rs` · `commands_render.rs` | `get-debug-overlays`, `set-debug-overlays`, `set-view-mode`, `RenderStatsDto::view_mode` |
-| World-space line builders | `engine/crates/host/src/overlay.rs` | `build_debug_overlays`, `build_collider_overlays`, `add_world_aabb`, `add_world_ring`, `add_world_oriented_box`, `add_world_arc`, `build_scene_edit_overlay` |
-| Grid pass + shader | `engine/crates/rendering/src/overlay.rs` · `pipelines.rs` · `engine/assets/shaders/grid.slang` | `record_grid`, `request_grid`, `Renderer::show_grid` / `set_show_grid` |
-| Editor panel + state | `editor/src/panels/RenderPanel.tsx` · `editor/src/state/store.ts` | `DEBUG_OVERLAYS`, `VIEW_MODES`, `onDebugToggle`, `onViewMode`, `debugOverlays` slice |
+| Overlay state and project JSON | `engine/crates/sceneedit/src/overlay.rs` | `DebugOverlayOptions`, `debug_overlays_to_json`, `debug_overlays_from_json` |
+| World-space line builders | `engine/crates/host/src/overlay.rs` | `build_debug_overlays`, `build_collider_overlays`, `build_scene_edit_overlay` |
+| Grid pass and shader | `engine/crates/rendering/src/overlay.rs` · `engine/assets/shaders/grid.slang` | `record_grid`, `Renderer::set_show_grid` |
+| View-mode state | `engine/crates/rendering/src/renderer.rs` | `ViewMode`, `Renderer::set_view_mode`, `ViewMode::debug_channel` |
+| Surface-channel evaluation | `engine/assets/shaders/lighting.slang` | `debugViewChannel`, `evalViewMode` |
+| Overlay commands | `engine/crates/control/src/commands_animation.rs` | `get-debug-overlays`, `set-debug-overlays` |
+| View-mode command | `engine/crates/control/src/commands_render.rs` | `set-view-mode` |
+| Editor controls | `editor/src/panels/RenderPanel.tsx` · `editor/src/panels/Topbar.tsx` | `DEBUG_OVERLAYS`, `ViewModeMenu` |
+| View-mode registry | `editor/src/lib/view-modes.ts` | `VIEW_MODES`, `VIEW_MODE_BY_VALUE` |
+
+## Related
+
+- [Selection](../selection/) — exact static and skinned surface picking
+- [Gizmo](../gizmo/) — the on-top transform overlay
+- [Physics panel](../physics-panel/) — runtime body and contact diagnostics
+- [Render graph overview](../../frame-and-render-graph/render-graph-overview/) — scheduling for grid and view-mode passes

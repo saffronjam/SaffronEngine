@@ -5,54 +5,82 @@ weight = 12
 
 # Editor settings
 
-Editor settings are the editor-wide preferences that belong to the *application*, not to any one project — the first of them being the keyboard shortcuts. A gear button at the top-right of the titlebar opens a modal where every editor shortcut can be rebound, and the choices persist across restarts and across projects.
+Editor settings hold preferences and credentials that belong to the editor user rather than the open project. The gear button in the Topbar opens sections for keyboard bindings, dock-layout reset, and connector secrets.
 
-The split matters: a project's scene, assets, and layout live with the project, but which key triggers the translate gizmo is a property of the person using the editor. So these settings save to one file in the editor's app-data directory, alongside the recent-projects list, never inside a project.
+## Persistence boundaries
 
-## The keybinding registry
+The three sections deliberately write to different stores:
 
-Every rebindable command is declared once, in a frontend registry (`editor/src/lib/keybindings.ts`). A command carries an id (`gizmo.translate`), a label and category for the modal, a default key, and two classifying fields:
+| Section | State | Storage |
+|---|---|---|
+| Keyboard | User overrides to command defaults | `<appDataDir>/settings.json` |
+| Layout | Scene and asset-editor dock trees | Per-project webview storage |
+| API & Secrets | Connector credentials | Operating-system keyring |
 
-- **kind** — `press` commands are one-shot actions matched on a normalized key-string (`event.key` plus modifier prefixes in a fixed order, e.g. `"shift+f"`). `hold` commands are the held-state fly-camera keys, matched on the physical `event.code` (`"KeyW"`, `"ShiftLeft"`) so they survive keyboard-layout differences and never carry modifiers.
-- **scope** — which commands can collide. `global` press commands share the one window-level shortcut listener, so a shared key would genuinely double-fire; the six `fly` keys share the viewport's fly listener; `hierarchy` and `assets` deletes are each scoped to their own focused panel, so the same Delete key in both is fine and never flagged.
+`appDataDir` comes from `SAFFRON_APPDATA_DIR` when set; an installed editor uses its platform data directory. The shell and spawned host receive the same path, but only the shell reads `settings.json`.
 
-The registry is the single source of truth. Handlers do not compare key literals anymore — they ask `matchesBinding(event, id, overrides)`, and the Topbar tooltips render `formatBinding(...)` so "Translate (W)" tracks a rebind to "Translate (T)" automatically.
+## Keyboard registry
 
-This is the same model major editors use — VS Code, Unity's Shortcut Manager, Unreal's keyboard-shortcut preferences — defaults defined in code, the user file holding only what they changed.
+Every rebindable command has one `CommandDef` in `COMMANDS`. The definition supplies its id, visible label, category, command kind, default binding, and conflict scope. Handlers resolve the effective binding through `bindingFor` or `matchesBinding`, so tooltips and input behavior change together after a rebind.
 
-## Deltas, not snapshots
+| Kind | Stored form | Matching rule | Example |
+|---|---|---|---|
+| `press` | Normalized `event.key` with ordered modifiers | Exact modifier set | `ctrl+shift+z` |
+| `hold` | Physical `event.code` | Layout-independent held key | `KeyW` |
+| `mouse` | Named mouse token | Middle or side-button dispatcher | `mouse:back` |
 
-The settings file stores **only the overrides**. A command the user never touched is absent from the file and resolves to its registry default; resetting a command deletes its key. This is VS Code's `keybindings.json` philosophy rather than Unreal's full-snapshot `.ini`: adding a command in a later version automatically gives every existing user its default, and a "reset" is just a key removal.
+Conflict scopes match the listener that receives an input. Global commands share the window shortcut listener, fly commands share the viewport's held-key handler, and tab mouse commands share the mouse dispatcher. Hierarchy and Assets deletion use separate focused-panel scopes, so both can use Delete without a conflict.
+
+The settings file stores only overrides:
 
 ```json
 {
-  "keyBindings": { "gizmo.rotate": "t", "camera.flyForward": "KeyR" }
+  "keyBindings": {
+    "gizmo.rotate": "t",
+    "camera.flyForward": "KeyR",
+    "tab.close": "mouse:back"
+  }
 }
 ```
 
-The file is `appdata/settings.json`, written next to `recent-projects.json` through the same Rust path helpers. The Rust side keeps the binding map untyped (`HashMap<String, String>`), so adding or renaming a command never touches Rust; the frontend drops any unknown command id on load, so an older binary reading a newer file degrades cleanly.
+`bindingFor` falls back to the registry default when a command id is absent. Assigning a command's default removes its override, and Reset all writes an empty map. Hydration drops unknown ids; a missing, unreadable, or malformed file also produces the empty map.
 
-## The modal
+## Capturing a binding
 
-The modal is a shadcn `Dialog` (a plain centered dialog — it does not park the viewport, unlike the asset viewer). A search box filters the command list, which groups by category. Each row shows the command label and a binding chip; clicking the chip enters **capture** mode, and the next keydown becomes the binding (Escape cancels). A bare modifier press (Shift alone) is ignored so capture keeps waiting for a real key; a `hold` row records the physical code instead, so `Left Shift` and `Space` are capturable there.
+The Keyboard section groups commands by category and filters them by label or category. Clicking a binding button starts capture. Escape cancels; a bare modifier keeps capture open; a press command records the normalized key chord; a hold command records the physical code.
 
-Conflicts are **advisory**, the VS Code way: a rebind that collides with another command in the same scope is still accepted, and both rows surface an "Also bound to …" warning rather than blocking the change. An overridden row gains a reset button; a footer "Reset all" clears every override after a confirm. Every change applies and persists immediately — there is no Apply/Cancel.
+Mouse commands accept the middle, back, or forward button. The middle button arrives through the webview pointer event. Native side-button events cover platforms where the webview consumes navigation buttons before page input.
 
-While the modal is open, the global shortcut hook is gated off (the dialog holds focus on non-text elements, so the text-entry guard alone would let shortcuts fire underneath it), and the capture listener runs in the capture phase so it pre-empts both that hook and the dialog's own Escape-to-close.
+Capture listeners run in the capture phase and stop propagation. This prevents the new binding from also invoking an editor command or closing the dialog. A same-scope conflict remains accepted, but both rows show which command shares the binding.
+
+Every accepted change updates the store and writes the delta immediately. A single reset removes one override; Reset all asks for confirmation before clearing the map.
+
+## Layout reset
+
+The Layout section restores the default Scene and Asset Editor dock trees while preserving the set of open panels. It also clears remembered panel locations, so an open panel returns to the default branch for its dock space. Normal dock mutations continue to persist through the [dock system](../dock-system/).
+
+## API secrets
+
+The API & Secrets section configures the API key used by the [Poly Pizza](https://poly.pizza/) asset-store connector. `ApiKeyField` can save, replace, or clear the key. The frontend receives only a presence boolean after storage; it never reads the secret back.
+
+`Credentials` stores secrets under the `saffron-anima` service with the connector id as the account. When no keyring service is reachable, or `SAFFRON_NO_KEYRING` is set, credentials use process memory and disappear when the shell exits. Secrets never enter `settings.json` or a project file.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Command registry + helpers | `editor/src/lib/keybindings.ts` | `COMMANDS`, `matchesBinding`, `bindingFor`, `normalizePressEvent`, `formatBinding`, `findConflict` |
-| The settings modal | `editor/src/app/SettingsModal.tsx` | `SettingsModal`, `KeyboardSection`, `BindingRow` |
-| Gear button | `editor/src/app/WindowTitlebar.tsx` | the `Settings` `TitlebarButton` |
-| Store slice + hydration | `editor/src/state/store.ts` | `keyBindings`, `settingsOpen`, `setKeyBinding`, `resetKeyBinding`, `loadEditorSettings` |
-| Persistence bridge | `editor/shell/src/settings.rs` | `load_editor_settings`, `save_editor_settings`, `EditorSettings`, `settings_path` |
-| Client wrappers | `editor/src/control/client.ts` | `loadEditorSettings`, `saveEditorSettings`, `EditorSettings` |
+| Command registry and matching | `editor/src/lib/keybindings.ts` | `COMMANDS`, `bindingFor`, `matchesBinding`, `findConflict` |
+| Settings UI | `editor/src/app/SettingsModal.tsx` | `SettingsModal`, `KeyboardSection`, `LayoutSection`, `ApiSecretsSection` |
+| Topbar entry point | `editor/src/panels/Topbar.tsx` | `setSettingsOpen` |
+| Keybinding store and hydration | `editor/src/state/store.ts` | `setKeyBinding`, `resetKeyBinding`, `resetAllKeyBindings`, `loadEditorSettings` |
+| Settings file | `editor/shell/src/settings.rs` | `EditorSettings`, `read_settings`, `write_settings` |
+| Dock reset | `editor/src/state/store.ts` | `resetDockLayout`, `resetLayoutPreservingOpen` |
+| Secret field | `editor/src/storefront/ApiKeyField.tsx` | `ApiKeyField` |
+| Credential backend | `editor/shell/src/connectors/credentials.rs` | `Credentials`, `CredentialError` |
 
 ## Related
 
-- [Transform gizmo](../gizmo/) — the W/E/R defaults bound here
-- [Viewport panel](../viewport-panel/) — the fly-camera keys bound here
-- [Hierarchy panel](../hierarchy-panel/) and [Assets panel](../assets-panel-and-thumbnails/) — the Delete shortcuts
+- [Gizmo](../gizmo/) — transform commands whose shortcuts come from the registry
+- [Viewport panel](../viewport-panel/) — held fly-camera bindings
+- [Dock system](../dock-system/) — layouts restored by the Layout section
+- [Assets panel and thumbnails](../assets-panel-and-thumbnails/) — focused-panel deletion binding

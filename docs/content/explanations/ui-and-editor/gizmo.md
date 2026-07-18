@@ -5,89 +5,86 @@ weight = 4
 
 # Transform gizmo
 
-A transform gizmo is an on-screen widget that edits a selected entity's translation, rotation, or scale by dragging handles drawn over it in the viewport. It is the direct-manipulation alternative to typing transform values into a panel.
+The transform gizmo edits a selected entity directly in the viewport. Its handles, hit testing, and transform math run in the engine; the editor supplies pointer phases and controls the operation, reference space, and child-preservation option.
 
-The gizmo is rendered by the engine, not a UI toolkit. The engine has no ImGui/ImGuizmo; under [the compositing path](../viewport-compositing/) it draws the handles itself as a native overlay, and the webview forwards pointer intent and the chosen mode over the control socket.
+## Overlay geometry
 
-## Engine-rendered overlay
+The host builds the gizmo as `OverlayVertex` geometry after rendering the scene. The renderer composites it over the tonemapped display image at display resolution, so exposure and scene anti-aliasing do not alter its colors or edges. Handles use the on-top overlay range and remain visible through scene geometry.
 
-The gizmo is part of the scene the engine presents. An overlay pipeline runs at the offscreen's native (1x) resolution *after* the tonemap pass, so the handles stay crisp and unaffected by exposure, MSAA resolve, or post-process. Because it is engine-side, the gizmo lines up exactly with the meshes it manipulates: it projects through the same [editor camera](../editor-camera/) the scene draws with, so there is no second projection to keep in sync.
+Each vertex carries signed edge coordinates and pixel half-extents. `gizmo_overlay.slang` converts those values to alpha coverage across a one-pixel feather. This analytic coverage smooths axis lines, filled plane handles, box ends, and rotation rings after the scene's multisample or temporal resolve.
 
-Drawing after the resolve also means the scene's [AA mode](../../anti-aliasing/aa-modes/) can never smooth the overlay, so it anti-aliases itself analytically: each primitive is widened by a pixel per side and carries signed edge coordinates plus half-extents, and the fragment shader turns the interpolated distances into a coverage alpha. A line feathers across its thickness, a filled plane quad across both of its directions — so lines, rotation rings, and plane handles are smooth at every AA setting, including off.
+| Operation | Handles | Effect |
+|---|---|---|
+| Translate | X, Y, and Z axes; XY, YZ, and XZ planes | Moves along one axis or two axes |
+| Rotate | X, Y, and Z rings | Changes the corresponding rotation channel |
+| Scale | X, Y, and Z axes with box ends; center box | Scales one channel or all channels uniformly |
 
-Each mode draws only its own handles: translate shows the three axis lines plus the two-axis plane quads, rotate shows only the three rings, scale shows the axis lines with box ends and a center box for uniform scale. The plane quads are drawn from the *same* projected corners the hit-test checks (`gizmoPlaneCorners`), so the handle under the cursor is always the one that activates.
+The host and hit tester share `gizmo_axes`, `gizmo_plane_corners`, and `ring_basis`. In World space the basis is the identity axes; in Local space it is rotated by the selected entity's world rotation. Handle length grows with camera distance, which keeps the projected control usable across zoom levels.
 
-Light billboards are drawn the same way. Camera entities use editor-only helpers instead: a
-black system camera model is appended to the edit-mode draw list, and the overlay draws a
-dark-orange frustum from the camera FOV and near/far planes, capped by `frustum_max_distance`. The
-`Camera` component can hide either helper with `show_model` or `show_frustum`; play mode renders
-neither one.
+## Pointer gesture
 
-The frustum is **depth-tested against the scene depth**, so the camera model and any geometry in
-front of it occlude the lines instead of the frustum painting over them. The overlay pass binds the
-1x scene depth as a read-only attachment (depth test on, depth write off), and only the frustum
-reads it — the manipulation handles and billboards still draw on top, so they stay visible and
-grabbable even behind a wall. Each frustum vertex carries its projected NDC depth, computed through
-the same editor camera the scene draws with, so the values line up with the depth buffer exactly.
-When an [AA mode](../../anti-aliasing/aa-modes/) makes the scene multisampled, the scene pass first
-resolves its depth into the 1x buffer the overlay reads.
+The transparent viewport element maps pointer coordinates into normalized device coordinates and sends `gizmo-pointer`. The engine maps the values back to viewport pixels before applying the shared projection and hit-test math.
 
-## The gizmo-pointer command
+| Phase | Editor event | Engine action |
+|---|---|---|
+| `hover` | Pointer move with no button | Hit-test and highlight a handle |
+| `begin` | Left press | Freeze the selected transform and activate the hovered handle |
+| `drag` | Movement beyond 3 CSS pixels | Update the latest pointer target |
+| `end` | Release or cancellation | Apply the release sample exactly and clear drag state |
 
-The handles are drawn into the frame stream the webview paints, so the engine receives no raw mouse from the canvas. The [viewport panel](../viewport-panel/) therefore translates each pointer phase into NDC and forwards it with the `gizmo-pointer` command:
+Hover and drag samples pass through a 16 ms latest-value coalescer. The engine smooths a pending drag toward the newest sample on rendered frames with `alpha = 1 - exp(-dt / 0.025)`. The final `end` sample bypasses any remaining smoothing distance.
 
-```ts
-gizmoPointer(phase: GizmoPointerPhase, x: number, y: number): Promise<unknown> {
-  return callRaw("gizmo-pointer", { phase, x, y });
+A press that stays within the threshold becomes a [selection](../selection/) pick at the press position. During a drag, `dragActive` prevents reconcile updates from replacing the in-progress inspector state. Each applied sample increments `sceneVersion`; release inspects the settled transform and records the whole gesture as one scene-tab undo entry.
+
+## Shared gizmo state
+
+`SceneEditContext` owns `gizmo_op`, `gizmo_space`, and `preserve_children`. The Topbar updates that state optimistically through `set-gizmo`, while the reconcile poll reads `get-gizmo` so an external control call appears in the UI.
+
+```json
+{
+  "cmd": "set-gizmo",
+  "params": {
+    "op": "rotate",
+    "space": "local",
+    "preserveChildren": true
+  }
 }
 ```
 
-`phase` is one of `hover | begin | drag | end`, and `x`/`y` are NDC in `[-1, 1]` (the same `u*2-1` mapping `pick` uses). The phases map to a gesture:
+The operation shortcuts default to W for Translate, E for Rotate, and R for Scale. They resolve through the [editor settings](../editor-settings/) registry, and the Topbar tooltips display the effective bindings. Gizmo controls and pointer commands reject writes outside Edit state. The overlay builder also hides edit chrome while an asset preview is active.
 
-- A bare move streams `hover`, so the engine highlights the handle under the cursor.
-- A press sends `begin`.
-- Travel past a few pixels turns the gesture into a `drag`, streamed and throttled; it sets `store.dragActive` so the reconcile poll will not clobber the in-progress transform. Each applied drag bumps the engine's `sceneVersion`, so the poll re-inspects and the Inspector's transform fields track the drag live.
-- The release always sends `end`, where the engine commits the authoritative transform.
+## Transform application
 
-A press that does not move is a click, and [ray-picks](../selection/) instead of dragging.
+Drag begin freezes the entity's world translation and rotation, local scale, and parent world matrix. Translation and rotation are computed in world space, then converted into the frozen parent frame. Scale stays in the entity's local transform. A minimum scale factor prevents a handle from crossing through zero.
 
-## Mode and space
+With Preserve Children disabled, a parent's transform carries its descendants through the normal relationship hierarchy. Enabling it freezes each direct child's world matrix at drag begin. After every parent update, the engine computes the child's new local matrix as:
 
-The operation (T/R/S), the world/local space, and the preserve-children flag are **one** shared gizmo state on the engine, read and written through `get-gizmo`/`set-gizmo`. A single source of truth keeps the Topbar buttons, the keyboard shortcuts, and an external `sa set-gizmo` in agreement.
+```text
+childLocal = inverse(parentWorld) * frozenChildWorld
+```
 
-- The **Topbar** has a T/R/S button group, a World/Local toggle, and an anchor-icon preserve-children toggle. A click updates `store.gizmo` optimistically and fires `set-gizmo`.
-- **W/E/R** are the *default* translate/rotate/scale shortcuts, bound on the webview (gated off while a text field is focused so typing a value never retargets the gizmo). They are rebindable in [Editor Settings](../editor-settings/); the Topbar tooltips show whatever key is currently bound.
-- The reconcile poll's `get-gizmo` read folds any external change back into `store.gizmo`, so the Topbar stays correct no matter who set the mode.
+`set_local_from_matrix` decomposes that matrix back into translation, rotation, and scale. Grandchildren follow their rebased direct parent. The same option applies to `set-transform`, so inspector edits and gizmo drags have matching subtree behavior.
 
-## Preserve children
-
-By default a parent's transform carries its whole subtree — that is what parenting means. Preserve children (Blender's *Affect Only Parents*, Maya's *Preserve Children*) inverts that for the moment you want to adjust the parent alone: with the toggle on, transforming a parent rebases each direct child's local TRS against the parent's new world matrix, so the children visually stay put.
-
-A drag freezes every direct child's world matrix at `begin` alongside the parent snapshot, and each applied frame rewrites the child locals from those frozen matrices — the same `local = world⁻¹ · childWorld` rebase [reparenting](../../scene-and-ecs/scene-hierarchy/) uses (`set_local_from_matrix`), so there is no per-frame drift. The Inspector path (`set-transform`) does the same around its one write. Grandchildren need no handling: they are relative to the rebased child and follow it.
-
-The rebase is TRS-only, like the reparent decompose: a rotated child under a non-uniformly scaled parent would need shear to hold its pose exactly, and the `Transform` component cannot represent shear — keep parents you scale non-uniformly unrotated relative to their children (or parent through a unit-scale empty).
+`Transform` cannot store shear. A rotated child beneath a non-uniformly scaled parent may therefore change slightly when the rebased matrix contains shear; the decomposition preserves only its representable TRS components.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Pointer forwarding | `editor/src/panels/ViewportPanel.tsx` | `gizmoPointer`, the `begin`/`drag`/`end` gesture, `DRAG_THRESHOLD_PX` |
-| The gizmo-pointer wrapper | `editor/src/control/client.ts` | `gizmoPointer`, `GizmoPointerPhase` |
-| T/R/S + world/local + preserve children | `editor/src/panels/Topbar.tsx` | `selectOp`, `selectSpace`, `togglePreserveChildren` |
-| Child rebase (engine) | `engine/crates/sceneedit/src/gizmo.rs` · `engine/crates/scene/src/hierarchy.rs` | `rebase_preserved_children`, `set_local_from_matrix` |
-| W/E/R shortcuts | `editor/src/app/useGizmoShortcuts.ts` | `useGizmoShortcuts`, `GIZMO_COMMANDS`, `matchesBinding` |
-| Shared gizmo state | `editor/src/state/store.ts` | `gizmo`, `setGizmo` |
-| Mode commands (engine) | `engine/crates/control/src/commands_scene.rs` | `get-gizmo`, `set-gizmo`, `gizmo-pointer` |
-| Overlay geometry (engine) | `engine/crates/host/src/overlay.rs` | `build_native_gizmo`, `build_scene_edit_camera_frustums`, `add_line`, `build_scene_edit_overlay` |
-| Hit-test / shared geometry (engine) | `engine/crates/sceneedit/src/gizmo.rs` | `hit_native_gizmo`, `gizmo_plane_corners`, `ring_basis` |
-| Analytic AA (engine) | `engine/assets/shaders/gizmo_overlay.slang` · `engine/crates/rendering/src/overlay.rs` | `fragmentMain`, `OverlayVertex` |
-| Depth-tested overlay (engine) | `engine/crates/rendering/src/overlay.rs` · `engine/crates/rendering/src/renderer.rs` | `OverlayState`, `record_overlay` (the `depth_tested` vs `on_top` ranges), `Renderer::submit_overlay` |
+| Viewport gesture and undo capture | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `DRAG_THRESHOLD_PX`, `GIZMO_STREAM_MS` |
+| Latest-sample transport | `editor/src/control/coalesce.ts` | `makeCoalescer` |
+| Topbar controls | `editor/src/panels/Topbar.tsx` | `Topbar` |
+| Rebindable shortcuts | `editor/src/app/useGizmoShortcuts.ts` | `useGizmoShortcuts`, `GIZMO_COMMANDS` |
+| Gizmo state, hit test, and drag math | `engine/crates/sceneedit/src/gizmo.rs` | `NativeGizmoState`, `SceneEditContext::hit_native_gizmo`, `SceneEditContext::apply_native_gizmo_drag`, `SceneEditContext::step_native_gizmo_drag` |
+| Overlay builder | `engine/crates/host/src/overlay.rs` | `build_native_gizmo`, `build_scene_edit_overlay` |
+| Overlay vertex and recorder | `engine/crates/rendering/src/overlay.rs` | `OverlayVertex`, `OverlayState`, `record_overlay` |
+| Control commands | `engine/crates/control/src/commands_scene.rs` | `get-gizmo`, `set-gizmo`, `gizmo-pointer` |
+| Child-local decomposition | `engine/crates/scene/src/hierarchy.rs` | `Scene::set_local_from_matrix` |
 
 ## Related
 
-- [Editor camera](../editor-camera/) — the eye the gizmo and scene share
-- [Play mode](../play-mode/) — the gizmo is hidden during play (its writes would be discarded with the play scene)
-- [Selection](../selection/) — the click-vs-drag split, and ray-pick on a non-drag click
-- [Viewport panel](../viewport-panel/) — where pointer phases are captured and forwarded
-- [Scene commands](../../tooling-and-control/scene-commands/) — `get-gizmo`/`set-gizmo`/`gizmo-pointer`
-- [Transform and matrices](../../scene-and-ecs/transform-and-matrices/) — the Euler-radians transform the gizmo edits
+- [Selection](../selection/) — click picking and the shared viewport gesture
+- [Editor camera](../editor-camera/) — projection used for drawing and hit testing
+- [Undo and redo](../undo-redo/) — the scene-tab history entry created on release
+- [Transform and matrices](../../scene-and-ecs/transform-and-matrices/) — local and world transform composition
+- [Scene hierarchy](../../scene-and-ecs/scene-hierarchy/) — parent-child relationships and rebasing

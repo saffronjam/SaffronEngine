@@ -5,185 +5,142 @@ weight = 2
 
 # Viewport compositing
 
-The editor's 3D viewport is the engine's render composited *under* the web UI: the engine
-publishes each frame into shared memory, and the editor presents those frames on a Wayland
-subsurface stacked below its own transparent window. Panels, shadows, rounded corners, and
-translucent overlays therefore blend over the live scene — something a native child window
-can never do, because window systems stack children opaquely on top ("airspace").
+The editor places the engine's 3D frame below the transparent CEF interface. The engine never
+sends scene pixels through the webview. It renders offscreen, publishes BGRA8 pixels to shared
+memory, and lets the native shell present them in a platform surface below the UI.
 
-## The pieces
+This keeps panels, menus, selection chrome, and translucent overlays in the web layer while the
+system compositor combines them with the live viewport. An opaque backdrop below both layers
+provides the page background wherever neither the UI nor a viewport is opaque.
 
-Four mechanisms carry the whole design; everything else is plumbing between them.
+## The layer stack
 
-**Shared memory.** A POSIX shm segment is a file-backed memory region: one process creates
-it by name (`shm_open` returns a file descriptor, `ftruncate` sizes it), and any process
-that `mmap`s that descriptor gets the *same physical pages* in its own address space. A
-write on one side is immediately a read on the other — no syscall, no copy, no message.
-The engine "publishes" a frame by `memcpy`ing pixels into the mapped region, and that is
-the last CPU copy in the pipeline: the editor hands the very same descriptor to the
-compositor as a `wl_shm_pool`, so the compositor samples the bytes the engine wrote.
+Both shell backends implement the same three-plane stack:
 
-**The seqlock.** Two processes racing on the same pages need an ordering rule, and a lock
-would couple their frame rates. A seqlock is the lock-free alternative for one writer and
-many readers: the writer writes the payload first, then bumps a sequence counter behind a
-release fence. The fence guarantees that a reader observing the new counter value also
-observes the payload written before it. Torn frames are skipped, never displayed, and
-neither side ever waits for the other.
+```text
+front   CEF UI                 transparent where the viewport shows through
+        Scene / asset view    one native presentation surface per editor view
+back    backdrop              opaque theme background
+```
 
-**Surfaces and subsurfaces.** A Wayland `wl_surface` is a compositor-side rectangle with a
-pixel buffer attached; the compositor — not the application — blends all surfaces into the
-final image each refresh. A `wl_subsurface` glues one surface to a parent at an offset and
-a z-order, and crucially the z-order may be *below* the parent. That inversion is the trick
-the X11 reparent could never do: the engine's pixels sit under the UI's, so every
-translucent UI pixel blends over the scene in the compositor, for free. The editor runs
-**two** such viewport subsurfaces — one per [view](../asset-editor/), the Scene viewport and
-the asset-editor preview — each permanently glued to its own pane, plus a shared opaque
-backdrop subsurface below both. `wp_viewport` adds a crop/scale stage, so each view's buffer
-is sampled to its pane's destination size independently; a *parked* view (its tab inactive)
-keeps its last attached buffer frozen on screen at no cost.
+The platform objects differ, but their roles do not.
 
-**DMA, for what comes next.** Today's transport still costs one GPU→CPU readback (the
-engine) and one CPU→GPU texture upload (the compositor) per frame. DMA — direct memory
-access — is hardware reading or writing memory without the CPU touching the bytes, and a
-*dma-buf* is a kernel handle (a file descriptor) to GPU memory that another process or
-device can import directly. Exporting the engine's render targets as dma-bufs would let
-the compositor's GPU sample them in place: zero copies, both transfers gone. That upgrade
-is scoped in `plans/dmabuf-viewport/`.
+| Plane | Linux | macOS |
+|---|---|---|
+| UI | Toplevel `wl_surface` painted from CEF's shared-memory frames | Transparent `CALayer` backed by an IOSurface pool |
+| Viewport | Desynchronized [`wl_subsurface`](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl-subsurface) below the toplevel | Opaque `CALayer` at z-position `-1` |
+| Backdrop | Opaque subsurface below both viewport surfaces | Opaque `CALayer` at z-position `-2` |
 
-## How it works
+On Linux, each viewport's `wl_shm_pool` wraps the engine's segment directly. The shell does not
+copy those pixels again. On macOS, a reader copies the newest ring slot into an
+[IOSurface](https://developer.apple.com/documentation/iosurface), then Core Animation uses that
+surface as the viewport layer's contents.
+
+## The published frame ring
+
+Each visible engine view owns a POSIX shared-memory segment. Its byte layout is a fixed 32-byte
+header followed by four equal-capacity frame slots.
+
+| Header word | Meaning |
+|---|---|
+| `0` | Magic `0x5346_5632` (`SFV2`) |
+| `1`, `2` | Published width and height |
+| `3` | Sequence number; `0` means no frame |
+| `4` | Ring depth, fixed at `4` |
+| `5` | Capacity of one slot in bytes |
+| `6`, `7` | Reserved, written as `0` |
+
+Frame sequence `s` occupies slot `s % 4`. For example, sequence `11` uses slot `3`. The writer
+copies the pixels, updates the dimensions, issues a release fence, and writes the new sequence
+last. This is a single-writer form of the sequence-counter pattern described by the Linux kernel's
+[seqlock documentation](https://docs.kernel.org/locking/seqlock.html). Readers ignore sequence `0`
+and sequences they have already presented, so neither process waits for the other.
+
+Slots start with enough capacity for a 3840 x 2160 BGRA8 frame. The segment grows when a larger
+frame arrives and never shrinks during the process lifetime. Growth and engine restarts can replace
+the object behind the same shared-memory name, so both presenters check its inode and size every
+250 ms and remap when either changes.
+
+## Engine readback
+
+The readback is part of the renderer's normal frame submission:
 
 ```mermaid
 flowchart LR
-    A[engine renders the ACTIVE view offscreen] --> B[blit to BGRA8 + copy to staging<br>recorded in the frame's own command buffer]
-    B --> C[that view's shm ring segment<br>header + 4 slots, seqlock]
-    C --> D[editor worker attaches the newest slot<br>to that view's wl_subsurface below the toplevel]
-    D --> E[compositor blends the transparent UI<br>over both viewports at monitor refresh]
+    A[Active view offscreen RGBA16F] --> B[GPU blit to BGRA8]
+    B --> C[GPU copy to mapped staging buffer]
+    C --> D[Normal frame fence signals]
+    D --> E[Host copies bytes to the view's ring]
+    E --> F[Native presenter shows the latest sequence]
 ```
 
-The engine side is a pipelined readback with zero added stalls. Each frame-in-flight slot
-owns a BGRA8 image and a persistently mapped staging buffer; `end_frame` records the
-offscreen→BGRA8 blit (the GPU does the format conversion) and the image→buffer copy into
-the frame's normal command buffer, then submits with the frame fence only — no swapchain
-acquire, no present, no `wait_gpu_idle`. When `begin_frame` waits that fence two frames later,
-the readback is complete by construction and a `memcpy` publishes it into the **active
-view's** shared segment. Each view owns its own segment + ring, and only the active view is
-rendered and published each frame, so the inactive view's last frame stays put. A segment is
-grow-only with a 32-byte header (`magic, width, height, seq, ring_slots, slot_capacity`) and a
-fixed-capacity 4-slot ring: frame `s` lands in slot `s % 4`, the header is written
-pixels-first with `seq` bumped last behind a release fence, so a reader that sees a new `seq`
-is guaranteed matching dimensions and pixels.
+Each frame-in-flight slot owns its BGRA8 image and mapped staging buffer. `record_shm_copy`
+records the format-converting blit and image-to-buffer copy in the same command buffer as the
+scene. It adds no queue submission or synchronous wait. When `begin_offscreen_frame` later waits
+that slot's normal fence, `stage_pending_shm_publish` exposes the completed mapping and the host
+copies it into shared memory.
 
-The editor side runs one worker thread that wraps winit's `wl_display` connection (via
-`from_foreign_display`) with a private event queue, binds
-`wl_compositor`/`wl_subcompositor`/`wl_shm`/`wp_viewporter`/`wp_presentation`, and creates
-**two desync subsurfaces placed below** the toplevel (one per view). The shell's compositor
-owns a shared opaque backdrop subsurface below both. One `wl_shm_pool` per view wraps that view's
-segment directly — the compositor reads the very memory the engine wrote, one copy end to
-end. The single loop polls both segments and, for each *unparked* view, attaches its newest
-ring slot, damages, and commits, paced by frame callbacks (one per monitor refresh) with a
-bounded self-paced fallback for the spans when callbacks are withheld. `wp_viewport` scales
-each view's buffer to its pane's logical rect and `set_position` pins it, both fed per-view
-from the [viewport panel](../viewport-panel/)'s bounds through a shell command
-(`set_viewport_bounds(view, …)`); a parked view's surface is left untouched, freezing its
-last frame.
+The renderer only records this path for a view whose segment is enabled. The thumbnail view is
+separate: it produces PNG data and is never published to a viewport segment.
 
-## Load-bearing details
+## Native presentation
 
-Each of these is the difference between a working viewport and one that is frozen,
-seamed, or absent — none of them fails with an error.
+### Wayland
 
-- **Subsurface state is double-buffered on the parent.** Creation and `set_position` only
-  take effect when the *toplevel* commits. The CEF UI commits the toplevel every frame it
-  paints, so the subsurfaces are adopted and re-positioned on the next UI frame.
-- **The page must resolve against a backdrop, not the desktop.** The page is transparent,
-  and not every pixel of it is opaque — panel borders are 10%-alpha hairlines, and a
-  UI repaint lags an interactive resize by a frame. A backdrop subsurface below *both*
-  viewport subsurfaces (created by the shell's compositor, stretched to the whole window with
-  a single opaque theme-colored pixel via `wp_viewport`) — including under a parked view's
-  frozen hole — so every translucent or unpainted page pixel blends against theme-dark exactly
-  as it would in an opaque app.
-- **A segment can be replaced under the reader.** The engine recreates a view's shm segment
-  if a frame ever outgrows the slot capacity, and a restarted engine makes a fresh one —
-  same name, new inode. A mapping is per-inode, so a reader that keeps its old `mmap`
-  reads a frozen orphan forever. The capacity is floored at 4K so ordinary resizes never
-  trigger this (shm pages are sparse; unused capacity costs nothing), and the presenter
-  probes each view's inode every 250ms and remaps that view's pool + buffers when it changes.
-- **Parking freezes, it does not clear.** A parked view (its tab inactive, or a modal owns
-  the region) is simply left out of the commit loop — its surface keeps the last buffer it
-  was given, so the inactive pane shows its last rendered frame frozen rather than going
-  black. Unparking resumes attaching that view's fresh frames; because the surface was never
-  re-bound and the engine resumes publishing the same segment, the live image returns within
-  a frame.
-- **Frame callbacks pace, they do not certify.** A callback per commit proves cadence, not
-  that those pixels reached glass. `wp_presentation` feedback (counted per second behind
-  `SAFFRON_VIEWPORT_STATS=1`) reports `presented`/`discarded` plus the vblank delta — and
-  even `presented` only certifies the surface was in an on-screen repaint, so the eyeball
-  test on fast motion stays part of verification.
+The presenter creates one desynchronized subsurface for `scene` and one for `assetPreview`. Both
+sit below the UI toplevel and above the backdrop. [`wp_viewport`](https://wayland.app/protocols/viewporter)
+scales the current buffer to the pane's logical bounds, so geometry follows a dock drag even before
+a newly sized engine frame arrives.
 
-Because the engine never presents, no swapchain vsync throttles its loop. Instead the host paces
-itself reactively (see [the main loop](../app-lifecycle-and-window/main-loop-and-run/)): it renders
-at the perf-config `target_fps` while the scene is active and idles the GPU on a static viewport,
-so slots are neither rewritten at thousands of fps nor refreshed when nothing changed.
+For each new sequence, the presenter creates or reuses the matching `wl_buffer`, attaches it,
+damages the surface, and commits. Frame callbacks pace further commits to the compositor. A bounded
+fallback keeps the first or occluded frame moving when callbacks are withheld. Optional
+`wp_presentation` feedback supplies presented and discarded counts plus the observed refresh rate.
 
-## Two views, two surfaces
+Parking detaches the buffer and exposes the backdrop. Unparking forces the retained ring frame to
+attach again, then normal sequence polling resumes.
 
-The editor has two viewport panes — the Scene viewport and the [asset-editor](../asset-editor/)
-preview — and each owns a permanent triple: an offscreen render target, an shm ring segment,
-and a Wayland subsurface glued to its pane. Switching tabs never re-binds a surface or resizes
-a target. The engine just changes which view is active (`set-active-view {scene|assetPreview}`),
-and the editor parks the surface whose pane is now hidden and unparks the one now showing. The
-appearing pane was already sized to its pane, so its first composited frame is correct — there
-is no resize, no device idle, and no stale-size frame on the switch.
+### AppKit
 
-Only the active view is rendered and advances its seqlock each frame; the parked view's surface
-holds its last color frame frozen. The tradeoff is deliberate: per-view temporal state (TAA
-history, motion vectors, ReSTIR reservoirs, the DDGI volume) resets when a view becomes active
-again, so GI and antialiasing re-converge over a few frames rather than the engine paying to
-keep two histories warm. Resizing a pane debounces a `set-viewport-size {view}` after the
-gesture settles (~150ms); a parked view defers the actual target recreation — recreating the
-whole offscreen chain behind a device idle — until it is next activated, so a hidden pane never
-stalls the visible one.
+Each view has a reader thread and a three-entry IOSurface pool. The reader takes a surface that
+WindowServer is not using, copies the latest BGRA8 slot into it, and places it in a single ready
+slot. When all three surfaces are busy, it skips the attempt and retries the same sequence.
 
-> [!NOTE]
-> CEF renders the UI windowless and the shell uploads each `on_paint` frame to the toplevel
-> `wl_surface` via `wl_shm` — there is no GPU dma-buf handoff for the UI (CEF's ANGLE-Vulkan
-> dma-buf can't be imported by Mutter's GL backend on NVIDIA). The engine's viewport frames,
-> shown on the subsurfaces here, likewise arrive over `wl_shm`. Both are CPU-shared-memory
-> paths; the engine itself still renders on the hardware ICD.
+A `CADisplayLink` runs on the main thread. On each display tick it applies pane geometry, hides or
+shows parked layers, and assigns ready surfaces to `CALayer.contents` inside a transaction with
+implicit animations disabled. The display link also reports the refresh rate of the display that
+contains the editor window.
 
-## Input rides the control plane
+## View identity and geometry
 
-The engine's winit window is hidden and receives no events, so every input path is a control
-command from the webview: `gizmo-pointer` and `pick` for the [gizmo](../gizmo/) and
-[selection](../selection/), and `fly-input` for the [editor camera](../editor-camera/)
-(pointer-lock relative deltas + move keys). Webview pointer events arrive at ~60Hz, so the
-engine smooths gizmo drag samples toward their target each rendered frame
-(`step_native_gizmo_drag`) instead of staircase-stepping at the sample rate.
+The Scene and asset-preview panes each keep a complete presentation path: a `ViewTarget`, a shared
+memory ring, native bounds, and a native surface or layer. `set-active-view` selects which target the
+renderer advances. Switching views resets the newly active target's temporal history so TAA, SSGI,
+ReSTIR, and DDGI converge from valid input instead of reprojecting stale state.
 
-> [!NOTE]
-> wl_shm makes the compositor upload each frame on its paint thread, and the ring has no
-> `wl_buffer.release` handshake. The planned cure is zero-copy linux-dmabuf buffers with a
-> release-driven lifecycle — see `plans/dmabuf-viewport/`.
+The web UI reports pane bounds in logical pixels through `set_viewport_bounds`. The shell stores
+position, size, UI offset, and parked state in atomics shared with the presenter. A settled resize
+also sends `set-viewport-size` in device pixels. That command recreates the selected view's render
+targets eagerly after waiting for the device to become idle; presentation stretches the previous
+frame to the current pane while the new extent is being produced.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Per-view targets + identity | `engine/crates/rendering/src/renderer.rs` · `view_target.rs` | `ViewId`, `ViewTarget`, `ShmCapture`, `active_view`, `active_view_id` |
-| Active view + temporal reset | `engine/crates/rendering/src/renderer.rs` | `set_active_view`, `reset_view_temporal` |
-| Segment publisher (seqlock ring) | `engine/crates/rendering/src/shm_publish.rs` | `ShmPublish`, `enable`, `publish`, `seq`, `slot_capacity` |
-| Recorded readback + fence-only submit | `engine/crates/rendering/src/renderer.rs` | `record_shm_copy`, `read_active_view_bgra8`, the active-view shm branch in `end_frame` |
-| Host shm wiring (per-view configs) | `engine/crates/host/src/viewport_shm.rs` | `ViewportShmPublisher`, `ShmViewConfig`, `configs_from_env` |
-| Loop cap | `engine/crates/app/src/lib.rs` | `max_fps_from_env`, `pace_loop` |
-| Two subsurfaces + one loop | `editor/shell/src/presenter.rs` | `install`, `run`, `Viewports`, `ViewportShared`, `ViewSurface`, `PresentationStats` |
-| Opaque backdrop (below both views) | `editor/shell/src/compositor.rs` | `ensure_backdrop` |
-| Per-view segment remap | `editor/shell/src/presenter.rs` | `stat_shm`, `open_shm` |
-| Rect + park bridge (per view) | `editor/shell/src/{commands,state,engine}.rs` | `set_viewport_bounds`, `set_viewport_parked`, `viewport_shm_name`, `spawn_engine` |
-| Render size + active-view commands | `engine/crates/control/src/commands_render.rs` · `commands_asset.rs` | `set-viewport-size`, `set-active-view` |
+| View identity and target ownership | `engine/crates/rendering/src/renderer.rs` · `view_target.rs` | `ViewId`, `ViewTarget`, `set_active_view`, `reset_view_temporal` |
+| GPU readback pipeline | `engine/crates/rendering/src/renderer.rs` | `record_shm_copy`, `stage_pending_shm_publish`, `pending_shm_view` |
+| Shared-memory ring producer | `engine/crates/rendering/src/shm_publish.rs` | `ShmPublish`, `SHM_HEADER_BYTES`, `SHM_RING_SLOTS`, `publish` |
+| Per-view host wiring | `engine/crates/host/src/viewport_shm.rs` · `layer.rs` | `ViewportShmPublisher`, `configs_from_env`, `publish_pipelined_view` |
+| Portable geometry and ring reader | `editor/shell/src/viewport.rs` | `Viewports`, `ViewportShared`, `open_shm`, `stat_shm` |
+| Wayland viewport surfaces | `editor/shell/src/backend/wayland/presenter.rs` | `install`, `ViewSurface`, `step_view` |
+| AppKit viewport layers | `editor/shell/src/backend/appkit/presenter.rs` | `install`, `PresenterTick`, `read_view` |
+| IOSurface rotation | `editor/shell/src/backend/appkit/iosurface.rs` | `IoSurfacePool`, `write_bgra` |
+| UI and backdrop planes | `editor/shell/src/backend/{wayland,appkit}/compositor.rs` | `UiCompositor`, `ensure_backdrop` |
 
 ## Related
 
-- [Editor shell and the viewport bridge](../editor-shell-and-viewport-bridge/) — the shell and control passthrough around this transport
-- [Viewport panel](../viewport-panel/) — the rect, input forwarding, and parking
-- [Editor camera](../editor-camera/) — the fly input streamed over `fly-input`
-- [Control plane](../../tooling-and-control/control-plane-architecture/) — the socket the input and size commands ride
+- [Editor shell and the viewport bridge](../editor-shell-and-viewport-bridge/)
+- [Viewport panel](../viewport-panel/)
+- [Asset editor](../asset-editor/)
+- [Main loop and run](../../app-lifecycle-and-window/main-loop-and-run/)

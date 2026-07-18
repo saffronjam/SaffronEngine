@@ -5,107 +5,112 @@ weight = 6
 
 # Inspector
 
-The Inspector is the editor panel for viewing and editing the components of the selected entity. It is data-driven: it holds no per-component code, rendering whatever components and fields the engine returns and choosing a widget for each field from its value shape.
+The Inspector displays and edits the selected entity's components. Ordinary components use a registry-driven field grid, while components with nested collections or import-derived data use focused editors over the same control surface.
 
-A component registered engine-side with `register_component!` appears here automatically, with a sensible widget even before it has an explicit hint. The panel describes itself entirely from the live `inspect` result, so the editor and the engine never drift on what an entity holds.
+The panel reads `componentsBySelected`, which the [selection reconciliation](../selection/) lane fills from `inspect`. It shows an empty state when there is no selected and inspected entity.
 
-## How it works
+## Component sections
 
-The panel reads `componentsBySelected` (the `inspect` result, kept fresh by the [reconcile poll](../selection/)) and iterates its `components` map. For each present component it draws a header and walks its fields, handing every `(component, field, value)` to `renderField`:
+`inspect` returns a component map and an authored `componentOrder`. `orderedComponentNames` keeps the present components in that order, appends missing names in canonical order, and hides `Relationship` and `Bone`. Parenting belongs to the [Hierarchy panel](../hierarchy-panel/), while the empty bone tag is represented by its entity row.
 
-```tsx
-{Object.entries(dto).map(([field, value]) => (
-  renderField(component, field, value,
-    (next) => onFieldChange(component, field, next),
-    { onDragStart, onDragEnd })
-))}
+Each visible component appears in a section with a reorder handle and, when allowed, a remove button. A one-shot `focusComponent` signal from a hierarchy component row scrolls the matching section into view.
+
+## Generic field grid
+
+The generic body passes each `(component, field, value)` to `renderField`. `resolveHint` first checks `FIELD_HINTS`, then infers a widget from vector, number, or Boolean value shapes. Values without one of those shapes use a text input.
+
+| Hint kind | Editor control | Typical use |
+|---|---|---|
+| `vec3`, `vec4` | Axis number editors | transforms, directions, and extents |
+| `color3`, `color4` | Color popover | light and material colors |
+| `number`, `slider` | Drag number or bounded slider | ranges, weights, and intensities |
+| `bool` | Switch | feature flags |
+| `enum` | Select | motion, shape, wrap, and blend modes |
+| `lockAxes` | Axis locks | rigid-body position and rotation locks |
+| `struct` | Nested field group | collider friction and restitution |
+| `uuid` | Filtered asset picker | mesh, texture, material, model, and animation references |
+
+Hints also provide bounds, step sizes, enum options, and asset kinds. [`AssetPicker`](../asset-pickers-and-drag-drop/) accepts catalog selection and drag-and-drop; choosing None writes the zero asset identifier.
+
+Unit conversion happens at the widget boundary. `Transform.rotation` vectors and `CharacterController.maxSlopeAngle` scalars display degrees but write radians. Spot-light angles already use degrees on the wire, so their degree hint supplies display bounds without conversion.
+
+## Structured component bodies
+
+Components whose data is not useful as a flat JSON grid have dedicated bodies:
+
+| Component | Inspector behavior |
+|---|---|
+| `Script` | Orders script slots, assigns or creates files, loads declared fields, and writes per-instance overrides. |
+| `Morph` | Shows one 0-to-1 slider per imported target name and sends the complete weight vector. |
+| `MaterialSet` | Edits each submesh slot's material reference and sparse object overrides. |
+| `Collider` | Adds Fit to mesh and identifies a collider without `Rigidbody` as a static body. |
+| `SkinnedMesh` | Resolves the imported mesh and root bone to names and reports joint count read-only. |
+| `FootIk` | Edits scalar settings and two-bone chains through joint-name selectors. |
+| `KinematicBones` | Edits enabled state and a joint mask, where an empty mask means all joints. |
+| `BonePhysics` | Edits fixed per-joint collider, constraint, and drive cards. |
+
+The rig editors derive joint names from `SkinnedMesh.bones` and the hierarchy entity list, so their pickers need no extra control request. [Physics inspector](../physics-inspector/) covers the authoring semantics of the physics components.
+
+A `FogVolume` section shows a warning when scene fog is disabled or uses a non-volumetric mode. The component remains editable, but it contributes no density to the froxel grid in that environment state.
+
+## Write routing
+
+`set-component` replaces a complete component body. A generic field edit therefore clones the inspected DTO, patches one field, applies that DTO optimistically, and routes the payload according to its field type:
+
+```ts
+if (hint.kind === "uuid") {
+  return component === "Mesh" && field === "mesh"
+    ? client.assignAsset(entity, "mesh", assetId)
+    : client.setComponentField(entity, component, field, assetId);
+}
+if (component === "Transform") {
+  return client.setTransform(entity, { [field]: dto[field] }, smooth);
+}
+return client.setComponent(entity, component, dto);
 ```
 
-The render path has no `if (component === "Transform")` branch. Components draw in the selected entity's authored order, which is returned by `inspect` and saved with the scene. New sections are added at the bottom, drag reordering writes a new order through the control plane, and the sort action restores the canonical order (`Name`, `Transform`, `Mesh`, …). Any unknown component falls in after the known set, but that is ordering only, never a render switch.
+Material slot changes bypass the top-level field path and call `set-component-field` with `field: "slots"` and a slot index. Script overrides use `set-script-override`, morph sliders use `set-morph-weights`, and Collider's Fit to mesh uses `fit-collider`.
 
-## Picking a widget
+## Gestures and undo
 
-`renderField` resolves a field to a widget in three steps:
+Generic fields use one coalescer per component and field. The first pointer or focus event captures the prior DTO and sets `dragActive`; intermediate values update the optimistic store and coalesced wire stream. Release clears the gate, sends the latest value once without transform smoothing, and records one undo entry from the captured DTO to the final DTO.
 
-1. The explicit `FIELD_HINTS` table, keyed `Component.field`, which mirrors the engine's per-component widgets.
-2. The value's shape — `{x,y,z}`→vec3, `{x,y,z,w}`→vec4, number, boolean, string.
-3. A read-only text fallback, so an unmapped field is still visible.
+Transform samples sent during a drag set `smooth`, which moves engine-side values toward per-entity targets with the shared edit smoother. The exact release write cancels that target. Other generic fields apply their coalesced values directly.
 
-A hint also carries min/max/step, slider-vs-drag, the option list for a closed enum (drawn as a Select — `Rigidbody.motion`, `Collider.shape`, `AnimationPlayer.wrap` and `transitionMode`), and the asset kind a uuid field picks from: `mesh`, `texture`, `material`, `model` (the `.smodel` a `ModelInstance` came from), or `animation` (an `AnimationPlayer` clip). Without a hint an enum or id would fall to step 3 and render as a free-text box, so each closed enum and each id reference is hinted. Field labels are sentence-cased from the wire key (`humanizeFieldName`: `albedoTexture` → "Albedo texture"), and color fields open a saturation/hue (and alpha) canvas in a popover rather than the native OS picker. Selecting **(none)** in a mesh or material-texture picker clears the slot — the engine treats the `0` asset id as "unassigned" rather than rejecting it.
-
-One unit conversion lives at the widget boundary. `Transform.rotation` is radians on the wire but shown in degrees, driven by the hint's `convertRadians` flag. SpotLight `innerAngle`/`outerAngle` are degrees on both sides, so their `unit:"deg"` is a label and clamp only, no conversion. A `MaterialSet` slot's `baseColor`/`emissive` override rows use color swatches, its `metallic`/`roughness` are sliders, and its texture rows plus `Mesh.mesh` are [asset pickers](../asset-pickers-and-drag-drop/).
-
-## Rig components
-
-A few components carry data keyed to the skeleton, so they get a bespoke body instead of the raw-id JSON the generic grid would produce. `SkinnedMesh` is genuinely not user-authored — its bone-entity array and inverse-bind matrices are import-derived — so it stays read-only: mesh and root bone resolved to names, a joint count in place of the matrices. The other three are **editable by joint name**, never by raw index:
-
-- **`FootIk`** — `enabled`/`groundHeight` are scalar fields; `chains` is an add/remove list of two-bone IK limbs, each picking Upper/Mid/End from a joint dropdown plus a pole vector.
-- **`KinematicBones`** — `enabled` toggles the feature; `driven` is a joint-subset mask with an "All joints" switch (an empty wire array means *every* joint) and a per-joint checklist.
-- **`BonePhysics`** — a fixed-length list (1:1 with the skeleton) of collapsible per-bone cards, each tuning the ragdoll body: collider half-extents, mass, the joint constraint type, its swing/twist limits (shown in degrees, stored in radians), and the PD drive gains.
-
-Joint names resolve entirely client-side — the bone entities are already in the [hierarchy](../hierarchy-panel/) list (`SkinnedMesh.bones[i]` → joint entity → `Name`), so no engine round-trip is needed. All three write the whole array back through the normal `set-component` read-modify-write, and the edits apply at the right moment: foot IK reads `chains` each frame, while the kinematic bodies and the ragdoll are built from `driven`/`bones` when physics starts at the next Play (not mid-Play). The runtime ragdoll blend is still driven from the [Physics panel](../physics-panel/).
+Material slot gestures and script override gestures follow the same one-entry undo pattern with their narrower commands. Discrete switches, selections, and resets record an entry immediately. Morph weight scrubs and Fit to mesh update the engine without adding an undo entry.
 
 ## Material slots
 
-`MaterialSet` is not a flat field grid but an **override editor**, one card per slot. A slot's first row is a material picker bound to `MaterialSlot.material` — the `.smat` this submesh draws with — with a shortcut that opens that material in the [graph editor](../../materials-and-pipelines/node-graph-codegen/). Below it, one row per exposed PBR parameter (`baseColor`, `metallic`, `roughness`, the texture ids, `blend`, …) shows the value inherited from the referenced material until you override it; editing a row writes that key into the slot's sparse `overrides` map, and clearing it reverts to the inherited value.
+Each `MaterialSet` slot binds one `.smat` asset for a mesh subrange. Its `overrides` object stores only parameters authored on that entity. Parameters absent from the map inherit from the referenced material and do not appear as rows.
 
-Every slot edit — the material reference and each override — routes through `set-component-field` addressing the slot by `index` (`{component:"MaterialSet", field:"slots", index, value:{…}}`), so the engine merges the pushed object into `slots[index]`. The parameter widgets reuse the `Material.<field>` hints, so a slider stays a slider and a colour stays a swatch, exactly as a flat component would render.
+The Override menu adds one supported parameter with its engine default. Editing writes the entire sparse override map into that slot, and removing a row deletes its key to restore inheritance. The material shortcut opens the referenced asset in the [material graph editor](../../materials-and-pipelines/node-graph-codegen/).
 
-## Read-modify-write
+## Add, remove, and order
 
-The engine's `set-component` rewrites the whole component rather than merging, so a single-field edit builds the full DTO with that one field patched and sends the lot:
+The Add Component menu follows `COMPONENT_ORDER` and excludes components managed by entity creation or import: `Name`, `MaterialSet`, `ModelInstance`, `SkinnedMesh`, and `Morph`. `AnimationPlayer`, `FootIk`, `KinematicBones`, and `BonePhysics` appear only when the entity has `SkinnedMesh`.
 
-```ts
-const onFieldChange = (component, field, next) => {
-  const current = (componentsObj[component] ?? {}) as Record<string, unknown>;
-  const patched = { ...current, [field]: next };
-  applyOptimisticComponent(component, patched);  // overlay immediately
-  coalescerFor(component, field).push(patched);  // coalesced send
-};
-```
+Remove is hidden for `Name`, `Transform`, `ModelInstance`, `SkinnedMesh`, and `Morph`. A successful add records remove as its inverse. A successful remove captures the prior body and order so undo can add the component, restore its values, and restore section order.
 
-`applyOptimisticComponent` overlays the change on the live inspect result so the widget updates without waiting a poll interval. High-frequency edits — dragging a number, moving a slider — funnel through a per-(component,field) coalescer, and the drag brackets flip `store.dragActive` so the reconcile poll will not overwrite the optimistic value mid-drag.
-
-A few fields take a narrower write than the full-DTO `set-component`:
-
-- `Transform` uses the `set-transform` merge helper, sending only the changed field.
-- `Mesh.mesh` uses the dedicated `assign-asset`.
-- `MaterialSet` slot edits — the referenced material and each parameter override — route through `set-component-field` with the slot `index` (see [Material slots](#material-slots)).
-- Any other uuid field uses the single-field merge `set-component-field`.
-
-Everything else takes the generic full-DTO `set-component` write, exactly like every other structured component.
-
-## Smoothed drags, drag-local widgets
-
-A drag samples at the webview's pointer rate (~60 Hz), far below the engine's frame rate, so writing each sample directly would render as visible steps. `Transform` edits borrow the [gizmo's](../gizmo/) answer: mid-drag sends carry `smooth:1`, which makes `set-transform` record the numeric fields as per-entity targets instead of writing them, and the engine converges the live component toward those targets every rendered frame with the same ~25ms exponential the gizmo uses for pointer samples (`step_edit_smoothing`). Once within epsilon the value snaps exactly and the entry is dropped. Transform smoothing yields to a live gizmo drag on the same entity, and applies exact under preserve-children (each write must rebase the subtree). Material scrubs are not smoothed engine-side — each coalesced sample writes directly; the optimistic-local overlay is what keeps the widget itself fluid.
-
-The widgets themselves never wait on that round trip. Every scrub widget (NumberDrag, SliderField, VectorEditor, ColorField) renders drag-local state through `useScrubValue`: the pointer updates the widget immediately, changes flow outward at most once per animation frame, and the prop only drives the widget when no gesture is active — so the color canvas or a scrubbed axis tracks the cursor exactly while the store, wire, and viewport follow.
-
-The release always ends the stream with one exact write: the widget flushes its pending emit, then `onFieldDragEnd` re-pushes the field's latest optimistic value after clearing `dragActive`, and a non-smooth send both writes verbatim and cancels any pending animation for that entity. Texture and `unlit` are not animatable and apply immediately either way.
-
-## Add and remove
-
-`add-component` and `remove-component` are guarded the same way the engine guards them. Remove only shows for removable components: `Name`, `Transform`, and the import-managed identity components `ModelInstance` and `SkinnedMesh` are in `NON_REMOVABLE`, so the inspector cannot strip an entity of its identity, its place in the world, or its rig. The Add Component dropdown lists every registered component the entity lacks, minus two exclusions: components written only by import (`ModelInstance`, `SkinnedMesh`, and `MaterialSet`) never appear, and the rig sidecars that index a skeleton (`AnimationPlayer`, `FootIk`, `KinematicBones`, `BonePhysics`) appear only on an entity that already carries a `SkinnedMesh`. Selecting one calls `add-component`, and the engine appends the new section to the entity's stored component order.
-
-Each section header has a drag handle. Dragging follows the tab-strip pattern: after a small pointer threshold, neighboring sections slide apart to show the landing slot, and the reordered list commits only on release. A drop sends the full visible component order to `set-component-order`, and undo/redo replays that same command. The hierarchy's selected-entity component subrows read the same order, so clicking a subrow always scrolls to the section in the matching position. The stored order excludes hidden structural sections such as `Relationship` and `Bone`.
+Section dragging uses a 4-pixel threshold and updates only a visual preview until release. The commit writes the full visible order through `set-component-order` and records the previous order for undo and redo. Sort Components writes the canonical order through the same path.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The generic panel | `editor/src/panels/InspectorPanel.tsx` | `InspectorPanel`, `NON_REMOVABLE`, `NON_ADDABLE`, `RIG_ONLY` |
-| Component order + rig bodies | `editor/src/lib/componentOrder.ts`, `editor/src/panels/InspectorPanel.tsx` | `COMPONENT_ORDER`, `canonicalComponentNames`, `orderedComponentNames`, `ReadonlyRow` |
-| Field-kind dispatch | `editor/src/components/fieldRenderer.tsx` | `renderField`, `resolveHint`, `FIELD_HINTS`, `AssetKind` |
-| Color canvas + label casing | `editor/src/components/ColorField.tsx`, `editor/src/lib/humanize.ts` | `ColorField`, `humanizeFieldName` |
-| Read-modify-write routing | `editor/src/panels/InspectorPanel.tsx` | `onFieldChange`, `sendWrite`, `coalescerFor` |
-| Optimistic overlay | `editor/src/state/store.ts` | `applyOptimisticComponent`, `dragActive` |
-| Edits (engine) | `engine/crates/control/src/commands_scene.rs` | `set-component`, `set-transform`, `set-component-field`, `set-component-order`, `add-component`, `remove-component` |
-| Smoothed drags (engine) | `engine/crates/sceneedit/src/smoothing.rs` | `step_edit_smoothing`, `TransformSmoothTarget` |
-| Drag-local widgets | `editor/src/lib/useScrubValue.ts` | `useScrubValue`, `ScrubValue` |
+| Sections, routing, and undo capture | `editor/src/panels/InspectorPanel.tsx` | `InspectorPanel`, `componentBody`, `applyWrite`, `onFieldChange`, `recordFieldEdit` |
+| Generic field dispatch | `editor/src/components/fieldRenderer.tsx` | `FIELD_HINTS`, `resolveHint`, `inferKind`, `renderField` |
+| Component ordering | `editor/src/lib/componentOrder.ts` | `COMPONENT_ORDER`, `HIDDEN_COMPONENTS`, `canonicalComponentNames`, `orderedComponentNames` |
+| Script slot editor | `editor/src/components/ScriptSlots.tsx` | `ScriptSlots`, `writeSlots`, `recordOverrideEdit` |
+| Rig editors | `editor/src/components/FootChainsEditor.tsx`, `BoneMaskField.tsx`, `BonePhysicsEditor.tsx` | `FootChainsEditor`, `BoneMaskField`, `BonePhysicsEditor` |
+| Optimistic store state | `editor/src/state/store.ts` | `applyOptimisticComponent`, `dragActive`, `pushEdit` |
+| Component registry | `engine/crates/scene/src/registry.rs` | `register_builtin_components`, `ComponentRegistry::component_order`, `ComponentRegistry::set_component_order` |
+| Scene edit commands | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `set-component`, `set-transform`, `set-component-field`, `set-component-order`, `add-component`, `remove-component` |
 
 ## Related
 
-- [Component registry](../../scene-and-ecs/component-registry/) — the registered components `inspect` enumerates
-- [Built-in components](../../scene-and-ecs/built-in-components/) — the structs being edited
-- [Asset pickers](../asset-pickers-and-drag-drop/) — the mesh/material uuid fields
-- [Scene commands](../../tooling-and-control/scene-commands/) — `inspect` and the component edit commands
+- [Component registry](../../scene-and-ecs/component-registry/) — defines the serializable component set exposed by `inspect`.
+- [Built-in components](../../scene-and-ecs/built-in-components/) — describes the component data edited here.
+- [Asset pickers](../asset-pickers-and-drag-drop/) — explains catalog filtering, clearing, and drag-and-drop.
+- [Physics inspector](../physics-inspector/) — explains collider, body, controller, and bone-physics authoring.
+- [Script-declared fields](../../scripting/script-declared-fields/) — explains slot schemas, defaults, and instance overrides.
+- [Scene commands](../../tooling-and-control/scene-commands/) — documents component inspection and edit commands.

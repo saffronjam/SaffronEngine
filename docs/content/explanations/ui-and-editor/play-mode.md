@@ -5,60 +5,78 @@ weight = 5
 
 # Play mode
 
-Play mode runs the scene the way the game will. Pressing Play switches the viewport from the editor fly-camera to the scene's own camera and starts a runtime tick; Stop returns to editing with the authored scene exactly as it was. Pause and Step in between let you freeze a frame and advance one tick at a time.
+Play mode runs physics, scripts, and animation against a disposable copy of the authored scene. Stop drops that copy and returns to the untouched edit scene. This boundary makes discard reliable: runtime changes never need to be reversed.
 
-The model is Unreal's play-in-editor adapted to this engine: Play does not mutate the scene you authored. It duplicates it, runs everything against the copy, and throws the copy away on Stop. So "what did play change?" has the same answer every time — nothing. You can move things, retune lights, spawn entities, and none of it survives the Stop.
+The state machine is `Edit -> Playing <-> Paused -> Edit`. Play enters or resumes simulation, Pause holds the current runtime state, Step grants fixed ticks while paused, and Stop returns to Edit.
 
-## Duplicate, don't restore
+## A scene built through the save format
 
-Entering play serializes the edit scene and deserializes it into a fresh throwaway scene — the copy is *defined* as "create this scene again", so it equals what loading a saved project would produce. Everything that touches the scene while playing — rendering, picking, every control command — routes through one chokepoint, `activeScene`, which hands back the play duplicate while playing and the authored scene otherwise. The edit scene is never writable through that chokepoint during play.
+Entering Play serializes the authored scene and loads the result into a fresh `Scene`. The duplicate therefore has the same component data that a project reload produces. Its asset catalog is shared, so referenced meshes, textures, and materials are not duplicated as GPU resources.
 
-Stop is then just dropping the duplicate (`play_scene = None`). There is no restore step to get wrong: the authored scene was never aliased, so dropping the duplicate *is* the restore. This is why the discard guarantee is structural rather than a careful undo — a runtime system can mutate anything in the play world and the authored scene cannot feel it.
+`active_scene` is the engine-side switch between the authored scene and the play duplicate. Scene queries and control commands use that switch, which lets the Hierarchy and Inspector inspect or edit the running copy without exposing the authored world. The current selection crosses the boundary by UUID; a runtime-created selection clears on Stop when no authored entity has the same UUID.
 
-The duplicate is cheap here. GPU meshes and textures are keyed by uuid on the asset server and shared by both scenes, so duplication copies only component structs, not GPU resources. On a typical scene the Play press costs a fraction of a millisecond.
+Animation players also start from runtime state rather than an editor preview. Each player begins at time zero, follows its authored `autoplay` setting, and discards preview and transition state. The play tick and script log/error rings start clean for the new session.
 
-## Camera handover
+## Runtime lifetime and tick gate
 
-In edit mode the viewport renders through the fly-camera. While playing it renders through the scene's primary `Camera` (`primary_camera`) — evaluated every frame, so a camera animated or re-flagged during play is honored live. A scene with no primary camera falls back to the fly-camera and reports `hasPrimaryCamera: false`, which the editor surfaces as a toast ("No primary camera — using the editor camera"). Play never renders a black frame for the lack of a camera; it warns and keeps going.
+The Edit-to-Play edge starts one `RuntimeSession`. It builds the physics world, starts the script VM, and retains the animation runtime until Stop. Pause and resume keep that session alive so its bodies, script instances, and component state remain available for inspection.
 
-The fly-camera stays controllable during play, which is what makes the fallback usable and what keeps `get-camera`/`set-camera`/`fly-input` outside the discard — the editor camera is session state, never part of the duplicated scene.
+On each host update, animation runs first. `play_step_dt` then decides whether physics and scripts advance:
 
-## The state machine
+| State | Simulation delta |
+|---|---|
+| Edit | no simulation step |
+| Playing | frame delta, clamped to $1/3$ second |
+| Paused | no step unless one is granted |
+| Paused with Step | exactly $1/60$ second per granted frame |
 
-`Edit → Playing ↔ Paused → Edit`. Pause freezes only the runtime tick; rendering, the control plane, and the fly-camera keep running, so a paused frame stays fully inspectable. Step advances exactly one fixed tick (1/60 s) and is accepted only while paused, so single-stepping is deterministic rather than tied to wall-clock frames. A max-delta clamp keeps a hitch from spiking the simulation.
+A Step command may grant more than one frame through its `frames` parameter. The host consumes one grant per update and increments `play_tick` only when simulation runs. Script failures are contained, recorded, and converted to a pause after the current step; the state transition does not re-enter the runtime while it is executing.
 
-`tick_play` is the gated driver, and the runtime systems hang off one `sim_tick` seam: the host installs a closure that runs animation, physics, and scripting against the play scene each tick, so `SceneEdit` stays free of those dependencies and the seam stays the single integration point. A lifecycle signal (`on_play_state_changed`) fires on every transition so a system can arm or tear down on the play edge without touching the machinery.
+## Camera and editor controls
 
-## Live-tune-and-discard
+Edit renders through the editor camera. Playing and Paused render through the active scene's first primary `Camera`, including its parent-composed transform. If the scene has no primary camera, rendering falls back to the editor camera and the editor reports that fallback after Play succeeds.
 
-Panels stay interactive during play. The hierarchy, inspector, and environment all address the running scene, so you can tweak a light or drag a value and watch it take effect immediately — and lose it on Stop. That is the deliberate model (Unity's and Unreal's), and the guardrail against losing real work to it is the tint: while playing or paused the editor chrome carries an amber inset ring and the topbar tinges amber. The viewport itself stays untinted — it is the game view.
+Pause stops simulation, not the host loop. Rendering, the control socket, inspection, and editor-camera input remain available. The Hierarchy and Inspector therefore show the held play scene, and their writes remain disposable.
 
-Two things lock during play. The gizmo is hidden (its overlay is editor chrome, and a transform it wrote would be swallowed by the discard), so the T/R/S controls and W/E/R shortcuts grey out. Save, open, reload, and new-project grey out too: scene swaps would pull state out from under the running duplicate, and saving is blocked to avoid mistaking a play-mode tweak for authored, saved state.
+The editor marks Playing and Paused with an amber ring and top-bar tint. It also locks operations whose meaning belongs to the authored scene:
 
-## Driving it
+- Gizmo controls and shortcuts are disabled, and editor overlays are omitted.
+- Scene-tab undo and redo are suspended without clearing their pre-play history.
+- New, save, save-as, open, recent-project, reload, and import-project actions are disabled.
 
-The toolbar's playback group is a context-sensitive Play/Pause button, Stop, and Step. The same commands drive the engine over the control plane (`play`, `pause`, `stop`, `step`, `get-play-state`), so a shell `sa play` flips the toolbar within a poll cycle, exactly like the gizmo buttons. The keyboard family is Unity's: Ctrl+P play/stop, Ctrl+Shift+P pause/resume, Ctrl+Alt+P step.
+These locks do not make the play scene read-only. Inspector and control-plane writes can still tune the running copy for diagnosis.
 
-The editor learns the engine's play state through its existing reconcile poll — `get-selection` now carries `playState`/`playVersion`, so propagation costs no extra round-trip. A click writes the store optimistically and fires the command; the poll repairs it on failure and reflects any external change.
+## Commands and reconciliation
+
+The playback controls call the same control commands exposed through `sa`:
+
+```text
+play
+pause
+step {"frames": 1}
+stop
+get-play-state
+```
+
+`play` enters from Edit and resumes from Paused. `pause` accepts only Playing, and `step` accepts only Paused. `stop` is idempotent in Edit. Entering Play is rejected while the asset editor owns the preview scene.
+
+The React store updates optimistically when a playback button or shortcut is used. The regular `get-selection` reconciliation response carries `playState` and `playVersion`, so rejected commands and changes made by another client converge without a separate polling lane. The fixed shortcuts are Ctrl/Cmd+P for Play or Stop, Ctrl/Cmd+Shift+P for Pause or Resume, and Ctrl/Cmd+Alt+P for Step.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| State machine + duplication + tick (engine) | `engine/crates/sceneedit/src/play.rs` | `enter_play`, `pause_play`, `resume_play`, `step_play`, `stop_play`, `tick_play`, `sim_tick` |
-| Play state + chokepoint (engine) | `engine/crates/sceneedit/src/play.rs` · `context.rs` | `PlayState`, `active_scene`, `render_camera_view`, `on_play_state_changed` |
-| Render + tick wiring (engine) | `engine/crates/host/src/layer.rs` | `HostLayer::on_ui`, `HostLayer::on_update` |
-| Play commands (engine) | `engine/crates/control/src/commands_scene.rs` | `play`, `pause`, `stop`, `step`, `get-play-state` |
-| Client wrappers | `editor/src/control/client.ts` | `play`, `pause`, `stop`, `step`, `getPlayState` |
-| Store slice + poll apply | `editor/src/state/store.ts` | `playState`, `setPlayState` |
-| Toolbar group | `editor/src/panels/Topbar.tsx` | `onPlayPause`, `onStop`, `onStep` |
-| Hotkeys | `editor/src/app/useGizmoShortcuts.ts` | the Ctrl+P family |
-| Tint + locks | `editor/src/app/Layout.tsx`, `editor/src/app/ProjectMenu.tsx` | `playRing`, the disabled menu items |
+| State machine, duplicate, camera, and tick gate | `engine/crates/sceneedit/src/play.rs` | `PlayState`, `enter_play`, `play_step_dt`, `render_camera_view`, `stop_play` |
+| Active-scene routing | `engine/crates/sceneedit/src/context.rs` | `active_scene`, `registry_and_active_scene`, `play_scene_and_input` |
+| Shared simulation session | `engine/crates/runtime/src/session.rs` | `RuntimeSession::start`, `RuntimeSession::step`, `RuntimeSession::stop` |
+| Host edge and update ordering | `engine/crates/host/src/layer.rs` | `HostLayer::reconcile_play_edge`, `HostLayer::update_session`, `HostLayer::drain_runtime_sinks` |
+| Playback control commands | `engine/crates/control/src/commands_scene.rs` | `play`, `pause`, `step`, `stop`, `get-play-state` |
+| Optimistic playback controls | `editor/src/panels/Topbar.tsx` | `onPlayPause`, `onStop`, `onStep` |
+| Reconciliation and shortcuts | `editor/src/state/store.ts` · `editor/src/app/useGizmoShortcuts.ts` | `playState`, `playVersion`, `startReconcile` |
 
 ## Related
 
-- [Asset editor](../asset-editor/) — Preview, the third mode that routes through `activeScene` the same way Play does
-- [Editor camera](../editor-camera/) — the fly-camera play falls back to, and which stays live during play
-- [Transform gizmo](../gizmo/) — hidden during play, since the play duplicate would swallow its writes
-- [Scene hierarchy](../../scene-and-ecs/scene-hierarchy/) — the uuid identity that lets the duplicate and the authored scene resolve the same entities
-- [Scene commands](../../tooling-and-control/scene-commands/) — `play`/`pause`/`stop`/`step`/`get-play-state` over the wire
+- [Editor camera](../editor-camera/) - the edit view and the fallback when a play scene has no primary camera
+- [Scene hierarchy](../../scene-and-ecs/scene-hierarchy/) - UUID identity and parent-composed transforms
+- [Script logs panel](../script-logs-panel/) - runtime output and contained script failures
+- [Scene commands](../../tooling-and-control/scene-commands/) - the control-plane surface used by playback and editor actions

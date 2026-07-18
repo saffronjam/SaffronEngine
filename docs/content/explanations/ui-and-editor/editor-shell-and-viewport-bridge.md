@@ -5,85 +5,120 @@ weight = 1
 
 # Editor shell and the viewport bridge
 
-The editor is a CEF (Chromium) application: a React/TypeScript front-end rendered through
-**windowless OSR**, a purpose-built Rust shell (`editor/shell`) that owns a winit Wayland
-toplevel, and the engine running as a separate process. The webview never renders the 3D
-scene. The engine renders headless and the shell composites its frames below the transparent
-UI ([viewport compositing](../viewport-compositing/)), so the viewport shows the live render
-while the UI owns all chrome — including chrome blended over the scene itself. CEF paints the
-UI off-screen (`on_paint`) and the shell uploads each frame to the toplevel surface at the
-monitor's refresh.
+The editor combines a React frontend, a Rust desktop shell, and a separate engine host. The shell renders the frontend through [CEF off-screen rendering](https://bitbucket.org/chromiumembedded/cef/wiki/GeneralUsage#markdown-header-off-screen-rendering), owns the native window, and presents engine frames below transparent regions of the web UI.
 
-Every editor operation that touches the scene rides the same JSON-over-unix-socket
-[control protocol](../../tooling-and-control/control-plane-architecture/) the `sa` CLI
-speaks. The engine workspace builds the `saffron-host` executable — a headless host
-that boots the engine, publishes frames, and drains the control socket, with no panels of
-its own.
+The engine host has no editor panels. It renders the scene, publishes viewport frames, and serves the same [control protocol](../../tooling-and-control/control-plane-architecture/) used by the `sa` CLI.
 
-## Two processes, one socket
+## Application boundary
 
-The shell spawns `saffron-host` with `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` (hidden window), a
-per-instance `SAFFRON_CONTROL_SOCK` (pid-scoped, so two editor windows do not collide),
-**two** shared-memory segment names — `SAFFRON_VIEWPORT_SHM_SCENE` and
-`SAFFRON_VIEWPORT_SHM_ASSET`, one ring per [view](../viewport-compositing/) so each pane's
-subsurface has frames even while parked. The engine is then the renderer and the webview is
-the UI, talking only over that socket.
+The Rust shell creates a [`winit`](https://docs.rs/winit/latest/winit/) toplevel and a windowless CEF browser. Development loads the Vite URL from `SAFFRON_DEV_URL`; a packaged editor serves the built frontend through the `saffron-app://` scheme.
 
-The TypeScript side is a typed client over one generic passthrough. Every scene, asset, and
-render command is `invoke('control', { cmd, params })` — where `invoke` is the shell bridge's
-`cefQuery` round-trip; the Rust layer forwards it verbatim, turns an engine `ok:false` into a
-rejected promise, and otherwise resolves the result JSON. Adding a new `sa` command needs no
-Rust change — the typed wrapper in `client.ts` and a DTO entry are all that move.
+CEF delivers BGRA `on_paint` buffers to `UiCompositor`. The shell preserves their alpha channel so the platform compositor can show the [native viewport surfaces](../viewport-compositing/) beneath the UI. Input, cursors, drag-and-drop, and native window operations return through the shell because windowless CEF owns no platform window of its own.
 
-```ts
-async function call<C extends keyof CommandResultMap>(
-  cmd: C,
-  params?: object,
-): Promise<CommandResultMap[C]> {
-  return invoke<CommandResultMap[C]>("control", { cmd, params: params ?? {} });
-}
+The shell spawns `saffron-host` with a per-process control socket and two per-view shared-memory names:
+
+| Environment variable | Purpose |
+|---|---|
+| `SAFFRON_EDITOR_NATIVE_VIEWPORT=1` | Runs the host without a window or swapchain |
+| `SAFFRON_CONTROL_SOCK` | Selects the PID-scoped JSON socket |
+| `SAFFRON_VIEWPORT_SHM_SCENE` | Publishes the `scene` view ring |
+| `SAFFRON_VIEWPORT_SHM_ASSET` | Publishes the `assetPreview` view ring |
+| `SAFFRON_APPDATA_DIR` | Shares the editor's application-data root |
+
+`backend::env::engine_env` adds the platform GPU-loader environment. Distinct socket and segment names let editor windows supervise independent host processes.
+
+## Frontend-to-shell IPC
+
+The frontend's `invoke(command, args)` serializes a CEF query as JSON. `CommandQueryHandler` receives the query in the browser process, moves dispatch to a worker thread, and completes the CEF callback with a JSON result or structured error.
+
+```mermaid
+sequenceDiagram
+    participant UI as React client
+    participant CEF as CEF message router
+    participant Shell as Rust command dispatch
+    participant Host as Engine control socket
+    UI->>CEF: invoke("control", {cmd, params})
+    CEF->>Shell: CommandQueryHandler
+    Shell->>Host: newline-delimited JSON
+    Host-->>Shell: result or error code
+    Shell-->>UI: Promise resolve or reject
 ```
 
-Rust handles only the lifecycle and presenter commands directly — `start_engine`,
-`set_viewport_bounds(view, …)`, `set_viewport_parked(view, …)`, `quit_engine`, `engine_alive`
-— because those manage the child process and the two compositor-side subsurfaces rather than
-the scene.
+Shell events travel in the other direction. Worker threads post an event to the main-thread inbox; the main loop evaluates `window.__saffronShellEvent(name, payload)`, and `listen` fans it out to frontend subscribers.
 
-> [!NOTE]
-> The presenter is a Wayland subsurface and the UI is composited on winit's `wl_display`, so
-> the editor requires a Wayland session.
+## Engine control passthrough
 
-## Auto-start and the loading overlay
+Every typed engine operation converges on `call`, which invokes one shell command named `control`:
 
-On boot the shell spawns the engine (`auto_start`), installs the presenter worker
-(`presenter::install`), then polls `viewport-native-info` with a child-liveness-aware bounded
-retry that distinguishes "socket not bound yet" from "process crashed". React drives an
-`engineStatus.phase` state machine — `idle → starting → attaching → ready` — and the
-[viewport panel](../viewport-panel/) probes the same command before flipping to `ready`.
-A `<LoadingOverlay/>` covers the viewport region until then; it paints an opaque
-background, which also covers the transparent hole before the first frame arrives.
+```ts
+return await invoke<CommandResultMap[C]>("control", {
+  cmd,
+  params: params ?? {},
+});
+```
 
-## Crash recovery
+The shell's `control_request_with_params` writes one request envelope to the Unix socket and reads one response. A mutex permits only one outstanding socket round trip, matching the host's frame-driven control drain. An engine error retains its message and machine-readable code through the Rust and TypeScript error types.
 
-The reconcile poll doubles as a liveness watchdog: each tick it calls `engineAlive()`,
-which uses `child.try_wait()` rather than a stale handle, so a dead engine reads as dead.
-If the child has exited, the store flips `phase` back to `error`, the overlay reappears,
-and it offers **Retry** (re-probe) and **Restart** (quit, re-spawn, re-probe).
+Adding an engine command does not require another shell dispatch arm. The protocol DTOs provide the frontend parameter and result types, while a client method can give panels a domain-specific name.
+
+Commands for native editor resources use dedicated shell handlers. These cover engine supervision, window controls, file dialogs, settings, viewport geometry, trace serving, and Asset Store connectors.
+
+## Platform backends
+
+`backend/mod.rs` selects one window-system module at compile time and re-exports a fixed surface. Shared shell code depends on `Handles`, `UiCompositor`, `presenter`, key translation, CEF bootstrap, window operations, and environment helpers.
+
+```rust
+#[cfg(target_os = "linux")]
+#[path = "wayland/mod.rs"]
+mod imp;
+
+#[cfg(target_os = "macos")]
+#[path = "appkit/mod.rs"]
+mod imp;
+
+pub use imp::{Handles, UiCompositor, bootstrap, env, keys, presenter, window};
+```
+
+Any other target fails at compile time. There is no runtime backend selection or trait-object dispatch.
+
+| Concern | Linux (`wayland`) | macOS (`appkit`) |
+|---|---|---|
+| Window chrome | Borderless window with frontend titlebar | Native decorations and transparent titlebar |
+| UI frames | `wl_shm` buffers on the toplevel surface | IOSurface pool on a UI `CALayer` |
+| Engine frames | One `wl_subsurface` per view | One `CALayer` per view |
+| Viewport pacing | `wl_surface.frame` callbacks | `CADisplayLink` from the `NSView` |
+| OSR scale | Scale 1 buffers | Window backing scale, including Retina |
+| CEF pump | Shell loop calls `do_message_loop_work` | Timer on the shared `NSRunLoop` |
+| CEF bootstrap | Linked `libcef` | Framework loaded from the app bundle |
+
+The macOS editor runs from an `.app` bundle. Its `Contents/Frameworks` directory contains `Chromium Embedded Framework.framework` and five CEF helper applications, following [CEF's macOS bundle model](https://bitbucket.org/chromiumembedded/cef/wiki/GeneralUsage.md#markdown-header-macos). The bundle builder assembles this layout for `just run`.
+
+## Startup and recovery
+
+The shell installs the UI compositor and both viewport presenters when the toplevel resumes. Each presenter retries its shared-memory open until the host creates the segment. `auto_start` launches the host and runs a failure watchdog that checks child liveness and control-socket availability; success remains owned by the frontend probe.
+
+`ViewportPanel` polls `viewport-native-info` with a 1.5-second per-attempt timeout and 150-millisecond retries. A successful reply changes the engine phase to `ready`. `LoadingOverlay` stays opaque over the viewport for every other phase, so an absent first frame never exposes the desktop through the transparent region.
+
+The reconcile service checks `engineAlive` once per second while the editor is focused and the host may be running. `child_alive` uses `Child::try_wait`, which distinguishes a running child from an exited process. Failure changes the phase to `error` and restores the loading overlay.
+
+Retry calls the idempotent `start_engine` handler and returns to attachment probing. Restart first sends `quit`, force-terminates any remaining child, removes the socket and both shared-memory names, then starts a fresh host.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Typed passthrough client | `editor/src/control/client.ts` | `call`, `callRaw`, `client` |
-| Lifecycle + presenter commands | `editor/src/control/client.ts` | `startEngine`, `setViewportBounds` (view), `setViewportParked` (view), `setActiveView`, `quitEngine`, `engineAlive` |
-| Engine spawn + supervision | `editor/shell/src/engine.rs` | `spawn_engine`, `auto_start`, watchdog |
-| App shell + lifecycle events | `editor/src/app/App.tsx` | `App`, `engine-phase` / `viewport-error` listeners |
-| Phase state machine | `editor/src/state/store.ts` | `EngineStatus`, `setPhase` |
-| Loading + crash overlay | `editor/src/app/LoadingOverlay.tsx` | `LoadingOverlay`, Retry / Restart |
+| Frontend shell API | `editor/src/shell/index.ts` | `invoke`, `listen`, `getCurrentWindow` |
+| Typed engine client | `editor/src/control/client.ts` | `call`, `client`, `ControlError` |
+| CEF query router | `editor/shell/src/ipc.rs` | `CommandQueryHandler`, `browser_router` |
+| Native dispatch | `editor/shell/src/commands.rs` | `dispatch` |
+| Socket passthrough | `editor/shell/src/control.rs` | `control_request_with_params`, `ControlError` |
+| Host supervision | `editor/shell/src/engine.rs` | `spawn_engine`, `auto_start`, `child_alive`, `teardown` |
+| Backend contract | `editor/shell/src/backend/mod.rs` | `Handles`, `UiCompositor`, `presenter`, `bootstrap` |
+| Readiness and overlay | `editor/src/panels/ViewportPanel.tsx`, `editor/src/app/LoadingOverlay.tsx` | `ViewportPanel`, `LoadingOverlay` |
 
 ## Related
 
-- [Viewport compositing](../viewport-compositing/) — how the engine's frames reach the screen
-- [Viewport panel](../viewport-panel/) — the host div the subsurface is glued to
-- [Theme and fonts](../theme-and-fonts/) — the shadcn/Tailwind chrome around the viewport
-- [Shared types](../../tooling-and-control/shared-types/) — the DTO-first wire contract the typed client consumes
+- [Viewport compositing](../viewport-compositing/) — shared-memory publication and native presentation
+- [Viewport panel](../viewport-panel/) — bounds, parking, and pointer input for the scene view
+- [Shared types](../../tooling-and-control/shared-types/) — generated TypeScript command contracts
+- [Control-plane architecture](../../tooling-and-control/control-plane-architecture/) — host-side dispatch and response envelopes

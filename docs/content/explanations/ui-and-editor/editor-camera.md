@@ -5,104 +5,87 @@ weight = 3
 
 # Editor camera
 
-The editor camera is the viewport's own fly-camera, the eye through which the scene appears while
-editing. It is distinct from any `CameraComponent` in the scene: those are authored game cameras,
-while the editor camera only controls the editing viewpoint. The scene, the [gizmo](../gizmo/),
-and [picking](../selection/) all draw and project through it.
+The editor camera is the engine-owned view used to inspect a scene. It is separate from authored `Camera` components, which define game views, and supplies the same `CameraView` to scene rendering, [selection](../selection/), and the [gizmo](../gizmo/).
 
-The camera is engine state, not part of the webview. The engine owns the eye, runs the look and move
-input, and renders the scene through it via the [compositing path](../viewport-compositing/).
-Camera, gizmo, and meshes line up because they share one `CameraView`, with no second projection to
-keep in sync.
+## Pose and view
 
-## State and orientation
-
-`SceneEditCamera` is a plain struct of position and orientation. Orientation is stored as yaw and pitch,
-so the look controls add directly to two scalars. At yaw 0 the camera looks down `-Z`, and the
-`forward()` vector is rebuilt from the angles when needed:
+`SceneEditCamera` stores position, yaw, pitch, field of view, clip planes, and input speeds. Yaw and pitch are degrees. At zero yaw and pitch the camera faces negative Z, and `forward` derives its direction from the two angles:
 
 ```rust
-Vec3::new(pitch.cos() * yaw.sin(), pitch.sin(), -pitch.cos() * yaw.cos()).normalize()
+let yaw = self.yaw.to_radians();
+let pitch = self.pitch.to_radians();
+Vec3::new(
+    pitch.cos() * yaw.sin(),
+    pitch.sin(),
+    -pitch.cos() * yaw.cos(),
+).normalize()
 ```
 
-## Input
+`view` builds a right-handed world-to-view matrix with positive Y as up. It returns that matrix with the projection parameters in `CameraView`, so render passes and screen-to-world tools use one camera definition.
 
-Look and move input streams over the control plane — the engine's hidden window receives no
-events. While the **right mouse button is held** over the [viewport panel](../viewport-panel/),
-the webview takes pointer lock and sends `fly-input` snapshots: accumulated relative mouse
-deltas plus the WASD/Space/Shift key state, at roughly the pointer-event cadence. The engine
-stores the latest snapshot on the edit context and drains the accumulated look delta once per
-frame into `update_scene_edit_camera`, so a burst of samples between frames is never lost.
-Releasing the button — or Escape, which exits pointer lock natively — sends `active:false`
-and ends the fly.
+The camera also carries target position and target angles. Absolute framing synchronizes the targets with the visible pose, while streamed look input moves the targets and lets the visible angles ease toward them. `is_easing` keeps the reactive renderer active until the pose converges.
 
-Samples arrive at ~60Hz, slower than the engine renders, so applying each delta whole would
-staircase the view. The drained delta instead lands in a pending accumulator (`look_pending`)
-that yaw and pitch consume through an exponential filter — the same ~25ms time constant the
-[gizmo](../gizmo/) uses for drag samples — turning the sample steps into continuous motion at
-about two frames of lag. The filter only reshapes timing; every pixel of input still lands.
+## Fly input path
 
-A "controlling" latch keeps control while the view swings off the panel mid-drag; movement is
-frame-rate independent (`moveSpeed * dt`) along the forward and right basis, and pitch is
-clamped just shy of vertical so the camera never flips.
+Holding the right mouse button over the [viewport panel](../viewport-panel/) asks the native shell to grab and hide the cursor. Raw relative mouse motion accumulates in the shell and arrives in the web UI as `fly-look` events. This native path is necessary because the windowless webview does not provide DOM pointer lock.
 
-The camera is also scriptable over the control socket through `get-camera` and `set-camera`, which
-merge the fly-cam fields the same way the transform commands do:
+The viewport accumulates those deltas and sends a `fly-input` snapshot at most once every 16 milliseconds. Each snapshot includes the six held movement actions. Their defaults are W, S, A, D, Space, and left Shift, and the keybinding registry supplies any user overrides.
 
-```ts
-getCamera(): Promise<EditorCamera> { return call("get-camera"); }
-setCamera(camera: Partial<EditorCamera>): Promise<EditorCamera> { return call("set-camera", camera); }
+```mermaid
+flowchart LR
+    A[Native relative motion] --> B[fly-look event]
+    B --> C[16 ms viewport accumulator]
+    C --> D[fly-input command]
+    D --> E[SceneEditCameraInput]
+    E --> F[Host frame drain]
+    F --> G[update_scene_edit_camera]
 ```
 
-`sa focus` moves the eye through this path: it reads the target transform and pulls the camera back
-along its forward axis. The native input and the control commands stay consistent because both read
-and write the one engine-side camera.
+The `fly-input` handler adds each look delta to the pending frame input rather than replacing it. `HostLayer::on_update` copies the input and clears only its accumulated look delta before updating the camera. Multiple control messages between engine frames therefore contribute to the same turn.
 
-## Feeding the renderer and the gizmo
+Right-button release, Escape, focus loss, or panel teardown releases the native pointer lock and sends an inactive snapshot with cleared keys. The camera's `controlling` flag follows that active state.
 
-The editor camera converts to a `CameraView`, the same view type a scene camera produces, so
-the scene pass, the gizmo overlay, and the pick ray all consume one view through
-`SceneEditCamera::view`:
+## Motion and smoothing
 
-```rust
-pub fn view(&self) -> CameraView {
-    CameraView {
-        view: Mat4::look_at_rh(self.position, self.position + self.forward(), Vec3::Y),
-        fov: self.fov,
-        near_plane: self.near_plane,
-        far_plane: self.far_plane,
-    }
-}
+`update_scene_edit_camera` adds the look delta to `target_yaw` and `target_pitch`, then clamps target pitch to -89 through 89 degrees. The visible angles use exponential smoothing with the shared `SMOOTH_TAU` constant. The easing tail requests frames after the final input sample until the target pose is reached.
+
+Translation uses the current forward vector, its horizontal right vector, and world Y. The combined direction is multiplied by `move_speed * dt`, making speed independent of engine frame rate. The same delta moves both position and target position, so held-key translation responds without an easing offset.
+
+Preview panes reuse the camera in orbit mode. An `OrbitState` holds a pivot and radius plus their targets; angle, pivot, and radius ease independently, then the eye is placed on the orbit arc. A free-eye `set-camera` leaves orbit mode and snaps to the requested pose.
+
+## Focus and control commands
+
+`get-camera` returns the complete editor camera DTO. `set-camera` accepts partial free-eye fields or an orbit sample with `pivot` and `distance`, which lets tools drive the same state used by native input.
+
+The `focus` command frames an entity from the current viewing direction. When render bounds are available, it uses the model forest's combined axis-aligned bounding box and computes this distance:
+
+```text
+distance = max(radius / tan(verticalFov / 2) * 1.3, 0.5)
+position = boundsCenter - forward * distance
 ```
 
-The view holds only the world-to-view transform and the projection params. The projection matrix, and
-the Vulkan Y-flip, is built where it is used.
+An entity without render bounds uses its world translation and a distance of 5 units. Both paths call `sync_target`, so focus lands at the framed pose immediately.
 
 ## Persistence
 
-The eye is part of the project: saving writes an `editorCamera` block (position, yaw, pitch, fov)
-into [`project.json`](../../geometry-and-assets/project-serialization/), and opening a project
-restores it, so a reopened project shows the framing it was saved with. Projects saved before the
-block existed keep the current camera. The tuning fields (speeds, planes) are not persisted —
-they are session preferences, not framing.
+Project save writes `position`, `yaw`, `pitch`, and `fov` into the `editorCamera` sidecar object. Project load applies the fields that are present, leaves unspecified fields unchanged, exits orbit mode, and synchronizes the target pose. Clip planes and movement speeds remain session state.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| State | `engine/crates/sceneedit/src/camera.rs` | `SceneEditCamera`, `SceneEditCameraInput` |
-| Forward from yaw/pitch | `engine/crates/sceneedit/src/camera.rs` | `SceneEditCamera::forward` |
-| Move/look math | `engine/crates/sceneedit/src/camera.rs` | `update_scene_edit_camera`, `look_pending`, the `controlling` latch |
-| Convert to a view | `engine/crates/sceneedit/src/camera.rs` | `SceneEditCamera::view` |
-| Persisted view ↔ JSON | `engine/crates/sceneedit/src/camera.rs` | `SceneEditCamera::to_json`, `SceneEditCamera::from_json` |
-| Fly snapshot drain | `engine/crates/host/src/layer.rs` | the `on_update` `fly_input` drain |
-| Pointer-lock streaming (webview) | `editor/src/panels/ViewportPanel.tsx` | the fly `useEffect` |
-| Camera commands (engine) | `engine/crates/control/src/commands_scene.rs` | `fly-input`, `get-camera`, `set-camera`, `focus` |
-| Camera wrappers (client) | `editor/src/control/client.ts` | `getCamera`, `setCamera` |
+| Camera pose, orbit, and view | `engine/crates/sceneedit/src/camera.rs` | `SceneEditCamera`, `OrbitState`, `forward`, `view`, `sync_target`, `is_easing` |
+| Per-frame camera update | `engine/crates/sceneedit/src/camera.rs`, `smoothing.rs` | `SceneEditCameraInput`, `update_scene_edit_camera`, `SMOOTH_TAU` |
+| Native relative motion | `editor/shell/src/main.rs` | `Shell::device_event`, `look_accum`, `emit_to_js` |
+| Viewport input stream | `editor/src/panels/ViewportPanel.tsx` | `FLY_STREAM_MS`, `flyingRef`, `sendState`, `endFly` |
+| Host frame drain | `engine/crates/host/src/layer.rs` | `HostLayer::on_update`, `render_activity_reasons` |
+| Camera and focus commands | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `camera_dto`, `focus`, `get-camera`, `set-camera`, `fly-input` |
+| Save and load | `engine/crates/sceneedit/src/camera.rs`, `engine/crates/control/src/project_loader.rs` | `to_json`, `from_json`, `install_doc` |
 
 ## Related
 
-- [Gizmo](../gizmo/) — manipulates through the same `CameraView`
-- [Play mode](../play-mode/) — the viewport renders through the scene camera during play, falling back to this one
-- [Selection](../selection/) — click-pick builds its ray from this camera
-- [Scene commands](../../tooling-and-control/scene-commands/) — `get-camera`/`set-camera`/`focus`
+- [Viewport panel](../viewport-panel/) — owns the screen rectangle and fly-input gesture.
+- [Gizmo](../gizmo/) — projects native handles through the same camera view.
+- [Play mode](../play-mode/) — switches rendering to the primary game camera during play.
+- [Selection](../selection/) — constructs pick rays from the editor view.
+- [Scene commands](../../tooling-and-control/scene-commands/) — lists the camera control surface.
