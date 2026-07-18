@@ -344,10 +344,17 @@ mod tests {
 
     #[test]
     fn deterministic_flags_carry_the_frozen_set() {
-        let flags = JoltBuildFlags::DETERMINISTIC;
+        // The test binary is built for the target arch, so `cfg!(target_arch)` names the same
+        // variant `build.rs` selects from `CARGO_CFG_TARGET_ARCH` for this build.
+        let target_arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+        let flags = JoltBuildFlags::for_arch(target_arch);
 
         // The determinism define is present and single precision is the *absence* of
-        // JPH_DOUBLE_PRECISION (it must never be defined here).
+        // JPH_DOUBLE_PRECISION (it must never be defined here). This holds on every arch.
         assert!(
             flags
                 .defines
@@ -363,24 +370,42 @@ mod tests {
             "single precision is the absence of JPH_DOUBLE_PRECISION; it must never be defined"
         );
         // FMADD is deliberately suppressed under determinism (contracted FMAs diverge across
-        // micro-architectures), so its define must be absent.
+        // micro-architectures), so its define must be absent, as must its `-mfma` flag.
         assert!(
             !flags.defines.iter().any(|(k, _)| *k == "JPH_USE_FMADD"),
             "JPH_USE_FMADD must be absent under cross-platform determinism"
         );
+        assert!(
+            !flags.arch_fp_flags.contains(&"-mfma"),
+            "-mfma must be absent under cross-platform determinism"
+        );
 
-        // The determinism FP pairing and the confined arch flags are present.
-        for expected in ["-ffp-model=precise", "-ffp-contract=off", "-mavx2"] {
+        // The determinism FP pairing is present on every arch.
+        for expected in ["-ffp-model=precise", "-ffp-contract=off"] {
             assert!(
                 flags.arch_fp_flags.contains(&expected),
                 "{expected} must be in the confined arch/FP flag set"
             );
         }
-        // `-mfma` must NOT appear (FMADD suppressed by determinism).
-        assert!(
-            !flags.arch_fp_flags.contains(&"-mfma"),
-            "-mfma must be absent under cross-platform determinism"
-        );
+
+        // The instruction-set selection is arch-specific: x86 carries its `-m*` SIMD flags,
+        // while aarch64 gets NEON from Jolt's own `Core.h` and so carries no arch `-m*` flag.
+        match target_arch {
+            "aarch64" => {
+                assert!(
+                    !flags.arch_fp_flags.iter().any(|f| f.starts_with("-m")),
+                    "aarch64 emits no `-m*` arch flag (NEON is baseline; Jolt defines JPH_USE_NEON)"
+                );
+                assert!(
+                    !flags.defines.iter().any(|(k, _)| k.starts_with("JPH_USE_")),
+                    "aarch64 defines no JPH_USE_* SIMD macro (Jolt's Core.h enables NEON itself)"
+                );
+            }
+            _ => assert!(
+                flags.arch_fp_flags.contains(&"-mavx2"),
+                "x86-64 must carry its `-mavx2` instruction-set flag"
+            ),
+        }
 
         // Jolt's own `-Werror` is overridden for its TUs.
         assert!(flags.warning_flags.contains(&"-Wno-error"));
