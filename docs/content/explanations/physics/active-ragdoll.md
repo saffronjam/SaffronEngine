@@ -5,90 +5,93 @@ weight = 9
 
 # Active ragdoll
 
-The passive ragdoll lets a body drive a bone and collapse under gravity. The active ragdoll closes
-the loop the other way: constraint **motors** pull the bodies *back* toward the animated pose, and a
-per-bone weight mixes physics against animation through the **same** `PoseOverride` blend layer foot
-IK and the passive ragdoll already use. The result is the spectrum a hit reaction needs — limp, fully
-driven, or anything between, per bone — with no new pose path.
+An active ragdoll uses constraint motors to pull simulated bones toward an animated pose. Per-bone
+blend weights then decide how much of the simulated pose reaches the skeleton, which supports limp,
+motor-driven, and mixed responses through the same `PoseOverride` path.
 
-## The spectrum: passive, active, partial
+## Motors and pose weights
 
-A ragdoll is one Jolt `Ragdoll` whose parts mirror `SkinnedMesh.bones` 1:1. Two independent dials
-decide how it behaves, and both live per bone:
+Each live [Jolt ragdoll](https://jrouwe.github.io/JoltPhysicsDocs/5.3.0/class_ragdoll.html) has two
+independent controls:
 
-- **Motors (`active`)** — whether the joint's motor is driven toward the animation each step. Off is a
-  passive limp (gravity + limits only); on is a body that tracks the clip.
-- **Weight (`body_weight` / per-bone `weight`)** — how much the *bone* follows physics vs. animation,
-  `0` = pure animation, `1` = pure physics. The world eases the live weight toward this target (at
-  `RAGDOLL_WEIGHT_RATE`) so a limb blends in and out without a pop.
+- `active` enables the motors on `SwingTwist` joints. An inactive ragdoll moves under gravity and
+  its joint limits.
+- `bodyWeight` sets the target physics weight for every bone. A per-bone `weight` can override one
+  entry. Weight `0` selects animation and weight `1` selects physics.
 
-Passive full-weight is the collapse of the previous page. Active full-weight is a body that holds the
-animated pose against gravity. **Partial** — upper-body weight `1` while the legs stay at `0` — is a
-character that takes an impact in the chest while still running, which is the headline UE Physical
-Animation result this mirrors.
+`World::advance_ragdoll_blend` moves each live weight toward its target at six weight units per
+second. The ramp prevents a discontinuity when a limb enters or leaves simulation. Motor state and
+pose weight remain separate, so a motor-driven body can influence the world while its rendered bone
+uses any blend between animation and physics.
 
-## Motors read the authored PD gains
+## Motor targets
 
-`BonePhysics` has carried `drive_stiffness` / `drive_damping` / `drive_max_force` per bone the whole
-time, authored-but-inert. They ride the `BonePart` into the shim's `add_ragdoll`, which bakes them
-into each `SwingTwistConstraint`'s swing + twist `MotorSettings` at build — so a freshly imported,
-auto-fit rig already has sane motors. Each fixed step, before the Jolt update,
-`World::drive_ragdolls_to_pose` walks every **active** ragdoll and, for each `SwingTwist` joint, sets
-the motor state to drive and the target orientation to the bone's local rotation from this frame's
-animation target (Jolt's `SetTargetOrientationBS`; glam and Jolt share quaternion order, so no
-swizzle). A `Free` (or `Hinge`/`Fixed`) joint carries no swing motor and stays limp under drive — the
-desired "this limb is dead, the rest is driven" behaviour.
+`BonePhysics` stores each bone's `drive_stiffness`, `drive_damping`, and `drive_max_force`. During
+ragdoll creation, the C++ bridge converts those fields into Jolt `MotorSettings` for both axes of a
+`SwingTwistConstraint`. Values near zero use an 8 Hz spring, damping `1`, and a torque limit of
+`1000`.
 
-The animation target is the rig's `AnimationRuntime.last_pose` — the post-IK local pose the evaluator
-produced this frame, in bone order. The host builds one `PoseTarget` per animated rig and hands it to
-`drive_ragdolls_to_pose`.
+Animation records each rig's final local pose in `AnimationRuntime::last_pose`. Before physics
+steps, `RuntimeSession::step` copies those poses into `PoseTarget` values. For every active ragdoll,
+`World::drive_ragdolls_to_pose` enables the swing and twist position motors and passes each local
+bone rotation to `SetTargetOrientationBS`.
 
-> [!NOTE]
-> Motors restore a joint's *relative* orientation, not the unconstrained root's world position. A
-> free ragdoll whose root has fallen is re-*posed* by the motors but not stood back up — recovering a
-> character to a standing pose needs a kinematic root anchor (the character controller's job),
-> deferred. Recovering the *bone* to the animated pose is the weight blend below, which always works.
+Only a `SwingTwist` parent constraint has these motors. Root parts and bones authored as `Fixed`,
+`Hinge`, or `Free` do not receive a motor target. A motor changes a joint's relative orientation; it
+does not move an unconstrained root body back to its animated world position.
 
-## The weight blend is the recover
+## Physics-to-animation blend
 
-After the step, `World::write_ragdoll_poses` converts each part's world transform to the bone's local
-TRS and writes it into `PoseOverride` — but mixed by the bone's eased weight. At/above
-`PURE_PHYSICS_WEIGHT` it overwrites; below it it `mix`/`slerp`s physics over the animation pose the
-evaluator wrote into the override earlier this frame. `World::advance_ragdoll_blend` eases the live
-weight toward the target each step, so ramping `body_weight` from `1` back to `0` slides the bone from
-the collapsed physics pose back onto the clip — **a hit blows a limb to physics and it recovers to the
-animation**. Because the evaluator rewrites the override from the clip every frame, the mix always
-starts from a fresh animation pose, never a stale physics one — there is no drift to accumulate.
+After the physics step, `World::write_ragdoll_poses` converts each part's world transform into a
+bone-local transform. At weights below `0.999`, it interpolates translation and scale and uses
+quaternion spherical interpolation for rotation. At or above that threshold, the physics transform
+overwrites the bone's `PoseOverride`.
 
-The host's `sim_tick` seam composes the per-frame order: `drive_ragdolls_to_pose` →
-`advance_ragdoll_blend` → `World::step` → `write_ragdoll_poses`.
+The animation evaluator writes a fresh override before physics runs, so a partial blend always
+starts from the animated pose for that tick. `RuntimeSession::step` performs the handoff in this
+order:
 
-## Authoring: auto-fit on import, then hand-tune
+```text
+AnimationRuntime::last_poses
+  -> World::drive_ragdolls_to_pose
+  -> World::advance_ragdoll_blend
+  -> World::step
+  -> World::write_ragdoll_poses
+```
 
-A `BonePhysicsComponent` is auto-fit on skinned import — a capsule per bone sized from the rest
-joint-to-child distance, `SwingTwist` joints, unit mass — so a rig is ragdoll-ready the instant it
-loads (the locked auto-fit decision, mirroring `Collider`). Hand-edit a single bone's field
-afterwards with `set-component-field {entity, "BonePhysics", field, index, value}`: the `index`
-addresses one element of the `bones` array, so `{field: "joint", index: 0, value: "Free"}` makes the
-pelvis limp without disturbing the rest.
+## Authoring and control
 
-## Driving it: `set-ragdoll` / `get-ragdoll`
+Model import creates one `BonePhysics` entry per bone. Its capsule length follows the greatest
+rest-pose distance to a direct child, the radius is 30% of the half-height with a `0.03` minimum,
+and every joint starts as `SwingTwist`. The generic `set-component-field` command edits an indexed
+entry when a rig needs different shapes, limits, masses, or drive values.
 
-`set-ragdoll {entity, active?, body_weight?, bone?, weight?}` drives the blend through
-`World::set_ragdoll_blend`: it auto-creates the ragdoll on first call (so a hit "just works" with no
-separate `enable-ragdoll`), flips the motors with `active`, sets a uniform target with `body_weight`,
-or targets one limb with `bone`+`weight`. A hit reaction is `set-ragdoll {bone, weight: 1}` on the
-struck limb, left to ease back down to its region's authored target. `get-ragdoll {entity}` reports
-the `RagdollState`: presence, the active flag, the mean weight, and the bone count. Both are
-scriptable from `sa` and bump `animation_version` so the editor reconciles.
+`set-ragdoll` creates the live ragdoll on its first call. It can change motor state, the uniform
+target weight, or one bone's target. `get-ragdoll` reports whether a ragdoll exists, whether its
+motors are active, its mean target weight, and its authored bone count.
 
-## What | File | Symbols
+For example, this command activates the motors and gives physics 35% of the rendered pose:
+
+```console
+$ sa set-ragdoll --entity 42 --active true --bodyWeight 0.35
+ragdoll=present  active=yes  bodyWeight=0.35  bones=64
+```
+
+The ragdoll commands require a live physics world, so they run while the scene is Playing or Paused.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Motor drive + blend + state | `engine/crates/physics/src/world.rs` | `World::drive_ragdolls_to_pose`, `World::advance_ragdoll_blend`, `World::write_ragdoll_poses`, `World::set_ragdoll_blend`, `World::ragdoll_state` |
-| The motor + target FFI (C++ shim) | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `add_ragdoll`, `ragdoll_set_swing_twist_motor`, `BonePart` |
-| The animation target | `engine/crates/physics/src/types.rs`, `engine/crates/animation/src/runtime.rs` | `PoseTarget`, `RagdollState`, `AnimationRuntime` (the `last_pose` snapshot) |
-| Per-frame composition | `engine/crates/host/src/layer.rs` | the `sim_tick` seam (drive → advance → step → write) |
-| Drive commands | `engine/crates/control/src/commands_physics.rs` | `set-ragdoll`, `get-ragdoll` |
-| Per-bone field edit | `engine/crates/control/src/commands_scene.rs` | `set-component-field` |
+| Motor drive and blend state | `engine/crates/physics/src/world.rs` | `World::drive_ragdolls_to_pose`, `World::advance_ragdoll_blend`, `World::set_ragdoll_blend`, `World::ragdoll_state` |
+| Pose write-back | `engine/crates/physics/src/world.rs` | `World::write_ragdoll_poses`, `PURE_PHYSICS_WEIGHT`, `RAGDOLL_WEIGHT_RATE` |
+| Jolt motor bridge | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `ragdoll_set_swing_twist_motor`, `bone_motor_settings`, `BonePart` |
+| Animation target and tick order | `engine/crates/animation/src/runtime.rs`, `engine/crates/runtime/src/session.rs` | `AnimationRuntime::last_poses`, `RuntimeSession::step`, `PoseTarget` |
+| Import defaults | `engine/crates/assets/src/spawn.rs` | `autofit_bone_physics` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `SetRagdollParams`, `GetRagdollParams`, `RagdollResult` |
+
+## Related
+
+- [Ragdoll](../ragdoll/) explains ragdoll construction and full-weight pose write-back.
+- [Animation data model](../../animation/animation-data-model/) explains local poses and `PoseOverride`.
+- [Kinematic bones](../kinematic-bones/) covers the animation-to-physics binding without pose write-back.

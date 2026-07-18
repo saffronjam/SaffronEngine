@@ -5,67 +5,112 @@ weight = 2
 
 # Rigidbody and collider
 
-A simulated object is described by two components, not one. `Collider` says *what shape* the object
-is and *how its surface behaves*; `Rigidbody` says *how it moves*. This is the Unity split
-(`Collider` / `Rigidbody`), and it keeps the common cases cheap: a floor or a wall is a single
-`Collider`, and a falling crate is a collider plus a rigidbody.
+`Collider` describes an entity's collision geometry and surface. `Rigidbody` describes how the
+solver may move that geometry. Keeping these concerns separate lets static scene geometry use one
+component while simulated objects add only the motion settings they need.
 
-## The split, and the collider-alone rule
+## Component roles
 
-- **`Collider`** — the `shape` (`Shape::Box` / `Sphere` / `Capsule` / `ConvexHull` / `Mesh`), its
-  `half_extents` / `offset`, a `PhysicsMaterial` (`friction`, `restitution`), and an `is_sensor`
-  flag. The shape **auto-fits** to the entity's mesh AABB when the component is added (the locked
-  decision — editable after).
-- **`Rigidbody`** — the motion type (`Motion::Static` / `Kinematic` / `Dynamic`), `mass`, linear and
-  angular damping, and a `gravity_factor`.
+`Collider` selects a shape, local dimensions, a local offset, friction, restitution, and sensor
+behavior. `sourceMesh` supplies geometry for convex-hull and triangle-mesh shapes. Adding the
+component through the control plane also attempts to fit it to the entity's mesh bounds.
 
-The rule that ties them together: **a `Collider` with no `Rigidbody` is an implicit Static body.**
-Floors and walls are one component. Add a `Rigidbody` and its motion type wins — `Dynamic` moves
-under gravity and contacts, `Kinematic` is driven by script or animation, `Static` never moves. The
-mapping is `MotionType::from_scene`, which folds the scene `Motion` enum onto the Jolt motion type.
+`Rigidbody` carries the solver settings:
 
-Both components live in `saffron-scene` (so they serialize and reach the editor through the generic
-component registry); `saffron-physics` only *consumes* them.
+| Field | Default | Meaning |
+|---|---:|---|
+| `motion` | `dynamic` | Static, kinematic, or force-driven motion |
+| `mass` | `1.0` kg | Dynamic-body mass |
+| `linearDamping` | `0.05` | Per-second linear velocity decay |
+| `angularDamping` | `0.05` | Per-second angular velocity decay |
+| `gravityFactor` | `1.0` | Scale applied to world gravity |
+| `lockPosition` | all false | Frozen translation axes for a dynamic body |
+| `lockRotation` | all false | Frozen rotation axes for a dynamic body |
+| `collisionLayer` | `0` | Moving-layer selection for non-static bodies |
 
-## Component → body → step → write-back
+A collider without a rigidbody becomes an implicit static body. If a rigidbody exists, its
+`Motion` selects the corresponding Jolt motion type. Static bodies never move; kinematic bodies
+follow scene transforms; dynamic bodies respond to gravity, contacts, forces, and impulses.
 
-This is the load-bearing loop, and it runs entirely inside the existing play tick — no new render
-pass:
+The collision layer applies to non-static rigidbodies. Values `0`, `1`, and `2` select `Moving`,
+`Character`, and `Debris`; other values select `Moving`. A sensor collider selects the `Sensor`
+layer regardless of its rigidbody field. The [collision-layer page](../collision-layers-and-triggers/)
+defines the resulting pair matrix.
 
-1. **Build** — on the `Edit → Playing` edge, `World::populate` walks every `Collider`, builds a Jolt
-   shape, reads the entity's current world transform for the body's initial pose, maps the
-   (optional) rigidbody's motion type, mass, damping, and gravity factor onto a `BodyCreate`, and
-   creates one Jolt body per entity. Bodies are tracked in **creation order** (a `Vec<BodyEntry>`,
-   never a map iteration) because that order is load-bearing for the deterministic sim.
-2. **Step** — inside the host's `sim_tick` seam (composed **physics-then-scripts**, so a script
-   reading a body's transform sees this frame's settled physics), `World::step` advances the world
-   with a **fixed-step accumulator**: it adds the frame's clamped `dt` to an accumulator and runs one
-   Jolt update per whole `FIXED_STEP` elapsed, capped at `MAX_SUBSTEPS` so a runaway `dt` cannot
-   spiral. Fixed substeps keep the simulation frame-rate independent and bit-exact under the
-   cross-platform-deterministic build.
-3. **Write back** — after stepping, each Dynamic body's world pose is written into its entity's
-   **local** `Transform` (`translation`, and `rotation` as a `Quat`). The later
-   `update_world_transforms` pass recomposes the cached world matrix from the written local, exactly
-   as it does for any edited transform — so the mesh follows the same frame.
+## Building the live bodies
 
-Physics writes the **local** `Transform`, never the cached `WorldTransform` (that is overwritten
-every frame). Dynamic bodies are scoped to **root** entities (world == local); the parented-body
-local rebase is a later refinement.
+`RuntimeSession::start` creates a [Jolt Physics](https://github.com/jrouwe/JoltPhysics) world from
+the duplicated play scene. `World::populate` walks its colliders, resolves each motion and object
+layer, prepares any cooked geometry, and constructs one Jolt body per accepted collider.
 
-## Play is the lifetime; stop is the restore
+`BodyCreate` crosses the FFI boundary with shape data, world position and rotation, material values,
+motion, and layer. Dynamic bodies also use mass, damping, gravity scale, and an `EAllowedDOFs`
+bitmask derived from the six axis locks. Jolt calculates inertia from the authored mass and shape.
 
-Bodies are created against the play-scene duplicate and die with the world when play stops. The
-authored scene is never written during play, so there is no authored-transform reset — stopping play
-discards the duplicate and the authored values stand untouched. A second play repopulates a fresh
-world.
+The initial transform omits scale. Collider fitting bakes hierarchy scale into shape dimensions and
+the local shape offset, while body position and rotation come from the entity's composed world
+transform.
 
-## What | File | Symbols
+## Fixed stepping and transform flow
+
+The play gate passes a frame delta only while Playing or for an explicit paused step. It clamps that
+delta to one third of a second. `World::step` accumulates the value and advances Jolt in `1/60`
+second increments, with at most eight substeps in one call.
+
+Before each Jolt update, kinematic bodies receive their entity's fresh composed transform through
+`MoveKinematic`. Jolt derives velocity over the fixed timestep, allowing the kinematic motion to
+push dynamic bodies. Static bodies require no per-step transform update.
+
+After at least one substep, every dynamic body's world position and quaternion are read from Jolt.
+Anima converts the quaternion to the scene's ZYX Euler convention, then writes translation and
+rotation into the entity's local `Transform`. Dynamic rigidbodies therefore use root entities, where
+the local transform equals the simulated world transform.
+
+`RuntimeSession::step` completes physics write-back before it dispatches contacts and calls script
+`on_update` handlers. A script that inspects an entity transform sees the settled result from that
+tick. The [physics world lifecycle](../physics-world-lifecycle/) covers the deterministic Jolt build
+and play-state gate in detail.
+
+This sequence summarizes the body path:
+
+```text
+Collider + optional Rigidbody
+  -> BodyCreate
+  -> fixed Jolt substeps
+  -> dynamic world pose
+  -> local Transform
+```
+
+## Play-scene lifetime
+
+The physics world and its bodies exist for the play session. Pausing retains the world without
+advancing it; stopping drops the world and discards the duplicated play scene. Physics never writes
+the authored scene, so a subsequent play session builds new bodies from the authored component and
+transform values.
+
+`physics-state` exposes the live body totals. For a scene containing a collider-only floor and one
+dynamic crate, it reports:
+
+```console
+$ sa physics-state
+physics=active  bodies=2  dynamic=1
+```
+
+In Edit, the same command returns `physics=inactive  bodies=0  dynamic=0`.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The two components + material | `engine/crates/scene/src/component.rs` | `Rigidbody`, `Collider`, `Motion`, `PhysicsMaterial` |
-| Body creation + step + write-back | `engine/crates/physics/src/world.rs` | `World::populate`, `World::step`, `BodyEntry` |
-| The motion-type mapping | `engine/crates/physics/src/types.rs` | `MotionType`, `MotionType::from_scene`, `FIXED_STEP` |
-| sim_tick composition + lifecycle | `engine/crates/host/src/layer.rs` | `HostLayer::reconcile_play_edge`, the `sim_tick` closure |
-| Auto-fit on add | `engine/crates/physics/src/world.rs` | `fit_collider_to_mesh` |
-| World summary | `engine/crates/control/src/commands_physics.rs` | `physics-state` |
+| Scene components and serialization | `engine/crates/scene/src/component.rs`, `serde.rs` | `Collider`, `Rigidbody`, `Motion`, `PhysicsMaterial`, `SceneSerialize for Rigidbody` |
+| Body creation and stepping | `engine/crates/physics/src/world.rs` | `World::populate`, `body_create`, `allowed_dofs`, `World::step`, `BodyEntry` |
+| Physics vocabulary | `engine/crates/physics/src/types.rs` | `MotionType`, `MotionType::from_scene`, `ObjectLayer`, `FIXED_STEP` |
+| Runtime lifecycle and tick order | `engine/crates/runtime/src/session.rs`, `engine/crates/host/src/layer.rs` | `RuntimeSession::start`, `RuntimeSession::step`, `HostLayer::reconcile_play_edge` |
+| Shape fitting | `engine/crates/physics/src/world.rs` | `fit_collider_to_mesh` |
+| World inspection | `engine/crates/control/src/commands_physics.rs` | `register_physics_commands`, `PhysicsStateResult`, `PhysicsBodiesResult` |
+
+## Related
+
+- [Collision shapes and materials](../collision-shapes/) details analytic shapes, mesh cooking, and fitting.
+- [Collision layers, sensors, and contact events](../collision-layers-and-triggers/) defines filtering and contact delivery.
+- [Physics world lifecycle](../physics-world-lifecycle/) explains world creation, teardown, and deterministic stepping.

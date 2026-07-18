@@ -5,78 +5,115 @@ weight = 4
 
 # Collision layers, sensors, and contact events
 
-Collisions become *selective* (which bodies test against which) and *observable* (gameplay learns
-when bodies touch). Three pieces do this: a fixed layer set with a collision matrix, a sensor flag
-that turns a collider into an overlap-only trigger, and a seq-cursored ring of contact events drained
-two ways — over the control plane and into scripts.
+Collision filtering decides which shapes may meet, while contact events tell gameplay when an
+accepted pair starts or stops touching. The engine combines five object layers, sensor bodies, and
+a bounded sequence-numbered event ring so scripts and control clients can observe contacts without
+entering the physics worker threads.
 
-## The v1 layer set + matrix
+## Object layers and filtering
 
-Every body lives in one **object layer**. v1 ships a fixed set (a project-authored matrix is
-deferred):
+[Jolt's collision-filtering model](https://jrouwe.github.io/JoltPhysicsDocs/5.3.0/) assigns each body
+one object layer, maps object layers onto broad-phase layers, and applies a pair filter before the
+narrow phase. Anima uses these five object layers:
 
-| Layer | Holds |
+| Layer | Selection |
 |---|---|
-| Static | immovable world geometry — the implicit layer of a collider with no rigidbody |
-| Moving | dynamic + kinematic bodies (the default for a rigidbody) |
-| Character | the character controller's body |
-| Debris | dynamic bodies that collide with the world/characters but not each other |
-| Sensor | trigger volumes — overlap-only, never solved |
+| `Static` | A collider without a rigidbody, or a rigidbody whose motion is `Static` |
+| `Moving` | A non-static rigidbody with `collisionLayer = 0`; unknown values also select this layer |
+| `Character` | A non-static rigidbody with `collisionLayer = 1`, and the query layer used by `CharacterVirtual` |
+| `Debris` | A non-static rigidbody with `collisionLayer = 2` |
+| `Sensor` | Any collider with `isSensor = true` |
 
-A body's layer resolves by precedence in `resolve_object_layer`: **`is_sensor` → the moving slot the
-rigidbody's `collision_layer` selects (0 = Moving, 1 = Character, 2 = Debris) → implicit Static** (a
-lone collider or an explicit static rigidbody). The whole collision policy is one symmetric matrix
-(`layers_collide`): a sensor overlaps every solid layer but never another sensor; two static bodies
-never collide; debris collides with the world and characters but not other debris; everything else
-collides. The same matrix is implemented twice — once in the C++ shim's filters, once in the safe
-crate's `layers_collide` — and a test pins them against each other so neither drifts. Two
-**broad-phase** layers back this (NonMoving for Static, Moving for the rest), kept to two because
-more is a perf micro-opt not worth v1 complexity.
+`resolve_object_layer` applies that selection in a fixed order. The sensor flag wins first, a
+non-static rigidbody selects one of the three moving slots, and every other collider is `Static`.
+The rigidbody still controls the Jolt motion type when its collider is a sensor.
 
-This is a deliberate simplification of UE5's collision channels / object-and-trace responses and
-Unity's layer collision matrix — the same idea (a per-pair "do these collide?" table), with a small
-fixed set instead of project-authored channels.
+The object-layer matrix is symmetric. `yes` marks an eligible pair; broad-phase overlap and shape
+tests must also succeed before a contact occurs.
 
-## Sensors: overlap without response
+| A / B | `Static` | `Moving` | `Character` | `Debris` | `Sensor` |
+|---|---:|---:|---:|---:|---:|
+| `Static` | no | yes | yes | yes | yes |
+| `Moving` | yes | yes | yes | yes | yes |
+| `Character` | yes | yes | yes | yes | yes |
+| `Debris` | yes | yes | yes | no | yes |
+| `Sensor` | yes | yes | yes | yes | no |
 
-Setting `Collider.is_sensor` makes the body a Jolt sensor: it generates contacts but applies no
-impulse. The body is placed in the Sensor layer, which the matrix lets overlap every solid layer —
-crucially, the "no response" comes from the Jolt sensor flag, **not** from the matrix excluding the
-pair (excluding it would suppress the event too). A trigger volume is the foundation for pickups,
-zones, and detection.
+`layers_collide` holds the Rust copy of the matrix, and `layers_collide_impl` supplies the same
+policy to Jolt's `ObjectLayerPairFilter`. At the coarser broad phase, only `Static` maps to
+`NonMoving`; all other object layers map to `Moving`. Static objects query the moving tree, while
+the other layers can query both trees.
 
-## The contact-event ring
+## Sensors report without solving
 
-Jolt invokes its contact callbacks **from job threads during the step**, so the C++ `ContactListener`
-must not touch the entity maps or the seq-stamped ring directly. The listener instead buffers the raw
-body pairs (`PendingContact` PODs) under a small mutex; immediately after the Jolt update returns,
-`World::step` drains that buffer over `saffron_physics_sys::drain_contacts`, maps each `BodyID` to its
-entity uuid through `index_by_body_id` (single-threaded-safe there), stamps a monotonic `seq` + the
-physics step, and appends to a bounded ring (oldest evicted at `CONTACT_RING_CAP`). v1 emits
-**Begin/End** transitions only (`ContactKind::Begin` / `End`) — the trigger model — not a per-frame
-"still overlapping" stream.
+`Collider.is_sensor` becomes Jolt's `BodyCreationSettings::mIsSensor`. A sensor reports accepted
+contacts through the listener but does not resolve penetration, so a moving body can pass through
+the volume. The pair matrix must still accept Sensor-versus-solid pairs; rejecting a pair there
+would suppress both physical response and the event. Sensor-versus-Sensor pairs are filtered out.
 
-The ring has two independent consumers, each with its own cursor:
+The object layer and sensor flag have separate jobs. The layer determines whether collision work
+may reach the contact stage. The sensor flag tells Jolt not to apply an impulse when it does.
 
-- **`drain-contacts {since}`** — a non-blocking control-plane drain. `World::drain_contacts` returns
-  the `ContactDrain`: events with `seq > since`, plus `high_water_seq` / `oldest_seq` / `overflowed`
-  so a stale cursor (e.g. held across a play stop/start, which resets the ring) detects it missed
-  evictions and resyncs. In Edit it returns empty, never an error.
-- **scripts** — each tick, after the step, the host drains the new events and `dispatch_contact`
-  routes them: a sensor Begin calls `on_trigger_enter(self, other)`, a sensor End
-  `on_trigger_exit(self, other)`, a solid Begin `on_contact(self, other, point, normal)`. A missing
-  handler is a silent skip; a failing handler routes to the script-error ring (pause-on-error),
-  exactly like `on_update`.
+## Contact callbacks become a ring
 
-The two cursors are independent: scripts consume eagerly per tick, the control plane consumes lazily
-by `since`, both reading the same ring.
+Jolt calls its [`ContactListener`](https://jrouwe.github.io/JoltPhysicsDocs/5.3.0/class_contact_listener.html)
+from multiple worker threads during `PhysicsSystem::Update`. `ContactListenerImpl` therefore stores
+raw body IDs, a representative point and normal, and the transition kind in a mutex-protected
+buffer. `OnContactPersisted` is ignored, so the engine records only `Begin` and `End` transitions.
 
-## What | File | Symbols
+After the fixed substeps finish, `World::drain_into_ring` drains that buffer on the simulation
+thread. It maps each Jolt `BodyID` to an entity UUID, marks the event as a sensor overlap when either
+body is a sensor, assigns the next `seq` and the current physics `tick`, then appends it to the ring.
+An `End` event has zero point and normal because Jolt's removal callback supplies only the body pair.
+
+The ring retains 256 events. `World::drain_contacts(since)` snapshots retained events with
+`seq > since` and returns three cursor fields:
+
+| Field | Meaning |
+|---|---|
+| `highWaterSeq` | Highest sequence number assigned in this play session |
+| `oldestSeq` | Oldest event still retained, or `0` when the ring is empty |
+| `overflowed` | The supplied cursor predates an event evicted from the ring |
+
+A cursor belongs to one play session. Creating or stopping the physics world clears the ring and
+resets its sequence counter. In Edit, `drain-contacts` returns an empty result with zero cursors.
+
+For example, a client that has processed sequence 41 asks only for newer transitions:
+
+```console
+$ sa drain-contacts --since 41
+  #42     begin  sensor  310 <-> 901
+  #43     end    sensor  310 <-> 901
+  high=43  oldest=1  overflowed=no  (2 events)
+```
+
+Passing `--since 43` on the next call yields no events unless another transition has entered the
+ring. A client that receives `overflowed=yes` processes the retained tail and advances to
+`highWaterSeq`.
+
+## Script dispatch
+
+`RuntimeSession::step` keeps a cursor separate from every control client. After physics steps, it
+drains new events and calls `ScriptHost::dispatch_contact` before `on_update`. Each transition is
+offered to the scripts on entity A and then entity B, with the opposite entity passed as `other`.
+
+Sensor `Begin` and `End` events call `on_trigger_enter(other)` and `on_trigger_exit(other)`. A solid
+`Begin` calls `on_contact(other, point, normal)` with world-space vectors. Solid `End` remains
+visible in the contact ring but has no script handler. Missing handlers are successful no-ops; a
+handler error enters the runtime error sink and stops that tick's dispatch.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Layer set + matrix + resolution | `engine/crates/physics/src/world.rs`, `src/types.rs` | `resolve_object_layer`, `ObjectLayer`, `layers_collide` |
-| The Jolt filters + matrix (C++ shim) | `engine/crates/physics-sys/shim/jolt_bridge.cpp` | `ContactListener`, the broad-phase / object-layer filters, `jolt_layers_collide` |
-| Contact drain + ring | `engine/crates/physics/src/world.rs`, `src/types.rs` | `World::step`, `World::drain_contacts`, `ContactEvent`, `ContactKind`, `CONTACT_RING_CAP` |
-| Control drain | `engine/crates/control/src/commands_physics.rs` | `drain-contacts` |
-| Script dispatch | `engine/crates/script/src/runtime.rs` | `dispatch_contact` |
+| Layer selection and Rust matrix | `engine/crates/physics/src/world.rs`, `src/types.rs` | `resolve_object_layer`, `ObjectLayer`, `layers_collide` |
+| Jolt layer filters and listener | `engine/crates/physics-sys/shim/jolt_bridge.h`, `jolt_bridge.cpp` | `BroadPhaseLayerImpl`, `ObjectVsBroadPhaseImpl`, `ObjectLayerPairImpl`, `ContactListenerImpl` |
+| Contact event ring | `engine/crates/physics/src/world.rs`, `src/types.rs` | `World::drain_into_ring`, `World::drain_contacts`, `ContactEvent`, `ContactDrain`, `CONTACT_RING_CAP` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `DrainContactsParams`, `DrainContactsResult`, `ContactEventDto` |
+| Script consumption | `engine/crates/runtime/src/session.rs`, `engine/crates/script/src/runtime.rs` | `RuntimeSession::step`, `ScriptHost::dispatch_contact`, `ContactInfo` |
+
+## Related
+
+- [Rigidbody and collider](../rigidbody-and-collider/) explains how components become Jolt bodies.
+- [Character controller](../character-controller/) uses the `Character` layer for sweep queries.
+- [Script components and the play runtime](../../scripting/script-components-and-runtime/) defines the contact handler surface.
