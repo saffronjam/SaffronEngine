@@ -6,61 +6,97 @@ math = true
 
 # Procedural atmosphere
 
-The procedural atmosphere is a physically based sky (Hillaire 2020) that fills the same environment cube the [procedural sky](../procedural-sky/) gradient otherwise paints. When enabled it replaces the analytic gradient with the in-scattered radiance of a Rayleigh + Mie + ozone atmosphere lit by the scene's directional light, so the visible sky, the IBL convolutions, and the directional-light-driven re-bake all re-tint coherently from one source.
+The procedural atmosphere computes sky radiance from wavelength-dependent Rayleigh scattering, directional Mie scattering, and ozone absorption. Anima follows Sébastien Hillaire's [scalable atmosphere model](https://sebh.github.io/publications/egsr2020.pdf): small lookup tables capture the costly path integrals, then a cube-generation pass turns the sky view into the environment used by visible sky and IBL.
 
-It is a *source switch* (`EnvSource::Atmosphere`), not a new pipeline. The cube it produces is opaque to everything downstream: the irradiance and prefilter passes, the BRDF lookup, and the visible-sky pass consume it exactly as they consume the gradient. The only new work is a short chain of lookup tables baked just before the cube fill.
+The atmosphere is one `EnvSource` for the shared environment cube. Diffuse irradiance and specular prefiltering do not need a separate atmosphere path; they convolve the resulting cube in the same way as procedural or equirectangular sources.
 
-## The LUT chain
+## Physical parameters
 
-The bake evaluates three lookup tables in order, each a compute dispatch reading the previous, then fills the cube from the last. All are small, persistent HDR images (`IblImage`), allocated once in `Ibl::new` and re-baked in place when the sun or atmosphere parameters change. Each shares the same `AtmosPush` (the atmosphere params + sun, packed into five vec4s).
+`AtmosphereSettings` stores lengths in kilometres and sea-level optical coefficients in inverse megametres. `drive_env_bake` copies those values into `AtmosphereParams`. `AtmosPush` packs them with the directional light's direction and intensity into five `float4` values for all four atmosphere shaders.
 
-**Transmittance LUT** ($256 \times 64$). For each texel it maps $(u, v)$ to a view-zenith cosine and an altitude,
+The default settings describe an Earth-scale atmosphere:
 
-$$\mu = 2u - 1, \qquad r = r_\text{planet} + v \, h_\text{atm},$$
+| Parameter | Default |
+|---|---:|
+| Planet radius | 6,360 km |
+| Atmosphere height | 100 km |
+| Rayleigh scale height | 8 km |
+| Mie scale height | 1.2 km |
+| Mie anisotropy | 0.8 |
+| Sun disk angular radius | 0.00465 rad |
+| Sun disk intensity | 20 |
 
-ray-marches to the top of the atmosphere (`rayTopDistance`), and stores $e^{-\tau}$ where $\tau$ is the accumulated Rayleigh + Mie + ozone optical depth (`densities`) along that ray. This is the fraction of light that survives a path to the atmosphere boundary — sampled later as "how much sunlight reaches this point."
+Rayleigh and Mie densities fall exponentially with altitude. Ozone uses a tent profile centred at 25 km and reaches zero 15 km below and above that centre.
 
-**Multiple-scattering LUT** ($32 \times 32$). Indexed by $(\cos\theta_\text{sun}, \text{altitude})$, it integrates second-order in-scattering over a coarse sphere of directions and closes Hillaire's energy-conserving geometric series,
+## LUT chain
 
-$$\Psi_\text{ms} = \frac{L_{2}}{1 - f_\text{ms}},$$
+`Ibl::record_atmosphere` records three 8 by 8 compute dispatches. Each pass writes an `R16G16B16A16_SFLOAT` image, transitions it to sampled layout, and supplies it to the next pass.
 
-where $L_2$ is the doubly scattered radiance and $f_\text{ms}$ the fraction of light re-scattered per bounce. A fixed sphere of directions is enough for a correct result on software rasterization; raising the sample count is a precision increment, not a correctness one.
+```mermaid
+flowchart LR
+    A[Transmittance<br/>256 x 64] --> B[Multiple scattering<br/>32 x 32]
+    A --> C[Sky view<br/>192 x 108]
+    B --> C
+    C --> D[Environment cube<br/>256 x 256 x 6]
+```
 
-**Sky-view LUT** ($192 \times 108$). For each $(\text{azimuth}, \text{elevation})$ it ray-marches the in-scattered radiance from the camera altitude, applying the Rayleigh phase (`rayleighPhase`), the Henyey–Greenstein Mie phase (`hgPhase`)
+### Transmittance
 
-$$p_\text{HG}(\cos\theta) = \frac{1 - g^2}{4\pi \, (1 + g^2 - 2g\cos\theta)^{3/2}},$$
+The transmittance LUT indexes view-zenith cosine horizontally and altitude vertically. `computeMain` takes 40 midpoint samples from that position to the top of the atmosphere. It accumulates Rayleigh, Mie, and ozone extinction and stores the fraction of light that survives:
 
-the transmittance toward the sun, and the multiple-scattering term. Elevation is horizon-densified with a $\sqrt{\cdot}$ mapping about the horizon so the bright, high-gradient band near $y = 0$ gets the most resolution.
+$$
+T = \exp\left(-10^{-3}\int_0^d \sigma_t(s)\,ds\right).
+$$
 
-## Filling the cube
+The factor $10^{-3}$ converts ray lengths in kilometres to the inverse-megametre units used by the coefficients.
 
-`atmos_skygen` keeps the gradient shader's output contract: one invocation per cube texel, `tid.z` the face, writing into the 6-layer HDR cube. For each direction it inverts the sky-view mapping (`dirToSkyViewUv`),
+### Multiple scattering
 
-$$u = \frac{\text{azimuth}}{2\pi}, \qquad v = \tfrac12 + \operatorname{sign}(\text{el}) \, \sqrt{\tfrac{|\text{el}|}{\pi/2}} \cdot \tfrac12,$$
+The 32² multiple-scattering LUT indexes sun-zenith cosine and altitude. Each texel integrates 64 directions over a sphere, with 20 midpoint steps along each ray. Downward rays stop at the planet surface; the others continue to the atmosphere boundary.
 
-samples the sky-view LUT, and adds a sun disk — a `smoothstep` cap around the sun direction within `sunDiskAngularRadius`, scaled by `sunDiskIntensity`. The result is the cube the rest of IBL convolves.
+The pass records second-order radiance $L_2$ and the fraction $f_{ms}$ scattered into another bounce. It closes the repeated-scattering series component-wise:
 
-## When it bakes
+$$
+\Psi_{ms} = \frac{L_2}{\max(1-f_{ms}, 10^{-3})}.
+$$
 
-The atmosphere rides the existing on-demand re-bake. `drive_env_bake` mirrors `scene.environment.atmosphere` onto the renderer-side `AtmosphereParams` and selects the source by precedence — a user equirect panorama wins, then the atmosphere when `enabled`, then the gradient. `Ibl::request_env_bake` flags a re-bake only when the source, the sun, or any atmosphere field actually changes (`should_rebake`, an exact `!=` over POD params, so an unchanged frame never re-bakes), and the renderer consumes that flag at a GPU-idle frame start (`Ibl::fire_rebake`). Moving the sun therefore re-tints the visible sky and the IBL together, and toggling `enabled` off restores the gradient bit-for-bit.
+### Sky view
 
-The whole chain lives inside `Ibl::bake` — a one-shot transient command buffer with manual sync2 barriers, like the irradiance/prefilter tail — not the per-frame render graph, because it only changes on a sun or parameter change.
+The sky-view LUT indexes azimuth and a quadratic elevation coordinate that puts more texels near the horizon. It traces 32 steps from an observer altitude of 0.5 km, combines the Rayleigh and anisotropic Mie phase terms, and samples both earlier LUTs for solar transmission and repeated scattering.
+
+`AtmosPush::new` leaves the camera-altitude lane at zero, and the shader clamps it to 0.5 km. This sky-view bake therefore does not move with the scene camera. [Aerial perspective](../../screen-space-and-post/aerial-perspective/) reconstructs scene positions separately while reusing the physical coefficients and the first two LUTs.
+
+## Environment cube
+
+`atmos_skygen.slang` runs one invocation per cube texel. `cubeFaceDir` reconstructs the world direction, and `dirToSkyViewUv` converts its azimuth and elevation to sky-view coordinates. The sampled radiance receives a smooth sun disk based on `sun_disk_angular_radius`, `sun_disk_intensity`, and the directional light's intensity.
+
+The atmosphere push does not contain the directional light's RGB color. Atmosphere radiance and the sun disk use scalar sun intensity; the scene's directional-light color still applies to direct surface lighting.
+
+## Activation and consumers
+
+`drive_env_bake` gives a loaded texture panorama first priority. If no panorama is selected and `AtmosphereSettings::enabled` is true, it requests `EnvSource::Atmosphere`; otherwise it requests the procedural sky. The atmosphere chain runs only when both the source and the enabled field select it.
+
+`Ibl::atmosphere_live` reports whether the last successful bake used the atmosphere source. The visible-sky pass and IBL sample the environment cube. The fog composite can use the sky-view LUT for its in-scatter tint, while the aerial-perspective pass samples the transmittance and multiple-scattering LUTs.
+
+Changes to the source, directional-light inputs, or atmosphere settings arm `Ibl::rebake_pending` through `should_rebake`. The renderer performs that bake before recording a later frame, so all consumers see LUTs and an environment cube from the same completed bake.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Transmittance | `engine/assets/shaders/atmos_transmittance.slang` | `computeMain`, `rayTopDistance`, `densities` |
-| Multiple scattering | `engine/assets/shaders/atmos_multiscatter.slang` | `computeMain` — sphere integral + series sum |
-| Sky-view | `engine/assets/shaders/atmos_skyview.slang` | `computeMain`, `hgPhase`, `rayleighPhase` |
-| Cube fill | `engine/assets/shaders/atmos_skygen.slang` | `computeMain`, `dirToSkyViewUv`, sun disk |
-| LUT alloc + chain dispatch | `engine/crates/rendering/src/ibl.rs` | `Ibl::record_atmosphere`, `AtmosPush`, `ATMOS_*` sizes |
-| Source select + re-bake gate | `engine/crates/assets/src/render_scene.rs` · `engine/crates/rendering/src/ibl.rs` | `drive_env_bake`, `request_env_bake`, `should_rebake` |
-| Parameters + serde | `engine/crates/scene/src/environment.rs` | `AtmosphereSettings`, `SceneEnvironment` |
+| Scene settings and defaults | `engine/crates/scene/src/environment.rs` | `AtmosphereSettings`, `AtmosphereSettings::default` |
+| Renderer parameter packing | `engine/crates/rendering/src/ibl.rs` | `AtmosphereParams`, `AtmosPush`, `AtmosPush::new` |
+| LUT allocation and dispatch | `engine/crates/rendering/src/ibl.rs` | `ATMOS_TRANSMITTANCE_W`, `ATMOS_MULTI_SCATTER_SIZE`, `ATMOS_SKY_VIEW_W`, `Ibl::record_atmosphere` |
+| Transmittance integration | `engine/assets/shaders/atmos_transmittance.slang` | `densities`, `rayTopDistance`, `computeMain` |
+| Repeated scattering | `engine/assets/shaders/atmos_multiscatter.slang` | `sampleTransmittance`, `hitsGround`, `computeMain` |
+| Sky radiance | `engine/assets/shaders/atmos_skyview.slang` | `rayleighPhase`, `hgPhase`, `computeMain` |
+| Cube generation | `engine/assets/shaders/atmos_skygen.slang` | `cubeFaceDir`, `dirToSkyViewUv`, `computeMain` |
+| Source resolution | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
 
 ## Related
 
-- [Procedural sky](../procedural-sky/) — the analytic gradient this replaces as the cube source
-- [Baking](../ibl-bake-pass/) — runs the cube fill first, then the convolutions
-- [Diffuse irradiance](../diffuse-irradiance/) — convolves the resulting cube for diffuse ambient
-- [Aerial perspective](../../screen-space-and-post/aerial-perspective/) — applies these transmittance + multiscatter LUTs to scene geometry, which the sky-view lookup does not
+- [Baking](../ibl-bake-pass/) — the command sequence around the atmosphere chain
+- [Procedural sky](../procedural-sky/) — the analytic environment source
+- [IBL overview](../ibl-overview/) — diffuse and specular consumers of the cube
+- [Aerial perspective](../../screen-space-and-post/aerial-perspective/) — scene-depth atmosphere integration
+- [Fog](../../screen-space-and-post/height-fog/) — sky-view tint and volumetric in-scatter

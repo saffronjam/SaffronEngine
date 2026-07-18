@@ -5,64 +5,83 @@ weight = 7
 
 # Baking
 
-Baking is the precomputation of an environment's lighting into a fixed set of textures, run once so that runtime lighting reduces to a few texture fetches.
+The IBL bake turns one environment source into the textures used for diffuse and specular ambient lighting. It performs the expensive convolution and [split-sum integration](https://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf) outside the per-frame render graph, leaving stable sampled images for scene rendering.
 
-The IBL compute shaders run inside one method, `Ibl::bake`, called at startup, and produce the persistent set 3 the mesh shader samples every frame after. The bake is synchronous one-time work: its own command pool, its own transient descriptors, and a `wait_idle` at the end. It sits outside the [per-frame render graph](../../frame-and-render-graph/render-graph-overview/).
+## Persistent images
 
-## Why bake once, not per frame
+`Ibl::new` allocates seven `R16G16B16A16_SFLOAT` images and the persistent descriptor set. The environment cube has a full mip chain because the specular prefilter samples coarser source levels to reduce variance.
 
-The convolutions are heavy. The irradiance integral takes a thousand environment samples per texel, and the prefilter and LUT each importance-sample 64 to 512 directions per texel. None of this changes once the environment is fixed, so computing it per frame would spend the whole budget on a result identical to the last frame's. Amortized to startup, the runtime cost collapses to three texture fetches in the [ambient block](../ibl-overview/).
+| Image | Extent | Levels | Use |
+|---|---:|---:|---|
+| Environment cube | 256² × 6 faces | 9 | source for convolution and procedural visible sky |
+| Irradiance cube | 32² × 6 faces | 1 | diffuse ambient |
+| Prefiltered cube | 256² × 6 faces | 5 | roughness-dependent specular ambient |
+| BRDF LUT | 256² | 1 | split-sum scale and bias |
+| Transmittance LUT | 256 × 64 | 1 | atmosphere transmission |
+| Multiple-scattering LUT | 32² | 1 | atmosphere energy returned by repeated scattering |
+| Sky-view LUT | 192 × 108 | 1 | atmosphere radiance by view direction |
 
-## The stages
+The renderer calls `Ibl::bake` after construction for the project IBL and the thumbnail-preview IBL. The first successful bake writes bindings 0 through 2 of set 3 with the irradiance cube, prefiltered cube, and BRDF LUT, then marks the set ready. Later bakes overwrite the same images, so their views and descriptor bindings stay valid.
 
-The bake runs the shaders in dependency order, since the environment cube must exist before it can be convolved. The BRDF LUT is independent and runs last. When the atmosphere source is active, the `atmos_*` LUT chain runs first to fill the environment cube ([procedural atmosphere](../procedural-atmosphere/)).
+## Bake sequence
+
+The selected `EnvSource` determines how mip 0 of the environment cube is filled:
+
+- `Procedural` dispatches `ibl_skygen.slang` with the sun direction, color, and intensity.
+- `Equirect` projects a loaded panorama through `ibl_equirect.slang`. A missing panorama uses the procedural shader.
+- `Atmosphere` runs the [Hillaire atmosphere model](https://sebh.github.io/publications/egsr2020.pdf) when `AtmosphereParams::enabled` is true. Its three LUT passes feed `atmos_skygen.slang`.
+
+The environment cube then receives its mip chain. Diffuse irradiance, the five prefiltered levels, and the BRDF LUT run in dependency order.
 
 ```mermaid
 flowchart TD
-    A[skygen → environment cube<br/>128² × 6] --> B[irradiance convolution<br/>→ irradiance cube 32²]
-    A --> C[prefilter, one dispatch per mip<br/>→ prefiltered cube 128² × 5 mips]
-    D[BRDF integration<br/>→ LUT 256²] -.->|independent| E
-    B --> E[write persistent set 3]
-    C --> E
+    A[Environment source] --> B[Environment cube mip 0]
+    B --> C[Generate source mip chain]
+    C --> D[Irradiance convolution]
+    C --> E[Five GGX prefilter dispatches]
+    F[BRDF integration] --> G[Persistent set 3]
+    D --> G
+    E --> G
 ```
 
-Each stage transitions its target to `GENERAL`, dispatches, then transitions to `SHADER_READ_ONLY_OPTIMAL`. The environment is the exception: after skygen writes it, it transitions to `SHADER_READ_ONLY_OPTIMAL` so the irradiance and prefilter passes can *sample* it. The barriers are written by hand here, outside the render graph, one sync2 `cube_barrier` per transition. The dispatch grid is `(size + 7) / 8` groups in X and Y (the `group` helper) to match the shaders' `[numthreads(8,8,1)]`, and 6 in Z, one per cube face.
+Every compute shader uses 8 by 8 workgroups. Cube passes dispatch six Z groups, one per face. The irradiance shader integrates a hemisphere, the prefilter uses 128 GGX samples per output texel, and the BRDF LUT uses 512 samples per texel.
 
-## Transient resources, freed at the end
+## Synchronization
 
-The bake builds a private `BakeScratch`: a command pool + buffer + fence, a descriptor pool, the set layouts (storage-only for skygen and the LUT, sampler-plus-storage for the convolutions, two-sampler for the atmosphere chain), the compute pipelines, and the per-mip 2D-array storage views described in [cubemaps and mips](../cubemaps-and-mips/). All of this exists only for the bake; `BakeScratch`'s `Drop` releases every handle on the way out, success or error.
+The bake owns its command pool, command buffer, fence, descriptor pool, descriptor layouts, compute pipelines, descriptor sets, and per-mip storage views through `BakeScratch`. Its `Drop` implementation frees these transient handles on both success and error paths. The `IblCube` and `IblImage` wrappers retain the sampled images for the renderer's lifetime.
 
-The four images — environment, irradiance, prefiltered, LUT (plus the three atmosphere LUTs) — persist, owned by `Ibl` as `IblCube`/`IblImage` Drop wrappers. The environment cube outlives the bake even though only the convolutions read it, kept as the source for a re-bake.
+Each output moves from `UNDEFINED` to `GENERAL` before a storage write and to `SHADER_READ_ONLY_OPTIMAL` before sampling. `cube_barrier` records these synchronization2 image barriers directly because the bake is not a render-graph pass. `generate_cube_mips` performs the environment cube's transfer transitions and blits.
 
-## Writing the persistent set
+The bake submits once to the graphics queue and blocks until its fence signals. A re-bake also calls `Device::wait_idle` before recording because it overwrites images that an in-flight frame may still sample. The first bake runs before any frame can reference those images and does not need that device-wide wait.
 
-On the first bake, `Ibl::write_mesh_set` writes the three samplers the mesh fragment binds as set 3 (bindings 0-2: irradiance, prefiltered, BRDF LUT), then sets `ready = true`. The set layout and the empty set are allocated in `Ibl::new` against the shared descriptor pool, so the mesh pipeline layout can reference set 3 before the bake fills it. The shared IBL sampler (`create_ibl_sampler`) is a linear/trilinear clamp-to-edge sampler with `LOD_CLAMP_NONE`, so the prefiltered mip chain filters across all levels.
+## Re-bake gate
 
-## The runtime gate
+`drive_env_bake` resolves the requested source in this order: a loaded texture panorama, an enabled atmosphere, then the procedural source. `Ibl::request_env_bake` stores the source, panorama, and parameters and calls `should_rebake` to decide whether work is needed.
 
-The mesh shader samples set 3 only when `globals.counts.z != 0`, which is `use_ibl && Ibl::ready` — both the toggle and the bake-completed flag, folded into the light UBO by `Lighting::set_frame_ibl`. IBL contributes the moment the bake finishes, and `sa set-ibl 0` returns to the flat scalar ambient without touching the baked textures.
+The comparison depends on the active source. A procedural environment reacts to sun changes. An atmosphere reacts to sun or atmosphere-parameter changes. An equirect environment reacts to its source or panorama binding. Source changes always arm a bake.
 
-## Re-baking on demand
+`Renderer::render_scene_offscreen` consumes `rebake_pending` before recording the frame. `Ibl::fire_rebake` clears the flag, performs the bake, and commits the pending source and parameters only after success. A failed bake is reported once and is not retried every frame.
 
-`Ibl::request_env_bake` arms `rebake_pending` when the sky inputs change — the sun moves, the panorama swaps, or any atmosphere field differs — gated by an exact `!=` over POD params (`should_rebake`), so an unchanged frame never re-bakes. The renderer consumes the flag at a GPU-idle frame start (`render_scene_offscreen`) via `Ibl::fire_rebake`, which re-bakes in place and commits the new params. A re-bake reuses the same images and views, so set 3 stays valid throughout.
+## Runtime gate
+
+Scene lighting enables global IBL when both `Ibl::use_ibl` and `Ibl::ready` are true. `Renderer::set_scene_lighting` passes that result to `Lighting::set_frame_ibl`, which stores it in `LightUbo.counts.z`. The mesh shader reads set 3 only when this flag is nonzero. `sa set-ibl 0` selects the flat ambient path without destroying the baked images.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The whole bake | `engine/crates/rendering/src/ibl.rs` | `Ibl::bake`, `BakeScratch`, `cube_barrier`, `group` |
-| Re-bake gate + fire | `engine/crates/rendering/src/ibl.rs` | `request_env_bake`, `should_rebake`, `rebake_pending`, `fire_rebake` |
-| Persistent set + sampler | `engine/crates/rendering/src/ibl.rs` | `write_mesh_set`, `create_ibl_sampler`, `ready` |
-| Runtime gate | `engine/crates/rendering/src/lighting.rs` | `set_frame_ibl`, `frame_ibl_flag` → `counts` |
-| Source select driver | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
-| Toggle command | `engine/crates/control/src/commands_render.rs` | `set-ibl` |
-
-> [!NOTE]
-> The bake submits on the graphics queue and waits idle to finish before returning. Fine at startup, but it would stall a running frame — it is deliberately a one-time init / editor-time event, fired only at a GPU-idle frame start, not a render-graph pass. `Ibl::bake` is one of the few legitimate mid-session `wait_idle` sites.
+| Image sizes and source selection | `engine/crates/rendering/src/ibl.rs` | `IBL_ENV_SIZE`, `IBL_IRRADIANCE_SIZE`, `IBL_PREFILTER_SIZE`, `IBL_PREFILTER_MIPS`, `IBL_LUT_SIZE`, `EnvSource` |
+| Persistent resources and bake | `engine/crates/rendering/src/ibl.rs` | `Ibl::new`, `Ibl::bake`, `Ibl::write_mesh_set` |
+| Transient state and barriers | `engine/crates/rendering/src/ibl.rs` | `BakeScratch`, `cube_barrier`, `generate_cube_mips`, `group` |
+| Re-bake decision | `engine/crates/rendering/src/ibl.rs` | `Ibl::request_env_bake`, `Ibl::fire_rebake`, `should_rebake` |
+| Scene source resolution | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
+| Runtime UBO gate | `engine/crates/rendering/src/renderer.rs`, `engine/crates/rendering/src/lighting.rs` | `Renderer::set_scene_lighting`, `Lighting::set_frame_ibl` |
+| Runtime control | `engine/crates/control/src/commands_render.rs` | `register_render_commands`, `"set-ibl"` |
 
 ## Related
 
-- [IBL overview](../ibl-overview/) — what set 3 feeds at runtime
-- [Cubemaps and mips](../cubemaps-and-mips/) — the image + transient-view setup the bake uses
-- [Procedural sky](../procedural-sky/) — stage one of the bake
-- [Render graph overview](../../frame-and-render-graph/render-graph-overview/) — the per-frame system this bake sits outside of
+- [IBL overview](../ibl-overview/) — how the baked textures contribute to scene lighting
+- [Cubemaps and mips](../cubemaps-and-mips/) — cube storage views and roughness levels
+- [Procedural atmosphere](../procedural-atmosphere/) — the physical LUT chain used by one source
+- [Procedural sky](../procedural-sky/) — the analytic environment source
+- [Render graph](../../frame-and-render-graph/render-graph-overview/) — the per-frame scheduler that does not own the bake

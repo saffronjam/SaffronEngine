@@ -6,101 +6,97 @@ math = true
 
 # IBL overview
 
-Image-based lighting computes a surface's indirect, or *ambient*, illumination by treating an environment as a light source and integrating the [Cook-Torrance BRDF](../../lighting-and-brdf/cook-torrance-brdf/) against it.
+Image-based lighting (IBL) turns an environment into indirect diffuse light and view-dependent
+reflections. Instead of assigning one ambient color to every surface, it integrates incoming
+environment radiance with the [Cook-Torrance BRDF](../../lighting-and-brdf/cook-torrance-brdf/).
 
-[Direct lighting](../../lighting-and-brdf/cook-torrance-brdf/) accounts only for the sun and the punctual lights. Everything else a surface sees — the sky, the bounce off nearby geometry, the general fill of a room — is the ambient term. The defining integral is too expensive to evaluate per pixel per frame, so the engine precomputes three small textures from the environment once at startup and the mesh fragment shader samples them.
+The full lighting integral is too costly to evaluate for every fragment. Anima precomputes a small
+set of textures whenever the environment changes, then combines their samples with the material's
+normal, roughness, metallic value, and view direction.
 
-## Split-sum approximation
+## Split-sum specular
 
-Reflected radiance from an environment is the BRDF integrated over the hemisphere:
-
-$$
-L_o(v) = \int_\Omega f(l, v)\, L_i(l)\, (n \cdot l)\, dl
-$$
-
-There is no closed form, and Monte-Carlo sampling it per fragment is too slow for real time. The split-sum approximation (Karis, *Real Shading in Unreal Engine 4*) factors the specular part into two integrals that each precompute into a lookup:
+Reflected environment radiance is the BRDF integrated over the hemisphere:
 
 $$
-\int_\Omega f\, L_i\, (n\cdot l)\, dl \;\approx\;
-\underbrace{\left(\frac{1}{N}\sum L_i(l_k)\right)}_{\text{prefiltered env}}
-\;\cdot\;
-\underbrace{\int_\Omega f\,(n\cdot l)\, dl}_{\text{BRDF LUT}}
+L_o(v) = \int_\Omega f(l,v)\,L_i(l)\,(n\cdot l)\,dl.
 $$
 
-The first factor is the environment prefiltered by roughness: a cubemap whose mip chain holds progressively blurrier reflections. The second depends only on $n\cdot v$, roughness, and $F_0$, and being environment-independent it bakes into a single 2D table reused across scenes. Diffuse is handled separately by a cosine-weighted irradiance convolution.
+The [split-sum approximation](https://cdn2.unrealengine.com/Resources/files/2013SiggraphPresentationsNotes-26915738.pdf)
+separates specular environment lighting into an environment-dependent prefilter and a
+material-dependent lookup. The engine stores the first term in a roughness-mipped cubemap and the
+second in a two-channel BRDF lookup table.
 
-## Three baked textures
-
-The engine bakes one environment (a procedural sky by default) into:
-
-| Texture | What it holds | Page |
-|---|---|---|
-| Irradiance cube | cosine-weighted diffuse over the hemisphere | [Diffuse irradiance](../diffuse-irradiance/) |
-| Prefiltered cube | GGX-blurred specular, one mip per roughness | [Specular prefilter](../specular-prefilter/) |
-| BRDF LUT | the Fresnel scale/bias split-sum factor | [BRDF LUT](../brdf-lut/) |
-
-All three are baked once by [the bake](../ibl-bake-pass/) and bound as descriptor set 3 in the mesh pipeline.
-
-## How the mesh shader uses them
-
-The ambient block in `lighting.slang` (imported by `mesh.slang`) reads all three and assembles diffuse plus specular. Diffuse samples the irradiance cube along the normal $n$ and scales by the energy-conservation factor $k_d$, computed with `fresnelSchlickRoughness` so rough surfaces do not over-reflect at grazing angles. Specular samples the prefiltered cube along the reflection vector $R$ at a mip chosen by roughness, then applies the LUT, where `F0 * ab.x + ab.y` is the split-sum scale and bias.
+At shading time, the reflection vector selects a cube direction and perceptual roughness selects a
+mip. The BRDF lookup uses $n\cdot v$ and roughness to return scale and bias values:
 
 ```hlsl
-float3 irradiance  = irradianceMap.SampleLevel(n, 0.0).rgb;   // along the shading normal
-float3 indirectIrr = irradiance;                              // analytic sky (residual; DDGI replaces it)
-float3 diffuseIBL  = kd * indirectIrr * albedo;
-float3 prefiltered = prefilteredMap.SampleLevel(R, roughness * IblPrefilterMaxMip).rgb;
-float2 ab          = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
-float3 specularIBL = prefiltered * (F0 * ab.x + ab.y) * specSkyVis;        // reflection-cone occluded
-ambient = diffuseIBL * ao + specularIBL;                      // ao = material × contact GTAO
+float3 prefiltered = prefilteredMap.SampleLevel(R, prefilterLod(roughness)).rgb;
+float2 ab = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
+float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
 ```
 
-## Why a ceiling does not block the sky on its own
+The fragment shader also applies GGX multi-scatter energy compensation, horizon occlusion, material
+occlusion, GTAO, and reflection-cone sky visibility. Local
+[reflection probes](../reflection-probes/), screen-space reflections, and ray-traced reflections can
+replace the global prefiltered radiance before those terms are applied.
 
-The irradiance cube treats the whole environment as visible from every point. A surface deep inside an enclosed room receives the same sky irradiance as one in open air, because the cube knows nothing about the geometry between them. Material AO maps and screen-space [GTAO](../../screen-space-and-post/) only darken the contact scale (creases, the few centimetres around a corner), so neither can say "a ceiling stands between this floor and the sky." Left alone, the analytic sky leaks into interiors and washes them out.
+## Diffuse irradiance
 
-Two mechanisms fix this, and they compose. Both leave open and outdoor areas alone; they only bite where geometry actually encloses a surface.
+Diffuse IBL uses a cosine-weighted convolution of the environment. This produces an irradiance cube
+that needs only the shading normal as its lookup direction. The material response multiplies the
+sampled irradiance by albedo and the energy-conserving diffuse factor
+$k_d=(1-F)(1-metallic)$.
 
-### DDGI replaces the IBL diffuse where it has coverage
+For opaque surfaces, `gi_resolve.slang` samples the global irradiance cube once per half-resolution
+pixel. It applies distance-field sky visibility and replaces the result with
+[DDGI](../../global-illumination-and-raytracing/ddgi-overview/) according to probe-cage coverage. The
+mesh fragment bilinearly samples this resolved irradiance and applies $k_d$, albedo, and contact AO.
 
-When [DDGI](../../global-illumination-and-raytracing/ddgi-overview/) is enabled, its probe irradiance already carries sky occlusion intrinsically — a probe inside a sealed room sees the sky only through the gaps its rays actually reach (the sky enters a probe's radiance only on a ray that *misses* every surface). So the indirect diffuse is a *replace*, not an add: the DDGI irradiance lerps over the analytic irradiance by the probe cage's coverage. Where the cage covers a surface, its occluded irradiance wins; where it does not, the analytic term remains as the residual. This DDGI ray-miss is the **large-range** indirect occlusion — there is no longer a distance-field ambient-occlusion prepass dimming the diffuse, which would double-count the same enclosure.
+Transparent surfaces cannot use the screen-space resolve because it describes the opaque surface
+behind them. They sample the irradiance cube and DDGI directly in `evalLighting`.
 
-```hlsl
-float3 indirectIrr = irradiance;                     // analytic sky (residual where DDGI is absent)
-if (ddgiEnabled) {
-    float4 ddgi = ddgiSampleIrradiance(worldPos, n); // .w = coverage
-    indirectIrr = lerp(indirectIrr, ddgi.rgb, ddgi.w);
-}
-float3 indirect = kd * indirectIrr * albedo * ao;    // ao = material × contact GTAO
-```
+## Baked resources
 
-The diffuse is a single replace rather than two stacked terms, so a mid-room floor never reads brighter than the analytic sky alone would have made it — DDGI carries the sky, it does not add a second copy of it. The only further occlusion is **contact-scale**: a small-radius [GTAO](../../screen-space-and-post/gtao/) fills in the creases and corners the coarse probe grid cannot resolve. [Screen-space GI](../../screen-space-and-post/) stays additive on top, because it is a one-bounce screen-space term, not the sky.
+The bake first fills a source environment cube from a procedural sky, an equirectangular panorama,
+or the [procedural atmosphere](../procedural-atmosphere/). It generates the source mip chain, then
+dispatches the diffuse convolution, one specular prefilter dispatch per mip, and the BRDF integration.
 
-### The distance field occludes the specular reflection
+| Resource | Extent | Format | Purpose |
+|---|---:|---|---|
+| Environment cube | 256×256 per face | RGBA16F | Source radiance and visible procedural sky |
+| Irradiance cube | 32×32 per face | RGBA16F | Diffuse hemisphere integral |
+| Prefiltered cube | 256×256 per face, 5 mips | RGBA16F | Specular radiance by roughness |
+| BRDF LUT | 256×256 | RGBA16F | Fresnel scale and bias |
 
-The diffuse no longer reads the distance field at all, but the specular does. A separate reflection-cone factor `specSkyVis` cuts back the reflected skybox where the reflection vector is blocked — see [distance field reflection occlusion](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/). It is gated on the sky-occlusion toggle. Dimming specular by a diffuse AO scalar would wrongly darken a chrome surface facing open sky, so the two are kept distinct.
+The irradiance cube, prefiltered cube, and BRDF LUT occupy bindings 0 through 2 of mesh descriptor set
+3. Reflection-probe arrays and metadata share bindings 3 through 5 of the same set.
 
-## When it replaces flat ambient
+## Bake lifetime
 
-IBL is the default. It runs whenever `globals.counts.z != 0`, which is `use_ibl && Ibl::ready`. Disabling it (`sa set-ibl 0`) falls back to a flat scalar — `albedo * (1 - metallic) * ambientColor` — that the scene's ambient carries. The flat version has no directionality and no specular reflection, the two qualities IBL adds.
+Renderer construction performs a procedural-sky bake before the first frame. A change to the
+environment source, panorama, sun, or atmosphere parameters arms another bake at the next GPU-idle
+frame boundary. The bake overwrites the persistent images, so descriptor set 3 remains valid.
+
+The master IBL switch is enabled by default. `sa set-ibl 0` selects the flat fallback
+`albedo * (1 - metallic) * ambientColor`; `sa set-ibl 1` restores the baked diffuse and specular
+paths.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Ambient assembly + set-3 bindings | `engine/assets/shaders/lighting.slang` | ambient block, `irradianceMap`, `prefilteredMap`, `brdfLut`, `IblPrefilterMaxMip` |
-| SDF reflection occlusion | `engine/assets/shaders/lighting.slang` | `globals.sdfOcclusion`, `specSkyVis`, `sdfReflectionOcclusion` |
-| DDGI replaces the IBL diffuse | `engine/assets/shaders/lighting.slang` | `ddgiSampleIrradiance` (coverage in `.w`), the `lerp(indirectIrr, ddgi.rgb, ddgi.w)` |
-| IBL-on flag | `engine/crates/rendering/src/lighting.rs` | `set_frame_ibl`, `frame_ibl_flag` → `counts` |
-| Toggle + default | `engine/crates/rendering/src/ibl.rs` | `Ibl::use_ibl` (default `true`), `Ibl::ready` |
-| Sky-occlusion toggle | `engine/crates/rendering/src/renderer.rs` | `Renderer::set_sky_occlusion`, `sky_occlusion_enabled` |
-| Control command | `engine/crates/control/src/commands_render.rs` | `set-ibl` |
+| Resources and bake lifetime | `rendering/src/ibl.rs` | `Ibl`, `Ibl::bake`, `Ibl::request_env_bake`, `EnvSource` |
+| Bake dimensions | `rendering/src/ibl.rs` | `IBL_ENV_SIZE`, `IBL_IRRADIANCE_SIZE`, `IBL_PREFILTER_SIZE`, `IBL_PREFILTER_MIPS`, `IBL_LUT_SIZE` |
+| IBL descriptor layout | `rendering/src/descriptors.rs` | `create_ibl_layout` |
+| Opaque diffuse resolve | `assets/shaders/gi_resolve.slang` | `computeMain`, `indirectOut` |
+| Specular and transparent diffuse | `assets/shaders/lighting.slang` | `evalLighting`, `prefilterLod`, `fresnelSchlickRoughness` |
+| Runtime toggle | `control/src/commands_render.rs` | `set-ibl` |
 
 ## Related
 
-- [Cook-Torrance BRDF](../../lighting-and-brdf/cook-torrance-brdf/) — the BRDF this integrates
-- [Diffuse irradiance](../diffuse-irradiance/) — the diffuse cube
-- [Specular prefilter](../specular-prefilter/) — the roughness-mipped specular cube
-- [BRDF LUT](../brdf-lut/) — the split-sum scale/bias table
-- [Distance field reflection occlusion](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/) — the SDF cone that occludes the reflected skybox
-- [HDR and exposure](../../lighting-and-brdf/hdr-and-exposure/) — the linear radiance space
+- [Diffuse irradiance](../diffuse-irradiance/) covers the cosine-weighted convolution.
+- [Specular prefilter](../specular-prefilter/) covers roughness-filtered environment radiance.
+- [BRDF LUT](../brdf-lut/) covers the scale-and-bias integration.
+- [IBL bake pass](../ibl-bake-pass/) follows the synchronous compute sequence.
+- [Distance field reflection occlusion](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/) covers diffuse and specular sky visibility.

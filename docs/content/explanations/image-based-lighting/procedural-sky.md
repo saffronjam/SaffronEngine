@@ -6,54 +6,86 @@ math = true
 
 # Procedural sky
 
-A procedural sky is an environment generated analytically from a direction function rather than loaded from an image. It produces a horizon-to-zenith gradient over a dim ground plane, plus a bright sun disk, written into the environment cube as HDR radiance.
+The procedural sky is an analytic HDR environment with a blue upper hemisphere, a dark ground hemisphere, and a directional sun. It gives IBL a complete source without requiring a panorama asset.
 
-Image-based lighting needs an environment to convolve. The procedural sky supplies one without an asset: the cube is filled in a compute pass, and the irradiance and prefilter passes then treat it as the light source. It is the default of the three [environment sources](../procedural-atmosphere/) (`EnvSource::Procedural`).
+`EnvSource::Procedural` selects `ibl_skygen.slang` for the environment-cube fill. The later irradiance, prefilter, and BRDF passes consume its output through the same interfaces used by equirectangular and atmosphere sources.
 
-## What the sky function returns
+## Hemisphere gradient
 
-`proceduralSky(dir)` takes a world direction and returns linear HDR radiance in three parts.
+`proceduralSky` starts with three fixed linear-radiance colors:
 
-**The gradient.** Above the horizon ($\text{dir}.y \ge 0$) it blends horizon color into zenith color by a softened upward factor; below, it blends toward a dark ground color. The `pow(up, 0.6)` curve pushes the blend so most of the visible dome reads as sky rather than horizon, and a scale lifts the whole into a brighter exposure range. The ground side ramps quickly to a near-flat dark, a floor for downward-facing reflections.
+| Region | RGB |
+|---|---|
+| Zenith | `(0.10, 0.26, 0.62)` |
+| Horizon | `(0.62, 0.70, 0.86)` |
+| Ground | `(0.16, 0.14, 0.12)` |
 
-**The sun disk.** The sun direction (from the bake push) drives two power lobes added on top:
+Above the horizon, the upward direction controls a softened blend from horizon to zenith:
+
+$$
+t_{sky}=\operatorname{saturate}(d_y)^{0.6}.
+$$
+
+Below the horizon, `saturate(-3 d_y)` reaches the ground color by $d_y=-1/3$. The shader multiplies either result by 1.6 before adding the sun.
+
+## Sun lobes
+
+`SkygenParams` receives the scene's directional-light color and intensity. Its sun direction points toward the light, so `drive_env_bake` negates the directional light's travel direction before filling `SkygenPush`.
+
+The shader adds a narrow core and a broad glow around that direction:
 
 ```hlsl
 float s = max(dot(normalize(dir), sunDir), 0.0);
-col += pow(s, 1200.0) * float3(22.0, 20.0, 17.0);   // tight bright core
-col += pow(s, 6.0)    * float3(0.30, 0.26, 0.20);    // soft surrounding glow
+col += pow(s, 1200.0) * float3(22.0, 20.0, 17.0) * sunTint * sunI;
+col += pow(s, 6.0) * float3(0.30, 0.26, 0.20) * sunTint * sunI;
 ```
 
-The $\cos^{1200}$ lobe is an extremely tight, very bright disk — values above 20, genuine HDR that the prefilter smears into bright specular reflections. The $\cos^6$ lobe is a wide, dim halo. The sun direction comes from `SkygenPush.sunDir` (= −lightDir), so IBL and the sun agree.
+Both terms are linear HDR radiance. The high exponent keeps the core close to the sun direction, while the sixth-power lobe spreads a lower-intensity tint across nearby directions. The specular prefilter carries those values into roughness-dependent reflections.
 
-## Writing it into the cube
+## Cube generation
 
-The compute shader runs one invocation per output texel, with `tid.z` selecting the cube face. It reconstructs the face direction, evaluates the sky, and stores the result:
+The output is mip 0 of a 256²-per-face `R16G16B16A16_SFLOAT` cube. `computeMain` uses an 8 by 8 by 1 local size and dispatches six Z groups, one for each cube face.
 
-```hlsl
-float2 uv  = (float2(tid.xy) + 0.5) / float2(width, height) * 2.0 - 1.0;
-float3 dir = cubeFaceDir(tid.z, uv);
-outCube[tid] = float4(proceduralSky(dir), 1.0);
+`cubeFaceDir` maps the face index and texel-centred coordinates to the corresponding world direction. The six cases match Vulkan cube sampling orientation. The shader writes the normalized direction's radiance through a six-layer `RWTexture2DArray<float4>` storage view.
+
+```mermaid
+flowchart LR
+    A[Directional-light inputs] --> B[proceduralSky]
+    B --> C[Environment cube mip 0]
+    C --> D[Environment mip chain]
+    D --> E[Diffuse irradiance]
+    D --> F[Specular prefilter]
 ```
 
-`cubeFaceDir` is the hardware cube convention shared by every IBL shader: a face index 0..5 and an in-face uv in $[-1, 1]$ map to the world direction that face represents. The `+ 0.5` keeps sampling aligned to texel centers. The result is bound as an HDR `RWTexture2DArray` (`outCube`).
+The bake generates the environment's full mip chain immediately after this dispatch. The prefilter shader samples those coarser source levels when an importance sample covers more solid angle than one mip-0 texel.
 
-## Why analytic, not a loaded HDR
+## Environment and background
 
-An analytic sky has no asset dependency, costs nothing to ship, and is deterministic across platforms: the bake produces the same environment every run. It serves as the default source. The downstream pipeline does not depend on where the environment came from, so swapping in a loaded HDR equirect (`EnvSource::Equirect`, `ibl_equirect.slang`) or the [physically based atmosphere](../procedural-atmosphere/) only changes what fills the environment cube — the convolutions, the BRDF lookup, and the visible-sky pass are unchanged.
+The procedural environment is the fallback when no loaded panorama is selected and the physical atmosphere is disabled. This source choice controls IBL regardless of the visible background mode.
+
+When `SkyMode::Procedural` is active, the fullscreen sky pass samples the same environment cube. `SkyRenderSettings::rotation` yaws that visible lookup, and `SkyRenderSettings::intensity` scales its output. Those presentation values do not modify the baked cube or its lighting contribution.
+
+Color mode draws `SceneEnvironment::clear_color` while IBL can still use the procedural environment. Texture mode draws its panorama when loaded; a missing texture falls back to the clear color for the background and leaves environment-source resolution to `drive_env_bake`.
+
+## Re-bake behavior
+
+`should_rebake` compares procedural inputs with the last successful bake. A change to sun direction, color, or intensity arms `rebake_pending`. The next completed bake replaces the cube contents in place, and existing sky and IBL descriptors continue to reference its views.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Sky model + face direction | `engine/assets/shaders/ibl_skygen.slang` | `proceduralSky`, `sunDir`, `cubeFaceDir` |
-| The write | `engine/assets/shaders/ibl_skygen.slang` | `computeMain`, `outCube` |
-| Bake inputs + push | `engine/crates/rendering/src/ibl.rs` | `SkygenParams`, `SkygenPush`, `EnvSource::Procedural` |
-| Dispatched once | `engine/crates/rendering/src/ibl.rs` | `Ibl::bake` — skygen dispatch over `IBL_ENV_SIZE` |
+| Gradient, sun, and face mapping | `engine/assets/shaders/ibl_skygen.slang` | `proceduralSky`, `cubeFaceDir`, `computeMain` |
+| Bake inputs | `engine/crates/rendering/src/ibl.rs` | `EnvSource::Procedural`, `SkygenParams`, `SkygenPush` |
+| Dispatch and mip generation | `engine/crates/rendering/src/ibl.rs` | `Ibl::bake`, `generate_cube_mips`, `IBL_ENV_SIZE` |
+| Source and sun resolution | `engine/crates/assets/src/render_scene.rs` | `drive_env_bake` |
+| Background modes | `engine/crates/scene/src/environment.rs`, `engine/assets/shaders/sky.slang` | `SkyMode`, `fragmentMain` |
+| Visible-sky state | `engine/crates/rendering/src/ibl.rs` | `SkyRenderSettings`, `Sky::submit`, `Sky::bind_env_cube` |
 
 ## Related
 
-- [Procedural atmosphere](../procedural-atmosphere/) — the physically based source that replaces this gradient
-- [Diffuse irradiance](../diffuse-irradiance/) — convolves this environment for diffuse
-- [Specular prefilter](../specular-prefilter/) — blurs this environment per roughness
-- [Baking](../ibl-bake-pass/) — runs skygen first, then the convolutions
+- [Baking](../ibl-bake-pass/) — dispatch and synchronization around the cube fill
+- [Procedural atmosphere](../procedural-atmosphere/) — the physical LUT-based source
+- [Diffuse irradiance](../diffuse-irradiance/) — diffuse convolution of this cube
+- [Specular prefilter](../specular-prefilter/) — roughness-dependent convolution of this cube
+- [IBL overview](../ibl-overview/) — runtime use of the baked textures
