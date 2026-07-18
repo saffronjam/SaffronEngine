@@ -6,23 +6,35 @@ math = true
 
 # PCF filtering
 
-Percentage-closer filtering averages several depth-comparison samples around a lookup point so a shadow edge fades over a few texels instead of snapping from lit to dark. The result is a visibility factor in $[0, 1]$ rather than a single lit-or-shadowed bit.
+Percentage-closer filtering averages several depth-comparison samples around a lookup point so a
+shadow edge fades over a few texels instead of snapping from lit to dark. The result is a
+visibility factor in $[0, 1]$ rather than a single lit-or-shadowed bit. The technique comes from
+Reeves, Salesin, and Cook (SIGGRAPH 1987); GPU Gems'
+[Shadow Map Antialiasing](https://developer.nvidia.com/gpugems/gpugems/part-ii-lighting-and-shadows/chapter-11-shadow-map-antialiasing)
+is the practical treatment.
 
-The 2D shadow maps (directional and spot) use a 3×3 grid of hardware comparison taps. The same `pcfShadow` function serves both maps.
+The 2D shadow maps (directional and spot) share one `pcfShadow` function: a 3×3 grid of hardware
+comparison taps.
 
 ## How it works
 
-The maps are bound as `Sampler2DShadow`, a comparison sampler. Each tap returns whether the stored depth passes the test against a reference, not the stored depth itself. `pcfShadow` projects the world position into the light's clip space, takes `ndc.z` as the reference depth, and averages nine `SampleCmp` taps stepped one texel apart (`texel = 1/2048`, matching `SHADOW_MAP_SIZE`):
+The maps are bound as `Sampler2DShadow`, a comparison sampler: each tap returns the result of a
+depth test, not the depth itself. `pcfShadow` projects the world position into the light's clip
+space, takes `ndc.z` as the reference depth, and averages nine `SampleCmp` taps stepped one texel
+apart (`texel = 1/2048`, matching `SHADOW_MAP_SIZE`):
 
 ```hlsl
 sum += map.SampleCmp(uv + float2(x, y) * texel, ndc.z);
 ```
 
-`SampleCmp` runs the depth-less-than-or-equal test in the sampler hardware. Averaging nine results yields 0, 1/9, 2/9, …, 1, a quantized soft edge.
+The sampler compares with `LESS_OR_EQUAL` and filters with `LINEAR`, so the hardware blends the
+comparison results of the four texels under each tap. Each tap is a small percentage-closer
+filter on its own. Nine of them give a smooth $[0, 1]$ gradient across the penumbra.
 
 ## Off-map and beyond-far cases
 
-A fragment can project outside the map, past its far plane, or behind the light. None of these positions carry valid shadow information, so an early-out guard handles each case:
+A fragment can project outside the map, past its far plane, or behind the light. None of these
+positions carry valid shadow information, so an early-out guard handles each case:
 
 | Condition | Meaning | Result |
 |---|---|---|
@@ -30,11 +42,24 @@ A fragment can project outside the map, past its far plane, or behind the light.
 | `uv` outside $[0,1]^2$ | outside the light frustum | lit |
 | `ndc.z > 1` | past the far plane | lit |
 
-Treating absent information as lit is the safe default. It avoids a hard black band at the frustum edge and a shadow that swallows everything past the far plane. The cost is that geometry genuinely outside the frustum is never shadowed, which is why the directional frustum is [fit to the whole scene](../directional-shadows/).
+Treating absent information as lit is the safe default. Shadowing these fragments instead would
+draw a hard black band at the frustum edge and put everything past the far plane in shadow. The
+sampler applies the same policy in hardware: `CLAMP_TO_BORDER` with an opaque-white border makes
+a stray off-map tap compare against depth 1.0 and pass as lit.
 
-## Design and trade-offs
+The cost is that geometry genuinely outside the frustum is never shadowed. That is why the
+directional frustum is [fit to the whole scene](../directional-shadows/).
 
-A fixed 3×3 kernel is the cheapest filter that visibly helps. It hides the texel grid at the cost of a constant-width penumbra: the softening is the same regardless of occluder distance, so it does not model contact-hardening soft shadows. Wider kernels, Poisson-disk taps, or a rotated kernel smooth more at more cost. The engine keeps the averaged grid and leaves those as drop-in changes to one function. The point light does not use this path; its cube stores distance and does a hard comparison (see [point shadows](../point-light-cube-shadows/)).
+## Trade-offs
+
+A fixed 3×3 kernel is the cheapest filter that visibly helps. It hides the texel grid, but the
+penumbra width is constant: the softening does not grow with occluder distance, so shadows do not
+contact-harden the way
+[percentage-closer soft shadows](https://developer.download.nvidia.com/shaderlibrary/docs/shadow_PCSS.pdf)
+do. A wider or jittered kernel smooths more and costs more taps per fragment.
+
+The point light does not use this path: its cube map stores distance and does a hard comparison,
+described in [point shadows](../point-light-cube-shadows/).
 
 ## In the code
 

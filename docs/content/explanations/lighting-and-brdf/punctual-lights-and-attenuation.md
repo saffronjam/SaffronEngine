@@ -6,48 +6,46 @@ math = true
 
 # Punctual lights
 
-A punctual light is a light source at a single world-space position: a point light radiating in
-all directions, or a spot light confined to a cone. Both fall off with distance, and a spot also
-cuts off by angle.
+A punctual light emits from one world-space position. A point light radiates in every direction,
+while a spot light restricts the same emission to a cone. Both use distance attenuation and a hard
+range so their influence remains spatially bounded.
 
-Each punctual light feeds the same [Cook-Torrance BRDF](../cook-torrance-brdf/) as the
-[directional sun](../directional-light/). The difference is the incoming radiance, which a punctual
-light builds from three multiplicative factors: distance attenuation, a spot cone, and shadow.
+Entities need a `Transform` together with `PointLight` or `SpotLight` to enter the render light list.
+The world translation supplies the position. For a spot, the entity's world rotation also rotates
+the component direction before upload.
 
-## One function per light
+## Packed light data
 
-`punctual` evaluates a single light at a world-space surface point. It computes the light
-direction, the attenuation, the cone, and the shadow, folds them into `radiance`, and passes that
-to `brdf`:
+Every point and spot becomes one 64-byte `GpuLight` record. Point records set `direction_type.w` to
+zero; spot records set it to one and store the cone cosines in `spot_cos.xy`.
 
-```hlsl
-float3 toLight = lt.positionRange.xyz - worldPos;
-float dist = length(toLight);
-if (dist > lt.positionRange.w)        // past range: contributes nothing
-    return float3(0.0);
-float3 l = toLight / max(dist, 0.0001);
-float attenuation = distanceAttenuation(dist, lt.positionRange.w);
-// ... cone, shadow ...
-float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a * attenuation * cone * shadow;
-return brdf(n, v, l, albedo, metallic, roughness, radiance);
-```
+| Property | Point default | Spot default |
+|---|---:|---:|
+| Intensity | `5.0` | `5.0` |
+| Range | `10.0` | `10.0` |
+| Inner half-angle | n/a | `20°` |
+| Outer half-angle | n/a | `30°` |
+| Volumetric scattering | `1.0` | `1.0` |
+| Cast volumetric shadow | `true` | `true` |
 
-The early `dist > range` test rejects a light cheaply before any BRDF work. Everything after it
-builds the `radiance` scalar the BRDF multiplies in.
+The per-frame storage buffer grows when the scene exceeds its capacity. The
+[cluster cull](../clustered-forward/) uses each light's position and range as a sphere, and the mesh
+fragment loops only the indices assigned to its froxel. Disabling clustered lighting makes the
+fragment loop the full punctual-light buffer.
 
 ## Distance attenuation
 
-A physical point source falls off as $1/d^2$. A pure inverse-square never reaches zero, so it
-touches every fragment in the scene and defeats culling. The engine uses the UE4-style windowed
-inverse-square: the physical $1/d^2$ multiplied by a smooth factor that reaches exactly zero at
-`range`.
+The attenuation follows the windowed inverse-square form described in
+[Real Shading in Unreal Engine 4](https://cdn2.unrealengine.com/Resources/files/2013SiggraphPresentationsNotes-26915738.pdf).
+It preserves inverse-square behavior near the source and reaches exactly zero at `range`:
 
 $$
-\text{att}(d, r) = \frac{1}{\max(d^2,\ 10^{-4})}\,\left[\operatorname{sat}\!\left(1 - \left(\tfrac{d}{r}\right)^4\right)\right]^2
+A(d,r)=\frac{1}{\max(d^2,10^{-4})}
+\left[\operatorname{sat}\left(1-\left(\frac{d}{r}\right)^4\right)\right]^2.
 $$
 
 ```hlsl
-float distanceAttenuation(float dist, float range)
+public float distanceAttenuation(float dist, float range)
 {
     float invSquare = 1.0 / max(dist * dist, 0.0001);
     float t = saturate(1.0 - pow(dist / range, 4.0));
@@ -55,61 +53,66 @@ float distanceAttenuation(float dist, float range)
 }
 ```
 
-The $\max(d^2, 10^{-4})$ floor keeps the value finite at the light's own position. The
-$\bigl(1-(d/r)^4\bigr)^2$ window is $1$ near the light and tapers smoothly to $0$ at $d = r$, giving
-the light compact support. That bounded support lets the [cluster cull](../clustered-forward/) treat
-`range` as a hard bounding radius.
+The denominator floor keeps the value finite at the source. The smooth range window gives the light
+compact support, allowing the cluster cull to reject froxels outside the range sphere. `punctual`
+also returns before BRDF work when the surface distance exceeds `range`.
 
-## The spot cone
+## Spotlight cone
 
-A spot adds an angular cutoff on top of the distance falloff. The light's `directionType.w` flags
-it as a spot. The shader compares the angle between the spot's aim and the direction to the
-fragment against two pre-computed cosines, smoothstepped for a soft penumbra:
+A spot compares its rotated aim with the direction from the light to the surface. The CPU converts
+the authored half-angles from degrees to cosines, and the shader interpolates between them:
 
 ```hlsl
-if (lt.directionType.w > 0.5)
-{
-    float3 spotDir = normalize(lt.directionType.xyz);
-    float cosAngle = dot(spotDir, -l);
-    cone = smoothstep(lt.spotCos.y, lt.spotCos.x, cosAngle);   // y = outer, x = inner
-}
+float3 spotDir = normalize(lt.directionType.xyz);
+float cosAngle = dot(spotDir, -l);
+float cone = smoothstep(lt.spotCos.y, lt.spotCos.x, cosAngle);
 ```
 
-`smoothstep(outer, inner, cosAngle)` is $1$ inside the inner half-angle, $0$ outside the outer one,
-and a smooth Hermite ramp between. Larger angles have smaller cosines, so the outer cosine is the
-low edge and the inner is the high edge. A point light leaves `cone` at `1.0`.
+`spot_cos.x` is the inner cosine and `spot_cos.y` is the outer cosine. The cone is one inside the
+inner angle, zero outside the outer angle, and follows a smooth Hermite ramp through the penumbra. A
+point light keeps the cone factor at one.
 
-## Shadow
+## Surface contribution
 
-The `shadow` factor is `1.0` unless this light is the one shadowed spot or point light, or RT
-shadows are on:
+`punctual` multiplies light color and intensity by attenuation, cone, and visibility. The result is
+incoming radiance for the shared [Cook-Torrance BRDF](../cook-torrance-brdf/):
 
-- the shadowed **spot** projects through `spotShadowViewProj` and PCF-samples `spotShadowMap`;
-- the shadowed **point** samples an omnidirectional cube of world distance-to-light
-  (`pointShadow`), comparing the fragment's distance against the stored nearest occluder;
-- with RT shadows enabled, every punctual light traces one ray toward the light instead.
+```hlsl
+float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a
+                * attenuation * cone * shadow;
+return brdf(n, v, l, albedo, metallic, roughness, radiance);
+```
 
-In v1 the map paths shadow exactly one spot and one point light; the RT path shadows all of them.
+The map-based path shadows the first spot light with a 2048×2048 perspective depth map. It shadows
+the first point light with 512×512 static and dynamic distance cubes, taking the nearer stored depth.
+When ray-query shadows run, every punctual surface contribution traces toward its light instead.
+
+For opaque surfaces, [ReSTIR](../../global-illumination-and-raytracing/restir-passes/) can replace the
+punctual loop with one selected, visibility-tested diffuse sample per pixel. Transparent surfaces
+continue through `punctual` because the ReSTIR radiance image describes opaque G-buffer pixels.
+
+## Volumetric contribution
+
+`fogPunctualInScatter` reuses the distance, cone, and map-based visibility terms for each fog froxel.
+It replaces the surface BRDF with the fog phase response and multiplies by
+`volumetric_scattering`. The `cast_volumetric_shadow` field controls only fog visibility; it does not
+disable the light's surface shadow.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| One light's contribution | `engine/assets/shaders/lighting.slang` | `punctual` |
-| Distance falloff | `engine/assets/shaders/lighting.slang` | `distanceAttenuation` |
-| Spot cone | `engine/assets/shaders/lighting.slang` | `punctual` — `smoothstep`, `spotCos` |
-| Spot / point shadow | `engine/assets/shaders/lighting.slang` | `pcfShadow`, `pointShadow` |
-| Cosines packed on the CPU | `engine/crates/assets/src/render_scene.rs` | `gather_punctual_lights` — `inner_angle.to_radians().cos()` into `spot_cos` |
-
-> [!TIP]
-> `range` is a hard cutoff, not just a falloff knob. The window forces attenuation to zero at
-> `range`, which is what makes `range` usable as the light's bounding radius in the cluster cull.
-> Too small and the visible falloff clips abruptly; too large and the light lands in more
-> clusters than it needs.
+| Authored components | `scene/src/component.rs` | `PointLight`, `SpotLight` |
+| GPU record | `rendering/src/gpu_types.rs` | `GpuLight` |
+| Scene packing | `assets/src/render_scene.rs` | `gather_punctual_lights` |
+| Surface evaluation | `assets/shaders/lighting.slang` | `punctual`, `distanceAttenuation` |
+| Fog evaluation | `assets/shaders/lighting.slang` | `fogPunctualInScatter` |
+| Froxel assignment | `assets/shaders/light_cull.slang` | `computeMain`, `MAX_LIGHTS_PER_CLUSTER` |
 
 ## Related
 
-- [Cook-Torrance BRDF](../cook-torrance-brdf/) — what `radiance` is multiplied into
-- [Light components](../light-components/) — where `range`, `intensity`, and the cone angles come from
-- [Clustered forward](../clustered-forward/) — how `range` becomes a culling radius
-- [Directional light](../directional-light/) — the same BRDF with no falloff or cone
+- [Light components](../light-components/) describes the scene-facing light types.
+- [Cook-Torrance BRDF](../cook-torrance-brdf/) defines the material response.
+- [Clustered forward](../clustered-forward/) explains how range bounds fragment work.
+- [Spot light shadows](../../shadows-and-culling/spot-light-shadows/) covers the perspective shadow pass.
+- [Point light shadows](../../shadows-and-culling/point-light-cube-shadows/) covers the distance cubes.
