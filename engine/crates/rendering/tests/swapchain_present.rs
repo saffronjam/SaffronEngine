@@ -9,6 +9,12 @@
 //! validation-clean. It **skips cleanly** when no Wayland/X11 display is available
 //! (no `WAYLAND_DISPLAY` / `DISPLAY`), so the gate stays green off a display while
 //! the self-contained offscreen smoke in the crate's unit tests always runs.
+//!
+//! Windowed present is exercised only on Linux: the test drives an off-main-thread Wayland/X11
+//! event loop (`winit::platform::{wayland,x11}` + `with_any_thread`), APIs that exist only there.
+//! The offscreen render-and-read-back path — which is what every other platform uses — is covered
+//! by the always-on unit tests, so gating this one to Linux loses no coverage elsewhere.
+#![cfg(target_os = "linux")]
 
 use std::time::{Duration, Instant};
 
