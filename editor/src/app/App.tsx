@@ -165,6 +165,9 @@ export function App() {
     const unlisteners: UnlistenFn[] = [];
 
     const register = async (): Promise<void> => {
+      // A backend-driven phase signal (e.g. a future runtime re-attach). The startup attach is NOT
+      // driven from here — the ViewportPanel probe owns `attaching → ready` — so applying a phase
+      // here simply re-enters the probe's not-ready state, which re-probes and recovers on its own.
       const offPhase = await listen<EnginePhaseEvent>("engine-phase", (event) => {
         setPhase(event.payload);
       });
