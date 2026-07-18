@@ -4,11 +4,13 @@ A from-scratch **Vulkan** renderer / **Rust** game engine. The workspace (`engin
 workspace) builds **`saffron-host`**, a *present-only viewport host*: it renders the scene plus a
 native gizmo overlay offscreen, publishes frames into shared memory, and serves the control plane —
 **no UI panels of its own**. The **editor is the CEF/React/TypeScript app in `editor/`** — a Rust shell
-(`editor/shell`) owning a winit Wayland toplevel that renders the React UI through CEF windowless OSR; it
-spawns the host, presents its frames on Wayland subsurfaces below the transparent UI (UI composites
-over the live viewport), and drives every operation over a JSON-over-unix-socket control plane. The
-engine keeps the API *shape* that works — an `App`/`Layer` lifecycle, a deferred `submit(closure)`
-render seam, a frame graph, a hecs scene, signal/slot events.
+(`editor/shell`) owning a winit toplevel that renders the React UI through CEF windowless OSR; it
+spawns the host, presents its frames below the transparent UI (UI composites over the live viewport),
+and drives every operation over a JSON-over-unix-socket control plane. The window-system code is a
+compile-time backend per OS (`editor/shell/src/backend/`): Wayland subsurfaces on Linux, AppKit
+CALayers/IOSurfaces on macOS (where the shell runs from an `.app` bundle and the engine renders via
+MoltenVK). The engine keeps the API *shape* that works — an `App`/`Layer` lifecycle, a deferred
+`submit(closure)` render seam, a frame graph, a hecs scene, signal/slot events.
 
 ## Conventions (not optional)
 
@@ -81,11 +83,15 @@ render seam, a frame graph, a hecs scene, signal/slot events.
 
 ## Build — always in the `saffron-build` toolbox
 
-The build toolchain is the project standard and lives in the **`saffron-build`** toolbox container,
-never on the host (assume the host has no Rust toolchain). The `just` recipes auto-enter the toolbox
-when run from a host shell, so `just engine`/`just run`/`just check` behave the same inside or out; the
-home directory is shared, so files edited outside are seen inside. To use the host toolchain instead,
-set `SAFFRON_NO_TOOLBOX=true`.
+On Linux the build toolchain is the project standard and lives in the **`saffron-build`** toolbox
+container, never on the host (assume the host has no Rust toolchain). The `just` recipes auto-enter the
+toolbox when run from a host shell, so `just engine`/`just run`/`just check` behave the same inside or
+out; the home directory is shared, so files edited outside are seen inside. To use the host toolchain
+instead, set `SAFFRON_NO_TOOLBOX=true`. On macOS there is no toolbox: the recipes use the host's rustup
+toolchain (`rust-toolchain.toml` pins the channel; keep `$HOME/.cargo/bin` ahead of any Homebrew cargo)
+and the engine renders through MoltenVK (`VK_ICD_FILENAMES`, set by the `gpu_driver` recipe macro); the
+editor shell builds against a CEF distribution provisioned once via `export-cef-dir` (the `cef_gate`
+macro prints the exact command) and runs from the `.app` bundle `just run` assembles.
 
 ```sh
 just engine                      # cargo build --workspace + shaders, inside the toolbox
@@ -105,14 +111,15 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
   gen-protocol` regenerates the editor-facing protocol artifacts from the `saffron-protocol` DTOs.
 - **The real GPU is available inside the toolbox** — the host's NVIDIA card enumerates fine (e.g. a
   discrete RTX). The toolbox reaches the host's Vulkan ICD through the `/run/host` mount; the driver is
-  **not** in the toolbox's own `/usr`. The `just run*` recipes add it via the `nvidia_icd` macro, which
-  resolves and exports:
+  **not** in the toolbox's own `/usr`. The `just run*` recipes add it via the `gpu_driver` macro, which
+  on Linux resolves and exports:
   `VK_ADD_DRIVER_FILES=/run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json`
   (falling back to `/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json`, then to llvmpipe if neither
-  exists). **Do not hand-roll this path in an ad-hoc script** — it is *not* `/usr/share/…/nvidia_icd.json`
+  exists), and on macOS exports `VK_ICD_FILENAMES` pointing at Homebrew's MoltenVK ICD manifest.
+  **Do not hand-roll this path in an ad-hoc script** — it is *not* `/usr/share/…/nvidia_icd.json`
   (wrong location *and* the filename carries the `.x86_64` suffix), and getting it wrong silently drops
   you to llvmpipe, which reads as "no GPU here" when in fact the card is right there. Reuse
-  `just run-engine-headless` / `just run-engine`, or copy the `nvidia_icd` macro from the `justfile`
+  `just run-engine-headless` / `just run-engine`, or copy the `gpu_driver` macro from the `justfile`
   verbatim. Confirm with `vulkaninfo --summary` (it lists the NVIDIA device) or the host's
   `vulkan ready — gpu 'NVIDIA …' (discrete)` log line. Mesa llvmpipe is the fallback and is fine for
   correctness/validation (just slow); `just run-software` forces it.

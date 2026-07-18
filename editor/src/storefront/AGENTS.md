@@ -9,7 +9,7 @@ for the wire shapes and auth model.
 
 - This UI calls **editor-local `store_*` / `connector_*` shell commands** wrapped in `types.ts`
   (`invoke(...)`), **not** the generated control client and **not** the engine. Only the final
-  *import* crosses to the host: `store_import` / `store_import_part` download the deliverable, hand
+  _import_ crosses to the host: `store_import` / `store_import_part` download the deliverable, hand
   it to the host importer, and the imported asset lands in the catalog (which the control plane then
   sees). Nothing else in this directory touches the control socket.
 - The **enabled-provider list** is the exception: it is control-plane, per-project state
@@ -65,10 +65,10 @@ surface. If you add a field to a Rust DTO in `connectors/`, add it to `types.ts`
   the Store shows the same dialog with the same selection. Never revert them to a body-portaled modal
   `Dialog` — that covers the tab strip and locks out navigation.
 - **The Store tab restores exactly as left — no rebuild, no re-animate.** Two `display:none` side
-  effects are neutralized so a tab switch doesn't *look* like a re-open: (1) the results grid's
+  effects are neutralized so a tab switch doesn't _look_ like a re-open: (1) the results grid's
   virtualizer is given a custom `observeElementRect` that ignores `0×0` (`StoreResultsGrid`), so the
   hidden grid doesn't collapse its window and tear down/rebuild cards on reveal — which also keeps a
-  card's open detail modal alive; (2) the scoped dialogs omit the CSS *entrance* animation
+  card's open detail modal alive; (2) the scoped dialogs omit the CSS _entrance_ animation
   (`DialogContent` gates `animate-in` on `container == null`; `DialogScopedOverlay` carries only the
   exit fade), because `display:none → visible` restarts CSS `animation`, which would replay the open
   animation on every reveal. Keep both: an element that persists across a `display:none` must not use
