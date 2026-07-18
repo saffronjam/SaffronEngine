@@ -253,7 +253,15 @@ float prefilterLod(float roughness)
 
 // Set 7: ReSTIR resolved direct-light radiance (screen UV). Replaces the punctual light
 // loop when screenFlags.w != 0 (multiplied by albedo/PI for the diffuse direct term).
+//
+// ReSTIR rides the ray-tracing path, so this binding — and every ray-query binding below — is
+// compiled only into the RT variant (`SAFFRON_NO_RT` undefined). A device without ray tracing
+// (its PSO layout omits sets 6/7) loads the RT-off variant, where these declarations are absent
+// so the shader's declared interface matches the layout — MoltenVK requires that match, and the
+// RT branches are runtime-dead there anyway.
+#ifndef SAFFRON_NO_RT
 [[vk::binding(0, 7)]] Sampler2D restirRadiance;
+#endif
 
 // Spatial reflection probes share the IBL set (set 3, bindings 3-5) so the mesh layout stays
 // within the maxBoundDescriptorSets budget. probeCubes[i] is probe i's prefiltered specular
@@ -287,8 +295,10 @@ float3 boxProject(float3 worldPos, float3 R, float3 origin, float3 extent)
 }
 
 // Set 6: the ray-tracing TLAS for inline ray-query shadows (pointShadowMeta.z gates it).
-// Present only when the device supports RT (the PSO layout omits set 6 otherwise), but the
-// binding compiles unconditionally — it is only accessed under the runtime flag.
+// Present only when the device supports RT — the PSO layout omits set 6 otherwise (its
+// acceleration-structure descriptor needs the RT extension), so the RT-off variant excludes
+// this declaration and the ray-query helpers below.
+#ifndef SAFFRON_NO_RT
 [[vk::binding(0, 6)]] RaytracingAccelerationStructure rtScene;
 
 // Trace one TerminateOnFirstHit shadow ray from worldPos toward `toLight` (a unit dir);
@@ -321,6 +331,7 @@ float rayQueryReflection(float3 worldPos, float3 dir, float maxDist)
     while (q.Proceed()) {}  // opaque triangle candidates auto-commit; loop finds the closest
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
 }
+#endif
 
 /// Builds the shared [`giprobe::DdgiVolume`] from this frame's light globals (the mesh's view of the
 /// camera-centered probe clipmap) for `giprobe::ddgiSampleIrradiance`.
@@ -465,10 +476,12 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
     float shadow = 1.0;
     // Ray-traced punctual shadow (one ray toward the light) when RT shadows are on — applies
     // to every punctual light, vs the map paths that shadow only one spot + one point light.
+#ifndef SAFFRON_NO_RT
     if (globals.pointShadowMeta.z != 0)
     {
         shadow = rayQueryShadow(rtScene, worldPos, l, dist);
     }
+#endif
     if (lt.directionType.w > 0.5)
     {
         float3 spotDir = normalize(lt.directionType.xyz);
@@ -726,6 +739,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     // attenuated by the shadow map + screen-space contact shadows (directional only).
     float3 lDir = -normalize(globals.directionAmbient.xyz);
     float shadow = 1.0;
+#ifndef SAFFRON_NO_RT
     if (globals.pointShadowMeta.z != 0)
     {
         // Ray-traced directional shadow (a long ray toward the sun) — A/B vs the map.
@@ -735,6 +749,12 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     {
         shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
     }
+#else
+    if (globals.counts.y != 0)
+    {
+        shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
+    }
+#endif
     if (globals.screenFlags.x != 0 && !translucent)
     {
         shadow *= contactMap.SampleLevel(screenUv, 0.0).r;  // fine contact detail (opaque only)
@@ -745,6 +765,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     // Punctual lights. ReSTIR (screenFlags.w) replaces the per-light loop with one resolved
     // stochastic many-light direct radiance sample (diffuse term); otherwise loop the
     // froxel cluster's lights (clustered) or every light (reference).
+#ifndef SAFFRON_NO_RT
     if (globals.screenFlags.w != 0 && !translucent)
     {
         // ReSTIR's resolved direct radiance is a screen-space buffer keyed to the opaque G-buffer, so
@@ -753,6 +774,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         lo += restir * albedo / PI;  // resolved radiance already includes geometry * vis * W
     }
     else if (clusterParams.screenSize.z != 0)
+#else
+    if (clusterParams.screenSize.z != 0)
+#endif
     {
         float viewZ = mul(clusterParams.view, float4(input.worldPos, 1.0)).z;
         uint clusterIndex = clusterIndexFor(clusterParams, input.position.xy, viewZ);
@@ -831,7 +855,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // Ray-traced reflections: trace the reflection ray against the TLAS (finds geometry
         // off-screen, where SSR fails) and reproject the world-space hit through last frame's
         // view-proj into prev_color for its reflected radiance. Gated to smooth surfaces; an
-        // off-screen reprojection or a missed ray falls back to the (SSR-or-env) radiance.
+        // off-screen reprojection or a missed ray falls back to the (SSR-or-env) radiance. RT
+        // only — the RT-off variant keeps the SSR/env reflection it already computed.
+#ifndef SAFFRON_NO_RT
         if (globals.extraFlags.y != 0 && !translucent)
         {
             float gate = saturate(1.0 - roughness * 2.0);
@@ -854,6 +880,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
                 }
             }
         }
+#endif
 
         // Specular sky occlusion: a cone along the reflection vector R (widened by roughness)
         // sphere-marched against the Global Distance Field — the reflected skybox is occluded only
