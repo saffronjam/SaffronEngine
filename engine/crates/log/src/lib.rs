@@ -28,7 +28,7 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{EnvFilter, registry};
+use tracing_subscriber::{EnvFilter, registry, reload};
 
 /// The wall-clock portion of a line: `12:30:01.234`.
 const TIMESTAMP: &[FormatItem<'static>] =
@@ -41,9 +41,10 @@ static INIT: Once = Once::new();
 
 /// The default `EnvFilter` directive when `RUST_LOG` is unset: our crates at `debug`, but the
 /// chatty third-party HTTP/TLS stack (pulled in by the editor's connector `reqwest`) pinned to
-/// `warn` so it doesn't drown the engine's own lines.
+/// `warn`, and `winit` to `info` (its debug stream narrates internal event queuing), so they
+/// don't drown the engine's own lines.
 const DEFAULT_FILTER: &str =
-    "debug,hyper=warn,hyper_util=warn,reqwest=warn,rustls=warn,h2=warn,tower=warn";
+    "debug,hyper=warn,hyper_util=warn,reqwest=warn,rustls=warn,h2=warn,tower=warn,winit=info";
 
 /// Installs the global `tracing` subscriber: an `EnvFilter` (honoring `RUST_LOG`, default
 /// [`DEFAULT_FILTER`]) feeding the [`CompactFormatter`] to stdout.
@@ -58,9 +59,31 @@ pub fn init_logging() {
 
         let filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+        let (filter, handle) = reload::Layer::new(filter);
+        let _ = FILTER_HANDLE.set(handle);
 
         // `try_init` (not `init`) so a subscriber already set elsewhere can't panic us.
         let _ = registry().with(filter).with(fmt_layer).try_init();
+    });
+}
+
+/// The live filter handle, so a target can be silenced after `init_logging`.
+static FILTER_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, registry::Registry>> =
+    std::sync::OnceLock::new();
+
+/// Silence a log target for the remainder of the process. For a third-party dependency whose
+/// global hooks keep emitting after its lifecycle in this process has ended (e.g. a windowing
+/// library's handlers observing stray platform events after its event loop finished) — the
+/// target's lines carry no signal past that boundary.
+pub fn silence_target(target: &str) {
+    let Some(handle) = FILTER_HANDLE.get() else {
+        return;
+    };
+    let Ok(directive) = format!("{target}=off").parse() else {
+        return;
+    };
+    let _ = handle.modify(|filter| {
+        *filter = std::mem::take(filter).add_directive(directive);
     });
 }
 
