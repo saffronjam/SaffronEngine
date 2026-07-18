@@ -16,7 +16,7 @@ import re
 import sys
 from urllib.parse import urldefrag
 
-BASEURL_PATH = "/saffron-engine"
+BASEURL_PATH = "/saffron-anima"
 SKIP_SUFFIXES = (".css", ".js", ".png", ".svg", ".woff", ".woff2", ".ico",
                  ".xml", ".json", ".txt", ".map")
 HREF = re.compile(r'href="([^"]+)"')
