@@ -6,120 +6,121 @@ math = true
 
 # Bloom
 
-Bloom spreads the energy of bright pixels into their neighbours, the way a real lens and sensor bleed
-light around an intense highlight. Emissive materials, speculars, and the sun already write unbounded
-radiance into the linear-HDR scene target, but without bloom a bright pixel stays a pinpoint. Bloom
-gathers that energy into a soft glow whose size and brightness track the source's luminance.
+Bloom spreads bright scene radiance over nearby pixels. An emissive surface or a sun reflection can
+carry far more energy than the display can show, yet remain a single sharp pixel without this filter.
+The resulting glow makes that intensity visible over a larger area before the view transform maps it
+to the display.
 
-It is an energy-conserving mip pyramid — the Call-of-Duty: Advanced Warfare / Jimenez method, not a
-bright-pass plus Gaussian blur. It runs as compute passes on the display-extent `rgba16f` offscreen
-**before** the [tonemap](../tonemap-and-exposure/) pass, so the glow lives in unbounded scene-linear
-radiance and the view transform rolls the bloomed highlights off for free.
+Anima follows the mip-pyramid veil/bloom method presented in Jorge Jimenez's
+[*Next Generation Post Processing in Call of Duty: Advanced Warfare*](https://www.advances.realtimerendering.com/s2014/index.html#_NEXT_GENERATION_POST_PROCESSING_IN_CALL_OF_DUTY_ADVANCED_WARFARE).
+Compute passes build and collapse the pyramid in scene-linear `rgba16f`, then composite it into the
+display-extent color image before [tonemapping](../tonemap-and-exposure/).
 
 ## The pyramid
 
-Three pass kinds, all driven by one shader (`bloom.slang`) and one PSO — a push `pass`/`karis` field
-selects the branch per dispatch:
+One compute pipeline serves four branches selected by `BloomPush.pass`:
 
-1. **Downsample** — a 13-tap bilinear kernel (36 effective taps) halves the image each level, building
-   a half-resolution-first mip chain (≈6 levels at 1080p, 7 at 1440p+). Each level is a distinct keyed
-   image from the transient pool, so its barriers stay independent and nothing outlives the frame.
-2. **Upsample** — a progressive 9-tap 3×3 tent, offsets scaled by one `filterRadius` UV (the scatter
-   dial), adds each coarse level back into the next-finer one on the way down to `mip0`.
-3. **Composite** — an energy-conserving `lerp` of the accumulated `mip0` glow back into the scene:
+1. **Downsample:** a 13-sample bilinear kernel halves the image at every level. The first output is
+   half resolution.
+2. **Upsample:** a 9-sample tent filter reads a coarse level and adds it into the next finer level.
+   `filterRadius` controls the UV spacing of the tent.
+3. **Streak:** two optional horizontal Gaussian passes blur `mip0` through ping-pong images.
+4. **Composite:** the shader combines the pyramid, dirt mask, and streak with the full-resolution
+   scene color.
+
+For a display extent with minimum dimension $d$, the renderer chooses
 
 $$
-c_\text{out} = \operatorname{lerp}(c_\text{hdr},\; c_\text{bloom} \cdot \text{tint},\; \text{intensity})
+N = \operatorname{clamp}(\lfloor \log_2 d \rfloor - 3,\ 1,\ 7).
 $$
 
-The composite is a **relative-fraction mix, never additive**. `intensity` reads as the glow's share of
-the final pixel (Jimenez uses ≈0.04), so bloom never piles brightness onto an already-bright pixel the
-way an additive blur does. There is one composite path — additive bloom is not offered as an alternate.
+A 1280x720 view therefore uses six levels; a 1920x1080 view reaches the seven-level cap. Each level
+has its own render-graph resource identity and barriers. The backing images come from keyed,
+per-frame-slot transient storage, which reuses compatible allocations after that frame slot becomes
+available again.
 
-## Thresholdless, with a Karis firefly guard
+The final branch evaluates the following base mix after applying the optional art-direction terms:
 
-Bloom is **thresholdless by default**: there is no bright-pass cutoff, so emissive and HDR-bright pixels
-bloom automatically in luminance proportion (matching Unity HDRP and the physically-based pyramid). The
-stability mechanism is instead a **Karis luma average** — each of the five overlapping 2×2 boxes on the
-`color → mip0` downsample is weighted by $1/(1 + \text{luma})$, so a lone single-texel HDR firefly
-contributes far less than its raw value. That is exactly where fireflies live, so the average is applied
-**only** on the first downsample (gated by the push `karis` flag); deeper mips are already smooth.
+$$
+c_\text{out} = \operatorname{lerp}
+\left(c_\text{hdr},\ c_\text{bloom}\,t_\text{bloom},\ w_\text{bloom}\right).
+$$
 
-A `threshold` knob exposes a non-physical soft-knee prefilter for art direction. It is off (`0.0`) by
-default and documented as an escape hatch, not the recommended path — do not treat it as a bright-pass
-stage.
+`intensity` supplies $w_\text{bloom}$ and defaults to `0.05`; `tint` supplies
+$t_\text{bloom}$. This is a relative `lerp` composite rather than an additive
+`c_hdr + bloom` operation.
 
-## Art direction: lens dirt, anamorphic streaks, per-mip tint
+## First-level filtering
 
-Three layers ride the *same* pre/post compositing — one `set-bloom` command, one `BloomPush`, one
-composite path — so they never fork a second bloom.
+Bloom is thresholdless when `threshold` is zero. In that mode, every scene-linear pixel contributes
+according to its value. The first downsample also applies a Karis luminance-weighted average to five
+overlapping 2x2 groups. Its $1/(1 + \operatorname{luma})$ weighting reduces the influence of an
+isolated high-energy sample. Deeper levels omit this step because their inputs have already passed
+through the first filter.
 
-**Lens dirt.** A mask texture models the scatter of a dirty lens or sensor cover *on the glow that
-already exists*, so it **multiplies** the accumulated pyramid, clamped `≤ 1` — it only attenuates,
-never adds energy (matching Unreal's dirt-mask semantics). An `intensity` lerps the mask in and a
-`tint` colours it. An absent mask binds the renderer's 1×1 white texture (mask = 1 ⇒ identity), so
-there is no `HAS_DIRT` branch — the shader always samples `dirtMask`. The mask is sampled in screen
-UV (the standard game approximation), so it does not track camera roll or FOV.
+A positive `threshold` enables the shader's soft-knee prefilter on that first downsample. Values
+below the knee contribute less, while brighter values pass through according to the prefilter curve.
+The renderer default is `0.0`.
 
-**Anamorphic streaks.** A horizontally-squeezed blur of the bright pyramid (Bart Wronski), added
-over the radial bloom before the composite lerp — the streak *is* extra glow energy, so unlike dirt
-it is additive. Two ping-pong passes widen a cool-tinted horizontal gaussian whose reach is
-`scatter × ratio` (a `ratio` of ~2 stretches it into a lens streak); `intensity` scales the add. Off
-by default, and when off the streak binding is the white fallback with `intensity = 0`, so no energy
-enters the composite.
+## Art-direction terms
 
-**Per-mip tint.** An optional stack tints each mip's contribution during the progressive tent
-upsample (a warm-core / cool-halo look). The tent is already one dispatch per mip, so the renderer
-fans the stack out on the CPU — one tint per upsample pass — and the push carries a single `mipTint`
-at a time (identity `1,1,1` when a level is absent), keeping the push tiny.
+The composite always samples a lens-dirt texture. Without an authored texture, the binding points to
+a 1x1 white fallback. With a texture, the shader clamps its RGB values to at most one, multiplies by
+`dirtTint`, and interpolates from identity using `dirtIntensity`. The dirt term therefore modulates
+the pyramid before the bloom tint and mix.
 
-All three attenuate/add on the pre-exposure radiance the composite already reads (exposure is grade
-op #1 *inside* the tonemap pass, after bloom); because the composite is an energy-conserving relative
-fraction, the dirt/streak intensities track the rest of the bloom.
+When anamorphic bloom is enabled, two half-resolution horizontal blur passes run from `mip0`. Their
+sample spacing is `scatter * max(ratio, 1)`. The composite adds the final streak image to the radial
+pyramid, multiplied by `anamorphicTint` and `anamorphicIntensity`. Disabled streaks bind the white
+fallback and set their composite intensity to zero.
 
-## Why before the tonemap
+`perMipTint` supplies one RGB tint for each progressive upsample step. Missing entries use white, so
+an empty list leaves the pyramid unchanged. This supports different colors at different glow scales
+without introducing another composite path.
 
-Bloom composites into `color` while it is still unbounded scene radiance, in the seam between the
-resolve / SSGI-history block and the mandatory tonemap. Running in scene-linear is what makes the glow
-physically plausible: the chosen view transform (AgX's highlight desaturation especially) then rolls the
-bloomed highlights off gracefully, so the ordering itself is a quality feature. Exposure is applied
-*inside* the tonemap pass, after bloom — because the composite is an energy-conserving fraction, this is
-correct and no duplicate exposure multiply is injected into the bloom stage.
+## Frame order
 
-Each pass declares its `(resource, usage)` and the [render graph](../../frame-and-render-graph/render-graph-overview/)
-derives every `GENERAL ↔ SHADER_READ_ONLY` transition — the same
-[compute post-process](../compute-post-process-pattern/) shape the tonemap uses, one step earlier.
+Bloom reads the scene color after SSGI history and atmospheric compositing. Fog therefore attenuates
+a distant bright source before that source spreads through the bloom pyramid. Tonemapping and
+exposure run after bloom, so the view transform receives the combined scene-linear result.
 
-## Driving it
+Every dispatch declares sampled reads and storage-image read/write access through the
+[render graph](../../frame-and-render-graph/render-graph-overview/). The graph derives the transitions
+between `GENERAL` and `SHADER_READ_ONLY_OPTIMAL`; bloom code does not record image barriers directly.
 
-`set-bloom` is the one control command for all bloom state — the core (`enabled`, `intensity`,
-`scatter`, `tint`, default-off `threshold`) plus the art-direction patch (`dirtTexture`,
-`dirtIntensity`, `dirtTint`, the `anamorphic` block, and `perMipTint`). It is scriptable from the `sa`
-CLI, read back through `render-stats`, persisted in the project `renderSettings` block (the dirt mask
-asset is rebound by the asset-aware project loader), and surfaced in the **Bloom** tab of the editor's
-[Post panel](../color-grading/#the-post-panel) alongside the color grade.
+## Example
+
+Enable thresholdless bloom with the renderer defaults for mix and scatter:
+
+```sh
+sa set-bloom \
+  --enabled true \
+  --intensity 0.05 \
+  --scatter 0.005 \
+  --tint '[1,1,1]' \
+  --threshold 0
+```
+
+The same `set-bloom` request can patch `dirtTexture`, `dirtIntensity`, `dirtTint`, `anamorphic`, and
+`perMipTint`. `render-stats` returns the applied settings. Project save/load stores them under
+`renderSettings`, and the editor exposes them in the Post panel.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The shader | `bloom.slang` | `computeMain`, `downsample13`, `upsampleTent`, `streakBlur`, `Push` |
-| Pyramid + streak passes + state | `renderer.rs` | `Renderer::add_bloom_pass`, `acquire_bloom_mips`, `acquire_bloom_streak`, `set_bloom`, `set_bloom_dirt_texture`, `set_bloom_anamorphic` |
-| Push struct | `overlay.rs` | `BloomPush` |
-| Transient mip + streak chains | `transient.rs` | `BLOOM_MIP_KEYS`, `BLOOM_STREAK_KEYS` |
-| PSO + descriptor set | `pipelines.rs`, `descriptors.rs` | `Pipelines::request_bloom`, `create_bloom_layout`, `MAX_BLOOM_MIPS`, `BLOOM_PASSES_PER_FRAME` |
-| Composite bindings + white fallback | `view_target.rs` | `write_bloom_sets`, `BloomCompositeBindings` |
-| Wire DTO + command | `dto.rs`, `commands_render.rs` | `SetBloomParams`, `AnamorphicParams`, the `set-bloom` command |
-| Persistence | `render_settings.rs` | the `bloom*` keys in `renderSettings` |
+| Compute shader | `engine/assets/shaders/bloom.slang` | `computeMain`, `downsample13`, `upsampleTent`, `streakBlur`, `Push` |
+| Pyramid and composite scheduling | `engine/crates/rendering/src/renderer.rs` | `acquire_bloom_mips`, `acquire_bloom_streak`, `add_bloom_pass`, `set_bloom` |
+| Push constants | `engine/crates/rendering/src/overlay.rs` | `BloomPush` |
+| Keyed transient images | `engine/crates/rendering/src/transient.rs` | `BLOOM_MIP_KEYS`, `BLOOM_STREAK_KEYS` |
+| Descriptors and pipeline | `engine/crates/rendering/src/descriptors.rs`, `engine/crates/rendering/src/pipelines.rs` | `MAX_BLOOM_MIPS`, `BLOOM_PASSES_PER_FRAME`, `create_bloom_layout`, `request_bloom` |
+| Per-view bindings | `engine/crates/rendering/src/view_target.rs` | `write_bloom_sets`, `BloomCompositeBindings` |
+| Control contract | `engine/crates/protocol/src/dto.rs`, `engine/crates/control/src/commands_render.rs` | `SetBloomParams`, `AnamorphicParams`, `set-bloom` |
+| Project persistence | `engine/crates/rendering/src/render_settings.rs` | `RenderSettings`, `settings_to_json`, `parse_render_settings` |
+| Editor controls | `editor/src/panels/PostProcessPanel.tsx` | `PostProcessPanel`, `bloomFrom`, `applyBloom` |
 
 ## Related
 
-- [Tonemapping](../tonemap-and-exposure/) — the display transform bloom composites in front of
-- [Compute post-process](../compute-post-process-pattern/) — the shared read-modify-write shape
-- [Render graph](../../frame-and-render-graph/render-graph-overview/) — how the layout moves are derived
-
-> [!NOTE]
-> FFT-convolution bloom — an authorable `.exr` point-spread kernel for aperture-diffraction and
-> anamorphic streaks for free — is a future extension that swaps only the blur stage behind this shared
-> composite. The dirt multiply, streak add, and per-mip tint all live in the composite/upsample stage,
-> so a future blur swap does not touch them — the seam is left clean.
+- [Tonemapping](../tonemap-and-exposure/): maps the bloomed HDR result to display values
+- [Compute post-process](../compute-post-process-pattern/): the shared compute-pass structure
+- [Render graph](../../frame-and-render-graph/render-graph-overview/): derives bloom's resource transitions

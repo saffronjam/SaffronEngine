@@ -6,130 +6,120 @@ math = true
 
 # SSGI
 
-Screen-space global illumination (SSGI) approximates one bounce of indirect diffuse light using only
-the data already on screen. Each pixel fires a few short rays into the hemisphere above it, and where
-a ray hits nearby geometry it gathers that surface's lit color from the previous frame as incoming
-indirect radiance.
+Screen-space global illumination (SSGI) estimates one bounce of diffuse indirect light from visible
+scene data. Rays march against the thin G-buffer and gather the previous frame's scene-linear HDR
+colour where they hit.
 
-Indirect light is the second bounce: direct light strikes a red wall and tints the white floor beside
-it. A forward renderer computes only direct lighting, so this bounce must be approximated separately.
-The gathered radiance adds to the ambient term.
+## Trace and gather
 
-## How it works
-
-Each pixel reconstructs its view-space position $p$ and normal $n$ from the
-[thin G-buffer](../thin-gbuffer/), then builds a tangent basis $(t, b, n)$ to orient a cosine-weighted
-hemisphere. It fires four rays, each a cosine sample so directions near the normal — which contribute
-most to diffuse — are favored:
+The trace reconstructs view-space position and normal from the [thin G-buffer](../thin-gbuffer/). It
+builds a tangent frame around the normal and draws tier-controlled samples from a
+[cosine-weighted hemisphere](https://pbr-book.org/4ed/Sampling_Algorithms/Sampling_Multidimensional_Functions#Cosine-WeightedHemisphereSampling):
 
 $$
-\text{local} = \big(\sqrt{u_1}\cos\varphi,\ \sqrt{u_1}\sin\varphi,\ \sqrt{1 - u_1}\big), \qquad \varphi = 2\pi\,u_2
+\mathbf{d}_\mathrm{local}=
+(\sqrt{u_1}\cos\phi,\sqrt{u_1}\sin\phi,\sqrt{1-u_1}),
+\qquad \phi=2\pi u_2
 $$
 
-The sample coordinates $(u_1, u_2)$ are seeded per pixel by interleaved gradient noise — a
-low-discrepancy, blue-noise-like pattern — rotated each frame by the golden ratio, then stepped by the
-golden angle across the four rays. Blue-noise error survives denoising; a white-noise hash would leave a
-low-frequency residual the blur and temporal accumulation cannot remove (visible as crawling grain).
-
-Each ray marches in view space, projecting to the screen and reading the stored depth at every step. A
-hit registers the first time the ray dips just behind the stored surface, inside a thickness window
-like the [contact shadow](../contact-shadows/) march. On a hit the ray gathers `prevColor`, the
-previous frame's resolved linear-HDR color:
+Each ray advances in view space, projects each step to screen UV, and compares its depth with the
+stored surface depth. The first sample inside the thickness window is a hit:
 
 ```hlsl
 float diff = surfZ - sp.z;
 if (diff > 0.02 && diff < radius * 0.5)
 {
-    indirect += prevColor.SampleLevel(suv, 0.0).rgb;
+    float3 c = prevColor.SampleLevel(suv, 0.0).rgb;
+    float lum = max(c.r, max(c.g, c.b));
+    if (lum > 8.0) { c *= 8.0 / lum; }
+    indirect += c;
     break;
 }
 ```
 
-Reading last frame's image makes a screen-space bounce affordable: the hit surface's full lighting
-(direct + ambient) is already computed and sitting in a texture. The cost is a one-frame lag and a
-dependence on whatever was on screen last frame. The four rays are averaged, scaled by an intensity
-knob, and stored in an `rgba16f` map.
+The shader implements the luminance clamp inline. It limits a single bright hit before spatial
+filtering can spread it. The accepted radiance is averaged across the rays and multiplied by the
+SSGI intensity.
 
-### Denoising
+Pixel seeds use
+[interleaved gradient noise](https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare),
+offset by the frame index and distributed across rays. `Ssao::next_ssgi_push` increments that frame
+index and supplies the radius, intensity, march steps, and ray count. The active
+[render quality tier](../render-quality-tiers/) selects the last two values.
 
-Four rays per pixel is far too few to converge a diffuse integral, so the raw map is noisy. Two passes
-clean it up, and both run whenever SSGI is enabled — independent of the final-image AA mode:
+## Spatial denoising
 
-- A **depth-aware spatial blur** (`ssgi-blur`, a 5×5 bilateral weighted by view-Z) smooths within the
-  frame without bleeding indirect light across depth edges. The trace runs at **half resolution**
-  (`ssgi_map` is half the viewport extent), and this same pass doubles as the bilateral *upsample*: it
-  writes the full-res `ssgi_denoised`, bilinearly samples the half-res input through a linear sampler,
-  and the view-Z weights keep the upsample crisp at edges. Halving the ray-march raster is the bulk of
-  the saving (the trace cost drops ~3× here), and indirect diffuse is low-frequency enough that the
-  upsample is visually lossless.
-- A **temporal accumulation** (`ssgi-accum`) reprojects the previous frame's resolved SSGI through the
-  [motion vectors](../motion-vectors/), neighborhood-clamps the history to reject ghosting, and blends
-  with an exponential moving average. This raises the effective sample count over many frames, so a
-  matte surface converges to a smooth bounce instead of showing each frame's four sparse ray hits as
-  drifting streaks. A **per-pixel disocclusion reset** guards the reprojection: the blur stores each
-  pixel's view-Z in the SSGI alpha channel (the mesh samples only `.rgb`), and the accumulation
-  compares the reprojected history's stored view-Z against the current pixel's — when they diverge the
-  motion vector landed on a different surface (a newly revealed edge), so the history is dropped rather
-  than smeared across the seam. It is buffer-free: the depth ride-along reuses an otherwise-unused
-  channel, needing no extra target.
+The raw `ssgi_map` is half the input width and height. `ssgi_blur.slang` runs a $5\times5$ bilateral
+filter at full input resolution, sampling the half-resolution radiance through a linear sampler.
+Gaussian spatial weights smooth the signal, while an exponential view-depth weight prevents most
+cross-edge bleeding.
 
-SSGI owns this accumulation: its own ping-pong history pair and motion-vector dependency, so it
-converges in every AA mode — not only when [TAA](../taa/) is the display anti-aliasing. The mesh then
-samples this resolved, temporally stable map.
+The filter writes full-resolution radiance to `ssgi_denoised`. Its alpha channel carries the current
+view-space depth for the temporal disocclusion test; mesh shading reads only RGB.
 
-### Where the radiance lands
+## Temporal accumulation
 
-The mesh fragment shader treats the gathered radiance as extra incoming light on the diffuse albedo,
-added into the ambient term and modulated by AO so occluded creases don't over-bounce:
+SSGI owns two history images and a resolved image. `ssgi-accum` reprojects the prior history with the
+[motion-vector](../motion-vectors/) texture, clamps its RGB into the current $3\times3$ neighbourhood,
+and blends it with the spatially filtered result. `SSGI_HISTORY_WEIGHT` is `0.9`, so a valid history
+contributes 90 percent.
 
-```hlsl
-if (globals.screenFlags.y != 0)
-{
-    float  ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
-    float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
-    ambient += gi * albedo * (1.0 - metallic) * ao;
-}
-```
+History weight becomes zero when the view history is invalid, the reprojected UV leaves the image, or
+the reprojected depth differs from current depth by more than 10 percent. The accumulator writes both
+`ssgi_resolved` for shading and the next ping-pong history image.
 
-It adds to the indirect term, never the direct lights, and only for non-metals, since metals have no
-diffuse response. The whole contribution is gated by `screenFlags.y`.
-
-### Feeding the next frame
-
-SSGI reads last frame's color, so each frame must save it before the in-place tonemap turns it
-display-referred. A `ssgi-history` compute pass copies the scene's resolved linear-HDR color into
-`prev_color` right after the scene pass, then a barrier-only `ssgi-history-restore` pass returns
-`prev_color` to its resting `SHADER_READ_ONLY_OPTIMAL` layout for next frame. The renderer imports the
-`prev_color` handle once and tracks its layout across both the read (this frame's gather) and the write
-(this frame's capture).
+Motion vectors are built when either TAA or SSGI needs them. SSGI accumulation therefore runs with
+FXAA, MSAA, or no final-image anti-aliasing as well as with [TAA](../taa/).
 
 ```mermaid
 flowchart LR
-    A[frame N scene] --> B[ssgi-history copy<br/>scene → prev_color]
-    B --> C[prev_color rests<br/>ShaderReadOnly]
-    C --> D[frame N+1 SSGI<br/>gathers prev_color]
-    D --> E[frame N+1 scene<br/>adds gi to ambient]
+    A[G-buffer + previous HDR] --> B[half-resolution trace]
+    B --> C[full-resolution bilateral filter]
+    C --> D[motion-reprojected accumulation]
+    D --> E[opaque diffuse lighting]
 ```
+
+## Previous-frame radiance
+
+The gather samples `prev_color`, which contains the prior frame's resolved scene-linear HDR image.
+After the current scene pass, `ssgi-history` copies the new HDR colour into that image. The copy occurs
+before fog, bloom, and tonemapping alter the frame for display.
+
+The render graph imports `prev_color` once for the SSGI read and the later copy write. A
+`ssgi-history-restore` pass returns it to `SHADER_READ_ONLY_OPTIMAL` for the next frame.
+
+## Lighting integration
+
+Opaque mesh shading adds resolved SSGI to the ambient term:
+
+```hlsl
+float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+ambient += gi * albedo * (1.0 - metallic) * ao;
+```
+
+The diffuse albedo and `(1 - metallic)` factor keep the contribution on diffuse materials. GTAO
+modulates the bounce near occluded creases. Transparent materials use world-space indirect sources
+because their screen UV corresponds to opaque G-buffer data behind them.
+
+SSGI cannot gather off-screen surfaces or geometry hidden by a nearer depth sample. [DDGI](../../global-illumination-and-raytracing/ddgi-overview/)
+provides world-space diffuse illumination where those cases matter.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The gather | `ssgi.slang` | `computeMain`, cosine-hemisphere sampling, interleaved gradient noise |
-| Denoise + accumulate | `ssgi_blur.slang`, `ssgi_accum.slang` | bilateral blur, motion-reprojected EMA + neighborhood clamp |
-| Push + frame seed | `ssao.rs` | `SsgiPush`, `SsgiAccumPush`, `Ssao::next_ssgi_push` |
-| Passes + prev-color import | `renderer.rs` | `ssgi` / `ssgi-blur` / `ssgi-accum` passes, `ssgi-history` copy, `prev_color` |
-| Where GI is added | `lighting.slang` | `ssgiMap`, `screenFlags.y` |
-
-> [!NOTE]
-> SSGI sees only what is on screen. A bounce off a surface that is off-screen or hidden behind nearer
-> geometry does not happen, because the gather can read only pixels the previous frame stored. This is
-> the defining limit of any screen-space method, and the reason the lighting roadmap moves on to
-> world-space [DDGI](../../global-illumination-and-raytracing/) for off-screen bounce.
+| Hemisphere trace and previous-colour gather | `ssgi.slang` | `Push`, `viewPosFromUv`, `computeMain` |
+| Bilateral upsample | `ssgi_blur.slang` | `computeMain` |
+| Temporal reprojection | `ssgi_accum.slang` | `Push`, `computeMain` |
+| Push constants and quality settings | `ssao.rs` | `SsgiPush`, `SsgiAccumPush`, `SSGI_HISTORY_WEIGHT`, `Ssao::next_ssgi_push`, `Ssao::apply_quality` |
+| Screen-space render-graph chain | `renderer.rs` | `add_screen_space_passes`, `import_ssgi_history`, `writeback_ssgi_history_layout` |
+| Previous-HDR copy | `copy_color.slang`, `renderer.rs` | `computeMain`, `ssgi-history`, `ssgi-history-restore` |
+| Diffuse-lighting contribution | `lighting.slang` | `ssgiMap`, `screenFlags` |
+| Per-view images and descriptors | `view_target.rs` | `ssgi_map`, `ssgi_denoised`, `ssgi_resolved`, `ssgi_history`, `prev_color` |
 
 ## Related
 
-- [G-buffer](../thin-gbuffer/) — the geometry the rays march against
-- [Contact shadows](../contact-shadows/) — the same view-space march, different gather
-- [GTAO](../gtao/) — the AO that modulates the bounce
-- [Tonemapping](../tonemap-and-exposure/) — runs after the linear color is captured for history
+- [Thin G-buffer](../thin-gbuffer/) — supplies view-space depth and normals
+- [Motion vectors](../motion-vectors/) — reproject the history image
+- [GTAO](../gtao/) — modulates the diffuse bounce at contact scale
+- [Render quality tiers](../render-quality-tiers/) — choose SSGI ray and step counts
