@@ -1,20 +1,17 @@
-//! Phase 4: the JS↔native IPC transport via CEF's message router. The frontend calls
-//! `window.cefQuery({ request, onSuccess, onFailure })` with `request = JSON{ command, args }`; the
-//! router carries it to the browser process, where `CommandQueryHandler` parses it and dispatches
-//! via [`crate::commands::dispatch`] on a worker thread (never the UI thread), completing the query
-//! with the handler's reply. The renderer side registers `cefQuery` on each V8 context; the browser
-//! side is forwarded from the `Client` (`on_process_message_received`) and `LifeSpanHandler`
-//! (`on_before_close`, canceling pending queries on browser destruction).
-//!
-//! Compile-verified. End-to-end exercised once the Phase-5 frontend bridge calls `cefQuery` — the
-//! Rust half of `invoke(name, args)`'s replacement.
+//! The browser-process half of the JS↔native IPC transport via CEF's message router. The frontend
+//! calls `window.cefQuery({ request, onSuccess, onFailure })` with `request = JSON{ command, args }`;
+//! the router carries it to the browser process, where `CommandQueryHandler` parses it and
+//! dispatches via [`crate::commands::dispatch`] on a worker thread (never the UI thread),
+//! completing the query with the handler's reply. The browser side is forwarded from the `Client`
+//! (`on_process_message_received`) and `LifeSpanHandler` (`on_before_close`, canceling pending
+//! queries on browser destruction). The renderer side, which registers `cefQuery` on each V8
+//! context, lives in `ipc_render.rs` so the macOS helper binary can include it too.
 
 use crate::commands;
 use crate::state::ShellState;
 use cef::wrapper::message_router::{
     BrowserSideCallback, BrowserSideHandler, BrowserSideRouter, MessageRouterBrowserSide,
-    MessageRouterBrowserSideHandlerCallbacks, MessageRouterConfig, MessageRouterRendererSide,
-    MessageRouterRendererSideHandlerCallbacks, RendererSideRouter,
+    MessageRouterBrowserSideHandlerCallbacks, MessageRouterConfig,
 };
 use cef::*;
 use serde_json::{Value, json};
@@ -109,59 +106,4 @@ wrap_life_span_handler! {
 /// The `LifeSpanHandler` the `Client` returns, so the router cancels pending queries on close.
 pub fn life_span_handler(router: Arc<BrowserSideRouter>) -> LifeSpanHandler {
     RouterLifeSpan::new(router)
-}
-
-wrap_render_process_handler! {
-    struct RouterRenderProcess {
-        router: Arc<RendererSideRouter>,
-    }
-
-    impl RenderProcessHandler {
-        fn on_context_created(
-            &self,
-            browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
-            context: Option<&mut V8Context>,
-        ) {
-            self.router
-                .on_context_created(browser.cloned(), frame.cloned(), context.cloned());
-        }
-
-        fn on_context_released(
-            &self,
-            browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
-            context: Option<&mut V8Context>,
-        ) {
-            self.router
-                .on_context_released(browser.cloned(), frame.cloned(), context.cloned());
-        }
-
-        fn on_process_message_received(
-            &self,
-            browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
-            source_process: ProcessId,
-            message: Option<&mut ProcessMessage>,
-        ) -> ::std::os::raw::c_int {
-            self.router.on_process_message_received(
-                browser.cloned(),
-                frame.cloned(),
-                Some(source_process),
-                message.cloned(),
-            ) as _
-        }
-    }
-}
-
-/// The `RenderProcessHandler` the `App` returns (invoked in the render subprocess): it registers
-/// `cefQuery` on each V8 context via the renderer-side router. The router is a **process-stable
-/// singleton** — the V8 `cefQuery` handler holds only a `Weak` ref to it, so a fresh router per call
-/// (with CEF retaining just the latest handler) would drop it and make every query silently no-op.
-pub fn render_process_handler() -> RenderProcessHandler {
-    thread_local! {
-        static ROUTER: Arc<RendererSideRouter> =
-            RendererSideRouter::new(MessageRouterConfig::default());
-    }
-    ROUTER.with(|router| RouterRenderProcess::new(Arc::clone(router)))
 }
