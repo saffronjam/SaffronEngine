@@ -210,10 +210,9 @@ impl Device {
     /// [`Error::NoQueueFamily`] if no graphics+present family exists, or
     /// [`Error::Vk`] for any failing Vulkan call.
     pub fn new(surface_source: &SurfaceSource<'_>) -> Result<Self> {
-        // SAFETY: the ash seam. `Entry::load` dynamically loads `libvulkan`; the
-        // returned entry is held for the whole `Device` lifetime (it owns the
-        // loader the instance/device dispatch through).
-        let entry = unsafe { ash::Entry::load() }.map_err(|err| Error::Loader(err.to_string()))?;
+        // The entry owns the dynamically-loaded `libvulkan`, held for the whole `Device`
+        // lifetime (the instance/device dispatch through it).
+        let entry = load_entry()?;
 
         // Validation runs in debug builds (or when forced) and never in release — it is a
         // heavy per-command CPU cost, not a shipping feature. The instance layer/extension and
@@ -594,6 +593,37 @@ impl Drop for Device {
 /// what lets the editor host boot under the NVIDIA ICD: that driver implements no
 /// headless surface, so requesting one would fail `create_instance` with
 /// `ERROR_EXTENSION_NOT_PRESENT`.
+/// Loads the Vulkan loader (`libvulkan`) into an [`ash::Entry`].
+///
+/// Everywhere but macOS this is `Entry::load`, which finds the loader on the system library path.
+/// macOS has no native Vulkan and no default search entry for Homebrew's `/opt/homebrew/lib`
+/// (Apple Silicon) or `/usr/local/lib` (Intel); worse, macOS strips `DYLD_*` env vars across the
+/// editor→host spawn (SIP), so a `DYLD_FALLBACK_LIBRARY_PATH` cannot be relied on to reach here.
+/// So on macOS the known Homebrew loader paths are tried by absolute path first, falling back to
+/// the default `Entry::load` (a bundled/`install_name`-resolved loader). The loader then finds
+/// MoltenVK through `VK_ICD_FILENAMES` (a non-`DYLD_` var that does survive the spawn).
+fn load_entry() -> Result<ash::Entry> {
+    // SAFETY: the ash seam. `Entry::load*` dynamically loads `libvulkan`; the returned entry owns
+    // the loader for the caller's use.
+    #[cfg(target_os = "macos")]
+    {
+        const LOADER_PATHS: [&str; 4] = [
+            "/opt/homebrew/lib/libvulkan.dylib",
+            "/opt/homebrew/lib/libvulkan.1.dylib",
+            "/usr/local/lib/libvulkan.dylib",
+            "/usr/local/lib/libvulkan.1.dylib",
+        ];
+        for path in LOADER_PATHS {
+            if std::path::Path::new(path).exists() {
+                if let Ok(entry) = unsafe { ash::Entry::load_from(path) } {
+                    return Ok(entry);
+                }
+            }
+        }
+    }
+    unsafe { ash::Entry::load() }.map_err(|err| Error::Loader(err.to_string()))
+}
+
 fn create_instance(
     entry: &ash::Entry,
     surface_source: &SurfaceSource<'_>,
@@ -630,7 +660,22 @@ fn create_instance(
         layers.push(VALIDATION_LAYER.as_ptr());
     }
 
+    // A portability driver (MoltenVK, the only Vulkan on macOS) is hidden from device
+    // enumeration unless the instance opts in with `VK_KHR_portability_enumeration` plus the
+    // matching create flag. Enable it whenever the loader advertises the extension; on a native
+    // ICD the extension is absent and this is a no-op, so there is one code path for every host.
+    let portability = instance_extension_available(entry, ash::khr::portability_enumeration::NAME);
+    if portability {
+        extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+    }
+    let flags = if portability {
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+    } else {
+        vk::InstanceCreateFlags::empty()
+    };
+
     let create_info = vk::InstanceCreateInfo::default()
+        .flags(flags)
         .application_info(&app_info)
         .enabled_extension_names(&extensions)
         .enabled_layer_names(&layers);
@@ -664,6 +709,19 @@ fn validation_enabled(entry: &ash::Entry) -> bool {
         tracing::warn!("validation layer unavailable — running without it");
         false
     }
+}
+
+/// Reports whether the loader advertises the given instance extension.
+fn instance_extension_available(entry: &ash::Entry, name: &CStr) -> bool {
+    // SAFETY: the ash seam. Enumerates instance extensions; no resource is created.
+    let Ok(extensions) = (unsafe { entry.enumerate_instance_extension_properties(None) }) else {
+        return false;
+    };
+    extensions.iter().any(|ext| {
+        ext.extension_name_as_c_str()
+            .map(|n| n == name)
+            .unwrap_or(false)
+    })
 }
 
 /// Reports whether the Khronos validation layer is installed.
@@ -1199,6 +1257,12 @@ fn create_logical_device(
     }
     if has_ext(ash::ext::memory_budget::NAME) {
         device_extensions.push(ash::ext::memory_budget::NAME.as_ptr());
+    }
+    // A portability physical device (MoltenVK) that advertises `VK_KHR_portability_subset` MUST
+    // have it enabled at device creation (`VUID-VkDeviceCreateInfo-pProperties-04451`). It is
+    // absent on native drivers, so the presence check keeps one code path across hosts.
+    if has_ext(ash::khr::portability_subset::NAME) {
+        device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
     }
     // VK_EXT_calibrated_timestamps lets the profiler project GPU spans onto the CPU clock.
     // The env var forces the own-axis fallback (testing it on hardware that supports it).
