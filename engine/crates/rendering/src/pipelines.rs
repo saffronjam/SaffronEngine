@@ -92,6 +92,10 @@ pub struct Pipelines {
     shader_dir: PathBuf,
     /// The set layouts every mesh PSO's pipeline layout binds.
     set_layouts: Vec<vk::DescriptorSetLayout>,
+    /// Whether the device supports ray tracing (sets 6/7 present in the mesh layout). When
+    /// false, the übershader loads its `_nort` variant so its declared descriptor interface
+    /// matches the RT-less layout — strict argument-buffer backends (MoltenVK) require the match.
+    rt_enabled: bool,
     fill_mode_non_solid: bool,
     sample_count: vk::SampleCountFlags,
 
@@ -278,6 +282,13 @@ impl Pipelines {
             descriptors.ssao_mesh_set_layout(),
             descriptors.ddgi_mesh_set_layout(),
         ];
+        let rt_enabled = matches!(
+            (
+                descriptors.rt_mesh_set_layout(),
+                descriptors.restir_mesh_set_layout(),
+            ),
+            (Some(_), Some(_))
+        );
         if let (Some(rt), Some(restir)) = (
             descriptors.rt_mesh_set_layout(),
             descriptors.restir_mesh_set_layout(),
@@ -290,6 +301,7 @@ impl Pipelines {
             resources: Arc::clone(device.resources()),
             shader_dir: resolve_shader_dir(),
             set_layouts,
+            rt_enabled,
             fill_mode_non_solid: device.capabilities.fill_mode_non_solid,
             sample_count,
             cache: HashMap::new(),
@@ -3101,6 +3113,15 @@ impl Pipelines {
             self.shader_dir
                 .join(shader.strip_prefix("shaders/").unwrap_or(shader))
         };
+        // On a device without ray tracing, prefer the `_nort` variant when one exists (the
+        // übershader): it omits the RT descriptor sets the RT-less pipeline layout also omits,
+        // so the shader interface matches — required by MoltenVK's argument-buffer backend.
+        let path = if self.rt_enabled {
+            path
+        } else {
+            let nort = nort_variant_path(&path);
+            if nort.is_file() { nort } else { path }
+        };
         let bytes = std::fs::read(&path)
             .map_err(|err| Error::ShaderLoad(format!("cannot read '{}': {err}", path.display())))?;
         if bytes.is_empty() || bytes.len() % 4 != 0 {
@@ -3191,6 +3212,18 @@ fn offset_of_skin_weights() -> u32 {
 /// one (the test binary runs from `target/<profile>/deps/`, one level below the
 /// `shaders/` the xtask emits into `target/<profile>/shaders/`). Shared with the IBL bake
 /// (which builds its own transient compute pipelines off the same dir).
+/// The `_nort` (ray-tracing-off) sibling of a compiled SPIR-V path: `…/mesh.spv` → `…/mesh_nort.spv`.
+/// Only the übershader emits one; for any other path the sibling simply does not exist and the
+/// caller falls back to the base file.
+fn nort_variant_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("spv");
+    path.with_file_name(format!("{stem}_nort.{ext}"))
+}
+
 pub(crate) fn resolve_shader_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SAFFRON_SHADER_DIR") {
         return PathBuf::from(dir);
