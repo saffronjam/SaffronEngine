@@ -31,7 +31,7 @@ export interface TabStripProps {
   onTabHover?(id: string | null): void;
   drag: Omit<UseTabStripDragOptions, "onActivate">;
   className?: string;
-  /// Extra attributes for the strip container (e.g. `data-titlebar-control` on the titlebar,
+  /// Extra attributes for the strip container (e.g. a `-webkit-app-region: no-drag` style on the titlebar,
   /// `data-dock-strip` on a dock leaf's strip).
   containerProps?: HTMLAttributes<HTMLDivElement> & { [key: `data-${string}`]: string };
 }
