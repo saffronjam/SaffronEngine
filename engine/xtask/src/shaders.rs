@@ -42,6 +42,14 @@ const GIPROBE_STEM: &str = "giprobe";
 /// precompiled `.slang-module`; it is only excluded from the entry-point `.spv` compile.
 const TONEMAP_OPS_STEM: &str = "tonemap_ops";
 
+/// The forward/gbuffer übershader stem. It alone gets an RT-off variant (see the fan-out).
+const MESH_STEM: &str = "mesh";
+/// The preprocessor define that compiles the RT-off übershader variant (strips the ray-tracing
+/// descriptor sets 6/7 so the shader interface matches the RT-less PSO layout).
+const NO_RT_DEFINE: &str = "SAFFRON_NO_RT=1";
+/// The output-name suffix for the RT-off variant (`mesh_nort.spv`).
+const NO_RT_SUFFIX: &str = "_nort";
+
 /// The pinned Slang version the toolbox provides (the `SAFFRON_SLANG_VERSION` pin). Used only
 /// to point at the conventional toolbox cache location when `slangc` is not otherwise found.
 const SLANG_VERSION: &str = "2026.10";
@@ -236,22 +244,40 @@ pub fn run(config: &Config) -> Result<Report> {
 
         // Every shader depends on the shared lighting + sdf + mdf_brick + octahedral modules (the
         // dep edge), so a touch of any forces a full fan-out rebuild.
-        if is_stale(
-            &spv,
-            &[
-                &path,
-                &lighting_src,
-                &sdf_src,
-                &mdf_brick_src,
-                &octahedral_src,
-                &giprobe_src,
-                &tonemap_ops_src,
-            ],
-        )? {
-            compile_spv(&config.slangc, &path, &config.shader_src_dir, &spv)?;
+        let deps = [
+            &path,
+            lighting_src.as_path(),
+            sdf_src.as_path(),
+            mdf_brick_src.as_path(),
+            octahedral_src.as_path(),
+            giprobe_src.as_path(),
+            tonemap_ops_src.as_path(),
+        ];
+        if is_stale(&spv, &deps)? {
+            compile_spv(&config.slangc, &path, &config.shader_src_dir, &spv, &[])?;
             report.spv_compiled += 1;
         } else {
             report.spv_skipped += 1;
+        }
+
+        // The übershader carries the ray-tracing bindings (sets 6/7); a device without RT loads
+        // the RT-off variant (`SAFFRON_NO_RT`), whose declared interface matches the RT-less PSO
+        // layout — required by strict argument-buffer backends (MoltenVK). Only `mesh` needs it:
+        // the meshlet path is mesh-shader-gated (same devices that lack RT lack mesh shaders).
+        if stem == MESH_STEM {
+            let spv_nort = out_dir.join(format!("{stem}{NO_RT_SUFFIX}.spv"));
+            if is_stale(&spv_nort, &deps)? {
+                compile_spv(
+                    &config.slangc,
+                    &path,
+                    &config.shader_src_dir,
+                    &spv_nort,
+                    &[NO_RT_DEFINE],
+                )?;
+                report.spv_compiled += 1;
+            } else {
+                report.spv_skipped += 1;
+            }
         }
         copy_if_different(&path, &src_copy)?;
     }
@@ -324,9 +350,15 @@ fn compile_module(slangc: &Path, src: &Path, module: &Path) -> Result<()> {
 
 /// `<name>.slang -> <name>.spv`: the per-shader entry-point compile with the frozen flag set
 /// plus the `-I <shader_dir>` include path and the `-o <out>`.
-fn compile_spv(slangc: &Path, src: &Path, include_dir: &Path, out: &Path) -> Result<()> {
+fn compile_spv(
+    slangc: &Path,
+    src: &Path,
+    include_dir: &Path,
+    out: &Path,
+    defines: &[&str],
+) -> Result<()> {
     let status = Command::new(slangc)
-        .args(spv_arg_vector(src, include_dir, out))
+        .args(spv_arg_vector(src, include_dir, out, defines))
         .status()
         .with_context(|| format!("spawning slangc for {}", src.display()))?;
     if !status.success() {
@@ -336,14 +368,18 @@ fn compile_spv(slangc: &Path, src: &Path, include_dir: &Path, out: &Path) -> Res
 }
 
 /// The exact argument vector `compile_spv` hands `slangc`, factored out as the single source of
-/// truth so the flag-drift test asserts against the same flags the real compile uses.
-fn spv_arg_vector(src: &Path, include_dir: &Path, out: &Path) -> Vec<String> {
+/// truth so the flag-drift test asserts against the same flags the real compile uses. `defines`
+/// are appended as `-D<name>` for feature variants (the RT-off übershader).
+fn spv_arg_vector(src: &Path, include_dir: &Path, out: &Path, defines: &[&str]) -> Vec<String> {
     let mut args = vec![src.to_string_lossy().into_owned()];
     args.extend(SLANGC_SPV_FLAGS.iter().map(|s| (*s).to_owned()));
     args.push("-I".to_owned());
     args.push(include_dir.to_string_lossy().into_owned());
     args.push("-o".to_owned());
     args.push(out.to_string_lossy().into_owned());
+    for define in defines {
+        args.push(format!("-D{define}"));
+    }
     args
 }
 
@@ -430,6 +466,7 @@ mod tests {
             Path::new("/shaders/mesh.slang"),
             Path::new("/shaders"),
             Path::new("/out/mesh.spv"),
+            &[],
         );
         assert_eq!(
             args,
