@@ -1,14 +1,15 @@
 +++
-title = 'Window & events'
+title = 'Window and events'
 weight = 4
 +++
 
-# Window & events
+# Window and events
 
-A window is an on-screen surface that the renderer presents into and that delivers the operating
-system's input events. In Anima it is a thin facade over a winit window plus a set of typed
-event signals. Input reaches the rest of the program through those signals — a layer subscribes
-in `on_attach` and gets called back when the matching event occurs.
+A window is the on-screen surface the renderer presents into and the source of the operating
+system's input events. In Anima it is a thin facade over a
+[winit](https://docs.rs/winit/latest/winit/) window plus six typed event signals. Input reaches
+the rest of the program through those signals: a layer subscribes in `on_attach` and is called
+back when the matching event arrives.
 
 ```rust
 pub struct Window {
@@ -18,39 +19,46 @@ pub struct Window {
     should_close: bool,
 
     pub on_close: SubscriberList<()>,
-    pub on_resize: SubscriberList<(u32, u32)>,          // width, height (pixels)
+    pub on_resize: SubscriberList<(u32, u32)>,           // width, height (pixels)
     pub on_key_pressed: SubscriberList<(KeyCode, bool)>, // keycode, is_repeat
-    pub on_key_released: SubscriberList<KeyCode>,        // keycode
-    pub on_file_dropped: SubscriberList<PathBuf>,        // dropped file path
+    pub on_key_released: SubscriberList<KeyCode>,
+    pub on_file_dropped: SubscriberList<PathBuf>,
     pub on_raw_event: SubscriberList<WindowEvent>,       // every raw winit event
 }
 ```
 
+Each signal is a `SubscriberList<Args>`, the engine-wide
+[signal/slot type](../../core-and-conventions/signals-and-slots/): a handler returns `true` to
+stop propagation or `false` to let later subscribers see the event. `KeyCode` is winit's
+`PhysicalKey`, a location-stable physical key identity that downstream code matches exhaustively
+(`PhysicalKey::Code(KeyCode::Escape)`).
+
 ## Two construction modes
 
-`Window::new` builds a real winit window from the host's active event loop and hands out a
-`raw-window-handle` / `raw-display-handle` pair that `ash-window` (in `saffron-rendering`)
-consumes for surface creation. That is the standalone present-only host path.
+`Window::new` builds a real OS window. winit 0.30 only creates windows from inside a running
+event loop, so the constructor takes the host's `ActiveEventLoop` and does not own it.
+`WindowConfig` supplies the title, the logical size, and visibility; the defaults are
+`"Saffron"` at 1600×900, visible. The constructor reads the created window's `inner_size` back,
+so a windowed `Window` starts at its real pixel size.
 
-`Window::headless` is the windowless mode the editor host takes. The signal facade and the
-public type exist with no OS window behind them; the handle accessors return `None` (or a
-`HandleError`), never a sentinel, so no Vulkan surface is built on that path. `KeyCode` is
-winit's `PhysicalKey` — a location-stable physical key identity, exhaustively matchable
-downstream.
+The windowed facade implements `HasWindowHandle` and `HasDisplayHandle` from
+[raw-window-handle](https://docs.rs/raw-window-handle/latest/raw_window_handle/) by forwarding
+to the winit window. [ash-window](https://docs.rs/ash-window/latest/ash_window/) in
+`saffron-rendering` consumes that handle pair to create the Vulkan surface.
+
+`Window::headless` builds the facade with no OS window behind it. The signals work normally,
+the size starts at 0×0 until a `Resized` event arrives, and the handle accessors return
+`HandleError::NotSupported` rather than a sentinel, so no Vulkan surface can be built on that
+path. The headless editor host's `App` carries no window at all; `HostLayer::on_update`
+constructs a headless `Window` per control drain as the stand-in the control plane's
+`EngineContext` requires.
 
 ## Dispatch
 
-The winit `ApplicationHandler` event loop that drives `poll → on_update → … → present` lives in
-`saffron_app`; this crate provides the translation from a raw winit event to the typed signals.
-`dispatch_window_event` is that pure translation table: it publishes the raw event to
-`on_raw_event` first, then maps the events it recognizes into typed signal publishes. It runs
-without a live event loop (a synthesized `WindowEvent` is enough), so it is testable headless.
-
-## Typed signals
-
-Each signal is a `SubscriberList<Args>`, the engine-wide signal/slot type. A subscriber is a
-closure that returns `true` to stop propagation or `false` to let later subscribers also see the
-event. winit events map in as:
+The winit `ApplicationHandler` loop that receives OS events lives in `saffron-app` (see
+[main loop](../main-loop-and-run/)); its `WindowedApp::window_event` hands every event to
+`Window::dispatch_window_event`, the translation table. That method publishes the raw event to
+`on_raw_event` first, then maps the events it recognizes:
 
 | Signal | winit event | Payload |
 |---|---|---|
@@ -58,41 +66,68 @@ event. winit events map in as:
 | `on_resize` | `WindowEvent::Resized` | new width, height in pixels |
 | `on_key_pressed` | `WindowEvent::KeyboardInput` (pressed) | keycode, `is_repeat` |
 | `on_key_released` | `WindowEvent::KeyboardInput` (released) | keycode |
-| `on_file_dropped` | `WindowEvent::DroppedFile` | dropped file path |
+| `on_file_dropped` | `WindowEvent::DroppedFile` | the dropped file's path |
 
-`on_resize` publishes the **pixel** size: `dispatch_window_event` reads winit's `PhysicalSize`
-and updates `width`/`height` from it. In windowed mode the host subscribes the Escape key to
-`request_close`, and `WindowedApp::window_event` exits the loop on `CloseRequested`; the editor
-subscribes `on_file_dropped` to import dropped models and textures.
+`on_resize` publishes the physical pixel size: the handler reads winit's `PhysicalSize` and
+updates `width`/`height` before publishing. `dispatch_window_event` needs no live event loop —
+a synthesized `WindowEvent` is enough — so the translation is unit-tested headless. The
+keyboard arm goes through `dispatch_key`, which takes the three fields the translation reads
+(`physical_key`, `state`, `repeat`) because winit's `KeyEvent` carries a private field and
+cannot be synthesized in a test.
 
-## Raw event sink
+## Closing
 
-Some consumers need the whole `WindowEvent`, not a typed slice. The viewport gizmo and the
-editor fly-camera are the main ones: they read raw mouse motion, button state, and modifier
-deltas that no typed signal carries. Rather than couple `Window` to those consumers, `Window`
-exposes `on_raw_event`, a `SubscriberList<WindowEvent>`, and the host subscribes a handler that
-forwards each event to the gizmo and camera input.
+`CloseRequested` latches `should_close` and publishes `on_close`; `request_close` sets the same
+latch programmatically. The windowed loop checks the latch in `about_to_wait` and exits, which
+is how the control plane's `quit` command ends a standalone run:
 
-The raw sink fires *before* typed dispatch, so it sees an event even when a typed signal later
-consumes it. This keeps `Window` ignorant of who is listening: it knows how to forward raw
-events and how to publish typed ones, nothing about the consumers.
+```sh
+sa quit   # → ctx.window.request_close() → should_close → the loop exits
+```
+
+The headless editor host has no OS window to close; it exits when its parent-death watch sees
+the editor process vanish.
+
+## Who subscribes
+
+The exported-game binary is the main consumer: `PlayerLayer::wire_input` in `saffron-player`
+routes window input into the shared `ScriptInputState` that Luau scripts read.
+
+```rust
+let input = Rc::clone(&self.input);
+window.on_key_pressed.subscribe(move |(key, _repeat)| {
+    if let Some(name) = key_name(key) {
+        input.borrow_mut().held.insert(name);
+    }
+    false // later subscribers still see the key
+});
+```
+
+Held keys come from the typed key signals. Mouse position, buttons, and scroll come from
+`on_raw_event`, since no typed signal carries them; the raw sink fires before typed dispatch,
+so it sees every event even when a typed handler later stops propagation. `Window` knows
+nothing about these consumers — it publishes, and whoever subscribed is called.
+
+The editor's viewport input takes a different route. The host runs headless, so fly-camera
+look deltas and gizmo interaction arrive over the control plane rather than through window
+signals.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Window data + signals | `window/src/lib.rs` | `Window`, `WindowConfig` |
-| Create modes | `window/src/lib.rs` | `Window::new`, `Window::headless` |
+| Construction modes | `window/src/lib.rs` | `Window::new`, `Window::headless` |
 | Event translation | `window/src/lib.rs` | `dispatch_window_event`, `dispatch_key` |
 | Surface handles | `window/src/lib.rs` | `HasWindowHandle`, `HasDisplayHandle` impls |
+| Event-loop driver | `app/src/lib.rs` | `WindowedApp::window_event`, `run_windowed` |
+| Close latch consumers | `app/src/lib.rs`, `commands_asset.rs` | `WindowedApp::about_to_wait`, the `quit` registration |
+| Game input wiring | `player/src/main.rs` | `PlayerLayer::wire_input`, `apply_mouse_event` |
 | Signal primitive | `signal/src/lib.rs` | `SubscriberList`, `subscribe`, `publish` |
-
-> [!TIP]
-> `width`/`height` are 0 until the first resize event, and a headless window starts at `0×0`.
-> The loop treats a 0 dimension as minimized and skips the frame, so don't divide by the window
-> size in `on_update` without guarding against zero.
 
 ## Related
 
-- [Main loop](../main-loop-and-run/) — where the event loop runs and `on_close` is wired
-- [Layers as a trait of hooks](../layer-system/) — a layer subscribes to these signals in `on_attach`
+- [Main loop](../main-loop-and-run/) — the loop that feeds `dispatch_window_event` and checks `should_close`
+- [Layers](../layer-system/) — the `on_attach` hook where subscriptions are made
+- [Signals](../../core-and-conventions/signals-and-slots/) — the `SubscriberList` primitive and its dispatch contract
+- [Signals reference](../../../reference/event-signals/) — the complete signal and accessor tables

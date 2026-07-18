@@ -6,7 +6,7 @@ bookCollapseSection = true
 
 # App lifecycle & window
 
-The application lifecycle is the path a Saffron Anima host follows from start to shutdown:
+The application lifecycle is the path an Anima host follows from start to shutdown:
 the `run` loop, the layers a client attaches, and the winit window with its typed event
 signals. Every feature hangs off a layer hook.
 
