@@ -20,6 +20,24 @@ export const ENGINE_BIN =
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+const IS_MACOS = process.platform === "darwin";
+
+/// macOS has no Wayland compositor; the offscreen host needs none. It needs `VK_ICD_FILENAMES`
+/// naming MoltenVK's ICD manifest (the host locates the Vulkan loader itself by absolute path).
+/// Applied only when not already set, so an explicit override in the environment still wins.
+function macosVulkanEnv(): Record<string, string> {
+  const candidates = [
+    "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
+    "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",
+  ];
+  const icd = candidates.find((p) => existsSync(p)) ?? candidates[0];
+  // Run the offscreen (no-window) host: macOS has no tested windowed Metal-surface path, and
+  // offscreen is the mode the editor drives anyway.
+  const env: Record<string, string> = { SAFFRON_EDITOR_NATIVE_VIEWPORT: "1" };
+  if (process.env.VK_ICD_FILENAMES === undefined) env.VK_ICD_FILENAMES = icd;
+  return env;
+}
+
 async function waitFor(ready: () => boolean, timeoutMs: number, what: string): Promise<void> {
   const start = Date.now();
   while (!ready()) {
@@ -38,7 +56,7 @@ export class Engine {
   /// and never pollute the source tree. A caller that passes its own `SAFFRON_APPDATA_DIR` owns it.
   readonly appdata: string;
   private proc: ChildProcess;
-  private weston: ChildProcess;
+  private weston: ChildProcess | null;
   private exited = false;
   private buf = "";
   private nextId = 1;
@@ -46,7 +64,7 @@ export class Engine {
 
   private constructor(
     proc: ChildProcess,
-    weston: ChildProcess,
+    weston: ChildProcess | null,
     socketPath: string,
     appdata: string,
     ownsAppdata: boolean,
@@ -75,12 +93,18 @@ export class Engine {
     const runtime = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`;
     const stamp = `${process.pid}-${Date.now()}`;
     const wlSocket = `wl-e2e-${stamp}`;
-    const weston = spawn(
-      "weston",
-      ["--backend=headless", "--width=1280", "--height=720", `--socket=${wlSocket}`, "--idle-time=0"],
-      { env: { ...process.env, XDG_RUNTIME_DIR: runtime }, stdio: "ignore" },
-    );
-    await waitFor(() => existsSync(join(runtime, wlSocket)), 10_000, "weston socket");
+    // The offscreen host needs no window surface. On Linux the harness still boots a headless
+    // weston so any Wayland-touching path has a compositor; macOS has no Wayland (the host renders
+    // through MoltenVK offscreen), so there is nothing to spawn.
+    let weston: ChildProcess | null = null;
+    if (!IS_MACOS) {
+      weston = spawn(
+        "weston",
+        ["--backend=headless", "--width=1280", "--height=720", `--socket=${wlSocket}`, "--idle-time=0"],
+        { env: { ...process.env, XDG_RUNTIME_DIR: runtime }, stdio: "ignore" },
+      );
+      await waitFor(() => existsSync(join(runtime, wlSocket)), 10_000, "weston socket");
+    }
 
     // A per-boot app-data root under the temp dir so a booted project (e.g. SAFFRON_SCRATCH_PROJECT)
     // writes its userdata/ there and never pollutes the source tree — the host runs with cwd=REPO,
@@ -95,8 +119,10 @@ export class Engine {
       env: {
         ...process.env,
         XDG_RUNTIME_DIR: runtime,
-        WAYLAND_DISPLAY: wlSocket,
-        SDL_VIDEODRIVER: "wayland",
+        // Wayland only matters to the Linux path; macOS renders offscreen through MoltenVK.
+        ...(IS_MACOS
+          ? macosVulkanEnv()
+          : { WAYLAND_DISPLAY: wlSocket, SDL_VIDEODRIVER: "wayland" }),
         SAFFRON_CONTROL_SOCK: socketPath,
         SAFFRON_APPDATA_DIR: appdata,
         ...env,
@@ -286,7 +312,7 @@ export class Engine {
       // already gone, or quit raced the socket close
     }
     this.proc.kill("SIGTERM");
-    this.weston.kill("SIGTERM");
+    this.weston?.kill("SIGTERM");
     await delay(100);
     this.cleanupAppdata();
   }
