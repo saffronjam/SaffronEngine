@@ -1,4 +1,4 @@
-//! Phase 3 (core): composite CEF's OSR `on_paint` buffer onto the host toplevel's `wl_surface` via
+//! Composite CEF's OSR `on_paint` buffer onto the host toplevel's `wl_surface` via
 //! `wl_shm`, alpha preserved. CEF hands back BGRA8888 pre-multiplied; Wayland `Argb8888` is
 //! `0xAARRGGBB` little-endian = bytes B,G,R,A, so the CEF buffer maps to `Argb8888` byte-for-byte.
 //! The connection shares winit's `wl_display` through `Backend::from_foreign_display` — the same
@@ -6,10 +6,12 @@
 //! surface reconstructed from winit's raw `wl_surface` pointer is the real toplevel surface.
 //!
 //! Not opaque: no `wl_surface::set_opaque_region` is set, so translucent/unpainted UI pixels resolve
-//! against whatever is below (Phase 6's engine subsurfaces / the desktop) — the transparent-viewport
+//! against whatever is below (the engine subsurfaces / the backdrop) — the transparent-viewport
 //! invariant. Double-buffered so a frame the compositor still holds is never overwritten mid-scanout.
 
+use super::window::Handles;
 use crate::ShellError;
+use crate::dnd::DndEvent;
 use cef::Rect;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -34,15 +36,6 @@ use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, event
 /// The `text/uri-list` MIME the file-drop receiver negotiates. File managers advertise it for a file
 /// drag; it carries newline-separated `file://` URIs (RFC 2483).
 const URI_LIST_MIME: &str = "text/uri-list";
-
-/// One step of an OS→editor file drag, drained by the shell each tick and re-emitted as the frontend's
-/// `drag-drop` event. `Over` carries no paths (the URI list is only read on drop); `Drop` carries the
-/// resolved file paths. Positions are surface-local device pixels (see `wl_data_device` handling).
-pub enum DndEvent {
-    Over { x: i32, y: i32 },
-    Leave,
-    Drop { paths: Vec<PathBuf>, x: i32, y: i32 },
-}
 
 #[derive(Default)]
 struct CompState {
@@ -213,7 +206,7 @@ impl Dispatch<WlDataOffer, ()> for CompState {
 
 /// Composites CPU `on_paint` frames onto the toplevel surface. Lives on the main thread (CEF OSR
 /// callbacks fire there), so `paint` is called straight from `on_paint`.
-pub struct ToplevelCompositor {
+pub struct UiCompositor {
     conn: Connection,
     queue: EventQueue<CompState>,
     state: CompState,
@@ -233,7 +226,7 @@ pub struct ToplevelCompositor {
     first_commit: bool,
     /// The shared opaque backdrop: a `wl_subsurface` just below the toplevel that fills the window
     /// with the theme background, so the editor's transparent regions resolve against it (not the
-    /// desktop). The engine viewport subsurfaces will later sit between this and the toplevel.
+    /// desktop). The engine viewport subsurfaces sit between this and the toplevel.
     backdrop_surface: WlSurface,
     #[allow(dead_code)]
     // held so the subsurface relationship persists for the compositor's lifetime
@@ -253,9 +246,10 @@ pub struct ToplevelCompositor {
     _data_device: Option<WlDataDevice>,
 }
 
-impl ToplevelCompositor {
-    /// Wrap winit's `wl_display` + toplevel `wl_surface` (raw addresses from `raw-window-handle`).
-    pub fn new(wl_display: usize, wl_surface: usize) -> Result<Self, ShellError> {
+impl UiCompositor {
+    /// Wrap winit's `wl_display` + toplevel `wl_surface` (raw addresses from the backend handles).
+    pub fn new(handles: &Handles) -> Result<Self, ShellError> {
+        let (wl_display, wl_surface) = (handles.wl_display(), handles.wl_surface());
         let backend = unsafe { Backend::from_foreign_display(wl_display as *mut _) };
         let conn = Connection::from_backend(backend);
         let mut queue = conn.new_event_queue::<CompState>();
@@ -570,6 +564,10 @@ impl ToplevelCompositor {
         let _ = self.queue.dispatch_pending(&mut self.state);
         std::mem::take(&mut self.state.dnd_queue)
     }
+
+    /// Winit events feed no part of this backend's drag source (drops arrive on the compositor's own
+    /// `wl_data_device`); present for the backend contract.
+    pub fn observe_window_event(&mut self, _event: &winit::event::WindowEvent) {}
 }
 
 /// Read the dropped `text/uri-list` off a pipe the compositor writes into, and parse its file paths.
