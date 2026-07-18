@@ -9,27 +9,31 @@
 
 mod appscheme;
 mod async_rt;
+mod backend;
 mod commands;
-mod compositor;
 mod connectors;
 mod control;
 mod dialog;
+mod dnd;
 mod engine;
 mod geometry;
 mod ipc;
+mod ipc_render;
 mod os;
-mod presenter;
 mod scheme;
+mod schemes;
 mod settings;
 mod state;
 mod store_commands;
+mod viewport;
 mod window;
 
 pub(crate) use os::open_url_in_browser;
 
+use backend::UiCompositor;
 use cef::wrapper::message_router::BrowserSideRouter;
 use cef::{args::Args, *};
-use compositor::{DndEvent, ToplevelCompositor};
+use dnd::DndEvent;
 use state::{ResizeEdge, ShellRequest, ShellState, WindowAction};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -54,8 +58,8 @@ use winit::{
 /// at the IPC boundary, wired in Phase 4).
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
-    #[error("not a Wayland session — the editor shell is Wayland-native")]
-    NotWayland,
+    #[error("window system not supported by the compiled shell backend")]
+    UnsupportedWindowSystem,
     #[error("window handle: {0}")]
     Handle(String),
     #[error(transparent)]
@@ -122,22 +126,14 @@ wrap_app! {
 
         fn render_process_handler(&self) -> Option<RenderProcessHandler> {
             // Invoked in the render subprocess: registers `cefQuery` via the renderer-side router.
-            Some(ipc::render_process_handler())
+            Some(ipc_render::render_process_handler())
         }
 
         fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
-            // Register `saffron-img` as a standard secure CORS+fetch scheme in every process, so
-            // Chromium loads the storefront's thumbnails from the scheme handler (registered in the
-            // browser process after `initialize`). Must match across processes.
+            // Custom schemes must be registered identically in every process; the handlers are
+            // registered in the browser process after `initialize`.
             if let Some(registrar) = registrar {
-                registrar.add_custom_scheme(
-                    Some(&scheme::SCHEME_NAME.into()),
-                    scheme::SCHEME_OPTIONS,
-                );
-                registrar.add_custom_scheme(
-                    Some(&appscheme::SCHEME_NAME.into()),
-                    appscheme::SCHEME_OPTIONS,
-                );
+                schemes::register(registrar);
             }
         }
     }
@@ -172,17 +168,30 @@ struct DragState {
 struct ShellRenderHandler {
     paints: Arc<AtomicU64>,
     size: Rc<RefCell<(i32, i32)>>,
-    compositor: Rc<RefCell<Option<ToplevelCompositor>>>,
+    /// The backend's OSR device-scale (`backend::window::osr_scale`): the view rect is physical ÷
+    /// scale (CEF lays out in logical units and paints at physical resolution).
+    scale: Rc<RefCell<f64>>,
+    compositor: Rc<RefCell<Option<UiCompositor>>>,
     drag: Rc<RefCell<DragState>>,
 }
 
 /// The OSR display handler: CEF reports every CSS cursor change here (windowless OSR has no window of
 /// its own), so the shell applies it to the winit toplevel — otherwise the pointer stays the default
 /// arrow everywhere (over buttons, text fields, dock splitters, and the window's own resize edges).
+/// Holds the window `Weak`: the shell is the window's one owner, so teardown (`Shell::exiting`)
+/// fully releases the toplevel while the event loop still runs — a CEF-side strong ref would defer
+/// the platform window close into `cef::shutdown`, outside winit's handler.
 #[derive(Clone)]
 struct ShellDisplayHandler {
-    window: Arc<Window>,
+    window: std::sync::Weak<Window>,
 }
+
+/// The platform cursor-handle type in CEF's `on_cursor_change` (an `NSCursor*` on macOS, an X11
+/// cursor id elsewhere). Unused — the shell maps the portable `CursorType` to winit icons instead.
+#[cfg(target_os = "macos")]
+type CefCursorHandle = *mut u8;
+#[cfg(not(target_os = "macos"))]
+type CefCursorHandle = ::std::os::raw::c_ulong;
 
 wrap_render_handler! {
     struct RenderHandlerBuilder {
@@ -193,13 +202,44 @@ wrap_render_handler! {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             if let Some(rect) = rect {
                 let (w, h) = *self.handler.size.borrow();
+                let scale = *self.handler.scale.borrow();
                 rect.x = 0;
                 rect.y = 0;
                 if w > 0 && h > 0 {
-                    rect.width = w;
-                    rect.height = h;
+                    // Logical units: CEF multiplies by `screen_info`'s device_scale_factor to
+                    // pick the physical paint resolution.
+                    rect.width = ((f64::from(w) / scale).round() as i32).max(1);
+                    rect.height = ((f64::from(h) / scale).round() as i32).max(1);
                 }
             }
+        }
+
+        /// Report the backend's OSR device-scale so CEF lays the page out in logical units and
+        /// paints at physical resolution (2× on Retina). Without this, scale defaults to 1 and
+        /// the UI renders at the wrong visual size on a scaled display.
+        fn screen_info(
+            &self,
+            _browser: Option<&mut Browser>,
+            screen_info: Option<&mut ScreenInfo>,
+        ) -> ::std::os::raw::c_int {
+            let Some(info) = screen_info else {
+                return 0;
+            };
+            let (w, h) = *self.handler.size.borrow();
+            let scale = *self.handler.scale.borrow();
+            let rect = Rect {
+                x: 0,
+                y: 0,
+                width: ((f64::from(w.max(1)) / scale).round() as i32).max(1),
+                height: ((f64::from(h.max(1)) / scale).round() as i32).max(1),
+            };
+            info.device_scale_factor = scale as f32;
+            info.depth = 24;
+            info.depth_per_component = 8;
+            info.is_monochrome = 0;
+            info.rect = rect.clone();
+            info.available_rect = rect;
+            1
         }
 
         fn on_paint(
@@ -267,17 +307,20 @@ wrap_display_handler! {
         fn on_cursor_change(
             &self,
             _browser: Option<&mut Browser>,
-            _cursor: ::std::os::raw::c_ulong,
+            _cursor: CefCursorHandle,
             type_: CursorType,
             _custom_cursor_info: Option<&CursorInfo>,
         ) -> ::std::os::raw::c_int {
+            let Some(window) = self.handler.window.upgrade() else {
+                return 1;
+            };
             match cursor_icon_for(type_) {
                 Some(icon) => {
-                    self.handler.window.set_cursor_visible(true);
-                    self.handler.window.set_cursor(icon);
+                    window.set_cursor_visible(true);
+                    window.set_cursor(icon);
                 }
                 // `CT_NONE` — the page asked for no cursor (e.g. pointer-lock fly-cam).
-                None => self.handler.window.set_cursor_visible(false),
+                None => window.set_cursor_visible(false),
             }
             1
         }
@@ -400,6 +443,52 @@ wrap_context_menu_handler! {
     }
 }
 
+/// The page's `-webkit-app-region` rectangles, in CEF's logical view units, in paint order. CEF
+/// reports BOTH the draggable rects and the `no-drag` holes (tabs, window controls) — the host
+/// honors both: a point is draggable when the topmost (last-painted) region containing it is
+/// draggable. Shared single-threaded between the `DragHandler` (CEF updates it on layout changes)
+/// and the `Shell`'s mouse handler (hit-tests a left press).
+type DragRegions = Rc<RefCell<Vec<(Rect, bool)>>>;
+
+/// The OSR drag handler: windowless CEF has no native window, so the host owns titlebar dragging.
+/// CEF reports the page's `-webkit-app-region` rectangles here; the shell starts a native window
+/// drag when a left press lands in one (see the `MouseInput` handler).
+#[derive(Clone)]
+struct ShellDragHandler {
+    regions: DragRegions,
+}
+
+wrap_drag_handler! {
+    struct DragHandlerBuilder {
+        handler: ShellDragHandler,
+    }
+
+    impl DragHandler {
+        fn on_draggable_regions_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            regions: Option<&[DraggableRegion]>,
+        ) {
+            let mut store = self.handler.regions.borrow_mut();
+            store.clear();
+            if let Some(regions) = regions {
+                store.extend(
+                    regions
+                        .iter()
+                        .map(|region| (region.bounds.clone(), region.draggable != 0)),
+                );
+            }
+        }
+    }
+}
+
+impl DragHandlerBuilder {
+    fn build(handler: ShellDragHandler) -> DragHandler {
+        Self::new(handler)
+    }
+}
+
 wrap_client! {
     struct ClientBuilder {
         render_handler: RenderHandler,
@@ -407,6 +496,7 @@ wrap_client! {
         life_span: LifeSpanHandler,
         context_menu: ContextMenuHandler,
         display: DisplayHandler,
+        drag: DragHandler,
     }
 
     impl Client {
@@ -420,6 +510,10 @@ wrap_client! {
 
         fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
             Some(self.context_menu.clone())
+        }
+
+        fn drag_handler(&self) -> Option<cef::DragHandler> {
+            Some(self.drag.clone())
         }
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
@@ -443,6 +537,7 @@ impl ClientBuilder {
         handler: ShellRenderHandler,
         router: Arc<BrowserSideRouter>,
         window: Arc<Window>,
+        drag_regions: DragRegions,
     ) -> Client {
         let life_span = ipc::life_span_handler(Arc::clone(&router));
         Self::new(
@@ -450,7 +545,12 @@ impl ClientBuilder {
             router,
             life_span,
             ShellContextMenuHandler::new(),
-            DisplayHandlerBuilder::build(ShellDisplayHandler { window }),
+            DisplayHandlerBuilder::build(ShellDisplayHandler {
+                window: Arc::downgrade(&window),
+            }),
+            DragHandlerBuilder::build(ShellDragHandler {
+                regions: drag_regions,
+            }),
         )
     }
 }
@@ -465,8 +565,11 @@ struct Shell {
     /// Shared with the `RenderHandler` so a resize reaches CEF's `view_rect` (single-threaded: CEF
     /// OSR callbacks fire on this same main thread that owns the winit loop).
     size: Rc<RefCell<(i32, i32)>>,
+    /// The backend's OSR device-scale, shared with the `RenderHandler`'s `view_rect`/`screen_info`.
+    /// Input coordinates hand CEF physical ÷ this (CEF's OSR view is logical at this scale).
+    scale: Rc<RefCell<f64>>,
     /// Shared with the `RenderHandler`; populated in `resumed` once the toplevel exists.
-    compositor: Rc<RefCell<Option<ToplevelCompositor>>>,
+    compositor: Rc<RefCell<Option<UiCompositor>>>,
     paints: Arc<AtomicU64>,
     url: String,
     /// Shared engine/window/IPC state; the main loop drains its request inbox and reads/writes its
@@ -499,6 +602,9 @@ struct Shell {
     /// The in-flight OSR drag, shared with the `RenderHandler` so its `start_dragging` opens the drag
     /// and the winit pointer handlers drive `drag_target_drag_over`/`drag_target_drop` to completion.
     drag: Rc<RefCell<DragState>>,
+    /// The frontend's `-webkit-app-region: drag` titlebar rectangles, shared with the `DragHandler`.
+    /// A left press inside one starts a native window drag instead of a content click.
+    drag_regions: DragRegions,
     /// Whether the RMB fly-cam has grabbed the pointer (CEF's windowless OSR can't do DOM pointer lock,
     /// so the shell locks the cursor natively). While set, `CursorMoved` stops and the relative motion
     /// arrives as `DeviceEvent::MouseMotion`, accumulated in `look_accum` and streamed to the frontend
@@ -506,6 +612,10 @@ struct Shell {
     pointer_locked: bool,
     /// Raw relative-motion delta accumulated since the last `fly-look` emit (only while `pointer_locked`).
     look_accum: (f64, f64),
+    /// The staged-exit state (see `new_events`): `None` while running; `Some(n)` counts the grace
+    /// iterations between teardown and `event_loop.exit()` that let the platform replay the
+    /// window close's queued events into the still-installed handler.
+    teardown_grace: Option<u8>,
 }
 
 /// CEF `cef_event_flags_t` modifier bits carried in `KeyEvent`/`MouseEvent.modifiers`.
@@ -518,10 +628,58 @@ const EVENTFLAG_RIGHT_MOUSE_BUTTON: u32 = 1 << 6;
 const EVENTFLAG_COMMAND_DOWN: u32 = 1 << 7;
 
 impl Shell {
+    /// The loop-entangled half of teardown, run from `new_events` while the loop is still
+    /// pumping. Dependency order: the engine (socket + shm), the CEF browser ref, the platform
+    /// CEF pump, the compositor (built over the window's handles), and the toplevel itself — the
+    /// shell holds the window's only strong ref (CEF's display handler is `Weak`), so the drop
+    /// here closes the platform window while its events can still be delivered. `cef::shutdown`
+    /// deliberately does NOT run here: CEF aborts when shut down from inside a handler callback's
+    /// nested context, so `main` calls it after the pump returns — by then the browser ref is
+    /// gone and every CEF callback that can still fire (`on_paint`, cursor changes) no-ops
+    /// against the emptied `Option`s/`Weak`.
+    fn teardown(&mut self) {
+        engine::teardown(&self.state);
+        self.flush_geometry();
+        self.browser = None;
+        // Stop the platform CEF pump before `cef::shutdown`, which drains the loop itself — the
+        // pump firing into that would call `do_message_loop_work` re-entrantly mid-shutdown.
+        backend::bootstrap::uninstall_cef_pump();
+        self.compositor.borrow_mut().take();
+        self.shell_window = None;
+    }
+
+    /// Whether a logical-coordinate point starts a window drag: the topmost (last-painted) region
+    /// containing it is draggable. CEF reports the `no-drag` holes (tabs, buttons) as `false`
+    /// regions on top of the titlebar's `true` region, so a press on a control falls through to
+    /// CEF instead of dragging the window.
+    fn in_drag_region(&self, (x, y): (i32, i32)) -> bool {
+        self.drag_regions
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(bounds, _)| {
+                x >= bounds.x
+                    && x < bounds.x + bounds.width
+                    && y >= bounds.y
+                    && y < bounds.y + bounds.height
+            })
+            .is_some_and(|(_, draggable)| *draggable)
+    }
+
+    /// The pointer position in CEF's logical view units (physical ÷ the backend's OSR scale).
+    fn cursor_logical(&self) -> (i32, i32) {
+        let scale = *self.scale.borrow();
+        (
+            (f64::from(self.cursor.0) / scale).round() as i32,
+            (f64::from(self.cursor.1) / scale).round() as i32,
+        )
+    }
+
     fn mouse_event(&self) -> MouseEvent {
+        let (x, y) = self.cursor_logical();
         MouseEvent {
-            x: self.cursor.0,
-            y: self.cursor.1,
+            x,
+            y,
             modifiers: self.modifiers | self.mouse_buttons,
         }
     }
@@ -535,7 +693,10 @@ impl Shell {
             return;
         };
         let (vk, native) = match event.physical_key {
-            PhysicalKey::Code(code) => (vk_from_keycode(code), native_from_keycode(code)),
+            PhysicalKey::Code(code) => (
+                vk_from_keycode(code),
+                backend::keys::native_from_keycode(code),
+            ),
             PhysicalKey::Unidentified(_) => (0, 0),
         };
         match event.state {
@@ -608,7 +769,6 @@ impl Shell {
         match action {
             WindowAction::Minimize => shell_window.minimize(),
             WindowAction::ToggleMaximize => shell_window.toggle_maximize(),
-            WindowAction::StartDrag => shell_window.drag_window(),
             WindowAction::StartResize(edge) => {
                 let direction = match edge {
                     ResizeEdge::North => ResizeDirection::North,
@@ -789,125 +949,13 @@ fn vk_from_keycode(code: KeyCode) -> i32 {
     }
 }
 
-/// Map a winit physical `KeyCode` to the Linux XKB keycode (evdev scancode + 8) that CEF's Linux OSR
-/// key translation expects in `KeyEvent.native_key_code`. Chromium derives the DOM `KeyboardEvent.code`
-/// (the physical `"KeyW"` string every registry shortcut and the fly-cam match on) from this via
-/// `NativeKeycodeToDomCode`; without it `event.code` is empty and only character-based text entry works.
-fn native_from_keycode(code: KeyCode) -> i32 {
-    match code {
-        KeyCode::Escape => 9,
-        KeyCode::Digit1 => 10,
-        KeyCode::Digit2 => 11,
-        KeyCode::Digit3 => 12,
-        KeyCode::Digit4 => 13,
-        KeyCode::Digit5 => 14,
-        KeyCode::Digit6 => 15,
-        KeyCode::Digit7 => 16,
-        KeyCode::Digit8 => 17,
-        KeyCode::Digit9 => 18,
-        KeyCode::Digit0 => 19,
-        KeyCode::Minus => 20,
-        KeyCode::Equal => 21,
-        KeyCode::Backspace => 22,
-        KeyCode::Tab => 23,
-        KeyCode::KeyQ => 24,
-        KeyCode::KeyW => 25,
-        KeyCode::KeyE => 26,
-        KeyCode::KeyR => 27,
-        KeyCode::KeyT => 28,
-        KeyCode::KeyY => 29,
-        KeyCode::KeyU => 30,
-        KeyCode::KeyI => 31,
-        KeyCode::KeyO => 32,
-        KeyCode::KeyP => 33,
-        KeyCode::BracketLeft => 34,
-        KeyCode::BracketRight => 35,
-        KeyCode::Enter => 36,
-        KeyCode::ControlLeft => 37,
-        KeyCode::KeyA => 38,
-        KeyCode::KeyS => 39,
-        KeyCode::KeyD => 40,
-        KeyCode::KeyF => 41,
-        KeyCode::KeyG => 42,
-        KeyCode::KeyH => 43,
-        KeyCode::KeyJ => 44,
-        KeyCode::KeyK => 45,
-        KeyCode::KeyL => 46,
-        KeyCode::Semicolon => 47,
-        KeyCode::Quote => 48,
-        KeyCode::Backquote => 49,
-        KeyCode::ShiftLeft => 50,
-        KeyCode::Backslash => 51,
-        KeyCode::KeyZ => 52,
-        KeyCode::KeyX => 53,
-        KeyCode::KeyC => 54,
-        KeyCode::KeyV => 55,
-        KeyCode::KeyB => 56,
-        KeyCode::KeyN => 57,
-        KeyCode::KeyM => 58,
-        KeyCode::Comma => 59,
-        KeyCode::Period => 60,
-        KeyCode::Slash => 61,
-        KeyCode::ShiftRight => 62,
-        KeyCode::NumpadMultiply => 63,
-        KeyCode::AltLeft => 64,
-        KeyCode::Space => 65,
-        KeyCode::CapsLock => 66,
-        KeyCode::F1 => 67,
-        KeyCode::F2 => 68,
-        KeyCode::F3 => 69,
-        KeyCode::F4 => 70,
-        KeyCode::F5 => 71,
-        KeyCode::F6 => 72,
-        KeyCode::F7 => 73,
-        KeyCode::F8 => 74,
-        KeyCode::F9 => 75,
-        KeyCode::F10 => 76,
-        KeyCode::NumLock => 77,
-        KeyCode::ScrollLock => 78,
-        KeyCode::Numpad7 => 79,
-        KeyCode::Numpad8 => 80,
-        KeyCode::Numpad9 => 81,
-        KeyCode::NumpadSubtract => 82,
-        KeyCode::Numpad4 => 83,
-        KeyCode::Numpad5 => 84,
-        KeyCode::Numpad6 => 85,
-        KeyCode::NumpadAdd => 86,
-        KeyCode::Numpad1 => 87,
-        KeyCode::Numpad2 => 88,
-        KeyCode::Numpad3 => 89,
-        KeyCode::Numpad0 => 90,
-        KeyCode::NumpadDecimal => 91,
-        KeyCode::F11 => 95,
-        KeyCode::F12 => 96,
-        KeyCode::NumpadEnter => 104,
-        KeyCode::ControlRight => 105,
-        KeyCode::NumpadDivide => 106,
-        KeyCode::AltRight => 108,
-        KeyCode::Home => 110,
-        KeyCode::ArrowUp => 111,
-        KeyCode::PageUp => 112,
-        KeyCode::ArrowLeft => 113,
-        KeyCode::ArrowRight => 114,
-        KeyCode::End => 115,
-        KeyCode::ArrowDown => 116,
-        KeyCode::PageDown => 117,
-        KeyCode::Insert => 118,
-        KeyCode::Delete => 119,
-        KeyCode::SuperLeft => 133,
-        KeyCode::SuperRight => 134,
-        KeyCode::ContextMenu => 135,
-        _ => 0,
-    }
-}
-
 impl ApplicationHandler for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.shell_window.is_some() {
             return;
         }
         let window = Arc::new(
-            match event_loop.create_window(
+            match event_loop.create_window(backend::window::attributes(
                 WindowAttributes::default()
                     .with_title("Saffron Anima")
                     .with_inner_size(LogicalSize::new(
@@ -918,50 +966,50 @@ impl ApplicationHandler for Shell {
                         geometry::MAIN_WINDOW_MIN_WIDTH,
                         geometry::MAIN_WINDOW_MIN_HEIGHT,
                     ))
-                    .with_decorations(false)
-                    .with_transparent(true)
                     .with_visible(false),
-            ) {
+            )) {
                 Ok(window) => window,
                 Err(err) => {
                     tracing::error!(target: "shell", "fatal: create toplevel: {err}");
-                    event_loop.exit();
+                    self.state.exit_requested.store(true, Ordering::Relaxed);
                     return;
                 }
             },
         );
 
+        // One-time platform window setup the attribute builder can't express (e.g. disarming
+        // AppKit's automatic titlebar dragging — the frontend is the drag authority).
+        backend::window::configure(&window);
+
         let shell_window = match ShellWindow::new(Arc::clone(&window)) {
             Ok(shell_window) => shell_window,
             Err(err) => {
                 tracing::error!(target: "shell", "fatal: {err}");
-                event_loop.exit();
+                self.state.exit_requested.store(true, Ordering::Relaxed);
                 return;
             }
         };
         tracing::info!(
             target: "shell",
-            "toplevel up; wl_display={:#x} wl_surface={:#x}",
-            shell_window.wl_display(),
-            shell_window.wl_surface()
+            "toplevel up; {}",
+            shell_window.handles().describe()
         );
 
-        // The wl_shm compositor sharing winit's wl_display (Phase 3). Failure is non-fatal here so
+        // The UI compositor on the backend's window-system handles. Failure is non-fatal here so
         // the rest of the shell still comes up and the cause is visible in the log.
-        match ToplevelCompositor::new(shell_window.wl_display(), shell_window.wl_surface()) {
+        match UiCompositor::new(shell_window.handles()) {
             Ok(compositor) => {
                 self.compositor.borrow_mut().replace(compositor);
-                tracing::info!(target: "shell", "toplevel compositor ready (wl_shm on winit's display)");
+                tracing::info!(target: "shell", "toplevel compositor ready");
             }
             Err(err) => tracing::error!(target: "shell", "compositor init failed: {err}"),
         }
 
-        // The viewport present loop: a worker thread composites the engine's shared-memory frames on
-        // subsurfaces below the toplevel (above the compositor's backdrop, below the UI). It shares
-        // winit's wl_display and retries opening each view's shm segment until the engine creates it.
-        presenter::install(
-            shell_window.wl_display(),
-            shell_window.wl_surface(),
+        // The viewport present loop: presents the engine's shared-memory frames below the UI (above
+        // the compositor's backdrop). It retries opening each view's shm segment until the engine
+        // creates it.
+        backend::presenter::install(
+            shell_window.handles(),
             state::viewport_shm_name("scene"),
             state::viewport_shm_name("assetPreview"),
             &self.state.viewports,
@@ -978,10 +1026,12 @@ impl ApplicationHandler for Shell {
 
         let sz = window.inner_size();
         *self.size.borrow_mut() = (sz.width as i32, sz.height as i32);
+        *self.scale.borrow_mut() = backend::window::osr_scale(&window);
 
         let render_handler = ShellRenderHandler {
             paints: Arc::clone(&self.paints),
             size: Rc::clone(&self.size),
+            scale: Rc::clone(&self.scale),
             compositor: Rc::clone(&self.compositor),
             drag: Rc::clone(&self.drag),
         };
@@ -1009,6 +1059,7 @@ impl ApplicationHandler for Shell {
             render_handler,
             Arc::clone(&self.router),
             Arc::clone(&window),
+            Rc::clone(&self.drag_regions),
         );
         let url = CefString::from(self.url.as_str());
         self.browser = browser_host_create_browser_sync(
@@ -1035,13 +1086,21 @@ impl ApplicationHandler for Shell {
         self.shell_window = Some(shell_window);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let window = match self.shell_window.as_ref() {
             Some(shell_window) => Arc::clone(shell_window.window()),
             None => return,
         };
+        // Offer every winit event to the compositor's OS-drag source first (a backend whose file
+        // drops arrive through winit accumulates them here; the Wayland backend no-ops). The steps
+        // are drained by `pump_dnd` in the main loop, uniformly across backends.
+        if let Some(compositor) = self.compositor.borrow_mut().as_mut() {
+            compositor.observe_window_event(&event);
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // Fold into the staged exit (`new_events`): teardown while the loop still runs, then
+            // exit after the grace iterations.
+            WindowEvent::CloseRequested => self.state.exit_requested.store(true, Ordering::Relaxed),
             WindowEvent::Resized(sz) => {
                 *self.size.borrow_mut() = (sz.width as i32, sz.height as i32);
                 if let Some(host) = self.browser.as_ref().and_then(|b| b.host()) {
@@ -1050,6 +1109,11 @@ impl ApplicationHandler for Shell {
                 geometry::capture_window_geometry(&window, &self.state.window);
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                *self.scale.borrow_mut() = backend::window::osr_scale(&window);
+                if let Some(host) = self.browser.as_ref().and_then(|b| b.host()) {
+                    host.notify_screen_info_changed();
+                    host.was_resized();
+                }
                 geometry::capture_window_geometry(&window, &self.state.window);
             }
             WindowEvent::RedrawRequested => {
@@ -1074,6 +1138,39 @@ impl ApplicationHandler for Shell {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // A left press inside a frontend-declared titlebar drag region starts a NATIVE
+                // window drag, synchronously — the winit mousedown is still the platform's current
+                // event, so the OS anchors the drag to the grab point. (A round-tripped request
+                // would run against a stale current event and teleport the window.) A second click
+                // of a double toggles maximize, the standard titlebar affordance. `no-drag`
+                // children (tabs, window controls) are excluded from the regions, so they click
+                // through to CEF as normal.
+                if matches!((state, button), (ElementState::Pressed, MouseButton::Left))
+                    && self.in_drag_region(self.cursor_logical())
+                {
+                    let now = Instant::now();
+                    let double = self.last_press.is_some_and(|(b, t, (px, py))| {
+                        b == button
+                            && now.duration_since(t) < Duration::from_millis(500)
+                            && (px - self.cursor.0).abs() <= 4
+                            && (py - self.cursor.1).abs() <= 4
+                    });
+                    if let Some(shell_window) = self.shell_window.as_ref() {
+                        if double {
+                            shell_window.toggle_maximize();
+                        } else {
+                            shell_window.drag_window();
+                        }
+                    }
+                    // Record the press for double-click detection, unless this WAS the second click
+                    // (so a third click starts a fresh drag rather than un-maximizing).
+                    self.last_press = if double {
+                        None
+                    } else {
+                        Some((button, now, self.cursor))
+                    };
+                    return;
+                }
                 let button_type = match button {
                     MouseButton::Left => MouseButtonType::LEFT,
                     MouseButton::Right => MouseButtonType::RIGHT,
@@ -1136,7 +1233,8 @@ impl ApplicationHandler for Shell {
                         let op = self.drag.borrow().current_op;
                         let event = self.mouse_event();
                         host.drag_target_drop(Some(&event));
-                        host.drag_source_ended_at(self.cursor.0, self.cursor.1, op);
+                        let (lx, ly) = self.cursor_logical();
+                        host.drag_source_ended_at(lx, ly, op);
                         host.drag_source_system_drag_ended();
                     }
                     self.drag.borrow_mut().active = false;
@@ -1156,7 +1254,11 @@ impl ApplicationHandler for Shell {
                 let (delta_x, delta_y) = match delta {
                     // Chromium wheel ticks are ~40px/line.
                     MouseScrollDelta::LineDelta(x, y) => ((x * 40.0) as i32, (y * 40.0) as i32),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as i32, p.y as i32),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        // Physical pixels → CEF's logical view units.
+                        let scale = *self.scale.borrow();
+                        ((p.x / scale) as i32, (p.y / scale) as i32)
+                    }
                 };
                 if let Some(host) = self.browser.as_ref().and_then(|b| b.host()) {
                     host.send_mouse_wheel_event(Some(&self.mouse_event()), delta_x, delta_y);
@@ -1208,9 +1310,37 @@ impl ApplicationHandler for Shell {
             self.look_accum.1 += delta.1;
         }
     }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        // The staged exit. Every exit trigger (window close, IPC quit, measurement deadline)
+        // raises `exit_requested`; teardown then runs HERE, while the loop is still running, and
+        // the loop keeps pumping for a few grace iterations before `event_loop.exit()`. The grace
+        // matters: closing the platform window dispatches synchronous events that winit queues
+        // (the handler is in use) and replays on the next default-mode run-loop pass — the pass
+        // must happen while the handler is still installed, or the replay lands in `cef::shutdown`
+        // and is dropped with an error logged. The replayed events hit the `shell_window == None`
+        // guards and are absorbed.
+        if !self.state.exit_requested.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.teardown_grace {
+            None => {
+                self.teardown();
+                self.teardown_grace = Some(2);
+            }
+            Some(0) => event_loop.exit(),
+            Some(n) => self.teardown_grace = Some(n - 1),
+        }
+    }
 }
 
 fn main() -> std::process::ExitCode {
+    // Whatever must happen before the first CEF call — the AppKit backend loads the CEF framework
+    // here; a platform that links libcef directly is a no-op.
+    if let Err(err) = backend::bootstrap::load_cef() {
+        eprintln!("fatal: load CEF: {err}");
+        return std::process::ExitCode::from(1);
+    }
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let args = Args::new();
@@ -1258,6 +1388,10 @@ fn main() -> std::process::ExitCode {
         "cef initialize failed"
     );
 
+    // On a platform whose run loop is shared with winit, CEF is pumped from run-loop context (see
+    // the backend contract); where the shell's loop pumps directly this is a no-op.
+    backend::bootstrap::install_cef_pump();
+
     // The engine-facing state container (socket, trace server); command handlers receive it in
     // Phase 4. Constructing it starts the profiler-trace loopback server.
     let state = Arc::new(ShellState::default());
@@ -1269,7 +1403,7 @@ fn main() -> std::process::ExitCode {
 
     // Serve `saffron-img://` thumbnails from the shared connector cache (browser process, post-init).
     register_scheme_handler_factory(
-        Some(&scheme::SCHEME_NAME.into()),
+        Some(&schemes::IMG_SCHEME_NAME.into()),
         None,
         Some(&mut scheme::factory(state.connectors.cache())),
     );
@@ -1280,7 +1414,7 @@ fn main() -> std::process::ExitCode {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     register_scheme_handler_factory(
-        Some(&appscheme::SCHEME_NAME.into()),
+        Some(&schemes::APP_SCHEME_NAME.into()),
         None,
         Some(&mut appscheme::factory(ui_dir.clone())),
     );
@@ -1301,6 +1435,7 @@ fn main() -> std::process::ExitCode {
         browser: None,
         router,
         size: Rc::new(RefCell::new((1600, 900))),
+        scale: Rc::new(RefCell::new(1.0)),
         compositor: Rc::new(RefCell::new(None)),
         paints: Arc::clone(&paints),
         // The React UI URL. The dev loop sets `SAFFRON_DEV_URL` (Vite); a packaged build has
@@ -1329,8 +1464,10 @@ fn main() -> std::process::ExitCode {
         last_press: None,
         click_count: 0,
         drag: Rc::new(RefCell::new(DragState::default())),
+        drag_regions: Rc::new(RefCell::new(Vec::new())),
         pointer_locked: false,
         look_accum: (0.0, 0.0),
+        teardown_grace: None,
     };
 
     let mut event_loop = EventLoop::new().unwrap();
@@ -1361,11 +1498,22 @@ fn main() -> std::process::ExitCode {
     let mut reports: u64 = 0;
 
     let code = loop {
-        do_message_loop_work();
-
-        if let PumpStatus::Exit(code) = event_loop.pump_app_events(Some(Duration::ZERO), &mut shell)
-        {
+        // Where the loop pumps CEF itself (Wayland), the pump returns immediately and the sleep
+        // below paces the iteration. Where the run loop is shared (AppKit), the loop blocks HERE
+        // for up to a frame: winit's handler is only installed inside `pump_app_events`, so all
+        // run-loop dispatch — CEF's timer-driven pump, the display link, input NSEvents — must
+        // happen within this window or the events are dropped.
+        let pump_timeout = if backend::bootstrap::PUMPS_IN_LOOP {
+            Duration::ZERO
+        } else {
+            frame_dt
+        };
+        if let PumpStatus::Exit(code) = event_loop.pump_app_events(Some(pump_timeout), &mut shell) {
             break code as u8;
+        }
+
+        if backend::bootstrap::PUMPS_IN_LOOP {
+            do_message_loop_work();
         }
 
         // Apply requests posted by IPC worker threads (window controls + JS event emits) on this,
@@ -1383,13 +1531,14 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        // Drain the compositor's OS file drag-drop steps (received on its Wayland connection) and
-        // re-emit them to the frontend. Owned `Vec` so the compositor borrow ends before `emit_dnd`.
+        // Drain the compositor's OS file drag-drop steps (received on the backend's own drag
+        // source) and re-emit them to the frontend. Owned `Vec` so the compositor borrow ends
+        // before `emit_dnd`.
         let dnd = shell
             .compositor
             .borrow_mut()
             .as_mut()
-            .map(ToplevelCompositor::pump_dnd)
+            .map(UiCompositor::pump_dnd)
             .unwrap_or_default();
         for ev in &dnd {
             shell.emit_dnd(ev);
@@ -1401,10 +1550,6 @@ fn main() -> std::process::ExitCode {
             let (dx, dy) = shell.look_accum;
             shell.look_accum = (0.0, 0.0);
             shell.emit_to_js("fly-look", &format!("{{\"dx\":{dx},\"dy\":{dy}}}"));
-        }
-
-        if state.exit_requested.load(Ordering::Relaxed) {
-            break 0;
         }
 
         // Pace to the monitor's refresh: pick it up once the surface maps, and follow a move to a
@@ -1436,15 +1581,20 @@ fn main() -> std::process::ExitCode {
             last_report = Instant::now();
         }
         if measure_secs > 0 && start.elapsed() >= Duration::from_secs(measure_secs) {
-            break 0;
+            // Funnel through the one exit path: the flag is picked up by `new_events` inside the
+            // next pump, which tears down and exits the loop.
+            state.exit_requested.store(true, Ordering::Relaxed);
         }
 
-        next_frame += frame_dt;
-        let now = Instant::now();
-        if next_frame > now {
-            std::thread::sleep(next_frame - now);
-        } else {
-            next_frame = now;
+        // Sleep-pace only when the pump returns immediately; a blocking pump already waited.
+        if backend::bootstrap::PUMPS_IN_LOOP {
+            next_frame += frame_dt;
+            let now = Instant::now();
+            if next_frame > now {
+                std::thread::sleep(next_frame - now);
+            } else {
+                next_frame = now;
+            }
         }
     };
 
@@ -1456,17 +1606,15 @@ fn main() -> std::process::ExitCode {
         );
     }
 
-    // Teardown order is load-bearing: the compositor's `Connection` was built via
-    // `from_foreign_display` over winit's `wl_display`, so it must die BEFORE winit's `EventLoop`
-    // frees that display, and the CEF browser (whose `RenderHandler` holds a ref to the compositor)
-    // must be released through `shutdown` first. Out-of-order teardown use-after-frees the shared
-    // display and segfaults on exit.
-    // Quit + reap the engine and unlink its socket/shm before releasing CEF and the display.
-    engine::teardown(&state);
-    shell.flush_geometry();
-    shell.browser = None;
+    // The loop-entangled teardown already ran inside the loop (the staged exit in `new_events`).
+    // Only CEF finalization remains, which must happen OUTSIDE any handler callback (CEF aborts on
+    // a nested-context shutdown): the browser ref is already released, and the CEF callbacks that
+    // can fire during the drain no-op against the emptied state. The drain also bounces stray
+    // platform events off winit's global hooks (its application subclass and delegates), which
+    // winit logs-and-ignores since its loop is finished — that target carries no signal past this
+    // boundary. Nothing may pump the winit loop again after this point.
+    saffron_log::silence_target("winit");
     cef::shutdown();
-    shell.compositor.borrow_mut().take();
     drop(shell);
     drop(event_loop);
     std::process::ExitCode::from(code)
