@@ -5,73 +5,87 @@ weight = 1
 
 # Rust house style
 
-The house style is the small set of rules the whole codebase follows so that the data stays
-visible, the control flow stays explicit, and there is one obvious way to write each thing. It
-favours plain data with free functions and methods over deep abstraction, errors returned as
-values, and `clippy -D warnings` as a hard gate rather than a suggestion.
+The house style is the set of code conventions the whole workspace follows, held in place by a
+lint gate rather than by review habit. The design vocabulary itself (plain structs, traits as
+interfaces, fn-pointer itables) has its own page,
+[Go-flavored design](../../core-and-conventions/go-flavored-design/); this page covers the written
+rules and the machinery that enforces them.
 
-Saffron Anima is written this way end to end. The rules are not optional: a design question
-resolves to "what is the idiomatic Rust here", and the answer is the one the rest of the tree
-already uses.
+## Clippy is law
 
-## What the style favours
+The workspace manifest turns the whole [Clippy](https://doc.rust-lang.org/clippy/) `all` group on
+as warnings, and the gate promotes every warning to an error: `just lint` runs
+`cargo clippy --workspace -- -D warnings` after `cargo fmt --check`. A change that trips a lint is
+not finished until the lint is clean.
 
-- **Plain structs with public fields and inherent methods.** Data is visible, not buried behind
-  accessors. A "constructor" is a free function or an associated `fn new(...) -> Self` (or
-  `-> Result<Self>` when it can fail).
-- **Traits as the runtime interface.** A behaviour boundary is a trait, dispatched statically with
-  generics where it can be and behind `Box<dyn Trait>` where the loop must hold a heterogeneous
-  thing. The clearest example is [`Layer`](../../app-lifecycle-and-window/main-loop-and-run/): a
-  set of default-empty lifecycle hooks an app implements, pushed with `attach_layer` as a
-  `Box<dyn Layer>`.
-- **Enums for sum types**, `Result<T>` for anything that can fail, and closures (`FnOnce` /
-  `FnMut`) for the deferred-work seams.
-- **RAII via `Drop`.** A GPU wrapper owns a Vulkan handle and frees it in its `Drop` impl. The
-  ownership default is `Ref<T> = Arc<T>` for a value built once and then only read; a shared-mutable
-  site spells `Arc<Mutex<T>>` explicitly at its declaration so the exception is visible where it
-  occurs.
+```toml
+[workspace.lints.rust]
+unsafe_code = "deny"
 
-## Errors as values
-
-Fallible work returns [`Result<T>`](../../core-and-conventions/error-handling/), never a panic for
-a recoverable condition. Each library crate declares its own `Error` enum with
-[`thiserror`](https://docs.rs/thiserror) and a `Result<T>` alias over it; downstream crates compose
-those with `#[from]` and propagate with `?`. `saffron-core` carries the root `Error`; a leaf like
-`saffron-app` adds its own `Error` whose variants `#[from]` the crates it drives
-(`saffron_window::Error`, `saffron_rendering::Error`).
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("failed to create renderer: {0}")]
-    Renderer(#[from] saffron_rendering::Error),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+[workspace.lints.clippy]
+all = "warn"
 ```
 
-`unsafe` is denied workspace-wide (`unsafe_code = "deny"`); the FFI seams that genuinely need it
-(the `ash` Vulkan calls, the `cxx` physics bridge) are confined to the crates that own them.
+```sh
+just lint
+# cd engine && cargo fmt --check
+# cd engine && cargo clippy --workspace -- -D warnings
+# cd editor && bun run lint      (oxlint over the editor TypeScript)
+```
 
-## Why it holds up in a renderer
+## Unsafe is opt-in, one crate per FFI seam
 
-Graphics code is where engines grow the deepest hierarchies: a `Resource` base, a `RenderPass`
-base, a `Material` base. Saffron Anima has none. A render pass is an
-[`RgPass`](../../frame-and-render-graph/render-graph-overview/) struct with a closure inside it. A
-GPU buffer is a `Buffer` struct that frees its allocation in `Drop`, passed around as a `Ref<T>`. A
-component is a plain struct the [registry](../../scene-and-ecs/component-registry/) knows how to
-serialize. Nothing stands between the data and the call site when something breaks.
+`unsafe_code = "deny"` applies workspace-wide, and most crate roots repeat the deny. Exactly three
+crates opt back in with a crate-root `#![allow(unsafe_code)]`, each owning one foreign boundary;
+every `unsafe` block inside them carries a `// SAFETY:` comment naming the invariant it relies on.
+
+| Crate | Seam |
+|---|---|
+| `saffron-rendering` | `ash` Vulkan calls and the VMA allocator (raw C bindings) |
+| `saffron-physics-sys` | the `cxx` bridge into vendored Jolt |
+| `saffron-host` | the shared-memory frame-publisher wiring and its raw syscalls |
+
+The unsafety never escapes. Each crate wraps its seam in safe methods (`Device::new`,
+`Renderer::render_frame`), so no caller of these crates touches a raw handle.
+[Dependencies](../dependencies/) covers how the FFI crates are pinned and built.
+
+## Errors are typed values
+
+Fallible work returns `Result<T>`, never a panic on an expected failure. Each library crate
+declares its own error enum with [`thiserror`](https://docs.rs/thiserror) and exports a
+`Result<T>` alias over it; callers compose errors with `#[from]` and propagate with `?`.
+[Error handling](../../core-and-conventions/error-handling/) walks through the whole model. A
+panic marks a broken invariant the type system cannot express, and `#[should_panic]` tests pin
+those.
+
+## Sharing is explicit
+
+A read-shared handle is an `Arc<T>`, written through the `Ref<T>` alias `saffron-core` exports for
+a value built once and then only read. A shared-mutable site spells `Arc<Mutex<T>>` (or
+`Arc<RwLock<T>>`) at its declaration, so the exception is visible where it occurs.
+[Ownership](../../core-and-conventions/ownership-and-raii/) covers `Drop`, the
+device-outlives-resources guarantee, and teardown order.
+
+## Comments say what, not when
+
+A public item carries a brief `///` saying what it is, plus a why when that is not obvious from
+the name. There are no section or banner dividers, and a comment describes the code as it stands,
+never by contrast with an earlier shape of it. The written rules themselves live in `AGENTS.md`
+at the repo root.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Root error + `Result` + `Ref` | `crates/core/src/error.rs`, `crates/core/src/lib.rs` | `Error`, `Result`, `Ref` |
-| The trait-as-itable pattern | `crates/app/src/lib.rs` | `Layer`, `attach_layer`, `App` |
-| RAII GPU wrappers | `crates/rendering/src/resources.rs` | `Buffer`, `Image`, `GpuMesh` (each with `Drop`) |
-| Lint policy | `engine/Cargo.toml` | `[workspace.lints]` (`unsafe_code = "deny"`, `clippy.all`) |
+| The lint gate | `engine/Cargo.toml` | `[workspace.lints.rust]` (`unsafe_code = "deny"`), `[workspace.lints.clippy]` (`all = "warn"`) |
+| The gate invocation | `justfile` | the `lint` recipe (`cargo clippy --workspace -- -D warnings`) |
+| The three unsafe opt-ins | `engine/crates/{rendering,physics-sys,host}/src/lib.rs` | `#![allow(unsafe_code)]` plus each crate-root seam note |
+| The written conventions | `AGENTS.md` | the "Conventions (not optional)" section |
 
 ## Related
-- [Error handling](../../core-and-conventions/error-handling/) — the `Result<T>` half of the style
-- [Main loop](../../app-lifecycle-and-window/main-loop-and-run/) — the `Layer` itable in action
-- [Vulkan foundation](../../vulkan-foundation/) — the `Drop`-owned GPU wrappers
+
+- [Go-flavored design](../../core-and-conventions/go-flavored-design/) — the design vocabulary these rules protect
+- [Error handling](../../core-and-conventions/error-handling/) — the `thiserror` / `Result<T>` model in full
+- [Ownership](../../core-and-conventions/ownership-and-raii/) — `Drop`, `Arc<T>`, and teardown
+- [Dependencies](../dependencies/) — the single pin list and the FFI crates
+- [Build environment](../build-environment/) — the toolbox the gate runs in

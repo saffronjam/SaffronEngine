@@ -5,98 +5,121 @@ weight = 5
 
 # Build environment
 
-The build environment is a single container that holds the entire Rust toolchain plus the Vulkan
-SDK and the Slang shader compiler. The host runs no compiler, so building, testing, and running all
-happen inside that container — and the `just` recipes auto-enter it, so the same command works from
-a host shell or from inside the container.
+The toolchain lives in one pinned environment, not on whatever machine runs the command. On Linux
+that environment is the **`saffron-build`** container; on macOS it is the host rustup toolchain
+plus MoltenVK. The [`just`](https://just.systems/man/en/) recipes select the right one, so
+`just engine` behaves the same from any shell.
 
-A toolbox is a Fedora development container with the home directory shared host-side. It isolates
-the toolchain from an immutable host while leaving project files editable from either side.
+## The `saffron-build` toolbox
 
-## The toolbox
+A toolbox is a [Toolbx](https://containertoolbx.org/) container: a Podman-based development
+environment that shares the home directory with the host and reaches the host filesystem at
+`/run/host`. The Linux host is assumed to carry no compiler of its own; `cargo`, the Vulkan SDK,
+and `slangc` all live inside `saffron-build`. Because home is the same directory, a file edited on
+the host is visible inside immediately.
 
-The dev machine is Fedora **Silverblue**, ostree-booted, with home under `/var/home`. It ships no
-Rust toolchain or Vulkan SDK on the host. Everything builds inside the **`saffron-build`**
-container. The home directory is shared host-to-toolbox, so files edited on the host are visible
-inside immediately.
+The container ships `rustc`/`cargo` 1.96.0 as Fedora packages, and `rust-toolchain.toml` pins the
+same `channel = "1.96.0"` (with the `rustfmt` and `clippy` components) so a
+[rustup-managed host](https://rust-lang.github.io/rustup/overrides.html) resolves the identical
+toolchain. The workspace itself declares `rust-version = "1.85"` as its minimum supported Rust and
+builds with `edition = "2024"`.
 
-The container carries `cargo` + `rustc` (the workspace pins `rust-version = "1.85"`, `edition =
-"2024"`), the Vulkan headers / loader / validation layers / tools, and the prebuilt `slangc` under
-`~/.cache/saffron-slang/`. The GPU inside the toolbox is **llvmpipe**, Mesa's software Vulkan,
-sufficient for correctness and validation; hardware acceleration needs the NVIDIA ICD (the `just
-run` recipes wire it in) or `mesa-vulkan-drivers` installed in the container.
+`xtask` resolves `slangc` in a fixed order: a `PATH` lookup, then `SAFFRON_SLANG_DIR/bin`, then
+the toolbox cache at `~/.cache/saffron-slang/slang/bin`, which holds the pinned Slang 2026.10. A
+missing `slangc` is a hard error (`find_slangc` bails); the build never fetches a prebuilt on its
+own.
 
 ## Driving the build with `just`
 
-The `justfile` at the repo root drives the flow through `cargo`, the `xtask` helper, and `bun`.
-Toolbox-bound recipes **auto-enter** `saffron-build` when run from the host, so a plain `just lint`
-behaves identically from a host shell or inside the container:
+The `justfile` at the repo root drives everything through `cargo`, the `xtask` helper, and `bun`:
 
 ```sh
-just engine    # cargo build --workspace, then cargo run -p xtask -- shaders
+just engine    # cargo build --workspace + cargo run -p xtask -- shaders
 just test      # cargo test --workspace
 just lint      # cargo fmt --check + cargo clippy --workspace -- -D warnings + editor oxlint
 just run       # build the host, compile shaders, start the CEF editor shell
+just e2e       # the tests/e2e bun suite against a headless host
 just check     # the full reproducible gate
 ```
 
-Under the hood, each toolbox recipe re-execs the same recipe inside the container when it is not
-already there (it checks `/run/.toolboxenv`). Because of that boundary, a host-side `ENV=… just …`
-would no-op — the variable never crosses into the container. Set the variable inside the recipe, or
-use a recipe argument.
+Every toolbox-bound recipe opens with the `reenter` prelude. On Linux it checks for
+`/run/.toolboxenv`; outside the container it re-execs the same recipe via
+`toolbox run -c saffron-build`, forwarding the recipe's positional arguments. On macOS there is no
+toolbox: the prelude puts `~/.cargo/bin` and `~/.bun/bin` on `PATH`, and the host rustup toolchain
+honors `rust-toolchain.toml`.
 
-The engine build is a workspace `cargo build`; running it directly is just as valid:
+That re-exec is why a host-side `FOO=1 just run` silently does nothing on Linux: the variable
+stays in the host shell and never crosses into the container. Set variables inside the recipe, or
+inside an explicit `toolbox run`:
 
 ```sh
 toolbox run -c saffron-build bash -lc '
   cd engine
   cargo build --workspace
-  cargo run -p xtask -- shaders        # compile shaders + copy runtime assets
-  ./target/debug/saffron-host          # the present-only viewport host
+  cargo run -p xtask -- shaders   # compile shaders + copy runtime assets
+  ./target/debug/saffron-host     # the present-only viewport host
 '
 ```
 
-## Opting out of the toolbox
+Setting `SAFFRON_NO_TOOLBOX` to any non-empty value skips the re-exec and runs the recipe directly
+on the host. This is the escape hatch for a machine that provides `cargo`, `bun`, and the
+Vulkan/Slang tooling itself, such as a provisioned CI runner.
 
-Set `SAFFRON_NO_TOOLBOX=true` to skip the auto-enter and run a recipe directly on the host. This
-trusts the host to provide `cargo`, `bun`, and the Vulkan/Slang tooling itself:
+## GPU selection
 
-```sh
-SAFFRON_NO_TOOLBOX=true just test
-```
+The container's own `/usr` carries only Mesa, so a Vulkan app inside it falls back to
+[llvmpipe](https://docs.mesa3d.org/drivers/llvmpipe.html), Mesa's software renderer (its software
+Vulkan device enumerates under the same name). The host's NVIDIA driver stays reachable through
+the `/run/host` mount. The `gpu_driver` prelude locates `nvidia_icd.x86_64.json` there (or under
+`/usr/share/vulkan/icd.d/`) and exports it via
+[`VK_ADD_DRIVER_FILES`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md),
+which adds a driver to the Vulkan loader's search without replacing the standard paths.
 
-It is the escape hatch for a host that already has the toolchain (CI on a provisioned runner, or a
-non-Silverblue dev box). On the standard Silverblue host it will fail at the first missing tool —
-which is the point: the toolbox is the default for a reason.
+`just run`, `just run-engine`, `just run-engine-headless`, `just e2e`, and `just capture` all
+start with that prelude, so they run on the hardware GPU when the manifest exists and on llvmpipe
+otherwise. `just run-software` and `just run-engine-software` omit it to force llvmpipe, which is
+correct but slow and fine for validation work. On macOS the same prelude exports
+`VK_ICD_FILENAMES` pointing at the ICD of [MoltenVK](https://github.com/KhronosGroup/MoltenVK),
+the Vulkan-on-Metal implementation Homebrew installs.
 
 ## Headless and bounded runs
 
-For headless or automated verification, bound the run so it exits on its own. The host honours
-`SAFFRON_EXIT_AFTER_FRAMES`:
+Two environment variables make the host suitable for automation. `SAFFRON_EXIT_AFTER_FRAMES`
+bounds a run: `frame_limit_from_env` parses it as a strict `u64` (unset, `0`, or garbage means no
+limit) and the main loop exits after that many frames. `SAFFRON_EDITOR_NATIVE_VIEWPORT` switches
+the host to `HostMode::Headless`: no window, an offscreen no-surface device, frames published over
+shared memory. Together they give a compositor-free smoke run:
 
 ```sh
-SAFFRON_EXIT_AFTER_FRAMES=5 ./target/debug/saffron-host
+just run-engine-headless 5   # build, compile shaders, render 5 frames offscreen, exit
 ```
 
-`just run-engine-headless 5` wraps this with the native-viewport driver set, so no window or
-compositor is needed.
+The recipe also wires the GPU prelude and a per-run control socket, so parallel runs do not
+collide. `tools/ci/check.sh`, the gate `just check` wraps, boots the host the same bounded way for
+its validation-clean smoke step.
 
-> [!NOTE]
-> The `cargo build` profile optimizes *dependencies* even in a debug engine build
-> (`[profile.dev.package."*"] opt-level = 3` in `engine/Cargo.toml`), so glam, ash inlining, and
-> the vendored Jolt run at speed while engine crates stay at `opt-level = 0` for fast incremental
-> rebuilds.
+## Build profiles
+
+A debug build optimizes its dependencies:
+[`[profile.dev.package."*"]`](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)
+sets `opt-level = 3` for every non-workspace crate, so glam, ash, and the vendored Jolt run at
+full speed while engine crates stay at `opt-level = 0` for fast incremental rebuilds. The release
+profile keeps `debug = true` and `panic = "unwind"`, because the FFI seams must unwind cleanly
+across the Rust/C++ boundary.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Recipes + toolbox auto-enter | `justfile` | `engine`, `test`, `lint`, `run`, `check`, the re-enter prelude |
-| Toolbox opt-out | `justfile` | `SAFFRON_NO_TOOLBOX` |
-| Toolchain + profile knobs | `engine/Cargo.toml` | `[workspace.package]`, `[profile.dev]`, `[profile.dev.package."*"]` |
-| Shader + asset step | `engine/xtask/src/shaders.rs` | `Config::resolve`, `run` |
+| Recipe preludes + opt-out | `justfile` | `reenter`, `gpu_driver`, `SAFFRON_NO_TOOLBOX` |
+| Toolchain pin | `rust-toolchain.toml` | `channel`, `components` |
+| MSRV + profile knobs | `engine/Cargo.toml` | `rust-version`, `[profile.dev]`, `[profile.dev.package."*"]`, `[profile.release]` |
+| `slangc` resolution + shader step | `engine/xtask/src/shaders.rs` | `Config::resolve`, `find_slangc`, `run` |
+| Bounded + headless run | `crates/app/src/lib.rs` | `frame_limit_from_env`, `HostMode` |
+| The reproducible gate | `tools/ci/check.sh` | `probe_host`, `pass_step`, `defer_step` |
 
 ## Related
-- [The Cargo workspace and crate model](../cargo-workspace/) — what `cargo build --workspace` builds
-- [Shader compilation](../shader-compilation/) — where `slangc` runs (the `xtask` step)
+
+- [Cargo workspace and crate model](../cargo-workspace/) — what `cargo build --workspace` builds
+- [Shader compilation](../shader-compilation/) — what `cargo run -p xtask -- shaders` does with the resolved `slangc`
 - [Dependencies](../dependencies/) — the pins the toolbox `cargo` resolves
