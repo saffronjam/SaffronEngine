@@ -5,120 +5,119 @@ weight = 6
 
 # Limits
 
-The limits of a render graph are the optimizations a mature graph can perform but a given
-implementation chooses to leave out. Anima's graph derives barriers and layout transitions from
-declared usage and does nothing more; several features a fuller graph eventually grows are absent
-by design.
-
-Each omission has a seam already in place: the data a future feature would need is declared, so
-adding it later is a contained change rather than a rewrite. The sections below name each limit,
-its cost, and the seam that anticipates it.
-
-## Single graphics queue
-
-Every pass records into one command buffer on one graphics queue, in declaration order.
-`RenderGraph::execute` walks `passes` start to finish into one command buffer. A pass
-has no queue selection and there is no second timeline.
-
-This rules out async compute, where a compute pass runs concurrently on a dedicated compute queue
-while the graphics queue does other work. The light-cull and screen-space passes are compute, but
-they run inline on the graphics queue, serialized by the same barriers as everything else.
-
-The seam is `RgPass::kind` (`Graphics` / `Compute`) and a barrier model that is stage- and
-access-based rather than queue-based. Adding a queue field and a cross-queue semaphore where the
-timeline splits is the work; the usage declarations would not change.
-
-## No transient resources, no aliasing
-
-The graph allocates nothing. Every resource is imported — an existing renderer-owned handle
-registered with `import_image` / `import_buffer` each frame. There are no graph-created images and
-no memory aliasing, which reuses one allocation for two resources whose lifetimes do not overlap.
-
-The cost is memory. The G-buffer normal target, the AO maps, the FXAA scratch, and the TAA history
-and motion targets each hold their own allocation for the whole frame, though many never overlap in
-time. A graph that allocated transients could fold several into one backing allocation.
-
-The seam is the separation of imports from tracked state: `import_image` builds an `RgResourceState`,
-and the resource table is a plain `Vec`. A transient would be a resource the graph allocates lazily
-and frees at end of frame, slotting into the same table. The right-sized targets that exist today
-are the first candidates to alias.
-
-## Volumes are dimension-agnostic
-
-Barrier derivation reasons about a whole image and never about its dimensionality, so a 3D image is
-tracked exactly like a 2D one. `import_image_3d` delegates straight to `import_image` with a `COLOR`
-aspect, and the `GENERAL` ↔ `SHADER_READ_ONLY` transitions the compute usages derive apply to a
-`TYPE_3D` image with no special case. On top of that, the transient pool serves 3D volumes:
-`acquire_image_3d` returns a keyed, grow-only `TYPE_3D` image (backed by `Image3D`) the same way
-`acquire_image` returns a 2D one, and a compute pass dispatches over it in three dimensions through
-the `groups_z` argument on `add_compute_pass`. The froxel-fog grid uses all three — a per-frame
-`rgba16f` frustum volume acquired transiently, written and sampled by a 3D compute grid, imported
-each frame for the graph to barrier.
-
-This is the pool side of the transient story, not graph-created aliasing (still absent, above): the
-allocation is renderer-owned and imported, only now it can be a `depth > 1` volume.
-
-## No pass culling
-
-The graph records every pass it is given; there is no reachability analysis that drops a pass whose
-outputs nothing reads. In practice this rarely matters, because the engine builds the graph
-conditionally. `record_scene_graph` adds the shadow pass only when a shadow is pending and the
-G-buffer only when a screen-space effect is on. The construction is pruned even though the graph
-never culls.
-
-The seam is the read and write declaration on every pass, which is exactly the information a
-dead-pass cull would need. The analysis is unwritten because conditional construction already covers
-the common case.
-
-## No scheduling or reordering
-
-Passes execute in the order they were added. The graph does not reorder them to overlap work or
-minimize barriers. This keeps the per-frame state in `apply_access` a simple running summary that
-reasons only about the previous touch, never about a reordered schedule.
-
-The trade is that a good order is the author's responsibility, not the graph's. For a single-queue
-frame with a handful of passes that is the right call; a large graph with many independent branches
-would benefit from a scheduler.
-
-## One subresource per barrier
-
-`apply_access` emits barriers against the full image — a single mip and a single array layer. The
-graph tracks one layout per resource, not per mip or per layer. Images with multiple mips or layers
-that need different layouts at once cannot be expressed. The omnidirectional point-shadow cube, for
-instance, is handled outside the graph rather than as a six-layer attachment.
-
-The seam is the tracked state, which would grow from one layout to a per-subresource set, with
-`apply_access` comparing ranges. The single-subresource assumption is baked into the barrier
-construction, so this is the most invasive of the listed changes.
+The render graph derives barriers and layout transitions from declared usage, and that is the whole
+job: it does not allocate memory, pick queues, cull passes, or reorder work. Each boundary below is
+a design fact, and each one shapes how the renderer is built around the graph.
 
 ```mermaid
 flowchart LR
     A["declared usage<br/>(RgUsage)"] --> B[derive barriers<br/>+ layout transitions]
-    B --> C[record passes<br/>in order, one queue]
-    C -. not done .-> D[async compute]
-    C -. not done .-> E[transient alloc + aliasing]
-    C -. not done .-> F[pass culling / reordering]
+    B --> C[record passes<br/>in declaration order]
+    C --> D[one command buffer,<br/>one graphics queue]
 ```
 
-The graph is a correctness tool, not a scheduler or an allocator. It removes the error-prone,
-repetitive part of Vulkan and leaves the performance-shaping parts for when they are needed, with
-the data they would require already declared.
+## One graphics queue
+
+`Device` creates a single queue, `graphics_queue`, from one graphics-capable family, and
+`RenderGraph::execute` records every pass into one command buffer in the order the passes were
+added. `RgPass::kind` distinguishes `Graphics` from `Compute`, but the distinction only controls
+whether the graph opens a `cmd_begin_rendering` scope around the body. Both kinds record on the
+same timeline.
+
+Compute passes such as `light-cull`, `skin`, and `ddgi-trace` run inline between graphics passes,
+ordered by the same derived barriers as everything else. There is no
+[async compute](https://gpuopen.com/learn/concurrent-execution-asynchronous-queues/), where compute
+work fills utilization gaps on a dedicated queue while the graphics queue draws. Every barrier the
+graph emits sets `QUEUE_FAMILY_IGNORED` on both sides; with one queue there is no ownership
+transfer to derive.
+
+## Import-only resources, one allocation each
+
+The graph owns no memory. Every resource enters through `import_image` or `import_buffer` each
+frame: an existing renderer-owned handle wrapped in fresh tracked state. There are no graph-created
+resources and no memory aliasing, the technique
+[Frostbite's FrameGraph](https://www.gdcvault.com/play/1024612/FrameGraph-Extensible-Rendering-Architecture-in)
+is built around, where one allocation backs two resources whose lifetimes never overlap.
+
+The cost is memory. The view's `g_normal` target, the AO maps, the motion target, and the TAA
+history images each hold their own allocation for the whole frame, even though several are live
+for only a slice of it.
+
+Scratch resources follow the same rule. `TransientResources` is a renderer-owned pool of grow-only
+allocations keyed per frame-in-flight; anything acquired from it enters the graph through the same
+import calls, as an imported resource with fresh state. A frame slot's allocations are recycled
+only after that slot's fence has signalled, so an acquired transient outlives the GPU work that
+reads it.
+
+Import-only is dimension-agnostic: barrier derivation reasons about a whole image, never its
+dimensionality, so a 3D image tracks exactly like a 2D one. `import_image_3d` delegates to
+`import_image` with a `COLOR` aspect, `acquire_image_3d` returns a keyed, grow-only `TYPE_3D` pool
+image, and a compute pass dispatches over all three dimensions through the `groups_z` argument of
+`add_compute_pass`. The froxel-fog grid is the concrete case: a per-frame `rgba16f` frustum volume
+acquired from the pool, written and sampled by a 3D compute grid, imported each frame.
+
+Import-only is also what lets state persist across frames: the renderer owns each image beyond the
+graph's per-frame lifetime, so the graph can write an image's exit layout back to an external slot
+and read it as the next frame's entry layout. [Cross-frame layouts](../cross-frame-layouts/)
+covers that write-back.
+
+## Every declared pass records, in order
+
+The graph records every pass it is handed, front to back. It runs no reachability analysis to drop
+a pass whose outputs nothing reads, and it never reorders passes to shorten barrier chains.
+`apply_access` keeps one running summary per resource (last stage, access, layout, write flag),
+and that summary is a valid hazard model precisely because the recorded order equals the declared
+order.
+
+Pruning happens at construction instead. `Renderer::record_scene_graph` adds each pass
+conditionally: the shadow passes only when `shadow_pending()` reports a stale map, the G-buffer
+prepass and screen-space chain only when an active effect requests them, the deform passes only
+when their dispatch lists are non-empty. A pass that would record nothing is never declared, so
+there is nothing for the graph to cull. Pass order is likewise the constructor's responsibility.
+
+## One mip, one layer per barrier
+
+The graph tracks a single layout per resource, and `apply_access` emits every image barrier
+against a fixed subresource range:
+
+```rust
+.subresource_range(vk::ImageSubresourceRange {
+    aspect_mask: r.aspect,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+})
+```
+
+An image whose mips or layers need different layouts at the same time cannot be declared. The
+point-shadow cube, six layers rendered face by face, is the concrete case: it enters the graph as
+a `Compute`-kind pass (`point-shadow-static` / `point-shadow-dynamic`) whose body opens its own
+per-face rendering scopes and transitions the cube's layout itself via `record_point_shadow`. The
+graph still orders the pass — the dynamic cube declares a `VertexInputRead` on the deformed
+buffer, placing it after the skin dispatch — but the cube's layout is the body's job.
+
+The graph is a correctness tool. It removes the error-prone part of Vulkan, hand-written barriers
+and layout transitions, and leaves allocation with the renderer's target and pool owners and
+ordering with the pass constructor.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Single-queue execution | `render_graph.rs` | `RenderGraph::execute`, `execute_profiled` |
-| Import-only resources | `render_graph.rs` | `RenderGraph::import_image`, `import_buffer` |
+| Single-queue recording | `render_graph.rs` | `RenderGraph::execute`, `execute_profiled`, `RgPassKind` |
+| The one queue | `device.rs` | `Device::graphics_queue`, `find_graphics_queue_family` |
+| Import-only resources | `render_graph.rs` | `RenderGraph::import_image`, `import_buffer`, `RgResourceState` |
+| Scratch pool | `transient.rs` | `TransientResources`, `acquire_buffer`, `acquire_image`, `begin_frame` |
 | 3D transient volumes | `transient.rs`, `render_graph.rs` | `acquire_image_3d`, `TransientImage3D`, `import_image_3d` |
-| 3D compute dispatch | `renderer.rs`, `froxel_fog.rs` | `add_compute_pass` (`groups_z`), `FROXEL_GRID_X`, `FogGridParams`, `froxel_grid_matches_shader` |
-| Full-image subresource | `render_graph.rs` | `apply_access`, `RgResourceState` |
-| Pass kind (the async seam) | `render_graph.rs` | `RgPass::kind`, `RgPassKind` |
-| Conditional construction | `renderer.rs` | `Renderer::record_scene_graph` (the `do_*` gates) |
+| 3D compute dispatch | `renderer.rs`, `froxel_fog.rs` | `add_compute_pass` (`groups_z`), `FROXEL_GRID_X`, `FogGridParams` |
+| Single-subresource barrier | `render_graph.rs` | `apply_access` |
+| Conditional construction | `renderer.rs` | `Renderer::record_scene_graph` |
+| Self-managed cube layout | `scene_pass.rs` | `record_point_shadow`, `PointShadowTarget` |
 
 ## Related
 
-- [Render graph](../render-graph-overview/) — the model and its closing caveat
-- [Cross-frame layouts](../cross-frame-layouts/) — why import-only is what cross-frame persistence relies on
-- [Barrier derivation](../usage-and-barrier-derivation/) — the single-subresource, in-order barrier model
-- [Adding passes](../who-can-add-passes/) — the app seam that already exists
+- [Render graph](../render-graph-overview/) — the model these boundaries belong to
+- [Barrier derivation](../usage-and-barrier-derivation/) — how `apply_access` turns usage into barriers
+- [Cross-frame layouts](../cross-frame-layouts/) — the layout write-back import-only enables
+- [Adding passes](../who-can-add-passes/) — who constructs the graph each frame

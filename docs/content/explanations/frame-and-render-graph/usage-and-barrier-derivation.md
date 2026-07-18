@@ -5,16 +5,17 @@ weight = 3
 
 # Barrier derivation
 
-Barrier derivation is the process that turns one `RgUsage` value on a resource into a correct
-Vulkan barrier. It is the core job of the render graph, and it rests on two small functions.
-`usage_info` maps a usage to its synchronization scope; `apply_access` compares that scope against
-what last touched the resource and emits a barrier only when one is required.
+Barrier derivation turns a pass's declared `RgUsage` into the Vulkan barrier that orders it
+against whatever touched the resource before. It is the core job of the
+[render graph](../render-graph-overview/), and it rests on two functions. `usage_info` expands a
+usage into its synchronization scope; `apply_access` compares that scope against the resource's
+tracked state and emits a barrier only when one is required.
 
 ## Usage is the single source of truth
 
-A pass states its intent as one `RgUsage`. `usage_info` expands the enum case into the four facts
-a barrier needs — `{ stage, access, layout, is_write }`. That `match` is the only place these
-correspondences live.
+A pass states its intent as one `RgUsage` per resource. `usage_info` expands the enum case into
+the four facts a barrier needs: `{ stage, access, layout, is_write }`. That `match` is the only
+place these correspondences live, and a device-free unit test pins every row.
 
 | `RgUsage` | Stage | Access | Layout | Write? |
 |---|---|---|---|---|
@@ -30,29 +31,34 @@ correspondences live.
 | `AccelStructBuildRead` | AccelerationStructureBuild | ShaderRead | (buffer) | no |
 
 Several choices follow from the table. `DepthWrite` spans both fragment-test stages because depth
-is touched in both. `StorageImageRwCompute` is a write in `GENERAL`, the in-place
-read-modify-write layout the tonemap and FXAA passes use. The buffer usages carry `UNDEFINED` for
-layout because buffers have none, and the barrier logic relies on that.
+is read and written in both. `StorageImageRwCompute` is a combined read+write in `GENERAL`, the
+layout storage-image access requires: the tonemap pass rewrites the offscreen in place under it,
+and the GI and post compute passes declare it on their write targets. The buffer usages carry
+`UNDEFINED` for layout because a buffer has none, and the layout logic keys off that.
 
-## The hazard line
+## The hazard rule
 
-`apply_access` receives the incoming usage's info and the resource's current tracked state. The
+`apply_access` receives the incoming usage's info and the resource's tracked state. The
 dependency decision is one boolean:
 
 ```rust
 let hazard = (target.is_write && r.touched) || (!target.is_write && r.last_was_write);
 ```
 
-A write that follows any prior touch is a hazard. `target.is_write && r.touched` covers
-write-after-write and write-after-read, both of which need the prior access to finish first. A
-read that follows a write is the classic read-after-write. Read-after-read is absent from this
-line: two reads do not conflict, so `hazard` stays false and no barrier is emitted. That is the
-one case the graph deliberately skips.
+A write after any prior touch is a hazard: `target.is_write && r.touched` covers write-after-write
+and write-after-read, both of which need the earlier access to finish first. A read that follows a
+write is the classic read-after-write. These are the hazard classes the Khronos
+[synchronization examples](https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples)
+catalogue barrier recipes for; the graph derives the same recipes from tracked state instead of
+hand-writing them.
+
+Read-after-read appears nowhere in the line. Two reads do not conflict, so `hazard` stays false
+and no barrier is emitted. That is the one case the derivation deliberately skips.
 
 ## Images get a second trigger
 
-A buffer barriers only on a hazard. An image has a second reason — a layout change. Even with no
-data hazard, a resource that sits in one layout while the incoming usage requires another must
+A buffer barriers only on a hazard. An image also barriers on a layout change: even with no data
+hazard, a resource sitting in one layout while the incoming usage requires another must
 transition.
 
 ```rust
@@ -64,22 +70,23 @@ if r.is_image {
 ```
 
 The image path emits a `vk::ImageMemoryBarrier2`. Its source scope is whatever last touched the
-resource (`r.last_stage`, `r.last_access`); its destination scope is the incoming usage's stage and
-access. `old_layout` is always the current layout, and `new_layout` differs only on a layout change.
-A barrier emitted purely to order a hazard therefore has matching layouts, does no transition, and
-still installs the execution and memory dependency.
+resource (`r.last_stage`, `r.last_access`); its destination scope is the incoming usage's stage
+and access. `old_layout` is always the current layout, and `new_layout` differs only on a layout
+change. A barrier emitted purely to order a hazard therefore has matching layouts, transitions
+nothing, and still installs the execution and memory dependency.
 
 The buffer path emits a `vk::MemoryBarrier2`, which has no layout fields. The `target.layout !=
-UNDEFINED` guard keeps a buffer, whose usages all carry `UNDEFINED`, from ever triggering the
-layout path.
+UNDEFINED` guard keeps a buffer, whose usages all carry `UNDEFINED`, from ever entering the
+layout branch.
 
 ## Advancing the state
 
-After deciding and possibly emitting, `apply_access` rolls the tracked state forward so the next
-pass sees the new reality: `last_stage`, `last_access`, `last_was_write`, `touched`, and, for images
-on a layout change, `layout`. This makes the next pass's checks correct without any global
-analysis. The state is a running summary of what last happened to a resource, updated one access
-at a time as the passes are walked in order.
+After deciding and possibly emitting, `apply_access` rolls the tracked `RgResourceState` forward:
+`last_stage`, `last_access`, `last_was_write`, `touched`, and, on a layout change, `layout`. The
+state is a running summary of what last happened to the resource, so the next pass's check is
+correct without any global analysis. For a freshly imported image the entry layout and source
+scope are seeded from a persisted slot; [cross-frame layouts](../cross-frame-layouts/) covers the
+seeding.
 
 ```mermaid
 flowchart TD
@@ -97,24 +104,38 @@ flowchart TD
     G --> J
 ```
 
+## One barrier batch per pass
+
+`derive_pass_barriers` runs `apply_access` over everything a pass declares: the `accesses` list,
+then each color attachment as an implied `ColorWrite`, then the depth attachment as `DepthWrite`.
+An MSAA resolve target derives a second write of the matching kind (see
+[passes](../passes-and-attachments/)). Every barrier the pass needs lands in one
+`DerivedBarriers` collection, and `execute_profiled` records the batch as a single
+`cmd_pipeline_barrier2` immediately before the pass body.
+
+The whole derivation is plain logic over plain data with no device handle in it, so the hazard
+and layout rules are unit-tested in isolation, from single accesses up to multi-pass chains such
+as the skin-write, vertex-read, color-write sequence.
+
 > [!NOTE]
-> The hazard line treats a write after any prior touch as conflicting, including write-after-read.
-> That is conservative but correct: it never misses a hazard. It also never coalesces or reorders
-> — each access emits at most one barrier, walked strictly in pass order, so the cost is one
-> barrier per real transition and nothing for read-after-read.
+> The hazard rule treats a write after any prior touch as conflicting, including write-after-read,
+> which strictly needs only an execution dependency. That is conservative but never misses a
+> hazard, and the cost stays bounded: each access emits at most one barrier, walked strictly in
+> pass order, and read-after-read emits nothing.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Usage → scope mapping | `render_graph.rs` | `usage_info`, `RgUsageInfo` |
-| The hazard decision | `render_graph.rs` | `apply_access`, `DerivedBarriers` |
+| The hazard + layout decision | `render_graph.rs` | `apply_access`, `DerivedBarriers` |
 | Tracked state | `render_graph.rs` | `RgResourceState` |
-| Where barriers are collected | `render_graph.rs` | `RenderGraph::derive_pass_barriers`, `execute_profiled` |
+| Per-pass collection + emission | `render_graph.rs` | `RenderGraph::derive_pass_barriers`, `execute_profiled` |
+| Device-free tests | `render_graph.rs` | `usage_info_matches_the_golden_table`, `multi_pass_skin_to_vertex_to_color_sequence` |
 
 ## Related
 
-- [Render graph](../render-graph-overview/) — the model this derivation serves
-- [Passes](../passes-and-attachments/) — where `ColorWrite`/`DepthWrite` come from implicitly
-- [Cross-frame layouts](../cross-frame-layouts/) — how the entry layout seeds the first barrier
-- [Synchronization2](../../vulkan-foundation/) — the barrier primitives this emits
+- [Render graph](../render-graph-overview/) — the declare-then-derive model this serves
+- [Passes](../passes-and-attachments/) — where the implied `ColorWrite`/`DepthWrite` come from
+- [Cross-frame layouts](../cross-frame-layouts/) — how the entry layout and source scope are seeded
+- [Synchronization2 and barriers](../../vulkan-foundation/synchronization2-and-barriers/) — the barrier primitives this emits
