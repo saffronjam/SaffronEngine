@@ -6,109 +6,128 @@ math = true
 
 # Distance field reflection occlusion
 
-After the distance-field GI work reconciled to one indirect path, the signed distance field has exactly
-one per-pixel consumer left: it occludes the reflected skybox. The indirect *diffuse* occlusion that a
-distance-field ambient-occlusion prepass used to compute is gone — that job now belongs to
-[DDGI](../ddgi-overview/), where the sky enters a probe's irradiance only on a ray that escapes to open
-space, plus a small-radius [GTAO](../../screen-space-and-post/gtao/) for the contact detail the coarse
-probe grid cannot resolve. Running a wide screen-space AO *and* DDGI would double-count the same
-occlusion, so the prepass was deleted outright.
+The prefiltered [IBL](../../image-based-lighting/ibl-overview/) environment treats the sky as
+visible from every point, so a polished floor under an overhang would mirror open sky it cannot
+see. Distance-field reflection occlusion corrects this: a cone sphere-marched along the reflection
+vector through the Global Distance Field yields a $[0,1]$ visibility factor that dims the specular
+IBL where the reflected direction is blocked. The technique is the reflection half of Wright's
+[Dynamic Occlusion with Signed Distance Fields](https://advances.realtimerendering.com/s2015/)
+(SIGGRAPH 2015).
 
-What remains is specular. The analytic [IBL](../../image-based-lighting/ibl-overview/) prefiltered cube
-treats the whole environment as visible from everywhere, so a polished floor under an overhang mirrors
-the open sky it cannot actually see. `sdfReflectionOcclusion` cuts that back: it sphere-marches one cone
-along the reflection vector against the Global Distance Field and returns a `[0,1]` factor that
-multiplies the specular IBL only where the reflection direction is blocked.
+## Why the cone follows the reflection vector
 
-## Why specular is occluded separately
-
-Dimming the reflected skybox by a diffuse AO scalar would be wrong: a chrome surface facing open sky
-should keep a full reflection even when the diffuse hemisphere around it is half-enclosed. Reflection
-occlusion is directional — it asks "is *this* reflected ray blocked," not "how much of the hemisphere is
-open." So it marches a single cone along $R$ rather than reusing any diffuse term.
-
-The cone's half-angle widens with roughness. A mirror sees a thin pencil of the environment (a narrow
-cone), a rough surface a broad one; the half-angle lerps from `0.05` at mirror-smooth to `~0.6` at full
-roughness. Along the march it accumulates the penumbra ratio
+Dimming reflections by a diffuse AO scalar gives the wrong answer for a chrome surface facing open
+sky: its hemisphere may be half-enclosed while the one direction it mirrors is unobstructed.
+Reflection occlusion asks whether that specific ray escapes. `sdfReflectionOcclusion` marches a
+single cone along $R$ and keeps the tightest penumbra ratio it meets:
 
 $$
-\text{occ} = \min\!\left(\text{occ}, \; \frac{d(t)}{\theta \cdot t}\right)
+\text{occ} = \min_{t}\ \operatorname{saturate}\!\left(\frac{d(t)}{\theta\, t}\right)
 $$
 
-where $d(t)$ is the field's distance to the nearest surface at march distance $t$ and $\theta$ is the
-cone half-angle. The running minimum is the most-closed point along the reflection; the result
-multiplies `specularIBL` after the energy-compensation and horizon terms. A glossy surface facing an
-opening keeps its reflection; one facing a wall loses it.
+where $d(t)$ is the field distance at march distance $t$ and $\theta\,t$ is the cone footprint
+there. The half-angle widens with roughness, from $\tan\theta = 0.05$ at mirror-smooth to $0.6$ at
+full roughness: a mirror samples a thin pencil of the environment, a rough surface a broad lobe.
+The march takes up to 12 sphere-trace steps over at most 12 m, stepping by the field distance
+(floored at 0.05 m), and exits early once the cone is fully open and far from any surface.
 
-## It taps the Global Distance Field, not per-mesh fields
+## Marching the Global Distance Field
 
-The cone reads the **Global Distance Field** (GDF) clipmap — the camera-centered cascade volumes the
-[Global SDF](../../) composite builds each frame by binning the per-mesh Mesh Distance Field bricks into
-one alias-free field. `gdfDistance` selects the finest cascade whose bounds contain the sample, converts
-world space to that cascade's toroidal UVW, and reads one trilinear tap; near a cascade's outer face it
-blends into the next coarser cascade so the handoff shows no shell. When the march leaves the coarsest
-cascade the field can say nothing more, so the cone stops and keeps the open fraction accumulated so far
-(the reflection then reaches the open sky the analytic environment intends).
+The cone reads the Global Distance Field clipmap: three camera-centered `R16_SNORM` volumes of
+128³ voxels, the finest spanning 32 m (a 0.25 m voxel) and each coarser cascade doubling the
+extent. `gdfDistance` selects the finest cascade containing the sample, converts world position to
+that cascade's toroidal UVW, and takes one trilinear tap; near a cascade's outer face it blends
+into the next coarser one so the handoff shows no shell. One tap costs the same regardless of
+scene size, because the cone never iterates an instance list.
 
-Reading the GDF rather than the per-mesh fields is what keeps this O(1) per tap: the cone never iterates
-an instance list. The per-mesh bricks still exist, but their only consumers are the GDF composite
-(compute) and the DDGI trace's near field (compute) — the fragment path touches only the composited
-clipmap (light set bindings 9/10). Distance-field detail near a surface is lower-frequency in the GDF
-than in a per-mesh field, which is acceptable here: specular reflection occlusion is a low-frequency
-term by nature.
+When a sample leaves the coarsest cascade the field can say nothing more, so the march stops and
+keeps the openness accumulated so far. The reflection then reaches the open sky, which is exactly
+what the analytic environment assumes. The per-mesh distance-field bricks feed only the GDF
+composite and the [DDGI trace's](../software-ray-trace/) near field; this cone taps the composited
+clipmap alone (light-set bindings 9 and 10).
 
-## Where it sits in the shader
+## Half-resolution prepass
 
-The cone runs inline in the lighting übershader's ambient block, gated by the sky-occlusion enable bit
-so the fragment marches the field only on the frames the GDF cascade clipmap actually composited:
+The march runs once per half-resolution pixel in the `specocc` compute pass, not per shaded
+fragment. The pass reconstructs world position and normal from the
+[thin G-buffer](../../screen-space-and-post/thin-gbuffer/), reads per-pixel roughness from the
+G-buffer roughness target, reflects the camera ray, and writes the cone result into an `rgba16f`
+image with view-Z in alpha. Background pixels write 1.0: no geometry, fully open sky.
 
-```hlsl
-float specSkyVis = 1.0;
-if (globals.sdfOcclusion.y != 0) {
-    specSkyVis = sdfReflectionOcclusion(input.worldPos, R, roughness);
-}
-// ... later, after energy comp + horizon:
-specularIBL *= specAO * specSkyVis;   // specAO = contact GTAO; specSkyVis = the GDF cone
-```
+A bilateral upsample (`specocc-blur`, the [SSGI](../../screen-space-and-post/ssgi/) blur kernel
+bound with this pass's set) lifts the half-res result to full resolution with depth-aware weights.
+There is no temporal accumulation: the term is view-dependent ($R$ moves with the camera), and
+reprojecting it through surface motion would smear it. Spatially denoised, the low-frequency
+scalar holds steady on its own.
 
-The two specular occlusion terms are distinct and never double-applied: `specAO` is the
-roughness-aware specular AO driven by the contact-scale GTAO (`ao`), occluding reflections in creases;
-`specSkyVis` is the directional GDF cone, occluding the reflected skybox under overhangs.
+## Application in the mesh
 
-## The indirect diffuse, for contrast
-
-The diffuse side carries no distance-field term at all. The analytic sky irradiance is sampled along the
-shading normal as a residual; where DDGI has coverage its already-occluded irradiance *replaces* the sky
-by coverage weight, and the only further occlusion is contact-scale (the material occlusion texture ×
-small-radius GTAO):
+The lighting übershader samples the resolved map by screen UV and multiplies it into the specular
+IBL after the energy-compensation and horizon terms:
 
 ```hlsl
-float3 indirectIrr = irradiance;                       // analytic sky, residual where DDGI is absent
-if (screenFlags.z != 0) {
-    float4 ddgi = ddgiSampleIrradiance(worldPos, n);
-    indirectIrr = lerp(indirectIrr, ddgi.rgb, ddgi.w); // DDGI ray-miss is the large-range occlusion
-}
-ambient = kd * indirectIrr * albedo * ao + specularIBL; // ao = material × contact GTAO
+float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent)
+    ? speoccMap.SampleLevel(screenUv, 0.0).r : 1.0;
+// ... energy compensation + horizon fade ...
+float specAO = saturate(pow(ndotv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
+specularIBL *= specAO * specSkyVis;
 ```
 
-So the large-range indirect occlusion is DDGI (a surface in an enclosed interior receives sky only
-through rays that escape), the contact-range occlusion is GTAO, and the distance field contributes only
-the reflection cone above.
+The two factors occlude different things. `specAO` is the roughness-aware specular occlusion from
+[Moving Frostbite to PBR](https://seblagarde.wordpress.com/2015/07/14/siggraph-2014-moving-frostbite-to-physically-based-rendering/)
+(Lagarde and de Rousiers), driven by the contact-scale `ao` (the material occlusion texture ×
+[GTAO](../../screen-space-and-post/gtao/)); it darkens reflections in creases and tends to 1 on
+smooth metals. `specSkyVis` is the directional GDF cone, darkening the reflected skybox under
+overhangs. Translucent surfaces read 1.0 because the map is keyed to the opaque G-buffer behind
+them.
+
+## The diffuse twin
+
+`sdfSkyVisibility` applies the same idea to indirect diffuse: nine cosine-weighted cones (about a
+30° half-angle, 8 m range) sample the hemisphere of the shading normal against the same clipmap.
+It runs in the `dfao` half-res prepass with an eight-position azimuth jitter per frame, and a
+bilateral upsample plus a temporal accumulator average the rotated cone rings into a denser
+hemisphere. Sky visibility is view-independent, so temporal reuse is safe here.
+
+The resolved sky visibility multiplies the analytic sky irradiance inside the half-res
+`gi-resolve` pass. Where [DDGI](../ddgi-overview/) has coverage, its probe irradiance overrides
+that analytic term by coverage weight, so the distance-field occlusion shapes only the residual
+sky. Contact-scale diffuse occlusion stays with GTAO and the material occlusion texture.
+
+## One gate
+
+`want_sky_occlusion` arms the whole apparatus per frame: IBL must be on and ready, the
+`sky_occlusion` toggle set, and the GDF clipmap composited. The same predicate resolves the two
+prepass PSOs and writes the `sdfOcclusion.y` bit into the light UBO, so the fragment never samples
+a map no pass produced. The toggle is scriptable:
+
+```sh
+sa set-sky-occlusion 0   # reflections keep the full sky everywhere
+sa set-sky-occlusion 1   # overhangs occlude the reflected skybox again
+```
+
+Disabling the Global Distance Field itself (`sa set-gdf 0`) drops the gate too, since the clipmap
+the cones march never composites.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Reflection-occlusion cone | `engine/assets/shaders/sdf.slang` | `sdfReflectionOcclusion`, `gdfDistance`, `gdfEnabled` |
-| Mesh-side application | `engine/assets/shaders/lighting.slang` | the ambient block, `specSkyVis`, `globals.sdfOcclusion` |
-| Frame enable gate | `engine/crates/rendering/src/renderer.rs` | `set_sky_occlusion`, `want_sky_occlusion` |
-| Lighting UBO bit | `engine/crates/rendering/src/lighting.rs` | `set_frame_sdf_occlusion` |
-| Sky-occlusion toggle | `engine/crates/control/src/commands_render.rs` | `set-sky-occlusion` |
-| Contact GTAO radius | `engine/crates/rendering/src/ssao.rs` | `Ssao::radius`, `gtao_push` |
+| Reflection cone march | `assets/shaders/sdf.slang` | `sdfReflectionOcclusion`, `gdfDistance`, `gdfEnabled` |
+| Diffuse sky-visibility cones | `assets/shaders/sdf.slang` | `sdfSkyVisibility` |
+| Specular prepass | `assets/shaders/specocc.slang` | `computeMain` |
+| Diffuse (DFAO) prepass | `assets/shaders/dfao.slang` | `computeMain` |
+| Mesh application | `assets/shaders/lighting.slang` | `speoccMap`, `globals.sdfOcclusion` |
+| Diffuse application | `assets/shaders/gi_resolve.slang` | `computeMain`, `dfaoMap` |
+| Frame gate + pass wiring | `crates/rendering/src/renderer.rs` | `want_sky_occlusion`, `set_sky_occlusion` |
+| Lighting UBO bit | `crates/rendering/src/lighting.rs` | `set_frame_sdf_occlusion` |
+| GDF cascade constants | `crates/rendering/src/global_sdf.rs` | `GDF_CASCADES`, `GDF_RES`, `GDF_CASCADE0_EXTENT` |
+| Control command | `crates/control/src/commands_render.rs` | `set-sky-occlusion` |
 
 ## Related
 
-- [DDGI overview](../ddgi-overview/) — the probe diffuse whose ray-miss is the large-range indirect occlusion
-- [Software ray trace](../software-ray-trace/) — the DDGI trace that sphere-marches the near MDF → far GDF field
-- [IBL overview](../../image-based-lighting/ibl-overview/) — the analytic specular the reflection cone occludes
-- [GTAO](../../screen-space-and-post/gtao/) — the small-radius contact AO that fills in what the probe grid cannot resolve
+- [Software ray trace](../software-ray-trace/) — the DDGI trace that sphere-marches the same near/far distance field
+- [DDGI overview](../ddgi-overview/) — the probe irradiance that overrides the occluded analytic sky by coverage
+- [IBL overview](../../image-based-lighting/ibl-overview/) — the analytic environment the cone occludes
+- [GTAO](../../screen-space-and-post/gtao/) — the contact-scale occlusion behind the specular AO term
+- [SSGI](../../screen-space-and-post/ssgi/) — the denoise kernels the prepasses reuse
