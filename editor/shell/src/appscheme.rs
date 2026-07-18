@@ -12,13 +12,6 @@ use cef::*;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// The scheme token the packaged shell navigates under.
-pub const SCHEME_NAME: &str = "saffron-app";
-
-/// `STANDARD | SECURE | CORS_ENABLED | FETCH_ENABLED` (1 | 8 | 16 | 64) — the same options as
-/// `saffron-img`, so the bundle's module scripts and `fetch()` load without opaque-response breakage.
-pub const SCHEME_OPTIONS: i32 = 1 | 8 | 16 | 64;
-
 /// The document a packaged build navigates to.
 pub const INDEX_URL: &str = "saffron-app://localhost/index.html";
 
@@ -122,11 +115,22 @@ wrap_resource_handler! {
 fn load(root: &Path, url: &str) -> FileState {
     let full = root.join(request_path(url));
     if !full.starts_with(root) {
-        return FileState { status: 403, ..Default::default() };
+        return FileState {
+            status: 403,
+            ..Default::default()
+        };
     }
     match std::fs::read(&full) {
-        Ok(bytes) => FileState { status: 200, mime: mime_for(&full).to_owned(), bytes, cursor: 0 },
-        Err(_) => FileState { status: 404, ..Default::default() },
+        Ok(bytes) => FileState {
+            status: 200,
+            mime: mime_for(&full).to_owned(),
+            bytes,
+            cursor: 0,
+        },
+        Err(_) => FileState {
+            status: 404,
+            ..Default::default()
+        },
     }
 }
 
@@ -220,8 +224,14 @@ mod tests {
 
     #[test]
     fn request_path_defaults_root_to_index() {
-        assert_eq!(request_path("saffron-app://localhost/"), PathBuf::from("index.html"));
-        assert_eq!(request_path("saffron-app://localhost"), PathBuf::from("index.html"));
+        assert_eq!(
+            request_path("saffron-app://localhost/"),
+            PathBuf::from("index.html")
+        );
+        assert_eq!(
+            request_path("saffron-app://localhost"),
+            PathBuf::from("index.html")
+        );
     }
 
     #[test]
@@ -234,7 +244,10 @@ mod tests {
 
     #[test]
     fn request_path_drops_traversal_segments() {
-        assert_eq!(request_path("saffron-app://localhost/../../etc/passwd"), PathBuf::from("etc/passwd"));
+        assert_eq!(
+            request_path("saffron-app://localhost/../../etc/passwd"),
+            PathBuf::from("etc/passwd")
+        );
     }
 
     #[test]

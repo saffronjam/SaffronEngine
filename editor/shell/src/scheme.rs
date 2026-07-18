@@ -20,13 +20,6 @@ use cef::rc::*;
 use cef::*;
 use std::sync::{Arc, Mutex};
 
-/// The scheme token the storefront builds URLs against.
-pub const SCHEME_NAME: &str = "saffron-img";
-
-/// `CEF_SCHEME_OPTION_STANDARD | SECURE | CORS_ENABLED | FETCH_ENABLED` (1 | 8 | 16 | 64) — a
-/// standard secure scheme Chromium will load from `<img>`/`fetch` without opaque-response breakage.
-pub const SCHEME_OPTIONS: i32 = 1 | 8 | 16 | 64;
-
 /// Immutable content-addressed images: let Chromium's cache absorb repeats.
 const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
