@@ -3,7 +3,7 @@
 /// never renders pixels — it owns the screen rectangle and forwards pointer input to
 /// the engine over the control plane. A <LoadingOverlay/> sibling covers the region
 /// while the renderer is not yet ready.
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { client } from "../control/client";
 import { makeCoalescer } from "../control/coalesce";
 import { useEditorStore } from "../state/store";
@@ -82,10 +82,10 @@ function targetOwnsTextInput(target: EventTarget | null): boolean {
 
 export function ViewportPanel() {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const attachedRef = useRef(false);
   // RMB fly-cam active: the shell has the cursor natively locked (CEF OSR can't do DOM pointer lock).
   // Shared between the fly effect (owner) and the gizmo effect (which stands down while it's set).
   const flyingRef = useRef(false);
+  const phase = useEditorStore((s) => s.engineStatus.phase);
   const setPhase = useEditorStore((s) => s.setPhase);
   const setSelectedId = useEditorStore((s) => s.setSelectedId);
   const setDragActive = useEditorStore((s) => s.setDragActive);
@@ -166,32 +166,48 @@ export function ViewportPanel() {
 
   useEffect(() => clearPlacementPreview, [clearPlacementPreview]);
 
-  // Readiness: probe the control plane until the engine has booted + bound its
-  // socket, then flip the phase. The `engine-phase` events are emitted from the Rust
-  // `.setup()` hook BEFORE this webview registers its listener (the shell does not buffer
-  // pre-listen events), so the probe — not the event — is the gate. (`cancelled`
-  // makes any pending retry a no-op after unmount.)
-  useLayoutEffect(() => {
+  // Readiness is owned here: this probe is the SINGLE source of truth for the viewport being live.
+  // It polls the control plane and flips the phase to `ready` once the engine can attach. It runs
+  // whenever the viewport is NOT ready — initial boot, or a legitimate re-attach that reset the
+  // phase away from `ready` — so recovery is automatic: nothing has to guard against or replay the
+  // backend's phase events (the backend no longer drives the startup attach at all; it only reports
+  // failures). The `attaching` label is set here for the `idle` boot state.
+  //
+  // Each attempt is bounded by a timeout so a single slow/dropped `invoke` (e.g. the shell's main
+  // thread busy under the first render burst) can't wedge the attach — the next attempt fires a
+  // fresh call. `cancelled` makes any pending retry a no-op after the phase changes or unmount.
+  useEffect(() => {
+    if (phase === "ready" || phase === "error") {
+      return;
+    }
+    if (phase === "idle") {
+      setPhase("attaching");
+      return;
+    }
+
     let cancelled = false;
+    const PROBE_TIMEOUT_MS = 1500;
 
     const probe = async (): Promise<void> => {
-      if (cancelled || attachedRef.current) {
-        return;
-      }
-      try {
-        await client.viewportNativeInfo();
-      } catch {
-        if (cancelled) {
-          return;
-        }
-        setTimeout(() => void probe(), 150);
-        return;
-      }
       if (cancelled) {
         return;
       }
-      attachedRef.current = true;
-      setPhase("ready");
+      try {
+        await Promise.race([
+          client.viewportNativeInfo(),
+          new Promise((_resolve, reject) => {
+            setTimeout(() => reject(new Error("viewport probe timed out")), PROBE_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        if (!cancelled) {
+          setTimeout(() => void probe(), 150);
+        }
+        return;
+      }
+      if (!cancelled) {
+        setPhase("ready");
+      }
     };
 
     void probe();
@@ -199,7 +215,7 @@ export function ViewportPanel() {
     return () => {
       cancelled = true;
     };
-  }, [setPhase]);
+  }, [phase, setPhase]);
 
   // Bounds-sync: keep the Scene view's subsurface glued to the host div on resize / dock-split / layout
   // changes. The shared hook is parameterized by view id — the asset editor's preview pane drives its
