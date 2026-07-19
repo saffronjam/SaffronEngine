@@ -51,6 +51,7 @@ The [Zustand](https://zustand.docs.pmnd.rs/) store holds editor-facing state. It
 | [Selection](selection/) | Authoritative selection, optimistic clicks, and reconciliation | `selectEntity`, `refreshHeavyState` |
 | [Undo/redo](undo-redo/) | Inverse commands, tab histories, and gesture grouping | `appendEdit`, `takeUndo`, `useTabSnapshotHistory` |
 | [Dock system](dock-system/) | Dock trees, tab isolation, tear-out, and persistence | `DockRoot`, `dockLayouts`, `dockDrag` |
+| [Environment and presentation panels](environment-and-presentation-panels/) | Environment authoring, profiles, quality ownership, and post-processing groups | `EnvironmentPanel`, `RenderPanel`, `PostProcessPanel` |
 | [Theme & fonts](theme-and-fonts/) | Theme tokens, typography, and shared UI styling | `styles.css` |
 | [Mesh thumbnails](mesh-thumbnails/) | Engine-rendered model previews and PNG readback | `render_mesh_thumbnail`, `encode_active_offscreen_png` |
 | [Metrics dashboard](metrics-dashboard/) | Frame graphs, pass timings, memory, and alarms | `RenderStatsPanel`, `FrameTimeGraph` |

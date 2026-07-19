@@ -92,10 +92,10 @@ one tetrahedral LUT lookup in place of the live grade and view-transform operati
 
 ## Editor and GPU state
 
-The Post panel exposes global Lift/Gamma/Gain wheels, the three tonal ranges, channel mixing, split
-toning, creative-LUT intensity, and tone curves. A wheel maps its disc to a zero-sum chroma offset and
-its vertical bar to luma. The panel sends edits through `set-color-grading` and reads the applied values
-from `RenderStatsDto.colorGrading`.
+The Post panel's Color tab exposes global Lift/Gamma/Gain wheels, the three tonal ranges, channel
+mixing, split toning, creative-LUT intensity, and tone curves. A wheel maps its disc to a zero-sum
+chroma offset and its vertical bar to luma. The panel sends edits through `set-color-grading` and
+reads the applied values from `RenderStatsDto.colorGrading`.
 
 Each view owns a persistently mapped `GradeUniform` buffer with one aligned slice per frame in flight.
 The renderer writes the active frame's slice and binds it through a dynamic uniform-buffer offset. The
@@ -112,7 +112,7 @@ tonemap descriptor set therefore does not need a per-frame rewrite.
 | Renderer controls and look bake | `renderer.rs` | `set_color_grading`, `color_grading`, `bake_look_lut`, `add_tonemap_pass` |
 | LUT parsing and persistence | `cube.rs` | `parse_cube`, `CubeLut`, `BakedLut`, `import_cube_lut`, `import_baked_lut` |
 | Wire types and commands | `dto.rs`, `commands_render.rs`, `commands_asset.rs` | `SetColorGradingParams`, `CreativeLutStat`, `set-color-grading`, `bake-look`, `import-lut` |
-| Post panel and grading controls | `PostProcessPanel.tsx`, `GradingWheel.tsx`, `ToneCurve.tsx` | `PostProcessPanel`, `GradingWheel`, `ToneCurve`, `curveToCube` |
+| Post Color tab and grading controls | `PostProcessPanel.tsx`, `GradingWheel.tsx`, `ToneCurve.tsx` | `PostProcessPanel`, `GradingWheel`, `ToneCurve`, `curveToCube` |
 
 ## Related
 

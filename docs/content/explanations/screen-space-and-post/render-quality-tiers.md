@@ -30,6 +30,10 @@ change therefore does not compile shaders or resize render targets.
 Other renderer switches remain independent. The tier does not select clustered lighting, IBL, DDGI,
 ray-traced shadows, ReSTIR, anti-aliasing, or the volumetric-fog grid quality.
 
+The Render panel also owns the independent environment-quality controls: atmosphere capture cadence,
+cloud march and temporal settings, and volumetric-fog grid and history settings. Their placement does
+not fold them into `QualityTier`; it keeps performance-oriented controls on one editor surface.
+
 ## Control and persistence
 
 `set-render-quality` applies a named tier. `get-render-quality` reports the tier and its resolved
@@ -85,7 +89,7 @@ state, target budget, and both extents.
 | Budget configuration | `frame_history.rs` | `PerfConfig`, `PerfConfig::budget_ms`, `PerfConfig::auto_quality` |
 | Quality and upscale commands | `commands_render.rs` | `set-render-quality`, `get-render-quality`, `render_quality_result`, `set-upscale`, `upscale_dto` |
 | Project persistence | `render_settings.rs` | `RenderSettings::quality` |
-| Editor selector | `RenderPanel.tsx` | `QUALITY_TIERS`, `onQuality` |
+| Editor selectors | `RenderPanel.tsx` | `RenderPanel`, `QUALITY_TIERS`, `onQuality`, `patchEnvironmentQuality` |
 
 ## Related
 

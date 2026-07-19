@@ -38,6 +38,11 @@ The curve input is normalized Sun elevation rather than clock time. An input of 
 
 Anima evaluates the control points with the same Fritsch-Carlson monotone cubic in Rust and in the editor. An active exposure curve owns renderer exposure for each frame. Disabling that curve returns exposure control to `set-exposure`. The master and RGB tint curves multiply visible-sky and ambient light without rebaking the atmosphere. Coverage and cloud-type curves own the corresponding cloud-shape inputs when active; clearing either curve returns that input to `CloudSettings`.
 
+The Environment panel keeps the clock and location in its Time tab. Appearance curves open in a
+wide editor with one full-width graph for exposure, sky tint, cloud coverage, or cloud type. This
+keeps curve manipulation separate from the narrow property list while editing the same scene-owned
+settings.
+
 ## Example
 
 This command selects Stockholm, starts at 06:00 UTC on the March equinox, and runs a ten-minute day:
@@ -61,10 +66,11 @@ sa set-time-of-day --manualOverride true
 | Frame application | `engine/crates/assets/src/render_scene.rs` | `drive_time_of_day`, `CelestialDirectionOverrides`, `TimeOfDayFrame` |
 | Curve evaluation | `engine/crates/assets/src/time_of_day.rs` | `eval_monotone_curve` |
 | Control command | `engine/crates/protocol/src/dto.rs` · `engine/crates/control/src/commands_scene.rs` | `SetTimeOfDayParams`, `set-time-of-day` |
-| Editor controls | `editor/src/panels/EnvironmentPanel.tsx` | `patchTod`, `todCoalescerFor`, `recordTodEdit` |
+| Editor controls | `editor/src/panels/EnvironmentPanel.tsx` | `EnvironmentPanel`, `patchTod`, `todCoalescerFor` |
 
 ## Related
 
 - [Night sky](../night-sky/) — sidereal stars, the phased Moon, and low-light adaptation
 - [Procedural atmosphere](../procedural-atmosphere/) — atmosphere refresh and role-tagged celestial lights
 - [Real-time sky-light capture](../realtime-skylight-capture/) — ambient and reflection reconvergence as the sky moves
+- [Environment and presentation panels](../../ui-and-editor/environment-and-presentation-panels/) — panel grouping, profiles, and curve-editor placement
