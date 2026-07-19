@@ -199,7 +199,7 @@ editor:
     cd "{{editor}}" && bun run build
 
 # control-schema contract test (live `sa` control output vs schemas/control)
-schema:
+schema: engine
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=schema; {{reenter}}
