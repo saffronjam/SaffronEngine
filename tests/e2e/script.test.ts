@@ -4,7 +4,7 @@
 // in the drain-script-errors ring with a traceback, pauses play, and never crashes
 // the host. Test scripts are authored into the auto project's src/ on the fly.
 
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
@@ -353,6 +353,13 @@ return Logger
 `,
   );
 });
+
+afterEach(async () => {
+  const state = await engine.call<PlayState>("get-play-state");
+  if (state.state !== "edit") {
+    await engine.call("stop");
+  }
+});
 afterAll(async () => {
   await engine?.shutdown();
 });
@@ -697,20 +704,25 @@ test("a script reaches another entity by name and moves it", async () => {
 });
 
 test("a script moves the primary camera through its transform", async () => {
-  const camera = await engine.call<Ref>("add-entity", { args: ["camera"] });
+  const entities = (await engine.call<{ entities: Ref[] }>("list-entities")).entities;
+  const inspected = await Promise.all(
+    entities.map((entity) => engine.call<Inspect>("inspect", { entity: entity.id })),
+  );
+  const camera = inspected.find((entity) => entity.components.Camera?.primary === true);
+  expect(camera).toBeDefined();
+  const authored = camera!.components.Transform.translation;
   const driver = await engine.call<Ref>("add-entity", { args: ["empty"] });
   await attachScripts(driver.id, ["camera.lua"]);
 
   await engine.call("play");
   await engine.settle();
   expect((await engine.call<PlayState>("get-play-state")).state).toBe("playing");
-  const during = await engine.call<Inspect>("inspect", { entity: camera.id });
+  const during = await engine.call<Inspect>("inspect", { entity: camera!.id });
   expect(during.components.Transform.translation).toEqual({ x: 0, y: 5, z: 10 });
 
   await engine.call("stop");
-  const after = await engine.call<Inspect>("inspect", { entity: camera.id });
-  expect(after.components.Transform.translation).not.toEqual({ x: 0, y: 5, z: 10 });
-  await engine.call("destroy-entity", { entity: camera.id });
+  const after = await engine.call<Inspect>("inspect", { entity: camera!.id });
+  expect(after.components.Transform.translation).toEqual(authored);
   await engine.call("destroy-entity", { entity: driver.id });
 });
 
@@ -839,6 +851,7 @@ test("a missing script file is a logged skip, not a crash", async () => {
 // sa.log(...) lands in the drain-script-logs ring tagged with the logging entity, drains via a seq
 // cursor (like drain-script-errors), and — unlike an error — never pauses play.
 test("sa.log lands in drain-script-logs tagged with the logging entity, and does not pause play", async () => {
+  const cursor = (await engine.call<ScriptLogs>("drain-script-logs", { since: 0 })).highWaterSeq;
   const robot = await engine.call<Ref>("create-entity", { name: "Robot" });
   await engine.call("add-component", { entity: robot.id, component: "Script" });
   await engine.call("set-component", {
@@ -850,7 +863,7 @@ test("sa.log lands in drain-script-logs tagged with the logging entity, and does
   await engine.call("play");
   await engine.settle();
 
-  const drained = await engine.call<ScriptLogs>("drain-script-logs", { since: 0 });
+  const drained = await engine.call<ScriptLogs>("drain-script-logs", { since: cursor });
   const line = drained.events.find((e) => e.message.includes("hello from Robot"));
   expect(line).toBeDefined();
   expect(line!.entity).toBe(robot.id); // tagged with the logging entity (currentSenderUuid)
