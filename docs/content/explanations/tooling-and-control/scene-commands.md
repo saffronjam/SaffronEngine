@@ -70,7 +70,19 @@ Raw writes to `Relationship` trigger a hierarchy relink. `set-parent` remains th
 
 ## Environment and play
 
-`get-environment` returns the scene-wide sky, ambient, atmosphere, and fog settings. `set-environment`, `set-atmosphere`, and `set-fog` merge either individual optional fields or an inline JSON object over the current state.
+`get-environment` returns the complete scene-wide sky, ambient, atmosphere, cloud, time-of-day, wind,
+and fog settings. `get-environment-defaults` returns the canonical reset value. `set-environment`,
+`set-atmosphere`, `set-clouds`, `set-time-of-day`, `set-wind`, and `set-fog` merge individual optional
+fields or an inline JSON object over the current state.
+
+`list-environment-profiles` combines built-in profiles with project `.senv` assets. Applying a
+profile replaces the complete active environment atomically. Saving creates a catalog asset from the
+active environment, and updating replaces an existing project profile without changing its asset id.
+
+```sh
+sa apply-environment-profile --profile '{"kind":"builtin","profile":"overcast"}'
+sa save-environment-profile --name 'Rainy afternoon'
+```
 
 The same registration group carries the play-state commands:
 
@@ -116,6 +128,7 @@ The editor compares these values before issuing heavier list and inspection requ
 | Hierarchy-safe structural edits | `engine/crates/scene/src/hierarchy.rs` | `Scene::set_parent`, `Scene::relink_hierarchy` |
 | Surface picking and framing bounds | `engine/crates/assets/src/render_scene.rs` | `pick_entity`, `model_render_aabb` |
 | Protocol shapes | `engine/crates/protocol/src/dto.rs` | `EntitySelector`, `SetTransformParams`, `SelectionResult` |
+| Environment profiles | `engine/crates/assets/src/environment_profile.rs` | `builtin_environment_profiles`, `save_environment_profile`, `load_environment_profile` |
 
 ## Related
 

@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 178 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 186 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -93,9 +93,17 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `focus` | `EntityParams` | `EntityRef` | focus {entity} |
 | `get-world-transform` | `EntityParams` | `WorldTransformResult` | get-world-transform {entity} — the entity's composed world translation + scale |
 | `get-environment` | `EmptyParams` | `EnvironmentDto` | get environment settings |
+| `get-environment-defaults` | `EmptyParams` | `EnvironmentDto` | get the canonical environment defaults |
+| `list-environment-profiles` | `EmptyParams` | `EnvironmentProfileListDto` | list built-in and project environment profiles |
+| `save-environment-profile` | `SaveEnvironmentProfileParams` | `EnvironmentProfileSummaryDto` | save the active environment as a project profile |
+| `update-environment-profile` | `UpdateEnvironmentProfileParams` | `EnvironmentProfileSummaryDto` | replace a project profile with the active environment |
+| `apply-environment-profile` | `ApplyEnvironmentProfileParams` | `EnvironmentDto` | apply a complete environment profile |
 | `set-environment` | `SetEnvironmentParams` | `EnvironmentDto` | set environment settings |
 | `set-atmosphere` | `SetAtmosphereParams` | `EnvironmentDto` | set procedural-atmosphere settings |
 | `set-fog` | `SetFogParams` | `EnvironmentDto` | set analytic height & distance fog settings |
+| `set-clouds` | `SetCloudsParams` | `EnvironmentDto` | set volumetric cloud shape settings |
+| `set-wind` | `SetWindParams` | `EnvironmentDto` | set shared global wind settings |
+| `set-time-of-day` | `SetTimeOfDayParams` | `EnvironmentDto` | set calendar-driven time-of-day settings |
 | `get-selection` | `EmptyParams` | `SelectionResult` | get current selection |
 | `deselect` | `EmptyParams` | `DeselectResult` | clear selection |
 | `play` | `EmptyParams` | `PlayStateResult` | enter or resume play mode |

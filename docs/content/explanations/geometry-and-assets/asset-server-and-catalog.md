@@ -31,9 +31,9 @@ pub struct AssetServer {
 
 The catalog is the source of truth; every map is a cache over it. The catalog records that asset
 42 is a mesh at `models/42.smesh`; the mesh cache records that 42 is uploaded and holds its
-`Arc<GpuMesh>`. `AssetServer::new` seeds the root's `models/`, `textures/`, and `materials/`
-subdirectories, and [loading a project](../project-serialization/) populates the catalog from a
-disk scan.
+`Arc<GpuMesh>`. `AssetServer::new` seeds the root's `models/`, `textures/`, `materials/`, and
+`environments/` subdirectories, and [loading a project](../project-serialization/) populates the
+catalog from a disk scan.
 
 A project switch drops every cache through `clear_asset_caches`, and its caller idles the GPU
 first: an in-flight frame may still reference a cached `Arc<GpuTexture>`, so the last `Arc` must
@@ -44,7 +44,9 @@ drop only under an idle device.
 Each entry pairs a human-facing, renameable name with a separate on-disk path:
 
 ```rust
-pub enum AssetType { Mesh, Texture, Other, Animation, Material, Model }
+pub enum AssetType {
+    Mesh, Texture, Other, Animation, Material, Model, Lut, Environment,
+}
 
 pub struct AssetEntry {
     pub id: Uuid,
@@ -79,6 +81,10 @@ is the model, and sibling rows are the meshes, materials, and textures embedded 
 texture's `role` is inferred from filename tokens at import, or supplied by a store connector, and
 routes its preview — a map renders on a lit sphere in its slot, an HDRI as an environment (see the
 [asset editor](../../ui-and-editor/asset-editor/)).
+
+An environment profile is a standalone `.senv` asset containing one complete scene environment.
+Its catalog identity lets the Environment panel browse, rename, move, delete, and update it through
+the same asset-management surface as other project data.
 
 ## The filesystem is the source of truth
 
