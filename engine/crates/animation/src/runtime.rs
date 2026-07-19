@@ -1706,4 +1706,59 @@ mod tests {
         );
         assert!(foot_y.is_finite(), "the solve must not produce NaN");
     }
+
+    #[test]
+    fn foot_ik_reaches_a_nearby_target_from_a_bent_pose() {
+        let clip_id = Uuid(32);
+        let (mut scene, rig, bones) = rig_scene(3, clip_id);
+        scene
+            .with_component_mut::<Transform, _>(bones[0], |transform| {
+                transform.translation = Vec3::ZERO;
+            })
+            .unwrap();
+        scene
+            .with_component_mut::<Transform, _>(bones[1], |transform| {
+                transform.translation = Vec3::Y;
+                transform.rotation.z = 67.5_f32.to_radians();
+            })
+            .unwrap();
+        scene
+            .with_component_mut::<Transform, _>(bones[2], |transform| {
+                transform.translation = Vec3::Y;
+            })
+            .unwrap();
+        scene.relink_hierarchy();
+        scene.update_world_transforms();
+        let target_y = scene.world_translation(bones[2]).y + 0.08;
+        scene
+            .add_component(
+                rig,
+                FootIk {
+                    enabled: true,
+                    ground_height: target_y,
+                    chains: vec![FootChain {
+                        upper: 0,
+                        mid: 1,
+                        end: 2,
+                        pole_vector: -Vec3::X,
+                    }],
+                },
+            )
+            .unwrap();
+
+        let mut runtime = AnimationRuntime::new();
+        let mut load = clip_loader(AnimClip {
+            name: "rest".to_string(),
+            duration: 1.0,
+            tracks: Vec::new(),
+        });
+        tick_animation(&mut runtime, &mut scene, 0.016, AnimMode::Play, &mut load);
+        scene.update_world_transforms();
+        let foot_y = scene.world_translation(bones[2]).y;
+
+        assert!(
+            (foot_y - target_y).abs() < 1.0e-3,
+            "foot y {foot_y} should reach target {target_y}"
+        );
+    }
 }

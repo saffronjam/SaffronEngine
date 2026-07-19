@@ -49,10 +49,15 @@ beforeAll(async () => {
   });
   // Enter Play and bend the knee, then freeze (playing=false) at a bent pose: the ankle is now
   // below full reach, so it has slack for the IK to lift, and the readings compare one pose.
-  await engine.call("set-component-field", { entity: rigId, component: "AnimationPlayer", field: "playing", value: true });
+  await engine.call("set-component-field", {
+    entity: rigId,
+    component: "AnimationPlayer",
+    field: "autoplay",
+    value: true,
+  });
   await engine.call("play");
   await engine.settle(500);
-  await engine.call("set-component-field", { entity: rigId, component: "AnimationPlayer", field: "playing", value: false });
+  await engine.call("set-animation-playing", { entity: rigId, playing: false });
   await engine.settle(300);
 });
 afterAll(async () => {
