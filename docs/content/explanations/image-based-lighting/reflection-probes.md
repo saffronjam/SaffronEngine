@@ -34,7 +34,7 @@ The serialized component uses `influenceRadius`, `intensity`, `boxProjection`, a
 
 Scene gathering sends at most `MAX_REFLECTION_PROBES = 8` records to the renderer. Each `ReflectionProbeUpload` carries the stable entity ID, world-space origin, component fields, and dirty state. Gathering clears the component's dirty flag after copying it.
 
-The IBL descriptor set reserves three bindings for probes:
+Each frame slot has an IBL descriptor set with three probe bindings:
 
 | Binding | Resource |
 |---:|---|
@@ -42,9 +42,18 @@ The IBL descriptor set reserves three bindings for probes:
 | `4` | Array of eight irradiance cubemaps |
 | `5` | Storage buffer of `ProbeMetaGpu` records |
 
-`ReflectionProbes::seed` and `ReflectionProbes::write_slot` bind the global prefiltered cube and environment cube as valid fallback descriptors for every array element. Global diffuse lighting comes from the sky SH buffer, outside these local-probe arrays. A metadata record occupies 48 bytes: origin and radius, box extent and intensity, then validity and box-projection flags.
+`ReflectionProbes::seed` and `ReflectionProbes::write_slot` bind the global prefiltered cube and
+environment cube as valid fallback descriptors for every array element in every frame set. Global
+diffuse lighting comes from the sky SH buffer, outside these local-probe arrays. A metadata record
+occupies 48 bytes: origin and radius, box extent and intensity, then validity and box-projection
+flags.
 
-`ReflectionProbes::submit` tracks entity, origin, radius, and dirty changes and raises `capture_pending` when a slot needs new data. No renderer operation consumes that flag or marks a slot allocated and valid. Consequently, `upload_meta` writes `valid = 0` for every slot.
+`ReflectionProbes::submit` tracks entity, origin, radius, and dirty changes in CPU state and raises
+`capture_pending` when a slot needs new data. `prepare_frame` writes that state into the metadata
+buffer paired with the frame slot whose fence has completed. Descriptor binding 5 remains fixed for
+the set's lifetime; only bindings 3 and 4 use update-after-bind when the global fallback changes. No
+renderer operation consumes `capture_pending` or marks a slot allocated and valid, so every uploaded
+record keeps `valid = 0`.
 
 > [!NOTE]
 > `sa recapture-probes` marks scene components dirty and causes submission to raise `capture_pending`; it does not capture a cubemap.
@@ -84,8 +93,8 @@ The CPU bit-casts the active record count into `LightUbo.ambient_color.w`. `sa s
 | Scene component | `engine/crates/scene/src/component.rs` | `ReflectionProbe` |
 | Save and load | `engine/crates/scene/src/serde.rs` | `SceneSerialize for ReflectionProbe`, `to_json`, `load_json` |
 | Scene gathering | `engine/crates/assets/src/render_scene.rs` | `gather_reflection_probes` |
-| Upload and metadata | `engine/crates/rendering/src/ibl.rs` | `ReflectionProbeUpload`, `ProbeMetaGpu`, `ReflectionProbes::submit`, `ReflectionProbes::upload_meta` |
-| Descriptor slots | `engine/crates/rendering/src/ibl.rs` | `ReflectionProbes::seed`, `ReflectionProbes::seed_set`, `ReflectionProbes::write_slot` |
+| Upload and metadata | `engine/crates/rendering/src/ibl.rs` | `ReflectionProbeUpload`, `ProbeMetaGpu`, `ReflectionProbes::submit`, `ReflectionProbes::prepare_frame` |
+| Descriptor slots | `engine/crates/rendering/src/ibl.rs` | `ReflectionProbes::seed`, `ReflectionProbes::refresh_fallbacks`, `ReflectionProbes::write_slot` |
 | Shader selection | `engine/assets/shaders/lighting.slang` | `ProbeMeta`, `boxProject`, `probeCubes`, `probeIrradiance`, `probeMeta` |
 | Control commands | `engine/crates/control/src/commands_render.rs` | `set-probes`, `recapture-probes`, `list-probes` |
 

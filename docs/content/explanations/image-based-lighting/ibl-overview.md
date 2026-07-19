@@ -43,7 +43,9 @@ The environment source is a procedural sky, an equirectangular panorama, or the 
 | Prefiltered cube | 256×256 per face, 5 mips | RGBA16F | Specular radiance by roughness |
 | BRDF LUT | 256×256 | RGBA16F | Fresnel scale and bias |
 
-Bindings 0 through 2 of mesh descriptor set 3 contain the SH buffer, prefiltered cube, and BRDF LUT. Reflection-probe arrays and metadata share bindings 3 through 5.
+Each frame slot has a mesh descriptor set 3. Bindings 0 through 2 share the persistent SH buffer,
+prefiltered cube, and BRDF LUT; bindings 3 through 5 carry the probe arrays and that slot's metadata
+buffer.
 
 ## Capture lifetime
 
