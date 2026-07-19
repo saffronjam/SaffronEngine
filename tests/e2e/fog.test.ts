@@ -4,6 +4,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
+import { prepareScene } from "./test-utils.ts";
 import type {
   EntityRef,
   EnvironmentDto,
@@ -18,7 +19,7 @@ beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // Size the scene view small so the extra fullscreen fog dispatch stays cheap on the software
   // rasterizer the headless (weston) surface falls back to.
-  await engine.call("set-viewport-size", { view: "scene", width: 480, height: 270 });
+  await prepareScene(engine);
   // A cube so the depth buffer carries a real near-surface (the closed-form term integrates over
   // reconstructed world position; the validation oracle is content-independent, this exercises it).
   await engine.call("add-entity", { preset: "cube" });
@@ -181,9 +182,7 @@ describe("volumetric quality tiers + temporal knobs", () => {
   });
 
   test("an out-of-range historyBlend is rejected", async () => {
-    await expect(
-      engine.call<EnvironmentDto>("set-fog", { historyBlend: 2 }),
-    ).rejects.toThrow();
+    await expect(engine.call<EnvironmentDto>("set-fog", { historyBlend: 2 })).rejects.toThrow();
   });
 });
 
@@ -335,9 +334,7 @@ describe("aerial perspective", () => {
   });
 
   test("a negative aerialIntensity is rejected", async () => {
-    await expect(
-      engine.call<EnvironmentDto>("set-fog", { aerialIntensity: -1 }),
-    ).rejects.toThrow();
+    await expect(engine.call<EnvironmentDto>("set-fog", { aerialIntensity: -1 })).rejects.toThrow();
   });
 });
 
