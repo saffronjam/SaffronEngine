@@ -7,10 +7,10 @@ weight = 6
 
 Shader compilation turns shader source into [SPIR-V](https://www.khronos.org/spir/), the Khronos
 intermediate form Vulkan drivers ingest. Anima writes every shader in
-[Slang](https://shader-slang.org/) and compiles ahead of time with the `xtask` build-task runner;
-there is no runtime shader compiler. Each entry-point `.slang` file under `engine/assets/shaders/`
-becomes a `.spv` beside the host binary before the engine starts, so shader errors surface at
-build time rather than at first use.
+[Slang](https://shader-slang.org/). The `xtask` build-task runner compiles the engine's static
+entry points ahead of time, while non-foldable material graphs invoke the same compiler when the
+material is authored or cooked. Each static entry-point `.slang` file under
+`engine/assets/shaders/` becomes a `.spv` beside the host binary.
 
 ## One pipeline run
 
@@ -28,10 +28,12 @@ xtask shaders: using slangc /usr/local/bin/slangc
 xtask shaders: 0 compiled, 52 up to date, lighting module up to date -> engine/target/debug/shaders
 ```
 
-A run also copies each `.slang` source next to its `.spv`, because the
+A run also installs every `.slang` file under `shaders/source/`. The
 [node-graph codegen](../../materials-and-pipelines/node-graph-codegen/) splices material graphs
-into the runtime copy of `mesh.slang`. The `models/`, `fonts/`, and `icons/` asset trees are
-copied beside the host binary so `engine_asset_path(...)` resolves them.
+into that copy of `mesh.slang` and resolves imports from the source-only tree. Keeping those sources
+separate from the static `.slang-module` files ensures feature defines propagate through imported
+lighting code. The `models/`, `fonts/`, and `icons/` asset trees are copied beside the host binary
+so `engine_asset_path(...)` resolves them.
 
 ## The flag set
 
@@ -78,10 +80,14 @@ flowchart LR
   lighting --> all[every entry-point .spv]
 ```
 
-The modules compile leaf-first: `octahedral` and `giprobe` and `mdf_brick` have no imports, `sdf`
+The static modules compile leaf-first: `octahedral` and `giprobe` and `mdf_brick` have no imports, `sdf`
 imports `octahedral` plus `mdf_brick`, and `lighting` imports `sdf` plus `giprobe`. The modules
 have consumers beyond `lighting` too: `sdf` feeds `ddgi_trace`, `giprobe` feeds `gi_resolve`, and
 `mdf_brick` feeds the Global-SDF `gdf_cull` / `gdf_composite` passes.
+
+Generated material shaders import the equivalent `.slang` sources from `shaders/source/`. They do
+not load the precompiled modules, because a precompiled import would freeze the module before the
+generated shader's feature defines are applied.
 
 Every entry-point `.spv` carries all six shared sources in its dependency set, so touching any of
 them rebuilds every shader. `is_stale` decides by mtime: an output is rebuilt when it is missing
@@ -90,11 +96,16 @@ files untouched, so a no-op run churns no mtimes.
 
 ## The RT-off übershader variant
 
-`mesh.slang` alone compiles twice. The second output, `mesh_nort.spv`, is built with
+Every mesh übershader compiles twice. For the static shader, the second output,
+`mesh_nort.spv`, is built with
 `-DSAFFRON_NO_RT=1`, which strips the ray-tracing descriptor sets 6 and 7 so the shader's declared
 interface matches the PSO layout on a device without ray tracing. Strict argument-buffer backends
 such as [MoltenVK](https://github.com/KhronosGroup/MoltenVK) reject the mismatch, so at pipeline
 build `nort_variant_path` swaps in the `_nort` sibling when the device lacks ray tracing.
+
+Material codegen applies the same rule to `<uuid>_mesh.spv` and `<uuid>_mesh_nort.spv`. Both
+variants compile from the source-only import tree, so `SAFFRON_NO_RT` reaches `lighting.slang` and
+removes its ray-query declarations.
 
 No other shader needs a variant. The meshlet path is gated on
 [`VK_EXT_mesh_shader`](https://www.khronos.org/blog/mesh-shading-for-vulkan), and a device
@@ -120,7 +131,7 @@ fetches a prebuilt compiler at build time.
 | Flag set + drift guard | `xtask/src/shaders.rs` | `SLANGC_SPV_FLAGS`, `SLANGC_CAPABILITIES`, `spv_arg_vector` |
 | Module precompiles | `xtask/src/shaders.rs` | `compile_module`, `LIGHTING_STEM`, `SDF_STEM` |
 | Staleness + copies | `xtask/src/shaders.rs` | `is_stale`, `copy_if_different` |
-| RT-off variant | `xtask/src/shaders.rs`, `crates/rendering/src/pipelines.rs` | `NO_RT_DEFINE`, `nort_variant_path` |
+| RT-off variants | `xtask/src/shaders.rs`, `crates/assets/src/codegen.rs`, `crates/rendering/src/pipelines.rs` | `NO_RT_DEFINE`, `compile_material_mesh_shader`, `nort_variant_path` |
 | Locating the compiler | `xtask/src/shaders.rs` | `find_slangc`, `SLANG_VERSION` |
 | Shader sources | `assets/shaders/` | `mesh.slang`, `lighting.slang`, `sdf.slang`, … |
 
@@ -128,4 +139,4 @@ fetches a prebuilt compiler at build time.
 
 - [Build environment](../build-environment/) — the toolbox that provisions `slangc`
 - [Übershader and specialization](../../materials-and-pipelines/ubershader-and-specialization/) — what `mesh.spv`'s entry points build
-- [Node-graph codegen](../../materials-and-pipelines/node-graph-codegen/) — why each `.slang` source is copied next to its `.spv`
+- [Node-graph codegen](../../materials-and-pipelines/node-graph-codegen/) — how generated materials compile from the staged source tree

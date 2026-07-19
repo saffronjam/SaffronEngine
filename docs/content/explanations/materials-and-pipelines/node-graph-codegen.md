@@ -93,15 +93,18 @@ Slang.
 
 `compile_material_mesh_shader` inserts the generated body between the `@graph-begin` and
 `@graph-end` markers in `mesh.slang`. It writes
-`materials/<uuid>_mesh.slang` and invokes [Slang](https://shader-slang.org/) to produce
-`materials/<uuid>_mesh.spv` in [SPIR-V](https://registry.khronos.org/SPIR-V/) form.
+`materials/<uuid>_mesh.slang` and invokes [Slang](https://shader-slang.org/) twice to produce
+`materials/<uuid>_mesh.spv` and `materials/<uuid>_mesh_nort.spv` in
+[SPIR-V](https://registry.khronos.org/SPIR-V/) form. The second compile defines
+`SAFFRON_NO_RT=1` for devices whose pipeline layout omits the ray-tracing sets.
 
-The generated consumer imports the shared `lighting` module. The shader build precompiles
-`lighting.slang` and its dependencies to `.slang-module` files beside the runtime shaders, so the
-material compile links those modules through the shader include directory.
+The generated consumer resolves `lighting.slang` and its dependencies from the staged
+`shaders/source/` tree. This source-only include path keeps precompiled static modules out of the
+compile, allowing `SAFFRON_NO_RT` to propagate through every imported declaration.
 
 `material-set-graph` stores the JSON and attempts a mesh-variant compile when folding fails. Material
-resolution selects the `_mesh.spv` artifact when it exists; otherwise it selects the shared mesh
+resolution selects the `_mesh.spv` artifact when it exists; pipeline creation selects its `_nort`
+sibling on a device without ray tracing. A missing generated artifact selects the shared mesh
 shader. The live material preview uses this same resolved scene-material path.
 
 `material-compile-graph` provides a separate compiler check. It wraps the emitted preview body in a
@@ -110,9 +113,9 @@ Compile command calls this validation path rather than changing which scene shad
 
 ## Cooking
 
-`material-cook` scans every material asset, skips graphs that lower to parameters, and rebuilds the
-`_mesh.spv` artifact for each non-foldable graph. `export-app` performs the same material-shader cook
-before copying the project assets, engine shaders, and player into the application folder.
+`material-cook` scans every material asset, skips graphs that lower to parameters, and rebuilds both
+mesh artifacts for each non-foldable graph. `export-app` performs the same material-shader cook before
+copying the project assets, engine shaders, and player into the application folder.
 
 The compiler path resolves `slangc` from `SAFFRON_SLANGC`, the `saffron-slang` cache under `HOME`, or
 `PATH`. Generated paths are passed as discrete process arguments, and compilation succeeds only when
