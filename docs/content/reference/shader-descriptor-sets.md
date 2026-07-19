@@ -13,11 +13,15 @@ The descriptor sets bound by the mesh übershader. The binding declarations live
 | The übershader entry points | `engine/assets/shaders/mesh.slang` | `vertexMain`, `fragmentMain` |
 | The set/binding declarations | `engine/assets/shaders/lighting.slang` | `albedoTextures`, `globals`, `instances`, `materialParams`, `irradianceMap`, … |
 
-## Set 0 — bindless albedo
+## Set 0 — bindless images
 
 | Binding | Slang type | Note |
 |---|---|---|
 | 0 | `Sampler2D albedoTextures[1024]` | one global array, indexed per-instance; size = `MAX_BINDLESS_TEXTURES` |
+| 1 | `Sampler3D sdfTextures[256]` | per-mesh signed-distance bricks |
+| 2 | `Texture3D<uint> sdfIndirection[256]` | brick indirection volumes |
+| 3 | `Sampler3D sdfCoverage[256]` | signed-distance coverage volumes |
+| 4 | `Sampler2D heightMinMaxTextures[1024]` | displacement min/max pyramids |
 
 ## Set 1 — lighting
 
@@ -30,6 +34,12 @@ The descriptor sets bound by the mesh übershader. The binding declarations live
 | 4 | `Sampler2DShadow shadowMap` | directional depth map (PCF compare) |
 | 5 | `Sampler2DShadow spotShadowMap` | spot depth map (PCF compare) |
 | 6 | `SamplerCube pointShadowMap` | omnidirectional distance cube |
+| 7 | `SamplerCube pointShadowMapDynamic` | dynamic omnidirectional distance cube |
+| 8 | `StructuredBuffer<SdfInstance> sdfInstances` | near-field SDF occluder instances |
+| 9 | `Sampler3D gdfCascades[4]` | Global-SDF cascade volumes |
+| 10 | `ConstantBuffer<GdfParams> gdfParams` | Global-SDF transforms and extents |
+| 11 | `Sampler3D<float4> froxelIntegration` | integrated volumetric fog |
+| 12 | `Sampler2DArray<float> cloudShadowMap` | cloud-shadow cascades |
 
 `LightGlobals.counts`: x = punctual count, y = directional shadow, z = IBL, w = SSAO. `screenFlags`: x = contact shadows, y = SSGI, z = DDGI, w = ReSTIR.
 
@@ -58,11 +68,18 @@ The global IBL is sampled for ambient when `globals.counts.z != 0`; the probe ar
 
 | Binding | Slang type | Gate | Note |
 |---|---|---|---|
-| 0 | `Sampler2D aoMap` | `counts.w` | AO factor (1 = open); darkens indirect |
-| 1 | `Sampler2D contactMap` | `screenFlags.x` | contact-shadow factor (1 = lit); darkens directional direct |
-| 2 | `Sampler2D ssgiMap` | `screenFlags.y` | one-bounce GI radiance (rgba16f) |
+| 0 | `Texture2D<float4> aoMap` | `counts.w` | AO factor (1 = open); darkens indirect |
+| 1 | `Texture2D<float4> contactMap` | `screenFlags.x` | contact-shadow factor (1 = lit); darkens directional direct |
+| 2 | `Texture2D<float4> ssgiMap` | `screenFlags.y` | one-bounce GI radiance |
+| 3 | `Texture2D<float4> ssrMap` | `extraFlags.x` | reflected radiance and hit confidence |
+| 4 | `Texture2D<float4> prevColorMesh` | `extraFlags.y` | prior lit frame for RT reflection reprojection |
+| 5 | `Texture2D<float4> dfaoMap` | `sdfOcclusion.y` | resolved sky visibility |
+| 6 | `Texture2D<float4> speoccMap` | `sdfOcclusion.y` | resolved specular occlusion |
+| 7 | `Texture2D<float4> giIndirectMap` | lit opaque path | resolved indirect diffuse |
+| 8 | `SamplerState screenLinearSampler` | always bound | immutable linear sampler shared by bindings 0–7 |
 
-All sampled by screen UV.
+Bindings 0 through 7 are sampled by screen UV through binding 8. Sharing one immutable sampler keeps
+the mesh interface within portability devices' per-stage sampler limit.
 
 ## Sets 5–7 — GI / RT extensions
 
