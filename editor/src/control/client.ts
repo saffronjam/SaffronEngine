@@ -35,6 +35,9 @@ import type {
   EntityList,
   EntityRef,
   Environment,
+  EnvironmentProfileListDto,
+  EnvironmentProfileSummaryDto,
+  ApplyEnvironmentProfileParams,
   FrameHistoryDto,
   GizmoState,
   InspectResult,
@@ -780,8 +783,26 @@ export const client = {
   getEnvironment(): Promise<Environment> {
     return call("get-environment");
   },
+  getEnvironmentDefaults(): Promise<Environment> {
+    return call("get-environment-defaults");
+  },
+  listEnvironmentProfiles(): Promise<EnvironmentProfileListDto> {
+    return call("list-environment-profiles");
+  },
+  saveEnvironmentProfile(name: string, folder?: string): Promise<EnvironmentProfileSummaryDto> {
+    return call("save-environment-profile", { name, folder });
+  },
+  updateEnvironmentProfile(profile: string): Promise<EnvironmentProfileSummaryDto> {
+    return call("update-environment-profile", { profile });
+  },
+  applyEnvironmentProfile(profile: ApplyEnvironmentProfileParams["profile"]): Promise<Environment> {
+    return call("apply-environment-profile", { profile });
+  },
   setEnvironment(env: Partial<Environment>): Promise<Environment> {
     return call("set-environment", env);
+  },
+  replaceEnvironment(env: Environment): Promise<Environment> {
+    return call("set-environment", { json: env });
   },
   /// Merge atmosphere fields over the current environment's `atmosphere` block; the
   /// engine re-bakes the LUT chain next frame. Returns the full updated environment.
