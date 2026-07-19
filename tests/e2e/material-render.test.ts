@@ -13,61 +13,48 @@
 //     renders validation-clean on an entity.
 
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
 import type { EntityRef, InspectResult } from "@saffron/protocol";
+import { bootEngine, captureViewport, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
 const MAPPED = join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb");
-const shots: string[] = [];
-const placed: string[] = [];
+const suiteCleaner = new Cleaner();
+const caseCleaner = new Cleaner();
 
 let mappedAsset: string | undefined;
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
+  engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
+  await prepareScene(engine, {
+    camera: { position: { x: 0.35, y: 0.35, z: 2 }, yaw: 0, pitch: 0 },
+  });
   await engine.call("set-ibl", { args: ["on"] }).catch(() => {});
   // The scratch project's starter scene already carries a Sun directional light.
 });
 afterAll(async () => {
-  await engine?.shutdown();
-  for (const shot of shots) {
-    rmSync(shot, { force: true });
-  }
+  await suiteCleaner.cleanup();
 });
 afterEach(async () => {
-  // Drop each case's entity so overlapping meshes never bleed into the next case's screenshots.
-  while (placed.length > 0) {
-    const id = placed.pop()!;
-    await engine.call("destroy-entity", { entity: id }).catch(() => {});
-  }
+  await caseCleaner.cleanup();
   await engine.settle(150);
 });
 
 async function screenshot(tag: string): Promise<Buffer> {
-  const path = `/tmp/saffron-e2e-matrender-${process.pid}-${tag}.png`;
-  shots.push(path);
-  rmSync(path, { force: true }); // never read a stale frame from a reused tag
-  await engine.call("screenshot", { target: "viewport", path });
-  const deadline = Date.now() + 10_000;
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) {
-      throw new Error(`screenshot ${tag} never landed`);
-    }
-    await engine.settle(100);
-  }
-  await engine.settle(200);
-  return readFileSync(path);
+  return captureViewport(engine, caseCleaner, `matrender-${tag}`);
 }
 
 /// mapped-material.glb is imported once (the bake is expensive); each call instantiates a fresh entity
-/// from the cached asset. Tracked in `placed` so afterEach destroys it.
+/// from the cached asset and registers it for per-test cleanup.
 async function mintMappedEntity(): Promise<EntityRef> {
   mappedAsset ??= (await engine.call<{ id: string }>("import-model", { path: MAPPED })).id;
-  const entity = await engine.call<EntityRef>("instantiate-model", { asset: mappedAsset });
-  placed.push(entity.id);
-  return entity;
+  return trackEntity(
+    caseCleaner,
+    engine,
+    await engine.call<EntityRef>("instantiate-model", { asset: mappedAsset }),
+  );
 }
 
 /// The albedo + packed-ORM texture ids on the mapped entity's referenced `.smat`, plus the slot
@@ -87,7 +74,6 @@ async function mintTextureId(
 
 test("a created .smat material assigned to an entity drives the render", async () => {
   const e = await mintMappedEntity();
-  await engine.call("set-camera", { position: { x: 0.35, y: 0.35, z: 2 }, yaw: 0, pitch: 0 });
   await engine.settle(300);
   const gltfShot = await screenshot("asset-gltf");
 
@@ -107,8 +93,6 @@ test("a created .smat material assigned to an entity drives the render", async (
 
 test("an ORM texture override changes the shaded pixels", async () => {
   const e = await mintMappedEntity();
-  // Frame the fixture's triangle (spans x,y in [0,1], facing +Z) head-on.
-  await engine.call("set-camera", { position: { x: 0.35, y: 0.35, z: 2 }, yaw: 0, pitch: 0 });
   await engine.settle(300);
 
   // The imported metallic-roughness map lives on the slot's referenced `.smat` (packed ORM).
@@ -142,7 +126,6 @@ test("a codegen material compiles a übershader variant and renders on an entity
   const root = isAbsolute(project.root) ? project.root : join(REPO, project.root);
 
   const e = await mintMappedEntity();
-  await engine.call("set-camera", { position: { x: 0.35, y: 0.35, z: 2 }, yaw: 0, pitch: 0 });
   await engine.settle(300);
   const before = await screenshot("cg-before");
 
@@ -160,7 +143,10 @@ test("a codegen material compiles a übershader variant and renders on an entity
       { from: ["mul", "rgba"], to: ["out", "baseColor"] },
     ],
   };
-  const set = await engine.call<{ foldable: boolean }>("material-set-graph", { material: m.id, graph });
+  const set = await engine.call<{ foldable: boolean }>("material-set-graph", {
+    material: m.id,
+    graph,
+  });
   expect(set.foldable).toBe(false); // procedural multiply -> codegen path
 
   // material-set-graph compiled a per-material übershader variant (the splice produced valid Slang).
