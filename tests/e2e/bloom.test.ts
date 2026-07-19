@@ -4,6 +4,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
+import { prepareScene } from "./test-utils.ts";
 import type { RenderStats, SetBloomParams, SetBloomResult } from "@saffron/protocol";
 
 let engine: Engine;
@@ -12,7 +13,7 @@ beforeAll(async () => {
   // Size the scene view small so the bloom pyramid's compute dispatches stay cheap on the software
   // rasterizer the headless (weston) surface falls back to — the base pipeline plus ~13 bloom
   // dispatches at the default swapchain extent would otherwise starve the control drain on llvmpipe.
-  await engine.call("set-viewport-size", { view: "scene", width: 480, height: 270 });
+  await prepareScene(engine);
   // A bright cube so the pyramid has non-trivial HDR energy to spread (the validation oracle does
   // not depend on content, but this exercises the composite lerp on real radiance).
   await engine.call("add-entity", { preset: "cube" });
