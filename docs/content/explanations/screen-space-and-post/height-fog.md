@@ -95,8 +95,9 @@ oriented box or sphere. Soft edges, a local height falloff, albedo, emission, an
 the medium.
 
 Optional tiling 3D noise erodes the density. `noiseScale`, `noiseIntensity`, and `noiseDetail` control
-the two sampled octaves; `wind` and `speed` advect the coordinates over time. A zero noise intensity
-produces uniform density and skips the texture sample.
+the two sampled octaves. A non-zero local `wind` uses the volume's own direction and `speed`; otherwise
+the scene-wide `WindSettings` advects the coordinates from the time-of-day clock. A zero noise
+intensity produces uniform density and skips the texture sample.
 
 The renderer uploads at most `MAX_FOG_VOLUMES` records per frame. Each record contains the inverse
 world transform and packed optical values. The native overlay draws a fog icon and the box or sphere
@@ -104,14 +105,20 @@ bounds so meshless volumes remain selectable.
 
 ## Composition and inspection
 
-The fog composite also reads the
-[aerial-perspective](../aerial-perspective/) volume when enabled. It multiplies fog and atmospheric
-transmittance, attenuates the scene once, and places aerial in-scatter behind the near fog:
+The fog composite also reads the [aerial-perspective](../aerial-perspective/) volume and the
+full-resolution cloud tuple. It multiplies all three transmittances, attenuates the scene once, and
+places aerial and cloud in-scatter behind the near fog:
 
 $$
-T=T_\mathrm{fog}T_\mathrm{aerial}, \qquad
+T=T_\mathrm{fog}T_\mathrm{aerial}T_\mathrm{cloud}, \qquad
 L=cT+L_\mathrm{fog}+T_\mathrm{fog}L_\mathrm{aerial}
+  +T_\mathrm{fog}L'_\mathrm{cloud}
 $$
+
+`L'_cloud` contains the camera-to-cloud atmosphere evaluated at the mean cloud front depth from the
+shared Transmittance and Multiple-Scattering LUTs. It is not multiplied by `T_aerial`, which belongs to
+the background receiver. The directional fog term also samples the cloud-shadow cascades per froxel,
+so cloud gaps produce light shafts without a screen-space radial blur.
 
 Forward transparent materials sample the integrated froxel volume in their mesh shader because they
 do not contribute receiver depth to the opaque depth buffer. `ViewMode::Fog` replaces the frame with
@@ -145,4 +152,5 @@ sa set-view-mode --mode fog
 - [Aerial perspective](../aerial-perspective/) — contributes planetary scattering to the same composite
 - [Bloom](../bloom/) — reads the fogged scene-linear image
 - [Procedural atmosphere](../../image-based-lighting/procedural-atmosphere/) — supplies the sky-view tint
+- [Cloud integration](../../image-based-lighting/cloud-integration/) — supplies cloud atmosphere, shadows, and wind
 - [Compute post-process](../compute-post-process-pattern/) — describes the in-place composite pass
