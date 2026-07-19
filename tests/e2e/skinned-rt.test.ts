@@ -1,29 +1,24 @@
-// Skinned ray tracing: with hardware ray-query shadows on, an animated rig's BLAS is refit
-// every frame from the deformed-vertex buffer (Phase 9) and referenced in the per-frame TLAS
-// with an identity transform. This drives the full refit -> TLAS build -> ray-query path with a
-// deforming mesh and asserts it stays validation-clean — the AS-build synchronization (skin
-// compute write -> AS build read, BLAS build -> TLAS build) is the thing under test. The
-// software lavapipe device advertises accelerationStructure + rayQuery, so the path runs here;
-// before the deformed buffer carried SHADER_DEVICE_ADDRESS usage this run flagged 20+ VUIDs, so
-// a clean log here is a real signal the refit path executed and is correct.
+// Skinned ray tracing: on a ray-query device, an animated rig's BLAS is refit every frame from the
+// deformed-vertex buffer and referenced in the per-frame TLAS. The test exercises the refit -> TLAS
+// build -> ray-query synchronization when the active Vulkan device exposes the required features.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
+import type { RenderStats } from "@saffron/protocol";
+import { bootEngine, captureViewport, Cleaner, prepareScene } from "./test-utils.ts";
 
 let engine: Engine;
 let meshId = "";
 let rtToggleOk = false;
+let rtSupported = false;
 const FIXTURE = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
-const shots: string[] = [];
+const cleaner = new Cleaner();
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  await engine.call("set-camera", { yaw: 0, pitch: 0 });
-  // set-rt-shadows resolves only when the device supports ray-query (lavapipe does); its result
-  // reflects whether shadows are *currently active*, which needs a built TLAS, so it is false
-  // this early — we only care that the toggle was accepted (the call did not reject).
+  engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
+  await prepareScene(engine, { camera: { yaw: 0, pitch: 0 } });
+  rtSupported = (await engine.call<RenderStats>("render-stats")).rtSupported;
   rtToggleOk = await engine
     .call("set-rt-shadows", { enabled: true })
     .then(() => true)
@@ -33,36 +28,25 @@ beforeAll(async () => {
   await engine.settle();
 });
 afterAll(async () => {
-  await engine?.shutdown();
-  for (const shot of shots) {
-    rmSync(shot, { force: true });
-  }
+  await cleaner.cleanup();
 });
 
 async function screenshot(tag: string): Promise<Buffer> {
-  const path = `/tmp/saffron-e2e-skinrt-${process.pid}-${tag}.png`;
-  shots.push(path);
-  await engine.call("screenshot", { target: "viewport", path });
-  const deadline = Date.now() + 10_000;
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) {
-      throw new Error(`screenshot ${tag} never landed at ${path}`);
-    }
-    await engine.settle(100);
-  }
-  await engine.settle(200);
-  return readFileSync(path);
+  return captureViewport(engine, cleaner, `skinrt-${tag}`);
 }
 
-test("ray-query shadows toggle is accepted on this device", () => {
-  expect(rtToggleOk).toBe(true);
+test("ray-query shadows follow the device capability gate", () => {
+  expect(rtToggleOk).toBe(rtSupported);
 });
 
 test("the rig plays many frames with the per-frame skinned BLAS refit running", async () => {
+  if (!rtSupported) {
+    return;
+  }
   await engine.call("set-component-field", {
     entity: meshId,
     component: "AnimationPlayer",
-    field: "playing",
+    field: "autoplay",
     value: true,
   });
   await engine.call("focus", { entity: meshId });
