@@ -82,11 +82,13 @@ clip types themselves are the [animation data model](../../animation/animation-d
 
 Each primitive's morph targets are read as dense position/normal delta streams, then compacted:
 a delta below a squared magnitude of `1e-12` is dropped, and the survivors are stored sparsely
-with their vertex index shifted by the primitive's base. One mesh-global `MorphData` is kept,
-from the first mesh-bearing node that has targets. `finalize_morph` reconciles the target count
-against the mesh-level rest weights, seeds each target's `rest_weight`, and synthesizes the
-names as `morph_{k}`. [Morph targets](../../animation/morph-targets/) covers what the deltas
-drive at runtime.
+with their vertex index shifted by the primitive's base. One mesh-global `MorphData` is kept from
+the first mesh-bearing node that has targets.
+
+`finalize_morph` reconciles the target count against the mesh-level rest weights and seeds each
+target's `rest_weight`. It preserves names from the glTF exporter convention
+`mesh.extras.targetNames`, using `morph_{k}` only when a target has no authored name. [Morph
+targets](../../animation/morph-targets/) covers what the deltas drive at runtime.
 
 ## OBJ through tobj
 

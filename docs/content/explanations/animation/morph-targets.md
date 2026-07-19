@@ -17,9 +17,10 @@ through the rest of the frame as an ordinary deformed vertex stream.
 
 The durable weights live in `MorphComponent { weights, names }` on the mesh-bearing entity, seeded at
 spawn from the asset's META `morph` block: one canonical `0..1` weight per target (the authored rest
-weights, else zeros) and one name per target. Import synthesizes the names as `morph_{k}` in glTF
-channel order. Like `SkinnedMesh`, the component is import-managed identity; the editor treats it as
-neither addable nor removable, and its length must match the mesh's target count.
+weights, else zeros) and one name per target. Import preserves the glTF exporter convention
+`mesh.extras.targetNames` in channel order and uses `morph_{k}` only for targets without an authored
+name. Like `SkinnedMesh`, the component is import-managed identity; the editor treats it as neither
+addable nor removable, and its length must match the mesh's target count.
 
 Animation writes elsewhere. A weight curve is an
 [`AnimTrack`](../animation-data-model/) with `path = Weights` carrying `morph_count`
