@@ -64,6 +64,13 @@ pub fn engine_asset_path(relative: &str) -> PathBuf {
         return PathBuf::from(dir).join(relative);
     }
     if let Ok(exe) = std::env::current_exe() {
+        #[cfg(target_os = "macos")]
+        if let Some(executable_dir) = exe.parent() {
+            let bundled = executable_dir.join("..").join("Resources").join(relative);
+            if bundled.exists() {
+                return bundled;
+            }
+        }
         let mut dir = exe.parent().map(Path::to_path_buf);
         while let Some(candidate) = dir {
             if candidate.join(relative).exists() {
@@ -823,9 +830,9 @@ mod tests {
     /// A live headless device + uploader + descriptors, or `None` (no Vulkan ICD) so the
     /// GPU-backed tests skip rather than fail off-hardware.
     struct GpuFixture {
-        device: Device,
-        descriptors: Descriptors,
         uploader: Uploader,
+        descriptors: Descriptors,
+        device: Device,
     }
 
     fn gpu_or_skip() -> Option<GpuFixture> {
@@ -841,9 +848,9 @@ mod tests {
         let queue = GpuQueue::new(device.graphics_queue);
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         Some(GpuFixture {
-            device,
-            descriptors,
             uploader,
+            descriptors,
+            device,
         })
     }
 

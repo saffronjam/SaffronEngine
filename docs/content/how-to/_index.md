@@ -21,4 +21,4 @@ How-to guides are task-focused recipes for a known goal: each page states the st
 | `write-a-slang-shader` | add a `.slang`, wire it into the `xtask shaders` compile, use the PSO |
 | `toggle-render-features` | `sa set-aa` / `set-clustered` / `set-ssao` / `set-gi` / `set-depth-prepass` |
 | `clean-unused-assets` | the deliberate cleanup workflow: `sa clean-assets` (dry-run) → `delete-unused --confirm` |
-| `export-a-standalone-app` | cook the project into a runnable `saffron-player` folder via **Export App…** or `sa export` |
+| `export-a-standalone-app` | cook the project into a Linux directory or macOS `.app` via **Export App…** or `sa export` |

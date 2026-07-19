@@ -1,12 +1,13 @@
 /// The "Export App" dialog: gathers the app manifest (title + window + present options) and an
-/// output folder, then drives the engine's `export-app` cook over the control plane. The engine
-/// pre-bakes shaders and stages the standalone `saffron-player` + project data into the folder.
+/// output path, then drives the engine's `export-app` cook over the control plane. The engine
+/// pre-bakes shaders and stages `saffron-player` + project data in the native platform layout.
 import { useEffect, useMemo, useState } from "react";
 import { open } from "../shell";
 import { FolderOpen, Package } from "lucide-react";
 import { client } from "../control/client";
 import { useEditorStore, withNativeDialog } from "../state/store";
 import { errorText, notify, notifyError } from "../lib/flash";
+import { IS_MACOS } from "../lib/platform";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -27,8 +28,7 @@ export function ExportModal() {
   const project = useEditorStore((s) => s.project);
 
   const [title, setTitle] = useState("");
-  // The user browses to a PARENT directory; export creates a `<parent>/<title>` subfolder so the
-  // staged player + data never spill loose into the chosen folder.
+  // The user browses to a parent directory; export creates a platform-native child inside it.
   const [parentDir, setParentDir] = useState("");
   const [width, setWidth] = useState(1280);
   const [height, setHeight] = useState(720);
@@ -53,10 +53,10 @@ export function ExportModal() {
     }
   }, [exportModalOpen, project]);
 
-  // The app folder is named after the title (filesystem-sanitized); the full staged path is the
-  // chosen parent joined with it, so the field shows e.g. `…/Downloads/My App`.
+  // The app is named after the title (filesystem-sanitized); macOS adds the bundle extension.
   const folderName = useMemo(() => sanitizeFolderName(title), [title]);
-  const outputDir = parentDir ? `${parentDir.replace(/\/+$/, "")}/${folderName}` : "";
+  const outputName = IS_MACOS ? `${folderName}.app` : folderName;
+  const outputDir = parentDir ? `${parentDir.replace(/\/+$/, "")}/${outputName}` : "";
 
   const pickParentDir = async (): Promise<void> => {
     const selection = await withNativeDialog(() => open({ directory: true, multiple: false }));
@@ -113,7 +113,7 @@ export function ExportModal() {
         <DialogHeader>
           <DialogTitle>Export App</DialogTitle>
           <DialogDescription>
-            Cook the project into a standalone, runnable app folder.
+            Cook the project into a standalone, runnable application.
           </DialogDescription>
         </DialogHeader>
 
@@ -191,7 +191,9 @@ export function ExportModal() {
             <Switch id="export-vsync" checked={vsync} onCheckedChange={setVsync} disabled={busy} />
           </div>
 
-          <p className="text-xs text-muted-foreground">Target: Linux (x86_64)</p>
+          <p className="text-xs text-muted-foreground">
+            Target: {IS_MACOS ? "macOS application bundle" : "Linux (x86_64)"}
+          </p>
           {status ? <p className="text-xs text-destructive">{status}</p> : null}
         </div>
 

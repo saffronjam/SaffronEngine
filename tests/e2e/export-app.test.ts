@@ -1,26 +1,25 @@
 // App export over the control plane: `export-app` cooks the loaded project into a standalone
-// folder (the player binary + project data + engine shaders + an `app.json` manifest), and the
-// exported `saffron-player` boots that folder on its own. This drives the whole Phase 4 pipeline
-// against a real headless engine, then runs the staged player headless-offscreen and asserts a
-// validation-clean run — the proof that an exported app actually runs without the editor.
+// platform-native application (a macOS bundle or Linux folder), and the exported `saffron-player`
+// boots its staged project on its own. The staged player runs headless-offscreen and must exit with
+// a validation-clean log.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Engine, ENGINE_BIN } from "./harness.ts";
+import { Engine } from "./harness.ts";
 
 let engine: Engine;
-let outDir: string | undefined;
+let scratchRoot: string | undefined;
 
 beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterAll(async () => {
   await engine?.shutdown();
-  if (outDir) {
-    rmSync(outDir, { recursive: true, force: true });
+  if (scratchRoot) {
+    rmSync(scratchRoot, { recursive: true, force: true });
   }
 });
 
@@ -30,36 +29,62 @@ interface ExportResult {
 }
 
 test("export-app stages a runnable app folder that the player boots clean", async () => {
-  outDir = mkdtempSync(join(tmpdir(), "saffron-export-"));
+  scratchRoot = mkdtempSync(join(tmpdir(), "saffron-export-"));
+  const outputDir = join(scratchRoot, "E2E App");
+  const appRoot = process.platform === "darwin" ? `${outputDir}.app` : outputDir;
   const app = { title: "E2E App", width: 800, height: 600, fullscreen: false, vsync: true };
 
-  const result = await engine.call<ExportResult>("export-app", { outputDir: outDir, app });
-  expect(result.path).toBe(outDir);
+  const result = await engine.call<ExportResult>("export-app", { outputDir, app });
+  expect(result.path).toBe(appRoot);
+  expect(result.warnings).toEqual([]);
 
-  // The staged folder is complete: the player binary, the manifest, the project, the data dirs,
-  // and the bundled C++ runtime libs (so the folder runs on a host without the toolbox's libc++).
-  for (const file of ["saffron-player", "app.json", "project.json", "libc++.so.1", "libc++abi.so.1"]) {
-    expect(existsSync(join(outDir, file)), `staged ${file}`).toBe(true);
+  const resources =
+    process.platform === "darwin" ? join(appRoot, "Contents", "Resources") : appRoot;
+  const player =
+    process.platform === "darwin"
+      ? join(appRoot, "Contents", "MacOS", "saffron-player")
+      : join(appRoot, "saffron-player");
+
+  for (const file of [player, join(resources, "app.json"), join(resources, "project.json")]) {
+    expect(existsSync(file), `staged ${file}`).toBe(true);
   }
-  expect(statSync(join(outDir, "assets")).isDirectory(), "staged assets/").toBe(true);
-  expect(statSync(join(outDir, "shaders")).isDirectory(), "staged shaders/").toBe(true);
+  expect(statSync(join(resources, "assets")).isDirectory(), "staged assets/").toBe(true);
+  expect(statSync(join(resources, "shaders")).isDirectory(), "staged shaders/").toBe(true);
+
+  if (process.platform === "darwin") {
+    for (const file of [
+      join(appRoot, "Contents", "Info.plist"),
+      join(appRoot, "Contents", "Frameworks", "libMoltenVK.dylib"),
+      join(resources, "licenses", "MoltenVK-LICENSE.txt"),
+    ]) {
+      expect(existsSync(file), `staged ${file}`).toBe(true);
+    }
+  } else {
+    for (const file of ["libc++.so.1", "libc++abi.so.1"]) {
+      expect(existsSync(join(appRoot, file)), `staged ${file}`).toBe(true);
+    }
+  }
 
   // app.json round-trips the manifest the editor passed.
-  const manifest = JSON.parse(readFileSync(join(outDir, "app.json"), "utf8"));
+  const manifest = JSON.parse(readFileSync(join(resources, "app.json"), "utf8"));
   expect(manifest.title).toBe("E2E App");
   expect(manifest.width).toBe(800);
   expect(manifest.height).toBe(600);
 
   // The exported player boots the staged folder headless-offscreen for a few frames, loading the
   // project and running a validation-clean frame loop — no editor, no control plane.
-  const player = join(dirname(ENGINE_BIN), "saffron-player");
+  const runEnv = {
+    ...process.env,
+    SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
+    SAFFRON_EXIT_AFTER_FRAMES: "8",
+  };
+  delete runEnv.SAFFRON_PROJECT;
+  if (process.platform === "darwin") {
+    delete runEnv.VK_DRIVER_FILES;
+    delete runEnv.VK_ICD_FILENAMES;
+  }
   const run = spawnSync(player, [], {
-    env: {
-      ...process.env,
-      SAFFRON_PROJECT: outDir,
-      SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
-      SAFFRON_EXIT_AFTER_FRAMES: "8",
-    },
+    env: runEnv,
     encoding: "utf8",
     timeout: 90_000,
   });

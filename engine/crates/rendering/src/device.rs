@@ -599,25 +599,44 @@ impl Drop for Device {
 /// macOS has no native Vulkan and no default search entry for Homebrew's `/opt/homebrew/lib`
 /// (Apple Silicon) or `/usr/local/lib` (Intel); worse, macOS strips `DYLD_*` env vars across the
 /// editor→host spawn (SIP), so a `DYLD_FALLBACK_LIBRARY_PATH` cannot be relied on to reach here.
-/// So on macOS the known Homebrew loader paths are tried by absolute path first, falling back to
-/// the default `Entry::load` (a bundled/`install_name`-resolved loader). The loader then finds
-/// MoltenVK through `VK_ICD_FILENAMES` (a non-`DYLD_` var that does survive the spawn).
+/// On macOS an exported app's bundled MoltenVK library is loaded directly. Development runs try the
+/// known Homebrew Vulkan loader paths so validation layers remain available, then fall back to the
+/// default `Entry::load`.
 fn load_entry() -> Result<ash::Entry> {
     // SAFETY: the ash seam. `Entry::load*` dynamically loads `libvulkan`; the returned entry owns
     // the loader for the caller's use.
     #[cfg(target_os = "macos")]
     {
-        const LOADER_PATHS: [&str; 4] = [
-            "/opt/homebrew/lib/libvulkan.dylib",
-            "/opt/homebrew/lib/libvulkan.1.dylib",
-            "/usr/local/lib/libvulkan.dylib",
-            "/usr/local/lib/libvulkan.1.dylib",
-        ];
-        for path in LOADER_PATHS {
-            if std::path::Path::new(path).exists() {
-                if let Ok(entry) = unsafe { ash::Entry::load_from(path) } {
-                    return Ok(entry);
-                }
+        let mut loader_paths = Vec::new();
+        if let Some(executable_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        {
+            let bundled_moltenvk = executable_dir
+                .join("..")
+                .join("Frameworks")
+                .join("libMoltenVK.dylib");
+            if bundled_moltenvk.is_file()
+                && let Ok(entry) = unsafe { ash::Entry::load_from(&bundled_moltenvk) }
+            {
+                return Ok(entry);
+            }
+        }
+        loader_paths.extend(
+            [
+                "/opt/homebrew/lib/libvulkan.dylib",
+                "/opt/homebrew/lib/libvulkan.1.dylib",
+                "/usr/local/lib/libvulkan.dylib",
+                "/usr/local/lib/libvulkan.1.dylib",
+            ]
+            .into_iter()
+            .map(std::path::PathBuf::from),
+        );
+        for path in loader_paths {
+            if path.is_file()
+                && let Ok(entry) = unsafe { ash::Entry::load_from(&path) }
+            {
+                return Ok(entry);
             }
         }
     }
@@ -1522,14 +1541,11 @@ mod tests {
         assert!(DevicePreference::Discrete > DevicePreference::Cpu);
     }
 
-    /// The feature-probe chain degrades correctly on a software device: the device
-    /// is created regardless of which optional features are present, and the
-    /// optional-feature flags never gate selection. On the toolbox's llvmpipe the
-    /// `software_gpu` flag is set; whether `rt_supported` is true or false (Mesa's
-    /// lavapipe advertises ray-query, so it may be true), the device is still built
-    /// and usable. Skips cleanly when no Vulkan device is obtainable.
+    /// The feature-probe chain creates an offscreen device regardless of which optional features
+    /// are present. Linux may select llvmpipe or a host GPU, while macOS selects MoltenVK; none of
+    /// those choices changes the optional-feature invariants. Skips when no device is obtainable.
     #[test]
-    fn software_device_probe_does_not_gate_selection() {
+    fn offscreen_device_probe_does_not_gate_selection() {
         let device = match Device::new(&SurfaceSource::Offscreen) {
             Ok(device) => device,
             Err(err) => {
@@ -1538,16 +1554,8 @@ mod tests {
             }
         };
 
-        // The offscreen toolbox device is the llvmpipe software rasterizer.
-        assert!(
-            device.capabilities.software_gpu,
-            "the offscreen toolbox device is the llvmpipe software rasterizer"
-        );
-        // RT is optional: whatever its probed value, selection still succeeded — the
-        // device is fully usable. The offscreen device carries no surface (it never
-        // presents), and an idle wait returns cleanly. (`rt_supported` is intentionally
-        // not asserted to a fixed value: lavapipe advertises ray-query, a hardware GPU
-        // may differ.)
+        // RT and software classification are probed properties, not selection gates. The offscreen
+        // device carries no surface, and an idle wait returns cleanly on every backend.
         assert!(
             device.surface().is_none(),
             "the offscreen device creates no surface"
