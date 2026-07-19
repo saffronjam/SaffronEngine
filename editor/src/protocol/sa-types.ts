@@ -942,6 +942,28 @@ export interface TodTintSettingsDto {
   blue: TodCurvePointDto[];
 }
 
+export interface EnvironmentProfileListDto {
+  profiles: EnvironmentProfileSummaryDto[];
+}
+
+export interface EnvironmentProfileSummaryDto {
+  reference: { "kind": "builtin", profile: ("neutral" | "clear-day" | "golden-hour" | "overcast" | "night"), } | { "kind": "asset", id: WireUuid, };
+  name: string;
+}
+
+export interface SaveEnvironmentProfileParams {
+  name: string;
+  folder?: string;
+}
+
+export interface UpdateEnvironmentProfileParams {
+  profile: WireUuid;
+}
+
+export interface ApplyEnvironmentProfileParams {
+  profile: { "kind": "builtin", profile: ("neutral" | "clear-day" | "golden-hour" | "overcast" | "night"), } | { "kind": "asset", id: WireUuid, };
+}
+
 export interface SetEnvironmentParams {
   json?: unknown;
   skyMode?: "color" | "texture" | "procedural";
@@ -1750,7 +1772,7 @@ export interface AssetList {
 export interface AssetEntryDto {
   id: WireUuid;
   name: string;
-  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut";
+  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut" | "environment";
   path: string;
   folder?: string;
   container?: WireUuid;
@@ -1952,7 +1974,7 @@ export interface AssetMetadataParams {
 export interface AssetMetadataDto {
   id: WireUuid;
   name: string;
-  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut";
+  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut" | "environment";
   path: string;
   folder?: string;
   sizeBytes: number;
@@ -2261,6 +2283,11 @@ export interface CommandParamsMap {
   "focus": EntityParams;
   "get-world-transform": EntityParams;
   "get-environment": EmptyParams;
+  "get-environment-defaults": EmptyParams;
+  "list-environment-profiles": EmptyParams;
+  "save-environment-profile": SaveEnvironmentProfileParams;
+  "update-environment-profile": UpdateEnvironmentProfileParams;
+  "apply-environment-profile": ApplyEnvironmentProfileParams;
   "set-environment": SetEnvironmentParams;
   "set-atmosphere": SetAtmosphereParams;
   "set-fog": SetFogParams;
@@ -2445,6 +2472,11 @@ export interface CommandResultMap {
   "focus": EntityRef;
   "get-world-transform": WorldTransformResult;
   "get-environment": EnvironmentDto;
+  "get-environment-defaults": EnvironmentDto;
+  "list-environment-profiles": EnvironmentProfileListDto;
+  "save-environment-profile": EnvironmentProfileSummaryDto;
+  "update-environment-profile": EnvironmentProfileSummaryDto;
+  "apply-environment-profile": EnvironmentDto;
   "set-environment": EnvironmentDto;
   "set-atmosphere": EnvironmentDto;
   "set-fog": EnvironmentDto;

@@ -380,6 +380,41 @@
       "fixture": "empty"
     },
     {
+      "name": "get-environment-defaults",
+      "params": "EmptyParams",
+      "result": "EnvironmentDto",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "list-environment-profiles",
+      "params": "EmptyParams",
+      "result": "EnvironmentProfileListDto",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "save-environment-profile",
+      "params": "SaveEnvironmentProfileParams",
+      "result": "EnvironmentProfileSummaryDto",
+      "status": "typed",
+      "fixture": "environment-profile-save"
+    },
+    {
+      "name": "update-environment-profile",
+      "params": "UpdateEnvironmentProfileParams",
+      "result": "EnvironmentProfileSummaryDto",
+      "status": "typed",
+      "fixture": "environment-profile-update"
+    },
+    {
+      "name": "apply-environment-profile",
+      "params": "ApplyEnvironmentProfileParams",
+      "result": "EnvironmentDto",
+      "status": "typed",
+      "fixture": "environment-profile-clear-day"
+    },
+    {
       "name": "set-environment",
       "params": "SetEnvironmentParams",
       "result": "EnvironmentDto",

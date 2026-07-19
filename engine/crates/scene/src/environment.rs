@@ -441,7 +441,7 @@ impl Default for SceneEnvironment {
 /// A project asset's kind.
 ///
 /// A model imported and baked to a mesh, a texture, an animation clip, a `.smat`
-/// material, or a `.smodel` container (the parent of its embedded sub-assets).
+/// material, an environment profile, or a `.smodel` container.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AssetType {
     /// A baked mesh (the default).
@@ -459,6 +459,8 @@ pub enum AssetType {
     Model,
     /// A creative 3D look-up table (`.cube` import or a baked `.slut`).
     Lut,
+    /// A complete reusable scene environment (`.senv`).
+    Environment,
 }
 
 /// How a texture's bytes are interpreted on upload.

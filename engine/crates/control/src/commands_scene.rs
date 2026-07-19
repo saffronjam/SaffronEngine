@@ -1,4 +1,4 @@
-//! The 44 scene-domain control commands: entity lifecycle (create/add/destroy/copy/
+//! The 50 scene-edit control commands registered here: entity lifecycle (create/add/destroy/copy/
 //! rename/parent), the registry-driven component commands (add/remove/set/set-field/
 //! order), selection (select/deselect/get-selection), picking + inspect + focus +
 //! world-transform, the editor camera + gizmo + fly/script input, the play-state machine
@@ -13,32 +13,39 @@
 //! The `get/set-debug-overlays` commands live in the animation domain
 //! (`commands_animation.rs`), `set-probes` / `recapture-probes` / `list-probes` in the
 //! render domain (`commands_render.rs`), and `quit` / `create-script` /
-//! `get-script-schema` in the asset domain / host. This file holds the remaining 44.
+//! `get-script-schema` in the asset domain / host.
 
-use saffron_assets::{BuiltinMesh, model_render_aabb, pick_entity};
+use saffron_assets::{
+    BuiltinMesh, builtin_environment_profile, builtin_environment_profiles,
+    load_environment_profile, model_render_aabb, pick_entity, save_environment_profile,
+    update_environment_profile,
+};
 use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3};
 use saffron_protocol::{
-    AddComponentResult, AddEntityParams, AddEntityPreset, AtmosphereSettingsDto, CloudSettingsDto,
-    ComponentList, ComponentParams, CreateEntityParams, DeselectResult, DestroyEntityResult,
+    AddComponentResult, AddEntityParams, AddEntityPreset, ApplyEnvironmentProfileParams,
+    AtmosphereSettingsDto, BuiltinEnvironmentProfileDto, CloudSettingsDto, ComponentList,
+    ComponentParams, CreateEntityParams, DeselectResult, DestroyEntityResult,
     DrainScriptErrorsParams, DrainScriptErrorsResult, DrainScriptLogsParams, DrainScriptLogsResult,
     EditorCamera, EmptyParams, EntityList, EntityListEntry, EntityParams, EntityRef,
-    EnvironmentDto, FlyInputParams, FlyInputResult, FogMode as FogModeDto,
+    EnvironmentDto, EnvironmentProfileListDto, EnvironmentProfileRefDto,
+    EnvironmentProfileSummaryDto, FlyInputParams, FlyInputResult, FogMode as FogModeDto,
     FogQuality as FogQualityDto, FogSettingsDto, GizmoOpDto, GizmoPointerParams, GizmoPointerPhase,
     GizmoPointerResult, GizmoSpaceDto, GizmoState, InspectResult, PickKind, PickParams, PickResult,
-    PlayStateResult, RemoveComponentResult, RenameEntityParams, ScriptErrorDto, ScriptInputParams,
-    ScriptInputResult, ScriptLogDto, ScriptStatusResult, SelectionResult, SetAtmosphereParams,
-    SetCameraParams, SetCloudsParams, SetComponentFieldParams, SetComponentFieldResult,
-    SetComponentOrderParams, SetComponentOrderResult, SetComponentParams, SetComponentResult,
-    SetEnvironmentParams, SetFogParams, SetGizmoParams, SetLightParams, SetParentParams,
-    SetScriptOverrideParams, SetScriptOverrideResult, SetTimeOfDayParams, SetTransformParams,
-    SetWindParams, SkyModeDto, StepParams, TimeOfDaySettingsDto, TodCurvePointDto,
-    TodTintSettingsDto, Uuid as WireUuid, Vec3, WindSettingsDto,
+    PlayStateResult, RemoveComponentResult, RenameEntityParams, SaveEnvironmentProfileParams,
+    ScriptErrorDto, ScriptInputParams, ScriptInputResult, ScriptLogDto, ScriptStatusResult,
+    SelectionResult, SetAtmosphereParams, SetCameraParams, SetCloudsParams,
+    SetComponentFieldParams, SetComponentFieldResult, SetComponentOrderParams,
+    SetComponentOrderResult, SetComponentParams, SetComponentResult, SetEnvironmentParams,
+    SetFogParams, SetGizmoParams, SetLightParams, SetParentParams, SetScriptOverrideParams,
+    SetScriptOverrideResult, SetTimeOfDayParams, SetTransformParams, SetWindParams, SkyModeDto,
+    StepParams, TimeOfDaySettingsDto, TodCurvePointDto, TodTintSettingsDto,
+    UpdateEnvironmentProfileParams, Uuid as WireUuid, Vec3, WindSettingsDto,
 };
 use saffron_scene::{
-    Bone, Camera, CameraView, CloudSettings, ComponentTraits, DirectionalLight, Entity,
+    AssetType, Bone, Camera, CameraView, CloudSettings, ComponentTraits, DirectionalLight, Entity,
     FogMode as SceneFogMode, FogQuality as SceneFogQuality, IdComponent, MaterialSet, MaterialSlot,
-    Mesh, Name, PointLight, PreviewGhost, Relationship, Script, SkyMode, SpotLight,
-    TimeOfDaySettings, TodCurve, Transform, WindSettings, environment_from_json,
+    Mesh, Name, PointLight, PreviewGhost, Relationship, SceneEnvironment, Script, SkyMode,
+    SpotLight, TimeOfDaySettings, TodCurve, Transform, WindSettings, environment_from_json,
     environment_to_json,
 };
 use saffron_sceneedit::{
@@ -275,9 +282,8 @@ fn camera_dto(camera: &SceneEditCamera) -> EditorCamera {
     }
 }
 
-/// The active scene's environment as its wire DTO.
-fn environment_dto(ctx: &mut EngineContext<'_>) -> EnvironmentDto {
-    let environment = &ctx.scene_edit.active_scene().environment;
+/// A complete scene environment as its wire DTO.
+fn scene_environment_dto(environment: &SceneEnvironment) -> EnvironmentDto {
     let atmosphere = &environment.atmosphere;
     let fog = &environment.fog;
     let cloud = &environment.cloud;
@@ -396,6 +402,32 @@ fn environment_dto(ctx: &mut EngineContext<'_>) -> EnvironmentDto {
             coverage_curve: tod_curve_dto(&time.coverage_curve),
             cloud_type_curve: tod_curve_dto(&time.cloud_type_curve),
         },
+    }
+}
+
+/// The active scene's environment as its wire DTO.
+fn environment_dto(ctx: &mut EngineContext<'_>) -> EnvironmentDto {
+    scene_environment_dto(&ctx.scene_edit.active_scene().environment)
+}
+
+fn builtin_environment_profile_key(profile: BuiltinEnvironmentProfileDto) -> &'static str {
+    match profile {
+        BuiltinEnvironmentProfileDto::Neutral => "neutral",
+        BuiltinEnvironmentProfileDto::ClearDay => "clear-day",
+        BuiltinEnvironmentProfileDto::GoldenHour => "golden-hour",
+        BuiltinEnvironmentProfileDto::Overcast => "overcast",
+        BuiltinEnvironmentProfileDto::Night => "night",
+    }
+}
+
+fn builtin_environment_profile_dto(key: &str) -> Option<BuiltinEnvironmentProfileDto> {
+    match key {
+        "neutral" => Some(BuiltinEnvironmentProfileDto::Neutral),
+        "clear-day" => Some(BuiltinEnvironmentProfileDto::ClearDay),
+        "golden-hour" => Some(BuiltinEnvironmentProfileDto::GoldenHour),
+        "overcast" => Some(BuiltinEnvironmentProfileDto::Overcast),
+        "night" => Some(BuiltinEnvironmentProfileDto::Night),
+        _ => None,
     }
 }
 
@@ -1089,6 +1121,120 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
         "get-environment",
         "get-environment — dump the scene sky/environment settings",
         |ctx, _params| Ok(environment_dto(ctx)),
+    );
+
+    reg.register::<EmptyParams, EnvironmentDto>(
+        "get-environment-defaults",
+        "get-environment-defaults — dump the canonical environment defaults",
+        |_ctx, _params| Ok(scene_environment_dto(&SceneEnvironment::default())),
+    );
+
+    reg.register::<EmptyParams, EnvironmentProfileListDto>(
+        "list-environment-profiles",
+        "list-environment-profiles — list built-in and project environment profiles",
+        |ctx, _params| {
+            let mut profiles = builtin_environment_profiles()
+                .into_iter()
+                .filter_map(|profile| {
+                    Some(EnvironmentProfileSummaryDto {
+                        reference: EnvironmentProfileRefDto::Builtin {
+                            profile: builtin_environment_profile_dto(profile.key)?,
+                        },
+                        name: profile.name.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut project_profiles = ctx
+                .assets
+                .catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.asset_type == AssetType::Environment)
+                .map(|entry| EnvironmentProfileSummaryDto {
+                    reference: EnvironmentProfileRefDto::Asset {
+                        id: WireUuid(entry.id.value()),
+                    },
+                    name: entry.name.clone(),
+                })
+                .collect::<Vec<_>>();
+            project_profiles.sort_by(|a, b| a.name.cmp(&b.name));
+            profiles.extend(project_profiles);
+            Ok(EnvironmentProfileListDto { profiles })
+        },
+    );
+
+    reg.register::<SaveEnvironmentProfileParams, EnvironmentProfileSummaryDto>(
+        "save-environment-profile",
+        "save-environment-profile {name, folder?} — save the active environment as a project profile",
+        |ctx, params| {
+            let name = params.name.trim();
+            if name.is_empty() {
+                return Err(Error::command("environment profile name cannot be empty"));
+            }
+            let environment = ctx.scene_edit.active_scene().environment.clone();
+            let id = save_environment_profile(
+                ctx.assets,
+                &environment,
+                name,
+                params.folder.as_deref().unwrap_or_default(),
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let entry = ctx
+                .assets
+                .catalog
+                .find(id)
+                .ok_or_else(|| Error::command("saved environment profile is not in the catalog"))?;
+            Ok(EnvironmentProfileSummaryDto {
+                reference: EnvironmentProfileRefDto::Asset {
+                    id: WireUuid(id.value()),
+                },
+                name: entry.name.clone(),
+            })
+        },
+    );
+
+    reg.register::<UpdateEnvironmentProfileParams, EnvironmentProfileSummaryDto>(
+        "update-environment-profile",
+        "update-environment-profile {profile} — replace a project profile with the active environment",
+        |ctx, params| {
+            let id = params.profile.into();
+            let environment = ctx.scene_edit.active_scene().environment.clone();
+            update_environment_profile(ctx.assets, id, &environment)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let entry = ctx
+                .assets
+                .catalog
+                .find(id)
+                .ok_or_else(|| Error::command("updated environment profile is not in the catalog"))?;
+            Ok(EnvironmentProfileSummaryDto {
+                reference: EnvironmentProfileRefDto::Asset { id: params.profile },
+                name: entry.name.clone(),
+            })
+        },
+    );
+
+    reg.register::<ApplyEnvironmentProfileParams, EnvironmentDto>(
+        "apply-environment-profile",
+        "apply-environment-profile {profile} — apply a complete environment profile",
+        |ctx, params| {
+            let environment = match params.profile {
+                EnvironmentProfileRefDto::Builtin { profile } => {
+                    let key = builtin_environment_profile_key(profile);
+                    builtin_environment_profile(key)
+                        .ok_or_else(|| {
+                            Error::command(format!("unknown environment profile '{key}'"))
+                        })?
+                        .environment
+                }
+                EnvironmentProfileRefDto::Asset { id } => {
+                    load_environment_profile(ctx.assets, id.into())
+                        .map_err(|error| Error::command(error.to_string()))?
+                }
+            };
+            ctx.scene_edit.active_scene().environment = environment;
+            ctx.scene_edit.scene_version += 1;
+            Ok(environment_dto(ctx))
+        },
     );
 
     // Merges the provided fields over the current environment (same wire shape as the scene

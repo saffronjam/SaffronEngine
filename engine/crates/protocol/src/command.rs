@@ -3,7 +3,7 @@
 //! `register_*_commands` joins this table to handler fns by name to dispatch, and the
 //! OpenRPC/manifest emitters read the same slice to emit `methods`.
 //!
-//! [`COMMANDS`] holds exactly the **162 typed commands** in the frozen wire order (the committed
+//! [`COMMANDS`] holds exactly the **186 typed commands** in the frozen wire order (the committed
 //! `schemas/control/command-manifest.generated.json` order, `ping` first, `quit` last) — the order
 //! is load-bearing: it is the manifest's `commands` order and the OpenRPC `methods` order, so the
 //! emitters reproduce the committed artifacts byte-for-byte. The lone untyped reflective builtin
@@ -32,7 +32,7 @@ pub struct CommandSpec {
     pub result: &'static str,
 }
 
-/// The 162 typed commands in frozen wire order (`help` excluded — see module docs).
+/// The 186 typed commands in frozen wire order (`help` excluded — see module docs).
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ping",
@@ -356,6 +356,36 @@ pub static COMMANDS: &[CommandSpec] = &[
         name: "get-environment",
         summary: "get environment settings",
         params: "EmptyParams",
+        result: "EnvironmentDto",
+    },
+    CommandSpec {
+        name: "get-environment-defaults",
+        summary: "get the canonical environment defaults",
+        params: "EmptyParams",
+        result: "EnvironmentDto",
+    },
+    CommandSpec {
+        name: "list-environment-profiles",
+        summary: "list built-in and project environment profiles",
+        params: "EmptyParams",
+        result: "EnvironmentProfileListDto",
+    },
+    CommandSpec {
+        name: "save-environment-profile",
+        summary: "save the active environment as a project profile",
+        params: "SaveEnvironmentProfileParams",
+        result: "EnvironmentProfileSummaryDto",
+    },
+    CommandSpec {
+        name: "update-environment-profile",
+        summary: "replace a project profile with the active environment",
+        params: "UpdateEnvironmentProfileParams",
+        result: "EnvironmentProfileSummaryDto",
+    },
+    CommandSpec {
+        name: "apply-environment-profile",
+        summary: "apply a complete environment profile",
+        params: "ApplyEnvironmentProfileParams",
         result: "EnvironmentDto",
     },
     CommandSpec {
@@ -1183,6 +1213,11 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("focus", "cube-entity"),
     ("get-world-transform", "cube-entity"),
     ("get-environment", "empty"),
+    ("get-environment-defaults", "empty"),
+    ("list-environment-profiles", "empty"),
+    ("save-environment-profile", "environment-profile-save"),
+    ("update-environment-profile", "environment-profile-update"),
+    ("apply-environment-profile", "environment-profile-clear-day"),
     ("set-environment", "environment-intensity"),
     ("set-atmosphere", "atmosphere-disabled"),
     ("set-fog", "fog-disabled"),
@@ -1680,6 +1715,13 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "PickResult",
     "InspectResult",
     "EnvironmentDto",
+    "BuiltinEnvironmentProfileDto",
+    "EnvironmentProfileRefDto",
+    "EnvironmentProfileSummaryDto",
+    "EnvironmentProfileListDto",
+    "SaveEnvironmentProfileParams",
+    "UpdateEnvironmentProfileParams",
+    "ApplyEnvironmentProfileParams",
     "SetEnvironmentParams",
     "SetAtmosphereParams",
     "SetFogParams",
@@ -1967,6 +2009,11 @@ mod tests {
             "focus",
             "get-world-transform",
             "get-environment",
+            "get-environment-defaults",
+            "list-environment-profiles",
+            "save-environment-profile",
+            "update-environment-profile",
+            "apply-environment-profile",
             "set-environment",
             "set-atmosphere",
             "set-fog",

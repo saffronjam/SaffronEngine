@@ -27,6 +27,7 @@ mod cache;
 mod catalog;
 mod codegen;
 mod cube;
+mod environment_profile;
 mod error;
 mod gpu;
 mod graph;
@@ -56,6 +57,10 @@ pub use catalog::{
 };
 pub use codegen::find_slangc;
 pub use cube::{BakedLut, CubeError, CubeLut, parse_cube};
+pub use environment_profile::{
+    BuiltinEnvironmentProfile, builtin_environment_profile, builtin_environment_profiles,
+    load_environment_profile, save_environment_profile, update_environment_profile,
+};
 pub use error::{Error, Result};
 pub use gpu::{GpuUploader, RendererUploader};
 pub use graph::{emit_graph_surface, lower_graph_to_params};
@@ -320,12 +325,12 @@ impl AssetServer {
 
     /// Creates the standard asset subdirectories under the root, idempotently.
     ///
-    /// `models/`, `textures/`, `materials/` live under the asset root. The thumbnail cache
+    /// Standard typed-asset directories live under the asset root. The thumbnail cache
     /// is app-level (shared across projects) and created lazily on first write. Directory
     /// creation errors are swallowed: a missing dir surfaces later as the real I/O failure
     /// that needs it.
     pub fn ensure_asset_directories(&self) {
-        for sub in ["models", "textures", "materials", "luts"] {
+        for sub in ["models", "textures", "materials", "luts", "environments"] {
             let _ = std::fs::create_dir_all(self.root.join(sub));
         }
     }

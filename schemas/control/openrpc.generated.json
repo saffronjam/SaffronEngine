@@ -978,6 +978,96 @@
       }
     },
     {
+      "name": "get-environment-defaults",
+      "summary": "get the canonical environment defaults",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentDto"
+        }
+      }
+    },
+    {
+      "name": "list-environment-profiles",
+      "summary": "list built-in and project environment profiles",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentProfileListDto"
+        }
+      }
+    },
+    {
+      "name": "save-environment-profile",
+      "summary": "save the active environment as a project profile",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SaveEnvironmentProfileParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentProfileSummaryDto"
+        }
+      }
+    },
+    {
+      "name": "update-environment-profile",
+      "summary": "replace a project profile with the active environment",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/UpdateEnvironmentProfileParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentProfileSummaryDto"
+        }
+      }
+    },
+    {
+      "name": "apply-environment-profile",
+      "summary": "apply a complete environment profile",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ApplyEnvironmentProfileParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentDto"
+        }
+      }
+    },
+    {
       "name": "set-environment",
       "summary": "set environment settings",
       "params": [
@@ -3700,6 +3790,18 @@
         },
         "required": []
       },
+      "ApplyEnvironmentProfileParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "$ref": "#/components/schemas/EnvironmentProfileRefDto"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
       "ApplyImpulseParams": {
         "type": "object",
         "additionalProperties": false,
@@ -3810,7 +3912,8 @@
               "animation",
               "material",
               "model",
-              "lut"
+              "lut",
+              "environment"
             ]
           },
           "path": {
@@ -3890,7 +3993,8 @@
               "animation",
               "material",
               "model",
-              "lut"
+              "lut",
+              "environment"
             ]
           },
           "path": {
@@ -4158,7 +4262,8 @@
           "animation",
           "material",
           "model",
-          "lut"
+          "lut",
+          "environment"
         ]
       },
       "AssetUsageDto": {
@@ -4510,6 +4615,16 @@
           "accel",
           "ready",
           "failed"
+        ]
+      },
+      "BuiltinEnvironmentProfileDto": {
+        "type": "string",
+        "enum": [
+          "neutral",
+          "clear-day",
+          "golden-hour",
+          "overcast",
+          "night"
         ]
       },
       "Camera": {
@@ -5836,6 +5951,80 @@
           "cloud",
           "wind",
           "timeOfDay"
+        ]
+      },
+      "EnvironmentProfileListDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentProfileSummaryDto"
+            }
+          }
+        },
+        "required": [
+          "profiles"
+        ]
+      },
+      "EnvironmentProfileRefDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "profile": {
+                "type": "string",
+                "enum": [
+                  "neutral",
+                  "clear-day",
+                  "golden-hour",
+                  "overcast",
+                  "night"
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "const": "builtin"
+              }
+            },
+            "required": [
+              "kind",
+              "profile"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "asset"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ]
+          }
+        ]
+      },
+      "EnvironmentProfileSummaryDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/EnvironmentProfileRefDto"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reference",
+          "name"
         ]
       },
       "ExportAppParams": {
@@ -8940,6 +9129,21 @@
           "collisionLayer"
         ]
       },
+      "SaveEnvironmentProfileParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "folder": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
       "ScanAssetsResult": {
         "type": "object",
         "additionalProperties": false,
@@ -11368,6 +11572,18 @@
           "translation",
           "scale",
           "rotation"
+        ]
+      },
+      "UpdateEnvironmentProfileParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile"
         ]
       },
       "UpscaleDto": {

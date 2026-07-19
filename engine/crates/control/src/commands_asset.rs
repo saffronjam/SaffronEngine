@@ -105,6 +105,7 @@ fn asset_type_dto(asset_type: AssetType) -> AssetTypeDto {
         AssetType::Model => AssetTypeDto::Model,
         AssetType::Mesh => AssetTypeDto::Mesh,
         AssetType::Lut => AssetTypeDto::Lut,
+        AssetType::Environment => AssetTypeDto::Environment,
     }
 }
 
@@ -1369,8 +1370,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if ctx.scene_edit.previewing() {
                 return Err(Error::command("exit the asset preview first"));
             }
+            let name = params.name.unwrap_or_default();
+            if !valid_project_name(&name) {
+                return Err(Error::command(format!("invalid project name '{name}'")));
+            }
             ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::New(NewProjectSpec {
-                name: params.name.unwrap_or_default(),
+                name,
                 display_name: params.display_name.unwrap_or_default(),
                 root: params.root.unwrap_or_default(),
             }));
@@ -4193,6 +4198,21 @@ mod tests {
             assert_eq!(reply["result"]["loaded"], json!(true));
             assert_eq!(reply["result"]["name"], json!("demo"));
             assert_eq!(reply["result"]["displayName"], json!("Demo"));
+        });
+    }
+
+    #[test]
+    fn new_project_rejects_an_invalid_name_before_queueing_load() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let reply = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "new-project", "params": { "name": "Bad_Name" } }),
+            );
+            assert_eq!(reply["ok"], json!(false));
+            assert_eq!(reply["error"], json!("invalid project name 'Bad_Name'"));
+            assert!(ctx.scene_edit.project_load_inbox.is_none());
         });
     }
 

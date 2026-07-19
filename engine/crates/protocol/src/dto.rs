@@ -369,6 +369,7 @@ pub enum AssetTypeDto {
     Material,
     Model,
     Lut,
+    Environment,
 }
 
 /// The profiler capture mode.
@@ -2571,6 +2572,74 @@ pub struct SetEnvironmentParams {
     pub ambient_color: Option<Vec3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient_intensity: Option<f32>,
+}
+
+/// A built-in complete environment profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum BuiltinEnvironmentProfileDto {
+    Neutral,
+    ClearDay,
+    GoldenHour,
+    Overcast,
+    Night,
+}
+
+/// A typed reference to either a built-in or project environment profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+#[ts(export)]
+pub enum EnvironmentProfileRefDto {
+    Builtin {
+        profile: BuiltinEnvironmentProfileDto,
+    },
+    Asset {
+        id: Uuid,
+    },
+}
+
+/// One environment profile shown in the profile browser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EnvironmentProfileSummaryDto {
+    pub reference: EnvironmentProfileRefDto,
+    pub name: String,
+}
+
+/// Every built-in and project environment profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EnvironmentProfileListDto {
+    pub profiles: Vec<EnvironmentProfileSummaryDto>,
+}
+
+/// Params for saving the active environment as a new project profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SaveEnvironmentProfileParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+/// Params for replacing a project profile with the active environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UpdateEnvironmentProfileParams {
+    pub profile: Uuid,
+}
+
+/// Params for applying a complete environment profile to the active scene.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ApplyEnvironmentProfileParams {
+    pub profile: EnvironmentProfileRefDto,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

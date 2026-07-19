@@ -258,6 +258,7 @@ pub fn reconcile_catalog_from_disk(
             "smesh" => (AssetType::Mesh, false),
             "smat" => (AssetType::Material, false),
             "sanim" => (AssetType::Animation, false),
+            "senv" => (AssetType::Environment, false),
             "png" | "jpg" | "jpeg" | "tga" | "bmp" => (AssetType::Texture, false),
             "hdr" => (AssetType::Texture, true),
             _ => continue,

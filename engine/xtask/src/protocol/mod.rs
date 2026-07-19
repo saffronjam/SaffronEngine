@@ -134,10 +134,41 @@ fn parse_decl(decl: &str) -> Decl {
     if rhs == "Record<string, never>" {
         return Decl::Struct(Vec::new());
     }
-    if let Some(inner) = rhs.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+    if !has_top_level_union(rhs)
+        && let Some(inner) = rhs.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+    {
         return Decl::Struct(parse_fields(inner));
     }
     Decl::Alias(rhs.to_owned())
+}
+
+/// Whether a declaration contains a union separator outside every object/array/generic group.
+/// Tagged enums from ts-rs have the shape `{ kind: "a", ... } | { kind: "b", ... }`; treating
+/// that as one object would emit an invalid TypeScript interface.
+fn has_top_level_union(value: &str) -> bool {
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '{' | '[' | '(' | '<' => depth += 1,
+            '}' | ']' | ')' | '>' => depth -= 1,
+            '|' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Split a `ts-rs` object body into ordered `(field, type)` pairs, dropping the `/** ... */`

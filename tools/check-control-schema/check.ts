@@ -336,6 +336,22 @@ async function paramsForFixture(
       return { u: 0.5, v: 0.5 };
     case "environment-intensity":
       return { skyIntensity: 1 };
+    case "environment-profile-save":
+      return { name: `Contract Environment ${process.pid}` };
+    case "environment-profile-update": {
+      const saved = await call("save-environment-profile", {
+        name: `Contract Environment Update ${process.pid}`,
+      });
+      const reference = saved.envelope.result?.reference;
+      const profile =
+        reference && typeof reference === "object" && "id" in reference ? reference.id : null;
+      if (saved.envelope.ok !== true || typeof profile !== "string") {
+        throw new Error(`failed to create environment-profile fixture: ${saved.envelope.error}`);
+      }
+      return { profile };
+    }
+    case "environment-profile-clear-day":
+      return { profile: { kind: "builtin", profile: "clear-day" } };
     case "atmosphere-disabled":
       return { enabled: false };
     case "fog-disabled":
@@ -510,6 +526,31 @@ async function main(): Promise<number> {
   if (!up) {
     proc.kill();
     console.error("engine control socket never came up");
+    return 2;
+  }
+
+  let projectReady = false;
+  for (let i = 0; i < 120 && !projectReady; i++) {
+    const status = await call("project-status");
+    if (status.envelope.ok !== true) {
+      proc.kill();
+      console.error(`project-status failed during startup: ${status.envelope.error}`);
+      return 2;
+    }
+    const phase = status.envelope.result?.phase;
+    if (phase === "failed") {
+      proc.kill();
+      console.error(`scratch project failed to load: ${status.envelope.result?.error ?? ""}`);
+      return 2;
+    }
+    projectReady = phase === "ready";
+    if (!projectReady) {
+      await sleep(100);
+    }
+  }
+  if (!projectReady) {
+    proc.kill();
+    console.error("scratch project did not become ready");
     return 2;
   }
 

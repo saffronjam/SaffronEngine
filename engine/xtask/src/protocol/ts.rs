@@ -135,7 +135,18 @@ fn type_aliases() -> std::collections::HashMap<String, String> {
 }
 
 fn map_alias_rhs(rhs: &str) -> String {
-    rhs.replace("bigint", "number").replace("Uuid", "WireUuid")
+    let mut mapped = rhs.replace("bigint", "number").replace("Uuid", "WireUuid");
+    for (ident, decl) in saffron_protocol::ts_decls() {
+        let Decl::Alias(nested) = super::parse_decl(&decl) else {
+            continue;
+        };
+        // String-literal enums are leaf aliases. Inline them when ts-rs nests one inside a
+        // tagged-enum alias; object unions and component aggregates remain named.
+        if !nested.contains('{') && nested.contains('"') && mapped.contains(ident) {
+            mapped = mapped.replace(ident, &format!("({nested})"));
+        }
+    }
+    mapped
 }
 
 /// `T | null` -> `T`; a bare `T` passes through (the nullable marker the TS walk strips before
@@ -201,5 +212,13 @@ mod tests {
             "\"off\" | \"fxaa\" | \"taa\" | \"msaa2\" | \"msaa4\" | \"msaa8\""
         );
         assert!(!optional);
+    }
+
+    #[test]
+    fn tagged_enum_field_inlines_object_union() {
+        let mapped = resolve_alias_or_passthrough("EnvironmentProfileRefDto");
+        assert!(mapped.contains("kind\": \"builtin"));
+        assert!(mapped.contains("kind\": \"asset"));
+        assert!(mapped.contains(" | "));
     }
 }
