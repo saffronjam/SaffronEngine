@@ -53,7 +53,7 @@ flowchart LR
     A[Directional-light inputs] --> B[proceduralSky]
     B --> C[Environment cube mip 0]
     C --> D[Environment mip chain]
-    D --> E[Diffuse irradiance]
+    D --> E[Nine SH coefficients]
     D --> F[Specular prefilter]
 ```
 
@@ -86,6 +86,6 @@ Color mode draws `SceneEnvironment::clear_color` while IBL can still use the pro
 
 - [Baking](../ibl-bake-pass/) — dispatch and synchronization around the cube fill
 - [Procedural atmosphere](../procedural-atmosphere/) — the physical LUT-based source
-- [Diffuse irradiance](../diffuse-irradiance/) — diffuse convolution of this cube
+- [Real-time sky-light capture](../realtime-skylight-capture/) — SH projection and specular reconvergence from this cube
 - [Specular prefilter](../specular-prefilter/) — roughness-dependent convolution of this cube
 - [IBL overview](../ibl-overview/) — runtime use of the baked textures
