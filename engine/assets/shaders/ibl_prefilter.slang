@@ -1,5 +1,5 @@
 // Prefiltered specular environment: GGX importance-sample the environment for a given
-// roughness (one dispatch per mip; the push constant carries that mip's roughness).
+// roughness (one dispatch per scheduled row slice; the push carries roughness and row range).
 // Set 0: binding 0 = environment cube (sampler), binding 1 = this mip's cube storage view.
 
 static const float PI = 3.14159265359;
@@ -11,6 +11,9 @@ static const float PI = 3.14159265359;
 struct Push
 {
     float roughness;
+    float blendAlpha;
+    uint rowOffset;
+    uint rowCount;
 };
 [[vk::push_constant]] Push push;
 
@@ -74,11 +77,12 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     uint height;
     uint layers;
     outCube.GetDimensions(width, height, layers);
-    if (tid.x >= width || tid.y >= height || tid.z >= layers)
+    uint outputY = tid.y + push.rowOffset;
+    if (tid.x >= width || tid.y >= push.rowCount || outputY >= height || tid.z >= layers)
     {
         return;
     }
-    float2 uv = (float2(tid.xy) + 0.5) / float2(width, height) * 2.0 - 1.0;
+    float2 uv = (float2(tid.x, outputY) + 0.5) / float2(width, height) * 2.0 - 1.0;
     float3 n = cubeFaceDir(tid.z, uv);
     float3 r = n;
     float3 v = n;  // split-sum approximation: view = normal = reflection
@@ -115,5 +119,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         }
     }
     prefiltered = totalWeight > 0.0 ? prefiltered / totalWeight : envCube.SampleLevel(n, 0.0).rgb;
-    outCube[tid] = float4(prefiltered, 1.0);
+    uint3 output = uint3(tid.x, outputY, tid.z);
+    float3 previous = outCube[output].rgb;
+    outCube[output] = float4(lerp(previous, prefiltered, push.blendAlpha), 1.0);
 }

@@ -6,6 +6,19 @@
 
 module tonemap_ops;
 
+// Mesopic adaptation retains cone color in locally bright pixels while progressively routing dim
+// radiance through a rod-weighted, blue-shifted response. The night factor is a global adaptation
+// state; the luminance gate supplies the local rod/cone blend and keeps emissive highlights colored.
+public float3 scotopicAdapt(float3 lin, float nightFactor)
+{
+    float photopic = max(dot(lin, float3(0.2126, 0.7152, 0.0722)), 1e-8);
+    float localRodWeight = 1.0 - smoothstep(-8.0, -2.0, log2(photopic));
+    float rodWeight = saturate(nightFactor) * localRodWeight;
+    float scotopic = dot(lin, float3(0.062, 0.608, 0.330));
+    float3 rodResponse = scotopic * float3(0.78, 0.94, 1.16);
+    return lerp(lin, rodResponse, rodWeight);
+}
+
 // Reinhard: simple, flat — caps 1.0->0.5 with no shoulder/path-to-white. Kept for reference/A-B.
 public float3 tonemapReinhard(float3 x)
 {

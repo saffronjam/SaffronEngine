@@ -10,7 +10,8 @@
 // set 0: binding 0 = the offscreen color (rgba16f storage image, GENERAL), binding 1 = the fog
 // params (a dynamic-offset UBO), binding 2 = the scene depth (combined image sampler, D32, .r),
 // binding 3 = the sky-view LUT (combined image sampler, rgba16f), binding 4 = the integrated froxel
-// volume, binding 5 = the aerial-perspective volume. The render graph transitions the offscreen
+// volume, binding 5 = the aerial-perspective volume, bindings 6/7 = atmosphere LUTs, and bindings
+// 8/9 = full-resolution cloud scatter/transmittance and mean front depth. The graph transitions
 // Color->General and the depth/LUT to ShaderReadOnly before the dispatch.
 //
 // The shared transmittance ledger folds fog and aerial perspective as two INDEPENDENT multiplied media
@@ -18,6 +19,8 @@
 // `T = T_fog * T_aerial`, `L = scene*T + inScatter_fog + T_fog*inScatter_aerial` (aerial sits behind the
 // near fog along the ray, so its in-scatter is pre-attenuated by `T_fog`). Fog is neutral (`T_fog = 1`,
 // `inScatter_fog = 0`) when fog is disabled but AP keeps the composite alive.
+
+import atmos_ap;
 
 static const float PI = 3.14159265358979;
 static const float LN2 = 0.6931472;
@@ -49,6 +52,8 @@ struct FogParams
     float3 camForward; // camera view direction (world), for the froxel/AP W depth mapping
     float fogEnabled;  // 1 = fog contributes; 0 = composite runs only for aerial perspective
     float4 aerial;     // x = AP live (atmosphere baked + authored), y = AP near, z = AP far, w unused
+    float4 cloud;      // x = lit cloud result live, y = atmosphere LUTs live
+    ApParams ap;
 };
 
 // The froxel `fog.mode` selector — the analytic closed form vs. the volumetric froxel path.
@@ -66,6 +71,10 @@ static const uint FOG_MODE_VOLUMETRIC = 1u;
 // The aerial-perspective volume (rgb = atmosphere in-scatter, a = mean transmittance), sampled at
 // `(screenUV, W_ap)` when the atmosphere is live. Gated by `aerial.x`, so untouched when AP is off.
 [[vk::binding(5, 0)]] Sampler3D<float4> aerialVolume;
+[[vk::binding(6, 0)]] Sampler2D<float4> transmittanceLut;
+[[vk::binding(7, 0)]] Sampler2D<float4> multiScatterLut;
+[[vk::binding(8, 0)]] Sampler2D<float4> cloudBuffer;
+[[vk::binding(9, 0)]] Sampler2D<float> cloudDepth;
 
 // Closed-form line integral of exp2(-falloff*y) along the ray. The `abs(f) <= 1e-4` Taylor branch is
 // the numerically critical detail for near-horizontal rays, where `(1 - exp2(-f))/f` is 0/0.
@@ -186,9 +195,38 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         fogInScatter = (inscatter + sun) * (1.0 - fogT);
     }
 
-    // One transmittance ledger: scene attenuated by the product (once), AP in-scatter behind the near
-    // fog so it is dimmed by `T_fog` before it reaches the eye.
-    float T = fogT * apT;
-    float3 L = c.rgb * T + fogInScatter + fogT * apInScatter;
+    float cloudT = 1.0;
+    float3 cloudL = float3(0.0);
+    if (params.cloud.x > 0.5)
+    {
+        float4 cloudSample = cloudBuffer.SampleLevel(uv, 0.0);
+        cloudT = saturate(cloudSample.a);
+        if (cloudT < 0.99999)
+        {
+            float dCloud = cloudDepth.SampleLevel(uv, 0.0);
+            cloudL = cloudSample.rgb;
+            if (params.cloud.y > 0.5)
+            {
+                AtmoSample atmosphere = marchAtmosphere(
+                    atmosphereObserverPosition(params.ap),
+                    viewDir,
+                    normalize(params.ap.sunDir.xyz),
+                    max(dCloud, 0.0) * params.ap.apPlanes.w,
+                    transmittanceLut,
+                    multiScatterLut,
+                    params.ap);
+                cloudL = cloudSample.rgb * atmosphere.transmittance
+                       + (1.0 - cloudT) * atmosphere.inScatter;
+            }
+        }
+    }
+
+    // One premultiplied front-to-back ledger. The background sees all three media; the cloud
+    // radiance carries its own camera-to-cloud atmosphere and is attenuated only by nearer fog.
+    float T = fogT * apT * cloudT;
+    float3 L = c.rgb * T
+             + fogInScatter
+             + fogT * apInScatter
+             + fogT * cloudL;
     target[px] = float4(L, c.a);
 }

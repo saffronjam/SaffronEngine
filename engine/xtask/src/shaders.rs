@@ -17,6 +17,9 @@ use anyhow::{Context, Result, bail};
 /// `import lighting` against the precompiled module rather than recompiling it.
 const LIGHTING_STEM: &str = "lighting";
 
+/// Resource-free lighting types and sampling helpers shared by forward surfaces and volumetric fog.
+const LIGHTING_COMMON_STEM: &str = "lighting_common";
+
 /// The shared SDF sampling module — like `lighting`, it has no entry points and emits no
 /// `.spv`. Precompiled to `sdf.slang-module`; both `lighting` (the GDF reflection-occlusion cone)
 /// and `ddgi_trace` (the unified near/far field sphere-march) `import sdf` against it.
@@ -37,10 +40,21 @@ const OCTAHEDRAL_STEM: &str = "octahedral";
 /// screen-space GI resolve) `import giprobe` for the one `ddgiSampleIrradiance` implementation.
 const GIPROBE_STEM: &str = "giprobe";
 
+/// The resource-free order-2 sky SH module shared by projection and every reconstruction consumer.
+const SKY_SH_STEM: &str = "sky_sh";
+
 /// The resource-free tonemap-operator module — like `octahedral`, no entry points, no `.spv`.
 /// Imported from source (via `-I`) by `tonemap.slang`. No runtime codegen splices it, so it needs no
 /// precompiled `.slang-module`; it is only excluded from the entry-point `.spv` compile.
 const TONEMAP_OPS_STEM: &str = "tonemap_ops";
+
+/// The resource-free cloud shape/noise module shared by the static bakes, weather fill, density
+/// debugger, and production cloud march. Imported from source through the shader include path.
+const CLOUDS_STEM: &str = "clouds";
+/// The resource-free cloud lighting module shared by the production cloud march.
+const CLOUD_LIGHTING_STEM: &str = "cloud_lighting";
+/// The resource-parameterized bounded atmosphere march shared by AP fill and cloud compositing.
+const ATMOS_AP_STEM: &str = "atmos_ap";
 
 /// The forward/gbuffer übershader stem. It alone gets an RT-off variant (see the fan-out).
 const MESH_STEM: &str = "mesh";
@@ -135,6 +149,14 @@ pub fn run(config: &Config) -> Result<Report> {
         );
     }
 
+    let lighting_common_src = config.shader_src_dir.join("lighting_common.slang");
+    if !lighting_common_src.is_file() {
+        bail!(
+            "shared lighting-common source not found: {}",
+            lighting_common_src.display()
+        );
+    }
+
     let sdf_src = config.shader_src_dir.join("sdf.slang");
     if !sdf_src.is_file() {
         bail!("shared sdf source not found: {}", sdf_src.display());
@@ -161,11 +183,35 @@ pub fn run(config: &Config) -> Result<Report> {
         bail!("shared giprobe source not found: {}", giprobe_src.display());
     }
 
+    let sky_sh_src = config.shader_src_dir.join("sky_sh.slang");
+    if !sky_sh_src.is_file() {
+        bail!("shared sky SH source not found: {}", sky_sh_src.display());
+    }
+
     let tonemap_ops_src = config.shader_src_dir.join("tonemap_ops.slang");
     if !tonemap_ops_src.is_file() {
         bail!(
             "shared tonemap_ops source not found: {}",
             tonemap_ops_src.display()
+        );
+    }
+
+    let clouds_src = config.shader_src_dir.join("clouds.slang");
+    if !clouds_src.is_file() {
+        bail!("shared clouds source not found: {}", clouds_src.display());
+    }
+    let cloud_lighting_src = config.shader_src_dir.join("cloud_lighting.slang");
+    if !cloud_lighting_src.is_file() {
+        bail!(
+            "shared cloud lighting source not found: {}",
+            cloud_lighting_src.display()
+        );
+    }
+    let atmos_ap_src = config.shader_src_dir.join("atmos_ap.slang");
+    if !atmos_ap_src.is_file() {
+        bail!(
+            "shared atmosphere AP source not found: {}",
+            atmos_ap_src.display()
         );
     }
 
@@ -184,6 +230,12 @@ pub fn run(config: &Config) -> Result<Report> {
     let giprobe_module = out_dir.join("giprobe.slang-module");
     if is_stale(&giprobe_module, &[&giprobe_src])? {
         compile_module(&config.slangc, &giprobe_src, &giprobe_module)?;
+        report.module_compiled = true;
+    }
+
+    let sky_sh_module = out_dir.join("sky_sh.slang-module");
+    if is_stale(&sky_sh_module, &[&sky_sh_src])? {
+        compile_module(&config.slangc, &sky_sh_src, &sky_sh_module)?;
         report.module_compiled = true;
     }
 
@@ -208,10 +260,12 @@ pub fn run(config: &Config) -> Result<Report> {
         &lighting_module,
         &[
             &lighting_src,
+            &lighting_common_src,
             &sdf_src,
             &mdf_brick_src,
             &octahedral_src,
             &giprobe_src,
+            &sky_sh_src,
         ],
     )? {
         compile_module(&config.slangc, &lighting_src, &lighting_module)?;
@@ -229,29 +283,40 @@ pub fn run(config: &Config) -> Result<Report> {
             .file_stem()
             .and_then(|s| s.to_str())
             .with_context(|| format!("non-utf8 shader name: {}", path.display()))?;
+        let src_copy = out_dir.join(format!("{stem}.slang"));
+        copy_if_different(&path, &src_copy)?;
         if stem == LIGHTING_STEM
+            || stem == LIGHTING_COMMON_STEM
             || stem == SDF_STEM
             || stem == MDF_BRICK_STEM
             || stem == OCTAHEDRAL_STEM
             || stem == GIPROBE_STEM
+            || stem == SKY_SH_STEM
             || stem == TONEMAP_OPS_STEM
+            || stem == CLOUDS_STEM
+            || stem == CLOUD_LIGHTING_STEM
+            || stem == ATMOS_AP_STEM
         {
             continue;
         }
 
         let spv = out_dir.join(format!("{stem}.spv"));
-        let src_copy = out_dir.join(format!("{stem}.slang"));
 
-        // Every shader depends on the shared lighting + sdf + mdf_brick + octahedral modules (the
-        // dep edge), so a touch of any forces a full fan-out rebuild.
+        // Every shader depends on the shared lighting modules and their transitive modules, so a
+        // touch of any forces a full fan-out rebuild.
         let deps = [
             &path,
             lighting_src.as_path(),
+            lighting_common_src.as_path(),
             sdf_src.as_path(),
             mdf_brick_src.as_path(),
             octahedral_src.as_path(),
             giprobe_src.as_path(),
+            sky_sh_src.as_path(),
             tonemap_ops_src.as_path(),
+            clouds_src.as_path(),
+            cloud_lighting_src.as_path(),
+            atmos_ap_src.as_path(),
         ];
         if is_stale(&spv, &deps)? {
             compile_spv(&config.slangc, &path, &config.shader_src_dir, &spv, &[])?;
@@ -279,7 +344,6 @@ pub fn run(config: &Config) -> Result<Report> {
                 report.spv_skipped += 1;
             }
         }
-        copy_if_different(&path, &src_copy)?;
     }
 
     copy_asset_tree(&config.asset_src_dir, &config.runtime_dir, "models")?;

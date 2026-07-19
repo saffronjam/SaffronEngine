@@ -5,7 +5,7 @@
 [[vk::image_format("rgba16f")]]
 [[vk::binding(0, 0)]] RWTexture2D<float4> outLut;
 
-// AtmosphereParams + sun, packed into 5 float4s (matches the C++ AtmosPush in renderer_detail).
+// AtmosphereParams + celestial lights, packed into 7 float4s.
 struct AtmosParams
 {
     float4 sunDir;    // xyz = dir to sun, w = sun intensity
@@ -13,6 +13,8 @@ struct AtmosParams
     float4 ozone;     // xyz = ozone absorption (1/Mm), w = mie scattering (1/Mm)
     float4 params0;   // planetRadius, atmosphereHeight, mieScaleHeight, mieAnisotropy
     float4 params1;   // sunDiskAngularRadius, sunDiskIntensity, cameraAltitude, unused
+    float4 moon;      // xyz = dir to moon, w = moon intensity trim
+    float4 moonDisk;  // angular radius, disk trim, earthshine, per-pixel transmittance
 };
 [[vk::push_constant]] AtmosParams pc;
 

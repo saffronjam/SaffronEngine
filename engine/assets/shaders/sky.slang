@@ -16,12 +16,17 @@ static const float PI = 3.14159265;
 [[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
 // Set 1: the procedural environment cube the IBL bake produced (shared with the lighting).
 [[vk::binding(0, 1)]] SamplerCube envCube;
+[[vk::binding(1, 1)]] SamplerCube milkyWayCube;
+[[vk::binding(2, 1)]] Sampler2D<float4> transmittanceLut;
+[[vk::binding(3, 1)]] Sampler2D<float4> skyViewLut;
 
 struct SkyPush
 {
     float4x4 invViewProj;  // clip -> world (this frame's camera, inverted)
     float4 params;         // x = intensity, y = rotation (yaw radians), z = mode, w = texture index
-    float4 clearColor;     // rgb = Color-mode fill
+    float4 clearColor;     // rgb = tinted Color-mode fill, or the sky tint in other scene modes
+    float4 worldFromEquatorial;
+    float4 night;          // x Milky Way intensity, y atmosphere height, z atmosphere live
 };
 [[vk::push_constant]] SkyPush push;
 
@@ -30,6 +35,11 @@ struct VertexOutput
     float4 position : SV_Position;
     float2 ndc : TEXCOORD0;
 };
+
+float3 rotateByQuaternion(float3 value, float4 rotation)
+{
+    return value + 2.0 * cross(rotation.xyz, cross(rotation.xyz, value) + rotation.w * value);
+}
 
 [shader("vertex")]
 VertexOutput vertexMain(uint vertexId : SV_VertexID)
@@ -74,6 +84,20 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     else if (mode == 2u)
     {
         color = envCube.SampleLevel(dir, 0.0).rgb;
+        if (push.night.x > 0.0)
+        {
+            float4 inverseRotation = float4(-push.worldFromEquatorial.xyz,
+                                             push.worldFromEquatorial.w);
+            float3 equatorialDir = normalize(rotateByQuaternion(dir, inverseRotation));
+            float3 milkyWay = milkyWayCube.SampleLevel(equatorialDir, 0.0).rgb * push.night.x;
+            if (push.night.z > 0.5)
+            {
+                float2 transmittanceUv = float2(dir.y * 0.5 + 0.5,
+                    saturate(0.5 / max(push.night.y, 1.0)));
+                milkyWay *= transmittanceLut.SampleLevel(transmittanceUv, 0.0).rgb;
+            }
+            color += dir.y > 0.0 ? milkyWay : float3(0.0, 0.0, 0.0);
+        }
     }
     else
     {
@@ -83,6 +107,10 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         // silhouette.
         float t = smoothstep(0.0, 1.0, saturate(dir.y * 0.5 + 0.5));
         color = lerp(float3(0.16, 0.16, 0.18), float3(0.48, 0.50, 0.55), t);
+    }
+    if (mode == 1u || mode == 2u)
+    {
+        color *= push.clearColor.rgb;
     }
     return float4(color * intensity, 1.0);
 }

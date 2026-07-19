@@ -18,14 +18,16 @@
 // Sets: 0 = the bindless brick arrays (the `sdf`/`mdf_brick` import), 1 = the light set (the
 // per-mesh SDF instance list at binding 8, the GDF cascade clipmap + params at 9/10), 2 = the
 // DDGI trace set (b0 = albedo cache Sampler3D, b1 = prev-irradiance atlas Sampler2D, b2 = ray
-// image rgba16f storage). Push = probe grid + volume + sun/sky + scroll/frame.
+// image rgba16f storage, b3 = raw-radiance sky SH). Push = probe grid + volume + sun + scroll/frame.
 
 import sdf;
+import sky_sh;
 
 [[vk::binding(0, 2)]] Sampler3D albedoCache;
 [[vk::binding(1, 2)]] Sampler2D irradianceAtlas;
 [[vk::image_format("rgba16f")]]
 [[vk::binding(2, 2)]] RWTexture2D<float4> rayOut;
+[[vk::binding(3, 2)]] StructuredBuffer<float4> skyShCoefficients;
 
 struct Push
 {
@@ -34,7 +36,7 @@ struct Push
     float4 volumeExtent;  // xyz = volume size (world) = count * spacing, w reserved
     float4 sunDir;        // xyz = direction the sun travels, w = sun intensity
     float4 sunColor;      // rgb sun color, w = frame index (for ray rotation)
-    float4 skyColor;      // rgb ambient sky radiance, w = round-robin probe-budget offset
+    float4 budgetOffset;  // x = round-robin probe-budget offset
     int4 scrollBase;      // xyz = toroidal scroll base (wrapMod(snapBase, count)), w = SDF instance count
 };
 [[vk::push_constant]] Push pc;
@@ -101,8 +103,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     uint ray = tid.x;
     uint total = pc.probeCount.x * pc.probeCount.y * pc.probeCount.z;
     // Round-robin probe budget: the dispatch covers only DDGI_PROBE_BUDGET probes, starting at
-    // the offset in skyColor.w and wrapping, so the whole volume refreshes over several frames.
-    uint physIndex = (tid.y + uint(pc.skyColor.w)) % total;
+    // the budget offset and wrapping, so the whole volume refreshes over several frames.
+    uint physIndex = (tid.y + uint(pc.budgetOffset.x)) % total;
     if (ray >= pc.probeCount.w)
     {
         return;
@@ -202,7 +204,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     if (!hit)
     {
         // The ray escaped to open space: it sees the sky (the only place sky enters radiance).
-        radiance = pc.skyColor.rgb;
+        radiance = skyShRadiance(dir, skyShCoefficients);
     }
     rayOut[uint2(ray, physIndex)] = float4(radiance, hitDist);
 }
