@@ -45,7 +45,7 @@ The descriptor sets bound by the mesh übershader. The binding declarations live
 
 | Binding | Slang type | Note |
 |---|---|---|
-| 0 | `SamplerCube irradianceMap` | global diffuse irradiance |
+| 0 | `StructuredBuffer<float4> skyShCoefficients` | nine raw-radiance sky SH coefficients |
 | 1 | `SamplerCube prefilteredMap` | global GGX-prefiltered specular (max mip 4) |
 | 2 | `Sampler2D brdfLut` | split-sum (scale, bias) LUT |
 | 3 | `SamplerCube probeCubes[8]` | per-probe prefiltered specular cubes (`MaxReflectionProbes` = 8) |

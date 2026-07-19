@@ -16,9 +16,9 @@ $$
 
 ## Indirect diffuse
 
-Opaque and transparent surfaces obtain diffuse irradiance through different paths. Opaque geometry samples `giIndirectMap`, a half-resolution result produced by `gi_resolve.slang`. The compute pass starts with the global irradiance cubemap, optionally multiplies it by distance-field sky visibility, and replaces it by [DDGI](../../global-illumination-and-raytracing/ddgi-overview/) irradiance where the probe volume has coverage.
+Opaque and transparent surfaces obtain diffuse irradiance through different paths. Opaque geometry samples `giIndirectMap`, a half-resolution result produced by `gi_resolve.slang`. The compute pass reconstructs global irradiance from the sky SH buffer, optionally multiplies it by distance-field sky visibility, and replaces it by [DDGI](../../global-illumination-and-raytracing/ddgi-overview/) irradiance where the probe volume has coverage.
 
-Transparent geometry cannot use the screen-space GI map because that map describes the opaque surface behind it. It samples the global irradiance cubemap directly and applies the same DDGI coverage blend in the fragment shader.
+Transparent geometry cannot use the screen-space GI map because that map describes the opaque surface behind it. It reconstructs global irradiance from the same SH buffer and applies the DDGI coverage blend in the fragment shader.
 
 Both paths apply the diffuse energy factor
 

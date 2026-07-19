@@ -42,7 +42,7 @@ The IBL descriptor set reserves three bindings for probes:
 | `4` | Array of eight irradiance cubemaps |
 | `5` | Storage buffer of `ProbeMetaGpu` records |
 
-`ReflectionProbes::seed` and `ReflectionProbes::write_slot` bind the global prefiltered and irradiance cubes to every array element. There is no per-slot cube storage. A metadata record occupies 48 bytes: origin and radius, box extent and intensity, then validity and box-projection flags.
+`ReflectionProbes::seed` and `ReflectionProbes::write_slot` bind the global prefiltered cube and environment cube as valid fallback descriptors for every array element. Global diffuse lighting comes from the sky SH buffer, outside these local-probe arrays. A metadata record occupies 48 bytes: origin and radius, box extent and intensity, then validity and box-projection flags.
 
 `ReflectionProbes::submit` tracks entity, origin, radius, and dirty changes and raises `capture_pending` when a slot needs new data. No renderer operation consumes that flag or marks a slot allocated and valid. Consequently, `upload_meta` writes `valid = 0` for every slot.
 
