@@ -261,7 +261,7 @@ struct ViewSurface {
     pool_fd: OwnedFd,
     base: *const u8,
     total: usize,
-    seg_ino: u64,
+    generation: u64,
     header: *const u32,
     pool: WlShmPool,
     buffers: Vec<WlBuffer>,
@@ -346,7 +346,7 @@ fn run(
         // Map this view's segment (retry until the engine creates it) + keep an fd for the pool.
         let cname = CString::new(shm_name.clone()).map_err(|_| "bad shm name".to_string())?;
         let mut attempts = 0u32;
-        let (pool_fd, base, total, seg_ino) = loop {
+        let (pool_fd, base, total, generation) = loop {
             if let Some(mapping) = open_shm(&cname) {
                 break mapping;
             }
@@ -375,7 +375,7 @@ fn run(
             cname,
             base,
             total,
-            seg_ino,
+            generation,
             header: base as *const u32,
             pool_fd,
             pool,
@@ -474,12 +474,12 @@ fn step_view(
     let pending_slot = vs.view.index();
 
     // The engine recreates the segment when a frame outgrows the slot capacity (and a restarted
-    // engine makes a fresh one): same name, new inode. Remap and rebuild the pool + buffers, or this
+    // engine makes a fresh one): same name, new generation. Remap and rebuild the pool + buffers, or this
     // view keeps reading the orphaned old mapping forever.
     if vs.last_segment_check.elapsed() >= Duration::from_millis(250) {
         vs.last_segment_check = Instant::now();
-        if let Some((ino, size)) = stat_shm(&vs.cname)
-            && (ino != vs.seg_ino || size != vs.total)
+        if let Some((generation, size)) = stat_shm(&vs.cname)
+            && (generation != vs.generation || size != vs.total)
             && let Some(mapping) = open_shm(&vs.cname)
         {
             for buffer in vs.buffers.drain(..) {
@@ -487,7 +487,7 @@ fn step_view(
             }
             vs.pool.destroy();
             unsafe { libc::munmap(vs.base as *mut _, vs.total) };
-            (vs.pool_fd, vs.base, vs.total, vs.seg_ino) = mapping;
+            (vs.pool_fd, vs.base, vs.total, vs.generation) = mapping;
             vs.header = vs.base as *const u32;
             vs.pool = wl_shm.create_pool(vs.pool_fd.as_fd(), vs.total as i32, qh, ());
             vs.buffer_dims = (0, 0);

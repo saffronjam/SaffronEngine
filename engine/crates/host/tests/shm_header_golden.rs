@@ -2,8 +2,8 @@
 //! live byte-exact reader-oracle gate in `shm_abi_gate.rs`.
 //!
 //! The frame transport's 32-byte header is `[magic, width, height, seq, ringSlots,
-//! slotCapacity, 0, 0]` (eight native-endian `u32` words), written at segment creation
-//! with width/height/seq = 0 and the capacity floored at 4K RGBA. A change to any of those
+//! slotCapacity, generationLo, generationHi]` (eight native-endian `u32` words), written at
+//! segment creation with width/height/seq = 0 and the capacity floored at 4K RGBA. A change to any of those
 //! words — a magic, a ring depth, a header size — is an ABI break the editor reader cannot
 //! tolerate, and it never throws. The detector is a golden header layout in
 //! `fixtures/golden/gen/`.
@@ -16,9 +16,12 @@
 
 use saffron_host::{ShmView, ShmViewConfig, ViewportShmPublisher};
 use saffron_rendering::{MIN_SHM_SLOT_CAPACITY, SHM_HEADER_BYTES, SHM_MAGIC, SHM_RING_SLOTS};
+use saffron_test_support::unique_shm_name;
+
+const GOLDEN_GENERATION: u64 = 0x0123_4567_89ab_cdef;
 
 /// The 32-byte header words at segment creation, exactly as `recreate_segment` writes them:
-/// magic, then width/height/seq = 0 (no frame yet), ring depth, capacity, two reserved.
+/// magic, then width/height/seq = 0 (no frame yet), ring depth, capacity, and generation.
 fn startup_header_words() -> [u32; 8] {
     [
         SHM_MAGIC,
@@ -27,8 +30,8 @@ fn startup_header_words() -> [u32; 8] {
         0,
         SHM_RING_SLOTS,
         MIN_SHM_SLOT_CAPACITY as u32,
-        0,
-        0,
+        GOLDEN_GENERATION as u32,
+        (GOLDEN_GENERATION >> 32) as u32,
     ]
 }
 
@@ -40,15 +43,19 @@ fn header_bytes(words: &[u32; 8]) -> Vec<u8> {
     bytes
 }
 
-/// The generator's `hexdumpBytes` shape: two hex digits + trailing space per byte, 16 per
-/// row, a trailing newline.
+/// The generator's `hexdumpBytes` shape: space-separated hex bytes, 16 per row, with a
+/// trailing newline.
 fn hexdump(bytes: &[u8]) -> String {
     let mut out = String::new();
     for (i, byte) in bytes.iter().enumerate() {
-        if i != 0 && i % 16 == 0 {
-            out.push('\n');
+        if i != 0 {
+            if i % 16 == 0 {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
         }
-        out.push_str(&format!("{byte:02x} "));
+        out.push_str(&format!("{byte:02x}"));
     }
     out.push('\n');
     out
@@ -61,32 +68,30 @@ fn shm_header_layout_matches_cpp_golden() {
     let bytes = header_bytes(&words);
 
     let mut map = String::new();
-    map.push_str("shm header SFV2 32 bytes, 8 u32 words native-endian\n");
+    map.push_str("shm header SFV3 32 bytes, 8 u32 words native-endian\n");
     map.push_str(&format!("word 0 magic 0x{:08x}\n", words[0]));
     map.push_str(&format!("word 1 width {}\n", words[1]));
     map.push_str(&format!("word 2 height {}\n", words[2]));
     map.push_str(&format!("word 3 seq {}\n", words[3]));
     map.push_str(&format!("word 4 ringSlots {}\n", words[4]));
     map.push_str(&format!("word 5 slotCapacity {}\n", words[5]));
-    map.push_str("word 6 reserved 0\n");
-    map.push_str("word 7 reserved 0\n");
+    map.push_str(&format!("word 6 generationLo 0x{:08x}\n", words[6]));
+    map.push_str(&format!("word 7 generationHi 0x{:08x}\n", words[7]));
     map.push_str("hexdump:\n");
     map.push_str(&hexdump(&bytes));
 
     saffron_test_support::assert_bytes_match_golden("shm_header.layout", map.as_bytes());
 }
 
-/// The live producer's segment header must carry the same bytes the golden pins, sans the
-/// width/height/seq frame words (which the golden captures at creation, before any publish).
-/// The capacity, ring depth, and magic are the ABI-frozen header words; this proves the real
-/// `ViewportShmPublisher` writes them, not just the constants.
+/// The live producer's segment header must carry the same field semantics the golden pins.
+/// The generation value itself is minted per mapping; every other startup word is fixed.
 #[test]
 fn live_publisher_header_matches_the_golden_abi_words() {
     let mut publisher = ViewportShmPublisher::new();
     publisher
         .enable(ShmViewConfig {
             view: ShmView::Scene,
-            name: format!("/saffron-golden-shm-{}", std::process::id()),
+            name: unique_shm_name(),
         })
         .expect("enable scene segment");
 
@@ -104,6 +109,7 @@ fn live_publisher_header_matches_the_golden_abi_words() {
         MIN_SHM_SLOT_CAPACITY as u32,
         "capacity floored at 4K RGBA, matching the golden"
     );
-    assert_eq!(word(6), 0, "reserved word 6 is 0");
-    assert_eq!(word(7), 0, "reserved word 7 is 0");
+    let generation = u64::from(word(6)) | (u64::from(word(7)) << 32);
+    assert_eq!(generation, scene.generation());
+    assert_ne!(generation, 0);
 }

@@ -159,18 +159,12 @@ impl ViewportShmPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saffron_test_support::unique_shm_name;
     use std::sync::Mutex;
 
     /// Serializes the env-reading tests: `set_var`/`remove_var` are process-global, so two
     /// tests mutating the same variables must not interleave.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn unique_name(tag: &str) -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("/saffron-host-test-{tag}-{}-{n}", std::process::id())
-    }
 
     #[test]
     fn wire_tokens_are_frozen() {
@@ -181,8 +175,8 @@ mod tests {
     #[test]
     fn env_selects_only_present_non_empty_views_in_scene_then_asset_order() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let scene = unique_name("scene");
-        let asset = unique_name("asset");
+        let scene = unique_shm_name();
+        let asset = unique_shm_name();
         // SAFETY: serialized by ENV_LOCK; no other thread reads these vars concurrently.
         unsafe {
             std::env::set_var(ENV_SHM_SCENE, &scene);
@@ -228,7 +222,7 @@ mod tests {
         publisher
             .enable(ShmViewConfig {
                 view: ShmView::Scene,
-                name: unique_name("enable"),
+                name: unique_shm_name(),
             })
             .expect("enable scene");
         assert!(publisher.is_enabled(ShmView::Scene));
@@ -248,7 +242,7 @@ mod tests {
     #[test]
     fn dropping_the_publisher_unlinks_every_segment() {
         use std::ffi::CString;
-        let name = unique_name("drop");
+        let name = unique_shm_name();
         {
             let mut publisher = ViewportShmPublisher::new();
             publisher

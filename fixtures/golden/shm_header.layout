@@ -1,12 +1,12 @@
-shm header SFV2 32 bytes, 8 u32 words native-endian
-word 0 magic 0x53465632
+shm header SFV3 32 bytes, 8 u32 words native-endian
+word 0 magic 0x53465633
 word 1 width 0
 word 2 height 0
 word 3 seq 0
 word 4 ringSlots 4
 word 5 slotCapacity 33177600
-word 6 reserved 0
-word 7 reserved 0
+word 6 generationLo 0x89abcdef
+word 7 generationHi 0x01234567
 hexdump:
-32 56 46 53 00 00 00 00 00 00 00 00 00 00 00 00 
-04 00 00 00 00 40 fa 01 00 00 00 00 00 00 00 00 
+33 56 46 53 00 00 00 00 00 00 00 00 00 00 00 00
+04 00 00 00 00 40 fa 01 ef cd ab 89 67 45 23 01

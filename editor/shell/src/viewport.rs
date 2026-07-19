@@ -4,8 +4,9 @@
 //! ring slot into pixels on screen — lives in `backend::presenter`.
 //!
 //! The ring ABI is frozen against the engine's `shm_publish` producer: a 32-byte header of eight
-//! `u32`s (`magic, width, height, seq, slots, capacity, _, _`), then `slots` fixed-`capacity` frame
-//! slots addressed `seq % slots`, pixels `Xrgb8888` (bytes B,G,R,X little-endian).
+//! `u32`s (`magic, width, height, seq, slots, capacity, generation_lo, generation_hi`), then
+//! `slots` fixed-`capacity` frame slots addressed `seq % slots`, pixels `Xrgb8888` (bytes B,G,R,X
+//! little-endian).
 
 use std::ffi::CStr;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -13,8 +14,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// The shm header magic ("SFV2").
-pub const SHM_MAGIC: u32 = 0x5346_5632;
+/// The shm header magic ("SFV3").
+pub const SHM_MAGIC: u32 = 0x5346_5633;
 /// The shm header size in bytes.
 pub const SHM_HEADER_BYTES: usize = 32;
 
@@ -110,8 +111,9 @@ impl Viewports {
     }
 }
 
-/// Open a published engine segment read-only and map it whole: `(fd, base, size, inode)`. `None`
-/// while the engine has not created it (the caller retries) or it is too small for the header.
+/// Open a published engine segment read-only and map it whole: `(fd, base, size, generation)`.
+/// `None` while the engine has not created it (the caller retries) or it is too small for the
+/// header.
 pub fn open_shm(name: &CStr) -> Option<(OwnedFd, *const u8, usize, u64)> {
     unsafe {
         let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR, 0);
@@ -136,17 +138,26 @@ pub fn open_shm(name: &CStr) -> Option<(OwnedFd, *const u8, usize, u64)> {
             libc::close(fd);
             return None;
         }
+        let header = base.cast::<u32>();
+        let magic = ptr::read_volatile(header);
+        let generation = u64::from(ptr::read_volatile(header.add(6)))
+            | (u64::from(ptr::read_volatile(header.add(7))) << 32);
+        if magic != SHM_MAGIC || generation == 0 {
+            libc::munmap(base, size);
+            libc::close(fd);
+            return None;
+        }
         Some((
             OwnedFd::from_raw_fd(fd),
             base as *const u8,
             size,
-            st.st_ino as u64,
+            generation,
         ))
     }
 }
 
-/// Inode + size of the segment currently behind `name` — a cheap probe to detect the engine
-/// recreating it (bigger frames, or an engine restart).
+/// Generation + size of the segment currently behind `name` — a cheap probe to detect the engine
+/// recreating it for bigger frames or after an engine restart.
 pub fn stat_shm(name: &CStr) -> Option<(u64, usize)> {
     unsafe {
         let fd = libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0);
@@ -154,12 +165,107 @@ pub fn stat_shm(name: &CStr) -> Option<(u64, usize)> {
             return None;
         }
         let mut st: libc::stat = std::mem::zeroed();
-        let ok = libc::fstat(fd, &mut st) == 0;
+        let ok = libc::fstat(fd, &mut st) == 0 && (st.st_size as usize) >= SHM_HEADER_BYTES;
+        if !ok {
+            libc::close(fd);
+            return None;
+        }
+        let base = libc::mmap(
+            ptr::null_mut(),
+            SHM_HEADER_BYTES,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
         libc::close(fd);
-        if ok {
-            Some((st.st_ino as u64, st.st_size as usize))
+        if base != libc::MAP_FAILED {
+            let header = base.cast::<u32>();
+            let magic = ptr::read_volatile(header);
+            let generation = u64::from(ptr::read_volatile(header.add(6)))
+                | (u64::from(ptr::read_volatile(header.add(7))) << 32);
+            libc::munmap(base, SHM_HEADER_BYTES);
+            (magic == SHM_MAGIC && generation != 0).then_some((generation, st.st_size as usize))
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    struct ShmFixture {
+        name: CString,
+    }
+
+    impl ShmFixture {
+        fn new() -> Self {
+            let name = CString::new(format!("/svt-{}", std::process::id())).unwrap();
+            unsafe { libc::shm_unlink(name.as_ptr()) };
+            Self { name }
+        }
+
+        fn create(&self, generation: u64) {
+            unsafe {
+                let fd = libc::shm_open(
+                    self.name.as_ptr(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                    0o600,
+                );
+                assert!(
+                    fd >= 0,
+                    "create test segment: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(libc::ftruncate(fd, SHM_HEADER_BYTES as libc::off_t), 0);
+                let base = libc::mmap(
+                    ptr::null_mut(),
+                    SHM_HEADER_BYTES,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(base, libc::MAP_FAILED);
+                let header = base.cast::<u32>();
+                ptr::write_volatile(header.add(6), generation as u32);
+                ptr::write_volatile(header.add(7), (generation >> 32) as u32);
+                ptr::write_volatile(header, SHM_MAGIC);
+                assert_eq!(libc::munmap(base, SHM_HEADER_BYTES), 0);
+                assert_eq!(libc::close(fd), 0);
+            }
+        }
+
+        fn unlink(&self) {
+            assert_eq!(unsafe { libc::shm_unlink(self.name.as_ptr()) }, 0);
+        }
+    }
+
+    impl Drop for ShmFixture {
+        fn drop(&mut self) {
+            unsafe { libc::shm_unlink(self.name.as_ptr()) };
+        }
+    }
+
+    #[test]
+    fn generation_identifies_same_size_segment_replacement() {
+        let fixture = ShmFixture::new();
+        fixture.create(0x1111_2222_3333_4444);
+
+        let first = stat_shm(&fixture.name).expect("probe first segment");
+        let (fd, base, size, generation) = open_shm(&fixture.name).expect("open first segment");
+        assert_eq!(generation, first.0);
+        unsafe { libc::munmap(base.cast_mut().cast(), size) };
+        drop(fd);
+
+        fixture.unlink();
+        fixture.create(0x5555_6666_7777_8888);
+        let second = stat_shm(&fixture.name).expect("probe replacement segment");
+
+        assert_eq!(second.1, first.1);
+        assert_ne!(second.0, first.0);
     }
 }

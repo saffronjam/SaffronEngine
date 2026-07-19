@@ -219,7 +219,7 @@ fn read_view(view: View, shm_name: &str, shared: &Arc<ViewportShared>, ready: &A
     };
 
     let mut attempts = 0u32;
-    let (mut _fd, mut base, mut total, mut seg_ino) = loop {
+    let (mut _fd, mut base, mut total, mut generation) = loop {
         if let Some(mapping) = open_shm(&cname) {
             break mapping;
         }
@@ -244,17 +244,17 @@ fn read_view(view: View, shm_name: &str, shared: &Arc<ViewportShared>, ready: &A
 
     loop {
         // The engine recreates the segment when a frame outgrows the slot capacity (and a
-        // restarted engine makes a fresh one): same name, new inode. Remap or this view keeps
+        // restarted engine makes a fresh one): same name, new generation. Remap or this view keeps
         // reading the orphaned old mapping forever.
         if last_segment_check.elapsed() >= Duration::from_millis(250) {
             last_segment_check = Instant::now();
-            if let Some((ino, size)) = stat_shm(&cname)
-                && (ino != seg_ino || size != total)
+            if let Some((current_generation, size)) = stat_shm(&cname)
+                && (current_generation != generation || size != total)
                 && let Some(mapping) = open_shm(&cname)
             {
                 // SAFETY: unmapping the exact prior mapping before adopting the new one.
                 unsafe { libc::munmap(base as *mut _, total) };
-                (_fd, base, total, seg_ino) = mapping;
+                (_fd, base, total, generation) = mapping;
                 header = base as *const u32;
                 last_seq = 0;
                 tracing::debug!(

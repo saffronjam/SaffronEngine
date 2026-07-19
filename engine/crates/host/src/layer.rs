@@ -1370,7 +1370,7 @@ mod tests {
         use crate::viewport_shm::{ShmView, ShmViewConfig, ViewportShmPublisher};
         use std::ffi::CString;
 
-        let name = format!("/saffron-host-teardown-shm-{}", std::process::id());
+        let name = saffron_test_support::unique_shm_name();
         let mut host = standalone("shm-drop");
         let mut shm = ViewportShmPublisher::new();
         shm.enable(ShmViewConfig {
