@@ -57,6 +57,16 @@ pub struct AtmosphereSettings {
     pub sun_disk_angular_radius: f32,
     /// Sun disk intensity.
     pub sun_disk_intensity: f32,
+    /// Moon disk angular radius (radians).
+    pub moon_disk_angular_radius: f32,
+    /// Moon disk radiance trim.
+    pub moon_disk_intensity: f32,
+    /// Earthshine contribution on the moon's dark side.
+    pub moon_earthshine: f32,
+    /// Whether celestial discs evaluate atmosphere transmittance per pixel.
+    pub per_pixel_transmittance: bool,
+    /// Frames over which the live specular sky capture reconverges.
+    pub sky_capture_cadence: f32,
 }
 
 impl Default for AtmosphereSettings {
@@ -72,7 +82,12 @@ impl Default for AtmosphereSettings {
             mie_anisotropy: 0.8,
             ozone_absorption: Vec3::new(0.650, 1.881, 0.085),
             sun_disk_angular_radius: 0.004_65,
-            sun_disk_intensity: 20.0,
+            sun_disk_intensity: 1.0,
+            moon_disk_angular_radius: 0.004_96,
+            moon_disk_intensity: 1.0,
+            moon_earthshine: 0.02,
+            per_pixel_transmittance: false,
+            sky_capture_cadence: 9.0,
         }
     }
 }
@@ -193,10 +208,181 @@ impl Default for FogSettings {
     }
 }
 
+/// Scene-wide volumetric cloud shape, lighting, and reconstruction controls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudSettings {
+    /// Whether the cloud density field is evaluated.
+    pub enabled: bool,
+    /// Global coverage applied to the weather map.
+    pub coverage: f32,
+    /// Height-profile blend from stratus through cumulus to cumulonimbus.
+    pub cloud_type: f32,
+    /// Precipitation carried by the weather map.
+    pub precipitation: f32,
+    /// Cumulonimbus spread near the layer top.
+    pub anvil_bias: f32,
+    /// Cloud-layer bottom altitude in world metres.
+    pub layer_altitude: f32,
+    /// Cloud-layer thickness in metres.
+    pub layer_height: f32,
+    /// World-to-base-noise frequency.
+    pub base_scale: f32,
+    /// World-to-detail-noise frequency.
+    pub detail_scale: f32,
+    /// Detail erosion strength.
+    pub detail_strength: f32,
+    /// Curl-warp displacement in world metres.
+    pub curl_strength: f32,
+    /// World-XZ-to-weather-map frequency.
+    pub weather_scale: f32,
+    /// Weather-map sampling offset.
+    pub weather_offset: Vec3,
+    /// Painted weather-map texture, or zero for procedural weather.
+    pub weather_texture: Uuid,
+    /// Maximum adaptive view-ray samples.
+    pub primary_steps: u32,
+    /// Cone-march samples toward the sun.
+    pub light_steps: u32,
+    /// Water-droplet diameter in micrometres for the analytic Mie phase fit.
+    pub droplet_diameter: f32,
+    /// Fresh-sample weight used by temporal reconstruction.
+    pub temporal_factor: f32,
+    /// Whether the density-integrated cloud shadow is rendered and consumed.
+    pub cast_cloud_shadows: bool,
+    /// Cloud-shadow strength for cloud self-shadowing and volumetric fog.
+    pub cloud_shadow_strength: f32,
+    /// Cloud-shadow strength on opaque surfaces.
+    pub cloud_shadow_on_surface_strength: f32,
+}
+
+impl Default for CloudSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            coverage: 0.5,
+            cloud_type: 0.4,
+            precipitation: 0.0,
+            anvil_bias: 0.0,
+            layer_altitude: 1500.0,
+            layer_height: 2500.0,
+            base_scale: 8e-5,
+            detail_scale: 1e-3,
+            detail_strength: 0.35,
+            curl_strength: 120.0,
+            weather_scale: 2e-5,
+            weather_offset: Vec3::ZERO,
+            weather_texture: Uuid(0),
+            primary_steps: 64,
+            light_steps: 6,
+            droplet_diameter: 20.0,
+            temporal_factor: 0.1,
+            cast_cloud_shadows: true,
+            cloud_shadow_strength: 1.0,
+            cloud_shadow_on_surface_strength: 1.0,
+        }
+    }
+}
+
+/// Scene-wide horizontal wind shared by atmospheric and visual systems.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindSettings {
+    /// Horizontal direction in degrees, clockwise from world +Z.
+    pub orientation: f32,
+    /// Mean advection speed in metres per second.
+    pub speed: f32,
+    /// Divergence-free turbulent warp amplitude.
+    pub gust: f32,
+}
+
+impl Default for WindSettings {
+    fn default() -> Self {
+        Self {
+            orientation: 0.0,
+            speed: 10.0,
+            gust: 0.25,
+        }
+    }
+}
+
+/// Monotone-cubic control points for a time-of-day appearance channel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TodCurve(pub Vec<(f32, f32)>);
+
+impl TodCurve {
+    /// Whether this curve owns its target value.
+    pub fn is_active(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+/// Master and per-channel curves for the time-of-day RGB tint.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TodTintCurve {
+    /// Overall tint multiplier.
+    pub master: TodCurve,
+    /// Red-channel multiplier.
+    pub red: TodCurve,
+    /// Green-channel multiplier.
+    pub green: TodCurve,
+    /// Blue-channel multiplier.
+    pub blue: TodCurve,
+}
+
+/// Scene-owned calendar, ephemeris locale, playback, and appearance curves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeOfDaySettings {
+    /// Whether the time-of-day driver is active.
+    pub enabled: bool,
+    /// Whether authored light directions override the ephemeris.
+    pub manual_override: bool,
+    /// Normalized UTC time within the date (`0` midnight, `0.5` noon).
+    pub time_of_day: f32,
+    /// Gregorian year.
+    pub year: i32,
+    /// Gregorian month.
+    pub month: i32,
+    /// Gregorian day.
+    pub day: i32,
+    /// Observer latitude in degrees.
+    pub latitude: f32,
+    /// Observer east-positive longitude in degrees.
+    pub longitude: f32,
+    /// Real seconds per simulated day; non-positive values pause playback.
+    pub day_length_seconds: f32,
+    /// Tonemap exposure in EV, indexed by normalized sun elevation.
+    pub exposure_curve: TodCurve,
+    /// RGB sky and ambient tint, indexed by normalized sun elevation.
+    pub tint_curve: TodTintCurve,
+    /// Cloud coverage indexed by normalized sun elevation.
+    pub coverage_curve: TodCurve,
+    /// Cloud type indexed by normalized sun elevation.
+    pub cloud_type_curve: TodCurve,
+}
+
+impl Default for TimeOfDaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            manual_override: false,
+            time_of_day: 0.5,
+            year: 2025,
+            month: 6,
+            day: 21,
+            latitude: 0.0,
+            longitude: 0.0,
+            day_length_seconds: 600.0,
+            exposure_curve: TodCurve::default(),
+            tint_curve: TodTintCurve::default(),
+            coverage_curve: TodCurve::default(),
+            cloud_type_curve: TodCurve::default(),
+        }
+    }
+}
+
 /// Scene-wide environment / sky state.
 ///
 /// The renderer resolves it into sky render settings each frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SceneEnvironment {
     /// How the sky background is produced.
     pub sky_mode: SkyMode,
@@ -222,6 +408,12 @@ pub struct SceneEnvironment {
     pub atmosphere: AtmosphereSettings,
     /// Analytic height & distance fog composited into scene-linear HDR before bloom.
     pub fog: FogSettings,
+    /// Volumetric cloud shape and weather controls.
+    pub cloud: CloudSettings,
+    /// Shared global wind field.
+    pub wind: WindSettings,
+    /// Calendar-driven celestial directions and appearance curves.
+    pub time_of_day: TimeOfDaySettings,
 }
 
 impl Default for SceneEnvironment {
@@ -239,6 +431,9 @@ impl Default for SceneEnvironment {
             ambient_intensity: 0.15,
             atmosphere: AtmosphereSettings::default(),
             fog: FogSettings::default(),
+            cloud: CloudSettings::default(),
+            wind: WindSettings::default(),
+            time_of_day: TimeOfDaySettings::default(),
         }
     }
 }
@@ -518,7 +713,12 @@ mod tests {
         assert_eq!(a.mie_anisotropy, 0.8);
         assert_eq!(a.ozone_absorption, Vec3::new(0.650, 1.881, 0.085));
         assert_eq!(a.sun_disk_angular_radius, 0.004_65);
-        assert_eq!(a.sun_disk_intensity, 20.0);
+        assert_eq!(a.sun_disk_intensity, 1.0);
+        assert_eq!(a.moon_disk_angular_radius, 0.004_96);
+        assert_eq!(a.moon_disk_intensity, 1.0);
+        assert_eq!(a.moon_earthshine, 0.02);
+        assert!(!a.per_pixel_transmittance);
+        assert_eq!(a.sky_capture_cadence, 9.0);
     }
 
     #[test]
@@ -546,6 +746,27 @@ mod tests {
     }
 
     #[test]
+    fn cloud_defaults() {
+        let cloud = CloudSettings::default();
+        assert!(!cloud.enabled);
+        assert_eq!(cloud.coverage, 0.5);
+        assert_eq!(cloud.cloud_type, 0.4);
+        assert_eq!(cloud.layer_altitude, 1500.0);
+        assert_eq!(cloud.layer_height, 2500.0);
+        assert_eq!(cloud.base_scale, 8e-5);
+        assert_eq!(cloud.detail_scale, 1e-3);
+        assert_eq!(cloud.detail_strength, 0.35);
+        assert_eq!(cloud.curl_strength, 120.0);
+        assert_eq!(cloud.weather_scale, 2e-5);
+        assert_eq!(cloud.weather_offset, Vec3::ZERO);
+        assert_eq!(cloud.weather_texture, Uuid(0));
+        assert_eq!(cloud.primary_steps, 64);
+        assert_eq!(cloud.light_steps, 6);
+        assert_eq!(cloud.droplet_diameter, 20.0);
+        assert_eq!(cloud.temporal_factor, 0.1);
+    }
+
+    #[test]
     fn scene_environment_defaults() {
         let e = SceneEnvironment::default();
         assert_eq!(e.sky_mode, SkyMode::Procedural);
@@ -560,6 +781,7 @@ mod tests {
         assert_eq!(e.ambient_intensity, 0.15);
         assert!(!e.atmosphere.enabled);
         assert!(!e.fog.enabled);
+        assert!(!e.cloud.enabled);
     }
 
     #[test]
