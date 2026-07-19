@@ -15,9 +15,9 @@
 // TAA render state does not perturb the default-AA diffs above.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
+import { bootEngine, captureViewport, Cleaner, prepareScene } from "./test-utils.ts";
 
 let engine: Engine;
 let skinMesh = ""; // hand-posed skeleton (skinned-strip)
@@ -27,13 +27,18 @@ let morphId = ""; // the mesh-bearing entity carrying the Morph component
 const SKINNED = join(REPO, "tests", "e2e", "fixtures", "skinned-strip.gltf");
 const ANIMATED = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
 const MORPH = join(REPO, "tests", "e2e", "fixtures", "AnimatedMorphCube.gltf");
-const shots: string[] = [];
+const cleaner = new Cleaner();
 
 interface Entry {
   id: string;
   name: string;
   parentId?: string;
   bone?: boolean;
+}
+
+interface AnimState {
+  clip: string;
+  playing: boolean;
 }
 
 async function entries(): Promise<Entry[]> {
@@ -43,7 +48,9 @@ async function entries(): Promise<Entry[]> {
 /// Find the entity in the imported hierarchy that actually carries the AnimationPlayer component.
 async function findPlayerEntity(): Promise<string | undefined> {
   for (const e of await entries()) {
-    const info = await engine.call<{ components: Record<string, unknown> }>("inspect", { entity: e.id });
+    const info = await engine.call<{ components: Record<string, unknown> }>("inspect", {
+      entity: e.id,
+    });
     if (info.components.AnimationPlayer) {
       return e.id;
     }
@@ -55,7 +62,9 @@ async function findPlayerEntity(): Promise<string | undefined> {
 /// which the single-node model may collapse onto the instantiated root).
 async function morphEntity(): Promise<string> {
   for (const e of await entries()) {
-    const info = await engine.call<{ components: Record<string, unknown> }>("inspect", { entity: e.id });
+    const info = await engine.call<{ components: Record<string, unknown> }>("inspect", {
+      entity: e.id,
+    });
     if (info.components.Morph) {
       return e.id;
     }
@@ -65,30 +74,15 @@ async function morphEntity(): Promise<string> {
 
 /// Capture the viewport and wait for the deferred write to land on disk.
 async function screenshot(tag: string): Promise<Buffer> {
-  const path = `/tmp/saffron-e2e-deform-${process.pid}-${tag}.png`;
-  shots.push(path);
-  rmSync(path, { force: true }); // never read a stale frame from a reused tag
-  await engine.call("screenshot", { target: "viewport", path });
-  const deadline = Date.now() + 10_000;
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) {
-      throw new Error(`screenshot ${tag} never landed at ${path}`);
-    }
-    await engine.settle(100);
-  }
-  await engine.settle(200);
-  return readFileSync(path);
+  return captureViewport(engine, cleaner, `deform-${tag}`);
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  await engine.call("set-camera", { yaw: 0, pitch: 0 });
+  engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
+  await prepareScene(engine, { camera: { yaw: 0, pitch: 0 } });
 });
 afterAll(async () => {
-  await engine?.shutdown();
-  for (const shot of shots) {
-    rmSync(shot, { force: true });
-  }
+  await cleaner.cleanup();
 });
 
 test("a rigged glTF imports as a bone-entity hierarchy", async () => {
@@ -115,7 +109,9 @@ test("the skinned mesh resolves its joints by uuid through inspect", async () =>
   type Skin = { mesh: string; rootBone: string; bones: string[] };
   let skin: Skin | undefined;
   for (const e of list) {
-    const info = await engine.call<{ components: { SkinnedMesh?: Skin } }>("inspect", { entity: e.id });
+    const info = await engine.call<{ components: { SkinnedMesh?: Skin } }>("inspect", {
+      entity: e.id,
+    });
     if (info.components.SkinnedMesh) {
       skin = info.components.SkinnedMesh;
       break;
@@ -171,20 +167,25 @@ test("the imported rig carries a stopped AnimationPlayer bound to the clip", asy
   playerId = (await findPlayerEntity()) ?? "";
 
   expect(playerId).not.toBe(""); // the rig descendant carrying AnimationPlayer must exist
-  const info = await engine.call<{ components: Record<string, { clip: string; playing: boolean }> }>("inspect", {
+  const info = await engine.call<{
+    components: Record<string, { clip: string; autoplay: boolean }>;
+  }>("inspect", {
     entity: playerId,
   });
   const player = info.components.AnimationPlayer;
   expect(player).toBeDefined();
-  expect(player.playing).toBe(false);
+  expect(player.autoplay).toBe(false);
   expect(player.clip).not.toBe("0"); // bound to the imported "Bend" clip
+  const state = await engine.call<AnimState>("get-animation-state", { entity: playerId });
+  expect(state.playing).toBe(false);
+  expect(state.clip).toBe(player.clip);
 });
 
 test("playing the clip deforms the mesh, and stop reverts it", async () => {
   await engine.call("set-component-field", {
     entity: playerId,
     component: "AnimationPlayer",
-    field: "playing",
+    field: "autoplay",
     value: true,
   });
   await engine.call("focus", { entity: animMesh });
@@ -257,7 +258,7 @@ test("TAA is active and the rig plays through the motion pass", async () => {
   await engine.call("set-component-field", {
     entity: playerId,
     component: "AnimationPlayer",
-    field: "playing",
+    field: "autoplay",
     value: true,
   });
   await engine.call("focus", { entity: animMesh });
