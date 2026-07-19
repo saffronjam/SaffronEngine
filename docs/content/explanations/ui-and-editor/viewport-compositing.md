@@ -43,12 +43,12 @@ header followed by four equal-capacity frame slots.
 
 | Header word | Meaning |
 |---|---|
-| `0` | Magic `0x5346_5632` (`SFV2`) |
+| `0` | Magic `0x5346_5633` (`SFV3`) |
 | `1`, `2` | Published width and height |
 | `3` | Sequence number; `0` means no frame |
 | `4` | Ring depth, fixed at `4` |
 | `5` | Capacity of one slot in bytes |
-| `6`, `7` | Reserved, written as `0` |
+| `6`, `7` | Low and high words of the segment generation |
 
 Frame sequence `s` occupies slot `s % 4`. For example, sequence `11` uses slot `3`. The writer
 copies the pixels, updates the dimensions, issues a release fence, and writes the new sequence
@@ -58,8 +58,9 @@ and sequences they have already presented, so neither process waits for the othe
 
 Slots start with enough capacity for a 3840 x 2160 BGRA8 frame. The segment grows when a larger
 frame arrives and never shrinks during the process lifetime. Growth and engine restarts can replace
-the object behind the same shared-memory name, so both presenters check its inode and size every
-250 ms and remap when either changes.
+the object behind the same shared-memory name. Each mapping gets a fresh 64-bit generation, so both
+presenters check the generation and size every 250 ms and remap when either changes. The explicit
+generation also works when POSIX shared-memory metadata does not expose a stable inode.
 
 ## Engine readback
 
