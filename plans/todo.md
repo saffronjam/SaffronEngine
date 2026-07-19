@@ -7,10 +7,6 @@
 - Let Inspector components have an explicit order, with add-at-bottom behavior, drag reordering, and a sort action.
 - Fix browser UI quirks like drag-selecting elements so the editor feels like a normal desktop app.
 
-## Materials
-
-- Collapse the two parallel material worlds (inline per-entity PBR blobs vs `.smat` graph assets) into one reference+override model, and fix the reverting/laggy Inspector material fields → `plans/material-instances/` (Phase 1 is a standalone Inspector correctness fix).
-
 ## Rendering
 
 - Improve PBR effect, seems a bit foggy.
