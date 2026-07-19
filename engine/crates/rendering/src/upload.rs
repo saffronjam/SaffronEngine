@@ -30,7 +30,8 @@ use vk_mem::Alloc;
 use crate::descriptors::Descriptors;
 use crate::resources::{
     ConditioningBuffers, DeviceResources, GpuLut, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts,
-    GpuTexture, GpuTextureParts, Image3D, MeshletBuffers, MinMaxPyramid, MorphBuffers,
+    GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, MeshletBuffers, MinMaxPyramid,
+    MorphBuffers,
 };
 use crate::{Device, Error, GradeUniform, Pipeline, Result, checked};
 
@@ -2285,6 +2286,97 @@ impl Uploader {
         self.finish_texture(descriptors, uploaded, None)
     }
 
+    /// Uploads six tightly packed linear-float RGBA faces into a sampled HDR cube.
+    ///
+    /// Faces use Vulkan cube order `+X, -X, +Y, -Y, +Z, -Z`; each carries `size²` texels.
+    pub fn upload_cube_float(&self, rgba: &[f32], size: u32) -> Result<Image> {
+        if size == 0 {
+            return Err(Error::ZeroSizedImage);
+        }
+        let texels = size as usize * size as usize * 6 * 4;
+        if rgba.len() < texels {
+            return Err(Error::InvalidUploadData(format!(
+                "cube upload expected {texels} floats, received {}",
+                rgba.len()
+            )));
+        }
+        let half: Vec<u16> = rgba[..texels].iter().copied().map(float_to_half).collect();
+        let bytes = (half.len() * std::mem::size_of::<u16>()) as vk::DeviceSize;
+        let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
+        staging
+            .mapped_slice()
+            .copy_from_slice(bytemuck::cast_slice(&half));
+        staging.flush();
+
+        let desc = ImageDesc {
+            extent: vk::Extent2D {
+                width: size,
+                height: size,
+            },
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            aspect: vk::ImageAspectFlags::COLOR,
+            view_type: vk::ImageViewType::CUBE,
+            mip_levels: 1,
+            array_layers: 6,
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        let mut image = Image::new(&self.resources, &desc)?;
+        let handle = image.handle();
+        let recorded = self.with_one_off_commands(|cmd| {
+            // SAFETY: the cube and staging buffer outlive the waited one-off submit.
+            unsafe {
+                transition_image_layers(
+                    self.raw(),
+                    cmd,
+                    handle,
+                    6,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 6,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: size,
+                        height: size,
+                        depth: 1,
+                    });
+                self.raw().cmd_copy_buffer_to_image(
+                    cmd,
+                    staging.handle(),
+                    handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                transition_image_layers(
+                    self.raw(),
+                    cmd,
+                    handle,
+                    6,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                );
+            }
+        });
+        drop(staging);
+        recorded?;
+        image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        Ok(image)
+    }
+
     /// Uploads an RGBA8 image as a sampled, mipmapped **displacement height** texture *and* builds its
     /// per-height min/max pyramid, writing both into the same bindless slot (the texture at binding 0,
     /// the pyramid at binding 4). Mirrors [`Uploader::upload_texture`] with `srgb = false` (height is
@@ -3699,6 +3791,43 @@ unsafe fn transition_image(
     let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
     // SAFETY: the caller's recording contract.
     unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
+}
+
+/// One whole-image sync2 transition for every array layer of a single-mip image.
+#[allow(clippy::too_many_arguments)]
+unsafe fn transition_image_layers(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    layers: u32,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+) {
+    let barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(from)
+        .new_layout(to)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: layers,
+        });
+    let barriers = [barrier];
+    let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+    // SAFETY: the caller's recording contract; the image outlives the submit.
+    unsafe { raw.cmd_pipeline_barrier2(cmd, &dependency) };
 }
 
 /// Narrows one finite f32 to an IEEE binary16 (round-to-nearest-even). Subnormals are

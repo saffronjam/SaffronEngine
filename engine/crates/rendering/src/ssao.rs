@@ -538,7 +538,7 @@ fn create_compute_layout(raw: &ash::Device, sampler_count: u32) -> Result<vk::De
 }
 
 /// The gi-resolve pass's single set layout (matches `gi_resolve.slang` set 0): b0 G-buffer sampler,
-/// b1 storage-image output, b2 params UBO, b3 IBL irradiance cube sampler, b4 dfao sampler, b5/b6 the
+/// b1 storage-image output, b2 params UBO, b3 sky SH storage buffer, b4 dfao sampler, b5/b6 the
 /// DDGI irradiance + distance-moment atlas samplers. All compute-stage.
 fn create_gi_resolve_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let sampled = |b: u32| {
@@ -560,7 +560,11 @@ fn create_gi_resolve_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        sampled(3),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
         sampled(4),
         sampled(5),
         sampled(6),

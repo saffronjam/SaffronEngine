@@ -270,6 +270,11 @@ impl Image {
     /// freed before returning on a view failure).
     pub fn new(resources: &Arc<DeviceResources>, desc: &ImageDesc) -> crate::Result<Self> {
         let image_info = vk::ImageCreateInfo::default()
+            .flags(if desc.view_type == vk::ImageViewType::CUBE {
+                vk::ImageCreateFlags::CUBE_COMPATIBLE
+            } else {
+                vk::ImageCreateFlags::empty()
+            })
             .image_type(vk::ImageType::TYPE_2D)
             .format(desc.format)
             .extent(vk::Extent3D {
@@ -340,6 +345,11 @@ impl Image {
     /// Returns [`super::Error::Vk`] if image creation fails.
     pub fn new_no_view(resources: &Arc<DeviceResources>, desc: &ImageDesc) -> crate::Result<Self> {
         let image_info = vk::ImageCreateInfo::default()
+            .flags(if desc.view_type == vk::ImageViewType::CUBE {
+                vk::ImageCreateFlags::CUBE_COMPATIBLE
+            } else {
+                vk::ImageCreateFlags::empty()
+            })
             .image_type(vk::ImageType::TYPE_2D)
             .format(desc.format)
             .extent(vk::Extent3D {

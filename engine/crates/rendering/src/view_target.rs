@@ -111,6 +111,16 @@ pub struct ViewTarget {
     pub prev_color: Option<Image>,
     /// SSGI temporal history (rgba16f), ping-pong sharing TAA's parity.
     pub ssgi_history: [Option<Image>; 2],
+    /// Reduced cloud scatter/transmittance accumulation, ping-ponging with the existing temporal
+    /// history parity. Half width and half height gives one quarter of the full pixel count.
+    pub cloud_reduced: [Option<Image>; 2],
+    /// Reduced cloud transmittance-weighted mean front depth (r16f).
+    pub cloud_reduced_depth: Option<Image>,
+    /// Full-resolution premultiplied cloud scatter and transmittance (rgba16f), consumed by the
+    /// atmosphere ledger.
+    pub cloud_full_color: Option<Image>,
+    /// Full-resolution cloud mean front depth (r32f), consumed by the atmosphere ledger.
+    pub cloud_full_depth: Option<Image>,
 
     /// The screen-space motion-vector target (rg16f): per-pixel `prevUv - curUv`, built
     /// when TAA or SSGI is on. `None` until the temporal targets are built.
@@ -375,6 +385,10 @@ impl ViewTarget {
             gi_indirect: None,
             prev_color: None,
             ssgi_history: [None, None],
+            cloud_reduced: [None, None],
+            cloud_reduced_depth: None,
+            cloud_full_color: None,
+            cloud_full_depth: None,
             motion: None,
             motion_depth: None,
             history: [None, None],
@@ -616,6 +630,11 @@ impl ViewTarget {
             width: extent.width.div_ceil(2).max(1),
             height: extent.height.div_ceil(2).max(1),
         };
+        let display_extent = self.published_extent();
+        let cloud_extent = vk::Extent2D {
+            width: display_extent.width.div_ceil(2).max(1),
+            height: display_extent.height.div_ceil(2).max(1),
+        };
         let ao_raw = Image::new(
             resources,
             &ImageDesc::color_2d(half_extent, AO_FORMAT, storage_sampled),
@@ -689,6 +708,34 @@ impl ViewTarget {
             resources,
             &ImageDesc::color_2d(extent, G_NORMAL_FORMAT, storage_sampled),
         )?;
+        let mut cloud_reduced_0 = Image::new(
+            resources,
+            &ImageDesc::color_2d(cloud_extent, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+        )?;
+        let mut cloud_reduced_1 = Image::new(
+            resources,
+            &ImageDesc::color_2d(cloud_extent, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+        )?;
+        let mut cloud_reduced_depth = Image::new(
+            resources,
+            &ImageDesc::color_2d(
+                cloud_extent,
+                vk::Format::R16_SFLOAT,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
+            ),
+        )?;
+        let mut cloud_full_color = Image::new(
+            resources,
+            &ImageDesc::color_2d(display_extent, OFFSCREEN_COLOR_FORMAT, storage_sampled),
+        )?;
+        let mut cloud_full_depth = Image::new(
+            resources,
+            &ImageDesc::color_2d(
+                display_extent,
+                vk::Format::R32_SFLOAT,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
+            ),
+        )?;
         let mut ao_map = ao_map;
         let mut contact_map = contact_map;
         let mut ssgi_map = ssgi_map;
@@ -708,7 +755,7 @@ impl ViewTarget {
         // storage-only scratch (ao_raw, ssgi_map written first by their producing pass)
         // stay UNDEFINED until the graph transitions them — except ssgi_map, also read
         // as a sampler by ssgi_blur, so it is seeded too.
-        let read_only: [&Image; 16] = [
+        let read_only: [&Image; 21] = [
             &ao_map,
             &contact_map,
             &ssgi_map,
@@ -725,6 +772,11 @@ impl ViewTarget {
             &prev_color,
             &ssgi_history_0,
             &ssgi_history_1,
+            &cloud_reduced_0,
+            &cloud_reduced_1,
+            &cloud_reduced_depth,
+            &cloud_full_color,
+            &cloud_full_depth,
         ];
         initialize_screen_space_layouts(device, &read_only)?;
         for image in [
@@ -744,6 +796,11 @@ impl ViewTarget {
             &mut prev_color,
             &mut ssgi_history_0,
             &mut ssgi_history_1,
+            &mut cloud_reduced_0,
+            &mut cloud_reduced_1,
+            &mut cloud_reduced_depth,
+            &mut cloud_full_color,
+            &mut cloud_full_depth,
         ] {
             image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
@@ -790,6 +847,10 @@ impl ViewTarget {
         self.gi_params_ubos = gi_params_ubos;
         self.prev_color = Some(prev_color);
         self.ssgi_history = [Some(ssgi_history_0), Some(ssgi_history_1)];
+        self.cloud_reduced = [Some(cloud_reduced_0), Some(cloud_reduced_1)];
+        self.cloud_reduced_depth = Some(cloud_reduced_depth);
+        self.cloud_full_color = Some(cloud_full_color);
+        self.cloud_full_depth = Some(cloud_full_depth);
         // A resize invalidates the temporal reprojection; the next frame re-seeds.
         self.history_valid = false;
         self.history_index = 0;
@@ -1274,6 +1335,8 @@ impl ViewTarget {
         let prev_color = self.view_of(&self.prev_color);
         let offscreen = self.offscreen.view();
         let depth = self.depth.view();
+        let cloud_full_color = self.view_of(&self.cloud_full_color);
+        let cloud_full_depth = self.view_of(&self.cloud_full_depth);
 
         // Each binding is a `(set, binding, kind)`. A sampler binding pairs a sampler +
         // a view (ShaderReadOnly); a storage binding is a view only (GENERAL). The whole
@@ -1353,6 +1416,8 @@ impl ViewTarget {
             // written once by the renderer.
             Binding::storage(self.fog_set, 0, offscreen),
             Binding::sampled(self.fog_set, 2, nearest, depth),
+            Binding::sampled(self.fog_set, 8, linear, cloud_full_color),
+            Binding::sampled(self.fog_set, 9, nearest, cloud_full_depth),
         ];
         // gi-resolve view-local image bindings, into every per-frame set (the shared IBL cube +
         // DDGI atlases at b3/b5/b6 are written from the renderer, which owns those sub-states; the
@@ -1531,6 +1596,36 @@ impl ViewTarget {
         unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
     }
 
+    /// Writes the atmosphere transmittance and multiscatter LUTs into fog bindings 6 and 7.
+    pub fn write_fog_atmosphere_luts(
+        &self,
+        device: &Device,
+        sampler: vk::Sampler,
+        transmittance: vk::ImageView,
+        multi_scatter: vk::ImageView,
+    ) {
+        let infos = [transmittance, multi_scatter].map(|view| {
+            [vk::DescriptorImageInfo {
+                sampler,
+                image_view: view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }]
+        });
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.fog_set)
+                .dst_binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[0]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.fog_set)
+                .dst_binding(7)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[1]),
+        ];
+        unsafe { device.raw().update_descriptor_sets(&writes, &[]) };
+    }
+
     /// Writes the creative-look 3D LUT `view` into binding 2 of the tonemap set with `sampler`. Called
     /// at view build with the identity default and rewritten (idled) when a creative look is assigned.
     /// The set is allocated once and never reallocated, so this binding persists across resizes.
@@ -1550,8 +1645,8 @@ impl ViewTarget {
         unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
     }
 
-    /// Writes the *shared* gi-resolve bindings into every per-frame set — b3 the IBL diffuse
-    /// irradiance cube, b5 the DDGI irradiance atlas, b6 the DDGI distance-moment atlas. Separate
+    /// Writes the *shared* gi-resolve bindings into every per-frame set — b3 the sky SH buffer,
+    /// b5 the DDGI irradiance atlas, b6 the DDGI distance-moment atlas. Separate
     /// from [`ViewTarget::write_screen_space_sets`] because the IBL + DDGI sub-states are owned by
     /// the renderer (not visible at view build). The renderer calls this once they are ready, and
     /// re-calls it on IBL rebake / DDGI rebuild (the views change) — the same triggers the mesh
@@ -1561,8 +1656,8 @@ impl ViewTarget {
         &self,
         device: &Device,
         frame: usize,
-        ibl_cube: vk::ImageView,
-        ibl_sampler: vk::Sampler,
+        sky_sh: vk::Buffer,
+        sky_sh_size: vk::DeviceSize,
         ddgi_irradiance: vk::ImageView,
         ddgi_distance: vk::ImageView,
         ddgi_sampler: vk::Sampler,
@@ -1575,13 +1670,16 @@ impl ViewTarget {
         if set == vk::DescriptorSet::null() {
             return; // sets not allocated yet (screen-space not built)
         }
-        let plan: [Binding; 3] = [
-            Binding::sampled(set, 3, ibl_sampler, ibl_cube),
+        let plan: [Binding; 2] = [
             Binding::sampled(set, 5, ddgi_sampler, ddgi_irradiance),
             Binding::sampled(set, 6, ddgi_sampler, ddgi_distance),
         ];
         let infos: Vec<vk::DescriptorImageInfo> = plan.iter().map(Binding::info).collect();
-        let writes: Vec<vk::WriteDescriptorSet> = plan
+        let sh_info = [vk::DescriptorBufferInfo::default()
+            .buffer(sky_sh)
+            .offset(0)
+            .range(sky_sh_size)];
+        let mut writes: Vec<vk::WriteDescriptorSet> = plan
             .iter()
             .zip(infos.iter())
             .map(|(binding, info)| {
@@ -1592,6 +1690,13 @@ impl ViewTarget {
                     .image_info(std::slice::from_ref(info))
             })
             .collect();
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&sh_info),
+        );
         // SAFETY: the ash seam. Sets/views/samplers are valid; the renderer calls this at a
         // post-fence point where the sets are not in use by an in-flight frame.
         unsafe { device.raw().update_descriptor_sets(&writes, &[]) };

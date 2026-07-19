@@ -295,7 +295,7 @@ impl Descriptors {
         self.instance_set_layout
     }
 
-    /// Set 3 in the mesh pipeline: the IBL set (global irradiance/prefiltered/BRDF +
+    /// Set 3 in the mesh pipeline: the IBL set (global sky SH/prefiltered/BRDF +
     /// the reflection-probe cube arrays + probe metadata). The mesh PSO layout binds
     /// it; the descriptor set + its data resources land in the IBL phase.
     pub fn ibl_set_layout(&self) -> vk::DescriptorSetLayout {
@@ -1170,6 +1170,7 @@ fn create_light_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
             .descriptor_type(sampler)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        light_binding(12, sampler), // cascaded cloud-shadow map
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1219,15 +1220,15 @@ fn create_instance_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> 
     )
 }
 
-/// Set 3 (mesh pipeline): the IBL set. Bindings 0-2 are the global IBL
-/// (irradiance/prefiltered/BRDF combined-image-samplers); bindings 3-4 carry the
+/// Set 3 (mesh pipeline): the IBL set. Binding 0 is the global sky-radiance SH buffer;
+/// bindings 1-2 are the prefiltered environment and BRDF combined-image-samplers; bindings 3-4 carry the
 /// reflection-probe cube arrays (`MAX_REFLECTION_PROBES` each); binding 5 is the
 /// probe-metadata SSBO — all fragment-stage. Probes ride the always-present IBL set
 /// rather than a 9th bound set.
 fn create_ibl_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let sampler = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
     let bindings = [
-        light_binding(0, sampler),
+        light_binding(0, vk::DescriptorType::STORAGE_BUFFER),
         light_binding(1, sampler),
         light_binding(2, sampler),
         vk::DescriptorSetLayoutBinding::default()
@@ -1242,7 +1243,20 @@ fn create_ibl_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         light_binding(5, vk::DescriptorType::STORAGE_BUFFER),
     ];
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    let binding_flags = [
+        vk::DescriptorBindingFlags::empty(),
+        vk::DescriptorBindingFlags::empty(),
+        vk::DescriptorBindingFlags::empty(),
+        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::empty(),
+    ];
+    let mut flags_info =
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
+    let info = vk::DescriptorSetLayoutCreateInfo::default()
+        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+        .bindings(&bindings)
+        .push_next(&mut flags_info);
     // SAFETY: the ash seam.
     checked(
         unsafe { raw.create_descriptor_set_layout(&info, None) },
@@ -1366,6 +1380,10 @@ fn create_fog_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
         // live + AP is authored. Bound to the fixed-size AP volume, always a valid descriptor (the
         // shader gates the sample on `aerial.x`, so it is untouched when AP is off).
         compute_binding(5, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(8, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(9, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1510,7 +1528,10 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
         ),
     ];
     let info = vk::DescriptorPoolCreateInfo::default()
-        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+        .flags(
+            vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET
+                | vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND,
+        )
         .max_sets(1024 + 8 * frames + 64 + 21 * views + bloom_sets + 1 + views)
         .pool_sizes(&pool_sizes);
     // SAFETY: the ash seam. The pool is owned and freed in teardown.

@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
-use saffron_geometry::glam::{Mat4, Vec3};
+use saffron_geometry::glam::{Mat4, Vec3, Vec4};
 
 use crate::budget::{BudgetController, BudgetStep};
 use crate::ddgi::DDGI_RAYS_PER_PROBE;
@@ -19,7 +19,8 @@ use crate::frame_history::{
     PerfConfig,
 };
 use crate::ibl::{
-    EnvSource, Ibl, ReflectionProbeUpload, ReflectionProbes, Sky, SkyRenderSettings, SkygenParams,
+    EnvSource, Ibl, LUNAR_ILLUMINANCE_FULL, ReflectionProbeUpload, ReflectionProbes,
+    SOLAR_ILLUMINANCE_TOA, Sky, SkyRenderSettings, SkygenParams, sun_transmittance,
 };
 use crate::instancing::Instancing;
 use crate::lighting::{ClusterCamera, Lighting, SceneLighting, point_shadow_face_matrices};
@@ -104,6 +105,8 @@ pub enum ViewMode {
     /// The froxel volumetric-fog volume: the integrated in-scatter + fog opacity, visualized by the
     /// fog composite pass (requires `fog.mode == volumetric`, where the froxel grid is populated).
     Fog,
+    /// Raw volumetric cloud density integrated by the dedicated cloud debug pass.
+    CloudDensity,
 }
 
 impl ViewMode {
@@ -118,7 +121,8 @@ impl ViewMode {
             | ViewMode::LitWireframe
             | ViewMode::MotionVectors
             // Fog is visualized by the fog composite pass, not the mesh debug channel.
-            | ViewMode::Fog => 0,
+            | ViewMode::Fog
+            | ViewMode::CloudDensity => 0,
             ViewMode::Albedo => 1,
             ViewMode::Normal => 2,
             ViewMode::Roughness => 3,
@@ -354,6 +358,18 @@ struct FramePipelines {
     tonemap: Option<Arc<crate::Pipeline>>,
     /// The analytic height-fog composite compute PSO, resolved only while fog is enabled this frame.
     fog: Option<Arc<crate::Pipeline>>,
+    /// The weather-map refill compute PSO, resolved only while the authored map is dirty.
+    cloud_weather: Option<Arc<crate::Pipeline>>,
+    /// The unlit cloud-density compute PSO, resolved only in CloudDensity view mode.
+    cloud_debug: Option<Arc<crate::Pipeline>>,
+    /// The adaptive lit cloud raymarch PSO.
+    cloud_raymarch: Option<Arc<crate::Pipeline>>,
+    /// The reduced cloud temporal reconstruction PSO.
+    cloud_reconstruct: Option<Arc<crate::Pipeline>>,
+    /// The bilateral upscale and HDR cloud composite PSO.
+    cloud_upscale: Option<Arc<crate::Pipeline>>,
+    /// The cascaded density-integrated cloud-shadow fill PSO.
+    cloud_shadow: Option<Arc<crate::Pipeline>>,
     /// The froxel fog-inject / fog-integrate compute PSOs, resolved only while volumetric fog is on.
     fog_inject: Option<Arc<crate::Pipeline>>,
     fog_integrate: Option<Arc<crate::Pipeline>>,
@@ -424,6 +440,46 @@ struct GdfResult {
     /// only when the composite ran this frame (it writes the cache GENERAL).
     albedo: Option<RgResource>,
     albedo_slot: Option<usize>,
+}
+
+/// External layout slots for persistent cloud shape fields and per-view temporal products.
+#[derive(Default)]
+struct CloudGraphResult {
+    base: Option<usize>,
+    detail: Option<usize>,
+    curl: Option<usize>,
+    weather: Option<usize>,
+    shadow: Option<usize>,
+    reduced: [Option<usize>; 2],
+    reduced_depth: Option<usize>,
+    full_color: Option<usize>,
+    full_depth: Option<usize>,
+    full_color_resource: Option<RgResource>,
+    full_depth_resource: Option<RgResource>,
+    temporal: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CloudGraphInputs {
+    color: RgResource,
+    depth: RgResource,
+    motion: Option<RgResource>,
+    sky_sh: RgResource,
+}
+
+#[derive(Clone, Copy)]
+struct CloudFrameResources {
+    base: RgResource,
+    detail: RgResource,
+    curl: RgResource,
+    weather: RgResource,
+    shadow: RgResource,
+    base_slot: usize,
+    detail_slot: usize,
+    curl_slot: usize,
+    weather_slot: usize,
+    shadow_slot: usize,
+    params_offset: u32,
 }
 
 /// The three ReSTIR DI compute PSOs, resolved together — the `doRestir` gate requires all
@@ -627,6 +683,10 @@ pub(crate) struct FogParams {
     /// Aerial perspective: `x` = enabled (atmosphere live + AP authored), `y` = AP near, `z` = AP far
     /// (the exponential-Z distribution the composite's AP W mapping inverts), `w` unused.
     aerial: [f32; 4],
+    /// `x` = full-resolution cloud scatter/transmittance is live.
+    cloud: [f32; 4],
+    /// Atmosphere physical and camera block shared with the AP volume fill.
+    ap: crate::AerialParamsUbo,
 }
 
 /// The renderer: device, swapchain, frame ring, and the clear color.
@@ -649,6 +709,8 @@ pub struct Renderer {
     /// The tonemap exposure in stops; the mandatory tonemap pass applies `exp2(this)`.
     /// Defaults to 0 (a 1× multiplier).
     exposure_ev: f32,
+    /// Sun-elevation-derived scotopic adaptation strength.
+    night_factor: f32,
     /// Whether the scene-linear bloom pyramid runs before the tonemap pass. Off by default.
     bloom_enabled: bool,
     /// The energy-conserving bloom composite weight (`lerp(hdr, bloom, this)`). Default `0.05`.
@@ -689,6 +751,8 @@ pub struct Renderer {
     /// The Hillaire-2020 aerial-perspective volume + fill set. Filled from the atmosphere LUTs and
     /// folded into the fog composite on the shared transmittance ledger while AP is live.
     aerial: crate::AerialPerspective,
+    /// Persistent channel-packed cloud noise, curl, and single resolved weather map.
+    clouds: crate::Clouds,
     /// This frame's local `FogVolume` records, baked from the scene's `submit_fog_volumes`, uploaded
     /// into the inject SSBO and looped per froxel during injection.
     fog_volumes: Vec<crate::FogVolumeGpu>,
@@ -698,6 +762,16 @@ pub struct Renderer {
     /// The directional light's travel direction (normalized; the way the sun's light goes), captured
     /// on the scene-lighting write so the fog pass can point its sun-inscatter lobe toward the sun.
     sun_direction: Vec3,
+    /// The atmosphere-coupled directional-light color consumed by cloud lighting.
+    sun_color: Vec3,
+    /// The atmosphere-coupled directional-light intensity consumed by cloud lighting.
+    sun_intensity: f32,
+    /// The moon-light travel direction captured for night cloud lighting.
+    moon_direction: Vec3,
+    /// The atmosphere-coupled moon-light color consumed by cloud lighting.
+    moon_color: Vec3,
+    /// The atmosphere-coupled moon-light intensity consumed by cloud lighting.
+    moon_intensity: f32,
     /// The infinite analytic ground grid debug overlay toggle.
     show_grid: bool,
     /// Native-viewport host mode: present blits the post-processed offscreen straight to
@@ -898,6 +972,7 @@ pub struct Renderer {
     /// is live never thrashes the project environment bake against the preview environment.
     preview_ibl: Ibl,
     sky: Sky,
+    stars: crate::StarCatalog,
     reflection: ReflectionProbes,
     ssao: Ssao,
     ddgi: crate::Ddgi,
@@ -965,6 +1040,15 @@ pub struct Renderer {
     /// thread-safe). The renderer is normally the last holder, and the worker is joined +
     /// its `Arc<Device>` dropped before the renderer's, so the device dies after every user.
     device: Arc<Device>,
+}
+
+fn chromatic_light(radiance: Vec3, trim: f32) -> (Vec3, f32) {
+    let luminance = radiance.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    if luminance <= f32::EPSILON {
+        (Vec3::ZERO, 0.0)
+    } else {
+        (radiance / luminance, luminance * trim.max(0.0))
+    }
 }
 
 impl Renderer {
@@ -1035,6 +1119,7 @@ impl Renderer {
             Ibl,
             Ibl,
             Sky,
+            crate::StarCatalog,
             ReflectionProbes,
             Ssao,
             crate::Ddgi,
@@ -1043,6 +1128,7 @@ impl Renderer {
             crate::Restir,
             crate::FroxelFog,
             crate::AerialPerspective,
+            crate::Clouds,
             Vec<ViewTarget>,
             BindlessFreeList,
             crate::Aa,
@@ -1099,8 +1185,18 @@ impl Renderer {
             // probes ride the IBL set, seeded with the global cubes after the bake.
             let mut ibl = Ibl::new(&device, &descriptors)?;
             ibl.bake(&device, true)?;
+            let stars = crate::StarCatalog::new(
+                &device,
+                &descriptors,
+                &uploader,
+                ibl.transmittance_view(),
+                ibl.sky_view_lut_view(),
+                ibl.sampler(),
+                vk::SampleCountFlags::TYPE_1,
+            )?;
             let mut sky = Sky::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1)?;
             sky.bind_env_cube(&ibl);
+            sky.bind_night_sky(&ibl, &stars);
             let reflection = ReflectionProbes::new(&device, ibl.set())?;
             reflection.seed(&ibl);
 
@@ -1123,6 +1219,7 @@ impl Renderer {
             // deferred to lazy request. Device-shared (one camera-centered probe clipmap); on by
             // default. Built after descriptors (it needs the mesh set-5 layout + the shared pool).
             let ddgi = crate::Ddgi::new(&device, &descriptors)?;
+            ddgi.bind_sky_sh(ibl.sh_coefficients());
             // Global SDF: the cascade clipmap volumes + cull SSBO + params UBO + the two compute
             // sets/layouts + the two PSOs deferred to lazy request. Device-shared (one clipmap);
             // off by default. Built after descriptors (it needs the shared pool + the light layout
@@ -1153,6 +1250,15 @@ impl Renderer {
                 ibl.multi_scatter_view(),
             );
 
+            // Static cloud noise is authored once by GPU compute; the weather map remains a single
+            // persistent image refilled only when its authoring inputs change.
+            let clouds = crate::Clouds::new(&device, &pipelines, &ibl, VIEW_COUNT)?;
+            lighting.bind_cloud_shadow(
+                &device,
+                clouds.cloud_shadow().view(),
+                clouds.shadow_sampler(),
+            );
+
             // The two editor views (Scene + AssetPreview), each with its own offscreen +
             // screen-space + AA + ReSTIR targets and per-view sets, so a view switch never
             // aliases another view's images. Both are sized to the initial extent; the
@@ -1179,6 +1285,12 @@ impl Renderer {
                 // Bind the aerial-perspective volume at binding 5 of the fog set (the AP composite
                 // sample). The volume is fixed-size and never reallocated, so this write persists.
                 view.write_fog_aerial(&device, aerial.sampler(), aerial.volume_view());
+                view.write_fog_atmosphere_luts(
+                    &device,
+                    ibl.sampler(),
+                    ibl.transmittance_view(),
+                    ibl.multi_scatter_view(),
+                );
                 // The AA targets (motion / history / scratch / MSAA), built after the
                 // screen-space chain (it reads the SSGI maps).
                 view.build_aa_targets(&device, &descriptors, aa)?;
@@ -1186,6 +1298,41 @@ impl Renderer {
                 view.restir
                     .build(&device, &descriptors, &restir, view.scaled_render_extent())?;
                 views.push(view);
+            }
+            for (index, view) in views.iter().enumerate() {
+                clouds.bind_view(
+                    index,
+                    crate::clouds::CloudViewBindings {
+                        color: view.offscreen.view(),
+                        depth: view.depth.view(),
+                        motion: view.motion.as_ref().expect("cloud motion built").view(),
+                        reduced: [
+                            view.cloud_reduced[0]
+                                .as_ref()
+                                .expect("cloud reduced 0 built")
+                                .view(),
+                            view.cloud_reduced[1]
+                                .as_ref()
+                                .expect("cloud reduced 1 built")
+                                .view(),
+                        ],
+                        reduced_depth: view
+                            .cloud_reduced_depth
+                            .as_ref()
+                            .expect("cloud reduced depth built")
+                            .view(),
+                        full_color: view
+                            .cloud_full_color
+                            .as_ref()
+                            .expect("cloud full color built")
+                            .view(),
+                        full_depth: view
+                            .cloud_full_depth
+                            .as_ref()
+                            .expect("cloud full depth built")
+                            .view(),
+                    },
+                );
             }
             ssao.ready = true;
             Ok((
@@ -1202,6 +1349,7 @@ impl Renderer {
                 ibl,
                 preview_ibl,
                 sky,
+                stars,
                 reflection,
                 ssao,
                 ddgi,
@@ -1210,6 +1358,7 @@ impl Renderer {
                 restir,
                 froxel,
                 aerial,
+                clouds,
                 views,
                 free_list,
                 aa,
@@ -1233,6 +1382,7 @@ impl Renderer {
             ibl,
             preview_ibl,
             sky,
+            stars,
             reflection,
             ssao,
             ddgi,
@@ -1241,6 +1391,7 @@ impl Renderer {
             restir,
             froxel,
             aerial,
+            clouds,
             views,
             bindless_free_list,
             aa,
@@ -1323,6 +1474,7 @@ impl Renderer {
             wireframe: false,
             use_depth_prepass: true,
             exposure_ev: 0.0,
+            night_factor: 0.0,
             bloom_enabled: false,
             bloom_intensity: 0.05,
             bloom_scatter: 0.005,
@@ -1340,9 +1492,15 @@ impl Renderer {
             fog: FogRenderSettings::default(),
             froxel,
             aerial,
+            clouds,
             fog_volumes: Vec::new(),
             fog_time: 0.0,
             sun_direction: Vec3::new(0.0, -1.0, 0.0),
+            sun_color: Vec3::ONE,
+            sun_intensity: 0.0,
+            moon_direction: Vec3::Y,
+            moon_color: Vec3::ZERO,
+            moon_intensity: 0.0,
             show_grid: false,
             present_viewport_only: false,
             frame_begun: false,
@@ -1420,6 +1578,7 @@ impl Renderer {
             ibl,
             preview_ibl,
             sky,
+            stars,
             reflection,
             ssao,
             ddgi,
@@ -1598,6 +1757,12 @@ impl Renderer {
         self.sky.submit(settings);
     }
 
+    /// Folds the scene's cloud-shape authoring into the persistent density resources. Weather-map
+    /// inputs mark the single weather image dirty; all other shape values update the shared UBO.
+    pub fn submit_clouds(&mut self, settings: crate::CloudRenderSettings) {
+        self.clouds.submit(settings);
+    }
+
     /// Folds this frame's analytic height/distance fog in. Resolved from `scene.environment.fog`
     /// each frame (the same shape as [`Renderer::submit_sky`]); the composite pass runs before the
     /// bloom pyramid only while `settings.enabled`.
@@ -1641,6 +1806,12 @@ impl Renderer {
         } else {
             &mut self.ibl
         }
+    }
+
+    /// Whether the active view's environment bake and derived lighting capture are complete.
+    /// Synchronous thumbnail readback uses this to avoid capturing a partially refreshed IBL.
+    pub fn active_environment_converged(&self) -> bool {
+        self.scene_ibl().dynamic_lighting_converged()
     }
 
     /// Re-arms the IBL environment bake when the source / panorama / params change.
@@ -1911,7 +2082,7 @@ impl Renderer {
         ibl_enabled && self.sky_occlusion_enabled() && self.global_sdf.enabled()
     }
 
-    /// Snaps the camera-centered DDGI probe clipmap to the camera + stores the sun/sky for the
+    /// Snaps the camera-centered DDGI probe clipmap to the camera + stores the sun for the
     /// trace. Call before [`Renderer::set_scene_lighting`], which folds the volume + probe grid +
     /// toroidal scroll base into the light UBO.
     pub fn set_ddgi_scene(
@@ -1920,10 +2091,9 @@ impl Renderer {
         sun_dir: saffron_geometry::glam::Vec3,
         sun_color: saffron_geometry::glam::Vec3,
         sun_intensity: f32,
-        sky_color: saffron_geometry::glam::Vec3,
     ) {
         self.ddgi
-            .set_scene(cam_pos, sun_dir, sun_color, sun_intensity, sky_color);
+            .set_scene(cam_pos, sun_dir, sun_color, sun_intensity);
     }
 
     /// Uploads this frame's per-static-instance SDF list into the host-mapped SSBO,
@@ -2002,9 +2172,36 @@ impl Renderer {
     /// Returns [`Error`] if growing the punctual SSBO fails.
     pub fn set_scene_lighting(&mut self, scene: &SceneLighting) -> Result<()> {
         let frame = self.frames.index();
+        let mut scene = scene.clone();
+        if self.scene_ibl().atmosphere_live() {
+            let atmosphere = self.scene_ibl().baked_atmosphere();
+            let sun_to_light = -scene.direction.normalize_or_zero();
+            let sun_radiance = sun_transmittance(&atmosphere, sun_to_light) * SOLAR_ILLUMINANCE_TOA;
+            (scene.color, scene.intensity) = chromatic_light(sun_radiance, scene.intensity);
+
+            let moon_to_light = -scene.moon_direction.normalize_or_zero();
+            let phase = (1.0 - sun_to_light.dot(moon_to_light).clamp(-1.0, 1.0)) * 0.5;
+            let moon_radiance =
+                sun_transmittance(&atmosphere, moon_to_light) * (LUNAR_ILLUMINANCE_FULL * phase);
+            (scene.moon_color, scene.moon_intensity) =
+                chromatic_light(moon_radiance, scene.moon_intensity);
+        }
         // Capture the directional-light travel direction for the fog pass's sun-inscatter lobe (it
         // points its lobe toward the sun, i.e. `-direction`).
         self.sun_direction = scene.direction.normalize_or_zero();
+        self.sun_color = scene.color;
+        self.sun_intensity = scene.intensity;
+        self.moon_direction = scene.moon_direction.normalize_or_zero();
+        self.moon_color = scene.moon_color;
+        self.moon_intensity = scene.moon_intensity;
+        let cloud_shadow = self.clouds.shadow_projection(
+            scene.eye_position,
+            -self.sun_direction,
+            self.sun_intensity,
+            -self.moon_direction,
+            self.moon_intensity,
+        );
+        self.lighting.set_frame_cloud_shadow(cloud_shadow);
         // Fold the IBL-ambient flag + the reflection-probe count into the UBO write.
         // Probes contribute only when IBL is baked + their toggle is on.
         let ibl = self.scene_ibl();
@@ -2052,7 +2249,7 @@ impl Renderer {
             crate::FROXEL_FAR,
         );
         self.lighting
-            .set_scene_lighting(&self.descriptors, frame, scene)
+            .set_scene_lighting(&self.descriptors, frame, &scene)
     }
 
     /// Whether screen-space reflections are enabled.
@@ -3414,7 +3611,45 @@ impl Renderer {
         self.views[i].restir.reset_history();
         self.views[i]
             .restir
-            .build(&self.device, &self.descriptors, &self.restir, input)
+            .build(&self.device, &self.descriptors, &self.restir, input)?;
+        self.clouds.bind_view(
+            i,
+            crate::clouds::CloudViewBindings {
+                color: self.views[i].offscreen.view(),
+                depth: self.views[i].depth.view(),
+                motion: self.views[i]
+                    .motion
+                    .as_ref()
+                    .expect("cloud motion built")
+                    .view(),
+                reduced: [
+                    self.views[i].cloud_reduced[0]
+                        .as_ref()
+                        .expect("cloud reduced 0 built")
+                        .view(),
+                    self.views[i].cloud_reduced[1]
+                        .as_ref()
+                        .expect("cloud reduced 1 built")
+                        .view(),
+                ],
+                reduced_depth: self.views[i]
+                    .cloud_reduced_depth
+                    .as_ref()
+                    .expect("cloud reduced depth built")
+                    .view(),
+                full_color: self.views[i]
+                    .cloud_full_color
+                    .as_ref()
+                    .expect("cloud full color built")
+                    .view(),
+                full_depth: self.views[i]
+                    .cloud_full_depth
+                    .as_ref()
+                    .expect("cloud full depth built")
+                    .view(),
+            },
+        );
+        Ok(())
     }
 
     /// A view's last-requested render width in device pixels (`0` until the view has been
@@ -4128,6 +4363,8 @@ impl Renderer {
             // target, or the sky pass draws MSAA color with a 1× pipeline.
             self.sky
                 .set_sample_count(&self.device, &self.descriptors, self.aa.sample_count())?;
+            self.stars
+                .set_sample_count(&self.device, self.aa.sample_count())?;
         }
         // Both views share the offscreen sample count, so rebuild every view's AA targets
         // (not just the active one) — a later `set-active-view` must find the inactive view's
@@ -4191,6 +4428,16 @@ impl Renderer {
     /// The current tonemap exposure in stops.
     pub fn exposure_ev(&self) -> f32 {
         self.exposure_ev
+    }
+
+    /// Sets low-light rod/cone adaptation strength for the next tonemap pass.
+    pub fn set_night_factor(&mut self, factor: f32) {
+        self.night_factor = factor.clamp(0.0, 1.0);
+    }
+
+    /// The current low-light adaptation strength.
+    pub fn night_factor(&self) -> f32 {
+        self.night_factor
     }
 
     /// Sets the bloom parameters: the enable flag, the energy-conserving composite `intensity`,
@@ -4908,20 +5155,22 @@ impl Renderer {
             self.set_render_scale(self.active_view, scale)?;
         }
 
-        // Re-bake the IBL environment if the sky inputs changed (the directional light
-        // moved). Deferred to here — a GPU-idle point — so the visible sky + IBL relight
-        // together. The bake waits idle internally; an editor-time event, not per-frame hot
-        // A failure is logged, not fatal. The preview IBL re-bakes the same way on the first
-        // thumbnail render (its `rebake_pending` stays false on every non-thumbnail frame).
-        if self.ibl.rebake_pending {
-            if let Err(err) = self.ibl.fire_rebake(&self.device) {
-                tracing::error!("ibl re-bake failed: {err}");
+        // Advance fence-owned IBL refreshes at the frame boundary. A completed back set is
+        // descriptor-committed here; in-flight frames continue sampling the front set.
+        match self.ibl.update_refresh(&self.device) {
+            Ok(true) => {
+                self.sky.bind_env_cube(&self.ibl);
+                self.reflection.seed(&self.ibl);
             }
+            Ok(false) => {}
+            Err(err) => tracing::error!("ibl refresh failed: {err}"),
         }
-        if self.preview_ibl.rebake_pending {
-            if let Err(err) = self.preview_ibl.fire_rebake(&self.device) {
-                tracing::error!("preview ibl re-bake failed: {err}");
-            }
+        match self.preview_ibl.update_refresh(&self.device) {
+            Ok(true) => self
+                .reflection
+                .seed_set(self.preview_ibl.set(), &self.preview_ibl),
+            Ok(false) => {}
+            Err(err) => tracing::error!("preview ibl refresh failed: {err}"),
         }
 
         // Wait + reset this slot's fence and command pool. The run loop calls
@@ -5207,7 +5456,10 @@ impl Renderer {
         };
         let have_scratch = self.views[self.active_view.index()].scratch.is_some();
         // DFAO also reprojects through the motion target, so it forces motion on (like TAA/SSGI).
-        let want_motion = (self.aa.taa() || want_ssgi || want_dfao) && have_motion_targets;
+        let want_cloud_motion =
+            self.clouds.settings().enabled && self.view_mode != ViewMode::CloudDensity;
+        let want_motion =
+            (self.aa.taa() || want_ssgi || want_dfao || want_cloud_motion) && have_motion_targets;
         let motion = if want_motion {
             self.pipelines.request_motion()
         } else {
@@ -5277,10 +5529,43 @@ impl Renderer {
         // Aerial perspective fills + composites only when authored AND the atmosphere baked its LUTs
         // (no LUTs → nothing to march); that gate is the atmosphere's own `enabled`, not a second flag.
         let ap_active = self.fog.aerial_perspective && self.scene_ibl().atmosphere_live();
-        // The fog composite arms while fog is authored this frame OR aerial perspective is live — the
-        // same pass applies AP on the shared ledger, so it must run even when fog itself is disabled.
-        let fog = if self.fog.enabled || ap_active {
+        let cloud_active = self.clouds.settings().enabled;
+        // Height fog is the one composite for fog, aerial perspective, and lit clouds.
+        let fog = if self.view_mode != ViewMode::CloudDensity
+            && (self.fog.enabled || ap_active || cloud_active)
+        {
             self.pipelines.request_fog()
+        } else {
+            None
+        };
+        let cloud_weather = if cloud_active && self.clouds.weather_dirty() {
+            self.pipelines
+                .request_cloud_weather(self.clouds.weather_layout())
+        } else {
+            None
+        };
+        let cloud_debug = if cloud_active && self.view_mode == ViewMode::CloudDensity {
+            self.pipelines
+                .request_cloud_debug(self.clouds.debug_layout())
+        } else {
+            None
+        };
+        let (cloud_raymarch, cloud_reconstruct, cloud_upscale) =
+            if cloud_active && self.view_mode != ViewMode::CloudDensity {
+                (
+                    self.pipelines
+                        .request_cloud_raymarch(self.clouds.raymarch_layout()),
+                    self.pipelines
+                        .request_cloud_reconstruct(self.clouds.reconstruct_layout()),
+                    self.pipelines
+                        .request_cloud_upscale(self.clouds.upscale_layout()),
+                )
+            } else {
+                (None, None, None)
+            };
+        let cloud_shadow = if cloud_active && self.clouds.settings().cast_cloud_shadows {
+            self.pipelines
+                .request_cloud_shadow(self.clouds.shadow_layout())
         } else {
             None
         };
@@ -5375,6 +5660,12 @@ impl Renderer {
             bloom,
             tonemap,
             fog,
+            cloud_weather,
+            cloud_debug,
+            cloud_raymarch,
+            cloud_reconstruct,
+            cloud_upscale,
+            cloud_shadow,
             fog_inject,
             fog_integrate,
             aerial,
@@ -5521,6 +5812,12 @@ impl Renderer {
         let raw = self.device.raw().clone();
 
         let mut graph = RenderGraph::new();
+        let ibl_live = self.scene_ibl_mut().add_live_capture_passes(&mut graph);
+        let ddgi_sh = if self.active_view == ViewId::Thumbnail {
+            graph.import_buffer(self.ibl.sh_coefficients().handle())
+        } else {
+            ibl_live.sh
+        };
 
         // Light-cull (compute): cull the punctual lights into the froxel grid. The graph
         // emits the compute→fragment barrier on the cluster buffer from the declared
@@ -5942,6 +6239,10 @@ impl Renderer {
             None => (None, None),
         };
 
+        // Resolve weather and fill the one camera-snapped cloud-shadow cascade array before any
+        // mesh, cloud, or froxel consumer reads it.
+        let cloud_frame = self.prepare_cloud_frame(&mut graph, &pipelines, frame);
+
         // Global SDF: the cull + composite passes that bin the per-mesh MDF bricks into the
         // camera-centered cascade clipmap the DDGI trace taps as one trilinear read beyond the near
         // field (and the scene's GDF reflection-occlusion cone marches per pixel). Runs FIRST
@@ -5981,8 +6282,9 @@ impl Renderer {
                     0,
                 ),
             };
-            let ibl_cube = self.scene_ibl().irradiance_cube_view();
-            let ibl_sampler = self.scene_ibl().sampler();
+            let sky_sh = self.scene_ibl().sh_coefficients();
+            let sky_sh_handle = sky_sh.handle();
+            let sky_sh_size = sky_sh.size();
             let ddgi_irr = self.ddgi.irradiance().1;
             let ddgi_dist = self.ddgi.distance().1;
             let ddgi_sampler = self.ddgi.sampler();
@@ -5996,8 +6298,8 @@ impl Renderer {
             self.views[active].write_gi_resolve_shared(
                 &self.device,
                 frame,
-                ibl_cube,
-                ibl_sampler,
+                sky_sh_handle,
+                sky_sh_size,
                 ddgi_irr,
                 ddgi_dist,
                 ddgi_sampler,
@@ -6012,6 +6314,7 @@ impl Renderer {
             (deformed_res, deformed_handle),
             light_set,
             gdf.cascades,
+            ibl_live.sh,
         );
 
         // ReSTIR DI: the three-pass reservoir chain (initial candidate sampling → temporal +
@@ -6035,8 +6338,8 @@ impl Renderer {
             &pipelines,
             bindless_set,
             light_set,
-            gdf.cascades,
-            gdf.albedo,
+            &gdf,
+            ddgi_sh,
         );
 
         // Visible sky: a fullscreen pass that fills the scene color target before the
@@ -6077,6 +6380,19 @@ impl Renderer {
                 },
             );
             graph.add_pass(sky_pass);
+
+            if self.active_view != ViewId::Thumbnail && self.sky.night().star_intensity > 0.0 {
+                let draw =
+                    self.stars
+                        .draw_data(self.scene_draw_list.view_proj, extent, self.sky.night());
+                let raw_for_body = raw.clone();
+                let stars_pass = RgPass::graphics("stars", extent)
+                    .color(color_load_store(scene_color_attachment))
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        crate::record_stars(&raw_for_body, cmd, &draw);
+                    });
+                graph.add_pass(stars_pass);
+            }
         }
 
         let did_depth_prepass = pipelines.depth_prepass.is_some();
@@ -6291,6 +6607,9 @@ impl Renderer {
         for resource in &screen.scene_sampled {
             scene = scene.access(*resource, RgUsage::SampledRead);
         }
+        scene = scene
+            .access(ibl_live.sh, RgUsage::StorageReadFragment)
+            .access(ibl_live.prefiltered, RgUsage::SampledRead);
         // When DDGI ran this frame, the irradiance + distance atlases were storage-written
         // (GENERAL); declare the scene's SampledRead so the graph transitions each back to
         // ShaderReadOnly before the mesh sample (the border pass leaves irradiance GENERAL).
@@ -6325,6 +6644,9 @@ impl Renderer {
         }
         if let Some(res) = spot_res {
             scene = scene.access(res, RgUsage::SampledRead);
+        }
+        if let Some(cloud) = cloud_frame {
+            scene = scene.access(cloud.shadow, RgUsage::SampledRead);
         }
         // A skinned batch reads the deformed buffer as its vertex stream; declare the read
         // so the graph orders the scene pass after the skin compute write.
@@ -6408,7 +6730,12 @@ impl Renderer {
         // Froxel volumetric fog: inject the shadowed per-froxel in-scatter + extinction over the
         // clustered light list, then front-to-back energy-conserving integration into the volume the
         // composite samples. Runs only in `fog.mode == volumetric` (the PSOs are resolved then).
-        let froxel_slots = self.add_froxel_fog_passes(&mut graph, &pipelines, frame);
+        let froxel_slots = self.add_froxel_fog_passes(
+            &mut graph,
+            &pipelines,
+            cloud_frame.map(|resources| resources.shadow),
+            frame,
+        );
 
         // Aerial perspective: ray-march the atmosphere LUTs into the 32³ AP volume the composite folds
         // onto the shared ledger. Independent of the fog inject/integrate (it only reads the LUTs and
@@ -6416,13 +6743,23 @@ impl Renderer {
         // only while the atmosphere is live + AP is authored (the PSO is resolved then).
         let aerial_slot = self.add_aerial_perspective_pass(&mut graph, &pipelines);
 
-        // Analytic height & distance fog: a fullscreen compute over the scene depth that composites
-        // the closed-form exponential-density fog into `color` in place, while it is still
-        // unbounded scene-linear HDR and BEFORE the bloom pyramid — distant bright emitters are
-        // fogged first, so bloom reads already-attenuated highlights (bloom-first would punch
-        // physically wrong halos through the fog). In volumetric mode the same pass instead samples
-        // the integrated froxel volume. Runs only while the PSO is resolved (fog enabled).
-        self.add_fog_pass(&mut graph, &pipelines, color, depth, frame);
+        // Clouds first produce full-resolution premultiplied scatter/transmittance + front depth.
+        // The CloudDensity view remains an isolated unlit visualizer that overwrites color directly.
+        let cloud_slots = self.add_cloud_passes(
+            &mut graph,
+            &pipelines,
+            CloudGraphInputs {
+                color,
+                depth,
+                motion: motion_resource,
+                sky_sh: ddgi_sh,
+            },
+            cloud_frame,
+        );
+
+        // Height fog is the sole fog/AP/cloud composite. It folds the already-upscaled cloud tuple
+        // onto the shared transmittance ledger before bloom.
+        self.add_fog_pass(&mut graph, &pipelines, color, depth, &cloud_slots, frame);
 
         // Scene-linear bloom: an energy-conserving mip pyramid composited into `color` while it is
         // still unbounded HDR radiance, immediately before the tonemap so the chosen view transform
@@ -6549,6 +6886,7 @@ impl Renderer {
         if ddgi.irradiance.is_some() {
             self.ddgi.advance_frame();
         }
+        self.scene_ibl_mut().resolve_live_layouts(&graph, ibl_live);
 
         // Read back the GDF cascade volumes' resolved exit layouts (each rode an external slot,
         // ending ShaderReadOnly after the scene's SampledRead), then commit the toroidal recenter
@@ -6587,6 +6925,51 @@ impl Renderer {
             self.aerial.set_volume_layout(graph.external_layout(slot));
         }
 
+        if let Some(slot) = cloud_slots.base {
+            self.clouds.set_base_layout(graph.external_layout(slot));
+        }
+        if let Some(slot) = cloud_slots.detail {
+            self.clouds.set_detail_layout(graph.external_layout(slot));
+        }
+        if let Some(slot) = cloud_slots.curl {
+            self.clouds.set_curl_layout(graph.external_layout(slot));
+        }
+        if let Some(slot) = cloud_slots.weather {
+            self.clouds.set_weather_layout(graph.external_layout(slot));
+        }
+        if let Some(slot) = cloud_slots.shadow {
+            self.clouds.set_shadow_layout(graph.external_layout(slot));
+        }
+        {
+            let view = &mut self.views[self.active_view.index()];
+            for (index, slot) in cloud_slots.reduced.iter().enumerate() {
+                if let Some(slot) = slot {
+                    view.cloud_reduced[index]
+                        .as_mut()
+                        .expect("cloud reduced built")
+                        .layout = graph.external_layout(*slot);
+                }
+            }
+            if let Some(slot) = cloud_slots.reduced_depth {
+                view.cloud_reduced_depth
+                    .as_mut()
+                    .expect("cloud reduced depth built")
+                    .layout = graph.external_layout(slot);
+            }
+            if let Some(slot) = cloud_slots.full_depth {
+                view.cloud_full_depth
+                    .as_mut()
+                    .expect("cloud full depth built")
+                    .layout = graph.external_layout(slot);
+            }
+            if let Some(slot) = cloud_slots.full_color {
+                view.cloud_full_color
+                    .as_mut()
+                    .expect("cloud full color built")
+                    .layout = graph.external_layout(slot);
+            }
+        }
+
         // Read back the ReSTIR radiance image's resolved exit layout (it rode an external
         // slot, ending ShaderReadOnly after the scene's SampledRead). The per-view temporal
         // state was already advanced inside `add_restir_passes`, before execute.
@@ -6602,7 +6985,8 @@ impl Renderer {
         // pair + the SSGI history pair + the ssgi_resolved each rode an external slot.
         let temporal_ran = taa_slots.is_some()
             || screen.ssgi_history_slots.is_some()
-            || screen.dfao_history_slots.is_some();
+            || screen.dfao_history_slots.is_some()
+            || cloud_slots.temporal;
         // Store the UN-jittered matrix as this view's previous frame (the motion prepass needs a
         // jitter-free previous camera).
         let frame_view_proj = self.scene_view_proj_unjittered();
@@ -6649,7 +7033,7 @@ impl Renderer {
         view.store_prev_view_proj(frame_view_proj);
         // Advance the Halton jitter cycle for next frame — only while TAA is active, so an
         // off/FXAA/MSAA frame renders un-jittered (`jitter` stays zero, the single gate).
-        if taa_active {
+        if taa_active || cloud_slots.temporal {
             view.advance_jitter();
         }
     }
@@ -6672,8 +7056,8 @@ impl Renderer {
         pipelines: &FramePipelines,
         bindless_set: vk::DescriptorSet,
         light_set: vk::DescriptorSet,
-        gdf_cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
-        gdf_albedo: Option<RgResource>,
+        gdf: &GdfResult,
+        sky_sh: RgResource,
     ) -> DdgiResult {
         // The four-pass chain runs only when DDGI is on + all PSOs resolved.
         let Some(ddgi_pipelines) = &pipelines.ddgi else {
@@ -6724,22 +7108,23 @@ impl Renderer {
         let raw_body = raw.clone();
         let mut trace_pass = RgPass::compute("ddgi-trace")
             .access(irr_res, RgUsage::SampledReadCompute)
-            .access(ray_res, RgUsage::StorageImageRwCompute);
+            .access(ray_res, RgUsage::StorageImageRwCompute)
+            .access(sky_sh, RgUsage::StorageReadCompute);
         // When the GDF composited this frame, the trace's far-field tap reads the cascade volumes
         // (light set binding 9) + the albedo cache (trace set 2) — declare the reads so the graph
         // transitions each from GENERAL (composite write) → ShaderReadOnly before the trace.
-        if let Some(cascades) = gdf_cascades {
+        if let Some(cascades) = gdf.cascades {
             for cascade in cascades {
                 trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
             }
         }
-        if let Some(albedo) = gdf_albedo {
+        if let Some(albedo) = gdf.albedo {
             trace_pass = trace_pass.access(albedo, RgUsage::SampledReadCompute);
         }
         let trace_pass = trace_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
             // SAFETY: the ash seam. The PSO + three sets are valid this frame; the dispatch
             // covers the round-robin probe-budget slice (the shader offsets the probe index by
-            // trace_push's sky_color.w), not the whole volume.
+            // trace_push's budget offset), not the whole volume.
             unsafe {
                 raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, trace_handle);
                 raw_body.cmd_bind_descriptor_sets(
@@ -7246,6 +7631,7 @@ impl Renderer {
         deformed: (Option<RgResource>, Option<vk::Buffer>),
         light_set: vk::DescriptorSet,
         gdf_cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
+        sky_sh: RgResource,
     ) -> ScreenSpaceResult {
         let (deformed_res, deformed_handle) = deformed;
         let mut result = ScreenSpaceResult::default();
@@ -7767,6 +8153,7 @@ impl Renderer {
             let mut accesses = vec![
                 (g_normal, RgUsage::SampledReadCompute),
                 (gi_indirect, RgUsage::StorageImageRwCompute),
+                (sky_sh, RgUsage::StorageReadCompute),
             ];
             if let Some(dfao_res) = dfao_denoised_res {
                 accesses.push((dfao_res, RgUsage::SampledReadCompute));
@@ -8684,6 +9071,7 @@ impl Renderer {
         &self,
         graph: &mut RenderGraph,
         pipelines: &FramePipelines,
+        cloud_shadow: Option<RgResource>,
         frame: usize,
     ) -> Option<(usize, usize, usize)> {
         let (Some(inject), Some(integrate)) = (&pipelines.fog_inject, &pipelines.fog_integrate)
@@ -8707,6 +9095,11 @@ impl Renderer {
         let history_valid = active_view.prev_view_proj_valid && self.froxel.history_ready();
         let jitter = self.active_view_jitter();
         let f = self.fog;
+        let wind = self.clouds.settings();
+        let wind_time = wind.time_of_day.rem_euclid(1.0) * 86_400.0;
+        let wind_angle = wind.wind_orientation.to_radians();
+        let gust =
+            1.0 + wind.wind_gust * (0.5 + 0.5 * (wind_time * std::f32::consts::TAU / 17.0).sin());
         let grid_params = crate::FogGridParams {
             inverse_projection: inv_proj,
             inverse_view: inv_view,
@@ -8735,6 +9128,12 @@ impl Renderer {
                 jitter.y,
                 jitter_index as f32,
                 self.fog_time,
+            ),
+            global_wind: saffron_geometry::glam::Vec4::new(
+                wind_angle.sin() * wind.wind_speed * gust,
+                0.0,
+                wind_angle.cos() * wind.wind_speed * gust,
+                wind_time,
             ),
         };
         self.froxel.update_grid(&grid_params);
@@ -8791,36 +9190,39 @@ impl Renderer {
             let layout = inject.layout();
             let raw_body = self.device.raw().clone();
             let dispatch = (gx.div_ceil(8), gy.div_ceil(8), gz.div_ceil(4));
-            let pass = RgPass::compute("fog-inject")
+            let mut pass = RgPass::compute("fog-inject")
                 .access(write_res, RgUsage::StorageImageRwCompute)
                 .access(hist_res, RgUsage::SampledReadCompute)
                 .access(cluster_res, RgUsage::StorageReadCompute)
-                .access(light_res, RgUsage::StorageReadCompute)
-                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    // SAFETY: the ash seam. The PSO/sets are valid this frame; the dispatch covers the
-                    // froxel grid (8×8×4 per group). Set 0 is the reused mesh light set, set 1 the fog
-                    // volume; the 64-byte push carries the authored medium.
-                    unsafe {
-                        raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
-                        raw_body.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::COMPUTE,
-                            layout,
-                            0,
-                            &[light_set, volume_set],
-                            &[],
-                        );
-                        raw_body.cmd_push_constants(
-                            cmd,
-                            layout,
-                            vk::ShaderStageFlags::COMPUTE,
-                            0,
-                            bytemuck::cast_slice(&push_vals),
-                        );
-                        raw_body.cmd_dispatch(cmd, dispatch.0, dispatch.1, dispatch.2);
-                    }
-                    drop(inject);
-                });
+                .access(light_res, RgUsage::StorageReadCompute);
+            if let Some(resource) = cloud_shadow {
+                pass = pass.access(resource, RgUsage::SampledReadCompute);
+            }
+            let pass = pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. The PSO/sets are valid this frame; the dispatch covers the
+                // froxel grid (8×8×4 per group). Set 0 is the reused mesh light set, set 1 the fog
+                // volume; the 64-byte push carries the authored medium.
+                unsafe {
+                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                    raw_body.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        layout,
+                        0,
+                        &[light_set, volume_set],
+                        &[],
+                    );
+                    raw_body.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::cast_slice(&push_vals),
+                    );
+                    raw_body.cmd_dispatch(cmd, dispatch.0, dispatch.1, dispatch.2);
+                }
+                drop(inject);
+            });
             graph.add_pass(pass);
         }
         {
@@ -8874,41 +9276,7 @@ impl Renderer {
     ) -> Option<usize> {
         let pipeline = pipelines.aerial.as_ref()?;
 
-        // The froxel-center reconstruction matrices (mirroring the fog inject) + the baked atmosphere
-        // physical params the LUTs were computed from, so the AP volume agrees with the sky.
-        let inv_view = self.ssao.view().inverse();
-        let inv_proj = (self.scene_view_proj_unjittered() * inv_view).inverse();
-        let atmos = self.scene_ibl().baked_atmosphere();
-        let (sun_dir, sun_intensity) = self.scene_ibl().baked_sun();
-        let sun_dir = sun_dir.normalize_or_zero();
-        use saffron_geometry::glam::Vec4;
-        let params = crate::AerialParamsUbo {
-            inverse_projection: inv_proj,
-            inverse_view: inv_view,
-            sun_dir: sun_dir.extend(sun_intensity),
-            rayleigh: atmos
-                .rayleigh_scattering
-                .extend(atmos.rayleigh_scale_height),
-            ozone: atmos.ozone_absorption.extend(atmos.mie_scattering),
-            params0: Vec4::new(
-                atmos.planet_radius,
-                atmos.atmosphere_height,
-                atmos.mie_scale_height,
-                atmos.mie_anisotropy,
-            ),
-            params1: Vec4::new(
-                atmos.sun_disk_angular_radius,
-                atmos.sun_disk_intensity,
-                0.0,
-                self.fog.aerial_intensity,
-            ),
-            ap_planes: Vec4::new(
-                crate::froxel_fog::FROXEL_NEAR,
-                crate::AP_FAR_M,
-                crate::AP_GRID as f32,
-                1.0e-3,
-            ),
-        };
+        let params = self.aerial_params(self.fog.aerial_intensity);
         self.aerial.update_params(&params);
 
         let (vol_img, vol_view, vol_layout) = self.aerial.volume_import();
@@ -8952,6 +9320,492 @@ impl Renderer {
         Some(vol_slot)
     }
 
+    fn aerial_params(&self, intensity: f32) -> crate::AerialParamsUbo {
+        let inverse_view = self.ssao.view().inverse();
+        let inverse_projection = (self.scene_view_proj_unjittered() * inverse_view).inverse();
+        let atmosphere = self.scene_ibl().baked_atmosphere();
+        let (sun_direction, sun_intensity) = self.scene_ibl().baked_sun();
+        crate::AerialParamsUbo {
+            inverse_projection,
+            inverse_view,
+            sun_dir: sun_direction.normalize_or_zero().extend(sun_intensity),
+            rayleigh: atmosphere
+                .rayleigh_scattering
+                .extend(atmosphere.rayleigh_scale_height),
+            ozone: atmosphere
+                .ozone_absorption
+                .extend(atmosphere.mie_scattering),
+            params0: Vec4::new(
+                atmosphere.planet_radius,
+                atmosphere.atmosphere_height,
+                atmosphere.mie_scale_height,
+                atmosphere.mie_anisotropy,
+            ),
+            params1: Vec4::new(
+                atmosphere.sun_disk_angular_radius,
+                atmosphere.sun_disk_intensity,
+                0.0,
+                intensity,
+            ),
+            ap_planes: Vec4::new(
+                crate::froxel_fog::FROXEL_NEAR,
+                crate::AP_FAR_M,
+                crate::AP_GRID as f32,
+                1.0e-3,
+            ),
+        }
+    }
+
+    fn prepare_cloud_frame(
+        &mut self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        frame: usize,
+    ) -> Option<CloudFrameResources> {
+        if !self.clouds.settings().enabled {
+            return None;
+        }
+        let view_index = self.active_view.index();
+        let inv_view_proj = self.scene_view_proj_unjittered().inverse();
+        let camera = self.ssao.view().inverse().col(3).truncate();
+        let view = &self.views[view_index];
+        let reduced_extent = view.cloud_reduced[0]
+            .as_ref()
+            .expect("cloud reduced built")
+            .extent;
+        let atmosphere = self.scene_ibl().baked_atmosphere();
+        let current_view_proj = self.scene_view_proj_unjittered();
+        let state = crate::clouds::CloudFrameState {
+            inv_view_proj,
+            prev_view_proj: if view.prev_view_proj_valid {
+                view.prev_view_proj
+            } else {
+                current_view_proj
+            },
+            camera,
+            sun_direction: (-self.sun_direction).normalize_or_zero(),
+            sun_color: self.sun_color,
+            sun_intensity: self.sun_intensity,
+            moon_direction: (-self.moon_direction).normalize_or_zero(),
+            moon_color: self.moon_color,
+            moon_intensity: self.moon_intensity,
+            planet_radius: atmosphere.planet_radius,
+            atmosphere_height: atmosphere.atmosphere_height,
+            jitter_index: view.jitter_index,
+            reduced_extent,
+            history_valid: view.history_valid && view.prev_view_proj_valid,
+            atmosphere_live: self.scene_ibl().atmosphere_live(),
+        };
+        self.clouds.write_params(view_index, frame, &state);
+        let params_offset = self.clouds.params_offset(view_index, frame);
+
+        let base = self.clouds.base_noise();
+        let base_slot = graph.alloc_external_layout(base.layout);
+        let base_res =
+            graph.import_image_3d(base.handle(), base.view(), base.layout, Some(base_slot));
+        let detail = self.clouds.detail_noise();
+        let detail_slot = graph.alloc_external_layout(detail.layout);
+        let detail_res = graph.import_image_3d(
+            detail.handle(),
+            detail.view(),
+            detail.layout,
+            Some(detail_slot),
+        );
+        let curl = self.clouds.curl_noise();
+        let curl_slot = graph.alloc_external_layout(curl.layout);
+        let curl_res = graph.import_image(
+            curl.handle(),
+            curl.view(),
+            vk::ImageAspectFlags::COLOR,
+            curl.layout,
+            Some(curl_slot),
+        );
+        let weather = self.clouds.weather_map();
+        let weather_slot = graph.alloc_external_layout(weather.layout);
+        let weather_res = graph.import_image(
+            weather.handle(),
+            weather.view(),
+            vk::ImageAspectFlags::COLOR,
+            weather.layout,
+            Some(weather_slot),
+        );
+        let shadow = self.clouds.cloud_shadow();
+        let shadow_slot = graph.alloc_external_layout(shadow.layout);
+        let shadow_res = graph.import_image(
+            shadow.handle(),
+            shadow.view(),
+            vk::ImageAspectFlags::COLOR,
+            shadow.layout,
+            Some(shadow_slot),
+        );
+
+        if let Some(pipeline) = &pipelines.cloud_weather {
+            let pipeline = Arc::clone(pipeline);
+            let handle = pipeline.handle();
+            let layout = pipeline.layout();
+            let set = self.clouds.weather_set();
+            let groups = crate::clouds::CLOUD_WEATHER_DIM.div_ceil(8);
+            let raw_body = self.device.raw().clone();
+            graph.add_pass(
+                RgPass::compute("cloud-weather")
+                    .access(weather_res, RgUsage::StorageImageRwCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        unsafe {
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[set],
+                                &[params_offset],
+                            );
+                            raw_body.cmd_dispatch(cmd, groups, groups, 1);
+                        }
+                        drop(pipeline);
+                    }),
+            );
+            self.clouds.mark_weather_clean();
+        }
+
+        if let Some(pipeline) = &pipelines.cloud_shadow {
+            let pipeline = Arc::clone(pipeline);
+            let handle = pipeline.handle();
+            let layout = pipeline.layout();
+            let set = self.clouds.shadow_set();
+            let groups = crate::clouds::CLOUD_SHADOW_DIM.div_ceil(8);
+            let raw_body = self.device.raw().clone();
+            graph.add_pass(
+                RgPass::compute("cloud-shadow")
+                    .access(shadow_res, RgUsage::StorageImageRwCompute)
+                    .access(base_res, RgUsage::SampledReadCompute)
+                    .access(detail_res, RgUsage::SampledReadCompute)
+                    .access(curl_res, RgUsage::SampledReadCompute)
+                    .access(weather_res, RgUsage::SampledReadCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        unsafe {
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[set],
+                                &[params_offset],
+                            );
+                            raw_body.cmd_dispatch(
+                                cmd,
+                                groups,
+                                groups,
+                                crate::clouds::CLOUD_SHADOW_CASCADES,
+                            );
+                        }
+                        drop(pipeline);
+                    }),
+            );
+        }
+
+        Some(CloudFrameResources {
+            base: base_res,
+            detail: detail_res,
+            curl: curl_res,
+            weather: weather_res,
+            shadow: shadow_res,
+            base_slot,
+            detail_slot,
+            curl_slot,
+            weather_slot,
+            shadow_slot,
+            params_offset,
+        })
+    }
+
+    /// Appends the weather-map refresh and unlit density debugger. Every persistent image is imported
+    /// on an external layout slot so the graph owns the write/read transitions and the resolved layouts
+    /// carry across frames. Weather resolves into one image for both procedural and painted sources.
+    fn add_cloud_passes(
+        &mut self,
+        graph: &mut RenderGraph,
+        pipelines: &FramePipelines,
+        inputs: CloudGraphInputs,
+        prepared: Option<CloudFrameResources>,
+    ) -> CloudGraphResult {
+        let CloudGraphInputs {
+            color,
+            depth,
+            motion,
+            sky_sh,
+        } = inputs;
+        let lit_ready = pipelines.cloud_raymarch.is_some()
+            && pipelines.cloud_reconstruct.is_some()
+            && pipelines.cloud_upscale.is_some()
+            && motion.is_some();
+        let Some(prepared) = prepared else {
+            return CloudGraphResult::default();
+        };
+        let view_index = self.active_view.index();
+        let reduced_extent = self.views[view_index].cloud_reduced[0]
+            .as_ref()
+            .expect("cloud reduced built")
+            .extent;
+        let base_res = prepared.base;
+        let detail_res = prepared.detail;
+        let curl_res = prepared.curl;
+        let weather_res = prepared.weather;
+        let params_offset = prepared.params_offset;
+        let mut result = CloudGraphResult {
+            base: Some(prepared.base_slot),
+            detail: Some(prepared.detail_slot),
+            curl: Some(prepared.curl_slot),
+            weather: Some(prepared.weather_slot),
+            shadow: Some(prepared.shadow_slot),
+            ..CloudGraphResult::default()
+        };
+        if pipelines.cloud_debug.is_none() && !lit_ready {
+            graph.add_pass(
+                RgPass::compute("cloud-resources-read")
+                    .access(base_res, RgUsage::SampledReadCompute)
+                    .access(detail_res, RgUsage::SampledReadCompute)
+                    .access(curl_res, RgUsage::SampledReadCompute)
+                    .access(weather_res, RgUsage::SampledReadCompute)
+                    .access(prepared.shadow, RgUsage::SampledReadCompute)
+                    .body(|_cmd, _scopes: &mut NestedScopeRecorder| {}),
+            );
+            return result;
+        }
+
+        if let Some(pipeline) = &pipelines.cloud_debug {
+            let pipeline = Arc::clone(pipeline);
+            let handle = pipeline.handle();
+            let layout = pipeline.layout();
+            let set = self.clouds.debug_set(view_index);
+            let extent = self.views[view_index].published_extent();
+            let groups_x = extent.width.div_ceil(8);
+            let groups_y = extent.height.div_ceil(8);
+            let raw_body = self.device.raw().clone();
+            graph.add_pass(
+                RgPass::compute("cloud-density-debug")
+                    .access(color, RgUsage::StorageImageRwCompute)
+                    .access(depth, RgUsage::SampledReadCompute)
+                    .access(base_res, RgUsage::SampledReadCompute)
+                    .access(detail_res, RgUsage::SampledReadCompute)
+                    .access(curl_res, RgUsage::SampledReadCompute)
+                    .access(weather_res, RgUsage::SampledReadCompute)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        unsafe {
+                            raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                            raw_body.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[set],
+                                &[params_offset],
+                            );
+                            raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                        }
+                        drop(pipeline);
+                    }),
+            );
+            return result;
+        }
+
+        let motion = motion.expect("lit cloud motion resource");
+        let parity = self.views[view_index].history_index;
+        let view = &self.views[view_index];
+        let mut reduced_resources = [None, None];
+        for (index, image) in view.cloud_reduced.iter().enumerate() {
+            let image = image.as_ref().expect("cloud reduced built");
+            let slot = graph.alloc_external_layout(image.layout);
+            reduced_resources[index] = Some(graph.import_image(
+                image.handle(),
+                image.view(),
+                vk::ImageAspectFlags::COLOR,
+                image.layout,
+                Some(slot),
+            ));
+            result.reduced[index] = Some(slot);
+        }
+        let reduced_resources = reduced_resources.map(|resource| resource.expect("cloud import"));
+        let reduced_depth = view
+            .cloud_reduced_depth
+            .as_ref()
+            .expect("cloud reduced depth built");
+        let reduced_depth_slot = graph.alloc_external_layout(reduced_depth.layout);
+        let reduced_depth_res = graph.import_image(
+            reduced_depth.handle(),
+            reduced_depth.view(),
+            vk::ImageAspectFlags::COLOR,
+            reduced_depth.layout,
+            Some(reduced_depth_slot),
+        );
+        result.reduced_depth = Some(reduced_depth_slot);
+        let full_color = view
+            .cloud_full_color
+            .as_ref()
+            .expect("cloud full color built");
+        let full_color_slot = graph.alloc_external_layout(full_color.layout);
+        let full_color_res = graph.import_image(
+            full_color.handle(),
+            full_color.view(),
+            vk::ImageAspectFlags::COLOR,
+            full_color.layout,
+            Some(full_color_slot),
+        );
+        result.full_color = Some(full_color_slot);
+        result.full_color_resource = Some(full_color_res);
+        let full_depth = view
+            .cloud_full_depth
+            .as_ref()
+            .expect("cloud full depth built");
+        let full_depth_slot = graph.alloc_external_layout(full_depth.layout);
+        let full_depth_res = graph.import_image(
+            full_depth.handle(),
+            full_depth.view(),
+            vk::ImageAspectFlags::COLOR,
+            full_depth.layout,
+            Some(full_depth_slot),
+        );
+        result.full_depth = Some(full_depth_slot);
+        result.full_depth_resource = Some(full_depth_res);
+
+        let groups_x = reduced_extent.width.div_ceil(8);
+        let groups_y = reduced_extent.height.div_ceil(8);
+        let raymarch = Arc::clone(
+            pipelines
+                .cloud_raymarch
+                .as_ref()
+                .expect("lit cloud raymarch pipeline"),
+        );
+        let raymarch_handle = raymarch.handle();
+        let raymarch_layout = raymarch.layout();
+        let raymarch_set = self.clouds.raymarch_set(view_index, parity);
+        let raw_body = self.device.raw().clone();
+        graph.add_pass(
+            RgPass::compute("cloud-raymarch")
+                .access(reduced_resources[parity], RgUsage::StorageImageRwCompute)
+                .access(reduced_depth_res, RgUsage::StorageImageRwCompute)
+                .access(depth, RgUsage::SampledReadCompute)
+                .access(base_res, RgUsage::SampledReadCompute)
+                .access(detail_res, RgUsage::SampledReadCompute)
+                .access(curl_res, RgUsage::SampledReadCompute)
+                .access(weather_res, RgUsage::SampledReadCompute)
+                .access(prepared.shadow, RgUsage::SampledReadCompute)
+                .access(sky_sh, RgUsage::StorageReadCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            raymarch_handle,
+                        );
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            raymarch_layout,
+                            0,
+                            &[raymarch_set],
+                            &[params_offset],
+                        );
+                        raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                    }
+                    drop(raymarch);
+                }),
+        );
+
+        let reconstruct = Arc::clone(
+            pipelines
+                .cloud_reconstruct
+                .as_ref()
+                .expect("lit cloud reconstruct pipeline"),
+        );
+        let reconstruct_handle = reconstruct.handle();
+        let reconstruct_layout = reconstruct.layout();
+        let reconstruct_set = self.clouds.reconstruct_set(view_index, parity);
+        let raw_body = self.device.raw().clone();
+        graph.add_pass(
+            RgPass::compute("cloud-reconstruct")
+                .access(reduced_resources[parity], RgUsage::StorageImageRwCompute)
+                .access(reduced_resources[1 - parity], RgUsage::SampledReadCompute)
+                .access(reduced_depth_res, RgUsage::SampledReadCompute)
+                .access(motion, RgUsage::SampledReadCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            reconstruct_handle,
+                        );
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            reconstruct_layout,
+                            0,
+                            &[reconstruct_set],
+                            &[params_offset],
+                        );
+                        raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                    }
+                    drop(reconstruct);
+                }),
+        );
+
+        let extent = self.views[view_index].published_extent();
+        let upscale = Arc::clone(
+            pipelines
+                .cloud_upscale
+                .as_ref()
+                .expect("lit cloud upscale pipeline"),
+        );
+        let upscale_handle = upscale.handle();
+        let upscale_layout = upscale.layout();
+        let upscale_set = self.clouds.upscale_set(view_index, parity);
+        let raw_body = self.device.raw().clone();
+        graph.add_pass(
+            RgPass::compute("cloud-upscale")
+                .access(full_color_res, RgUsage::StorageImageRwCompute)
+                .access(reduced_resources[parity], RgUsage::SampledReadCompute)
+                .access(reduced_depth_res, RgUsage::SampledReadCompute)
+                .access(depth, RgUsage::SampledReadCompute)
+                .access(full_depth_res, RgUsage::StorageImageRwCompute)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            upscale_handle,
+                        );
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            upscale_layout,
+                            0,
+                            &[upscale_set],
+                            &[params_offset],
+                        );
+                        raw_body.cmd_dispatch(
+                            cmd,
+                            extent.width.div_ceil(8),
+                            extent.height.div_ceil(8),
+                            1,
+                        );
+                    }
+                    drop(upscale);
+                }),
+        );
+        graph.add_pass(
+            RgPass::compute("cloud-history-read")
+                .access(reduced_resources[0], RgUsage::SampledReadCompute)
+                .access(reduced_resources[1], RgUsage::SampledReadCompute)
+                .access(reduced_depth_res, RgUsage::SampledReadCompute)
+                .access(full_color_res, RgUsage::SampledReadCompute)
+                .access(full_depth_res, RgUsage::SampledReadCompute)
+                .body(|_cmd, _scopes: &mut NestedScopeRecorder| {}),
+        );
+        result.temporal = true;
+        result
+    }
+
     /// Appends the analytic height & distance fog composite: an in-place compute pass over the scene
     /// depth that blends `scene*T + inscatter*(1-T)` into the offscreen `color` before bloom. Reads
     /// `color` (`StorageImageRwCompute`, GENERAL) and `depth` (`SampledReadCompute`, DEPTH aspect →
@@ -8964,6 +9818,7 @@ impl Renderer {
         pipelines: &FramePipelines,
         color: RgResource,
         depth: RgResource,
+        cloud: &CloudGraphResult,
         frame: usize,
     ) {
         let Some(pipeline) = &pipelines.fog else {
@@ -8988,6 +9843,8 @@ impl Renderer {
         // LUTs; the fog term is neutral (`T_fog = 1`, `inScatter_fog = 0`) when fog itself is off but AP
         // keeps the composite alive.
         let ap_active = f.aerial_perspective && atmosphere_live;
+        let cloud_present =
+            cloud.full_color_resource.is_some() && cloud.full_depth_resource.is_some();
         let params = FogParams {
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
             camera_pos: eye.to_array(),
@@ -9022,6 +9879,13 @@ impl Renderer {
                 crate::AP_FAR_M,
                 0.0,
             ],
+            cloud: [
+                if cloud_present { 1.0 } else { 0.0 },
+                if atmosphere_live { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+            ap: self.aerial_params(1.0),
         };
 
         let vi = self.active_view.index();
@@ -9034,26 +9898,32 @@ impl Renderer {
         let groups_y = groups(extent.height);
 
         let raw_body = self.device.raw().clone();
-        let pass = RgPass::compute("height-fog")
+        let mut pass = RgPass::compute("height-fog")
             .access(color, RgUsage::StorageImageRwCompute)
-            .access(depth, RgUsage::SampledReadCompute)
-            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch covers the
-                // viewport (8×8 per group); the dynamic offset addresses this frame's `FogParams` slice.
-                unsafe {
-                    raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
-                    raw_body.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::COMPUTE,
-                        layout,
-                        0,
-                        &[set],
-                        &[offset],
-                    );
-                    raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
-                }
-                drop(pipeline);
-            });
+            .access(depth, RgUsage::SampledReadCompute);
+        if let Some(resource) = cloud.full_color_resource {
+            pass = pass.access(resource, RgUsage::SampledReadCompute);
+        }
+        if let Some(resource) = cloud.full_depth_resource {
+            pass = pass.access(resource, RgUsage::SampledReadCompute);
+        }
+        let pass = pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+            // SAFETY: the ash seam. The PSO/set are valid this frame; the dispatch covers the
+            // viewport (8×8 per group); the dynamic offset addresses this frame's `FogParams` slice.
+            unsafe {
+                raw_body.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, handle);
+                raw_body.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[offset],
+                );
+                raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+            }
+            drop(pipeline);
+        });
         graph.add_pass(pass);
     }
 
@@ -9076,7 +9946,7 @@ impl Renderer {
         let view = &self.views[self.active_view.index()];
         // In-place on the DISPLAY-extent offscreen (after the resolve reconstructed it).
         let extent = view.published_extent();
-        let push = TonemapPush::new(self.exposure_ev, self.tonemap_mode);
+        let push = TonemapPush::new(self.exposure_ev, self.tonemap_mode, self.night_factor);
         let groups = |n: u32| n.div_ceil(8);
         let groups_x = groups(extent.width);
         let groups_y = groups(extent.height);
@@ -10822,7 +11692,7 @@ mod tests {
 
         // Thumbnails use PBR-Neutral so a material's color (a gold sphere) stays accurate in the
         // asset preview rather than getting the viewport's filmic look.
-        let exposure = TonemapPush::new(0.0, crate::overlay::TonemapMode::PbrNeutral);
+        let exposure = TonemapPush::new(0.0, crate::overlay::TonemapMode::PbrNeutral, 0.0);
 
         // Render the chain twice; the only difference is the present-only flag, which does
         // not touch this path — the two readbacks must be byte-identical.

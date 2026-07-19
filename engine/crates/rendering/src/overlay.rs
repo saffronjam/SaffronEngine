@@ -79,7 +79,7 @@ impl OverlayVertex {
     }
 }
 
-/// The tonemap compute push: the linear exposure multiplier + the operator mode, matching
+/// The tonemap compute push: exposure, operator, and low-light adaptation, matching
 /// `tonemap.slang`'s `Push`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -88,9 +88,12 @@ pub struct TonemapPush {
     pub exposure: f32,
     /// The tonemap operator ([`TonemapMode`] as `u32`).
     pub mode: u32,
+    /// Sun-elevation-derived scotopic adaptation strength.
+    pub night_factor: f32,
+    _pad: f32,
 }
 
-const _: () = assert!(size_of::<TonemapPush>() == 8);
+const _: () = assert!(size_of::<TonemapPush>() == 16);
 
 /// One masked correction range (Shadows / Midtones / Highlights): an ASC-CDL SOP triplet plus a
 /// saturation and a contrast, blended into the frame by a smooth luma weight. Neutral is slope
@@ -429,11 +432,13 @@ impl BloomPush {
 }
 
 impl TonemapPush {
-    /// The tonemap push for `exposure_ev` stops + operator `mode`.
-    pub fn new(exposure_ev: f32, mode: TonemapMode) -> Self {
+    /// The tonemap push for exposure, operator, and scotopic adaptation.
+    pub fn new(exposure_ev: f32, mode: TonemapMode, night_factor: f32) -> Self {
         Self {
             exposure: exposure_ev.exp2(),
             mode: mode as u32,
+            night_factor: night_factor.clamp(0.0, 1.0),
+            _pad: 0.0,
         }
     }
 }
@@ -723,12 +728,13 @@ mod tests {
     #[test]
     fn tonemap_push_is_exp2_of_the_ev() {
         let m = TonemapMode::Aces;
-        assert!((TonemapPush::new(0.0, m).exposure - 1.0).abs() < 1e-6);
-        assert!((TonemapPush::new(1.0, m).exposure - 2.0).abs() < 1e-6);
-        assert!((TonemapPush::new(-1.0, m).exposure - 0.5).abs() < 1e-6);
-        assert!((TonemapPush::new(2.0, m).exposure - 4.0).abs() < 1e-6);
-        assert_eq!(TonemapPush::new(0.0, TonemapMode::Agx).mode, 2);
-        assert_eq!(size_of::<TonemapPush>(), 8);
+        assert!((TonemapPush::new(0.0, m, 0.0).exposure - 1.0).abs() < 1e-6);
+        assert!((TonemapPush::new(1.0, m, 0.0).exposure - 2.0).abs() < 1e-6);
+        assert!((TonemapPush::new(-1.0, m, 0.0).exposure - 0.5).abs() < 1e-6);
+        assert!((TonemapPush::new(2.0, m, 0.0).exposure - 4.0).abs() < 1e-6);
+        assert_eq!(TonemapPush::new(0.0, TonemapMode::Agx, 0.0).mode, 2);
+        assert_eq!(TonemapPush::new(0.0, m, 2.0).night_factor, 1.0);
+        assert_eq!(size_of::<TonemapPush>(), 16);
     }
 
     /// `GridPush::new` records `view_proj` and its mathematical inverse — round-tripping

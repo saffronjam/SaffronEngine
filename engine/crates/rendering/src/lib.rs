@@ -17,6 +17,7 @@
 
 mod aa;
 mod budget;
+mod clouds;
 mod ddgi;
 mod descriptors;
 mod device;
@@ -47,6 +48,7 @@ mod scene_pass;
 mod shm_publish;
 mod skinning;
 mod ssao;
+mod stars;
 mod swapchain;
 mod targets;
 mod tessellation;
@@ -59,6 +61,7 @@ pub use aa::{
     Aa, MOTION_FORMAT, MotionPush, REACTIVE_FORMAT, TAA_JITTER_PHASES, TaaParams, TaaPush,
     clamp_sample_count, jitter_offset, jitter_phase_count, record_motion,
 };
+pub use clouds::{CloudRenderSettings, Clouds};
 pub use ddgi::{
     BlendPush as DdgiBlendPush, BorderPush as DdgiBorderPush, DDGI_DIST_FORMAT, DDGI_DIST_INTERIOR,
     DDGI_HYSTERESIS, DDGI_IRR_FORMAT, DDGI_IRR_INTERIOR, DDGI_PROBE_BUDGET, DDGI_PROBE_SPACING,
@@ -93,9 +96,9 @@ pub use gpu_types::{GpuLight, InstanceData, Material, MaterialParamsData, SdfIns
 pub use ibl::{
     ATMOS_MULTI_SCATTER_SIZE, ATMOS_SKY_VIEW_H, ATMOS_SKY_VIEW_W, ATMOS_TRANSMITTANCE_H,
     ATMOS_TRANSMITTANCE_W, AtmosphereParams, EnvSource, IBL_COLOR_FORMAT, IBL_ENV_SIZE,
-    IBL_IRRADIANCE_SIZE, IBL_LUT_SIZE, IBL_PREFILTER_MIPS, IBL_PREFILTER_SIZE, Ibl, ProbeMetaGpu,
-    ReflectionProbe, ReflectionProbeUpload, ReflectionProbes, Sky, SkyDraw, SkyRenderSettings,
-    SkygenParams, record_sky,
+    IBL_LUT_SIZE, IBL_PREFILTER_MIPS, IBL_PREFILTER_SIZE, Ibl, NightSkyParams, ProbeMetaGpu,
+    ReflectionProbe, ReflectionProbeUpload, ReflectionProbes, SKY_SH_COEFFICIENTS, Sky, SkyDraw,
+    SkyRenderSettings, SkygenParams, record_sky,
 };
 pub use instancing::{DrawListInputs, Instancing};
 pub use lighting::{
@@ -153,6 +156,7 @@ pub use ssao::{
     AO_FORMAT, ContactPush, DfaoPush, G_NORMAL_FORMAT, GbufferPush, GtaoPush, ROUGHNESS_FORMAT,
     SSGI_HISTORY_WEIGHT, SpecoccPush, Ssao, SsgiAccumPush, SsgiPush,
 };
+pub use stars::{StarCatalog, StarDraw, record_stars};
 pub use swapchain::Swapchain;
 pub use targets::{PointShadowCube, Targets};
 pub use tessellation::{
@@ -221,6 +225,10 @@ pub enum Error {
     /// A texture upload was handed a zero-width or zero-height image.
     #[error("upload_texture: zero-sized image")]
     ZeroSizedImage,
+
+    /// A CPU upload payload does not match the declared GPU resource shape.
+    #[error("invalid upload data: {0}")]
+    InvalidUploadData(String),
 
     /// A SPIR-V shader module could not be read or is malformed (size not a
     /// multiple of 4, or unreadable).
