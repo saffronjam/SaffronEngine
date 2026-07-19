@@ -898,15 +898,14 @@ fn write_shadow_samplers(
     light_set: vk::DescriptorSet,
     targets: &Targets,
 ) {
-    let compare = descriptors.shadow_sampler();
     let linear = descriptors.linear_sampler();
     let directional = [vk::DescriptorImageInfo {
-        sampler: compare,
+        sampler: vk::Sampler::null(),
         image_view: targets.directional_shadow_view(),
         image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     }];
     let spot = [vk::DescriptorImageInfo {
-        sampler: compare,
+        sampler: vk::Sampler::null(),
         image_view: targets.spot_shadow_view(),
         image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     }];

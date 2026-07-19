@@ -736,6 +736,10 @@ impl ViewTarget {
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
             ),
         )?;
+        let mut gi_indirect = Image::new(
+            resources,
+            &ImageDesc::color_2d(half_extent, G_NORMAL_FORMAT, storage_sampled),
+        )?;
         let mut ao_map = ao_map;
         let mut contact_map = contact_map;
         let mut ssgi_map = ssgi_map;
@@ -755,7 +759,7 @@ impl ViewTarget {
         // storage-only scratch (ao_raw, ssgi_map written first by their producing pass)
         // stay UNDEFINED until the graph transitions them — except ssgi_map, also read
         // as a sampler by ssgi_blur, so it is seeded too.
-        let read_only: [&Image; 21] = [
+        let read_only: [&Image; 22] = [
             &ao_map,
             &contact_map,
             &ssgi_map,
@@ -777,6 +781,7 @@ impl ViewTarget {
             &cloud_reduced_depth,
             &cloud_full_color,
             &cloud_full_depth,
+            &gi_indirect,
         ];
         initialize_screen_space_layouts(device, &read_only)?;
         for image in [
@@ -801,16 +806,13 @@ impl ViewTarget {
             &mut cloud_reduced_depth,
             &mut cloud_full_color,
             &mut cloud_full_depth,
+            &mut gi_indirect,
         ] {
             image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
 
         // The gi-resolve half-res indirect-diffuse output + its per-frame-slot params UBOs (mapped,
         // memcpy'd per frame — the descriptor sets stay stable so there is no in-flight hazard).
-        let gi_indirect = Image::new(
-            resources,
-            &ImageDesc::color_2d(half_extent, G_NORMAL_FORMAT, storage_sampled),
-        )?;
         let gi_params_size = size_of::<crate::ssao::GiParams>() as vk::DeviceSize;
         let mut gi_params_ubos = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
@@ -1119,10 +1121,9 @@ impl ViewTarget {
             Binding::storage(self.motion_vis_set, 1, offscreen),
             // mesh set 4 binding 2: the SSGI map the scene samples — the temporally
             // resolved map when TAA is on, the spatially denoised map otherwise.
-            Binding::sampled(
+            Binding::sampled_image(
                 self.mesh_set,
                 2,
-                linear,
                 if aa.taa() {
                     ssgi_resolved
                 } else {
@@ -1390,23 +1391,23 @@ impl ViewTarget {
             Binding::storage(self.copy_color_set, 1, prev_color),
             // mesh set 4: AO + contact + denoised SSGI (all linear-sampled). Without motion
             // it samples the spatially denoised map — the accum pass is off.
-            Binding::sampled(self.mesh_set, 0, linear, ao_map),
-            Binding::sampled(self.mesh_set, 1, linear, contact_map),
-            Binding::sampled(self.mesh_set, 2, linear, ssgi_denoised),
-            Binding::sampled(self.mesh_set, 3, linear, ssr_map),
-            Binding::sampled(self.mesh_set, 4, linear, prev_color),
+            Binding::sampled_image(self.mesh_set, 0, ao_map),
+            Binding::sampled_image(self.mesh_set, 1, contact_map),
+            Binding::sampled_image(self.mesh_set, 2, ssgi_denoised),
+            Binding::sampled_image(self.mesh_set, 3, ssr_map),
+            Binding::sampled_image(self.mesh_set, 4, prev_color),
             // mesh set 4 binding 5: the temporally-resolved DFAO sky-visibility. The accum runs
             // whenever motion runs (TAA / SSGI / DFAO all force it on), so the mesh always samples
             // the resolved map; on a frame with no valid history it equals the spatial result.
-            Binding::sampled(self.mesh_set, 5, linear, dfao_resolved),
+            Binding::sampled_image(self.mesh_set, 5, dfao_resolved),
             // mesh set 4 binding 6: the spatially-denoised specular reflection-occlusion. It is
             // view-dependent, so it is not temporally accumulated (surface-motion reprojection would
             // smear it); the half-res trace + bilateral upsample are its whole denoise.
-            Binding::sampled(self.mesh_set, 6, linear, specocc_denoised),
+            Binding::sampled_image(self.mesh_set, 6, specocc_denoised),
             // mesh set 4 binding 7: the half-res screen-space indirect-diffuse resolve (DDGI + IBL
             // diffuse × sky-vis), linear-sampled to bilinearly upsample. Replaces the fragment's own
             // per-pixel DDGI cage + IBL-diffuse resolve.
-            Binding::sampled(self.mesh_set, 7, linear, gi_indirect),
+            Binding::sampled_image(self.mesh_set, 7, gi_indirect),
             // The mandatory tonemap set: binding 0 = the offscreen color as a storage
             // image (GENERAL).
             Binding::storage(self.tonemap_set, 0, offscreen),
@@ -1833,6 +1834,7 @@ fn align_up(value: u64, align: u64) -> u64 {
 struct Binding {
     set: vk::DescriptorSet,
     binding: u32,
+    kind: vk::DescriptorType,
     sampler: Option<vk::Sampler>,
     view: vk::ImageView,
 }
@@ -1847,7 +1849,18 @@ impl Binding {
         Self {
             set,
             binding,
+            kind: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             sampler: Some(sampler),
+            view,
+        }
+    }
+
+    fn sampled_image(set: vk::DescriptorSet, binding: u32, view: vk::ImageView) -> Self {
+        Self {
+            set,
+            binding,
+            kind: vk::DescriptorType::SAMPLED_IMAGE,
+            sampler: None,
             view,
         }
     }
@@ -1856,28 +1869,29 @@ impl Binding {
         Self {
             set,
             binding,
+            kind: vk::DescriptorType::STORAGE_IMAGE,
             sampler: None,
             view,
         }
     }
 
     fn kind(&self) -> vk::DescriptorType {
-        if self.sampler.is_some() {
-            vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-        } else {
-            vk::DescriptorType::STORAGE_IMAGE
-        }
+        self.kind
     }
 
     fn info(&self) -> vk::DescriptorImageInfo {
-        match self.sampler {
-            Some(sampler) => vk::DescriptorImageInfo::default()
-                .sampler(sampler)
+        match self.kind {
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER => vk::DescriptorImageInfo::default()
+                .sampler(self.sampler.expect("combined image sampler"))
                 .image_view(self.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            None => vk::DescriptorImageInfo::default()
+            vk::DescriptorType::SAMPLED_IMAGE => vk::DescriptorImageInfo::default()
+                .image_view(self.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorType::STORAGE_IMAGE => vk::DescriptorImageInfo::default()
                 .image_view(self.view)
                 .image_layout(vk::ImageLayout::GENERAL),
+            _ => unreachable!("image binding descriptor type"),
         }
     }
 }

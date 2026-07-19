@@ -138,28 +138,29 @@ float prefilterLod(float roughness)
 // indirect/ambient term (counts.w); contact shadows (factor, 1 = lit) darken the
 // directional direct term (screenFlags.x); SSGI (rgba16f radiance) adds one-bounce indirect
 // (screenFlags.y).
-[[vk::binding(0, 4)]] Sampler2D aoMap;
-[[vk::binding(1, 4)]] Sampler2D contactMap;
-[[vk::binding(2, 4)]] Sampler2D ssgiMap;
+[[vk::binding(0, 4)]] Texture2D<float4> aoMap;
+[[vk::binding(1, 4)]] Texture2D<float4> contactMap;
+[[vk::binding(2, 4)]] Texture2D<float4> ssgiMap;
 // Screen-space reflection map (rgb = reflected radiance, a = hit confidence), blended over
 // the prefiltered-env specular when extraFlags.x != 0.
-[[vk::binding(3, 4)]] Sampler2D ssrMap;
+[[vk::binding(3, 4)]] Texture2D<float4> ssrMap;
 // Previous frame's lit color, sampled by reprojecting an RT reflection hit (extraFlags.y).
-[[vk::binding(4, 4)]] Sampler2D prevColorMesh;
+[[vk::binding(4, 4)]] Texture2D<float4> prevColorMesh;
 // Reduced-resolution, temporally-accumulated DFAO sky-visibility (r = [0,1] factor, 1 = open),
 // produced by the dfao → dfao-blur → dfao-accum prepass. Sampled to occlude the analytic sky
 // irradiance when sdfOcclusion.y != 0 (the diffuse half of the DFAO term; the per-fragment
 // 9-cone GDF march it replaces).
-[[vk::binding(5, 4)]] Sampler2D dfaoMap;
+[[vk::binding(5, 4)]] Texture2D<float4> dfaoMap;
 // Reduced-resolution, temporally-accumulated specular reflection-occlusion (r = [0,1] factor,
 // 1 = open), produced by the specocc → specocc-blur → specocc-accum prepass. Sampled to occlude
 // the reflected skybox when sdfOcclusion.y != 0 (the specular half of the SDF occlusion term; the
 // per-fragment reflection cone-march it replaces).
-[[vk::binding(6, 4)]] Sampler2D speoccMap;
+[[vk::binding(6, 4)]] Texture2D<float4> speoccMap;
 // The half-res screen-space indirect-diffuse resolve (DDGI cage + IBL diffuse × sky-visibility),
 // computed once per half-res pixel by the gi-resolve pass; sampled here (bilinear upsample) instead
 // of resolving the DDGI cage + IBL diffuse per full-res fragment.
-[[vk::binding(7, 4)]] Sampler2D giIndirectMap;
+[[vk::binding(7, 4)]] Texture2D<float4> giIndirectMap;
+[[vk::binding(8, 4)]] SamplerState screenLinearSampler;
 
 // Set 5: DDGI probe atlases (octahedral irradiance + distance moments), passed to the shared
 // `giprobe::ddgiSampleIrradiance` (which declares no bindings of its own) for multi-bounce indirect
@@ -574,7 +575,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
 #endif
     if (globals.screenFlags.x != 0 && !translucent)
     {
-        shadow *= contactMap.SampleLevel(screenUv, 0.0).r;  // fine contact detail (opaque only)
+        shadow *= contactMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;  // fine contact detail (opaque only)
     }
     shadow *= cloudShadowVisibility(
         input.worldPos, cloudShadowMap, globals, globals.cloudShadowMeta.z);
@@ -669,7 +670,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // level so the BRDF + multi-scatter + horizon + specular-AO below treat it uniformly.
         if (globals.extraFlags.x != 0 && !translucent)
         {
-            float4 ssr = ssrMap.SampleLevel(screenUv, 0.0);
+            float4 ssr = ssrMap.SampleLevel(screenLinearSampler, screenUv, 0.0);
             float gate = saturate(1.0 - roughness * 2.0);
             prefiltered = lerp(prefiltered, ssr.rgb, ssr.a * gate);
         }
@@ -695,7 +696,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
                         float2 huv = (hclip.xy / hclip.w) * 0.5 + 0.5;
                         if (all(huv >= float2(0.0)) && all(huv <= float2(1.0)))
                         {
-                            float3 rtRefl = prevColorMesh.SampleLevel(huv, 0.0).rgb;
+                            float3 rtRefl = prevColorMesh.SampleLevel(screenLinearSampler, huv, 0.0).rgb;
                             prefiltered = lerp(prefiltered, rtRefl, gate);
                         }
                     }
@@ -710,7 +711,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // wrongly dim a chrome surface facing open sky). The march runs in the reduced-resolution
         // specocc prepass (denoised + temporally accumulated); the mesh samples the resolved map.
         // Off (1.0) unless enabled this frame.
-        float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent) ? speoccMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent) ? speoccMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
 
         float2 ab = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
         float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
@@ -737,7 +738,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         float ao = surf.occlusion;  // material occlusion (1.0 = none)
         if (globals.counts.w != 0 && !translucent)
         {
-            ao *= aoMap.SampleLevel(screenUv, 0.0).r;  // screen-space GTAO (contact scale, opaque only)
+            ao *= aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;  // screen-space GTAO (contact scale, opaque only)
         }
         float specAO = saturate(pow(ndotv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
         specularIBL *= specAO * specSkyVis;  // reflection-cone occludes the reflected skybox
@@ -766,7 +767,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         }
         else
         {
-            indirectIrr = giIndirectMap.SampleLevel(screenUv, 0.0).rgb;
+            indirectIrr = giIndirectMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
         }
         float3 indirect = kd * indirectIrr * albedo;
         // Indirect diffuse occlusion: the large-range term is the DDGI ray-miss already folded into
@@ -778,18 +779,18 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // modulated by AO so occluded creases don't over-bounce. Screen-space, so opaque only.
         if (globals.screenFlags.y != 0 && !translucent)
         {
-            float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+            float3 gi = ssgiMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
         }
     }
     else
     {
-        float ao = (globals.counts.w != 0 && !translucent) ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float ao = (globals.counts.w != 0 && !translucent) ? aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
         ambient = albedo * (1.0 - metallic) * globals.ambientColor.rgb * surf.occlusion * ao;
         // SSGI bounce on the non-IBL fallback path (additive, AO-modulated). Screen-space, opaque only.
         if (globals.screenFlags.y != 0 && !translucent)
         {
-            float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+            float3 gi = ssgiMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
         }
         // DDGI on the fallback path: no analytic IBL diffuse to replace, so add the cage
@@ -868,7 +869,7 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
     if (channel == 11u)
     {
         float2 screenUv = input.position.xy / float2(clusterParams.screenSize.xy);
-        float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
         return float4(ao.xxx, 1.0);
     }
 
