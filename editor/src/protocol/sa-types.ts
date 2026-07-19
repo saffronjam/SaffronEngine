@@ -6,297 +6,6 @@
 
 export type WireUuid = string;
 
-/** The material alpha/blend mode (glTF `alphaMode`). */
-export type BlendMode = "opaque" | "masked" | "translucent";
-
-export interface Name {
-  name: string;
-}
-
-export interface Transform {
-  translation: Vec3;
-  scale: Vec3;
-  rotation: Vec3;
-}
-
-export interface Mesh {
-  mesh: WireUuid;
-}
-
-export interface Camera {
-  fov: number;
-  near: number;
-  far: number;
-  primary: boolean;
-  showModel: boolean;
-  showFrustum: boolean;
-  frustumMaxDistance: number;
-}
-
-export interface Material {
-  baseColor: Vec4;
-  albedoTexture: WireUuid;
-  metallicRoughnessTexture: WireUuid;
-  metallic: number;
-  roughness: number;
-  emissive: Vec3;
-  emissiveStrength: number;
-  unlit: boolean;
-  normalTexture: WireUuid;
-  occlusionTexture: WireUuid;
-  emissiveTexture: WireUuid;
-  heightTexture: WireUuid;
-  normalStrength: number;
-  heightScale: number;
-  blend: BlendMode;
-  alphaCutoff: number;
-}
-
-export interface MaterialSet {
-  slots: Material[];
-}
-
-export interface ScriptSlot {
-  scriptPath: string;
-  overrides: Record<string, unknown>;
-}
-
-export interface Script {
-  scripts: ScriptSlot[];
-}
-
-export interface DirectionalLight {
-  direction: Vec3;
-  color: Vec3;
-  intensity: number;
-  ambient: number;
-  volumetricScattering: number;
-  castVolumetricShadow: boolean;
-}
-
-export interface PointLight {
-  color: Vec3;
-  intensity: number;
-  range: number;
-  volumetricScattering: number;
-  castVolumetricShadow: boolean;
-}
-
-export interface SpotLight {
-  direction: Vec3;
-  color: Vec3;
-  intensity: number;
-  range: number;
-  innerAngle: number;
-  outerAngle: number;
-  volumetricScattering: number;
-  castVolumetricShadow: boolean;
-}
-
-export interface ReflectionProbe {
-  influenceRadius: number;
-  intensity: number;
-  boxProjection: boolean;
-  boxExtent: Vec3;
-}
-
-export interface FogVolume {
-  shape: "box" | "sphere";
-  extents: Vec3;
-  radius: number;
-  edgeFalloff: number;
-  density: number;
-  albedo: Vec3;
-  emissive: Vec3;
-  phaseG: number;
-  heightFalloff: number;
-  noiseScale: number;
-  noiseIntensity: number;
-  noiseDetail: number;
-  wind: Vec3;
-  speed: number;
-}
-
-export interface Relationship {
-  parent: WireUuid;
-}
-
-export interface SkinnedMesh {
-  mesh: WireUuid;
-  rootBone: WireUuid;
-  bones: WireUuid[];
-  inverseBind: number[][];
-}
-
-export interface Bone {}
-
-export interface ModelInstance {
-  modelId: WireUuid;
-}
-
-export interface FootChainDto {
-  upper: number;
-  mid: number;
-  end: number;
-  poleVector: Vec3;
-}
-
-export interface FootIk {
-  enabled: boolean;
-  groundHeight: number;
-  chains: FootChainDto[];
-}
-
-export interface BonePhysicsDto {
-  shapeHalfExtents: Vec3;
-  mass: number;
-  joint: string;
-  swingTwistLimits: Vec3;
-  driveStiffness: number;
-  driveDamping: number;
-  driveMaxForce: number;
-}
-
-export interface BonePhysics {
-  bones: BonePhysicsDto[];
-}
-
-export interface BVec3 {
-  x: boolean;
-  y: boolean;
-  z: boolean;
-}
-
-export interface PhysicsMaterial {
-  friction: number;
-  restitution: number;
-}
-
-export interface Rigidbody {
-  motion: "static" | "kinematic" | "dynamic";
-  mass: number;
-  linearDamping: number;
-  angularDamping: number;
-  gravityFactor: number;
-  lockPosition: BVec3;
-  lockRotation: BVec3;
-  collisionLayer: number;
-}
-
-export interface Collider {
-  shape: "box" | "sphere" | "capsule" | "convexhull" | "mesh";
-  halfExtents: Vec3;
-  sourceMesh: WireUuid;
-  offset: Vec3;
-  material: PhysicsMaterial;
-  isSensor: boolean;
-}
-
-export interface KinematicBones {
-  enabled: boolean;
-  driven: number[];
-}
-
-export interface CharacterController {
-  maxSpeed: number;
-  maxSlopeAngle: number;
-  maxStepHeight: number;
-  gravityFactor: number;
-}
-
-export interface AtmosphereSettingsDto {
-  enabled: boolean;
-  planetRadius: number;
-  atmosphereHeight: number;
-  rayleighScattering: Vec3;
-  rayleighScaleHeight: number;
-  mieScattering: number;
-  mieScaleHeight: number;
-  mieAnisotropy: number;
-  ozoneAbsorption: Vec3;
-  sunDiskAngularRadius: number;
-  sunDiskIntensity: number;
-}
-
-export type FogMode = "analytic" | "volumetric";
-
-export type FogQuality = "low" | "medium" | "high";
-
-export interface FogSettingsDto {
-  enabled: boolean;
-  mode: FogMode;
-  quality: FogQuality;
-  historyBlend: number;
-  neighborhoodClamp: boolean;
-  lightClamp: number;
-  baseDensity: number;
-  scatterAlbedo: number;
-  phaseG: number;
-  density: number;
-  albedo: Vec3;
-  height: number;
-  heightFalloff: number;
-  startDistance: number;
-  maxOpacity: number;
-  emissive: Vec3;
-  directionalColor: Vec3;
-  directionalExponent: number;
-  layer2Density: number;
-  layer2Falloff: number;
-  layer2Height: number;
-  aerialPerspective: boolean;
-  aerialIntensity: number;
-}
-
-export interface Components {
-  Name?: Name;
-  Transform?: Transform;
-  Mesh?: Mesh;
-  Camera?: Camera;
-  Material?: Material;
-  MaterialSet?: MaterialSet;
-  Script?: Script;
-  DirectionalLight?: DirectionalLight;
-  PointLight?: PointLight;
-  SpotLight?: SpotLight;
-  ReflectionProbe?: ReflectionProbe;
-  FogVolume?: FogVolume;
-  Relationship?: Relationship;
-  SkinnedMesh?: SkinnedMesh;
-  Bone?: Bone;
-  FootIk?: FootIk;
-  BonePhysics?: BonePhysics;
-  Rigidbody?: Rigidbody;
-  Collider?: Collider;
-  KinematicBones?: KinematicBones;
-  CharacterController?: CharacterController;
-}
-
-export type ComponentBody =
-  | Name
-  | Transform
-  | Mesh
-  | Camera
-  | Material
-  | MaterialSet
-  | Script
-  | DirectionalLight
-  | PointLight
-  | SpotLight
-  | ReflectionProbe
-  | FogVolume
-  | Relationship
-  | SkinnedMesh
-  | Bone
-  | ModelInstance
-  | FootIk
-  | BonePhysics
-  | Rigidbody
-  | Collider
-  | KinematicBones
-  | CharacterController
-  | Record<string, unknown>;
-
 export interface EntityRef {
   id: WireUuid;
   name: string;
@@ -377,7 +86,7 @@ export interface RenderStatsDto {
   bloomAnamorphic: AnamorphicParams;
   bloomPerMipTint: [number, number, number][];
   aa: "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
-  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog";
+  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
 }
 
 export interface SetColorGradingParams {
@@ -661,11 +370,11 @@ export interface SetTaaParamsResult {
 }
 
 export interface SetViewModeParams {
-  mode?: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog";
+  mode?: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
 }
 
 export interface SetViewModeResult {
-  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog";
+  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
 }
 
 export interface ToggleParams {
@@ -796,7 +505,7 @@ export interface CreateEntityParams {
 }
 
 export interface EntityParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
 }
 
 export interface DestroyEntityResult {
@@ -804,12 +513,12 @@ export interface DestroyEntityResult {
 }
 
 export interface SetParentParams {
-  entity: WireUuid | string | number;
-  parent?: WireUuid | string | number;
+  entity: number | string;
+  parent?: number | string;
 }
 
 export interface ComponentParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   component: string;
 }
 
@@ -822,17 +531,19 @@ export interface RemoveComponentResult {
 }
 
 export interface SetComponentParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   component: string;
   json: ComponentBody;
 }
+
+export type ComponentBody = Name | Transform | Mesh | Camera | MaterialSet | ModelInstance | Script | AnimationPlayer | DirectionalLight | PointLight | SpotLight | ReflectionProbe | FogVolume | Relationship | SkinnedMesh | Morph | Bone | FootIk | BonePhysics | Rigidbody | Collider | KinematicBones | CharacterController;
 
 export interface SetComponentResult {
   set: string;
 }
 
 export interface SetComponentOrderParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   components: string[];
 }
 
@@ -841,7 +552,7 @@ export interface SetComponentOrderResult {
 }
 
 export interface SetTransformParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   translation?: Vec3;
   rotation?: Vec3;
   scale?: Vec3;
@@ -855,7 +566,7 @@ export interface Vec3 {
 }
 
 export interface SetLightParams {
-  entity?: WireUuid | string | number;
+  entity?: number | string;
   direction?: Vec3;
   color?: Vec3;
   intensity?: number;
@@ -881,6 +592,230 @@ export interface InspectResult {
   componentOrder: string[];
 }
 
+export interface Components {
+  Name?: Name;
+  Transform?: Transform;
+  Mesh?: Mesh;
+  Camera?: Camera;
+  MaterialSet?: MaterialSet;
+  ModelInstance?: ModelInstance;
+  Script?: Script;
+  AnimationPlayer?: AnimationPlayer;
+  DirectionalLight?: DirectionalLight;
+  PointLight?: PointLight;
+  SpotLight?: SpotLight;
+  ReflectionProbe?: ReflectionProbe;
+  FogVolume?: FogVolume;
+  Relationship?: Relationship;
+  SkinnedMesh?: SkinnedMesh;
+  Morph?: Morph;
+  Bone?: Bone;
+  FootIk?: FootIk;
+  BonePhysics?: BonePhysics;
+  Rigidbody?: Rigidbody;
+  Collider?: Collider;
+  KinematicBones?: KinematicBones;
+  CharacterController?: CharacterController;
+}
+
+export interface Name {
+  name: string;
+}
+
+export interface Transform {
+  translation: Vec3;
+  scale: Vec3;
+  rotation: Vec3;
+}
+
+export interface Mesh {
+  mesh: WireUuid;
+}
+
+export interface Camera {
+  fov: number;
+  near: number;
+  far: number;
+  primary: boolean;
+  showModel: boolean;
+  showFrustum: boolean;
+  frustumMaxDistance: number;
+}
+
+export interface MaterialSet {
+  slots: MaterialSlot[];
+}
+
+export interface MaterialSlot {
+  material: WireUuid;
+  overrides: Record<string, unknown>;
+}
+
+export interface ModelInstance {
+  modelId: WireUuid;
+}
+
+export interface Script {
+  scripts: ScriptSlot[];
+}
+
+export interface ScriptSlot {
+  scriptPath: string;
+  overrides: Record<string, unknown>;
+}
+
+export interface AnimationPlayer {
+  clip: WireUuid;
+  autoplay: boolean;
+  speed: number;
+  wrap: "once" | "loop" | "pingpong";
+  transitionMode: "inertialize" | "crossfade";
+  loopBlend: number;
+}
+
+export interface DirectionalLight {
+  atmosphereRole: "sun" | "moon";
+  direction: Vec3;
+  color: Vec3;
+  intensity: number;
+  ambient: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
+}
+
+export interface PointLight {
+  color: Vec3;
+  intensity: number;
+  range: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
+}
+
+export interface SpotLight {
+  direction: Vec3;
+  color: Vec3;
+  intensity: number;
+  range: number;
+  innerAngle: number;
+  outerAngle: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
+}
+
+export interface ReflectionProbe {
+  influenceRadius: number;
+  intensity: number;
+  boxProjection: boolean;
+  boxExtent: Vec3;
+}
+
+export interface FogVolume {
+  shape: "box" | "sphere";
+  extents: Vec3;
+  radius: number;
+  edgeFalloff: number;
+  density: number;
+  albedo: Vec3;
+  emissive: Vec3;
+  phaseG: number;
+  heightFalloff: number;
+  noiseScale: number;
+  noiseIntensity: number;
+  noiseDetail: number;
+  wind: Vec3;
+  speed: number;
+}
+
+export interface Relationship {
+  parent: WireUuid;
+}
+
+export interface SkinnedMesh {
+  mesh: WireUuid;
+  rootBone: WireUuid;
+  bones: WireUuid[];
+  inverseBind: number[][];
+}
+
+export interface Morph {
+  weights: number[];
+  names: string[];
+}
+
+export interface Bone {
+
+}
+
+export interface FootIk {
+  enabled: boolean;
+  groundHeight: number;
+  chains: FootChainDto[];
+}
+
+export interface FootChainDto {
+  upper: number;
+  mid: number;
+  end: number;
+  poleVector: Vec3;
+}
+
+export interface BonePhysics {
+  bones: BonePhysicsDto[];
+}
+
+export interface BonePhysicsDto {
+  shapeHalfExtents: Vec3;
+  mass: number;
+  joint: "fixed" | "hinge" | "swingtwist" | "free";
+  swingTwistLimits: Vec3;
+  driveStiffness: number;
+  driveDamping: number;
+  driveMaxForce: number;
+}
+
+export interface Rigidbody {
+  motion: "static" | "kinematic" | "dynamic";
+  mass: number;
+  linearDamping: number;
+  angularDamping: number;
+  gravityFactor: number;
+  lockPosition: BVec3;
+  lockRotation: BVec3;
+  collisionLayer: number;
+}
+
+export interface BVec3 {
+  x: boolean;
+  y: boolean;
+  z: boolean;
+}
+
+export interface Collider {
+  shape: "box" | "sphere" | "capsule" | "convexhull" | "mesh";
+  halfExtents: Vec3;
+  sourceMesh: WireUuid;
+  offset: Vec3;
+  material: PhysicsMaterial;
+  isSensor: boolean;
+}
+
+export interface PhysicsMaterial {
+  friction: number;
+  restitution: number;
+}
+
+export interface KinematicBones {
+  enabled: boolean;
+  driven: number[];
+}
+
+export interface CharacterController {
+  maxSpeed: number;
+  maxSlopeAngle: number;
+  maxStepHeight: number;
+  gravityFactor: number;
+}
+
 export interface WorldTransformResult {
   translation: Vec3;
   scale: Vec3;
@@ -899,11 +834,117 @@ export interface EnvironmentDto {
   ambientIntensity: number;
   atmosphere: AtmosphereSettingsDto;
   fog: FogSettingsDto;
+  cloud: CloudSettingsDto;
+  wind: WindSettingsDto;
+  timeOfDay: TimeOfDaySettingsDto;
+}
+
+export interface AtmosphereSettingsDto {
+  enabled: boolean;
+  planetRadius: number;
+  atmosphereHeight: number;
+  rayleighScattering: Vec3;
+  rayleighScaleHeight: number;
+  mieScattering: number;
+  mieScaleHeight: number;
+  mieAnisotropy: number;
+  ozoneAbsorption: Vec3;
+  sunDiskAngularRadius: number;
+  sunDiskIntensity: number;
+  moonDiskAngularRadius: number;
+  moonDiskIntensity: number;
+  moonEarthshine: number;
+  perPixelTransmittance: boolean;
+  skyCaptureCadence: number;
+}
+
+export interface FogSettingsDto {
+  enabled: boolean;
+  mode: "analytic" | "volumetric";
+  quality: "low" | "medium" | "high";
+  historyBlend: number;
+  neighborhoodClamp: boolean;
+  lightClamp: number;
+  baseDensity: number;
+  scatterAlbedo: number;
+  phaseG: number;
+  density: number;
+  albedo: Vec3;
+  height: number;
+  heightFalloff: number;
+  startDistance: number;
+  maxOpacity: number;
+  emissive: Vec3;
+  directionalColor: Vec3;
+  directionalExponent: number;
+  layer2Density: number;
+  layer2Falloff: number;
+  layer2Height: number;
+  aerialPerspective: boolean;
+  aerialIntensity: number;
+}
+
+export interface CloudSettingsDto {
+  enabled: boolean;
+  coverage: number;
+  cloudType: number;
+  precipitation: number;
+  anvilBias: number;
+  layerAltitude: number;
+  layerHeight: number;
+  baseScale: number;
+  detailScale: number;
+  detailStrength: number;
+  curlStrength: number;
+  weatherScale: number;
+  weatherOffset: Vec3;
+  weatherTexture: WireUuid;
+  primarySteps: number;
+  lightSteps: number;
+  dropletDiameter: number;
+  temporalFactor: number;
+  castCloudShadows: boolean;
+  cloudShadowStrength: number;
+  cloudShadowOnSurfaceStrength: number;
+}
+
+export interface WindSettingsDto {
+  orientation: number;
+  speed: number;
+  gust: number;
+}
+
+export interface TimeOfDaySettingsDto {
+  enabled: boolean;
+  manualOverride: boolean;
+  timeOfDay: number;
+  year: number;
+  month: number;
+  day: number;
+  latitude: number;
+  longitude: number;
+  dayLengthSeconds: number;
+  exposureCurve: TodCurvePointDto[];
+  tintCurve: TodTintSettingsDto;
+  coverageCurve: TodCurvePointDto[];
+  cloudTypeCurve: TodCurvePointDto[];
+}
+
+export interface TodCurvePointDto {
+  x: number;
+  y: number;
+}
+
+export interface TodTintSettingsDto {
+  master: TodCurvePointDto[];
+  red: TodCurvePointDto[];
+  green: TodCurvePointDto[];
+  blue: TodCurvePointDto[];
 }
 
 export interface SetEnvironmentParams {
   json?: unknown;
-  skyMode?: string;
+  skyMode?: "color" | "texture" | "procedural";
   clearColor?: Vec3;
   skyTexture?: WireUuid;
   skyIntensity?: number;
@@ -928,6 +969,11 @@ export interface SetAtmosphereParams {
   ozoneAbsorption?: Vec3;
   sunDiskAngularRadius?: number;
   sunDiskIntensity?: number;
+  moonDiskAngularRadius?: number;
+  moonDiskIntensity?: number;
+  moonEarthshine?: number;
+  perPixelTransmittance?: boolean;
+  skyCaptureCadence?: number;
 }
 
 export interface SetFogParams {
@@ -957,6 +1003,62 @@ export interface SetFogParams {
   aerialIntensity?: number;
 }
 
+export interface SetCloudsParams {
+  json?: unknown;
+  enabled?: boolean;
+  coverage?: number;
+  cloudType?: number;
+  precipitation?: number;
+  anvilBias?: number;
+  layerAltitude?: number;
+  layerHeight?: number;
+  baseScale?: number;
+  detailScale?: number;
+  detailStrength?: number;
+  curlStrength?: number;
+  weatherScale?: number;
+  weatherOffset?: Vec3;
+  weatherTexture?: WireUuid;
+  primarySteps?: number;
+  lightSteps?: number;
+  dropletDiameter?: number;
+  temporalFactor?: number;
+  castCloudShadows?: boolean;
+  cloudShadowStrength?: number;
+  cloudShadowOnSurfaceStrength?: number;
+}
+
+export interface SetWindParams {
+  json?: unknown;
+  orientation?: number;
+  speed?: number;
+  gust?: number;
+}
+
+export interface SetTimeOfDayParams {
+  json?: unknown;
+  enabled?: boolean;
+  manualOverride?: boolean;
+  timeOfDay?: number;
+  year?: number;
+  month?: number;
+  day?: number;
+  latitude?: number;
+  longitude?: number;
+  dayLengthSeconds?: number;
+  exposureCurve?: [number, number][];
+  tintCurve?: TodTintCurveDto;
+  coverageCurve?: [number, number][];
+  cloudTypeCurve?: [number, number][];
+}
+
+export interface TodTintCurveDto {
+  master: [number, number][];
+  red: [number, number][];
+  green: [number, number][];
+  blue: [number, number][];
+}
+
 export interface SelectionResult {
   selectionVersion: number;
   sceneVersion: number;
@@ -984,7 +1086,7 @@ export interface StepParams {
 }
 
 export interface AnimationStateParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
 }
 
 export interface AnimationStateResult {
@@ -1000,7 +1102,7 @@ export interface AnimationStateResult {
 }
 
 export interface ListClipsParams {
-  asset?: WireUuid | string | number;
+  asset?: number | string;
 }
 
 export interface ListClipsResult {
@@ -1024,8 +1126,8 @@ export interface AnimationChannelDto {
 }
 
 export interface PlayAnimationParams {
-  entity: WireUuid | string | number;
-  clip: WireUuid | string | number;
+  entity: number | string;
+  clip: number | string;
   speed?: number;
   loop?: boolean;
   blend?: number;
@@ -1033,18 +1135,18 @@ export interface PlayAnimationParams {
 }
 
 export interface SetAnimationPlayingParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   playing: boolean;
 }
 
 export interface SeekAnimationParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   time: number;
   seekBlend?: number;
 }
 
 export interface SetAnimationLoopParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   wrap: string;
 }
 
@@ -1101,7 +1203,7 @@ export interface AssetPreviewOptionsResult {
 }
 
 export interface GetFootIkParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
 }
 
 export interface FootIkResult {
@@ -1111,13 +1213,13 @@ export interface FootIkResult {
 }
 
 export interface SetFootIkParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   enabled?: boolean;
   groundHeight?: number;
 }
 
 export interface SetMorphWeightsParams {
-  entity: unknown;
+  entity: number | string;
   weights: number[];
 }
 
@@ -1127,12 +1229,12 @@ export interface MorphWeightsResult {
 }
 
 export interface GetMorphWeightsParams {
-  entity: unknown;
+  entity: number | string;
 }
 
 export interface ListClipBindingsParams {
-  entity: unknown;
-  clip: unknown;
+  entity: number | string;
+  clip: number | string;
 }
 
 export interface ClipBindingsResult {
@@ -1163,7 +1265,7 @@ export interface PhysicsBodyDto {
 }
 
 export interface FitColliderParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
 }
 
 export interface FitColliderResult {
@@ -1174,7 +1276,7 @@ export interface FitColliderResult {
 }
 
 export interface ApplyImpulseParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   impulse: Vec3;
 }
 
@@ -1205,7 +1307,7 @@ export interface ContactEventDto {
 }
 
 export interface SetKinematicBonesParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   enabled?: boolean;
 }
 
@@ -1216,7 +1318,7 @@ export interface KinematicBonesResult {
 }
 
 export interface MoveCharacterParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   velocity: Vec3;
   jump?: boolean;
 }
@@ -1248,7 +1350,7 @@ export interface ShapecastParams {
 }
 
 export interface EnableRagdollParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   enabled?: boolean;
 }
 
@@ -1260,7 +1362,7 @@ export interface RagdollResult {
 }
 
 export interface SetRagdollParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   active?: boolean;
   bodyWeight?: number;
   bone?: number;
@@ -1268,7 +1370,7 @@ export interface SetRagdollParams {
 }
 
 export interface GetRagdollParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
 }
 
 export interface DrainScriptErrorsParams {
@@ -1324,7 +1426,7 @@ export interface ScriptFieldDto {
 }
 
 export interface SetScriptOverrideParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   slot: number;
   name: string;
   value: unknown;
@@ -1340,12 +1442,12 @@ export interface AddEntityParams {
 }
 
 export interface RenameEntityParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   name: string;
 }
 
 export interface SetComponentFieldParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   component: string;
   field: string;
   value: unknown;
@@ -1597,13 +1699,13 @@ export interface ImportModelResult {
 }
 
 export interface InstantiateModelParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
   name?: string;
 }
 
 export interface AssetPlacementParams {
   phase: "preview" | "commit" | "clear";
-  asset?: unknown;
+  asset?: number | string;
   u?: number;
   v?: number;
 }
@@ -1666,7 +1768,7 @@ export interface ScanAssetsResult {
 }
 
 export interface ExtractSubAssetParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
   subAsset: WireUuid;
   dest?: string;
 }
@@ -1678,12 +1780,12 @@ export interface AssetRef {
 }
 
 export interface ClearExtractionParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
   subAsset: WireUuid;
 }
 
 export interface ReimportModelParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface ReimportModelResult {
@@ -1694,7 +1796,7 @@ export interface ReimportModelResult {
 }
 
 export interface ModelInfoParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface ModelInfoResult {
@@ -1717,7 +1819,7 @@ export interface ModelSubAssetDto {
 }
 
 export interface AssetReferencesParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface AssetReferencesResult {
@@ -1727,7 +1829,7 @@ export interface AssetReferencesResult {
 }
 
 export interface GetAssetModelParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface AssetModelResult {
@@ -1755,7 +1857,7 @@ export interface BoneDto {
 }
 
 export interface EnterAssetPreviewParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface AssetPreviewResult {
@@ -1807,7 +1909,7 @@ export interface DeleteUnusedResult {
 }
 
 export interface RenameAssetParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
   name: string;
 }
 
@@ -1825,12 +1927,12 @@ export interface DeleteAssetFolderParams {
 }
 
 export interface MoveAssetParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
   folder?: string;
 }
 
 export interface AssetUsagesParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface AssetUsagesResult {
@@ -1844,7 +1946,7 @@ export interface AssetUsageDto {
 }
 
 export interface AssetMetadataParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface AssetMetadataDto {
@@ -1860,7 +1962,7 @@ export interface AssetMetadataDto {
 }
 
 export interface DeleteAssetParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface DeleteAssetResult {
@@ -1871,9 +1973,9 @@ export interface DeleteAssetResult {
 }
 
 export interface AssignAssetParams {
-  entity: WireUuid | string | number;
+  entity: number | string;
   slot: "mesh" | "albedo" | "metallic-roughness" | "normal" | "occlusion" | "emissive" | "height";
-  asset: WireUuid | string | number;
+  asset: number | string;
 }
 
 export interface AssignAssetResult {
@@ -1892,8 +1994,8 @@ export interface MaterialCreateResult {
 }
 
 export interface MaterialAssignParams {
-  entity: WireUuid | string | number;
-  material: WireUuid | string | number;
+  entity: number | string;
+  material: number | string;
 }
 
 export interface MaterialAssignResult {
@@ -1922,7 +2024,7 @@ export interface MaterialRefDto {
 }
 
 export interface MaterialGetParams {
-  material: WireUuid | string | number;
+  material: number | string;
 }
 
 export interface MaterialGetResult {
@@ -1953,7 +2055,7 @@ export interface Vec4 {
 }
 
 export interface MaterialSchemaParams {
-  material: unknown;
+  material: number | string;
 }
 
 export interface MaterialSchemaResult {
@@ -1967,7 +2069,7 @@ export interface ExposedParamDto {
 }
 
 export interface MaterialUpdateParams {
-  material: WireUuid | string | number;
+  material: number | string;
   baseColor?: Vec4;
   metallic?: number;
   roughness?: number;
@@ -1989,7 +2091,7 @@ export interface MaterialUpdateResult {
 }
 
 export interface PreviewRenderParams {
-  material: WireUuid | string | number;
+  material: number | string;
   size?: number;
 }
 
@@ -1998,7 +2100,7 @@ export interface PreviewRenderResult {
 }
 
 export interface MaterialSetGraphParams {
-  material: WireUuid | string | number;
+  material: number | string;
   graph: unknown;
 }
 
@@ -2008,12 +2110,12 @@ export interface MaterialSetGraphResult {
 }
 
 export interface MaterialCreateInstanceParams {
-  parent: WireUuid | string | number;
+  parent: number | string;
   name: string;
 }
 
 export interface MaterialSetOverrideParams {
-  material: WireUuid | string | number;
+  material: number | string;
   field: string;
   value: unknown;
 }
@@ -2023,7 +2125,7 @@ export interface MaterialSetOverrideResult {
 }
 
 export interface MaterialCompileParams {
-  material: WireUuid | string | number;
+  material: number | string;
 }
 
 export interface MaterialCompileResult {
@@ -2060,13 +2162,13 @@ export interface ScreenshotResult {
 }
 
 export interface ThumbnailParams {
-  asset: WireUuid | string | number;
+  asset: number | string;
   size?: number;
 }
 
 export interface ThumbnailResult {
   id: WireUuid;
-  format: string;
+  format: "png";
   width: number;
   height: number;
   base64: string;
@@ -2162,6 +2264,9 @@ export interface CommandParamsMap {
   "set-environment": SetEnvironmentParams;
   "set-atmosphere": SetAtmosphereParams;
   "set-fog": SetFogParams;
+  "set-clouds": SetCloudsParams;
+  "set-wind": SetWindParams;
+  "set-time-of-day": SetTimeOfDayParams;
   "get-selection": EmptyParams;
   "deselect": EmptyParams;
   "play": EmptyParams;
@@ -2343,6 +2448,9 @@ export interface CommandResultMap {
   "set-environment": EnvironmentDto;
   "set-atmosphere": EnvironmentDto;
   "set-fog": EnvironmentDto;
+  "set-clouds": EnvironmentDto;
+  "set-wind": EnvironmentDto;
+  "set-time-of-day": EnvironmentDto;
   "get-selection": SelectionResult;
   "deselect": DeselectResult;
   "play": PlayStateResult;

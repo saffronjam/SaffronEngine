@@ -61,6 +61,7 @@ fn enum_wire_spellings_match_cpp_table() {
     check!(ViewModeDto::Metallic, "metallic");
     check!(ViewModeDto::Emissive, "emissive");
     check!(ViewModeDto::Fog, "fog");
+    check!(ViewModeDto::CloudDensity, "cloud-density");
 
     check!(AssetSlotDto::Mesh, "mesh");
     check!(AssetSlotDto::Albedo, "albedo");

@@ -2,23 +2,14 @@
 
 use std::collections::HashSet;
 
-use super::{Decl, DtoDecls, command_type_names, selector_fields};
+use super::{Decl, DtoDecls, command_type_names};
 
-/// The hand-authored component-interfaces block: the 21 component shapes + `Components` +
-/// `ComponentBody`. Emitted verbatim.
-const COMPONENT_BLOCK: &str = include_str!("component_block.ts");
-
-/// The hand-authored `EnvironmentDto` interface: the Rust DTO is opaque (`{ value: Value }`), so
-/// its wire-shaped interface is emitted verbatim, not from `ts-rs`.
-const ENVIRONMENT_DTO: &str = include_str!("environment_dto.ts");
-
-/// Build `editor/src/protocol/sa-types.ts`: header, `WireUuid` alias, the component block, the
-/// command-reachable interfaces in `transitiveStructs` order, and the two command maps.
+/// Build `editor/src/protocol/sa-types.ts` from the Rust DTO declarations.
 pub fn emit_sa_types(decls: &DtoDecls) -> String {
     let names = interface_order(decls);
     let interfaces = names
         .iter()
-        .map(|name| emit_interface(decls, name))
+        .map(|name| emit_declaration(decls, name))
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -35,28 +26,24 @@ pub fn emit_sa_types(decls: &DtoDecls) -> String {
 
     format!(
         "/**\n * GENERATED - do not edit.\n *\n * Produced by cargo run -p xtask -- \
-         gen-protocol.\n */\n\nexport type WireUuid = string;\n\n{}\n\n{}\n\nexport \
+         gen-protocol.\n */\n\nexport type WireUuid = string;\n\n{}\n\nexport \
          interface CommandParamsMap {{\n{}\n}}\n\nexport interface CommandResultMap \
          {{\n{}\n}}\n",
-        COMPONENT_BLOCK.trim_end_matches('\n'),
-        interfaces,
-        params_map,
-        result_map,
+        interfaces, params_map, result_map,
     )
 }
 
-/// The interface emission order: `EntityRef` first, then the transitive structs over the command
-/// roots + `Vec3`/`Vec4`/`ProbeRef`, deduped, struct-only.
+/// The declaration emission order, rooted at every command and shared wire helper.
 fn interface_order(decls: &DtoDecls) -> Vec<String> {
     let mut roots = command_type_names();
-    roots.extend(["Vec3", "Vec4", "ProbeRef"]);
+    roots.extend(["Vec3", "Vec4", "ProbeRef", "ComponentBody"]);
 
     let mut seen = HashSet::new();
     let mut order = Vec::new();
     seen.insert("EntityRef".to_owned());
     order.push("EntityRef".to_owned());
     for root in roots {
-        for dep in struct_deps(decls, root) {
+        for dep in declaration_deps(decls, root) {
             if seen.insert(dep.clone()) {
                 order.push(dep);
             }
@@ -65,113 +52,90 @@ fn interface_order(decls: &DtoDecls) -> Vec<String> {
     order
 }
 
-/// A DFS pre-order of the struct types reachable from `ty`'s fields (unwrapping `Array<...>` and
-/// ` | null`), itself included; non-structs return empty.
-fn struct_deps(decls: &DtoDecls, ty: &str) -> Vec<String> {
+/// A DFS pre-order of the emitted declarations reachable from `ty`.
+fn declaration_deps(decls: &DtoDecls, ty: &str) -> Vec<String> {
     let mut out = Vec::new();
     let inner = unwrap_array(strip_nullable(ty));
-    // Aliases (enums, the `Uuid` = `string` alias) and primitives are not struct nodes.
     if let Some(Decl::Struct(fields)) = decls.get(inner) {
         out.push(inner.to_owned());
         for (_, field_ty) in fields {
-            out.extend(struct_deps(decls, field_ty));
+            out.extend(declaration_deps(decls, field_ty));
         }
+    } else if inner == "ComponentBody" && matches!(decls.get(inner), Some(Decl::Alias(_))) {
+        out.push(inner.to_owned());
     }
     out
 }
 
-/// One interface: `EnvironmentDto` is verbatim; an empty struct is `{\n\n}`; otherwise one
-/// `  name(?): type;` line per field in declaration order.
-fn emit_interface(decls: &DtoDecls, name: &str) -> String {
-    if name == "EnvironmentDto" {
-        return ENVIRONMENT_DTO.trim_end_matches('\n').to_owned();
+/// Emit one Rust-derived TypeScript interface or named union.
+fn emit_declaration(decls: &DtoDecls, name: &str) -> String {
+    match decls.get(name) {
+        Some(Decl::Struct(fields)) => {
+            let body = fields
+                .iter()
+                .map(|(field, ty)| {
+                    let (mapped, optional) = ts_type(ty);
+                    format!("  {field}{}: {mapped};", if optional { "?" } else { "" })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("export interface {name} {{\n{body}\n}}")
+        }
+        Some(Decl::Alias(rhs)) => format!("export type {name} = {};", map_alias_rhs(rhs)),
+        None => panic!("interface-order type {name} has no declaration"),
     }
-    let Some(Decl::Struct(fields)) = decls.get(name) else {
-        panic!("interface-order type {name} is not a struct declaration");
-    };
-    let body = fields
-        .iter()
-        .map(|(field, ty)| {
-            let (mapped, optional) = ts_type(ty, name, field);
-            format!("  {field}{}: {mapped};", if optional { "?" } else { "" })
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("export interface {name} {{\n{body}\n}}")
 }
 
 /// Map a `ts-rs` type token to its TS spelling, returning `(type, optional)`. `T | null` is
 /// optional; `Array<T>` -> `T[]`; `bigint` -> `number`; `Uuid` -> `WireUuid`; `JsonValue` -> a
-/// selector union when `(struct, field)` is a selector, else `unknown`; an enum ident inlines its
-/// `"a" | "b"` union; structs/`Vec3`/etc. pass through.
-fn ts_type(ty: &str, struct_name: &str, field: &str) -> (String, bool) {
+/// `unknown`; a Rust alias inlines its union; structs and primitives pass through.
+fn ts_type(ty: &str) -> (String, bool) {
     let (core, optional) = match ty.strip_suffix("| null") {
         Some(inner) => (inner.trim(), true),
         None => (ty.trim(), false),
     };
 
-    // The two cross-boundary special-cases.
-    if struct_name == "InspectResult" && field == "components" {
-        return ("Components".to_owned(), optional);
-    }
-    if struct_name == "SetComponentParams" && field == "json" {
-        return ("ComponentBody".to_owned(), optional);
-    }
-
     if let Some(item) = core
         .strip_prefix("Array<")
         .and_then(|s| s.strip_suffix('>'))
     {
-        let (mapped, _) = ts_type(item, struct_name, field);
+        let (mapped, _) = ts_type(item);
         return (format!("{mapped}[]"), optional);
     }
     match core {
         "bigint" => ("number".to_owned(), optional),
         "Uuid" => ("WireUuid".to_owned(), optional),
-        "JsonValue" => {
-            if is_selector_field(struct_name, field) {
-                ("WireUuid | string | number".to_owned(), optional)
-            } else {
-                ("unknown".to_owned(), optional)
-            }
-        }
-        other => (resolve_enum_or_passthrough(other), optional),
+        "JsonValue" => ("unknown".to_owned(), optional),
+        other => (resolve_alias_or_passthrough(other), optional),
     }
 }
 
-/// Whether `(struct, field)` is a selector field — reusing the protocol crate's
-/// [`selector_fields`] set so the TS mapping never drifts from the schema emitter.
-fn is_selector_field(struct_name: &str, field: &str) -> bool {
-    selector_fields()
-        .iter()
-        .any(|(s, f)| *s == struct_name && *f == field)
-}
-
-/// An enum ident inlines to its `"a" | "b"` union (looked up from the protocol enum decls); any
-/// other name (a struct, `Vec3`, `number`, `boolean`, `string`) passes through unchanged.
-fn resolve_enum_or_passthrough(name: &str) -> String {
-    if let Some(union) = ENUM_UNIONS.with(|m| m.get(name).cloned()) {
+/// Inline Rust-derived primitive and string-literal unions.
+fn resolve_alias_or_passthrough(name: &str) -> String {
+    if name != "ComponentBody"
+        && let Some(union) = TYPE_ALIASES.with(|aliases| aliases.get(name).cloned())
+    {
         return union;
     }
     name.to_owned()
 }
 
 thread_local! {
-    /// The enum ident -> `"a" | "b"` union map, parsed once from the protocol `ts-rs` decls.
-    static ENUM_UNIONS: std::collections::HashMap<String, String> = enum_unions();
+    static TYPE_ALIASES: std::collections::HashMap<String, String> = type_aliases();
 }
 
-fn enum_unions() -> std::collections::HashMap<String, String> {
+fn type_aliases() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for (ident, decl) in saffron_protocol::ts_decls() {
         if let Decl::Alias(rhs) = super::parse_decl(&decl) {
-            // The `Uuid` alias (`string`) is not an enum union; only keep `"..."`-led unions.
-            if rhs.starts_with('"') {
-                map.insert(ident.to_owned(), rhs);
-            }
+            map.insert(ident.to_owned(), map_alias_rhs(&rhs));
         }
     }
     map
+}
+
+fn map_alias_rhs(rhs: &str) -> String {
+    rhs.replace("bigint", "number").replace("Uuid", "WireUuid")
 }
 
 /// `T | null` -> `T`; a bare `T` passes through (the nullable marker the TS walk strips before
@@ -197,40 +161,41 @@ mod tests {
         let decls = DtoDecls::load();
         // `PingParams`/`EmptyParams` are `Record<string, never>` -> `{\n\n}`.
         assert_eq!(
-            emit_interface(&decls, "PingParams"),
+            emit_declaration(&decls, "PingParams"),
             "export interface PingParams {\n\n}"
         );
     }
 
     #[test]
     fn bigint_field_maps_to_number() {
-        let (mapped, optional) = ts_type("bigint", "FrameSampleDto", "frameIndex");
+        let (mapped, optional) = ts_type("bigint");
         assert_eq!(mapped, "number");
         assert!(!optional);
     }
 
     #[test]
-    fn selector_field_maps_to_union() {
-        let (mapped, _) = ts_type("JsonValue", "ComponentParams", "entity");
-        assert_eq!(mapped, "WireUuid | string | number");
+    fn selector_alias_maps_to_union() {
+        let mapped = resolve_alias_or_passthrough("EntitySelector");
+        assert!(mapped.contains("string"));
+        assert!(mapped.contains("number"));
     }
 
     #[test]
     fn opaque_json_field_maps_to_unknown() {
-        let (mapped, _) = ts_type("JsonValue", "MaterialSetGraphParams", "graph");
+        let (mapped, _) = ts_type("JsonValue");
         assert_eq!(mapped, "unknown");
     }
 
     #[test]
     fn nullable_field_is_optional() {
-        let (mapped, optional) = ts_type("Vec3 | null", "SetTransformParams", "translation");
+        let (mapped, optional) = ts_type("Vec3 | null");
         assert_eq!(mapped, "Vec3");
         assert!(optional);
     }
 
     #[test]
     fn enum_field_inlines_union() {
-        let (mapped, optional) = ts_type("AaModeDto", "SetAaParams", "mode");
+        let (mapped, optional) = ts_type("AaModeDto");
         assert_eq!(
             mapped,
             "\"off\" | \"fxaa\" | \"taa\" | \"msaa2\" | \"msaa4\" | \"msaa8\""

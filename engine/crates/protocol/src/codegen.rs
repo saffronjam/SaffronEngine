@@ -3,19 +3,14 @@
 //! Rust has no runtime reflection, so the emitters cannot enumerate the DTO set themselves;
 //! this module is the single in-crate dispatch that turns the named DTO universe into the two
 //! inputs the emitters need: every type's `ts-rs` declaration (the TS interface + enum-union
-//! source) and every struct's `schemars` OpenRPC fragment. Both lists are the same ordered DTO
+//! source) and every type's `schemars` OpenRPC fragment. Both lists are the same ordered DTO
 //! universe the `inventory` test pins, so a dropped or added type fails to compile here too.
-//!
-//! The three wire-helpers (`WireUuid`, `EntitySelector`, `AssetSelector`) are not Rust
-//! structs (`Uuid` is a string alias; the selectors are opaque `Value`), so their OpenRPC
-//! object fragments are hand-emitted by the xtask, not produced here.
 
 use schemars::JsonSchema;
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::dto::*;
-use crate::{Uuid, fragment_for};
+use crate::*;
 
 /// One DTO type's `ts-rs` declaration: `(ident, decl)` where `decl` is the raw `type X = ...;`
 /// string `ts-rs` emits (an object type for structs, a string-literal union for enums, the
@@ -31,9 +26,57 @@ pub fn ts_decls() -> Vec<(&'static str, String)> {
     }
     vec![
         decl_entry!(Uuid),
+        decl_entry!(EntitySelector),
+        decl_entry!(AssetSelector),
         decl_entry!(EntityRef),
         decl_entry!(Vec3),
         decl_entry!(Vec4),
+        decl_entry!(Name),
+        decl_entry!(Transform),
+        decl_entry!(Mesh),
+        decl_entry!(Camera),
+        decl_entry!(MaterialSlot),
+        decl_entry!(MaterialSet),
+        decl_entry!(ModelInstance),
+        decl_entry!(ScriptSlot),
+        decl_entry!(Script),
+        decl_entry!(AnimationWrapDto),
+        decl_entry!(AnimationTransitionDto),
+        decl_entry!(AnimationPlayer),
+        decl_entry!(AtmosphereRoleDto),
+        decl_entry!(DirectionalLight),
+        decl_entry!(PointLight),
+        decl_entry!(SpotLight),
+        decl_entry!(ReflectionProbe),
+        decl_entry!(FogShapeDto),
+        decl_entry!(FogVolume),
+        decl_entry!(Relationship),
+        decl_entry!(SkinnedMesh),
+        decl_entry!(Morph),
+        decl_entry!(Bone),
+        decl_entry!(FootChainDto),
+        decl_entry!(FootIk),
+        decl_entry!(JointDto),
+        decl_entry!(BonePhysicsDto),
+        decl_entry!(BonePhysics),
+        decl_entry!(BVec3),
+        decl_entry!(MotionDto),
+        decl_entry!(Rigidbody),
+        decl_entry!(ColliderShapeDto),
+        decl_entry!(PhysicsMaterial),
+        decl_entry!(Collider),
+        decl_entry!(KinematicBones),
+        decl_entry!(CharacterController),
+        decl_entry!(Components),
+        decl_entry!(ComponentBody),
+        decl_entry!(SkyModeDto),
+        decl_entry!(AtmosphereSettingsDto),
+        decl_entry!(FogSettingsDto),
+        decl_entry!(CloudSettingsDto),
+        decl_entry!(WindSettingsDto),
+        decl_entry!(TodCurvePointDto),
+        decl_entry!(TodTintSettingsDto),
+        decl_entry!(TimeOfDaySettingsDto),
         decl_entry!(AddEntityPreset),
         decl_entry!(PickKind),
         decl_entry!(GizmoOpDto),
@@ -46,6 +89,7 @@ pub fn ts_decls() -> Vec<(&'static str, String)> {
         decl_entry!(ViewModeDto),
         decl_entry!(AssetSlotDto),
         decl_entry!(ScreenshotTargetDto),
+        decl_entry!(ThumbnailFormatDto),
         decl_entry!(AssetTypeDto),
         decl_entry!(ProfilerModeDto),
         decl_entry!(ProfileLaneDto),
@@ -263,6 +307,10 @@ pub fn ts_decls() -> Vec<(&'static str, String)> {
         decl_entry!(SetEnvironmentParams),
         decl_entry!(SetAtmosphereParams),
         decl_entry!(SetFogParams),
+        decl_entry!(SetCloudsParams),
+        decl_entry!(SetWindParams),
+        decl_entry!(TodTintCurveDto),
+        decl_entry!(SetTimeOfDayParams),
         decl_entry!(SelectionResult),
         decl_entry!(PlayStateResult),
         decl_entry!(AnimationChannelDto),
@@ -338,11 +386,9 @@ pub fn ts_decls() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Every DTO **struct**'s OpenRPC schema fragment: `(name, fragment)` in declaration order.
-/// Enums and [`Uuid`] are excluded (enums inline into their referencing fragment; `Uuid` is a
-/// `string`). The xtask sorts these by name and merges the hand-authored component block.
+/// Every named OpenRPC schema fragment in declaration order.
 #[must_use]
-pub fn struct_fragments() -> Vec<(&'static str, Value)> {
+pub fn schema_fragments() -> Vec<(&'static str, Value)> {
     fn frag<T: JsonSchema>(name: &'static str) -> (&'static str, Value) {
         (name, fragment_for::<T>(name))
     }
@@ -352,9 +398,78 @@ pub fn struct_fragments() -> Vec<(&'static str, Value)> {
         };
     }
     vec![
+        frag_entry!(Uuid),
+        frag_entry!(EntitySelector),
+        frag_entry!(AssetSelector),
         frag_entry!(EntityRef),
         frag_entry!(Vec3),
         frag_entry!(Vec4),
+        frag_entry!(Name),
+        frag_entry!(Transform),
+        frag_entry!(Mesh),
+        frag_entry!(Camera),
+        frag_entry!(MaterialSlot),
+        frag_entry!(MaterialSet),
+        frag_entry!(ModelInstance),
+        frag_entry!(ScriptSlot),
+        frag_entry!(Script),
+        frag_entry!(AnimationWrapDto),
+        frag_entry!(AnimationTransitionDto),
+        frag_entry!(AnimationPlayer),
+        frag_entry!(AtmosphereRoleDto),
+        frag_entry!(DirectionalLight),
+        frag_entry!(PointLight),
+        frag_entry!(SpotLight),
+        frag_entry!(ReflectionProbe),
+        frag_entry!(FogShapeDto),
+        frag_entry!(FogVolume),
+        frag_entry!(Relationship),
+        frag_entry!(SkinnedMesh),
+        frag_entry!(Morph),
+        frag_entry!(Bone),
+        frag_entry!(FootChainDto),
+        frag_entry!(FootIk),
+        frag_entry!(JointDto),
+        frag_entry!(BonePhysicsDto),
+        frag_entry!(BonePhysics),
+        frag_entry!(BVec3),
+        frag_entry!(MotionDto),
+        frag_entry!(Rigidbody),
+        frag_entry!(ColliderShapeDto),
+        frag_entry!(PhysicsMaterial),
+        frag_entry!(Collider),
+        frag_entry!(KinematicBones),
+        frag_entry!(CharacterController),
+        frag_entry!(Components),
+        frag_entry!(ComponentBody),
+        frag_entry!(SkyModeDto),
+        frag_entry!(AtmosphereSettingsDto),
+        frag_entry!(FogSettingsDto),
+        frag_entry!(CloudSettingsDto),
+        frag_entry!(WindSettingsDto),
+        frag_entry!(TodCurvePointDto),
+        frag_entry!(TodTintSettingsDto),
+        frag_entry!(TimeOfDaySettingsDto),
+        frag_entry!(AddEntityPreset),
+        frag_entry!(PickKind),
+        frag_entry!(GizmoOpDto),
+        frag_entry!(GizmoSpaceDto),
+        frag_entry!(GizmoPointerPhase),
+        frag_entry!(FogMode),
+        frag_entry!(FogQuality),
+        frag_entry!(AaModeDto),
+        frag_entry!(GiModeDto),
+        frag_entry!(ViewModeDto),
+        frag_entry!(AssetSlotDto),
+        frag_entry!(ScreenshotTargetDto),
+        frag_entry!(ThumbnailFormatDto),
+        frag_entry!(AssetTypeDto),
+        frag_entry!(ProfilerModeDto),
+        frag_entry!(ProfileLaneDto),
+        frag_entry!(CaptureModeDto),
+        frag_entry!(CaptureStateDto),
+        frag_entry!(AlarmSeverityDto),
+        frag_entry!(AlarmStateDto),
         frag_entry!(PingParams),
         frag_entry!(EmptyParams),
         frag_entry!(PingResult),
@@ -455,6 +570,8 @@ pub fn struct_fragments() -> Vec<(&'static str, Value)> {
         frag_entry!(SetActiveViewParams),
         frag_entry!(SetActiveViewResult),
         frag_entry!(ProjectInfoDto),
+        frag_entry!(ProjectPhaseDto),
+        frag_entry!(BootStageDto),
         frag_entry!(ProjectStatusDto),
         frag_entry!(NewProjectParams),
         frag_entry!(PathParams),
@@ -465,6 +582,7 @@ pub fn struct_fragments() -> Vec<(&'static str, Value)> {
         frag_entry!(ImportModelResult),
         frag_entry!(InstantiateModelParams),
         frag_entry!(AssetPlacementParams),
+        frag_entry!(AssetPlacementPhaseDto),
         frag_entry!(PlacementTransformDto),
         frag_entry!(AssetPlacementResult),
         frag_entry!(ExtractSubAssetParams),
@@ -562,6 +680,10 @@ pub fn struct_fragments() -> Vec<(&'static str, Value)> {
         frag_entry!(SetEnvironmentParams),
         frag_entry!(SetAtmosphereParams),
         frag_entry!(SetFogParams),
+        frag_entry!(SetCloudsParams),
+        frag_entry!(SetWindParams),
+        frag_entry!(TodTintCurveDto),
+        frag_entry!(SetTimeOfDayParams),
         frag_entry!(SelectionResult),
         frag_entry!(PlayStateResult),
         frag_entry!(AnimationChannelDto),
@@ -641,7 +763,7 @@ pub fn struct_fragments() -> Vec<(&'static str, Value)> {
 mod tests {
     use super::*;
 
-    // (The former `ts_decls_cover_the_full_dto_universe` / `struct_fragments_cover_every_openrpc_struct`
+    // (The former declaration-count tests
     // tests asserted only a hardcoded length. DTO coverage is enforced structurally elsewhere:
     // `tests/inventory.rs` names every DTO (a compile-time existence + derive check), and the
     // committed generated artifacts — validated live by the control-schema gate — are the snapshot

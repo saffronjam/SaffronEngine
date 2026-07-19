@@ -2,15 +2,13 @@
 //!
 //! The DTO crate (`saffron-protocol`) is the single source of truth: its `ts-rs` derives give
 //! the field metadata (via [`saffron_protocol::ts_decls`]) and its `schemars` fragments give the
-//! OpenRPC per-DTO schemas (via [`saffron_protocol::struct_fragments`]). This module assembles
+//! OpenRPC per-DTO schemas (via [`saffron_protocol::schema_fragments`]). This module assembles
 //! the three editor-facing artifacts:
 //!
-//! - `editor/src/protocol/sa-types.ts` — header, the `WireUuid` alias, the hand-authored
-//!   component-interfaces block, the command-reachable DTO interfaces in the `transitiveStructs`
-//!   order, and the `CommandParamsMap`/`CommandResultMap`.
+//! - `editor/src/protocol/sa-types.ts` — header, the `WireUuid` alias, the command-reachable DTO
+//!   interfaces, and the `CommandParamsMap`/`CommandResultMap`.
 //! - `schemas/control/openrpc.generated.json` — the `{ openrpc, info, methods, components.schemas
-//!   }` envelope, `methods` in command-table order, `components.schemas` = the sorted per-DTO
-//!   fragments + the hand-authored component block.
+//!   }` envelope, with methods in command-table order and schemas generated from Rust DTOs.
 //! - `schemas/control/command-manifest.generated.json` — the fixture/skip ledger.
 //! - `schemas/control/sa.generated.luau` — the single Luau defs file: the `sa.*` API surface
 //!   ([`luau::emit_api_defs`], from the `saffron-script` binding table) followed by the
@@ -26,9 +24,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use saffron_protocol::{
-    COMMANDS, SELECTOR_FIELDS, component_schemas, fixture_for, skip_for, struct_fragments, ts_decls,
-};
+use saffron_protocol::{COMMANDS, fixture_for, schema_fragments, skip_for, ts_decls};
 use serde_json::{Map, Value, json};
 
 pub mod luau;
@@ -200,22 +196,12 @@ fn strip_doc_comments(input: &str) -> String {
 fn emit_openrpc() -> String {
     let mut schemas: Map<String, Value> = Map::new();
 
-    // Every struct fragment + the three wire-helper struct shapes, sorted by name. The fragments
-    // come from `schemars`; the wire-helpers are hand-emitted.
-    let mut named: Vec<(String, Value)> = struct_fragments()
+    let mut named: Vec<(String, Value)> = schema_fragments()
         .into_iter()
         .map(|(name, frag)| (name.to_owned(), frag))
         .collect();
-    for (name, frag) in wire_helper_fragments() {
-        named.push((name, frag));
-    }
     named.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, frag) in named {
-        schemas.insert(name, frag);
-    }
-    // The hand-authored component block is inserted last: a key already present keeps its sorted
-    // position, a new key (the aggregates + `Environment`) appends.
-    for (name, frag) in component_schemas() {
         schemas.insert(name, frag);
     }
 
@@ -244,41 +230,6 @@ fn emit_openrpc() -> String {
         "components": { "schemas": Value::Object(schemas) },
     });
     pretty(&doc)
-}
-
-/// The three wire-helper struct fragments: `WireUuid` is `{ value: integer }`, the two selectors
-/// are `{ value: {} }`. Rust models these as a `string` alias / opaque `Value`, so their object
-/// shapes are hand-emitted.
-fn wire_helper_fragments() -> Vec<(String, Value)> {
-    vec![
-        (
-            "WireUuid".to_owned(),
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": { "value": { "type": "integer" } },
-                "required": ["value"],
-            }),
-        ),
-        (
-            "EntitySelector".to_owned(),
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": { "value": {} },
-                "required": ["value"],
-            }),
-        ),
-        (
-            "AssetSelector".to_owned(),
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": { "value": {} },
-                "required": ["value"],
-            }),
-        ),
-    ]
 }
 
 /// The command manifest. Each command carries exactly one of a fixture or a skip; neither is a
@@ -341,12 +292,6 @@ fn command_type_names() -> Vec<&'static str> {
         }
     }
     out
-}
-
-/// `(struct, field)` pairs whose `serde_json::Value` field is a selector — the TS mapping
-/// reuses the protocol crate's [`SELECTOR_FIELDS`] so it never drifts from the schema emitter.
-fn selector_fields() -> HashSet<(&'static str, &'static str)> {
-    SELECTOR_FIELDS.iter().copied().collect()
 }
 
 #[cfg(test)]

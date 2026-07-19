@@ -28,12 +28,12 @@ use saffron_assets::{
 use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3 as MathVec3};
 use saffron_protocol::{
-    AnimationClipDto, AssetAttributionDto, AssetCapabilitiesDto, AssetEntryDto, AssetList,
-    AssetMetadataDto, AssetMetadataParams, AssetModelResult, AssetPlacementParams,
+    AnimationClipDto, AppManifest, AssetAttributionDto, AssetCapabilitiesDto, AssetEntryDto,
+    AssetList, AssetMetadataDto, AssetMetadataParams, AssetModelResult, AssetPlacementParams,
     AssetPlacementPhaseDto, AssetPlacementResult, AssetRef, AssetReferencesParams,
-    AssetReferencesResult, AssetSlotDto, AssetTypeDto, AssetUsageDto, AssetUsagesParams,
-    AssetUsagesResult, AssignAssetParams, AssignAssetResult, BoneDto, BootStageDto,
-    CleanAssetsParams, CleanCandidateDto, CleanReport, ClearExtractionParams,
+    AssetReferencesResult, AssetSelector, AssetSlotDto, AssetTypeDto, AssetUsageDto,
+    AssetUsagesParams, AssetUsagesResult, AssignAssetParams, AssignAssetResult, BoneDto,
+    BootStageDto, CleanAssetsParams, CleanCandidateDto, CleanReport, ClearExtractionParams,
     CreateAssetFolderParams, CreateScriptParams, CreateScriptResult, DeleteAssetFolderParams,
     DeleteAssetParams, DeleteAssetResult, DeleteUnusedParams, DeleteUnusedResult, EmptyParams,
     EntityRef, ExportAppParams, ExportAppResult, ExposedParamDto, ExtractSubAssetParams,
@@ -50,8 +50,8 @@ use saffron_protocol::{
     ProjectStatusDto, ProjectStoresDto, QuitResult, ReimportModelParams, ReimportModelResult,
     RenameAssetFolderParams, RenameAssetParams, ScanAssetsResult, ScreenshotParams,
     ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams, SetActiveViewResult,
-    ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailParams, ThumbnailResult, Uuid as WireUuid,
-    Vec3, Vec4,
+    ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailFormatDto, ThumbnailParams,
+    ThumbnailResult, Uuid as WireUuid, Vec3, Vec4,
 };
 use saffron_rendering::ViewId;
 use saffron_scene::{
@@ -109,8 +109,8 @@ fn asset_type_dto(asset_type: AssetType) -> AssetTypeDto {
 }
 
 /// Reads an id-or-name selector value as its string form, treating any non-string as empty.
-fn selector_string(selector: &Value) -> String {
-    selector.as_str().unwrap_or_default().to_owned()
+fn selector_string(selector: &AssetSelector) -> String {
+    selector.name().unwrap_or_default().to_owned()
 }
 
 /// Wraps a folder path as an optional, mapping an empty path to `None`.
@@ -124,19 +124,13 @@ fn optional_folder(folder: &str) -> Option<String> {
 
 /// The uuid an id-or-name selector resolves to: an unsigned number, a non-negative signed
 /// number, or a whole-string decimal parse.
-fn selector_id(selector: &Value) -> u64 {
-    if let Some(value) = selector.as_u64() {
-        return value;
-    }
-    if let Some(value) = selector.as_i64() {
-        return u64::try_from(value).unwrap_or(0);
-    }
-    selector_string(selector).parse::<u64>().unwrap_or(0)
+fn selector_id(selector: &AssetSelector) -> u64 {
+    selector.id().unwrap_or(0)
 }
 
 /// Resolves an [`AssetSelector`](saffron_protocol::AssetSelector) to a catalog entry id,
 /// by id or name.
-fn resolve_asset(ctx: &EngineContext<'_>, selector: &Value) -> Result<Uuid> {
+fn resolve_asset(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<Uuid> {
     let by_id = selector_id(selector);
     let name = selector_string(selector);
     for entry in &ctx.assets.catalog.entries {
@@ -149,7 +143,7 @@ fn resolve_asset(ctx: &EngineContext<'_>, selector: &Value) -> Result<Uuid> {
 
 /// Resolves an [`AssetSelector`](saffron_protocol::AssetSelector) to its index in the
 /// catalog `entries`.
-fn resolve_asset_index(ctx: &EngineContext<'_>, selector: &Value) -> Result<usize> {
+fn resolve_asset_index(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<usize> {
     let by_id = selector_id(selector);
     let name = selector_string(selector);
     for (i, entry) in ctx.assets.catalog.entries.iter().enumerate() {
@@ -800,8 +794,9 @@ impl ProjectHost for RendererProjectHost<'_> {
 /// Cooks the loaded project into a standalone app folder at `params.output_dir`: pre-bakes every
 /// material's mesh SPIR-V (so the shipped player never needs `slangc`), then stages the player
 /// binary + the project data (`project.json`, `assets/`, `src/`) + the engine `shaders/` + an
-/// `app.json` manifest. Side-effecting (writes to disk); returns the staged path and any non-fatal
-/// warnings (a material that failed to bake, a missing player binary).
+/// `app.json` manifest. macOS uses a native `.app` bundle with its Vulkan runtime in
+/// `Contents/Frameworks`; other platforms use a flat directory. Side-effecting (writes to disk);
+/// returns the staged path and any non-fatal warnings.
 fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<ExportAppResult> {
     if params.output_dir.trim().is_empty() {
         return Err(Error::command("missing 'outputDir'"));
@@ -839,10 +834,15 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
         }
     }
 
-    // 2. Stage the folder. The player binary + engine shaders sit beside the running host binary.
-    let out = PathBuf::from(&params.output_dir);
-    std::fs::create_dir_all(&out)
-        .map_err(|e| Error::command(format!("create output dir '{}': {e}", out.display())))?;
+    // 2. Stage the platform-native application layout. The player binary + engine shaders sit
+    //    beside the running host binary in the build tree.
+    let layout = ExportLayout::for_output(Path::new(&params.output_dir));
+    std::fs::create_dir_all(&layout.resources).map_err(|e| {
+        Error::command(format!(
+            "create output dir '{}': {e}",
+            layout.root.display()
+        ))
+    })?;
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
@@ -850,26 +850,29 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
 
     copy_file(
         &project_root.join("project.json"),
-        &out.join("project.json"),
+        &layout.resources.join("project.json"),
     )
     .map_err(|e| Error::command(format!("copy project.json: {e}")))?;
-    copy_dir_recursive(&project_root.join("assets"), &out.join("assets"))
-        .map_err(|e| Error::command(format!("copy assets/: {e}")))?;
+    copy_dir_recursive(
+        &project_root.join("assets"),
+        &layout.resources.join("assets"),
+    )
+    .map_err(|e| Error::command(format!("copy assets/: {e}")))?;
     let src = project_root.join("src");
     if src.is_dir() {
-        copy_dir_recursive(&src, &out.join("src"))
+        copy_dir_recursive(&src, &layout.resources.join("src"))
             .map_err(|e| Error::command(format!("copy src/: {e}")))?;
     }
     let shaders = exe_dir.join("shaders");
     if shaders.is_dir() {
-        copy_dir_recursive(&shaders, &out.join("shaders"))
+        copy_dir_recursive(&shaders, &layout.resources.join("shaders"))
             .map_err(|e| Error::command(format!("copy shaders/: {e}")))?;
     } else {
         warnings.push(format!("engine shaders not found at {}", shaders.display()));
     }
     let player = exe_dir.join("saffron-player");
     if player.is_file() {
-        copy_file(&player, &out.join("saffron-player"))
+        copy_file(&player, &layout.executable)
             .map_err(|e| Error::command(format!("copy saffron-player: {e}")))?;
     } else {
         warnings.push(format!(
@@ -877,32 +880,218 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
             player.display()
         ));
     }
-    // Bundle the C++ runtime libs the player links through the vendored Jolt physics (built
-    // against libc++ for deterministic physics). The player's `$ORIGIN` rpath finds them here, so
-    // the folder runs on a host without the toolbox's libc++.
+    let app_json = serde_json::to_string_pretty(&params.app)
+        .map_err(|e| Error::command(format!("serialize app.json: {e}")))?;
+    std::fs::write(layout.resources.join("app.json"), app_json)
+        .map_err(|e| Error::command(format!("write app.json: {e}")))?;
+    stage_platform_runtime(&layout, &params.app, &mut warnings)?;
+
+    Ok(ExportAppResult {
+        path: layout.root.to_string_lossy().into_owned(),
+        warnings,
+    })
+}
+
+/// The platform-native output paths for one exported application.
+struct ExportLayout {
+    root: PathBuf,
+    resources: PathBuf,
+    executable: PathBuf,
+}
+
+impl ExportLayout {
+    fn for_output(output: &Path) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let root = if output.extension().is_some_and(|ext| ext == "app") {
+                output.to_path_buf()
+            } else {
+                PathBuf::from(format!("{}.app", output.display()))
+            };
+            let contents = root.join("Contents");
+            Self {
+                resources: contents.join("Resources"),
+                executable: contents.join("MacOS").join("saffron-player"),
+                root,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self {
+            root: output.to_path_buf(),
+            resources: output.to_path_buf(),
+            executable: output.join("saffron-player"),
+        }
+    }
+}
+
+/// Stages the Linux C++ runtime beside the player, where its `$ORIGIN` rpath resolves it.
+#[cfg(not(target_os = "macos"))]
+fn stage_platform_runtime(
+    layout: &ExportLayout,
+    _app: &AppManifest,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     for lib in ["libc++.so.1", "libc++abi.so.1"] {
         match find_runtime_lib(lib) {
-            Some(src) => copy_file(&src, &out.join(lib))
+            Some(src) => copy_file(&src, &layout.root.join(lib))
                 .map_err(|e| Error::command(format!("copy {lib}: {e}")))?,
             None => warnings.push(format!(
                 "{lib} not found on the host; the exported app needs it beside saffron-player"
             )),
         }
     }
-    let app_json = serde_json::to_string_pretty(&params.app)
-        .map_err(|e| Error::command(format!("serialize app.json: {e}")))?;
-    std::fs::write(out.join("app.json"), app_json)
-        .map_err(|e| Error::command(format!("write app.json: {e}")))?;
+    Ok(())
+}
 
-    Ok(ExportAppResult {
-        path: out.to_string_lossy().into_owned(),
-        warnings,
-    })
+/// Stages a self-contained macOS application bundle with MoltenVK, metadata, its license, and
+/// ad-hoc signatures. The player loads the bundled MoltenVK dynamic library directly.
+#[cfg(target_os = "macos")]
+fn stage_platform_runtime(
+    layout: &ExportLayout,
+    app: &AppManifest,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let contents = layout.root.join("Contents");
+    let frameworks = contents.join("Frameworks");
+    let moltenvk = find_macos_runtime_lib("libMoltenVK.dylib")
+        .ok_or_else(|| Error::command("macOS Vulkan driver libMoltenVK.dylib not found"))?;
+    let bundled_moltenvk = frameworks.join("libMoltenVK.dylib");
+    copy_file(&moltenvk, &bundled_moltenvk)
+        .map_err(|e| Error::command(format!("copy libMoltenVK.dylib: {e}")))?;
+
+    std::fs::write(contents.join("Info.plist"), macos_info_plist(app))
+        .map_err(|e| Error::command(format!("write Info.plist: {e}")))?;
+    stage_macos_runtime_licenses(&layout.resources, warnings)?;
+
+    for code in [&bundled_moltenvk, &layout.executable] {
+        ad_hoc_sign(code)?;
+    }
+    ad_hoc_sign(&layout.root)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_runtime_lib(name: &str) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
+        dirs.push(PathBuf::from(sdk).join("lib"));
+    }
+    dirs.extend(
+        ["/opt/homebrew/lib", "/usr/local/lib"]
+            .into_iter()
+            .map(PathBuf::from),
+    );
+    dirs.into_iter()
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_info_plist(app: &AppManifest) -> String {
+    let title = xml_escape(&app.title);
+    let identifier = bundle_identifier_component(&app.title);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>{title}</string>
+  <key>CFBundleExecutable</key><string>saffron-player</string>
+  <key>CFBundleIdentifier</key><string>com.saffron.anima.{identifier}</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>{title}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{}</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_identifier_component(title: &str) -> String {
+    let mut component = String::new();
+    let mut separator = false;
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            component.push(ch);
+            separator = false;
+        } else if !component.is_empty() && !separator {
+            component.push('-');
+            separator = true;
+        }
+    }
+    while component.ends_with('-') {
+        component.pop();
+    }
+    if component.is_empty() {
+        "app".to_owned()
+    } else {
+        component
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stage_macos_runtime_licenses(resources: &Path, warnings: &mut Vec<String>) -> Result<()> {
+    let licenses = resources.join("licenses");
+    for (name, candidates) in [(
+        "MoltenVK-LICENSE.txt",
+        [
+            "/opt/homebrew/opt/molten-vk/LICENSE",
+            "/usr/local/opt/molten-vk/LICENSE",
+        ],
+    )] {
+        if let Some(source) = candidates
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        {
+            copy_file(&source, &licenses.join(name))
+                .map_err(|e| Error::command(format!("copy {name}: {e}")))?;
+        } else {
+            warnings.push(format!("license file for {name} not found"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ad_hoc_sign(path: &Path) -> Result<()> {
+    let output = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--timestamp=none"])
+        .arg(path)
+        .output()
+        .map_err(|e| Error::command(format!("run codesign for '{}': {e}", path.display())))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Error::command(format!(
+            "codesign '{}': {}",
+            path.display(),
+            stderr.trim()
+        )))
+    }
 }
 
 /// Resolves a shared library by SONAME from the usual Linux library directories (honoring a
 /// `LD_LIBRARY_PATH` override first), returning the first match — for bundling the C++ runtime
 /// into a standalone export.
+#[cfg(not(target_os = "macos"))]
 fn find_runtime_lib(name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var("LD_LIBRARY_PATH")
         .unwrap_or_default()
@@ -957,7 +1146,7 @@ fn thumbnail_result(
     if reply.pending {
         return Ok(ThumbnailResult {
             id: WireUuid(id.value()),
-            format: "png".to_owned(),
+            format: ThumbnailFormatDto::Png,
             width: 0,
             height: 0,
             base64: String::new(),
@@ -966,7 +1155,7 @@ fn thumbnail_result(
     }
     Ok(ThumbnailResult {
         id: WireUuid(id.value()),
-        format: "png".to_owned(),
+        format: ThumbnailFormatDto::Png,
         width: i32::try_from(reply.width).unwrap_or(0),
         height: i32::try_from(reply.height).unwrap_or(0),
         base64: base64_encode(&reply.png),
@@ -1960,10 +2149,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             }
             let entity = resolve_entity(ctx, &params.entity)?;
             let selector = selector_string(&params.asset);
-            let clearing = selector == "0"
-                || selector.is_empty()
-                || params.asset.as_u64() == Some(0)
-                || params.asset.as_i64() == Some(0);
+            let clearing = selector == "0" || selector.is_empty() || params.asset.id() == Some(0);
             let (assign_id, assign_name) = if clearing {
                 (Uuid(0), String::new())
             } else if let Some(builtin) =
@@ -2047,7 +2233,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let entity = resolve_entity(ctx, &params.entity)?;
             let selector = selector_string(&params.material);
             let clearing =
-                selector == "0" || selector.is_empty() || params.material.as_u64() == Some(0);
+                selector == "0" || selector.is_empty() || params.material.id() == Some(0);
             let mat_id = if clearing {
                 Uuid(0)
             } else {
@@ -2265,7 +2451,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             }
             update_material_asset(ctx.assets, id, &m).map_err(|e| Error::command(e.to_string()))?;
             if !foldable {
-                let _ = ctx.assets.compile_material_mesh_shader(&m.graph, id);
+                ctx.assets
+                    .compile_material_mesh_shader(&m.graph, id)
+                    .map_err(|e| Error::command(e.to_string()))?;
             }
             ctx.scene_edit.scene_version += 1;
             Ok(MaterialSetGraphResult {
@@ -4008,9 +4196,8 @@ mod tests {
         });
     }
 
-    /// The asset domain registers in the frozen manifest order (`get-project` … `quit`),
-    /// contiguously at the tail of the registry — the order `help` + the contract test
-    /// iterate.
+    /// The asset commands register in their frozen manifest order, with the global `quit` command
+    /// checked separately at the end of the registry.
     #[test]
     fn asset_commands_register_in_manifest_order() {
         const FROZEN: &[&str] = &[
@@ -4024,6 +4211,7 @@ mod tests {
             "instantiate-model",
             "asset-placement",
             "import-texture",
+            "import-lut",
             "list-assets",
             "scan-assets",
             "extract-subasset",
@@ -4071,7 +4259,6 @@ mod tests {
             "get-thumbnail",
             "view-asset",
             "thumbnail-cache",
-            "quit",
         ];
         let reg = registry();
         let names: Vec<&str> = reg.rows().iter().map(|c| c.name).collect();

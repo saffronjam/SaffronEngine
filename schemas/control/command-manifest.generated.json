@@ -401,6 +401,27 @@
       "fixture": "fog-disabled"
     },
     {
+      "name": "set-clouds",
+      "params": "SetCloudsParams",
+      "result": "EnvironmentDto",
+      "status": "typed",
+      "fixture": "clouds-disabled"
+    },
+    {
+      "name": "set-wind",
+      "params": "SetWindParams",
+      "result": "EnvironmentDto",
+      "status": "typed",
+      "fixture": "wind-calm"
+    },
+    {
+      "name": "set-time-of-day",
+      "params": "SetTimeOfDayParams",
+      "result": "EnvironmentDto",
+      "status": "typed",
+      "fixture": "time-of-day-noon"
+    },
+    {
       "name": "get-selection",
       "params": "EmptyParams",
       "result": "SelectionResult",
@@ -552,14 +573,14 @@
       "params": "GetFootIkParams",
       "result": "FootIkResult",
       "status": "typed",
-      "fixture": "cube-entity"
+      "skip": "needs a rigged entity with foot-IK state — covered in make e2e"
     },
     {
       "name": "set-foot-ik",
       "params": "SetFootIkParams",
       "result": "FootIkResult",
       "status": "typed",
-      "fixture": "foot-ik-on"
+      "skip": "needs a rigged entity with foot-IK state — covered in make e2e"
     },
     {
       "name": "set-morph-weights",

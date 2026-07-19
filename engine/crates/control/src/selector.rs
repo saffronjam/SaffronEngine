@@ -7,9 +7,8 @@
 //! non-numeric string falls back to a [`Name`] scan.
 
 use saffron_geometry::glam;
-use saffron_protocol::{EntityRef, Uuid, Vec3};
+use saffron_protocol::{EntityRef, EntitySelector, Uuid, Vec3};
 use saffron_scene::{Entity, IdComponent, Name, Scene};
-use serde_json::Value;
 
 use crate::error::Error;
 use crate::registry::EngineContext;
@@ -39,30 +38,27 @@ pub fn entity_uuid(scene: &Scene, entity: Entity) -> u64 {
         .unwrap_or(0)
 }
 
-/// Resolves an [`EntitySelector`](saffron_protocol::EntitySelector) (a raw JSON value:
-/// a uuid number, a numeric string, or a name) to a live [`Entity`] in the active scene.
+/// Resolves an [`EntitySelector`] to a live [`Entity`] in the active scene.
 ///
 /// UUID first (stable across reloads; a fully-numeric string counts as a UUID, parsed
-/// whole-string), then a [`Name`] scan. A `null` selector is the "missing 'entity'"
-/// error; an unresolved selector dumps the selector JSON.
+/// whole-string), then a [`Name`] scan.
 ///
 /// # Errors
 ///
-/// [`Error::Command`] when the selector is `null` (missing) or resolves to no entity.
-pub fn resolve_entity(ctx: &mut EngineContext<'_>, selector: &Value) -> Result<Entity, Error> {
-    if selector.is_null() {
-        return Err(Error::command("missing 'entity' (uuid or name)"));
-    }
+/// [`Error::Command`] when the selector resolves to no entity.
+pub fn resolve_entity(
+    ctx: &mut EngineContext<'_>,
+    selector: &EntitySelector,
+) -> Result<Entity, Error> {
     let scene = ctx.scene_edit.active_scene();
 
-    let wanted = wanted_uuid(selector);
-    if let Some(wanted) = wanted
+    if let Some(wanted) = selector.id()
         && let Some(found) = scene.find_entity_by_uuid(saffron_core::Uuid(wanted))
     {
         return Ok(found);
     }
 
-    if let Some(name) = selector.as_str() {
+    if let Some(name) = selector.name() {
         let mut found: Option<Entity> = None;
         scene.for_each::<&Name, _>(|entity, component| {
             if found.is_none() && component.name == name {
@@ -74,19 +70,8 @@ pub fn resolve_entity(ctx: &mut EngineContext<'_>, selector: &Value) -> Result<E
         }
     }
 
-    Err(Error::command(format!(
-        "entity not found: {}",
-        saffron_json::dump_json(selector, -1)
-    )))
-}
-
-/// The uuid a selector names, if any: an unsigned number, or a fully-numeric string
-/// (whole-string parse). A non-numeric string is `None`.
-fn wanted_uuid(selector: &Value) -> Option<u64> {
-    if let Some(number) = selector.as_u64() {
-        return Some(number);
-    }
-    selector.as_str().and_then(|text| text.parse::<u64>().ok())
+    let selector = serde_json::to_string(selector).unwrap_or_else(|_| "<selector>".to_owned());
+    Err(Error::command(format!("entity not found: {selector}")))
 }
 
 /// Re-fits an entity's `Collider` to its mesh AABB through the asset reader: a thin

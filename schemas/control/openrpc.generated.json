@@ -1032,6 +1032,60 @@
       }
     },
     {
+      "name": "set-clouds",
+      "summary": "set volumetric cloud shape settings",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetCloudsParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentDto"
+        }
+      }
+    },
+    {
+      "name": "set-wind",
+      "summary": "set shared global wind settings",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetWindParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentDto"
+        }
+      }
+    },
+    {
+      "name": "set-time-of-day",
+      "summary": "set calendar-driven time-of-day settings",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SetTimeOfDayParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EnvironmentDto"
+        }
+      }
+    },
+    {
       "name": "get-selection",
       "summary": "get current selection",
       "params": [
@@ -3175,7 +3229,7 @@
     },
     {
       "name": "export-app",
-      "summary": "export-app {outputDir, app} — cook the project into a standalone app folder",
+      "summary": "export-app {outputDir, app} — cook the project into a platform-native application",
       "params": [
         {
           "name": "params",
@@ -3212,6 +3266,17 @@
   ],
   "components": {
     "schemas": {
+      "AaModeDto": {
+        "type": "string",
+        "enum": [
+          "off",
+          "fxaa",
+          "taa",
+          "msaa2",
+          "msaa4",
+          "msaa8"
+        ]
+      },
       "ActiveAlarmDto": {
         "type": "object",
         "additionalProperties": false,
@@ -3306,6 +3371,21 @@
         },
         "required": []
       },
+      "AddEntityPreset": {
+        "type": "string",
+        "enum": [
+          "empty",
+          "cube",
+          "plane",
+          "sphere",
+          "point-light",
+          "spot-light",
+          "directional-light",
+          "camera",
+          "reflection-probe",
+          "fog-volume"
+        ]
+      },
       "AlarmEventDto": {
         "type": "object",
         "additionalProperties": false,
@@ -3365,6 +3445,21 @@
           "sinceFrame",
           "count",
           "durationMs"
+        ]
+      },
+      "AlarmSeverityDto": {
+        "type": "string",
+        "enum": [
+          "info",
+          "warning",
+          "critical"
+        ]
+      },
+      "AlarmStateDto": {
+        "type": "string",
+        "enum": [
+          "firing",
+          "resolved"
         ]
       },
       "AnamorphicParams": {
@@ -3461,19 +3556,53 @@
           "channels"
         ]
       },
+      "AnimationPlayer": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "clip": {
+            "type": "string"
+          },
+          "autoplay": {
+            "type": "boolean"
+          },
+          "speed": {
+            "type": "number"
+          },
+          "wrap": {
+            "type": "string",
+            "enum": [
+              "once",
+              "loop",
+              "pingpong"
+            ]
+          },
+          "transitionMode": {
+            "type": "string",
+            "enum": [
+              "inertialize",
+              "crossfade"
+            ]
+          },
+          "loopBlend": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "clip",
+          "autoplay",
+          "speed",
+          "wrap",
+          "transitionMode",
+          "loopBlend"
+        ]
+      },
       "AnimationStateParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           }
         },
         "required": [
@@ -3527,6 +3656,21 @@
           "morphWeights"
         ]
       },
+      "AnimationTransitionDto": {
+        "type": "string",
+        "enum": [
+          "inertialize",
+          "crossfade"
+        ]
+      },
+      "AnimationWrapDto": {
+        "type": "string",
+        "enum": [
+          "once",
+          "loop",
+          "pingpong"
+        ]
+      },
       "AppManifest": {
         "type": "object",
         "additionalProperties": false,
@@ -3537,10 +3681,12 @@
           },
           "width": {
             "type": "integer",
+            "minimum": 0,
             "default": 1280
           },
           "height": {
             "type": "integer",
+            "minimum": 0,
             "default": 720
           },
           "fullscreen": {
@@ -3559,14 +3705,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "impulse": {
             "$ref": "#/components/schemas/Vec3"
@@ -3761,13 +3900,16 @@
             "type": "string"
           },
           "sizeBytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "vertexCount": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "triangleCount": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "createdAt": {
             "type": "integer"
@@ -3787,14 +3929,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -3847,7 +3982,9 @@
               "clear"
             ]
           },
-          "asset": {},
+          "asset": {
+            "$ref": "#/components/schemas/AssetSelector"
+          },
           "u": {
             "type": "number"
           },
@@ -3857,6 +3994,14 @@
         },
         "required": [
           "phase"
+        ]
+      },
+      "AssetPlacementPhaseDto": {
+        "type": "string",
+        "enum": [
+          "preview",
+          "commit",
+          "clear"
         ]
       },
       "AssetPlacementResult": {
@@ -3947,14 +4092,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -3978,7 +4116,8 @@
             }
           },
           "footprint": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -3988,13 +4127,38 @@
         ]
       },
       "AssetSelector": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "value": {}
-        },
-        "required": [
-          "value"
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "AssetSlotDto": {
+        "type": "string",
+        "enum": [
+          "mesh",
+          "albedo",
+          "metallic-roughness",
+          "normal",
+          "occlusion",
+          "emissive",
+          "height"
+        ]
+      },
+      "AssetTypeDto": {
+        "type": "string",
+        "enum": [
+          "mesh",
+          "texture",
+          "other",
+          "animation",
+          "material",
+          "model",
+          "lut"
         ]
       },
       "AssetUsageDto": {
@@ -4020,14 +4184,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -4054,14 +4211,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "slot": {
             "type": "string",
@@ -4076,14 +4226,7 @@
             ]
           },
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -4121,6 +4264,107 @@
           "slot"
         ]
       },
+      "AtmosphereRoleDto": {
+        "type": "string",
+        "enum": [
+          "sun",
+          "moon"
+        ]
+      },
+      "AtmosphereSettingsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "planetRadius": {
+            "type": "number"
+          },
+          "atmosphereHeight": {
+            "type": "number"
+          },
+          "rayleighScattering": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "rayleighScaleHeight": {
+            "type": "number"
+          },
+          "mieScattering": {
+            "type": "number"
+          },
+          "mieScaleHeight": {
+            "type": "number"
+          },
+          "mieAnisotropy": {
+            "type": "number"
+          },
+          "ozoneAbsorption": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "sunDiskAngularRadius": {
+            "type": "number"
+          },
+          "sunDiskIntensity": {
+            "type": "number"
+          },
+          "moonDiskAngularRadius": {
+            "type": "number"
+          },
+          "moonDiskIntensity": {
+            "type": "number"
+          },
+          "moonEarthshine": {
+            "type": "number"
+          },
+          "perPixelTransmittance": {
+            "type": "boolean"
+          },
+          "skyCaptureCadence": {
+            "type": "number",
+            "minimum": 1.0,
+            "maximum": 60.0
+          }
+        },
+        "required": [
+          "enabled",
+          "planetRadius",
+          "atmosphereHeight",
+          "rayleighScattering",
+          "rayleighScaleHeight",
+          "mieScattering",
+          "mieScaleHeight",
+          "mieAnisotropy",
+          "ozoneAbsorption",
+          "sunDiskAngularRadius",
+          "sunDiskIntensity",
+          "moonDiskAngularRadius",
+          "moonDiskIntensity",
+          "moonEarthshine",
+          "perPixelTransmittance",
+          "skyCaptureCadence"
+        ]
+      },
+      "BVec3": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "type": "boolean"
+          },
+          "y": {
+            "type": "boolean"
+          },
+          "z": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "z"
+        ]
+      },
       "BakeLookParams": {
         "type": "object",
         "additionalProperties": false,
@@ -4143,7 +4387,8 @@
             "type": "string"
           },
           "size": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -4151,6 +4396,10 @@
           "path",
           "size"
         ]
+      },
+      "Bone": {
+        "type": "object",
+        "additionalProperties": false
       },
       "BoneDto": {
         "type": "object",
@@ -4192,6 +4441,121 @@
           "entity"
         ]
       },
+      "BonePhysics": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "bones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BonePhysicsDto"
+            }
+          }
+        },
+        "required": [
+          "bones"
+        ]
+      },
+      "BonePhysicsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "shapeHalfExtents": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "mass": {
+            "type": "number"
+          },
+          "joint": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "hinge",
+              "swingtwist",
+              "free"
+            ]
+          },
+          "swingTwistLimits": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "driveStiffness": {
+            "type": "number"
+          },
+          "driveDamping": {
+            "type": "number"
+          },
+          "driveMaxForce": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "shapeHalfExtents",
+          "mass",
+          "joint",
+          "swingTwistLimits",
+          "driveStiffness",
+          "driveDamping",
+          "driveMaxForce"
+        ]
+      },
+      "BootStageDto": {
+        "type": "string",
+        "enum": [
+          "manifest",
+          "catalog",
+          "scene",
+          "install",
+          "assets",
+          "skybox",
+          "accel",
+          "ready",
+          "failed"
+        ]
+      },
+      "Camera": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "fov": {
+            "type": "number"
+          },
+          "near": {
+            "type": "number"
+          },
+          "far": {
+            "type": "number"
+          },
+          "primary": {
+            "type": "boolean"
+          },
+          "showModel": {
+            "type": "boolean"
+          },
+          "showFrustum": {
+            "type": "boolean"
+          },
+          "frustumMaxDistance": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "fov",
+          "near",
+          "far",
+          "primary",
+          "showModel",
+          "showFrustum",
+          "frustumMaxDistance"
+        ]
+      },
+      "CaptureModeDto": {
+        "type": "string",
+        "enum": [
+          "single",
+          "frames",
+          "rolling"
+        ]
+      },
       "CaptureStartParams": {
         "type": "object",
         "additionalProperties": false,
@@ -4224,7 +4588,8 @@
         "additionalProperties": false,
         "properties": {
           "captureId": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "ack": {
             "type": "boolean"
@@ -4233,6 +4598,15 @@
         "required": [
           "captureId",
           "ack"
+        ]
+      },
+      "CaptureStateDto": {
+        "type": "string",
+        "enum": [
+          "idle",
+          "arming",
+          "recording",
+          "ready"
         ]
       },
       "CaptureStatusResult": {
@@ -4249,10 +4623,12 @@
             ]
           },
           "capturedFrames": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "targetFrames": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "mode": {
             "type": "string",
@@ -4290,7 +4666,8 @@
             ]
           },
           "frameCount": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "inlined": {
             "type": "boolean"
@@ -4317,6 +4694,30 @@
           "chromeTrace",
           "path",
           "pending"
+        ]
+      },
+      "CharacterController": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "maxSpeed": {
+            "type": "number"
+          },
+          "maxSlopeAngle": {
+            "type": "number"
+          },
+          "maxStepHeight": {
+            "type": "number"
+          },
+          "gravityFactor": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "maxSpeed",
+          "maxSlopeAngle",
+          "maxStepHeight",
+          "gravityFactor"
         ]
       },
       "CleanAssetsParams": {
@@ -4349,7 +4750,8 @@
             "type": "string"
           },
           "bytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "reason": {
             "type": "string"
@@ -4374,7 +4776,8 @@
             }
           },
           "reclaimableBytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -4387,14 +4790,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "subAsset": {
             "type": "string"
@@ -4420,6 +4816,245 @@
           "channels"
         ]
       },
+      "CloudSettingsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "coverage": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "cloudType": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "precipitation": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "anvilBias": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "layerAltitude": {
+            "type": "number"
+          },
+          "layerHeight": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "baseScale": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "detailScale": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "detailStrength": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "curlStrength": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "weatherScale": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "weatherOffset": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "weatherTexture": {
+            "type": "string"
+          },
+          "primarySteps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "lightSteps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "dropletDiameter": {
+            "type": "number",
+            "minimum": 5.0,
+            "maximum": 50.0
+          },
+          "temporalFactor": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "castCloudShadows": {
+            "type": "boolean"
+          },
+          "cloudShadowStrength": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "cloudShadowOnSurfaceStrength": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          }
+        },
+        "required": [
+          "enabled",
+          "coverage",
+          "cloudType",
+          "precipitation",
+          "anvilBias",
+          "layerAltitude",
+          "layerHeight",
+          "baseScale",
+          "detailScale",
+          "detailStrength",
+          "curlStrength",
+          "weatherScale",
+          "weatherOffset",
+          "weatherTexture",
+          "primarySteps",
+          "lightSteps",
+          "dropletDiameter",
+          "temporalFactor",
+          "castCloudShadows",
+          "cloudShadowStrength",
+          "cloudShadowOnSurfaceStrength"
+        ]
+      },
+      "Collider": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "shape": {
+            "type": "string",
+            "enum": [
+              "box",
+              "sphere",
+              "capsule",
+              "convexhull",
+              "mesh"
+            ]
+          },
+          "halfExtents": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "sourceMesh": {
+            "type": "string"
+          },
+          "offset": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "material": {
+            "$ref": "#/components/schemas/PhysicsMaterial"
+          },
+          "isSensor": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "shape",
+          "halfExtents",
+          "sourceMesh",
+          "offset",
+          "material",
+          "isSensor"
+        ]
+      },
+      "ColliderShapeDto": {
+        "type": "string",
+        "enum": [
+          "box",
+          "sphere",
+          "capsule",
+          "convexhull",
+          "mesh"
+        ]
+      },
+      "ComponentBody": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Name"
+          },
+          {
+            "$ref": "#/components/schemas/Transform"
+          },
+          {
+            "$ref": "#/components/schemas/Mesh"
+          },
+          {
+            "$ref": "#/components/schemas/Camera"
+          },
+          {
+            "$ref": "#/components/schemas/MaterialSet"
+          },
+          {
+            "$ref": "#/components/schemas/ModelInstance"
+          },
+          {
+            "$ref": "#/components/schemas/Script"
+          },
+          {
+            "$ref": "#/components/schemas/AnimationPlayer"
+          },
+          {
+            "$ref": "#/components/schemas/DirectionalLight"
+          },
+          {
+            "$ref": "#/components/schemas/PointLight"
+          },
+          {
+            "$ref": "#/components/schemas/SpotLight"
+          },
+          {
+            "$ref": "#/components/schemas/ReflectionProbe"
+          },
+          {
+            "$ref": "#/components/schemas/FogVolume"
+          },
+          {
+            "$ref": "#/components/schemas/Relationship"
+          },
+          {
+            "$ref": "#/components/schemas/SkinnedMesh"
+          },
+          {
+            "$ref": "#/components/schemas/Morph"
+          },
+          {
+            "$ref": "#/components/schemas/Bone"
+          },
+          {
+            "$ref": "#/components/schemas/FootIk"
+          },
+          {
+            "$ref": "#/components/schemas/BonePhysics"
+          },
+          {
+            "$ref": "#/components/schemas/Rigidbody"
+          },
+          {
+            "$ref": "#/components/schemas/Collider"
+          },
+          {
+            "$ref": "#/components/schemas/KinematicBones"
+          },
+          {
+            "$ref": "#/components/schemas/CharacterController"
+          }
+        ]
+      },
       "ComponentList": {
         "type": "object",
         "additionalProperties": false,
@@ -4440,14 +5075,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "component": {
             "type": "string"
@@ -4457,6 +5085,82 @@
           "entity",
           "component"
         ]
+      },
+      "Components": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "Name": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "Transform": {
+            "$ref": "#/components/schemas/Transform"
+          },
+          "Mesh": {
+            "$ref": "#/components/schemas/Mesh"
+          },
+          "Camera": {
+            "$ref": "#/components/schemas/Camera"
+          },
+          "MaterialSet": {
+            "$ref": "#/components/schemas/MaterialSet"
+          },
+          "ModelInstance": {
+            "$ref": "#/components/schemas/ModelInstance"
+          },
+          "Script": {
+            "$ref": "#/components/schemas/Script"
+          },
+          "AnimationPlayer": {
+            "$ref": "#/components/schemas/AnimationPlayer"
+          },
+          "DirectionalLight": {
+            "$ref": "#/components/schemas/DirectionalLight"
+          },
+          "PointLight": {
+            "$ref": "#/components/schemas/PointLight"
+          },
+          "SpotLight": {
+            "$ref": "#/components/schemas/SpotLight"
+          },
+          "ReflectionProbe": {
+            "$ref": "#/components/schemas/ReflectionProbe"
+          },
+          "FogVolume": {
+            "$ref": "#/components/schemas/FogVolume"
+          },
+          "Relationship": {
+            "$ref": "#/components/schemas/Relationship"
+          },
+          "SkinnedMesh": {
+            "$ref": "#/components/schemas/SkinnedMesh"
+          },
+          "Morph": {
+            "$ref": "#/components/schemas/Morph"
+          },
+          "Bone": {
+            "$ref": "#/components/schemas/Bone"
+          },
+          "FootIk": {
+            "$ref": "#/components/schemas/FootIk"
+          },
+          "BonePhysics": {
+            "$ref": "#/components/schemas/BonePhysics"
+          },
+          "Rigidbody": {
+            "$ref": "#/components/schemas/Rigidbody"
+          },
+          "Collider": {
+            "$ref": "#/components/schemas/Collider"
+          },
+          "KinematicBones": {
+            "$ref": "#/components/schemas/KinematicBones"
+          },
+          "CharacterController": {
+            "$ref": "#/components/schemas/CharacterController"
+          }
+        },
+        "required": []
       },
       "ContactEventDto": {
         "type": "object",
@@ -4557,7 +5261,8 @@
             "type": "number"
           },
           "size": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -4633,14 +5338,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -4700,7 +5398,8 @@
             "type": "integer"
           },
           "reclaimedBytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -4730,6 +5429,46 @@
         },
         "required": [
           "destroyed"
+        ]
+      },
+      "DirectionalLight": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "atmosphereRole": {
+            "type": "string",
+            "enum": [
+              "sun",
+              "moon"
+            ]
+          },
+          "direction": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "color": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "ambient": {
+            "type": "number"
+          },
+          "volumetricScattering": {
+            "type": "number"
+          },
+          "castVolumetricShadow": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "atmosphereRole",
+          "direction",
+          "color",
+          "intensity",
+          "ambient",
+          "volumetricScattering",
+          "castVolumetricShadow"
         ]
       },
       "DrainAlarmsParams": {
@@ -4921,24 +5660,14 @@
         ]
       },
       "EmptyParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {},
-        "required": []
+        "type": "object"
       },
       "EnableRagdollParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "enabled": {
             "type": "boolean"
@@ -4953,14 +5682,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -5009,14 +5731,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           }
         },
         "required": [
@@ -5040,17 +5755,88 @@
         ]
       },
       "EntitySelector": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "value": {}
-        },
-        "required": [
-          "value"
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "string"
+          }
         ]
       },
       "EnvironmentDto": {
-        "$ref": "#/components/schemas/Environment"
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "skyMode": {
+            "type": "string",
+            "enum": [
+              "color",
+              "texture",
+              "procedural"
+            ]
+          },
+          "clearColor": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "skyTexture": {
+            "type": "string"
+          },
+          "skyIntensity": {
+            "type": "number"
+          },
+          "skyRotation": {
+            "type": "number"
+          },
+          "exposure": {
+            "type": "number"
+          },
+          "visible": {
+            "type": "boolean"
+          },
+          "useSkyForAmbient": {
+            "type": "boolean"
+          },
+          "ambientColor": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "ambientIntensity": {
+            "type": "number"
+          },
+          "atmosphere": {
+            "$ref": "#/components/schemas/AtmosphereSettingsDto"
+          },
+          "fog": {
+            "$ref": "#/components/schemas/FogSettingsDto"
+          },
+          "cloud": {
+            "$ref": "#/components/schemas/CloudSettingsDto"
+          },
+          "wind": {
+            "$ref": "#/components/schemas/WindSettingsDto"
+          },
+          "timeOfDay": {
+            "$ref": "#/components/schemas/TimeOfDaySettingsDto"
+          }
+        },
+        "required": [
+          "skyMode",
+          "clearColor",
+          "skyTexture",
+          "skyIntensity",
+          "skyRotation",
+          "exposure",
+          "visible",
+          "useSkyForAmbient",
+          "ambientColor",
+          "ambientIntensity",
+          "atmosphere",
+          "fog",
+          "cloud",
+          "wind",
+          "timeOfDay"
+        ]
       },
       "ExportAppParams": {
         "type": "object",
@@ -5110,14 +5896,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "subAsset": {
             "type": "string"
@@ -5136,14 +5915,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           }
         },
         "required": [
@@ -5218,6 +5990,252 @@
         },
         "required": [
           "active"
+        ]
+      },
+      "FogMode": {
+        "type": "string",
+        "enum": [
+          "analytic",
+          "volumetric"
+        ]
+      },
+      "FogQuality": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "FogSettingsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "analytic",
+              "volumetric"
+            ]
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "historyBlend": {
+            "type": "number"
+          },
+          "neighborhoodClamp": {
+            "type": "boolean"
+          },
+          "lightClamp": {
+            "type": "number"
+          },
+          "baseDensity": {
+            "type": "number"
+          },
+          "scatterAlbedo": {
+            "type": "number"
+          },
+          "phaseG": {
+            "type": "number"
+          },
+          "density": {
+            "type": "number"
+          },
+          "albedo": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "height": {
+            "type": "number"
+          },
+          "heightFalloff": {
+            "type": "number"
+          },
+          "startDistance": {
+            "type": "number"
+          },
+          "maxOpacity": {
+            "type": "number"
+          },
+          "emissive": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "directionalColor": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "directionalExponent": {
+            "type": "number"
+          },
+          "layer2Density": {
+            "type": "number"
+          },
+          "layer2Falloff": {
+            "type": "number"
+          },
+          "layer2Height": {
+            "type": "number"
+          },
+          "aerialPerspective": {
+            "type": "boolean"
+          },
+          "aerialIntensity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "enabled",
+          "mode",
+          "quality",
+          "historyBlend",
+          "neighborhoodClamp",
+          "lightClamp",
+          "baseDensity",
+          "scatterAlbedo",
+          "phaseG",
+          "density",
+          "albedo",
+          "height",
+          "heightFalloff",
+          "startDistance",
+          "maxOpacity",
+          "emissive",
+          "directionalColor",
+          "directionalExponent",
+          "layer2Density",
+          "layer2Falloff",
+          "layer2Height",
+          "aerialPerspective",
+          "aerialIntensity"
+        ]
+      },
+      "FogShapeDto": {
+        "type": "string",
+        "enum": [
+          "box",
+          "sphere"
+        ]
+      },
+      "FogVolume": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "shape": {
+            "type": "string",
+            "enum": [
+              "box",
+              "sphere"
+            ]
+          },
+          "extents": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "radius": {
+            "type": "number"
+          },
+          "edgeFalloff": {
+            "type": "number"
+          },
+          "density": {
+            "type": "number"
+          },
+          "albedo": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "emissive": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "phaseG": {
+            "type": "number"
+          },
+          "heightFalloff": {
+            "type": "number"
+          },
+          "noiseScale": {
+            "type": "number"
+          },
+          "noiseIntensity": {
+            "type": "number"
+          },
+          "noiseDetail": {
+            "type": "number"
+          },
+          "wind": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "speed": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "shape",
+          "extents",
+          "radius",
+          "edgeFalloff",
+          "density",
+          "albedo",
+          "emissive",
+          "phaseG",
+          "heightFalloff",
+          "noiseScale",
+          "noiseIntensity",
+          "noiseDetail",
+          "wind",
+          "speed"
+        ]
+      },
+      "FootChainDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "upper": {
+            "type": "integer"
+          },
+          "mid": {
+            "type": "integer"
+          },
+          "end": {
+            "type": "integer"
+          },
+          "poleVector": {
+            "$ref": "#/components/schemas/Vec3"
+          }
+        },
+        "required": [
+          "upper",
+          "mid",
+          "end",
+          "poleVector"
+        ]
+      },
+      "FootIk": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "groundHeight": {
+            "type": "number"
+          },
+          "chains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FootChainDto"
+            }
+          }
+        },
+        "required": [
+          "enabled",
+          "groundHeight",
+          "chains"
         ]
       },
       "FootIkResult": {
@@ -5334,14 +6352,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -5353,14 +6364,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           }
         },
         "required": [
@@ -5371,7 +6375,9 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "entity": {}
+          "entity": {
+            "$ref": "#/components/schemas/EntitySelector"
+          }
         },
         "required": [
           "entity"
@@ -5382,14 +6388,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           }
         },
         "required": [
@@ -5447,6 +6446,21 @@
           "upscale"
         ]
       },
+      "GiModeDto": {
+        "type": "string",
+        "enum": [
+          "off",
+          "ddgi"
+        ]
+      },
+      "GizmoOpDto": {
+        "type": "string",
+        "enum": [
+          "translate",
+          "rotate",
+          "scale"
+        ]
+      },
       "GizmoPointerParams": {
         "type": "object",
         "additionalProperties": false,
@@ -5469,6 +6483,15 @@
         },
         "required": []
       },
+      "GizmoPointerPhase": {
+        "type": "string",
+        "enum": [
+          "hover",
+          "begin",
+          "drag",
+          "end"
+        ]
+      },
       "GizmoPointerResult": {
         "type": "object",
         "additionalProperties": false,
@@ -5483,6 +6506,13 @@
         "required": [
           "hovered",
           "dragging"
+        ]
+      },
+      "GizmoSpaceDto": {
+        "type": "string",
+        "enum": [
+          "world",
+          "local"
         ]
       },
       "GizmoState": {
@@ -5678,14 +6708,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "name": {
             "type": "string"
@@ -5693,6 +6716,34 @@
         },
         "required": [
           "asset"
+        ]
+      },
+      "JointDto": {
+        "type": "string",
+        "enum": [
+          "fixed",
+          "hinge",
+          "swingtwist",
+          "free"
+        ]
+      },
+      "KinematicBones": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "driven": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "enabled",
+          "driven"
         ]
       },
       "KinematicBonesResult": {
@@ -5719,8 +6770,12 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "entity": {},
-          "clip": {}
+          "entity": {
+            "$ref": "#/components/schemas/EntitySelector"
+          },
+          "clip": {
+            "$ref": "#/components/schemas/AssetSelector"
+          }
         },
         "required": [
           "entity",
@@ -5732,14 +6787,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": []
@@ -5767,7 +6815,8 @@
             "type": "boolean"
           },
           "count": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "probes": {
             "type": "array",
@@ -5787,24 +6836,10 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -5829,14 +6864,7 @@
         "additionalProperties": false,
         "properties": {
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -5864,10 +6892,12 @@
         "additionalProperties": false,
         "properties": {
           "compiled": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "failed": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -5880,14 +6910,7 @@
         "additionalProperties": false,
         "properties": {
           "parent": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "name": {
             "type": "string"
@@ -5931,14 +6954,7 @@
         "additionalProperties": false,
         "properties": {
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -6093,7 +7109,9 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "material": {}
+          "material": {
+            "$ref": "#/components/schemas/AssetSelector"
+          }
         },
         "required": [
           "material"
@@ -6114,19 +7132,27 @@
           "params"
         ]
       },
+      "MaterialSet": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "slots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MaterialSlot"
+            }
+          }
+        },
+        "required": [
+          "slots"
+        ]
+      },
       "MaterialSetGraphParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "graph": {}
         },
@@ -6156,14 +7182,7 @@
         "additionalProperties": false,
         "properties": {
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "field": {
             "type": "string"
@@ -6188,19 +7207,29 @@
           "id"
         ]
       },
+      "MaterialSlot": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "material": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "material",
+          "overrides"
+        ]
+      },
       "MaterialUpdateParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "baseColor": {
             "$ref": "#/components/schemas/Vec4"
@@ -6261,19 +7290,24 @@
           "id"
         ]
       },
+      "Mesh": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mesh": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mesh"
+        ]
+      },
       "ModelInfoParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -6306,7 +7340,8 @@
             "type": "integer"
           },
           "totalBytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "subAssets": {
             "type": "array",
@@ -6327,6 +7362,18 @@
           "subAssets"
         ]
       },
+      "ModelInstance": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "modelId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "modelId"
+        ]
+      },
       "ModelSubAssetDto": {
         "type": "object",
         "additionalProperties": false,
@@ -6341,7 +7388,8 @@
             "type": "string"
           },
           "bytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -6349,6 +7397,28 @@
           "name",
           "type",
           "bytes"
+        ]
+      },
+      "Morph": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "weights": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "weights",
+          "names"
         ]
       },
       "MorphWeightsResult": {
@@ -6373,19 +7443,20 @@
           "names"
         ]
       },
+      "MotionDto": {
+        "type": "string",
+        "enum": [
+          "static",
+          "kinematic",
+          "dynamic"
+        ]
+      },
       "MoveAssetParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "folder": {
             "type": "string"
@@ -6400,14 +7471,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "velocity": {
             "$ref": "#/components/schemas/Vec3"
@@ -6435,6 +7499,18 @@
         "required": [
           "position",
           "onGround"
+        ]
+      },
+      "Name": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ]
       },
       "NewProjectParams": {
@@ -6570,6 +7646,22 @@
           "position"
         ]
       },
+      "PhysicsMaterial": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "friction": {
+            "type": "number"
+          },
+          "restitution": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "friction",
+          "restitution"
+        ]
+      },
       "PhysicsStateResult": {
         "type": "object",
         "additionalProperties": false,
@@ -6588,6 +7680,13 @@
           "active",
           "bodyCount",
           "dynamicCount"
+        ]
+      },
+      "PickKind": {
+        "type": "string",
+        "enum": [
+          "billboard",
+          "mesh"
         ]
       },
       "PickParams": {
@@ -6664,10 +7763,7 @@
         ]
       },
       "PingParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {},
-        "required": []
+        "type": "object"
       },
       "PingResult": {
         "type": "object",
@@ -6698,25 +7794,32 @@
         "additionalProperties": false,
         "properties": {
           "inputVertices": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "vertexInvocations": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "clippingInvocations": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "clippingPrimitives": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "fragmentInvocations": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "computeInvocations": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "pixels": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -6754,24 +7857,10 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "clip": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "speed": {
             "type": "number"
@@ -6823,22 +7912,44 @@
           "previewAsset"
         ]
       },
+      "PointLight": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "color": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "range": {
+            "type": "number"
+          },
+          "volumetricScattering": {
+            "type": "number"
+          },
+          "castVolumetricShadow": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "color",
+          "intensity",
+          "range",
+          "volumetricScattering",
+          "castVolumetricShadow"
+        ]
+      },
       "PreviewRenderParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "material": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "size": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -6862,7 +7973,8 @@
         "additionalProperties": false,
         "properties": {
           "slot": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "entity": {
             "type": "string"
@@ -6947,7 +8059,8 @@
             "type": "string"
           },
           "frameCount": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -6959,6 +8072,13 @@
           "mode",
           "filter",
           "frameCount"
+        ]
+      },
+      "ProfileLaneDto": {
+        "type": "string",
+        "enum": [
+          "cpu",
+          "gpu"
         ]
       },
       "ProfileSpanDto": {
@@ -6976,16 +8096,19 @@
             ]
           },
           "startNs": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "endNs": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "parentIndex": {
             "type": "integer"
           },
           "depth": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "pipelineStats": {
             "$ref": "#/components/schemas/PipelineStatsDto"
@@ -6998,6 +8121,14 @@
           "endNs",
           "parentIndex",
           "depth"
+        ]
+      },
+      "ProfilerModeDto": {
+        "type": "string",
+        "enum": [
+          "off",
+          "timestamps",
+          "pipeline-stats"
         ]
       },
       "ProfilerModeResult": {
@@ -7070,6 +8201,15 @@
           "path",
           "name",
           "displayName"
+        ]
+      },
+      "ProjectPhaseDto": {
+        "type": "string",
+        "enum": [
+          "unloaded",
+          "loading",
+          "ready",
+          "failed"
         ]
       },
       "ProjectStatusDto": {
@@ -7239,11 +8379,36 @@
         "additionalProperties": false,
         "properties": {
           "marked": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
           "marked"
+        ]
+      },
+      "ReflectionProbe": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "influenceRadius": {
+            "type": "number"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "boxProjection": {
+            "type": "boolean"
+          },
+          "boxExtent": {
+            "$ref": "#/components/schemas/Vec3"
+          }
+        },
+        "required": [
+          "influenceRadius",
+          "intensity",
+          "boxProjection",
+          "boxExtent"
         ]
       },
       "ReimportModelParams": {
@@ -7251,14 +8416,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           }
         },
         "required": [
@@ -7287,6 +8445,18 @@
           "added",
           "removedFromSource",
           "skipped"
+        ]
+      },
+      "Relationship": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "parent": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "parent"
         ]
       },
       "RemoveComponentResult": {
@@ -7322,14 +8492,7 @@
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "name": {
             "type": "string"
@@ -7345,14 +8508,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "name": {
             "type": "string"
@@ -7482,10 +8638,12 @@
             "type": "integer"
           },
           "vramUsageBytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "vramBudgetBytes": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "softwareGpu": {
             "type": "boolean"
@@ -7670,7 +8828,8 @@
               "gi",
               "light-complexity",
               "motion-vectors",
-              "fog"
+              "fog",
+              "cloud-density"
             ]
           }
         },
@@ -7736,6 +8895,51 @@
           "viewMode"
         ]
       },
+      "Rigidbody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "motion": {
+            "type": "string",
+            "enum": [
+              "static",
+              "kinematic",
+              "dynamic"
+            ]
+          },
+          "mass": {
+            "type": "number"
+          },
+          "linearDamping": {
+            "type": "number"
+          },
+          "angularDamping": {
+            "type": "number"
+          },
+          "gravityFactor": {
+            "type": "number"
+          },
+          "lockPosition": {
+            "$ref": "#/components/schemas/BVec3"
+          },
+          "lockRotation": {
+            "$ref": "#/components/schemas/BVec3"
+          },
+          "collisionLayer": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "motion",
+          "mass",
+          "linearDamping",
+          "angularDamping",
+          "gravityFactor",
+          "lockPosition",
+          "lockRotation",
+          "collisionLayer"
+        ]
+      },
       "ScanAssetsResult": {
         "type": "object",
         "additionalProperties": false,
@@ -7793,6 +8997,28 @@
           "target",
           "path",
           "pending"
+        ]
+      },
+      "ScreenshotTargetDto": {
+        "type": "string",
+        "enum": [
+          "viewport",
+          "window"
+        ]
+      },
+      "Script": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "scripts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScriptSlot"
+            }
+          }
+        },
+        "required": [
+          "scripts"
         ]
       },
       "ScriptErrorDto": {
@@ -7914,6 +9140,23 @@
           "tick"
         ]
       },
+      "ScriptSlot": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "scriptPath": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "scriptPath",
+          "overrides"
+        ]
+      },
       "ScriptStatusResult": {
         "type": "object",
         "additionalProperties": false,
@@ -7939,14 +9182,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "time": {
             "type": "number"
@@ -7971,14 +9207,7 @@
             "type": "integer"
           },
           "entity": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/EntityRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "$ref": "#/components/schemas/EntityRef"
           },
           "playState": {
             "type": "string"
@@ -8065,14 +9294,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "wrap": {
             "type": "string"
@@ -8088,14 +9310,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "playing": {
             "type": "boolean"
@@ -8152,6 +9367,21 @@
             "type": "number"
           },
           "sunDiskIntensity": {
+            "type": "number"
+          },
+          "moonDiskAngularRadius": {
+            "type": "number"
+          },
+          "moonDiskIntensity": {
+            "type": "number"
+          },
+          "moonEarthshine": {
+            "type": "number"
+          },
+          "perPixelTransmittance": {
+            "type": "boolean"
+          },
+          "skyCaptureCadence": {
             "type": "number"
           }
         },
@@ -8316,6 +9546,79 @@
             "$ref": "#/components/schemas/Vec3"
           },
           "distance": {
+            "type": "number"
+          }
+        },
+        "required": []
+      },
+      "SetCloudsParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "json": {},
+          "enabled": {
+            "type": "boolean"
+          },
+          "coverage": {
+            "type": "number"
+          },
+          "cloudType": {
+            "type": "number"
+          },
+          "precipitation": {
+            "type": "number"
+          },
+          "anvilBias": {
+            "type": "number"
+          },
+          "layerAltitude": {
+            "type": "number"
+          },
+          "layerHeight": {
+            "type": "number"
+          },
+          "baseScale": {
+            "type": "number"
+          },
+          "detailScale": {
+            "type": "number"
+          },
+          "detailStrength": {
+            "type": "number"
+          },
+          "curlStrength": {
+            "type": "number"
+          },
+          "weatherScale": {
+            "type": "number"
+          },
+          "weatherOffset": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "weatherTexture": {
+            "type": "string"
+          },
+          "primarySteps": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lightSteps": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dropletDiameter": {
+            "type": "number"
+          },
+          "temporalFactor": {
+            "type": "number"
+          },
+          "castCloudShadows": {
+            "type": "boolean"
+          },
+          "cloudShadowStrength": {
+            "type": "number"
+          },
+          "cloudShadowOnSurfaceStrength": {
             "type": "number"
           }
         },
@@ -8547,14 +9850,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "component": {
             "type": "string"
@@ -8595,14 +9891,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "components": {
             "type": "array",
@@ -8636,14 +9925,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "component": {
             "type": "string"
@@ -8700,7 +9982,12 @@
         "properties": {
           "json": {},
           "skyMode": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "color",
+              "texture",
+              "procedural"
+            ]
           },
           "clearColor": {
             "$ref": "#/components/schemas/Vec3"
@@ -8847,14 +10134,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "enabled": {
             "type": "boolean"
@@ -8949,14 +10229,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "enabled": {
             "type": "boolean"
@@ -8971,14 +10244,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "direction": {
             "$ref": "#/components/schemas/Vec3"
@@ -8999,7 +10265,9 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "entity": {},
+          "entity": {
+            "$ref": "#/components/schemas/EntitySelector"
+          },
           "weights": {
             "type": "array",
             "items": {
@@ -9017,24 +10285,10 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "parent": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           }
         },
         "required": [
@@ -9093,14 +10347,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "active": {
             "type": "boolean"
@@ -9172,14 +10419,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "slot": {
             "type": "integer"
@@ -9356,6 +10596,77 @@
           "edgeLengthTarget"
         ]
       },
+      "SetTimeOfDayParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "json": {},
+          "enabled": {
+            "type": "boolean"
+          },
+          "manualOverride": {
+            "type": "boolean"
+          },
+          "timeOfDay": {
+            "type": "number"
+          },
+          "year": {
+            "type": "integer"
+          },
+          "month": {
+            "type": "integer"
+          },
+          "day": {
+            "type": "integer"
+          },
+          "latitude": {
+            "type": "number"
+          },
+          "longitude": {
+            "type": "number"
+          },
+          "dayLengthSeconds": {
+            "type": "number"
+          },
+          "exposureCurve": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "tintCurve": {
+            "$ref": "#/components/schemas/TodTintCurveDto"
+          },
+          "coverageCurve": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "cloudTypeCurve": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        },
+        "required": []
+      },
       "SetTonemapParams": {
         "type": "object",
         "additionalProperties": false,
@@ -9373,14 +10684,7 @@
         "additionalProperties": false,
         "properties": {
           "entity": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/EntitySelector"
           },
           "translation": {
             "$ref": "#/components/schemas/Vec3"
@@ -9451,7 +10755,8 @@
               "gi",
               "light-complexity",
               "motion-vectors",
-              "fog"
+              "fog",
+              "cloud-density"
             ]
           }
         },
@@ -9481,7 +10786,8 @@
               "gi",
               "light-complexity",
               "motion-vectors",
-              "fog"
+              "fog",
+              "cloud-density"
             ]
           }
         },
@@ -9533,6 +10839,23 @@
           "height"
         ]
       },
+      "SetWindParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "json": {},
+          "orientation": {
+            "type": "number"
+          },
+          "speed": {
+            "type": "number"
+          },
+          "gust": {
+            "type": "number"
+          }
+        },
+        "required": []
+      },
       "ShapecastParams": {
         "type": "object",
         "additionalProperties": false,
@@ -9580,6 +10903,49 @@
           "highlightJoint"
         ]
       },
+      "SkinnedMesh": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mesh": {
+            "type": "string"
+          },
+          "rootBone": {
+            "type": "string"
+          },
+          "bones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "inverseBind": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 16,
+              "maxItems": 16
+            }
+          }
+        },
+        "required": [
+          "mesh",
+          "rootBone",
+          "bones",
+          "inverseBind"
+        ]
+      },
+      "SkyModeDto": {
+        "type": "string",
+        "enum": [
+          "color",
+          "texture",
+          "procedural"
+        ]
+      },
       "SplitToneDto": {
         "type": "object",
         "additionalProperties": false,
@@ -9608,6 +10974,46 @@
           "shadow",
           "highlight",
           "balance"
+        ]
+      },
+      "SpotLight": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "color": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "intensity": {
+            "type": "number"
+          },
+          "range": {
+            "type": "number"
+          },
+          "innerAngle": {
+            "type": "number"
+          },
+          "outerAngle": {
+            "type": "number"
+          },
+          "volumetricScattering": {
+            "type": "number"
+          },
+          "castVolumetricShadow": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "direction",
+          "color",
+          "intensity",
+          "range",
+          "innerAngle",
+          "outerAngle",
+          "volumetricScattering",
+          "castVolumetricShadow"
         ]
       },
       "StepParams": {
@@ -9676,19 +11082,18 @@
           "bytes"
         ]
       },
+      "ThumbnailFormatDto": {
+        "type": "string",
+        "enum": [
+          "png"
+        ]
+      },
       "ThumbnailParams": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "asset": {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "integer"
-              }
-            ]
+            "$ref": "#/components/schemas/AssetSelector"
           },
           "size": {
             "type": "integer"
@@ -9706,7 +11111,10 @@
             "type": "string"
           },
           "format": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "png"
+            ]
           },
           "width": {
             "type": "integer"
@@ -9728,6 +11136,196 @@
           "height",
           "base64",
           "pending"
+        ]
+      },
+      "TimeOfDaySettingsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "manualOverride": {
+            "type": "boolean"
+          },
+          "timeOfDay": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "year": {
+            "type": "integer"
+          },
+          "month": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12
+          },
+          "day": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 31
+          },
+          "latitude": {
+            "type": "number",
+            "minimum": -90.0,
+            "maximum": 90.0
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180.0,
+            "maximum": 180.0
+          },
+          "dayLengthSeconds": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "exposureCurve": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          },
+          "tintCurve": {
+            "$ref": "#/components/schemas/TodTintSettingsDto"
+          },
+          "coverageCurve": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          },
+          "cloudTypeCurve": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          }
+        },
+        "required": [
+          "enabled",
+          "manualOverride",
+          "timeOfDay",
+          "year",
+          "month",
+          "day",
+          "latitude",
+          "longitude",
+          "dayLengthSeconds",
+          "exposureCurve",
+          "tintCurve",
+          "coverageCurve",
+          "cloudTypeCurve"
+        ]
+      },
+      "TodCurvePointDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "y": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ]
+      },
+      "TodTintCurveDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "master": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "red": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "green": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "blue": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        },
+        "required": [
+          "master",
+          "red",
+          "green",
+          "blue"
+        ]
+      },
+      "TodTintSettingsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "master": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          },
+          "red": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          },
+          "green": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          },
+          "blue": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodCurvePointDto"
+            }
+          }
+        },
+        "required": [
+          "master",
+          "red",
+          "green",
+          "blue"
         ]
       },
       "ToggleParams": {
@@ -9752,6 +11350,26 @@
           "mode"
         ]
       },
+      "Transform": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "translation": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "scale": {
+            "$ref": "#/components/schemas/Vec3"
+          },
+          "rotation": {
+            "$ref": "#/components/schemas/Vec3"
+          }
+        },
+        "required": [
+          "translation",
+          "scale",
+          "rotation"
+        ]
+      },
       "UpscaleDto": {
         "type": "object",
         "additionalProperties": false,
@@ -9766,16 +11384,20 @@
             "type": "number"
           },
           "inputWidth": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "inputHeight": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "displayWidth": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           },
           "displayHeight": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -9787,6 +11409,9 @@
           "displayWidth",
           "displayHeight"
         ]
+      },
+      "Uuid": {
+        "type": "string"
       },
       "Vec3": {
         "type": "object",
@@ -9830,6 +11455,30 @@
           "y",
           "z",
           "w"
+        ]
+      },
+      "ViewModeDto": {
+        "type": "string",
+        "enum": [
+          "lit",
+          "unlit",
+          "wireframe",
+          "lit-wireframe",
+          "detail-lighting",
+          "lighting-only",
+          "reflections",
+          "albedo",
+          "normal",
+          "roughness",
+          "metallic",
+          "emissive",
+          "depth",
+          "ambient-occlusion",
+          "gi",
+          "light-complexity",
+          "motion-vectors",
+          "fog",
+          "cloud-density"
         ]
       },
       "ViewportNativeInfoResult": {
@@ -9880,16 +11529,26 @@
           "state"
         ]
       },
-      "WireUuid": {
+      "WindSettingsDto": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "value": {
-            "type": "integer"
+          "orientation": {
+            "type": "number"
+          },
+          "speed": {
+            "type": "number",
+            "minimum": 0.0
+          },
+          "gust": {
+            "type": "number",
+            "minimum": 0.0
           }
         },
         "required": [
-          "value"
+          "orientation",
+          "speed",
+          "gust"
         ]
       },
       "WorldTransformResult": {
@@ -9906,1004 +11565,6 @@
         "required": [
           "translation",
           "scale"
-        ]
-      },
-      "Name": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "name"
-        ]
-      },
-      "Transform": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "translation": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "scale": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "rotation": {
-            "$ref": "#/components/schemas/Vec3"
-          }
-        },
-        "required": [
-          "translation",
-          "scale",
-          "rotation"
-        ]
-      },
-      "Mesh": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "mesh": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "mesh"
-        ]
-      },
-      "Camera": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "fov": {
-            "type": "number"
-          },
-          "near": {
-            "type": "number"
-          },
-          "far": {
-            "type": "number"
-          },
-          "primary": {
-            "type": "boolean"
-          },
-          "showModel": {
-            "type": "boolean"
-          },
-          "showFrustum": {
-            "type": "boolean"
-          },
-          "frustumMaxDistance": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "fov",
-          "near",
-          "far",
-          "primary",
-          "showModel",
-          "showFrustum",
-          "frustumMaxDistance"
-        ]
-      },
-      "MaterialSet": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "slots": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "material": {
-                  "type": "string"
-                },
-                "overrides": {
-                  "type": "object"
-                }
-              },
-              "required": [
-                "material",
-                "overrides"
-              ]
-            }
-          }
-        },
-        "required": [
-          "slots"
-        ]
-      },
-      "Script": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "scripts": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "scriptPath": {
-                  "type": "string"
-                },
-                "overrides": {
-                  "type": "object"
-                }
-              },
-              "required": [
-                "scriptPath",
-                "overrides"
-              ]
-            }
-          }
-        },
-        "required": [
-          "scripts"
-        ]
-      },
-      "DirectionalLight": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "direction": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "color": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "intensity": {
-            "type": "number"
-          },
-          "ambient": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "direction",
-          "color",
-          "intensity",
-          "ambient"
-        ]
-      },
-      "PointLight": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "color": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "intensity": {
-            "type": "number"
-          },
-          "range": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "color",
-          "intensity",
-          "range"
-        ]
-      },
-      "SpotLight": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "direction": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "color": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "intensity": {
-            "type": "number"
-          },
-          "range": {
-            "type": "number"
-          },
-          "innerAngle": {
-            "type": "number"
-          },
-          "outerAngle": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "direction",
-          "color",
-          "intensity",
-          "range",
-          "innerAngle",
-          "outerAngle"
-        ]
-      },
-      "ReflectionProbe": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "influenceRadius": {
-            "type": "number"
-          },
-          "intensity": {
-            "type": "number"
-          },
-          "boxProjection": {
-            "type": "boolean"
-          },
-          "boxExtent": {
-            "$ref": "#/components/schemas/Vec3"
-          }
-        },
-        "required": [
-          "influenceRadius",
-          "intensity",
-          "boxProjection",
-          "boxExtent"
-        ]
-      },
-      "FogVolume": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "shape": {
-            "type": "string",
-            "enum": [
-              "box",
-              "sphere"
-            ]
-          },
-          "extents": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "radius": {
-            "type": "number"
-          },
-          "edgeFalloff": {
-            "type": "number"
-          },
-          "density": {
-            "type": "number"
-          },
-          "albedo": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "emissive": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "phaseG": {
-            "type": "number"
-          },
-          "heightFalloff": {
-            "type": "number"
-          },
-          "noiseScale": {
-            "type": "number"
-          },
-          "noiseIntensity": {
-            "type": "number"
-          },
-          "noiseDetail": {
-            "type": "number"
-          },
-          "wind": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "speed": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "shape",
-          "extents",
-          "radius",
-          "edgeFalloff",
-          "density",
-          "albedo",
-          "emissive",
-          "phaseG",
-          "heightFalloff",
-          "noiseScale",
-          "noiseIntensity",
-          "noiseDetail",
-          "wind",
-          "speed"
-        ]
-      },
-      "Relationship": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "parent": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "parent"
-        ]
-      },
-      "SkinnedMesh": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "mesh": {
-            "type": "string"
-          },
-          "rootBone": {
-            "type": "string"
-          },
-          "bones": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "inverseBind": {
-            "type": "array",
-            "items": {
-              "type": "array",
-              "items": {
-                "type": "number"
-              },
-              "minItems": 16,
-              "maxItems": 16
-            }
-          }
-        },
-        "required": [
-          "mesh",
-          "rootBone",
-          "bones",
-          "inverseBind"
-        ]
-      },
-      "Bone": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {}
-      },
-      "ModelInstance": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "modelId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "modelId"
-        ]
-      },
-      "FootIk": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "groundHeight": {
-            "type": "number"
-          },
-          "chains": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "upper": {
-                  "type": "number"
-                },
-                "mid": {
-                  "type": "number"
-                },
-                "end": {
-                  "type": "number"
-                },
-                "poleVector": {
-                  "$ref": "#/components/schemas/Vec3"
-                }
-              },
-              "required": [
-                "upper",
-                "mid",
-                "end",
-                "poleVector"
-              ]
-            }
-          }
-        },
-        "required": [
-          "enabled",
-          "groundHeight",
-          "chains"
-        ]
-      },
-      "BonePhysics": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "bones": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "shapeHalfExtents": {
-                  "$ref": "#/components/schemas/Vec3"
-                },
-                "mass": {
-                  "type": "number"
-                },
-                "joint": {
-                  "type": "string",
-                  "enum": [
-                    "fixed",
-                    "hinge",
-                    "swingtwist",
-                    "free"
-                  ]
-                },
-                "swingTwistLimits": {
-                  "$ref": "#/components/schemas/Vec3"
-                },
-                "driveStiffness": {
-                  "type": "number"
-                },
-                "driveDamping": {
-                  "type": "number"
-                },
-                "driveMaxForce": {
-                  "type": "number"
-                }
-              },
-              "required": [
-                "shapeHalfExtents",
-                "mass",
-                "joint",
-                "swingTwistLimits",
-                "driveStiffness",
-                "driveDamping",
-                "driveMaxForce"
-              ]
-            }
-          }
-        },
-        "required": [
-          "bones"
-        ]
-      },
-      "Rigidbody": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "motion": {
-            "type": "string",
-            "enum": [
-              "static",
-              "kinematic",
-              "dynamic"
-            ]
-          },
-          "mass": {
-            "type": "number"
-          },
-          "linearDamping": {
-            "type": "number"
-          },
-          "angularDamping": {
-            "type": "number"
-          },
-          "gravityFactor": {
-            "type": "number"
-          },
-          "lockPosition": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "x": {
-                "type": "boolean"
-              },
-              "y": {
-                "type": "boolean"
-              },
-              "z": {
-                "type": "boolean"
-              }
-            },
-            "required": [
-              "x",
-              "y",
-              "z"
-            ]
-          },
-          "lockRotation": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "x": {
-                "type": "boolean"
-              },
-              "y": {
-                "type": "boolean"
-              },
-              "z": {
-                "type": "boolean"
-              }
-            },
-            "required": [
-              "x",
-              "y",
-              "z"
-            ]
-          },
-          "collisionLayer": {
-            "type": "integer"
-          }
-        },
-        "required": [
-          "motion",
-          "mass",
-          "linearDamping",
-          "angularDamping",
-          "gravityFactor",
-          "lockPosition",
-          "lockRotation",
-          "collisionLayer"
-        ]
-      },
-      "Collider": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "shape": {
-            "type": "string",
-            "enum": [
-              "box",
-              "sphere",
-              "capsule",
-              "convexhull",
-              "mesh"
-            ]
-          },
-          "halfExtents": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "sourceMesh": {
-            "type": "string"
-          },
-          "offset": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "material": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "friction": {
-                "type": "number"
-              },
-              "restitution": {
-                "type": "number"
-              }
-            },
-            "required": [
-              "friction",
-              "restitution"
-            ]
-          },
-          "isSensor": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "shape",
-          "halfExtents",
-          "sourceMesh",
-          "offset",
-          "material",
-          "isSensor"
-        ]
-      },
-      "KinematicBones": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "driven": {
-            "type": "array",
-            "items": {
-              "type": "integer"
-            }
-          }
-        },
-        "required": [
-          "enabled",
-          "driven"
-        ]
-      },
-      "CharacterController": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "maxSpeed": {
-            "type": "number"
-          },
-          "maxSlopeAngle": {
-            "type": "number"
-          },
-          "maxStepHeight": {
-            "type": "number"
-          },
-          "gravityFactor": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "maxSpeed",
-          "maxSlopeAngle",
-          "maxStepHeight",
-          "gravityFactor"
-        ]
-      },
-      "AtmosphereSettingsDto": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "planetRadius": {
-            "type": "number"
-          },
-          "atmosphereHeight": {
-            "type": "number"
-          },
-          "rayleighScattering": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "rayleighScaleHeight": {
-            "type": "number"
-          },
-          "mieScattering": {
-            "type": "number"
-          },
-          "mieScaleHeight": {
-            "type": "number"
-          },
-          "mieAnisotropy": {
-            "type": "number"
-          },
-          "ozoneAbsorption": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "sunDiskAngularRadius": {
-            "type": "number"
-          },
-          "sunDiskIntensity": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "enabled",
-          "planetRadius",
-          "atmosphereHeight",
-          "rayleighScattering",
-          "rayleighScaleHeight",
-          "mieScattering",
-          "mieScaleHeight",
-          "mieAnisotropy",
-          "ozoneAbsorption",
-          "sunDiskAngularRadius",
-          "sunDiskIntensity"
-        ]
-      },
-      "FogSettingsDto": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "analytic",
-              "volumetric"
-            ]
-          },
-          "quality": {
-            "type": "string",
-            "enum": [
-              "low",
-              "medium",
-              "high"
-            ]
-          },
-          "historyBlend": {
-            "type": "number"
-          },
-          "neighborhoodClamp": {
-            "type": "boolean"
-          },
-          "lightClamp": {
-            "type": "number"
-          },
-          "baseDensity": {
-            "type": "number"
-          },
-          "scatterAlbedo": {
-            "type": "number"
-          },
-          "phaseG": {
-            "type": "number"
-          },
-          "density": {
-            "type": "number"
-          },
-          "albedo": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "height": {
-            "type": "number"
-          },
-          "heightFalloff": {
-            "type": "number"
-          },
-          "startDistance": {
-            "type": "number"
-          },
-          "maxOpacity": {
-            "type": "number"
-          },
-          "emissive": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "directionalColor": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "directionalExponent": {
-            "type": "number"
-          },
-          "layer2Density": {
-            "type": "number"
-          },
-          "layer2Falloff": {
-            "type": "number"
-          },
-          "layer2Height": {
-            "type": "number"
-          },
-          "aerialPerspective": {
-            "type": "boolean"
-          },
-          "aerialIntensity": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "enabled",
-          "mode",
-          "quality",
-          "historyBlend",
-          "neighborhoodClamp",
-          "lightClamp",
-          "baseDensity",
-          "scatterAlbedo",
-          "phaseG",
-          "density",
-          "albedo",
-          "height",
-          "heightFalloff",
-          "startDistance",
-          "maxOpacity",
-          "emissive",
-          "directionalColor",
-          "directionalExponent",
-          "layer2Density",
-          "layer2Falloff",
-          "layer2Height",
-          "aerialPerspective",
-          "aerialIntensity"
-        ]
-      },
-      "Components": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "Name": {
-            "$ref": "#/components/schemas/Name"
-          },
-          "Transform": {
-            "$ref": "#/components/schemas/Transform"
-          },
-          "Mesh": {
-            "$ref": "#/components/schemas/Mesh"
-          },
-          "Camera": {
-            "$ref": "#/components/schemas/Camera"
-          },
-          "MaterialSet": {
-            "$ref": "#/components/schemas/MaterialSet"
-          },
-          "Script": {
-            "$ref": "#/components/schemas/Script"
-          },
-          "DirectionalLight": {
-            "$ref": "#/components/schemas/DirectionalLight"
-          },
-          "PointLight": {
-            "$ref": "#/components/schemas/PointLight"
-          },
-          "SpotLight": {
-            "$ref": "#/components/schemas/SpotLight"
-          },
-          "ReflectionProbe": {
-            "$ref": "#/components/schemas/ReflectionProbe"
-          },
-          "FogVolume": {
-            "$ref": "#/components/schemas/FogVolume"
-          },
-          "Relationship": {
-            "$ref": "#/components/schemas/Relationship"
-          },
-          "SkinnedMesh": {
-            "$ref": "#/components/schemas/SkinnedMesh"
-          },
-          "Bone": {
-            "$ref": "#/components/schemas/Bone"
-          },
-          "ModelInstance": {
-            "$ref": "#/components/schemas/ModelInstance"
-          },
-          "FootIk": {
-            "$ref": "#/components/schemas/FootIk"
-          },
-          "BonePhysics": {
-            "$ref": "#/components/schemas/BonePhysics"
-          },
-          "Rigidbody": {
-            "$ref": "#/components/schemas/Rigidbody"
-          },
-          "Collider": {
-            "$ref": "#/components/schemas/Collider"
-          },
-          "KinematicBones": {
-            "$ref": "#/components/schemas/KinematicBones"
-          },
-          "CharacterController": {
-            "$ref": "#/components/schemas/CharacterController"
-          }
-        }
-      },
-      "ComponentBody": {
-        "oneOf": [
-          {
-            "$ref": "#/components/schemas/Name"
-          },
-          {
-            "$ref": "#/components/schemas/Transform"
-          },
-          {
-            "$ref": "#/components/schemas/Mesh"
-          },
-          {
-            "$ref": "#/components/schemas/Camera"
-          },
-          {
-            "$ref": "#/components/schemas/MaterialSet"
-          },
-          {
-            "$ref": "#/components/schemas/Script"
-          },
-          {
-            "$ref": "#/components/schemas/DirectionalLight"
-          },
-          {
-            "$ref": "#/components/schemas/PointLight"
-          },
-          {
-            "$ref": "#/components/schemas/SpotLight"
-          },
-          {
-            "$ref": "#/components/schemas/ReflectionProbe"
-          },
-          {
-            "$ref": "#/components/schemas/FogVolume"
-          },
-          {
-            "$ref": "#/components/schemas/Relationship"
-          },
-          {
-            "$ref": "#/components/schemas/SkinnedMesh"
-          },
-          {
-            "$ref": "#/components/schemas/Bone"
-          },
-          {
-            "$ref": "#/components/schemas/ModelInstance"
-          },
-          {
-            "$ref": "#/components/schemas/FootIk"
-          },
-          {
-            "$ref": "#/components/schemas/BonePhysics"
-          },
-          {
-            "$ref": "#/components/schemas/Rigidbody"
-          },
-          {
-            "$ref": "#/components/schemas/Collider"
-          },
-          {
-            "$ref": "#/components/schemas/KinematicBones"
-          },
-          {
-            "$ref": "#/components/schemas/CharacterController"
-          }
-        ]
-      },
-      "Environment": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "skyMode": {
-            "type": "string",
-            "enum": [
-              "color",
-              "texture",
-              "procedural"
-            ]
-          },
-          "clearColor": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "skyTexture": {
-            "type": "string"
-          },
-          "skyIntensity": {
-            "type": "number"
-          },
-          "skyRotation": {
-            "type": "number"
-          },
-          "exposure": {
-            "type": "number"
-          },
-          "visible": {
-            "type": "boolean"
-          },
-          "useSkyForAmbient": {
-            "type": "boolean"
-          },
-          "ambientColor": {
-            "$ref": "#/components/schemas/Vec3"
-          },
-          "ambientIntensity": {
-            "type": "number"
-          },
-          "atmosphere": {
-            "$ref": "#/components/schemas/AtmosphereSettingsDto"
-          },
-          "fog": {
-            "$ref": "#/components/schemas/FogSettingsDto"
-          }
-        },
-        "required": [
-          "skyMode",
-          "clearColor",
-          "skyTexture",
-          "skyIntensity",
-          "skyRotation",
-          "exposure",
-          "visible",
-          "useSkyForAmbient",
-          "ambientColor",
-          "ambientIntensity",
-          "atmosphere",
-          "fog"
         ]
       }
     }

@@ -3,12 +3,12 @@ import type {
   AssetList as DtoAssetList,
   CommandParamsMap as DtoCommandParamsMap,
   CommandResultMap as DtoCommandResultMap,
-  EntityRef,
+  EnvironmentDto,
   ProjectInfoDto,
   ProjectStatusDto,
   RenderStatsDto,
+  SelectionResult,
   ThumbnailResult,
-  Vec3,
   WireUuid,
 } from "./sa-types";
 
@@ -89,7 +89,7 @@ export type {
   ClipBindingsResult,
   MorphWeightsResult,
   ListProbesResult,
-  Material,
+  MaterialSlot,
   Mesh,
   MoveAssetParams,
   Name,
@@ -193,7 +193,7 @@ export type ProjectStatus = ProjectStatusDto;
 export type ProjectPhase = ProjectStatusDto["phase"];
 export type BootStage = ProjectStatusDto["stage"];
 export type RenderStats = RenderStatsDto;
-export type Thumbnail = Omit<ThumbnailResult, "format"> & { format: "png" };
+export type Thumbnail = ThumbnailResult;
 
 export interface Envelope {
   ok: boolean;
@@ -201,79 +201,8 @@ export interface Envelope {
   result?: unknown;
 }
 
-export interface Environment {
-  skyMode: "color" | "texture" | "procedural";
-  clearColor: Vec3;
-  skyTexture: Uuid;
-  skyIntensity: number;
-  skyRotation: number;
-  exposure: number;
-  visible: boolean;
-  useSkyForAmbient: boolean;
-  ambientColor: Vec3;
-  ambientIntensity: number;
-  atmosphere: {
-    enabled: boolean;
-    planetRadius: number;
-    atmosphereHeight: number;
-    rayleighScattering: Vec3;
-    rayleighScaleHeight: number;
-    mieScattering: number;
-    mieScaleHeight: number;
-    mieAnisotropy: number;
-    ozoneAbsorption: Vec3;
-    sunDiskAngularRadius: number;
-    sunDiskIntensity: number;
-  };
-  fog: {
-    enabled: boolean;
-    mode: "analytic" | "volumetric";
-    quality: "low" | "medium" | "high";
-    historyBlend: number;
-    neighborhoodClamp: boolean;
-    lightClamp: number;
-    baseDensity: number;
-    scatterAlbedo: number;
-    phaseG: number;
-    density: number;
-    albedo: Vec3;
-    height: number;
-    heightFalloff: number;
-    startDistance: number;
-    maxOpacity: number;
-    emissive: Vec3;
-    directionalColor: Vec3;
-    directionalExponent: number;
-    layer2Density: number;
-    layer2Falloff: number;
-    layer2Height: number;
-    aerialPerspective: boolean;
-    aerialIntensity: number;
-  };
-}
-
-export interface Selection {
-  entity: EntityRef | null;
-  selectionVersion: number;
-  sceneVersion: number;
-  playState: string;
-  playVersion: number;
-  animationVersion: number;
-}
-
-type CompatCommandResultOverrides = {
-  "get-environment": Environment;
-  "set-environment": Environment;
-  "set-atmosphere": Environment;
-  "set-fog": Environment;
-  "get-selection": Selection;
-  "get-thumbnail": Thumbnail;
-  "view-asset": Thumbnail;
-};
+export type Environment = EnvironmentDto;
+export type Selection = SelectionResult;
 
 export type CommandParamsMap = DtoCommandParamsMap;
-export type CommandResultMap = Omit<
-  DtoCommandResultMap,
-  keyof CompatCommandResultOverrides
-> &
-  CompatCommandResultOverrides;
+export type CommandResultMap = DtoCommandResultMap;

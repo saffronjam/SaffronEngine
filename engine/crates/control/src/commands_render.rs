@@ -107,6 +107,7 @@ fn view_mode_to_dto(mode: ViewMode) -> ViewModeDto {
         ViewMode::LightComplexity => ViewModeDto::LightComplexity,
         ViewMode::MotionVectors => ViewModeDto::MotionVectors,
         ViewMode::Fog => ViewModeDto::Fog,
+        ViewMode::CloudDensity => ViewModeDto::CloudDensity,
     }
 }
 
@@ -130,6 +131,7 @@ fn view_mode_from_dto(mode: ViewModeDto) -> ViewMode {
         ViewModeDto::LightComplexity => ViewMode::LightComplexity,
         ViewModeDto::MotionVectors => ViewMode::MotionVectors,
         ViewModeDto::Fog => ViewMode::Fog,
+        ViewModeDto::CloudDensity => ViewMode::CloudDensity,
     }
 }
 

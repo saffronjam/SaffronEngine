@@ -19,20 +19,19 @@
 use saffron_geometry::{AnimClip, AnimPath, AnimTarget, AnimTrack};
 use saffron_protocol::{
     AnimationChannelDto, AnimationClipDto, AnimationStateParams, AnimationStateResult,
-    AssetPreviewOptionsResult, ClipBindingsResult, DebugOverlaysParams, DebugOverlaysResult,
-    EmptyParams, FootIkResult, GetFootIkParams, GetMorphWeightsParams, ListClipBindingsParams,
-    ListClipsParams, ListClipsResult, MorphWeightsResult, PickSkeletonJointParams,
-    PickSkeletonJointResult, PlayAnimationParams, SeekAnimationParams, SetAnimationLoopParams,
-    SetAnimationPlayingParams, SetAssetPreviewOptionsParams, SetFootIkParams,
-    SetMorphWeightsParams, SetSkeletonHighlightParams, SetSkeletonOverlayParams,
-    SkeletonOverlayResult, Uuid,
+    AssetPreviewOptionsResult, AssetSelector, ClipBindingsResult, DebugOverlaysParams,
+    DebugOverlaysResult, EmptyParams, EntitySelector, FootIkResult, GetFootIkParams,
+    GetMorphWeightsParams, ListClipBindingsParams, ListClipsParams, ListClipsResult,
+    MorphWeightsResult, PickSkeletonJointParams, PickSkeletonJointResult, PlayAnimationParams,
+    SeekAnimationParams, SetAnimationLoopParams, SetAnimationPlayingParams,
+    SetAssetPreviewOptionsParams, SetFootIkParams, SetMorphWeightsParams,
+    SetSkeletonHighlightParams, SetSkeletonOverlayParams, SkeletonOverlayResult, Uuid,
 };
 use saffron_scene::{
     AnimationPlayer, AssetType, Entity, FootIk, MorphComponent, MorphWeightOverride, Name,
     Relationship, Wrap,
 };
 use saffron_sceneedit::{DebugOverlayOptions, SkeletonOverlayOptions, viewport_project};
-use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::registry::{CommandRegistry, EngineContext};
@@ -59,18 +58,16 @@ fn wrap_from_name(name: &str) -> Wrap {
 /// The uuid a uuid-or-name selector names (an unsigned number, or a whole-string parse), and
 /// the name string (empty when the selector is not a string), shared by the clip and
 /// container resolvers.
-fn asset_selector_parts(selector: &Value) -> (u64, String) {
-    let name = selector.as_str().unwrap_or_default().to_owned();
-    let by_id = selector
-        .as_u64()
-        .or_else(|| name.parse::<u64>().ok())
-        .unwrap_or(0);
-    (by_id, name)
+fn asset_selector_parts(selector: &AssetSelector) -> (u64, String) {
+    (
+        selector.id().unwrap_or(0),
+        selector.name().unwrap_or_default().to_owned(),
+    )
 }
 
 /// Resolves an [`AssetSelector`](saffron_protocol::AssetSelector) to an animation catalog
 /// entry id.
-fn resolve_clip(ctx: &EngineContext<'_>, selector: &Value) -> Result<saffron_core::Uuid> {
+fn resolve_clip(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<saffron_core::Uuid> {
     let (by_id, name) = asset_selector_parts(selector);
     for entry in &ctx.assets.catalog.entries {
         if entry.asset_type == AssetType::Animation && (entry.id.0 == by_id || entry.name == name) {
@@ -83,7 +80,10 @@ fn resolve_clip(ctx: &EngineContext<'_>, selector: &Value) -> Result<saffron_cor
 /// Resolves an [`AssetSelector`](saffron_protocol::AssetSelector) to its owning `.smodel`
 /// container id (the model's own id for a model, the container for a sub-asset, `0` for a
 /// standalone).
-fn resolve_container(ctx: &EngineContext<'_>, selector: &Value) -> Result<saffron_core::Uuid> {
+fn resolve_container(
+    ctx: &EngineContext<'_>,
+    selector: &AssetSelector,
+) -> Result<saffron_core::Uuid> {
     let (by_id, name) = asset_selector_parts(selector);
     for entry in &ctx.assets.catalog.entries {
         if entry.id.0 == by_id || entry.name == name {
@@ -98,7 +98,7 @@ fn resolve_container(ctx: &EngineContext<'_>, selector: &Value) -> Result<saffro
 
 /// Resolves a selector to its rig descendant and ensures it carries an [`AnimationPlayer`],
 /// attaching a default one if absent.
-fn player_entity(ctx: &mut EngineContext<'_>, selector: &Value) -> Result<Entity> {
+fn player_entity(ctx: &mut EngineContext<'_>, selector: &EntitySelector) -> Result<Entity> {
     let entity = resolve_entity(ctx, selector)?;
     let scene = ctx.scene_edit.active_scene();
     // Resolve to the model's single animation authority (up to the model root, then down to
@@ -227,7 +227,7 @@ fn morph_weights_of(scene: &saffron_scene::Scene, target: Entity) -> (Vec<f32>, 
 /// [`MorphComponent`], else the first such entity in its forest ([`Scene::model_morph_entity`]) —
 /// the morph mesh rides a child node while the selection resolves to the container. Falls back
 /// to `entity` when none, so a non-morph target degrades to the caller's no-op.
-fn morph_entity(ctx: &mut EngineContext<'_>, selector: &Value) -> Result<Entity> {
+fn morph_entity(ctx: &mut EngineContext<'_>, selector: &EntitySelector) -> Result<Entity> {
     let entity = resolve_entity(ctx, selector)?;
     let scene = ctx.scene_edit.active_scene();
     Ok(scene.model_morph_entity(entity).unwrap_or(entity))
@@ -266,7 +266,7 @@ fn debug_overlays_state(opts: &DebugOverlayOptions) -> DebugOverlaysResult {
 
 /// Resolves a selector to its rig descendant and ensures it carries a [`FootIk`], attaching
 /// a default one if absent.
-fn foot_ik_entity(ctx: &mut EngineContext<'_>, selector: &Value) -> Result<Entity> {
+fn foot_ik_entity(ctx: &mut EngineContext<'_>, selector: &EntitySelector) -> Result<Entity> {
     let entity = resolve_entity(ctx, selector)?;
     let scene = ctx.scene_edit.active_scene();
     // Foot IK needs a skeleton; reject a model with no rig in its forest rather than attaching a
