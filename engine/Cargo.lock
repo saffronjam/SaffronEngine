@@ -2519,6 +2519,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "glam",
  "image",
  "saffron-core",
  "saffron-geometry",
@@ -2527,6 +2528,7 @@ dependencies = [
  "saffron-scene",
  "saffron-test-support",
  "serde_json",
+ "solar-positioning",
  "thiserror 2.0.18",
  "tracing",
  "walkdir",
@@ -2595,6 +2597,7 @@ dependencies = [
  "image",
  "saffron-core",
  "saffron-test-support",
+ "serde_json",
  "thiserror 2.0.18",
  "tobj",
  "tracing",
@@ -3066,6 +3069,12 @@ checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "solar-positioning"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43be6efda1aa40c21271a0349b351b09c15294c3d9c5a5facca4da97c373633c"
 
 [[package]]
 name = "spin"

@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 tracing.workspace = true
+glam.workspace = true
 saffron-core = { path = "../core" }
 saffron-json = { path = "../json" }
 saffron-geometry = { path = "../geometry" }
@@ -19,6 +20,7 @@ saffron-scene = { path = "../scene" }
 serde_json.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
+solar-positioning.workspace = true
 
 [dev-dependencies]
 ash.workspace = true

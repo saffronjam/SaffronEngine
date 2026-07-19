@@ -16,6 +16,7 @@ glam = { workspace = true, features = ["bytemuck"] }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 gltf = { workspace = true, features = ["KHR_materials_emissive_strength"] }
+serde_json.workspace = true
 tobj = { workspace = true }
 image = { workspace = true }
 
