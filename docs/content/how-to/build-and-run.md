@@ -13,7 +13,7 @@ Build the Rust workspace and shaders, run a bounded host smoke test, then launch
 - Run every command from the repository root.
 - Install `just` and Bun.
 - On Linux, create the `saffron-build` toolbox. The recipes enter it automatically and use its Rust, Vulkan, SDL3, and Slang tools.
-- On macOS, install the Rust 1.96 toolchain selected by `rust-toolchain.toml` and a Vulkan loader with MoltenVK.
+- On macOS, install the Rust 1.96 toolchain selected by `rust-toolchain.toml`, a Vulkan loader with MoltenVK, and Homebrew's `vulkan-validationlayers` package.
 - Use a Wayland desktop session on Linux when launching the editor.
 
 On macOS, provision the pinned CEF 149.0.6 distribution once:

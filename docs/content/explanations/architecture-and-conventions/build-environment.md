@@ -80,7 +80,8 @@ start with that prelude, so they run on the hardware GPU when the manifest exist
 otherwise. `just run-software` and `just run-engine-software` omit it to force llvmpipe, which is
 correct but slow and fine for validation work. On macOS the same prelude exports
 `VK_ICD_FILENAMES` pointing at the ICD of [MoltenVK](https://github.com/KhronosGroup/MoltenVK),
-the Vulkan-on-Metal implementation Homebrew installs.
+the Vulkan-on-Metal implementation Homebrew installs. It also locates Homebrew's validation-layer
+manifest and dynamic library so debug runs execute the same validation-clean gate as Linux.
 
 ## Headless and bounded runs
 
