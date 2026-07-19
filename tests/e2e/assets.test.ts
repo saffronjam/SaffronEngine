@@ -1,11 +1,11 @@
 // Asset control-plane behaviour:
 //   - probe-asset reports on-disk metadata (size, vertex/triangle counts, mtime);
 //   - assign-asset with the "0" none sentinel clears a slot instead of erroring.
-// Boots with SAFFRON_SCRATCH_PROJECT so the cube preset (which imports a model and
-// so needs a loaded project) populates the asset catalog.
+// Boots with SAFFRON_SCRATCH_PROJECT so imported fixtures have a loaded asset catalog.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { Engine } from "./harness.ts";
+import { join } from "node:path";
+import { Engine, REPO } from "./harness.ts";
 import type { AssetList, AssetMetadataDto, EntityRef, InspectResult } from "@saffron/protocol";
 
 let engine: Engine;
@@ -19,7 +19,7 @@ afterAll(async () => {
 const DECIMAL_U64 = /^[0-9]+$/;
 
 test("probe-asset returns on-disk metadata for a mesh", async () => {
-  await engine.call<EntityRef>("add-entity", { args: ["cube"] });
+  await engine.importEntity(join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb"));
   const assets = await engine.call<AssetList>("list-assets");
   const mesh = assets.assets.find((a) => a.type === "mesh");
   expect(mesh).toBeDefined();
