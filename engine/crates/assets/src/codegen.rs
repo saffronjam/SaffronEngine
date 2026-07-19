@@ -533,6 +533,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn compile_material_mesh_shader_produces_a_non_empty_spv_when_slangc_present() {
+        let slangc = find_slangc();
+        let probe = Command::new(&slangc)
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if probe.is_err() {
+            eprintln!("skipping: slangc not runnable ({slangc:?})");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "saffron-codegen-mesh-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = tmp.join("project").join("assets");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let assets = AssetServer::new(&root);
+        let graph = serde_json::json!({
+            "nodes": [
+                { "id": "c1", "type": "constant", "props": { "value": [0, 1, 0, 1] } },
+                { "id": "c2", "type": "constant", "props": { "value": [1, 1, 1, 1] } },
+                { "id": "mul", "type": "multiply" },
+                { "id": "out", "type": "materialOutput" }
+            ],
+            "edges": [
+                { "from": ["c1", "rgba"], "to": ["mul", "a"] },
+                { "from": ["c2", "rgba"], "to": ["mul", "b"] },
+                { "from": ["mul", "rgba"], "to": ["out", "baseColor"] }
+            ]
+        });
+
+        let spv = assets
+            .compile_material_mesh_shader(&graph, Uuid(7778))
+            .unwrap_or_else(|err| {
+                panic!("mesh compile failed; generated source is under {tmp:?}: {err}")
+            });
+        let bytes = std::fs::read(&spv).expect("read mesh .spv");
+        assert!(!bytes.is_empty(), "compiled mesh .spv is non-empty");
+        assert_eq!(spv, root.join("materials").join("7778_mesh.spv"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// A non-zero `slangc` exit (invalid source) surfaces [`Error::SlangcFailed`] and
     /// leaves no `.spv`, gated on `slangc` being runnable (else skipped + logged).
     #[test]
