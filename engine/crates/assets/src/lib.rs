@@ -48,6 +48,7 @@ mod scan;
 mod seam;
 mod spawn;
 mod thumbnail;
+mod time_of_day;
 
 pub use cache::{AssetCache, resolve_cached};
 pub use catalog::{
@@ -106,6 +107,10 @@ pub use thumbnail::{
     PreviewRenderJob, PreviewRenderKind, THUMBNAIL_CACHE_VERSION, ThumbnailCacheStats,
     ThumbnailContent, ThumbnailJob, ThumbnailPng, ThumbnailReply, ThumbnailTextureSource,
     request_thumbnail, write_thumbnail_cache,
+};
+pub use time_of_day::{
+    CelestialPosition, CelestialTime, advance_time_of_day, dir_from_az_el, eval_monotone_curve,
+    julian_date, local_sidereal_time, lunar_position, solar_position, world_from_equatorial,
 };
 
 use std::path::{Path, PathBuf};

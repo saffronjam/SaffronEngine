@@ -23,6 +23,10 @@ pub enum Error {
     #[error("render error: {0}")]
     Render(#[from] saffron_rendering::Error),
 
+    /// A calendar value could not be evaluated by the solar ephemeris.
+    #[error("ephemeris error: {0}")]
+    Ephemeris(#[from] solar_positioning::Error),
+
     /// A scene serde / ECS operation failed (the project's `scene` block load).
     #[error("scene error: {0}")]
     Scene(#[from] saffron_scene::Error),
