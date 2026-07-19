@@ -42,7 +42,7 @@ use crate::names::{
 };
 
 /// The `.smeta` sidecar co-located with an asset file — the durable, id-keyed home for its
-/// name / folder / colorspace.
+/// name / folder / texture metadata.
 ///
 /// A foreign/headerless file (a raw `.png` dropped into `assets/`) also uses it for a stable
 /// id (its bytes carry none). Engine-written files (`.smodel`, `textures/<uuid>.*`, extracted
@@ -462,7 +462,7 @@ impl AssetServer {
     }
 
     /// Writes the durable `<path>.smeta` sidecar for the catalog row `id` — its name, folder,
-    /// and (for a texture) colorspace. Call after any create / rename / move so the metadata
+    /// and (for a texture) colorspace and role. Call after any create / rename / move so the metadata
     /// survives a cold scan without a project save; [`apply_sidecar_overrides`] reads it back.
     ///
     /// A no-op for an unknown id, a row with no own file, or an **embedded** sub-asset
@@ -692,7 +692,7 @@ fn preserve_name_folder(previous: &AssetCatalog, row: &mut AssetEntry) {
 }
 
 /// Overlays each row's durable metadata from a co-located `<path>.smeta` sidecar — the
-/// authoritative home for an asset's name / folder / colorspace. Runs after the walk (and
+/// authoritative home for an asset's name / folder / texture metadata. Runs after the walk (and
 /// after [`preserve_name_folder`]) so the eagerly-written sidecar wins over the stale
 /// `project.json` seed; that is what makes a never-saved rename or import survive a cold scan.
 ///
@@ -701,7 +701,7 @@ fn preserve_name_folder(previous: &AssetCatalog, row: &mut AssetEntry) {
 /// whose id it names, never to a path-sharing sibling. This also makes the extracted-asset
 /// case order-independent: the leaf row and the container's remap row share an id, so the
 /// overlay lands on whichever won the `put`. The invariant it rests on: every name/folder/
-/// colorspace mutation writes the sidecar, so it never lags `project.json`.
+/// texture-metadata mutation writes the sidecar, so it never lags `project.json`.
 fn apply_sidecar_overrides(root: &std::path::Path, rebuilt: &mut AssetCatalog) {
     for row in &mut rebuilt.entries {
         if row.path.is_empty() {
@@ -721,6 +721,9 @@ fn apply_sidecar_overrides(root: &std::path::Path, rebuilt: &mut AssetCatalog) {
                     row.colorspace = sidecar.colorspace;
                     row.hdr = sidecar.colorspace == Colorspace::Hdr;
                     row.linear = sidecar.colorspace == Colorspace::Linear;
+                }
+                if row.asset_type == AssetType::Texture {
+                    row.role = sidecar.role;
                 }
             }
             // A sidecar whose id names a different asset (a path-sharing sibling) is not ours.
