@@ -1197,7 +1197,7 @@ impl Renderer {
             let mut sky = Sky::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1)?;
             sky.bind_env_cube(&ibl);
             sky.bind_night_sky(&ibl, &stars);
-            let reflection = ReflectionProbes::new(&device, ibl.set())?;
+            let reflection = ReflectionProbes::new(&device)?;
             reflection.seed(&ibl);
 
             // The offscreen thumbnail preview IBL: a second set validated with the global procedural
@@ -1206,7 +1206,7 @@ impl Renderer {
             // Its probe bindings ride the same fallback seeding — thumbnails never capture probes.
             let mut preview_ibl = Ibl::new(&device, &descriptors)?;
             preview_ibl.bake(&device, true)?;
-            reflection.seed_set(preview_ibl.set(), &preview_ibl);
+            reflection.seed(&preview_ibl);
 
             // Screen-space effects: the device-shared sub-state (sampler + the two
             // compute layouts). `ready` flips once the views are built.
@@ -5160,7 +5160,7 @@ impl Renderer {
         match self.ibl.update_refresh(&self.device) {
             Ok(true) => {
                 self.sky.bind_env_cube(&self.ibl);
-                self.reflection.seed(&self.ibl);
+                self.reflection.refresh_fallbacks(&self.ibl);
             }
             Ok(false) => {}
             Err(err) => tracing::error!("ibl refresh failed: {err}"),
@@ -5168,7 +5168,7 @@ impl Renderer {
         match self.preview_ibl.update_refresh(&self.device) {
             Ok(true) => self
                 .reflection
-                .seed_set(self.preview_ibl.set(), &self.preview_ibl),
+                .refresh_secondary_fallbacks(&self.preview_ibl),
             Ok(false) => {}
             Err(err) => tracing::error!("preview ibl refresh failed: {err}"),
         }
@@ -5186,6 +5186,7 @@ impl Renderer {
         let raw = self.device.raw();
         let frame = self.frames.index();
         let command_buffer = self.frames.command_buffer();
+        self.reflection.prepare_frame(frame);
 
         // Reset this slot's CPU span buffer for a fresh frame when the profiler is active
         // When `Off` the
@@ -5808,7 +5809,7 @@ impl Renderer {
         let bindless_set = self.descriptors.bindless_set();
         let light_set = self.lighting.light_set(frame);
         let instance_set = self.instancing.instance_set(frame);
-        let ibl_set = self.scene_ibl().set();
+        let ibl_set = self.scene_ibl().set(frame);
         let raw = self.device.raw().clone();
 
         let mut graph = RenderGraph::new();

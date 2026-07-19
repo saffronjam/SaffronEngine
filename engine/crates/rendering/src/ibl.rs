@@ -23,6 +23,7 @@ use saffron_geometry::glam::{UVec4, Vec3, Vec4};
 use vk_mem::Alloc;
 
 use crate::descriptors::{Descriptors, MAX_REFLECTION_PROBES};
+use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::render_graph::{RenderGraph, RgPass, RgResource, RgUsage};
 use crate::resources::{Buffer, DeviceResources, GpuTexture};
 use crate::{Device, Error, Result, checked};
@@ -727,7 +728,7 @@ pub struct Ibl {
     /// The descriptors' linear repeat sampler (the equirect panorama wraps in longitude;
     /// the clamp IBL sampler would seam the meridian). Borrowed, not owned.
     equirect_sampler: vk::Sampler,
-    set: vk::DescriptorSet,
+    sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
     /// Whether the bake has run and set 3 is written.
     pub ready: bool,
     /// Master IBL ambient toggle; false = the flat scalar ambient fallback.
@@ -789,15 +790,19 @@ impl Ibl {
                 return Err(err);
             }
         };
-        let set = match descriptors.allocate_set(descriptors.ibl_set_layout()) {
-            Ok(set) => set,
-            Err(err) => {
-                // SAFETY: the ash seam. The sampler was created just above; free it on
-                // the early return (the images free via their Drop).
-                unsafe { resources.device().destroy_sampler(sampler, None) };
-                return Err(err);
-            }
-        };
+        let mut sets = [vk::DescriptorSet::null(); MAX_FRAMES_IN_FLIGHT];
+        for set in &mut sets {
+            *set = match descriptors.allocate_set(descriptors.ibl_set_layout()) {
+                Ok(set) => set,
+                Err(err) => {
+                    // SAFETY: the ash seam. The sampler was created just above; free it on
+                    // the early return (the images free via their Drop and allocated sets
+                    // free with the shared pool).
+                    unsafe { resources.device().destroy_sampler(sampler, None) };
+                    return Err(err);
+                }
+            };
+        }
 
         Ok(Self {
             resources,
@@ -814,7 +819,7 @@ impl Ibl {
             refresh_sky_view_initialized: false,
             sampler,
             equirect_sampler: descriptors.linear_sampler(),
-            set,
+            sets,
             ready: false,
             use_ibl: true,
             baked_params: SkygenParams::default(),
@@ -836,9 +841,10 @@ impl Ibl {
         })
     }
 
-    /// The IBL set (set 3 in the mesh pipeline; also the reflection-probe set).
-    pub fn set(&self) -> vk::DescriptorSet {
-        self.set
+    /// The current frame slot's IBL set (set 3 in the mesh pipeline; also the
+    /// reflection-probe set).
+    pub fn set(&self, frame: usize) -> vk::DescriptorSet {
+        self.sets[frame]
     }
 
     /// The IBL linear/clamp/mipped sampler (shared by the sky + probe sets).
@@ -861,17 +867,16 @@ impl Ibl {
         self.live.prefiltered.view
     }
 
-    /// The Hillaire sky-view LUT's sampling view (the height-fog in-scatter tint). Always in
-    /// `SHADER_READ_ONLY_OPTIMAL` after the first bake; carries the atmosphere in-scatter only when
-    /// [`Ibl::atmosphere_live`] is true (else it holds a stale/undefined tint the fog pass gates out).
+    /// The Hillaire sky-view LUT's sampling view (the height-fog in-scatter tint). Contains a valid
+    /// physical-atmosphere evaluation and is in `SHADER_READ_ONLY_OPTIMAL` after the first bake;
+    /// consumers use it only when [`Ibl::atmosphere_live`] is true.
     pub fn sky_view_lut_view(&self) -> vk::ImageView {
         self.sky_view_lut.view
     }
 
     /// The transmittance LUT view (Hillaire 2020), bound into the aerial-perspective pass's descriptor
-    /// set with the shared clamp [`Ibl::sampler`]. `SHADER_READ_ONLY_OPTIMAL` after the first bake;
-    /// carries the atmosphere transmittance only when [`Ibl::atmosphere_live`] (else stale contents the
-    /// AP pass never dispatches over).
+    /// set with the shared clamp [`Ibl::sampler`]. Contains a valid physical-atmosphere base and is
+    /// in `SHADER_READ_ONLY_OPTIMAL` after the first bake.
     pub fn transmittance_view(&self) -> vk::ImageView {
         self.transmittance_lut.view
     }
@@ -1034,12 +1039,13 @@ impl Ibl {
 
         if refresh.kind == RefreshKind::Rebuild {
             self.refresh_target_initialized = !refresh.first_bake;
-            if refresh.source == EnvSource::Atmosphere && refresh.params.atmosphere.enabled {
-                if !refresh.first_bake {
-                    std::mem::swap(&mut self.sky_view_lut, &mut self.refresh_sky_view_lut);
-                    self.refresh_sky_view_initialized = true;
-                }
-                self.atmosphere_base_ready |= refresh.atmosphere_base_written;
+            self.atmosphere_base_ready |= refresh.atmosphere_base_written;
+            if refresh.source == EnvSource::Atmosphere
+                && refresh.params.atmosphere.enabled
+                && !refresh.first_bake
+            {
+                std::mem::swap(&mut self.sky_view_lut, &mut self.refresh_sky_view_lut);
+                self.refresh_sky_view_initialized = true;
             }
             self.baked_params = refresh.params;
             self.baked_source = refresh.source;
@@ -1071,12 +1077,13 @@ impl Ibl {
         let rebuild = kind == RefreshKind::Rebuild;
         let use_atmosphere =
             rebuild && self.source == EnvSource::Atmosphere && sky.atmosphere.enabled;
+        let prepare_atmosphere = use_atmosphere || first_bake;
         let use_equirect =
             rebuild && self.source == EnvSource::Equirect && self.env_panorama.is_some();
         if self.source == EnvSource::Equirect && self.env_panorama.is_none() {
             tracing::warn!("ibl bake: Equirect source has no panorama; falling back to procedural");
         }
-        let mut scratch = BakeScratch::new(&raw, device, use_atmosphere)?;
+        let mut scratch = BakeScratch::new(&raw, device, prepare_atmosphere)?;
 
         let destination = if first_bake { &self.front } else { &self.back };
         let generated = if first_bake {
@@ -1102,20 +1109,20 @@ impl Ibl {
             &raw,
             self,
             &views,
-            use_atmosphere,
+            prepare_atmosphere,
             use_equirect,
             !first_bake,
         )?;
 
         let atmos = AtmosPush::new(&sky);
-        let atmosphere_base_written =
-            use_atmosphere && (first_bake || self.atmosphere_dirty || !self.atmosphere_base_ready);
+        let atmosphere_base_written = prepare_atmosphere
+            && (first_bake || self.atmosphere_dirty || !self.atmosphere_base_ready);
         unsafe {
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             checked(raw.begin_command_buffer(scratch.cmd, &begin), "ibl begin")?;
 
-            if use_atmosphere {
+            if prepare_atmosphere {
                 if atmosphere_base_written {
                     self.record_atmosphere_base(&raw, &scratch, &atmos, self.atmosphere_base_ready);
                 }
@@ -1250,25 +1257,6 @@ impl Ibl {
                     1,
                 );
                 readable_image(&raw, scratch.cmd, self.brdf_lut.image, 1);
-            }
-
-            // Procedural / equirect leave the atmosphere sky-view LUT unwritten, so put it in a
-            // readable layout regardless — the height-fog pass binds it every frame (gated to a flat
-            // tint by `useSkyLut = 0`), and a bound-but-unwritten image must not sit in UNDEFINED.
-            if first_bake && !use_atmosphere {
-                cube_barrier(
-                    &raw,
-                    scratch.cmd,
-                    self.sky_view_lut.image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags2::TOP_OF_PIPE,
-                    vk::AccessFlags2::empty(),
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_SAMPLED_READ,
-                    0,
-                    1,
-                );
             }
 
             checked(raw.end_command_buffer(scratch.cmd), "ibl end")?;
@@ -1488,8 +1476,8 @@ impl Ibl {
         slices
     }
 
-    /// Writes the persistent set 3 (bindings 0-2: sky SH / prefiltered / BRDF LUT) the
-    /// mesh fragment samples.
+    /// Writes every per-frame persistent set 3 (bindings 0-2: sky SH / prefiltered / BRDF
+    /// LUT) the mesh fragment samples.
     fn write_mesh_set(&self, raw: &ash::Device) {
         let sh_info = [vk::DescriptorBufferInfo::default()
             .buffer(self.live.sh_coefficients.handle())
@@ -1501,26 +1489,28 @@ impl Ibl {
                 .image_view(view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         });
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&sh_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&image_infos[0..1]),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&image_infos[1..2]),
-        ];
-        // SAFETY: the ash seam. The set/views/sampler outlive the renderer; host access to
-        // the set is single-threaded at the (idle) bake point.
-        unsafe { raw.update_descriptor_sets(&writes, &[]) };
+        for &set in &self.sets {
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&sh_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_infos[0..1]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_infos[1..2]),
+            ];
+            // SAFETY: the ash seam. The sets/views/sampler outlive the renderer; host access
+            // is single-threaded during the synchronous startup bake.
+            unsafe { raw.update_descriptor_sets(&writes, &[]) };
+        }
     }
 }
 
@@ -3212,27 +3202,24 @@ pub struct ReflectionProbes {
     resources: Arc<DeviceResources>,
     probes: [ReflectionProbe; MAX_REFLECTION_PROBES as usize],
     count: u32,
-    /// The IBL set (set 3; probes live at bindings 3-5). Shared with [`Ibl::set`].
-    mesh_set: vk::DescriptorSet,
     sampler: vk::Sampler,
-    meta_buffer: Buffer,
+    meta_buffers: Vec<Buffer>,
     /// Master probe toggle.
     pub use_probes: bool,
     /// Any probe dirty this frame → capture at the next idle point.
     pub capture_pending: bool,
     warned_overflow: bool,
-    frame_probe_count: u32,
 }
 
 impl ReflectionProbes {
-    /// Allocates the per-probe metadata SSBO, the probe sampler, and seeds the meta buffer
-    /// to zero. The `mesh_set` is the shared [`Ibl::set`]; seeding the array slots happens
-    /// after the first IBL bake via [`ReflectionProbes::seed`].
+    /// Allocates one probe-metadata SSBO per frame slot, the probe sampler, and seeds the
+    /// buffers to zero. Descriptor seeding happens after the first IBL bake via
+    /// [`ReflectionProbes::seed`].
     ///
     /// # Errors
     ///
     /// Returns [`Error`] for any failing buffer/sampler step.
-    pub fn new(device: &Device, mesh_set: vk::DescriptorSet) -> Result<Self> {
+    pub fn new(device: &Device) -> Result<Self> {
         let resources = Arc::clone(device.resources());
         let raw = resources.device();
 
@@ -3244,58 +3231,58 @@ impl ReflectionProbes {
             ..Default::default()
         };
         let size = (size_of::<ProbeMetaGpu>() * MAX_REFLECTION_PROBES as usize) as vk::DeviceSize;
-        let mut meta_buffer = match Buffer::new(
-            &resources,
-            size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            &alloc_info,
-        ) {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                // SAFETY: the ash seam. Free the sampler on the early return.
-                unsafe { raw.destroy_sampler(sampler, None) };
-                return Err(err);
+        let mut meta_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let mut buffer = match Buffer::new(
+                &resources,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                &alloc_info,
+            ) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    // SAFETY: the ash seam. Free the sampler on the early return; any
+                    // buffers already allocated free through their Drop implementation.
+                    unsafe { raw.destroy_sampler(sampler, None) };
+                    return Err(err);
+                }
+            };
+            if let Some(dst) = buffer.mapped_bytes() {
+                dst.fill(0);
             }
-        };
-        if let Some(dst) = meta_buffer.mapped_bytes() {
-            dst.fill(0);
+            meta_buffers.push(buffer);
         }
 
         Ok(Self {
             resources,
             probes: std::array::from_fn(|_| ReflectionProbe::default()),
             count: 0,
-            mesh_set,
             sampler,
-            meta_buffer,
+            meta_buffers,
             use_probes: true,
             capture_pending: false,
             warned_overflow: false,
-            frame_probe_count: 0,
         })
     }
 
-    /// Seeds every probe array slot (IBL set bindings 3/4) with the global IBL cubes and
-    /// writes the metadata-SSBO binding (5), so the mesh bind is valid before any capture.
-    /// Called once after the first IBL bake.
+    /// Seeds every probe array slot in every frame's IBL set (bindings 3/4) with the global
+    /// IBL cubes and binds that frame's metadata SSBO at binding 5. Called once after the
+    /// first IBL bake.
     pub fn seed(&self, ibl: &Ibl) {
-        self.seed_set(self.mesh_set, ibl);
+        for frame in 0..MAX_FRAMES_IN_FLIGHT {
+            self.seed_set(ibl.set(frame), ibl, &self.meta_buffers[frame]);
+        }
     }
 
-    /// Seeds an arbitrary IBL set's probe bindings — the shared [`Ibl::set`] for the project IBL
-    /// (via [`ReflectionProbes::seed`]), or a secondary set (the offscreen thumbnail preview IBL)
-    /// whose bindings 3/4/5 must be valid before it is bound even though probes are never captured
-    /// into it. The fallback cubes come from `ibl`; binding 5 shares the one metadata SSBO (a
-    /// secondary set carries no probes, so it is read for `probe_count == 0`, i.e. never).
-    pub fn seed_set(&self, dst_set: vk::DescriptorSet, ibl: &Ibl) {
+    fn seed_set(&self, dst_set: vk::DescriptorSet, ibl: &Ibl, meta_buffer: &Buffer) {
         let raw = self.resources.device();
         for slot in 0..MAX_REFLECTION_PROBES {
             self.write_slot(raw, dst_set, ibl, slot as usize);
         }
         let buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.meta_buffer.handle())
+            .buffer(meta_buffer.handle())
             .offset(0)
-            .range(self.meta_buffer.size())];
+            .range(meta_buffer.size())];
         let write = [vk::WriteDescriptorSet::default()
             .dst_set(dst_set)
             .dst_binding(5)
@@ -3303,6 +3290,32 @@ impl ReflectionProbes {
             .buffer_info(&buffer_info)];
         // SAFETY: the ash seam. Host access at the (idle) post-bake point is single-threaded.
         unsafe { raw.update_descriptor_sets(&write, &[]) };
+    }
+
+    /// Rebinds uncaptured project probe slots to a newly committed global environment.
+    /// Bindings 3/4 are update-after-bind; binding 5 remains fixed for the renderer lifetime.
+    pub fn refresh_fallbacks(&self, ibl: &Ibl) {
+        let raw = self.resources.device();
+        for frame in 0..MAX_FRAMES_IN_FLIGHT {
+            let set = ibl.set(frame);
+            for (slot, probe) in self.probes.iter().enumerate() {
+                if !probe.valid {
+                    self.write_slot(raw, set, ibl, slot);
+                }
+            }
+        }
+    }
+
+    /// Rebinds every fallback slot in a secondary IBL whose sets never carry captured probes.
+    /// Bindings 3/4 are update-after-bind; binding 5 remains fixed for the renderer lifetime.
+    pub fn refresh_secondary_fallbacks(&self, ibl: &Ibl) {
+        let raw = self.resources.device();
+        for frame in 0..MAX_FRAMES_IN_FLIGHT {
+            let set = ibl.set(frame);
+            for slot in 0..MAX_REFLECTION_PROBES as usize {
+                self.write_slot(raw, set, ibl, slot);
+            }
+        }
     }
 
     /// Writes one probe slot's prefiltered (binding 3) + irradiance (binding 4) cube into
@@ -3343,8 +3356,8 @@ impl ReflectionProbes {
 
     /// Folds the host's per-frame probe uploads in:
     /// re-arms a slot on a real change (new/moved/resized probe, or an explicit dirty flag),
-    /// drops removed slots, and re-uploads the metadata SSBO. Overflow past
-    /// `MAX_REFLECTION_PROBES` is logged once.
+    /// drops removed slots, and stages the metadata represented by the next frame slot.
+    /// Overflow past `MAX_REFLECTION_PROBES` is logged once.
     pub fn submit(&mut self, uploads: &[ReflectionProbeUpload]) {
         let cap = MAX_REFLECTION_PROBES as usize;
         let mut count = uploads.len();
@@ -3381,13 +3394,12 @@ impl ReflectionProbes {
         if any_dirty {
             self.capture_pending = true;
         }
-        self.upload_meta();
     }
 
-    /// Re-uploads the metadata SSBO (cheap; the shader reads only `count` records). The
-    /// sampled count is 0 when probes are disabled, so the mesh fragment ignores them.
-    fn upload_meta(&mut self) {
-        let sample_count = if self.use_probes { self.count } else { 0 };
+    /// Writes probe metadata into the frame slot whose fence has completed. The shader reads
+    /// only `frame_probe_count()` records; disabled probes therefore sample no records.
+    pub fn prepare_frame(&mut self, frame: usize) {
+        let sample_count = self.frame_probe_count();
         let mut meta = [ProbeMetaGpu::zeroed(); MAX_REFLECTION_PROBES as usize];
         for (slot, probe) in meta
             .iter_mut()
@@ -3405,17 +3417,16 @@ impl ReflectionProbes {
                 ),
             };
         }
-        if let Some(dst) = self.meta_buffer.mapped_bytes() {
+        if let Some(dst) = self.meta_buffers[frame].mapped_bytes() {
             let bytes = bytemuck::bytes_of(&meta);
             dst[..bytes.len()].copy_from_slice(bytes);
         }
-        self.frame_probe_count = sample_count;
     }
 
     /// The reflection-probe count the mesh fragment iterates this frame (0 when probes are
     /// disabled). The renderer folds this into the light UBO's `ambientColor.w`.
     pub fn frame_probe_count(&self) -> u32 {
-        self.frame_probe_count
+        if self.use_probes { self.count } else { 0 }
     }
 
     /// The active probe-slot count (≤ `MAX_REFLECTION_PROBES`).
@@ -3433,7 +3444,7 @@ impl ReflectionProbes {
 impl Drop for ReflectionProbes {
     fn drop(&mut self) {
         // SAFETY: the ash seam. The device idled before teardown; the sampler is freed once.
-        // The meta buffer frees via its Drop; the set frees with the shared pool.
+        // The meta buffers free via their Drop; the sets free with the shared pool.
         unsafe {
             self.resources.device().destroy_sampler(self.sampler, None);
         }
@@ -3796,7 +3807,7 @@ mod tests {
         };
         let before = validation_issue_count();
         let ibl = Ibl::new(&device, &descriptors).expect("ibl init");
-        let reflection = ReflectionProbes::new(&device, ibl.set()).expect("probes init");
+        let reflection = ReflectionProbes::new(&device).expect("probes init");
         // Seeds bindings 3 (prefiltered ×8) + 4 (irradiance ×8) + 5 (meta SSBO); a bad
         // slot or array element would trip a validation error.
         reflection.seed(&ibl);
@@ -3821,9 +3832,12 @@ mod tests {
         let before = validation_issue_count();
         let mut ibl = Ibl::new(&device, &descriptors).expect("ibl init (procedural)");
         ibl.bake(&device, true).expect("startup bake");
+        assert!(
+            ibl.atmosphere_base_ready,
+            "startup initializes the persistently bound atmosphere LUTs"
+        );
 
-        // Procedural: the first bake already ran in `new`; a re-bake exercises the
-        // overwrite-in-place path (UNDEFINED→GENERAL discards, then convolve).
+        // Procedural: a re-bake exercises the retained front/back environment path.
         ibl.request_env_bake(
             EnvSource::Procedural,
             None,
@@ -3891,16 +3905,14 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ProbeMetaGpu, flags), 32);
     }
 
-    /// `submit` arms a capture on a dirty/new probe, drops removed slots, and uploads the
-    /// metadata SSBO with the correct sampled count. Device-backed (the meta buffer is GPU
-    /// memory); skipped without an ICD.
+    /// `submit` arms a capture on a dirty/new probe and drops removed slots; `prepare_frame`
+    /// writes the selected frame slot's metadata SSBO. Device-backed; skipped without an ICD.
     #[test]
     fn submit_reflection_probes_tracks_dirty_and_count() {
-        let Some((device, descriptors)) = device_or_skip() else {
+        let Some((device, _descriptors)) = device_or_skip() else {
             return;
         };
-        let ibl = Ibl::new(&device, &descriptors).expect("ibl init");
-        let mut reflection = ReflectionProbes::new(&device, ibl.set()).expect("probes init");
+        let mut reflection = ReflectionProbes::new(&device).expect("probes init");
 
         let probe = ReflectionProbeUpload {
             entity: 7,
@@ -3908,6 +3920,7 @@ mod tests {
             ..ReflectionProbeUpload::default()
         };
         reflection.submit(&[probe]);
+        reflection.prepare_frame(0);
         assert_eq!(reflection.count(), 1);
         assert!(reflection.capture_pending, "a new probe must arm a capture");
         assert_eq!(reflection.frame_probe_count(), 1);
@@ -3915,6 +3928,7 @@ mod tests {
         // Disabling probes zeroes the sampled count even with an active slot.
         reflection.use_probes = false;
         reflection.submit(&[probe]);
+        reflection.prepare_frame(0);
         assert_eq!(
             reflection.frame_probe_count(),
             0,
