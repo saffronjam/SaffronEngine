@@ -15,7 +15,7 @@ A `DockLayout` is a DOM-free tree. Branches describe horizontal or vertical spli
 
 ```ts
 interface DockLayout {
-  version: 1;
+  version: 2;
   rootId: DockNodeId;
   nodes: Record<DockNodeId, DockBranch | DockLeaf>;
 }
@@ -82,6 +82,10 @@ The asset editor opens panels from the previewed asset's capabilities. `preview`
 The editor stores both trees and `lastLocation` under a key derived from the project path. Dock mutations debounce writes by 300 milliseconds. Closing or moving a panel records its leaf, and reopening resolves a destination in this order: remembered leaf, canonical default leaf, first unlocked leaf, then a new leaf beside the root.
 
 Hydration validates each tree against its island's known panel identifiers and required structural panels. Invalid stored data falls back to the default layout. Without a loaded project, changes remain in the current session.
+
+The default Scene tree keeps Hierarchy above Inspector on the left, gives the viewport the centre,
+and places Environment, Render, and Post in one full-height right dock. A layout-version change
+intentionally discards older persisted trees when the canonical panel ownership or placement changes.
 
 ## In the code
 
