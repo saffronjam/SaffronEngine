@@ -84,7 +84,16 @@ import {
 const TEXTURE_EXTS = new Set(["png", "jpg", "jpeg", "hdr", "tga", "bmp"]);
 
 /// Asset kinds offered by the search bar's `type:` chip.
-const ASSET_TYPE_VALUES = ["mesh", "texture", "material", "animation", "model", "other"] as const;
+const ASSET_TYPE_VALUES = [
+  "mesh",
+  "texture",
+  "material",
+  "animation",
+  "model",
+  "lut",
+  "environment",
+  "other",
+] as const;
 
 const sentenceCase = (value: string): string => value.charAt(0).toUpperCase() + value.slice(1);
 
