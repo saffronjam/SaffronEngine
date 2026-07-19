@@ -2,8 +2,8 @@
 //!
 //! Compiles every `*.slang` entry-point shader in `engine/assets/shaders/` to
 //! `<runtime>/shaders/<name>.spv`, precompiles the shared `lighting.slang` to a reusable
-//! `lighting.slang-module`, copies each `.slang` source next to its `.spv` (the runtime
-//! node-graph codegen splices `mesh.slang`), and copies the `models/`, `fonts/`, `icons/`
+//! `lighting.slang-module`, copies each `.slang` source into `<runtime>/shaders/source/`
+//! (the runtime node-graph codegen splices `mesh.slang`), and copies the `models/`, `fonts/`, `icons/`
 //! asset trees next to the host binary. Staleness is tracked by source vs output mtime with
 //! the `lighting.slang` shared-dependency edge, so a second run recompiles nothing.
 
@@ -140,6 +140,13 @@ pub fn run(config: &Config) -> Result<Report> {
     let out_dir = config.runtime_dir.join("shaders");
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating shader output dir {}", out_dir.display()))?;
+    let runtime_source_dir = out_dir.join("source");
+    std::fs::create_dir_all(&runtime_source_dir).with_context(|| {
+        format!(
+            "creating shader source dir {}",
+            runtime_source_dir.display()
+        )
+    })?;
 
     let lighting_src = config.shader_src_dir.join("lighting.slang");
     if !lighting_src.is_file() {
@@ -283,7 +290,7 @@ pub fn run(config: &Config) -> Result<Report> {
             .file_stem()
             .and_then(|s| s.to_str())
             .with_context(|| format!("non-utf8 shader name: {}", path.display()))?;
-        let src_copy = out_dir.join(format!("{stem}.slang"));
+        let src_copy = runtime_source_dir.join(format!("{stem}.slang"));
         copy_if_different(&path, &src_copy)?;
         if stem == LIGHTING_STEM
             || stem == LIGHTING_COMMON_STEM
@@ -464,8 +471,7 @@ fn is_stale(output: &Path, deps: &[&Path]) -> Result<bool> {
     Ok(false)
 }
 
-/// Copies `src` to `dst` only when the contents differ — keeps each `.slang` next to its `.spv`
-/// without churning mtimes on a no-op run.
+/// Copies `src` to `dst` only when the contents differ, without churning mtimes on a no-op run.
 fn copy_if_different(src: &Path, dst: &Path) -> Result<()> {
     if files_equal(src, dst)? {
         return Ok(());
