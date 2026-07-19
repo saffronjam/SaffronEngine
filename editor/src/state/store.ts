@@ -1792,7 +1792,7 @@ function loadExpanded(path: string): Set<string> {
 const DOCK_LAYOUT_STORAGE_PREFIX = "saffron.layout.dock:";
 
 interface PersistedDockLayouts {
-  version: 1;
+  version: 2;
   layouts: Record<DockSpaceKind, DockLayout>;
   lastLocation: Partial<Record<DockPanelId, DockNodeId>>;
 }
@@ -1806,7 +1806,7 @@ export function persistDockLayouts(
     return;
   }
   try {
-    const payload: PersistedDockLayouts = { version: 1, layouts, lastLocation };
+    const payload: PersistedDockLayouts = { version: 2, layouts, lastLocation };
     localStorage.setItem(DOCK_LAYOUT_STORAGE_PREFIX + path, JSON.stringify(payload));
   } catch {
     // Storage may be unavailable (private mode); the layout is then session-only.
@@ -1823,7 +1823,7 @@ function loadDockLayouts(path: string | undefined): PersistedDockLayouts | null 
       return null;
     }
     const parsed = JSON.parse(raw) as PersistedDockLayouts;
-    if (parsed?.version !== 1 || !parsed.layouts) {
+    if (parsed?.version !== 2 || !parsed.layouts) {
       return null;
     }
     return parsed;

@@ -67,7 +67,7 @@ export interface DockBranch {
 export type DockNode = DockLeaf | DockBranch;
 
 export interface DockLayout {
-  version: 1;
+  version: 2;
   rootId: DockNodeId;
   nodes: Record<DockNodeId, DockNode>;
 }
@@ -249,7 +249,7 @@ function freshNodeId(layout: DockLayout, kind: "leaf" | "branch"): DockNodeId {
 }
 
 function withNodes(layout: DockLayout, nodes: Record<DockNodeId, DockNode>): DockLayout {
-  return { version: 1, rootId: layout.rootId, nodes };
+  return { version: 2, rootId: layout.rootId, nodes };
 }
 
 function setNode(layout: DockLayout, node: DockNode): DockLayout {
@@ -393,7 +393,7 @@ export function splitLeaf(
     delete sizes[targetId];
     next = setNode(next, { ...parent, children, sizes });
   } else {
-    next = { version: 1, rootId: newBranchId, nodes: next.nodes };
+    next = { version: 2, rootId: newBranchId, nodes: next.nodes };
   }
   return next;
 }
@@ -556,7 +556,7 @@ function normalizeOnce(layout: DockLayout): { layout: DockLayout; changed: boole
   if (!changed) {
     return { layout, changed: false };
   }
-  return { layout: pruneUnreachable({ version: 1, rootId, nodes }), changed: true };
+  return { layout: pruneUnreachable({ version: 2, rootId, nodes }), changed: true };
 }
 
 /// Delete empty (non-locked, non-persistent) leaves, collapse single-child branches, and
@@ -577,7 +577,7 @@ export function normalize(layout: DockLayout): DockLayout {
 /// and normalizes. Returns null when the tree is irreparably broken (caller falls back to
 /// the kind's default factory).
 export function validate(layout: DockLayout, knownIds: ReadonlySet<string>): DockLayout | null {
-  if (layout.version !== 1 || typeof layout.rootId !== "string" || !layout.nodes[layout.rootId]) {
+  if (layout.version !== 2 || typeof layout.rootId !== "string" || !layout.nodes[layout.rootId]) {
     return null;
   }
   const nodes: Record<DockNodeId, DockNode> = {};
@@ -682,12 +682,12 @@ function firstNonLockedLeaf(layout: DockLayout): DockNodeId | null {
 
 /// The full Scene tree: a horizontal root [left sidebar | center column | right dock] over
 /// the center's vertical [viewport | assets | bottom dock]. The viewport leaf is `locked`
-/// (live subsurface); the three well-known docks (leftBottom trio, right, bottom) are
+/// (live subsurface); the three well-known docks (left bottom, right, bottom) are
 /// `persistent` so they never vanish from the model — an empty non-locked leaf is simply not
 /// rendered (DockRoot skips it), so the region collapses while its drop target still exists.
 export function defaultSceneLayout(): DockLayout {
   return {
-    version: 1,
+    version: 2,
     rootId: "branch:scene-root",
     nodes: {
       "branch:scene-root": {
@@ -720,7 +720,7 @@ export function defaultSceneLayout(): DockLayout {
       "leaf:leftBottom": {
         type: "leaf",
         id: "leaf:leftBottom",
-        tabs: ["inspector", "environment", "render", "postProcess"],
+        tabs: ["inspector"],
         activeTab: "inspector",
         persistent: true,
       },
@@ -748,8 +748,8 @@ export function defaultSceneLayout(): DockLayout {
       "leaf:right": {
         type: "leaf",
         id: "leaf:right",
-        tabs: [],
-        activeTab: null,
+        tabs: ["environment", "render", "postProcess"],
+        activeTab: "environment",
         persistent: true,
       },
     },
@@ -764,7 +764,7 @@ export function defaultSceneLayout(): DockLayout {
 /// capability-gated via `openPanel`/`normalize`, never a second render branch.
 export function defaultAssetEditorLayout(): DockLayout {
   return {
-    version: 1,
+    version: 2,
     rootId: "branch:ae-root",
     nodes: {
       "branch:ae-root": {
@@ -856,9 +856,9 @@ export function defaultDockLayouts(): Record<DockSpaceKind, DockLayout> {
 /// The `openPanel` fallback leaf per panel — where a panel opens when it has no last-location.
 export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   inspector: "leaf:leftBottom",
-  environment: "leaf:leftBottom",
-  render: "leaf:leftBottom",
-  postProcess: "leaf:leftBottom",
+  environment: "leaf:right",
+  render: "leaf:right",
+  postProcess: "leaf:right",
   stats: "leaf:right",
   profiler: "leaf:right",
   physics: "leaf:right",
