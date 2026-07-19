@@ -3,7 +3,8 @@
 // entity. Asserts a validation-clean log.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { Engine } from "./harness.ts";
+import { join } from "node:path";
+import { Engine, REPO } from "./harness.ts";
 import type { AssetList } from "@saffron/protocol";
 
 let engine: Engine;
@@ -25,8 +26,7 @@ afterAll(async () => {
 });
 
 test("asset-usages reports the placed entity for a mesh asset", async () => {
-  // The cube preset imports a model and instantiates it, so an entity holds a MeshComponent.
-  await engine.call("add-entity", { args: ["cube"] });
+  await engine.importEntity(join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb"));
   const assets = await engine.call<AssetList>("list-assets");
   const mesh = assets.assets.find((a) => a.type === "mesh");
   expect(mesh).toBeDefined();
