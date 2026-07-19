@@ -6,11 +6,12 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
+import { bootEngine, Cleaner, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
 let meshSub = "";
-// Entities each test creates; torn down in afterEach so absolute body counts stay per-test.
-let created: string[] = [];
+const caseCleaner = new Cleaner();
+const suiteCleaner = new Cleaner();
 
 const FIXTURE = join(REPO, "tests", "e2e", "fixtures", "two-materials.gltf");
 
@@ -42,8 +43,7 @@ const FLOOR_TOP = 0.1;
 
 async function spawn(name: string): Promise<string> {
   const id = (await engine.call<{ id: string }>("create-entity", { name })).id;
-  created.push(id);
-  return id;
+  return trackEntity(caseCleaner, engine, id);
 }
 async function setCollider(entity: string, field: string, value: unknown): Promise<void> {
   await engine.call("set-component-field", { entity, component: "Collider", field, value });
@@ -57,7 +57,7 @@ async function makeFloor(): Promise<string> {
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
+  engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   const model = await engine.call<{ id: string }>("import-model", { path: FIXTURE });
   await engine.settle();
   const info = await engine.call<ModelInfo>("model-info", { asset: model.id });
@@ -65,19 +65,21 @@ beforeAll(async () => {
 });
 afterEach(async () => {
   await engine.call("stop").catch(() => {}); // back to Edit (idempotent)
-  for (const id of created) {
-    await engine.call("destroy-entity", { entity: id }).catch(() => {});
-  }
-  created = [];
+  await caseCleaner.cleanup();
 });
 afterAll(async () => {
-  await engine?.shutdown();
+  await suiteCleaner.cleanup();
 });
 
 test("auto-fit sizes the shape the collider holds (box -> sphere -> capsule)", async () => {
   const e = await spawn("Fitted");
   await engine.call("add-component", { entity: e, component: "Mesh" });
-  await engine.call("set-component-field", { entity: e, component: "Mesh", field: "mesh", value: meshSub });
+  await engine.call("set-component-field", {
+    entity: e,
+    component: "Mesh",
+    field: "mesh",
+    value: meshSub,
+  });
   await engine.call("add-component", { entity: e, component: "Collider" }); // auto-fits a box
 
   const box = await engine.call<FitResult>("fit-collider", { entity: e });
