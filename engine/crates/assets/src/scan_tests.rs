@@ -456,9 +456,9 @@ use saffron_rendering::{
 };
 
 struct GpuFixture {
-    device: Device,
-    descriptors: Descriptors,
     uploader: Uploader,
+    descriptors: Descriptors,
+    device: Device,
 }
 
 fn gpu_or_skip() -> Option<GpuFixture> {
@@ -474,9 +474,9 @@ fn gpu_or_skip() -> Option<GpuFixture> {
     let queue = GpuQueue::new(device.graphics_queue);
     let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
     Some(GpuFixture {
-        device,
-        descriptors,
         uploader,
+        descriptors,
+        device,
     })
 }
 
