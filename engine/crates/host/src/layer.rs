@@ -21,7 +21,7 @@ use saffron_animation::{AnimMode, AnimationRuntime};
 use saffron_app::{App, Layer};
 use saffron_assets::{
     AssetServer, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind, RenderSceneOptions,
-    RendererScene, RendererUploader, render_scene, write_thumbnail_cache,
+    RendererScene, RendererUploader, advance_time_of_day, render_scene, write_thumbnail_cache,
 };
 use saffron_control::{ControlContext, PreviewSubject, build_preview_scene_for_thumbnail};
 use saffron_runtime::RuntimeSession;
@@ -377,6 +377,8 @@ impl HostLayer {
         // Smoothed edits (`set-transform smooth:1`) converge here too.
         self.editor.step_edit_smoothing(dt.seconds);
 
+        advance_time_of_day(self.editor.active_scene(), dt.seconds);
+
         ParentWatch::Alive
     }
 
@@ -389,6 +391,10 @@ impl HostLayer {
         // Physics + scripts advance every frame while Playing (Paused / Edit do not).
         if self.editor.play_state == PlayState::Playing {
             reasons.push("play");
+        }
+        let time_of_day = &self.editor.active_scene().environment.time_of_day;
+        if time_of_day.enabled && time_of_day.day_length_seconds > 0.0 {
+            reasons.push("time-of-day");
         }
         // Smoothed edits (`set-transform smooth:1`) converge over frames.
         if !self.editor.transform_smoothing.is_empty() {
@@ -910,10 +916,11 @@ impl Layer for HostLayer {
 
 /// Renders a throwaway preview `scene` through the main forward+ graph on the offscreen
 /// [`saffron_rendering::ViewId::Thumbnail`] view and returns the encoded PNG — the one render
-/// primitive both the async Assets-tile queue and the sync `preview-render` seam drive. Converges a
-/// few frames so TAA / SSAO / GI settle to match the interactive previewer's look, then reads the
-/// offscreen back. Restores the prior active view *without* resetting its temporal state, so a
-/// `Scene → Thumbnail → Scene` excursion never wipes the live viewport's accumulated history.
+/// primitive both the async Assets-tile queue and the sync `preview-render` seam drive. Converges
+/// temporal effects and waits for the preview environment's asynchronous IBL refresh and derived
+/// lighting capture before readback. Restores the prior active view *without* resetting its temporal
+/// state, so a `Scene → Thumbnail → Scene` excursion never wipes the live viewport's accumulated
+/// history.
 pub(crate) fn render_preview_scene_to_png(
     renderer: &mut Renderer,
     uploader: &Uploader,
@@ -923,26 +930,40 @@ pub(crate) fn render_preview_scene_to_png(
     camera: &CameraView,
     size: u32,
 ) -> saffron_rendering::Result<saffron_rendering::ThumbnailPng> {
-    /// Frames rendered before read-back so temporal effects converge to the previewer's look.
-    const CONVERGE_FRAMES: u32 = 8;
+    /// Minimum frames rendered before readback so temporal effects converge to the previewer's look.
+    const MIN_CONVERGE_FRAMES: u32 = 8;
+    /// Safety bound for a failed asynchronous environment refresh.
+    const MAX_CONVERGE_FRAMES: u32 = 256;
 
     let prev_view = renderer.active_view_id();
     renderer.set_active_view(saffron_rendering::ViewId::Thumbnail);
-    renderer.set_viewport_desired_size(saffron_rendering::ViewId::Thumbnail, size, size)?;
-    let options = RenderSceneOptions {
-        show_editor_camera_models: false,
-        show_grid: false,
-    };
-    for _ in 0..CONVERGE_FRAMES {
-        {
-            let mut driver = RendererScene::new(renderer, uploader, skinning);
-            render_scene(&mut driver, scene, assets, camera, options);
+    let result = (|| {
+        renderer.set_viewport_desired_size(saffron_rendering::ViewId::Thumbnail, size, size)?;
+        let options = RenderSceneOptions {
+            show_editor_camera_models: false,
+            show_grid: false,
+        };
+        let mut converged = false;
+        for frame in 0..MAX_CONVERGE_FRAMES {
+            {
+                let mut driver = RendererScene::new(renderer, uploader, skinning);
+                render_scene(&mut driver, scene, assets, camera, options);
+            }
+            renderer.render_scene_offscreen()?;
+            if frame + 1 >= MIN_CONVERGE_FRAMES && renderer.active_environment_converged() {
+                converged = true;
+                break;
+            }
         }
-        renderer.render_scene_offscreen()?;
-    }
-    let png = renderer.encode_active_offscreen_png()?;
+        if !converged {
+            return Err(saffron_rendering::Error::ShaderLoad(
+                "thumbnail environment did not converge".to_owned(),
+            ));
+        }
+        renderer.encode_active_offscreen_png()
+    })();
     renderer.restore_active_view_no_reset(prev_view);
-    Ok(png)
+    result
 }
 
 #[cfg(test)]
