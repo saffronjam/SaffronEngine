@@ -33,6 +33,16 @@ cleanup() {
     reap_engine
   fi
   rm -rf "$APPDATA" "$PNG" "$SOCK"
+  rm -f \
+    /tmp/saffron-projects-engine-$$.log \
+    /tmp/saffron-projects-status-$$.json \
+    /tmp/saffron-projects-invalid-$$.json \
+    /tmp/saffron-projects-model-$$.json \
+    /tmp/saffron-projects-texture-$$.json \
+    /tmp/saffron-projects-save-$$.json \
+    /tmp/saffron-projects-get-$$.json \
+    /tmp/saffron-projects-list-$$.json \
+    /tmp/saffron-projects-thumb-$$.json
 }
 trap cleanup EXIT
 
@@ -49,7 +59,17 @@ start_engine() {
   ENGINE_PID=$!
   for _ in $(seq 1 80); do
     if [ -S "$SOCK" ]; then
-      return 0
+      if SAFFRON_CONTROL_SOCK="$SOCK" "$SA" --output=json project-status \
+        >/tmp/saffron-projects-status-$$.json 2>/dev/null; then
+        if grep -q '"phase": "ready"' /tmp/saffron-projects-status-$$.json; then
+          return 0
+        fi
+        if grep -q '"phase": "failed"' /tmp/saffron-projects-status-$$.json; then
+          cat /tmp/saffron-projects-status-$$.json >&2
+          cat /tmp/saffron-projects-engine-$$.log >&2
+          return 1
+        fi
+      fi
     fi
     if ! kill -0 "$ENGINE_PID" 2>/dev/null; then
       cat /tmp/saffron-projects-engine-$$.log >&2
