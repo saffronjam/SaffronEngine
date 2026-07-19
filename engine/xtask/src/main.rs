@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 
 mod protocol;
 mod shaders;
+mod stars;
 
 fn main() -> ExitCode {
     match run() {
@@ -26,9 +27,26 @@ fn run() -> Result<()> {
     match task.as_deref() {
         Some("shaders") => run_shaders(args.collect()),
         Some("gen-protocol") => run_gen_protocol(),
-        Some(other) => bail!("unknown task '{other}' (known: shaders, gen-protocol)"),
-        None => bail!("usage: cargo run -p xtask <task>  (known: shaders, gen-protocol)"),
+        Some("bake-stars") => run_bake_stars(args.collect()),
+        Some(other) => bail!("unknown task '{other}' (known: shaders, gen-protocol, bake-stars)"),
+        None => {
+            bail!("usage: cargo run -p xtask <task>  (known: shaders, gen-protocol, bake-stars)")
+        }
     }
+}
+
+/// `xtask bake-stars <ybsc5>` — bake the fixed-width Yale BSC5 catalog into the runtime table.
+fn run_bake_stars(args: Vec<String>) -> Result<()> {
+    let [source] = args.as_slice() else {
+        bail!("usage: cargo run -p xtask -- bake-stars <decompressed-ybsc5>");
+    };
+    let output = workspace_root().join("assets/night/bsc5.bin");
+    let count = stars::bake(Path::new(source), &output)?;
+    println!(
+        "xtask bake-stars: wrote {count} stars to {}",
+        output.display()
+    );
+    Ok(())
 }
 
 /// `xtask gen-protocol` — emit the editor-facing protocol artifacts (`sa-types.ts`, the OpenRPC
