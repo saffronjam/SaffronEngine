@@ -5,22 +5,28 @@
 // scene save/load. Parenting is written through the generic set-component path (the raw
 // Relationship write relinks server-side).
 //
-// The two `set-parent` / `set-transform` reparent-math cases below are pure transform-compose
-// checks (keepWorld / preserve-children rebasing) that could move to a saffron-scene unit test;
-// they are kept here as e2e for now so no coverage is dropped.
-
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { Engine } from "./harness.ts";
+import { bootEngine, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
+const caseCleaner = new Cleaner();
+const suiteCleaner = new Cleaner();
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
+  engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
   // yaw 0 / pitch 0 looks down -Z, so after a focus the world X axis projects screen-right
   // and world Y screen-up — deterministic gizmo probing.
-  await engine.call("set-camera", { yaw: 0, pitch: 0 });
+  await prepareScene(engine, { camera: { yaw: 0, pitch: 0 } });
 });
 afterAll(async () => {
-  await engine?.shutdown();
+  await suiteCleaner.cleanup();
+});
+afterEach(async () => {
+  caseCleaner.defer(async () => {
+    await engine.call("set-gizmo", { preserveChildren: false });
+    await engine.settle(100);
+  });
+  await caseCleaner.cleanup();
 });
 
 interface Ref {
@@ -40,20 +46,49 @@ interface Vec3 {
 }
 
 async function makeCube(name: string, translation: Vec3): Promise<Ref> {
-  const ref = await engine.call<Ref>("add-entity", { args: ["cube"] });
+  const ref = trackEntity(
+    caseCleaner,
+    engine,
+    await engine.call<Ref>("add-entity", { args: ["cube"] }),
+  );
   await engine.call("rename-entity", { entity: ref.id, name });
   await engine.call("set-transform", { entity: ref.id, translation });
   return ref;
 }
 
 async function parentTo(child: string, parent: string): Promise<void> {
-  await engine.call("set-component", { entity: child, component: "Relationship", json: { parent } });
+  await engine.call("set-component", {
+    entity: child,
+    component: "Relationship",
+    json: { parent },
+  });
 }
 
 async function focusPick(entity: string): Promise<PickResult> {
   await engine.call("focus", { entity });
   await engine.settle();
   return engine.call<PickResult>("pick", {});
+}
+
+async function findWorldXHandle(): Promise<{ x: number; y: number }> {
+  // Focusing a parent frames its whole child forest, so the parent's own pivot need not land at
+  // screen center. Probe several points along the projected +X handle while sweeping vertically.
+  for (let offset = 0; offset <= 0.5; offset += 0.02) {
+    const rows = offset === 0 ? [0] : [offset, -offset];
+    for (const y of rows) {
+      for (const x of [0.06, 0.1, 0.14, 0.18, 0.22]) {
+        const result = await engine.call<{ hovered: string }>("gizmo-pointer", {
+          phase: "hover",
+          x,
+          y,
+        });
+        if (result.hovered === "x") {
+          return { x, y };
+        }
+      }
+    }
+  }
+  throw new Error("world X gizmo handle was not hittable");
 }
 
 test("a parented child picks at its world position, not its local origin", async () => {
@@ -75,7 +110,11 @@ test("a parented child picks at its world position, not its local origin", async
   expect(atWorld.id).toBe(child.id);
 
   // The child's local origin no longer holds it once parented.
-  const probe = await engine.call<Ref>("create-entity", { args: ["h-probe"] });
+  const probe = trackEntity(
+    caseCleaner,
+    engine,
+    await engine.call<Ref>("create-entity", { args: ["h-probe"] }),
+  );
   await engine.call("set-transform", { entity: probe.id, translation: { x: 0, y: 2, z: 0 } });
   const atLocal = await focusPick(probe.id);
   expect(atLocal.hit === false || atLocal.id !== child.id).toBe(true);
@@ -83,7 +122,11 @@ test("a parented child picks at its world position, not its local origin", async
 
 test("a parented light's billboard picks and focuses at its world position", async () => {
   const anchor = await makeCube("h-anchor", { x: -6, y: 1, z: 2 });
-  const light = await engine.call<Ref>("add-entity", { args: ["point-light"] });
+  const light = trackEntity(
+    caseCleaner,
+    engine,
+    await engine.call<Ref>("add-entity", { args: ["point-light"] }),
+  );
   await engine.call("set-transform", { entity: light.id, translation: { x: 0, y: 3, z: 0 } });
   await parentTo(light.id, anchor.id);
   await engine.settle();
@@ -103,24 +146,15 @@ test("gizmo drag on a parented child moves it in world space and rebases the loc
   await engine.call("focus", { entity: child.id });
   await engine.settle();
 
-  // Probe outward from the center until the X handle answers, then drag it right.
-  let beginX = 0;
-  for (let x = 0.02; x <= 0.5; x += 0.02) {
-    const r = await engine.call<{ hovered: string }>("gizmo-pointer", { phase: "hover", x, y: 0 });
-    if (r.hovered === "x") {
-      beginX = x;
-      break;
-    }
-  }
-  expect(beginX).toBeGreaterThan(0);
+  const handle = await findWorldXHandle();
   const begin = await engine.call<{ dragging: boolean }>("gizmo-pointer", {
     phase: "begin",
-    x: beginX,
-    y: 0,
+    x: handle.x,
+    y: handle.y,
   });
   expect(begin.dragging).toBe(true);
-  await engine.call("gizmo-pointer", { phase: "drag", x: beginX + 0.2, y: 0 });
-  await engine.call("gizmo-pointer", { phase: "end", x: beginX + 0.2, y: 0 });
+  await engine.call("gizmo-pointer", { phase: "drag", x: handle.x + 0.2, y: handle.y });
+  await engine.call("gizmo-pointer", { phase: "end", x: handle.x + 0.2, y: handle.y });
 
   // A world +X drag rebased into the parent frame: local x moved, y/z untouched.
   const info = await engine.call<{ components: { Transform: { translation: Vec3 } } }>("inspect", {
@@ -136,9 +170,12 @@ test("gizmo drag on a parented child moves it in world space and rebases the loc
   await engine.call("save-scene", { path });
   await engine.call("load-scene", { path });
   await engine.settle();
-  const reloaded = await engine.call<{ components: { Transform: { translation: Vec3 } } }>("inspect", {
-    entity: "g-child",
-  });
+  const reloaded = await engine.call<{ components: { Transform: { translation: Vec3 } } }>(
+    "inspect",
+    {
+      entity: "g-child",
+    },
+  );
   const rt = reloaded.components.Transform.translation;
   expect(rt.x).toBeCloseTo(t.x, 4);
   expect(rt.y).toBeCloseTo(t.y, 4);
@@ -167,22 +204,31 @@ test("set-parent preserves world position, keeps the selection, and detaches cle
   expect(info.components.Transform.translation.z).toBeCloseTo(5, 4);
 
   // The reparent bumped sceneVersion and left the selection intact.
-  const after = await engine.call<{ sceneVersion: number; entity?: { id: string } }>("get-selection");
+  const after = await engine.call<{ sceneVersion: number; entity?: { id: string } }>(
+    "get-selection",
+  );
   expect(after.sceneVersion).toBeGreaterThan(before.sceneVersion);
   expect(after.entity?.id).toBe(child.id);
 
-  const list = await engine.call<{ entities: { id: string; parentId?: string }[] }>("list-entities");
+  const list = await engine.call<{ entities: { id: string; parentId?: string }[] }>(
+    "list-entities",
+  );
   expect(list.entities.find((e) => e.id === child.id)?.parentId).toBe(parent.id);
 
   // Detach restores the original local translation (world preserved both ways).
   await engine.call("set-parent", { entity: child.id, parent: "0" });
-  const detached = await engine.call<{ components: { Transform: { translation: Vec3 } } }>("inspect", {
-    entity: child.id,
-  });
+  const detached = await engine.call<{ components: { Transform: { translation: Vec3 } } }>(
+    "inspect",
+    {
+      entity: child.id,
+    },
+  );
   expect(detached.components.Transform.translation.x).toBeCloseTo(-1, 4);
   expect(detached.components.Transform.translation.y).toBeCloseTo(0.5, 4);
   expect(detached.components.Transform.translation.z).toBeCloseTo(3, 4);
-  const relisted = await engine.call<{ entities: { id: string; parentId?: string }[] }>("list-entities");
+  const relisted = await engine.call<{ entities: { id: string; parentId?: string }[] }>(
+    "list-entities",
+  );
   expect(relisted.entities.find((e) => e.id === child.id)?.parentId).toBeUndefined();
 });
 
@@ -226,18 +272,10 @@ test("preserve-children: a gizmo drag on the parent leaves the child's world pos
   await engine.call("focus", { entity: parent.id });
   await engine.settle();
 
-  let beginX = 0;
-  for (let x = 0.02; x <= 0.5; x += 0.02) {
-    const r = await engine.call<{ hovered: string }>("gizmo-pointer", { phase: "hover", x, y: 0 });
-    if (r.hovered === "x") {
-      beginX = x;
-      break;
-    }
-  }
-  expect(beginX).toBeGreaterThan(0);
-  await engine.call("gizmo-pointer", { phase: "begin", x: beginX, y: 0 });
-  await engine.call("gizmo-pointer", { phase: "drag", x: beginX + 0.2, y: 0 });
-  await engine.call("gizmo-pointer", { phase: "end", x: beginX + 0.2, y: 0 });
+  const handle = await findWorldXHandle();
+  await engine.call("gizmo-pointer", { phase: "begin", x: handle.x, y: handle.y });
+  await engine.call("gizmo-pointer", { phase: "drag", x: handle.x + 0.2, y: handle.y });
+  await engine.call("gizmo-pointer", { phase: "end", x: handle.x + 0.2, y: handle.y });
 
   // The parent moved along world +X; the child's local compensated so its drag-begin
   // world position (parent 10 + local 0, y 2) is unchanged: parent.x + child.x == 10.
