@@ -102,7 +102,11 @@ Moving the Sun-role light by more than 0.25° queues a dynamic sky refresh. Dire
 
 ## Activation and consumers
 
-`drive_env_bake` gives a loaded texture panorama first priority. If no panorama is selected and `AtmosphereSettings::enabled` is true, it requests `EnvSource::Atmosphere`; otherwise it requests the procedural sky. The atmosphere chain runs only when both the source and the enabled field select it.
+`drive_env_bake` gives a loaded texture panorama first priority. If no panorama is selected and
+`AtmosphereSettings::enabled` is true, it requests `EnvSource::Atmosphere`; otherwise it requests
+the procedural sky. The startup bake evaluates the LUT chain once for every source so all persistent
+consumers begin with defined physical data. Later LUT refreshes run when the atmosphere source is
+active and its physical or celestial inputs change.
 
 `Ibl::atmosphere_live` reports whether the committed source is the atmosphere. The visible-sky pass and IBL sample the front environment cube. Fog can use the sky-view LUT for in-scatter tint, while aerial perspective samples the frozen transmittance and multiple-scattering LUTs.
 

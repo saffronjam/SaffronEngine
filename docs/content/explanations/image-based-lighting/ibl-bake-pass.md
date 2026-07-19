@@ -21,20 +21,29 @@ The IBL startup bake makes every environment-lighting binding valid before frame
 | Multiple-scattering LUT | 32² | 1 | repeated-scattering energy |
 | Sky-view LUT | 192 × 108 | 1 | atmosphere radiance by view direction |
 
-Mesh descriptor set 3 binds the SH buffer, prefiltered cube, and BRDF LUT at bindings 0 through 2. Their handles do not change during refreshes.
+Each frame slot owns a mesh descriptor set 3. Bindings 0 through 2 point at the shared SH buffer,
+prefiltered cube, and BRDF LUT, while bindings 3 through 5 point at frame-safe reflection-probe
+state. The persistent image and buffer handles do not change during refreshes.
 
 ## Startup sequence
 
-The selected `EnvSource` fills environment mip zero:
+The startup submission first evaluates transmittance, multiple scattering, and sky view from the
+physical atmosphere defaults. Fog, clouds, stars, and aerial perspective can therefore bind valid,
+sampled-layout LUTs even when the selected environment source is procedural or equirectangular.
+
+The selected `EnvSource` then fills environment mip zero:
 
 - `Procedural` dispatches `ibl_skygen.slang`.
 - `Equirect` projects a loaded panorama through `ibl_equirect.slang`.
 - `Atmosphere` evaluates the [Hillaire atmosphere model](https://sebh.github.io/publications/egsr2020.pdf) and feeds `atmos_skygen.slang`.
 
-The startup command then builds the source mip chain, projects SH, fills every prefiltered mip with a blend alpha of one, and integrates the BRDF LUT. Waiting for that submission's fence guarantees valid bindings before rendering begins.
+The command builds the source mip chain, projects SH, fills every prefiltered mip with a blend alpha
+of one, and integrates the BRDF LUT. Waiting for that submission's fence guarantees valid bindings
+before rendering begins.
 
 ```mermaid
 flowchart TD
+    P[Physical atmosphere LUTs] --> G[Fog, clouds, stars, aerial perspective]
     A[Environment source] --> B[Environment cube and mips]
     B --> C[Nine SH coefficients]
     B --> D[Five GGX prefiltered mips]
@@ -53,7 +62,11 @@ The render graph imports the environment, SH buffer, and prefiltered cube. It ru
 
 ## Ownership and synchronization
 
-`BakeScratch` owns the transient command pool, command buffer, fence, descriptor pool, environment pipelines, descriptor sets, and storage views for one environment submission. `LiveCapture` owns the persistent SH and prefilter pipelines, their descriptor layouts, and the prefiltered mip views.
+`BakeScratch` owns the transient command pool, command buffer, fence, descriptor pool, environment
+pipelines, descriptor sets, and storage views for one environment submission. `LiveCapture` owns the
+persistent SH and prefilter pipelines, their descriptor layouts, and the prefiltered mip views.
+`Ibl` owns one set 3 per frame slot. `ReflectionProbes` pairs each set with a metadata buffer and
+writes only the slot whose frame fence has completed.
 
 Environment images transition directly because the fence-owned bake sits outside the render graph. Live SH and prefilter work uses `RgUsage::StorageWriteCompute`, `StorageImageRwCompute`, `StorageReadCompute`, and sampled-read declarations so graph execution derives synchronization and writes the prefiltered cube's exit layout back for the next frame.
 
