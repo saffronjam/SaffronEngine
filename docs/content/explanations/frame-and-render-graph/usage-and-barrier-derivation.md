@@ -75,6 +75,12 @@ and access. `old_layout` is always the current layout, and `new_layout` differs 
 change. A barrier emitted purely to order a hazard therefore has matching layouts, transitions
 nothing, and still installs the execution and memory dependency.
 
+An imported image represents the whole Vulkan image rather than one view subresource. Its barrier
+starts at mip zero and array layer zero, with `VK_REMAINING_MIP_LEVELS` and
+`VK_REMAINING_ARRAY_LAYERS` covering the rest. A cube, mip chain, array, or 3D image therefore
+enters the declared layout as one tracked resource; a pass cannot leave untracked faces or levels
+behind the view it samples.
+
 The buffer path emits a `vk::MemoryBarrier2`, which has no layout fields. The `target.layout !=
 UNDEFINED` guard keeps a buffer, whose usages all carry `UNDEFINED`, from ever entering the
 layout branch.
@@ -131,7 +137,7 @@ as the skin-write, vertex-read, color-write sequence.
 | The hazard + layout decision | `render_graph.rs` | `apply_access`, `DerivedBarriers` |
 | Tracked state | `render_graph.rs` | `RgResourceState` |
 | Per-pass collection + emission | `render_graph.rs` | `RenderGraph::derive_pass_barriers`, `execute_profiled` |
-| Device-free tests | `render_graph.rs` | `usage_info_matches_the_golden_table`, `multi_pass_skin_to_vertex_to_color_sequence` |
+| Device-free tests | `render_graph.rs` | `usage_info_matches_the_golden_table`, `image_barrier_on_layout_change`, `multi_pass_skin_to_vertex_to_color_sequence` |
 
 ## Related
 
