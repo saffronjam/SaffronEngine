@@ -23,6 +23,12 @@ import { NumberDrag } from "../components/NumberDrag";
 import { ColorField } from "../components/ColorField";
 import { VectorEditor } from "../components/VectorEditor";
 import { AssetPicker } from "../components/AssetPicker";
+import {
+  IDENTITY_CURVE,
+  ToneCurve,
+  type CurvePoint,
+  type ToneCurveChannels,
+} from "../components/ToneCurve";
 import type { Environment, Vec3 } from "../protocol";
 import { DEG_TO_RAD, RAD_TO_DEG } from "@/lib/utils";
 import { humanizeFieldName } from "@/lib/humanize";
@@ -41,6 +47,32 @@ import {
 type SkyMode = Environment["skyMode"];
 type Atmosphere = Environment["atmosphere"];
 type Fog = Environment["fog"];
+type Cloud = Environment["cloud"];
+type Wind = Environment["wind"];
+type TimeOfDay = Environment["timeOfDay"];
+
+const emptyScalarChannels = (curve: CurvePoint[]): ToneCurveChannels => ({
+  master: curve,
+  r: [],
+  g: [],
+  b: [],
+});
+
+const tintChannels = (tint: TimeOfDay["tintCurve"]): ToneCurveChannels => ({
+  master: tint.master,
+  r: tint.red,
+  g: tint.green,
+  b: tint.blue,
+});
+
+const timeOfDayTint = (channels: ToneCurveChannels): TimeOfDay["tintCurve"] => ({
+  master: channels.master,
+  red: channels.r,
+  green: channels.g,
+  blue: channels.b,
+});
+
+const identityCurve = (): CurvePoint[] => IDENTITY_CURVE.map((point) => ({ ...point }));
 
 const SKY_MODES: { value: SkyMode; label: string }[] = [
   { value: "color", label: "Color" },
@@ -171,13 +203,76 @@ export function EnvironmentPanel() {
     [],
   );
 
+  const cloudCoalescers = useRef(new Map<keyof Cloud, Coalescer<Partial<Cloud>>>());
+  const cloudCoalescerFor = useMemo(
+    () =>
+      (field: keyof Cloud): Coalescer<Partial<Cloud>> => {
+        let c = cloudCoalescers.current.get(field);
+        if (!c) {
+          c = makeCoalescer<Partial<Cloud>>({
+            send: async (patch) => {
+              const merged = await client.setClouds(patch);
+              if (!useEditorStore.getState().dragActive) {
+                useEditorStore.getState().setEnvironment(merged);
+              }
+            },
+          });
+          cloudCoalescers.current.set(field, c);
+        }
+        return c;
+      },
+    [],
+  );
+
+  const windCoalescers = useRef(new Map<keyof Wind, Coalescer<Partial<Wind>>>());
+  const windCoalescerFor = useMemo(
+    () =>
+      (field: keyof Wind): Coalescer<Partial<Wind>> => {
+        let c = windCoalescers.current.get(field);
+        if (!c) {
+          c = makeCoalescer<Partial<Wind>>({
+            send: async (patch) => {
+              const merged = await client.setWind(patch);
+              if (!useEditorStore.getState().dragActive) {
+                useEditorStore.getState().setEnvironment(merged);
+              }
+            },
+          });
+          windCoalescers.current.set(field, c);
+        }
+        return c;
+      },
+    [],
+  );
+
+  const todCoalescers = useRef(new Map<keyof TimeOfDay, Coalescer<Partial<TimeOfDay>>>());
+  const todCoalescerFor = useMemo(
+    () =>
+      (field: keyof TimeOfDay): Coalescer<Partial<TimeOfDay>> => {
+        let c = todCoalescers.current.get(field);
+        if (!c) {
+          c = makeCoalescer<Partial<TimeOfDay>>({
+            send: async (patch) => {
+              const merged = await client.setTimeOfDay(patch);
+              if (!useEditorStore.getState().dragActive) {
+                useEditorStore.getState().setEnvironment(merged);
+              }
+            },
+          });
+          todCoalescers.current.set(field, c);
+        }
+        return c;
+      },
+    [],
+  );
+
   // Undo capture: a gesture touches exactly one field, captured on its first tick and
   // recorded as one entry at drag end; a discrete edit records inline. The shared drag
-  // bracket needs no per-field binding because `patch`/`patchAtmos`/`patchFog` carry the
+  // bracket needs no per-field binding because each block patch carries the
   // field. Declared before the early return so the hook count never changes between renders.
   const gesturing = useRef(false);
   const envGesture = useRef<{
-    block: "env" | "atmos" | "fog";
+    block: "env" | "atmos" | "fog" | "cloud" | "wind" | "tod";
     field: string;
     prior: unknown;
   } | null>(null);
@@ -235,6 +330,45 @@ export function EnvironmentPanel() {
       "scene",
     );
   };
+  const recordCloudEdit = (field: keyof Cloud, prior: unknown, after: unknown): void => {
+    if (JSON.stringify(prior) === JSON.stringify(after)) {
+      return;
+    }
+    useEditorStore.getState().pushEdit(
+      {
+        label: humanizeFieldName(field),
+        undo: () => client.setClouds({ [field]: prior } as Partial<Cloud>),
+        redo: () => client.setClouds({ [field]: after } as Partial<Cloud>),
+      },
+      "scene",
+    );
+  };
+  const recordWindEdit = (field: keyof Wind, prior: unknown, after: unknown): void => {
+    if (JSON.stringify(prior) === JSON.stringify(after)) {
+      return;
+    }
+    useEditorStore.getState().pushEdit(
+      {
+        label: humanizeFieldName(field),
+        undo: () => client.setWind({ [field]: prior } as Partial<Wind>),
+        redo: () => client.setWind({ [field]: after } as Partial<Wind>),
+      },
+      "scene",
+    );
+  };
+  const recordTodEdit = (field: keyof TimeOfDay, prior: unknown, after: unknown): void => {
+    if (JSON.stringify(prior) === JSON.stringify(after)) {
+      return;
+    }
+    useEditorStore.getState().pushEdit(
+      {
+        label: humanizeFieldName(field),
+        undo: () => client.setTimeOfDay({ [field]: prior } as Partial<TimeOfDay>),
+        redo: () => client.setTimeOfDay({ [field]: after } as Partial<TimeOfDay>),
+      },
+      "scene",
+    );
+  };
 
   // Optimistic local write + coalesced send of the one changed field. A discrete edit
   // records immediately; a gesture captures its field + prior on the first tick.
@@ -272,6 +406,24 @@ export function EnvironmentPanel() {
       );
     } else if (g.block === "fog") {
       recordFogEdit(g.field as keyof Fog, g.prior, structuredClone(live.fog[g.field as keyof Fog]));
+    } else if (g.block === "cloud") {
+      recordCloudEdit(
+        g.field as keyof Cloud,
+        g.prior,
+        structuredClone(live.cloud[g.field as keyof Cloud]),
+      );
+    } else if (g.block === "wind") {
+      recordWindEdit(
+        g.field as keyof Wind,
+        g.prior,
+        structuredClone(live.wind[g.field as keyof Wind]),
+      );
+    } else if (g.block === "tod") {
+      recordTodEdit(
+        g.field as keyof TimeOfDay,
+        g.prior,
+        structuredClone(live.timeOfDay[g.field as keyof TimeOfDay]),
+      );
     } else {
       recordEnvEdit(
         g.field as keyof Environment,
@@ -328,6 +480,48 @@ export function EnvironmentPanel() {
     (channels: Record<string, number>): void => {
       patchFog(field, { ...(fog[field] as Vec3), ...channels } as Fog[typeof field]);
     };
+
+  const cloud = env.cloud;
+  const patchCloud = <K extends keyof Cloud>(field: K, value: Cloud[K]): void => {
+    if (gesturing.current) {
+      if (envGesture.current === null) {
+        envGesture.current = { block: "cloud", field, prior: structuredClone(cloud[field]) };
+      }
+    } else {
+      recordCloudEdit(field, structuredClone(cloud[field]), structuredClone(value));
+    }
+    setEnvironment({ ...env, cloud: { ...cloud, [field]: value } } as Environment);
+    cloudCoalescerFor(field).push({ [field]: value } as Partial<Cloud>);
+  };
+  const onCloudVec = (channels: Record<string, number>): void => {
+    patchCloud("weatherOffset", { ...cloud.weatherOffset, ...channels });
+  };
+
+  const wind = env.wind;
+  const patchWind = <K extends keyof Wind>(field: K, value: Wind[K]): void => {
+    if (gesturing.current) {
+      if (envGesture.current === null) {
+        envGesture.current = { block: "wind", field, prior: structuredClone(wind[field]) };
+      }
+    } else {
+      recordWindEdit(field, structuredClone(wind[field]), structuredClone(value));
+    }
+    setEnvironment({ ...env, wind: { ...wind, [field]: value } } as Environment);
+    windCoalescerFor(field).push({ [field]: value } as Partial<Wind>);
+  };
+
+  const tod = env.timeOfDay;
+  const patchTod = <K extends keyof TimeOfDay>(field: K, value: TimeOfDay[K]): void => {
+    if (gesturing.current) {
+      if (envGesture.current === null) {
+        envGesture.current = { block: "tod", field, prior: structuredClone(tod[field]) };
+      }
+    } else {
+      recordTodEdit(field, structuredClone(tod[field]), structuredClone(value));
+    }
+    setEnvironment({ ...env, timeOfDay: { ...tod, [field]: value } } as Environment);
+    todCoalescerFor(field).push({ [field]: value } as Partial<TimeOfDay>);
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -439,6 +633,209 @@ export function EnvironmentPanel() {
 
           <Separator className="my-1" />
 
+          <Row label="Time of Day">
+            <Switch
+              checked={tod.enabled}
+              onCheckedChange={(checked) => patchTod("enabled", checked)}
+            />
+          </Row>
+
+          {tod.enabled ? (
+            <>
+              <Row label="Manual Sun">
+                <Switch
+                  checked={tod.manualOverride}
+                  onCheckedChange={(checked) => patchTod("manualOverride", checked)}
+                />
+              </Row>
+
+              <Row label="Time (hours)">
+                <NumberDrag
+                  value={tod.timeOfDay * 24}
+                  min={0}
+                  max={24}
+                  step={0.01}
+                  onChange={(value) => patchTod("timeOfDay", value / 24)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Year">
+                <NumberDrag
+                  value={tod.year}
+                  min={-2000}
+                  max={6000}
+                  step={1}
+                  onChange={(value) => patchTod("year", Math.round(value))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Month">
+                <NumberDrag
+                  value={tod.month}
+                  min={1}
+                  max={12}
+                  step={1}
+                  onChange={(value) => patchTod("month", Math.round(value))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Day">
+                <NumberDrag
+                  value={tod.day}
+                  min={1}
+                  max={31}
+                  step={1}
+                  onChange={(value) => patchTod("day", Math.round(value))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Latitude">
+                <NumberDrag
+                  value={tod.latitude}
+                  min={-90}
+                  max={90}
+                  step={0.01}
+                  onChange={(value) => patchTod("latitude", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Longitude">
+                <NumberDrag
+                  value={tod.longitude}
+                  min={-180}
+                  max={180}
+                  step={0.01}
+                  onChange={(value) => patchTod("longitude", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Day Seconds">
+                <NumberDrag
+                  value={tod.dayLengthSeconds}
+                  min={0}
+                  max={86400}
+                  step={1}
+                  onChange={(value) => patchTod("dayLengthSeconds", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Exposure Curve">
+                <Switch
+                  checked={tod.exposureCurve.length > 0}
+                  onCheckedChange={(checked) =>
+                    patchTod("exposureCurve", checked ? identityCurve() : [])
+                  }
+                />
+              </Row>
+              {tod.exposureCurve.length > 0 ? (
+                <Row label="Exposure">
+                  <ToneCurve
+                    channels={emptyScalarChannels(tod.exposureCurve)}
+                    visibleChannels={["master"]}
+                    masterLabel="EV"
+                    onChange={(channels) => patchTod("exposureCurve", channels.master)}
+                    onDragStart={onDragStart}
+                    onDragEnd={onDragEnd}
+                  />
+                </Row>
+              ) : null}
+
+              <Row label="Tint Curve">
+                <Switch
+                  checked={Object.values(tod.tintCurve).some((curve) => curve.length > 0)}
+                  onCheckedChange={(checked) =>
+                    patchTod(
+                      "tintCurve",
+                      checked
+                        ? {
+                            master:
+                              tod.tintCurve.master.length > 0
+                                ? tod.tintCurve.master
+                                : identityCurve(),
+                            red: tod.tintCurve.red.length > 0 ? tod.tintCurve.red : identityCurve(),
+                            green:
+                              tod.tintCurve.green.length > 0
+                                ? tod.tintCurve.green
+                                : identityCurve(),
+                            blue:
+                              tod.tintCurve.blue.length > 0 ? tod.tintCurve.blue : identityCurve(),
+                          }
+                        : { master: [], red: [], green: [], blue: [] },
+                    )
+                  }
+                />
+              </Row>
+              {Object.values(tod.tintCurve).some((curve) => curve.length > 0) ? (
+                <Row label="Sky Tint">
+                  <ToneCurve
+                    channels={tintChannels(tod.tintCurve)}
+                    onChange={(channels) => patchTod("tintCurve", timeOfDayTint(channels))}
+                    onDragStart={onDragStart}
+                    onDragEnd={onDragEnd}
+                  />
+                </Row>
+              ) : null}
+
+              <Row label="Coverage Curve">
+                <Switch
+                  checked={tod.coverageCurve.length > 0}
+                  onCheckedChange={(checked) =>
+                    patchTod("coverageCurve", checked ? identityCurve() : [])
+                  }
+                />
+              </Row>
+              {tod.coverageCurve.length > 0 ? (
+                <Row label="Coverage">
+                  <ToneCurve
+                    channels={emptyScalarChannels(tod.coverageCurve)}
+                    visibleChannels={["master"]}
+                    masterLabel="Cloud"
+                    onChange={(channels) => patchTod("coverageCurve", channels.master)}
+                    onDragStart={onDragStart}
+                    onDragEnd={onDragEnd}
+                  />
+                </Row>
+              ) : null}
+
+              <Row label="Cloud Type Curve">
+                <Switch
+                  checked={tod.cloudTypeCurve.length > 0}
+                  onCheckedChange={(checked) =>
+                    patchTod("cloudTypeCurve", checked ? identityCurve() : [])
+                  }
+                />
+              </Row>
+              {tod.cloudTypeCurve.length > 0 ? (
+                <Row label="Cloud Type">
+                  <ToneCurve
+                    channels={emptyScalarChannels(tod.cloudTypeCurve)}
+                    visibleChannels={["master"]}
+                    masterLabel="Type"
+                    onChange={(channels) => patchTod("cloudTypeCurve", channels.master)}
+                    onDragStart={onDragStart}
+                    onDragEnd={onDragEnd}
+                  />
+                </Row>
+              ) : null}
+            </>
+          ) : null}
+
+          <Separator className="my-1" />
+
           <Row label="Atmosphere">
             <Switch
               checked={atmos.enabled}
@@ -531,8 +928,328 @@ export function EnvironmentPanel() {
                   onDragEnd={onDragEnd}
                 />
               </Row>
+
+              <Row label="Moon Radius">
+                <NumberDrag
+                  value={atmos.moonDiskAngularRadius}
+                  min={0.0001}
+                  max={0.05}
+                  step={0.00001}
+                  onChange={(v) => patchAtmos("moonDiskAngularRadius", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Moon Disk">
+                <NumberDrag
+                  value={atmos.moonDiskIntensity}
+                  min={0}
+                  max={100}
+                  step={0.01}
+                  onChange={(v) => patchAtmos("moonDiskIntensity", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Earthshine">
+                <NumberDrag
+                  value={atmos.moonEarthshine}
+                  min={0}
+                  max={1}
+                  step={0.001}
+                  onChange={(v) => patchAtmos("moonEarthshine", v)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+
+              <Row label="Per-Pixel T">
+                <Switch
+                  checked={atmos.perPixelTransmittance}
+                  onCheckedChange={(checked) => patchAtmos("perPixelTransmittance", checked)}
+                />
+              </Row>
+
+              <Row label="Capture Frames">
+                <NumberDrag
+                  value={atmos.skyCaptureCadence}
+                  min={1}
+                  max={60}
+                  step={1}
+                  onChange={(v) => patchAtmos("skyCaptureCadence", Math.round(v))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
             </>
           ) : null}
+
+          <Separator className="my-1" />
+
+          <Row label="Clouds">
+            <Switch
+              checked={cloud.enabled}
+              onCheckedChange={(checked) => patchCloud("enabled", checked)}
+            />
+          </Row>
+
+          {cloud.enabled ? (
+            <>
+              <Row label="Coverage">
+                <NumberDrag
+                  value={cloud.coverage}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) => patchCloud("coverage", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Cloud Type">
+                <NumberDrag
+                  value={cloud.cloudType}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) => patchCloud("cloudType", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Precipitation">
+                <NumberDrag
+                  value={cloud.precipitation}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) => patchCloud("precipitation", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Anvil Bias">
+                <NumberDrag
+                  value={cloud.anvilBias}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) => patchCloud("anvilBias", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Layer Altitude">
+                <NumberDrag
+                  value={cloud.layerAltitude}
+                  min={-1000}
+                  max={20000}
+                  step={10}
+                  onChange={(value) => patchCloud("layerAltitude", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Layer Height">
+                <NumberDrag
+                  value={cloud.layerHeight}
+                  min={1}
+                  max={20000}
+                  step={10}
+                  onChange={(value) => patchCloud("layerHeight", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Base Scale">
+                <NumberDrag
+                  value={cloud.baseScale}
+                  min={0.000001}
+                  max={0.01}
+                  step={0.000001}
+                  onChange={(value) => patchCloud("baseScale", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Detail Scale">
+                <NumberDrag
+                  value={cloud.detailScale}
+                  min={0.000001}
+                  max={0.1}
+                  step={0.00001}
+                  onChange={(value) => patchCloud("detailScale", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Detail Strength">
+                <NumberDrag
+                  value={cloud.detailStrength}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) => patchCloud("detailStrength", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Curl Strength">
+                <NumberDrag
+                  value={cloud.curlStrength}
+                  min={0}
+                  max={2000}
+                  step={1}
+                  onChange={(value) => patchCloud("curlStrength", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Weather Scale">
+                <NumberDrag
+                  value={cloud.weatherScale}
+                  min={0.000001}
+                  max={0.01}
+                  step={0.000001}
+                  onChange={(value) => patchCloud("weatherScale", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Weather Offset">
+                <VectorEditor
+                  axes={["x", "z"]}
+                  labels={["X", "Z"]}
+                  value={cloud.weatherOffset as unknown as Record<string, number>}
+                  step={10}
+                  onChange={onCloudVec}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Weather Map">
+                <AssetPicker
+                  value={cloud.weatherTexture}
+                  assetType="texture"
+                  onChange={(id) => patchCloud("weatherTexture", id)}
+                />
+              </Row>
+              <Row label="Primary Steps">
+                <NumberDrag
+                  value={cloud.primarySteps}
+                  min={1}
+                  max={256}
+                  step={1}
+                  onChange={(value) => patchCloud("primarySteps", Math.round(value))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Light Steps">
+                <NumberDrag
+                  value={cloud.lightSteps}
+                  min={1}
+                  max={32}
+                  step={1}
+                  onChange={(value) => patchCloud("lightSteps", Math.round(value))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Droplet Diameter">
+                <NumberDrag
+                  value={cloud.dropletDiameter}
+                  min={5}
+                  max={50}
+                  step={0.1}
+                  onChange={(value) => patchCloud("dropletDiameter", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Temporal Factor">
+                <NumberDrag
+                  value={cloud.temporalFactor}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) => patchCloud("temporalFactor", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Cast Shadows">
+                <Switch
+                  checked={cloud.castCloudShadows}
+                  onCheckedChange={(checked) => patchCloud("castCloudShadows", checked)}
+                />
+              </Row>
+              {cloud.castCloudShadows ? (
+                <>
+                  <Row label="Cloud Shadow">
+                    <NumberDrag
+                      value={cloud.cloudShadowStrength}
+                      min={0}
+                      max={1}
+                      step={0.005}
+                      onChange={(value) => patchCloud("cloudShadowStrength", value)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+                  <Row label="Surface Shadow">
+                    <NumberDrag
+                      value={cloud.cloudShadowOnSurfaceStrength}
+                      min={0}
+                      max={1}
+                      step={0.005}
+                      onChange={(value) => patchCloud("cloudShadowOnSurfaceStrength", value)}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                    />
+                  </Row>
+                </>
+              ) : null}
+            </>
+          ) : null}
+
+          <Separator className="my-1" />
+
+          <Row label="Wind Dir.">
+            <NumberDrag
+              value={wind.orientation}
+              min={-360}
+              max={360}
+              step={1}
+              onChange={(value) => patchWind("orientation", value)}
+              onDragStart={onDragStart}
+              onDragEnd={onDragEnd}
+            />
+          </Row>
+          <Row label="Wind Speed">
+            <NumberDrag
+              value={wind.speed}
+              min={0}
+              max={200}
+              step={0.1}
+              onChange={(value) => patchWind("speed", value)}
+              onDragStart={onDragStart}
+              onDragEnd={onDragEnd}
+            />
+          </Row>
+          <Row label="Wind Gust">
+            <NumberDrag
+              value={wind.gust}
+              min={0}
+              max={4}
+              step={0.01}
+              onChange={(value) => patchWind("gust", value)}
+              onDragStart={onDragStart}
+              onDragEnd={onDragEnd}
+            />
+          </Row>
 
           <Separator className="my-1" />
 

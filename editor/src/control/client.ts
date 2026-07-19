@@ -793,6 +793,35 @@ export const client = {
   setFog(fog: Partial<Environment["fog"]>): Promise<Environment> {
     return call("set-fog", fog);
   },
+  /// Merge volumetric-cloud shape, lighting, and reconstruction fields over the current block.
+  setClouds(cloud: Partial<Environment["cloud"]>): Promise<Environment> {
+    return call("set-clouds", cloud);
+  },
+  /// Merge shared global wind fields over the current environment's wind block.
+  setWind(wind: Partial<Environment["wind"]>): Promise<Environment> {
+    return call("set-wind", wind);
+  },
+  /// Merge calendar, ephemeris, playback, and appearance-curve fields over the scene's
+  /// time-of-day block. Environment curves use point objects; the command wire uses tuples.
+  setTimeOfDay(time: Partial<Environment["timeOfDay"]>): Promise<Environment> {
+    const tupleCurve = (curve: { x: number; y: number }[]): [number, number][] =>
+      curve.map(({ x, y }) => [x, y]);
+    const params: CommandParamsMap["set-time-of-day"] = {
+      ...time,
+      exposureCurve: time.exposureCurve ? tupleCurve(time.exposureCurve) : undefined,
+      tintCurve: time.tintCurve
+        ? {
+            master: tupleCurve(time.tintCurve.master),
+            red: tupleCurve(time.tintCurve.red),
+            green: tupleCurve(time.tintCurve.green),
+            blue: tupleCurve(time.tintCurve.blue),
+          }
+        : undefined,
+      coverageCurve: time.coverageCurve ? tupleCurve(time.coverageCurve) : undefined,
+      cloudTypeCurve: time.cloudTypeCurve ? tupleCurve(time.cloudTypeCurve) : undefined,
+    };
+    return call("set-time-of-day", params);
+  },
 
   /// Anti-aliasing mode. Echoes `{ aa }`.
   setAa(mode: RenderStats["aa"]): Promise<{ aa: RenderStats["aa"] }> {
@@ -893,8 +922,8 @@ export const client = {
   setStores(enabled: string[]): Promise<CommandResultMap["set-stores"]> {
     return call("set-stores", { enabled });
   },
-  /// Cook the loaded project into a standalone app folder at `outputDir`, writing `app` as the
-  /// runtime manifest (`app.json`). Returns the staged path + any non-fatal cook warnings.
+  /// Cook the loaded project into a platform-native app at `outputDir`, writing `app` as the runtime
+  /// manifest (`app.json`). Returns the staged path + any non-fatal cook warnings.
   exportApp(outputDir: string, app: AppManifest): Promise<ExportAppResult> {
     return call("export-app", { outputDir, app });
   },

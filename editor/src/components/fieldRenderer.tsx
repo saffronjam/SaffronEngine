@@ -115,6 +115,13 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Material.doubleSided": { kind: "bool" },
 
   "DirectionalLight.direction": { kind: "vec3", step: 0.01 },
+  "DirectionalLight.atmosphereRole": {
+    kind: "enum",
+    options: [
+      { value: "sun", label: "Sun" },
+      { value: "moon", label: "Moon" },
+    ],
+  },
   "DirectionalLight.color": { kind: "color3" },
   "DirectionalLight.intensity": { kind: "number", min: 0, max: 50, step: 0.05 },
   "DirectionalLight.ambient": { kind: "slider", min: 0, max: 1, step: 0.01 },

@@ -25,6 +25,8 @@ export type ToneChannel = keyof ToneCurveChannels;
 export interface ToneCurveProps {
   channels: ToneCurveChannels;
   onChange(channels: ToneCurveChannels): void;
+  visibleChannels?: ToneChannel[];
+  masterLabel?: string;
   onDragStart?(): void;
   onDragEnd?(): void;
 }
@@ -128,7 +130,14 @@ export function evalCurve(points: CurvePoint[], x: number): number {
 
 const VB = 100;
 
-export function ToneCurve({ channels, onChange, onDragStart, onDragEnd }: ToneCurveProps) {
+export function ToneCurve({
+  channels,
+  onChange,
+  visibleChannels,
+  masterLabel,
+  onDragStart,
+  onDragEnd,
+}: ToneCurveProps) {
   const scrub = useScrubValue<ToneCurveChannels>(channels, onChange);
   const [active, setActive] = useState<ToneChannel>("master");
   const svgRef = useRef<SVGSVGElement>(null);
@@ -237,7 +246,9 @@ export function ToneCurve({ channels, onChange, onDragStart, onDragEnd }: ToneCu
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-1">
-        {CHANNELS.map((c) => (
+        {CHANNELS.filter((channel) =>
+          visibleChannels ? visibleChannels.includes(channel.key) : true,
+        ).map((c) => (
           <button
             key={c.key}
             type="button"
@@ -250,7 +261,7 @@ export function ToneCurve({ channels, onChange, onDragStart, onDragEnd }: ToneCu
             )}
             style={active === c.key ? { color: c.color } : undefined}
           >
-            {c.label}
+            {c.key === "master" && masterLabel ? masterLabel : c.label}
           </button>
         ))}
         <button
