@@ -14,14 +14,17 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 
 | File | Role |
 |---|---|
-| `harness.ts` | `Engine.boot()` spawns a headless weston + the engine (`SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`) on a per-run control socket, captures stdout/stderr into `.log`, and exposes `call(cmd, params)` + `validationErrors()`. Always `shutdown()`. |
+| `harness.ts` | `Engine.boot()` starts the engine (`SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`) on a per-run control socket, with headless Weston on Linux and the native offscreen path on macOS. It captures stdout/stderr into `.log` and exposes `call(cmd, params)` + `validationErrors()`. Always `shutdown()`. |
 | `*.test.ts` | The suite, grouped by area: control plane + rendering (`rendering`, `control`, `scene`, `camera`, `picking`, `play`, `perf`, `profiler`, `toggles`, `assets`, `hierarchy`, …), animation (`animation*`, `foot-ik`), skinning (`skinning`, `skinned-*`, `skeleton-overlay`), scripting (`script`), materials (`material*`), and pixel/golden render checks (`*_render`, `material_scene_codegen`). |
 
 ## Conventions
 
-- **No display setup needed.** Each `Engine` starts its own headless weston with a unique
-  socket, so tests are isolated and never open a window. Needs `weston` + the engine binary
-  (build it first: `just engine`).
+- **No display setup needed.** Each `Engine` uses a unique control socket. Linux starts its own
+  headless Weston socket; macOS runs the native offscreen host through MoltenVK. Build the engine
+  first with `just engine`; Linux needs `weston`, and macOS needs Homebrew's
+  `vulkan-validationlayers`. The harness configures its manifest and dynamic-library search path.
+  The `just` recipes cap the suite at four concurrent engine hosts so GPU initialization and socket
+  startup remain deterministic.
 - **Assert on `validationErrors()`.** The engine runs with validation layers on; a test that
   exercises a feature should assert the log stays free of `ERROR  vulkan  [validation]`
   lines — that is what catches GPU-state bugs (e.g. the MSAA sample-count regression) headlessly.

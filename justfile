@@ -14,6 +14,7 @@ docs := repo / "docs"
 toolbox := "saffron-build"
 bun_bin := "/var/home/saffronjam/.bun/bin"
 engine_bin := engine / "target/debug/saffron-host"
+e2e_test_args := "--timeout 30000 --max-concurrency 4"
 
 # Put the toolchain on PATH: on Linux re-exec the recipe inside the toolbox (unless already in it
 # or SAFFRON_NO_TOOLBOX) then add bun; on macOS there is no toolbox, so use the host's rustup
@@ -31,13 +32,24 @@ reenter := '''
 '''
 
 # Point the Vulkan loader at the host GPU driver: on Linux add the host's NVIDIA ICD (Mesa/llvmpipe
-# stays the fallback); on macOS there is no native Vulkan, so name MoltenVK's ICD manifest (the
-# engine locates the loader itself by absolute path — macOS strips DYLD_* across spawns).
+# stays the fallback); on macOS name MoltenVK's ICD plus Homebrew's validation-layer manifest and
+# dynamic-library directory.
 gpu_driver := '''
     if [ "$(uname)" = "Darwin" ]; then
       for icd in /opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json /usr/local/etc/vulkan/icd.d/MoltenVK_icd.json; do
         [ -f "$icd" ] && export VK_ICD_FILENAMES="$icd" && break
       done
+      if [ -z "${VK_LAYER_PATH:-}" ]; then
+        for prefix in /opt/homebrew /usr/local; do
+          layer_manifest="$prefix/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d"
+          layer_library="$prefix/opt/vulkan-validationlayers/lib"
+          if [ -d "$layer_manifest" ] && [ -d "$layer_library" ]; then
+            export VK_LAYER_PATH="$layer_manifest"
+            export DYLD_FALLBACK_LIBRARY_PATH="$layer_library${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+            break
+          fi
+        done
+      fi
     else
       NVIDIA_ICD="$(ls /run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json 2>/dev/null | head -n1 || true)"
       [ -n "$NVIDIA_ICD" ] && export VK_ADD_DRIVER_FILES="$NVIDIA_ICD"
@@ -203,6 +215,7 @@ schema: engine
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=schema; {{reenter}}
+    {{gpu_driver}}
     cd "{{repo}}/tools/check-control-schema" && bun run check.ts
 
 # end-to-end tests driving a headless engine over the control plane (bun test)
@@ -215,7 +228,7 @@ e2e: engine
     # A generous per-test/hook timeout: boots wait for the non-blocking project load to reach
     # `ready`, and on the llvmpipe fallback the first content renders are slow, so the 5s default is
     # too tight for the heavier setup hooks (boot + multiple loads + import).
-    cd "{{repo}}/tests/e2e" && bun test --timeout 30000
+    cd "{{repo}}/tests/e2e" && bun test {{e2e_test_args}}
 
 # run one e2e file by name (`.test.ts` appended if omitted): `just e2e-file rendering`
 e2e-file NAME: engine
@@ -226,7 +239,7 @@ e2e-file NAME: engine
     rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
     name="{{NAME}}"
     case "$name" in *.test.ts) ;; *) name="$name.test.ts";; esac
-    cd "{{repo}}/tests/e2e" && bun test --timeout 30000 "$name"
+    cd "{{repo}}/tests/e2e" && bun test {{e2e_test_args}} "$name"
 
 # run the e2e files matching a filename glob: `just e2e-glob 'material_*'`
 e2e-glob PATTERN: engine
@@ -235,7 +248,7 @@ e2e-glob PATTERN: engine
     RECIPE=e2e-glob; {{reenter}}
     {{gpu_driver}}
     rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
-    cd "{{repo}}/tests/e2e" && bun test --timeout 30000 "{{PATTERN}}"
+    cd "{{repo}}/tests/e2e" && bun test {{e2e_test_args}} "{{PATTERN}}"
 
 # fast representative e2e subset (<1 min): one scene, one play, one physics, one skinned proof
 e2e-smoke: engine
@@ -244,7 +257,7 @@ e2e-smoke: engine
     RECIPE=e2e-smoke; {{reenter}}
     {{gpu_driver}}
     rm -f /tmp/saffron-e2e-*.sock 2>/dev/null || true
-    cd "{{repo}}/tests/e2e" && bun test --timeout 30000 \
+    cd "{{repo}}/tests/e2e" && bun test {{e2e_test_args}} \
       rendering.test.ts play.test.ts physics-falling-box.test.ts skinned-rt.test.ts
 
 # run the Rust workspace unit + integration tests
