@@ -47,8 +47,8 @@ export interface FieldHint {
   min?: number;
   max?: number;
   step?: number;
-  /// Degree semantics: `convertRadians` true converts UI<->wire (Transform.rotation
-  /// only). `unit:"deg"` is a display label/clamp with NO conversion (spot angles).
+  /// Degree semantics: `convertRadians` true converts UI<->wire for radians-backed fields.
+  /// `unit:"deg"` without it is a display label/clamp only.
   unit?: "deg";
   convertRadians?: boolean;
   /// For `uuid` fields: which asset catalog the picker filters to.

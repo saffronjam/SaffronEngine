@@ -145,14 +145,17 @@ describe("the 57x radians-bug guard", () => {
     expect(outer.convertRadians).toBeUndefined();
   });
 
-  test("convertRadians is set on exactly one hint in the whole parity table (Transform.rotation)", () => {
+  test("convertRadians is set on every radians-backed degree field", () => {
     const converting = Object.entries(FIELD_HINTS).filter(([, h]) => h.convertRadians === true);
-    expect(converting.map(([k]) => k)).toEqual(["Transform.rotation"]);
+    expect(converting.map(([k]) => k).sort()).toEqual([
+      "CharacterController.maxSlopeAngle",
+      "Transform.rotation",
+    ]);
   });
 
-  test("every unit:deg hint that is NOT Transform.rotation must omit convertRadians", () => {
+  test("degree-native fields use the label without radians conversion", () => {
     const degLabelOnly = Object.entries(FIELD_HINTS).filter(
-      ([key, h]) => h.unit === "deg" && key !== "Transform.rotation",
+      ([, h]) => h.unit === "deg" && h.convertRadians !== true,
     );
     // SpotLight inner/outer angle are the deg-label-only fields.
     expect(degLabelOnly.map(([k]) => k).sort()).toEqual([
@@ -176,7 +179,9 @@ describe("FIELD_HINTS parity table sanity", () => {
     const uuids = Object.entries(FIELD_HINTS).filter(([, h]) => h.kind === "uuid");
     expect(uuids.length).toBeGreaterThan(0);
     for (const [key, hint] of uuids) {
-      expect(["mesh", "texture", "material"], `${key} asset`).toContain(hint.asset as string);
+      expect(["mesh", "texture", "material", "model", "animation"], `${key} asset`).toContain(
+        hint.asset as string,
+      );
     }
   });
 
