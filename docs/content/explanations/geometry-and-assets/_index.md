@@ -29,3 +29,5 @@ crate owns the CPU types and byte codecs; `saffron-assets` owns the catalog, imp
 | `draw-list` | `render_scene` → flat `DrawItem` list, `(pipeline, mesh)` buckets, per-submesh materials | `assets/src/render_scene.rs`; `rendering/src/instancing.rs` · `submit_draw_list` |
 | `project-serialization` | project folders, `project.json`, app-data startup, local assets | `assets/src/project.rs`; `control/src/commands_asset.rs` |
 | `smodel-container` | one self-contained model container; header/TOC/metadata, scan, extract, reimport | `geometry/src/smodel.rs`; `assets/src/import.rs` · `write_container`, `bake_model`, `scan_assets` |
+| `vegetation-assets` | Plant families, biome graphs, and sparse vegetation maps | `vegetation/src/asset.rs` · `PlantFamilyAsset`, `BiomeAsset`, `VegetationMapAsset` |
+| `biome-graph-evaluation` | Typed biome compilation, deterministic cells, executors, and provenance | `vegetation/src/graph.rs` · `BiomeGraphEvaluator` |
