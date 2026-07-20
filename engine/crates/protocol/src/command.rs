@@ -3,7 +3,7 @@
 //! `register_*_commands` joins this table to handler fns by name to dispatch, and the
 //! OpenRPC/manifest emitters read the same slice to emit `methods`.
 //!
-//! [`COMMANDS`] holds exactly the **186 typed commands** in the frozen wire order (the committed
+//! [`COMMANDS`] holds exactly the **192 typed commands** in the frozen wire order (the committed
 //! `schemas/control/command-manifest.generated.json` order, `ping` first, `quit` last) — the order
 //! is load-bearing: it is the manifest's `commands` order and the OpenRPC `methods` order, so the
 //! emitters reproduce the committed artifacts byte-for-byte. The lone untyped reflective builtin
@@ -32,7 +32,7 @@ pub struct CommandSpec {
     pub result: &'static str,
 }
 
-/// The 186 typed commands in frozen wire order (`help` excluded — see module docs).
+/// The 192 typed commands in frozen wire order (`help` excluded — see module docs).
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ping",
@@ -333,6 +333,30 @@ pub static COMMANDS: &[CommandSpec] = &[
         summary: "pick {u=0.5, v=0.5}",
         params: "PickParams",
         result: "PickResult",
+    },
+    CommandSpec {
+        name: "spatial-cell",
+        summary: "spatial-cell {world? | ticks?, level?} — canonical position and owner cell",
+        params: "SpatialCellParams",
+        result: "SpatialCellResult",
+    },
+    CommandSpec {
+        name: "spatial-providers",
+        summary: "spatial-providers — list live surface providers and capabilities",
+        params: "EmptyParams",
+        result: "SurfaceProvidersResult",
+    },
+    CommandSpec {
+        name: "spatial-sample",
+        summary: "spatial-sample {provider, channel, position, derivative?}",
+        params: "SpatialSampleParams",
+        result: "SpatialSampleResult",
+    },
+    CommandSpec {
+        name: "spatial-residency",
+        summary: "spatial-residency — list spatial sources and per-facet cell references",
+        params: "EmptyParams",
+        result: "SpatialResidencyResult",
     },
     CommandSpec {
         name: "inspect",
@@ -797,6 +821,42 @@ pub static COMMANDS: &[CommandSpec] = &[
         result: "SetTessellationQualityResult",
     },
     CommandSpec {
+        name: "vegetation-compile-biome",
+        summary: "compile a biome graph and inspect dependencies, halo, estimates, and hard caps",
+        params: "VegetationCompileBiomeParams",
+        result: "VegetationCompileBiomeResult",
+    },
+    CommandSpec {
+        name: "vegetation-node-schema",
+        summary: "inspect typed biome-node pins, parameters, seed namespaces, and execution capability",
+        params: "VegetationNodeSchemaParams",
+        result: "VegetationNodeSchemaResult",
+    },
+    CommandSpec {
+        name: "vegetation-evaluate-region",
+        summary: "start one bounded asynchronous biome evaluation through the canonical evaluator",
+        params: "VegetationEvaluateRegionParams",
+        result: "VegetationEvaluationJobDto",
+    },
+    CommandSpec {
+        name: "vegetation-evaluation-status",
+        summary: "poll an asynchronous vegetation evaluation and its deterministic aggregate",
+        params: "VegetationEvaluationJobParams",
+        result: "VegetationEvaluationStatusDto",
+    },
+    CommandSpec {
+        name: "vegetation-cancel-evaluation",
+        summary: "cancel an asynchronous vegetation evaluation without partial publication",
+        params: "VegetationEvaluationJobParams",
+        result: "VegetationEvaluationStatusDto",
+    },
+    CommandSpec {
+        name: "vegetation-explain-point",
+        summary: "trace an accepted plant or rejected candidate through its provenance decision DAG",
+        params: "VegetationExplainPointParams",
+        result: "ProvenanceExplanationDto",
+    },
+    CommandSpec {
         name: "get-project",
         summary: "active project metadata",
         params: "EmptyParams",
@@ -863,10 +923,22 @@ pub static COMMANDS: &[CommandSpec] = &[
         result: "ImportLutResult",
     },
     CommandSpec {
+        name: "import-vegetation-asset",
+        summary: "import-vegetation-asset {path} [folder] — import an authored .splant, .sbiome, or .svegmap package",
+        params: "ImportVegetationAssetParams",
+        result: "ImportVegetationAssetResult",
+    },
+    CommandSpec {
         name: "list-assets",
         summary: "list project asset catalog",
         params: "EmptyParams",
         result: "AssetList",
+    },
+    CommandSpec {
+        name: "vegetation-asset-summary",
+        summary: "vegetation-asset-summary {asset} — inspect an authored plant, biome, or vegetation map",
+        params: "VegetationAssetSummaryParams",
+        result: "VegetationAssetSummaryResult",
     },
     CommandSpec {
         name: "scan-assets",
@@ -1209,6 +1281,10 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("set-light", "temp-directional-light"),
     ("select", "cube-entity"),
     ("pick", "viewport-center"),
+    ("spatial-cell", "spatial-origin"),
+    ("spatial-providers", "empty"),
+    ("spatial-sample", "spatial-sample-cube"),
+    ("spatial-residency", "empty"),
     ("inspect", "cube-entity"),
     ("focus", "cube-entity"),
     ("get-world-transform", "cube-entity"),
@@ -1265,6 +1341,7 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
     ("set-color-grading", "color-grading"),
     ("bake-look", "bake-look"),
     ("set-tessellation-quality", "tess-quality"),
+    ("vegetation-node-schema", "empty"),
     ("get-project", "empty"),
     ("project-status", "empty"),
     ("cancel-load", "empty"),
@@ -1290,6 +1367,26 @@ pub static COMMAND_FIXTURES: &[(&str, &str)] = &[
 /// side-effecting, or stateful commands). Looked up by command name; fed only to the manifest
 /// emitter.
 pub static COMMAND_SKIPS: &[(&str, &str)] = &[
+    (
+        "vegetation-compile-biome",
+        "requires an imported biome asset or map-local biome instance",
+    ),
+    (
+        "vegetation-evaluate-region",
+        "requires an imported vegetation map and bound biome instance",
+    ),
+    (
+        "vegetation-evaluation-status",
+        "requires a prior vegetation evaluation job",
+    ),
+    (
+        "vegetation-cancel-evaluation",
+        "requires a running vegetation evaluation job",
+    ),
+    (
+        "vegetation-explain-point",
+        "requires a completed vegetation evaluation and point identity",
+    ),
     ("import-model", "requires an external model fixture path"),
     (
         "instantiate-model",
@@ -1408,6 +1505,14 @@ pub static COMMAND_SKIPS: &[(&str, &str)] = &[
         "requires an external texture fixture path",
     ),
     ("import-lut", "requires an external .cube fixture path"),
+    (
+        "import-vegetation-asset",
+        "requires an external authored vegetation asset path",
+    ),
+    (
+        "vegetation-asset-summary",
+        "needs an imported vegetation asset",
+    ),
     ("create-asset-folder", "mutates the project asset catalog"),
     ("rename-asset-folder", "mutates the project asset catalog"),
     ("delete-asset-folder", "mutates the project asset catalog"),
@@ -1503,6 +1608,87 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "AssetPlacementPhaseDto",
     "ScreenshotTargetDto",
     "AssetTypeDto",
+    "PlantId",
+    "VegetationGuid",
+    "WorldCellDto",
+    "WorldBoundsDto",
+    "PlantLifecycleDto",
+    "InteractionPolicyDto",
+    "FieldChannelKindDto",
+    "FieldChannelDto",
+    "SurfaceAttachmentDto",
+    "PlantPointDto",
+    "ProvenanceDto",
+    "ProvenanceDecisionOutcomeDto",
+    "ProvenanceDecisionDto",
+    "VegetationCandidateRejectionReasonDto",
+    "ProvenanceExplanationDto",
+    "VegetationCompileTargetDto",
+    "VegetationCompileBiomeParams",
+    "VegetationGraphEstimateDto",
+    "VegetationGraphLimitsDto",
+    "VegetationGraphDependencyDto",
+    "VegetationCompileBiomeResult",
+    "VegetationGraphOperatorDto",
+    "VegetationNodeSchemaParams",
+    "VegetationGraphPinDto",
+    "VegetationGraphParameterDto",
+    "VegetationNodeSchemaDto",
+    "VegetationNodeSchemaResult",
+    "VegetationEvaluateRegionParams",
+    "VegetationEvaluationJobStateDto",
+    "VegetationEvaluationJobDto",
+    "VegetationEvaluationJobParams",
+    "VegetationExecutionDomainDto",
+    "VegetationNodeEvaluationDiagnosticDto",
+    "VegetationGraphNodeAddressDto",
+    "VegetationDiagnosticResultSourceDto",
+    "VegetationDiagnosticStreamScopeDto",
+    "VegetationDiagnosticCandidateSampleDto",
+    "VegetationDiagnosticScalarSampleDto",
+    "VegetationDiagnosticProvenanceIdDto",
+    "VegetationDiagnosticRejectionDto",
+    "VegetationNamedDiagnosticStreamDto",
+    "VegetationGpuGroupEvaluationDiagnosticDto",
+    "VegetationEvaluationSummaryDto",
+    "VegetationEvaluationStatusDto",
+    "VegetationCandidateIdentityDto",
+    "VegetationExplainSubjectDto",
+    "VegetationExplainPointParams",
+    "ThinSheetNormalBehaviorDto",
+    "CoverageSourceDto",
+    "AlphaClassificationDto",
+    "CoverageMipMetadataDto",
+    "VoxelMaterialMomentsDto",
+    "OpacityMicromapDerivationDto",
+    "ThinSheetFoliageParametersDto",
+    "MaterialSurfaceDto",
+    "PlantSourceKindDto",
+    "PlantAssetSummaryDto",
+    "BiomeRoleDto",
+    "BiomeAssetSummaryDto",
+    "VegetationMapSummaryDto",
+    "VegetationAssetSummaryDto",
+    "LayerCoordinateSpaceDto",
+    "FieldBlendOperatorDto",
+    "InclusionOperatorDto",
+    "SpeciesWeightDto",
+    "PlantTransformOverrideDto",
+    "PlantStateOverrideDto",
+    "VegetationLayerOperatorDto",
+    "VegetationLayerDto",
+    "VegetationManifestDependencyDto",
+    "VegetationBaseManifestDto",
+    "VegetationMutationHeaderDto",
+    "PlantTransformDto",
+    "VegetationMutationDto",
+    "VegetationMutationRecordDto",
+    "VegetationAssetSummaryParams",
+    "VegetationAssetSummaryResult",
+    "ImportVegetationAssetParams",
+    "ImportVegetationAssetResult",
+    "PointExtensionColumnDto",
+    "VegetationGestureMetadataDto",
     "ProfilerModeDto",
     "ProfileLaneDto",
     "CaptureModeDto",
@@ -1713,6 +1899,26 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "SetLightParams",
     "PickParams",
     "PickResult",
+    "SpatialTicksDto",
+    "WorldCellKeyDto",
+    "SpatialLocalPositionDto",
+    "SpatialWorldPositionDto",
+    "SpatialCellParams",
+    "SpatialCellResult",
+    "SurfaceCapabilitiesDto",
+    "SpatialBoundsDto",
+    "SurfaceProviderDto",
+    "SurfaceProvidersResult",
+    "SpatialFieldChannelDto",
+    "SpatialFieldDerivativeDto",
+    "SpatialSampleParams",
+    "SpatialSampleResult",
+    "ResidencyFacetDto",
+    "SpatialSourceLevelDto",
+    "SpatialSourceDto",
+    "ResidencyCountsDto",
+    "SpatialResidencyCellDto",
+    "SpatialResidencyResult",
     "InspectResult",
     "EnvironmentDto",
     "BuiltinEnvironmentProfileDto",
@@ -1857,7 +2063,7 @@ mod tests {
         }
     }
 
-    /// The per-domain first/last names, in the order the five `register_*_commands` files
+    /// The per-domain first/last names, in the order the six `register_*_commands` files
     /// register them — the registration domains the catalog groups by. Each command in the table
     /// belongs to exactly one domain, and the domain endpoints match the catalog.
     #[test]
@@ -1867,11 +2073,12 @@ mod tests {
         let asset = asset_domain();
         let animation = animation_domain();
         let physics = physics_domain();
+        let vegetation = vegetation_domain();
 
-        // The five registration domains (render → scene → asset → animation → physics) partition
+        // The six registration domains partition
         // the table: every command belongs to exactly one. The real invariant is the coverage
         // (`hits == 1`) + the endpoints below; the manifest snapshot carries the exact counts.
-        let domains = [render, scene, asset, animation, physics];
+        let domains = [render, scene, asset, animation, physics, vegetation];
         for c in COMMANDS {
             let hits = domains.iter().filter(|d| d.contains(&c.name)).count();
             assert_eq!(
@@ -1892,6 +2099,8 @@ mod tests {
         assert_eq!(*animation.last().unwrap(), "list-clip-bindings");
         assert_eq!(*physics.first().unwrap(), "physics-state");
         assert_eq!(*physics.last().unwrap(), "get-ragdoll");
+        assert_eq!(*vegetation.first().unwrap(), "vegetation-compile-biome");
+        assert_eq!(*vegetation.last().unwrap(), "vegetation-explain-point");
     }
 
     /// Every command has exactly one of a fixture or a skip, so a new command without
@@ -2005,6 +2214,10 @@ mod tests {
             "set-light",
             "select",
             "pick",
+            "spatial-cell",
+            "spatial-providers",
+            "spatial-sample",
+            "spatial-residency",
             "inspect",
             "focus",
             "get-world-transform",
@@ -2077,7 +2290,9 @@ mod tests {
             "delete-unused",
             "import-texture",
             "import-lut",
+            "import-vegetation-asset",
             "list-assets",
+            "vegetation-asset-summary",
             "rename-asset",
             "create-asset-folder",
             "rename-asset-folder",
@@ -2151,6 +2366,17 @@ mod tests {
             "enable-ragdoll",
             "set-ragdoll",
             "get-ragdoll",
+        ]
+    }
+
+    fn vegetation_domain() -> &'static [&'static str] {
+        &[
+            "vegetation-compile-biome",
+            "vegetation-node-schema",
+            "vegetation-evaluate-region",
+            "vegetation-evaluation-status",
+            "vegetation-cancel-evaluation",
+            "vegetation-explain-point",
         ]
     }
 }
