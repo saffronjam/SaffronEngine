@@ -82,6 +82,7 @@ import {
 /// Image extensions that import as a catalog texture; everything else is imported
 /// as a model.
 const TEXTURE_EXTS = new Set(["png", "jpg", "jpeg", "hdr", "tga", "bmp"]);
+const VEGETATION_EXTS = new Set(["splant", "sbiome", "svegmap"]);
 
 /// Asset kinds offered by the search bar's `type:` chip.
 const ASSET_TYPE_VALUES = [
@@ -92,6 +93,9 @@ const ASSET_TYPE_VALUES = [
   "model",
   "lut",
   "environment",
+  "plant",
+  "biome",
+  "vegetation-map",
   "other",
 ] as const;
 
@@ -149,6 +153,7 @@ function sortAssets(assets: AssetEntry[], mode: AssetSortMode): AssetEntry[] {
 /// Model + image extensions offered in the file dialog.
 const MODEL_EXTS = ["gltf", "glb", "obj", "smesh"];
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "hdr", "tga", "bmp"];
+const NATIVE_VEGETATION_EXTS = ["splant", "sbiome", "svegmap"];
 
 function extensionOf(path: string): string {
   const dot = path.lastIndexOf(".");
@@ -235,15 +240,16 @@ async function importPath(path: string, folder: string | null): Promise<void> {
       if (folder) {
         await client.moveAsset(imported.texture, folder);
       }
+    } else if (VEGETATION_EXTS.has(extensionOf(path))) {
+      await client.importVegetationAsset(path, folder ?? undefined);
     } else {
       const imported = await client.importModel(path);
       if (folder) {
         await moveImportedAsset(imported.id, folder);
       }
     }
-  } catch {
-    // The engine reports a bad import as ok:false (a rejected promise); swallow so
-    // a single bad file doesn't break a multi-file drop.
+  } catch (err) {
+    notifyError(errorText(err));
   }
 }
 
@@ -255,6 +261,7 @@ export function AssetsPanel() {
   const instantiateModel = useEditorStore((s) => s.instantiateModel);
   const nativeDialogOpen = useEditorStore((s) => s.nativeDialogOpen);
   const openImageViewerTab = useEditorStore((s) => s.openImageViewerTab);
+  const openVegetationAssetTab = useEditorStore((s) => s.openVegetationAssetTab);
   const openAssetEditorForAsset = useEditorStore((s) => s.openAssetEditorForAsset);
   const closeViewTab = useEditorStore((s) => s.closeViewTab);
   const setAssetsPanelHovered = useEditorStore((s) => s.setAssetsPanelHovered);
@@ -473,9 +480,13 @@ export function AssetsPanel() {
       open({
         multiple: true,
         filters: [
-          { name: "Models & Images", extensions: [...MODEL_EXTS, ...IMAGE_EXTS] },
+          {
+            name: "Project assets",
+            extensions: [...MODEL_EXTS, ...IMAGE_EXTS, ...NATIVE_VEGETATION_EXTS],
+          },
           { name: "Models", extensions: MODEL_EXTS },
           { name: "Images", extensions: IMAGE_EXTS },
+          { name: "Vegetation", extensions: NATIVE_VEGETATION_EXTS },
         ],
       }),
     );
@@ -799,13 +810,15 @@ export function AssetsPanel() {
         asset.type === "animation" ||
         asset.type === "texture" ||
         asset.type === "material";
-      if (ridesAssetEditor) {
+      if (asset.type === "plant" || asset.type === "biome" || asset.type === "vegetation-map") {
+        openVegetationAssetTab(asset.id, asset.name, asset.type);
+      } else if (ridesAssetEditor) {
         openAssetEditorForAsset(asset.id, asset.name);
       } else {
         openImageViewerTab(asset);
       }
     },
-    [openImageViewerTab, openAssetEditorForAsset],
+    [openImageViewerTab, openVegetationAssetTab, openAssetEditorForAsset],
   );
 
   const confirmDeleteAssets = useCallback(
@@ -819,6 +832,7 @@ export function AssetsPanel() {
               await client.deleteAsset(asset.id);
               deletedIds.add(asset.id);
               closeViewTab(`imageViewer:${asset.id}`);
+              closeViewTab(`vegetationAsset:${asset.id}`);
               // The asset-editor tab is keyed by the owning model container (a sub-asset opens
               // its container's editor), so close both the asset's own key and its container's.
               closeViewTab(`assetEditor:${asset.id}`);
