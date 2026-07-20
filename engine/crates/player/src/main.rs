@@ -20,7 +20,7 @@ use saffron_assets::{
 };
 use saffron_core::TimeSpan;
 use saffron_protocol::AppManifest;
-use saffron_rendering::{GpuQueue, Renderer, Uploader};
+use saffron_rendering::{Renderer, Uploader};
 use saffron_runtime::RuntimeSession;
 use saffron_scene::{ComponentRegistry, Scene, ScriptInputState, register_builtin_components};
 use saffron_window::keyboard::{KeyCode, PhysicalKey};
@@ -203,7 +203,7 @@ impl PlayerLayer {
         if self.uploader.is_some() {
             return;
         }
-        let queue = GpuQueue::new(renderer.device().graphics_queue);
+        let queue = renderer.device().graphics_queue.clone();
         match Uploader::new(renderer.device(), &queue) {
             Ok(uploader) => self.uploader = Some(uploader),
             Err(err) => tracing::error!("saffron-player: uploader create failed: {err}"),

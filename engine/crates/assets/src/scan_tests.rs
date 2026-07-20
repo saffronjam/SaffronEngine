@@ -451,8 +451,7 @@ fn png_2x2() -> Vec<u8> {
 
 use crate::RendererUploader;
 use saffron_rendering::{
-    BindlessFreeList, Descriptors, Device, GpuQueue, SurfaceSource, Uploader,
-    validation_issue_count,
+    BindlessFreeList, Descriptors, Device, SurfaceSource, Uploader, validation_issue_count,
 };
 
 struct GpuFixture {
@@ -471,7 +470,7 @@ fn gpu_or_skip() -> Option<GpuFixture> {
     };
     let free_list: BindlessFreeList = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-    let queue = GpuQueue::new(device.graphics_queue);
+    let queue = device.graphics_queue.clone();
     let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
     Some(GpuFixture {
         uploader,
