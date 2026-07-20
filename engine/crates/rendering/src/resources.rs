@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use saffron_geometry::glam::Vec3;
-use saffron_geometry::{Submesh, VertexSkin};
+use saffron_geometry::{Submesh, Vertex, VertexSkin};
 use vk_mem::{Alloc, Allocator};
 
 /// The shared bindless texture free-list: returned slot indices a later upload
@@ -182,6 +182,26 @@ impl Buffer {
         // SAFETY: the allocation is HOST_VISIBLE + persistently MAPPED for `size`
         // bytes; the `&mut self` borrow makes the slice exclusive.
         Some(unsafe { std::slice::from_raw_parts_mut(self.mapped, self.size as usize) })
+    }
+
+    /// Flushes the complete mapped allocation before GPU reads.
+    pub(crate) fn flush_mapped(&self) -> crate::Result<()> {
+        checked_vma(
+            self.resources
+                .allocator()
+                .flush_allocation(&self.allocation, 0, self.size),
+            "vmaFlushAllocation",
+        )
+    }
+
+    /// Invalidates the complete mapped allocation before host readback.
+    pub(crate) fn invalidate_mapped(&self) -> crate::Result<()> {
+        checked_vma(
+            self.resources
+                .allocator()
+                .invalidate_allocation(&self.allocation, 0, self.size),
+            "vmaInvalidateAllocation",
+        )
     }
 }
 
@@ -981,11 +1001,11 @@ pub struct GpuMesh {
     pub bounds_min: Vec3,
     /// Local-space AABB maximum (for ray picking).
     pub bounds_max: Vec3,
-    /// CPU copy of positions (local/rest space) for triangle-precise picking.
-    pub cpu_positions: Vec<Vec3>,
+    /// CPU copy of the complete local/rest vertex stream for surface queries.
+    pub cpu_vertices: Arc<[Vertex]>,
     /// CPU copy of the flat index buffer spanning every submesh.
-    pub cpu_indices: Vec<u32>,
-    /// CPU copy of the skin stream parallel to [`GpuMesh::cpu_positions`] (empty
+    pub cpu_indices: Arc<[u32]>,
+    /// CPU copy of the skin stream parallel to [`GpuMesh::cpu_vertices`] (empty
     /// when unskinned).
     pub cpu_skin: Vec<VertexSkin>,
     /// The ray-tracing BLAS (`None` when RT is unsupported or not yet built).
@@ -995,6 +1015,22 @@ pub struct GpuMesh {
     /// a build without SDF support). Held here so the fields live exactly as long as the mesh
     /// that owns them; the lighting cone-trace indexes each by [`GpuSdf::bindless_index`].
     pub sdfs: Vec<Arc<GpuSdf>>,
+}
+
+impl GpuMesh {
+    /// Returns the host bytes retained for exact mesh-surface and deformation queries.
+    pub fn retained_query_cpu_bytes(&self) -> u64 {
+        fn bytes_for<T>(len: usize) -> u64 {
+            u64::try_from(len)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(size_of::<T>() as u64)
+        }
+
+        bytes_for::<Vertex>(self.cpu_vertices.len())
+            .saturating_add(bytes_for::<u32>(self.cpu_indices.len()))
+            .saturating_add(bytes_for::<VertexSkin>(self.cpu_skin.len()))
+            .saturating_add(bytes_for::<Submesh>(self.submeshes.len()))
+    }
 }
 
 /// The device-local meshlet buffers a [`GpuMesh`] carries when built with mesh-shader support: the
@@ -1087,8 +1123,8 @@ pub struct GpuMeshParts {
     pub bounds_min: Vec3,
     /// Local-space AABB maximum.
     pub bounds_max: Vec3,
-    /// CPU positions for picking.
-    pub cpu_positions: Vec<Vec3>,
+    /// Complete CPU vertex stream for surface queries.
+    pub cpu_vertices: Vec<Vertex>,
     /// CPU indices for picking.
     pub cpu_indices: Vec<u32>,
     /// CPU skin stream for picking (empty when unskinned).
@@ -1118,8 +1154,8 @@ impl GpuMesh {
             submeshes: parts.submeshes,
             bounds_min: parts.bounds_min,
             bounds_max: parts.bounds_max,
-            cpu_positions: parts.cpu_positions,
-            cpu_indices: parts.cpu_indices,
+            cpu_vertices: parts.cpu_vertices.into(),
+            cpu_indices: parts.cpu_indices.into(),
             cpu_skin: parts.cpu_skin,
             blas: parts.blas,
             sdfs: parts.sdfs,
@@ -1555,7 +1591,7 @@ mod tests {
                 submeshes: Vec::new(),
                 bounds_min: Vec3::ZERO,
                 bounds_max: Vec3::ONE,
-                cpu_positions: Vec::new(),
+                cpu_vertices: Vec::new(),
                 cpu_indices: Vec::new(),
                 cpu_skin: Vec::new(),
                 blas: None,
