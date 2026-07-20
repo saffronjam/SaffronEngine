@@ -19,8 +19,9 @@ use saffron_assets::{
     PREVIEW_MATERIAL_ID, ProjectHost, ProjectInfo, analyze_clean, asset_bytes, asset_type_name,
     build_dependency_graph, clear_extraction, colorspace_for_role_explicit, colorspace_name,
     create_project_script, default_display_name, default_material_asset, delete_unused,
-    exposed_parameter, extract_sub_asset, import_material_folder, load_catalog_material_asset,
-    load_catalog_material_asset_raw, lower_graph_to_params, model_render_aabb,
+    exposed_parameter, extract_sub_asset, import_material_folder, import_vegetation_asset,
+    load_biome_asset, load_catalog_material_asset, load_catalog_material_asset_raw,
+    load_plant_family_asset, load_vegetation_map_asset, lower_graph_to_params, model_render_aabb,
     pbr_exposed_parameters, pick_scene_surface, reimport_model, request_thumbnail,
     save_material_asset, texture_role_from_hint, texture_role_name, update_material_asset,
     valid_project_name, viewport_ray,
@@ -28,40 +29,54 @@ use saffron_assets::{
 use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3 as MathVec3};
 use saffron_protocol::{
-    AnimationClipDto, AppManifest, AssetAttributionDto, AssetCapabilitiesDto, AssetEntryDto,
-    AssetList, AssetMetadataDto, AssetMetadataParams, AssetModelResult, AssetPlacementParams,
-    AssetPlacementPhaseDto, AssetPlacementResult, AssetRef, AssetReferencesParams,
-    AssetReferencesResult, AssetSelector, AssetSlotDto, AssetTypeDto, AssetUsageDto,
-    AssetUsagesParams, AssetUsagesResult, AssignAssetParams, AssignAssetResult, BoneDto,
-    BootStageDto, CleanAssetsParams, CleanCandidateDto, CleanReport, ClearExtractionParams,
-    CreateAssetFolderParams, CreateScriptParams, CreateScriptResult, DeleteAssetFolderParams,
-    DeleteAssetParams, DeleteAssetResult, DeleteUnusedParams, DeleteUnusedResult, EmptyParams,
-    EntityRef, ExportAppParams, ExportAppResult, ExposedParamDto, ExtractSubAssetParams,
+    AlphaClassificationDto, AnimationClipDto, AppManifest, AssetAttributionDto,
+    AssetCapabilitiesDto, AssetEntryDto, AssetList, AssetMetadataDto, AssetMetadataParams,
+    AssetModelResult, AssetPlacementParams, AssetPlacementPhaseDto, AssetPlacementResult, AssetRef,
+    AssetReferencesParams, AssetReferencesResult, AssetSelector, AssetSlotDto, AssetTypeDto,
+    AssetUsageDto, AssetUsagesParams, AssetUsagesResult, AssignAssetParams, AssignAssetResult,
+    BiomeAssetSummaryDto, BiomeRoleDto, BoneDto, BootStageDto, CleanAssetsParams,
+    CleanCandidateDto, CleanReport, ClearExtractionParams, CoverageMipMetadataDto,
+    CoverageSourceDto, CreateAssetFolderParams, CreateScriptParams, CreateScriptResult,
+    DeleteAssetFolderParams, DeleteAssetParams, DeleteAssetResult, DeleteUnusedParams,
+    DeleteUnusedResult, EmptyParams, EntityRef, ExportAppParams, ExportAppResult, ExposedParamDto,
+    ExtractSubAssetParams, FieldBlendOperatorDto, FieldChannelDto, FieldChannelKindDto,
     GetAssetModelParams, ImportModelParams, ImportModelResult, ImportTextureParams,
-    ImportTextureResult, InstantiateModelParams, MaterialAssignParams, MaterialAssignResult,
-    MaterialCompileParams, MaterialCompileResult, MaterialCookResult, MaterialCreateInstanceParams,
-    MaterialCreateParams, MaterialCreateResult, MaterialGetParams, MaterialGetResult,
-    MaterialImportParams, MaterialImportResultDto, MaterialListResult, MaterialRefDto,
-    MaterialSchemaParams, MaterialSchemaResult, MaterialSetGraphParams, MaterialSetGraphResult,
-    MaterialSetOverrideParams, MaterialSetOverrideResult, MaterialUpdateParams,
-    MaterialUpdateResult, ModelInfoParams, ModelInfoResult, ModelSubAssetDto, MoveAssetParams,
-    NewProjectParams, OptionalPathParams, PathParams, PathResult, PlacementTransformDto,
-    PlayStateResult, PreviewRenderParams, PreviewRenderResult, ProjectInfoDto, ProjectPhaseDto,
-    ProjectStatusDto, ProjectStoresDto, QuitResult, ReimportModelParams, ReimportModelResult,
-    RenameAssetFolderParams, RenameAssetParams, ScanAssetsResult, ScreenshotParams,
-    ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams, SetActiveViewResult,
-    ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailFormatDto, ThumbnailParams,
-    ThumbnailResult, Uuid as WireUuid, Vec3, Vec4,
+    ImportTextureResult, ImportVegetationAssetParams, ImportVegetationAssetResult,
+    InclusionOperatorDto, InstantiateModelParams, InteractionPolicyDto, LayerCoordinateSpaceDto,
+    MaterialAssignParams, MaterialAssignResult, MaterialCompileParams, MaterialCompileResult,
+    MaterialCookResult, MaterialCreateInstanceParams, MaterialCreateParams, MaterialCreateResult,
+    MaterialGetParams, MaterialGetResult, MaterialImportParams, MaterialImportResultDto,
+    MaterialListResult, MaterialRefDto, MaterialSchemaParams, MaterialSchemaResult,
+    MaterialSetGraphParams, MaterialSetGraphResult, MaterialSetOverrideParams,
+    MaterialSetOverrideResult, MaterialSurfaceDto, MaterialUpdateParams, MaterialUpdateResult,
+    ModelInfoParams, ModelInfoResult, ModelSubAssetDto, MoveAssetParams, NewProjectParams,
+    OpacityMicromapDerivationDto, OptionalPathParams, PathParams, PathResult,
+    PlacementTransformDto, PlantAssetSummaryDto, PlantId, PlantSourceKindDto,
+    PlantStateOverrideDto, PlantTransformOverrideDto, PlayStateResult, PreviewRenderParams,
+    PreviewRenderResult, ProjectInfoDto, ProjectPhaseDto, ProjectStatusDto, ProjectStoresDto,
+    QuitResult, ReimportModelParams, ReimportModelResult, RenameAssetFolderParams,
+    RenameAssetParams, ScanAssetsResult, ScreenshotParams, ScreenshotResult, ScreenshotTargetDto,
+    SetActiveViewParams, SetActiveViewResult, SpeciesWeightDto, ThinSheetFoliageParametersDto,
+    ThinSheetNormalBehaviorDto, ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailFormatDto,
+    ThumbnailParams, ThumbnailResult, Uuid as WireUuid, Vec3, Vec4, VegetationAssetSummaryDto,
+    VegetationAssetSummaryParams, VegetationAssetSummaryResult, VegetationGuid, VegetationLayerDto,
+    VegetationLayerOperatorDto, VegetationMapSummaryDto, VoxelMaterialMomentsDto, WorldBoundsDto,
 };
 use saffron_rendering::ViewId;
 use saffron_scene::{
     AnimationPlayer, AssetEntry, AssetType, Attribution, Colorspace, DirectionalLight, Entity,
     IdComponent, MaterialSet, MaterialSlot, Mesh, Name, PreviewGhost, Scene, SkinnedMesh, SkyMode,
-    TextureRole, Transform,
+    TextureRole, Transform, VegetationField,
 };
 use saffron_sceneedit::{
     BootStage, NewProjectSpec, OrbitState, PlacementPreview, PlayState, ProjectLoadRequest,
     ProjectPhase, SceneEditCamera, SceneEditContext,
+};
+use saffron_vegetation::{
+    AlphaClassification, BiomeRole, CoverageMipMetadata, CoverageSource, FieldBlendOperator,
+    InclusionOperator, LayerCoordinateSpace, MaterialSurface, OpacityMicromapDerivation,
+    PlantFamilySource, ThinSheetFoliageParameters, ThinSheetNormalBehavior, VegetationLayer,
+    VegetationLayerOperator, VoxelMaterialMoments,
 };
 use serde_json::{Value, json};
 
@@ -106,6 +121,391 @@ fn asset_type_dto(asset_type: AssetType) -> AssetTypeDto {
         AssetType::Mesh => AssetTypeDto::Mesh,
         AssetType::Lut => AssetTypeDto::Lut,
         AssetType::Environment => AssetTypeDto::Environment,
+        AssetType::Plant => AssetTypeDto::Plant,
+        AssetType::Biome => AssetTypeDto::Biome,
+        AssetType::VegetationMap => AssetTypeDto::VegetationMap,
+    }
+}
+
+fn vegetation_guid(value: u128) -> VegetationGuid {
+    VegetationGuid(format!("{value:032x}"))
+}
+
+fn plant_id(value: saffron_vegetation::PlantId) -> PlantId {
+    PlantId(value.to_string())
+}
+
+fn world_bounds_dto(bounds: saffron_spatial::WorldBounds) -> WorldBoundsDto {
+    WorldBoundsDto {
+        min_ticks: bounds.min_ticks().map(|value| value.to_string()),
+        max_ticks_exclusive: bounds.max_ticks_exclusive().map(|value| value.to_string()),
+    }
+}
+
+fn field_channel_dto(channel: saffron_spatial::FieldChannel) -> FieldChannelDto {
+    use saffron_spatial::FieldChannel;
+    let (kind, user) = match channel {
+        FieldChannel::Altitude => (FieldChannelKindDto::Altitude, None),
+        FieldChannel::Slope => (FieldChannelKindDto::Slope, None),
+        FieldChannel::Curvature => (FieldChannelKindDto::Curvature, None),
+        FieldChannel::Concavity => (FieldChannelKindDto::Concavity, None),
+        FieldChannel::Drainage => (FieldChannelKindDto::Drainage, None),
+        FieldChannel::Moisture => (FieldChannelKindDto::Moisture, None),
+        FieldChannel::Temperature => (FieldChannelKindDto::Temperature, None),
+        FieldChannel::Precipitation => (FieldChannelKindDto::Precipitation, None),
+        FieldChannel::Sunlight => (FieldChannelKindDto::Sunlight, None),
+        FieldChannel::Exposure => (FieldChannelKindDto::Exposure, None),
+        FieldChannel::WaterDistance => (FieldChannelKindDto::WaterDistance, None),
+        FieldChannel::WaterDepth => (FieldChannelKindDto::WaterDepth, None),
+        FieldChannel::SignedBlocker => (FieldChannelKindDto::SignedBlocker, None),
+        FieldChannel::SplineDistance => (FieldChannelKindDto::SplineDistance, None),
+        FieldChannel::User(value) => (FieldChannelKindDto::User, Some(value.to_string())),
+    };
+    FieldChannelDto { kind, user }
+}
+
+fn field_blend_dto(operator: FieldBlendOperator) -> FieldBlendOperatorDto {
+    match operator {
+        FieldBlendOperator::Replace => FieldBlendOperatorDto::Replace,
+        FieldBlendOperator::Add => FieldBlendOperatorDto::Add,
+        FieldBlendOperator::Multiply => FieldBlendOperatorDto::Multiply,
+        FieldBlendOperator::Minimum => FieldBlendOperatorDto::Minimum,
+        FieldBlendOperator::Maximum => FieldBlendOperatorDto::Maximum,
+    }
+}
+
+fn inclusion_dto(operator: InclusionOperator) -> InclusionOperatorDto {
+    match operator {
+        InclusionOperator::Include => InclusionOperatorDto::Include,
+        InclusionOperator::Exclude => InclusionOperatorDto::Exclude,
+    }
+}
+
+fn interaction_policy_dto(policy: saffron_vegetation::InteractionPolicy) -> InteractionPolicyDto {
+    match policy {
+        saffron_vegetation::InteractionPolicy::Decorative => InteractionPolicyDto::Decorative,
+        saffron_vegetation::InteractionPolicy::Interactive => InteractionPolicyDto::Interactive,
+        saffron_vegetation::InteractionPolicy::Harvestable => InteractionPolicyDto::Harvestable,
+        saffron_vegetation::InteractionPolicy::Structural => InteractionPolicyDto::Structural,
+    }
+}
+
+fn coverage_hash_text(hash: &[u8; 32]) -> String {
+    let mut text = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write as _;
+        write!(&mut text, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    text
+}
+
+fn parse_coverage_hash(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::command(
+            "coverage mip hash must be 64 lowercase hexadecimal digits",
+        ));
+    }
+    let mut hash = [0_u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| Error::command("coverage mip hash is invalid"))?;
+    }
+    Ok(hash)
+}
+
+fn material_surface_dto(surface: &MaterialSurface) -> MaterialSurfaceDto {
+    let MaterialSurface::ThinSheetFoliage(parameters) = surface else {
+        return MaterialSurfaceDto::Standard;
+    };
+    MaterialSurfaceDto::ThinSheetFoliage {
+        parameters: ThinSheetFoliageParametersDto {
+            front_albedo_response: parameters.front_albedo_response.bits(),
+            back_albedo_response: parameters.back_albedo_response.bits(),
+            thickness_bits: parameters.thickness.bits(),
+            absorption_color_bits: parameters.absorption_color.map(|value| value.bits()),
+            transmission_color_bits: parameters.transmission_color.map(|value| value.bits()),
+            roughness: parameters.roughness.bits(),
+            normal_behavior: match parameters.normal_behavior {
+                ThinSheetNormalBehavior::Preserve => ThinSheetNormalBehaviorDto::Preserve,
+                ThinSheetNormalBehavior::FaceForwardBack => {
+                    ThinSheetNormalBehaviorDto::FaceForwardBack
+                }
+                ThinSheetNormalBehavior::Symmetric => ThinSheetNormalBehaviorDto::Symmetric,
+            },
+            coverage_source: match parameters.coverage_source {
+                CoverageSource::AlbedoAlpha => CoverageSourceDto::AlbedoAlpha,
+                CoverageSource::Texture(texture) => CoverageSourceDto::Texture {
+                    texture: WireUuid(texture.value()),
+                },
+                CoverageSource::ModeledGeometry => CoverageSourceDto::ModeledGeometry,
+            },
+            coverage: CoverageMipMetadataDto {
+                reference_cutoff: parameters.coverage.reference_cutoff.bits(),
+                source_extent: parameters.coverage.source_extent,
+                spatial_hash_salt: parameters.coverage.spatial_hash_salt.to_string(),
+                classification: match parameters.coverage.classification {
+                    AlphaClassification::Opaque => AlphaClassificationDto::Opaque,
+                    AlphaClassification::Masked => AlphaClassificationDto::Masked,
+                    AlphaClassification::Transmissive => AlphaClassificationDto::Transmissive,
+                },
+                mip_hashes: parameters
+                    .coverage
+                    .mip_hashes
+                    .iter()
+                    .map(coverage_hash_text)
+                    .collect(),
+            },
+            voxel_moments: VoxelMaterialMomentsDto {
+                occupancy: parameters.voxel_moments.occupancy.bits(),
+                albedo_mean_bits: parameters
+                    .voxel_moments
+                    .albedo_mean
+                    .map(|value| value.bits()),
+                roughness_mean: parameters.voxel_moments.roughness_mean.bits(),
+                transmission_mean_bits: parameters
+                    .voxel_moments
+                    .transmission_mean
+                    .map(|value| value.bits()),
+                thickness_mean_bits: parameters.voxel_moments.thickness_mean.bits(),
+                normal_second_moments_bits: parameters
+                    .voxel_moments
+                    .normal_second_moments
+                    .map(|value| value.bits()),
+            },
+            opacity_micromap: OpacityMicromapDerivationDto {
+                enabled: parameters.opacity_micromap.enabled,
+                max_subdivision: parameters.opacity_micromap.max_subdivision,
+                transparent_threshold: parameters.opacity_micromap.transparent_threshold.bits(),
+                opaque_threshold: parameters.opacity_micromap.opaque_threshold.bits(),
+            },
+            energy_limit: parameters.energy_limit.bits(),
+        },
+    }
+}
+
+fn material_surface_from_dto(surface: MaterialSurfaceDto) -> Result<MaterialSurface> {
+    let surface = match surface {
+        MaterialSurfaceDto::Standard => MaterialSurface::Standard,
+        MaterialSurfaceDto::ThinSheetFoliage { parameters } => {
+            let coverage_source = match parameters.coverage_source {
+                CoverageSourceDto::AlbedoAlpha => CoverageSource::AlbedoAlpha,
+                CoverageSourceDto::Texture { texture } => CoverageSource::Texture(Uuid(texture.0)),
+                CoverageSourceDto::ModeledGeometry => CoverageSource::ModeledGeometry,
+            };
+            let coverage = CoverageMipMetadata {
+                reference_cutoff: saffron_spatial::UnitInterval::from_bits(
+                    parameters.coverage.reference_cutoff,
+                ),
+                source_extent: parameters.coverage.source_extent,
+                spatial_hash_salt: parameters
+                    .coverage
+                    .spatial_hash_salt
+                    .parse::<u64>()
+                    .map_err(|_| Error::command("coverage spatial hash salt is invalid"))?,
+                classification: match parameters.coverage.classification {
+                    AlphaClassificationDto::Opaque => AlphaClassification::Opaque,
+                    AlphaClassificationDto::Masked => AlphaClassification::Masked,
+                    AlphaClassificationDto::Transmissive => AlphaClassification::Transmissive,
+                },
+                mip_hashes: parameters
+                    .coverage
+                    .mip_hashes
+                    .iter()
+                    .map(|hash| parse_coverage_hash(hash))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            MaterialSurface::ThinSheetFoliage(ThinSheetFoliageParameters {
+                front_albedo_response: saffron_spatial::UnitInterval::from_bits(
+                    parameters.front_albedo_response,
+                ),
+                back_albedo_response: saffron_spatial::UnitInterval::from_bits(
+                    parameters.back_albedo_response,
+                ),
+                thickness: saffron_spatial::DecisionScalar::from_bits(parameters.thickness_bits),
+                absorption_color: parameters
+                    .absorption_color_bits
+                    .map(saffron_spatial::DecisionScalar::from_bits),
+                transmission_color: parameters
+                    .transmission_color_bits
+                    .map(saffron_spatial::DecisionScalar::from_bits),
+                roughness: saffron_spatial::UnitInterval::from_bits(parameters.roughness),
+                normal_behavior: match parameters.normal_behavior {
+                    ThinSheetNormalBehaviorDto::Preserve => ThinSheetNormalBehavior::Preserve,
+                    ThinSheetNormalBehaviorDto::FaceForwardBack => {
+                        ThinSheetNormalBehavior::FaceForwardBack
+                    }
+                    ThinSheetNormalBehaviorDto::Symmetric => ThinSheetNormalBehavior::Symmetric,
+                },
+                coverage_source,
+                coverage,
+                voxel_moments: VoxelMaterialMoments {
+                    occupancy: saffron_spatial::UnitInterval::from_bits(
+                        parameters.voxel_moments.occupancy,
+                    ),
+                    albedo_mean: parameters
+                        .voxel_moments
+                        .albedo_mean_bits
+                        .map(saffron_spatial::DecisionScalar::from_bits),
+                    roughness_mean: saffron_spatial::UnitInterval::from_bits(
+                        parameters.voxel_moments.roughness_mean,
+                    ),
+                    transmission_mean: parameters
+                        .voxel_moments
+                        .transmission_mean_bits
+                        .map(saffron_spatial::DecisionScalar::from_bits),
+                    thickness_mean: saffron_spatial::DecisionScalar::from_bits(
+                        parameters.voxel_moments.thickness_mean_bits,
+                    ),
+                    normal_second_moments: parameters
+                        .voxel_moments
+                        .normal_second_moments_bits
+                        .map(saffron_spatial::DecisionScalar::from_bits),
+                },
+                opacity_micromap: OpacityMicromapDerivation {
+                    enabled: parameters.opacity_micromap.enabled,
+                    max_subdivision: parameters.opacity_micromap.max_subdivision,
+                    transparent_threshold: saffron_spatial::UnitInterval::from_bits(
+                        parameters.opacity_micromap.transparent_threshold,
+                    ),
+                    opaque_threshold: saffron_spatial::UnitInterval::from_bits(
+                        parameters.opacity_micromap.opaque_threshold,
+                    ),
+                },
+                energy_limit: saffron_spatial::UnitInterval::from_bits(parameters.energy_limit),
+            })
+        }
+    };
+    surface
+        .validate()
+        .map_err(|error| Error::command(error.to_string()))?;
+    Ok(surface)
+}
+
+fn vegetation_layer_dto(layer: &VegetationLayer) -> VegetationLayerDto {
+    let operator = match &layer.operator {
+        VegetationLayerOperator::ScalarField(field) => VegetationLayerOperatorDto::ScalarField {
+            channel: field_channel_dto(field.channel),
+            tile_set: vegetation_guid(field.tile_set),
+            blend: field_blend_dto(field.blend),
+            weight: field.weight.bits(),
+        },
+        VegetationLayerOperator::VectorField {
+            channel,
+            tile_set,
+            value,
+            blend,
+        } => VegetationLayerOperatorDto::VectorField {
+            channel: field_channel_dto(*channel),
+            tile_set: vegetation_guid(*tile_set),
+            value_bits: [value.x.bits(), value.y.bits(), value.z.bits()],
+            blend: field_blend_dto(*blend),
+        },
+        VegetationLayerOperator::SpeciesWeights(weights) => {
+            VegetationLayerOperatorDto::SpeciesWeights {
+                weights: weights
+                    .iter()
+                    .map(|weight| SpeciesWeightDto {
+                        family: WireUuid(weight.family.value()),
+                        weight: weight.weight.bits(),
+                    })
+                    .collect(),
+            }
+        }
+        VegetationLayerOperator::Density(field) => VegetationLayerOperatorDto::Density {
+            channel: field_channel_dto(field.channel),
+            tile_set: vegetation_guid(field.tile_set),
+            blend: field_blend_dto(field.blend),
+            weight: field.weight.bits(),
+        },
+        VegetationLayerOperator::Mask {
+            tile_set,
+            operation,
+        } => VegetationLayerOperatorDto::Mask {
+            tile_set: vegetation_guid(*tile_set),
+            operation: inclusion_dto(*operation),
+        },
+        VegetationLayerOperator::Volume(volume) => VegetationLayerOperatorDto::Volume {
+            bounds: world_bounds_dto(volume.bounds),
+            operation: inclusion_dto(volume.operation),
+            falloff_bits: volume.falloff.bits(),
+        },
+        VegetationLayerOperator::Spline(spline) => VegetationLayerOperatorDto::Spline {
+            spline: vegetation_guid(spline.spline),
+            points: spline
+                .points
+                .iter()
+                .map(|point| point.global_ticks().map(|value| value.to_string()))
+                .collect(),
+            radius_bits: spline.radius.bits(),
+            operation: inclusion_dto(spline.operation),
+        },
+        VegetationLayerOperator::Anchors(plants) => VegetationLayerOperatorDto::Anchors {
+            plants: plants.iter().copied().map(plant_id).collect(),
+        },
+        VegetationLayerOperator::Pins(plants) => VegetationLayerOperatorDto::Pins {
+            plants: plants.iter().copied().map(plant_id).collect(),
+        },
+        VegetationLayerOperator::TransformOverrides(overrides) => {
+            VegetationLayerOperatorDto::TransformOverrides {
+                overrides: overrides
+                    .iter()
+                    .map(|value| PlantTransformOverrideDto {
+                        plant: plant_id(value.plant),
+                        global_ticks: value
+                            .position
+                            .global_ticks()
+                            .map(|component| component.to_string()),
+                        scale_bits: value.scale.map(|component| component.bits()),
+                    })
+                    .collect(),
+            }
+        }
+        VegetationLayerOperator::StateOverrides(overrides) => {
+            VegetationLayerOperatorDto::StateOverrides {
+                overrides: overrides
+                    .iter()
+                    .map(|value| PlantStateOverrideDto {
+                        plant: plant_id(value.plant),
+                        health: value.health.map(|item| item.bits()),
+                        moisture: value.moisture.map(|item| item.bits()),
+                        fuel: value.fuel.map(|item| item.bits()),
+                        interaction_policy: value.interaction_policy.map(interaction_policy_dto),
+                    })
+                    .collect(),
+            }
+        }
+        VegetationLayerOperator::Blocker {
+            tile_set,
+            categories,
+        } => VegetationLayerOperatorDto::Blocker {
+            tile_set: vegetation_guid(*tile_set),
+            categories: *categories,
+        },
+    };
+    VegetationLayerDto {
+        id: vegetation_guid(layer.id),
+        name: layer.name.clone(),
+        coordinate_space: match layer.coordinate_space {
+            LayerCoordinateSpace::World => LayerCoordinateSpaceDto::World,
+            LayerCoordinateSpace::Surface => LayerCoordinateSpaceDto::Surface,
+            LayerCoordinateSpace::OwnerLocal => LayerCoordinateSpaceDto::OwnerLocal,
+        },
+        bounds: world_bounds_dto(layer.bounds),
+        operator,
+        dependencies: layer
+            .dependencies
+            .iter()
+            .copied()
+            .map(vegetation_guid)
+            .collect(),
+        order: layer.order,
+        locked: layer.locked,
+        muted: layer.muted,
+        revision: layer.revision.to_string(),
     }
 }
 
@@ -347,7 +747,14 @@ fn compute_asset_placement(
     }
     let ray = viewport_ray(viewport, cam, ndc);
     let target = pick_scene_surface(gpu, viewport, scene, assets, cam, ndc)
-        .map(|hit| hit.point)
+        .map_err(|error| error.to_string())?
+        .map(|hit| {
+            hit.surface
+                .position
+                .to_render_relative(saffron_spatial::WorldPosition::origin())
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?
         .or_else(|| ground_plane_hit(ray))
         .ok_or_else(|| "placement ray did not hit the scene or ground plane".to_owned())?;
     let (min, max) = rest_bounds.ok_or_else(|| "model has no renderable bounds".to_owned())?;
@@ -403,14 +810,6 @@ fn attribution_from_dto(dto: AssetAttributionDto) -> Attribution {
         author: dto.author,
         source_url: dto.source_url,
         store_id: dto.store_id,
-    }
-}
-
-/// Rebuilds the catalog's `by_id` index after an in-place `entries` mutation.
-fn rebuild_asset_index(catalog: &mut saffron_scene::AssetCatalog) {
-    catalog.by_id.clear();
-    for (i, entry) in catalog.entries.iter().enumerate() {
-        catalog.by_id.insert(entry.id.value(), i);
     }
 }
 
@@ -562,7 +961,8 @@ type Reference = (Entity, &'static str);
 
 /// Collects every `(entity, slot)` reference to `asset` in the scene (the scan half of
 /// [`collect_asset_usages`] / [`clear_asset_usages`]): mesh slots + material albedo /
-/// metallic-roughness slots. The environment sky-texture hit is the boolean second tuple.
+/// metallic-roughness slots, and the vegetation-map field. The environment sky-texture hit is
+/// the boolean second tuple.
 fn scan_asset_references(scene: &mut Scene, asset: Uuid) -> (Vec<Reference>, bool) {
     let mut refs = Vec::new();
     scene.for_each::<(&Mesh,), _>(|entity, (mesh,)| {
@@ -577,6 +977,11 @@ fn scan_asset_references(scene: &mut Scene, asset: Uuid) -> (Vec<Reference>, boo
             .any(|s| s.material.value() == asset.value())
         {
             refs.push((entity, "material"));
+        }
+    });
+    scene.for_each::<(&VegetationField,), _>(|entity, (field,)| {
+        if field.map.value() == asset.value() {
+            refs.push((entity, "vegetationField.map"));
         }
     });
     let sky = scene.environment.sky_texture.value() == asset.value();
@@ -622,6 +1027,12 @@ fn clear_asset_usages(scene: &mut Scene, asset: Uuid) -> Vec<AssetUsageDto> {
         match slot {
             "mesh" => {
                 let _ = scene.with_component_mut::<Mesh, _>(entity, |m| m.mesh = Uuid(0));
+            }
+            "vegetationField.map" => {
+                let _ = scene.with_component_mut::<VegetationField, _>(entity, |field| {
+                    field.map = Uuid(0);
+                    field.enabled = false;
+                });
             }
             // "material": clear every slot that referenced the deleted material to the
             // built-in default.
@@ -1556,10 +1967,134 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         },
     );
 
+    reg.register::<ImportVegetationAssetParams, ImportVegetationAssetResult>(
+        "import-vegetation-asset",
+        "import-vegetation-asset {path} [folder] — import an authored .splant, .sbiome, or .svegmap package",
+        |ctx, params| {
+            if params.path.is_empty() {
+                return Err(Error::command("missing 'path'"));
+            }
+            require_project_loaded(ctx)?;
+            let folder = params.folder.unwrap_or_default();
+            if !folder.is_empty() && !has_folder(&ctx.assets.catalog, &folder) {
+                return Err(Error::command(format!("no asset folder '{folder}'")));
+            }
+            let imported = import_vegetation_asset(ctx.assets, &params.path, &folder)
+                .map_err(|error| Error::command(error.to_string()))?;
+            ctx.scene_edit.scene_version += 1;
+            Ok(ImportVegetationAssetResult {
+                id: WireUuid(imported.id.value()),
+                name: imported.name,
+                r#type: asset_type_dto(imported.asset_type),
+            })
+        },
+    );
+
     reg.register::<EmptyParams, AssetList>(
         "list-assets",
         "list the project asset catalog",
         |ctx, _params| Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog)),
+    );
+
+    reg.register::<VegetationAssetSummaryParams, VegetationAssetSummaryResult>(
+        "vegetation-asset-summary",
+        "vegetation-asset-summary {asset} — inspect an authored plant, biome, or vegetation map",
+        |ctx, params| {
+            let id = resolve_asset(ctx, &params.asset)?;
+            let entry = ctx
+                .assets
+                .catalog
+                .find(id)
+                .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?
+                .clone();
+            let (summary, layers) = match entry.asset_type {
+                AssetType::Plant => {
+                    let plant = load_plant_family_asset(ctx.assets, id)
+                        .map_err(|error| Error::command(error.to_string()))?;
+                    let source = match plant.source {
+                        PlantFamilySource::Imported(_) => PlantSourceKindDto::Imported,
+                        PlantFamilySource::Native(_) => PlantSourceKindDto::Native,
+                    };
+                    (
+                        VegetationAssetSummaryDto::Plant(PlantAssetSummaryDto {
+                            id: WireUuid(id.value()),
+                            name: plant.name,
+                            version: plant.version,
+                            source,
+                            part_count: u32::try_from(plant.parts.len()).unwrap_or(u32::MAX),
+                            phenotype_count: u32::try_from(plant.phenotypes.len())
+                                .unwrap_or(u32::MAX),
+                            material_slots: plant
+                                .material_slots
+                                .into_iter()
+                                .map(|material| WireUuid(material.value()))
+                                .collect(),
+                        }),
+                        Vec::new(),
+                    )
+                }
+                AssetType::Biome => {
+                    let biome = load_biome_asset(ctx.assets, id)
+                        .map_err(|error| Error::command(error.to_string()))?;
+                    (
+                        VegetationAssetSummaryDto::Biome(BiomeAssetSummaryDto {
+                            id: WireUuid(id.value()),
+                            name: biome.name,
+                            version: biome.version,
+                            role: match biome.role {
+                                BiomeRole::Root => BiomeRoleDto::Root,
+                                BiomeRole::Module => BiomeRoleDto::Module,
+                            },
+                            plant_palette: biome
+                                .palette
+                                .into_iter()
+                                .map(|item| WireUuid(item.plant.value()))
+                                .collect(),
+                            modules: biome
+                                .modules
+                                .into_iter()
+                                .map(|item| WireUuid(item.biome.value()))
+                                .collect(),
+                            parameter_count: u32::try_from(biome.parameters.len())
+                                .unwrap_or(u32::MAX),
+                        }),
+                        Vec::new(),
+                    )
+                }
+                AssetType::VegetationMap => {
+                    let map = load_vegetation_map_asset(ctx.assets, id)
+                        .map_err(|error| Error::command(error.to_string()))?;
+                    let layers = map.layers.iter().map(vegetation_layer_dto).collect();
+                    (
+                        VegetationAssetSummaryDto::VegetationMap(VegetationMapSummaryDto {
+                            id: WireUuid(id.value()),
+                            name: map.name,
+                            version: map.version,
+                            bounds: world_bounds_dto(map.bounds),
+                            layer_count: u32::try_from(map.layers.len()).unwrap_or(u32::MAX),
+                            biome_instances: map
+                                .biome_instances
+                                .into_iter()
+                                .map(|instance| WireUuid(instance.biome.value()))
+                                .collect(),
+                            chunk_level: map.chunk_layout.level,
+                        }),
+                        layers,
+                    )
+                }
+                _ => {
+                    return Err(Error::command(format!(
+                        "asset {} is not a plant, biome, or vegetation map",
+                        id.value()
+                    )));
+                }
+            };
+            Ok(VegetationAssetSummaryResult {
+                r#type: asset_type_dto(entry.asset_type),
+                summary,
+                layers,
+            })
+        },
     );
 
     reg.register::<EmptyParams, ScanAssetsResult>("scan-assets", "scan-assets", |ctx, _params| {
@@ -2115,9 +2650,10 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             }
             let index = resolve_asset_index(ctx, &params.asset)?;
             let entry = ctx.assets.catalog.entries[index].clone();
+            saffron_assets::remove_vegetation_map_package(ctx.assets, &entry)
+                .map_err(|error| Error::command(error.to_string()))?;
             let cleared = clear_asset_usages(&mut ctx.scene_edit.scene, entry.id);
-            ctx.assets.catalog.entries.remove(index);
-            rebuild_asset_index(&mut ctx.assets.catalog);
+            ctx.assets.catalog.remove(entry.id);
             ctx.assets.mesh_by_uuid.remove(&entry.id.value());
             ctx.assets.texture_by_uuid.remove(&entry.id.value());
             // The deleted row (and any instance that referenced it as a parent) is now stale.
@@ -2325,6 +2861,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 .map_or_else(|| json!({}), |raw| raw.graph);
             Ok(MaterialGetResult {
                 id: WireUuid(id.value()),
+                surface: material_surface_dto(&m.surface),
                 blend: m.blend.clone(),
                 unlit: m.unlit,
                 base_color: vec4(m.base_color),
@@ -2371,6 +2908,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let id = resolve_asset(ctx, &params.material)?;
             let mut m = load_catalog_material_asset(ctx.assets, id)
                 .map_err(|e| Error::command(e.to_string()))?;
+            if let Some(surface) = params.surface {
+                m.surface = material_surface_from_dto(surface)?;
+            }
             if let Some(base) = params.base_color {
                 m.base_color = from_vec4(base);
             }
@@ -3844,7 +4384,7 @@ fn from_vec4(v: Vec4) -> saffron_geometry::glam::Vec4 {
 
 #[cfg(test)]
 mod tests {
-    use saffron_scene::{AssetEntry, AssetType, MaterialSet, Mesh};
+    use saffron_scene::{AssetEntry, AssetType, MaterialSet, Mesh, VegetationField};
     use saffron_sceneedit::ProjectPhase;
     use serde_json::json;
 
@@ -4161,6 +4701,123 @@ mod tests {
         });
     }
 
+    #[test]
+    fn material_surface_union_round_trips_complete_thin_sheet_parameters() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "material-thin-sheet");
+            let create = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "material-create", "params": { "name": "Leaf" } }),
+            );
+            let id = create["result"]["id"].as_str().unwrap();
+            let surface = json!({
+                "model": "thin-sheet-foliage",
+                "parameters": {
+                    "frontAlbedoResponse": 20_000,
+                    "backAlbedoResponse": 21_000,
+                    "thicknessBits": 655,
+                    "absorptionColorBits": [1_000, 2_000, 3_000],
+                    "transmissionColorBits": [10_000, 11_000, 12_000],
+                    "roughness": 32_768,
+                    "normalBehavior": "face-forward-back",
+                    "coverageSource": { "kind": "albedo-alpha" },
+                    "coverage": {
+                        "referenceCutoff": 30_000,
+                        "sourceExtent": [512, 256],
+                        "spatialHashSalt": "9876543210987654321",
+                        "classification": "masked",
+                        "mipHashes": []
+                    },
+                    "voxelMoments": {
+                        "occupancy": 20_000,
+                        "albedoMeanBits": [4_000, 5_000, 6_000],
+                        "roughnessMean": 30_000,
+                        "transmissionMeanBits": [7_000, 8_000, 9_000],
+                        "thicknessMeanBits": 327,
+                        "normalSecondMomentsBits": [1, 2, 3, 4, 5, 6]
+                    },
+                    "opacityMicromap": {
+                        "enabled": true,
+                        "maxSubdivision": 5,
+                        "transparentThreshold": 1_000,
+                        "opaqueThreshold": 60_000
+                    },
+                    "energyLimit": 50_000
+                }
+            });
+            let update = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "material-update", "params": { "material": id, "surface": surface } }),
+            );
+            assert_eq!(update["ok"], json!(true), "update: {update:?}");
+            let get = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "material-get", "params": { "material": id } }),
+            );
+            assert_eq!(get["ok"], json!(true), "get: {get:?}");
+            assert_eq!(get["result"]["surface"], surface);
+        });
+    }
+
+    #[test]
+    fn vegetation_import_and_summary_use_the_native_map_contract() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "vegetation-summary");
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
+            let source = ctx.assets.root.parent().unwrap().join("world.svegmap");
+            let bounds = saffron_spatial::WorldBounds::new([0; 3], [4096; 3]).unwrap();
+            let map = saffron_vegetation::VegetationMapAsset {
+                version: saffron_vegetation::VEGETATION_MAP_VERSION,
+                id: saffron_core::Uuid(9_001),
+                name: "World vegetation".to_owned(),
+                bounds,
+                chunk_layout: saffron_vegetation::VegetationMapChunkLayout {
+                    level: 0,
+                    schema_hash: saffron_vegetation::vegetation_map_chunk_schema_hash(),
+                },
+                layers: Vec::new(),
+                biome_instances: Vec::new(),
+                brush_history: Vec::new(),
+            };
+            std::fs::write(
+                &source,
+                saffron_vegetation::write_vegetation_map_asset(&map).unwrap(),
+            )
+            .unwrap();
+
+            let imported = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "import-vegetation-asset", "params": { "path": source.to_string_lossy() } }),
+            );
+            assert_eq!(imported["ok"], json!(true), "import: {imported:?}");
+            assert_eq!(imported["result"]["id"], json!("9001"));
+            assert_eq!(imported["result"]["type"], json!("vegetation-map"));
+
+            let summary = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "vegetation-asset-summary", "params": { "asset": "9001" } }),
+            );
+            assert_eq!(summary["ok"], json!(true), "summary: {summary:?}");
+            assert_eq!(
+                summary["result"]["summary"]["kind"],
+                json!("vegetation-map")
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["name"],
+                json!("World vegetation")
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["layerCount"],
+                json!(0)
+            );
+            assert_eq!(summary["result"]["layers"], json!([]));
+        });
+    }
+
     /// `thumbnail-cache stats` reports a clean cache; an unknown action errors.
     #[test]
     fn thumbnail_cache_stats_and_unknown_action() {
@@ -4232,7 +4889,9 @@ mod tests {
             "asset-placement",
             "import-texture",
             "import-lut",
+            "import-vegetation-asset",
             "list-assets",
+            "vegetation-asset-summary",
             "scan-assets",
             "extract-subasset",
             "clear-extraction",
@@ -4321,6 +4980,59 @@ mod tests {
             assert_eq!(usages.len(), 1);
             assert_eq!(usages[0]["slot"], json!("mesh"));
             assert_eq!(usages[0]["entity"], json!(entity_uuid));
+        });
+    }
+
+    #[test]
+    fn vegetation_map_usage_and_delete_clear_the_scene_field() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let map = saffron_core::Uuid::new();
+            ctx.assets.catalog.put(AssetEntry {
+                id: map,
+                name: "World vegetation".to_owned(),
+                asset_type: AssetType::VegetationMap,
+                ..AssetEntry::default()
+            });
+            let entity = ctx.scene_edit.active_scene().create_entity("Vegetation");
+            ctx.scene_edit
+                .active_scene()
+                .add_component(entity, VegetationField { map, enabled: true })
+                .unwrap();
+            let entity_id = entity_uuid(ctx.scene_edit.active_scene(), entity).to_string();
+
+            let usages = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "asset-usages", "params": { "asset": map.value().to_string() } }),
+            );
+            assert_eq!(usages["ok"], json!(true), "usages: {usages:?}");
+            assert_eq!(
+                usages["result"]["usages"],
+                json!([{
+                    "entity": entity_id,
+                    "entityName": "Vegetation",
+                    "slot": "vegetationField.map"
+                }])
+            );
+
+            let deleted = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "delete-asset", "params": { "asset": map.value().to_string() } }),
+            );
+            assert_eq!(deleted["ok"], json!(true), "delete: {deleted:?}");
+            assert_eq!(deleted["result"]["cleared"], usages["result"]["usages"]);
+            assert!(ctx.assets.catalog.find(map).is_none());
+            assert_eq!(
+                ctx.scene_edit
+                    .active_scene()
+                    .component::<VegetationField>(entity)
+                    .unwrap(),
+                VegetationField {
+                    map: saffron_core::Uuid(0),
+                    enabled: false,
+                }
+            );
         });
     }
 }
