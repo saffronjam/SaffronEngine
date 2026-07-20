@@ -440,8 +440,8 @@ impl Default for SceneEnvironment {
 
 /// A project asset's kind.
 ///
-/// A model imported and baked to a mesh, a texture, an animation clip, a `.smat`
-/// material, an environment profile, or a `.smodel` container.
+/// A model imported and baked to a mesh, a texture, an animation clip, a native authored asset,
+/// or a `.smodel` container.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AssetType {
     /// A baked mesh (the default).
@@ -461,6 +461,12 @@ pub enum AssetType {
     Lut,
     /// A complete reusable scene environment (`.senv`).
     Environment,
+    /// A complete plant-family source and normalized intrinsic payload (`.splant`).
+    Plant,
+    /// A root biome or reusable typed biome graph module (`.sbiome`).
+    Biome,
+    /// A sparse authored vegetation-map package (`.svegmap`).
+    VegetationMap,
 }
 
 /// How a texture's bytes are interpreted on upload.
@@ -637,6 +643,16 @@ impl AssetCatalog {
         self.entries.push(entry);
     }
 
+    /// Removes and returns the entry carrying `id`, preserving catalog order.
+    pub fn remove(&mut self, id: Uuid) -> Option<AssetEntry> {
+        let index = self.by_id.remove(&id.value())?;
+        let removed = self.entries.remove(index);
+        for (offset, entry) in self.entries[index..].iter().enumerate() {
+            self.by_id.insert(entry.id.value(), index + offset);
+        }
+        Some(removed)
+    }
+
     /// Records source/license attribution on the entry for `id`, returning whether it
     /// existed.
     pub fn set_attribution(&mut self, id: Uuid, attribution: Attribution) -> bool {
@@ -721,6 +737,30 @@ mod tests {
         assert_eq!(a.moon_earthshine, 0.02);
         assert!(!a.per_pixel_transmittance);
         assert_eq!(a.sky_capture_cadence, 9.0);
+    }
+
+    #[test]
+    fn catalog_remove_preserves_order_and_rebuilds_indices() {
+        let mut catalog = AssetCatalog::default();
+        for id in [1, 2, 3] {
+            catalog.put(AssetEntry {
+                id: Uuid(id),
+                name: id.to_string(),
+                ..AssetEntry::default()
+            });
+        }
+
+        assert_eq!(catalog.remove(Uuid(2)).unwrap().id, Uuid(2));
+        assert_eq!(
+            catalog
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![Uuid(1), Uuid(3)]
+        );
+        assert_eq!(catalog.find(Uuid(3)).unwrap().name, "3");
+        assert!(catalog.remove(Uuid(2)).is_none());
     }
 
     #[test]
