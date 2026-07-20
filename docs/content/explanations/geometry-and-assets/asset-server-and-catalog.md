@@ -31,9 +31,9 @@ pub struct AssetServer {
 
 The catalog is the source of truth; every map is a cache over it. The catalog records that asset
 42 is a mesh at `models/42.smesh`; the mesh cache records that 42 is uploaded and holds its
-`Arc<GpuMesh>`. `AssetServer::new` seeds the root's `models/`, `textures/`, `materials/`, and
-`environments/` subdirectories, and [loading a project](../project-serialization/) populates the
-catalog from a disk scan.
+`Arc<GpuMesh>`. `AssetServer::new` seeds the root's model, texture, material, environment, and
+vegetation subdirectories. [Loading a project](../project-serialization/) populates the catalog
+from a disk scan.
 
 A project switch drops every cache through `clear_asset_caches`, and its caller idles the GPU
 first: an in-flight frame may still reference a cached `Arc<GpuTexture>`, so the last `Arc` must
@@ -46,6 +46,7 @@ Each entry pairs a human-facing, renameable name with a separate on-disk path:
 ```rust
 pub enum AssetType {
     Mesh, Texture, Other, Animation, Material, Model, Lut, Environment,
+    Plant, Biome, VegetationMap,
 }
 
 pub struct AssetEntry {
@@ -83,8 +84,8 @@ routes its preview — a map renders on a lit sphere in its slot, an HDRI as an 
 [asset editor](../../ui-and-editor/asset-editor/)).
 
 An environment profile is a standalone `.senv` asset containing one complete scene environment.
-Its catalog identity lets the Environment panel browse, rename, move, delete, and update it through
-the same asset-management surface as other project data.
+Plant, biome, and vegetation-map assets use `.splant`, `.sbiome`, and `.svegmap`. Their catalog
+identities support the same browse, rename, move, and delete operations as other project data.
 
 ## The filesystem is the source of truth
 
@@ -175,13 +176,14 @@ orphans every old entry in one stroke; the orphans age out through the size-cap 
 Materials are the exception to content addressing: their key hashes the *resolved* material
 state, so editing a parent reflows every instance's tile without touching the child `.smat`.
 
-`request_thumbnail` checks the cache before loading anything: a mesh, texture, or model reads its
-`content_hash` straight from the in-memory catalog, so a hit never opens the container it would
-otherwise decode. A miss enqueues a `PreviewRenderJob` and replies `pending`; the host drains the
-queue in `on_update`, renders the tile through the main forward+ graph on an offscreen view,
-writes the PNG, and the editor's next poll hits it. A row whose stored hash is `0` derives one
-from the gathered bytes, backfills the catalog, and persists the catalog cache, so the next
-request takes the cheap path.
+`request_thumbnail` checks the cache before loading anything. A mesh, texture, model, or vegetation
+asset reads its `content_hash` from the in-memory catalog, so a hit never opens the source file.
+Plant, biome, and vegetation-map misses rasterize their type icon immediately. Rendered asset misses
+enqueue a `PreviewRenderJob`; the host renders the tile through the main forward+ graph and writes the
+PNG for the editor's next poll.
+
+A row whose stored hash is `0` derives one from the gathered bytes, backfills the catalog, and
+persists the catalog cache. The next request uses the cheap path.
 
 The shared cache is bounded to 1 GiB: a write that pushes past the cap deletes the oldest files
 (by mtime) until the directory is back under 80 % of it.

@@ -5,7 +5,7 @@ weight = 8
 
 # Assets panel & thumbnails
 
-The Assets panel is the editor surface over the project's [asset catalog](../../scene-and-ecs/asset-catalog-in-scene/). A folder tree and tile grid organize catalog entries, while thumbnails make meshes, materials, and textures recognizable without opening them.
+The Assets panel is the editor surface over the project's [asset catalog](../../scene-and-ecs/asset-catalog-in-scene/). A folder tree and tile grid organize catalog entries, while thumbnails identify render assets and vegetation data without opening them.
 
 ## Browsing the catalog
 
@@ -27,13 +27,20 @@ Root / Characters / Hero
 
 ## Catalog actions
 
-The panel imports model and image formats through the shell's native file dialog. An operating-system file drop over the panel uses the same extension routing: image files call `import-texture`; model files call `import-model`. An import into a virtual folder moves the returned catalog entry after the import finishes.
+The panel imports model, image, and authored vegetation formats through the shell's native file
+dialog. An operating-system file drop uses the same extension routing: images call `import-texture`,
+models call `import-model`, and `.splant`, `.sbiome`, or `.svegmap` files call
+`import-vegetation-asset`. An import into a virtual folder moves the returned catalog entry after the
+import finishes.
 
 The context menu changes with its target. Empty space offers Import and New Folder. A folder can be renamed or deleted. An asset can be viewed, renamed, inspected, or deleted; model assets can also be added to the scene. Multi-selection exposes batch viewing and deletion, plus scene instantiation for selected models.
 
 Asset deletion first calls `asset-usages`. The confirmation lists component slots that reference the asset, and `delete-asset` clears those usages before removing the catalog entry and imported file. The Details dialog calls `probe-asset` for file size, creation time, and mesh geometry counts.
 
-Double-click routes models, meshes, animations, textures, and materials to the [asset editor](../asset-editor/). Other file kinds open the flat image viewer. Renaming is inline: Enter or blur commits `rename-asset`, while Escape restores the catalog name.
+Double-click routes models, meshes, animations, textures, and materials to the [asset editor](../asset-editor/).
+Plant, biome, and vegetation-map rows open the vegetation asset workspace. Other file kinds use the
+flat image viewer. Renaming is inline: Enter or blur commits `rename-asset`, while Escape restores the
+catalog name.
 
 ## Thumbnail request path
 
@@ -59,7 +66,11 @@ sequenceDiagram
 
 A cache miss does not render inside the control request. `request_thumbnail` enqueues a preview job and returns `pending: true`; the client retries with exponential backoff. The host drains at most two jobs per update and renders each furnished preview scene through the main render graph on `ViewId::Thumbnail`. It restores the previous active view without resetting that view's temporal history.
 
-The disk cache lives at `<appDataRoot>/thumbnail-cache/`, outside every project. Filenames combine `THUMBNAIL_CACHE_VERSION`, a content hash, and the requested size. Textures, meshes, and models use their catalog content hash; materials hash their resolved state. Identical content can therefore reuse a PNG across assets and projects.
+The disk cache lives at `<appDataRoot>/thumbnail-cache/`, outside every project. Filenames combine `THUMBNAIL_CACHE_VERSION`, a content hash, and the requested size. Textures, meshes, models, plants, biomes, and vegetation maps use their catalog content hash; materials hash their resolved state. Identical content can therefore reuse a PNG across assets and projects.
+
+Plant, biome, and vegetation-map thumbnails rasterize canonical vector icons synchronously. Opening
+one of these rows creates a vegetation asset tab backed by `vegetation-asset-summary`, which shows
+the native source, references, package bounds, and ordered layer metadata.
 
 The cache is capped at 1 GiB. A write above the cap removes the oldest files until usage falls to 80 percent of the cap. The `thumbnail-cache` control command reports cache statistics or clears the directory.
 
@@ -79,6 +90,7 @@ The cache is capped at 1 GiB. A write above the cap removes the oldest files unt
 ## Related
 
 - [Asset editor](../asset-editor/) — the interactive preview opened from a tile
+- [Vegetation assets](../../geometry-and-assets/vegetation-assets/) — plant, biome, and map catalog formats
 - [Asset pickers and drag-drop](../asset-pickers-and-drag-drop/) — inspector targets for catalog drags
 - [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — catalog identity and persistence
 - [Asset commands](../../tooling-and-control/asset-commands/) — shell access to asset management and cache operations
