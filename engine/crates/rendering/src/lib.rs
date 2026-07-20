@@ -18,6 +18,8 @@
 mod aa;
 mod budget;
 mod clouds;
+mod compute_dispatch;
+mod conformance;
 mod ddgi;
 mod descriptors;
 mod device;
@@ -45,8 +47,11 @@ mod resources;
 mod restir;
 mod rt;
 mod scene_pass;
+mod shader_artifact;
 mod shm_publish;
 mod skinning;
+#[cfg(test)]
+mod spatial_numeric;
 mod ssao;
 mod stars;
 mod swapchain;
@@ -55,6 +60,9 @@ mod tessellation;
 mod thumbnail;
 mod transient;
 mod upload;
+mod vegetation_compute;
+#[cfg(test)]
+mod vegetation_graph;
 mod view_target;
 
 pub use aa::{
@@ -62,6 +70,11 @@ pub use aa::{
     clamp_sample_count, jitter_offset, jitter_phase_count, record_motion,
 };
 pub use clouds::{CloudRenderSettings, Clouds};
+pub use conformance::{
+    ComputeConformanceEvidence, GraphProgramEvidence, QualifiedOperatorEvidence,
+    ShaderArtifactEvidence, SpatialNumericEvidence, ValidationEvidence, VulkanProfileEvidence,
+    capture_compute_conformance,
+};
 pub use ddgi::{
     BlendPush as DdgiBlendPush, BorderPush as DdgiBorderPush, DDGI_DIST_FORMAT, DDGI_DIST_INTERIOR,
     DDGI_HYSTERESIS, DDGI_IRR_FORMAT, DDGI_IRR_INTERIOR, DDGI_PROBE_BUDGET, DDGI_PROBE_SPACING,
@@ -71,7 +84,10 @@ pub use ddgi::{
 pub use descriptors::{
     DEFAULT_WHITE_SLOT, Descriptors, MAX_BINDLESS_SDF, MAX_BINDLESS_TEXTURES, MAX_REFLECTION_PROBES,
 };
-pub use device::{Capabilities, Device, ProfilerFacts, SurfaceSource, validation_issue_count};
+pub use device::{
+    Capabilities, Device, ProfilerFacts, SurfaceSource, VulkanDeviceIdentity,
+    validation_issue_count,
+};
 pub use draw_list::{
     DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
     SkinDispatch, SubmeshMaterial, TessDraw, TessRtSlice, normal_matrix,
@@ -145,6 +161,7 @@ pub use scene_pass::{
     record_reactive_coverage, record_scene_draw_list, record_shadow_depth,
     record_transparent_draw_list,
 };
+pub use shader_artifact::{ShaderArtifactError, ShaderArtifactIdentity, ShaderSha256};
 pub use shm_publish::{
     MIN_SHM_SLOT_CAPACITY, SHM_HEADER_BYTES, SHM_MAGIC, SHM_RING_SLOTS, ShmPublish,
 };
@@ -172,6 +189,7 @@ pub use thumbnail::{
 };
 pub use transient::{FROXEL_VOLUME_KEYS, TransientResources};
 pub use upload::{GpuQueue, SdfBake, Uploader};
+pub use vegetation_compute::VulkanGraphComputeExecutor;
 pub use view_target::ViewTarget;
 
 use ash::vk;
@@ -234,6 +252,10 @@ pub enum Error {
     /// multiple of 4, or unreadable).
     #[error("shader load failed: {0}")]
     ShaderLoad(String),
+
+    /// A generated shader artifact or its compiler/source manifest is missing or stale.
+    #[error(transparent)]
+    ShaderArtifact(#[from] ShaderArtifactError),
 
     /// The GPU signed-distance-field bake could not run or its sidecar was malformed
     /// (no bake pipelines, or a decode/IO failure on the cache).
