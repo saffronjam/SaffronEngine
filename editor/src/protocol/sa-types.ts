@@ -6,12 +6,912 @@
 
 export type WireUuid = string;
 
+export type EntitySelector = number | string;
+
+export type AssetSelector = number | string;
+
 export interface EntityRef {
   id: WireUuid;
   name: string;
 }
 
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface Vec4 {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+}
+
+export interface Name {
+  name: string;
+}
+
+export interface Transform {
+  translation: Vec3;
+  scale: Vec3;
+  rotation: Vec3;
+}
+
+export interface Mesh {
+  mesh: WireUuid;
+}
+
+export interface VegetationField {
+  map: WireUuid;
+  enabled: boolean;
+}
+
+export interface Camera {
+  fov: number;
+  near: number;
+  far: number;
+  primary: boolean;
+  showModel: boolean;
+  showFrustum: boolean;
+  frustumMaxDistance: number;
+}
+
+export interface MaterialSlot {
+  material: WireUuid;
+  overrides: Record<string, unknown>;
+}
+
+export interface MaterialSet {
+  slots: MaterialSlot[];
+}
+
+export interface ModelInstance {
+  modelId: WireUuid;
+}
+
+export interface ScriptSlot {
+  scriptPath: string;
+  overrides: Record<string, unknown>;
+}
+
+export interface Script {
+  scripts: ScriptSlot[];
+}
+
+export type AnimationWrapDto = "once" | "loop" | "pingpong";
+
+export type AnimationTransitionDto = "inertialize" | "crossfade";
+
+export interface AnimationPlayer {
+  clip: WireUuid;
+  autoplay: boolean;
+  speed: number;
+  wrap: AnimationWrapDto;
+  transitionMode: AnimationTransitionDto;
+  loopBlend: number;
+}
+
+export type AtmosphereRoleDto = "sun" | "moon";
+
+export interface DirectionalLight {
+  atmosphereRole: AtmosphereRoleDto;
+  direction: Vec3;
+  color: Vec3;
+  intensity: number;
+  ambient: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
+}
+
+export interface PointLight {
+  color: Vec3;
+  intensity: number;
+  range: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
+}
+
+export interface SpotLight {
+  direction: Vec3;
+  color: Vec3;
+  intensity: number;
+  range: number;
+  innerAngle: number;
+  outerAngle: number;
+  volumetricScattering: number;
+  castVolumetricShadow: boolean;
+}
+
+export interface ReflectionProbe {
+  influenceRadius: number;
+  intensity: number;
+  boxProjection: boolean;
+  boxExtent: Vec3;
+}
+
+export type FogShapeDto = "box" | "sphere";
+
+export interface FogVolume {
+  shape: FogShapeDto;
+  extents: Vec3;
+  radius: number;
+  edgeFalloff: number;
+  density: number;
+  albedo: Vec3;
+  emissive: Vec3;
+  phaseG: number;
+  heightFalloff: number;
+  noiseScale: number;
+  noiseIntensity: number;
+  noiseDetail: number;
+  wind: Vec3;
+  speed: number;
+}
+
+export interface Relationship {
+  parent: WireUuid;
+}
+
+export interface SkinnedMesh {
+  mesh: WireUuid;
+  rootBone: WireUuid;
+  bones: WireUuid[];
+  inverseBind: number[][];
+}
+
+export interface Morph {
+  weights: number[];
+  names: string[];
+}
+
+export interface Bone {
+
+}
+
+export interface FootChainDto {
+  upper: number;
+  mid: number;
+  end: number;
+  poleVector: Vec3;
+}
+
+export interface FootIk {
+  enabled: boolean;
+  groundHeight: number;
+  chains: FootChainDto[];
+}
+
+export type JointDto = "fixed" | "hinge" | "swingtwist" | "free";
+
+export interface BonePhysicsDto {
+  shapeHalfExtents: Vec3;
+  mass: number;
+  joint: JointDto;
+  swingTwistLimits: Vec3;
+  driveStiffness: number;
+  driveDamping: number;
+  driveMaxForce: number;
+}
+
+export interface BonePhysics {
+  bones: BonePhysicsDto[];
+}
+
+export interface BVec3 {
+  x: boolean;
+  y: boolean;
+  z: boolean;
+}
+
+export type MotionDto = "static" | "kinematic" | "dynamic";
+
+export interface Rigidbody {
+  motion: MotionDto;
+  mass: number;
+  linearDamping: number;
+  angularDamping: number;
+  gravityFactor: number;
+  lockPosition: BVec3;
+  lockRotation: BVec3;
+  collisionLayer: number;
+}
+
+export type ColliderShapeDto = "box" | "sphere" | "capsule" | "convexhull" | "mesh";
+
+export interface PhysicsMaterial {
+  friction: number;
+  restitution: number;
+}
+
+export interface Collider {
+  shape: ColliderShapeDto;
+  halfExtents: Vec3;
+  sourceMesh: WireUuid;
+  offset: Vec3;
+  material: PhysicsMaterial;
+  isSensor: boolean;
+}
+
+export interface KinematicBones {
+  enabled: boolean;
+  driven: number[];
+}
+
+export interface CharacterController {
+  maxSpeed: number;
+  maxSlopeAngle: number;
+  maxStepHeight: number;
+  gravityFactor: number;
+}
+
+export interface Components {
+  Name?: Name;
+  Transform?: Transform;
+  Mesh?: Mesh;
+  VegetationField?: VegetationField;
+  Camera?: Camera;
+  MaterialSet?: MaterialSet;
+  ModelInstance?: ModelInstance;
+  Script?: Script;
+  AnimationPlayer?: AnimationPlayer;
+  DirectionalLight?: DirectionalLight;
+  PointLight?: PointLight;
+  SpotLight?: SpotLight;
+  ReflectionProbe?: ReflectionProbe;
+  FogVolume?: FogVolume;
+  Relationship?: Relationship;
+  SkinnedMesh?: SkinnedMesh;
+  Morph?: Morph;
+  Bone?: Bone;
+  FootIk?: FootIk;
+  BonePhysics?: BonePhysics;
+  Rigidbody?: Rigidbody;
+  Collider?: Collider;
+  KinematicBones?: KinematicBones;
+  CharacterController?: CharacterController;
+}
+
+export type ComponentBody = Name | Transform | Mesh | VegetationField | Camera | MaterialSet | ModelInstance | Script | AnimationPlayer | DirectionalLight | PointLight | SpotLight | ReflectionProbe | FogVolume | Relationship | SkinnedMesh | Morph | Bone | FootIk | BonePhysics | Rigidbody | Collider | KinematicBones | CharacterController;
+
+export type SkyModeDto = "color" | "texture" | "procedural";
+
+export interface AtmosphereSettingsDto {
+  enabled: boolean;
+  planetRadius: number;
+  atmosphereHeight: number;
+  rayleighScattering: Vec3;
+  rayleighScaleHeight: number;
+  mieScattering: number;
+  mieScaleHeight: number;
+  mieAnisotropy: number;
+  ozoneAbsorption: Vec3;
+  sunDiskAngularRadius: number;
+  sunDiskIntensity: number;
+  moonDiskAngularRadius: number;
+  moonDiskIntensity: number;
+  moonEarthshine: number;
+  perPixelTransmittance: boolean;
+  skyCaptureCadence: number;
+}
+
+export interface FogSettingsDto {
+  enabled: boolean;
+  mode: FogMode;
+  quality: FogQuality;
+  historyBlend: number;
+  neighborhoodClamp: boolean;
+  lightClamp: number;
+  baseDensity: number;
+  scatterAlbedo: number;
+  phaseG: number;
+  density: number;
+  albedo: Vec3;
+  height: number;
+  heightFalloff: number;
+  startDistance: number;
+  maxOpacity: number;
+  emissive: Vec3;
+  directionalColor: Vec3;
+  directionalExponent: number;
+  layer2Density: number;
+  layer2Falloff: number;
+  layer2Height: number;
+  aerialPerspective: boolean;
+  aerialIntensity: number;
+}
+
+export interface CloudSettingsDto {
+  enabled: boolean;
+  coverage: number;
+  cloudType: number;
+  precipitation: number;
+  anvilBias: number;
+  layerAltitude: number;
+  layerHeight: number;
+  baseScale: number;
+  detailScale: number;
+  detailStrength: number;
+  curlStrength: number;
+  weatherScale: number;
+  weatherOffset: Vec3;
+  weatherTexture: WireUuid;
+  primarySteps: number;
+  lightSteps: number;
+  dropletDiameter: number;
+  temporalFactor: number;
+  castCloudShadows: boolean;
+  cloudShadowStrength: number;
+  cloudShadowOnSurfaceStrength: number;
+}
+
+export interface WindSettingsDto {
+  orientation: number;
+  speed: number;
+  gust: number;
+}
+
+export interface TodCurvePointDto {
+  x: number;
+  y: number;
+}
+
+export interface TodTintSettingsDto {
+  master: TodCurvePointDto[];
+  red: TodCurvePointDto[];
+  green: TodCurvePointDto[];
+  blue: TodCurvePointDto[];
+}
+
+export interface TimeOfDaySettingsDto {
+  enabled: boolean;
+  manualOverride: boolean;
+  timeOfDay: number;
+  year: number;
+  month: number;
+  day: number;
+  latitude: number;
+  longitude: number;
+  dayLengthSeconds: number;
+  exposureCurve: TodCurvePointDto[];
+  tintCurve: TodTintSettingsDto;
+  coverageCurve: TodCurvePointDto[];
+  cloudTypeCurve: TodCurvePointDto[];
+}
+
+export type AddEntityPreset = "empty" | "cube" | "plane" | "sphere" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe" | "fog-volume";
+
+export type PickKind = "billboard" | "mesh";
+
+export type GizmoOpDto = "translate" | "rotate" | "scale";
+
+export type GizmoSpaceDto = "world" | "local";
+
+export type GizmoPointerPhase = "hover" | "begin" | "drag" | "end";
+
+export type FogMode = "analytic" | "volumetric";
+
+export type FogQuality = "low" | "medium" | "high";
+
+export type AaModeDto = "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
+
+export type GiModeDto = "off" | "ddgi";
+
+export type ViewModeDto = "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
+
+export type AssetSlotDto = "mesh" | "albedo" | "metallic-roughness" | "normal" | "occlusion" | "emissive" | "height";
+
+export type ScreenshotTargetDto = "viewport" | "window";
+
+export type ThumbnailFormatDto = "png";
+
+export type AssetTypeDto = "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut" | "environment" | "plant" | "biome" | "vegetation-map";
+
+export type PlantId = string;
+
+export type VegetationGuid = string;
+
+export interface WorldCellDto {
+  coordinates: [string, string, string];
+  level: number;
+}
+
+export interface WorldBoundsDto {
+  minTicks: [string, string, string];
+  maxTicksExclusive: [string, string, string];
+}
+
+export type PlantLifecycleDto = "seed" | "sprout" | "juvenile" | "mature" | "senescent" | "dead" | "stump" | "removed";
+
+export type InteractionPolicyDto = "decorative" | "interactive" | "harvestable" | "structural";
+
+export type FieldChannelKindDto = "altitude" | "slope" | "curvature" | "concavity" | "drainage" | "moisture" | "temperature" | "precipitation" | "sunlight" | "exposure" | "water-distance" | "water-depth" | "signed-blocker" | "spline-distance" | "user";
+
+export interface FieldChannelDto {
+  kind: FieldChannelKindDto;
+  user?: string;
+}
+
+export interface SurfaceAttachmentDto {
+  provider: string;
+  primitive: string;
+  barycentric: [number, number, number];
+  revision: string;
+}
+
+export interface PlantPointDto {
+  id: PlantId;
+  owner: WorldCellDto;
+  localPosition: [number, number, number];
+  orientation: [number, number, number, number];
+  scaleBits: [number, number, number];
+  bounds: WorldBoundsDto;
+  family: WireUuid;
+  variation: number;
+  lifecycle: PlantLifecycleDto;
+  phenotype: number;
+  representationClass: number;
+  deterministicKey: VegetationGuid;
+  candidate: string;
+  parent?: PlantId;
+  colony?: PlantId;
+  ecologyTick: string;
+  health: number;
+  moisture: number;
+  fuel: number;
+  phenology: number;
+  flags: number;
+  interactionPolicy: InteractionPolicyDto;
+  provenance: number;
+  attachment?: SurfaceAttachmentDto;
+  surfaceProjectionBits: [number, number, number];
+}
+
+export interface ProvenanceDto {
+  map: WireUuid;
+  layer: VegetationGuid;
+  biome: WireUuid;
+  decision: number;
+  candidate: string;
+  family?: WireUuid;
+  plant?: PlantId;
+  variation: number;
+}
+
+export type ProvenanceDecisionOutcomeDto = "produced" | "retained" | "accepted" | "rejected";
+
+export interface ProvenanceDecisionDto {
+  handle: number;
+  parents: number[];
+  subgraphPath: VegetationGuid[];
+  node: VegetationGuid;
+  operator: string;
+  candidate: string;
+  outcome: ProvenanceDecisionOutcomeDto;
+}
+
+export type VegetationCandidateRejectionReasonDto = "surface-miss" | "threshold" | "weighted-elimination" | "priority-exclusion" | "competition" | "foreign-owner" | "no-species";
+
+export interface ProvenanceExplanationDto {
+  handle: number;
+  record: ProvenanceDto;
+  decisions: ProvenanceDecisionDto[];
+  rejectionReason?: VegetationCandidateRejectionReasonDto;
+}
+
+export type VegetationCompileTargetDto = { "scope": "asset", biome: WireUuid, } | { "scope": "instance", map: WireUuid, biomeInstance: VegetationGuid, };
+
+export interface VegetationCompileBiomeParams {
+  target: VegetationCompileTargetDto;
+}
+
+export interface VegetationGraphEstimateDto {
+  candidates: string;
+  accepted: string;
+  microSamples: string;
+  memoryBytes: string;
+  transferBytes: string;
+}
+
+export interface VegetationGraphLimitsDto {
+  workers: number;
+  outputCells: string;
+  globalStageTiles: string;
+  inputTiles: string;
+  candidates: string;
+  macroPoints: string;
+  microSamples: string;
+  memoryBytes: string;
+  transferBytes: string;
+  moduleDepth: number;
+  timeMs: string;
+}
+
+export interface VegetationGraphDependencyDto {
+  kind: string;
+  identity: string;
+  contentHash: string;
+}
+
+export interface VegetationCompileBiomeResult {
+  biome: WireUuid;
+  biomeInstance?: VegetationGuid;
+  graphIdentity: string;
+  requiredHaloBits: number;
+  estimate: VegetationGraphEstimateDto;
+  limits: VegetationGraphLimitsDto;
+  dependencies: VegetationGraphDependencyDto[];
+}
+
+export type VegetationGraphOperatorDto = "interface-input" | "region-input" | "spline-input" | "species-input" | "community-input" | "explicit-anchors" | "stratified-coverage" | "blue-noise-poisson" | "surface-projection" | "field-sample" | "painted-tile" | "noise" | "gradient" | "curve" | "remap" | "combine" | "clamp" | "distance-field" | "weighted-elimination" | "variable-spacing" | "field-importance" | "cluster-patch-colony" | "spline-follow" | "recursive-companion" | "transform" | "priority-exclusion" | "bounds-overlap" | "competition" | "suitability" | "community-blend" | "succession-input" | "macro-output" | "micro-output" | "diagnostic-output" | "module-call";
+
+export interface VegetationNodeSchemaParams {
+  operator?: VegetationGraphOperatorDto;
+}
+
+export interface VegetationGraphPinDto {
+  name: string;
+  domain: string;
+  required: boolean;
+}
+
+export interface VegetationGraphParameterDto {
+  name: string;
+  kind: string;
+  required: boolean;
+}
+
+export interface VegetationNodeSchemaDto {
+  operator: VegetationGraphOperatorDto;
+  inputs: VegetationGraphPinDto[];
+  outputs: VegetationGraphPinDto[];
+  parameters: VegetationGraphParameterDto[];
+  seedNamespaces: string[];
+  slangCompute: boolean;
+}
+
+export interface VegetationNodeSchemaResult {
+  nodes: VegetationNodeSchemaDto[];
+}
+
+export interface VegetationEvaluateRegionParams {
+  map: WireUuid;
+  biomeInstance: VegetationGuid;
+  bounds: WorldBoundsDto;
+  level: number;
+  ecologyTick?: string;
+  workers?: number;
+}
+
+export type VegetationEvaluationJobStateDto = "running" | "completed" | "cancelled" | "failed";
+
+export interface VegetationEvaluationJobDto {
+  job: string;
+  state: VegetationEvaluationJobStateDto;
+  cells: string;
+}
+
+export interface VegetationEvaluationJobParams {
+  job: string;
+}
+
+export type VegetationExecutionDomainDto = "reference-cpu" | "parallel-cpu" | "slang-compute";
+
+export interface VegetationNodeEvaluationDiagnosticDto {
+  modulePath: VegetationGuid[];
+  node: VegetationGuid;
+  operator: VegetationGraphOperatorDto;
+  symbol: string;
+  inputCandidates: string;
+  outputCandidates: string;
+  outputBytes: string;
+  predictedTransferBytes: string;
+  elapsedMicros: string;
+  executionDomain: VegetationExecutionDomainDto;
+}
+
+export interface VegetationGraphNodeAddressDto {
+  modulePath: VegetationGuid[];
+  node: VegetationGuid;
+}
+
+export type VegetationDiagnosticResultSourceDto = { "kind": "cell", cell: WorldCellDto, } | { "kind": "global-stage", stage: string, owner: WorldCellDto, };
+
+export type VegetationDiagnosticStreamScopeDto = { "kind": "global-snapshot" } | { "kind": "candidate-lineage", lineage: VegetationGuid, };
+
+export interface VegetationDiagnosticCandidateSampleDto {
+  source: VegetationDiagnosticResultSourceDto;
+  identity: VegetationCandidateIdentityDto;
+  owner: WorldCellDto;
+  positionTicks: [string, string, string];
+  family?: WireUuid;
+  variation: number;
+  priorityBits: number;
+  ecologyTick: string;
+}
+
+export interface VegetationDiagnosticScalarSampleDto {
+  source: VegetationDiagnosticResultSourceDto;
+  candidate: VegetationCandidateIdentityDto;
+  valueBits: number;
+}
+
+export interface VegetationDiagnosticProvenanceIdDto {
+  source: VegetationDiagnosticResultSourceDto;
+  handle: number;
+}
+
+export interface VegetationDiagnosticRejectionDto {
+  candidate: VegetationCandidateIdentityDto;
+  reason: VegetationCandidateRejectionReasonDto;
+  provenance: VegetationDiagnosticProvenanceIdDto;
+}
+
+export interface VegetationNamedDiagnosticStreamDto {
+  node: VegetationGraphNodeAddressDto;
+  label: string;
+  scope: VegetationDiagnosticStreamScopeDto;
+  candidateSamples?: VegetationDiagnosticCandidateSampleDto[];
+  scalarSamples?: VegetationDiagnosticScalarSampleDto[];
+  rejected: VegetationDiagnosticRejectionDto[];
+}
+
+export interface VegetationGpuGroupEvaluationDiagnosticDto {
+  nodes: VegetationGraphNodeAddressDto[];
+  invocationCount: string;
+  outputBytes: string;
+  transferBytes: string;
+  elapsedMicros: string;
+}
+
+export interface VegetationEvaluationSummaryDto {
+  cells: string;
+  globalStages: string;
+  globalResidentBytes: string;
+  candidates: string;
+  accepted: string;
+  microTiles: string;
+  rejected: string;
+  canonicalHash: string;
+  nodes: VegetationNodeEvaluationDiagnosticDto[];
+  gpuGroups: VegetationGpuGroupEvaluationDiagnosticDto[];
+  streams: VegetationNamedDiagnosticStreamDto[];
+}
+
+export interface VegetationEvaluationStatusDto {
+  job: string;
+  state: VegetationEvaluationJobStateDto;
+  summary?: VegetationEvaluationSummaryDto;
+  error?: string;
+}
+
+export interface VegetationCandidateIdentityDto {
+  node: VegetationGuid;
+  nodeAddress: VegetationGuid;
+  nodeSemanticRevision: number;
+  ordinal: string;
+  ancestor: string;
+}
+
+export type VegetationExplainSubjectDto = { "kind": "plant", plant: PlantId, } | { "kind": "rejected", candidate: VegetationCandidateIdentityDto, };
+
+export interface VegetationExplainPointParams {
+  job: string;
+  cell: WorldCellDto;
+  subject: VegetationExplainSubjectDto;
+}
+
+export type ThinSheetNormalBehaviorDto = "preserve" | "face-forward-back" | "symmetric";
+
+export type CoverageSourceDto = { "kind": "albedo-alpha" } | { "kind": "texture", texture: WireUuid, } | { "kind": "modeled-geometry" };
+
+export type AlphaClassificationDto = "opaque" | "masked" | "transmissive";
+
+export interface CoverageMipMetadataDto {
+  referenceCutoff: number;
+  sourceExtent: [number, number];
+  spatialHashSalt: string;
+  classification: AlphaClassificationDto;
+  mipHashes: string[];
+}
+
+export interface VoxelMaterialMomentsDto {
+  occupancy: number;
+  albedoMeanBits: [number, number, number];
+  roughnessMean: number;
+  transmissionMeanBits: [number, number, number];
+  thicknessMeanBits: number;
+  normalSecondMomentsBits: [number, number, number, number, number, number];
+}
+
+export interface OpacityMicromapDerivationDto {
+  enabled: boolean;
+  maxSubdivision: number;
+  transparentThreshold: number;
+  opaqueThreshold: number;
+}
+
+export interface ThinSheetFoliageParametersDto {
+  frontAlbedoResponse: number;
+  backAlbedoResponse: number;
+  thicknessBits: number;
+  absorptionColorBits: [number, number, number];
+  transmissionColorBits: [number, number, number];
+  roughness: number;
+  normalBehavior: ThinSheetNormalBehaviorDto;
+  coverageSource: CoverageSourceDto;
+  coverage: CoverageMipMetadataDto;
+  voxelMoments: VoxelMaterialMomentsDto;
+  opacityMicromap: OpacityMicromapDerivationDto;
+  energyLimit: number;
+}
+
+export type MaterialSurfaceDto = { "model": "standard" } | { "model": "thin-sheet-foliage", parameters: ThinSheetFoliageParametersDto, };
+
+export type PlantSourceKindDto = "imported" | "native";
+
+export interface PlantAssetSummaryDto {
+  id: WireUuid;
+  name: string;
+  version: number;
+  source: PlantSourceKindDto;
+  partCount: number;
+  phenotypeCount: number;
+  materialSlots: WireUuid[];
+}
+
+export type BiomeRoleDto = "root" | "module";
+
+export interface BiomeAssetSummaryDto {
+  id: WireUuid;
+  name: string;
+  version: number;
+  role: BiomeRoleDto;
+  plantPalette: WireUuid[];
+  modules: WireUuid[];
+  parameterCount: number;
+}
+
+export interface VegetationMapSummaryDto {
+  id: WireUuid;
+  name: string;
+  version: number;
+  bounds: WorldBoundsDto;
+  layerCount: number;
+  biomeInstances: WireUuid[];
+  chunkLevel: number;
+}
+
+export type VegetationAssetSummaryDto = { "kind": "plant", "asset": PlantAssetSummaryDto } | { "kind": "biome", "asset": BiomeAssetSummaryDto } | { "kind": "vegetation-map", "asset": VegetationMapSummaryDto };
+
+export type LayerCoordinateSpaceDto = "world" | "surface" | "owner-local";
+
+export type FieldBlendOperatorDto = "replace" | "add" | "multiply" | "minimum" | "maximum";
+
+export type InclusionOperatorDto = "include" | "exclude";
+
+export interface SpeciesWeightDto {
+  family: WireUuid;
+  weight: number;
+}
+
+export interface PlantTransformOverrideDto {
+  plant: PlantId;
+  globalTicks: [string, string, string];
+  scaleBits: [number, number, number];
+}
+
+export interface PlantStateOverrideDto {
+  plant: PlantId;
+  health?: number;
+  moisture?: number;
+  fuel?: number;
+  interactionPolicy?: InteractionPolicyDto;
+}
+
+export type VegetationLayerOperatorDto = { "kind": "scalar-field", channel: FieldChannelDto, tileSet: VegetationGuid, blend: FieldBlendOperatorDto, weight: number, } | { "kind": "vector-field", channel: FieldChannelDto, tileSet: VegetationGuid, valueBits: [number, number, number], blend: FieldBlendOperatorDto, } | { "kind": "species-weights", weights: Array<SpeciesWeightDto>, } | { "kind": "density", channel: FieldChannelDto, tileSet: VegetationGuid, blend: FieldBlendOperatorDto, weight: number, } | { "kind": "mask", tileSet: VegetationGuid, operation: InclusionOperatorDto, } | { "kind": "volume", bounds: WorldBoundsDto, operation: InclusionOperatorDto, falloffBits: number, } | { "kind": "spline", spline: VegetationGuid, points: Array<[string, string, string]>, radiusBits: number, operation: InclusionOperatorDto, } | { "kind": "anchors", plants: Array<PlantId>, } | { "kind": "pins", plants: Array<PlantId>, } | { "kind": "transform-overrides", overrides: Array<PlantTransformOverrideDto>, } | { "kind": "state-overrides", overrides: Array<PlantStateOverrideDto>, } | { "kind": "blocker", tileSet: VegetationGuid, categories: number, };
+
+export interface VegetationLayerDto {
+  id: VegetationGuid;
+  name: string;
+  coordinateSpace: LayerCoordinateSpaceDto;
+  bounds: WorldBoundsDto;
+  operator: VegetationLayerOperatorDto;
+  dependencies: VegetationGuid[];
+  order: number;
+  locked: boolean;
+  muted: boolean;
+  revision: string;
+}
+
+export interface VegetationManifestDependencyDto {
+  id: WireUuid;
+  contentHash: string;
+}
+
+export interface VegetationBaseManifestDto {
+  version: number;
+  map: WireUuid;
+  mapHash: string;
+  dependencies: VegetationManifestDependencyDto[];
+  pointSchemaHash: string;
+  evaluatorVersion: number;
+  cookerVersion: number;
+  identity: string;
+}
+
+export interface VegetationMutationHeaderDto {
+  cell: WorldCellDto;
+  transaction: VegetationGuid;
+  authority: VegetationGuid;
+  logicalTick: string;
+  idempotencyKey: VegetationGuid;
+  baseRevision?: string;
+}
+
+export interface PlantTransformDto {
+  globalTicks: [string, string, string];
+  orientation: [number, number, number, number];
+  scaleBits: [number, number, number];
+}
+
+export type VegetationMutationDto = { "kind": "field-tile-patch", layer: VegetationGuid, channel: FieldChannelDto, tile: VegetationGuid, dimensions: [number, number, number], quantumBits: number, values: Array<number>, } | { "kind": "anchor-addition", point: PlantPointDto, } | { "kind": "tombstone", plant: PlantId, } | { "kind": "transform-override", plant: PlantId, transform: PlantTransformDto, } | { "kind": "state-override", plant: PlantId, lifecycle: PlantLifecycleDto | null, phenotype: number | null, health: number | null, moisture: number | null, fuel: number | null, interactionPolicy: InteractionPolicyDto | null, } | { "kind": "planting", point: PlantPointDto, } | { "kind": "damage", plant: PlantId, amount: number, phenotype: number | null, } | { "kind": "moisture-fuel", plant: PlantId, moisture: number, fuel: number, } | { "kind": "lifecycle-transition", plant: PlantId, from: PlantLifecycleDto | null, to: PlantLifecycleDto, ecologyTick: string, } | { "kind": "harvest", plant: PlantId, phenotype: number, } | { "kind": "burn", plant: PlantId, phenotype: number, remainingFuel: number, } | { "kind": "regrow", plant: PlantId, lifecycle: PlantLifecycleDto, phenotype: number, ecologyTick: string, } | { "kind": "promotion-origin-state", plant: PlantId, transform: PlantTransformDto, linearVelocityBits: [number, number, number], angularVelocityBits: [number, number, number], } | { "kind": "disturbance-mask", categories: number, tile: VegetationGuid, values: Array<number>, };
+
+export interface VegetationMutationRecordDto {
+  header: VegetationMutationHeaderDto;
+  mutation: VegetationMutationDto;
+}
+
+export interface VegetationAssetSummaryParams {
+  asset: AssetSelector;
+}
+
+export interface VegetationAssetSummaryResult {
+  type: AssetTypeDto;
+  summary: VegetationAssetSummaryDto;
+  layers: VegetationLayerDto[];
+}
+
+export interface ImportVegetationAssetParams {
+  path: string;
+  folder?: string;
+}
+
+export interface ImportVegetationAssetResult {
+  id: WireUuid;
+  name: string;
+  type: AssetTypeDto;
+}
+
+export interface PointExtensionColumnDto {
+  id: number;
+  elementType: string;
+  stride: number;
+  bytes: number[];
+}
+
+export interface VegetationGestureMetadataDto {
+  gesture: VegetationGuid;
+  presentation: Record<string, unknown>;
+}
+
+export type ProfilerModeDto = "off" | "timestamps" | "pipeline-stats";
+
+export type ProfileLaneDto = "cpu" | "gpu";
+
+export type CaptureModeDto = "single" | "frames" | "rolling";
+
+export type CaptureStateDto = "idle" | "arming" | "recording" | "ready";
+
+export type AlarmSeverityDto = "info" | "warning" | "critical";
+
+export type AlarmStateDto = "firing" | "resolved";
+
 export interface PingParams {
+
+}
+
+export interface EmptyParams {
 
 }
 
@@ -22,14 +922,15 @@ export interface PingResult {
   pid: number;
 }
 
-export interface EmptyParams {
-
-}
-
 export interface RenderStatsDto {
   drawCalls: number;
   batches: number;
   instances: number;
+  sceneGatherMs: number;
+  instanceUploadBytes: number;
+  retainedMeshCpuBytes: number;
+  shadowDrawCalls: number;
+  rtInstances: number;
   frameMs: number;
   fps: number;
   gpuMs: number;
@@ -44,7 +945,7 @@ export interface RenderStatsDto {
   vramUsageBytes: number;
   vramBudgetBytes: number;
   softwareGpu: boolean;
-  profilerMode: "off" | "timestamps" | "pipeline-stats";
+  profilerMode: ProfilerModeDto;
   clustered: boolean;
   depthPrepass: boolean;
   shadows: boolean;
@@ -85,73 +986,8 @@ export interface RenderStatsDto {
   bloomDirtTint: [number, number, number];
   bloomAnamorphic: AnamorphicParams;
   bloomPerMipTint: [number, number, number][];
-  aa: "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
-  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
-}
-
-export interface SetColorGradingParams {
-  temperature: number;
-  tint: number;
-  contrast: number;
-  pivot: number;
-  saturation: number;
-  slope: [number, number, number];
-  offset: [number, number, number];
-  power: [number, number, number];
-  shadows: GradeRangeDto;
-  midtones: GradeRangeDto;
-  highlights: GradeRangeDto;
-  shadowsMax: number;
-  highlightsMin: number;
-  channelMixer: [number, number, number, number, number, number, number, number, number];
-  splitTone: SplitToneDto;
-  creativeLutAsset: WireUuid;
-  creativeLutIntensity: number;
-}
-
-export interface GradeRangeDto {
-  slope: [number, number, number];
-  offset: [number, number, number];
-  power: [number, number, number];
-  saturation: number;
-  contrast: number;
-}
-
-export interface SplitToneDto {
-  shadow: [number, number, number];
-  highlight: [number, number, number];
-  balance: number;
-}
-
-export interface CreativeLutStat {
-  asset: WireUuid;
-  intensity: number;
-  size: number;
-}
-
-export interface AnamorphicParams {
-  enabled: boolean;
-  ratio: number;
-  tint: [number, number, number];
-  intensity: number;
-}
-
-export interface ProfilerSetModeParams {
-  mode?: "off" | "timestamps" | "pipeline-stats";
-}
-
-export interface ProfilerModeResult {
-  mode: "off" | "timestamps" | "pipeline-stats";
-  timestampsSupported: boolean;
-  pipelineStatsSupported: boolean;
-  softwareGpu: boolean;
-}
-
-export interface RenderPassTimingsDto {
-  passes: RenderPassTimingDto[];
-  gpuTotalMs: number;
-  softwareGpu: boolean;
-  profilerMode: "off" | "timestamps" | "pipeline-stats";
+  aa: AaModeDto;
+  viewMode: ViewModeDto;
 }
 
 export interface RenderPassTimingDto {
@@ -159,8 +995,62 @@ export interface RenderPassTimingDto {
   gpuMs: number;
 }
 
+export interface RenderPassTimingsDto {
+  passes: RenderPassTimingDto[];
+  gpuTotalMs: number;
+  softwareGpu: boolean;
+  profilerMode: ProfilerModeDto;
+}
+
+export interface ProfilerSetModeParams {
+  mode?: ProfilerModeDto;
+}
+
+export interface ProfilerModeResult {
+  mode: ProfilerModeDto;
+  timestampsSupported: boolean;
+  pipelineStatsSupported: boolean;
+  softwareGpu: boolean;
+}
+
+export interface PipelineStatsDto {
+  inputVertices: number;
+  vertexInvocations: number;
+  clippingInvocations: number;
+  clippingPrimitives: number;
+  fragmentInvocations: number;
+  computeInvocations: number;
+  pixels: number;
+}
+
+export interface ProfileSpanDto {
+  name: string;
+  lane: ProfileLaneDto;
+  startNs: number;
+  endNs: number;
+  parentIndex: number;
+  depth: number;
+  pipelineStats?: PipelineStatsDto;
+}
+
+export interface ProfileCaptureMetadataDto {
+  softwareGpu: boolean;
+  correlated: boolean;
+  deviceName: string;
+  timestampPeriod: number;
+  targetFps: number;
+  mode: ProfilerModeDto;
+  filter: string;
+  frameCount: number;
+}
+
+export interface ProfileCaptureDto {
+  spans: ProfileSpanDto[];
+  metadata: ProfileCaptureMetadataDto;
+}
+
 export interface CaptureStartParams {
-  mode?: "single" | "frames" | "rolling";
+  mode?: CaptureModeDto;
   frames?: number;
   filter?: string;
   includeCpu?: boolean;
@@ -174,7 +1064,7 @@ export interface CaptureStartResult {
 
 export interface CaptureStopResult {
   ready: boolean;
-  mode: "single" | "frames" | "rolling";
+  mode: CaptureModeDto;
   frameCount: number;
   inlined: boolean;
   capture: ProfileCaptureDto;
@@ -183,48 +1073,19 @@ export interface CaptureStopResult {
   pending: boolean;
 }
 
-export interface ProfileCaptureDto {
-  spans: ProfileSpanDto[];
-  metadata: ProfileCaptureMetadataDto;
-}
-
-export interface ProfileSpanDto {
-  name: string;
-  lane: "cpu" | "gpu";
-  startNs: number;
-  endNs: number;
-  parentIndex: number;
-  depth: number;
-  pipelineStats?: PipelineStatsDto;
-}
-
-export interface PipelineStatsDto {
-  inputVertices: number;
-  vertexInvocations: number;
-  clippingInvocations: number;
-  clippingPrimitives: number;
-  fragmentInvocations: number;
-  computeInvocations: number;
-  pixels: number;
-}
-
-export interface ProfileCaptureMetadataDto {
-  softwareGpu: boolean;
-  correlated: boolean;
-  deviceName: string;
-  timestampPeriod: number;
-  targetFps: number;
-  mode: "off" | "timestamps" | "pipeline-stats";
-  filter: string;
-  frameCount: number;
-}
-
 export interface CaptureStatusResult {
-  state: "idle" | "arming" | "recording" | "ready";
+  state: CaptureStateDto;
   capturedFrames: number;
   targetFrames: number;
-  mode: "single" | "frames" | "rolling";
+  mode: CaptureModeDto;
   pipelineStatsSupported: boolean;
+}
+
+export interface FrameSampleDto {
+  frameIndex: number;
+  cpuMs: number;
+  gpuMs: number;
+  cpuWaitMs: number;
 }
 
 export interface FrameHistoryParams {
@@ -243,13 +1104,6 @@ export interface FrameHistoryDto {
   sampleCount: number;
   budgetMs: number;
   samples: FrameSampleDto[];
-}
-
-export interface FrameSampleDto {
-  frameIndex: number;
-  cpuMs: number;
-  gpuMs: number;
-  cpuWaitMs: number;
 }
 
 export interface PerfConfigDto {
@@ -273,10 +1127,6 @@ export interface SetPerfConfigParams {
   vramCritFrac?: number;
 }
 
-export interface GetUpscaleResult {
-  upscale: UpscaleDto;
-}
-
 export interface UpscaleDto {
   ratio: number;
   dynamic: boolean;
@@ -287,6 +1137,10 @@ export interface UpscaleDto {
   displayHeight: number;
 }
 
+export interface GetUpscaleResult {
+  upscale: UpscaleDto;
+}
+
 export interface SetUpscaleParams {
   ratio?: number;
   dynamic?: boolean;
@@ -295,6 +1149,20 @@ export interface SetUpscaleParams {
 
 export interface SetUpscaleResult {
   upscale: UpscaleDto;
+}
+
+export interface AlarmEventDto {
+  seq: number;
+  fingerprint: string;
+  metric: string;
+  pass: string;
+  severity: AlarmSeverityDto;
+  state: AlarmStateDto;
+  value: number;
+  threshold: number;
+  sinceFrame: number;
+  count: number;
+  durationMs: number;
 }
 
 export interface DrainAlarmsParams {
@@ -308,45 +1176,231 @@ export interface DrainAlarmsResult {
   overflowed: boolean;
 }
 
-export interface AlarmEventDto {
-  seq: number;
-  fingerprint: string;
-  metric: string;
-  pass: string;
-  severity: "info" | "warning" | "critical";
-  state: "firing" | "resolved";
-  value: number;
-  threshold: number;
-  sinceFrame: number;
-  count: number;
-  durationMs: number;
+export interface ScriptStatusResult {
+  state: string;
+  instances: number;
+  errorHighWater: number;
 }
 
-export interface ActiveAlarmsDto {
-  alarms: ActiveAlarmDto[];
+export interface PhysicsStateResult {
+  active: boolean;
+  bodyCount: number;
+  dynamicCount: number;
+}
+
+export interface FitColliderParams {
+  entity: EntitySelector;
+}
+
+export interface FitColliderResult {
+  entity: WireUuid;
+  shape: string;
+  halfExtents: Vec3;
+  offset: Vec3;
+}
+
+export interface ContactEventDto {
+  seq: number;
+  kind: string;
+  entityA: WireUuid;
+  entityB: WireUuid;
+  sensor: boolean;
+  point: Vec3;
+  normal: Vec3;
+  tick: number;
+}
+
+export interface DrainContactsParams {
+  since?: number;
+}
+
+export interface DrainContactsResult {
+  events: ContactEventDto[];
+  highWaterSeq: number;
+  oldestSeq: number;
+  overflowed: boolean;
+}
+
+export interface PhysicsBodyDto {
+  entity: WireUuid;
+  motion: string;
+  active: boolean;
+  position: Vec3;
+}
+
+export interface PhysicsBodiesResult {
+  bodies: PhysicsBodyDto[];
+}
+
+export interface ApplyImpulseParams {
+  entity: EntitySelector;
+  impulse: Vec3;
+}
+
+export interface ApplyImpulseResult {
+  velocity: Vec3;
+}
+
+export interface SetKinematicBonesParams {
+  entity: EntitySelector;
+  enabled?: boolean;
+}
+
+export interface KinematicBonesResult {
+  entity: WireUuid;
+  enabled: boolean;
+  boneCount: number;
+}
+
+export interface MoveCharacterParams {
+  entity: EntitySelector;
+  velocity: Vec3;
+  jump?: boolean;
+}
+
+export interface MoveCharacterResult {
+  position: Vec3;
+  onGround: boolean;
+}
+
+export interface RaycastParams {
+  origin: Vec3;
+  dir: Vec3;
+  maxDist?: number;
+}
+
+export interface ShapecastParams {
+  origin: Vec3;
+  dir: Vec3;
+  radius: number;
+  maxDist?: number;
+}
+
+export interface RaycastResult {
+  hit: boolean;
+  entity: WireUuid;
+  point: Vec3;
+  normal: Vec3;
+  distance: number;
+}
+
+export interface EnableRagdollParams {
+  entity: EntitySelector;
+  enabled?: boolean;
+}
+
+export interface RagdollResult {
+  present: boolean;
+  active: boolean;
+  bodyWeight: number;
+  bones: number;
+}
+
+export interface SetRagdollParams {
+  entity: EntitySelector;
+  active?: boolean;
+  bodyWeight?: number;
+  bone?: number;
+  weight?: number;
+}
+
+export interface GetRagdollParams {
+  entity: EntitySelector;
+}
+
+export interface ScriptErrorDto {
+  seq: number;
+  entity: WireUuid;
+  script: string;
+  message: string;
+  tick: number;
+}
+
+export interface DrainScriptErrorsParams {
+  since?: number;
+}
+
+export interface DrainScriptErrorsResult {
+  events: ScriptErrorDto[];
+  highWaterSeq: number;
+  oldestSeq: number;
+  overflowed: boolean;
+}
+
+export interface ScriptLogDto {
+  seq: number;
+  entity: WireUuid;
+  message: string;
+  epochMs: number;
+  tick: number;
+}
+
+export interface DrainScriptLogsParams {
+  since?: number;
+}
+
+export interface DrainScriptLogsResult {
+  events: ScriptLogDto[];
+  highWaterSeq: number;
+  oldestSeq: number;
+  overflowed: boolean;
+}
+
+export interface GetScriptSchemaParams {
+  path: string;
+}
+
+export interface ScriptFieldDto {
+  name: string;
+  type: string;
+  defaultValue: unknown;
+}
+
+export interface GetScriptSchemaResult {
+  fields: ScriptFieldDto[];
+}
+
+export interface SetScriptOverrideParams {
+  entity: EntitySelector;
+  slot: number;
+  name: string;
+  value: unknown;
+}
+
+export interface SetScriptOverrideResult {
+  scriptPath: string;
+  overrides: unknown;
+}
+
+export interface CreateScriptParams {
+  name: string;
+}
+
+export interface CreateScriptResult {
+  path: string;
 }
 
 export interface ActiveAlarmDto {
   fingerprint: string;
   metric: string;
   pass: string;
-  severity: "info" | "warning" | "critical";
+  severity: AlarmSeverityDto;
   value: number;
   threshold: number;
   sinceFrame: number;
   count: number;
 }
 
+export interface ActiveAlarmsDto {
+  alarms: ActiveAlarmDto[];
+}
+
 export interface SetAaParams {
-  mode?: "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
+  mode?: AaModeDto;
 }
 
 export interface SetAaResult {
-  aa: "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
-}
-
-export interface GetTaaParamsResult {
-  params: TaaParamsDto;
+  aa: AaModeDto;
 }
 
 export interface TaaParamsDto {
@@ -355,6 +1409,10 @@ export interface TaaParamsDto {
   velocityRejection: number;
   clipGamma: number;
   sharpness: number;
+}
+
+export interface GetTaaParamsResult {
+  params: TaaParamsDto;
 }
 
 export interface SetTaaParamsParams {
@@ -370,11 +1428,11 @@ export interface SetTaaParamsResult {
 }
 
 export interface SetViewModeParams {
-  mode?: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
+  mode?: ViewModeDto;
 }
 
 export interface SetViewModeResult {
-  viewMode: "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
+  viewMode: ViewModeDto;
 }
 
 export interface ToggleParams {
@@ -433,7 +1491,7 @@ export interface SetRtReflectionsResult {
 }
 
 export interface SetGiParams {
-  mode: "off" | "ddgi";
+  mode: GiModeDto;
 }
 
 export interface SetGiResult {
@@ -485,8 +1543,537 @@ export interface SetViewportSizeResult {
   height: number;
 }
 
-export interface EntityList {
-  entities: EntityListEntry[];
+export interface SetActiveViewParams {
+  view: string;
+}
+
+export interface SetActiveViewResult {
+  view: string;
+}
+
+export interface ProjectInfoDto {
+  loaded: boolean;
+  root: string;
+  path: string;
+  name: string;
+  displayName: string;
+}
+
+export type ProjectPhaseDto = "unloaded" | "loading" | "ready" | "failed";
+
+export type BootStageDto = "manifest" | "catalog" | "scene" | "install" | "assets" | "skybox" | "accel" | "ready" | "failed";
+
+export interface ProjectStatusDto {
+  phase: ProjectPhaseDto;
+  stage: BootStageDto;
+  done: number;
+  total: number;
+  label: string;
+  currentItem: string;
+  error: string;
+  version: number;
+  name: string;
+  path: string;
+}
+
+export interface NewProjectParams {
+  name?: string;
+  displayName?: string;
+  root?: string;
+}
+
+export interface PathParams {
+  path: string;
+}
+
+export interface ProjectStoresDto {
+  enabled: string[];
+}
+
+export interface OptionalPathParams {
+  path?: string;
+}
+
+export interface AssetAttributionDto {
+  licenseId: string;
+  requiresAttribution: boolean;
+  licenseUrl: string;
+  author: string;
+  sourceUrl: string;
+  storeId: string;
+}
+
+export interface ImportModelParams {
+  path: string;
+  attribution?: AssetAttributionDto;
+}
+
+export interface ImportModelResult {
+  id: WireUuid;
+  name: string;
+  type: string;
+}
+
+export interface InstantiateModelParams {
+  asset: AssetSelector;
+  name?: string;
+}
+
+export type AssetPlacementPhaseDto = "preview" | "commit" | "clear";
+
+export interface AssetPlacementParams {
+  phase: AssetPlacementPhaseDto;
+  asset?: AssetSelector;
+  u?: number;
+  v?: number;
+}
+
+export interface PlacementTransformDto {
+  translation: Vec3;
+  rotation: Vec3;
+  scale: Vec3;
+}
+
+export interface AssetPlacementResult {
+  active: boolean;
+  valid: boolean;
+  transform?: PlacementTransformDto;
+  entity?: EntityRef;
+  reason?: string;
+}
+
+export interface ExtractSubAssetParams {
+  asset: AssetSelector;
+  subAsset: WireUuid;
+  dest?: string;
+}
+
+export interface ClearExtractionParams {
+  asset: AssetSelector;
+  subAsset: WireUuid;
+}
+
+export interface ImportTextureParams {
+  path: string;
+  colorspace?: string;
+  role?: string;
+}
+
+export interface ImportTextureResult {
+  texture: WireUuid;
+}
+
+export interface ImportLutParams {
+  path: string;
+}
+
+export interface ImportLutResult {
+  lut: WireUuid;
+}
+
+export interface AssetEntryDto {
+  id: WireUuid;
+  name: string;
+  type: AssetTypeDto;
+  path: string;
+  folder?: string;
+  container?: WireUuid;
+  duration?: number;
+  rigged?: boolean;
+  colorspace?: string;
+  role?: string;
+  createdAt: number;
+  attribution?: AssetAttributionDto;
+}
+
+export interface AssetList {
+  assets: AssetEntryDto[];
+  folders: string[];
+}
+
+export interface ScanAssetsResult {
+  added: number;
+  removed: number;
+}
+
+export interface ReimportModelResult {
+  updated: number;
+  added: number;
+  removedFromSource: number;
+  skipped: boolean;
+}
+
+export interface ReimportModelParams {
+  asset: AssetSelector;
+}
+
+export interface ModelInfoParams {
+  asset: AssetSelector;
+}
+
+export interface ModelSubAssetDto {
+  id: WireUuid;
+  name: string;
+  type: string;
+  bytes: number;
+}
+
+export interface ModelInfoResult {
+  id: WireUuid;
+  name: string;
+  sourcePath: string;
+  sourceHash: string;
+  materialCount: number;
+  hasSkin: boolean;
+  nodeCount: number;
+  totalBytes: number;
+  subAssets: ModelSubAssetDto[];
+}
+
+export interface AssetReferencesParams {
+  asset: AssetSelector;
+}
+
+export interface AssetReferencesResult {
+  referencedBy: string[];
+  references: string[];
+  footprint: number;
+}
+
+export interface CleanCandidateDto {
+  id: WireUuid;
+  path: string;
+  category: string;
+  bytes: number;
+  reason: string;
+}
+
+export interface CleanReport {
+  candidates: CleanCandidateDto[];
+  reclaimableBytes: number;
+}
+
+export interface CleanAssetsParams {
+  dryRun?: boolean;
+  exclude?: string[];
+}
+
+export interface DeleteUnusedParams {
+  ids: string[];
+  confirm?: boolean;
+}
+
+export interface DeleteUnusedResult {
+  deleted: number;
+  reclaimedBytes: number;
+}
+
+export interface RenameAssetParams {
+  asset: AssetSelector;
+  name: string;
+}
+
+export interface AssetRef {
+  id: WireUuid;
+  name: string;
+  folder?: string;
+}
+
+export interface CreateAssetFolderParams {
+  folder: string;
+}
+
+export interface RenameAssetFolderParams {
+  folder: string;
+  name: string;
+}
+
+export interface DeleteAssetFolderParams {
+  folder: string;
+}
+
+export interface MoveAssetParams {
+  asset: AssetSelector;
+  folder?: string;
+}
+
+export interface AssetUsagesParams {
+  asset: AssetSelector;
+}
+
+export interface AssetUsageDto {
+  entity?: WireUuid;
+  entityName?: string;
+  slot: string;
+}
+
+export interface AssetUsagesResult {
+  usages: AssetUsageDto[];
+}
+
+export interface AssetMetadataParams {
+  asset: AssetSelector;
+}
+
+export interface AssetMetadataDto {
+  id: WireUuid;
+  name: string;
+  type: AssetTypeDto;
+  path: string;
+  folder?: string;
+  sizeBytes: number;
+  vertexCount?: number;
+  triangleCount?: number;
+  createdAt: number;
+}
+
+export interface DeleteAssetParams {
+  asset: AssetSelector;
+}
+
+export interface DeleteAssetResult {
+  id: WireUuid;
+  name: string;
+  cleared: AssetUsageDto[];
+  fileDeleted: boolean;
+}
+
+export interface AssignAssetParams {
+  entity: EntitySelector;
+  slot: AssetSlotDto;
+  asset: AssetSelector;
+}
+
+export interface MaterialCreateParams {
+  name: string;
+}
+
+export interface MaterialCreateResult {
+  id: WireUuid;
+  name: string;
+}
+
+export interface MaterialAssignParams {
+  entity: EntitySelector;
+  material: AssetSelector;
+}
+
+export interface MaterialAssignResult {
+  material: WireUuid;
+}
+
+export interface MaterialImportParams {
+  path: string;
+  name: string;
+  attribution?: AssetAttributionDto;
+}
+
+export interface MaterialImportResultDto {
+  id: WireUuid;
+  roles: string;
+}
+
+export interface MaterialRefDto {
+  id: WireUuid;
+  name: string;
+  folder: string;
+}
+
+export interface MaterialListResult {
+  materials: MaterialRefDto[];
+}
+
+export interface MaterialGetParams {
+  material: AssetSelector;
+}
+
+export interface MaterialGetResult {
+  id: WireUuid;
+  surface: MaterialSurfaceDto;
+  blend: string;
+  unlit: boolean;
+  baseColor: Vec4;
+  metallic: number;
+  roughness: number;
+  emissive: Vec3;
+  emissiveStrength: number;
+  heightScale: number;
+  heightMode: string;
+  albedoTexture: WireUuid;
+  ormTexture: WireUuid;
+  normalTexture: WireUuid;
+  emissiveTexture: WireUuid;
+  heightTexture: WireUuid;
+  vectorDisplacementTexture: WireUuid;
+  graph: unknown;
+}
+
+export interface MaterialSchemaParams {
+  material: AssetSelector;
+}
+
+export interface ExposedParamDto {
+  name: string;
+  kind: string;
+  default: unknown;
+}
+
+export interface MaterialSchemaResult {
+  params: ExposedParamDto[];
+}
+
+export interface MaterialUpdateParams {
+  material: AssetSelector;
+  surface?: MaterialSurfaceDto;
+  baseColor?: Vec4;
+  metallic?: number;
+  roughness?: number;
+  emissive?: Vec3;
+  emissiveStrength?: number;
+  normalStrength?: number;
+  heightScale?: number;
+  heightMode?: string;
+  albedoTexture?: WireUuid;
+  ormTexture?: WireUuid;
+  normalTexture?: WireUuid;
+  emissiveTexture?: WireUuid;
+  heightTexture?: WireUuid;
+  vectorDisplacementTexture?: WireUuid;
+}
+
+export interface MaterialUpdateResult {
+  id: WireUuid;
+}
+
+export interface PreviewRenderParams {
+  material: AssetSelector;
+  size?: number;
+}
+
+export interface PreviewRenderResult {
+  png: string;
+}
+
+export interface MaterialSetGraphParams {
+  material: AssetSelector;
+  graph: unknown;
+}
+
+export interface MaterialSetGraphResult {
+  id: WireUuid;
+  foldable: boolean;
+}
+
+export interface MaterialCreateInstanceParams {
+  parent: AssetSelector;
+  name: string;
+}
+
+export interface MaterialSetOverrideParams {
+  material: AssetSelector;
+  field: string;
+  value: unknown;
+}
+
+export interface MaterialSetOverrideResult {
+  id: WireUuid;
+}
+
+export interface MaterialCompileParams {
+  material: AssetSelector;
+}
+
+export interface MaterialCompileResult {
+  id: WireUuid;
+  ok: boolean;
+}
+
+export interface MaterialCookResult {
+  compiled: number;
+  failed: number;
+}
+
+export interface AppManifest {
+  title: string;
+  width: number;
+  height: number;
+  fullscreen: boolean;
+  vsync: boolean;
+}
+
+export interface ExportAppParams {
+  outputDir: string;
+  app: AppManifest;
+}
+
+export interface ExportAppResult {
+  path: string;
+  warnings: string[];
+}
+
+export interface AssignAssetResult {
+  id: WireUuid;
+  name: string;
+  slot: AssetSlotDto;
+}
+
+export interface PathResult {
+  path: string;
+}
+
+export interface ScreenshotParams {
+  target?: ScreenshotTargetDto;
+  path: string;
+}
+
+export interface ScreenshotResult {
+  target: ScreenshotTargetDto;
+  path: string;
+  pending: boolean;
+}
+
+export interface ThumbnailParams {
+  asset: AssetSelector;
+  size?: number;
+}
+
+export interface ThumbnailResult {
+  id: WireUuid;
+  format: ThumbnailFormatDto;
+  width: number;
+  height: number;
+  base64: string;
+  pending: boolean;
+}
+
+export interface ThumbnailCacheParams {
+  action: string;
+}
+
+export interface ThumbnailCacheResult {
+  entries: number;
+  bytes: number;
+}
+
+export interface QuitResult {
+  quitting: boolean;
+}
+
+export interface CreateEntityParams {
+  name: string;
+}
+
+export interface EntityParams {
+  entity: EntitySelector;
+}
+
+export interface SetParentParams {
+  entity: EntitySelector;
+  parent?: EntitySelector;
+}
+
+export interface DestroyEntityResult {
+  destroyed: WireUuid;
 }
 
 export interface EntityListEntry {
@@ -496,29 +2083,16 @@ export interface EntityListEntry {
   bone?: boolean;
 }
 
+export interface EntityList {
+  entities: EntityListEntry[];
+}
+
 export interface ComponentList {
   components: string[];
 }
 
-export interface CreateEntityParams {
-  name: string;
-}
-
-export interface EntityParams {
-  entity: number | string;
-}
-
-export interface DestroyEntityResult {
-  destroyed: WireUuid;
-}
-
-export interface SetParentParams {
-  entity: number | string;
-  parent?: number | string;
-}
-
 export interface ComponentParams {
-  entity: number | string;
+  entity: EntitySelector;
   component: string;
 }
 
@@ -531,19 +2105,17 @@ export interface RemoveComponentResult {
 }
 
 export interface SetComponentParams {
-  entity: number | string;
+  entity: EntitySelector;
   component: string;
   json: ComponentBody;
 }
-
-export type ComponentBody = Name | Transform | Mesh | Camera | MaterialSet | ModelInstance | Script | AnimationPlayer | DirectionalLight | PointLight | SpotLight | ReflectionProbe | FogVolume | Relationship | SkinnedMesh | Morph | Bone | FootIk | BonePhysics | Rigidbody | Collider | KinematicBones | CharacterController;
 
 export interface SetComponentResult {
   set: string;
 }
 
 export interface SetComponentOrderParams {
-  entity: number | string;
+  entity: EntitySelector;
   components: string[];
 }
 
@@ -552,21 +2124,15 @@ export interface SetComponentOrderResult {
 }
 
 export interface SetTransformParams {
-  entity: number | string;
+  entity: EntitySelector;
   translation?: Vec3;
   rotation?: Vec3;
   scale?: Vec3;
   smooth?: boolean;
 }
 
-export interface Vec3 {
-  x: number;
-  y: number;
-  z: number;
-}
-
 export interface SetLightParams {
-  entity?: number | string;
+  entity?: EntitySelector;
   direction?: Vec3;
   color?: Vec3;
   intensity?: number;
@@ -582,7 +2148,133 @@ export interface PickResult {
   hit: boolean;
   id?: WireUuid;
   name?: string;
-  kind?: "billboard" | "mesh";
+  kind?: PickKind;
+}
+
+export interface SpatialTicksDto {
+  x: string;
+  y: string;
+  z: string;
+}
+
+export interface WorldCellKeyDto {
+  x: string;
+  y: string;
+  z: string;
+  level: number;
+  canonicalHex: string;
+}
+
+export interface SpatialLocalPositionDto {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface SpatialWorldPositionDto {
+  cell: WorldCellKeyDto;
+  local: SpatialLocalPositionDto;
+  globalTicks: SpatialTicksDto;
+}
+
+export interface SpatialCellParams {
+  world?: Vec3;
+  ticks?: SpatialTicksDto;
+  level?: number;
+}
+
+export interface SpatialCellResult {
+  position: SpatialWorldPositionDto;
+  selectedCell: WorldCellKeyDto;
+}
+
+export interface SurfaceCapabilitiesDto {
+  ray: boolean;
+  project: boolean;
+  nearest: boolean;
+  uv: boolean;
+  authoritativeAttachments: boolean;
+  authoritativeFields: boolean;
+}
+
+export interface SpatialBoundsDto {
+  minTicks: SpatialTicksDto;
+  maxTicksExclusive: SpatialTicksDto;
+}
+
+export interface SurfaceProviderDto {
+  id: WireUuid;
+  entity: WireUuid;
+  name: string;
+  revision: string;
+  bounds: SpatialBoundsDto;
+  primitiveCount: string;
+  capabilities: SurfaceCapabilitiesDto;
+}
+
+export interface SurfaceProvidersResult {
+  providers: SurfaceProviderDto[];
+}
+
+export type SpatialFieldChannelDto = "altitude" | "slope" | "curvature" | "concavity" | "drainage" | "moisture" | "temperature" | "precipitation" | "sunlight" | "exposure" | "water-distance" | "water-depth" | "signed-blocker" | "spline-distance" | "user";
+
+export type SpatialFieldDerivativeDto = "value" | "gradient" | "hessian";
+
+export interface SpatialSampleParams {
+  provider: WireUuid;
+  channel: SpatialFieldChannelDto;
+  userChannel?: string;
+  position: Vec3;
+  derivative?: SpatialFieldDerivativeDto;
+}
+
+export interface SpatialSampleResult {
+  provider: WireUuid;
+  channel: SpatialFieldChannelDto;
+  userChannel?: string;
+  derivative: SpatialFieldDerivativeDto;
+  valueBits: number;
+  value: number;
+  revision: string;
+}
+
+export type ResidencyFacetDto = "render" | "physics" | "simulation" | "editing" | "navigation" | "network";
+
+export interface SpatialSourceLevelDto {
+  level: number;
+  loadRadiusCells: number;
+  cleanupRadiusCells: number;
+}
+
+export interface SpatialSourceDto {
+  id: string;
+  revision: string;
+  position: SpatialWorldPositionDto;
+  velocityMps: Vec3;
+  predictionSeconds: number;
+  levels: SpatialSourceLevelDto[];
+  facets: ResidencyFacetDto[];
+  priority: number;
+}
+
+export interface ResidencyCountsDto {
+  render: number;
+  physics: number;
+  simulation: number;
+  editing: number;
+  navigation: number;
+  network: number;
+}
+
+export interface SpatialResidencyCellDto {
+  cell: WorldCellKeyDto;
+  referenceCounts: ResidencyCountsDto;
+  priority: number;
+}
+
+export interface SpatialResidencyResult {
+  sources: SpatialSourceDto[];
+  cells: SpatialResidencyCellDto[];
 }
 
 export interface InspectResult {
@@ -592,237 +2284,8 @@ export interface InspectResult {
   componentOrder: string[];
 }
 
-export interface Components {
-  Name?: Name;
-  Transform?: Transform;
-  Mesh?: Mesh;
-  Camera?: Camera;
-  MaterialSet?: MaterialSet;
-  ModelInstance?: ModelInstance;
-  Script?: Script;
-  AnimationPlayer?: AnimationPlayer;
-  DirectionalLight?: DirectionalLight;
-  PointLight?: PointLight;
-  SpotLight?: SpotLight;
-  ReflectionProbe?: ReflectionProbe;
-  FogVolume?: FogVolume;
-  Relationship?: Relationship;
-  SkinnedMesh?: SkinnedMesh;
-  Morph?: Morph;
-  Bone?: Bone;
-  FootIk?: FootIk;
-  BonePhysics?: BonePhysics;
-  Rigidbody?: Rigidbody;
-  Collider?: Collider;
-  KinematicBones?: KinematicBones;
-  CharacterController?: CharacterController;
-}
-
-export interface Name {
-  name: string;
-}
-
-export interface Transform {
-  translation: Vec3;
-  scale: Vec3;
-  rotation: Vec3;
-}
-
-export interface Mesh {
-  mesh: WireUuid;
-}
-
-export interface Camera {
-  fov: number;
-  near: number;
-  far: number;
-  primary: boolean;
-  showModel: boolean;
-  showFrustum: boolean;
-  frustumMaxDistance: number;
-}
-
-export interface MaterialSet {
-  slots: MaterialSlot[];
-}
-
-export interface MaterialSlot {
-  material: WireUuid;
-  overrides: Record<string, unknown>;
-}
-
-export interface ModelInstance {
-  modelId: WireUuid;
-}
-
-export interface Script {
-  scripts: ScriptSlot[];
-}
-
-export interface ScriptSlot {
-  scriptPath: string;
-  overrides: Record<string, unknown>;
-}
-
-export interface AnimationPlayer {
-  clip: WireUuid;
-  autoplay: boolean;
-  speed: number;
-  wrap: "once" | "loop" | "pingpong";
-  transitionMode: "inertialize" | "crossfade";
-  loopBlend: number;
-}
-
-export interface DirectionalLight {
-  atmosphereRole: "sun" | "moon";
-  direction: Vec3;
-  color: Vec3;
-  intensity: number;
-  ambient: number;
-  volumetricScattering: number;
-  castVolumetricShadow: boolean;
-}
-
-export interface PointLight {
-  color: Vec3;
-  intensity: number;
-  range: number;
-  volumetricScattering: number;
-  castVolumetricShadow: boolean;
-}
-
-export interface SpotLight {
-  direction: Vec3;
-  color: Vec3;
-  intensity: number;
-  range: number;
-  innerAngle: number;
-  outerAngle: number;
-  volumetricScattering: number;
-  castVolumetricShadow: boolean;
-}
-
-export interface ReflectionProbe {
-  influenceRadius: number;
-  intensity: number;
-  boxProjection: boolean;
-  boxExtent: Vec3;
-}
-
-export interface FogVolume {
-  shape: "box" | "sphere";
-  extents: Vec3;
-  radius: number;
-  edgeFalloff: number;
-  density: number;
-  albedo: Vec3;
-  emissive: Vec3;
-  phaseG: number;
-  heightFalloff: number;
-  noiseScale: number;
-  noiseIntensity: number;
-  noiseDetail: number;
-  wind: Vec3;
-  speed: number;
-}
-
-export interface Relationship {
-  parent: WireUuid;
-}
-
-export interface SkinnedMesh {
-  mesh: WireUuid;
-  rootBone: WireUuid;
-  bones: WireUuid[];
-  inverseBind: number[][];
-}
-
-export interface Morph {
-  weights: number[];
-  names: string[];
-}
-
-export interface Bone {
-
-}
-
-export interface FootIk {
-  enabled: boolean;
-  groundHeight: number;
-  chains: FootChainDto[];
-}
-
-export interface FootChainDto {
-  upper: number;
-  mid: number;
-  end: number;
-  poleVector: Vec3;
-}
-
-export interface BonePhysics {
-  bones: BonePhysicsDto[];
-}
-
-export interface BonePhysicsDto {
-  shapeHalfExtents: Vec3;
-  mass: number;
-  joint: "fixed" | "hinge" | "swingtwist" | "free";
-  swingTwistLimits: Vec3;
-  driveStiffness: number;
-  driveDamping: number;
-  driveMaxForce: number;
-}
-
-export interface Rigidbody {
-  motion: "static" | "kinematic" | "dynamic";
-  mass: number;
-  linearDamping: number;
-  angularDamping: number;
-  gravityFactor: number;
-  lockPosition: BVec3;
-  lockRotation: BVec3;
-  collisionLayer: number;
-}
-
-export interface BVec3 {
-  x: boolean;
-  y: boolean;
-  z: boolean;
-}
-
-export interface Collider {
-  shape: "box" | "sphere" | "capsule" | "convexhull" | "mesh";
-  halfExtents: Vec3;
-  sourceMesh: WireUuid;
-  offset: Vec3;
-  material: PhysicsMaterial;
-  isSensor: boolean;
-}
-
-export interface PhysicsMaterial {
-  friction: number;
-  restitution: number;
-}
-
-export interface KinematicBones {
-  enabled: boolean;
-  driven: number[];
-}
-
-export interface CharacterController {
-  maxSpeed: number;
-  maxSlopeAngle: number;
-  maxStepHeight: number;
-  gravityFactor: number;
-}
-
-export interface WorldTransformResult {
-  translation: Vec3;
-  scale: Vec3;
-}
-
 export interface EnvironmentDto {
-  skyMode: "color" | "texture" | "procedural";
+  skyMode: SkyModeDto;
   clearColor: Vec3;
   skyTexture: WireUuid;
   skyIntensity: number;
@@ -839,116 +2302,17 @@ export interface EnvironmentDto {
   timeOfDay: TimeOfDaySettingsDto;
 }
 
-export interface AtmosphereSettingsDto {
-  enabled: boolean;
-  planetRadius: number;
-  atmosphereHeight: number;
-  rayleighScattering: Vec3;
-  rayleighScaleHeight: number;
-  mieScattering: number;
-  mieScaleHeight: number;
-  mieAnisotropy: number;
-  ozoneAbsorption: Vec3;
-  sunDiskAngularRadius: number;
-  sunDiskIntensity: number;
-  moonDiskAngularRadius: number;
-  moonDiskIntensity: number;
-  moonEarthshine: number;
-  perPixelTransmittance: boolean;
-  skyCaptureCadence: number;
-}
+export type BuiltinEnvironmentProfileDto = "neutral" | "clear-day" | "golden-hour" | "overcast" | "night";
 
-export interface FogSettingsDto {
-  enabled: boolean;
-  mode: "analytic" | "volumetric";
-  quality: "low" | "medium" | "high";
-  historyBlend: number;
-  neighborhoodClamp: boolean;
-  lightClamp: number;
-  baseDensity: number;
-  scatterAlbedo: number;
-  phaseG: number;
-  density: number;
-  albedo: Vec3;
-  height: number;
-  heightFalloff: number;
-  startDistance: number;
-  maxOpacity: number;
-  emissive: Vec3;
-  directionalColor: Vec3;
-  directionalExponent: number;
-  layer2Density: number;
-  layer2Falloff: number;
-  layer2Height: number;
-  aerialPerspective: boolean;
-  aerialIntensity: number;
-}
+export type EnvironmentProfileRefDto = { "kind": "builtin", profile: BuiltinEnvironmentProfileDto, } | { "kind": "asset", id: WireUuid, };
 
-export interface CloudSettingsDto {
-  enabled: boolean;
-  coverage: number;
-  cloudType: number;
-  precipitation: number;
-  anvilBias: number;
-  layerAltitude: number;
-  layerHeight: number;
-  baseScale: number;
-  detailScale: number;
-  detailStrength: number;
-  curlStrength: number;
-  weatherScale: number;
-  weatherOffset: Vec3;
-  weatherTexture: WireUuid;
-  primarySteps: number;
-  lightSteps: number;
-  dropletDiameter: number;
-  temporalFactor: number;
-  castCloudShadows: boolean;
-  cloudShadowStrength: number;
-  cloudShadowOnSurfaceStrength: number;
-}
-
-export interface WindSettingsDto {
-  orientation: number;
-  speed: number;
-  gust: number;
-}
-
-export interface TimeOfDaySettingsDto {
-  enabled: boolean;
-  manualOverride: boolean;
-  timeOfDay: number;
-  year: number;
-  month: number;
-  day: number;
-  latitude: number;
-  longitude: number;
-  dayLengthSeconds: number;
-  exposureCurve: TodCurvePointDto[];
-  tintCurve: TodTintSettingsDto;
-  coverageCurve: TodCurvePointDto[];
-  cloudTypeCurve: TodCurvePointDto[];
-}
-
-export interface TodCurvePointDto {
-  x: number;
-  y: number;
-}
-
-export interface TodTintSettingsDto {
-  master: TodCurvePointDto[];
-  red: TodCurvePointDto[];
-  green: TodCurvePointDto[];
-  blue: TodCurvePointDto[];
+export interface EnvironmentProfileSummaryDto {
+  reference: EnvironmentProfileRefDto;
+  name: string;
 }
 
 export interface EnvironmentProfileListDto {
   profiles: EnvironmentProfileSummaryDto[];
-}
-
-export interface EnvironmentProfileSummaryDto {
-  reference: { "kind": "builtin", profile: ("neutral" | "clear-day" | "golden-hour" | "overcast" | "night"), } | { "kind": "asset", id: WireUuid, };
-  name: string;
 }
 
 export interface SaveEnvironmentProfileParams {
@@ -961,12 +2325,12 @@ export interface UpdateEnvironmentProfileParams {
 }
 
 export interface ApplyEnvironmentProfileParams {
-  profile: { "kind": "builtin", profile: ("neutral" | "clear-day" | "golden-hour" | "overcast" | "night"), } | { "kind": "asset", id: WireUuid, };
+  profile: EnvironmentProfileRefDto;
 }
 
 export interface SetEnvironmentParams {
   json?: unknown;
-  skyMode?: "color" | "texture" | "procedural";
+  skyMode?: SkyModeDto;
   clearColor?: Vec3;
   skyTexture?: WireUuid;
   skyIntensity?: number;
@@ -1001,8 +2365,8 @@ export interface SetAtmosphereParams {
 export interface SetFogParams {
   json?: unknown;
   enabled?: boolean;
-  mode?: "analytic" | "volumetric";
-  quality?: "low" | "medium" | "high";
+  mode?: FogMode;
+  quality?: FogQuality;
   historyBlend?: number;
   neighborhoodClamp?: boolean;
   lightClamp?: number;
@@ -1057,6 +2421,13 @@ export interface SetWindParams {
   gust?: number;
 }
 
+export interface TodTintCurveDto {
+  master: [number, number][];
+  red: [number, number][];
+  green: [number, number][];
+  blue: [number, number][];
+}
+
 export interface SetTimeOfDayParams {
   json?: unknown;
   enabled?: boolean;
@@ -1074,13 +2445,6 @@ export interface SetTimeOfDayParams {
   cloudTypeCurve?: [number, number][];
 }
 
-export interface TodTintCurveDto {
-  master: [number, number][];
-  red: [number, number][];
-  green: [number, number][];
-  blue: [number, number][];
-}
-
 export interface SelectionResult {
   selectionVersion: number;
   sceneVersion: number;
@@ -1088,10 +2452,6 @@ export interface SelectionResult {
   playState: string;
   playVersion: number;
   animationVersion: number;
-}
-
-export interface DeselectResult {
-  selectionVersion: number;
 }
 
 export interface PlayStateResult {
@@ -1103,12 +2463,101 @@ export interface PlayStateResult {
   previewAsset: WireUuid;
 }
 
-export interface StepParams {
-  frames?: number;
+export interface AnimationChannelDto {
+  kind: string;
+  label: string;
+  targetName: string;
+  times: number[];
+  width: number;
+  values: number[];
+}
+
+export interface AnimationClipDto {
+  id: WireUuid;
+  name: string;
+  duration: number;
+  channels: AnimationChannelDto[];
+}
+
+export interface BoneDto {
+  index: number;
+  name: string;
+  parent: number;
+  joint: boolean;
+}
+
+export interface AssetCapabilitiesDto {
+  meshCount: number;
+  materialCount: number;
+  nodeCount: number;
+  hasRig: boolean;
+  boneCount: number;
+  clipCount: number;
+}
+
+export interface GetAssetModelParams {
+  asset: AssetSelector;
+}
+
+export interface AssetModelResult {
+  mesh: WireUuid;
+  name: string;
+  capabilities: AssetCapabilitiesDto;
+  bones: BoneDto[];
+  clips: AnimationClipDto[];
+}
+
+export interface EnterAssetPreviewParams {
+  asset: AssetSelector;
+}
+
+export interface BoneEntityDto {
+  index: number;
+  entity: WireUuid;
+}
+
+export interface AssetPreviewResult {
+  rootEntity: WireUuid;
+  bones: BoneEntityDto[];
+  target: Vec3;
+  distance: number;
+}
+
+export interface ListClipsParams {
+  asset?: AssetSelector;
+}
+
+export interface ListClipsResult {
+  clips: AnimationClipDto[];
+}
+
+export interface PlayAnimationParams {
+  entity: EntitySelector;
+  clip: AssetSelector;
+  speed?: number;
+  loop?: boolean;
+  blend?: number;
+  paused?: boolean;
+}
+
+export interface SeekAnimationParams {
+  entity: EntitySelector;
+  time: number;
+  seekBlend?: number;
+}
+
+export interface SetAnimationLoopParams {
+  entity: EntitySelector;
+  wrap: string;
+}
+
+export interface SetAnimationPlayingParams {
+  entity: EntitySelector;
+  playing: boolean;
 }
 
 export interface AnimationStateParams {
-  entity: number | string;
+  entity: EntitySelector;
 }
 
 export interface AnimationStateResult {
@@ -1123,53 +2572,10 @@ export interface AnimationStateResult {
   morphWeights: number[];
 }
 
-export interface ListClipsParams {
-  asset?: number | string;
-}
-
-export interface ListClipsResult {
-  clips: AnimationClipDto[];
-}
-
-export interface AnimationClipDto {
-  id: WireUuid;
-  name: string;
-  duration: number;
-  channels: AnimationChannelDto[];
-}
-
-export interface AnimationChannelDto {
-  kind: string;
-  label: string;
-  targetName: string;
-  times: number[];
-  width: number;
-  values: number[];
-}
-
-export interface PlayAnimationParams {
-  entity: number | string;
-  clip: number | string;
-  speed?: number;
-  loop?: boolean;
-  blend?: number;
-  paused?: boolean;
-}
-
-export interface SetAnimationPlayingParams {
-  entity: number | string;
-  playing: boolean;
-}
-
-export interface SeekAnimationParams {
-  entity: number | string;
-  time: number;
-  seekBlend?: number;
-}
-
-export interface SetAnimationLoopParams {
-  entity: number | string;
-  wrap: string;
+export interface SetSkeletonOverlayParams {
+  show?: boolean;
+  axes?: boolean;
+  jointSize?: number;
 }
 
 export interface SkeletonOverlayResult {
@@ -1179,10 +2585,12 @@ export interface SkeletonOverlayResult {
   highlightJoint: number;
 }
 
-export interface SetSkeletonOverlayParams {
-  show?: boolean;
-  axes?: boolean;
-  jointSize?: number;
+export interface DebugOverlaysParams {
+  bounds?: boolean;
+  sceneAabb?: boolean;
+  lightVolumes?: boolean;
+  grid?: boolean;
+  colliders?: boolean;
 }
 
 export interface DebugOverlaysResult {
@@ -1191,14 +2599,6 @@ export interface DebugOverlaysResult {
   lightVolumes: boolean;
   grid: boolean;
   colliders: boolean;
-}
-
-export interface DebugOverlaysParams {
-  bounds?: boolean;
-  sceneAabb?: boolean;
-  lightVolumes?: boolean;
-  grid?: boolean;
-  colliders?: boolean;
 }
 
 export interface SetSkeletonHighlightParams {
@@ -1224,8 +2624,14 @@ export interface AssetPreviewOptionsResult {
   floor: boolean;
 }
 
+export interface SetFootIkParams {
+  entity: EntitySelector;
+  enabled?: boolean;
+  groundHeight?: number;
+}
+
 export interface GetFootIkParams {
-  entity: number | string;
+  entity: EntitySelector;
 }
 
 export interface FootIkResult {
@@ -1234,15 +2640,13 @@ export interface FootIkResult {
   chains: number;
 }
 
-export interface SetFootIkParams {
-  entity: number | string;
-  enabled?: boolean;
-  groundHeight?: number;
+export interface SetMorphWeightsParams {
+  entity: EntitySelector;
+  weights: number[];
 }
 
-export interface SetMorphWeightsParams {
-  entity: number | string;
-  weights: number[];
+export interface GetMorphWeightsParams {
+  entity: EntitySelector;
 }
 
 export interface MorphWeightsResult {
@@ -1250,226 +2654,39 @@ export interface MorphWeightsResult {
   names: string[];
 }
 
-export interface GetMorphWeightsParams {
-  entity: number | string;
-}
-
 export interface ListClipBindingsParams {
-  entity: number | string;
-  clip: number | string;
+  entity: EntitySelector;
+  clip: AssetSelector;
 }
 
 export interface ClipBindingsResult {
   channels: AnimationChannelDto[];
 }
 
-export interface ScriptStatusResult {
-  state: string;
-  instances: number;
-  errorHighWater: number;
+export interface WorldTransformResult {
+  translation: Vec3;
+  scale: Vec3;
 }
 
-export interface PhysicsStateResult {
-  active: boolean;
-  bodyCount: number;
-  dynamicCount: number;
+export interface StepParams {
+  frames?: number;
 }
 
-export interface PhysicsBodiesResult {
-  bodies: PhysicsBodyDto[];
-}
-
-export interface PhysicsBodyDto {
-  entity: WireUuid;
-  motion: string;
-  active: boolean;
-  position: Vec3;
-}
-
-export interface FitColliderParams {
-  entity: number | string;
-}
-
-export interface FitColliderResult {
-  entity: WireUuid;
-  shape: string;
-  halfExtents: Vec3;
-  offset: Vec3;
-}
-
-export interface ApplyImpulseParams {
-  entity: number | string;
-  impulse: Vec3;
-}
-
-export interface ApplyImpulseResult {
-  velocity: Vec3;
-}
-
-export interface DrainContactsParams {
-  since?: number;
-}
-
-export interface DrainContactsResult {
-  events: ContactEventDto[];
-  highWaterSeq: number;
-  oldestSeq: number;
-  overflowed: boolean;
-}
-
-export interface ContactEventDto {
-  seq: number;
-  kind: string;
-  entityA: WireUuid;
-  entityB: WireUuid;
-  sensor: boolean;
-  point: Vec3;
-  normal: Vec3;
-  tick: number;
-}
-
-export interface SetKinematicBonesParams {
-  entity: number | string;
-  enabled?: boolean;
-}
-
-export interface KinematicBonesResult {
-  entity: WireUuid;
-  enabled: boolean;
-  boneCount: number;
-}
-
-export interface MoveCharacterParams {
-  entity: number | string;
-  velocity: Vec3;
-  jump?: boolean;
-}
-
-export interface MoveCharacterResult {
-  position: Vec3;
-  onGround: boolean;
-}
-
-export interface RaycastParams {
-  origin: Vec3;
-  dir: Vec3;
-  maxDist?: number;
-}
-
-export interface RaycastResult {
-  hit: boolean;
-  entity: WireUuid;
-  point: Vec3;
-  normal: Vec3;
-  distance: number;
-}
-
-export interface ShapecastParams {
-  origin: Vec3;
-  dir: Vec3;
-  radius: number;
-  maxDist?: number;
-}
-
-export interface EnableRagdollParams {
-  entity: number | string;
-  enabled?: boolean;
-}
-
-export interface RagdollResult {
-  present: boolean;
-  active: boolean;
-  bodyWeight: number;
-  bones: number;
-}
-
-export interface SetRagdollParams {
-  entity: number | string;
-  active?: boolean;
-  bodyWeight?: number;
-  bone?: number;
-  weight?: number;
-}
-
-export interface GetRagdollParams {
-  entity: number | string;
-}
-
-export interface DrainScriptErrorsParams {
-  since?: number;
-}
-
-export interface DrainScriptErrorsResult {
-  events: ScriptErrorDto[];
-  highWaterSeq: number;
-  oldestSeq: number;
-  overflowed: boolean;
-}
-
-export interface ScriptErrorDto {
-  seq: number;
-  entity: WireUuid;
-  script: string;
-  message: string;
-  tick: number;
-}
-
-export interface DrainScriptLogsParams {
-  since?: number;
-}
-
-export interface DrainScriptLogsResult {
-  events: ScriptLogDto[];
-  highWaterSeq: number;
-  oldestSeq: number;
-  overflowed: boolean;
-}
-
-export interface ScriptLogDto {
-  seq: number;
-  entity: WireUuid;
-  message: string;
-  epochMs: number;
-  tick: number;
-}
-
-export interface GetScriptSchemaParams {
-  path: string;
-}
-
-export interface GetScriptSchemaResult {
-  fields: ScriptFieldDto[];
-}
-
-export interface ScriptFieldDto {
-  name: string;
-  type: string;
-  defaultValue: unknown;
-}
-
-export interface SetScriptOverrideParams {
-  entity: number | string;
-  slot: number;
-  name: string;
-  value: unknown;
-}
-
-export interface SetScriptOverrideResult {
-  scriptPath: string;
-  overrides: unknown;
+export interface DeselectResult {
+  selectionVersion: number;
 }
 
 export interface AddEntityParams {
-  preset?: "empty" | "cube" | "plane" | "sphere" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe" | "fog-volume";
+  preset?: AddEntityPreset;
 }
 
 export interface RenameEntityParams {
-  entity: number | string;
+  entity: EntitySelector;
   name: string;
 }
 
 export interface SetComponentFieldParams {
-  entity: number | string;
+  entity: EntitySelector;
   component: string;
   field: string;
   value: unknown;
@@ -1506,19 +2723,19 @@ export interface SetCameraParams {
 }
 
 export interface GizmoState {
-  op: "translate" | "rotate" | "scale";
-  space: "world" | "local";
+  op: GizmoOpDto;
+  space: GizmoSpaceDto;
   preserveChildren: boolean;
 }
 
 export interface SetGizmoParams {
-  op?: "translate" | "rotate" | "scale";
-  space?: "world" | "local";
+  op?: GizmoOpDto;
+  space?: GizmoSpaceDto;
   preserveChildren?: boolean;
 }
 
 export interface GizmoPointerParams {
-  phase?: "hover" | "begin" | "drag" | "end";
+  phase?: GizmoPointerPhase;
   x?: number;
   y?: number;
 }
@@ -1568,12 +2785,6 @@ export interface RecaptureProbesResult {
   marked: number;
 }
 
-export interface ListProbesResult {
-  enabled: boolean;
-  count: number;
-  probes: ProbeRef[];
-}
-
 export interface ProbeRef {
   slot: number;
   entity: WireUuid;
@@ -1585,12 +2796,25 @@ export interface ProbeRef {
   dirty: boolean;
 }
 
+export interface ListProbesResult {
+  enabled: boolean;
+  count: number;
+  probes: ProbeRef[];
+}
+
 export interface SetExposureParams {
   ev: number;
 }
 
 export interface SetExposureResult {
   exposureEv: number;
+}
+
+export interface AnamorphicParams {
+  enabled: boolean;
+  ratio: number;
+  tint: [number, number, number];
+  intensity: number;
 }
 
 export interface SetBloomParams {
@@ -1619,6 +2843,40 @@ export interface SetBloomResult {
   perMipTint: [number, number, number][];
 }
 
+export interface GradeRangeDto {
+  slope: [number, number, number];
+  offset: [number, number, number];
+  power: [number, number, number];
+  saturation: number;
+  contrast: number;
+}
+
+export interface SplitToneDto {
+  shadow: [number, number, number];
+  highlight: [number, number, number];
+  balance: number;
+}
+
+export interface SetColorGradingParams {
+  temperature: number;
+  tint: number;
+  contrast: number;
+  pivot: number;
+  saturation: number;
+  slope: [number, number, number];
+  offset: [number, number, number];
+  power: [number, number, number];
+  shadows: GradeRangeDto;
+  midtones: GradeRangeDto;
+  highlights: GradeRangeDto;
+  shadowsMax: number;
+  highlightsMin: number;
+  channelMixer: [number, number, number, number, number, number, number, number, number];
+  splitTone: SplitToneDto;
+  creativeLutAsset: WireUuid;
+  creativeLutIntensity: number;
+}
+
 export interface SetColorGradingResult {
   temperature: number;
   tint: number;
@@ -1637,6 +2895,12 @@ export interface SetColorGradingResult {
   splitTone: SplitToneDto;
   creativeLutAsset: WireUuid;
   creativeLutIntensity: number;
+}
+
+export interface CreativeLutStat {
+  asset: WireUuid;
+  intensity: number;
+  size: number;
 }
 
 export interface BakeLookParams {
@@ -1659,573 +2923,6 @@ export interface SetTessellationQualityResult {
   factorCap: number;
   minFactor: number;
   edgeLengthTarget: number;
-}
-
-export interface ProjectInfoDto {
-  loaded: boolean;
-  root: string;
-  path: string;
-  name: string;
-  displayName: string;
-}
-
-export interface ProjectStatusDto {
-  phase: "unloaded" | "loading" | "ready" | "failed";
-  stage: "manifest" | "catalog" | "scene" | "install" | "assets" | "skybox" | "accel" | "ready" | "failed";
-  done: number;
-  total: number;
-  label: string;
-  currentItem: string;
-  error: string;
-  version: number;
-  name: string;
-  path: string;
-}
-
-export interface NewProjectParams {
-  name?: string;
-  displayName?: string;
-  root?: string;
-}
-
-export interface CreateScriptParams {
-  name: string;
-}
-
-export interface CreateScriptResult {
-  path: string;
-}
-
-export interface PathParams {
-  path: string;
-}
-
-export interface ImportModelParams {
-  path: string;
-  attribution?: AssetAttributionDto;
-}
-
-export interface AssetAttributionDto {
-  licenseId: string;
-  requiresAttribution: boolean;
-  licenseUrl: string;
-  author: string;
-  sourceUrl: string;
-  storeId: string;
-}
-
-export interface ImportModelResult {
-  id: WireUuid;
-  name: string;
-  type: string;
-}
-
-export interface InstantiateModelParams {
-  asset: number | string;
-  name?: string;
-}
-
-export interface AssetPlacementParams {
-  phase: "preview" | "commit" | "clear";
-  asset?: number | string;
-  u?: number;
-  v?: number;
-}
-
-export interface AssetPlacementResult {
-  active: boolean;
-  valid: boolean;
-  transform?: PlacementTransformDto;
-  entity?: EntityRef;
-  reason?: string;
-}
-
-export interface PlacementTransformDto {
-  translation: Vec3;
-  rotation: Vec3;
-  scale: Vec3;
-}
-
-export interface ImportTextureParams {
-  path: string;
-  colorspace?: string;
-  role?: string;
-}
-
-export interface ImportTextureResult {
-  texture: WireUuid;
-}
-
-export interface ImportLutParams {
-  path: string;
-}
-
-export interface ImportLutResult {
-  lut: WireUuid;
-}
-
-export interface AssetList {
-  assets: AssetEntryDto[];
-  folders: string[];
-}
-
-export interface AssetEntryDto {
-  id: WireUuid;
-  name: string;
-  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut" | "environment";
-  path: string;
-  folder?: string;
-  container?: WireUuid;
-  duration?: number;
-  rigged?: boolean;
-  colorspace?: string;
-  role?: string;
-  createdAt: number;
-  attribution?: AssetAttributionDto;
-}
-
-export interface ScanAssetsResult {
-  added: number;
-  removed: number;
-}
-
-export interface ExtractSubAssetParams {
-  asset: number | string;
-  subAsset: WireUuid;
-  dest?: string;
-}
-
-export interface AssetRef {
-  id: WireUuid;
-  name: string;
-  folder?: string;
-}
-
-export interface ClearExtractionParams {
-  asset: number | string;
-  subAsset: WireUuid;
-}
-
-export interface ReimportModelParams {
-  asset: number | string;
-}
-
-export interface ReimportModelResult {
-  updated: number;
-  added: number;
-  removedFromSource: number;
-  skipped: boolean;
-}
-
-export interface ModelInfoParams {
-  asset: number | string;
-}
-
-export interface ModelInfoResult {
-  id: WireUuid;
-  name: string;
-  sourcePath: string;
-  sourceHash: string;
-  materialCount: number;
-  hasSkin: boolean;
-  nodeCount: number;
-  totalBytes: number;
-  subAssets: ModelSubAssetDto[];
-}
-
-export interface ModelSubAssetDto {
-  id: WireUuid;
-  name: string;
-  type: string;
-  bytes: number;
-}
-
-export interface AssetReferencesParams {
-  asset: number | string;
-}
-
-export interface AssetReferencesResult {
-  referencedBy: string[];
-  references: string[];
-  footprint: number;
-}
-
-export interface GetAssetModelParams {
-  asset: number | string;
-}
-
-export interface AssetModelResult {
-  mesh: WireUuid;
-  name: string;
-  capabilities: AssetCapabilitiesDto;
-  bones: BoneDto[];
-  clips: AnimationClipDto[];
-}
-
-export interface AssetCapabilitiesDto {
-  meshCount: number;
-  materialCount: number;
-  nodeCount: number;
-  hasRig: boolean;
-  boneCount: number;
-  clipCount: number;
-}
-
-export interface BoneDto {
-  index: number;
-  name: string;
-  parent: number;
-  joint: boolean;
-}
-
-export interface EnterAssetPreviewParams {
-  asset: number | string;
-}
-
-export interface AssetPreviewResult {
-  rootEntity: WireUuid;
-  bones: BoneEntityDto[];
-  target: Vec3;
-  distance: number;
-}
-
-export interface BoneEntityDto {
-  index: number;
-  entity: WireUuid;
-}
-
-export interface SetActiveViewParams {
-  view: string;
-}
-
-export interface SetActiveViewResult {
-  view: string;
-}
-
-export interface CleanAssetsParams {
-  dryRun?: boolean;
-  exclude?: string[];
-}
-
-export interface CleanReport {
-  candidates: CleanCandidateDto[];
-  reclaimableBytes: number;
-}
-
-export interface CleanCandidateDto {
-  id: WireUuid;
-  path: string;
-  category: string;
-  bytes: number;
-  reason: string;
-}
-
-export interface DeleteUnusedParams {
-  ids: string[];
-  confirm?: boolean;
-}
-
-export interface DeleteUnusedResult {
-  deleted: number;
-  reclaimedBytes: number;
-}
-
-export interface RenameAssetParams {
-  asset: number | string;
-  name: string;
-}
-
-export interface CreateAssetFolderParams {
-  folder: string;
-}
-
-export interface RenameAssetFolderParams {
-  folder: string;
-  name: string;
-}
-
-export interface DeleteAssetFolderParams {
-  folder: string;
-}
-
-export interface MoveAssetParams {
-  asset: number | string;
-  folder?: string;
-}
-
-export interface AssetUsagesParams {
-  asset: number | string;
-}
-
-export interface AssetUsagesResult {
-  usages: AssetUsageDto[];
-}
-
-export interface AssetUsageDto {
-  entity?: WireUuid;
-  entityName?: string;
-  slot: string;
-}
-
-export interface AssetMetadataParams {
-  asset: number | string;
-}
-
-export interface AssetMetadataDto {
-  id: WireUuid;
-  name: string;
-  type: "mesh" | "texture" | "other" | "animation" | "material" | "model" | "lut" | "environment";
-  path: string;
-  folder?: string;
-  sizeBytes: number;
-  vertexCount?: number;
-  triangleCount?: number;
-  createdAt: number;
-}
-
-export interface DeleteAssetParams {
-  asset: number | string;
-}
-
-export interface DeleteAssetResult {
-  id: WireUuid;
-  name: string;
-  cleared: AssetUsageDto[];
-  fileDeleted: boolean;
-}
-
-export interface AssignAssetParams {
-  entity: number | string;
-  slot: "mesh" | "albedo" | "metallic-roughness" | "normal" | "occlusion" | "emissive" | "height";
-  asset: number | string;
-}
-
-export interface AssignAssetResult {
-  id: WireUuid;
-  name: string;
-  slot: "mesh" | "albedo" | "metallic-roughness" | "normal" | "occlusion" | "emissive" | "height";
-}
-
-export interface MaterialCreateParams {
-  name: string;
-}
-
-export interface MaterialCreateResult {
-  id: WireUuid;
-  name: string;
-}
-
-export interface MaterialAssignParams {
-  entity: number | string;
-  material: number | string;
-}
-
-export interface MaterialAssignResult {
-  material: WireUuid;
-}
-
-export interface MaterialImportParams {
-  path: string;
-  name: string;
-  attribution?: AssetAttributionDto;
-}
-
-export interface MaterialImportResultDto {
-  id: WireUuid;
-  roles: string;
-}
-
-export interface MaterialListResult {
-  materials: MaterialRefDto[];
-}
-
-export interface MaterialRefDto {
-  id: WireUuid;
-  name: string;
-  folder: string;
-}
-
-export interface MaterialGetParams {
-  material: number | string;
-}
-
-export interface MaterialGetResult {
-  id: WireUuid;
-  blend: string;
-  unlit: boolean;
-  baseColor: Vec4;
-  metallic: number;
-  roughness: number;
-  emissive: Vec3;
-  emissiveStrength: number;
-  heightScale: number;
-  heightMode: string;
-  albedoTexture: WireUuid;
-  ormTexture: WireUuid;
-  normalTexture: WireUuid;
-  emissiveTexture: WireUuid;
-  heightTexture: WireUuid;
-  vectorDisplacementTexture: WireUuid;
-  graph: unknown;
-}
-
-export interface Vec4 {
-  x: number;
-  y: number;
-  z: number;
-  w: number;
-}
-
-export interface MaterialSchemaParams {
-  material: number | string;
-}
-
-export interface MaterialSchemaResult {
-  params: ExposedParamDto[];
-}
-
-export interface ExposedParamDto {
-  name: string;
-  kind: string;
-  default: unknown;
-}
-
-export interface MaterialUpdateParams {
-  material: number | string;
-  baseColor?: Vec4;
-  metallic?: number;
-  roughness?: number;
-  emissive?: Vec3;
-  emissiveStrength?: number;
-  normalStrength?: number;
-  heightScale?: number;
-  heightMode?: string;
-  albedoTexture?: WireUuid;
-  ormTexture?: WireUuid;
-  normalTexture?: WireUuid;
-  emissiveTexture?: WireUuid;
-  heightTexture?: WireUuid;
-  vectorDisplacementTexture?: WireUuid;
-}
-
-export interface MaterialUpdateResult {
-  id: WireUuid;
-}
-
-export interface PreviewRenderParams {
-  material: number | string;
-  size?: number;
-}
-
-export interface PreviewRenderResult {
-  png: string;
-}
-
-export interface MaterialSetGraphParams {
-  material: number | string;
-  graph: unknown;
-}
-
-export interface MaterialSetGraphResult {
-  id: WireUuid;
-  foldable: boolean;
-}
-
-export interface MaterialCreateInstanceParams {
-  parent: number | string;
-  name: string;
-}
-
-export interface MaterialSetOverrideParams {
-  material: number | string;
-  field: string;
-  value: unknown;
-}
-
-export interface MaterialSetOverrideResult {
-  id: WireUuid;
-}
-
-export interface MaterialCompileParams {
-  material: number | string;
-}
-
-export interface MaterialCompileResult {
-  id: WireUuid;
-  ok: boolean;
-}
-
-export interface MaterialCookResult {
-  compiled: number;
-  failed: number;
-}
-
-export interface PathResult {
-  path: string;
-}
-
-export interface OptionalPathParams {
-  path?: string;
-}
-
-export interface ProjectStoresDto {
-  enabled: string[];
-}
-
-export interface ScreenshotParams {
-  target?: "viewport" | "window";
-  path: string;
-}
-
-export interface ScreenshotResult {
-  target: "viewport" | "window";
-  path: string;
-  pending: boolean;
-}
-
-export interface ThumbnailParams {
-  asset: number | string;
-  size?: number;
-}
-
-export interface ThumbnailResult {
-  id: WireUuid;
-  format: "png";
-  width: number;
-  height: number;
-  base64: string;
-  pending: boolean;
-}
-
-export interface ThumbnailCacheParams {
-  action: string;
-}
-
-export interface ThumbnailCacheResult {
-  entries: number;
-  bytes: number;
-}
-
-export interface ExportAppParams {
-  outputDir: string;
-  app: AppManifest;
-}
-
-export interface AppManifest {
-  title: string;
-  width: number;
-  height: number;
-  fullscreen: boolean;
-  vsync: boolean;
-}
-
-export interface ExportAppResult {
-  path: string;
-  warnings: string[];
-}
-
-export interface QuitResult {
-  quitting: boolean;
 }
 
 export interface CommandParamsMap {
@@ -2279,6 +2976,10 @@ export interface CommandParamsMap {
   "set-light": SetLightParams;
   "select": EntityParams;
   "pick": PickParams;
+  "spatial-cell": SpatialCellParams;
+  "spatial-providers": EmptyParams;
+  "spatial-sample": SpatialSampleParams;
+  "spatial-residency": EmptyParams;
   "inspect": EntityParams;
   "focus": EntityParams;
   "get-world-transform": EntityParams;
@@ -2356,6 +3057,12 @@ export interface CommandParamsMap {
   "set-color-grading": SetColorGradingParams;
   "bake-look": BakeLookParams;
   "set-tessellation-quality": SetTessellationQualityParams;
+  "vegetation-compile-biome": VegetationCompileBiomeParams;
+  "vegetation-node-schema": VegetationNodeSchemaParams;
+  "vegetation-evaluate-region": VegetationEvaluateRegionParams;
+  "vegetation-evaluation-status": VegetationEvaluationJobParams;
+  "vegetation-cancel-evaluation": VegetationEvaluationJobParams;
+  "vegetation-explain-point": VegetationExplainPointParams;
   "get-project": EmptyParams;
   "project-status": EmptyParams;
   "cancel-load": EmptyParams;
@@ -2367,7 +3074,9 @@ export interface CommandParamsMap {
   "asset-placement": AssetPlacementParams;
   "import-texture": ImportTextureParams;
   "import-lut": ImportLutParams;
+  "import-vegetation-asset": ImportVegetationAssetParams;
   "list-assets": EmptyParams;
+  "vegetation-asset-summary": VegetationAssetSummaryParams;
   "scan-assets": EmptyParams;
   "extract-subasset": ExtractSubAssetParams;
   "clear-extraction": ClearExtractionParams;
@@ -2468,6 +3177,10 @@ export interface CommandResultMap {
   "set-light": EntityRef;
   "select": EntityRef;
   "pick": PickResult;
+  "spatial-cell": SpatialCellResult;
+  "spatial-providers": SurfaceProvidersResult;
+  "spatial-sample": SpatialSampleResult;
+  "spatial-residency": SpatialResidencyResult;
   "inspect": InspectResult;
   "focus": EntityRef;
   "get-world-transform": WorldTransformResult;
@@ -2545,6 +3258,12 @@ export interface CommandResultMap {
   "set-color-grading": SetColorGradingResult;
   "bake-look": BakeLookResult;
   "set-tessellation-quality": SetTessellationQualityResult;
+  "vegetation-compile-biome": VegetationCompileBiomeResult;
+  "vegetation-node-schema": VegetationNodeSchemaResult;
+  "vegetation-evaluate-region": VegetationEvaluationJobDto;
+  "vegetation-evaluation-status": VegetationEvaluationStatusDto;
+  "vegetation-cancel-evaluation": VegetationEvaluationStatusDto;
+  "vegetation-explain-point": ProvenanceExplanationDto;
   "get-project": ProjectInfoDto;
   "project-status": ProjectStatusDto;
   "cancel-load": ProjectStatusDto;
@@ -2556,7 +3275,9 @@ export interface CommandResultMap {
   "asset-placement": AssetPlacementResult;
   "import-texture": ImportTextureResult;
   "import-lut": ImportLutResult;
+  "import-vegetation-asset": ImportVegetationAssetResult;
   "list-assets": AssetList;
+  "vegetation-asset-summary": VegetationAssetSummaryResult;
   "scan-assets": ScanAssetsResult;
   "extract-subasset": AssetRef;
   "clear-extraction": AssetRef;
