@@ -17,11 +17,19 @@ import {
   File,
   Image as ImageIcon,
   Loader2,
+  Map as MapIcon,
   Square,
+  Sprout,
+  TreePine,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { getCachedThumbnailUrl, getThumbnailUrl, useEditorStore } from "../state/store";
-import { ASSET_DND_MIME, assetIdsFromPayload, readAssetPayload } from "./AssetTile";
+import {
+  ASSET_DND_MIME,
+  assetIdsFromPayload,
+  readAssetPayload,
+  supportsRenderedThumbnail,
+} from "./AssetTile";
 import type { AssetEntry } from "../protocol";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -32,7 +40,13 @@ const NONE_UUID = "0";
 /// The catalog `type` an `AssetKind` field picks from. (Mesh fields show meshes;
 /// albedo/sky/texture fields show textures; modelId shows `.smodel` containers; a
 /// clip slot shows animation assets.)
-export type PickerAssetKind = "mesh" | "texture" | "material" | "model" | "animation";
+export type PickerAssetKind =
+  | "mesh"
+  | "texture"
+  | "material"
+  | "model"
+  | "animation"
+  | "vegetation-map";
 
 /// The native built-in primitive meshes, mirroring the engine's `BuiltinMesh` reserved
 /// ids (`saffron-assets`). They are choosable in the mesh picker but are never catalog
@@ -72,11 +86,19 @@ function PickerGroupLabel({ children }: { children: React.ReactNode }) {
 /// cache so a warm-cache mount paints the image on the first frame (the popover
 /// remounts its rows on every open).
 function AssetSwatch({ asset, size }: { asset: AssetEntry; size: number }) {
-  const [url, setUrl] = useState<string | null>(() => getCachedThumbnailUrl(asset.id, 64));
+  const supportsThumbnail = supportsRenderedThumbnail(asset.type);
+  const [url, setUrl] = useState<string | null>(() =>
+    supportsThumbnail ? getCachedThumbnailUrl(asset.id, 64) : null,
+  );
   const [status, setStatus] = useState<"loading" | "ready" | "none">(() =>
-    getCachedThumbnailUrl(asset.id, 64) ? "ready" : "loading",
+    !supportsThumbnail ? "none" : getCachedThumbnailUrl(asset.id, 64) ? "ready" : "loading",
   );
   useEffect(() => {
+    if (!supportsThumbnail) {
+      setUrl(null);
+      setStatus("none");
+      return;
+    }
     let cancelled = false;
     const cached = getCachedThumbnailUrl(asset.id, 64);
     setUrl(cached);
@@ -96,7 +118,7 @@ function AssetSwatch({ asset, size }: { asset: AssetEntry; size: number }) {
     return () => {
       cancelled = true;
     };
-  }, [asset.id]);
+  }, [asset.id, supportsThumbnail]);
 
   const style = { width: size, height: size } as const;
   if (status === "ready" && url) {
@@ -110,7 +132,18 @@ function AssetSwatch({ asset, size }: { asset: AssetEntry; size: number }) {
       />
     );
   }
-  const Icon = asset.type === "mesh" ? Box : asset.type === "texture" ? ImageIcon : File;
+  const Icon =
+    asset.type === "mesh"
+      ? Box
+      : asset.type === "texture"
+        ? ImageIcon
+        : asset.type === "plant"
+          ? Sprout
+          : asset.type === "biome"
+            ? TreePine
+            : asset.type === "vegetation-map"
+              ? MapIcon
+              : File;
   return (
     <span
       style={style}
@@ -150,7 +183,7 @@ export function AssetPicker({ value, assetType, onChange }: AssetPickerProps) {
   // costs nothing once fetched).
   useEffect(() => {
     for (const asset of assets) {
-      if (asset.type === assetType) {
+      if (asset.type === assetType && supportsRenderedThumbnail(asset.type)) {
         void getThumbnailUrl(asset.id, 64).catch(() => {});
       }
     }
