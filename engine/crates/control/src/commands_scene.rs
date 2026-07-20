@@ -1,4 +1,4 @@
-//! The 50 scene-edit control commands registered here: entity lifecycle (create/add/destroy/copy/
+//! The 54 scene-edit control commands registered here: entity lifecycle (create/add/destroy/copy/
 //! rename/parent), the registry-driven component commands (add/remove/set/set-field/
 //! order), selection (select/deselect/get-selection), picking + inspect + focus +
 //! world-transform, the editor camera + gizmo + fly/script input, the play-state machine
@@ -17,8 +17,8 @@
 
 use saffron_assets::{
     BuiltinMesh, builtin_environment_profile, builtin_environment_profiles,
-    load_environment_profile, model_render_aabb, pick_entity, save_environment_profile,
-    update_environment_profile,
+    load_environment_profile, model_render_aabb, pick_entity, sample_scene_surface_field,
+    save_environment_profile, scene_surface_providers, update_environment_profile,
 };
 use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3};
 use saffron_protocol::{
@@ -31,15 +31,20 @@ use saffron_protocol::{
     EnvironmentProfileSummaryDto, FlyInputParams, FlyInputResult, FogMode as FogModeDto,
     FogQuality as FogQualityDto, FogSettingsDto, GizmoOpDto, GizmoPointerParams, GizmoPointerPhase,
     GizmoPointerResult, GizmoSpaceDto, GizmoState, InspectResult, PickKind, PickParams, PickResult,
-    PlayStateResult, RemoveComponentResult, RenameEntityParams, SaveEnvironmentProfileParams,
-    ScriptErrorDto, ScriptInputParams, ScriptInputResult, ScriptLogDto, ScriptStatusResult,
-    SelectionResult, SetAtmosphereParams, SetCameraParams, SetCloudsParams,
-    SetComponentFieldParams, SetComponentFieldResult, SetComponentOrderParams,
-    SetComponentOrderResult, SetComponentParams, SetComponentResult, SetEnvironmentParams,
-    SetFogParams, SetGizmoParams, SetLightParams, SetParentParams, SetScriptOverrideParams,
-    SetScriptOverrideResult, SetTimeOfDayParams, SetTransformParams, SetWindParams, SkyModeDto,
-    StepParams, TimeOfDaySettingsDto, TodCurvePointDto, TodTintSettingsDto,
-    UpdateEnvironmentProfileParams, Uuid as WireUuid, Vec3, WindSettingsDto,
+    PlayStateResult, RemoveComponentResult, RenameEntityParams, ResidencyCountsDto,
+    ResidencyFacetDto, SaveEnvironmentProfileParams, ScriptErrorDto, ScriptInputParams,
+    ScriptInputResult, ScriptLogDto, ScriptStatusResult, SelectionResult, SetAtmosphereParams,
+    SetCameraParams, SetCloudsParams, SetComponentFieldParams, SetComponentFieldResult,
+    SetComponentOrderParams, SetComponentOrderResult, SetComponentParams, SetComponentResult,
+    SetEnvironmentParams, SetFogParams, SetGizmoParams, SetLightParams, SetParentParams,
+    SetScriptOverrideParams, SetScriptOverrideResult, SetTimeOfDayParams, SetTransformParams,
+    SetWindParams, SkyModeDto, SpatialBoundsDto, SpatialCellParams, SpatialCellResult,
+    SpatialFieldChannelDto, SpatialFieldDerivativeDto, SpatialLocalPositionDto,
+    SpatialResidencyCellDto, SpatialResidencyResult, SpatialSampleParams, SpatialSampleResult,
+    SpatialSourceDto, SpatialSourceLevelDto, SpatialTicksDto, SpatialWorldPositionDto, StepParams,
+    SurfaceCapabilitiesDto, SurfaceProviderDto, SurfaceProvidersResult, TimeOfDaySettingsDto,
+    TodCurvePointDto, TodTintSettingsDto, UpdateEnvironmentProfileParams, Uuid as WireUuid, Vec3,
+    WindSettingsDto, WorldCellKeyDto,
 };
 use saffron_scene::{
     AssetType, Bone, Camera, CameraView, CloudSettings, ComponentTraits, DirectionalLight, Entity,
@@ -51,6 +56,9 @@ use saffron_scene::{
 use saffron_sceneedit::{
     GizmoOp, GizmoSpace, NativeGizmoHandle, OrbitState, PlayState, SceneEditCamera,
     SceneEditContext, viewport_project,
+};
+use saffron_spatial::{
+    FieldChannel, FieldDerivative, ResidencyFacet, SurfaceCapabilities, WorldCellKey, WorldPosition,
 };
 use serde_json::{Map, Value, json};
 
@@ -69,6 +77,108 @@ fn from_glam3(v: GlamVec3) -> Vec3 {
         x: v.x,
         y: v.y,
         z: v.z,
+    }
+}
+
+fn spatial_ticks_dto(ticks: [i128; 3]) -> SpatialTicksDto {
+    SpatialTicksDto {
+        x: ticks[0].to_string(),
+        y: ticks[1].to_string(),
+        z: ticks[2].to_string(),
+    }
+}
+
+fn world_cell_dto(cell: WorldCellKey) -> WorldCellKeyDto {
+    let coordinates = cell.coordinates();
+    WorldCellKeyDto {
+        x: coordinates[0].to_string(),
+        y: coordinates[1].to_string(),
+        z: coordinates[2].to_string(),
+        level: cell.level(),
+        canonical_hex: cell
+            .canonical_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
+
+fn world_position_dto(position: WorldPosition) -> SpatialWorldPositionDto {
+    let local = position.local().ticks();
+    SpatialWorldPositionDto {
+        cell: world_cell_dto(position.cell()),
+        local: SpatialLocalPositionDto {
+            x: local[0],
+            y: local[1],
+            z: local[2],
+        },
+        global_ticks: spatial_ticks_dto(position.global_ticks()),
+    }
+}
+
+fn surface_capabilities_dto(capabilities: SurfaceCapabilities) -> SurfaceCapabilitiesDto {
+    SurfaceCapabilitiesDto {
+        ray: capabilities.ray,
+        project: capabilities.project,
+        nearest: capabilities.nearest,
+        uv: capabilities.uv,
+        authoritative_attachments: capabilities.authoritative_attachments,
+        authoritative_fields: capabilities.authoritative_fields,
+    }
+}
+
+fn field_channel(
+    channel: SpatialFieldChannelDto,
+    user_channel: Option<&str>,
+) -> crate::Result<FieldChannel> {
+    let ordinary = match channel {
+        SpatialFieldChannelDto::Altitude => Some(FieldChannel::Altitude),
+        SpatialFieldChannelDto::Slope => Some(FieldChannel::Slope),
+        SpatialFieldChannelDto::Curvature => Some(FieldChannel::Curvature),
+        SpatialFieldChannelDto::Concavity => Some(FieldChannel::Concavity),
+        SpatialFieldChannelDto::Drainage => Some(FieldChannel::Drainage),
+        SpatialFieldChannelDto::Moisture => Some(FieldChannel::Moisture),
+        SpatialFieldChannelDto::Temperature => Some(FieldChannel::Temperature),
+        SpatialFieldChannelDto::Precipitation => Some(FieldChannel::Precipitation),
+        SpatialFieldChannelDto::Sunlight => Some(FieldChannel::Sunlight),
+        SpatialFieldChannelDto::Exposure => Some(FieldChannel::Exposure),
+        SpatialFieldChannelDto::WaterDistance => Some(FieldChannel::WaterDistance),
+        SpatialFieldChannelDto::WaterDepth => Some(FieldChannel::WaterDepth),
+        SpatialFieldChannelDto::SignedBlocker => Some(FieldChannel::SignedBlocker),
+        SpatialFieldChannelDto::SplineDistance => Some(FieldChannel::SplineDistance),
+        SpatialFieldChannelDto::User => None,
+    };
+    match (ordinary, user_channel) {
+        (Some(channel), None) => Ok(channel),
+        (Some(_), Some(_)) => Err(Error::command(
+            "userChannel is valid only when channel is 'user'",
+        )),
+        (None, Some(value)) => value
+            .parse::<u64>()
+            .map(FieldChannel::User)
+            .map_err(|_| Error::command("userChannel must be a decimal u64")),
+        (None, None) => Err(Error::command(
+            "userChannel is required when channel is 'user'",
+        )),
+    }
+}
+
+fn field_derivative(derivative: SpatialFieldDerivativeDto) -> FieldDerivative {
+    match derivative {
+        SpatialFieldDerivativeDto::Value => FieldDerivative::Value,
+        SpatialFieldDerivativeDto::Gradient => FieldDerivative::Gradient,
+        SpatialFieldDerivativeDto::Hessian => FieldDerivative::Hessian,
+    }
+}
+
+fn residency_facet_dto(facet: ResidencyFacet) -> ResidencyFacetDto {
+    match facet {
+        ResidencyFacet::Render => ResidencyFacetDto::Render,
+        ResidencyFacet::Physics => ResidencyFacetDto::Physics,
+        ResidencyFacet::Simulation => ResidencyFacetDto::Simulation,
+        ResidencyFacet::Editing => ResidencyFacetDto::Editing,
+        ResidencyFacet::Navigation => ResidencyFacetDto::Navigation,
+        ResidencyFacet::Network => ResidencyFacetDto::Network,
     }
 }
 
@@ -718,7 +828,8 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     params.component
                 )));
             }
-            (row.add_default)(ctx.scene_edit.active_scene(), entity);
+            (row.add_default)(ctx.scene_edit.active_scene(), entity)
+                .map_err(|error| Error::command(error.to_string()))?;
             // Auto-fit a Collider's shape to the entity mesh AABB on add (the locked
             // decision). The registry add hook can't see the asset/renderer handles, so it
             // runs here.
@@ -993,12 +1104,12 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             let ndc = Vec2::new(u * 2.0 - 1.0, v * 2.0 - 1.0);
             let assets = &mut *ctx.assets;
             let viewport = (width, height);
-            let mut hit = Entity::NULL;
+            let mut hit_result = Ok(Entity::NULL);
             // The borrow split: pick_entity needs the upload seam + the active scene + the
             // asset server at once. The scene is borrowed from scene_edit; take it inside the
             // upload closure so the renderer borrow does not overlap it.
             ctx.renderer.with_gpu_uploader(&mut |gpu| {
-                hit = pick_entity(
+                hit_result = pick_entity(
                     gpu,
                     viewport,
                     ctx.scene_edit.active_scene(),
@@ -1007,6 +1118,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     ndc,
                 );
             });
+            let hit = hit_result.map_err(|error| Error::command(error.to_string()))?;
             if hit == Entity::NULL {
                 ctx.scene_edit.set_selection(hit);
                 return Ok(PickResult {
@@ -1028,6 +1140,183 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 name: Some(r.name),
                 kind: Some(PickKind::Mesh),
             })
+        },
+    );
+
+    reg.register::<SpatialCellParams, SpatialCellResult>(
+        "spatial-cell",
+        "spatial-cell {world? | ticks?, level?} — canonical position and owner cell",
+        |_ctx, params| {
+            if params.world.is_some() && params.ticks.is_some() {
+                return Err(Error::command("provide world or ticks, not both"));
+            }
+            let position = if let Some(ticks) = params.ticks {
+                let parse = |value: &str| {
+                    value
+                        .parse::<i128>()
+                        .map_err(|_| Error::command("ticks must be signed decimal integers"))
+                };
+                WorldPosition::from_global_ticks([
+                    parse(&ticks.x)?,
+                    parse(&ticks.y)?,
+                    parse(&ticks.z)?,
+                ])
+                .map_err(|error| Error::command(error.to_string()))?
+            } else {
+                let world = params.world.unwrap_or(Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
+                WorldPosition::from_world_meters(saffron_geometry::glam::DVec3::new(
+                    f64::from(world.x),
+                    f64::from(world.y),
+                    f64::from(world.z),
+                ))
+                .map_err(|error| Error::command(error.to_string()))?
+            };
+            let selected_cell = position
+                .cell()
+                .ancestor(params.level.unwrap_or(0))
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(SpatialCellResult {
+                position: world_position_dto(position),
+                selected_cell: world_cell_dto(selected_cell),
+            })
+        },
+    );
+
+    reg.register::<EmptyParams, SurfaceProvidersResult>(
+        "spatial-providers",
+        "spatial-providers — list live surface providers and capabilities",
+        |ctx, _params| {
+            let assets = &mut *ctx.assets;
+            let mut result = Ok(Vec::new());
+            ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                result = scene_surface_providers(gpu, ctx.scene_edit.active_scene(), assets);
+            });
+            let providers = result
+                .map_err(|error| Error::command(error.to_string()))?
+                .into_iter()
+                .map(|provider| {
+                    let descriptor = provider.descriptor;
+                    let (entity, name) = {
+                        let scene = ctx.scene_edit.active_scene();
+                        let reference = entity_ref_dto(scene, provider.entity);
+                        (reference.id, reference.name)
+                    };
+                    SurfaceProviderDto {
+                        id: WireUuid(descriptor.id.0),
+                        entity,
+                        name,
+                        revision: descriptor.revision.0.to_string(),
+                        bounds: SpatialBoundsDto {
+                            min_ticks: spatial_ticks_dto(descriptor.bounds.min_ticks()),
+                            max_ticks_exclusive: spatial_ticks_dto(
+                                descriptor.bounds.max_ticks_exclusive(),
+                            ),
+                        },
+                        primitive_count: descriptor.primitive_count.to_string(),
+                        capabilities: surface_capabilities_dto(descriptor.capabilities),
+                    }
+                })
+                .collect();
+            Ok(SurfaceProvidersResult { providers })
+        },
+    );
+
+    reg.register::<SpatialSampleParams, SpatialSampleResult>(
+        "spatial-sample",
+        "spatial-sample {provider, channel, position, derivative?}",
+        |ctx, params| {
+            let derivative_dto = params.derivative.unwrap_or_default();
+            let channel = field_channel(params.channel, params.user_channel.as_deref())?;
+            let derivative = field_derivative(derivative_dto);
+            let position = WorldPosition::from_world_meters(saffron_geometry::glam::DVec3::new(
+                f64::from(params.position.x),
+                f64::from(params.position.y),
+                f64::from(params.position.z),
+            ))
+            .map_err(|error| Error::command(error.to_string()))?;
+            let provider_id = saffron_spatial::SurfaceProviderId(params.provider.0);
+            let assets = &mut *ctx.assets;
+            let mut result = Ok(None);
+            ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                result = sample_scene_surface_field(
+                    gpu,
+                    ctx.scene_edit.active_scene(),
+                    assets,
+                    provider_id,
+                    channel,
+                    derivative,
+                    position,
+                );
+            });
+            let sample = result
+                .map_err(|error| Error::command(error.to_string()))?
+                .ok_or_else(|| Error::command("surface provider not found"))?;
+            Ok(SpatialSampleResult {
+                provider: params.provider,
+                channel: params.channel,
+                user_channel: params.user_channel,
+                derivative: derivative_dto,
+                value_bits: sample.value.bits(),
+                value: sample.value.to_f64(),
+                revision: sample.revision.0.to_string(),
+            })
+        },
+    );
+
+    reg.register::<EmptyParams, SpatialResidencyResult>(
+        "spatial-residency",
+        "spatial-residency — list spatial sources and per-facet cell references",
+        |ctx, _params| {
+            let sources = ctx
+                .spatial
+                .sources()
+                .into_iter()
+                .map(|source| SpatialSourceDto {
+                    id: source.id.0.to_string(),
+                    revision: source.revision.to_string(),
+                    position: world_position_dto(source.position),
+                    velocity_mps: Vec3 {
+                        x: source.velocity_mps.x as f32,
+                        y: source.velocity_mps.y as f32,
+                        z: source.velocity_mps.z as f32,
+                    },
+                    prediction_seconds: source.prediction_seconds,
+                    levels: source
+                        .levels
+                        .into_iter()
+                        .map(|level| SpatialSourceLevelDto {
+                            level: level.level,
+                            load_radius_cells: level.load_radius_cells,
+                            cleanup_radius_cells: level.cleanup_radius_cells,
+                        })
+                        .collect(),
+                    facets: source.facets.iter().map(residency_facet_dto).collect(),
+                    priority: source.priority,
+                })
+                .collect();
+            let cells = ctx
+                .spatial
+                .snapshots()
+                .map_err(|error| Error::command(error.to_string()))?
+                .into_iter()
+                .map(|snapshot| SpatialResidencyCellDto {
+                    cell: world_cell_dto(snapshot.cell),
+                    reference_counts: ResidencyCountsDto {
+                        render: snapshot.reference_counts[ResidencyFacet::Render as usize],
+                        physics: snapshot.reference_counts[ResidencyFacet::Physics as usize],
+                        simulation: snapshot.reference_counts[ResidencyFacet::Simulation as usize],
+                        editing: snapshot.reference_counts[ResidencyFacet::Editing as usize],
+                        navigation: snapshot.reference_counts[ResidencyFacet::Navigation as usize],
+                        network: snapshot.reference_counts[ResidencyFacet::Network as usize],
+                    },
+                    priority: snapshot.priority,
+                })
+                .collect();
+            Ok(SpatialResidencyResult { sources, cells })
         },
     );
 
@@ -2045,7 +2334,8 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     Error::command(format!("unknown component '{}'", params.component))
                 })?;
             if !(row.has)(ctx.scene_edit.active_scene(), entity) {
-                (row.add_default)(ctx.scene_edit.active_scene(), entity);
+                (row.add_default)(ctx.scene_edit.active_scene(), entity)
+                    .map_err(|error| Error::command(error.to_string()))?;
             }
             let mut body = (row.serialize)(ctx.scene_edit.active_scene(), entity);
             // The CLI passes every value as a string; a fully-numeric one becomes a u64 so
@@ -2341,6 +2631,10 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use saffron_geometry::glam::DVec3;
+    use saffron_spatial::{
+        ResidencyFacet, ResidencyMask, SourceLevel, SpatialSource, SpatialSourceId, WorldPosition,
+    };
     use serde_json::json;
 
     use crate::registry::{CommandRegistry, EngineContext, register_builtin_commands};
@@ -2350,6 +2644,104 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register_builtin_commands(&mut reg);
         reg
+    }
+
+    #[test]
+    fn spatial_cell_reports_exact_negative_face_ownership() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let reply = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "spatial-cell",
+                    "params": { "ticks": { "x": "-1", "y": "-262144", "z": "262144" }, "level": 1 }
+                }),
+            );
+            assert_eq!(reply["ok"], json!(true));
+            assert_eq!(reply["result"]["position"]["cell"]["x"], json!("-1"));
+            assert_eq!(reply["result"]["position"]["cell"]["y"], json!("-1"));
+            assert_eq!(reply["result"]["position"]["cell"]["z"], json!("1"));
+            assert_eq!(reply["result"]["position"]["local"]["x"], json!(262_143));
+            assert_eq!(reply["result"]["selectedCell"]["x"], json!("-1"));
+            assert_eq!(reply["result"]["selectedCell"]["y"], json!("-1"));
+            assert_eq!(reply["result"]["selectedCell"]["z"], json!("0"));
+            assert_eq!(
+                reply["result"]["selectedCell"]["canonicalHex"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                50
+            );
+        });
+    }
+
+    #[test]
+    fn spatial_provider_and_user_channel_diagnostics_are_read_only() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let providers = reg.dispatch(ctx, &json!({ "cmd": "spatial-providers" }));
+            assert_eq!(providers["result"]["providers"], json!([]));
+
+            let missing_user_id = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "spatial-sample",
+                    "params": {
+                        "provider": "1",
+                        "channel": "user",
+                        "position": { "x": 0, "y": 0, "z": 0 }
+                    }
+                }),
+            );
+            assert_eq!(missing_user_id["ok"], json!(false));
+            assert_eq!(
+                missing_user_id["error"],
+                json!("userChannel is required when channel is 'user'")
+            );
+        });
+    }
+
+    #[test]
+    fn spatial_residency_reports_sources_and_facet_counts() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            ctx.spatial
+                .update_source(SpatialSource {
+                    id: SpatialSourceId(19),
+                    revision: 7,
+                    position: WorldPosition::origin(),
+                    velocity_mps: DVec3::new(2.0, 0.0, 0.0),
+                    prediction_seconds: 0.5,
+                    levels: vec![SourceLevel {
+                        level: 0,
+                        load_radius_cells: 0,
+                        cleanup_radius_cells: 1,
+                    }],
+                    facets: ResidencyMask::one(ResidencyFacet::Render)
+                        .with(ResidencyFacet::Editing),
+                    priority: 42,
+                })
+                .unwrap();
+            let reply = reg.dispatch(ctx, &json!({ "cmd": "spatial-residency" }));
+            assert_eq!(reply["ok"], json!(true));
+            assert_eq!(reply["result"]["sources"][0]["id"], json!("19"));
+            assert_eq!(
+                reply["result"]["sources"][0]["facets"],
+                json!(["render", "editing"])
+            );
+            assert_eq!(
+                reply["result"]["cells"][0]["referenceCounts"]["render"],
+                json!(1)
+            );
+            assert_eq!(
+                reply["result"]["cells"][0]["referenceCounts"]["editing"],
+                json!(1)
+            );
+            assert_eq!(reply["result"]["cells"][0]["priority"], json!(42));
+        });
     }
 
     /// `create-entity` then `destroy-entity` round-trips, and the returned `EntityRef.id` is
@@ -2470,6 +2862,75 @@ mod tests {
             assert_eq!(
                 inspect["result"]["components"]["Name"]["name"],
                 json!("Renamed")
+            );
+        });
+    }
+
+    #[test]
+    fn vegetation_field_create_inspect_remove_and_singleton_contract() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let first = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Vegetation" } }),
+            );
+            let second = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Other" } }),
+            );
+            let first_id = first["result"]["id"].as_str().unwrap().to_owned();
+            let second_id = second["result"]["id"].as_str().unwrap().to_owned();
+
+            let added = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "add-component",
+                    "params": { "entity": first_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(added["ok"], json!(true), "add: {added:?}");
+            let inspect = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "inspect", "params": { "entity": first_id } }),
+            );
+            assert_eq!(
+                inspect["result"]["components"]["VegetationField"],
+                json!({ "map": "0", "enabled": true })
+            );
+
+            let duplicate = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "add-component",
+                    "params": { "entity": second_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(duplicate["ok"], json!(false));
+            assert_eq!(
+                duplicate["error"],
+                json!("scene already has a VegetationField component")
+            );
+
+            let removed = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "remove-component",
+                    "params": { "entity": first_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(removed["ok"], json!(true), "remove: {removed:?}");
+            let replacement = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "add-component",
+                    "params": { "entity": second_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(
+                replacement["ok"],
+                json!(true),
+                "replacement: {replacement:?}"
             );
         });
     }
