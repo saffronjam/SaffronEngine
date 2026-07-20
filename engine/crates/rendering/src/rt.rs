@@ -1317,8 +1317,10 @@ fn record_and_submit_oneoff<R: FnOnce(vk::CommandBuffer)>(
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init (no frame in flight);
         // submit without a fence and drain with `wait_idle` below (an init path).
-        checked(
-            unsafe { raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()) },
+        device.graphics_queue.submit2(
+            raw,
+            &submits,
+            vk::Fence::null(),
             "queue_submit2 (seed tlas)",
         )?;
         device.wait_idle()
@@ -1569,7 +1571,7 @@ mod tests {
     /// *does* advertise the RT extensions, so the build runs here.
     #[test]
     fn tlas_build_over_static_instance_is_validation_clean() {
-        use crate::upload::{GpuQueue, Uploader};
+        use crate::upload::Uploader;
         use saffron_geometry::glam::{Vec2, Vec3};
         use saffron_geometry::{Mesh, Submesh, Vertex};
 
@@ -1586,7 +1588,7 @@ mod tests {
         }
 
         // Upload a unit triangle; on an RT device this builds its BLAS at upload time.
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
         let v = |x: f32, y: f32| Vertex {
             position: Vec3::new(x, y, 0.0),

@@ -1262,10 +1262,9 @@ impl Ibl {
             checked(raw.end_command_buffer(scratch.cmd), "ibl end")?;
             let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(scratch.cmd)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submit, scratch.fence),
-                "ibl submit",
-            )?;
+            device
+                .graphics_queue
+                .submit2(&raw, &submit, scratch.fence, "ibl submit")?;
         }
 
         self.atmosphere_dirty = false;

@@ -862,7 +862,7 @@ mod tests {
     use crate::resources::BindlessFreeList;
     use crate::skinning::Skinning;
     use crate::targets::Targets;
-    use crate::upload::{GpuQueue, Uploader};
+    use crate::upload::Uploader;
     use crate::validation_issue_count;
     use crate::{Result, checked};
     use saffron_geometry::glam::{Vec2, Vec3 as G3};
@@ -916,7 +916,7 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
         let mesh = triangle(&descriptors, &uploader);
@@ -1088,10 +1088,9 @@ mod tests {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. Single-threaded queue use in the test.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "submit")?;
                 checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())

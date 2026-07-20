@@ -1649,10 +1649,9 @@ mod tests {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. Single-threaded queue use in the test.
             unsafe {
-                crate::checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "submit")?;
                 crate::checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())
