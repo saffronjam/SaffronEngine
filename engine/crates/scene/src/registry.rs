@@ -24,7 +24,7 @@ use crate::component::{
     AnimationPlayer, Bone, BonePhysicsComponent, Camera, CharacterController, Collider,
     ComponentOrder, DirectionalLight, FogVolume, FootIk, KinematicBones, MaterialSet, Mesh,
     ModelInstance, MorphComponent, Name, PointLight, ReflectionProbe, Relationship, Rigidbody,
-    Script, SkinnedMesh, SpotLight, Transform,
+    Script, SkinnedMesh, SpotLight, Transform, VegetationField,
 };
 use crate::error::Result;
 use crate::scene::{Component, Entity, Scene};
@@ -73,12 +73,12 @@ pub struct ComponentTraits {
     /// Whether `entity` carries this component.
     pub has: fn(&Scene, Entity) -> bool,
     /// Default-constructs this component onto `entity`.
-    pub add_default: fn(&mut Scene, Entity),
+    pub add_default: fn(&mut Scene, Entity) -> Result<()>,
     /// Removes this component from `entity` if present.
     pub remove: fn(&mut Scene, Entity),
     /// Clones this component from `(src, from)` onto `(dst, to)` when present on the
     /// source.
-    pub copy_to: fn(&Scene, Entity, &mut Scene, Entity),
+    pub copy_to: fn(&Scene, Entity, &mut Scene, Entity) -> Result<()>,
     /// Serializes `entity`'s component to JSON, dispatching to the type's
     /// [`SceneSerialize::to_json`].
     pub serialize: fn(&Scene, Entity) -> Value,
@@ -133,14 +133,13 @@ impl ComponentRegistry {
             name,
             removable,
             has: |scene, entity| scene.has_component::<C>(entity),
-            add_default: |scene, entity| {
-                let _ = scene.add_component(entity, C::default());
-            },
+            add_default: |scene, entity| scene.add_component(entity, C::default()),
             remove: |scene, entity| scene.remove_component::<C>(entity),
             copy_to: |src, from, dst, to| {
                 if let Ok(value) = src.with_component::<C, _>(from, Clone::clone) {
-                    let _ = dst.add_component(to, value);
+                    dst.add_component(to, value)?;
                 }
+                Ok(())
             },
             serialize,
             deserialize,
@@ -381,8 +380,6 @@ impl ComponentRegistry {
 /// `ComponentOrder`, and the `Relationship` / `SkinnedMesh` runtime caches) are absent by
 /// design: they never serialize through a registry row.
 ///
-/// The serde bodies are phase-6 placeholders ([`SceneSerialize`]'s defaults); the
-/// registration shape and the row set are this phase's deliverable.
 #[must_use]
 pub fn register_builtin_components() -> ComponentRegistry {
     let mut reg = ComponentRegistry::new();
@@ -390,6 +387,7 @@ pub fn register_builtin_components() -> ComponentRegistry {
     register_component!(reg, Name, "Name", false);
     register_component!(reg, Transform, "Transform", false);
     register_component!(reg, Mesh, "Mesh");
+    register_component!(reg, VegetationField, "VegetationField");
     register_component!(reg, Camera, "Camera");
     register_component!(reg, MaterialSet, "MaterialSet");
     register_component!(reg, ModelInstance, "ModelInstance");
@@ -423,6 +421,7 @@ pub const BUILTIN_COMPONENT_NAMES: &[&str] = &[
     "Name",
     "Transform",
     "Mesh",
+    "VegetationField",
     "Camera",
     "MaterialSet",
     "ModelInstance",
@@ -689,13 +688,13 @@ mod tests {
         let mut dst_scene = Scene::new();
         let dst = dst_scene.create_entity("dst");
         let camera_row = reg.find_by_name("Camera").unwrap();
-        (camera_row.copy_to)(&src_scene, src, &mut dst_scene, dst);
+        (camera_row.copy_to)(&src_scene, src, &mut dst_scene, dst).unwrap();
         assert!(dst_scene.has_component::<Camera>(dst));
         assert_eq!(dst_scene.component::<Camera>(dst).unwrap().fov, 77.0);
 
         // A no-op when the source lacks the component (Mesh, never added).
         let mesh_row = reg.find_by_name("Mesh").unwrap();
-        (mesh_row.copy_to)(&src_scene, src, &mut dst_scene, dst);
+        (mesh_row.copy_to)(&src_scene, src, &mut dst_scene, dst).unwrap();
         assert!(!dst_scene.has_component::<Mesh>(dst));
     }
 

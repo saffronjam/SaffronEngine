@@ -314,8 +314,7 @@ impl EntityHandle {
             if (traits.has)(scene, self.entity) {
                 return false;
             }
-            (traits.add_default)(scene, self.entity);
-            true
+            (traits.add_default)(scene, self.entity).is_ok()
         })
         .unwrap_or(false)
     }
