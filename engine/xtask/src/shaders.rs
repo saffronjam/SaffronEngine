@@ -4,13 +4,22 @@
 //! `<runtime>/shaders/<name>.spv`, precompiles the shared `lighting.slang` to a reusable
 //! `lighting.slang-module`, copies each `.slang` source into `<runtime>/shaders/source/`
 //! (the runtime node-graph codegen splices `mesh.slang`), and copies the `models/`, `fonts/`, `icons/`
-//! asset trees next to the host binary. Staleness is tracked by source vs output mtime with
-//! the `lighting.slang` shared-dependency edge, so a second run recompiles nothing.
+//! asset trees next to the host binary. A generated qualification manifest binds every SPIR-V
+//! artifact to its compiler, flags, defines, and compiler-resolved transitive source closure.
 
+use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use atomic_write_file::AtomicWriteFile;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const SHADER_ARTIFACT_MANIFEST: &str = "shader-artifacts.generated.json";
+const SHADER_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const COMPILE_INPUT_HASH_DOMAIN: &[u8] = b"saffron-anima/shader-compile-input/v1\0";
 
 /// The Slang module half is special: it has no entry points and emits no `.spv`. It is
 /// precompiled once to `lighting.slang-module`; `mesh.slang` and codegen material variants
@@ -47,6 +56,9 @@ const SKY_SH_STEM: &str = "sky_sh";
 /// Imported from source (via `-I`) by `tonemap.slang`. No runtime codegen splices it, so it needs no
 /// precompiled `.slang-module`; it is only excluded from the entry-point `.spv` compile.
 const TONEMAP_OPS_STEM: &str = "tonemap_ops";
+
+/// The authoritative fixed-point and counter-RNG module shared by CPU-parity compute work.
+const SPATIAL_NUMERIC_STEM: &str = "spatial_numeric";
 
 /// The resource-free cloud shape/noise module shared by the static bakes, weather fill, density
 /// debugger, and production cloud march. Imported from source through the shader include path.
@@ -88,6 +100,36 @@ pub const SLANGC_SPV_FLAGS: &[&str] = &[
 /// front so Slang does not implicitly upgrade the profile and emit an informational warning per
 /// entry point.
 const SLANGC_CAPABILITIES: &str = "SPV_KHR_non_semantic_info+SPV_GOOGLE_user_type+spvSparseResidency+spvMinLod+spvFragmentFullyCoveredEXT+spvShaderNonUniformEXT+spvRayQueryKHR+spvMeshShadingEXT+spvGroupNonUniform+spvGroupNonUniformBallot";
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShaderArtifactManifest {
+    schema_version: u32,
+    slangc_version: String,
+    spirv_flags: Vec<String>,
+    artifacts: Vec<ShaderArtifactEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShaderArtifactEntry {
+    shader: String,
+    source: String,
+    artifact: String,
+    defines: Vec<String>,
+    source_files: Vec<String>,
+    compile_input_sha256: String,
+    spirv_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShaderVariant {
+    shader: String,
+    source: PathBuf,
+    source_name: String,
+    artifact: String,
+    defines: Vec<String>,
+}
 
 /// Inputs to one shader-pipeline run, resolved from the workspace layout + the build profile.
 pub struct Config {
@@ -147,6 +189,16 @@ pub fn run(config: &Config) -> Result<Report> {
             runtime_source_dir.display()
         )
     })?;
+    let manifest_path = out_dir.join(SHADER_ARTIFACT_MANIFEST);
+    let slangc_version = slangc_version(&config.slangc)?;
+    let spirv_flags = SLANGC_SPV_FLAGS
+        .iter()
+        .map(|flag| (*flag).to_owned())
+        .collect::<Vec<_>>();
+    let previous_manifest = read_manifest_if_valid(&manifest_path)?;
+    let compiler_changed = previous_manifest
+        .as_ref()
+        .is_none_or(|manifest| manifest.slangc_version != slangc_version);
 
     let lighting_src = config.shader_src_dir.join("lighting.slang");
     if !lighting_src.is_file() {
@@ -203,6 +255,14 @@ pub fn run(config: &Config) -> Result<Report> {
         );
     }
 
+    let spatial_numeric_src = config.shader_src_dir.join("spatial_numeric.slang");
+    if !spatial_numeric_src.is_file() {
+        bail!(
+            "shared spatial numeric source not found: {}",
+            spatial_numeric_src.display()
+        );
+    }
+
     let clouds_src = config.shader_src_dir.join("clouds.slang");
     if !clouds_src.is_file() {
         bail!("shared clouds source not found: {}", clouds_src.display());
@@ -222,12 +282,17 @@ pub fn run(config: &Config) -> Result<Report> {
         );
     }
 
+    let shader_sources = shader_sources(&config.shader_src_dir)?;
+    for (stem, path) in &shader_sources {
+        copy_if_different(path, &runtime_source_dir.join(format!("{stem}.slang")))?;
+    }
+    let variants = shader_variants(&shader_sources);
     let mut report = Report::default();
 
     // The `octahedral` module (no imports) compiles first; `sdf` re-exports it and `lighting`
     // imports `sdf`, so an `octahedral` touch fans out to both modules + every entry-point `.spv`.
     let octahedral_module = out_dir.join("octahedral.slang-module");
-    if is_stale(&octahedral_module, &[&octahedral_src])? {
+    if compiler_changed || is_stale(&octahedral_module, &[&octahedral_src])? {
         compile_module(&config.slangc, &octahedral_src, &octahedral_module)?;
         report.module_compiled = true;
     }
@@ -235,13 +300,13 @@ pub fn run(config: &Config) -> Result<Report> {
     // The `giprobe` module (the DDGI probe-cage sampler, no imports) compiles before `lighting`
     // (which imports it) and `gi_resolve`; a touch fans out to both.
     let giprobe_module = out_dir.join("giprobe.slang-module");
-    if is_stale(&giprobe_module, &[&giprobe_src])? {
+    if compiler_changed || is_stale(&giprobe_module, &[&giprobe_src])? {
         compile_module(&config.slangc, &giprobe_src, &giprobe_module)?;
         report.module_compiled = true;
     }
 
     let sky_sh_module = out_dir.join("sky_sh.slang-module");
-    if is_stale(&sky_sh_module, &[&sky_sh_src])? {
+    if compiler_changed || is_stale(&sky_sh_module, &[&sky_sh_src])? {
         compile_module(&config.slangc, &sky_sh_src, &sky_sh_module)?;
         report.module_compiled = true;
     }
@@ -249,7 +314,7 @@ pub fn run(config: &Config) -> Result<Report> {
     // The `mdf_brick` module (the per-mesh brick sample) is imported by `sdf` and the Global-SDF
     // passes, so it compiles before `sdf` and a touch fans out to both.
     let mdf_brick_module = out_dir.join("mdf_brick.slang-module");
-    if is_stale(&mdf_brick_module, &[&mdf_brick_src])? {
+    if compiler_changed || is_stale(&mdf_brick_module, &[&mdf_brick_src])? {
         compile_module(&config.slangc, &mdf_brick_src, &mdf_brick_module)?;
         report.module_compiled = true;
     }
@@ -257,107 +322,500 @@ pub fn run(config: &Config) -> Result<Report> {
     // The `sdf` module imports `octahedral` + `mdf_brick`; `lighting` imports `sdf`, so a `sdf`
     // touch also rebuilds the lighting module + every entry-point `.spv` (the shared dep edge).
     let sdf_module = out_dir.join("sdf.slang-module");
-    if is_stale(&sdf_module, &[&sdf_src, &mdf_brick_src, &octahedral_src])? {
+    if compiler_changed || is_stale(&sdf_module, &[&sdf_src, &mdf_brick_src, &octahedral_src])? {
         compile_module(&config.slangc, &sdf_src, &sdf_module)?;
         report.module_compiled = true;
     }
 
     let lighting_module = out_dir.join("lighting.slang-module");
-    if is_stale(
-        &lighting_module,
-        &[
-            &lighting_src,
-            &lighting_common_src,
-            &sdf_src,
-            &mdf_brick_src,
-            &octahedral_src,
-            &giprobe_src,
-            &sky_sh_src,
-        ],
-    )? {
+    if compiler_changed
+        || is_stale(
+            &lighting_module,
+            &[
+                &lighting_src,
+                &lighting_common_src,
+                &sdf_src,
+                &mdf_brick_src,
+                &octahedral_src,
+                &giprobe_src,
+                &sky_sh_src,
+            ],
+        )?
+    {
         compile_module(&config.slangc, &lighting_src, &lighting_module)?;
         report.module_compiled = true;
     }
 
-    for entry in std::fs::read_dir(&config.shader_src_dir)
-        .with_context(|| format!("reading shader dir {}", config.shader_src_dir.display()))?
-    {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("slang") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .with_context(|| format!("non-utf8 shader name: {}", path.display()))?;
-        let src_copy = runtime_source_dir.join(format!("{stem}.slang"));
-        copy_if_different(&path, &src_copy)?;
-        if stem == LIGHTING_STEM
-            || stem == LIGHTING_COMMON_STEM
-            || stem == SDF_STEM
-            || stem == MDF_BRICK_STEM
-            || stem == OCTAHEDRAL_STEM
-            || stem == GIPROBE_STEM
-            || stem == SKY_SH_STEM
-            || stem == TONEMAP_OPS_STEM
-            || stem == CLOUDS_STEM
-            || stem == CLOUD_LIGHTING_STEM
-            || stem == ATMOS_AP_STEM
-        {
-            continue;
-        }
-
-        let spv = out_dir.join(format!("{stem}.spv"));
-
-        // Every shader depends on the shared lighting modules and their transitive modules, so a
-        // touch of any forces a full fan-out rebuild.
-        let deps = [
-            &path,
-            lighting_src.as_path(),
-            lighting_common_src.as_path(),
-            sdf_src.as_path(),
-            mdf_brick_src.as_path(),
-            octahedral_src.as_path(),
-            giprobe_src.as_path(),
-            sky_sh_src.as_path(),
-            tonemap_ops_src.as_path(),
-            clouds_src.as_path(),
-            cloud_lighting_src.as_path(),
-            atmos_ap_src.as_path(),
-        ];
-        if is_stale(&spv, &deps)? {
-            compile_spv(&config.slangc, &path, &config.shader_src_dir, &spv, &[])?;
-            report.spv_compiled += 1;
-        } else {
-            report.spv_skipped += 1;
-        }
-
-        // The übershader carries the ray-tracing bindings (sets 6/7); a device without RT loads
-        // the RT-off variant (`SAFFRON_NO_RT`), whose declared interface matches the RT-less PSO
-        // layout — required by strict argument-buffer backends (MoltenVK). Only `mesh` needs it:
-        // the meshlet path is mesh-shader-gated (same devices that lack RT lack mesh shaders).
-        if stem == MESH_STEM {
-            let spv_nort = out_dir.join(format!("{stem}{NO_RT_SUFFIX}.spv"));
-            if is_stale(&spv_nort, &deps)? {
+    let mut artifacts = Vec::with_capacity(variants.len());
+    for variant in &variants {
+        let artifact_path = out_dir.join(&variant.artifact);
+        let source_files = match qualified_source_files(
+            previous_manifest.as_ref(),
+            variant,
+            &slangc_version,
+            &spirv_flags,
+            &config.shader_src_dir,
+            &artifact_path,
+        )? {
+            Some(source_files) => {
+                report.spv_skipped += 1;
+                source_files
+            }
+            None => {
+                let depfile = TemporaryDepfile::new(&out_dir, &variant.shader);
                 compile_spv(
                     &config.slangc,
-                    &path,
+                    &variant.source,
                     &config.shader_src_dir,
-                    &spv_nort,
-                    &[NO_RT_DEFINE],
+                    &artifact_path,
+                    &depfile.path,
+                    &variant.defines,
                 )?;
                 report.spv_compiled += 1;
-            } else {
-                report.spv_skipped += 1;
+                source_files_from_depfile(&depfile.path, &config.shader_src_dir)?
             }
-        }
+        };
+        let compile_input_sha256 = compile_input_sha256(
+            &config.shader_src_dir,
+            &source_files,
+            &spirv_flags,
+            &variant.defines,
+        )?;
+        let spirv_sha256 = sha256_file(&artifact_path)?;
+        artifacts.push(ShaderArtifactEntry {
+            shader: variant.shader.clone(),
+            source: variant.source_name.clone(),
+            artifact: variant.artifact.clone(),
+            defines: variant.defines.clone(),
+            source_files,
+            compile_input_sha256,
+            spirv_sha256,
+        });
     }
+
+    let manifest = ShaderArtifactManifest {
+        schema_version: SHADER_ARTIFACT_SCHEMA_VERSION,
+        slangc_version,
+        spirv_flags,
+        artifacts,
+    };
+    validate_manifest(&manifest, &variants, &config.shader_src_dir, &out_dir)?;
 
     copy_asset_tree(&config.asset_src_dir, &config.runtime_dir, "models")?;
     copy_asset_tree(&config.asset_src_dir, &config.runtime_dir, "fonts")?;
     copy_asset_tree(&config.asset_src_dir, &config.runtime_dir, "icons")?;
+    write_manifest(&manifest_path, &manifest)?;
 
     Ok(report)
+}
+
+fn shader_sources(shader_src_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(shader_src_dir)
+        .with_context(|| format!("reading shader dir {}", shader_src_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("slang") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .with_context(|| format!("non-utf8 shader name: {}", path.display()))?
+            .to_owned();
+        sources.push((stem, path));
+    }
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(sources)
+}
+
+fn shader_variants(sources: &[(String, PathBuf)]) -> Vec<ShaderVariant> {
+    let mut variants = Vec::new();
+    for (stem, source) in sources {
+        if is_shared_source(stem) {
+            continue;
+        }
+        variants.push(ShaderVariant {
+            shader: stem.clone(),
+            source: source.clone(),
+            source_name: format!("{stem}.slang"),
+            artifact: format!("{stem}.spv"),
+            defines: Vec::new(),
+        });
+        if stem == MESH_STEM {
+            let shader = format!("{stem}{NO_RT_SUFFIX}");
+            variants.push(ShaderVariant {
+                shader: shader.clone(),
+                source: source.clone(),
+                source_name: format!("{stem}.slang"),
+                artifact: format!("{shader}.spv"),
+                defines: vec![NO_RT_DEFINE.to_owned()],
+            });
+        }
+    }
+    variants.sort_by(|left, right| left.shader.cmp(&right.shader));
+    variants
+}
+
+fn is_shared_source(stem: &str) -> bool {
+    matches!(
+        stem,
+        LIGHTING_STEM
+            | LIGHTING_COMMON_STEM
+            | SDF_STEM
+            | MDF_BRICK_STEM
+            | OCTAHEDRAL_STEM
+            | GIPROBE_STEM
+            | SKY_SH_STEM
+            | TONEMAP_OPS_STEM
+            | SPATIAL_NUMERIC_STEM
+            | CLOUDS_STEM
+            | CLOUD_LIGHTING_STEM
+            | ATMOS_AP_STEM
+    )
+}
+
+fn slangc_version(slangc: &Path) -> Result<String> {
+    let output = Command::new(slangc)
+        .arg("-version")
+        .output()
+        .with_context(|| format!("spawning {} -version", slangc.display()))?;
+    if !output.status.success() {
+        bail!("{} -version failed ({})", slangc.display(), output.status);
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .context("slangc -version stdout is not UTF-8")?
+        .trim()
+        .to_owned();
+    let stderr = String::from_utf8(output.stderr)
+        .context("slangc -version stderr is not UTF-8")?
+        .trim()
+        .to_owned();
+    let version = match (stdout.is_empty(), stderr.is_empty()) {
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+        (true, true) => String::new(),
+    };
+    if version.is_empty() {
+        bail!("{} -version returned an empty identity", slangc.display());
+    }
+    Ok(version)
+}
+
+fn read_manifest_if_valid(path: &Path) -> Result<Option<ShaderArtifactManifest>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let Ok(manifest) = serde_json::from_slice::<ShaderArtifactManifest>(&bytes) else {
+        return Ok(None);
+    };
+    let ordered = manifest
+        .artifacts
+        .windows(2)
+        .all(|pair| pair[0].shader < pair[1].shader);
+    Ok((manifest.schema_version == SHADER_ARTIFACT_SCHEMA_VERSION && ordered).then_some(manifest))
+}
+
+fn qualified_source_files(
+    manifest: Option<&ShaderArtifactManifest>,
+    variant: &ShaderVariant,
+    slangc_version: &str,
+    spirv_flags: &[String],
+    shader_src_dir: &Path,
+    artifact_path: &Path,
+) -> Result<Option<Vec<String>>> {
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    if manifest.schema_version != SHADER_ARTIFACT_SCHEMA_VERSION
+        || manifest.slangc_version != slangc_version
+        || manifest.spirv_flags != spirv_flags
+    {
+        return Ok(None);
+    }
+    let Ok(index) = manifest
+        .artifacts
+        .binary_search_by(|entry| entry.shader.as_str().cmp(&variant.shader))
+    else {
+        return Ok(None);
+    };
+    let entry = &manifest.artifacts[index];
+    if entry.source != variant.source_name
+        || entry.artifact != variant.artifact
+        || entry.defines != variant.defines
+        || entry.source_files.is_empty()
+        || !entry.source_files.contains(&variant.source_name)
+        || !source_file_names_are_canonical(&entry.source_files)
+        || !artifact_path.is_file()
+    {
+        return Ok(None);
+    }
+    for source in &entry.source_files {
+        let Some(path) = source_file_path(shader_src_dir, source) else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+    }
+    let compile_input_sha256 = compile_input_sha256(
+        shader_src_dir,
+        &entry.source_files,
+        spirv_flags,
+        &variant.defines,
+    )?;
+    if compile_input_sha256 != entry.compile_input_sha256
+        || sha256_file(artifact_path)? != entry.spirv_sha256
+    {
+        return Ok(None);
+    }
+    Ok(Some(entry.source_files.clone()))
+}
+
+fn compile_input_sha256(
+    shader_src_dir: &Path,
+    source_files: &[String],
+    spirv_flags: &[String],
+    defines: &[String],
+) -> Result<String> {
+    let source_files = source_files.iter().collect::<BTreeSet<_>>();
+    let mut hasher = Sha256::new();
+    hasher.update(COMPILE_INPUT_HASH_DOMAIN);
+    hash_string_sequence(
+        &mut hasher,
+        b"spirv-flags",
+        spirv_flags.iter().map(String::as_str),
+    )?;
+    hash_string_sequence(&mut hasher, b"defines", defines.iter().map(String::as_str))?;
+    hash_len(&mut hasher, source_files.len())?;
+    for source in source_files {
+        let path = source_file_path(shader_src_dir, source)
+            .with_context(|| format!("invalid canonical shader source path '{source}'"))?;
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading shader compile input {}", path.display()))?;
+        hash_bytes(&mut hasher, source.as_bytes())?;
+        hash_bytes(&mut hasher, &bytes)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_string_sequence<'a>(
+    hasher: &mut Sha256,
+    label: &[u8],
+    values: impl ExactSizeIterator<Item = &'a str>,
+) -> Result<()> {
+    hash_bytes(hasher, label)?;
+    hash_len(hasher, values.len())?;
+    for value in values {
+        hash_bytes(hasher, value.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {
+    hash_len(hasher, bytes.len())?;
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_len(hasher: &mut Sha256, len: usize) -> Result<()> {
+    let len = u64::try_from(len).context("shader compile input length exceeds u64")?;
+    hasher.update(len.to_be_bytes());
+    Ok(())
+}
+
+fn source_files_from_depfile(depfile: &Path, shader_src_dir: &Path) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(depfile)
+        .with_context(|| format!("reading slang dependency file {}", depfile.display()))?;
+    let (_, dependencies) = text
+        .split_once(": ")
+        .with_context(|| format!("invalid slang dependency file {}", depfile.display()))?;
+    let shader_src_dir = std::fs::canonicalize(shader_src_dir)
+        .with_context(|| format!("canonicalizing {}", shader_src_dir.display()))?;
+    let mut sources = BTreeSet::new();
+    for dependency in makefile_words(dependencies) {
+        let path = std::fs::canonicalize(&dependency)
+            .with_context(|| format!("canonicalizing slang dependency {dependency}"))?;
+        let relative = path.strip_prefix(&shader_src_dir).with_context(|| {
+            format!(
+                "slang dependency {} is outside {}",
+                path.display(),
+                shader_src_dir.display()
+            )
+        })?;
+        let relative = canonical_relative_name(relative)?;
+        if Path::new(&relative)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("slang")
+        {
+            bail!("slang dependency '{relative}' is not a .slang source");
+        }
+        sources.insert(relative);
+    }
+    if sources.is_empty() {
+        bail!("slang dependency file {} is empty", depfile.display());
+    }
+    Ok(sources.into_iter().collect())
+}
+
+fn makefile_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+            if character != '\n' && character != '\r' {
+                word.push(character);
+            }
+        } else if character == '\\' {
+            escaped = true;
+        } else if character.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(character);
+        }
+    }
+    if escaped {
+        word.push('\\');
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn source_file_names_are_canonical(source_files: &[String]) -> bool {
+    !source_files.is_empty()
+        && source_files.windows(2).all(|pair| pair[0] < pair[1])
+        && source_files
+            .iter()
+            .all(|source| source_file_path(Path::new("."), source).is_some())
+}
+
+fn source_file_path(shader_src_dir: &Path, source: &str) -> Option<PathBuf> {
+    let path = Path::new(source);
+    if path.extension().and_then(|extension| extension.to_str()) != Some("slang")
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(shader_src_dir.join(path))
+}
+
+fn canonical_relative_name(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(part) = component else {
+            bail!(
+                "shader dependency path is not canonical: {}",
+                path.display()
+            );
+        };
+        parts.push(
+            part.to_str()
+                .with_context(|| format!("non-UTF-8 shader dependency {}", path.display()))?,
+        );
+    }
+    Ok(parts.join("/"))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_manifest(
+    manifest: &ShaderArtifactManifest,
+    variants: &[ShaderVariant],
+    shader_src_dir: &Path,
+    out_dir: &Path,
+) -> Result<()> {
+    if manifest.schema_version != SHADER_ARTIFACT_SCHEMA_VERSION {
+        bail!("shader artifact manifest schema version is not current");
+    }
+    let expected_flags = SLANGC_SPV_FLAGS
+        .iter()
+        .map(|flag| (*flag).to_owned())
+        .collect::<Vec<_>>();
+    if manifest.spirv_flags != expected_flags {
+        bail!("shader artifact manifest SPIR-V flags do not match the compiler pipeline");
+    }
+    if manifest.artifacts.len() != variants.len() {
+        bail!("shader artifact manifest does not cover every generated variant");
+    }
+    for (entry, variant) in manifest.artifacts.iter().zip(variants) {
+        if entry.shader != variant.shader
+            || entry.source != variant.source_name
+            || entry.artifact != variant.artifact
+            || entry.defines != variant.defines
+            || !source_file_names_are_canonical(&entry.source_files)
+            || !entry.source_files.contains(&entry.source)
+        {
+            bail!(
+                "shader artifact manifest entry '{}' is not canonical",
+                entry.shader
+            );
+        }
+        let compile_input_sha256 = compile_input_sha256(
+            shader_src_dir,
+            &entry.source_files,
+            &manifest.spirv_flags,
+            &entry.defines,
+        )?;
+        if compile_input_sha256 != entry.compile_input_sha256 {
+            bail!(
+                "shader artifact manifest input hash mismatch for '{}'",
+                entry.shader
+            );
+        }
+        let artifact = out_dir.join(&entry.artifact);
+        if sha256_file(&artifact)? != entry.spirv_sha256 {
+            bail!(
+                "shader artifact manifest SPIR-V hash mismatch for '{}'",
+                entry.shader
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_manifest(path: &Path, manifest: &ShaderArtifactManifest) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(manifest).context("serializing shader manifest")?;
+    bytes.push(b'\n');
+    let mut file = AtomicWriteFile::options()
+        .open(path)
+        .with_context(|| format!("opening atomic shader manifest {}", path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("writing atomic shader manifest {}", path.display()))?;
+    file.commit()
+        .with_context(|| format!("committing atomic shader manifest {}", path.display()))
+}
+
+struct TemporaryDepfile {
+    path: PathBuf,
+}
+
+impl TemporaryDepfile {
+    fn new(out_dir: &Path, shader: &str) -> Self {
+        Self {
+            path: out_dir.join(format!(".{shader}.dependencies.{}.tmp", std::process::id())),
+        }
+    }
+}
+
+impl Drop for TemporaryDepfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Resolves `slangc`: a `PATH` lookup, then `SAFFRON_SLANG_DIR/bin`, then the conventional
@@ -426,10 +884,14 @@ fn compile_spv(
     src: &Path,
     include_dir: &Path,
     out: &Path,
-    defines: &[&str],
+    depfile: &Path,
+    defines: &[String],
 ) -> Result<()> {
+    let mut args = spv_arg_vector(src, include_dir, out, defines);
+    args.push("-depfile".to_owned());
+    args.push(depfile.to_string_lossy().into_owned());
     let status = Command::new(slangc)
-        .args(spv_arg_vector(src, include_dir, out, defines))
+        .args(args)
         .status()
         .with_context(|| format!("spawning slangc for {}", src.display()))?;
     if !status.success() {
@@ -441,7 +903,7 @@ fn compile_spv(
 /// The exact argument vector `compile_spv` hands `slangc`, factored out as the single source of
 /// truth so the flag-drift test asserts against the same flags the real compile uses. `defines`
 /// are appended as `-D<name>` for feature variants (the RT-off übershader).
-fn spv_arg_vector(src: &Path, include_dir: &Path, out: &Path, defines: &[&str]) -> Vec<String> {
+fn spv_arg_vector(src: &Path, include_dir: &Path, out: &Path, defines: &[String]) -> Vec<String> {
     let mut args = vec![src.to_string_lossy().into_owned()];
     args.extend(SLANGC_SPV_FLAGS.iter().map(|s| (*s).to_owned()));
     args.push("-I".to_owned());
@@ -564,6 +1026,74 @@ mod tests {
     fn lighting_module_is_excluded_from_spv_flags() {
         assert!(!SLANGC_SPV_FLAGS.contains(&"-emit-ir"));
         assert!(SLANGC_SPV_FLAGS.contains(&"-emit-spirv-directly"));
+    }
+
+    #[test]
+    fn shader_variants_have_deterministic_name_order() {
+        let sources = vec![
+            ("zeta".to_owned(), PathBuf::from("zeta.slang")),
+            (LIGHTING_STEM.to_owned(), PathBuf::from("lighting.slang")),
+            (MESH_STEM.to_owned(), PathBuf::from("mesh.slang")),
+            ("alpha".to_owned(), PathBuf::from("alpha.slang")),
+        ];
+
+        let variants = shader_variants(&sources);
+
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant.shader.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "mesh", "mesh_nort", "zeta"]
+        );
+        assert_eq!(variants[2].defines, [NO_RT_DEFINE]);
+    }
+
+    #[test]
+    fn compile_input_hash_is_order_independent_and_invalidates_every_input_class() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("xtask_shader_hash_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp)?;
+        std::fs::write(tmp.join("entry.slang"), b"import shared;\n")?;
+        std::fs::write(tmp.join("shared.slang"), b"const uint VALUE = 1;\n")?;
+        let flags = SLANGC_SPV_FLAGS
+            .iter()
+            .map(|flag| (*flag).to_owned())
+            .collect::<Vec<_>>();
+        let forward = vec!["entry.slang".to_owned(), "shared.slang".to_owned()];
+        let reverse = vec!["shared.slang".to_owned(), "entry.slang".to_owned()];
+
+        let baseline = compile_input_sha256(&tmp, &forward, &flags, &[])?;
+        assert_eq!(baseline, compile_input_sha256(&tmp, &reverse, &flags, &[])?);
+
+        std::fs::write(tmp.join("shared.slang"), b"const uint VALUE = 2;\n")?;
+        assert_ne!(baseline, compile_input_sha256(&tmp, &forward, &flags, &[])?);
+        assert_ne!(
+            baseline,
+            compile_input_sha256(&tmp, &forward, &flags, &["FEATURE=1".to_owned()])?
+        );
+        let mut changed_flags = flags.clone();
+        changed_flags.push("-O3".to_owned());
+        assert_ne!(
+            baseline,
+            compile_input_sha256(&tmp, &forward, &changed_flags, &[])?
+        );
+
+        std::fs::remove_dir_all(&tmp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn makefile_dependency_words_preserve_escaped_paths_and_continuations() {
+        assert_eq!(
+            makefile_words(
+                "/shader/entry.slang /shader/shared\\ file.slang \\\n/shader/nested.slang\n"
+            ),
+            [
+                "/shader/entry.slang",
+                "/shader/shared file.slang",
+                "/shader/nested.slang"
+            ]
+        );
     }
 
     /// A missing output is always stale; an output newer than every dep is fresh; an output

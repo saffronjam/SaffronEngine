@@ -68,6 +68,8 @@ clap_complete = "4"
 
 # Filesystem walk for the asset catalog scan (saffron-assets) — deterministic when sorted.
 walkdir = "2.5"
+atomic-write-file = "0.3"
+sha2 = "0.10"
 
 # GPU struct casts.
 bytemuck = { version = "1", features = ["derive"] }
