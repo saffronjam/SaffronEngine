@@ -19,6 +19,7 @@ const ENGINE =
 const SOCK = process.env.SAFFRON_CONTROL_SOCK ?? `/tmp/saffron-contract-${process.pid}.sock`;
 const APPDATA =
   process.env.SAFFRON_APPDATA_DIR ?? mkdtempSync(join(tmpdir(), "saffron-contract-appdata."));
+const CALL_TIMEOUT_MS = Number(process.env.SAFFRON_SCHEMA_CALL_TIMEOUT_MS) || 15_000;
 const FIXTURES = mkdtempSync(join(tmpdir(), "saffron-contract-fixtures."));
 const MODEL_FIXTURE = join(FIXTURES, "contract-triangle.obj");
 const RT_COMMANDS = new Set(["set-rt-shadows", "set-restir", "set-rt-reflections"]);
@@ -168,7 +169,7 @@ function call(
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new Error(`timeout calling ${cmd}`));
-    }, 8000);
+    }, CALL_TIMEOUT_MS);
     socket.on("connect", () => socket.write(JSON.stringify({ id: nextId++, cmd, params }) + "\n"));
     socket.on("data", (d) => {
       buf += d.toString("utf8");
@@ -334,6 +335,14 @@ async function paramsForFixture(
       return { entity: state.cubeId };
     case "viewport-center":
       return { u: 0.5, v: 0.5 };
+    case "spatial-origin":
+      return { world: { x: 0, y: 0, z: 0 }, level: 0 };
+    case "spatial-sample-cube":
+      return {
+        provider: state.cubeId,
+        channel: "altitude",
+        position: { x: 0, y: 0, z: 0 },
+      };
     case "environment-intensity":
       return { skyIntensity: 1 };
     case "environment-profile-save":
