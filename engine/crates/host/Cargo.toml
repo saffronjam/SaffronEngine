@@ -35,6 +35,7 @@ saffron-script = { path = "../script" }
 saffron-assets = { path = "../assets" }
 saffron-signal = { path = "../signal" }
 saffron-protocol = { path = "../protocol" }
+saffron-spatial = { path = "../spatial" }
 glam.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true, features = ["process"] }

@@ -29,10 +29,13 @@ use saffron_runtime::RuntimeSession;
 use crate::control_renderer::HostControlRenderer;
 use saffron_core::TimeSpan;
 use saffron_protocol::{GetScriptSchemaParams, GetScriptSchemaResult, ScriptFieldDto};
-use saffron_rendering::{GpuQueue, Renderer, Uploader};
+use saffron_rendering::{Renderer, Uploader};
 use saffron_scene::{AnimationPlayer, CameraView, Entity, Mesh, Scene};
 use saffron_sceneedit::{PlayState, ProjectPhase, SceneEditContext, update_scene_edit_camera};
 use saffron_signal::SubscriptionId;
+use saffron_spatial::{
+    ResidencyFacet, ResidencyMask, SourceLevel, SpatialSource, SpatialSourceId, WorldPosition,
+};
 use saffron_window::Window;
 
 use crate::overlay::build_scene_edit_overlay;
@@ -50,6 +53,8 @@ pub struct HostLayer {
     assets: AssetServer,
     /// The control plane: the command registry + the once-per-frame socket drain.
     control: ControlContext,
+    /// Shared hierarchical cell residency and source state.
+    spatial: saffron_spatial::ResidencyManager,
     /// The shared play-mode simulation spine: the Jolt world + script VM + animation runtime.
     /// Idle in Edit; `start`/`stop` on the Edit↔Play edge, `tick_animation` (both modes) and
     /// the gated `step` (play only) each frame. The same `RuntimeSession` the standalone
@@ -138,6 +143,7 @@ impl HostLayer {
             editor,
             assets,
             control,
+            spatial: saffron_spatial::ResidencyManager::new(),
             runtime: RuntimeSession::new(),
             last_play_state: PlayState::Edit,
             uploader: None,
@@ -465,8 +471,59 @@ impl HostLayer {
             &mut control_renderer,
             &mut self.editor,
             &mut self.assets,
+            &mut self.spatial,
             physics.as_mut(),
         )
+    }
+
+    /// Updates the editor viewport's shared predicted residency source.
+    fn update_spatial_source(&mut self) {
+        const EDITOR_VIEW_SOURCE: SpatialSourceId = SpatialSourceId(1);
+        let camera_position = self
+            .editor
+            .render_camera_view()
+            .view
+            .inverse()
+            .w_axis
+            .truncate();
+        let Ok(position) =
+            WorldPosition::from_render_relative(camera_position, WorldPosition::origin())
+        else {
+            self.spatial.remove_source(EDITOR_VIEW_SOURCE);
+            return;
+        };
+        let ticks = position.global_ticks();
+        let revision = ticks
+            .into_iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+                value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+            });
+        let source = SpatialSource {
+            id: EDITOR_VIEW_SOURCE,
+            revision,
+            position,
+            velocity_mps: glam::DVec3::ZERO,
+            prediction_seconds: 0.25,
+            levels: vec![
+                SourceLevel {
+                    level: 0,
+                    load_radius_cells: 4,
+                    cleanup_radius_cells: 6,
+                },
+                SourceLevel {
+                    level: 4,
+                    load_radius_cells: 2,
+                    cleanup_radius_cells: 3,
+                },
+            ],
+            facets: ResidencyMask::one(ResidencyFacet::Render).with(ResidencyFacet::Editing),
+            priority: 100,
+        };
+        if let Err(error) = self.spatial.update_source(source) {
+            tracing::warn!("spatial source rejected: {error}");
+        }
     }
 
     /// Reconciles the play world + script VM against the editor's play state on the Edit↔Playing
@@ -745,7 +802,7 @@ impl HostLayer {
         if self.uploader.is_some() {
             return;
         }
-        let queue = GpuQueue::new(renderer.device().graphics_queue);
+        let queue = renderer.device().graphics_queue.clone();
         match Uploader::new(renderer.device(), &queue) {
             Ok(uploader) => self.uploader = Some(uploader),
             Err(err) => tracing::error!("uploader create failed: {err}"),
@@ -835,6 +892,7 @@ impl Layer for HostLayer {
         // `frame_host` and `window` are distinct `App` fields, so they borrow disjointly.
         let mut mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
+            self.update_spatial_source();
             // Headless editor mode has no window; the control plane still takes a `Window`
             // facade, so a standalone headless window stands in (its size is unused in publish
             // mode and its signals are inert without an event loop).
