@@ -383,7 +383,13 @@ fn collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn main() {
-    let flags = JoltBuildFlags::DETERMINISTIC;
+    // Pick the determinism flag set for the target CPU architecture (the SSE and NEON variants
+    // carry the identical `JPH_CROSS_PLATFORM_DETERMINISTIC` contract; only the instruction-set
+    // selection differs). `CARGO_CFG_TARGET_ARCH` is the target's arch even under cross-compiles,
+    // where the build script's own `cfg!(target_arch)` would report the host's.
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH")
+        .expect("CARGO_CFG_TARGET_ARCH is always set for a build script");
+    let flags = JoltBuildFlags::for_arch(&target_arch);
     let jolt_root = vendored_jolt_root();
     let jolt_lib_dir = jolt_root.join("Jolt");
     let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shim");

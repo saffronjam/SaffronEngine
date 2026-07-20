@@ -74,10 +74,10 @@ enum Subcmd {
         /// The shell to generate completions for.
         shell: Shell,
     },
-    /// Export the loaded project into a standalone, runnable app folder (the `export-app` command
-    /// with a typed app manifest).
+    /// Export the loaded project as a platform-native application (the `export-app` command with a
+    /// typed app manifest).
     Export {
-        /// The destination directory for the staged app.
+        /// The destination path for the staged app.
         output_dir: String,
         /// The app + window title (default: "Saffron App").
         #[arg(long)]

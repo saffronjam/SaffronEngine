@@ -4,7 +4,16 @@
 /// Delete key on a focused tile starts the same delete flow as the grid's shared
 /// context menu (the panel owns that menu — a tile renders no Radix root of its own).
 import { memo, useEffect, useRef, useState } from "react";
-import { Box, Clapperboard, File, Image as ImageIcon, Loader2 } from "lucide-react";
+import {
+  Box,
+  Clapperboard,
+  File,
+  Image as ImageIcon,
+  Loader2,
+  Map as MapIcon,
+  Sprout,
+  TreePine,
+} from "lucide-react";
 import { client } from "../control/client";
 import { getCachedThumbnailUrl, getThumbnailUrl, useEditorStore } from "../state/store";
 import { matchesBinding } from "../lib/keybindings";
@@ -142,6 +151,18 @@ export function isCatalogDrag(dt: DataTransfer): boolean {
   return dt.types.includes(ASSET_DND_MIME) || dt.types.includes(FOLDER_DND_MIME);
 }
 
+export function supportsRenderedThumbnail(type: AssetEntry["type"]): boolean {
+  return (
+    type === "mesh" ||
+    type === "texture" ||
+    type === "material" ||
+    type === "model" ||
+    type === "plant" ||
+    type === "biome" ||
+    type === "vegetation-map"
+  );
+}
+
 function TypeIcon({ type }: { type: AssetEntry["type"] }) {
   const className = "size-7 text-muted-foreground";
   if (type === "mesh") {
@@ -152,6 +173,15 @@ function TypeIcon({ type }: { type: AssetEntry["type"] }) {
   }
   if (type === "animation") {
     return <Clapperboard className={className} />;
+  }
+  if (type === "plant") {
+    return <Sprout className={className} />;
+  }
+  if (type === "biome") {
+    return <TreePine className={className} />;
+  }
+  if (type === "vegetation-map") {
+    return <MapIcon className={className} />;
   }
   return <File className={className} />;
 }
@@ -224,7 +254,11 @@ export const AssetTile = memo(function AssetTile({
     getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE),
   );
   const [status, setStatus] = useState<ThumbStatus>(() =>
-    getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE) ? "ready" : "loading",
+    !supportsRenderedThumbnail(entry.type)
+      ? "none"
+      : getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE)
+        ? "ready"
+        : "loading",
   );
   const [draft, setDraft] = useState(entry.name);
   // The just-committed name, shown optimistically until the catalog refresh reflects it — so a
@@ -237,6 +271,11 @@ export const AssetTile = memo(function AssetTile({
   // tiles; `loading` shows a spinner, a rejection settles to `none` (the type icon),
   // and a warm cache starts `ready` so re-opening a folder never flashes the spinner.
   useEffect(() => {
+    if (!supportsRenderedThumbnail(entry.type)) {
+      setUrl(null);
+      setStatus("none");
+      return;
+    }
     let cancelled = false;
     const cached = getCachedThumbnailUrl(entry.id, THUMBNAIL_FETCH_SIZE);
     setUrl(cached);
@@ -256,7 +295,7 @@ export const AssetTile = memo(function AssetTile({
     return () => {
       cancelled = true;
     };
-  }, [entry.id]);
+  }, [entry.id, entry.type]);
 
   // Keep the rename draft in sync when the catalog name changes externally
   // (e.g. an `sa rename-asset` reflected by the poll), but not while renaming.

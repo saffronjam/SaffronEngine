@@ -24,22 +24,42 @@
 //! query that also reads the hierarchy.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
-use saffron_geometry::{Ray, ray_aabb_slab, ray_triangle, world_aabb_from_corners};
+use saffron_geometry::{
+    Ray, Vertex, ray_aabb_slab, ray_triangle_coordinates, world_aabb_from_corners,
+};
 use saffron_rendering::{
-    ClusterCamera, DrawItem, EnvSource, FOG_SHAPE_BOX, FOG_SHAPE_SPHERE, FogRenderSettings,
-    FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES, MAX_REFLECTION_PROBES, Material,
-    ReflectionProbeUpload, SceneLighting, SdfInstance, SkyRenderSettings, SkygenParams,
+    CloudRenderSettings, ClusterCamera, DrawItem, EnvSource, FOG_SHAPE_BOX, FOG_SHAPE_SPHERE,
+    FogRenderSettings, FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES, MAX_REFLECTION_PROBES,
+    Material, ReflectionProbeUpload, SceneLighting, SdfInstance, SkyRenderSettings, SkygenParams,
 };
 use saffron_scene::{
-    Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, Mesh as MeshComponent,
-    MorphComponent, MorphWeightOverride, PointLight, PreviewGhost, ReflectionProbe, Scene,
-    SkinnedMesh, SkyMode, SpotLight, Transform, camera_projection,
+    AtmosphereRole, Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, IdComponent,
+    MaterialSet, Mesh as MeshComponent, MorphComponent, MorphWeightOverride, PointLight,
+    PreviewGhost, ReflectionProbe, Scene, SkinnedMesh, SkyMode, SpotLight, Transform,
+    camera_projection,
+};
+use saffron_spatial::{
+    FieldChannel, FieldDerivative, FieldSample, SurfaceCapabilities, SurfaceCoordinates,
+    SurfaceField, SurfaceFrame, SurfaceHit, SurfaceProviderDescriptor, SurfaceProviderId,
+    SurfaceRay, SurfaceRevision, SurfaceTagId, UnitInterval, WeightedSurfaceTag, WorldBounds,
+    WorldPosition,
 };
 
 use crate::gpu::GpuUploader;
-use crate::{AssetServer, RenderSceneOptions, SystemMeshVisual};
+use crate::time_of_day::{
+    CelestialTime, dir_from_az_el, eval_monotone_curve, julian_date, lunar_position,
+    solar_position, world_from_equatorial,
+};
+use crate::{
+    AssetServer, RenderSceneOptions, StaticMeshSurfaceInput, StaticMeshSurfaceProvider,
+    SystemMeshVisual,
+};
+
+const STAR_RADIANCE_SCALE: f32 = 4.0e-5;
+const MILKY_WAY_RADIANCE_SCALE: f32 = 0.025;
 
 /// The per-frame renderer operations [`render_scene`] drives, plus the upload + skinning
 /// seam it inherits from [`GpuUploader`].
@@ -75,16 +95,8 @@ pub trait SceneRenderer: GpuUploader {
     fn set_directional_shadow(&mut self, light_view_proj: Mat4, casting: bool);
     /// Captures the frame's static RT instances.
     fn set_rt_scene(&mut self, models: Vec<Mat4>, meshes: Vec<Arc<GpuMesh>>);
-    /// Snaps the camera-centered DDGI probe clipmap to the camera + passes the sun/sky for the
-    /// trace (which sphere-marches the per-mesh MDF + the Global SDF, the sky on miss).
-    fn set_ddgi_scene(
-        &mut self,
-        cam_pos: Vec3,
-        sun_dir: Vec3,
-        sun_color: Vec3,
-        sun_intensity: f32,
-        sky_color: Vec3,
-    );
+    /// Snaps the camera-centered DDGI probe clipmap to the camera + passes the sun for the trace.
+    fn set_ddgi_scene(&mut self, cam_pos: Vec3, sun_dir: Vec3, sun_color: Vec3, sun_intensity: f32);
     /// Uploads this frame's per-static-instance SDF list (the lighting cone-trace iterates
     /// it for directional sky occlusion).
     fn set_sdf_scene(&mut self, instances: &[SdfInstance]);
@@ -111,6 +123,8 @@ pub trait SceneRenderer: GpuUploader {
     fn set_ssao_camera(&mut self, view: Mat4, proj: Mat4, sun_direction_world: Vec3);
     /// Toggles the ground-grid debug overlay this frame.
     fn set_show_grid(&mut self, enabled: bool);
+    /// Records the static + skinned draw-list gather duration.
+    fn record_scene_gather(&mut self, elapsed: Duration);
     /// Builds the frame's draw list + concatenated joint palette.
     ///
     /// # Errors
@@ -124,19 +138,34 @@ pub trait SceneRenderer: GpuUploader {
     ) -> saffron_rendering::Result<()>;
     /// Folds the visible-sky settings in.
     fn submit_sky(&mut self, settings: &SkyRenderSettings);
+    /// Folds the cloud shape and resolved painted-weather source in.
+    fn submit_clouds(&mut self, settings: CloudRenderSettings);
+    /// Sets the tonemap exposure in EV.
+    fn set_exposure(&mut self, ev: f32);
+    /// Sets the mesopic/scotopic adaptation strength.
+    fn set_night_factor(&mut self, factor: f32);
     /// Folds the analytic height/distance fog settings in.
     fn submit_fog(&mut self, settings: &FogRenderSettings);
 }
 
-/// The nearest rendered-surface hit for a viewport ray.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A shared surface hit paired with the scene entity that publishes the provider.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SceneSurfaceHit {
     /// The entity whose mesh was hit.
     pub entity: Entity,
-    /// The world-space hit point.
-    pub point: Vec3,
-    /// The ray distance to the hit point.
-    pub distance: f32,
+    /// The complete shared surface result.
+    pub surface: SurfaceHit,
+    /// Provider capabilities at the sampled revision.
+    pub capabilities: SurfaceCapabilities,
+}
+
+/// A surface provider paired with its scene entity for inspection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SceneSurfaceProvider {
+    /// The entity publishing the provider.
+    pub entity: Entity,
+    /// Stable provider metadata.
+    pub descriptor: SurfaceProviderDescriptor,
 }
 
 /// The live-renderer [`SceneRenderer`]: a `&mut Renderer` (the setter target) plus a
@@ -270,10 +299,9 @@ impl SceneRenderer for RendererScene<'_> {
         sun_dir: Vec3,
         sun_color: Vec3,
         sun_intensity: f32,
-        sky_color: Vec3,
     ) {
         self.renderer
-            .set_ddgi_scene(cam_pos, sun_dir, sun_color, sun_intensity, sky_color);
+            .set_ddgi_scene(cam_pos, sun_dir, sun_color, sun_intensity);
     }
 
     fn set_sdf_scene(&mut self, instances: &[SdfInstance]) {
@@ -314,6 +342,10 @@ impl SceneRenderer for RendererScene<'_> {
         self.renderer.set_show_grid(enabled);
     }
 
+    fn record_scene_gather(&mut self, elapsed: Duration) {
+        self.renderer.record_scene_gather(elapsed);
+    }
+
     fn submit_draw_list(
         &mut self,
         view_proj: Mat4,
@@ -326,6 +358,18 @@ impl SceneRenderer for RendererScene<'_> {
 
     fn submit_sky(&mut self, settings: &SkyRenderSettings) {
         self.renderer.submit_sky(settings);
+    }
+
+    fn submit_clouds(&mut self, settings: CloudRenderSettings) {
+        self.renderer.submit_clouds(settings);
+    }
+
+    fn set_exposure(&mut self, ev: f32) {
+        self.renderer.set_exposure(ev);
+    }
+
+    fn set_night_factor(&mut self, factor: f32) {
+        self.renderer.set_night_factor(factor);
     }
 
     fn submit_fog(&mut self, settings: &FogRenderSettings) {
@@ -560,6 +604,166 @@ fn point_shadow_content_key(scene: &mut Scene, light_pos: Vec3, far_plane: f32) 
     hash
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CelestialDirectionOverrides {
+    sun: Option<Vec3>,
+    moon: Option<Vec3>,
+}
+
+impl CelestialDirectionOverrides {
+    const NONE: Self = Self {
+        sun: None,
+        moon: None,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimeOfDayFrame {
+    directions: CelestialDirectionOverrides,
+    exposure: Option<f32>,
+    tint: Vec3,
+    night_factor: f32,
+    star_intensity: f32,
+    milky_way_intensity: f32,
+    world_from_equatorial: Vec4,
+    moon_illuminated_fraction: f32,
+    cloud_coverage: Option<f32>,
+    cloud_type: Option<f32>,
+}
+
+impl Default for TimeOfDayFrame {
+    fn default() -> Self {
+        Self {
+            directions: CelestialDirectionOverrides::NONE,
+            exposure: None,
+            tint: Vec3::ONE,
+            night_factor: 0.0,
+            star_intensity: 0.0,
+            milky_way_intensity: 0.0,
+            world_from_equatorial: Vec4::new(0.0, 0.0, 0.0, 1.0),
+            moon_illuminated_fraction: 0.0,
+            cloud_coverage: None,
+            cloud_type: None,
+        }
+    }
+}
+
+fn authored_sun_elevation(scene: &mut Scene) -> Option<f32> {
+    let mut sun = None;
+    scene.for_each::<&DirectionalLight, _>(|entity, light| {
+        if sun.is_none() && light.atmosphere_role == AtmosphereRole::Sun {
+            sun = Some((entity, *light));
+        }
+    });
+    let (entity, light) = sun?;
+    let travel_direction = (scene.world_rotation(entity) * light.direction).try_normalize()?;
+    Some((-travel_direction).y.clamp(-1.0, 1.0).asin())
+}
+
+fn curve_factor(curve: &saffron_scene::TodCurve, x: f32) -> f32 {
+    if curve.is_active() {
+        eval_monotone_curve(curve, x)
+    } else {
+        1.0
+    }
+}
+
+fn drive_time_of_day(scene: &mut Scene) -> TimeOfDayFrame {
+    let settings = scene.environment.time_of_day.clone();
+    if !settings.enabled {
+        return TimeOfDayFrame::default();
+    }
+    let Ok(month) = u32::try_from(settings.month) else {
+        tracing::error!("time-of-day: month is outside the supported calendar range");
+        return TimeOfDayFrame::default();
+    };
+    let Ok(day) = u32::try_from(settings.day) else {
+        tracing::error!("time-of-day: day is outside the supported calendar range");
+        return TimeOfDayFrame::default();
+    };
+    let time = CelestialTime {
+        year: settings.year,
+        month,
+        day,
+        time_of_day: f64::from(settings.time_of_day),
+    };
+    let julian = match julian_date(time) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!("time-of-day: {err}");
+            return TimeOfDayFrame::default();
+        }
+    };
+    let sun = match solar_position(
+        time,
+        f64::from(settings.latitude),
+        f64::from(settings.longitude),
+        0.0,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!("time-of-day: {err}");
+            return TimeOfDayFrame::default();
+        }
+    };
+    let moon = lunar_position(
+        julian,
+        f64::from(settings.latitude),
+        f64::from(settings.longitude),
+        0.0,
+    );
+    let sun_direction = dir_from_az_el(sun.azimuth, sun.elevation);
+    let moon_direction = dir_from_az_el(moon.azimuth, moon.elevation);
+    let elevation = if settings.manual_override {
+        authored_sun_elevation(scene).unwrap_or(sun.elevation as f32)
+    } else {
+        sun.elevation as f32
+    };
+    let sun_elevation_norm = (elevation.to_degrees() / 90.0 * 0.5 + 0.5).clamp(0.0, 1.0);
+    let night_linear = (-elevation.to_degrees() / 18.0).clamp(0.0, 1.0);
+    let night_factor = night_linear * night_linear * (3.0 - 2.0 * night_linear);
+    let master = curve_factor(&settings.tint_curve.master, sun_elevation_norm);
+    let tint = Vec3::new(
+        curve_factor(&settings.tint_curve.red, sun_elevation_norm),
+        curve_factor(&settings.tint_curve.green, sun_elevation_norm),
+        curve_factor(&settings.tint_curve.blue, sun_elevation_norm),
+    ) * master;
+    let rotation = world_from_equatorial(
+        julian,
+        f64::from(settings.latitude),
+        f64::from(settings.longitude),
+    );
+    TimeOfDayFrame {
+        directions: if settings.manual_override {
+            CelestialDirectionOverrides::NONE
+        } else {
+            CelestialDirectionOverrides {
+                sun: Some(-sun_direction),
+                moon: Some(-moon_direction),
+            }
+        },
+        exposure: settings
+            .exposure_curve
+            .is_active()
+            .then(|| eval_monotone_curve(&settings.exposure_curve, sun_elevation_norm)),
+        tint,
+        night_factor,
+        star_intensity: STAR_RADIANCE_SCALE,
+        milky_way_intensity: MILKY_WAY_RADIANCE_SCALE,
+        world_from_equatorial: Vec4::from_array(rotation.to_array()),
+        moon_illuminated_fraction: ((1.0 - sun_direction.dot(moon_direction)) * 0.5)
+            .clamp(0.0, 1.0),
+        cloud_coverage: settings
+            .coverage_curve
+            .is_active()
+            .then(|| eval_monotone_curve(&settings.coverage_curve, sun_elevation_norm)),
+        cloud_type: settings
+            .cloud_type_curve
+            .is_active()
+            .then(|| eval_monotone_curve(&settings.cloud_type_curve, sun_elevation_norm)),
+    }
+}
+
 /// Renders the authored scene into one frame draw list. Asset-placement preview ghosts are
 /// ordinary [`PreviewGhost`](saffron_scene::PreviewGhost)-tagged entities in this scene, so they
 /// render through the normal gather; nothing else special-cases them.
@@ -592,16 +796,22 @@ pub fn render_scene<R: SceneRenderer>(
     // transform cache this writes.
     scene.update_world_transforms();
 
-    let directional = gather_directional_light(scene);
-    let has_sun = directional.is_some();
-    let DirectionalResolved {
-        direction: light_dir,
-        color: light_color,
-        intensity: light_intensity,
-        ambient: light_ambient,
-        volumetric_scattering: light_volumetric,
-        cast_volumetric_shadow: light_cast_volumetric_shadow,
-    } = directional.unwrap_or_else(DirectionalResolved::none);
+    let time_of_day = drive_time_of_day(scene);
+    if let Some(exposure) = time_of_day.exposure {
+        renderer.set_exposure(exposure);
+    }
+    renderer.set_night_factor(time_of_day.night_factor);
+
+    let (sun, moon) = gather_directional_lights(scene, time_of_day.directions);
+    let has_sun = sun.is_some();
+    let sun = sun.unwrap_or_else(DirectionalResolved::none);
+    let light_dir = sun.direction;
+    let light_color = sun.color;
+    let light_intensity = sun.intensity;
+    let light_ambient = sun.ambient;
+    let light_volumetric = sun.volumetric_scattering;
+    let light_cast_volumetric_shadow = sun.cast_volumetric_shadow;
+    let moon = moon.unwrap_or_else(DirectionalResolved::none);
     let (lights, point_shadow, spot_shadow) = gather_punctual_lights(scene);
 
     renderer.set_spot_shadow(
@@ -624,6 +834,7 @@ pub fn render_scene<R: SceneRenderer>(
     // AABB (hence the shadow frustum) is known.
     let eye_position = view.inverse().w_axis.truncate();
 
+    let gather_started = Instant::now();
     let mut build = DrawListBuild::default();
     gather_static_draw_list(renderer, scene, assets, &mut build);
     let frame_joints = if renderer.skinning_enabled() {
@@ -637,6 +848,7 @@ pub fn render_scene<R: SceneRenderer>(
         scene_max,
         sdf_instances,
     } = build;
+    let scene_gather_elapsed = gather_started.elapsed();
 
     // Fit an orthographic shadow frustum to the scene's world AABB, looking down the
     // directional light. A bounding sphere keeps the fit rotation-stable. With no sun in
@@ -678,21 +890,11 @@ pub fn render_scene<R: SceneRenderer>(
     // off.
     renderer.set_sdf_scene(&sdf_instances);
 
-    // DDGI: snap the camera-centered probe clipmap to the camera and pass the sun/sky. The trace
+    // DDGI: snap the camera-centered probe clipmap to the camera and pass the sun. The trace
     // sphere-marches the real distance field (per-mesh MDF near + Global SDF far), so it needs no
     // scene-box proxy. Done before the lighting upload, which reads the volume placement + scroll
     // base into the light UBO.
-    let mut ddgi_sky = Vec3::new(0.1, 0.13, 0.2);
-    if scene.environment.use_sky_for_ambient {
-        ddgi_sky = scene.environment.ambient_color * scene.environment.ambient_intensity;
-    }
-    renderer.set_ddgi_scene(
-        eye_position,
-        light_dir,
-        light_color,
-        light_intensity,
-        ddgi_sky,
-    );
+    renderer.set_ddgi_scene(eye_position, light_dir, light_color, light_intensity);
 
     let probe_uploads = gather_reflection_probes(scene);
     renderer.submit_reflection_probes(&probe_uploads);
@@ -703,15 +905,53 @@ pub fn render_scene<R: SceneRenderer>(
     // Fallback ambient (used when IBL is off): the scene environment's ambient color when
     // use_sky_for_ambient, else the directional light's scalar ambient (grayscale).
     let ambient = if scene.environment.use_sky_for_ambient {
-        scene.environment.ambient_color * scene.environment.ambient_intensity
+        scene.environment.ambient_color * scene.environment.ambient_intensity * time_of_day.tint
     } else {
-        Vec3::splat(light_ambient)
+        Vec3::splat(light_ambient) * time_of_day.tint
     };
+    let c = &scene.environment.cloud;
+    let weather_texture = if c.weather_texture.value() != 0 {
+        assets.load_texture_asset(renderer, c.weather_texture)
+    } else {
+        None
+    };
+    renderer.submit_clouds(CloudRenderSettings {
+        enabled: c.enabled,
+        coverage: time_of_day.cloud_coverage.unwrap_or(c.coverage),
+        cloud_type: time_of_day.cloud_type.unwrap_or(c.cloud_type),
+        precipitation: c.precipitation,
+        anvil_bias: c.anvil_bias,
+        layer_altitude: c.layer_altitude,
+        layer_height: c.layer_height,
+        base_scale: c.base_scale,
+        detail_scale: c.detail_scale,
+        detail_strength: c.detail_strength,
+        curl_strength: c.curl_strength,
+        weather_scale: c.weather_scale,
+        weather_offset: c.weather_offset,
+        weather_texture_id: c.weather_texture.value(),
+        weather_texture,
+        primary_steps: c.primary_steps,
+        light_steps: c.light_steps,
+        droplet_diameter: c.droplet_diameter,
+        temporal_factor: c.temporal_factor,
+        cast_cloud_shadows: c.cast_cloud_shadows,
+        cloud_shadow_strength: c.cloud_shadow_strength,
+        cloud_shadow_on_surface_strength: c.cloud_shadow_on_surface_strength,
+        wind_orientation: scene.environment.wind.orientation,
+        wind_speed: scene.environment.wind.speed,
+        wind_gust: scene.environment.wind.gust,
+        time_of_day: scene.environment.time_of_day.time_of_day,
+    });
     if let Err(err) = renderer.set_scene_lighting(&SceneLighting {
         direction: light_dir,
         color: light_color,
         intensity: light_intensity,
+        moon_direction: moon.direction,
+        moon_color: moon.color,
+        moon_intensity: moon.intensity,
         ambient,
+        ibl_tint: time_of_day.tint,
         eye_position,
         directional_volumetric: light_volumetric,
         directional_cast_volumetric_shadow: light_cast_volumetric_shadow,
@@ -726,9 +966,9 @@ pub fn render_scene<R: SceneRenderer>(
         renderer,
         scene,
         assets,
-        light_dir,
-        light_color,
-        light_intensity,
+        &sun,
+        &moon,
+        time_of_day.moon_illuminated_fraction,
     );
 
     renderer.set_cluster_camera(ClusterCamera {
@@ -747,19 +987,28 @@ pub fn render_scene<R: SceneRenderer>(
     if options.show_editor_camera_models {
         append_editor_camera_models(scene, assets, renderer, &mut items);
     }
+    renderer.record_scene_gather(scene_gather_elapsed);
     if let Err(err) = renderer.submit_draw_list(view_projection, &items, &frame_joints) {
         tracing::error!("submit_draw_list: {err}");
     }
 
     // Resolve the scene environment into the visible-sky settings.
-    let env = scene.environment;
+    let env = &scene.environment;
     let mut sky = SkyRenderSettings {
         mode: env.sky_mode as u32,
         clear_color: env.clear_color,
         intensity: env.sky_intensity,
+        tint: time_of_day.tint,
         rotation: env.sky_rotation,
         visible: env.visible,
         texture_index: 0,
+        night: saffron_rendering::NightSkyParams {
+            world_from_equatorial: time_of_day.world_from_equatorial,
+            star_intensity: time_of_day.star_intensity,
+            milky_way_intensity: time_of_day.milky_way_intensity,
+            atmosphere_height: env.atmosphere.atmosphere_height,
+            atmosphere_live: env.atmosphere.enabled && sky_panorama.is_none(),
+        },
     };
     if env.sky_mode == SkyMode::Texture && env.sky_texture.value() != 0 {
         if let Some(panorama) = &sky_panorama {
@@ -772,7 +1021,7 @@ pub fn render_scene<R: SceneRenderer>(
 
     // Resolve the scene environment into the analytic height/distance fog settings (one frame push,
     // the same shape as the sky).
-    let f = env.fog;
+    let f = &env.fog;
     renderer.submit_fog(&FogRenderSettings {
         enabled: f.enabled,
         density: f.density,
@@ -833,22 +1082,41 @@ impl DirectionalResolved {
     }
 }
 
-/// The scene's directional light for the frame — the first `DirectionalLight` wins, re-aimed
-/// by its entity's world rotation when it carries a [`Transform`]. `None` when the scene has
-/// no directional light: the caller then shades with no direct sun.
-fn gather_directional_light(scene: &mut Scene) -> Option<DirectionalResolved> {
-    let mut found: Option<(Entity, DirectionalLight)> = None;
+/// Resolves the first directional light for each atmosphere role, including entity rotation.
+fn gather_directional_lights(
+    scene: &mut Scene,
+    overrides: CelestialDirectionOverrides,
+) -> (Option<DirectionalResolved>, Option<DirectionalResolved>) {
+    let mut sun: Option<(Entity, DirectionalLight)> = None;
+    let mut moon: Option<(Entity, DirectionalLight)> = None;
     scene.for_each::<&DirectionalLight, _>(|entity, light| {
-        if found.is_none() {
-            found = Some((entity, *light));
+        let slot = match light.atmosphere_role {
+            AtmosphereRole::Sun => &mut sun,
+            AtmosphereRole::Moon => &mut moon,
+        };
+        if slot.is_none() {
+            *slot = Some((entity, *light));
         }
     });
+    (
+        resolve_directional(scene, sun, overrides.sun),
+        resolve_directional(scene, moon, overrides.moon),
+    )
+}
+
+fn resolve_directional(
+    scene: &Scene,
+    found: Option<(Entity, DirectionalLight)>,
+    direction_override: Option<Vec3>,
+) -> Option<DirectionalResolved> {
     let (entity, light) = found?;
-    let aimed = if scene.has_component::<Transform>(entity) {
-        scene.world_rotation(entity) * light.direction
-    } else {
-        light.direction
-    };
+    let aimed = direction_override.unwrap_or_else(|| {
+        if scene.has_component::<Transform>(entity) {
+            scene.world_rotation(entity) * light.direction
+        } else {
+            light.direction
+        }
+    });
     // A degenerate authored direction would `normalize` to NaN downstream; fall back to the
     // canonical aim so the sun stays finite regardless of what the user typed.
     let direction = aimed
@@ -1216,16 +1484,19 @@ fn drive_env_bake<R: SceneRenderer>(
     renderer: &mut R,
     scene: &Scene,
     assets: &mut AssetServer,
-    light_dir: Vec3,
-    light_color: Vec3,
-    light_intensity: f32,
+    sun: &DirectionalResolved,
+    moon: &DirectionalResolved,
+    moon_illuminated_fraction: f32,
 ) -> Option<Arc<saffron_rendering::GpuTexture>> {
-    let env = scene.environment;
+    let env = &scene.environment;
     let at = env.atmosphere;
     let sky_bake = SkygenParams {
-        sun_dir: -light_dir,
-        sun_intensity: light_intensity,
-        sun_color: light_color,
+        sun_dir: -sun.direction,
+        sun_intensity: sun.intensity,
+        sun_color: sun.color,
+        moon_dir: -moon.direction,
+        moon_intensity: moon.intensity,
+        moon_illuminated_fraction,
         atmosphere: saffron_rendering::AtmosphereParams {
             enabled: at.enabled,
             planet_radius: at.planet_radius,
@@ -1238,6 +1509,11 @@ fn drive_env_bake<R: SceneRenderer>(
             ozone_absorption: at.ozone_absorption,
             sun_disk_angular_radius: at.sun_disk_angular_radius,
             sun_disk_intensity: at.sun_disk_intensity,
+            moon_disk_angular_radius: at.moon_disk_angular_radius,
+            moon_disk_intensity: at.moon_disk_intensity,
+            moon_earthshine: at.moon_earthshine,
+            per_pixel_transmittance: at.per_pixel_transmittance,
+            sky_capture_cadence: at.sky_capture_cadence,
         },
     };
     // Resolution order: a user equirect panorama wins, then the atmosphere, then the
@@ -1278,9 +1554,11 @@ pub fn pick_entity(
     assets: &mut AssetServer,
     camera: &CameraView,
     ndc: Vec2,
-) -> Entity {
-    pick_scene_surface(gpu, viewport, scene, assets, camera, ndc)
-        .map_or(Entity::NULL, |hit| hit.entity)
+) -> crate::Result<Entity> {
+    Ok(
+        pick_scene_surface(gpu, viewport, scene, assets, camera, ndc)?
+            .map_or(Entity::NULL, |hit| hit.entity),
+    )
 }
 
 /// Picks the nearest rendered surface hit for a viewport NDC point.
@@ -1291,12 +1569,32 @@ pub fn pick_scene_surface(
     assets: &mut AssetServer,
     camera: &CameraView,
     ndc: Vec2,
-) -> Option<SceneSurfaceHit> {
+) -> crate::Result<Option<SceneSurfaceHit>> {
     let (width, height) = viewport;
     if width == 0 || height == 0 {
-        return None;
+        return Ok(None);
     }
     let ray = viewport_ray(viewport, camera, ndc);
+    let query = SurfaceRay::new(
+        WorldPosition::from_render_relative(ray.origin, WorldPosition::origin())?,
+        ray.dir.as_dvec3(),
+        f64::from(f32::MAX),
+    )?;
+    query_scene_surface_ray(gpu, scene, assets, &query)
+}
+
+/// Queries every live mesh provider with one arbitrary-direction world ray.
+pub fn query_scene_surface_ray(
+    gpu: &dyn GpuUploader,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+    query: &SurfaceRay,
+) -> crate::Result<Option<SceneSurfaceHit>> {
+    let world_origin = query.origin.to_render_relative(WorldPosition::origin())?;
+    let world_ray = Ray {
+        origin: world_origin,
+        dir: query.direction.as_vec3(),
+    };
 
     // The world transforms come from the last frame's flatten (lockstep with the draw loop);
     // the joint palette is rebuilt fresh below.
@@ -1309,55 +1607,24 @@ pub fn pick_scene_surface(
         skins.push((entity, skin.clone()));
     });
 
-    let mut hit = None;
-    let mut nearest = f32::MAX;
+    let mut nearest: Option<SceneSurfaceHit> = None;
 
     for (entity, mesh) in statics {
         // A placement ghost must never be its own placement target.
         if scene.has_component::<PreviewGhost>(entity) {
             continue;
         }
-        let Some(mesh_ref) = assets.load_mesh_asset(gpu, mesh.mesh) else {
+        let Some(provider) = static_mesh_surface_provider(gpu, scene, assets, entity, mesh)? else {
             continue;
         };
-        if mesh_ref.cpu_positions.is_empty() {
-            continue;
-        }
-        let model = scene.world_matrix(entity);
-        let mut world_min = Vec3::splat(f32::MAX);
-        let mut world_max = Vec3::splat(f32::MIN);
-        world_aabb_from_corners(
-            &model,
-            mesh_ref.bounds_min,
-            mesh_ref.bounds_max,
-            &mut world_min,
-            &mut world_max,
-        );
-        if ray_aabb_slab(&ray, world_min, world_max).is_none() {
-            continue;
-        }
-        // Narrowphase via the cached per-mesh BVH, traversed in mesh-local space (transform the
-        // world ray by the inverse world matrix, then map the hit point back to world). This is
-        // sublinear in the mesh's triangle count, unlike transforming and scanning every triangle.
-        let Some(bvh) = assets.mesh_pick_bvh(mesh.mesh, &mesh_ref) else {
-            continue;
-        };
-        let inv = model.inverse();
-        let local_ray = Ray {
-            origin: inv.transform_point3(ray.origin),
-            dir: inv.transform_vector3(ray.dir),
-        };
-        if let Some(t_local) = bvh.raycast(&local_ray) {
-            let world_hit = model.transform_point3(local_ray.origin + local_ray.dir * t_local);
-            // `ray.dir` is unit-length in world space, so the projection is the world distance.
-            let world_t = (world_hit - ray.origin).dot(ray.dir);
-            if world_t > 0.0 && world_t < nearest {
-                nearest = world_t;
-                hit = Some(SceneSurfaceHit {
-                    entity,
-                    point: world_hit,
-                    distance: world_t,
-                });
+        if let Some(surface) = provider.raycast(query)? {
+            let candidate = SceneSurfaceHit {
+                entity,
+                capabilities: provider.descriptor().capabilities,
+                surface,
+            };
+            if scene_surface_is_nearer(&candidate, nearest.as_ref()) {
+                nearest = Some(candidate);
             }
         }
     }
@@ -1369,7 +1636,7 @@ pub fn pick_scene_surface(
         let Some(mesh_ref) = assets.load_mesh_asset(gpu, skin.mesh) else {
             continue;
         };
-        if mesh_ref.cpu_positions.is_empty() || mesh_ref.cpu_skin.is_empty() {
+        if mesh_ref.cpu_vertices.is_empty() || mesh_ref.cpu_skin.is_empty() {
             continue;
         }
         let palette = scene.joint_matrices(&skin);
@@ -1389,16 +1656,16 @@ pub fn pick_scene_surface(
                 &mut world_max,
             );
         }
-        if ray_aabb_slab(&ray, world_min, world_max).is_none() {
+        if ray_aabb_slab(&world_ray, world_min, world_max).is_none() {
             continue;
         }
         // Skin every vertex into world space once: deformed = Σ w_k · (palette · pos);
         // matches skin.slang, so picking agrees with what the screen shows.
         let deformed: Vec<Vec3> = mesh_ref
-            .cpu_positions
+            .cpu_vertices
             .iter()
             .zip(&mesh_ref.cpu_skin)
-            .map(|(&pos, inf)| {
+            .map(|(vertex, inf)| {
                 let mut acc = Vec3::ZERO;
                 for k in 0..4 {
                     let w = inf.weights[k];
@@ -1406,23 +1673,384 @@ pub fn pick_scene_surface(
                     if w == 0.0 || j >= palette.len() {
                         continue;
                     }
-                    acc += w * palette[j].transform_point3(pos);
+                    acc += w * palette[j].transform_point3(vertex.position);
                 }
                 acc
             })
             .collect();
-        if let Some(t) = nearest_triangle(&ray, &deformed, &mesh_ref.cpu_indices)
-            && t < nearest
+        if let Some((triangle_index, triangle_hit)) =
+            nearest_triangle(&world_ray, &deformed, &mesh_ref.cpu_indices)
         {
-            nearest = t;
-            hit = Some(SceneSurfaceHit {
+            let distance_m = f64::from(triangle_hit.distance);
+            if distance_m > query.max_distance_m {
+                continue;
+            }
+            let Some(provider_id) = scene
+                .component::<IdComponent>(entity)
+                .ok()
+                .map(|id| SurfaceProviderId(id.id.value()))
+            else {
+                continue;
+            };
+            let material_tags = surface_material_tags(scene, entity);
+            let revision = mesh_surface_revision(
+                skin.mesh.value(),
+                &mesh_ref.cpu_vertices,
+                &mesh_ref.cpu_indices,
+                &palette,
+                material_tags.as_slice(),
+            );
+            let base = triangle_index as usize * 3;
+            let indices = &mesh_ref.cpu_indices[base..base + 3];
+            let vertices = [
+                mesh_ref.cpu_vertices[indices[0] as usize],
+                mesh_ref.cpu_vertices[indices[1] as usize],
+                mesh_ref.cpu_vertices[indices[2] as usize],
+            ];
+            let points = [
+                deformed[indices[0] as usize],
+                deformed[indices[1] as usize],
+                deformed[indices[2] as usize],
+            ];
+            let frame = deformed_surface_frame(points, vertices.map(|vertex| vertex.uv0))?;
+            let barycentric = triangle_hit.barycentric;
+            let uv = vertices[0].uv0 * barycentric[0]
+                + vertices[1].uv0 * barycentric[1]
+                + vertices[2].uv0 * barycentric[2];
+            let rest_point = vertices[0].position * barycentric[0]
+                + vertices[1].position * barycentric[1]
+                + vertices[2].position * barycentric[2];
+            let world_point = world_ray.origin + world_ray.dir * triangle_hit.distance;
+            let tag =
+                material_tag_for_triangle(&mesh_ref, triangle_index, material_tags.as_slice());
+            let candidate = SceneSurfaceHit {
                 entity,
-                point: ray.origin + ray.dir * t,
-                distance: t,
-            });
+                capabilities: SurfaceCapabilities {
+                    ray: true,
+                    project: true,
+                    nearest: false,
+                    uv: true,
+                    authoritative_attachments: false,
+                    authoritative_fields: false,
+                },
+                surface: SurfaceHit {
+                    provider: provider_id,
+                    position: WorldPosition::from_render_relative(
+                        world_point,
+                        WorldPosition::origin(),
+                    )?,
+                    distance_m,
+                    frame,
+                    coordinates: SurfaceCoordinates {
+                        uv: Some(uv),
+                        projection: rest_point.as_dvec3(),
+                    },
+                    attachment: None,
+                    tags: tag
+                        .map(|tag| {
+                            vec![WeightedSurfaceTag {
+                                tag,
+                                weight: UnitInterval::ONE,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    revision,
+                },
+            };
+            if scene_surface_is_nearer(&candidate, nearest.as_ref()) {
+                nearest = Some(candidate);
+            }
         }
     }
-    hit
+    Ok(nearest)
+}
+
+/// Lists every live mesh surface provider in stable provider-id order.
+pub fn scene_surface_providers(
+    gpu: &dyn GpuUploader,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+) -> crate::Result<Vec<SceneSurfaceProvider>> {
+    let mut skins = Vec::new();
+    scene.for_each::<(&Transform, &SkinnedMesh), _>(|entity, (_, skin)| {
+        skins.push((entity, skin.clone()));
+    });
+    let mut providers = static_scene_surface_snapshots(gpu, scene, assets)?
+        .into_iter()
+        .map(|(entity, provider)| SceneSurfaceProvider {
+            entity,
+            descriptor: provider.descriptor(),
+        })
+        .collect::<Vec<_>>();
+    for (entity, skin) in skins {
+        if scene.has_component::<PreviewGhost>(entity) {
+            continue;
+        }
+        let Some(mesh) = assets.load_mesh_asset(gpu, skin.mesh) else {
+            continue;
+        };
+        let Some(provider_id) = scene
+            .component::<IdComponent>(entity)
+            .ok()
+            .map(|id| SurfaceProviderId(id.id.value()))
+        else {
+            continue;
+        };
+        let palette = scene.joint_matrices(&skin);
+        if palette.is_empty() {
+            continue;
+        }
+        let mut minimum = Vec3::splat(f32::MAX);
+        let mut maximum = Vec3::splat(f32::MIN);
+        for joint in &palette {
+            world_aabb_from_corners(
+                joint,
+                mesh.bounds_min,
+                mesh.bounds_max,
+                &mut minimum,
+                &mut maximum,
+            );
+        }
+        let tags = surface_material_tags(scene, entity);
+        providers.push(SceneSurfaceProvider {
+            entity,
+            descriptor: SurfaceProviderDescriptor {
+                id: provider_id,
+                revision: mesh_surface_revision(
+                    skin.mesh.value(),
+                    &mesh.cpu_vertices,
+                    &mesh.cpu_indices,
+                    &palette,
+                    tags.as_slice(),
+                ),
+                bounds: WorldBounds::from_world_meters(minimum.as_dvec3(), maximum.as_dvec3())?,
+                primitive_count: mesh.cpu_indices.len() as u64 / 3,
+                capabilities: SurfaceCapabilities {
+                    ray: true,
+                    project: true,
+                    nearest: false,
+                    uv: true,
+                    authoritative_attachments: false,
+                    authoritative_fields: false,
+                },
+            },
+        });
+    }
+    providers.sort_by_key(|provider| provider.descriptor.id);
+    Ok(providers)
+}
+
+/// Captures every authoritative static-mesh surface provider as an immutable worker-safe snapshot.
+pub fn scene_surface_field_snapshots(
+    gpu: &dyn GpuUploader,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+) -> crate::Result<Vec<Arc<dyn SurfaceField>>> {
+    Ok(static_scene_surface_snapshots(gpu, scene, assets)?
+        .into_iter()
+        .map(|(_, provider)| Arc::new(provider) as Arc<dyn SurfaceField>)
+        .collect())
+}
+
+fn static_scene_surface_snapshots(
+    gpu: &dyn GpuUploader,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+) -> crate::Result<Vec<(Entity, StaticMeshSurfaceProvider)>> {
+    let mut statics = Vec::new();
+    scene.for_each::<(&Transform, &MeshComponent), _>(|entity, (_, mesh)| {
+        statics.push((entity, *mesh));
+    });
+    let mut providers = Vec::new();
+    for (entity, mesh) in statics {
+        if scene.has_component::<PreviewGhost>(entity) {
+            continue;
+        }
+        if let Some(provider) = static_mesh_surface_provider(gpu, scene, assets, entity, mesh)? {
+            providers.push((entity, provider));
+        }
+    }
+    providers.sort_by_key(|(_, provider)| provider.descriptor().id);
+    Ok(providers)
+}
+
+/// Samples one static mesh provider's canonical scalar channel.
+pub fn sample_scene_surface_field(
+    gpu: &dyn GpuUploader,
+    scene: &mut Scene,
+    assets: &mut AssetServer,
+    provider_id: SurfaceProviderId,
+    channel: FieldChannel,
+    derivative: FieldDerivative,
+    position: WorldPosition,
+) -> crate::Result<Option<FieldSample>> {
+    let Some(entity) = scene.find_entity_by_uuid(saffron_core::Uuid(provider_id.0)) else {
+        return Ok(None);
+    };
+    let Ok(mesh) = scene.component::<MeshComponent>(entity) else {
+        return Ok(None);
+    };
+    let Some(provider) = static_mesh_surface_provider(gpu, scene, assets, entity, mesh)? else {
+        return Ok(None);
+    };
+    provider
+        .sample_scalar(channel, derivative, position)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+fn static_mesh_surface_provider(
+    gpu: &dyn GpuUploader,
+    scene: &Scene,
+    assets: &mut AssetServer,
+    entity: Entity,
+    mesh: MeshComponent,
+) -> crate::Result<Option<StaticMeshSurfaceProvider>> {
+    let Some(mesh_ref) = assets.load_mesh_asset(gpu, mesh.mesh) else {
+        return Ok(None);
+    };
+    if mesh_ref.cpu_vertices.is_empty() {
+        return Ok(None);
+    }
+    let Some(bvh) = assets.mesh_pick_bvh(mesh.mesh, &mesh_ref) else {
+        return Ok(None);
+    };
+    let Some(provider_id) = scene
+        .component::<IdComponent>(entity)
+        .ok()
+        .map(|id| SurfaceProviderId(id.id.value()))
+    else {
+        return Ok(None);
+    };
+    let model = scene.world_matrix(entity);
+    let material_tags = surface_material_tags(scene, entity);
+    let revision = mesh_surface_revision(
+        mesh.mesh.value(),
+        &mesh_ref.cpu_vertices,
+        &mesh_ref.cpu_indices,
+        &[model],
+        material_tags.as_slice(),
+    );
+    StaticMeshSurfaceProvider::new(StaticMeshSurfaceInput {
+        id: provider_id,
+        revision,
+        vertices: Arc::clone(&mesh_ref.cpu_vertices),
+        indices: Arc::clone(&mesh_ref.cpu_indices),
+        submeshes: mesh_ref.submeshes.clone(),
+        bounds_min: mesh_ref.bounds_min,
+        bounds_max: mesh_ref.bounds_max,
+        bvh,
+        model,
+        render_origin: WorldPosition::origin(),
+        material_tags,
+    })
+    .map(Some)
+    .map_err(Into::into)
+}
+
+fn surface_material_tags(scene: &Scene, entity: Entity) -> Vec<SurfaceTagId> {
+    let tags: Vec<SurfaceTagId> = scene
+        .with_component::<MaterialSet, _>(entity, |materials| {
+            materials
+                .slots
+                .iter()
+                .map(|slot| SurfaceTagId(slot.material.value()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if tags.is_empty() {
+        vec![SurfaceTagId(crate::DEFAULT_MATERIAL_ID.value())]
+    } else {
+        tags
+    }
+}
+
+fn material_tag_for_triangle(
+    mesh: &GpuMesh,
+    triangle_index: u32,
+    tags: &[SurfaceTagId],
+) -> Option<SurfaceTagId> {
+    let index_offset = triangle_index.saturating_mul(3);
+    mesh.submeshes.iter().find_map(|submesh| {
+        let end = submesh.first_index.saturating_add(submesh.index_count);
+        (index_offset >= submesh.first_index && index_offset < end)
+            .then(|| tags.get(submesh.material_slot as usize).copied())
+            .flatten()
+    })
+}
+
+fn mesh_surface_revision(
+    mesh_id: u64,
+    vertices: &[Vertex],
+    indices: &[u32],
+    transforms: &[Mat4],
+    tags: &[SurfaceTagId],
+) -> SurfaceRevision {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let mut fold = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    };
+    fold(&mesh_id.to_le_bytes());
+    for vertex in vertices {
+        for component in vertex.position.to_array() {
+            fold(&component.to_bits().to_le_bytes());
+        }
+        for component in vertex.normal.to_array() {
+            fold(&component.to_bits().to_le_bytes());
+        }
+        for component in vertex.uv0.to_array() {
+            fold(&component.to_bits().to_le_bytes());
+        }
+        for component in vertex.tangent {
+            fold(&component.to_bits().to_le_bytes());
+        }
+    }
+    for index in indices {
+        fold(&index.to_le_bytes());
+    }
+    for transform in transforms {
+        for component in transform.to_cols_array() {
+            fold(&component.to_bits().to_le_bytes());
+        }
+    }
+    for tag in tags {
+        fold(&tag.0.to_le_bytes());
+    }
+    SurfaceRevision(hash)
+}
+
+fn deformed_surface_frame(points: [Vec3; 3], uv: [Vec2; 3]) -> crate::Result<SurfaceFrame> {
+    let edge1 = points[1] - points[0];
+    let edge2 = points[2] - points[0];
+    let normal = edge1.cross(edge2).normalize_or_zero();
+    let duv1 = uv[1] - uv[0];
+    let duv2 = uv[2] - uv[0];
+    let determinant = duv1.x * duv2.y - duv1.y * duv2.x;
+    if determinant.abs() <= 1e-12 {
+        return SurfaceFrame::from_normal(normal).map_err(Into::into);
+    }
+    let inverse = 1.0 / determinant;
+    let tangent = (edge1 * duv2.y - edge2 * duv1.y) * inverse;
+    let bitangent = (edge2 * duv1.x - edge1 * duv2.x) * inverse;
+    let handedness = if normal.cross(tangent).dot(bitangent) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    SurfaceFrame::new(normal, tangent, handedness).map_err(Into::into)
+}
+
+fn scene_surface_is_nearer(candidate: &SceneSurfaceHit, current: Option<&SceneSurfaceHit>) -> bool {
+    current.is_none_or(|current| {
+        candidate.surface.distance_m < current.surface.distance_m
+            || (candidate.surface.distance_m == current.surface.distance_m
+                && candidate.surface.provider < current.surface.provider)
+    })
 }
 
 /// Builds the world-space viewport ray used by picking and placement.
@@ -1441,25 +2069,31 @@ pub fn viewport_ray(viewport: (u32, u32), camera: &CameraView, ndc: Vec2) -> Ray
     }
 }
 
-/// Walks a triangle soup (flat indices into `positions`, already in world space) and reports
-/// the nearest forward triangle hit's `t`, if any.
-fn nearest_triangle(ray: &Ray, positions: &[Vec3], indices: &[u32]) -> Option<f32> {
-    let mut best = f32::MAX;
-    let mut found = false;
-    for tri in indices.chunks_exact(3) {
+/// Walks a deformed triangle soup and reports the nearest source triangle with barycentrics.
+fn nearest_triangle(
+    ray: &Ray,
+    positions: &[Vec3],
+    indices: &[u32],
+) -> Option<(u32, saffron_geometry::TriangleRayHit)> {
+    let mut best: Option<(u32, saffron_geometry::TriangleRayHit)> = None;
+    for (triangle_index, tri) in indices.chunks_exact(3).enumerate() {
         let (a, b, c) = (
             positions[tri[0] as usize],
             positions[tri[1] as usize],
             positions[tri[2] as usize],
         );
-        if let Some(t) = ray_triangle(ray, a, b, c)
-            && t < best
-        {
-            best = t;
-            found = true;
+        if let Some(hit) = ray_triangle_coordinates(ray, a, b, c) {
+            let triangle_index = triangle_index as u32;
+            let replace = best.is_none_or(|(current_index, current)| {
+                hit.distance < current.distance
+                    || (hit.distance == current.distance && triangle_index < current_index)
+            });
+            if replace {
+                best = Some((triangle_index, hit));
+            }
         }
     }
-    found.then_some(best)
+    best
 }
 
 #[cfg(test)]
@@ -1469,8 +2103,8 @@ mod tests {
     use std::path::PathBuf;
 
     use saffron_rendering::{
-        BindlessFreeList, Descriptors, Device, FogRenderSettings, GpuQueue, GpuTexture,
-        SurfaceSource, Uploader,
+        BindlessFreeList, Descriptors, Device, FogRenderSettings, GpuTexture, SurfaceSource,
+        Uploader,
     };
     use saffron_scene::{AssetEntry, AssetType};
 
@@ -1509,6 +2143,9 @@ mod tests {
         },
         Sky {
             mode: u32,
+        },
+        Clouds {
+            enabled: bool,
         },
         Fog {
             enabled: bool,
@@ -1639,7 +2276,6 @@ mod tests {
             _sun_dir: Vec3,
             _sun_color: Vec3,
             _sun_intensity: f32,
-            _sky_color: Vec3,
         ) {
             self.calls.borrow_mut().push(Call::DdgiScene);
         }
@@ -1677,6 +2313,7 @@ mod tests {
         fn set_show_grid(&mut self, enabled: bool) {
             self.calls.borrow_mut().push(Call::ShowGrid(enabled));
         }
+        fn record_scene_gather(&mut self, _elapsed: Duration) {}
         fn submit_draw_list(
             &mut self,
             _view_proj: Mat4,
@@ -1695,6 +2332,13 @@ mod tests {
                 mode: settings.mode,
             });
         }
+        fn submit_clouds(&mut self, settings: CloudRenderSettings) {
+            self.calls.borrow_mut().push(Call::Clouds {
+                enabled: settings.enabled,
+            });
+        }
+        fn set_exposure(&mut self, _ev: f32) {}
+        fn set_night_factor(&mut self, _factor: f32) {}
         fn submit_fog(&mut self, settings: &FogRenderSettings) {
             self.calls.borrow_mut().push(Call::Fog {
                 enabled: settings.enabled,
@@ -1772,6 +2416,7 @@ mod tests {
                 Call::DdgiScene,
                 Call::ReflectionProbes(0),
                 Call::FogVolumes(0),
+                Call::Clouds { enabled: false },
                 Call::SceneLighting { light_count: 0 },
                 Call::EnvBake(EnvSource::Procedural),
                 Call::ClusterCamera,
@@ -1791,7 +2436,9 @@ mod tests {
     #[test]
     fn no_directional_light_resolves_to_none() {
         let mut scene = Scene::new();
-        assert!(gather_directional_light(&mut scene).is_none());
+        let (sun, moon) = gather_directional_lights(&mut scene, CelestialDirectionOverrides::NONE);
+        assert!(sun.is_none());
+        assert!(moon.is_none());
     }
 
     #[test]
@@ -1807,7 +2454,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let resolved = gather_directional_light(&mut scene).expect("a sun");
+        let (resolved, moon) =
+            gather_directional_lights(&mut scene, CelestialDirectionOverrides::NONE);
+        let resolved = resolved.expect("a sun");
+        assert!(moon.is_none());
         assert_eq!(resolved.direction, Vec3::new(0.0, -1.0, 0.0));
         assert_eq!(resolved.intensity, 1.0);
     }
@@ -1825,9 +2475,93 @@ mod tests {
                 },
             )
             .unwrap();
-        let resolved = gather_directional_light(&mut scene).expect("a sun");
+        let (resolved, _) =
+            gather_directional_lights(&mut scene, CelestialDirectionOverrides::NONE);
+        let resolved = resolved.expect("a sun");
         assert!(resolved.direction.is_finite());
         assert!((resolved.direction.length() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn directional_lights_resolve_by_atmosphere_role() {
+        let mut scene = Scene::new();
+        let moon = scene.create_entity("Moon");
+        scene
+            .add_component(
+                moon,
+                DirectionalLight {
+                    atmosphere_role: AtmosphereRole::Moon,
+                    intensity: 0.5,
+                    ..DirectionalLight::default()
+                },
+            )
+            .unwrap();
+        let sun = scene.create_entity("Sun");
+        scene
+            .add_component(sun, DirectionalLight::default())
+            .unwrap();
+
+        let (sun, moon) = gather_directional_lights(&mut scene, CelestialDirectionOverrides::NONE);
+        assert_eq!(sun.expect("sun").intensity, 1.0);
+        assert_eq!(moon.expect("moon").intensity, 0.5);
+    }
+
+    #[test]
+    fn celestial_override_is_frame_local_and_preserves_authored_direction() {
+        let mut scene = Scene::new();
+        let sun = scene.create_entity("Sun");
+        let authored = Vec3::new(0.25, -0.9, 0.35);
+        scene
+            .add_component(
+                sun,
+                DirectionalLight {
+                    direction: authored,
+                    ..DirectionalLight::default()
+                },
+            )
+            .unwrap();
+
+        let overrides = CelestialDirectionOverrides {
+            sun: Some(Vec3::X),
+            moon: None,
+        };
+        let (resolved, _) = gather_directional_lights(&mut scene, overrides);
+
+        assert_eq!(resolved.expect("sun").direction, Vec3::X);
+        let stored = scene
+            .with_component::<DirectionalLight, _>(sun, |light| light.direction)
+            .expect("authored light");
+        assert_eq!(stored, authored);
+    }
+
+    #[test]
+    fn night_sky_radiance_is_not_hand_faded_by_sun_elevation() {
+        let mut scene = Scene::new();
+        scene.environment.time_of_day.enabled = true;
+        scene.environment.time_of_day.time_of_day = 0.0;
+        let midnight = drive_time_of_day(&mut scene);
+        scene.environment.time_of_day.time_of_day = 0.5;
+        let noon = drive_time_of_day(&mut scene);
+
+        assert_eq!(midnight.star_intensity, STAR_RADIANCE_SCALE);
+        assert_eq!(noon.star_intensity, STAR_RADIANCE_SCALE);
+        assert_eq!(midnight.milky_way_intensity, MILKY_WAY_RADIANCE_SCALE);
+        assert_eq!(noon.milky_way_intensity, MILKY_WAY_RADIANCE_SCALE);
+    }
+
+    #[test]
+    fn time_of_day_weather_curves_own_cloud_shape_when_active() {
+        let mut scene = Scene::new();
+        scene.environment.time_of_day.enabled = true;
+        scene.environment.time_of_day.coverage_curve =
+            saffron_scene::TodCurve(vec![(0.0, 0.8), (1.0, 0.8)]);
+        scene.environment.time_of_day.cloud_type_curve =
+            saffron_scene::TodCurve(vec![(0.0, 0.7), (1.0, 0.7)]);
+
+        let frame = drive_time_of_day(&mut scene);
+
+        assert_eq!(frame.cloud_coverage, Some(0.8));
+        assert_eq!(frame.cloud_type, Some(0.7));
     }
 
     #[test]
@@ -1918,9 +2652,9 @@ mod tests {
     /// A live headless GPU fixture, or `None` (no Vulkan ICD) so the GPU-backed draw/pick
     /// tests skip rather than fail off-hardware. Mirrors `load.rs`'s `gpu_or_skip`.
     struct GpuFixture {
-        device: Device,
-        descriptors: Descriptors,
         uploader: Uploader,
+        descriptors: Descriptors,
+        device: Device,
     }
 
     fn gpu_or_skip() -> Option<GpuFixture> {
@@ -1933,12 +2667,12 @@ mod tests {
         };
         let free_list: BindlessFreeList = Arc::new(std::sync::Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         Some(GpuFixture {
-            device,
-            descriptors,
             uploader,
+            descriptors,
+            device,
         })
     }
 
@@ -2109,8 +2843,8 @@ mod tests {
                     .calls()
                     .contains(&Call::RtScene { static_count: 2 })
             );
-            // The two DrawItems carry the distinct world matrices + the resolved base color +
-            // the directional shadow now casts (a non-empty scene AABB).
+            // The two DrawItems carry distinct world matrices and the resolved base color. The
+            // directional shadow stays off because the fixture has no Sun-role light.
             let items = renderer.draw_items.borrow();
             assert_eq!(items.len(), 2);
             let xs: Vec<f32> = items.iter().map(|it| it.model.w_axis.x).collect();
@@ -2125,7 +2859,7 @@ mod tests {
             assert!(
                 renderer
                     .calls()
-                    .contains(&Call::DirectionalShadow { casting: true })
+                    .contains(&Call::DirectionalShadow { casting: false })
             );
         }
 
@@ -2186,7 +2920,8 @@ mod tests {
             &mut assets,
             &camera,
             Vec2::ZERO,
-        );
+        )
+        .unwrap();
         assert_eq!(hit, e, "a click through the center hits the triangle");
 
         // A click far in the corner of the loose AABB but outside the triangle misses (the
@@ -2198,7 +2933,8 @@ mod tests {
             &mut assets,
             &camera,
             Vec2::new(-0.99, -0.99),
-        );
+        )
+        .unwrap();
         assert_eq!(miss, Entity::NULL, "a click into empty space misses");
 
         drop(renderer);
@@ -2410,7 +3146,8 @@ mod tests {
             &mut assets,
             &camera,
             Vec2::ZERO,
-        );
+        )
+        .unwrap();
         assert_eq!(hit, e, "the skinned triangle picks against a fresh palette");
 
         drop(renderer);

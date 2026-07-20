@@ -65,14 +65,18 @@ How a pass uses a non-attachment resource — the single source of truth for bar
 | Method | Effect |
 |---|---|
 | `RenderGraph::new()` | an empty graph |
-| `import_image(image, view, aspect, initial_layout, external)` | track an external 2D image; `external: Option<usize>` is a cross-frame layout slot |
-| `import_image_3d(image, view, initial_layout, external)` | track an external 3D image (GDF cascade volume, lite albedo cache) |
+| `import_image(image, view, aspect, initial_layout, external)` | track a complete external 2D image; `external: Option<usize>` is a cross-frame layout slot |
+| `import_image_3d(image, view, initial_layout, external)` | track a complete external 3D image (GDF cascade volume, lite albedo cache) |
 | `import_buffer(buffer)` | track an external buffer; returns an `RgResource` |
 | `alloc_external_layout(initial)` / `external_layout(slot)` | allocate / read a cross-frame layout slot |
 | `add_pass(pass)` | append an `RgPass` |
 | `image(resource)` / `view(resource)` / `buffer(resource)` | resolve a handle for a pass body |
 | `execute(device, cmd)` | derive + emit barriers, record each body, write back cross-frame layouts |
 | `execute_profiled(device, cmd, recorders)` | the same, with GPU-timestamp / CPU-span recorders armed |
+
+Image imports track one state for the complete image. Derived image barriers start at mip and layer
+zero and use `VK_REMAINING_MIP_LEVELS` plus `VK_REMAINING_ARRAY_LAYERS`, so the declared usage covers
+every mip and array layer represented by the imported handle.
 
 ## Related
 

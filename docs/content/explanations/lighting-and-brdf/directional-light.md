@@ -6,85 +6,92 @@ math = true
 
 # Directional light
 
-A directional light is a parallel light source with a direction but no position and no falloff,
-modelling the sun. It is the first term the fragment shader accumulates, evaluated through the
-same [BRDF](../cook-torrance-brdf/) as every punctual light, then attenuated by its shadow.
+A directional light represents a source whose rays are parallel across the scene, such as the sun.
+It has a direction but no position, range, or distance attenuation. Every surface therefore receives
+the same incoming radiance before the BRDF and visibility terms are applied.
 
-It is an ordinary scene entity — a `DirectionalLight` component you add, edit, and delete like
-any other. The scene shades through the **first** one; a scene with no directional light has **no
-direct sun** at all (only the sky and [IBL ambient](../ibl-ambient-term/) light it, so it can go
-genuinely dark). A freshly created scene seeds a real "Sun" entity so there is something to light
-it by default — delete it and the direct sun is gone; there is no hidden fallback sun behind it.
+The light is an ordinary scene entity with a `DirectionalLight` component. A fresh scene contains an
+editable `Sun` entity, but the renderer does not create a hidden fallback. Removing the component
+leaves the scene without direct sunlight.
 
-## A single direction, no attenuation
+## Resolving the scene sun
 
-A directional light has no distance, so it has no attenuation and no cone. The incoming radiance
-is the light's color times its intensity, identical for every fragment. The only per-fragment
-work is the BRDF and the shadow. The shader stores the light's travel direction in
-`globals.directionAmbient.xyz` and negates it to get the direction toward the light, which is
-what the BRDF expects:
+The renderer uses the first `DirectionalLight` found in the scene. If its entity has a `Transform`,
+the entity's world rotation rotates the component's authored direction. The result is normalized
+before upload; a zero-length direction falls back to `DirectionalLight::DEFAULT_DIRECTION` so shader
+normalization remains finite.
+
+| Field | Default | Effect |
+|---|---:|---|
+| `direction` | `(-0.5, -1.0, -0.3)` | World-space direction the light travels |
+| `color` | `(1, 1, 1)` | Direct-light color |
+| `intensity` | `1.0` | Direct radiance multiplier |
+| `ambient` | `0.15` | Grayscale flat-ambient fallback |
+| `volumetric_scattering` | `1.0` | Sun in-scatter multiplier in volumetric fog |
+| `cast_volumetric_shadow` | `true` | Applies the directional shadow map to fog in-scatter |
+
+The frame upload stores the travel direction in `direction_ambient.xyz` and color plus intensity in
+`color_intensity`. Zero intensity represents the no-sun case while retaining a valid direction for
+the sky and lighting math.
+
+## Surface lighting
+
+The fragment shader negates the stored travel direction to obtain the direction from the surface
+toward the light. It then evaluates the same
+[Cook-Torrance BRDF](../cook-torrance-brdf/) used by punctual lights:
 
 ```hlsl
 float3 lDir = -normalize(globals.directionAmbient.xyz);
-float3 lo = brdf(n, v, lDir, albedo, metallic, roughness,
-                 globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
+float3 lo = brdf(
+    n,
+    v,
+    lDir,
+    albedo,
+    metallic,
+    roughness,
+    globals.colorIntensity.rgb * globals.colorIntensity.a
+) * shadow;
 ```
 
-The `radiance` argument is `color * intensity` directly. A
-[punctual light](../punctual-lights-and-attenuation/) passes the same slot as
-`color * intensity * attenuation * cone`: the same function with extra factors.
+Unlike a [punctual light](../punctual-lights-and-attenuation/), the directional radiance has no range
+window or spotlight cone. Surface orientation, material response, and visibility provide all
+per-fragment variation.
 
-## Shadow: map, contact, or ray
+## Visibility
 
-The `shadow` scalar multiplies the whole direct term. The directional light is the one light
-with a full shadowing stack, selected by flags in the global constants:
+The directional shadow pass renders a 2048×2048 depth map from an orthographic light view fitted to
+the scene bounds. `pcfShadow` projects the surface into that map and averages a 3×3 comparison kernel.
+Samples outside the map or beyond its far plane are lit.
 
-- **Shadow map.** When `counts.y` is set, `pcfShadow` projects the fragment into the sun's
-  light-space `shadowViewProj`, does a 3×3 PCF comparison against a 2048² depth map, and
-  returns a `[0, 1]` visibility. Off-map and beyond-far-plane samples count as lit.
-- **Contact shadows.** When `screenFlags.x` is set, a screen-space contact-shadow factor
-  multiplies on top, adding fine detail the coarse map misses.
-- **Ray-traced.** When RT shadows are enabled (`pointShadowMeta.z`), the map path is skipped
-  and a long ray-query traces toward the sun instead (`rayQueryShadow`, `1e4` max distance).
+When inline ray-query shadows run, `evalLighting` traces toward the sun with a maximum distance of
+`1e4` instead of sampling the map. Opaque surfaces can also multiply the selected visibility by the
+screen-space contact-shadow map. The contact term supplies short-range detail while the map or ray
+query handles larger occluders.
 
-```hlsl
-float shadow = 1.0;
-if (globals.pointShadowMeta.z != 0)
-    shadow = rayQueryShadow(input.worldPos, lDir, 1e4);   // RT shadow
-else if (globals.counts.y != 0)
-    shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
-if (globals.screenFlags.x != 0)
-    shadow *= contactMap.SampleLevel(screenUv, 0.0).r;    // fine contact detail
-```
+## Fog and ambient
 
-Contact shadows are directional-only in v1; the map and ray paths are mutually exclusive.
+Volumetric fog calls `fogDirectionalInScatter` with the same color, intensity, and direction. The
+light's `volumetric_scattering` scales this contribution. When `cast_volumetric_shadow` is true and a
+directional shadow map is available, the fog sample uses that map to form shadowed shafts.
 
-## The ambient companion
-
-The directional component is the only one carrying an `ambient` scalar
-(`directionAmbient.w`). When [IBL](../ibl-ambient-term/) is off, that scalar is the flat
-indirect fallback: a constant fill so unlit surfaces are not pure black. It is not part of the
-direct term above; it is added later with the rest of the ambient. With no directional light in
-the scene, there is no scalar fallback either — the ambient comes only from the sky/IBL.
+The `ambient` field does not change the direct term. When IBL is disabled and the environment does
+not supply sky ambient, the renderer expands the scalar into a grayscale flat-ambient value. If the
+environment enables `use_sky_for_ambient`, its `ambient_color * ambient_intensity` replaces the
+component scalar. [IBL](../ibl-ambient-term/) ignores both flat fallbacks while it is enabled.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Direct term | `engine/assets/shaders/lighting.slang` | `evalLighting` — `lDir`, the `brdf` call |
-| Shadow map PCF | `engine/assets/shaders/lighting.slang` | `pcfShadow`, `globals.shadowViewProj` |
-| Contact + RT shadow | `engine/assets/shaders/lighting.slang` | `contactMap`, `rayQueryShadow` |
-| Direction + ambient upload | `engine/crates/rendering/src/lighting.rs` | `Lighting::set_scene_lighting` — `LightUbo::direction_ambient`, `LightUbo::color_intensity` |
-| Gather the sun from the scene (`None` = no sun) | `engine/crates/assets/src/render_scene.rs` | `gather_directional_light`, `DirectionalResolved` |
-| Seed the starter Sun on a fresh scene | `engine/crates/scene/src/starter.rs` | `seed_starter_scene` |
-
-> [!TIP]
-> `globals.directionAmbient.xyz` is the direction the light travels, not the direction toward
-> the sun. The shader negates it. A sun pointing straight down is `direction = (0, -1, 0)`.
+| Authored component | `scene/src/component.rs` | `DirectionalLight`, `DirectionalLight::DEFAULT_DIRECTION` |
+| Scene resolution | `assets/src/render_scene.rs` | `gather_directional_light`, `DirectionalResolved` |
+| Frame upload | `rendering/src/lighting.rs` | `SceneLighting`, `Lighting::set_scene_lighting`, `LightUbo` |
+| Surface and fog shading | `assets/shaders/lighting.slang` | `evalLighting`, `fogDirectionalInScatter`, `pcfShadow` |
+| Starter sun | `scene/src/starter.rs` | `seed_starter_scene` |
 
 ## Related
 
-- [Cook-Torrance BRDF](../cook-torrance-brdf/) — the shared shading model
-- [Light components](../light-components/) — where the direction and intensity come from
-- [Punctual lights and attenuation](../punctual-lights-and-attenuation/) — the same BRDF with falloff and a cone
-- [IBL ambient term](../ibl-ambient-term/) — what replaces the flat `ambient` scalar
+- [Light components](../light-components/) compares directional, point, and spot components.
+- [Cook-Torrance BRDF](../cook-torrance-brdf/) defines the shared direct-light response.
+- [Directional shadows](../../shadows-and-culling/directional-shadows/) covers the orthographic shadow pass.
+- [IBL ambient term](../ibl-ambient-term/) explains the baked ambient path and flat fallback.

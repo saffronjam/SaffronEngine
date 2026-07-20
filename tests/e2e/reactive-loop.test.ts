@@ -45,7 +45,7 @@ test("a mutating command re-arms rendering, then it settles back to idle", async
   await waitForIdle(true);
   // A state-changing command pulls the loop out of idle.
   await engine.call("set-view-mode", { mode: "wireframe" });
-  expect((await stats()).idle).toBe(false);
+  expect(await waitForIdle(false)).toBe(true);
   // With no further commands it converges and idles again.
   expect(await waitForIdle(true)).toBe(true);
   await engine.call("set-view-mode", { mode: "lit" });
@@ -69,7 +69,7 @@ test("occluded power-state suppresses rendering even after a mutation", async ()
     state: "focused",
   });
   expect(focused.state).toBe("focused");
-  expect((await stats()).idle).toBe(false);
+  expect(await waitForIdle(false)).toBe(true);
   await engine.call("set-view-mode", { mode: "lit" });
 });
 

@@ -5,120 +5,148 @@ weight = 6
 
 # Node-graph codegen
 
-A material can be authored as a node graph — constants, texture samples, and math wired into a surface — the way Unreal's material editor works. The graph is stored on the [material asset](../native-materials/) and turned into a shader two different ways depending on what it contains. This is the engine's endgame for material authoring: arbitrary procedural surface math, without hand-writing Slang and without exploding the pipeline count.
+A material node graph expresses surface values as connected constants, texture samples, and math
+operations. The graph remains editable JSON on the [native material](../native-materials/). Its
+output either lowers to ordinary material parameters or becomes a material-specific shader body.
 
-## The data model
+Both paths end at the same `SurfaceData` seam used by the fixed PBR material. Lighting, shadows,
+fog, and post-processing therefore remain shared; the graph controls only the surface values supplied
+to them.
 
-A graph is plain JSON on the `.smat`:
+## Graph document
+
+The wire model contains a `nodes` array and an `edges` array. Each edge names its source and
+destination as `[nodeId, pin]`. Canvas positions live in `props.editorPos`, which the engine ignores
+while folding and emitting code.
 
 ```jsonc
 {
   "nodes": [
-    { "id": "c",   "type": "constant",   "props": { "value": [1,0,0,1] } },
-    { "id": "t",   "type": "textureSlot","props": { "slot": "albedo" } },
+    { "id": "tint", "type": "constant", "props": { "value": [0.8, 0.2, 0.1, 1.0] } },
+    { "id": "tex", "type": "textureSlot", "props": { "slot": "albedo" } },
     { "id": "mul", "type": "multiply" },
     { "id": "out", "type": "materialOutput" }
   ],
   "edges": [
-    { "from": ["c","rgba"],   "to": ["mul","a"] },
-    { "from": ["t","rgba"],   "to": ["mul","b"] },
-    { "from": ["mul","rgba"], "to": ["out","baseColor"] }
+    { "from": ["tint", "rgba"], "to": ["mul", "a"] },
+    { "from": ["tex", "rgba"], "to": ["mul", "b"] },
+    { "from": ["mul", "rgba"], "to": ["out", "baseColor"] }
   ]
 }
 ```
 
-Node `type` strings match the emitter's match arm in `graph.rs` and the editor palette in `materials/graph.ts` — the two are kept in sync by hand. Editor-only data (a node's canvas position) rides in the node `props`, which the engine ignores.
+The emitter processes nodes in array order rather than sorting the graph. Sources must therefore
+appear before their consumers, and every required math input must be connected. Node ids become part
+of generated variable names such as `n_tint` and `n_mul`.
 
-## Fold or codegen
+## Fold decision
 
-The key decision is whether a graph needs a *new shader* at all.
+`lower_graph_to_params` inspects the edges entering `materialOutput`. A constant wired directly to a
+supported output can become a `MaterialAsset` factor. A direct JSON `texture` node can similarly
+become a texture UUID for a compatible material slot.
+
+An intermediate math node or the editor's sampling `textureSlot` node requires code generation. An
+unknown output channel or unresolved source also makes the graph non-foldable. The caller folds into
+a clone and commits those parameter changes only when the function returns `true`.
 
 ```mermaid
 flowchart TD
-    G["material graph"] --> L["lower_graph_to_params"]
-    L --> Q{"all nodes fold<br/>to params?"}
-    Q -- "yes (constant→param,<br/>texture→slot)" --> P["write MaterialParamsData<br/>(no recompile)"]
-    Q -- "no (multiply, frac,<br/>uv, …)" --> E["emit_graph_surface<br/>→ Slang evalSurface body"]
-    E --> S["slangc → SPIR-V"]
-    S --> PSO["per-graph PSO"]
-    P --> R["render"]
-    PSO --> R
+    A[Stored graph] --> B[lower_graph_to_params]
+    B --> C{Foldable outputs?}
+    C -->|yes| D[Update MaterialAsset factors and textures]
+    D --> E[Shared mesh shader]
+    C -->|no| F[emit_graph_surface]
+    F --> G[Splice generated SurfaceData assignments]
+    G --> H[Compile material mesh variant]
+    E --> I[Pipeline selection]
+    H --> I
 ```
 
-A graph that is just a constant feeding `baseColor`, or a texture feeding a slot, **folds**:
-`lower_graph_to_params` collapses its values into the flat `MaterialAsset` factors and it draws on the
-shared übershader — no compile. A graph with procedural math (`multiply`, `lerp`, `frac`, `uv`, …)
-**cannot** fold; `lower_graph_to_params` returns `false` and the graph is lowered to a Slang
-`evalSurface` body and compiled.
+Folding avoids shader compilation and keeps the material on the shared mesh shader. Changing a
+folded constant changes the per-frame parameter table. A non-foldable edit changes generated source
+and produces a distinct shader identity for [pipeline selection](../material-and-pso-selection/).
 
-This is the cost model: editing a *constant* is a buffer write; changing graph *topology* is a recompile. The editor folds first and only pays slangc when the graph genuinely needs it.
+## Surface emission
 
-## Emitting and compiling
+`emit_graph_surface` initializes a surface and emits one `float4` statement for each non-output
+node. Math nodes refer to their connected source variables, while `textureSlot` samples the material's
+bindless texture index for the selected slot.
 
-`emit_graph_surface` walks the nodes in array order (inputs precede consumers), emitting one typed
-Slang statement per node — `float4 n_<id> = …` — then assigns the `materialOutput` channels. The
-supported set is the [node library](#the-node-library).
-`compile_material_graph` / `compile_material_preview_shader` splice that body into a self-contained
-shader (the preview variant matches `PreviewPush` and the sphere vertex layout), then shell out to
-`slangc` (`find_slangc` locates it via `SAFFRON_SLANGC`, the prebuilt slang cache under `HOME`, or
-`PATH`). The result is a per-graph `.spv`.
+| Category | Node types |
+|---|---|
+| Inputs | `constant`, `textureSlot`, `uv` |
+| Arithmetic | `multiply`, `add`, `subtract`, `divide`, `lerp` |
+| Range and comparison | `saturate`, `clamp`, `step`, `smoothstep` |
+| Utility | `oneMinus`, `dot`, `sin`, `cos`, `frac` |
+| Sink | `materialOutput` |
 
-Two render targets are wired end to end:
+All intermediate values are `float4`. Division floors the denominator at `1e-5`, `dot` replicates
+its RGB dot product across all lanes, and an unknown node emits zero. The generated mesh body assigns
+`baseColor`, `metallic`, `roughness`, and `emissive` when those pins are connected.
 
-- **Preview.** `preview-render` detects a non-foldable graph, codegens a self-contained preview
-  shader, builds a per-call pipeline (`render_material_preview` takes the compiled `.spv` path), and
-  renders the procedural surface on the sphere.
-- **Scene.** The emitter also targets the real übershader (`emit_graph_surface(graph, mesh=true)` uses
-  `mat`/`albedoTextures`/world normal). `compile_material_mesh_shader` splices that body between
-  `mesh.slang`'s `// @graph-begin`/`// @graph-end` markers and compiles a per-material übershader
-  variant; `material-set-graph` builds it, `resolve_entity_materials` points `Material.shader` at the
-  compiled `.spv` (falling back to the shared übershader if absent). So a codegen material renders on
-  actual entities with full PBR lighting — not just the preview.
+The mesh target initializes normal from the world normal, occlusion to one, and opacity from the
+material base-color alpha. Those three values remain at their initialized values in generated graph
+bodies. The self-contained compile target uses a smaller five-field surface for validating emitted
+Slang.
 
-Both produce validation-clean images — the full `graph → Slang → slangc → PSO → pixels` pipeline.
+## Mesh variant compilation
 
-A scene variant does **not** recompile the whole übershader. `mesh.slang` imports a shared `lighting`
-Slang **module** (the bindings + the lighting half, `evalLighting` / `makeMaterialInput` /
-`transformVertex`) and a thin consumer (`import lighting;` + `evalSurface` + the entry points). The
-module is precompiled once to `lighting.slang-module` by the `xtask` shader step; `compile_material_mesh_shader`
-compiles only the variant's `evalSurface` + entry points and **links** the precompiled module
-(`-I <shaders dir>` resolves `import lighting`). So editing lighting rebuilds only the module (+
-variants relink) and editing a material recompiles only its `evalSurface` — linear PSO/compile cost,
-not "recompile the world."
+`compile_material_mesh_shader` inserts the generated body between the `@graph-begin` and
+`@graph-end` markers in `mesh.slang`. It writes
+`materials/<uuid>_mesh.slang` and invokes [Slang](https://shader-slang.org/) twice to produce
+`materials/<uuid>_mesh.spv` and `materials/<uuid>_mesh_nort.spv` in
+[SPIR-V](https://registry.khronos.org/SPIR-V/) form. The second compile defines
+`SAFFRON_NO_RT=1` for devices whose pipeline layout omits the ray-tracing sets.
 
-> [!NOTE]
-> Runtime `slangc` is an **editor** capability. `material-cook` bakes every codegen variant's spv to disk;
-> a shipping asset-bundle that the runtime loads without `slangc` is the remaining packaging step.
+The generated consumer resolves `lighting.slang` and its dependencies from the staged
+`shaders/source/` tree. This source-only include path keeps precompiled static modules out of the
+compile, allowing `SAFFRON_NO_RT` to propagate through every imported declaration.
 
-## The node library
+`material-set-graph` stores the JSON and attempts a mesh-variant compile when folding fails. Material
+resolution selects the `_mesh.spv` artifact when it exists; pipeline creation selects its `_nort`
+sibling on a device without ray tracing. A missing generated artifact selects the shared mesh
+shader. The live material preview uses this same resolved scene-material path.
 
-Math/utility nodes operate on `float4` values, wired by pin name (`a`/`b`/`t`): `multiply`, `add`,
-`subtract`, `divide`, `lerp`, `saturate`, `oneMinus`, `dot`, `step`, `smoothstep`. Procedural nodes —
-`uv`, `sin`, `cos`, `frac` — read the surface UV, so a `frac(uv * 8)` graph renders a repeating
-pattern. Leaf nodes are `constant` and `textureSlot`; the sink is `materialOutput` (`baseColor`,
-`metallic`, `roughness`, `normal`, `emissive`). An unknown node emits a safe `float4(0)`.
+`material-compile-graph` provides a separate compiler check. It wraps the emitted preview body in a
+self-contained fragment shader and writes `materials/<uuid>.slang` plus `<uuid>.spv`. The editor's
+Compile command calls this validation path rather than changing which scene shader is selected.
 
-## The editor
+## Cooking
 
-The React Flow view (`MaterialGraphEditor`) is a full-screen canvas over the live preview: a categorized palette adds nodes, drag wires pins, and edits **auto-apply** (debounced) through `material-set-graph` → `preview-render` so the sphere morphs as you work. A *Compile* button forces codegen (`material-compile-graph`). `material-get` returns the stored graph, so reopening a material loads its canvas.
+`material-cook` scans every material asset, skips graphs that lower to parameters, and rebuilds both
+mesh artifacts for each non-foldable graph. `export-app` performs the same material-shader cook before
+copying the project assets, engine shaders, and player into the application folder.
+
+The compiler path resolves `slangc` from `SAFFRON_SLANGC`, the `saffron-slang` cache under `HOME`, or
+`PATH`. Generated paths are passed as discrete process arguments, and compilation succeeds only when
+the process exits successfully and the output file exists.
+
+## Editor flow
+
+The editor maps the wire graph to [React Flow](https://reactflow.dev/) nodes and edges through
+`graphToFlow`, then restores `editorPos` through `flowToGraph`. Its palette comes from `NODE_SPECS`,
+and `TEXTURE_SLOTS` limits texture sampling to albedo, metallic-roughness, normal, emissive,
+occlusion, and height.
+
+Graph edits apply through `material-set-graph` after a 500 ms debounce. The material preview is a
+live engine subsurface, so cache invalidation makes the edited asset appear on the preview scene
+without a PNG readback. Per-tab snapshot history replays the same graph command for undo and redo.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Fold vs codegen | `graph.rs` | `lower_graph_to_params` |
-| Slang emitter | `graph.rs` | `emit_graph_surface` |
-| Compile + locate slangc | `codegen.rs` | `compile_material_graph`, `compile_material_preview_shader`, `find_slangc` |
-| Scene-path splice + PSO | `codegen.rs`; `mesh.slang` | `compile_material_mesh_shader`; `// @graph-begin` / `// @graph-end` |
-| Entity material resolve | `render_material.rs` | `resolve_entity_materials` |
-| Shared lighting module | `lighting.slang`; `shaders.rs` | `module lighting`, `evalLighting`, `transformVertex`; `lighting.slang-module` |
-| Preview render-wiring | `thumbnail_render.rs` | `render_material_preview` |
-| Control commands | `commands_asset.rs` | `material-set-graph`, `material-compile-graph`, `material-cook`, `preview-render` |
-| Editor model + palette | `editor/src/materials/graph.ts` | `NODE_SPECS`, `graphToFlow`, `flowToGraph` |
-| Editor canvas | `editor/src/panels/MaterialGraphEditor.tsx` | `MaterialGraphEditor`, `SaffronNode` |
+| Fold and emission | `assets/src/graph.rs` | `lower_graph_to_params`, `emit_graph_surface`, `emit_math_node` |
+| Generated artifacts | `assets/src/codegen.rs` | `AssetServer::compile_material_graph`, `AssetServer::compile_material_mesh_shader`, `find_slangc` |
+| Mesh splice points | `assets/shaders/mesh.slang` | `evalSurface`, `@graph-begin`, `@graph-end` |
+| Shared module build | `xtask/src/shaders.rs` | `compile_module`, `LIGHTING_STEM` |
+| Store, compile, and cook commands | `control/src/commands_asset.rs` | `material-set-graph`, `material-compile-graph`, `material-cook` |
+| Editor graph model | `editor/src/materials/graph.ts` | `NODE_SPECS`, `graphToFlow`, `flowToGraph` |
+| Editor canvas | `editor/src/panels/MaterialGraphEditor.tsx` | `MaterialGraphEditor`, `GraphCanvas` |
 
 ## Related
 
-- [Native materials](../native-materials/) — the asset the graph lives on, and the params it folds into
-- [Übershader](../ubershader-and-specialization/) — the shared shader foldable graphs draw on
-- [Materials & PSOs](../material-and-pso-selection/) — why a per-graph shader still means few pipelines
+- [Native materials](../native-materials/) describes the asset and parameter table.
+- [Übershader](../ubershader-and-specialization/) covers the shared shader permutations.
+- [Materials and PSOs](../material-and-pso-selection/) explains shader identity in the pipeline key.
+- [Shader compilation](../../architecture-and-conventions/shader-compilation/) covers the project-wide Slang build.

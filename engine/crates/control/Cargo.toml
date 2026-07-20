@@ -21,11 +21,13 @@ saffron-sceneedit = { path = "../sceneedit" }
 saffron-assets = { path = "../assets" }
 saffron-physics = { path = "../physics" }
 saffron-protocol = { path = "../protocol" }
+saffron-spatial = { path = "../spatial" }
+saffron-vegetation = { path = "../vegetation" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-rustix = { workspace = true, features = ["net", "event", "fs"] }
+rustix = { workspace = true, features = ["net", "event", "fs", "process"] }
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["net", "event", "fs", "std"] }

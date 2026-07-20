@@ -12,7 +12,7 @@ use serde::de::{Deserializer, Error as _};
 use serde::ser::Serializer;
 use serde_with::{DeserializeAs, SerializeAs};
 
-pub use serde_json::Value;
+pub use serde_json::{Map, Value};
 
 /// Errors raised by the JSON gateway and the typed readers.
 #[derive(Debug, thiserror::Error)]

@@ -6,15 +6,34 @@ math = true
 
 # Directional shadows
 
-A directional shadow is a shadow cast by a light treated as parallel rays from infinity, like the sun. The scene is rendered once into a single 2D depth map from the light's point of view. Each mesh fragment then tests that map to find whether a nearer surface stood between it and the light.
+A directional shadow treats the light as parallel rays from infinity, like the sun. Anima uses
+[shadow mapping](https://doi.org/10.1145/800248.807402): it renders the scene into one 2D depth map
+from the light's point of view, then compares each shaded fragment with the stored depth.
 
-A shadow map records the distance to the nearest surface along each direction the light sees. For a directional source the whole scene fits one orthographic frustum, so there is no cascade split — a single depth map covers everything.
+A shadow map records the nearest light-space depth at each texel. For a directional source, one
+orthographic frustum encloses the scene bounds. There is no cascade split; the 2,048×2,048 map
+spreads its texels across that complete fit.
 
 ## Light view and the depth pass
 
-A directional light has a direction but no position, so its view is an orthographic projection looking down that direction. `render_scene` fits the frustum to the scene's world-space AABB each frame, building the light transform from a bounding sphere of that box so the fit stays stable as the light rotates. The `orthographic` helper emits Vulkan's $[0, 1]$ clip depth directly, with no remap. The transform reaches the renderer through `set_directional_shadow`, which stores it and flags the caster; `Lighting` uploads it as `shadow_view_proj` in the light UBO.
+A directional light has a direction but no position, so its view uses an orthographic projection
+looking down that direction. `render_scene` encloses the frame's world-space scene AABB in a sphere:
 
-The pass itself is a depth-only draw. The graph adds it before the scene pass when a caster is present, with the 2048² `D32` shadow map as its sole depth attachment. `add_shadow_pass` records the body through `record_shadow_depth`, which reuses the depth-pre-pass machinery — the vertex-only shadow pipeline and the per-frame instance set — but pushes the light's view-projection instead of the camera's, and applies a [depth bias](../shadow-bias/) per batch.
+$$
+c = \frac{b_{min}+b_{max}}{2}, \qquad
+r = \frac{\lVert b_{max}-b_{min}\rVert}{2} + 0.5.
+$$
+
+The light eye is $c-d(r+1)$, and the projection spans $[-r,r]$ in X and Y with depth
+$[0,2r+2]$. The sphere keeps the extent invariant under light rotation. `orthographic` emits
+Vulkan's $[0,1]$ clip depth directly. `set_directional_shadow` stores the transform and arms the
+pass; `Lighting` uploads it as `shadow_view_proj` in the light UBO.
+
+The pass is a depth-only draw. The graph adds it before the scene pass when a directional light and
+scene items are present and shadow rendering is enabled. Its sole attachment is the 2,048² `D32`
+shadow map. `record_shadow_depth` binds the vertex-only shadow pipeline, sets the
+[depth bias](../shadow-bias/) once, pushes the light transform, and draws every batch using the
+per-frame instance set.
 
 ```mermaid
 flowchart LR
@@ -26,11 +45,26 @@ The [render graph](../../frame-and-render-graph/render-graph-overview/) derives 
 
 ## Sampling in the scene pass
 
-The mesh fragment evaluates the directional light through the same BRDF as every other light, then multiplies the result by visibility from `pcfShadow`. The `globals.counts.y` flag is the directional-shadow toggle, so the map is sampled only when a caster ran this frame. `pcfShadow` projects the world position into the light's clip space and runs a 3×3 comparison filter — see [PCF filtering](../pcf-filtering/) for the kernel.
+The mesh fragment evaluates the directional light through the same BRDF as every other light. When
+ray-query shadows are disabled and `globals.counts.y` is set, `pcfShadow` projects the world position
+into light clip space and applies a 3×3 comparison filter. The
+[PCF filtering](../pcf-filtering/) page covers the kernel. Ray-query shadows take precedence when
+enabled, and the opaque contact-shadow term multiplies either visibility result.
 
-## Design and trade-offs
+The volumetric-fog injector can sample the same map for sun shafts. Its per-light
+`cast_volumetric_shadow` flag controls that sample independently of opaque surface contact shadows.
 
-One orthographic frustum fit to the whole scene is the simplest correct approach and stays correct as the scene grows. The cost is resolution: a single 2048² map spread over a large world gives coarse texels far from the camera. Cascaded shadow maps are the standard fix and a clean future addition, since the pass already slots into the graph by declaration. The map's layout is tracked in an external-layout slot, so its descriptor stays valid as `ShaderReadOnly` on frames where no caster runs.
+## Coverage and retained layout
+
+The single orthographic fit gives the whole scene uniform shadow texel density. Expanding scene
+bounds therefore reduces world-space resolution everywhere; there is no camera-weighted cascade to
+concentrate texels near the viewer. `pcfShadow` treats coordinates outside the map and depths beyond
+the far plane as lit.
+
+The map's layout travels through an external-layout slot. A frame that renders the map transitions
+it from `SHADER_READ_ONLY_OPTIMAL` to the depth-attachment layout and back before the scene samples
+it. A frame without a valid caster leaves the map untouched, keeps the retained read-only layout,
+and clears `globals.counts.y` so surface shading does not sample stale contents.
 
 ## In the code
 

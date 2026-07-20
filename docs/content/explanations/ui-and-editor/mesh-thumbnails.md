@@ -5,138 +5,101 @@ weight = 11
 
 # Mesh thumbnails
 
-A mesh thumbnail is a small rendered 3/4 preview of an asset, drawn from the mesh itself rather than a
-generic icon. The mesh is rendered once into a tiny offscreen image with a camera auto-framed to its
-bounds, read back as a base64 PNG, and shown in the webview as an `<img>`. The render is engine-side;
-the transport is the control socket.
+Mesh thumbnails are rendered asset previews, not static type icons. They use the same [forward+ scene graph](../../lighting-and-brdf/clustered-forward/) as the interactive asset preview, then cross the control socket as base64-encoded PNG data.
 
-## How it works
+The thumbnail system also handles models, materials, texture maps, and HDRIs. Each asset kind becomes a small furnished scene on an offscreen renderer view.
 
-The preview camera is placed from the mesh's bounding box so any mesh fills the frame regardless of
-size. `mesh_bounds` finds the center and a bounding radius, then `framed_view_proj` backs the camera
-off by the distance that fits that radius in the field of view:
+## Preview subjects
 
-```rust
-let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
-let mut radius = (mesh.bounds_max - mesh.bounds_min).length() * 0.5;
-if radius <= 0.0001 { radius = 1.0; }
+`request_thumbnail` classifies the requested asset into a `PreviewRenderKind`. The control layer maps that kind to a `PreviewSubject` when the host drains the render queue:
 
-let fovy = 45.0_f32.to_radians();
-let distance = radius / (fovy * 0.5).tan() * 1.3;
-let eye = center + Vec3::new(1.0, 0.7, 1.0).normalize() * distance;
+| Asset kind | Preview subject |
+|---|---|
+| Mesh | The mesh with one default material slot |
+| Model | The instantiated model forest with its materials and node transforms |
+| Material | The material on the built-in sphere, including displacement |
+| Texture | The texture on a sphere through a material matching its semantic role |
+| HDRI | A chrome ball lit by and reflecting the HDRI |
+
+Animation assets have no thumbnail subject and fall back to their type icon in the Assets panel.
+
+`build_preview_scene_for_thumbnail` creates a throwaway scene with no floor. Meshes, models, materials, and ordinary textures use a procedural environment with a key light. An HDRI supplies image-based lighting to its chrome ball, while the thumbnail view keeps the fixed studio gradient as the visible background.
+
+## Framing
+
+The preview builder computes the world-space axis-aligned bounds of every renderable node in the subject forest. It derives a center and bounding-sphere radius, using a radius of 1 for degenerate or unresolved bounds.
+
+```text
+distance = radius / tan(verticalFov / 2) * margin
+eye = center + normalize(1, 0.7, 1) * distance
 ```
 
-The eye offset `(1, 0.7, 1)` gives the canonical 3/4 view. The `1.3` factor leaves a margin so the
-mesh does not touch the edges, and the degenerate-radius guard keeps a flat or point mesh from putting
-the camera on top of it. Near and far planes are derived from the framing distance for a tight depth
-range, and the projection's Y is flipped to match the viewport convention so the thumbnail comes out
-upright.
+The eye vector produces the three-quarter view. Subject-specific margins frame a smooth HDRI ball most tightly, leave displacement headroom for material and texture spheres, and give arbitrary mesh bounds more room. Near and far planes expand from the resulting distance and radius.
 
-## A one-shot render
+## Main-graph render
 
-The thumbnail pipeline is deliberately bare: vertex position, normal, and uv in; a two-matrix push
-constant (MVP and a normal matrix); no descriptor sets, no lighting, no materials. The mesh shows in a
-flat color. The render is multisampled at the highest count the device supports (up to 8x) — at
-thumbnail sizes geometry edges alias hard without it, and a one-shot tiny render makes the extra
-samples free in practice. The pass draws into a transient MSAA target and resolves into the 1x image
-that gets read back; the sample count is independent of the viewport's [AA mode](../../anti-aliasing/aa-modes/).
-`render_to_texture` records a one-time-submit command buffer through dynamic rendering — clear, then
-the closure paints the shared backdrop gradient (below) and binds the pipeline, pushes the matrices,
-and draws each submesh:
+Queued jobs render on the engine's render thread through `ViewId::Thumbnail`. The view owns separate targets and temporal state, so the Scene and asset-preview views retain their accumulated histories. A separate preview IBL state also prevents a thumbnail environment bake from replacing the project's lighting state.
 
-```rust
-raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.handle());
-raw.cmd_push_constants(cmd, pipeline.layout(), vk::ShaderStageFlags::VERTEX, 0,
-    bytemuck::bytes_of(&push));
-raw.cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertex_buffer()], &[0]);
-raw.cmd_bind_index_buffer(cmd, mesh.index_buffer(), 0, vk::IndexType::UINT32);
-for submesh in &mesh.submeshes {
-    raw.cmd_draw_indexed(cmd, submesh.index_count, 1,
-        submesh.first_index, submesh.vertex_offset, 0);
-}
+```mermaid
+flowchart LR
+    A[PreviewRenderJob] --> B[Build throwaway scene]
+    B --> C[Select Thumbnail view]
+    C --> D[Render 8 convergence frames]
+    D --> E[Read post-processed offscreen]
+    E --> F[Encode PNG]
+    F --> G[Write content cache]
+    G --> H[Restore prior view without reset]
 ```
 
-The Vulkan calls go through `ash`'s raw device seam; the render is synchronous — submit, then wait the
-fence. Thumbnails are built lazily and once, between frames on the
-[control-drain step, off the present path](../../tooling-and-control/asset-commands/), so the wait is
-acceptable. The pipeline is built on first use and cached (`ensure_thumbnail_pipeline`), so the second
-thumbnail reuses it. A texture asset skips the render and copies its decoded image straight back.
+Eight frames let temporal effects settle before readback. The render disables the editor grid and camera models but otherwise uses the scene pipeline, materials, post-processing, and the requested square extent. Restoring the previous active view uses `restore_active_view_no_reset`, which avoids clearing its temporal resources.
 
-## Model thumbnails are textured
+`encode_active_offscreen_png` waits for a safe readback, converts the post-processed framebuffer to RGB, and encodes it with the Rust `image` crate's PNG encoder. The reply reports dimensions read from the encoded image rather than echoing the request.
 
-A bare mesh shows in a flat color, but a [`.smodel`](../../geometry-and-assets/smodel-container/) tile
-shows the model as it looks — its mesh shaded with the embedded materials. `render_model_thumbnail`
-frames the mesh exactly as above, then draws each submesh through the **material-preview pipeline**
-(`preview.slang`, the same studio-lit shader the [material preview](../../materials-and-pipelines/native-materials/)
-uses) with that submesh's material from the table, indexed by `Submesh.material_slot`:
+## Pending requests
 
-```rust
-let pushes: Vec<(Submesh, PreviewPush)> = mesh.submeshes.iter().map(|submesh| {
-    let idx = (submesh.material_slot as usize).min(submesh_materials.len() - 1);
-    (*submesh, preview_push(&submesh_materials[idx], view_proj))
-}).collect();
-// in the record closure: bind the bindless set, then per submesh push + draw_indexed
+`get-thumbnail` defaults to 128 pixels and `view-asset` defaults to 512. A disk-cache hit returns PNG data immediately. A miss inserts a deduplicated `PreviewRenderJob` and returns a pending response with empty image data.
+
+The host renders at most two queued previews in one update tick because each job executes eight convergence frames. After the PNG reaches the cache, the editor's next request becomes a cache hit. Rendering and readback stay on the render thread; the pending control response keeps the initial request from blocking on that work.
+
+The editor retries a pending response after 60 milliseconds, doubles the delay after each miss, and caps it at 1 second. A rejected request settles the tile to its asset-type icon without an error toast.
+
+## Content-addressed cache
+
+Cache files live in the app-level thumbnail directory and use this shape:
+
+```text
+v<THUMBNAIL_CACHE_VERSION>-<contentHash>-<size>.png
 ```
 
-The materials and their textures live as chunks of the container, so the thumbnail worker has no
-`AssetServer`: the main thread resolves them at enqueue — the mesh chunk into bytes, each material
-into a `MaterialAsset`, and each referenced texture's chunk into bytes — and the
-worker decodes from memory, uploads, and builds the `SubmeshMaterial` table. `THUMBNAIL_CACHE_VERSION`
-prefixes every cache filename (`v<VERSION>-<contentHash>-<size>.png`), so bumping that one number
-retires the whole on-disk cache — every kind, not just materials — and the tiles regenerate.
+Mesh, texture, and model entries use their catalog content hash. A model hash covers mesh chunks, node transforms, material state, and referenced texture bytes. Materials use a live hash of resolved parameters, texture identifiers, shader, and blend mode, so changing a parent material also changes an instance's key.
 
-## A shared backdrop and matched color
+The cache is shared across projects and asset identifiers that resolve to the same content. Writes cap it at 1 GiB; crossing the cap removes oldest files until usage reaches 80 percent. `thumbnail-cache` reports entry count and bytes or clears the directory.
 
-Every 3D-render tile — a bare mesh, a textured model, a material or texture sphere, an HDRI chrome
-ball — draws over one shared studio backdrop, so the grid reads as a set rather than four different
-near-black squares. The backdrop is a fullscreen-triangle vertical gradient (`thumbnail_bg.slang`,
-lighter at the top), recorded as the first draw of each tile through a depth-disabled pipeline
-(`build_bg_pipeline`) so it paints under the object without touching the depth buffer the object needs.
+Changing `THUMBNAIL_CACHE_VERSION` changes the filename prefix for every asset kind. Old files then age out through the same size-cap eviction.
 
-The tiles also match the viewport's color response. The offscreen target is a non-sRGB `UNORM` image,
-so — exactly like the scene [tonemap pass](../../screen-space-and-post/tonemap-and-exposure/) — the
-display transfer must be applied in the shader, not by the hardware. The preview shaders share that
-step: `tonemap_ops.slang` is a resource-free module holding the tonemap operators plus a
-`tonemapAndEncode` that folds in the sRGB gamma, imported by both `tonemap.slang` and the thumbnail
-shaders so there is one encode. The tiles run it as **Khronos PBR Neutral** — the operator tuned to
-keep material color true for asset previews — over a fixed studio key light, so a thumbnail reads like
-the same asset in the live [material preview](../../materials-and-pipelines/native-materials/), only
-cheaper.
+## Browser cache
 
-## Across the socket as a PNG
+`AssetTile` requests a 128-pixel image and displays it in a 72-pixel square. `getThumbnailUrl` converts the base64 payload to a `Blob`, creates an object URL, and caches the URL with its fetched size. A cached image satisfies any request for the same asset at an equal or smaller size.
 
-There is no shared GPU context with the webview. The rendered image is read back into a host-visible
-staging buffer, encoded to a PNG in memory, and returned as base64 in the `get-thumbnail` result
-(`{format, width, height, base64}`, the dimensions truthful to the PNG). The [Assets
-panel](../assets-panel-and-thumbnails/) asks for 128px; the View modal re-renders at 512px through
-`view-asset`. A mesh renders straight into the requested size, so it needs no downscale before
-readback — that step only kicks in for an oversized [texture](../assets-panel-and-thumbnails/) asset.
-
-The render is not synchronous on the request. A cold miss is generated on the engine's thumbnail
-[worker thread](../assets-panel-and-thumbnails/) (the loaded mesh is handed back to the main thread's
-cache afterward): `get-thumbnail` replies `pending` and the result lands in the persistent disk cache,
-so the editor's retry — and every later start — is a plain cache read, never a frame-loop stall.
-
-The webview decodes the base64 to a `Blob`, makes an object URL, and caches it by asset id. The
-readback runs once per asset, not once per tile or per frame. That
-[blob-URL cache](../assets-panel-and-thumbnails/) is where the size-reuse and de-dup live.
+The in-flight map lets concurrent consumers share one retry loop per asset. Replacing a cached image revokes its prior object URL. Project or catalog replacement calls `invalidateThumbnails`, which revokes every client URL; the content-addressed disk cache remains available to the next request.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The render | `engine/crates/rendering/src/thumbnail_render.rs` | `render_mesh_thumbnail` |
-| Textured model render | `engine/crates/rendering/src/thumbnail_render.rs` · `engine/crates/assets/src/thumbnail.rs` | `render_model_thumbnail`, the `ThumbnailContent::Model` arm in `generate_thumbnail` |
-| Auto-framing | `engine/crates/rendering/src/thumbnail_render.rs` | `mesh_bounds`, `framed_view_proj`, the `(1, 0.7, 1)` eye |
-| The minimal pipeline | `engine/crates/rendering/src/thumbnail_render.rs` | `ensure_thumbnail_pipeline`, `render_to_texture` |
-| Shared backdrop gradient | `engine/assets/shaders/thumbnail_bg.slang` · `engine/crates/rendering/src/thumbnail_render.rs` | `build_bg_pipeline`, `draw_backdrop`, `THUMBNAIL_BG_CLEAR` |
-| Shared tonemap + sRGB encode | `engine/assets/shaders/tonemap_ops.slang` · `preview.slang` · `hdri_ball.slang` · `thumbnail.slang` | `tonemapAndEncode` (PBR Neutral) |
-| MSAA + resolve | `engine/crates/rendering/src/thumbnail_render.rs` | `ThumbnailTargets::sample_count`, the resolve attachment |
-| Readback → base64 PNG (engine) | `engine/crates/control/src/commands_asset.rs` | `get-thumbnail`, `view-asset` |
-| Decode + blob-URL cache (client) | `editor/src/state/store.ts` | `getThumbnailUrl`, `base64ToBlob`, `thumbnailCache` |
+| Request classification and disk cache | `engine/crates/assets/src/thumbnail.rs` | `request_thumbnail`, `PreviewRenderKind`, `PreviewRenderJob`, `THUMBNAIL_CACHE_VERSION`, `write_thumbnail_cache` |
+| Preview scene and framing | `engine/crates/control/src/commands_asset.rs` | `PreviewSubject`, `build_preview_scene_for_thumbnail`, `compute_preview_bounds`, `frame_preview_camera` |
+| Queue drain and convergence | `engine/crates/host/src/layer.rs` | `HostLayer::drive_preview_render_queue`, `render_preview_scene_to_png` |
+| Offscreen view isolation | `engine/crates/rendering/src/renderer.rs` | `ViewId::Thumbnail`, `scene_ibl`, `encode_active_offscreen_png`, `restore_active_view_no_reset` |
+| PNG conversion | `engine/crates/rendering/src/thumbnail.rs` | `convert_to_rgb`, `encode_to_png`, `ThumbnailPng` |
+| Thumbnail commands | `engine/crates/control/src/commands_asset.rs` | `thumbnail_result`, `get-thumbnail`, `view-asset`, `thumbnail-cache` |
+| Blob URL cache and retries | `editor/src/state/store.ts` | `getThumbnailUrl`, `getCachedThumbnailUrl`, `base64ToBlob`, `invalidateThumbnails` |
+| Grid tile display | `editor/src/components/AssetTile.tsx` | `AssetTile`, `THUMBNAIL_FETCH_SIZE`, `ThumbnailLoading` |
 
 ## Related
 
-- [Assets panel & thumbnails](../assets-panel-and-thumbnails/) — where the preview is shown + cached
-- [Asset commands](../../tooling-and-control/asset-commands/) — the `get-thumbnail`/`view-asset` readback
-- [Mesh and GPU upload](../../geometry-and-assets/) — the `GpuMesh` bounds the framing reads
+- [Assets panel and thumbnails](../assets-panel-and-thumbnails/) — explains grid loading, selection, and asset details.
+- [Asset editor](../asset-editor/) — uses the interactive version of the preview scene.
+- [Material graph live preview](../material-graph-live-preview/) — updates material assets shown by the preview path.
+- [Asset commands](../../tooling-and-control/asset-commands/) — documents thumbnail and larger-view requests.
+- [Tonemap and exposure](../../screen-space-and-post/tonemap-and-exposure/) — explains the display transform applied before PNG readback.

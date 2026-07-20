@@ -7,86 +7,127 @@ weight = 7
 
 The import pipeline is the write side of the asset system: it turns an external file into a
 project asset. Importing a model bakes the source into one [`.smodel` container](../smodel-container/)
-under the project's asset directory and adds the catalog rows it contributes. It does not touch
-the GPU and does not spawn anything; placing the asset in a scene is a separate step.
+under the project's asset directory and adds the catalog rows it contributes. The bake touches
+no GPU and spawns nothing; placing the asset in a scene is a separate step.
 
-Resolution — turning a cached id back into an `Arc` — is the read side. This page covers
-import alone.
+Resolution, turning a cataloged id back into a live `Arc`, is the read side and belongs to the
+[asset server](../asset-server-and-catalog/). This page covers import alone.
 
 ## Importing a model
 
-`AssetServer::import_model` is the full chain from a source file to a stored asset:
+`AssetServer::import_model` (the `import-model` command) is the full chain from a source file
+to a stored asset:
 
 ```rust
-let graph = translate_model(path)?;                       // parse glTF/OBJ → ImportedModel
-let bake = self.bake_model(&graph, options, path, Uuid(0))?;  // write one .smodel (0 mints a fresh id)
-// bake.rows are added to self.catalog (the container + its sub-assets)
+let graph = translate_model(path)?;                          // parse glTF/OBJ → ImportedModel
+let bake = self.bake_model(&graph, options, path, Uuid(0))?; // write one .smodel (0 mints a fresh id)
+for row in &bake.rows {
+    self.catalog.put(row.clone());                           // the container + its sub-assets
+}
 ```
 
 The steps run in order:
 
-1. Parse the source through the [importer](../gltf-and-obj-import/) into an `ImportedModel`.
-2. `bake_model` writes one `assets/models/<uuid>.smodel`: the mesh as a [`.smesh`](../smesh-format/)
-   `MESH` chunk, each material as an `SMAT` chunk, each texture as an `STEX` chunk (colorspace in
-   the chunk flags), each animation clip as a [`.sanim`](../sanim-format/) `SANM` chunk, and a
-   front-loaded `META` chunk holding the node hierarchy, skin, and the deterministic reimport
-   recipe.
-3. `catalog_rows_for_model` produces the catalog rows the container contributes: one `Model`
-   row plus one row per embedded sub-asset, each linked back to the container by id and chunk
-   index.
+1. `translate_model` parses [glTF/OBJ](../gltf-and-obj-import/) into an `ImportedModel`: a node
+   forest, materials, clips, and optional skin and morph payloads.
+2. `bake_model` writes `assets/models/<uuid>.smodel`: one [`.smesh`](../smesh-format/) `MESH`
+   chunk per mesh-bearing node, an `SMAT` chunk per material, an `STEX` chunk per texture, a
+   [`.sanim`](../sanim-format/) `SANM` chunk per clip, and a front-loaded `META` chunk.
+3. `catalog_rows_for_container` adds the container's rows: one `Model` row plus one per
+   embedded sub-asset, linked back by container id and chunk index.
 
-The on-disk asset is the single `.smodel`. The source glTF/OBJ is read once and never
-referenced again, and nothing loose lands beside the container.
+`META` holds the node hierarchy, the skin, the morph target names, and the reimport recipe: the
+source path, an [FNV-1a](https://datatracker.ietf.org/doc/html/rfc9923) content hash of its
+bytes, the importer version, and the `ImportOptions` verbatim, so a reimport replays the
+recorded options rather than the current defaults. Texture chunks carry their colorspace in the
+chunk flags; `ImportOptions::colorspace_for` marks albedo and emissive maps sRGB and every data
+map linear.
+
+The on-disk asset is the single `.smodel`; nothing loose lands beside it. The disk scan builds
+rows through the same `catalog_rows_for_container`, so a freshly baked container and a
+rediscovered one yield identical rows.
 
 ## Placing a model
 
 Import populates the catalog; it never spawns. `AssetServer::instantiate_model` (the
 `instantiate-model` command) reconstructs a `ModelSpawnInput` from the container's `META` and
-expands the stored hierarchy into entities: `spawn_model` builds the mesh entity, dispatching
-to `spawn_skinned_model` for a rig (with its bone entities, joints, and a stopped
-`AnimationPlayer`), and `apply_imported_materials` attaches a `MaterialSet` whose slots reference the
-baked `.smat` chunks — one slot per material. The root carries a `ModelInstance` component naming its
-source asset. One `.smodel` instantiates into many independent entity trees, so the
-`add-entity cube` preset is just an instantiate of the built-in cube model.
+hands it to `spawn_model`, which dispatches on shape:
+
+- **A skinned import** spawns the rigged path (`spawn_skinned_model`): one entity per glTF
+  node, `Bone` tags on the joints, a `SkinnedMesh` on the mesh node listing the joints in glTF
+  order, and a stopped `AnimationPlayer` for the first clip.
+- **A single identity root** collapses to one entity carrying the mesh and material table.
+- **Any other forest** spawns one entity per node under a container root
+  (`spawn_node_forest`), each mesh-bearing node carrying its node-local mesh.
+
+`apply_imported_materials` attaches a `MaterialSet` whose slots reference the baked `.smat`
+chunks by sub-id, with no inline copy, so editing an embedded material propagates to every
+instance. The root carries a `ModelInstance` component naming its source asset; one `.smodel`
+instantiates into many independent entity trees.
+
+```sh
+sa import-model /path/to/robot.gltf   # → { "id": "…", "name": "robot", "type": "model" }
+sa instantiate-model robot            # expand the stored hierarchy into entities
+```
 
 ## Importing a texture
 
-A standalone texture import is its own path: `import_texture` reads a file into bytes and calls
-`register_texture_bytes`, which decodes to confirm a valid image, uploads via the
-[`GpuUploader`](../gpu-mesh-upload/) seam, then writes the original encoded bytes to a loose
-`textures/<uuid>.<ext>` and adds a `Texture` catalog row:
+A standalone texture import is its own path. `import_texture` (the `import-texture` command)
+reads the file and resolves a colorspace: an explicit override wins, a role hint (albedo,
+normal, …) derives one, and with neither an `.hdr` extension routes to the float path while
+everything else uploads as sRGB. `register_texture_bytes` then does the work:
 
 ```rust
-let decoded = decode_image_from_memory(&encoded)?;
-let texture = gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, /* srgb */ true)?;
-// write `encoded` (not the decoded pixels) under textures/<uuid>.<ext>, then catalog.put(...)
+let decoded = decode_image_from_memory(encoded)?;
+let texture = gpu.upload_texture(&decoded.rgba, decoded.width, decoded.height, srgb)?;
+// write `encoded` (not the decoded pixels) to textures/<uuid>.<ext>, then add the catalog row
 ```
 
-The disk copy is the encoded PNG/JPG, so reloading it re-runs [the decode](../image-decoding/)
-rather than storing bulky raw RGBA. The `srgb = true` argument matches albedo being authored in
-sRGB. A model's textures, by contrast, ride inside the `.smodel` as `STEX` chunks rather than
-loose files. (`register_hdr_texture_bytes` is the parallel float path for `.hdr` panoramas.)
+It decodes through [image decoding](../image-decoding/), uploads via the
+[`GpuUploader`](../gpu-mesh-upload/) seam, writes the original encoded bytes to a loose
+`textures/<uuid>.<ext>`, adds a `Texture` catalog row with a `.smeta` sidecar, and seeds the
+GPU texture cache with the fresh upload. The disk copy is the encoded PNG/JPG, so a reload
+re-runs the decode instead of storing bulky raw RGBA. `register_hdr_texture_bytes` is the
+parallel float path for `.hdr` panoramas.
 
-## Deduplication
+A model's textures ride inside its `.smodel` as `STEX` chunks rather than loose files. Material
+sets imported from the [Asset Store](../../asset-store-and-connectors/connector-framework/)
+follow the same container discipline: `bake_material_container` writes the role-tagged maps
+plus their material document into one `assets/materials/<uuid>.smatx`, the material as the
+container parent and each texture a hidden sub-row.
 
-A fresh `import_model` mints a new model id, so importing `cube.gltf` twice writes two `.smodel`
-containers and two catalog entries (`cube`, `cube (2)`). Within a container the sub-asset ids
-are stable (`sub_id_for`, keyed by source name), and `reimport_model` reuses the model id and
-skips a byte-identical source by its content hash (`hash_file_fnv` versus the stored
-`import.source_hash`, plus the importer version). Otherwise there is no cross-import content
-dedup; GPU-side sharing happens at resolve time, where entities referencing the same sub-id
-share one upload through the cache.
+## Sub-id stability and reimport
+
+Within a container, sub-asset ids come from `sub_id_for`: an FNV-1a fold over the model key
+(the source file stem), the sub-asset kind, the source name, and a duplicate index. The same
+tuple always yields the same id, so a re-bake of the same source resolves every sub-asset to
+its prior identity. A drifting hash would silently orphan every baked sub-asset; a golden test
+pins the exact value.
+
+`reimport_model` (the `reimport-model` command) re-bakes a container from its stored source and
+options, reusing the model id. A byte-identical source is a content-addressed skip:
+`hash_file_fnv` over the current source bytes must differ from the stored `import.source_hash`
+(or the importer version must have bumped) for a re-bake to run. A changed source produces a
+`ReimportDelta` diffed by stable sub-id — updated, added, and removed-from-source, the last
+kept and reported rather than silently dropped. Live instances resolve by sub-id, so they pick
+up the new bytes without re-instantiation.
+
+A fresh `import_model` always mints a new model id, so importing the same file twice writes two
+containers. There is no cross-import content dedup; GPU-side sharing happens at resolve time,
+where entities referencing the same sub-id share one upload through the cache.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Parse → import graph | `geometry/src/translate.rs` | `translate_model` |
-| Bake + import a model | `assets/src/import.rs` | `bake_model`, `import_model` |
-| Catalog rows a container contributes | `assets/src/import.rs` | `catalog_rows_for_model` |
-| Reimport (content-hash skip) | `assets/src/manage.rs` | `reimport_model`, `hash_file_fnv` |
+| Parse dispatch | `geometry/src/translate.rs` | `translate_model` |
+| Bake + import a model | `assets/src/import.rs` | `bake_model`, `import_model`, `ImportOptions` |
+| Rows a container contributes | `assets/src/import.rs` | `catalog_rows_for_container` |
+| Content hashes | `assets/src/import.rs` | `hash_file_fnv`, `hash_bytes_fnv` |
+| Reimport (content-hash skip) | `assets/src/manage.rs` | `reimport_model`, `ReimportDelta` |
 | Texture import | `assets/src/scan.rs` | `import_texture`, `register_texture_bytes`, `register_hdr_texture_bytes` |
-| Place a model in the scene | `assets/src/spawn.rs` | `instantiate_model`, `spawn_model`, `spawn_skinned_model` |
+| Material container bake | `assets/src/import.rs` | `bake_material_container` |
+| Place a model in the scene | `assets/src/spawn.rs` | `instantiate_model`, `spawn_model`, `apply_imported_materials` |
 | Stable sub-ids | `geometry/src/sub_id.rs` | `sub_id_for` |
 
 ## Related

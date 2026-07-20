@@ -335,23 +335,23 @@ mod tests {
         assert!(matches!(err, Error::Engine { .. }));
     }
 
+    fn test_socket_path(label: &str) -> String {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("sa-{label}-{}-{nonce:x}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// A live round-trip against a one-shot in-process server: connect, read the framed request,
     /// reply with a canned envelope, and assert the client decodes the typed result. This proves
     /// the framing (the `<json>\n` request, the one reply line) end to end without an engine.
     #[test]
     fn client_round_trips_against_a_local_socket() {
-        let dir = std::env::temp_dir();
-        let path = dir
-            .join(format!(
-                "saffron-control-client-{}-{}.sock",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-            ))
-            .to_string_lossy()
-            .into_owned();
+        let path = test_socket_path("roundtrip");
 
         let listener = UnixListener::bind(&path).expect("bind");
         let server_path = path.clone();
@@ -405,17 +405,7 @@ mod tests {
     /// carried (a parsed `Value` would have coerced it). It still lifts an `ok:false` envelope.
     #[test]
     fn call_raw_text_returns_verbatim_bytes() {
-        let path = std::env::temp_dir()
-            .join(format!(
-                "saffron-control-client-rawtext-{}-{}.sock",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-            ))
-            .to_string_lossy()
-            .into_owned();
+        let path = test_socket_path("raw");
 
         let listener = UnixListener::bind(&path).expect("bind");
         let handle = std::thread::spawn(move || {
@@ -453,17 +443,7 @@ mod tests {
 
     #[test]
     fn is_up_reflects_a_bound_listener() {
-        let path = std::env::temp_dir()
-            .join(format!(
-                "saffron-control-client-isup-{}-{}.sock",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-            ))
-            .to_string_lossy()
-            .into_owned();
+        let path = test_socket_path("up");
         let client = Client::new(path.clone());
         assert!(!client.is_up(), "nothing bound yet");
         let listener = UnixListener::bind(&path).expect("bind");

@@ -24,6 +24,7 @@ use std::sync::Arc;
 use ash::vk;
 use saffron_geometry::glam::{Mat4, UVec4, Vec3, Vec4};
 
+use crate::clouds::CLOUD_SHADOW_CASCADES;
 use crate::descriptors::Descriptors;
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::gpu_types::GpuLight;
@@ -80,6 +81,10 @@ pub struct LightUbo {
     pub direction_ambient: Vec4,
     /// `rgb` directional color, `a` intensity.
     pub color_intensity: Vec4,
+    /// `xyz` normalized moon-light travel direction, `w` moon intensity.
+    pub moon_direction_intensity: Vec4,
+    /// `rgb` moon-light color.
+    pub moon_color: Vec4,
     /// `x` punctual count, `y` directional-shadow flag, `z` IBL-ambient flag, `w` SSAO flag.
     pub counts: UVec4,
     /// `xyz` world-space camera position.
@@ -111,6 +116,8 @@ pub struct LightUbo {
     pub sdf_occlusion: UVec4,
     /// `rgb` scene-environment ambient (the non-IBL fallback), `a` reflection-probe count.
     pub ambient_color: Vec4,
+    /// `rgb` artist-authored time-of-day tint for image-based ambient lighting.
+    pub ibl_tint: Vec4,
     /// `x` screen-space-reflection flag, `y` ray-traced-reflection flag, `z` directional
     /// volumetric-scatter multiplier (float bits), `w` directional cast-volumetric-shadow gate (0/1).
     pub extra_flags: UVec4,
@@ -121,11 +128,19 @@ pub struct LightUbo {
     /// when `fog.mode == volumetric` this frame, else 0), `y` = froxel near, `z` = froxel far (the
     /// exponential-Z distribution the transparent W mapping inverts), `w` reserved.
     pub froxel_fog: Vec4,
+    /// Cloud-shadow light-plane right axis.
+    pub cloud_shadow_right: Vec4,
+    /// Cloud-shadow light-plane up axis.
+    pub cloud_shadow_up: Vec4,
+    /// Camera-snapped cloud-shadow centers and half extents.
+    pub cloud_shadow_centers: [Vec4; CLOUD_SHADOW_CASCADES as usize],
+    /// `x` ESM exponent, `y` cloud/fog strength, `z` surface strength, `w` enabled.
+    pub cloud_shadow_meta: Vec4,
 }
 
 const _: () = assert!(
-    size_of::<LightUbo>() == 448,
-    "LightUbo must match the std140 shader layout (5 vec4 + 2 mat4 + 10 vec4 + 1 mat4 + 1 vec4)"
+    size_of::<LightUbo>() == 592,
+    "LightUbo must match the std140 shader layout"
 );
 
 impl Default for LightUbo {
@@ -133,6 +148,8 @@ impl Default for LightUbo {
         Self {
             direction_ambient: Vec4::new(0.0, -1.0, 0.0, 0.0),
             color_intensity: Vec4::new(1.0, 1.0, 1.0, 0.0),
+            moon_direction_intensity: Vec4::ZERO,
+            moon_color: Vec4::ZERO,
             counts: UVec4::ZERO,
             eye_position: Vec4::ZERO,
             shadow_view_proj: Mat4::IDENTITY,
@@ -147,9 +164,14 @@ impl Default for LightUbo {
             ddgi_scroll_base: UVec4::ZERO,
             sdf_occlusion: UVec4::ZERO,
             ambient_color: Vec4::ZERO,
+            ibl_tint: Vec4::ONE,
             extra_flags: UVec4::ZERO,
             prev_view_proj: Mat4::IDENTITY,
             froxel_fog: Vec4::ZERO,
+            cloud_shadow_right: Vec4::X,
+            cloud_shadow_up: Vec4::Z,
+            cloud_shadow_centers: [Vec4::ZERO; CLOUD_SHADOW_CASCADES as usize],
+            cloud_shadow_meta: Vec4::ZERO,
         }
     }
 }
@@ -217,8 +239,16 @@ pub struct SceneLighting {
     pub color: Vec3,
     /// The directional light intensity.
     pub intensity: f32,
+    /// The moon-light travel direction.
+    pub moon_direction: Vec3,
+    /// The atmosphere-coupled moon-light color.
+    pub moon_color: Vec3,
+    /// The atmosphere-coupled moon-light intensity.
+    pub moon_intensity: f32,
     /// The scene-environment ambient (the non-IBL fallback term).
     pub ambient: Vec3,
+    /// Per-frame artist tint applied to image-based ambient lighting.
+    pub ibl_tint: Vec3,
     /// The world-space camera position.
     pub eye_position: Vec3,
     /// The directional light's per-light fog in-scatter multiplier (its shaft brightness).
@@ -238,7 +268,11 @@ impl Default for SceneLighting {
             direction: Vec3::NEG_Y,
             color: Vec3::ONE,
             intensity: 0.0,
+            moon_direction: Vec3::Y,
+            moon_color: Vec3::ZERO,
+            moon_intensity: 0.0,
             ambient: Vec3::ZERO,
+            ibl_tint: Vec3::ONE,
             eye_position: Vec3::ZERO,
             directional_volumetric: 0.0,
             directional_cast_volumetric_shadow: false,
@@ -284,6 +318,10 @@ pub struct Lighting {
     frame_rt_reflections_flag: bool,
     frame_prev_view_proj: Mat4,
     frame_froxel_fog: Vec4,
+    frame_cloud_shadow_right: Vec4,
+    frame_cloud_shadow_up: Vec4,
+    frame_cloud_shadow_centers: [Vec4; CLOUD_SHADOW_CASCADES as usize],
+    frame_cloud_shadow_meta: Vec4,
     frame_ddgi_volume_min: Vec4,
     frame_ddgi_volume_extent: Vec4,
     frame_ddgi_probe_count: UVec4,
@@ -338,6 +376,10 @@ impl Lighting {
             frame_rt_reflections_flag: false,
             frame_prev_view_proj: Mat4::IDENTITY,
             frame_froxel_fog: Vec4::ZERO,
+            frame_cloud_shadow_right: Vec4::X,
+            frame_cloud_shadow_up: Vec4::Z,
+            frame_cloud_shadow_centers: [Vec4::ZERO; CLOUD_SHADOW_CASCADES as usize],
+            frame_cloud_shadow_meta: Vec4::ZERO,
             frame_ddgi_volume_min: Vec4::ZERO,
             frame_ddgi_volume_extent: Vec4::ZERO,
             frame_ddgi_probe_count: UVec4::ZERO,
@@ -536,6 +578,11 @@ impl Lighting {
         let ubo = LightUbo {
             direction_ambient: dir.extend(ambient_luma),
             color_intensity: scene.color.extend(scene.intensity),
+            moon_direction_intensity: scene
+                .moon_direction
+                .normalize_or_zero()
+                .extend(scene.moon_intensity),
+            moon_color: scene.moon_color.extend(0.0),
             counts: UVec4::new(
                 count,
                 u32::from(self.shadow_pending),
@@ -569,6 +616,7 @@ impl Lighting {
             ddgi_scroll_base: self.frame_ddgi_scroll_base,
             sdf_occlusion: self.frame_sdf_occlusion,
             ambient_color: scene.ambient.extend(f32::from_bits(self.frame_probe_count)),
+            ibl_tint: scene.ibl_tint.extend(0.0),
             extra_flags: UVec4::new(
                 u32::from(self.frame_ssr_flag),
                 u32::from(self.frame_rt_reflections_flag),
@@ -577,6 +625,10 @@ impl Lighting {
             ),
             prev_view_proj: self.frame_prev_view_proj,
             froxel_fog: self.frame_froxel_fog,
+            cloud_shadow_right: self.frame_cloud_shadow_right,
+            cloud_shadow_up: self.frame_cloud_shadow_up,
+            cloud_shadow_centers: self.frame_cloud_shadow_centers,
+            cloud_shadow_meta: self.frame_cloud_shadow_meta,
         };
         let dst = self.frames[frame]
             .light_ubo
@@ -645,6 +697,39 @@ impl Lighting {
     /// froxel grid's exponential-Z extent (the transparent W mapping inverts them).
     pub fn set_frame_froxel_fog(&mut self, enabled: bool, near: f32, far: f32) {
         self.frame_froxel_fog = Vec4::new(if enabled { 1.0 } else { 0.0 }, near, far, 0.0);
+    }
+
+    /// Folds the camera-snapped cloud-shadow projection into the next light UBO write.
+    pub(crate) fn set_frame_cloud_shadow(
+        &mut self,
+        projection: crate::clouds::CloudShadowProjection,
+    ) {
+        self.frame_cloud_shadow_right = projection.right;
+        self.frame_cloud_shadow_up = projection.up;
+        self.frame_cloud_shadow_centers = projection.centers;
+        self.frame_cloud_shadow_meta = projection.meta;
+    }
+
+    /// Binds the one cloud-shadow cascade array for the mesh and fog consumers.
+    pub(crate) fn bind_cloud_shadow(
+        &self,
+        device: &Device,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) {
+        let info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        for frame in &self.frames {
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(frame.light_set)
+                .dst_binding(12)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { device.raw().update_descriptor_sets(&[write], &[]) };
+        }
     }
 
     /// Writes the current frame's cluster params from the camera + viewport, and arms
@@ -813,15 +898,14 @@ fn write_shadow_samplers(
     light_set: vk::DescriptorSet,
     targets: &Targets,
 ) {
-    let compare = descriptors.shadow_sampler();
     let linear = descriptors.linear_sampler();
     let directional = [vk::DescriptorImageInfo {
-        sampler: compare,
+        sampler: vk::Sampler::null(),
         image_view: targets.directional_shadow_view(),
         image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     }];
     let spot = [vk::DescriptorImageInfo {
-        sampler: compare,
+        sampler: vk::Sampler::null(),
         image_view: targets.spot_shadow_view(),
         image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     }];
@@ -1062,31 +1146,38 @@ mod tests {
     use std::mem::offset_of;
     use std::sync::Mutex;
 
-    /// `LightUbo` is exactly 432 bytes with each field at the std140 offset the mesh
+    /// `LightUbo` is exactly 592 bytes with each field at the std140 offset the mesh
     /// fragment reads — the contract the shaded path reads by raw bytes.
     #[test]
     fn light_ubo_byte_layout_matches_std140() {
-        assert_eq!(size_of::<LightUbo>(), 448);
+        assert_eq!(size_of::<LightUbo>(), 592);
         assert_eq!(align_of::<LightUbo>(), 16);
         assert_eq!(offset_of!(LightUbo, direction_ambient), 0);
         assert_eq!(offset_of!(LightUbo, color_intensity), 16);
-        assert_eq!(offset_of!(LightUbo, counts), 32);
-        assert_eq!(offset_of!(LightUbo, eye_position), 48);
-        assert_eq!(offset_of!(LightUbo, shadow_view_proj), 64);
-        assert_eq!(offset_of!(LightUbo, spot_shadow_view_proj), 128);
-        assert_eq!(offset_of!(LightUbo, spot_shadow), 192);
-        assert_eq!(offset_of!(LightUbo, point_shadow), 208);
-        assert_eq!(offset_of!(LightUbo, point_shadow_meta), 224);
-        assert_eq!(offset_of!(LightUbo, screen_flags), 240);
-        assert_eq!(offset_of!(LightUbo, ddgi_volume_min), 256);
-        assert_eq!(offset_of!(LightUbo, ddgi_volume_extent), 272);
-        assert_eq!(offset_of!(LightUbo, ddgi_probe_count), 288);
-        assert_eq!(offset_of!(LightUbo, ddgi_scroll_base), 304);
-        assert_eq!(offset_of!(LightUbo, sdf_occlusion), 320);
-        assert_eq!(offset_of!(LightUbo, ambient_color), 336);
-        assert_eq!(offset_of!(LightUbo, extra_flags), 352);
-        assert_eq!(offset_of!(LightUbo, prev_view_proj), 368);
-        assert_eq!(offset_of!(LightUbo, froxel_fog), 432);
+        assert_eq!(offset_of!(LightUbo, moon_direction_intensity), 32);
+        assert_eq!(offset_of!(LightUbo, moon_color), 48);
+        assert_eq!(offset_of!(LightUbo, counts), 64);
+        assert_eq!(offset_of!(LightUbo, eye_position), 80);
+        assert_eq!(offset_of!(LightUbo, shadow_view_proj), 96);
+        assert_eq!(offset_of!(LightUbo, spot_shadow_view_proj), 160);
+        assert_eq!(offset_of!(LightUbo, spot_shadow), 224);
+        assert_eq!(offset_of!(LightUbo, point_shadow), 240);
+        assert_eq!(offset_of!(LightUbo, point_shadow_meta), 256);
+        assert_eq!(offset_of!(LightUbo, screen_flags), 272);
+        assert_eq!(offset_of!(LightUbo, ddgi_volume_min), 288);
+        assert_eq!(offset_of!(LightUbo, ddgi_volume_extent), 304);
+        assert_eq!(offset_of!(LightUbo, ddgi_probe_count), 320);
+        assert_eq!(offset_of!(LightUbo, ddgi_scroll_base), 336);
+        assert_eq!(offset_of!(LightUbo, sdf_occlusion), 352);
+        assert_eq!(offset_of!(LightUbo, ambient_color), 368);
+        assert_eq!(offset_of!(LightUbo, ibl_tint), 384);
+        assert_eq!(offset_of!(LightUbo, extra_flags), 400);
+        assert_eq!(offset_of!(LightUbo, prev_view_proj), 416);
+        assert_eq!(offset_of!(LightUbo, froxel_fog), 480);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_right), 496);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_up), 512);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_centers), 528);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_meta), 576);
     }
 
     /// `ClusterParams` is exactly 192 bytes with each field at the std140 offset both
@@ -1558,10 +1649,9 @@ mod tests {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. Single-threaded queue use in the test.
             unsafe {
-                crate::checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "submit")?;
                 crate::checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())

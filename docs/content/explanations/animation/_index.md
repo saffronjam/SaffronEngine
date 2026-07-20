@@ -6,35 +6,56 @@ bookCollapseSection = true
 
 # Animation
 
-Animation drives a scene over time from authored clips. A clip carries three kinds of channel on
-**one** track model: *bone* tracks deform a rigged mesh's skeleton, *node-TRS* tracks move a plain
-scene-graph entity's transform, and *morph-weight* tracks slide a mesh between stored blend shapes. All
-three are sampled by the same evaluator at the current time and written into a runtime layer rather than
-over the authored rest state.
+Animation evaluates authored clips without changing the scene's saved transforms. The same track
+model drives skeleton joints, ordinary scene nodes, and morph-target weights, while the runtime
+keeps playback state on the entity that owns the rig or animated node forest.
 
-Skeletal animation is the oldest of the three. The engine already skins — the glTF skin import builds
-one entity per joint, tags each with a `Bone` component, and a vertex palette deforms the mesh every
-frame — so a bone track supplies a new *source* for each joint's local transform: a clip, sampled at the
-current time, written into a runtime pose rather than over the authored rest transforms. Node-TRS reuses
-that same pose-override seam for plain entities; morph targets deform on the GPU before skinning.
+An `AnimTrack` identifies a target, a translation/rotation/scale or weights path, an interpolation
+mode, and its keyframes. Bone tracks bind by imported joint index with a name fallback. Node and
+morph tracks bind by durable node name. The sampler supports Step, Linear, and CubicSpline curves;
+linear quaternion tracks use spherical interpolation.
 
-The pose flows **sample → pose buffer → an (inert) per-bone blend layer → world-transform
-composition**. The authored bone transforms keep the rest pose and are never overwritten, so
-playback is non-destructive in both Edit and Play, and the blend layer is the seam every later
-pose producer — foot IK, and the powered ragdoll in `saffron-physics` — plugs into without
-touching the sampling path. The whole CPU pose core lives in the FFI-free `saffron-animation`
-crate.
+## Pose flow
 
-This section starts at the bottom: the pure data and math the rest of the system is built on.
+`tick_animation` samples the active `AnimationPlayer` into a `PoseBuffer`. Clip transitions and
+foot IK modify that buffer before the runtime writes a `PoseOverride` on each driven entity. Scene
+hierarchy composition reads the override in preference to the authored `Transform`, then builds the
+joint matrices consumed by compute skinning.
+
+```mermaid
+flowchart LR
+    Clip[AnimClip tracks] --> Sample[tick_animation]
+    Player[AnimationPlayer] --> Sample
+    Sample --> Pose[PoseBuffer]
+    Pose --> Blend[Transitions and foot IK]
+    Blend --> Override[PoseOverride]
+    Override --> World[World transforms]
+    World --> Skin[Joint palette and compute skinning]
+```
+
+Edit mode previews one selected animation target. Play mode advances every player and supplies the
+resulting poses to the physics world. A ragdoll can replace or blend individual bone poses, and an
+active ragdoll uses the animation pose as its motor target. Morph animation follows a parallel path:
+the evaluator writes `MorphWeightOverride`, which the GPU morph pass consumes before skinning.
 
 ## Pages
 
 | Page | Covers | Code |
 |---|---|---|
-| `animation-data-model` | the clip/track keyframe model, the decomposed joint pose + blend layer, and clip sampling (Step/Linear/CubicSpline with slerp) | `geometry/src/types.rs`; `animation/src/pose.rs`; `animation/src/sample.rs` |
-| `playback-runtime` | the per-frame evaluator: sample → pose → blend → pose override → world composition; non-destructive Edit preview vs Play; wrap modes | `animation/src/runtime.rs`; `scene/src/component.rs`; `host/src/layer.rs` |
-| `skeleton-overlay` | the line-skeleton viewport overlay for the selected rig — bone segments, joint dots, optional RGB axes; on-top, Edit + Play; the `set-skeleton-overlay` toggle | `host/src/overlay.rs`; `sceneedit/src/overlay.rs`; `control/src/commands_animation.rs` |
-| `timeline` | the editor Timeline panel — the clip bar with real per-channel keyframe ticks, ms ruler, a scrubbable playhead, Edit-preview transport; reads playback via the `animationVersion` poll gate | `TimelinePanel.tsx`; `timelineCanvas.ts`; `store.ts` |
-| `node-trs-animation` | non-skeletal node animation — the generalized `AnimTarget`, the live entity forest, name→entity binding, and reuse of the one playback surface | `geometry/src/types.rs`; `assets/src/spawn.rs`; `animation/src/runtime.rs` |
-| `morph-targets` | blend shapes — sparse `MorphDelta` storage, the fixed-point atomic-scatter GPU deform before skin, motion/RT, and the weight commands + sliders | `geometry/src/types.rs`; `assets/shaders/morph.slang`; `rendering/src/skinning.rs` |
-| `foot-ik-and-physics-ahead` | the blend-layer pose-producer model, two-bone analytic IK, the v1 ground-plane foot planting, and the reserved per-bone `BonePhysics` metadata as the ragdoll on-ramp | `animation/src/ik.rs`; `animation/src/runtime.rs`; `scene/src/component.rs` |
+| [`animation-data-model`](animation-data-model/) | Clip, track, pose, and interpolation types | `AnimClip`, `AnimTrack`, `PoseBuffer`, `sample_track` |
+| [`playback-runtime`](playback-runtime/) | Player advance, transitions, overrides, and wrap modes | `AnimationRuntime`, `tick_animation`, `AnimationPlayer` |
+| [`skeleton-overlay`](skeleton-overlay/) | Selected-rig bones, joints, axes, and controls | `build_skeleton_overlay`, `set-skeleton-overlay` |
+| [`timeline`](timeline/) | Clip selection, transport, ruler, keys, and scrubbing | `TimelinePanel`, `TimelineSurface`, `TimelineCanvas` |
+| [`foot-ik-and-physics-ahead`](foot-ik-and-physics-ahead/) | Two-bone foot IK and ragdoll pose composition | `solve_two_bone_ik`, `FootIk`, `write_ragdoll_poses` |
+| [`morph-targets`](morph-targets/) | Sparse blend shapes and GPU deformation | `MorphDelta`, `MorphWeightOverride`, `morph.slang` |
+| [`node-trs-animation`](node-trs-animation/) | Animation of ordinary scene-graph nodes | `AnimTarget`, `tick_node_rig`, `resolve_node_targets` |
+
+## In the code
+
+| What | File | Symbols |
+|---|---|---|
+| Clip and track data | `geometry/src/types.rs` | `AnimClip`, `AnimTrack`, `AnimTarget`, `AnimPath` |
+| CPU evaluator | `animation/src/runtime.rs` | `AnimationRuntime`, `tick_animation` |
+| Pose math | `animation/src/pose.rs` | `JointPose`, `PoseBuffer`, `PoseDelta` |
+| Scene playback state | `scene/src/component.rs` | `AnimationPlayer`, `PoseOverride`, `MorphWeightOverride` |
+| Physics pose producer | `physics/src/world.rs` | `drive_ragdolls_to_pose`, `write_ragdoll_poses` |

@@ -145,7 +145,6 @@ export function getCurrentWindow() {
     minimize: (): Promise<void> => invoke<void>("window_minimize"),
     toggleMaximize: (): Promise<void> => invoke<void>("window_toggle_maximize"),
     close: (): Promise<void> => invoke<void>("window_close"),
-    startDragging: (): Promise<void> => invoke<void>("window_start_drag"),
     startResizeDragging: (direction: ResizeDirection): Promise<void> =>
       invoke<void>("window_start_resize", { direction }),
     /// Grab + hide the cursor for the RMB fly-cam (`true`), or release it (`false`). CEF's windowless

@@ -20,7 +20,7 @@
 //! `instances[SV_VulkanInstanceID]`, and Vulkan's instance id includes `firstInstance`,
 //! so this is exactly the row each draw fetches.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ash::vk;
 use saffron_core::{BlendMode, HeightMode};
@@ -676,6 +676,7 @@ impl Instancing {
             &batches,
             &transparent_batches,
             pipelines.pipelines_created() - pipelines_before,
+            instances.len(),
         );
 
         list.batches = batches;
@@ -1177,13 +1178,23 @@ fn compute_stats(
     batches: &[DrawBatch],
     transparent: &[DrawBatch],
     pipelines_created: u32,
+    instance_rows: usize,
 ) -> RenderStats {
     let mut stats = RenderStats {
         batches: (batches.len() + transparent.len()) as u32,
         pipelines_created,
+        instance_upload_bytes: u64::try_from(instance_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(size_of::<InstanceData>() as u64),
         ..RenderStats::default()
     };
+    let mut retained_meshes = HashSet::new();
     for batch in batches.iter().chain(transparent) {
+        if retained_meshes.insert(Arc::as_ptr(&batch.mesh)) {
+            stats.retained_mesh_cpu_bytes = stats
+                .retained_mesh_cpu_bytes
+                .saturating_add(batch.mesh.retained_query_cpu_bytes());
+        }
         // A batch draws only its submesh subset (one mesh's submeshes split across batches by
         // blend mode), so the draw-call + triangle tallies key off that subset, not the whole mesh.
         if batch.mesh.submeshes.is_empty() {
@@ -1213,7 +1224,7 @@ mod tests {
     use crate::gpu_types::Material;
     use crate::resources::BindlessFreeList;
     use crate::skinning::Skinning;
-    use crate::upload::{GpuQueue, Uploader};
+    use crate::upload::Uploader;
     use crate::validation_issue_count;
     use saffron_geometry::glam::{Mat4, Vec2, Vec3, Vec4};
     use saffron_geometry::{Mesh, Submesh, Vertex, VertexSkin};
@@ -1242,7 +1253,7 @@ mod tests {
         let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let instancing = Instancing::new(&device, &descriptors).expect("Instancing::new");
         let skinning = Skinning::new(&device).expect("Skinning::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         Some((
             device,
@@ -1427,6 +1438,18 @@ mod tests {
         assert_eq!(list.batches.len(), 2, "two (pipeline, mesh) buckets");
         assert_eq!(stats.batches, 2);
         assert_eq!(stats.instances, 3, "three logical instances total");
+        assert_eq!(
+            stats.instance_upload_bytes,
+            3 * size_of::<InstanceData>() as u64,
+            "the counter reports the exact uploaded row bytes"
+        );
+        assert_eq!(
+            stats.retained_mesh_cpu_bytes,
+            mesh_a
+                .retained_query_cpu_bytes()
+                .saturating_add(mesh_b.retained_query_cpu_bytes()),
+            "shared mesh instances contribute retained query memory once"
+        );
         // One drawIndexed per submesh per batch (instanced), not per instance: two
         // single-submesh batches → two draw calls.
         assert_eq!(

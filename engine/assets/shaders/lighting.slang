@@ -1,7 +1,9 @@
 module lighting;
 
+import lighting_common;
 import sdf;
 import giprobe;
+import sky_sh;
 
 // Instanced mesh shader. Vertex inputs come from an interleaved buffer
 // (position/normal/uv0); per-instance model + normal matrix + base color come from
@@ -12,8 +14,6 @@ import giprobe;
 // directional UBO (0), punctual light list (1), per-cluster light lists (2), cluster
 // params UBO (3). Punctual lights are clustered-forward: the fragment loops only its
 // froxel cluster's lights (params.screenSize.z != 0), or every light otherwise.
-
-static const uint MAX_LIGHTS_PER_CLUSTER = 64;
 
 public struct VertexInput
 {
@@ -59,55 +59,12 @@ struct Camera
 // (linked above); the specular reflection-occlusion cone trace below indexes it through that
 // module's `sdfReflectionOcclusion`.
 
-public struct LightGlobals
-{
-    float4 directionAmbient;     // xyz = travel direction, w = ambient
-    float4 colorIntensity;       // rgb = color, a = intensity
-    uint4 counts;                // x = punctual count, y = directional shadow, z = IBL, w = SSAO
-    float4 eyePosition;          // xyz = world-space camera position (for the view vector)
-    float4x4 shadowViewProj;     // world -> directional light clip space
-    float4x4 spotShadowViewProj; // world -> shadowed spot light clip space (perspective)
-    uint4 spotShadow;            // x = shadowed spot's light index, y = enabled (0/1)
-    float4 pointShadow;          // xyz = shadowed point light world pos, w = far plane
-    uint4 pointShadowMeta;       // x = shadowed point's light index, y = enabled (0/1)
-    uint4 screenFlags;           // x = contact shadows, y = SSGI, z = DDGI (AO is counts.w)
-    float4 ddgiVolumeMin;        // xyz = DDGI probe volume world min
-    float4 ddgiVolumeExtent;     // xyz = DDGI probe volume world size
-    uint4 ddgiProbeCount;        // xyz = probes per axis, w = irradiance tile interior
-    uint4 ddgiScrollBase;        // xyz = toroidal scroll base (wrapMod(snapBase, count)), w reserved
-    uint4 sdfOcclusion;          // x reserved, y = GDF reflection-occlusion enabled (0/1), zw reserved
-    float4 ambientColor;         // rgb = scene-environment ambient (non-IBL fallback)
-    uint4 extraFlags;            // x = SSR, y = RT reflections, z = sun volumetric-scatter mult (float
-                                 // bits), w = sun cast-volumetric-shadow gate (0/1)
-    float4x4 prevViewProj;       // previous frame world->clip, reprojecting an RT hit into prev_color
-    float4 froxelFog;            // x = volumetric-fog enabled, y = froxel near, z = froxel far, w reserved
-};
 [[vk::binding(0, 1)]] ConstantBuffer<LightGlobals> globals;
 
-public struct GpuLight
-{
-    float4 positionRange;   // xyz = world position, w = range
-    float4 colorIntensity;  // rgb = color, a = intensity
-    float4 directionType;   // xyz = world direction (spot), w = type (0 point, 1 spot)
-    float4 spotCos;         // x = cos(inner half-angle), y = cos(outer half-angle)
-};
 [[vk::binding(1, 1)]] StructuredBuffer<GpuLight> lights;
 
-public struct Cluster
-{
-    public uint count;
-    public uint indices[MAX_LIGHTS_PER_CLUSTER];
-};
 [[vk::binding(2, 1)]] StructuredBuffer<Cluster> clusters;
 
-public struct ClusterParams
-{
-    float4x4 view;
-    float4x4 inverseProjection;
-    uint4 gridSize;       // xyz = grid dims, w = light count
-    uint4 screenSize;     // xy = pixels, z = clustered flag
-    float4 zPlanes;       // x = near, y = far
-};
 [[vk::binding(3, 1)]] ConstantBuffer<ClusterParams> clusterParams;
 
 // Directional + spot shadow maps: depth textures sampled with a comparison (PCF) sampler.
@@ -126,53 +83,12 @@ public struct ClusterParams
 // receive the same volumetric fog the composite applies to opaque geometry. Bindings 8/9/10 are the
 // SDF-occluder list + GDF clipmap (declared by the `sdf` module).
 [[vk::binding(11, 1)]] Sampler3D<float4> froxelIntegration;
+[[vk::binding(12, 1)]] Sampler2DArray<float> cloudShadowMap;
 
 // The shared `sdf` module (linked above) also declares the per-mesh SDF-occluder instance list
 // (set 1, binding 8) + the Global-SDF cascade clipmap (bindings 9/10). The fragment reaches only
 // the GDF tap (the reflection-occlusion cone, `gdfDistance`); the instance list is used solely by
 // the DDGI ray trace's near-field sphere-march, so it is dead-stripped from this fragment.
-
-// Visibility for the shadowed point light: compare the fragment's distance to the light against the
-// nearest occluder distance across both cubes (sampled by light->frag dir). Resource-parameterized
-// (giprobe shape): the two cubes + the light world position are passed in, so the mesh forward path
-// and the fog inject pass share one copy against their own descriptor sets.
-public float pointShadow(SamplerCube staticCube, SamplerCube dynCube, float3 lightPos, float3 worldPos)
-{
-    float3 toFrag = worldPos - lightPos;
-    float dist = length(toFrag);
-    float3 dir = normalize(toFrag);
-    float stored = min(
-        staticCube.SampleLevel(dir, 0.0).r,
-        dynCube.SampleLevel(dir, 0.0).r);
-    const float bias = 0.08;  // matches PointShadowDistanceBias (renderer_detail.cppm)
-    return dist - bias <= stored ? 1.0 : 0.0;
-}
-
-// 3x3 PCF visibility for a light-space projection (1 = lit, 0 = shadowed). Off-map and
-// beyond-far-plane samples are treated as lit. `map` selects which shadow texture.
-public float pcfShadow(Sampler2DShadow map, float4x4 viewProj, float3 worldPos)
-{
-    float4 clip = mul(viewProj, float4(worldPos, 1.0));
-    float3 ndc = clip.xyz / clip.w;
-    float2 uv = ndc.xy * 0.5 + 0.5;
-    if (clip.w <= 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0)
-    {
-        return 1.0;
-    }
-    const float texel = 1.0 / 2048.0;  // matches ShadowMapSize
-    float sum = 0.0;
-    for (int x = -1; x <= 1; x = x + 1)
-    {
-        for (int y = -1; y <= 1; y = y + 1)
-        {
-            // SampleCmpLevelZero (explicit LOD 0) rather than SampleCmp so this shared helper runs in
-            // the fog inject compute pass without the compute-derivative capability; the shadow maps
-            // are single-mip, so LOD 0 is what SampleCmp would select anyway (mesh path unchanged).
-            sum += map.SampleCmpLevelZero(uv + float2(x, y) * texel, ndc.z);
-        }
-    }
-    return sum / 9.0;
-}
 
 public struct Instance
 {
@@ -203,9 +119,9 @@ public struct MaterialParams
 };
 [[vk::binding(2, 2)]] public StructuredBuffer<MaterialParams> materialParams;
 
-// Set 3: image-based lighting — diffuse irradiance cube, prefiltered specular cube, and
+// Set 3: image-based lighting — raw-radiance sky SH, prefiltered specular cube, and
 // the split-sum BRDF LUT. Sampled for the ambient term when globals.counts.z != 0.
-[[vk::binding(0, 3)]] SamplerCube irradianceMap;
+[[vk::binding(0, 3)]] StructuredBuffer<float4> skyShCoefficients;
 [[vk::binding(1, 3)]] SamplerCube prefilteredMap;
 [[vk::binding(2, 3)]] Sampler2D brdfLut;
 static const float IblPrefilterMaxMip = 4.0;  // == IblPrefilterMips - 1 (renderer_detail.cppm)
@@ -222,28 +138,29 @@ float prefilterLod(float roughness)
 // indirect/ambient term (counts.w); contact shadows (factor, 1 = lit) darken the
 // directional direct term (screenFlags.x); SSGI (rgba16f radiance) adds one-bounce indirect
 // (screenFlags.y).
-[[vk::binding(0, 4)]] Sampler2D aoMap;
-[[vk::binding(1, 4)]] Sampler2D contactMap;
-[[vk::binding(2, 4)]] Sampler2D ssgiMap;
+[[vk::binding(0, 4)]] Texture2D<float4> aoMap;
+[[vk::binding(1, 4)]] Texture2D<float4> contactMap;
+[[vk::binding(2, 4)]] Texture2D<float4> ssgiMap;
 // Screen-space reflection map (rgb = reflected radiance, a = hit confidence), blended over
 // the prefiltered-env specular when extraFlags.x != 0.
-[[vk::binding(3, 4)]] Sampler2D ssrMap;
+[[vk::binding(3, 4)]] Texture2D<float4> ssrMap;
 // Previous frame's lit color, sampled by reprojecting an RT reflection hit (extraFlags.y).
-[[vk::binding(4, 4)]] Sampler2D prevColorMesh;
+[[vk::binding(4, 4)]] Texture2D<float4> prevColorMesh;
 // Reduced-resolution, temporally-accumulated DFAO sky-visibility (r = [0,1] factor, 1 = open),
 // produced by the dfao → dfao-blur → dfao-accum prepass. Sampled to occlude the analytic sky
 // irradiance when sdfOcclusion.y != 0 (the diffuse half of the DFAO term; the per-fragment
 // 9-cone GDF march it replaces).
-[[vk::binding(5, 4)]] Sampler2D dfaoMap;
+[[vk::binding(5, 4)]] Texture2D<float4> dfaoMap;
 // Reduced-resolution, temporally-accumulated specular reflection-occlusion (r = [0,1] factor,
 // 1 = open), produced by the specocc → specocc-blur → specocc-accum prepass. Sampled to occlude
 // the reflected skybox when sdfOcclusion.y != 0 (the specular half of the SDF occlusion term; the
 // per-fragment reflection cone-march it replaces).
-[[vk::binding(6, 4)]] Sampler2D speoccMap;
+[[vk::binding(6, 4)]] Texture2D<float4> speoccMap;
 // The half-res screen-space indirect-diffuse resolve (DDGI cage + IBL diffuse × sky-visibility),
 // computed once per half-res pixel by the gi-resolve pass; sampled here (bilinear upsample) instead
 // of resolving the DDGI cage + IBL diffuse per full-res fragment.
-[[vk::binding(7, 4)]] Sampler2D giIndirectMap;
+[[vk::binding(7, 4)]] Texture2D<float4> giIndirectMap;
+[[vk::binding(8, 4)]] SamplerState screenLinearSampler;
 
 // Set 5: DDGI probe atlases (octahedral irradiance + distance moments), passed to the shared
 // `giprobe::ddgiSampleIrradiance` (which declares no bindings of its own) for multi-bounce indirect
@@ -253,7 +170,15 @@ float prefilterLod(float roughness)
 
 // Set 7: ReSTIR resolved direct-light radiance (screen UV). Replaces the punctual light
 // loop when screenFlags.w != 0 (multiplied by albedo/PI for the diffuse direct term).
+//
+// ReSTIR rides the ray-tracing path, so this binding — and every ray-query binding below — is
+// compiled only into the RT variant (`SAFFRON_NO_RT` undefined). A device without ray tracing
+// (its PSO layout omits sets 6/7) loads the RT-off variant, where these declarations are absent
+// so the shader's declared interface matches the layout — MoltenVK requires that match, and the
+// RT branches are runtime-dead there anyway.
+#ifndef SAFFRON_NO_RT
 [[vk::binding(0, 7)]] Sampler2D restirRadiance;
+#endif
 
 // Spatial reflection probes share the IBL set (set 3, bindings 3-5) so the mesh layout stays
 // within the maxBoundDescriptorSets budget. probeCubes[i] is probe i's prefiltered specular
@@ -287,8 +212,10 @@ float3 boxProject(float3 worldPos, float3 R, float3 origin, float3 extent)
 }
 
 // Set 6: the ray-tracing TLAS for inline ray-query shadows (pointShadowMeta.z gates it).
-// Present only when the device supports RT (the PSO layout omits set 6 otherwise), but the
-// binding compiles unconditionally — it is only accessed under the runtime flag.
+// Present only when the device supports RT — the PSO layout omits set 6 otherwise (its
+// acceleration-structure descriptor needs the RT extension), so the RT-off variant excludes
+// this declaration and the ray-query helpers below.
+#ifndef SAFFRON_NO_RT
 [[vk::binding(0, 6)]] RaytracingAccelerationStructure rtScene;
 
 // Trace one TerminateOnFirstHit shadow ray from worldPos toward `toLight` (a unit dir);
@@ -321,6 +248,7 @@ float rayQueryReflection(float3 worldPos, float3 dir, float maxDist)
     while (q.Proceed()) {}  // opaque triangle candidates auto-commit; loop finds the closest
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
 }
+#endif
 
 /// Builds the shared [`giprobe::DdgiVolume`] from this frame's light globals (the mesh's view of the
 /// camera-centered probe clipmap) for `giprobe::ddgiSampleIrradiance`.
@@ -382,28 +310,10 @@ public VertexOutput transformVertexSkinned(SkinnedVertexInput input, uint instan
     return output;
 }
 
-// UE4-style punctual attenuation: inverse-square with a smooth range window.
-public float distanceAttenuation(float dist, float range)
-{
-    float invSquare = 1.0 / max(dist * dist, 0.0001);
-    float t = saturate(1.0 - pow(dist / range, 4.0));
-    return invSquare * t * t;
-}
-
 // Cook-Torrance metallic/roughness BRDF (energy-conserving). `radiance` is the
 // incoming light's color * intensity * attenuation * cone; the cosine + diffuse/PI
 // are applied here. Shared by the directional and the punctual lights.
 static const float PI = 3.14159265;
-
-// Henyey-Greenstein phase (lifted verbatim from atmos_skyview.slang) — the fog inject path's
-// substitute for the surface BRDF: participating media scatters incoming light by this angular lobe
-// (`g` in [-1, 1], forward-scattering for g > 0), it does not shade an opaque surface.
-public float hgPhase(float cosTheta, float g)
-{
-    float g2 = g * g;
-    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
-    return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
-}
 
 float3 fresnelSchlick(float cosT, float3 F0)
 {
@@ -465,10 +375,12 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
     float shadow = 1.0;
     // Ray-traced punctual shadow (one ray toward the light) when RT shadows are on — applies
     // to every punctual light, vs the map paths that shadow only one spot + one point light.
+#ifndef SAFFRON_NO_RT
     if (globals.pointShadowMeta.z != 0)
     {
         shadow = rayQueryShadow(rtScene, worldPos, l, dist);
     }
+#endif
     if (lt.directionType.w > 0.5)
     {
         float3 spotDir = normalize(lt.directionType.xyz);
@@ -485,87 +397,6 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
     }
     float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a * attenuation * cone * shadow;
     return brdf(n, v, l, albedo, metallic, roughness, radiance);
-}
-
-// Froxel cluster index for a fragment, from its pixel position + view-space depth. Resource-
-// parameterized (giprobe shape): the cluster params are passed in so the mesh forward path and the
-// fog inject pass reconstruct the containing cull cluster with one copy of the exponential-Z math.
-public uint clusterIndexFor(ClusterParams p, float2 pixel, float viewZ)
-{
-    float near = p.zPlanes.x;
-    float far = p.zPlanes.y;
-    float depth = max(-viewZ, near);
-    uint zSlice = uint(log(depth / near) / log(far / near) * float(p.gridSize.z));
-    zSlice = min(zSlice, p.gridSize.z - 1);
-
-    float2 tileSize = float2(p.screenSize.xy) / float2(p.gridSize.xy);
-    uint tileX = min(uint(pixel.x / tileSize.x), p.gridSize.x - 1);
-    uint tileY = min(uint(pixel.y / tileSize.y), p.gridSize.y - 1);
-    return tileX + tileY * p.gridSize.x + zSlice * p.gridSize.x * p.gridSize.y;
-}
-
-// Per-froxel in-scatter from one punctual (point/spot) light — the fog inject path's analog of
-// `punctual`, substituting the HG phase for the Cook-Torrance BRDF (fog scatters, it does not shade
-// a surface). Returns the incoming radiance already weighted by attenuation, spot cone, shadow, and
-// the phase lobe; the caller multiplies by the scattering coefficient. The map-based shadow selection
-// mirrors `punctual` (the sun defaults to cascade PCF; the inline TLAS ray-query is Phase 4's per-light
-// opt-in, so it is deliberately absent here to keep the default fog boot off the RT path).
-public float3 fogPunctualInScatter(
-    GpuLight lt, uint lightIndex, float3 worldPos, float3 viewDir, float phaseG,
-    LightGlobals lg, Sampler2DShadow spotMap, SamplerCube ptStatic, SamplerCube ptDyn)
-{
-    float3 toLight = lt.positionRange.xyz - worldPos;
-    float dist = length(toLight);
-    if (dist > lt.positionRange.w)
-    {
-        return float3(0.0);
-    }
-    float3 l = toLight / max(dist, 0.0001);
-    float atten = distanceAttenuation(dist, lt.positionRange.w);
-    float cone = 1.0;
-    float shadow = 1.0;
-    // Per-light volumetric controls packed into the free spotCos lanes: z = in-scatter multiplier,
-    // w = cast-volumetric-shadow gate (< 0.5 -> the light throws no shaft, sampled unshadowed in fog).
-    float volMult = lt.spotCos.z;
-    bool castShadow = lt.spotCos.w >= 0.5;
-    if (lt.directionType.w > 0.5)
-    {
-        float3 spotDir = normalize(lt.directionType.xyz);
-        cone = smoothstep(lt.spotCos.y, lt.spotCos.x, dot(spotDir, -l));
-        if (castShadow && lg.spotShadow.y != 0 && lightIndex == lg.spotShadow.x)
-        {
-            shadow = pcfShadow(spotMap, lg.spotShadowViewProj, worldPos);
-        }
-    }
-    else if (castShadow && lg.pointShadowMeta.y != 0 && lightIndex == lg.pointShadowMeta.x)
-    {
-        shadow = pointShadow(ptStatic, ptDyn, lg.pointShadow.xyz, worldPos);
-    }
-    float phase = hgPhase(dot(viewDir, l), phaseG);
-    return lt.colorIntensity.rgb * lt.colorIntensity.a * atten * cone * shadow * phase * volMult;
-}
-
-// Per-froxel in-scatter from the directional sun: cascade PCF is the volumetric shadow (crisp RT
-// shafts are Phase 4's per-light opt-in). Returns radiance × shadow × phase; the caller multiplies by
-// the scattering coefficient.
-public float3 fogDirectionalInScatter(
-    float3 worldPos, float3 viewDir, float phaseG, LightGlobals lg, Sampler2DShadow sunMap)
-{
-    // Per-sun volumetric controls fold into the reserved extraFlags lanes: z = in-scatter multiplier
-    // (float bits), w = cast-volumetric-shadow gate (0 -> the sun casts no volumetric shadow).
-    float volMult = asfloat(lg.extraFlags.z);
-    bool castShadow = lg.extraFlags.w != 0;
-    float3 lDir = -normalize(lg.directionAmbient.xyz);  // toward the sun
-    float shadow = (castShadow && lg.counts.y != 0) ? pcfShadow(sunMap, lg.shadowViewProj, worldPos) : 1.0;
-    float phase = hgPhase(dot(viewDir, lDir), phaseG);
-    return lg.colorIntensity.rgb * lg.colorIntensity.a * shadow * phase * volMult;
-}
-
-// The isotropic ambient in-scatter (scene environment ambient), phase-neutral (1/4π). The caller
-// multiplies by the scattering coefficient; a cheap stand-in for full IBL/atmosphere ambient this phase.
-public float3 fogAmbientInScatter(LightGlobals lg)
-{
-    return lg.ambientColor.rgb * max(lg.directionAmbient.w, 0.0) / (4.0 * PI);
 }
 
 // The material seam: evalSurface turns interpolated vertex data + bound textures into the
@@ -726,6 +557,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     // attenuated by the shadow map + screen-space contact shadows (directional only).
     float3 lDir = -normalize(globals.directionAmbient.xyz);
     float shadow = 1.0;
+#ifndef SAFFRON_NO_RT
     if (globals.pointShadowMeta.z != 0)
     {
         // Ray-traced directional shadow (a long ray toward the sun) — A/B vs the map.
@@ -735,16 +567,28 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     {
         shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
     }
+#else
+    if (globals.counts.y != 0)
+    {
+        shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
+    }
+#endif
     if (globals.screenFlags.x != 0 && !translucent)
     {
-        shadow *= contactMap.SampleLevel(screenUv, 0.0).r;  // fine contact detail (opaque only)
+        shadow *= contactMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;  // fine contact detail (opaque only)
     }
+    shadow *= cloudShadowVisibility(
+        input.worldPos, cloudShadowMap, globals, globals.cloudShadowMeta.z);
     float3 lo = brdf(n, v, lDir, albedo, metallic, roughness,
                      globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
+    float3 moonDir = -normalize(globals.moonDirectionIntensity.xyz);
+    lo += brdf(n, v, moonDir, albedo, metallic, roughness,
+               globals.moonColor.rgb * globals.moonDirectionIntensity.w);
 
     // Punctual lights. ReSTIR (screenFlags.w) replaces the per-light loop with one resolved
     // stochastic many-light direct radiance sample (diffuse term); otherwise loop the
     // froxel cluster's lights (clustered) or every light (reference).
+#ifndef SAFFRON_NO_RT
     if (globals.screenFlags.w != 0 && !translucent)
     {
         // ReSTIR's resolved direct radiance is a screen-space buffer keyed to the opaque G-buffer, so
@@ -753,6 +597,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         lo += restir * albedo / PI;  // resolved radiance already includes geometry * vis * W
     }
     else if (clusterParams.screenSize.z != 0)
+#else
+    if (clusterParams.screenSize.z != 0)
+#endif
     {
         float viewZ = mul(clusterParams.view, float4(input.worldPos, 1.0)).z;
         uint clusterIndex = clusterIndexFor(clusterParams, input.position.xy, viewZ);
@@ -783,7 +630,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // Analytic IBL sky irradiance along the shading normal. It is the residual indirect
         // diffuse where the DDGI cage does not cover the surface; the DDGI replace below overrides
         // it wherever coverage exists (DDGI carries the sky occlusion intrinsically, via ray-miss).
-        float3 irradiance = irradianceMap.SampleLevel(n, 0.0).rgb;
+        float3 irradiance = skyShIrradiance(n, skyShCoefficients);
         float3 R = reflect(-v, n);
         float3 prefiltered = prefilteredMap.SampleLevel(R, prefilterLod(roughness)).rgb;
 
@@ -823,7 +670,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // level so the BRDF + multi-scatter + horizon + specular-AO below treat it uniformly.
         if (globals.extraFlags.x != 0 && !translucent)
         {
-            float4 ssr = ssrMap.SampleLevel(screenUv, 0.0);
+            float4 ssr = ssrMap.SampleLevel(screenLinearSampler, screenUv, 0.0);
             float gate = saturate(1.0 - roughness * 2.0);
             prefiltered = lerp(prefiltered, ssr.rgb, ssr.a * gate);
         }
@@ -831,7 +678,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // Ray-traced reflections: trace the reflection ray against the TLAS (finds geometry
         // off-screen, where SSR fails) and reproject the world-space hit through last frame's
         // view-proj into prev_color for its reflected radiance. Gated to smooth surfaces; an
-        // off-screen reprojection or a missed ray falls back to the (SSR-or-env) radiance.
+        // off-screen reprojection or a missed ray falls back to the (SSR-or-env) radiance. RT
+        // only — the RT-off variant keeps the SSR/env reflection it already computed.
+#ifndef SAFFRON_NO_RT
         if (globals.extraFlags.y != 0 && !translucent)
         {
             float gate = saturate(1.0 - roughness * 2.0);
@@ -847,13 +696,14 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
                         float2 huv = (hclip.xy / hclip.w) * 0.5 + 0.5;
                         if (all(huv >= float2(0.0)) && all(huv <= float2(1.0)))
                         {
-                            float3 rtRefl = prevColorMesh.SampleLevel(huv, 0.0).rgb;
+                            float3 rtRefl = prevColorMesh.SampleLevel(screenLinearSampler, huv, 0.0).rgb;
                             prefiltered = lerp(prefiltered, rtRefl, gate);
                         }
                     }
                 }
             }
         }
+#endif
 
         // Specular sky occlusion: a cone along the reflection vector R (widened by roughness)
         // sphere-marched against the Global Distance Field — the reflected skybox is occluded only
@@ -861,7 +711,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         // wrongly dim a chrome surface facing open sky). The march runs in the reduced-resolution
         // specocc prepass (denoised + temporally accumulated); the mesh samples the resolved map.
         // Off (1.0) unless enabled this frame.
-        float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent) ? speoccMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float specSkyVis = (globals.sdfOcclusion.y != 0 && !translucent) ? speoccMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
 
         float2 ab = brdfLut.SampleLevel(float2(ndotv, roughness), 0.0).rg;
         float3 specularIBL = prefiltered * (F0 * ab.x + ab.y);
@@ -888,7 +738,7 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         float ao = surf.occlusion;  // material occlusion (1.0 = none)
         if (globals.counts.w != 0 && !translucent)
         {
-            ao *= aoMap.SampleLevel(screenUv, 0.0).r;  // screen-space GTAO (contact scale, opaque only)
+            ao *= aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r;  // screen-space GTAO (contact scale, opaque only)
         }
         float specAO = saturate(pow(ndotv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
         specularIBL *= specAO * specSkyVis;  // reflection-cone occludes the reflected skybox
@@ -917,30 +767,30 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         }
         else
         {
-            indirectIrr = giIndirectMap.SampleLevel(screenUv, 0.0).rgb;
+            indirectIrr = giIndirectMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
         }
         float3 indirect = kd * indirectIrr * albedo;
         // Indirect diffuse occlusion: the large-range term is the DDGI ray-miss already folded into
         // indirectIrr (the sky enters only on a ray that escapes), so the only further occlusion is
         // contact-scale — the material texture × small-radius GTAO (`ao`) — filling in the contact
         // detail the coarse probe grid cannot resolve, with no large-range double-count.
-        ambient = indirect * ao + specularIBL;
+        ambient = (indirect * ao + specularIBL) * globals.iblTint.rgb;
         // SSGI adds one-bounce screen-space indirect on top (it is a bounce, not the sky term),
         // modulated by AO so occluded creases don't over-bounce. Screen-space, so opaque only.
         if (globals.screenFlags.y != 0 && !translucent)
         {
-            float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+            float3 gi = ssgiMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
         }
     }
     else
     {
-        float ao = (globals.counts.w != 0 && !translucent) ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float ao = (globals.counts.w != 0 && !translucent) ? aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
         ambient = albedo * (1.0 - metallic) * globals.ambientColor.rgb * surf.occlusion * ao;
         // SSGI bounce on the non-IBL fallback path (additive, AO-modulated). Screen-space, opaque only.
         if (globals.screenFlags.y != 0 && !translucent)
         {
-            float3 gi = ssgiMap.SampleLevel(screenUv, 0.0).rgb;
+            float3 gi = ssgiMap.SampleLevel(screenLinearSampler, screenUv, 0.0).rgb;
             ambient += gi * albedo * (1.0 - metallic) * ao;
         }
         // DDGI on the fallback path: no analytic IBL diffuse to replace, so add the cage
@@ -1019,7 +869,7 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
     if (channel == 11u)
     {
         float2 screenUv = input.position.xy / float2(clusterParams.screenSize.xy);
-        float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenUv, 0.0).r : 1.0;
+        float ao = globals.counts.w != 0 ? aoMap.SampleLevel(screenLinearSampler, screenUv, 0.0).r : 1.0;
         return float4(ao.xxx, 1.0);
     }
 

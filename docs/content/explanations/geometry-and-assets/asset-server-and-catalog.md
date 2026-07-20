@@ -1,180 +1,213 @@
 +++
-title = 'Asset catalog'
+title = 'Asset server and catalog'
 weight = 6
 +++
 
-# Asset catalog
+# Asset server and catalog
 
-An asset catalog is a named registry that maps stable UUIDs to files on disk, decoupling
-the assets a project references from where those files live. Components reference an asset
-by `Uuid`; the catalog resolves that id to a name, a type, and a relative path.
-
-The catalog gives every asset an identity that survives renaming and moving its file. A
-scene stores a `Uuid` rather than a path, so editing the asset's location or display name
-never breaks the reference. Around the catalog sits the asset server, which turns a `Uuid`
-into a live GPU resource.
+An asset catalog is a named registry that maps stable ids to files on disk, so what a project
+references is decoupled from where the bytes live. A component stores a `Uuid`; the catalog
+resolves it to a name, a type, and a relative path, and renaming or moving the file never breaks
+the reference. Around the catalog sits the asset server, which turns an id into a live GPU
+resource.
 
 ## The server
 
-`AssetServer` is the project's single owner of assets: the catalog plus three UUID-keyed
-GPU caches, so entities sharing an asset upload it once.
+`AssetServer` owns the project's assets: the catalog plus id-keyed caches, so entities sharing an
+asset load and upload it once.
 
 ```rust
 pub struct AssetServer {
-    pub root: PathBuf,
-    pub catalog: AssetCatalog,            // id -> {name, type, path, ...}
-    pub mesh_by_uuid: AssetCache<GpuMesh>,        // GPU cache
-    pub texture_by_uuid: AssetCache<GpuTexture>,  // GPU cache
-    pub model_by_uuid: AssetCache<ModelAsset>,    // opened .smodel containers
-    // editor-camera gizmo visual + the optional thumbnail worker
+    pub root: PathBuf,                               // the project's assets/ dir
+    pub catalog: AssetCatalog,                       // id -> {name, type, path, ...}
+    pub mesh_by_uuid: AssetCache<GpuMesh>,           // uploaded meshes
+    pub mesh_bvh_by_uuid: AssetCache<MeshBvh>,       // lazily built ray-pick BVHs
+    pub texture_by_uuid: AssetCache<GpuTexture>,     // uploaded textures
+    pub model_by_uuid: AssetCache<ModelAsset>,       // opened .smodel containers
+    pub material_by_uuid: AssetCache<MaterialAsset>, // parent-resolved .smat state
+    // + the codegen-shader memo, the preview-render queue, the thumbnail cache root
 }
 ```
 
-The catalog is the source of truth; the three maps are caches over it. The catalog records
-that asset 42 is a model at `models/42.smodel`; a cache records that 42 is already uploaded
-and holds its `Arc`. `AssetServer::new` creates the asset root with its `models/`,
-`textures/`, and `materials/` subdirectories. The catalog is normally populated by
-[loading a project](../project-serialization/) or a scan.
+The catalog is the source of truth; every map is a cache over it. The catalog records that asset
+42 is a mesh at `models/42.smesh`; the mesh cache records that 42 is uploaded and holds its
+`Arc<GpuMesh>`. `AssetServer::new` seeds the root's model, texture, material, environment, and
+vegetation subdirectories. [Loading a project](../project-serialization/) populates the catalog
+from a disk scan.
+
+A project switch drops every cache through `clear_asset_caches`, and its caller idles the GPU
+first: an in-flight frame may still reference a cached `Arc<GpuTexture>`, so the last `Arc` must
+drop only under an idle device.
 
 ## The catalog
 
-The catalog is a named registry, not a filesystem view. Each entry pairs a human-facing name
-the user can rename with a separate on-disk path:
+Each entry pairs a human-facing, renameable name with a separate on-disk path:
 
 ```rust
-pub enum AssetType { Mesh, Texture, Other, Animation, Material, Model }
+pub enum AssetType {
+    Mesh, Texture, Other, Animation, Material, Model, Lut, Environment,
+    Plant, Biome, VegetationMap,
+}
 
 pub struct AssetEntry {
     pub id: Uuid,
-    pub name: String,        // UTF-8, renameable, user-facing
+    pub name: String,          // UTF-8, renameable, user-facing
     pub asset_type: AssetType,
-    pub path: String,        // relative to the asset root
-    pub container: Uuid,     // 0 = standalone; else the owning .smodel
-    pub chunk: i32,          // TOC chunk index inside the container (-1 = standalone)
+    pub path: String,          // relative to the asset root
+    pub container: Uuid,       // 0 = standalone; else the owning container's id
+    pub chunk: i32,            // TOC chunk index inside it (-1 = standalone)
     pub colorspace: Colorspace,
-    pub role: TextureRole,   // albedo/normal/roughness/…/hdri — how a texture previews
-    pub content_hash: u64,   // FNV of the baked content; the thumbnail cache key
+    pub role: TextureRole,     // albedo/normal/.../hdri: routes the preview
+    pub content_hash: u64,     // FNV-1a of the baked bytes; the thumbnail key
+    pub attribution: Option<Attribution>, // store source + license, if imported
     // + folder, hdr/linear flags, animation duration/tracks, rigged
 }
 
 pub struct AssetCatalog {
     pub entries: Vec<AssetEntry>,
+    pub folders: Vec<String>,
     pub by_id: HashMap<u64, usize>,  // id -> index into entries
 }
 ```
 
-`AssetCatalog::put` inserts or replaces by id and keeps `by_id` in sync; `find` resolves an
-id to an `Option<&AssetEntry>`; `rename` renames in place; `unique_name` appends ` (2)`,
-` (3)`, … so two imports of `cube.gltf` get distinct names. `AssetCatalog` lives in
-`saffron-scene`, not `saffron-assets`, so the inspector can read it without depending on the
-renderer; the asset layer hands the scene a shared read-only handle (`Option<Arc<AssetCatalog>>`).
+`AssetCatalog::put` inserts or replaces by id and keeps `by_id` in sync; `find` resolves an id to
+an `Option<&AssetEntry>`; `rename` renames in place; `unique_name` appends ` (2)`, ` (3)`, … so
+two imports of `cube.gltf` get distinct names. The type lives in `saffron-scene`, not
+`saffron-assets`, so the inspector reads it without depending on the renderer; the asset layer
+hands the scene a shared read-only handle (see
+[asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/)).
 
-`AssetEntry` carries container linkage — `container` (the owning [`.smodel`](../smodel-container/))
-and `chunk` — so one row can be the model and another a mesh/material/texture embedded inside
-it, resolved by `(container, sub-id)`. A standalone asset's editable `name`, `folder`, and (for a
-texture) `colorspace` and `role` are the fields its filename can't carry, so they live in a co-located
-`.smeta` sidecar (see below); an embedded sub-asset recovers them from the container META. A texture's
-`role` — albedo, normal, roughness, height, hdri, … — is inferred from its filename token at import and
-drives how it previews (its map on a lit sphere, or an HDRI as a lit environment); the [asset
-editor](../../ui-and-editor/asset-editor/) reads it to route the preview.
+`container` and `chunk` link a sub-asset to its owning [`.smodel`](../smodel-container/): one row
+is the model, and sibling rows are the meshes, materials, and textures embedded inside it. A
+texture's `role` is inferred from filename tokens at import, or supplied by a store connector, and
+routes its preview — a map renders on a lit sphere in its slot, an HDRI as an environment (see the
+[asset editor](../../ui-and-editor/asset-editor/)).
+
+An environment profile is a standalone `.senv` asset containing one complete scene environment.
+Plant, biome, and vegetation-map assets use `.splant`, `.sbiome`, and `.svegmap`. Their catalog
+identities support the same browse, rename, move, and delete operations as other project data.
 
 ## The filesystem is the source of truth
 
-The catalog is **derived from a scan**, not authored in `project.json`. `scan_assets` walks
-`assets/`, prefix-reads every `.smodel` into a `Model` row plus a row per sub-asset, and
-identifies engine-written standalone files by their uuid filename. `load_project` reconciles the
-loaded catalog against the scan, so an import you never saved is rediscovered rather than
-orphaned. `load_catalog` is the fast path: `assets/.cache/catalog.json` memoizes the scan keyed
-by a signature of the tree. It is a latency shortcut only — delete it and a cold scan rebuilds an
-identical catalog.
+The catalog is derived from a scan, not authored by hand. `reconcile_catalog_from_disk` walks
+`assets/` in sorted order, skipping `.cache/`. A `.smodel` container (or a `.smatx`
+texture-embedding material) contributes a parent row plus one row per embedded sub-asset from a
+prefix read of its metadata; an engine-written standalone file is recognized by its decimal-uuid
+filename stem; a foreign file identifies through its `.smeta` sidecar. A deleted file's row
+drops, and an import you never saved is rediscovered.
+
+`load_catalog` is the fast path: `assets/.cache/catalog.json` memoizes the scan, keyed by a
+signature — an [FNV-1a](https://datatracker.ietf.org/doc/html/rfc9923) fold over every file's
+`(path, mtime, size)`, stat-only. A matching signature reuses the cached rows and skips every
+container read; anything else falls back to the cold scan and rewrites the cache. The cache is a
+latency shortcut only: delete it and the next load rebuilds an identical catalog.
+
+Both are scriptable from a shell:
+
+```sh
+sa scan-assets           # reconcile the live catalog against disk
+# { "added": 2, "removed": 0 }
+sa list-assets           # type, name, id per row
+#   model     helmet        4462050936982726040
+#   mesh      helmet_mesh   4462050936982726041
+```
 
 ### The `.smeta` sidecar
 
-A file's bytes carry its geometry, not its display name — so an asset's editable metadata
-(`name`, `folder`, and a texture's `colorspace` + `role`) lives beside it in a `<path>.smeta` sidecar.
-It is written **eagerly**: an import mints it, and `rename-asset` / `move-asset` rewrite it, so the
-metadata is durable the instant you touch it, with no project save. The scan overlays the sidecar
-onto the row it matches **by id** — authoritative over the `project.json` seed (which is only as
-fresh as the last save), so a *never-saved rename survives a restart* and a linear normal map can't
-silently rescan as sRGB. A foreign file with no identity in its own bytes (a raw `.png` dropped in)
-additionally takes its stable id from the sidecar, minted on first sight. The id guard keeps a
-`.smodel`'s sidecar from bleeding onto an embedded sub-asset that shares its path — which is also
-the one gap: an *embedded* sub-asset has no own file, so its rename stays in the container META
-until the sub-asset is extracted.
+A file's bytes carry its geometry, not its display name. The editable metadata — `name`,
+`folder`, and a texture's `colorspace` and `role` — lives beside the file in a `<path>.smeta`
+JSON sidecar, written eagerly: an import mints it, and `rename-asset` / `move-asset` rewrite it,
+so the metadata is durable the instant it changes, with no project save.
 
-The scan also records each row's `content_hash` — an FNV fold of the asset's baked bytes.
-An embedded sub-asset's hash is baked into the `.smodel` META, so the scan recovers it for
-free; a standalone file is hashed on the cold scan (which runs exactly when a file changed).
+After the walk, `apply_sidecar_overrides` overlays each sidecar onto the row whose id it names.
+The sidecar wins over the `project.json` seed, which is only as fresh as the last save, so a
+never-saved rename survives a restart and a linear normal map cannot rescan as sRGB. A foreign
+file with no identity in its own bytes (a raw `.png` dropped into `assets/`) also takes its
+stable id from the sidecar, minted on first sight.
 
-## The thumbnail cache
+The id check keeps a container's sidecar from bleeding onto an embedded sub-asset that shares its
+path. An embedded sub-asset has no file of its own, so `write_asset_sidecar` skips it; its name
+stays in the container metadata until the sub-asset is extracted.
 
-Thumbnails are **content-addressed** and **app-level**: a PNG lives at
-`<appDataRoot>/thumbnail-cache/<contentHash>-<size>.png`, keyed on the asset's baked content
-rather than its uuid or a file stat. The consequences fall out of the key. A cache entry
-survives a project switch and is shared across projects (identical content resolves to one
-file); a bare touch that bumps a file's mtime without changing bytes still hits; and only a
-real content change mints a new key and regenerates. Materials are the exception: their key is
-a hash of the *resolved* material state, so editing a parent reflows every instance's
-thumbnail without touching the child `.smat`.
-
-`request_thumbnail` checks the cache **before** loading anything: a mesh/texture/model reads
-its `content_hash` straight from the catalog (in memory) and looks up the file, so a hit never
-opens the 50 MB container it would otherwise decode on the main thread. Only a miss builds the
-full job. A legacy row with no stored hash self-heals — it derives the hash from the gathered
-bytes, backfills the catalog, and persists it, so the next boot takes the cheap path. The
-shared cache is bounded: a write that pushes it over its size cap evicts the oldest files.
+The scan also records each row's `content_hash`, an FNV-1a fold of the asset's baked bytes. An
+embedded sub-asset's hash is baked into the container metadata, so the scan recovers it without
+reading chunk data; a standalone file is hashed during the cold scan, which runs exactly when
+some file changed.
 
 ## Resolving an id to a GPU resource
 
-`load_mesh_asset` and `load_texture_asset` are the resolve-on-demand front doors. Both share
-one code path through `resolve_cached`: check the cache; on an absent key, look the id up in
-the catalog, load and upload the file, and cache the outcome.
+`load_mesh_asset` and `load_texture_asset` resolve on demand: check the cache, then route by the
+catalog row. An engine id in the reserved range (below 1024) has no catalog row: a
+[built-in primitive](../built-in-primitives/)'s id generates and uploads its geometry on first
+use. An embedded sub-asset (`container != 0`) routes through `resolve_mesh` / `resolve_texture`,
+which read the owning container's chunk; a standalone file reads its own path. A texture's upload
+colorspace comes from an explicit `.smeta` value, else from its `hdr`/`linear` provenance flags.
 
-```rust
-// resolve_cached(cache, id.value(), || { ... look up + load + upload ... })
-//  - a present key returns its cached Option<Arc<T>> verbatim (a live Arc or a cached None)
-//  - an absent key runs the loader once and caches its result
-```
-
-The cache means many entities referencing the same mesh trigger one load and one
-[upload](../gpu-mesh-upload/); the rest are map hits. `render_scene` calls these resolvers
-once per entity per frame, so the caching keeps that cheap. `resolve_mesh` / `resolve_texture`
-are the cache-only lookups the draw loop uses when the upload has already happened.
+The cache means many entities referencing one mesh trigger one load and one
+[upload](../gpu-mesh-upload/); the rest are map hits. `render_scene` calls the resolvers once per
+entity per frame, so the hit path stays a hash lookup.
 
 ## Negative caching
 
-A GPU cache is an `AssetCache<T> = HashMap<u64, Option<Arc<T>>>`, and the inner `Option` is
-load-bearing: a **present** key holding `None` is a *negative-cache marker* — a load that
-failed and is not retried — distinct from an **absent** key that was never attempted.
-`resolve_cached` is the single place that honors this:
-
 ```rust
-if let Some(cached) = cache.get(&key) {
-    return cached.clone();   // a present None is returned verbatim, not retried
-}
+pub type AssetCache<T> = HashMap<u64, Option<Arc<T>>>;
 ```
 
-On the next frame the lookup hits that cached `None` and returns it immediately, without
-re-reading the broken file or re-warning. Because `render_scene` runs every frame, this keeps
-a missing or corrupt asset from flooding the log and re-hitting the disk many times a second.
+Two distinct facts live in that shape. A **present** key holding `None` is a negative-cache
+marker: a load that failed and is not retried. An **absent** key was never attempted, and only an
+absent key triggers a load. `resolve_cached` packages the get-or-load-or-mark contract as a
+helper; the mesh, texture, and model loaders apply the same discipline inline — return a present
+entry verbatim, insert the outcome of a miss, including a `None`.
+
+Because `render_scene` runs every frame, this keeps a missing or corrupt asset from re-reading
+the disk many times a second. A texture id with no catalog row warns once, negative-caches, and
+the draw path substitutes the default-white slot.
+
+## The thumbnail cache
+
+Thumbnails are content-addressed and app-level: a tile lives at
+`<appDataRoot>/thumbnail-cache/v<version>-<contentHash>-<size>.png`, keyed on the asset's baked
+content rather than its id or a file stat. Identical content resolves to one file shared across
+projects; a touch that bumps a file's mtime without changing bytes still hits; only a real
+content change mints a new key.
+
+Bumping `THUMBNAIL_CACHE_VERSION` changes the filename prefix, so a change to how tiles render
+orphans every old entry in one stroke; the orphans age out through the size-cap eviction.
+Materials are the exception to content addressing: their key hashes the *resolved* material
+state, so editing a parent reflows every instance's tile without touching the child `.smat`.
+
+`request_thumbnail` checks the cache before loading anything. A mesh, texture, model, or vegetation
+asset reads its `content_hash` from the in-memory catalog, so a hit never opens the source file.
+Plant, biome, and vegetation-map misses rasterize their type icon immediately. Rendered asset misses
+enqueue a `PreviewRenderJob`; the host renders the tile through the main forward+ graph and writes the
+PNG for the editor's next poll.
+
+A row whose stored hash is `0` derives one from the gathered bytes, backfills the catalog, and
+persists the catalog cache. The next request uses the cheap path.
+
+The shared cache is bounded to 1 GiB: a write that pushes past the cap deletes the oldest files
+(by mtime) until the directory is back under 80 % of it.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The server | `assets/src/lib.rs` | `AssetServer`, `AssetServer::new` |
-| Catalog type | `scene/src/environment.rs` | `AssetCatalog`, `AssetEntry`, `AssetType`, `Colorspace` |
+| The server | `assets/src/lib.rs` | `AssetServer`, `AssetServer::new`, `clear_asset_caches` |
+| Catalog types | `scene/src/environment.rs` | `AssetCatalog`, `AssetEntry`, `AssetType`, `Colorspace`, `TextureRole` |
 | Catalog ops | `scene/src/environment.rs` | `AssetCatalog::put`, `find`, `rename`, `unique_name` |
-| The cache shape | `assets/src/cache.rs` | `AssetCache`, `resolve_cached` |
+| Cache shape | `assets/src/cache.rs` | `AssetCache`, `resolve_cached` |
 | Resolve + cache | `assets/src/load.rs` | `load_mesh_asset`, `load_texture_asset`, `resolve_mesh`, `resolve_texture` |
-| Scan + sidecar + cache | `assets/src/scan.rs` | `scan_assets`, `load_catalog`, `apply_sidecar_overrides`, `read_smeta`, `write_asset_sidecar` |
-| Thumbnail cache | `assets/src/thumbnail.rs` | `request_thumbnail`, `thumbnail_content_cache_path`, `evict_thumbnail_cache` |
+| Scan, sidecar, catalog cache | `assets/src/scan.rs` | `reconcile_catalog_from_disk`, `load_catalog`, `apply_sidecar_overrides`, `write_asset_sidecar`, `asset_signature` |
+| Role inference | `assets/src/scan.rs` | `infer_texture_role`, `detect_material_role`, `colorspace_for_role_explicit` |
+| Thumbnail cache | `assets/src/thumbnail.rs` | `request_thumbnail`, `THUMBNAIL_CACHE_VERSION`, `write_thumbnail_cache` |
 
 ## Related
 
 - [The .smodel container](../smodel-container/) — the scanned, self-describing model file
 - [Import pipeline](../import-pipeline/) — how entries get into the catalog
 - [Project files](../project-serialization/) — how the catalog persists
-- [Draw list](../draw-list/) — calls the resolvers per entity per frame
-- [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — why it lives in `saffron-scene`
+- [Built-in primitives](../built-in-primitives/) — the reserved ids that bypass the catalog
+- [Draw list](../draw-list/) — the per-frame consumer of resolved meshes
+- [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — why the type lives in `saffron-scene`
 - [Asset commands](../../tooling-and-control/asset-commands/) — driving the catalog from the CLI
+- [Assets panel and thumbnails](../../ui-and-editor/assets-panel-and-thumbnails/) — the editor surface over the catalog

@@ -17,58 +17,24 @@
 //!   wire-shape catalog the registry knows.
 //! - [`emit_defs`] concatenates the two into the single `.luau` defs file.
 //!
-//! The component wire shapes are the hand-authored catalog in `component_block.ts`, the
-//! registered-name set is [`REGISTERED`], and the two shapes with no catalog entry
-//! (`AnimationPlayer`, `MaterialAsset`) are supplied here.
+//! Component wire shapes and registered names come from `saffron-protocol`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 
 use saffron_script::{BINDINGS, Binding, BindingKind};
 
-/// The hand-authored component-interface catalog (the wire shapes the `:get_component` snapshots
-/// reproduce). The component-snapshot defs are parsed from these interfaces, so there is one
-/// source for the component wire shape.
-const COMPONENT_BLOCK: &str = include_str!("component_block.ts");
+use super::{Decl, parse_decl};
 
-/// The component names the registry registers, in registration order — the roots of the
-/// reachability walk: the 21 serialized components plus `MaterialAsset` and `AnimationPlayer`,
-/// which serialize through their own serde but have no `component_block.ts` interface (they are
-/// the two synthetic shapes [`synthetic_shapes`] supplies).
-pub const REGISTERED: &[&str] = &[
-    "Name",
-    "Transform",
-    "Mesh",
-    "Camera",
-    "Material",
-    "MaterialSet",
-    "MaterialAsset",
-    "ModelInstance",
-    "Script",
-    "AnimationPlayer",
-    "DirectionalLight",
-    "PointLight",
-    "SpotLight",
-    "ReflectionProbe",
-    "FogVolume",
-    "Relationship",
-    "SkinnedMesh",
-    "Bone",
-    "FootIk",
-    "BonePhysics",
-    "Rigidbody",
-    "Collider",
-    "KinematicBones",
-    "CharacterController",
-];
+/// The serialized built-in component names in registry order.
+pub const REGISTERED: &[&str] = saffron_protocol::COMPONENT_NAMES;
 
 /// One parsed interface field: the wire name, its wire-type token, and whether it is optional.
 #[derive(Debug, Clone)]
 pub struct Field {
     /// The wire (camelCase) field name.
     pub name: String,
-    /// The wire-type token (the `component_block.ts` spelling: `Vec3`, `WireUuid`, a `T[]`
-    /// array, a `"a" | "b"` union, a nested interface name, …).
+    /// The Rust-generated wire-type token.
     pub ty: String,
     /// `true` when the TS field carries the `?` optional marker.
     pub optional: bool,
@@ -117,88 +83,56 @@ fn referenced(ty: &str) -> Option<&str> {
     }
 }
 
-/// The synthetic component shapes with no `component_block.ts` interface: they serialize through
-/// their own serde, not a catalog interface, so their literal field lists are supplied here.
-fn synthetic_shapes() -> Vec<(String, Vec<Field>)> {
-    let field = |name: &str, ty: &str| Field {
-        name: name.to_owned(),
-        ty: ty.to_owned(),
-        optional: false,
-    };
-    vec![
-        (
-            "AnimationPlayer".to_owned(),
-            vec![
-                field("clip", "WireUuid"),
-                field("time", "number"),
-                field("speed", "number"),
-                field("wrap", "\"once\" | \"loop\" | \"pingpong\""),
-                field("playing", "boolean"),
-                field("transitionMode", "\"crossfade\" | \"inertialize\""),
-                field("loopBlend", "number"),
-            ],
-        ),
-        (
-            "MaterialAsset".to_owned(),
-            vec![field("material", "WireUuid")],
-        ),
-    ]
-}
-
-/// Parse `component_block.ts` into `interface name -> ordered fields`, then add the two synthetic
-/// shapes (which have no catalog interface). `referenced` types not present here are leaf nodes
-/// (`Vec3`/unions/primitives), so the walk simply stops at them.
+/// Read the component and nested DTO interfaces from the Rust declarations.
 fn interfaces() -> HashMap<String, Vec<Field>> {
-    let mut out = parse_interfaces(COMPONENT_BLOCK);
-    for (name, fields) in synthetic_shapes() {
-        out.entry(name).or_insert(fields);
-    }
-    out
-}
-
-/// Parse every `export interface Name { ... }` block into ordered [`Field`]s. The catalog is
-/// flat (no nested braces inside a body), so a brace-delimited scan over the field lines suffices.
-fn parse_interfaces(text: &str) -> HashMap<String, Vec<Field>> {
+    let declarations = saffron_protocol::ts_decls();
+    let aliases: HashMap<String, String> = declarations
+        .iter()
+        .filter_map(|(name, declaration)| match parse_decl(declaration) {
+            Decl::Alias(rhs) => Some(((*name).to_owned(), rhs)),
+            Decl::Struct(_) => None,
+        })
+        .collect();
     let mut out = HashMap::new();
-    let mut rest = text;
-    while let Some(idx) = rest.find("export interface ") {
-        let after_kw = &rest[idx + "export interface ".len()..];
-        let Some(brace) = after_kw.find('{') else {
-            break;
+    for (name, declaration) in declarations {
+        let Decl::Struct(fields) = parse_decl(&declaration) else {
+            continue;
         };
-        let name = after_kw[..brace].trim().to_owned();
-        let body_start = &after_kw[brace + 1..];
-        let Some(close) = body_start.find('}') else {
-            break;
-        };
-        let body = &body_start[..close];
-        out.insert(name, parse_fields(body));
-        rest = &body_start[close + 1..];
+        let fields = fields
+            .into_iter()
+            .map(|(name, ty)| {
+                let (ty, optional) = ty
+                    .strip_suffix("| null")
+                    .map_or((ty.as_str(), false), |inner| (inner.trim(), true));
+                Field {
+                    name: name.trim_end_matches('?').to_owned(),
+                    ty: canonical_type(ty, &aliases),
+                    optional: optional || name.ends_with('?'),
+                }
+            })
+            .collect();
+        out.insert(name.to_owned(), fields);
     }
     out
 }
 
-/// Split one interface body into ordered `(name, type, optional)` fields, one per line.
-fn parse_fields(body: &str) -> Vec<Field> {
-    let mut fields = Vec::new();
-    for line in body.lines() {
-        let line = line.trim();
-        let Some((lhs, rhs)) = line.split_once(':') else {
-            continue;
-        };
-        let optional = lhs.ends_with('?');
-        let name = lhs.trim_end_matches('?').trim();
-        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            continue;
-        }
-        let ty = rhs.trim().trim_end_matches(';').trim().to_owned();
-        fields.push(Field {
-            name: name.to_owned(),
-            ty,
-            optional,
-        });
+fn canonical_type(ty: &str, aliases: &HashMap<String, String>) -> String {
+    if let Some(item) = ty
+        .strip_prefix("Array<")
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        return format!("{}[]", canonical_type(item, aliases));
     }
-    fields
+    match ty {
+        "bigint" => "number".to_owned(),
+        "Uuid" => "WireUuid".to_owned(),
+        "JsonValue" => "Record<string, unknown>".to_owned(),
+        other => aliases
+            .get(other)
+            .filter(|alias| alias.starts_with('"'))
+            .cloned()
+            .unwrap_or_else(|| other.to_owned()),
+    }
 }
 
 /// The transitive set of interface names reachable from [`REGISTERED`] via field references — the
@@ -514,7 +448,7 @@ mod tests {
         assert_eq!(map_type("WireUuid[]"), "string[]");
         assert_eq!(map_type("number[]"), "number[]");
         assert_eq!(map_type("number[][]"), "number[][]");
-        assert_eq!(map_type("Material[]"), "sa.Material[]");
+        assert_eq!(map_type("MaterialSlot[]"), "sa.MaterialSlot[]");
     }
 
     #[test]
@@ -569,12 +503,14 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_shapes_carry_their_literal_fields() {
+    fn generated_animation_and_morph_shapes_are_complete() {
         let defs = emit_component_defs();
         assert!(defs.contains("---@class sa.AnimationPlayer"));
+        assert!(defs.contains("---@field autoplay boolean"));
         assert!(defs.contains("---@field wrap \"once\"|\"loop\"|\"pingpong\""));
-        assert!(defs.contains("---@field transitionMode \"crossfade\"|\"inertialize\""));
-        assert!(defs.contains("---@class sa.MaterialAsset\n---@field material string"));
+        assert!(defs.contains("---@field transitionMode \"inertialize\"|\"crossfade\""));
+        assert!(defs.contains("---@class sa.Morph"));
+        assert!(defs.contains("---@field weights number[]"));
     }
 
     #[test]

@@ -5,18 +5,20 @@ weight = 7
 
 # Meta-layer resources
 
-A meta-layer resource is a RAII wrapper around one or more raw Vulkan and VMA handles, owning them and
-freeing them in its `Drop`. The crate defines a small set — `Buffer`, `Image`, `Image3D`, `GpuTexture`,
-`GpuMesh`, `Pipeline`, and `AccelerationStructure`. A logical resource is a value backed by a plain struct,
-not an opaque integer behind a manager, and shared resources are wrapped in `Arc<T>` where the scene draw
-list, the PSO cache, ECS components, and capture closures all need to hold one.
+A meta-layer resource is a Rust value that owns related Vulkan handles and VMA allocations. It gives
+one logical resource one destruction path while still exposing the handles needed to record commands.
+`Buffer`, `Image`, `GpuTexture`, `GpuMesh`, `Pipeline`, and `AccelerationStructure` are representative
+wrappers. More specialized values such as `GpuLut`, `GpuSdf`, and `DefaultHeightMinMax` follow the same
+ownership rule.
 
-The layer sits between the raw `ash` handles and the rest of the engine. It is thin enough to carry no
-abstraction tax, yet present enough that nothing outside the rendering crate touches a raw handle.
+This layer does not hide Vulkan state or synchronization. It localizes ownership: successful
+construction transfers every acquired handle into a wrapper, and that wrapper releases them in
+dependency order. A constructor that fails partway instead destroys the handles it acquired before it
+returns the error.
 
-## The wrapper shape
+## One owner for each handle set
 
-Every wrapper follows the same shape, illustrated by `Pipeline`:
+`Pipeline` shows the basic shape:
 
 ```rust
 pub struct Pipeline {
@@ -35,68 +37,67 @@ impl Drop for Pipeline {
 }
 ```
 
-Two invariants hold for all of them:
+Rust moves the wrapper without copying its ownership, and [`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html)
+runs when the successful value leaves scope. Each implementation destroys dependent objects first:
+an `Image` releases its view before its VMA image, while an `AccelerationStructure` releases its Vulkan
+acceleration-structure handle before the backing buffer.
 
-- **`Drop` is the single free path.** Each wrapper frees its own handles in `Drop` — `Image`,
-  `Image3D`, and `GpuTexture` free a view then an image; `Buffer` and `GpuMesh` free buffers;
-  `AccelerationStructure` frees the AS handle through a cloned dispatch table, then its backing buffer. The
-  language's move semantics mean a wrapper is freed exactly once; there is no manual null-out or
-  double-free guard to write.
-- **A shared device + allocator, not a borrow.** Rust cannot encode "borrowed but the owner outlives me"
-  for a `Drop` type, so each wrapper holds a clone of `Arc<DeviceResources>` — the ash device + the VMA
-  allocator behind one `Arc`. The allocator/device are destroyed only when the last clone drops.
+The wrapper and `Arc<T>` solve different problems. The wrapper uniquely owns the Vulkan objects.
+`Arc<GpuMesh>`, `Arc<GpuTexture>`, or `Arc<Pipeline>` lets caches, draw lists, and recorded work share
+that logical resource. Destruction starts only when the last logical owner releases its `Arc`.
 
-## Arc for sharing, Send for off-thread drop
+## The device lifetime anchor
 
-The wrappers themselves are owned values; a *shared* logical resource is an `Arc<T>`. The upload path
-hands out `Arc<GpuMesh>` and `Arc<GpuTexture>`, and the PSO cache holds `Arc<Pipeline>`. When the last
-`Arc` drops, the wrapper's `Drop` runs and frees the GPU resource — no base class, no virtual destructor,
-no handle table.
-
-Each wrapper is `unsafe impl Send` (and the shared ones `Sync`): the raw handles carry no thread-affine
-state and `vk-mem`'s `Allocation` is `Send`. This is load-bearing — a worker-uploaded `GpuTexture` may be
-dropped off the main thread, and its `Drop` returns its bindless slot to the shared free-list under a
-mutex (`Arc<Mutex<Vec<u32>>>`) before freeing the image.
+Every owning wrapper stores `Arc<DeviceResources>`. The bundle contains the `ash::Device` and VMA
+allocator needed by `Drop`, so neither can disappear while a wrapper is releasing its objects. This is
+an owned lifetime link rather than a borrow from `Device`.
 
 ```mermaid
 flowchart LR
-    A[Uploader / PSO cache] --> B["Arc&lt;GpuMesh&gt; / Arc&lt;GpuTexture&gt; /<br/>Arc&lt;Pipeline&gt;"]
-    B --> C[DrawItem / PSO cache /<br/>ECS component]
-    C --> D{last Arc<br/>dropped?}
-    D -- yes --> E["Drop → destroy_buffer /<br/>destroy_image / destroy_pipeline"]
+    A[Arc of logical resource] --> B[GPU wrapper]
+    B --> C[Arc of DeviceResources]
+    B --> D[Vulkan handles]
+    B --> E[VMA allocations]
+    C --> F[ash Device]
+    C --> G[VMA allocator]
 ```
 
-## The teardown contract
+`DeviceResources::drop` releases the allocator before calling `vkDestroyDevice`. The surrounding
+`Device::drop` releases this bundle before destroying the Vulkan instance. Vulkan requires an
+application to destroy child objects before their parents, as defined by the
+[Vulkan object model](https://docs.vulkan.org/spec/latest/chapters/fundamentals.html#fundamentals-objectmodel-overview).
 
-Every wrapper holds a clone of `Arc<DeviceResources>`, so nothing leaks the device/allocator and nothing
-is freed under a live read:
+## CPU lifetime is not GPU completion
 
-1. **`wait_idle` before releasing resources.** No in-flight command buffer may still reference a resource
-   when its `Drop` runs. The run loop calls `wait_idle` before any teardown.
-2. **The bundle outlives every resource structurally.** The allocator and device are destroyed only when
-   the last `Arc<DeviceResources>` clone drops. Normally that is the `Device` itself, after the run loop's
-   `wait_idle` and the owner's resource teardown. `DeviceResources::drop` then frees the allocator before
-   the device (`vmaDestroyAllocator` before `vkDestroyDevice`). A resource that outlived the device would
-   keep the bundle alive, which the validation layer flags.
+An `Arc` proves that CPU owners still retain a wrapper; it does not prove that the GPU has finished
+using its handles. Per-frame code therefore pins resources in structures such as `DrawList::live_textures`
+and retains replaced buffers for the frame ring where required. Whole-application teardown calls
+`Device::wait_idle` before layer detachment and resource release.
+
+The teardown sequence has three independent obligations:
+
+1. Wait until submitted GPU work has completed every use of the resource.
+2. Release every logical resource owner so its wrapper can run `Drop`.
+3. Release `DeviceResources`, then destroy the Vulkan instance.
+
+Thread traits are declared only where the contained state supports them. `Buffer`, `Image`, `Image3D`,
+and `Pipeline` are `Send`; shared uploaded resources including `GpuTexture`, `GpuSdf`, `GpuMesh`, and
+`AccelerationStructure` are both `Send` and `Sync`. A `GpuTexture` can consequently return its bindless
+slot through `Arc<Mutex<Vec<u32>>>` even when its last owner drops on a worker thread.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The wrappers | `resources.rs` | `Buffer`, `Image`, `Image3D`, `GpuTexture`, `GpuMesh`, `Pipeline`, `AccelerationStructure` |
-| `Drop` free paths | `resources.rs` | each wrapper's `Drop` impl |
-| The shared bundle | `resources.rs` | `DeviceResources`, `DeviceResources::drop` |
-| Send/Sync + off-thread slot return | `resources.rs` | `unsafe impl Send`, `BindlessFreeList`, `GpuTexture::drop` |
-| Factories returning `Arc` | `upload.rs`, `pipelines.rs` | `Uploader`, `Pipelines` |
-
-> [!NOTE]
-> A `GpuTexture`'s `Drop` returns its bindless slot to the free-list but does not zero the descriptor.
-> No live material references a destroyed texture's slot, so its stale descriptor is never sampled, and
-> the next upload reuses the slot — a real reclaim would need to defer past in-flight frames.
+| Resource wrappers and destruction | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `Image3D`, `GpuTexture`, `GpuLut`, `GpuSdf`, `GpuMesh`, `Pipeline`, `AccelerationStructure` |
+| Shared device and allocator bundle | `engine/crates/rendering/src/resources.rs` | `DeviceResources`, `DeviceResources::drop` |
+| Logical-resource sharing | `engine/crates/rendering/src/draw_list.rs` | `DrawItem`, `DrawList::live_textures` |
+| Wrapper construction | `engine/crates/rendering/src/upload.rs` | `Uploader::upload_mesh`, `GpuTexture::from_parts` |
+| Ordered device teardown | `engine/crates/rendering/src/device.rs` | `Device::wait_idle`, `Device::drop` |
 
 ## Related
 
-- [Ash and the Vulkan seam](../vulkan-hpp-no-exceptions/) — why the engine owns ash's raw handles itself
-- [VMA allocator](../vma-allocator/) — the shared allocator these wrappers free through
-- [GPU mesh upload](../../geometry-and-assets/gpu-mesh-upload/) — the upload building a `GpuMesh` and returning an `Arc`
-- [Material and PSO selection](../../materials-and-pipelines/material-and-pso-selection/) — the `Arc<Pipeline>` cache
+- [Ash and the Vulkan seam](../vulkan-hpp-no-exceptions/): raw calls and typed Vulkan errors
+- [VMA allocator](../vma-allocator/): allocation policy behind the wrappers
+- [GPU mesh upload](../../geometry-and-assets/gpu-mesh-upload/): construction of shared GPU meshes
+- [Material and PSO selection](../../materials-and-pipelines/material-and-pso-selection/): cached pipeline ownership

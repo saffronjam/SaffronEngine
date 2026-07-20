@@ -5,73 +5,115 @@ weight = 1
 
 # MSAA
 
-Multisample anti-aliasing (MSAA) rasterizes the scene at several coverage samples per pixel
-and resolves them down to one. It runs at rasterization time rather than as a post-process,
-so it smooths the case the post-process filters cannot: hard polygon edges against the
-background. It does nothing for detail inside a triangle, which is where shading aliasing
-lives.
+Multisample anti-aliasing rasterizes several coverage samples per pixel and resolves them down to
+one color, so triangle edges land on a finer grid than the shading
+([LearnOpenGL's Anti Aliasing](https://learnopengl.com/Advanced-OpenGL/Anti-Aliasing) walks the
+mechanics). The hardware tests coverage and depth per sample but runs the fragment shader once per
+covered pixel, so edge quality scales with the sample count while shading work stays per-pixel.
+It smooths geometric edges only; aliasing inside a triangle looks the same at any sample count,
+which is what the [FXAA](../fxaa/) and [TAA](../../screen-space-and-post/taa/) modes address
+instead.
 
-The hardware tests coverage at each sample but shades once per pixel, so the cost is bounded:
-edge quality scales with the sample count while the fragment shader still runs once per
-covered pixel.
+## Multisampled targets
 
-## How it works
+When MSAA is the active [AA mode](../aa-modes/), `ViewTarget::build_aa_targets` allocates
+`msaa_color` (rgba16f) and `msaa_depth` (d32) at `Aa::sample_count` and the render extent. Both
+exist only for this mode and only as attachments; nothing ever samples them. The single-sample
+scene scratch stays allocated alongside, because it receives the resolve.
 
-With MSAA on, the scene renders into a multisampled color/depth pair rather than straight into
-the offscreen. `ViewTarget::build_aa_targets` allocates `msaa_color` and `msaa_depth` at the
-requested sample count (`Aa::sample_count`) and the offscreen's extent, and the frame-graph
-build points the scene pass at them. At end-of-pass the multisampled color is resolved into the
-single-sample offscreen, which is what tonemap reads and what the present blit samples.
+The count is clamped before any image is created. `Device::supported_sample_counts` intersects the
+device's framebuffer color and depth sample limits with each format's image support, since a count
+valid as a framebuffer limit can still be invalid for a specific format. `Aa::set` then picks the
+largest supported count not above the request, out of 8×, 4×, and 2×.
 
-The scene pass declares the resolve as part of its color attachment: the multisampled image is
-the attachment, the offscreen (`scene_output`) is its `resolve` target, and the multisampled
-samples are discarded afterward because only the resolved image is kept.
+The pair is not cheap. At 1920×1080 and 4×, `msaa_color` holds 2,073,600 pixels × 8 bytes × 4
+samples ≈ 63 MiB and `msaa_depth` another ≈ 32 MiB, roughly four times the single-sample scene
+targets.
 
-### Resolve in the graph
+## One resolve, owned by the scene pass
 
-The [render graph](../../frame-and-render-graph/render-graph-overview/) treats an
-`RgAttachment.resolve` as a second color write. It runs the resolve target through the same
-`ColorWrite` usage info, so the barrier and layout for the offscreen come out the same
-as any other attachment. When it builds the dynamic-rendering attachment info it sets the color
-resolve mode to `AVERAGE`, which averages each pixel's N samples into one. The pass body is
-unchanged: the same draw list records into a multisampled attachment, and the hardware
-resolves at the end of rendering.
+Several passes rasterize against the multisampled pair, and exactly one resolves it. The sky pass,
+when it draws, clears and stores the multisampled color; the depth pre-pass, when enabled, clears
+and stores the multisampled depth. The scene pass loads whatever an earlier pass wrote (clearing
+the rest itself), draws the batched scene, and carries the resolve on its attachments, so the
+samples exist for one pass chain and collapse at its end.
 
 ```mermaid
 flowchart LR
+    sky[sky clear] --> B
+    prepass[depth pre-pass] --> C
     A[scene draws] --> B[msaa_color<br/>N samples]
     A --> C[msaa_depth<br/>N samples]
-    B -- AVERAGE --> D[offscreen<br/>1 sample]
-    D --> E[tonemap → present blit]
+    B -- AVERAGE --> S[scene scratch<br/>1 sample]
+    C -- SAMPLE_ZERO --> D[scene depth<br/>1 sample]
+    S -- scene-resolve copy --> O[offscreen] --> T[tonemap]
 ```
 
-### Sample count baked into PSOs
+The color resolves into the scene scratch (`scene_output`), the same render-extent image the scene
+writes directly in every other mode. The `scene-resolve` compute pass then upscales the scratch
+into the display-extent offscreen that [tonemap](../../screen-space-and-post/tonemap-and-exposure/)
+reads; at a 1:1 render scale that is a straight copy. Depth resolves into the single-sample scene
+depth, which the post-tonemap grid and gizmo overlays depth-test against.
 
-A graphics pipeline declares how many samples it rasterizes against, and that count must match
-the attachment. The mesh and depth-prepass PSOs read the renderer's chosen sample count
-(`rasterization_samples`) when they are built. Because the count is baked in, changing the MSAA
-level cannot just swap a target; every mesh PSO becomes stale. `Renderer::set_aa` clears the PSO
-cache through `Pipelines::set_sample_count` so übershader pipelines rebuild on demand at the new
-count, and rebuilds the depth-prepass pipeline immediately.
+## Resolve in the graph
+
+`record_scene_graph` declares the resolve on the scene pass's attachments: the multisampled image
+is the attachment and `RgAttachment.resolve` names the single-sample target. The
+[render graph](../../frame-and-render-graph/render-graph-overview/) treats a resolve target as a
+second write of the attachment's kind — `derive_pass_barriers` runs it through the same
+`ColorWrite` or `DepthWrite` usage, so its barrier and layout come out as for any other attachment.
+
+The graph builds the dynamic-rendering attachment info with resolve mode `AVERAGE` for color and
+`SAMPLE_ZERO` for depth, the two modes the
+[Vulkan render-pass chapter](https://docs.vulkan.org/spec/latest/chapters/renderpass.html) defines
+for multisample resolve operations. Averaging N HDR samples is the anti-aliasing itself; depth
+takes sample zero because an average of depths lies on no surface. Both multisampled attachments
+store with `DONT_CARE`: after the resolve their samples are discarded, and only the resolved
+images leave the pass.
+
+## Sample count baked into PSOs
+
+A graphics pipeline's multisample state fixes the sample count it rasterizes against, and Vulkan
+requires it to match the attachment. The übershader cache keys every mesh pipeline on
+`PsoKey.sample_count`, and the depth pre-pass, meshlet, and sky PSOs bake the count too. Changing
+the MSAA level therefore cannot just swap targets; every one of those pipelines goes stale.
+
+On a count change `Renderer::set_aa` idles the GPU, then `Pipelines::set_sample_count` clears the
+mesh PSO cache and drops the depth pre-pass and meshlet PSOs so they rebuild lazily at the new
+count. The sky PSO rebuilds immediately via `Sky::set_sample_count`, since the next frame's sky
+pass draws before any lazy request. The [AA modes](../aa-modes/) page covers the full switch
+sequence.
+
+## Alpha-to-coverage
+
+MSAA also upgrades masked (alpha-tested) materials. Under any other mode a masked fragment is a
+hard per-pixel `discard`, which aliases exactly like a geometric edge. With a sample count above
+1× the PSO cache mints an alpha-to-coverage permutation (`PsoKey.alpha_to_coverage`), and the
+fragment sharpens its alpha into a coverage value the hardware spreads across the samples:
+
+```hlsl
+float coverage = saturate((surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5);
+```
+
+Rescaling alpha around the cutoff by its screen-space derivative makes the lit-to-clipped
+transition span about one pixel, so foliage and cutout edges resolve as smoothly as triangle
+edges. A masked material at 1× shares the plain opaque PSO; the permutation exists only where the
+samples do.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Mode switch + clamp + PSO rebuild | `aa.rs`, `renderer.rs` | `Aa::set`, `Aa::max_sample_count`, `Renderer::set_aa` |
 | Multisampled target pair | `view_target.rs` | `ViewTarget::build_aa_targets`, `msaa_color`, `msaa_depth` |
-| Sample count in PSO | `pipelines.rs` | `Pipelines::set_sample_count`, `rasterization_samples` |
-| Scene attachment + resolve wiring | `renderer.rs` | `record_scene_graph`, `scene_output`, `color_att.resolve` |
-| Resolve in the graph | `render_graph.rs` | `RgAttachment.resolve`, `ResolveModeFlags::AVERAGE`, `ResolveModeFlags::SAMPLE_ZERO` |
-
-> [!NOTE]
-> Depth is multisampled too (geometry has to test against the right per-sample coverage) and
-> resolves with `SAMPLE_ZERO` rather than averaging. Only the resolved offscreen color survives
-> the pass as scene input.
+| Count selection + clamp | `aa.rs`, `device.rs` | `Aa::set`, `Aa::sample_count`, `clamp_sample_count`, `Device::supported_sample_counts` |
+| Scene attachment + resolve wiring | `renderer.rs` | `record_scene_graph`, `scene_output`, `add_scene_resolve_pass` |
+| Resolve in the graph | `render_graph.rs` | `RgAttachment.resolve`, `derive_pass_barriers` |
+| Sample count in PSOs | `pipelines.rs` | `PsoKey`, `Pipelines::set_sample_count`, `Pipelines::request_mesh_pipeline` |
+| Alpha-to-coverage cutout | `mesh.slang` | `fragmentMain`, `kAlphaToCoverage` |
 
 ## Related
 
-- [AA modes](../aa-modes/) — the full mode table and how the three are switched
-- [FXAA](../fxaa/) — the cheap post-process alternative
+- [AA modes](../aa-modes/) — the mode selector and what a switch rebuilds
+- [FXAA](../fxaa/) — the post-process alternative
 - [TAA](../../screen-space-and-post/taa/) — the temporal alternative
-- [Render graph](../../frame-and-render-graph/render-graph-overview/) — derives the resolve
+- [Render graph](../../frame-and-render-graph/render-graph-overview/) — derives the resolve's barriers

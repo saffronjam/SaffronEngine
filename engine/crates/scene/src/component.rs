@@ -1,6 +1,6 @@
 //! The component structs the world holds.
 //!
-//! The 24 serialized components plus the runtime-only caches. Vectors use the matching
+//! The serialized components plus the runtime-only caches. Vectors use the matching
 //! `glam` type, with `Vec3` pinned at 12 bytes (the geometry-area pin) so the downstream
 //! std430/byte layouts stay correct.
 //!
@@ -572,6 +572,27 @@ pub struct Mesh {
     pub mesh: Uuid,
 }
 
+/// The scene's single authored vegetation-world binding.
+///
+/// Local ecological areas and biome variation are layers inside the referenced map, so a scene
+/// carries at most one of these components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationField {
+    /// Referenced `.svegmap` catalog asset.
+    pub map: Uuid,
+    /// Whether vegetation evaluation, simulation, and presentation are active.
+    pub enabled: bool,
+}
+
+impl Default for VegetationField {
+    fn default() -> Self {
+        Self {
+            map: Uuid(0),
+            enabled: true,
+        }
+    }
+}
+
 /// One material binding for a submesh: a reference to a `.smat` material asset plus a
 /// sparse per-object override map applied over the referenced material's resolved params.
 ///
@@ -683,12 +704,23 @@ impl Default for Camera {
     }
 }
 
-/// A directional light — the scene's sun. The first one shades the scene; with no
-/// directional light the scene has no direct sun (sky and IBL ambient still apply).
+/// A directional light's role in the atmosphere model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AtmosphereRole {
+    /// Drives the sky-view LUT, solar disc, and primary directional light.
+    #[default]
+    Sun,
+    /// Drives the lunar disc and the secondary directional light.
+    Moon,
+}
+
+/// A directional light. Its atmosphere role selects the solar or lunar light slot.
 ///
 /// `direction` points the way the light travels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectionalLight {
+    /// The celestial light slot this light drives.
+    pub atmosphere_role: AtmosphereRole,
     /// The direction the light travels.
     pub direction: Vec3,
     /// Light color.
@@ -713,6 +745,7 @@ impl DirectionalLight {
 impl Default for DirectionalLight {
     fn default() -> Self {
         Self {
+            atmosphere_role: AtmosphereRole::Sun,
             direction: Self::DEFAULT_DIRECTION,
             color: Vec3::ONE,
             intensity: 1.0,
@@ -1047,6 +1080,7 @@ mod tests {
     #[test]
     fn directional_light_defaults() {
         let d = DirectionalLight::default();
+        assert_eq!(d.atmosphere_role, AtmosphereRole::Sun);
         assert_eq!(d.direction, Vec3::new(-0.5, -1.0, -0.3));
         assert_eq!(d.color, Vec3::ONE);
         assert_eq!(d.intensity, 1.0);

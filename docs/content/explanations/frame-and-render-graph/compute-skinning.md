@@ -5,141 +5,167 @@ weight = 10
 
 # Compute skinning
 
-A skinned mesh deforms its vertices by a per-joint matrix palette. The naive place to do that is the
-graphics vertex shader: a skinned variant reads the joint palette and blends four bone matrices per
-vertex. The cost of that choice is hidden — skinning in the vertex shader means **every geometry
-pass needs a skinned pipeline permutation** (depth pre-pass, each shadow map, the SSAO G-buffer,
-motion vectors, …), and a ray-traced BLAS built from the static bind pose never sees the animated
-shape at all. Skipping skinned meshes in those passes is worse still: animated characters would cast
-no shadows, take no AO, ghost under TAA, and not deform in any ray-traced effect.
+A skinned mesh deforms its vertices by a per-joint matrix palette using
+[linear blend skinning](https://skinning.org/): each vertex blends four bone matrices by weight. The
+obvious place for that blend is the graphics vertex shader, but the cost hides in the pipeline
+count: every geometry pass then needs a skinned permutation (depth pre-pass, each shadow map, the
+G-buffer, motion vectors), and a ray-traced
+[BLAS](../../global-illumination-and-raytracing/raytracing-foundation/) built from the bind pose
+never sees the animated shape. Skipping skinned meshes in those passes means characters that cast
+no shadows and ghost under [TAA](../../screen-space-and-post/taa/).
 
-Compute skinning deforms **once, up front**, into a buffer laid out exactly like a static mesh. Every
-later pass then reads that buffer as ordinary geometry — no skinned permutation, no special case. It
-collapses the skinned pipeline variants to zero and is the foundation every later pass (and the BLAS)
-builds on.
+Compute skinning deforms once, up front, into a buffer laid out exactly like a static mesh. Every
+later pass reads that buffer as ordinary geometry, so no skinned pipeline permutation exists
+anywhere and the ray-traced acceleration structure follows the pose.
 
 ## The flow
 
 ```mermaid
 flowchart LR
-  palette[joint palette<br/>worldMatrix·inverseBind] --> skin
+  palette[joint palette<br/>worldBone·inverseBind] --> skin
   static[static Vertex + VertexSkin] --> skin[skin compute pass]
-  skin -->|writes| deformed[deformed Vertex buffer]
-  deformed -->|read as binding 0| scene[scene + every geometry pass]
+  skin -->|writes its slice| deformed[deformed Vertex buffer]
+  deformed -->|read as binding 0| scene[scene + every geometry pass + BLAS refit]
 ```
 
-`skin.slang`'s `computeMain` runs one thread per vertex: it reads the static `Vertex`
-(position/normal/uv) and the skin stream (four joint indices + weights), builds
-`skinMatrix = Σ wᵢ·palette[jointOffset + jointᵢ]`, and writes a deformed `Vertex` — the skin matrix
-applied to the bind pose, **without** the instance model matrix. The graphics passes still apply
-`model` / `normalMatrix`, exactly as for a static mesh, so a skinned mesh and a static mesh shade
-through one path.
+`skin.slang`'s `computeMain` runs one thread per vertex. It reads the static `Vertex` (position,
+normal, UV, tangent) and the parallel `VertexSkin` stream (four `u16` joint indices plus four
+weights), then blends the palette:
+
+```hlsl
+const float4x4 skin = weights.x * jointMatrices[base + joints.x]
+                    + weights.y * jointMatrices[base + joints.y]
+                    + weights.z * jointMatrices[base + joints.z]
+                    + weights.w * jointMatrices[base + joints.w];
+```
+
+The kernel writes a deformed `Vertex`: the skin matrix applied to the bind pose, without the
+instance model matrix. The graphics passes still apply `model` / `normalMatrix` exactly as for a
+static mesh, so skinned and static geometry shade through one path. The tangent rotates with the
+skin matrix and keeps its ±1 handedness sign, so normal mapping stays valid on the deformed
+surface.
+
+Both streams are bound as raw byte buffers and loaded at the engine's tight strides (48 bytes per
+`Vertex`, 24 per `VertexSkin`). A typed `StructuredBuffer<Vertex>` would impose std430's 16-byte
+`float3` alignment and misplace every field past the position.
 
 ## The deformed buffer
 
-The deformed vertices live in a per-frame, grow-only device buffer that `Skinning` owns (one per
-frame-in-flight), carrying both `STORAGE` (compute writes it) and `VERTEX` (the scene pass binds it)
-usage. It is sized to the sum of skinned-instance vertex counts; each skinned mesh-instance gets a
-base offset into it (`SkinBucket::deformed_offset`), mirroring the joint-palette's grow-only
-allocation. Because each instance carries a distinct pose, skinned draws are **not instanced** —
-each is one indexed draw whose vertex offset points at that instance's region of the deformed buffer.
+The deformed vertices live in a per-frame-in-flight, grow-only device buffer that `Skinning` owns,
+with both `STORAGE` (compute writes it) and `VERTEX` (every geometry pass binds it) usage. It grows
+by powers of two from a 4096-vertex seed and never shrinks. On a ray-tracing device it also carries
+device-address and acceleration-structure-build-input usage for the BLAS refit.
+
+The buffer is shared across the deform passes: skin, [morph](../../animation/morph-targets/), and
+[displacement](../compute-displacement/) each stamp disjoint slices from one per-frame cursor, and
+each skinned mesh-instance gets a base offset (`SkinBucket::deformed_offset`) into it. Because
+every instance carries a distinct pose, skinned draws never merge into an instanced batch — each is
+one indexed draw whose vertex offset points at its slice.
+
+A frame budgets `SKIN_MAX_SETS_PER_FRAME` (64) skinned instances; instances past the budget are
+clamped and logged rather than failing the frame.
 
 ## The compute dispatch
 
-Per skinned mesh-instance, the draw-list build records a `SkinDispatch` and allocates a descriptor
-set (from a per-frame pool, reset wholesale each frame) binding the instance's static vertex stream,
-its skin stream, the joint palette, and the deformed buffer. A push constant carries
-`{vertex_count, joint_offset, deformed_offset}`. The `skin` compute `RgPass` — placed right after
-light-cull, before any pass that reads the deformed buffer — dispatches `ceil(vertex_count / 64)`
-groups per instance.
+The draw-list build (`Instancing::submit_draw_list`) records a `SkinDispatch` per skinned
+mesh-instance and allocates its descriptor set from a per-frame pool that is reset wholesale each
+frame. The set binds four storage buffers: the static vertex stream, the skin stream, the joint
+palette, and the deformed output. A 16-byte push constant carries
+`{vertexCount, jointOffset, deformedOffset}`.
+
+The palette itself is `worldBone · inverseBind` per joint, concatenated across skinned instances
+and uploaded by `Instancing` (set 2, binding 1); the
+[animation runtime](../../animation/playback-runtime/) produces the bone world matrices. The `skin`
+compute pass replays the dispatches inside the deform scope with `morph` and `displace`,
+`ceil(vertexCount / 64)` groups per instance. Morph runs before skin, so a skinned-morph instance's
+morphed base is skinned in place.
 
 ## Every geometry pass reads it
 
-Because the deformed buffer is laid out like a static mesh, **every** geometry pass binds it for
-skinned batches the same way — through one `bind_batch_vertices` helper that picks the deformed buffer
-over the static stream. The depth pre-pass, the directional/spot/point shadow passes, and the SSAO
-G-buffer pre-pass all draw skinned geometry, so an animated character gets early-Z, casts and receives
-shadows, and shows AO. The deform happened once; every pass is just a read. The ray-traced
-acceleration structure reads the very same buffer (see [Ray tracing](#ray-tracing) below), so it is
-the last consumer to fall in line.
+Every geometry pass binds skinned batches the same way, through one `bind_batch_vertices` helper
+that picks the deformed buffer over the static stream. The depth pre-pass, the
+directional/spot/point shadow passes, the [thin G-buffer](../../screen-space-and-post/thin-gbuffer/),
+and the scene pass all draw skinned geometry with no pass-specific code, so an animated character
+gets early-Z, casts and receives shadows, and shows AO.
+
+The whole path hangs off one runtime toggle:
+
+```sh
+sa set-skinning 0   # drop the skinned draw list: no deform pass, no skinned draws
+sa set-skinning 1   # the compute path returns, every consumer picks the pose back up
+```
 
 ## Motion vectors
 
-TAA needs a per-pixel velocity for every surface, and a skinned mesh moves two ways at once: the
-whole entity can translate/rotate (**object motion**) and a bone can bend between frames
-(**deformation motion**). The motion pass reprojects both — `prevClip = prevViewProj · prevModel ·
-prevPosition` against `curClip = curViewProj · model · position` — so it needs last frame's model
-matrix *and* last frame's deformed position for every vertex.
+A skinned mesh moves two ways at once: the whole entity translates or rotates (object motion) and
+a bone bends between frames (deformation motion). The [motion pass](../../screen-space-and-post/motion-vectors/)
+reprojects both, so it needs last frame's model matrix and last frame's deformed position for every
+vertex.
 
-Object motion is one matrix: `InstanceData` carries a `prev_model` (last frame's world matrix, cached
-per entity in `Skinning`'s `prev_model_by_entity`; a brand-new instance sets `prev_model = model` so
-it emits zero velocity instead of a garbage flash). Deformation motion reuses the deform-once
-architecture rather than skinning twice in a shader: the `skin` compute pass runs a **second**
-dispatch per skinned instance with **last frame's joint palette** (`prev_palette_by_entity`) into a
-**previous** deformed buffer. `motion.slang`'s `vertexMain` then binds the current deformed buffer on
-binding 0 and the previous one on binding 1 and just *reads* `prevPosition` — no skinning math in the
-vertex shader. For a static mesh both bindings point at the same static stream, so
-`prevPosition == position` and only object motion contributes; the one shader handles both cases, so
-animated characters do not ghost under TAA.
+Object motion is one matrix: `InstanceData` carries `prev_model`, cached per entity in `Skinning`'s
+`prev_model_by_entity`. A brand-new instance seeds `prev_model = model`, so its first frame emits
+zero velocity instead of a flash.
+
+Deformation motion reuses the deform-once machinery instead of skinning twice in a shader. The
+`skin` pass runs a second dispatch per instance with last frame's palette
+(`Skinning::swap_palette`) into a parallel prev-deformed buffer. `motion.slang`'s `vertexMain`
+binds the current deformed buffer at binding 0 and the previous one at binding 1 and reads
+`prevPosition` directly — no skinning math in the vertex shader. A static mesh binds the same
+static stream at both bindings, so `prevPosition == position` and only object motion contributes;
+one shader covers both cases.
 
 ## Ray tracing
 
-A ray query traces against an acceleration structure, not the rasterized vertex stream — so making a
-skinned character cast a ray-traced shadow, occlude DDGI, or block a ReSTIR visibility ray means its
-**BLAS** must follow the pose, not the bind shape. A static mesh builds its BLAS once at upload from
-the object-space bind-pose vertices, and the TLAS instance carries `model`. That is wrong for a
-skinned mesh twice over: the bind pose is frozen, and the deformed vertices are **already in world
-space** (the palette is `worldBone · inverseBind` and `skin.slang` omits the model matrix), so any
-instance transform would double-apply the placement.
+A ray query traces the acceleration structure, not the rasterized vertex stream, so a skinned
+character occludes ray-traced effects only if its BLAS follows the pose. A static mesh builds its
+BLAS once from object-space bind-pose vertices, and the TLAS instance carries `model`. That is
+wrong for a skinned mesh twice over: the bind pose is frozen, and the deformed vertices are already
+in world space (the palette bakes `worldBone · inverseBind` and the kernel omits the model matrix),
+so any instance transform would double-apply the placement.
 
-So each skinned instance gets its **own** BLAS, refit every frame from its slice of the deformed
-buffer, and the TLAS references it with an **identity** transform. Topology never changes — only
-positions move — so the first frame for an entity is a full `BUILD` (with `ALLOW_UPDATE`) and every
-later frame is an in-place `UPDATE` (refit, `src == dst`), which is far cheaper than a rebuild. The
-refit BLAS is **per frame-in-flight, keyed by entity**: it reads the current frame's deformed buffer,
-and a per-slot fence wait keeps frame *N+1* from refitting an AS frame *N* may still be tracing. The
-refits record into the same command buffer as the TLAS build, immediately before it.
+Each skinned instance therefore gets its own BLAS, refit every frame from its slice of the deformed
+buffer, and the TLAS references it with an identity transform. Topology never changes (only
+positions move), so the entity's first frame is a full `BUILD` (with `ALLOW_UPDATE`) and every
+later frame an in-place `UPDATE`, which is far cheaper than a rebuild. The refit BLAS map is per
+frame-in-flight, keyed by entity uuid; the frame loop's per-slot fence wait keeps one slot's refit
+from rewriting an AS the GPU may still trace.
 
-This is the one place an app pass writes barriers by hand — the accepted exception, the same one the
-TLAS build already takes. The refits emit an AS-build → AS-build barrier so the TLAS build sees the
-finished BLASes, and a scratch-reuse barrier between consecutive refits (they share one scratch
-region). The skin-compute-write → AS-build-read dependency on the deformed buffer is still
-graph-derived: the TLAS pass declares it `AccelStructBuildRead`. The whole path is gated on a
-ray-tracing consumer being on **and** skinned instances existing, so non-RT or static scenes allocate
-nothing and dispatch nothing.
+The refit rides the `DeformedRtInstance` list, which covers every deformed instance: a skinned (or
+skinned-morph) instance enters the TLAS at identity, an unskinned-morph instance at its node world
+matrix (its deformed vertices stay mesh-local). The refits record into the `tlas-build` pass,
+immediately before the TLAS build itself.
 
 ## Barriers
 
-The skin pass runs **before every geometry pass** and declares the deformed buffer as
-`StorageWriteCompute`; each consumer (shadows, depth pre-pass, G-buffer, scene) declares it as
-`VertexInputRead`, and the TLAS/BLAS pass declares it `AccelStructBuildRead`. The
-[render graph](usage-and-barrier-derivation/) derives the single compute-write → consumer barrier from
-those usages — no hand-written `cmd_pipeline_barrier2`, and the later reads are read-after-read (no
-extra barrier). (The static/skin/palette reads need none: the mesh streams are uploaded long before,
-and the palette's host write is visible at submit.) The acceleration-structure builds are the sole
-exception — they self-manage their AS-build barriers, documented above.
+The `skin` pass declares the deformed and prev-deformed buffers `StorageWriteCompute`; each
+geometry consumer declares `VertexInputRead` (the motion pass on both buffers), and the
+`tlas-build` pass declares `AccelStructBuildRead`. The [render graph](../usage-and-barrier-derivation/)
+derives every compute-write → consumer barrier from those usages, and the later reads are
+read-after-read, so no extra barrier follows the first.
+
+The acceleration-structure builds self-manage the rest inside `record_tlas_build_plan`: a
+scratch-reuse barrier between consecutive refits (they share one scratch region) and an
+AS-build → AS-build-read barrier handing the finished BLASes to the TLAS build.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
 | Compute kernel | `skin.slang` | `computeMain` |
-| State + grow-only buffers | `skinning.rs` | `Skinning`, `SkinBucket`, `SKIN_MAX_SETS_PER_FRAME` |
-| Dispatch records | `draw_list.rs` | `SkinDispatch`, `SkinnedRtInstance` |
-| The compute pass | `renderer.rs` | `Renderer::record_scene_graph` (the `skin` `RgPass`, `do_skin`) |
-| Scene-pass read | `scene_pass.rs` | `record_scene_draw_list`, `bind_batch_vertices`, `record_batch_submeshes` |
-| Compute→vertex / AS-build barrier | `render_graph.rs` | `RgUsage::VertexInputRead`, `RgUsage::AccelStructBuildRead` |
-| Skinned motion vectors | `motion.slang`, `gpu_types.rs`, `skinning.rs` | `vertexMain`, `InstanceData::prev_model`, `Skinning::prev_deformed_buffer`, `prev_palette_by_entity` |
+| State + grow-only buffers | `skinning.rs` | `Skinning`, `SkinBucket`, `SKIN_MAX_SETS_PER_FRAME`, `record_skin` |
+| Dispatch + RT records | `draw_list.rs` | `SkinDispatch`, `DeformedRtInstance` |
+| Draw-list build + palette upload | `instancing.rs` | `Instancing::submit_draw_list` |
+| The compute pass + toggle | `renderer.rs` | `Renderer::record_scene_graph` (the `skin` `RgPass`, `do_skin`), `set_skinning` |
+| Geometry-pass read | `scene_pass.rs` | `record_scene_draw_list`, `bind_batch_vertices`, `record_batch_submeshes` |
+| Derived buffer usages | `render_graph.rs` | `RgUsage::StorageWriteCompute`, `RgUsage::VertexInputRead`, `RgUsage::AccelStructBuildRead` |
+| Skinned motion vectors | `motion.slang`, `gpu_types.rs`, `skinning.rs` | `vertexMain`, `InstanceData::prev_model`, `Skinning::prev_deformed_buffer`, `swap_palette` |
 | Skinned BLAS refit | `rt.rs` | `Rt::prepare_tlas_build`, `plan_skinned_blas_refits`, `SkinnedBlas`, `record_tlas_build_plan` |
-
-> [!NOTE]
-> The scene, depth pre-pass, shadow, SSAO G-buffer, and motion-vector passes all read the deformed
-> buffer; the motion pass also reads a second deformed buffer skinned with last frame's palette; and
-> the per-frame BLAS refit reads it as acceleration-structure build input. Every consumer reads the
-> one deformed buffer, so skinned characters are correct in raster, TAA, and ray tracing alike.
 
 ## Related
 
-- [Barrier derivation](usage-and-barrier-derivation/) — how the compute→vertex barrier is derived
-- [Animation playback](../animation/playback-runtime/) — where the pose (and thus the palette) comes from
-- [GPU mesh upload](../geometry-and-assets/gpu-mesh-upload/) — the static `Vertex` / `VertexSkin` streams
+- [Compute displacement](../compute-displacement/) — the sibling deform pass sharing the deformed buffer
+- [Morph targets](../../animation/morph-targets/) — blend shapes writing the same buffer before skin
+- [Barrier derivation](../usage-and-barrier-derivation/) — how the compute→vertex barrier is derived
+- [Motion vectors](../../screen-space-and-post/motion-vectors/) — the pass that reads both deformed buffers
+- [Animation playback](../../animation/playback-runtime/) — where the pose (and thus the palette) comes from
+- [GPU mesh upload](../../geometry-and-assets/gpu-mesh-upload/) — the static `Vertex` / `VertexSkin` streams

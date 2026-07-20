@@ -185,10 +185,13 @@ impl Descriptors {
         partial.minmax_sampler = Some(create_minmax_sampler(raw)?);
 
         partial.bindless_set_layout = Some(create_bindless_layout(raw)?);
-        partial.light_set_layout = Some(create_light_layout(raw)?);
+        partial.light_set_layout = Some(create_light_layout(raw, partial.shadow_sampler.unwrap())?);
         partial.instance_set_layout = Some(create_instance_layout(raw)?);
         partial.ibl_set_layout = Some(create_ibl_layout(raw)?);
-        partial.ssao_mesh_set_layout = Some(create_ssao_mesh_layout(raw)?);
+        partial.ssao_mesh_set_layout = Some(create_ssao_mesh_layout(
+            raw,
+            partial.linear_sampler.unwrap(),
+        )?);
         partial.ddgi_mesh_set_layout = Some(create_ddgi_mesh_layout(raw)?);
         // Sets 6/7 (TLAS + ReSTIR radiance) need the AS extension, so they exist only
         // when RT is supported; the mesh PSO appends them to its layout only then.
@@ -204,7 +207,10 @@ impl Descriptors {
         partial.taa_set_layout = Some(create_taa_layout(raw)?);
         partial.depth_upscale_set_layout = Some(create_depth_upscale_layout(raw)?);
 
-        partial.descriptor_pool = Some(create_descriptor_pool(raw)?);
+        partial.descriptor_pool = Some(create_descriptor_pool(
+            raw,
+            device.capabilities.rt_supported,
+        )?);
         partial.bindless_pool = Some(create_bindless_pool(raw)?);
 
         let bindless_set = allocate_bindless_set(
@@ -295,7 +301,7 @@ impl Descriptors {
         self.instance_set_layout
     }
 
-    /// Set 3 in the mesh pipeline: the IBL set (global irradiance/prefiltered/BRDF +
+    /// Set 3 in the mesh pipeline: the IBL set (global sky SH/prefiltered/BRDF +
     /// the reflection-probe cube arrays + probe metadata). The mesh PSO layout binds
     /// it; the descriptor set + its data resources land in the IBL phase.
     pub fn ibl_set_layout(&self) -> vk::DescriptorSetLayout {
@@ -1127,17 +1133,29 @@ fn create_bindless_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> 
 
 /// Set 1: directional + punctual light UBO/SSBO, cluster lists + params, and the
 /// directional/spot/point shadow samplers — all fragment-stage.
-fn create_light_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+fn create_light_layout(
+    raw: &ash::Device,
+    shadow_sampler: vk::Sampler,
+) -> Result<vk::DescriptorSetLayout> {
     let uniform = vk::DescriptorType::UNIFORM_BUFFER;
     let storage = vk::DescriptorType::STORAGE_BUFFER;
     let sampler = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+    let immutable_shadow = [shadow_sampler];
+    let shadow_binding = |slot| {
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(slot)
+            .descriptor_type(sampler)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE)
+            .immutable_samplers(&immutable_shadow)
+    };
     let bindings = [
         light_binding(0, uniform), // directional + ambient + counts UBO
         light_binding(1, storage), // punctual light storage buffer
         light_binding(2, storage), // per-cluster light lists (read)
         light_binding(3, uniform), // cluster params UBO
-        light_binding(4, sampler), // directional shadow map (compare sampler)
-        light_binding(5, sampler), // spot shadow map (compare sampler)
+        shadow_binding(4),         // directional shadow map (immutable compare sampler)
+        shadow_binding(5),         // spot shadow map (immutable compare sampler)
         light_binding(6, sampler), // point shadow STATIC distance cube (linear sampler)
         light_binding(7, sampler), // point shadow DYNAMIC distance cube (linear sampler)
         // per-mesh SDF-occluder instance list (the near-field sphere-march): COMPUTE-only, read
@@ -1170,6 +1188,7 @@ fn create_light_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
             .descriptor_type(sampler)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        light_binding(12, sampler), // cascaded cloud-shadow map
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1219,15 +1238,15 @@ fn create_instance_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> 
     )
 }
 
-/// Set 3 (mesh pipeline): the IBL set. Bindings 0-2 are the global IBL
-/// (irradiance/prefiltered/BRDF combined-image-samplers); bindings 3-4 carry the
+/// Set 3 (mesh pipeline): the IBL set. Binding 0 is the global sky-radiance SH buffer;
+/// bindings 1-2 are the prefiltered environment and BRDF combined-image-samplers; bindings 3-4 carry the
 /// reflection-probe cube arrays (`MAX_REFLECTION_PROBES` each); binding 5 is the
 /// probe-metadata SSBO — all fragment-stage. Probes ride the always-present IBL set
 /// rather than a 9th bound set.
 fn create_ibl_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let sampler = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
     let bindings = [
-        light_binding(0, sampler),
+        light_binding(0, vk::DescriptorType::STORAGE_BUFFER),
         light_binding(1, sampler),
         light_binding(2, sampler),
         vk::DescriptorSetLayoutBinding::default()
@@ -1242,7 +1261,20 @@ fn create_ibl_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         light_binding(5, vk::DescriptorType::STORAGE_BUFFER),
     ];
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    let binding_flags = [
+        vk::DescriptorBindingFlags::empty(),
+        vk::DescriptorBindingFlags::empty(),
+        vk::DescriptorBindingFlags::empty(),
+        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::empty(),
+    ];
+    let mut flags_info =
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
+    let info = vk::DescriptorSetLayoutCreateInfo::default()
+        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+        .bindings(&bindings)
+        .push_next(&mut flags_info);
     // SAFETY: the ash seam.
     checked(
         unsafe { raw.create_descriptor_set_layout(&info, None) },
@@ -1250,22 +1282,30 @@ fn create_ibl_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     )
 }
 
-/// Set 4 (mesh pipeline): the AO + contact + SSGI + SSR + prev-color + DFAO + specular-occlusion
-/// sampler set — seven fragment-stage combined-image-samplers (prev-color feeds the RT-reflection
-/// reprojection; DFAO the reduced-resolution sky-visibility that occludes the analytic sky
-/// irradiance; specular-occlusion the reduced-resolution reflection occlusion that occludes the
-/// reflected skybox).
-fn create_ssao_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    let sampler = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+/// Set 4 (mesh pipeline): eight screen-space sampled images behind one immutable linear sampler.
+/// Sharing the sampler keeps the complete mesh interface within portability devices' per-stage
+/// sampler limit while preserving independent image bindings.
+fn create_ssao_mesh_layout(
+    raw: &ash::Device,
+    linear_sampler: vk::Sampler,
+) -> Result<vk::DescriptorSetLayout> {
+    let sampled_image = vk::DescriptorType::SAMPLED_IMAGE;
+    let immutable_linear = [linear_sampler];
     let bindings = [
-        light_binding(0, sampler),
-        light_binding(1, sampler),
-        light_binding(2, sampler),
-        light_binding(3, sampler),
-        light_binding(4, sampler),
-        light_binding(5, sampler),
-        light_binding(6, sampler),
-        light_binding(7, sampler), // gi_indirect: the half-res screen-space indirect-diffuse resolve
+        light_binding(0, sampled_image),
+        light_binding(1, sampled_image),
+        light_binding(2, sampled_image),
+        light_binding(3, sampled_image),
+        light_binding(4, sampled_image),
+        light_binding(5, sampled_image),
+        light_binding(6, sampled_image),
+        light_binding(7, sampled_image), // gi_indirect: the half-res screen-space indirect-diffuse resolve
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(8)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&immutable_linear),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1366,6 +1406,10 @@ fn create_fog_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
         // live + AP is authored. Bound to the fixed-size AP volume, always a valid descriptor (the
         // shader gates the sample on `aerial.x`, so it is untouched when AP is off).
         compute_binding(5, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(8, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        compute_binding(9, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1464,7 +1508,7 @@ fn compute_binding(slot: u32, kind: vk::DescriptorType) -> vk::DescriptorSetLayo
 /// (`FREE_DESCRIPTOR_SET` so freed sets return capacity). Sized for headroom: the
 /// bindless count, the per-frame light/instance UBOs/SSBOs, and the per-view
 /// post-process storage images.
-fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
+fn create_descriptor_pool(raw: &ash::Device, rt_supported: bool) -> Result<vk::DescriptorPool> {
     let frames = crate::frame::MAX_FRAMES_IN_FLIGHT as u32;
     let views = VIEW_COUNT;
     // Bloom binds one set per pyramid pass (up to `BLOOM_PASSES_PER_FRAME` per view), and its mip
@@ -1472,7 +1516,7 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
     // slot too — `BLOOM_PASSES_PER_FRAME * frames * views` sets. Each set has three combined-image
     // samplers (source + dirt mask + streak) and one storage image (target).
     let bloom_sets = BLOOM_PASSES_PER_FRAME as u32 * frames * views;
-    let pool_sizes = [
+    let mut pool_sizes = vec![
         pool_size(
             // +views for the creative-look 3D LUT (binding 2 of each per-view tonemap set), +1 for the
             // transient look-bake set (a tonemap-layout set allocated + freed per `bake-look`), +3*views
@@ -1504,13 +1548,22 @@ fn create_descriptor_pool(raw: &ash::Device) -> Result<vk::DescriptorPool> {
             vk::DescriptorType::STORAGE_IMAGE,
             48 + 29 * views + bloom_sets + (crate::GDF_CASCADES + 1) * frames + 1 + views,
         ),
-        pool_size(
+        // The mesh screen-space set carries eight sampled images behind one immutable sampler.
+        pool_size(vk::DescriptorType::SAMPLED_IMAGE, 8 * views),
+        // One immutable sampler descriptor per mesh screen-space set.
+        pool_size(vk::DescriptorType::SAMPLER, views),
+    ];
+    if rt_supported {
+        pool_sizes.push(pool_size(
             vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
             frames + 2 + views,
-        ),
-    ];
+        ));
+    }
     let info = vk::DescriptorPoolCreateInfo::default()
-        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+        .flags(
+            vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET
+                | vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND,
+        )
         .max_sets(1024 + 8 * frames + 64 + 21 * views + bloom_sets + 1 + views)
         .pool_sizes(&pool_sizes);
     // SAFETY: the ash seam. The pool is owned and freed in teardown.

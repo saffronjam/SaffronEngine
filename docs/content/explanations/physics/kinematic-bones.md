@@ -5,69 +5,73 @@ weight = 5
 
 # Kinematic bodies and bone following
 
-A **Kinematic** body is one the simulation does not push but *pushes back from*. It ignores gravity
-and contacts — its motion is set explicitly each step — yet a dynamic body that hits it bounces off
-correctly, because the kinematic body's swept motion imparts the right contact velocity. This is how
-a moving platform carries a crate, and how a walking character's limbs shove the world around.
+A kinematic body participates in collision but takes its motion from the scene rather than forces or gravity. Anima uses this motion type for moving rigidbodies and for optional per-bone capsules that make animated limbs push dynamic objects.
 
-## The three binding modes
+Bone following is animation-to-physics binding. Animation remains authoritative for the skeleton, while physics reads each driven joint's pose and moves a collision body to match it. [Ragdolls](../ragdoll/) use the opposite direction by writing simulated body poses back to bones.
 
-A skeleton and a physics body can be wired together three ways. Naming them keeps the modes straight:
+## Swept motion
 
-- **(a) static** — the body *is* the character's collision proxy; animation plays independently on
-  top (the character controller).
-- **(b) animation → physics** — per-bone kinematic bodies *follow* the animated pose, so the world
-  reacts to a moving character. **This is what this page covers.**
-- **(c) physics → animation** — the body drives the bone (the ragdoll), writing back into the pose.
+Each fixed substep calls Jolt's [`BodyInterface::MoveKinematic`](https://jrouwe.github.io/JoltPhysicsDocs/5.3.0/class_body_interface.html) with the target position, target rotation, and `FIXED_STEP`. Jolt derives the linear and angular velocity that reaches the target over that interval.
 
-Mode (b) is strictly one-way: animation is authoritative for the skeleton, and physics only *reads*
-it. The `PoseOverride` blend layer is left untouched here — that seam is mode (c)'s.
+This velocity lets a moving kinematic body transfer motion through contacts. Setting its transform directly would place the body at the target without describing the intervening motion to the solver.
 
-## MoveKinematic, never a teleport
+```mermaid
+flowchart LR
+    A["Animation writes PoseOverride"] --> B["Compose joint world pose"]
+    B --> C["MoveKinematic over FIXED_STEP"]
+    C --> D["Jolt world step"]
+    D --> E["Dynamic-body write-back"]
+```
 
-The simulation moves a kinematic body with `saffron_physics_sys::move_kinematic` (Jolt's
-`BodyInterface::MoveKinematic`), which derives the linear + angular velocity that carries the body to
-the target over `FIXED_STEP` and integrates it as a swept motion. A teleport (`SetPosition`) would
-leave the body's velocity at zero, so a dynamic body it overlaps is resolved as a static penetration
-push with no momentum — the crate would *ooze* off the platform instead of getting *hit*. Deriving
-velocity from `(target − current)/dt` is the whole point, so the same `FIXED_STEP` feeds both the
-kinematic move and the Jolt update and the swept velocity matches the integration step.
+`World::move_kinematic_bodies` drives free kinematic rigidbodies and bone bodies through the same path. It runs before `world_step` inside each accumulator substep, so target motion and collision integration use the same duration.
 
-Every kinematic body — a free `Rigidbody` whose motion is `Motion::Kinematic`, and every per-bone
-body — is driven this way in `move_kinematic_bodies`, each fixed substep, toward its entity's current
-world transform.
+## Fresh joint poses
 
-## Reading the pose: compose, don't trust the cache
+The animation evaluator writes `PoseOverride` values before the runtime steps physics. `fresh_world_pose` calls `Scene::compose_world_matrix` for each body entity, which composes the active local pose through the parent chain.
 
-The bone target is each joint's animated world transform. The subtle trap: the cached
-`WorldTransform` is **one frame stale** during the simulation tick, because the pass that refreshes
-it (`update_world_transforms`) runs *after* the update. So the follow step composes the world matrix
-itself from the parent chain and the fresh `PoseOverride` the animation evaluator just wrote, rather
-than reading the cache — that is what `fresh_world_pose` does. Getting this wrong is the single most
-likely source of a one-frame follow lag.
+The follow step does not depend on the cached `WorldTransform`. That cache refresh belongs to scene hierarchy processing, while the fixed step needs the pose produced earlier in the same host update.
 
-The ordering that makes this work is already fixed: the host's `tick_animation` writes the pose
-overrides *before* `tick_play` runs the simulation seam, so by the time the bone bodies read the
-skeleton, this frame's pose is in hand.
+## Rig setup
 
-## Per-bone bodies, auto-fit on add
+`KinematicBones` lives on the entity with `SkinnedMesh`. Its fields select the active bone bodies:
 
-A rig opts in with a `KinematicBones` component (`enabled` + an optional `driven` index list; empty
-means every joint). Adding it auto-fits a capsule per bone into the reserved
-`BonePhysics.shape_half_extents` (via `fit_bone_capsules`) — half-height from the joint-to-child rest
-distance, radius a fraction of it, with a small default for leaf joints so Jolt never sees a
-degenerate capsule. On play, `World::build_bone_bodies` creates one **Kinematic** capsule body per
-driven joint, keyed by the joint entity so it tears down with the world on stop. The bodies are
-**independent colliders** — no constraints link them; that joint graph is the ragdoll. A rig with
-`KinematicBones` is simply a moving collision proxy, which is all "the world reacts to a walking
-character" needs.
+| Field | Meaning |
+|---|---|
+| `enabled` | Creates bone bodies for the play session when true |
+| `driven` | Bone indices to follow; an empty list selects every bone |
 
-## What | File | Symbols
+Adding `KinematicBones` through `add-component` also calls `fit_bone_capsules`. The fit measures each bone to its farthest direct child in the rest pose. It uses half the distance as capsule half-height and 30% of that value as radius, with `0.05` and `0.03` minimums for leaf length and radius.
+
+The dimensions are stored in the parallel `BonePhysicsComponent::bones` array. Existing masses, joint limits, and motor values survive a fit because the function updates only `shape_half_extents`.
+
+`World::build_bone_bodies` creates one Y-up capsule for every selected joint. Each body uses kinematic motion, the `Moving` object layer, friction `0.2`, and zero restitution. If fitted metadata is absent, radius and half-height both fall back to `0.03`.
+
+Bone-following capsules have no constraints between them. Their purpose is a moving collision proxy for the animated rig; [ragdoll](../ragdoll/) construction owns the constrained body graph.
+
+## Control surface
+
+`set-kinematic-bones` accepts either the rig entity or its model-container root. The command resolves the descendant carrying `SkinnedMesh`, creates the component when absent, and toggles `enabled` when the field is supplied.
+
+```console
+$ sa set-kinematic-bones --entity 42 --enabled true
+kinematic-bones=on  entity=42  bones=3
+```
+
+The reported entity is the resolved rig UUID and `bones` is its skeleton bone count. The command changes authored configuration in Edit mode; the bodies appear when the next play session populates its [physics world](../physics-world-lifecycle/).
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Kinematic drive (free + bone bodies) | `engine/crates/physics/src/world.rs` | `World::move_kinematic_bodies`, `fresh_world_pose` |
-| Per-bone body creation | `engine/crates/physics/src/world.rs` | `World::build_bone_bodies` |
-| The MoveKinematic FFI | `engine/crates/physics-sys/src/lib.rs` | `move_kinematic` |
-| The opt-in component | `engine/crates/scene/src/component.rs` | `KinematicBones`, `BonePhysics` |
-| Auto-fit + toggle | `engine/crates/physics/src/world.rs`, `engine/crates/control/src/commands_physics.rs` | `fit_bone_capsules`, `set-kinematic-bones` |
+| Component and per-bone metadata | `scene/src/component.rs` | `KinematicBones`, `BonePhysicsComponent`, `BonePhysics` |
+| Body construction and drive | `physics/src/world.rs` | `World::build_bone_bodies`, `World::move_kinematic_bodies`, `fresh_world_pose` |
+| Capsule fitting | `physics/src/world.rs` | `fit_bone_capsules` |
+| Jolt motion bridge | `physics-sys/src/lib.rs` | `move_kinematic` |
+| Toggle command | `control/src/commands_physics.rs` | `set-kinematic-bones` |
+
+## Related
+
+- [Physics world lifecycle](../physics-world-lifecycle/) — when bone bodies are built and dropped
+- [Rigidbody and collider](../rigidbody-and-collider/) — free kinematic bodies and ordinary collider data
+- [Character controller](../character-controller/) — a separate animation-independent collision proxy
+- [Ragdoll](../ragdoll/) — physics-to-animation bone binding

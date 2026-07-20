@@ -9,7 +9,8 @@
 //! - [`AssetServer::compile_material_mesh_shader`] — splices the emitted surface body
 //!   into the runtime `mesh.slang` übershader between the `// @graph-begin` /
 //!   `// @graph-end` markers, compiles with `-I <shaders dir>` so `import lighting`
-//!   resolves → `materials/<uuid>_mesh.spv`.
+//!   resolves, and emits `materials/<uuid>_mesh.spv` plus the RT-off
+//!   `materials/<uuid>_mesh_nort.spv` sibling.
 //!
 //! # The slangc invocation
 //!
@@ -33,6 +34,8 @@ use crate::load::engine_asset_path;
 const GRAPH_BEGIN: &str = "// @graph-begin";
 /// The end marker that closes the spliceable default-body block in `mesh.slang`.
 const GRAPH_END: &str = "// @graph-end";
+/// The feature define used by the RT-off mesh variant, matching the static shader pipeline.
+const NO_RT_DEFINE: &str = "SAFFRON_NO_RT=1";
 
 /// Locates `slangc`: the `SAFFRON_SLANGC` env override, else the prebuilt slang cache
 /// (`~/.cache/saffron-slang/slang/bin/slangc`), else bare `slangc` on `PATH`.
@@ -68,7 +71,7 @@ fn resolve_slangc(
     PathBuf::from("slangc")
 }
 
-/// The fixed `slangc` flag set the three runtime compiles share, matching the static
+/// The fixed `slangc` flag set the runtime compiles share, matching the static
 /// xtask shader flags: `-profile glsl_450 -target spirv -emit-spirv-directly
 /// -fvk-use-entrypoint-name -matrix-layout-column-major -capability <atoms>`. The capabilities are
 /// declared so Slang does not implicitly upgrade the profile (see `xtask`'s `SLANGC_CAPABILITIES`).
@@ -96,6 +99,7 @@ fn slangc_argv(
     slang_path: &Path,
     spv_path: &Path,
     include_dir: Option<&Path>,
+    defines: &[&str],
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     argv.push(slangc.as_os_str().to_owned());
@@ -109,6 +113,9 @@ fn slangc_argv(
     }
     argv.push(OsString::from("-o"));
     argv.push(spv_path.as_os_str().to_owned());
+    for define in defines {
+        argv.push(OsString::from(format!("-D{define}")));
+    }
     argv
 }
 
@@ -119,8 +126,9 @@ fn build_slangc_command(
     slang_path: &Path,
     spv_path: &Path,
     include_dir: Option<&Path>,
+    defines: &[&str],
 ) -> Command {
-    let argv = slangc_argv(slangc, slang_path, spv_path, include_dir);
+    let argv = slangc_argv(slangc, slang_path, spv_path, include_dir, defines);
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -140,6 +148,7 @@ fn write_and_compile(
     spv_path: &Path,
     source: &str,
     include_dir: Option<&Path>,
+    defines: &[&str],
     label: &str,
 ) -> Result<PathBuf> {
     std::fs::write(slang_path, source).map_err(|err| {
@@ -148,7 +157,7 @@ fn write_and_compile(
         ))
     })?;
 
-    let status = build_slangc_command(slangc, slang_path, spv_path, include_dir)
+    let status = build_slangc_command(slangc, slang_path, spv_path, include_dir, defines)
         .status()
         .map_err(|err| Error::SlangcFailed(format!("{label}: cannot spawn slangc: {err}")))?;
     if !status.success() || !spv_path.exists() {
@@ -218,21 +227,23 @@ impl AssetServer {
             &spv_path,
             &source,
             None,
+            &[],
             &format!("material graph {}", id.value()),
         )
     }
 
     /// Splices the graph's emitted surface body into the runtime `mesh.slang` übershader
-    /// and compiles a per-material variant (with `-I <shaders dir>` so `import lighting`
-    /// resolves) to `materials/<uuid>_mesh.spv`, returning the `.spv` path. `render_scene`
-    /// points a codegen material's `shader` at this `.spv`.
+    /// and compiles RT and RT-off per-material variants from the staged source bundle,
+    /// returning the `materials/<uuid>_mesh.spv` path. `render_scene` points a codegen
+    /// material's `shader` at this path; pipeline selection chooses its `_nort` sibling
+    /// on a device without ray tracing.
     pub fn compile_material_mesh_shader(&self, graph: &Value, id: Uuid) -> Result<PathBuf> {
         let slangc = find_slangc();
-        let shaders_dir = engine_asset_path("shaders");
+        let shaders_dir = engine_asset_path("shaders").join("source");
         let mesh_src_path = shaders_dir.join("mesh.slang");
         let src = std::fs::read_to_string(&mesh_src_path).map_err(|err| {
             Error::Io(format!(
-                "cannot read übershader source {mesh_src_path:?} (is the .slang copied beside the binary?): {err}"
+                "cannot read übershader source {mesh_src_path:?} (is the shader source bundle installed?): {err}"
             ))
         })?;
         let spliced = splice_mesh_source(&src, &emit_graph_surface(graph, true))?;
@@ -246,8 +257,20 @@ impl AssetServer {
             &spv_path,
             &spliced,
             Some(&shaders_dir),
+            &[],
             &format!("übershader variant {}", id.value()),
-        )
+        )?;
+        let no_rt_path = self.material_artifact_path(id, "_mesh_nort.spv");
+        write_and_compile(
+            &slangc,
+            &slang_path,
+            &no_rt_path,
+            &spliced,
+            Some(&shaders_dir),
+            &[NO_RT_DEFINE],
+            &format!("RT-off übershader variant {}", id.value()),
+        )?;
+        Ok(spv_path)
     }
 
     /// `<root>/materials/<uuid><suffix>` — the codegen artifact path for a material id
@@ -326,7 +349,7 @@ mod tests {
         let slangc = Path::new("slangc");
         let slang_path = Path::new("/proj/assets/materials/42.slang");
         let spv_path = Path::new("/proj/assets/materials/42.spv");
-        let argv = slangc_argv(slangc, slang_path, spv_path, None);
+        let argv = slangc_argv(slangc, slang_path, spv_path, None, &[]);
 
         let mut expected: Vec<OsString> = vec![
             OsString::from("slangc"),
@@ -343,12 +366,12 @@ mod tests {
     }
 
     #[test]
-    fn mesh_argv_inserts_the_include_dir_before_the_output() {
+    fn rt_off_mesh_argv_carries_the_include_dir_and_define() {
         let slangc = Path::new("slangc");
         let slang_path = Path::new("/proj/assets/materials/42_mesh.slang");
         let spv_path = Path::new("/proj/assets/materials/42_mesh.spv");
         let include = Path::new("/opt/saffron/shaders");
-        let argv = slangc_argv(slangc, slang_path, spv_path, Some(include));
+        let argv = slangc_argv(slangc, slang_path, spv_path, Some(include), &[NO_RT_DEFINE]);
 
         let mut expected: Vec<OsString> = vec![
             OsString::from("slangc"),
@@ -361,6 +384,7 @@ mod tests {
         expected.push(OsString::from("/opt/saffron/shaders"));
         expected.push(OsString::from("-o"));
         expected.push(OsString::from("/proj/assets/materials/42_mesh.spv"));
+        expected.push(OsString::from("-DSAFFRON_NO_RT=1"));
 
         assert_eq!(argv, expected);
         assert_no_shell_tokens(&argv);
@@ -440,7 +464,11 @@ mod tests {
     #[test]
     fn mesh_splice_against_the_real_ubershader() {
         // The actual mesh.slang must splice cleanly (the markers are present and ordered).
-        let src = std::fs::read_to_string(engine_asset_path("shaders").join("mesh.slang"));
+        let src = std::fs::read_to_string(
+            engine_asset_path("shaders")
+                .join("source")
+                .join("mesh.slang"),
+        );
         let Ok(src) = src else {
             eprintln!("skipping: mesh.slang not staged beside the test binary");
             return;
@@ -533,6 +561,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn compile_material_mesh_shader_produces_a_non_empty_spv_when_slangc_present() {
+        let slangc = find_slangc();
+        let probe = Command::new(&slangc)
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if probe.is_err() {
+            eprintln!("skipping: slangc not runnable ({slangc:?})");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "saffron-codegen-mesh-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = tmp.join("project").join("assets");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let assets = AssetServer::new(&root);
+        let graph = serde_json::json!({
+            "nodes": [
+                { "id": "c1", "type": "constant", "props": { "value": [0, 1, 0, 1] } },
+                { "id": "c2", "type": "constant", "props": { "value": [1, 1, 1, 1] } },
+                { "id": "mul", "type": "multiply" },
+                { "id": "out", "type": "materialOutput" }
+            ],
+            "edges": [
+                { "from": ["c1", "rgba"], "to": ["mul", "a"] },
+                { "from": ["c2", "rgba"], "to": ["mul", "b"] },
+                { "from": ["mul", "rgba"], "to": ["out", "baseColor"] }
+            ]
+        });
+
+        let spv = assets
+            .compile_material_mesh_shader(&graph, Uuid(7778))
+            .unwrap_or_else(|err| {
+                panic!("mesh compile failed; generated source is under {tmp:?}: {err}")
+            });
+        let bytes = std::fs::read(&spv).expect("read mesh .spv");
+        assert!(!bytes.is_empty(), "compiled mesh .spv is non-empty");
+        assert_eq!(spv, root.join("materials").join("7778_mesh.spv"));
+        let no_rt = root.join("materials").join("7778_mesh_nort.spv");
+        assert!(
+            std::fs::metadata(&no_rt).is_ok_and(|meta| meta.len() > 0),
+            "compiled RT-off mesh .spv is non-empty"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// A non-zero `slangc` exit (invalid source) surfaces [`Error::SlangcFailed`] and
     /// leaves no `.spv`, gated on `slangc` being runnable (else skipped + logged).
     #[test]
@@ -563,6 +642,7 @@ mod tests {
             &spv_path,
             "this is not valid slang @@@\n",
             None,
+            &[],
             "broken test shader",
         );
         assert!(

@@ -16,7 +16,6 @@ import type {
   RenderStats,
 } from "@saffron/protocol";
 
-
 let engine: Engine;
 let caps: ProfilerModeResult;
 beforeAll(async () => {
@@ -45,6 +44,11 @@ test("render-stats reports throughput counters and the CPU/GPU split", async () 
   const stats = await engine.call<RenderStats>("render-stats");
   expect(stats.drawCalls).toBeGreaterThan(0);
   expect(stats.triangles).toBeGreaterThan(0);
+  expect(stats.sceneGatherMs).toBeGreaterThanOrEqual(0);
+  expect(stats.instanceUploadBytes).toBeGreaterThan(0);
+  expect(stats.retainedMeshCpuBytes).toBeGreaterThan(0);
+  expect(stats.shadowDrawCalls).toBeGreaterThanOrEqual(0);
+  expect(stats.rtInstances).toBeGreaterThanOrEqual(0);
   expect(stats.descriptorBinds).toBeGreaterThan(0);
   expect(stats.commandBuffers).toBeGreaterThan(0);
   expect(stats.queueSubmits).toBeGreaterThan(0);

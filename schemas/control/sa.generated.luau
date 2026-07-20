@@ -30,7 +30,7 @@ function Vec3:lerp(other, t) end ---@param other sa.Vec3 @param t number @return
 ---@field body_weight number
 ---@field bones integer
 
----@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"Camera"|"Material"|"MaterialSet"|"MaterialAsset"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"Relationship"|"SkinnedMesh"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
+---@alias sa.ComponentName "Name"|"Transform"|"Mesh"|"VegetationField"|"Camera"|"MaterialSet"|"ModelInstance"|"Script"|"AnimationPlayer"|"DirectionalLight"|"PointLight"|"SpotLight"|"ReflectionProbe"|"FogVolume"|"Relationship"|"SkinnedMesh"|"Morph"|"Bone"|"FootIk"|"BonePhysics"|"Rigidbody"|"Collider"|"KinematicBones"|"CharacterController"
 
 ---@class sa.Entity
 local Entity = {}
@@ -105,11 +105,10 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 -- its serialized wire shape (vectors as {x,y,z} tables, ids as decimal strings); nil when absent.
 ---@class sa.AnimationPlayer
 ---@field clip string
----@field time number
+---@field autoplay boolean
 ---@field speed number
 ---@field wrap "once"|"loop"|"pingpong"
----@field playing boolean
----@field transitionMode "crossfade"|"inertialize"
+---@field transitionMode "inertialize"|"crossfade"
 ---@field loopBlend number
 
 ---@class sa.BVec3
@@ -125,7 +124,7 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@class sa.BonePhysicsDto
 ---@field shapeHalfExtents { x: number, y: number, z: number }
 ---@field mass number
----@field joint string
+---@field joint "fixed"|"hinge"|"swingtwist"|"free"
 ---@field swingTwistLimits { x: number, y: number, z: number }
 ---@field driveStiffness number
 ---@field driveDamping number
@@ -155,6 +154,7 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field isSensor boolean
 
 ---@class sa.DirectionalLight
+---@field atmosphereRole "sun"|"moon"
 ---@field direction { x: number, y: number, z: number }
 ---@field color { x: number, y: number, z: number }
 ---@field intensity number
@@ -193,35 +193,22 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field enabled boolean
 ---@field driven number[]
 
----@class sa.Material
----@field baseColor { x: number, y: number, z: number, w: number }
----@field albedoTexture string
----@field metallicRoughnessTexture string
----@field metallic number
----@field roughness number
----@field emissive { x: number, y: number, z: number }
----@field emissiveStrength number
----@field unlit boolean
----@field normalTexture string
----@field occlusionTexture string
----@field emissiveTexture string
----@field heightTexture string
----@field normalStrength number
----@field heightScale number
----@field blend sa.BlendMode
----@field alphaCutoff number
-
----@class sa.MaterialAsset
----@field material string
-
 ---@class sa.MaterialSet
----@field slots sa.Material[]
+---@field slots sa.MaterialSlot[]
+
+---@class sa.MaterialSlot
+---@field material string
+---@field overrides table<string, any>
 
 ---@class sa.Mesh
 ---@field mesh string
 
 ---@class sa.ModelInstance
 ---@field modelId string
+
+---@class sa.Morph
+---@field weights number[]
+---@field names string[]
 
 ---@class sa.Name
 ---@field name string
@@ -284,6 +271,10 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@field scale { x: number, y: number, z: number }
 ---@field rotation { x: number, y: number, z: number }
 
+---@class sa.VegetationField
+---@field map string
+---@field enabled boolean
+
 ---@overload fun(self: sa.Entity, name: "AnimationPlayer"): sa.AnimationPlayer?
 ---@overload fun(self: sa.Entity, name: "Bone"): sa.Bone?
 ---@overload fun(self: sa.Entity, name: "BonePhysics"): sa.BonePhysics?
@@ -294,11 +285,10 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@overload fun(self: sa.Entity, name: "FogVolume"): sa.FogVolume?
 ---@overload fun(self: sa.Entity, name: "FootIk"): sa.FootIk?
 ---@overload fun(self: sa.Entity, name: "KinematicBones"): sa.KinematicBones?
----@overload fun(self: sa.Entity, name: "Material"): sa.Material?
----@overload fun(self: sa.Entity, name: "MaterialAsset"): sa.MaterialAsset?
 ---@overload fun(self: sa.Entity, name: "MaterialSet"): sa.MaterialSet?
 ---@overload fun(self: sa.Entity, name: "Mesh"): sa.Mesh?
 ---@overload fun(self: sa.Entity, name: "ModelInstance"): sa.ModelInstance?
+---@overload fun(self: sa.Entity, name: "Morph"): sa.Morph?
 ---@overload fun(self: sa.Entity, name: "Name"): sa.Name?
 ---@overload fun(self: sa.Entity, name: "PointLight"): sa.PointLight?
 ---@overload fun(self: sa.Entity, name: "ReflectionProbe"): sa.ReflectionProbe?
@@ -308,4 +298,5 @@ function sa.delay(seconds, fn) end ---@param seconds number @param fn any @retur
 ---@overload fun(self: sa.Entity, name: "SkinnedMesh"): sa.SkinnedMesh?
 ---@overload fun(self: sa.Entity, name: "SpotLight"): sa.SpotLight?
 ---@overload fun(self: sa.Entity, name: "Transform"): sa.Transform?
+---@overload fun(self: sa.Entity, name: "VegetationField"): sa.VegetationField?
 function Entity:get_component(name) end  ---@param name sa.ComponentName @return table?

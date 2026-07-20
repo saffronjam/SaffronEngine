@@ -1,83 +1,113 @@
 +++
 title = 'Collision shapes and materials'
 weight = 3
+math = true
 +++
 
 # Collision shapes and materials
 
-A `Collider` can be one of five shapes. Two are **analytic** — a sphere and a capsule, sized from a
-few numbers — and two are **cooked** from the entity's mesh: a convex hull and a full triangle mesh.
-The box rounds out the set. Which one you pick depends on whether the body moves and how closely the
-collision shape needs to track the visible geometry.
+A collider combines geometry with friction and restitution. Anima provides three shapes defined
+by dimensions and two shapes built from mesh data, with different motion constraints and fitting
+rules for each.
 
-## The five shapes
+## Shape selection
 
-- **Box** — half-extents per axis. The cheap default.
-- **Sphere** — a radius (packed into `half_extents.x`). The cheapest dynamic shape; rolls.
-- **Capsule** — a radius (`.x`) and a cylinder half-height (`.y`), Y-up. The standard character /
-  limb shape.
-- **ConvexHull** — the convex wrapping of the source mesh's vertices, cooked from the `.smesh`.
-  Valid on **dynamic** bodies, and the right choice when a box/sphere/capsule is too coarse.
-- **Mesh** — the exact triangle mesh, cooked from the `.smesh`. **Static or kinematic only** — Jolt's
-  `MeshShape` cannot back a dynamic body.
+[Jolt's shape system](https://jrouwe.github.io/JoltPhysicsDocs/5.3.0/md__docs__architecture.html#autotoc_md12)
+distinguishes convex shapes from triangle geometry. Anima maps `Collider.shape` to five Jolt shape
+types:
 
-### Mesh on a dynamic body fails loudly
+| Shape | Collider fields | Suitable motion |
+|---|---|---|
+| `Box` | Local half-size in `halfExtents.xyz` | Static, kinematic, or dynamic |
+| `Sphere` | Radius in `halfExtents.x` | Static, kinematic, or dynamic |
+| `Capsule` | Radius in `.x`, cylinder half-height in `.y`, Y-up | Static, kinematic, or dynamic |
+| `ConvexHull` | Vertices from `sourceMesh` | Static, kinematic, or dynamic |
+| `Mesh` | Vertices and triangle indices from `sourceMesh` | Static or kinematic |
 
-Putting a `Mesh` shape on a `Dynamic` rigidbody is a real authoring error, not something to paper
-over. `cook_shape_geometry` returns the typed `Error::MeshShapeOnDynamic`, the populate walk **skips
-that body and logs** a message naming the fix (use a ConvexHull for dynamic, or make the body
-static/kinematic), and the world still builds. It is never silently downgraded to a box — silent
-substitution would hide the mistake. ConvexHull is the dynamic-capable cooked shape.
+The bridge clamps box, sphere, and capsule dimensions to at least `0.01` before constructing a Jolt
+shape. Boxes also receive a convex radius equal to half their smallest half-extent, capped at
+`0.05`.
 
-## Cooking re-reads the `.smesh`
+A triangle-mesh collider on a dynamic body is invalid. `cook_shape_geometry` returns
+`Error::MeshShapeOnDynamic`, and `World::populate` logs the error and skips that body while it
+continues building the rest of the world. A moving object that needs mesh-derived geometry uses a
+`ConvexHull`.
 
-The GPU mesh keeps only its vertex/index buffers and an AABB — it discards the CPU vertices after
-upload. So convex-hull and mesh cooking re-read the baked `.smesh` through `load_mesh_cpu_asset`
-(a catalog lookup + a bytes read + decode, no GPU upload and no cache entry — cooking is a one-shot
-at `Edit → Playing`, not the draw path). The vertices and indices are fed to Jolt in **mesh index
-order**, never through a hash set, so the cooked shape — and therefore the simulation — is
-byte-reproducible run-to-run, which is what the cross-platform-deterministic build needs. A
-ConvexHull/Mesh with no `source_mesh` is the typed `Error::NoCookSource`; a cook closure failure
-becomes `Error::CookFailed`.
+## Mesh cooking
 
-The cook crosses the crate boundary as the `MeshCook` seam (`FnMut(Uuid) -> Result<Mesh, String>`)
-the host binds to `load_mesh_cpu_asset`. That keeps Jolt out of `saffron-assets` (the cook returns a
-plain `saffron_geometry::Mesh`) and keeps the asset reader out of the one unsafe FFI crate.
+`ConvexHull` and `Mesh` require a nonzero `sourceMesh`. `AssetServer::load_mesh_cpu_asset` resolves
+that asset through the catalog and decodes its `.smesh` bytes into a CPU `Mesh` without uploading it
+to the GPU or entering the render-resource cache.
 
-## Auto-fit is the default, not a button
+Convex-hull cooking sends every source vertex position to `ConvexHullShapeSettings` in stored vertex
+order. Triangle-mesh cooking sends the stored vertex array and flat index list to
+`MeshShapeSettings`. Stable ordering gives Jolt the same cooking input on each run.
 
-Adding a `Collider` fits its shape to the entity's mesh AABB automatically — the locked design
-decision. `fit_collider_to_mesh` is shape-aware:
+The safe physics crate obtains mesh data through `MeshCook`, a callback with this boundary:
 
-| Shape | Fit from the AABB half-extents `h` and centre `c` |
+```rust
+pub type MeshCook<'a> =
+    dyn FnMut(Uuid) -> Result<saffron_geometry::Mesh, String> + 'a;
+```
+
+An absent source produces `Error::NoCookSource`. Asset-read failures and empty source geometry
+produce `Error::CookFailed`. A Jolt shape-construction failure returns an invalid body ID and omits
+that body from the live world.
+
+## Shape-aware fitting
+
+Adding a `Collider` through the control plane calls `fit_collider_to_mesh`. The same helper backs
+`fit-collider`, which recomputes dimensions after a shape, transform, or model change.
+
+The fitter examines the entity's mesh, or every mesh entity beneath a model root. It transforms the
+eight corners of each mesh AABB into the collider body's local frame and unions them. This includes
+hierarchy transforms and world scale while leaving the Jolt body itself scale-free. The first
+resolvable mesh becomes `sourceMesh` for cooked shapes.
+
+For local bounds with half-size $h$ and center $c$, the selected shape receives:
+
+| Shape | Fitted values |
 |---|---|
-| Box | `half_extents = h`, `offset = c` |
-| Sphere | radius `= max(h.x, h.y, h.z)` (the box's bounding sphere — never smaller than the mesh) |
-| Capsule | radius `= max(h.x, h.z)`, half-height `= max(0, h.y − radius)`, Y-up |
-| ConvexHull / Mesh | a fallback box in `half_extents`; the cook uses the real geometry, `source_mesh = the mesh` |
+| `Box` | `halfExtents = h`, `offset = c` |
+| `Sphere` | Radius $= \max(h_x, h_y, h_z)$ in all three extent fields |
+| `Capsule` | Radius $= \max(h_x, h_z)$; half-height $= \max(0, h_y - radius)$ |
+| `ConvexHull`, `Mesh` | `halfExtents = h`; cooking uses `sourceMesh` |
 
-Auto-fit reads the mesh AABB and bakes the entity's world scale into the half-extents, in
-**mesh-local space**, so a re-fit after scaling reproduces the same local dims. Three layers cover
-the authoring: auto-fit on add (the default that just works), `fit-collider` to re-fit on demand
-(after a shape or mesh change), and `set-component-field` for manual overrides.
+The capsule axis remains Y-up regardless of which AABB axis is longest. Fitting returns without
+changing the collider when it finds no collider, no resolvable mesh, or only a single-point bound.
+A planar mesh remains valid because at least one extent has positive length.
 
-> **Capsule axis (v1):** the capsule is fitted Y-up regardless of the mesh's dominant axis. A mesh
-> long on X or Z is still fitted Y-up; per-axis capsule orientation is a later refinement.
+For example, a fitted collider reports the values written back to the component:
 
-## PhysicsMaterial: friction and restitution
+```console
+$ sa fit-collider --entity 42
+fitted capsule  entity=42  halfExtents=(0.420, 0.780, 0.420)  offset=(0.000, 1.200, 0.000)
+```
 
-`Collider.material` carries `friction` (0 = ice, 1 = rubber) and `restitution` (bounciness, 0..1).
-These are written onto the body at creation and are what produces the visible behaviour — a
-high-friction box stops sliding where a low-friction one keeps going, and a high-restitution sphere
-rebounds where a `restitution = 0` one comes to rest on first contact.
+## Surface material
 
-## What | File | Symbols
+`PhysicsMaterial` contributes `friction` and `restitution` to Jolt's `BodyCreationSettings`.
+Friction defaults to `0.5`; restitution defaults to `0.0`. Lower friction permits more sliding,
+while higher restitution preserves more separating speed after impact. Authored restitution uses
+the `0` to `1` range described by the component model.
+
+Material values belong to the collider, so a collider-only static surface and a collider paired
+with a rigidbody use the same material path. Sensor colliders also carry these fields, although
+their contacts do not apply impulses.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Shape cook + Mesh-on-dynamic guard | `engine/crates/physics/src/world.rs` | `cook_shape_geometry`, `World::populate`, `MeshCook` |
-| The shape/material components | `engine/crates/scene/src/component.rs` | `Shape`, `Collider`, `PhysicsMaterial` |
-| The typed cook errors | `engine/crates/physics/src/error.rs` | `Error::MeshShapeOnDynamic`, `Error::NoCookSource`, `Error::CookFailed` |
-| CPU mesh decode for cooking | `engine/crates/assets/src/load.rs` | `load_mesh_cpu_asset` |
-| Shape-aware auto-fit | `engine/crates/physics/src/world.rs` | `fit_collider_to_mesh` |
-| Re-fit command | `engine/crates/control/src/commands_physics.rs` | `fit-collider` |
+| Shape and material components | `engine/crates/scene/src/component.rs`, `serde.rs` | `Shape`, `Collider`, `PhysicsMaterial`, `SceneSerialize for Collider` |
+| Shape cooking and body population | `engine/crates/physics/src/world.rs` | `cook_shape_geometry`, `CookedGeometry`, `World::populate`, `MeshCook` |
+| Typed cooking errors | `engine/crates/physics/src/error.rs` | `Error::MeshShapeOnDynamic`, `Error::NoCookSource`, `Error::CookFailed` |
+| Jolt shape construction | `engine/crates/physics-sys/shim/jolt_bridge.cpp` | `build_collider_shape`, `jolt_create_body` |
+| CPU mesh loading | `engine/crates/assets/src/load.rs` | `AssetServer::load_mesh_cpu_asset` |
+| Auto-fit and control command | `engine/crates/physics/src/world.rs`, `engine/crates/control/src/commands_physics.rs` | `fit_collider_to_mesh`, `register_physics_commands`, `FitColliderResult` |
+
+## Related
+
+- [Rigidbody and collider](../rigidbody-and-collider/) explains how motion settings combine with a shape.
+- [Collision layers, sensors, and contact events](../collision-layers-and-triggers/) covers contact filtering and sensors.
+- [Asset server and catalog](../../geometry-and-assets/asset-server-and-catalog/) explains stable mesh identifiers.

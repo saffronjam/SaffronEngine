@@ -32,6 +32,7 @@ import { AssetPreview } from "../components/AssetViewer";
 import { CaptureFlame } from "../components/CaptureFlame";
 import { MaterialGraphEditor } from "../panels/MaterialGraphEditor";
 import { AssetEditorWorkspace } from "../panels/AssetEditorWorkspace";
+import { VegetationAssetWorkspace } from "../panels/VegetationAssetWorkspace";
 import { StoreWorkspace } from "../storefront/StoreWorkspace";
 import { DockPanelsHost } from "../components/dock/DockPanelsHost";
 import { DockDropOverlay } from "../components/dock/DockDropOverlay";
@@ -80,6 +81,12 @@ export function App() {
   const activeAssetEditorId = useEditorStore((s) => {
     const tab = s.viewTabs.find((candidate) => candidate.id === s.activeViewTabId);
     return tab?.kind === "assetEditor" ? tab.assetId : null;
+  });
+  const activeVegetationAsset = useEditorStore((s) => {
+    const tab = s.viewTabs.find((candidate) => candidate.id === s.activeViewTabId);
+    return tab?.kind === "vegetationAsset"
+      ? { assetId: tab.assetId, assetType: tab.assetType }
+      : null;
   });
   // The Store tab stays mounted (hidden when inactive) while its tab exists, so the search
   // query and results survive switching to another tab and back.
@@ -165,6 +172,9 @@ export function App() {
     const unlisteners: UnlistenFn[] = [];
 
     const register = async (): Promise<void> => {
+      // A backend-driven phase signal (e.g. a future runtime re-attach). The startup attach is NOT
+      // driven from here — the ViewportPanel probe owns `attaching → ready` — so applying a phase
+      // here simply re-enters the probe's not-ready state, which re-probes and recovers on its own.
       const offPhase = await listen<EnginePhaseEvent>("engine-phase", (event) => {
         setPhase(event.payload);
       });
@@ -402,6 +412,12 @@ export function App() {
         <DockDropOverlay />
         <CatalogDragGhost />
         {activeKind === "imageViewer" && <ImageViewerWorkspace asset={activeImage} />}
+        {activeKind === "vegetationAsset" && activeVegetationAsset !== null && (
+          <VegetationAssetWorkspace
+            assetId={activeVegetationAsset.assetId}
+            assetType={activeVegetationAsset.assetType}
+          />
+        )}
         {activeKind === "flamegraph" && <FlameGraphWorkspace />}
         {/* Kept mounted (hidden when inactive) so the search query + results persist across
             tab switches, like the scene dock and asset editor. */}

@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use glam::Quat;
 
@@ -50,6 +51,14 @@ pub const IK_REACH_EPS: f32 = 1e-3;
 /// target and lands at max reach this close. Looser than [`IK_REACH_EPS`] because the
 /// clamped solve only approximately straightens.
 pub const IK_OVER_REACH_EPS: f32 = 1e-2;
+
+/// Returns a process-unique POSIX shared-memory name within macOS's 31-byte name limit.
+#[must_use]
+pub fn unique_shm_name() -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("/sat-{}-{sequence}", std::process::id())
+}
 
 /// Whether `a` and `b` are within `eps` of each other.
 ///
@@ -238,6 +247,16 @@ mod tests {
             assert!(IK_REACH_EPS > EPS);
             assert!(IK_OVER_REACH_EPS > IK_REACH_EPS);
         }
+    }
+
+    #[test]
+    fn shared_memory_names_are_unique_and_portable() {
+        let first = unique_shm_name();
+        let second = unique_shm_name();
+        assert_ne!(first, second);
+        assert!(first.starts_with('/'));
+        assert!(first.len() <= 31);
+        assert!(second.len() <= 31);
     }
 
     #[test]

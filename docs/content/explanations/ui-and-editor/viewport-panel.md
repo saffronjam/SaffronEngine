@@ -1,98 +1,87 @@
 +++
 title = 'Viewport panel'
 weight = 2
+math = true
 +++
 
 # Viewport panel
 
-The viewport panel is the editor's window onto the 3D scene: a transparent `div` that owns
-a screen rectangle and keeps the engine's **Scene-view** subsurface glued to it. The panel
-renders no pixels of its own. The scene inside it is the engine's render showing through the
-transparent page ([viewport compositing](../viewport-compositing/)).
+The Viewport panel is the transparent Scene region through which the engine's native presentation surface is visible. The React panel does not draw the scene. It owns the surface bounds, the loading cover, and the browser-side input that must cross the control plane.
 
-It is one of two viewport panes — the [asset-editor](../asset-editor/) preview is the other —
-and each pane drives its **own** subsurface + render target through the shared
-`useSubsurfaceBounds` hook, parameterized by a view id (`"scene"` here). The subsurfaces sit
-below the webview, so this panel's role is bounds-sync (report where the Scene view should be)
-and input forwarding (translate pointer input into engine intent). Parking the region — when a
-modal or another tab owns it — is driven from `App` per view.
+The shell maintains two presenter views: `scene` and `assetPreview`. Each has its own shared-frame ring, native surface, geometry, park state, and engine render target. The Scene panel owns the `scene` view. The asset editor and material-graph preview take turns placing the shared `assetPreview` view in their active pane.
 
-## Bounds-sync
+On Wayland, a view is a subsurface below the CEF webview. On macOS, it is an AppKit layer below the transparent browser content. The rest of the editor addresses both backends through the same view IDs and shell commands. See [viewport compositing](../viewport-compositing/) for the frame transport.
 
-`useSubsurfaceBounds(hostRef, "scene")` reports the panel's logical CSS rect plus the window
-scale factor through one shell command, `set_viewport_bounds(view, …)`. Rust fans it out for
-that view: the logical rect (the UI *is* the toplevel surface in the CEF shell, so its offset
-within the toplevel is zero) positions and sizes the Scene subsurface, and the device-pixel size goes to the
-engine as `set-viewport-size {scene}` so the render matches the panel one-to-one. The
-asset-editor preview drives the same hook with `"assetPreview"`, so the two surfaces are sized
-independently.
+## Geometry and render size
 
-Each surface is permanently its pane's size, so a tab switch never resizes it — only an
-in-pane resize (a dock-divider drag) does. That resize uses two tiers so it never pays the
-engine's target-recreation cost per drag tick:
+`useSubsurfaceBounds(hostRef, "scene")` reads the panel's logical CSS rectangle and the window scale factor. It sends both through `set_viewport_bounds`, which updates native geometry immediately. A settled update also asks the engine to set that view's render size in device pixels:
 
-- a **throttled live sync** (~16ms) on every geometry change — a `ResizeObserver` on the
-  host div fires during a drag, and each tick moves and stretches the subsurface only
-  (the current frame scales into the new rect);
-- a **debounced resize-end commit** (~150ms) that sends one final exact bounds *and* the
-  engine render size, so the scene re-renders sharp at the settled rect — once per
-  gesture instead of per tick.
+$$
+(w_{render}, h_{render}) = \operatorname{round}(scale \cdot (w_{css}, h_{css})).
+$$
 
-```ts
-const observer = new ResizeObserver(onGeometryChange);  // live sync + schedule end-commit
-observer.observe(el);
-window.addEventListener("resize", onGeometryChange);
-const offLayout = onLayoutSettled(scheduleEndCommit);   // a settled panel-split commits too
-```
+The hook separates interactive geometry from render-target recreation:
 
-Both paths share a diff guard (skip if the bounds are unchanged). On mount the panel also
-probes `viewport-native-info` until the engine's socket answers, then flips the phase to
-`ready`, dismissing the loading overlay that covers the region until the first frame.
+| Update | Cadence | Shell work | Engine work |
+|---|---:|---|---|
+| Live geometry | at most every 16 ms | move and stretch the current frame | none |
+| Settled geometry | 150 ms after the last change | commit exact bounds | `set-viewport-size` for that view |
+| Forced settle | immediately | commit exact bounds | resize before a reveal |
 
-## Parking
+A [`ResizeObserver`](https://developer.mozilla.org/en-US/docs/Web/API/ResizeObserver) drives changes to the host element. Window resize and the editor's layout-settled bus cover changes that do not produce another observed dock mutation. Degenerate rectangles are ignored, and unchanged live bounds are deduplicated.
 
-Web UI composites freely over the live viewport — that is the point of the architecture —
-but when a pane should show no scene (its tab is inactive, or a modal owns the region), its
-surface is *parked*. `App` owns this per view: it calls `set_viewport_parked(view, true)` so
-the surface keeps its last frame frozen rather than going black (the shared backdrop fills any
-transparent gap). The Scene view is parked when the scene tab is inactive or a modal hides it
-(the store's `viewportHidden` flag, now modal-only); the asset-preview view is parked whenever
-its tab is not the active one. Because `App` drives it, parking works even while this panel is
-unmounted, and the panel still paints an opaque background over its own region when
-`viewportHidden` so the page never exposes the desktop.
+The split keeps a divider drag responsive: the native surface follows the panel while the existing image stretches, then the engine recreates the offscreen target once at the final device-pixel size. Each hidden view retains its last committed bounds. The `assetPreview` view receives new bounds when another preview-bearing tab becomes active.
 
-## Pointer forwarding
+## Startup and parking
 
-The panel turns DOM pointer events into engine intent — the engine's hidden window
-receives no input at all. A left press sends [`gizmo-pointer begin`](../gizmo/); travel
-past a few pixels makes it a `drag` (streamed, with `dragActive` set so the poll backs
-off); the release sends `end`. A press that did not travel is a click — it
-[ray-picks](../selection/) at the press UV. A bare move with no button streams `hover`,
-so the engine highlights the handle under the cursor.
+The Viewport panel owns renderer readiness. Until the control socket answers `viewport-native-info`, it probes with a 1.5-second timeout and retries after 150 ms. A successful response moves the editor to `ready`; `LoadingOverlay` covers the viewport until then.
 
-Holding the **right button** flies the [editor camera](../editor-camera/): the panel takes
-pointer lock, accumulates relative deltas (`movementX/Y`) and the WASD/Space/Shift key
-state, and streams them over `fly-input` (~16ms cadence; deltas accumulate between sends,
-so nothing is lost). Releasing the button or pressing Escape (which exits pointer lock
-natively) ends the fly. The six fly keys default to WASD/Space/Shift and are rebindable in
-[Editor Settings](../editor-settings/) (the `camera.fly*` commands, matched on the physical
-key code).
+`App` decides which view is visible. A modal parks both views. A Scene tab unparks `scene`, while an asset-editor or material-graph tab unparks `assetPreview` and calls `set-active-view` so the engine routes the matching scene, camera, and render target.
+
+Parking hides the AppKit layer or detaches the Wayland buffer. The shared-frame ring keeps the last image, but that image is not visible while parked. Unparking happens immediately and reattaches the retained frame before a new render arrives. Parking is delayed by two animation frames so the incoming opaque tab paints before the outgoing native surface disappears.
+
+When a modal hides the Scene region, the panel paints `bg-background` over its normally transparent area. Tabs without any viewport also mark the host as occluded to stop background rendering; play-mode simulation continues because only rendering is gated.
+
+## Picking and gizmo input
+
+The engine window receives no direct pointer events, so the panel maps DOM coordinates into clamped viewport UVs. A left-button gesture follows this protocol:
+
+1. Press captures the pointer and sends `gizmo-pointer begin` in normalized device coordinates.
+2. Movement beyond 3 CSS pixels on either axis becomes a drag. Drag samples are coalesced to a 16 ms cadence, and `dragActive` pauses editor reconciliation.
+3. Release sends `gizmo-pointer end`. A completed transform change records one Scene-tab undo entry after the authoritative transform is inspected.
+4. A press and release below the threshold runs `pick` at the press UV. A miss clears selection.
+
+Unpressed movement streams `gizmo-pointer hover` through a separate 16 ms coalescer. The engine tests editor billboards before mesh bounds, then returns the selected UUID. See [Gizmo](../gizmo/) and [Selection](../selection/) for those engine-side paths.
+
+## Editor camera and gameplay keys
+
+Holding the right mouse button asks the shell to lock and hide the cursor. CEF windowless rendering does not supply usable DOM motion while the native grab is active, so the shell emits relative `fly-look` events. The panel accumulates those deltas and the configured fly-key state, then sends `fly-input` at most every 16 ms. Releasing the button, pressing Escape, losing focus, or unmounting ends the grab and sends an inactive state.
+
+Fly bindings use physical key codes from Editor Settings. Their defaults are W, S, A, D, Space, and Left Shift for forward, back, left, right, up, and down. The camera remains available in Play as the fallback when the scene has no primary camera.
+
+While Playing or Paused, a separate window-level listener forwards gameplay keys through `script-input`. It ignores key presses owned by text inputs and ignores Meta-modified input. The pressed-key set is sent only when it changes and is cleared on window blur, document hiding, return to Edit, or effect teardown. This prevents a lost key-up event from leaving a script action held.
+
+## Model placement
+
+Asset drags carry `application/x-sa-asset`. When the payload contains a model, drag-over samples are coalesced through `asset-placement {phase: "preview"}`. The engine maintains a transient preview subtree and positions it on the scene surface or ground plane under the cursor.
+
+Drop sends one final preview position followed by `phase: "commit"`; leaving the region or a failed drop sends `phase: "clear"`. Placement is accepted only in Edit on the Scene view. The preview stream allows only one request in flight and keeps the latest cursor sample, so asset dragging cannot queue behind camera or gizmo input.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The panel | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `eventToUv` |
-| Per-view two-tier bounds-sync hook | `editor/src/lib/useSubsurfaceBounds.ts` | `useSubsurfaceBounds`, `computeBounds`, `liveSync`, `scheduleEndCommit` |
-| Pointer-lock fly streaming | `editor/src/panels/ViewportPanel.tsx` | the fly `useEffect`, `FLY_STREAM_MS` |
-| Per-view rect + park bridge (Rust) | `editor/shell/src/commands.rs` | `set_viewport_bounds`, `set_viewport_parked` |
-| Subsurface side | `editor/shell/src/presenter.rs` | `Viewports`, `ViewportShared`, `ViewSurface`, `install` |
-| Render size + active view (engine) | `engine/crates/control/src/commands_render.rs` · `commands_asset.rs` | `set-viewport-size`, `viewport-native-info`, `set-active-view` |
+| Scene host, input, and model drop | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `eventToUv`, `DRAG_THRESHOLD_PX`, `FLY_STREAM_MS` |
+| Two-tier per-view geometry | `editor/src/lib/useSubsurfaceBounds.ts` | `useSubsurfaceBounds`, `computeBounds`, `liveSync`, `scheduleEndCommit` |
+| View selection and parking policy | `editor/src/app/App.tsx` | `activeRenderView`, `sceneParked`, `assetParked` |
+| Shell command bridge | `editor/shell/src/commands.rs` | `set_viewport_bounds`, `set_viewport_parked` |
+| Shared view state and presenters | `editor/shell/src/viewport.rs` · `editor/shell/src/backend/*/presenter.rs` | `Viewports`, `ViewportShared`, `install` |
+| Render view and input commands | `engine/crates/control/src/commands_render.rs` · `commands_asset.rs` · `commands_scene.rs` | `set-viewport-size`, `viewport-native-info`, `set-active-view`, `asset-placement`, `script-input` |
 
 ## Related
 
-- [Viewport compositing](../viewport-compositing/) — the transport this panel positions
-- [Editor shell and the viewport bridge](../editor-shell-and-viewport-bridge/) — the shell and lifecycle around it
-- [Gizmo](../gizmo/) — the pointer phases this panel forwards
-- [Selection](../selection/) — click-pick from a non-drag press
-- [Editor camera](../editor-camera/) — the fly input this panel streams
+- [Viewport compositing](../viewport-compositing/) - shared frames and native presentation
+- [Editor shell and viewport bridge](../editor-shell-and-viewport-bridge/) - shell ownership and platform backends
+- [Asset pickers and drag-and-drop](../asset-pickers-and-drag-drop/) - asset payloads and drop targets
+- [Editor camera](../editor-camera/) - fly controls, smoothing, and persistence
+- [Play mode](../play-mode/) - primary-camera handover and gameplay input lifetime

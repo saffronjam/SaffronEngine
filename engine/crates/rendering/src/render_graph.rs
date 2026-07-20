@@ -404,9 +404,9 @@ fn apply_access(r: &mut RgResourceState, target: RgUsageInfo, barriers: &mut Der
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: r.aspect,
                     base_mip_level: 0,
-                    level_count: 1,
+                    level_count: vk::REMAINING_MIP_LEVELS,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
                 });
             barriers.image.push(barrier);
         }
@@ -895,6 +895,10 @@ mod tests {
         assert_eq!(b.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         assert_eq!(b.src_stage_mask, vk::PipelineStageFlags2::TOP_OF_PIPE);
         assert_eq!(b.dst_stage_mask, vk::PipelineStageFlags2::FRAGMENT_SHADER);
+        assert_eq!(b.subresource_range.base_mip_level, 0);
+        assert_eq!(b.subresource_range.level_count, vk::REMAINING_MIP_LEVELS);
+        assert_eq!(b.subresource_range.base_array_layer, 0);
+        assert_eq!(b.subresource_range.layer_count, vk::REMAINING_ARRAY_LAYERS);
         assert_eq!(r.layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 

@@ -1,11 +1,10 @@
 //! `saffron-player`: the standalone runtime that runs an exported Saffron app.
 //!
-//! It loads a project from the directory beside its executable (an `app.json` manifest +
-//! `project.json` + `assets/` + `src/` + `shaders/`, the layout the editor's Export produces),
-//! opens a real window, and runs the scene as a live simulation — animation, physics, and Luau
-//! scripts — through the shared [`saffron_runtime::RuntimeSession`]. It links none of the editor
-//! stack: no control plane, no shared-memory frame publishing, no gizmo overlay. Material shaders
-//! are loaded pre-baked (`.spv`); the player never invokes `slangc`.
+//! It loads a project from the exported runtime data directory: beside its executable on Linux, or
+//! under `Contents/Resources` in a macOS application bundle. It opens a real window and runs the
+//! scene as a live simulation through the shared [`saffron_runtime::RuntimeSession`]. It links none
+//! of the editor stack. Material shaders are loaded pre-baked (`.spv`); the player never invokes
+//! `slangc`.
 
 #![deny(unsafe_code)]
 
@@ -16,11 +15,12 @@ use std::rc::Rc;
 
 use saffron_app::{App, AppConfig, Layer, attach_layer, run};
 use saffron_assets::{
-    AssetServer, ProjectHost, ProjectInfo, RenderSceneOptions, RendererScene, render_scene,
+    AssetServer, ProjectHost, ProjectInfo, RenderSceneOptions, RendererScene, advance_time_of_day,
+    render_scene,
 };
 use saffron_core::TimeSpan;
 use saffron_protocol::AppManifest;
-use saffron_rendering::{GpuQueue, Renderer, Uploader};
+use saffron_rendering::{Renderer, Uploader};
 use saffron_runtime::RuntimeSession;
 use saffron_scene::{ComponentRegistry, Scene, ScriptInputState, register_builtin_components};
 use saffron_window::keyboard::{KeyCode, PhysicalKey};
@@ -40,13 +40,17 @@ fn main() -> ExitCode {
         manifest.height,
         project_dir.display()
     );
-    // v1 limitation: the window backend presents FIFO (vsync on) and has no fullscreen path yet,
-    // so these manifest fields are read but not yet applied — surfaced rather than silently dropped.
+    // The window backend presents FIFO and has no fullscreen path, so surface unsupported manifest
+    // settings instead of silently dropping them.
     if manifest.fullscreen {
-        tracing::warn!("saffron-player: fullscreen requested but not yet applied (v1)");
+        tracing::warn!(
+            "saffron-player: fullscreen requested but the window backend does not support it"
+        );
     }
     if !manifest.vsync {
-        tracing::warn!("saffron-player: vsync=false requested but present mode is FIFO (v1)");
+        tracing::warn!(
+            "saffron-player: vsync disabled but the window backend uses FIFO presentation"
+        );
     }
 
     let window = WindowConfig {
@@ -66,8 +70,8 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-/// Resolves the project directory: an explicit CLI argument, else `SAFFRON_PROJECT`, else the
-/// directory containing the executable (the staged-folder default).
+/// Resolves the project directory: an explicit CLI argument, then `SAFFRON_PROJECT`, then the
+/// platform-native runtime data directory derived from the executable.
 fn resolve_project_dir() -> PathBuf {
     resolve_project_dir_from(
         std::env::args().nth(1),
@@ -80,8 +84,7 @@ fn resolve_project_dir() -> PathBuf {
     )
 }
 
-/// The pure precedence logic behind [`resolve_project_dir`]: CLI argument wins, then a non-empty
-/// `SAFFRON_PROJECT`, then the executable's directory, falling back to the current directory.
+/// The pure precedence logic behind [`resolve_project_dir`].
 fn resolve_project_dir_from(
     arg: Option<String>,
     env: Option<String>,
@@ -93,7 +96,28 @@ fn resolve_project_dir_from(
     if let Some(env) = env {
         return PathBuf::from(env);
     }
-    exe_dir.unwrap_or_else(|| PathBuf::from("."))
+    exe_dir
+        .map(|dir| platform_project_dir(&dir))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Maps the executable directory onto the staged project directory for this platform.
+fn platform_project_dir(executable_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if executable_dir
+        .file_name()
+        .is_some_and(|name| name == "MacOS")
+        && executable_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "Contents")
+    {
+        return executable_dir
+            .parent()
+            .expect("Contents parent checked")
+            .join("Resources");
+    }
+    executable_dir.to_path_buf()
 }
 
 /// Reads `app.json` from the project directory, falling back to defaults (field-by-field via
@@ -179,7 +203,7 @@ impl PlayerLayer {
         if self.uploader.is_some() {
             return;
         }
-        let queue = GpuQueue::new(renderer.device().graphics_queue);
+        let queue = renderer.device().graphics_queue.clone();
         match Uploader::new(renderer.device(), &queue) {
             Ok(uploader) => self.uploader = Some(uploader),
             Err(err) => tracing::error!("saffron-player: uploader create failed: {err}"),
@@ -279,6 +303,7 @@ impl Layer for PlayerLayer {
             self.runtime
                 .advance(&mut self.scene, &mut self.assets, dt.seconds, &mut input);
         }
+        advance_time_of_day(&mut self.scene, dt.seconds);
         self.drain_logs();
     }
 
@@ -614,6 +639,19 @@ mod tests {
         assert_eq!(
             resolve_project_dir_from(None, None, None),
             PathBuf::from(".")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn platform_project_dir_resolves_macos_bundle_resources() {
+        assert_eq!(
+            platform_project_dir(Path::new("/Applications/Game.app/Contents/MacOS")),
+            PathBuf::from("/Applications/Game.app/Contents/Resources")
+        );
+        assert_eq!(
+            platform_project_dir(Path::new("/tmp/bin")),
+            PathBuf::from("/tmp/bin")
         );
     }
 

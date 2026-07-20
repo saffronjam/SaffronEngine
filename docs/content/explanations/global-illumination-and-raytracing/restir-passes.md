@@ -6,111 +6,112 @@ math = true
 
 # ReSTIR passes
 
-[ReSTIR](../restir-overview/) runs as three compute passes over per-pixel reservoir buffers: initial
-candidate sampling, spatiotemporal reuse, and resolve-and-shade. Each pass dispatches one thread per
-pixel in 8×8 groups, and the three are wired together through a small set of structured buffers.
+[ReSTIR DI](https://research.nvidia.com/publication/2020-07_spatiotemporal-reservoir-resampling-real-time-ray-tracing-dynamic-direct)
+reduces many-light direct illumination to one selected punctual light per opaque pixel. Three
+compute passes sample candidates, reuse reservoirs across space and time, and test the selected
+light for visibility. Each pass dispatches one thread per pixel in 8×8 groups.
 
-The reservoirs carry sampling state from one pass to the next and from one frame to the next. The
-temporal link is what makes the estimator converge, and also what introduces the bias that
-M-clamping controls.
+The chain runs when ReSTIR is enabled and the active view has ray-query support, a TLAS, a G-buffer,
+and clustered-light data. Otherwise, opaque meshes use the
+[clustered-forward](../../lighting-and-brdf/clustered-forward/) punctual-light loop.
 
-> [!NOTE]
-> ReSTIR is feature-gated on ray-query support and runs at ~1 FPS on the software dev GPU —
-> correctness-validated, awaiting hardware.
+## Per-view state
 
-## The reservoir buffers
+Each view owns three storage buffers with one 32-byte `Reservoir` per pixel. A reservoir records the
+selected light index, normalized weight $W$, accumulated weight, sample count $M$, and selected target
+value. The view also owns an RGBA16F image containing the resolved direct radiance.
 
-Three SSBOs each hold one `Reservoir` (32 bytes) per pixel, sized to the offscreen resolution
-(`RestirView::reservoir_capacity`):
+| Buffer | Written by | Read by |
+|---|---|---|
+| `initial` | Initial sampling | Reuse |
+| `combined` | Reuse | Resolve |
+| `previous` | Resolve | Reuse in the next frame |
 
-- `initial` — this frame's RIS result (written by pass 1, read by pass 2)
-- `combined` — after reuse (written by pass 2, read by pass 3)
-- `previous` — last frame's combined, the temporal source (pass 3 writes it for next frame)
+Enabling ReSTIR or rebuilding a resized view invalidates temporal history. The first reuse after a
+reset therefore uses the current frame and spatial neighbours only.
 
-Consecutive passes serialize through a sentinel buffer access in the
-[render graph](../../frame-and-render-graph/render-graph-overview/). Pass 1 declares
-`StorageWriteCompute` on `combined`, passes 2 and 3 declare `StorageReadCompute`, so the graph
-derives the write→read barriers between them.
+## Initial sampling
 
-## Pass 1 — initial (RIS)
+`restir_initial.slang` reconstructs the world-space surface from the view normal and view depth. It
+draws $K=16$ candidates uniformly from the pixel's froxel light list. An empty froxel falls back to
+the full punctual-light list, while a background pixel or a scene without punctual lights produces
+an empty reservoir.
 
-`restir_initial.slang` reconstructs the world surface from the G-buffer (view normal and view-Z),
-finds the pixel's froxel cluster, and draws $K$ candidate lights from that cluster's light list. The
-candidate set is the [clustered](../../lighting-and-brdf/clustered-forward/) light pool, and $K = 16$
-by default (`RESTIR_CANDIDATE_COUNT`). Each candidate is weighted by its unshadowed target contribution
-$\hat p$ and kept by weighted reservoir sampling.
+The target value $\hat p$ is the luminance of the light's unshadowed diffuse contribution. It includes
+intensity, $n\cdot l$, inverse-square attenuation with the range window, and the spotlight cone. Each
+candidate receives importance weight $w=\hat p/p_{source}$ and competes through weighted reservoir
+sampling.
 
-`targetContribution` is the scalar luminance of the light's diffuse contribution: intensity ×
-$n\cdot l$ × distance attenuation × spot cone, with no shadow term. The pass then computes the
-unbiased weight $W = \tfrac{1}{K}\,\text{wSum} / \hat p_\text{chosen}$ and writes the reservoir.
-Background pixels with no surface write an empty reservoir and bail.
-
-## Pass 2 — reuse (temporal + spatial)
-
-`restir_reuse.slang` starts the combined reservoir from this pixel's initial one, then merges in more
-samples via `combineInto`. The merge is WRS over reservoirs: each incoming reservoir is reweighted by
-*its chosen light's* target function at this pixel and contributes $\hat p \cdot W \cdot M$ to the
-running sum.
-
-The temporal sample is the previous frame's reservoir, fetched by reprojecting the pixel through the
-motion vector (`uv + mv`) and merged when the reprojected UV lands on-screen. The spatial samples are
-four random neighbours within a 16-pixel radius, each merged only when its depth and normal are
-similar (`abs(Δdepth) < 0.5` and normal dot > 0.9). The similarity test keeps reuse to surfaces that
-share lighting.
-
-The final unbiased weight is recomputed from the merged state:
+After $K$ candidates, the pass stores
 
 $$
-W = \frac{\text{wSum}}{M \cdot \hat p_\text{chosen}}
+W = \frac{\sum_i w_i}{K\,\hat p_{selected}}.
 $$
 
-## M-clamping
+No visibility ray is traced in this pass. Deferring visibility keeps candidate evaluation cheap even
+when a froxel contains many lights.
 
-The temporal source is last frame's combined reservoir, which itself absorbed the frame before it.
-Left unbounded, $M$ grows without limit and the estimator becomes badly biased: stale samples
-dominate and lighting lags. The history's $M$ is therefore clamped before merging
-(`RESTIR_MAX_M = 20`).
+## Temporal and spatial reuse
 
-Clamping caps how much weight any past frame carries, trading a little variance for a bounded bias and
-keeping the lighting responsive to change. It is the standard ReSTIR bias control.
+`restir_reuse.slang` starts with the current pixel's `initial` reservoir. If history is valid, the
+motion vector maps the pixel to a `previous` reservoir. Four random offsets also select candidate
+reservoirs from the current `initial` buffer within a 16-pixel radius.
 
-## Pass 3 — resolve and shade
+A spatial candidate passes only when its view-depth difference is at most `0.5` and its view-normal
+dot product is at least `0.9`. Each accepted reservoir is evaluated at the destination surface and
+contributes
 
-`restir_resolve.slang` reads the combined reservoir and performs the work deferred from pass 1. It
-traces *one* ray-query shadow ray toward the chosen light — the only visibility ray ReSTIR needs — and
-if lit, shades the light's contribution scaled by the reservoir weight $W$:
+$$
+w_{merge}=\hat p_{destination}\,W_{source}\,M_{source}.
+$$
 
-```hlsl
-float vis = rayShadow(worldPos, l, dist);   // single ACCEPT_FIRST_HIT ray
-if (vis <= 0.0) { radianceOut[tid.xy] = 0; return; }
-float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a
-                * atten * cone * ndotl * res.a.y * vis;   // res.a.y = W
-```
+The pass clamps each reused source count to $M=20$ before merging. This bounds the influence of
+accumulated history and keeps new samples relevant when lights or geometry move. The combined
+reservoir receives a normalized weight from the merged sum:
 
-The output is geometry × visibility × $W$, *without* the surface albedo. The mesh fragment multiplies
-by `albedo / PI` when it samples the radiance, so the material stays with the material. The pass also
-copies the combined reservoir into `previous` for next frame's temporal reuse, closing the loop.
+$$
+W = \frac{\sum w_{merge}}{M_{combined}\,\hat p_{selected}}.
+$$
+
+## Visibility and material response
+
+`restir_resolve.slang` reads the selected light from `combined` and traces one inline ray query toward
+it. The ray starts `0.02` world units along the light direction, stops at the light distance, accepts
+the first triangle hit, and skips procedural primitives. A hit writes zero direct radiance.
+
+For a visible light, the pass writes light color and intensity multiplied by attenuation, spotlight
+cone, $n\cdot l$, and reservoir weight $W$. It does not apply the surface albedo. The mesh fragment
+shader samples the radiance image and multiplies it by `albedo / PI`, replacing its ordinary punctual
+light loop for opaque surfaces.
+
+Resolve also copies `combined` into `previous`. This copy supplies the temporal candidate for the
+next frame.
+
+## Graph ordering
+
+The render graph imports `combined` as a sentinel resource for the reservoir chain. Initial sampling
+declares `StorageWriteCompute` on the sentinel, and reuse and resolve declare
+`StorageReadCompute`. The motion-vector image and resolved-radiance image are tracked as their own
+graph resources.
+
+The shader descriptor sets bind the actual `initial`, `combined`, and `previous` buffers. The
+sentinel declarations order the pass bodies; the resolve shader performs the cross-frame copy to
+`previous` directly.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Candidate sampling + RIS | `restir_initial.slang` | `computeMain`, `targetContribution`, `clusterIndexFor` |
-| Reservoir merge | `restir_reuse.slang` | `combineInto`, the temporal + spatial blocks |
-| M-clamping | `restir_reuse.slang` | `prevM = min(prev.a.w, maxM)`, `nbM` |
-| Resolve ray + shade | `restir_resolve.slang` | `computeMain`, `rayShadow` |
-| The three graph passes | `rendering/src/renderer.rs` | `restir-initial`, `restir-reuse`, `restir-resolve` (`Renderer::add_restir_passes`) |
-| Reservoir SSBOs | `rendering/src/restir.rs` | `RestirView::initial`, `combined`, `previous` |
-
-> [!WARNING]
-> The three passes serialize through a single *sentinel* buffer access (`combined`) rather than
-> declaring each reservoir buffer to the graph. That's enough to force the RAW barriers between
-> consecutive passes, but the graph doesn't track the individual reservoir buffers — the ping-pong of
-> `previous` is managed by hand in the resolve pass, not derived.
+| Reservoir layout and limits | `rendering/src/restir.rs` | `Reservoir`, `RESTIR_CANDIDATE_COUNT`, `RESTIR_SPATIAL_RADIUS`, `RESTIR_MAX_M` |
+| Candidate sampling | `assets/shaders/restir_initial.slang` | `computeMain`, `targetContribution`, `clusterIndexFor` |
+| Temporal and spatial reuse | `assets/shaders/restir_reuse.slang` | `computeMain`, `combineInto` |
+| Visibility resolve | `assets/shaders/restir_resolve.slang` | `computeMain`, `rayShadow` |
+| Graph integration | `rendering/src/renderer.rs` | `Renderer::add_restir_passes` |
+| Material integration | `assets/shaders/lighting.slang` | `evalLighting` |
 
 ## Related
 
-- [ReSTIR](../restir-overview/) — the reservoir + RIS theory these implement
-- [Clustered forward](../../lighting-and-brdf/clustered-forward/) — where the candidate light pool comes from
-- [Ray-query shadows](../ray-query-shadows/) — the `rayShadow` used in resolve
-- [Motion vectors](../../screen-space-and-post/) — the temporal reprojection input for reuse
+- [ReSTIR](../restir-overview/) explains reservoir resampling in the lighting pipeline.
+- [Clustered forward](../../lighting-and-brdf/clustered-forward/) supplies the initial candidate lists.
+- [Ray-query shadows](../ray-query-shadows/) covers inline visibility rays and the TLAS.
+- [Motion vectors](../../screen-space-and-post/) provide temporal reprojection.

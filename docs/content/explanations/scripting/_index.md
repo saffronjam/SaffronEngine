@@ -6,31 +6,46 @@ bookCollapseSection = true
 
 # Scripting
 
-Entities run gameplay logic written in Lua. An entity carries a `Script` component — an ordered
-list of `.lua` script slots — and on Play each slot becomes a live instance whose
-`on_update(self, dt)` runs every tick against the throwaway play duplicate. The engine embeds a
-Luau VM in the `saffron-script` crate, which is the only place the VM exists: the rest of the
-engine sees a small surface of plain types and `Result`-returning functions, and the host owns the
-VM and wires it to the play loop. Script errors become values, never crashes — every failure
-carries a Luau traceback and pauses play rather than taking down the host.
+Anima runs gameplay code in [Luau](https://luau.org/) during Play. An entity's `Script` component contains ordered slots, each naming a `.lua` file below the project's `src/` directory and storing per-entity field overrides.
 
-Authoring is editor-first: every project carries a `src/` folder (scaffolded with a starter
-`example.lua`) and a `library/sa.lua` + `.luarc.json` that give VS Code full autocomplete and
-type-checking for the `sa` surface; the Inspector renders the Script component as ordered slots with
-each script's declared fields as widgets — New Script writes a class-table boilerplate
-(`create-script`) and assigns it in one step — the project menu jumps to the sources with Open in VS
-Code, and a contained script error during play raises a toast carrying the traceback.
+The shared `RuntimeSession` owns the play-scene duplicate, physics world, and one `ScriptHost`. Script instances can inspect input, edit components and transforms, spawn entities, query physics, exchange messages, and schedule coroutine work through the `sa` API.
 
-Scripts reach the engine through a deliberately small but complete `sa` API: typed `sa.Vec3` math,
-read/write access to any non-structural component, transform and hierarchy control, spawn and
-destroy, per-tick input (held keys, edges, mouse), physics impulses/queries and the ragdoll blend,
-entity messaging, and a coroutine scheduler (`sa.wait`/`sa.delay`). The full reference lives on the
-`script-components-and-runtime` page.
+## Script shape
+
+A script returns a class table with `on_update`. `on_create` and `on_destroy` are optional.
+
+```lua
+local Spinner = {}
+
+Spinner.properties = { speed = 1.0 }
+
+function Spinner:on_update(dt)
+  local rotation = self.entity:get_rotation()
+  rotation.y += self.speed * dt
+  self.entity:set_rotation(rotation)
+end
+
+return Spinner
+```
+
+Each slot receives its own `self` table and `EntityHandle`. The class table is cached by resolved path, while declared field values are copied into the instance and overlaid with the slot's authored overrides.
+
+## Authoring surface
+
+Project loading ensures `src/example.lua`, generated `library/sa.lua` definitions, and `.luarc.json` configuration exist. These files give [Lua Language Server](https://luals.github.io/) type information for `sa`, entity methods, vectors, and registered component names.
+
+The Inspector manages ordered script slots and renders controls for declared number, Boolean, string, and `sa.Vec3` fields. Script logs and contained runtime errors return to dedicated editor panels over the control plane.
+
+## Runtime boundary
+
+`saffron-script` is the only crate that embeds the Luau VM through `mlua`. Scoped session access lends callbacks the active scene, component registry, input snapshot, and host bridge without storing Rust scene references in script userdata.
+
+The VM removes filesystem, process, package, and native-loading facilities. Memory and instruction budgets bound each session and callback. Load failures skip the affected slot; update and contact callback failures pause simulation and enter the error ring; teardown and scheduled-task failures are logged without terminating the host.
 
 ## Pages
 
-| Page | Covers | Code |
+| Page | Covers | Main code |
 |---|---|---|
-| `lua-runtime` | the embedded Luau VM, the sandboxed library set, the instruction/memory budgets, errors as `Result` with tracebacks | `script/src/vm.rs`; `script/src/error.rs` |
-| `script-components-and-runtime` | `Script` slots, the class-table script shape, the play lifecycle, error containment + the drain commands, the `sa`/entity API reference | `script/src/runtime.rs`; `script/src/entity.rs`; `host/src/layer.rs` |
-| `script-declared-fields` | the `properties` table, inferred types, defaults-in-Lua vs overrides-in-scene, the edit-time schema reader + commands | `script/src/schema.rs`; `script/src/runtime.rs` |
+| [Lua runtime](lua-runtime/) | VM ownership, sandbox, budgets, tracebacks, and error conversion | `engine/crates/script/src/vm.rs` |
+| [Script components and the play runtime](script-components-and-runtime/) | Slot data, play lifecycle, `sa` APIs, messages, tasks, and callbacks | `engine/crates/script/src/runtime.rs` |
+| [Script-declared fields](script-declared-fields/) | Property discovery, defaults, per-slot overrides, and Inspector controls | `engine/crates/script/src/schema.rs` |

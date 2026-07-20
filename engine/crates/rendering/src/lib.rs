@@ -17,6 +17,9 @@
 
 mod aa;
 mod budget;
+mod clouds;
+mod compute_dispatch;
+mod conformance;
 mod ddgi;
 mod descriptors;
 mod device;
@@ -44,20 +47,33 @@ mod resources;
 mod restir;
 mod rt;
 mod scene_pass;
+mod shader_artifact;
 mod shm_publish;
 mod skinning;
+#[cfg(test)]
+mod spatial_numeric;
 mod ssao;
+mod stars;
 mod swapchain;
 mod targets;
 mod tessellation;
 mod thumbnail;
 mod transient;
 mod upload;
+mod vegetation_compute;
+#[cfg(test)]
+mod vegetation_graph;
 mod view_target;
 
 pub use aa::{
     Aa, MOTION_FORMAT, MotionPush, REACTIVE_FORMAT, TAA_JITTER_PHASES, TaaParams, TaaPush,
     clamp_sample_count, jitter_offset, jitter_phase_count, record_motion,
+};
+pub use clouds::{CloudRenderSettings, Clouds};
+pub use conformance::{
+    ComputeConformanceEvidence, GraphProgramEvidence, QualifiedOperatorEvidence,
+    ShaderArtifactEvidence, SpatialNumericEvidence, ValidationEvidence, VulkanProfileEvidence,
+    capture_compute_conformance,
 };
 pub use ddgi::{
     BlendPush as DdgiBlendPush, BorderPush as DdgiBorderPush, DDGI_DIST_FORMAT, DDGI_DIST_INTERIOR,
@@ -68,7 +84,10 @@ pub use ddgi::{
 pub use descriptors::{
     DEFAULT_WHITE_SLOT, Descriptors, MAX_BINDLESS_SDF, MAX_BINDLESS_TEXTURES, MAX_REFLECTION_PROBES,
 };
-pub use device::{Capabilities, Device, ProfilerFacts, SurfaceSource, validation_issue_count};
+pub use device::{
+    Capabilities, Device, ProfilerFacts, SurfaceSource, VulkanDeviceIdentity,
+    validation_issue_count,
+};
 pub use draw_list::{
     DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
     SkinDispatch, SubmeshMaterial, TessDraw, TessRtSlice, normal_matrix,
@@ -93,9 +112,9 @@ pub use gpu_types::{GpuLight, InstanceData, Material, MaterialParamsData, SdfIns
 pub use ibl::{
     ATMOS_MULTI_SCATTER_SIZE, ATMOS_SKY_VIEW_H, ATMOS_SKY_VIEW_W, ATMOS_TRANSMITTANCE_H,
     ATMOS_TRANSMITTANCE_W, AtmosphereParams, EnvSource, IBL_COLOR_FORMAT, IBL_ENV_SIZE,
-    IBL_IRRADIANCE_SIZE, IBL_LUT_SIZE, IBL_PREFILTER_MIPS, IBL_PREFILTER_SIZE, Ibl, ProbeMetaGpu,
-    ReflectionProbe, ReflectionProbeUpload, ReflectionProbes, Sky, SkyDraw, SkyRenderSettings,
-    SkygenParams, record_sky,
+    IBL_LUT_SIZE, IBL_PREFILTER_MIPS, IBL_PREFILTER_SIZE, Ibl, NightSkyParams, ProbeMetaGpu,
+    ReflectionProbe, ReflectionProbeUpload, ReflectionProbes, SKY_SH_COEFFICIENTS, Sky, SkyDraw,
+    SkyRenderSettings, SkygenParams, record_sky,
 };
 pub use instancing::{DrawListInputs, Instancing};
 pub use lighting::{
@@ -142,6 +161,7 @@ pub use scene_pass::{
     record_reactive_coverage, record_scene_draw_list, record_shadow_depth,
     record_transparent_draw_list,
 };
+pub use shader_artifact::{ShaderArtifactError, ShaderArtifactIdentity, ShaderSha256};
 pub use shm_publish::{
     MIN_SHM_SLOT_CAPACITY, SHM_HEADER_BYTES, SHM_MAGIC, SHM_RING_SLOTS, ShmPublish,
 };
@@ -153,6 +173,7 @@ pub use ssao::{
     AO_FORMAT, ContactPush, DfaoPush, G_NORMAL_FORMAT, GbufferPush, GtaoPush, ROUGHNESS_FORMAT,
     SSGI_HISTORY_WEIGHT, SpecoccPush, Ssao, SsgiAccumPush, SsgiPush,
 };
+pub use stars::{StarCatalog, StarDraw, record_stars};
 pub use swapchain::Swapchain;
 pub use targets::{PointShadowCube, Targets};
 pub use tessellation::{
@@ -168,6 +189,7 @@ pub use thumbnail::{
 };
 pub use transient::{FROXEL_VOLUME_KEYS, TransientResources};
 pub use upload::{GpuQueue, SdfBake, Uploader};
+pub use vegetation_compute::VulkanGraphComputeExecutor;
 pub use view_target::ViewTarget;
 
 use ash::vk;
@@ -222,10 +244,18 @@ pub enum Error {
     #[error("upload_texture: zero-sized image")]
     ZeroSizedImage,
 
+    /// A CPU upload payload does not match the declared GPU resource shape.
+    #[error("invalid upload data: {0}")]
+    InvalidUploadData(String),
+
     /// A SPIR-V shader module could not be read or is malformed (size not a
     /// multiple of 4, or unreadable).
     #[error("shader load failed: {0}")]
     ShaderLoad(String),
+
+    /// A generated shader artifact or its compiler/source manifest is missing or stale.
+    #[error(transparent)]
+    ShaderArtifact(#[from] ShaderArtifactError),
 
     /// The GPU signed-distance-field bake could not run or its sidecar was malformed
     /// (no bake pipelines, or a decode/IO failure on the cache).

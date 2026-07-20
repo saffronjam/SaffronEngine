@@ -30,7 +30,8 @@ use vk_mem::Alloc;
 use crate::descriptors::Descriptors;
 use crate::resources::{
     ConditioningBuffers, DeviceResources, GpuLut, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts,
-    GpuTexture, GpuTextureParts, Image3D, MeshletBuffers, MinMaxPyramid, MorphBuffers,
+    GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, MeshletBuffers, MinMaxPyramid,
+    MorphBuffers,
 };
 use crate::{Device, Error, GradeUniform, Pipeline, Result, checked};
 
@@ -66,7 +67,7 @@ unsafe impl Sync for GpuQueue {}
 
 impl GpuQueue {
     /// Wraps the device's graphics queue for shared, externally-synchronized use.
-    pub fn new(queue: vk::Queue) -> Self {
+    pub(crate) fn new(queue: vk::Queue) -> Self {
         Self {
             inner: Arc::new(Mutex::new(queue)),
         }
@@ -78,19 +79,33 @@ impl GpuQueue {
     /// # Errors
     ///
     /// Returns [`Error::Vk`] if `vkQueueSubmit2` fails.
-    fn submit2(
+    pub(crate) fn submit2(
         &self,
         raw: &ash::Device,
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
+        context: &'static str,
     ) -> Result<()> {
         let queue = *self.inner.lock().expect("gpu queue mutex");
         // SAFETY: the ash seam. The queue is externally synchronized by the mutex held
         // here; the submit-infos + fence are valid for the call.
-        checked(
-            unsafe { raw.queue_submit2(queue, submits, fence) },
-            "queue_submit2 (one-off)",
-        )
+        checked(unsafe { raw.queue_submit2(queue, submits, fence) }, context)
+    }
+
+    /// Presents one swapchain image under the same external-synchronization lock as submits.
+    pub(crate) fn present(
+        &self,
+        loader: &ash::khr::swapchain::Device,
+        info: &vk::PresentInfoKHR<'_>,
+    ) -> std::result::Result<bool, vk::Result> {
+        let queue = *self.inner.lock().expect("gpu queue mutex");
+        unsafe { loader.queue_present(queue, info) }
+    }
+
+    /// Waits for the logical device while excluding concurrent queue submissions.
+    pub(crate) fn wait_device_idle(&self, raw: &ash::Device) -> Result<()> {
+        let _queue = self.inner.lock().expect("gpu queue mutex");
+        checked(unsafe { raw.device_wait_idle() }, "device_wait_idle")
     }
 }
 
@@ -226,14 +241,17 @@ impl Uploader {
         let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos);
         let submits = [submit];
 
-        let result = self.queue.submit2(raw, &submits, fence).and_then(|()| {
-            // SAFETY: the ash seam. The fence belongs to this device; the wait blocks
-            // until the one-off submit completes.
-            checked(
-                unsafe { raw.wait_for_fences(&[fence], true, u64::MAX) },
-                "wait_for_fences (one-off)",
-            )
-        });
+        let result = self
+            .queue
+            .submit2(raw, &submits, fence, "queue_submit2 (one-off)")
+            .and_then(|()| {
+                // SAFETY: the ash seam. The fence belongs to this device; the wait blocks
+                // until the one-off submit completes.
+                checked(
+                    unsafe { raw.wait_for_fences(&[fence], true, u64::MAX) },
+                    "wait_for_fences (one-off)",
+                )
+            });
 
         // SAFETY: the ash seam. The fence was waited (or the submit failed before
         // signaling it), so it is idle and destroyed exactly once.
@@ -359,7 +377,7 @@ impl Uploader {
         }
         staging.flush();
 
-        // Compute bounds + the retained CPU copies for triangle-precise picking.
+        // Compute bounds; the complete CPU vertex stream is retained for surface queries.
         let mut bounds_min = Vec3::splat(f32::MAX);
         let mut bounds_max = Vec3::splat(f32::MIN);
         let mut cpu_positions = Vec::with_capacity(mesh.vertices.len());
@@ -567,7 +585,7 @@ impl Uploader {
             submeshes: mesh.submeshes.clone(),
             bounds_min,
             bounds_max,
-            cpu_positions,
+            cpu_vertices: mesh.vertices.clone(),
             cpu_indices: mesh.indices.clone(),
             cpu_skin: skin.to_vec(),
             blas,
@@ -2285,6 +2303,97 @@ impl Uploader {
         self.finish_texture(descriptors, uploaded, None)
     }
 
+    /// Uploads six tightly packed linear-float RGBA faces into a sampled HDR cube.
+    ///
+    /// Faces use Vulkan cube order `+X, -X, +Y, -Y, +Z, -Z`; each carries `size²` texels.
+    pub fn upload_cube_float(&self, rgba: &[f32], size: u32) -> Result<Image> {
+        if size == 0 {
+            return Err(Error::ZeroSizedImage);
+        }
+        let texels = size as usize * size as usize * 6 * 4;
+        if rgba.len() < texels {
+            return Err(Error::InvalidUploadData(format!(
+                "cube upload expected {texels} floats, received {}",
+                rgba.len()
+            )));
+        }
+        let half: Vec<u16> = rgba[..texels].iter().copied().map(float_to_half).collect();
+        let bytes = (half.len() * std::mem::size_of::<u16>()) as vk::DeviceSize;
+        let mut staging = StagingBuffer::new(self.allocator(), bytes)?;
+        staging
+            .mapped_slice()
+            .copy_from_slice(bytemuck::cast_slice(&half));
+        staging.flush();
+
+        let desc = ImageDesc {
+            extent: vk::Extent2D {
+                width: size,
+                height: size,
+            },
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            aspect: vk::ImageAspectFlags::COLOR,
+            view_type: vk::ImageViewType::CUBE,
+            mip_levels: 1,
+            array_layers: 6,
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        let mut image = Image::new(&self.resources, &desc)?;
+        let handle = image.handle();
+        let recorded = self.with_one_off_commands(|cmd| {
+            // SAFETY: the cube and staging buffer outlive the waited one-off submit.
+            unsafe {
+                transition_image_layers(
+                    self.raw(),
+                    cmd,
+                    handle,
+                    6,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 6,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: size,
+                        height: size,
+                        depth: 1,
+                    });
+                self.raw().cmd_copy_buffer_to_image(
+                    cmd,
+                    staging.handle(),
+                    handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                transition_image_layers(
+                    self.raw(),
+                    cmd,
+                    handle,
+                    6,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                );
+            }
+        });
+        drop(staging);
+        recorded?;
+        image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        Ok(image)
+    }
+
     /// Uploads an RGBA8 image as a sampled, mipmapped **displacement height** texture *and* builds its
     /// per-height min/max pyramid, writing both into the same bindless slot (the texture at binding 0,
     /// the pyramid at binding 4). Mirrors [`Uploader::upload_texture`] with `srgb = false` (height is
@@ -3701,6 +3810,43 @@ unsafe fn transition_image(
     unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
 }
 
+/// One whole-image sync2 transition for every array layer of a single-mip image.
+#[allow(clippy::too_many_arguments)]
+unsafe fn transition_image_layers(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    layers: u32,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+) {
+    let barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(from)
+        .new_layout(to)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: layers,
+        });
+    let barriers = [barrier];
+    let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+    // SAFETY: the caller's recording contract; the image outlives the submit.
+    unsafe { raw.cmd_pipeline_barrier2(cmd, &dependency) };
+}
+
 /// Narrows one finite f32 to an IEEE binary16 (round-to-nearest-even). Subnormals are
 /// flushed where the source underflows; finite magnitudes above the f16 max saturate
 /// to ±inf, matching what the GPU produces sampling an f16 texture.
@@ -3782,7 +3928,7 @@ mod tests {
         let before = validation_issue_count();
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let mesh = triangle();
 
@@ -3795,8 +3941,8 @@ mod tests {
             plain.skin_buffer().is_none(),
             "no skin stream → null skin buffer"
         );
-        assert_eq!(plain.cpu_indices, mesh.indices);
-        assert_eq!(plain.cpu_positions.len(), 3);
+        assert_eq!(&*plain.cpu_indices, mesh.indices.as_slice());
+        assert_eq!(plain.cpu_vertices.len(), 3);
 
         let skin = vec![VertexSkin::default(); mesh.vertices.len()];
         let skinned = uploader
@@ -3840,7 +3986,7 @@ mod tests {
         let before = validation_issue_count();
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
 
         // A 4×4 sRGB image: mip 0 + a blitted-down chain (mip_count(4,4) == 3).
@@ -4034,7 +4180,7 @@ mod tests {
         let Some(device) = device_or_skip() else {
             return;
         };
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let (positions, indices) = l_prism_geometry();
         let fields = uploader
@@ -4067,7 +4213,7 @@ mod tests {
         let before = validation_issue_count();
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
 
         let (positions, indices) = box_geometry(Vec3::splat(-1.0), Vec3::splat(1.0));
@@ -4136,7 +4282,7 @@ mod tests {
         let Some(device) = device_or_skip() else {
             return;
         };
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let dir = std::env::temp_dir().join(format!("saffron-sdf-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

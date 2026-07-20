@@ -1,24 +1,24 @@
 +++
-title = 'How a crate organizes its modules'
+title = 'Module partitions'
 weight = 3
 +++
 
-# How a crate organizes its modules
+# Module partitions
 
-A large crate is not one file. It is split into many module files under `src/`, each declared with
-`mod name;` in the crate root, and the root re-exports the curated public surface with `pub use`.
-The module files are private organization; the `pub use` block is the crate's API. This is how a
-crate like `saffron-rendering` carries thirty-odd feature files behind one tidy import.
+A large crate is many files, not one. Each feature lives in its own module file under `src/`,
+declared with `mod name;` in the crate root, and the root publishes the crate's API in a `pub use`
+block. Under [Rust's module system](https://doc.rust-lang.org/book/ch07-00-managing-growing-projects-with-packages-crates-and-modules.html)
+the files are private organization and the re-exports are the entire public surface.
 
-The split is by feature, one module per concern, and it costs nothing at the boundary: modules in
-one crate share a single compilation unit, so a call from one module file to another is an ordinary
-function call with no extra ceremony. The only thing the crate root decides is what escapes.
+The split costs nothing at the call site. A crate is one compilation unit, so a call from one
+module file into a sibling is an ordinary function call. The only decision the crate root makes is
+what escapes.
 
 ## Module files and the re-export root
 
-`saffron-rendering` is one crate spread across many files under `crates/rendering/src/`. Each
-feature is its own module file — `pipelines.rs`, `lighting.rs`, `aa.rs`, `render_graph.rs`,
-`ssao.rs`, and so on — declared privately in `lib.rs`:
+`saffron-rendering` has the most module files of any crate in the workspace: 38 under
+`crates/rendering/src/`, one per feature (`lighting.rs`, `pipelines.rs`, `render_graph.rs`,
+`ssao.rs`, …), each declared privately in `lib.rs`:
 
 ```rust
 // crates/rendering/src/lib.rs
@@ -27,48 +27,73 @@ mod pipelines;
 mod render_graph;
 mod renderer;
 mod resources;
-// … ~30 module files
+// … 38 `mod` lines in all
 
-pub use render_graph::{RenderGraph, RgPass, RgUsage};
-pub use renderer::{Renderer, ViewId, ViewMode};
-pub use resources::{Buffer, Image, GpuMesh};
+pub use render_graph::{
+    ProfileRecorders, RenderGraph, RgAccess, RgAttachment, RgPass, RgPassKind, RgResource, RgUsage,
+};
+pub use renderer::{RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
 ```
 
-Every `mod` is private, so the module files are internal by default. A type is reachable to
-consumers only when `lib.rs` re-exports it with `pub use`. A consumer writes
-`use saffron_rendering::{Renderer, RenderGraph};` and sees exactly the curated surface — the feature
-files that produced those types stay invisible.
+None of the `mod` declarations is `pub`, so a type inside a module stays unreachable to consumers
+until `lib.rs` re-exports it, even when the type itself is written `pub`. A consumer writes
+`use saffron_rendering::{Renderer, RenderGraph};` and sees exactly the curated list. Which file
+produced each type is invisible from outside.
 
-Items a module file needs from a *sibling* file are reached with `use crate::pipelines::Pipelines;`
-(an internal path), distinct from the `pub use` that publishes to the outside world. Internal
-visibility lives between the two: a helper used across sibling modules but not exported is `pub(crate)`,
-visible crate-wide but absent from the public API.
+Between public and private sits `pub(crate)`: visible to every module in the crate, absent from
+the API. The crate root's `checked` helper is the pattern. `pub(crate) fn checked` wraps an ash
+`vk::Result` into the crate's typed error, callable from any pass module but never exported.
+
+## Internal-only modules
+
+Re-export is per item, so a module can contribute nothing to the API at all. Five rendering
+modules appear in no `pub use` line: `budget`, `meshlet_raster`, `nested_scopes`, `present`, and
+`render_settings`. Their types are plain `pub` (`pub struct BudgetController`), which lets sibling
+files reach them through internal paths:
+
+```rust
+// crates/rendering/src/renderer.rs
+use crate::budget::{BudgetController, BudgetStep};
+use crate::present::PresentSync;
+```
+
+A `use crate::…` path is the wiring between sibling files. A `pub use` in the root is the separate
+act of publishing to consumers, and one never implies the other.
 
 ## Where the file lines fall
 
-The division is by responsibility, not by size cap:
+The division is by responsibility, not by a size cap:
 
-- The orchestration file (`renderer.rs`) owns the top-level type (`Renderer`) and the frame entry
-  points, and calls into the feature files.
-- Each feature file owns one subsystem's types and logic — `lighting.rs` the clustered lighting,
-  `ssao.rs` the ambient-occlusion pass, `render_graph.rs` the [`RgPass`/`RgUsage`
-  graph](../../frame-and-render-graph/render-graph-overview/).
-- A purely internal helper lives in the file with its sole caller and is never re-exported.
+- The orchestration file (`renderer.rs`) owns the top-level `Renderer` aggregate and the frame
+  entry points (`render_frame`, `submit`), and calls into the feature files.
+- Each feature file owns one subsystem's types and logic: `lighting.rs` the clustered lighting and
+  shadow-map constants, `ssao.rs` the ambient-occlusion passes, `render_graph.rs` the
+  [`RgPass`/`RgUsage` graph](../../frame-and-render-graph/render-graph-overview/).
+- A helper with a single caller stays in that caller's file and is never re-exported.
 
-A nested module group (a `mod foo { ... }` block, or a `foo/` directory with a `mod.rs`) is used
-when a feature has several closely-related files of its own — the same pattern one level down. The
-crate root re-exports only the public leaves either way.
+Modules partition code, not state. Every pass module works against the shared `Renderer`
+aggregate, which is why the renderer is one crate of many files rather than many crates: the
+aggregate cannot be cut across a crate boundary, while module files slice the code around it
+freely.
+
+Every file-level module in the workspace is a single flat file; no crate uses a module directory
+(`foo/` with a `mod.rs`). Nesting appears only as an inline `mod name { … }` block where one file
+wants a private namespace, such as the `coerce` block in the protocol crate's `dto.rs` that groups
+its serde bool-coercion helpers, or a `#[cfg(test)] mod tests` block.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Private module files | `crates/rendering/src/lib.rs` | `mod lighting;`, `mod pipelines;`, … |
+| Private module declarations | `crates/rendering/src/lib.rs` | `mod lighting;`, `mod pipelines;`, … |
 | The re-export surface | `crates/rendering/src/lib.rs` | `pub use renderer::{Renderer, ...}` |
-| An orchestration module | `crates/rendering/src/renderer.rs` | `Renderer`, `submit`, the frame entry points |
-| A feature module | `crates/rendering/src/render_graph.rs` | `RenderGraph`, `RgPass`, `RgUsage` |
+| A crate-wide internal helper | `crates/rendering/src/lib.rs` | `pub(crate) fn checked` |
+| The orchestration module | `crates/rendering/src/renderer.rs` | `Renderer`, `render_frame`, `submit` |
+| An internal-only module | `crates/rendering/src/budget.rs` | `BudgetController` (no re-export) |
+| An inline module block | `crates/protocol/src/dto.rs` | `mod coerce` |
 
 ## Related
-- [The Cargo workspace and crate model](../cargo-workspace/) — crates vs modules
+
+- [Cargo workspace and crate model](../cargo-workspace/) — crates vs modules
 - [The crate DAG](../module-dag/) — where the rendering crate sits in the graph
 - [Render graph overview](../../frame-and-render-graph/render-graph-overview/) — the `RgPass` API

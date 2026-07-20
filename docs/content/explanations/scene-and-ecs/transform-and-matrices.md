@@ -6,23 +6,21 @@ math = true
 
 # Transforms
 
-A transform places an object in the world by combining a translation, a rotation, and a scale into a
-single 4x4 model matrix. Every renderable and the camera share the same representation, so one
-function builds the matrix they all use.
+A `Transform` stores an entity's placement relative to its parent. Anima composes that local translation, rotation, and scale into a matrix, then walks the [scene hierarchy](../scene-hierarchy/) to produce the world matrices used by rendering, physics synchronization, picking, cameras, and editor overlays.
 
-A `Transform` holds three vectors: translation, scale, and rotation stored as Euler XYZ angles in
-radians. `transform_matrix` composes them into the local model matrix. The result is local to the
-entity's parent; the [scene hierarchy](../scene-hierarchy/) composes the parent chain into the
-cached world matrix that rendering, picking, and the gizmo actually consume.
+Keeping authored and derived state separate lets a parent move an entire subtree without rewriting each child's local values.
 
-## The composition
+## Local TRS
 
-The composition follows the standard TRS order. Read right to left, a point is scaled, then rotated,
-then translated:
+`Transform` contains `translation: Vec3`, `rotation: Vec3`, and `scale: Vec3`. Rotation uses XYZ [Euler angles](https://en.wikipedia.org/wiki/Euler_angles) in radians; the editor converts only this field to degrees for display.
+
+`transform_matrix` uses translation-rotation-scale order:
 
 $$
-M = T \cdot R \cdot S
+M_{local} = T \cdot R \cdot S
 $$
+
+Because matrix multiplication applies right to left, a point is scaled, rotated, and then translated.
 
 ```rust
 pub fn transform_matrix(transform: &Transform) -> Mat4 {
@@ -32,63 +30,69 @@ pub fn transform_matrix(transform: &Transform) -> Mat4 {
 }
 ```
 
-The Euler vector becomes a quaternion via `quat_from_euler_xyz`, the engine's own half-angle
-product. The conversion is hand-rolled rather than delegated to `glam::Quat::from_euler`, whose
-`EulerRot` conventions do not match the engine's for a generic rotation. This is the single place an
-authored Euler becomes a rotation, so the convention here is load-bearing across the whole engine.
+`quat_from_euler_xyz` defines the engine's Euler-to-quaternion convention with half-angle products. Animation rest poses and matrix composition call this one function, so they cannot disagree about rotation order.
 
-## Why rotation is stored as Euler radians
+## World composition
 
-Rotation could be stored as a quaternion. Euler angles are a deliberate authoring choice: a
-quaternion edited through a UI must be decomposed back to angles, and that decomposition is ambiguous
-and clips at $\pm 90°$ on the middle axis. The inspector edits the stored Euler vector directly,
-converting to degrees only for display, which avoids the clip.
+`Scene::update_world_transforms` starts at hierarchy roots and recursively computes:
 
-The trade is a known one. Euler angles can gimbal-lock, but for hand-authored scene transforms the
-clip-free editing is worth more. The conversion to a quaternion happens once, at matrix-build time,
-away from the UI. The inverse, `quat_to_euler_zyx`, is the stable $R_z \cdot R_y \cdot R_x$ matrix
-extraction the reparent rebase uses; `glam`'s `Quat::to_euler` is numerically unstable at yaw
-$\pm 90°$, so the scene owns its own extraction.
+$$
+M_{world} = M_{parent} \cdot M_{local}
+$$
 
-## The camera is the same data, inverted
+For example, a parent translated to `(10, 0, 0)` and a child translated locally to `(0, 2, 0)` place the child at `(10, 2, 0)` before rotation or scale changes the result.
 
-A camera entity has no separate orientation. `primary_camera` finds the first entity with a
-`Transform` and a primary `Camera`, takes its cached **world** matrix, and inverts it to get the
-view matrix:
+Each transformable entity receives a runtime-only `WorldTransform`. Full `Mat4` multiplication preserves non-uniform parent scale; render code derives the corresponding inverse-transpose normal matrix from the final world matrix.
+
+Animation can attach a `PoseOverride`. `Scene::local_matrix` prefers that evaluated translation, quaternion, and scale while it is present, leaving the authored `Transform` unchanged for edit previews and later playback resets.
+
+## Reparenting
+
+`Scene::set_parent` stores the new parent's stable `Uuid`, rejects cycles, and rebuilds the hierarchy caches. Editor reparenting uses `keep_world: true`, which computes a replacement local matrix:
+
+$$
+M'_{local} = M^{-1}_{new\ parent} \cdot M_{world}
+$$
+
+`set_local_from_matrix` decomposes this matrix back into translation, quaternion, and scale, then converts the quaternion with `quat_to_euler_zyx`. A `Transform` has no shear field, so decomposition discards shear from a source matrix that contains it.
+
+The custom quaternion-to-Euler extraction remains stable at the middle-axis gimbal pole. At that pole it may return a different Euler triple that represents the same rotation matrix, which is sufficient for preserving world placement.
+
+## Camera view
+
+A `Camera` component contains projection settings, not a second transform. `Scene::primary_camera` finds the first primary camera and inverts its world matrix:
 
 ```rust
-Some(CameraView {
-    view: self.world_matrix(entity).inverse(),
+CameraView {
+    view: scene.world_matrix(entity).inverse(),
     fov: camera.fov,
     near_plane: camera.near_plane,
     far_plane: camera.far_plane,
-})
+}
 ```
 
-A camera is positioned and aimed with the same transform component as any object, and a parented
-camera views from its world placement. The view matrix is the inverse of that world matrix.
+A parented camera therefore inherits its ancestors' placement. The camera's vertical field of view is stored in degrees and converted to radians when `camera_projection` builds the perspective matrix.
 
-## The projection lives un-flipped
+## Projection convention
 
-`camera_projection` returns a plain right-handed GL-clip perspective (`Mat4::perspective_rh_gl`).
-The Vulkan Y-flip is not baked in, so the projection has one source of truth. The renderer and
-[picking](../picking/) apply `proj.y_axis.y *= -1.0` where they build the actual draw / pick matrix;
-the editor gizmo consumes the un-flipped matrix as-is, so it is not mirrored. A flip baked into
-`camera_projection` would draw the gizmo backwards.
+`camera_projection` returns an unflipped right-handed GL-clip projection through `Mat4::perspective_rh_gl`. The renderer and [picking](../picking/) negate `proj.y_axis.y` when they build a Vulkan-facing view-projection matrix. The editor gizmo consumes the unflipped projection, preventing a mirrored control.
 
-## In the code
+This division keeps camera projection parameters in one place while each consumer applies the coordinate-system adaptation it requires.
+
+## Source map
 
 | What | File | Symbols |
 |---|---|---|
-| The component | `scene/src/component.rs` | `Transform` |
-| TRS composition | `scene/src/hierarchy.rs` | `transform_matrix`, `quat_from_euler_xyz` |
-| Stable Euler extraction | `scene/src/hierarchy.rs` | `quat_to_euler_zyx`, `set_local_from_matrix` |
-| Camera view from transform | `scene/src/hierarchy.rs` | `primary_camera`, `CameraView` |
-| Un-flipped projection | `scene/src/hierarchy.rs` | `camera_projection` |
-| Where the Y-flip is applied | `assets/src/render_scene.rs` | `render_scene`, `pick_entity` |
-| Degree/radian edit | `editor/src/components/fieldRenderer.tsx` | `Transform.rotation`, `RAD_TO_DEG` |
+| Authored and cached transform data | `engine/crates/scene/src/component.rs` | `Transform`, `WorldTransform`, `PoseOverride` |
+| TRS and Euler conversion | `engine/crates/scene/src/hierarchy.rs` | `transform_matrix`, `quat_from_euler_xyz`, `quat_to_euler_zyx` |
+| Hierarchy composition and reparenting | `engine/crates/scene/src/hierarchy.rs` | `Scene::update_world_transforms`, `Scene::set_parent`, `Scene::set_local_from_matrix` |
+| Camera view and projection | `engine/crates/scene/src/hierarchy.rs` | `Scene::primary_camera`, `CameraView`, `camera_projection` |
+| Vulkan Y flip | `engine/crates/assets/src/render_scene.rs` | `render_scene`, `viewport_ray` |
+| Degree/radian editor conversion | `editor/src/components/fieldRenderer.tsx` | `Transform.rotation`, `RAD_TO_DEG`, `DEG_TO_RAD` |
 
 ## Related
-- [Components](../built-in-components/) — the rest of the value structs
-- [Picking](../picking/) — where the flipped projection is rebuilt for the ray
-- [Inspector](../../ui-and-editor/inspector/) — the degrees-to-radians edit path
+
+- [Components](../built-in-components/)
+- [Scene hierarchy](../scene-hierarchy/)
+- [Picking](../picking/)
+- [Inspector](../../ui-and-editor/inspector/)

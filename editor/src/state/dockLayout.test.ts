@@ -48,15 +48,18 @@ function branch(
 }
 
 function layoutOf(rootId: string, ...nodes: (DockLeaf | DockBranch)[]): DockLayout {
-  return { version: 1, rootId, nodes: Object.fromEntries(nodes.map((n) => [n.id, n])) };
+  return { version: 2, rootId, nodes: Object.fromEntries(nodes.map((n) => [n.id, n])) };
 }
 
 describe("default factories", () => {
-  test("defaultSceneLayout has three persistent leaves with the trio in leftBottom", () => {
+  test("defaultSceneLayout gives scene settings a full-height right dock", () => {
     const l = defaultSceneLayout();
     const lb = l.nodes["leaf:leftBottom"];
-    expect(isLeaf(lb) && lb.tabs).toEqual(["inspector", "environment", "render"]);
+    const right = l.nodes["leaf:right"];
+    expect(isLeaf(lb) && lb.tabs).toEqual(["inspector"]);
     expect(isLeaf(lb) && lb.activeTab).toBe("inspector");
+    expect(isLeaf(right) && right.tabs).toEqual(["environment", "render", "postProcess"]);
+    expect(isLeaf(right) && right.activeTab).toBe("environment");
     for (const id of ["leaf:leftBottom", "leaf:right", "leaf:bottom"]) {
       const node = l.nodes[id];
       expect(isLeaf(node) && node.persistent).toBe(true);
@@ -67,7 +70,7 @@ describe("default factories", () => {
     const l = defaultSceneLayout();
     const n = normalize(l);
     expect(Object.keys(n.nodes).sort()).toEqual(Object.keys(l.nodes).sort());
-    expect(leafTabs(n, "leaf:right")).toEqual([]);
+    expect(leafTabs(n, "leaf:right")).toEqual(["environment", "render", "postProcess"]);
     expect(leafTabs(n, "leaf:bottom")).toEqual([]);
   });
 
@@ -126,7 +129,7 @@ describe("default factories", () => {
 describe("insertPanel / removePanel", () => {
   test("insertPanel adds at index and activates", () => {
     const l = insertPanel(defaultSceneLayout(), "stats", "leaf:right", 0);
-    expect(leafTabs(l, "leaf:right")).toEqual(["stats"]);
+    expect(leafTabs(l, "leaf:right")).toEqual(["stats", "environment", "render", "postProcess"]);
     const right = l.nodes["leaf:right"];
     expect(isLeaf(right) && right.activeTab).toBe("stats");
   });
@@ -151,9 +154,9 @@ describe("insertPanel / removePanel", () => {
   });
 
   test("removePanel of the first active tab falls to the new first", () => {
-    const l = removePanel(defaultSceneLayout(), "inspector");
-    const lb = l.nodes["leaf:leftBottom"];
-    expect(isLeaf(lb) && lb.activeTab).toBe("environment");
+    const l = removePanel(defaultSceneLayout(), "environment");
+    const right = l.nodes["leaf:right"];
+    expect(isLeaf(right) && right.activeTab).toBe("render");
   });
 
   test("removePanel of a non-active tab leaves the active tab intact", () => {
@@ -176,13 +179,13 @@ describe("insertPanel / removePanel", () => {
 
 describe("reorderTab (without-moving-tab index space)", () => {
   test("moves a tab to a later index", () => {
-    const l = reorderTab(defaultSceneLayout(), "leaf:leftBottom", "inspector", 2);
-    expect(leafTabs(l, "leaf:leftBottom")).toEqual(["environment", "render", "inspector"]);
+    const l = reorderTab(defaultSceneLayout(), "leaf:right", "environment", 2);
+    expect(leafTabs(l, "leaf:right")).toEqual(["render", "postProcess", "environment"]);
   });
 
   test("moves a tab to the front", () => {
-    const l = reorderTab(defaultSceneLayout(), "leaf:leftBottom", "render", 0);
-    expect(leafTabs(l, "leaf:leftBottom")).toEqual(["render", "inspector", "environment"]);
+    const l = reorderTab(defaultSceneLayout(), "leaf:right", "postProcess", 0);
+    expect(leafTabs(l, "leaf:right")).toEqual(["postProcess", "environment", "render"]);
   });
 });
 
@@ -440,7 +443,7 @@ describe("validate", () => {
   });
 
   test("returns null when the root is missing", () => {
-    const l: DockLayout = { version: 1, rootId: "ghost", nodes: {} };
+    const l: DockLayout = { version: 2, rootId: "ghost", nodes: {} };
     expect(validate(l, scene)).toBeNull();
   });
 
@@ -471,7 +474,7 @@ describe("Scene tree render helpers", () => {
 
   test("isNodeRendered: empty non-locked leaf collapses, locked/non-empty render", () => {
     const l = defaultSceneLayout();
-    expect(isNodeRendered(l, "leaf:right")).toBe(false); // empty, non-locked
+    expect(isNodeRendered(l, "leaf:right")).toBe(true); // scene settings
     expect(isNodeRendered(l, "leaf:bottom")).toBe(false);
     expect(isNodeRendered(l, "leaf:viewport")).toBe(true); // locked
     expect(isNodeRendered(l, "leaf:leftBottom")).toBe(true); // non-empty
@@ -480,7 +483,11 @@ describe("Scene tree render helpers", () => {
   test("renderedChildIds drops empty leaves from the root", () => {
     const l = defaultSceneLayout();
     const root = l.nodes[l.rootId] as DockBranch;
-    expect(renderedChildIds(l, root)).toEqual(["branch:scene-left", "branch:scene-center"]);
+    expect(renderedChildIds(l, root)).toEqual([
+      "branch:scene-left",
+      "branch:scene-center",
+      "leaf:right",
+    ]);
   });
 
   test("subtreeMinPx propagates the viewport's 520px width up through its column", () => {
@@ -510,9 +517,9 @@ describe("openPanelResolve", () => {
   test("an already-open panel is activated in place", () => {
     const l = defaultSceneLayout();
     const r = openPanelResolve(l, "environment", { defaultLeafId: DEFAULT_LEAF.environment });
-    expect(r.leafId).toBe("leaf:leftBottom");
-    const lb = r.layout.nodes["leaf:leftBottom"];
-    expect(isLeaf(lb) && lb.activeTab).toBe("environment");
+    expect(r.leafId).toBe("leaf:right");
+    const right = r.layout.nodes["leaf:right"];
+    expect(isLeaf(right) && right.activeTab).toBe("environment");
   });
 
   test("falls to lastLocation when present and usable", () => {
@@ -529,7 +536,12 @@ describe("openPanelResolve", () => {
     const l = defaultSceneLayout();
     const r = openPanelResolve(l, "stats", { defaultLeafId: "leaf:right" });
     expect(r.leafId).toBe("leaf:right");
-    expect(leafTabs(r.layout, "leaf:right")).toEqual(["stats"]);
+    expect(leafTabs(r.layout, "leaf:right")).toEqual([
+      "environment",
+      "render",
+      "postProcess",
+      "stats",
+    ]);
   });
 
   test("terminal fallback appends a fresh leaf when only locked leaves exist", () => {
@@ -557,7 +569,13 @@ describe("resetLayoutPreservingOpen", () => {
     expect(findPanelLeaf(reset, "material")).toBe("leaf:right");
     expect(findPanelLeaf(reset, "timeline")).toBe("leaf:assets");
     // Structural panels keep their home, untouched.
-    expect(leafTabs(reset, "leaf:leftBottom")).toEqual(["inspector", "environment", "render"]);
+    expect(leafTabs(reset, "leaf:leftBottom")).toEqual(["inspector"]);
+    expect(leafTabs(reset, "leaf:right")).toEqual([
+      "environment",
+      "render",
+      "postProcess",
+      "material",
+    ]);
     expect(findPanelLeaf(reset, "assets")).toBe("leaf:assets");
   });
 

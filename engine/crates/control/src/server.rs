@@ -5,7 +5,7 @@
 //! pending clients, reads readable bytes, splits on `\n`, runs each request on
 //! the calling thread, and writes one compact JSON line back, never blocking.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use rustix::event::{PollFlags, poll};
 use rustix::fs::{Mode, chmod, unlink};
@@ -16,6 +16,38 @@ use rustix::net::{
 };
 
 use crate::error::{Error, Result};
+
+/// Socket-creation flags set atomically where the OS offers them. Linux has `SOCK_NONBLOCK` /
+/// `SOCK_CLOEXEC` (and `accept4`); macOS has neither in the socket type field, so there the flags
+/// are empty and [`configure_socket`] applies `O_NONBLOCK` + `FD_CLOEXEC` with `ioctl`/`fcntl`
+/// right after creation.
+#[cfg(not(target_os = "macos"))]
+const SOCKET_CREATE_FLAGS: SocketFlags = SocketFlags::NONBLOCK.union(SocketFlags::CLOEXEC);
+#[cfg(target_os = "macos")]
+const SOCKET_CREATE_FLAGS: SocketFlags = SocketFlags::empty();
+
+/// The send flags for a reply. `MSG_NOSIGNAL` suppresses `SIGPIPE` on a vanished peer where the
+/// OS defines it (Linux). macOS has no `MSG_NOSIGNAL`, but Rust's runtime installs `SIG_IGN` for
+/// `SIGPIPE` at startup, so `send` returns `EPIPE` there and the caller marks the client dead —
+/// no signal is raised.
+#[cfg(not(target_os = "macos"))]
+const REPLY_SEND_FLAGS: SendFlags = SendFlags::NOSIGNAL;
+#[cfg(target_os = "macos")]
+const REPLY_SEND_FLAGS: SendFlags = SendFlags::empty();
+
+/// Makes a freshly created socket fd non-blocking and close-on-exec. A no-op where the socket
+/// type flags already did so at creation (Linux); on macOS, which lacks those atomic flags, it
+/// sets `O_NONBLOCK` (via `FIONBIO`) and `FD_CLOEXEC` (via `fcntl`).
+#[cfg(target_os = "macos")]
+fn configure_socket(fd: BorrowedFd<'_>) {
+    use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd, ioctl_fionbio};
+    let _ = ioctl_fionbio(fd, true);
+    if let Ok(flags) = fcntl_getfd(fd) {
+        let _ = fcntl_setfd(fd, flags | FdFlags::CLOEXEC);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn configure_socket(_fd: BorrowedFd<'_>) {}
 
 /// The `recv` scratch buffer size.
 const RECV_CHUNK: usize = 4096;
@@ -90,10 +122,11 @@ pub fn start_control_server(path: String) -> Result<ControlServer> {
     let listen_fd = socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        SOCKET_CREATE_FLAGS,
         None,
     )
     .map_err(|e| Error::Socket(format!("socket: {e}")))?;
+    configure_socket(listen_fd.as_fd());
 
     // Remove any stale socket before binding.
     let _ = unlink(path.as_str());
@@ -149,10 +182,8 @@ impl ControlServer {
 
     /// Accepts every pending connection until `accept` would block.
     fn accept_pending(&mut self) {
-        while let Ok(fd) = accept_with(
-            self.listen_fd.as_fd(),
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        ) {
+        while let Ok(fd) = accept_with(self.listen_fd.as_fd(), SOCKET_CREATE_FLAGS) {
+            configure_socket(fd.as_fd());
             self.clients.push(Client {
                 fd,
                 inbuf: Vec::new(),
@@ -197,7 +228,7 @@ fn read_into(client: &mut Client) {
 fn flush_reply(client: &mut Client, out: &[u8]) {
     let mut sent = 0;
     while sent < out.len() && !client.dead {
-        match send(client.fd.as_fd(), &out[sent..], SendFlags::NOSIGNAL) {
+        match send(client.fd.as_fd(), &out[sent..], REPLY_SEND_FLAGS) {
             Ok(n) => sent += n,
             // `EAGAIN`/`EWOULDBLOCK` (one errno on Linux): the send buffer is full;
             // wait for writability, then retry.

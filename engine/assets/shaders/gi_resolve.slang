@@ -2,20 +2,18 @@
 // view-independent indirect DIFFUSE irradiance once per HALF-res pixel off the thin G-buffer, so the
 // forward fragment stops resolving the DDGI 8-probe cage + IBL diffuse per full-res pixel and instead
 // samples one upsampled indirect-diffuse map. Mirrors `lighting.slang`'s `indirectIrr` exactly:
-//   analyticIrr = irradiance(IBL diffuse cube by n) * dfao sky-visibility
+//   analyticIrr = skyShIrradiance(n) * dfao sky-visibility
 //   indirectIrr = DDGI on ? lerp(analyticIrr, ddgiSampleIrradiance(...), coverage) : analyticIrr
 // The DDGI cage sample is the shared `giprobe::ddgiSampleIrradiance` (one copy, set 5 atlases). The
 // output feeds a bilateral upsample + the fragment multiply (kd·albedo·ao) — specular stays full-res.
 //
-// First cut: the global IBL irradiance cube only (matches the fragment when no reflection probes are
-// placed — probeCount == 0). The reflection-probe diffuse blend is added before the fragment cutover.
-//
 // One descriptor set (set 0) — a self-contained compute pass, since `giprobe` declares no bindings
 // (the DDGI atlases are passed in): b0 G-buffer sampler (view-normal.xyz + view-Z.a), b1 half-res
-// indirect-diffuse storage, b2 params UBO, b3 IBL diffuse irradiance cube, b4 resolved dfao
+// indirect-diffuse storage, b2 params UBO, b3 raw-radiance sky SH, b4 resolved dfao
 // sky-visibility, b5/b6 the DDGI irradiance + distance-moment atlases.
 
 import giprobe;
+import sky_sh;
 
 [[vk::binding(0, 0)]] Sampler2D gbuffer;
 [[vk::image_format("rgba16f")]]
@@ -30,7 +28,7 @@ struct GiParams
 };
 [[vk::binding(2, 0)]] ConstantBuffer<GiParams> params;
 
-[[vk::binding(3, 0)]] SamplerCube irradianceMap;  // global IBL diffuse irradiance
+[[vk::binding(3, 0)]] StructuredBuffer<float4> skyShCoefficients;
 [[vk::binding(4, 0)]] Sampler2D dfaoMap;          // resolved half-res sky-visibility (r = [0,1])
 [[vk::binding(5, 0)]] Sampler2D ddgiIrradiance;   // DDGI octahedral irradiance atlas
 [[vk::binding(6, 0)]] Sampler2D ddgiDistance;     // DDGI distance-moment atlas
@@ -70,7 +68,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     float3 worldPos = mul(params.invView, float4(viewPos, 1.0)).xyz;
     float3 n = normalize(mul((float3x3)params.invView, normalize(g.xyz)));
 
-    float3 irradiance = irradianceMap.SampleLevel(n, 0.0).rgb;
+    float3 irradiance = skyShIrradiance(n, skyShCoefficients);
     float skyVis = params.flags.y != 0 ? dfaoMap.SampleLevel(uv, 0.0).r : 1.0;
     float3 analyticIrr = irradiance * skyVis;  // occlude the analytic sky (DFAO)
     float3 indirectIrr = analyticIrr;          // residual where DDGI is absent

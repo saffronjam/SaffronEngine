@@ -22,6 +22,8 @@ struct Push
 {
     float exposure;  // linear multiplier (exp2 of the EV stop)
     uint mode;       // 0 Reinhard, 1 ACES, 2 AgX, 3 PBR-Neutral (TonemapMode)
+    float nightFactor;
+    float _pad;
 };
 [[vk::push_constant]] Push push;
 
@@ -44,6 +46,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     uint frozenLook = uint(gradeUniform.look.z);
 
     float3 lin = color.rgb * push.exposure;       // 1 — exposure (the existing push)
+    lin = scotopicAdapt(lin, push.nightFactor);   // 2 — mesopic rod/cone adaptation
     float3 display;
     if (frozenLook == 1u)
     {

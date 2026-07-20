@@ -5,71 +5,88 @@ weight = 1
 
 # Materials & PSOs
 
-A material is a small, declarative description of how a surface draws: a shader name and a variant flag. A pipeline state object (PSO) is the compiled Vulkan object that renders with it. PSO selection is the step that maps one to the other.
+Surface data and pipeline state have different lifetimes. Anima resolves authored material assets into per-submesh data, then selects a Vulkan pipeline state object (PSO) from the small set of properties that affect GPU state.
 
-The two are separated because they have different costs and different cardinalities. Many materials describe one surface each; few distinct pipelines exist. Building a PSO is expensive, so the renderer constructs each one lazily and caches it, keyed by the properties that affect the pipeline rather than by material instance. A thousand entities with a thousand base colors then resolve to one PSO, which lets the draw-list batcher group them.
+This split keeps colors, texture choices, and numeric factors out of the PSO cache key. Surfaces with different appearances can share a pipeline and remain eligible for instancing.
 
-## How selection works
+## Two material records
 
-A material names a shader and a variant. The renderer derives a cache key from those plus the skinned/wireframe permutation, looks it up, and returns the cached pipeline or builds one and inserts it. The caller never constructs a pipeline directly; it holds a `Material` and asks the `Pipelines` cache for the matching `Arc<Pipeline>`, which many draws share.
+A [`MaterialSet`](../native-materials/) resolves each mesh slot into a `SubmeshMaterial`. This record contains the surface inputs needed for rendering, including texture handles, PBR factors, blend mode, culling choice, and height treatment. The instancing path deduplicates the numeric data into `MaterialParamsData` rows and addresses textures through the [bindless arrays](../bindless-textures/).
 
-## The material
+The renderer's `Material` type is a smaller pipeline selector:
 
 ```rust
 pub struct Material {
-    pub shader: String,  // "shaders/mesh.spv" by default, or a codegen'd material .spv
-    pub unlit: bool,     // selects the unlit übershader permutation (a distinct PSO)
-    pub blend: bool,     // translucent: blend-enabled, depth-write-off PSO (the sorted pass)
-    pub masked: bool,    // alpha-tested: under MSAA, the alpha-to-coverage PSO permutation
+    shader: String,
+    unlit: bool,
+    blend: bool,
+    masked: bool,
 }
 ```
 
-That is the whole type. The per-instance albedo index and base color live in the per-instance data, not the material; the material only decides which pipeline a renderable draws with. There is one übershader (`mesh.slang`), so almost everything resolves to the same PSO and the flags pick permutations of it. The three glTF alpha modes map onto `blend`/`masked` (from `BlendMode { Opaque, Masked, Blend }`): `Opaque` uses the plain PSO, `Blend` the depth-write-off blend PSO drawn in the [sorted translucent pass](../../frame-and-render-graph/render-graph-overview/), and `Masked` a hard `discard` — upgraded to [alpha-to-coverage](../ubershader-and-specialization/) when MSAA is active. See [the übershader](../ubershader-and-specialization/).
+`shader` identifies the mesh shader module. Most surfaces use the shared mesh shader, while a non-foldable [node graph](../node-graph-codegen/) can supply a generated shader. The remaining fields select the unlit, translucent, or alpha-masked behavior for one submesh.
 
-**`blend`/`masked` are resolved per submesh, not per item.** Blend mode belongs to a material slot, and one mesh can carry submeshes of different modes (a glTF model imports as one `MaterialSet` spanning all three). So `submit_draw_list` requests a PSO for each submesh from its own `BlendMode` and groups the mesh's submeshes into batches by the resulting PSO — opaque and (at 1×) masked submeshes share one opaque batch, translucent ones form a blend batch routed to the sorted pass — all sharing the one submesh-major instance block (`DrawBatch::submeshes` records the subset). A whole-mesh blend flag would draw a mixed model's translucent panels opaque.
+## Cache selection
 
-## Build on miss
-
-`request_mesh_pipeline` is the entry point. It builds a `PsoKey` from the material and the skinned/wireframe flags, looks it up, and either returns the cached `Arc<Pipeline>` or builds one and inserts it. The cache is a `HashMap<PsoKey, Arc<Pipeline>>` on `Pipelines`; the key is a typed struct (shader, unlit, skinned, wireframe, blend, alpha-to-coverage, sample count), not a stringly-typed concat. The `alpha_to_coverage` axis is derived, not raw: it is `masked && sample_count > 1`, so a masked material at 1× shares the opaque PSO and only masked-under-MSAA mints a distinct pipeline.
+`request_mesh_pipeline` converts the selector and frame state into a typed `PsoKey`. The key contains the shader name, unlit mode, vertex entry, wireframe mode, blend mode, alpha-to-coverage mode, and sample count. Two requests with equal keys receive the same `Arc<Pipeline>`.
 
 ```mermaid
-flowchart TD
-    A["request_mesh_pipeline(material, skinned, wireframe)"] --> B["build PsoKey"]
-    B --> C{"key in cache?"}
-    C -- hit --> D["return cached Arc&lt;Pipeline&gt;"]
-    C -- miss --> E["build_mesh_pipeline: compile PSO<br/>(bakes the unlit + alpha-to-coverage spec constants,<br/>blend + depth-write state)"]
-    E --> F["cache.insert(key, pipeline)"]
-    F --> D
+flowchart LR
+    A["Material selector"] --> B["Build PsoKey"]
+    C["Vertex and frame state"] --> B
+    B --> D{"Cache hit?"}
+    D -- Yes --> E["Return Arc<Pipeline>"]
+    D -- No --> F["Create Vulkan pipeline"]
+    F --> G["Insert by PsoKey"]
+    G --> E
 ```
 
-Two materials that name the same shader and permutation get the *same* `Arc<Pipeline>`, because the übershader makes them interchangeable. A build failure logs and returns `None` rather than panicking. The draw-list path skips a batch whose pipeline came back `None`, so one bad shader cannot bring down the frame. Wireframe is gated on the `fill_mode_non_solid` capability: an unsupported device folds the wireframe key back to fill, so the key never names a permutation the device cannot make.
+The cache builds on demand. A failed pipeline build produces an error log and no pipeline for that batch; it does not panic the render loop. Unsupported wireframe requests fold to fill mode before key construction, so the cache cannot contain a line-mode key on a device without `fillModeNonSolid`.
 
-## What a PSO bakes in
+## Per-submesh resolution
 
-`build_mesh_pipeline` is the only place a mesh pipeline is constructed. Beyond the shader stages it bakes in everything that has to match the frame's targets:
+Blend mode belongs to a material slot rather than the whole mesh. `submit_draw_list` derives one `Material` selector per submesh, requests its PSO, and groups submeshes that resolve to the same pipeline. A model can therefore place opaque bodywork, masked foliage, and translucent glass in their respective passes.
 
-- the MSAA sample count (`PsoKey::sample_count`);
-- the color-blend state — the `blend` permutation enables straight-alpha `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` "over" and turns depth-write off (opaque/masked leave blending off, depth-write on);
-- alpha-to-coverage on the multisample state plus the `kAlphaToCoverage` fragment spec constant, on the derived masked-under-MSAA permutation;
-- the `R16G16B16A16_SFLOAT` offscreen color format and `D32_SFLOAT` depth format for dynamic rendering;
-- a `LESS_OR_EQUAL` depth compare, so a depth pre-pass's values pass;
-- the full set-layout list — sets 0–5 always, 6–7 only when ray tracing is enabled.
+At one sample, opaque and masked submeshes share the opaque PSO because the shader performs the alpha test. With MSAA, a masked submesh selects an alpha-to-coverage PSO. Translucent submeshes use blending with depth writes disabled and remain in individual, back-to-front sorted batches.
 
-Because the sample count is baked into the key, `set_sample_count` clears the cache when the AA mode changes targets, and the next request rebuilds.
+Opaque instances can merge when their mesh, base shader, unlit choice, and complete per-submesh blend pattern match. Different texture handles and PBR factors do not split the batch. Skinned, morphing, displaced, or translucent draw items remain separate because their geometry or ordering requirements differ.
 
-`pipeline_count` returns the live cache size, reported by `sa render-stats`. It is a direct check that übershader reuse is happening, and the number should stay small. `pipelines_created` counts builds (a non-zero count on a steady-state frame is a PSO-compile hitch).
+## Pipeline state
+
+The PSO bakes the state required by Vulkan pipeline creation:
+
+- shader module and vertex entry point;
+- the [`VkSpecializationInfo`](https://registry.khronos.org/vulkan/specs/latest/man/html/VkSpecializationInfo.html) values for unlit, alpha-to-coverage, and translucent variants;
+- polygon mode, sample count, blend state, and depth-write state;
+- dynamic-rendering color and depth formats;
+- descriptor-set layouts and the mesh push-constant range.
+
+Face culling is dynamic state, so a double-sided submesh does not create another PSO. Textures and material parameters also stay outside the key because descriptor tables carry them. On a device without ray tracing, the pipeline loads the shader sibling compiled with `SAFFRON_NO_RT` and uses the layout without ray-tracing sets.
+
+Changing the sample count first idles the GPU and then clears the mesh-pipeline cache. Subsequent requests rebuild entries against the new render targets. `pipeline_count` reports the live mesh-cache size, while `pipelinesCreated` counts builds observed during draw-list submission.
+
+```console
+$ sa render-stats
+...
+"pipelines": 3,
+"pipelinesCreated": 0
+```
+
+A steady frame normally reports zero newly created pipelines. A nonzero value identifies pipeline construction during that submission, which can explain a frame-time spike.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Material type | `gpu_types.rs` | `Material` |
-| Cache + key + counters | `pipelines.rs` | `Pipelines::cache`, `PsoKey`, `pipeline_count`, `pipelines_created` |
-| Lookup / build-on-miss | `pipelines.rs` | `request_mesh_pipeline` |
-| PSO construction | `pipelines.rs` | `build_mesh_pipeline`, `set_sample_count` |
+| Pipeline selector | `gpu_types.rs` | `Material` |
+| Resolved surface data | `draw_list.rs` | `SubmeshMaterial`, `DrawItem` |
+| Batch and submesh selection | `instancing.rs` | `Instancing::submit_draw_list` |
+| Cache key and construction | `pipelines.rs` | `PsoKey`, `request_mesh_pipeline`, `build_mesh_pipeline_with_module` |
+| Cache reset and counters | `pipelines.rs` | `set_sample_count`, `pipeline_count`, `pipelines_created` |
 
 ## Related
 
-- [Übershader](../ubershader-and-specialization/) — why N materials share one PSO
-- [Descriptor sets](../descriptor-sets/) — the set-layout list every mesh PSO bakes in
-- [Render graph](../../frame-and-render-graph/render-graph-overview/) — where the resolved pipeline is bound
+- [Native materials](../native-materials/) — authored assets, instances, and slot overrides
+- [Übershader](../ubershader-and-specialization/) — specialization axes inside the shared mesh shader
+- [Descriptor sets](../descriptor-sets/) — layouts baked into each mesh pipeline
+- [Render graph](../../frame-and-render-graph/render-graph-overview/) — passes that bind the resolved batches

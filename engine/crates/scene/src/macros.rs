@@ -90,8 +90,7 @@ macro_rules! register_component {
                 let from_json: fn(&mut $ty, &::serde_json::Value) -> $crate::Result<()> =
                     $from_json;
                 if !scene.has_component::<$ty>(entity) {
-                    let _ =
-                        scene.add_component(entity, <$ty as ::core::default::Default>::default());
+                    scene.add_component(entity, <$ty as ::core::default::Default>::default())?;
                 }
                 scene.with_component_mut::<$ty, _>(entity, |c| from_json(c, value))?
             },

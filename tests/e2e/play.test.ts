@@ -4,8 +4,9 @@
 // touches the authored scene. Each case proves that the way the editor experiences it: over the
 // wire, against a real headless engine.
 
-import { afterAll, beforeAll, expect, test } from "bun:test";
-import { Engine } from "./harness.ts";
+import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { join } from "node:path";
+import { Engine, REPO } from "./harness.ts";
 
 let engine: Engine;
 beforeAll(async () => {
@@ -13,6 +14,13 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   await engine?.shutdown();
+});
+
+afterEach(async () => {
+  const state = await engine.call<PlayState>("get-play-state");
+  if (state.state !== "edit") {
+    await engine.call("stop");
+  }
 });
 
 interface PlayState {
@@ -69,12 +77,29 @@ test("the play state machine accepts only legal transitions", async () => {
 });
 
 test("hasPrimaryCamera reflects whether the scene has one", async () => {
-  // The empty project has no camera yet.
+  const entities = (await engine.call<EntityList>("list-entities")).entities;
+  const inspected = await Promise.all(
+    entities.map((entity) => engine.call<Inspect>("inspect", { entity: entity.id })),
+  );
+  const camera = inspected.find((entity) => entity.components.Camera?.primary === true);
+  expect(camera).toBeDefined();
+
+  await engine.call("set-component-field", {
+    entity: camera!.id,
+    component: "Camera",
+    field: "primary",
+    value: false,
+  });
   const noCamera = await engine.call<PlayState>("play");
   expect(noCamera.hasPrimaryCamera).toBe(false);
   await engine.call("stop");
 
-  await engine.call("add-entity", { args: ["camera"] });
+  await engine.call("set-component-field", {
+    entity: camera!.id,
+    component: "Camera",
+    field: "primary",
+    value: true,
+  });
   const withCamera = await engine.call<PlayState>("play");
   expect(withCamera.hasPrimaryCamera).toBe(true);
   await engine.call("stop");
@@ -143,7 +168,7 @@ test("environment edits during play are discarded on stop", async () => {
 });
 
 test("an asset assignment during play is discarded; delete-asset is blocked", async () => {
-  await engine.call("add-entity", { args: ["cube"] }); // imports the cube mesh into the catalog
+  await engine.importEntity(join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb"));
   const assets = await engine.call<{ assets: { id: string; type: string }[] }>("list-assets");
   const mesh = assets.assets.find((a) => a.type === "mesh");
   expect(mesh).toBeDefined();

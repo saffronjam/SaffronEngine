@@ -14,10 +14,16 @@ const REPO = join(HERE, "..", "..");
 const SCHEMA_DIR = join(REPO, "schemas", "control");
 const OPENRPC = join(SCHEMA_DIR, "openrpc.generated.json");
 const MANIFEST = join(SCHEMA_DIR, "command-manifest.generated.json");
-const ENGINE = process.env.SAFFRON_ANIMA_BIN ?? join(REPO, "build", "debug", "bin", "SaffronAnima");
+const ENGINE =
+  process.env.SAFFRON_ANIMA_BIN ?? join(REPO, "engine", "target", "debug", "saffron-host");
 const SOCK = process.env.SAFFRON_CONTROL_SOCK ?? `/tmp/saffron-contract-${process.pid}.sock`;
 const APPDATA =
   process.env.SAFFRON_APPDATA_DIR ?? mkdtempSync(join(tmpdir(), "saffron-contract-appdata."));
+const CALL_TIMEOUT_MS = Number(process.env.SAFFRON_SCHEMA_CALL_TIMEOUT_MS) || 15_000;
+const FIXTURES = mkdtempSync(join(tmpdir(), "saffron-contract-fixtures."));
+const MODEL_FIXTURE = join(FIXTURES, "contract-triangle.obj");
+const RT_COMMANDS = new Set(["set-rt-shadows", "set-restir", "set-rt-reflections"]);
+const PROJECT_TRANSITIONS = new Set(["new-project", "open-project", "load-project"]);
 
 interface ManifestCommand {
   name: string;
@@ -163,7 +169,7 @@ function call(
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new Error(`timeout calling ${cmd}`));
-    }, 8000);
+    }, CALL_TIMEOUT_MS);
     socket.on("connect", () => socket.write(JSON.stringify({ id: nextId++, cmd, params }) + "\n"));
     socket.on("data", (d) => {
       buf += d.toString("utf8");
@@ -180,6 +186,23 @@ function call(
       reject(e);
     });
   });
+}
+
+async function waitForProjectReady(): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const status = await call("project-status");
+    if (status.envelope.ok !== true) {
+      throw new Error(`failed to poll project status: ${status.envelope.error}`);
+    }
+    if (status.envelope.result?.phase === "ready") {
+      return;
+    }
+    if (status.envelope.result?.phase === "failed") {
+      throw new Error(`project load failed: ${status.envelope.result.error}`);
+    }
+    await sleep(100);
+  }
+  throw new Error("project load did not become ready within 30 seconds");
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -219,7 +242,25 @@ async function meshAssetId(): Promise<string> {
   }
   let id = firstAssetId(assets.envelope.result);
   if (!id) {
-    await call("add-entity", { preset: "cube" });
+    writeFileSync(
+      MODEL_FIXTURE,
+      [
+        "o ContractTriangle",
+        "v -0.5 0 0",
+        "v 0.5 0 0",
+        "v 0 1 0",
+        "vt 0 0",
+        "vt 1 0",
+        "vt 0.5 1",
+        "vn 0 0 1",
+        "f 1/1/1 2/2/1 3/3/1",
+        "",
+      ].join("\n"),
+    );
+    const imported = await call("import-model", { path: MODEL_FIXTURE });
+    if (imported.envelope.ok !== true) {
+      throw new Error(`failed to import mesh fixture: ${imported.envelope.error}`);
+    }
     assets = await call("list-assets");
     id = firstAssetId(assets.envelope.result);
   }
@@ -231,7 +272,7 @@ async function meshAssetId(): Promise<string> {
 
 async function paramsForFixture(
   fixture: string,
-  state: { cubeId: string },
+  state: { cubeId: string; rtSupported: boolean },
 ): Promise<Record<string, unknown>> {
   switch (fixture) {
     case "empty":
@@ -269,11 +310,17 @@ async function paramsForFixture(
     }
     case "cube-name-component":
       return { entity: state.cubeId, component: "Name", json: { name: "Component Set Cube" } };
-    case "cube-component-order":
+    case "cube-component-order": {
+      const inspected = await call("inspect", { entity: state.cubeId });
+      const components = inspected.envelope.result?.componentOrder;
+      if (inspected.envelope.ok !== true || !Array.isArray(components)) {
+        throw new Error(`failed to read component-order fixture: ${inspected.envelope.error}`);
+      }
       return {
         entity: state.cubeId,
-        components: ["Transform", "Name", "Mesh", "Material", "ModelInstance"],
+        components,
       };
+    }
     case "cube-transform":
       return { entity: state.cubeId, translation: { x: 1, y: 2, z: 3 } };
     case "temp-directional-light": {
@@ -288,8 +335,32 @@ async function paramsForFixture(
       return { entity: state.cubeId };
     case "viewport-center":
       return { u: 0.5, v: 0.5 };
+    case "spatial-origin":
+      return { world: { x: 0, y: 0, z: 0 }, level: 0 };
+    case "spatial-sample-cube":
+      return {
+        provider: state.cubeId,
+        channel: "altitude",
+        position: { x: 0, y: 0, z: 0 },
+      };
     case "environment-intensity":
       return { skyIntensity: 1 };
+    case "environment-profile-save":
+      return { name: `Contract Environment ${process.pid}` };
+    case "environment-profile-update": {
+      const saved = await call("save-environment-profile", {
+        name: `Contract Environment Update ${process.pid}`,
+      });
+      const reference = saved.envelope.result?.reference;
+      const profile =
+        reference && typeof reference === "object" && "id" in reference ? reference.id : null;
+      if (saved.envelope.ok !== true || typeof profile !== "string") {
+        throw new Error(`failed to create environment-profile fixture: ${saved.envelope.error}`);
+      }
+      return { profile };
+    }
+    case "environment-profile-clear-day":
+      return { profile: { kind: "builtin", profile: "clear-day" } };
     case "atmosphere-disabled":
       return { enabled: false };
     case "fog-disabled":
@@ -303,6 +374,12 @@ async function paramsForFixture(
         aerialPerspective: true,
         aerialIntensity: 1.2,
       };
+    case "clouds-disabled":
+      return { enabled: false };
+    case "wind-calm":
+      return { speed: 0, gust: 0 };
+    case "time-of-day-noon":
+      return { timeOfDay: 0.5 };
     case "cube-preset":
       return { preset: "cube" };
     case "cube-rename":
@@ -376,8 +453,6 @@ async function paramsForFixture(
       return { bounds: true };
     case "stores-polyhaven":
       return { enabled: ["polyhaven"] };
-    case "foot-ik-on":
-      return { entity: state.cubeId, enabled: true, groundHeight: 0 };
     case "step-one":
       return { frames: 1 };
     case "profiler-timestamps":
@@ -463,6 +538,31 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  let projectReady = false;
+  for (let i = 0; i < 120 && !projectReady; i++) {
+    const status = await call("project-status");
+    if (status.envelope.ok !== true) {
+      proc.kill();
+      console.error(`project-status failed during startup: ${status.envelope.error}`);
+      return 2;
+    }
+    const phase = status.envelope.result?.phase;
+    if (phase === "failed") {
+      proc.kill();
+      console.error(`scratch project failed to load: ${status.envelope.result?.error ?? ""}`);
+      return 2;
+    }
+    projectReady = phase === "ready";
+    if (!projectReady) {
+      await sleep(100);
+    }
+  }
+  if (!projectReady) {
+    proc.kill();
+    console.error("scratch project did not become ready");
+    return 2;
+  }
+
   const errors: string[] = [];
   const checked: string[] = [];
 
@@ -501,7 +601,14 @@ async function main(): Promise<number> {
       errors.push("fixture add-entity: no id");
       throw new Error("cannot seed cube fixture id");
     }
-    const state = { cubeId };
+    const capabilityStats = await call("render-stats");
+    if (capabilityStats.envelope.ok !== true) {
+      throw new Error(`failed to read renderer capabilities: ${capabilityStats.envelope.error}`);
+    }
+    const state = {
+      cubeId,
+      rtSupported: capabilityStats.envelope.result?.rtSupported === true,
+    };
 
     for (const command of manifest.commands) {
       if (command.skip) {
@@ -514,6 +621,18 @@ async function main(): Promise<number> {
       }
       const params = await paramsForFixture(command.fixture, state);
       const { envelope, raw } = await call(command.name, params);
+      if (RT_COMMANDS.has(command.name) && !state.rtSupported) {
+        validate(envelopeSchema, envelope, command.name, errors);
+        if (
+          envelope.ok !== false ||
+          envelope.error !== "ray tracing not supported on this device"
+        ) {
+          errors.push(`${command.name}: expected the unsupported-device error`);
+        } else {
+          checked.push(`${command.name} -> unsupported-device envelope`);
+        }
+        continue;
+      }
       if (envelope.ok !== true) {
         errors.push(`${command.name}: ok=${envelope.ok} error=${envelope.error}`);
         continue;
@@ -521,6 +640,9 @@ async function main(): Promise<number> {
       validate(schemaForResult(command.result), envelope.result, command.name, errors);
       assertRawU64(raw, command.name, errors);
       checked.push(`${command.name} -> ${command.result}`);
+      if (PROJECT_TRANSITIONS.has(command.name)) {
+        await waitForProjectReady();
+      }
     }
 
     // Hierarchy round-trip: reparent a fresh entity under a fresh parent (the loop's
@@ -589,6 +711,7 @@ async function main(): Promise<number> {
     if (process.env.SAFFRON_APPDATA_DIR === undefined) {
       rmSync(APPDATA, { recursive: true, force: true });
     }
+    rmSync(FIXTURES, { recursive: true, force: true });
   }
 
   for (const item of checked) {

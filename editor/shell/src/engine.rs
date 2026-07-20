@@ -1,12 +1,14 @@
 //! Engine (host) supervision: spawn the present-only `saffron-host`
-//! child with the viewport/shm/socket env, poll readiness on a watchdog thread emitting
-//! `engine-phase`/`viewport-error` events, report liveness via `try_wait` (never `Option::is_some`,
+//! child with the viewport/shm/socket env, watch its startup on a failure-only watchdog thread
+//! (`viewport-error` on death / a socket that never binds — the frontend's viewport probe owns
+//! the attach), report liveness via `try_wait` (never `Option::is_some`,
 //! which reports a crashed engine as alive), and tear down (quit → kill → unlink socket + shm).
 //! Shell-agnostic (`std::process` + the control passthrough + the event push). `auto_start` runs
 //! once at shell launch (at launch); the `start_engine` command is the idempotent
 //! ensure the frontend's loading overlay calls.
 
 use crate::ShellError;
+use crate::backend;
 use crate::control::control_request;
 use crate::geometry::{app_data_dir, ensure_app_dirs, repo_root};
 use crate::state::{ShellState, viewport_shm_name};
@@ -15,11 +17,6 @@ use std::fs;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// The host's NVIDIA ICD, mounted from the host into the toolbox. The engine is a Vulkan/ash
-/// program; pointing it here keeps it on hardware instead of llvmpipe. (CEF's own GPU process
-/// reaches the GPU via GL/EGL/ANGLE, not this var — see Phase 1.)
-const NVIDIA_ICD: &str = "/run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json";
 
 fn engine_binary() -> String {
     std::env::var("SAFFRON_ANIMA_BIN").unwrap_or_else(|_| {
@@ -45,11 +42,9 @@ pub fn spawn_engine(socket_path: &str) -> Result<Child, ShellError> {
             "SAFFRON_VIEWPORT_SHM_ASSET",
             viewport_shm_name("assetPreview"),
         );
-    // The toolbox ships only Mesa ICD manifests; point Vulkan at the host's NVIDIA ICD so the
-    // engine renders on hardware. The host paces itself, so there is no launch-time fps cap.
-    if std::env::var_os("VK_ICD_FILENAMES").is_none() && std::path::Path::new(NVIDIA_ICD).exists() {
-        command.env("VK_ICD_FILENAMES", NVIDIA_ICD);
-    }
+    // Platform GPU/loader env so the engine renders on hardware. The host paces itself, so there
+    // is no launch-time fps cap.
+    backend::env::engine_env(&mut command);
     command
         .current_dir(repo_root())
         .stdout(Stdio::inherit())
@@ -73,9 +68,12 @@ pub fn start_engine(state: &Arc<ShellState>) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// Spawn the engine at shell launch and poll its readiness on a background thread, emitting
-/// `engine-phase` (`starting` → `attaching`) / `viewport-error` events. The frontend drives the
-/// actual attach (it owns the viewport rect); this only reports the process coming up.
+/// Spawn the engine at shell launch and watch its startup on a background thread. The frontend
+/// owns the attach (it holds the viewport rect) and its viewport probe is the single source of
+/// truth for `attaching → ready`, so this thread is only a *failure* watchdog — it reports the
+/// engine dying or the control socket never coming up, and deliberately emits NO success/attaching
+/// phase (that would race the probe and could revert an already-ready viewport back to
+/// "Attaching viewport…").
 pub fn auto_start(state: &Arc<ShellState>) -> Result<(), ShellError> {
     let child = spawn_engine(&state.socket_path)?;
     state
@@ -83,7 +81,6 @@ pub fn auto_start(state: &Arc<ShellState>) -> Result<(), ShellError> {
         .lock()
         .map_err(|_| ShellError::Engine("engine lock poisoned".to_owned()))?
         .replace(child);
-    state.emit("engine-phase", json!("starting"));
 
     let monitor = Arc::clone(state);
     std::thread::spawn(move || {
@@ -95,8 +92,8 @@ pub fn auto_start(state: &Arc<ShellState>) -> Result<(), ShellError> {
                 monitor.emit("viewport-error", json!("engine exited during startup"));
                 return;
             }
+            // Socket up = startup succeeded; the frontend probe takes it from here. Stop watching.
             if control_request(&monitor.socket_path, "viewport-native-info").is_ok() {
-                monitor.emit("engine-phase", json!("attaching"));
                 return;
             }
         }
@@ -132,6 +129,6 @@ pub fn teardown(state: &ShellState) {
     let _ = fs::remove_file(&state.socket_path);
     // The engine unlinks its shm on clean exit; cover the killed case too (both views).
     for view in ["scene", "assetPreview"] {
-        let _ = fs::remove_file(format!("/dev/shm{}", viewport_shm_name(view)));
+        backend::env::remove_viewport_shm(&viewport_shm_name(view));
     }
 }

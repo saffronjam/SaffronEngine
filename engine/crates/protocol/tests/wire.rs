@@ -61,6 +61,7 @@ fn enum_wire_spellings_match_cpp_table() {
     check!(ViewModeDto::Metallic, "metallic");
     check!(ViewModeDto::Emissive, "emissive");
     check!(ViewModeDto::Fog, "fog");
+    check!(ViewModeDto::CloudDensity, "cloud-density");
 
     check!(AssetSlotDto::Mesh, "mesh");
     check!(AssetSlotDto::Albedo, "albedo");
@@ -80,6 +81,9 @@ fn enum_wire_spellings_match_cpp_table() {
     check!(AssetTypeDto::Material, "material");
     check!(AssetTypeDto::Model, "model");
     check!(AssetTypeDto::Lut, "lut");
+    check!(AssetTypeDto::Plant, "plant");
+    check!(AssetTypeDto::Biome, "biome");
+    check!(AssetTypeDto::VegetationMap, "vegetation-map");
 
     check!(ProfilerModeDto::Off, "off");
     check!(ProfilerModeDto::Timestamps, "timestamps");
@@ -103,6 +107,35 @@ fn enum_wire_spellings_match_cpp_table() {
 
     check!(AlarmStateDto::Firing, "firing");
     check!(AlarmStateDto::Resolved, "resolved");
+
+    check!(
+        VegetationCandidateRejectionReasonDto::SurfaceMiss,
+        "surface-miss"
+    );
+    check!(
+        VegetationCandidateRejectionReasonDto::Threshold,
+        "threshold"
+    );
+    check!(
+        VegetationCandidateRejectionReasonDto::WeightedElimination,
+        "weighted-elimination"
+    );
+    check!(
+        VegetationCandidateRejectionReasonDto::PriorityExclusion,
+        "priority-exclusion"
+    );
+    check!(
+        VegetationCandidateRejectionReasonDto::Competition,
+        "competition"
+    );
+    check!(
+        VegetationCandidateRejectionReasonDto::ForeignOwner,
+        "foreign-owner"
+    );
+    check!(
+        VegetationCandidateRejectionReasonDto::NoSpecies,
+        "no-species"
+    );
 }
 
 /// An unknown enum value is a `Deserialize` error, not a silent default.
@@ -111,6 +144,161 @@ fn unknown_enum_value_is_an_error() {
     assert!(serde_json::from_str::<AaModeDto>("\"bogus\"").is_err());
     assert!(serde_json::from_str::<GizmoOpDto>("\"slide\"").is_err());
     assert!(serde_json::from_str::<AssetSlotDto>("\"roughness\"").is_err());
+    assert!(
+        serde_json::from_str::<VegetationCandidateRejectionReasonDto>("\"random-rejection\"")
+            .is_err()
+    );
+}
+
+#[test]
+fn vegetation_estimates_and_diagnostics_use_complete_camel_case_fields() {
+    let estimate = VegetationGraphEstimateDto {
+        candidates: "10".to_owned(),
+        accepted: "4".to_owned(),
+        micro_samples: "128".to_owned(),
+        memory_bytes: "2048".to_owned(),
+        transfer_bytes: "512".to_owned(),
+    };
+    let estimate_json = serde_json::to_value(&estimate).unwrap();
+    assert_eq!(estimate_json["microSamples"], serde_json::json!("128"));
+    assert_eq!(estimate_json["transferBytes"], serde_json::json!("512"));
+    assert_eq!(
+        serde_json::from_value::<VegetationGraphEstimateDto>(estimate_json).unwrap(),
+        estimate
+    );
+
+    let limits = VegetationGraphLimitsDto {
+        workers: 8,
+        output_cells: "64".to_owned(),
+        global_stage_tiles: "128".to_owned(),
+        input_tiles: "512".to_owned(),
+        candidates: "4096".to_owned(),
+        macro_points: "2048".to_owned(),
+        micro_samples: "8192".to_owned(),
+        memory_bytes: "1048576".to_owned(),
+        transfer_bytes: "524288".to_owned(),
+        module_depth: 8,
+        time_ms: "30000".to_owned(),
+    };
+    let limits_json = serde_json::to_value(&limits).unwrap();
+    assert_eq!(limits_json["globalStageTiles"], serde_json::json!("128"));
+    assert_eq!(
+        serde_json::from_value::<VegetationGraphLimitsDto>(limits_json).unwrap(),
+        limits
+    );
+
+    let diagnostic_source = VegetationDiagnosticResultSourceDto::Cell {
+        cell: WorldCellDto {
+            coordinates: ["0".to_owned(), "1".to_owned(), "2".to_owned()],
+            level: 0,
+        },
+    };
+    let candidate = VegetationCandidateIdentityDto {
+        node: VegetationGuid("00000000000000000000000000000003".to_owned()),
+        node_address: VegetationGuid("00000000000000000000000000000004".to_owned()),
+        node_semantic_revision: 1,
+        ordinal: "5".to_owned(),
+        ancestor: "6".to_owned(),
+    };
+    let summary = VegetationEvaluationSummaryDto {
+        cells: "2".to_owned(),
+        global_stages: "3".to_owned(),
+        global_resident_bytes: "4096".to_owned(),
+        candidates: "10".to_owned(),
+        accepted: "4".to_owned(),
+        micro_tiles: "1".to_owned(),
+        rejected: "6".to_owned(),
+        canonical_hash: "00".repeat(32),
+        nodes: Vec::new(),
+        gpu_groups: vec![VegetationGpuGroupEvaluationDiagnosticDto {
+            nodes: vec![VegetationGraphNodeAddressDto {
+                module_path: vec![VegetationGuid(
+                    "00000000000000000000000000000001".to_owned(),
+                )],
+                node: VegetationGuid("00000000000000000000000000000002".to_owned()),
+            }],
+            invocation_count: "10".to_owned(),
+            output_bytes: "256".to_owned(),
+            transfer_bytes: "512".to_owned(),
+            elapsed_micros: "12".to_owned(),
+        }],
+        streams: vec![VegetationNamedDiagnosticStreamDto {
+            node: VegetationGraphNodeAddressDto {
+                module_path: Vec::new(),
+                node: VegetationGuid("00000000000000000000000000000002".to_owned()),
+            },
+            label: "density audit".to_owned(),
+            scope: VegetationDiagnosticStreamScopeDto::GlobalSnapshot,
+            candidate_samples: None,
+            scalar_samples: Some(vec![VegetationDiagnosticScalarSampleDto {
+                source: diagnostic_source.clone(),
+                candidate: candidate.clone(),
+                value_bits: 65536,
+            }]),
+            rejected: vec![VegetationDiagnosticRejectionDto {
+                candidate,
+                reason: VegetationCandidateRejectionReasonDto::Threshold,
+                provenance: VegetationDiagnosticProvenanceIdDto {
+                    source: diagnostic_source,
+                    handle: 7,
+                },
+            }],
+        }],
+    };
+    let summary_json = serde_json::to_value(&summary).unwrap();
+    assert_eq!(summary_json["globalStages"], serde_json::json!("3"));
+    assert_eq!(
+        summary_json["globalResidentBytes"],
+        serde_json::json!("4096")
+    );
+    assert_eq!(summary_json["gpuGroups"][0]["invocationCount"], "10");
+    assert!(summary_json["streams"][0].get("candidateSamples").is_none());
+    assert_eq!(
+        summary_json["streams"][0]["scope"]["kind"],
+        "global-snapshot"
+    );
+    assert_eq!(
+        summary_json["streams"][0]["scalarSamples"][0]["valueBits"],
+        65536
+    );
+    assert_eq!(
+        summary_json["streams"][0]["rejected"][0]["provenance"]["source"]["kind"],
+        "cell"
+    );
+    assert_eq!(
+        summary_json["gpuGroups"][0]["nodes"][0]["modulePath"][0],
+        "00000000000000000000000000000001"
+    );
+    assert_eq!(
+        serde_json::from_value::<VegetationEvaluationSummaryDto>(summary_json).unwrap(),
+        summary
+    );
+
+    let diagnostic = VegetationNodeEvaluationDiagnosticDto {
+        module_path: vec![VegetationGuid(
+            "00000000000000000000000000000001".to_owned(),
+        )],
+        node: VegetationGuid("00000000000000000000000000000002".to_owned()),
+        operator: VegetationGraphOperatorDto::Noise,
+        symbol: "noise".to_owned(),
+        input_candidates: "10".to_owned(),
+        output_candidates: "8".to_owned(),
+        output_bytes: "256".to_owned(),
+        predicted_transfer_bytes: "96".to_owned(),
+        elapsed_micros: "12".to_owned(),
+        execution_domain: VegetationExecutionDomainDto::SlangCompute,
+    };
+    let diagnostic_json = serde_json::to_value(&diagnostic).unwrap();
+    assert_eq!(
+        diagnostic_json["predictedTransferBytes"],
+        serde_json::json!("96")
+    );
+    assert_eq!(diagnostic_json["executionDomain"], "slang-compute");
+    assert!(diagnostic_json.get("transferBytes").is_none());
+    assert_eq!(
+        serde_json::from_value::<VegetationNodeEvaluationDiagnosticDto>(diagnostic_json).unwrap(),
+        diagnostic
+    );
 }
 
 /// An absent `Option<T>` field is a **missing key**, not `null`. `RaycastParams.maxDist`

@@ -5,14 +5,15 @@ weight = 1
 
 # Vertex layout
 
-A vertex layout is the fixed memory format of a single mesh vertex: which attributes it
-carries, in what order, and at what total stride. Anima uses one CPU-side mesh type,
-`Mesh`, and one 48-byte vertex struct for every importer.
+A vertex layout is the fixed memory format of one mesh vertex: which attributes it carries, in
+what order, and at what total stride. Anima has one CPU-side mesh type, `Mesh`, and one 48-byte
+vertex struct shared by every importer.
 
-A single fixed layout lets one mesh pipeline, one `.smesh` on-disk stride, and one upload
-path serve glTF and OBJ alike. The format is the same in memory, on disk, and on the GPU.
+A single fixed layout lets one mesh pipeline, one `.smesh` on-disk stride, and one upload path
+serve [glTF and OBJ](../gltf-and-obj-import/) alike. The bytes are the same in memory, on disk,
+and in the GPU vertex buffer.
 
-## The vertex
+## One 48-byte vertex
 
 A vertex is position, normal, one UV channel, and a UV-aligned tangent:
 
@@ -27,27 +28,45 @@ pub struct Vertex {
 }
 ```
 
-The size is pinned at compile time. `saffron-geometry`'s `lib.rs` carries a
-`const _: () = assert!(size_of::<Vertex>() == 48, …)`, so a stray `Vec3A` or a glam bump
-that changed a layout fails the build, not at a torn-mesh runtime. The
-[`.smesh` format](../smesh-format/) writes the vertex array as one raw `bytemuck::cast_slice`
-blob and the loader reads it straight back, so the in-memory stride is the disk stride.
-Adding a member without bumping the format version would misalign every baked mesh on disk.
+Position and normal are [glam](https://docs.rs/glam)'s 12-byte `Vec3`, never the 16-byte SIMD
+`Vec3A`, so the struct packs to exactly 48 bytes. The size is pinned at compile time:
+`saffron-geometry`'s `lib.rs` carries `const _: () = assert!(size_of::<Vertex>() == 48, …)`,
+with sibling asserts pinning `Submesh` to 16 bytes and `VertexSkin` to 24. A stray `Vec3A` or a
+glam bump that changes a layout fails the build, not a torn-mesh runtime.
 
-The **tangent** is UV-aligned (Lengyel's method, computed on import — or the glTF `TANGENT`
-accessor when present), with the ±1 bitangent handedness in `w` (glTF convention:
-`bitangent = w · cross(normal, tangent)`). It is a raw `[f32; 4]` rather than glam's
-SIMD-aligned `Vec4` so the struct stays tightly packed at 48 bytes. It lets a UV-space vector
-field — a normal map's frame, or tangent-space vector displacement — be transformed by a true
-TBN instead of a derivative-reconstructed one, and the skin/morph/displace compute kernels
-carry (and skinning rotates) it into the deformed buffer. The `#[repr(C)]` Pod derive (the
-`Pod`/`Zeroable` from `bytemuck`) is what lets the byte codec reinterpret the array safely
-under the crate's `#![deny(unsafe_code)]`.
+The `#[repr(C)]` plus the `Pod`/`Zeroable` derives (from
+[bytemuck](https://docs.rs/bytemuck)) let the [`.smesh` format](../smesh-format/) write the
+vertex array as one raw `bytemuck::cast_slice` blob and read it straight back, all under the
+crate's `#![deny(unsafe_code)]`. The `.smesh` header records the stride, and the loader rejects
+a file whose `vertex_stride` differs from `size_of::<Vertex>()` with `Error::BadLayout`, so a
+layout change makes stale bakes fail loudly instead of decoding garbage.
+
+Normals come from the source asset. An OBJ that ships none gets smooth normals rebuilt from
+accumulated triangle face normals (`generate_normals`) before the tangent pass runs.
+
+## The tangent
+
+The tangent is UV-aligned: `xyz` points along +U on the surface, and `w` stores the ±1
+bitangent handedness so a shader rebuilds the bitangent as `w · cross(normal, tangent)` — the
+convention of the [glTF 2.0 specification](https://github.com/KhronosGroup/glTF/tree/main/specification/2.0).
+
+The importers compute it with [Lengyel's method](https://terathon.com/blog/tangent-space.html)
+in `compute_tangents`: accumulate each triangle's UV-gradient tangent into its vertices, then
+Gram-Schmidt-orthonormalize against the normal. The glTF importer keeps a provided `TANGENT`
+accessor and computes only when the asset omits one. A vertex with no usable UV gradient falls
+back to a stable basis built from the normal, so every tangent stays finite and unit-length.
+
+The field is a raw `[f32; 4]` rather than glam's `Vec4`, which is 16-byte SIMD-aligned and
+would pad the struct past 48 bytes. Storing the tangent gives every consumer a true UV-aligned
+TBN for normal maps and tangent-space vector displacement, instead of a
+derivative-reconstructed frame. The skin, morph, and displace compute kernels carry it through
+into the deformed buffer; skinning rotates the `xyz` and keeps `w`, since the handedness sign
+is invariant under rotation.
 
 ## Mesh and submeshes
 
-A `Mesh` is three flat vectors: one shared vertex buffer, one shared index buffer, and a
-list of `Submesh` ranges over them.
+A `Mesh` is three flat vectors: one shared vertex buffer, one shared index buffer, and a list
+of `Submesh` ranges over them.
 
 ```rust
 pub struct Mesh {
@@ -57,7 +76,8 @@ pub struct Mesh {
 }
 ```
 
-A `Submesh` is one `drawIndexed` call's worth of arguments:
+A `Submesh` is one `vkCmdDrawIndexed` call's worth of arguments — 16 bytes, baked directly
+into a `.smesh`:
 
 ```rust
 #[repr(C)]
@@ -70,43 +90,56 @@ pub struct Submesh {
 }
 ```
 
-`vertex_offset` is signed because that is the type `vkCmdDrawIndexed` takes. The glTF
-importer sets it per primitive so each primitive's indices stay zero-based against its own
-vertex block; the OBJ importer leaves it at 0 and emits indices already relative to the
-shared array. Indices are 32-bit throughout, and the loader rejects any file whose
-`index_width` is not 4.
+`vertex_offset` is signed because that is the type `vkCmdDrawIndexed` takes. The glTF importer
+sets it to each primitive's base vertex, so a primitive's indices stay zero-based against its
+own block of the shared array; the OBJ importer dedups every face corner into one array up
+front and leaves it at 0. Indices are 32-bit throughout, and the `.smesh` loader rejects any
+file whose `index_width` is not 4.
 
-A parallel `VertexSkin` stream (24 bytes — `[u16; 4]` joints plus `[f32; 4]` weights, the
-raw array rather than glam's SIMD-aligned `Vec4` so the stride stays fixed) rides alongside
-the vertices for a skinned mesh, and is empty for an unskinned one.
+## Parallel streams
 
-## Why submeshes
+An attribute only some meshes need rides a parallel stream instead of widening `Vertex`:
 
-A submesh is one `drawIndexed` call's worth of arguments over the mesh's shared buffers, so
-one logical model can carry several draw ranges. The draw path loops every batch's
-submeshes and issues one `drawIndexed` per submesh. A model with three glTF primitives
-becomes three draw ranges against one bound buffer pair.
+- **`VertexSkin`** — 24 bytes per vertex: `[u16; 4]` joint indices plus `[f32; 4]` blend
+  weights, one entry per vertex, empty for an unskinned mesh. The weights are a raw `[f32; 4]`
+  for the same reason the tangent is: glam's `Vec4` would pad the stride.
+- **`MorphDelta`** — 28 bytes: a sparse blend-shape record of one vertex index plus the
+  position and normal deltas applied at weight 1.0. Only moved vertices are stored; the morph
+  kernel copies the base tangent through unchanged.
 
-Each submesh selects a material through `material_slot`, an index into the entity's
-[`MaterialSet`](../../scene-and-ecs/built-in-components/). A single-material mesh keeps every
-submesh at slot 0 (one slot); a multi-material import gets one slot per material, and the
-[draw list](../draw-list/) indexes the slots by `material_slot` so each submesh draws with its
-own material.
+An unskinned mesh with no blend shapes pays nothing for either stream.
+
+## Submeshes at draw time
+
+A submesh lets one logical model carry several draw ranges over one bound buffer pair.
+`record_batch_submeshes` walks a batch's submesh list and issues one instanced `drawIndexed`
+per submesh, adding the batch's deformed-buffer offset to the submesh's own `vertex_offset`. A
+model with three glTF primitives is three draw ranges, not three meshes; the same `submeshes`
+table rides `GpuMesh` after upload.
+
+Each submesh selects its material through `material_slot`, an index into the entity's
+[`MaterialSet`](../../scene-and-ecs/built-in-components/) slots. `resolve_entity_materials`
+clamps the index to the last slot, so a single-slot set covers every submesh of a
+single-material mesh. The [draw list](../draw-list/) carries one item per submesh, keyed by the
+same slot.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Vertex + stride assert | `geometry/src/types.rs`; `geometry/src/lib.rs` | `Vertex` |
-| Mesh + submesh | `geometry/src/types.rs` | `Mesh`, `Submesh` |
-| Skin stream | `geometry/src/types.rs` | `VertexSkin` |
+| Vertex, mesh, submesh, stream types | `geometry/src/types.rs` | `Vertex`, `Mesh`, `Submesh`, `VertexSkin`, `MorphDelta` |
+| Compile-time stride pins | `geometry/src/lib.rs` | the `const _` size asserts |
+| Tangent generation | `geometry/src/types.rs` | `compute_tangents` |
 | Normal regeneration | `geometry/src/picking.rs` | `generate_normals` |
+| Disk round-trip | `geometry/src/smesh.rs` | `save_mesh_to_buffer`, `load_mesh_from_bytes` |
 | GPU side | `rendering/src/resources.rs` | `GpuMesh` |
 | Per-submesh draw loop | `rendering/src/scene_pass.rs` | `record_batch_submeshes` |
+| Slot → material resolve | `assets/src/render_material.rs` | `resolve_entity_materials` |
 
 ## Related
 
 - [Model import](../gltf-and-obj-import/) — what fills these vectors
-- [.smesh format](../smesh-format/) — why the stride asserts matter
+- [.smesh format](../smesh-format/) — the byte image that pins these strides
 - [Mesh upload](../gpu-mesh-upload/) — `Mesh` → `GpuMesh`
-- [Built-in components](../../scene-and-ecs/built-in-components/) — where material actually lives
+- [Draw list](../draw-list/) — how submeshes become draws
+- [Built-in components](../../scene-and-ecs/built-in-components/) — the `MaterialSet` the slots index

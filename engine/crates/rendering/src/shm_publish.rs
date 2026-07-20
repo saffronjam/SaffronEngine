@@ -2,7 +2,7 @@
 //! presenter reads.
 //!
 //! The segment is a **frozen wire contract**: a 32-byte header of eight `u32`s
-//! `[magic, width, height, seq, ring_slots, slot_capacity, 0, 0]` followed by
+//! `[magic, width, height, seq, ring_slots, slot_capacity, generation_lo, generation_hi]` followed by
 //! `ring_slots` fixed-capacity BGRA8 frames. Frame `s` lands in ring slot
 //! `s % ring_slots`; `seq` is bumped last under a [`Ordering::Release`] fence so a
 //! reader that observes the new `seq` is guaranteed the matching width/height + pixels
@@ -25,9 +25,10 @@ use std::sync::atomic::{Ordering, fence};
 use rustix::fs::ftruncate;
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::shm::{self, Mode};
+use saffron_core::Uuid;
 
-/// The segment magic, "SFV2" little-endian. Must equal the reader's `SHM_MAGIC`.
-pub const SHM_MAGIC: u32 = 0x5346_5632;
+/// The segment magic, "SFV3" little-endian. Must equal the reader's `SHM_MAGIC`.
+pub const SHM_MAGIC: u32 = 0x5346_5633;
 
 /// The header size in bytes: eight `u32`s. Must equal the reader's `SHM_HEADER_BYTES`.
 pub const SHM_HEADER_BYTES: usize = 32;
@@ -48,12 +49,12 @@ const _: () = {
     const HEADER_FIELDS: usize = 8;
     assert!(SHM_HEADER_BYTES == HEADER_FIELDS * size_of::<u32>());
     assert!(MIN_SHM_SLOT_CAPACITY == 3840 * 2160 * 4);
-    assert!(SHM_MAGIC == 0x5346_5632);
+    assert!(SHM_MAGIC == 0x5346_5633);
     assert!(SHM_RING_SLOTS == 4);
 };
 
 /// The header field indices, named so the producer and the tests cannot drift from the
-/// frozen `[magic, width, height, seq, ring_slots, slot_capacity, 0, 0]` order.
+/// frozen header order.
 mod field {
     pub const MAGIC: usize = 0;
     pub const WIDTH: usize = 1;
@@ -61,6 +62,8 @@ mod field {
     pub const SEQ: usize = 3;
     pub const RING_SLOTS: usize = 4;
     pub const SLOT_CAPACITY: usize = 5;
+    pub const GENERATION_LO: usize = 6;
+    pub const GENERATION_HI: usize = 7;
 }
 
 /// The producer side of one view's shm segment.
@@ -80,6 +83,8 @@ pub struct ShmPublish {
     slot_capacity: usize,
     /// The last published sequence number; `0` means no frame yet.
     seq: u32,
+    /// Identity of the current named object, regenerated whenever its mapping is recreated.
+    generation: u64,
     /// Whether publishing is enabled for this view.
     enabled: bool,
 }
@@ -133,9 +138,15 @@ impl ShmPublish {
         self.seq
     }
 
+    /// Identity of the current named object, used by readers to detect replacement.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// (Re)creates the segment sized for `capacity` bytes per ring slot: drops any
     /// prior mapping, opens + `ftruncate`s the header + ring, `mmap`s it, and writes
-    /// the header (`magic` / `ring_slots` / `slot_capacity`; `seq = 0` = no frame yet).
+    /// the header (`magic` / `ring_slots` / `slot_capacity` / `generation`;
+    /// `seq = 0` = no frame yet).
     ///
     /// Grow-only: the floor at [`MIN_SHM_SLOT_CAPACITY`] means ordinary resizes never
     /// recreate it. The reader remaps on inode/size change.
@@ -170,6 +181,7 @@ impl ShmPublish {
 
         self.slot_capacity = capacity;
         self.seq = 0;
+        self.generation = Uuid::new().value();
         self.mapping = Some(Mapping {
             fd,
             base,
@@ -180,19 +192,20 @@ impl ShmPublish {
     }
 
     /// Writes the initial header: magic, zero width/height/seq (no frame yet), the ring
-    /// depth, the per-slot capacity, and the two trailing zero words.
+    /// depth, the per-slot capacity, and the mapping generation.
     fn write_header_init(&mut self, capacity: usize) {
         let header = self.header_ptr().expect("segment mapped");
         // SAFETY: `header` points at the 32-byte (8×u32) header inside the live mapping.
         unsafe {
-            *header.add(field::MAGIC) = SHM_MAGIC;
             *header.add(field::WIDTH) = 0;
             *header.add(field::HEIGHT) = 0;
             *header.add(field::SEQ) = 0;
             *header.add(field::RING_SLOTS) = SHM_RING_SLOTS;
             *header.add(field::SLOT_CAPACITY) = capacity as u32;
-            *header.add(6) = 0;
-            *header.add(7) = 0;
+            *header.add(field::GENERATION_LO) = self.generation as u32;
+            *header.add(field::GENERATION_HI) = (self.generation >> 32) as u32;
+            fence(Ordering::Release);
+            *header.add(field::MAGIC) = SHM_MAGIC;
         }
     }
 
@@ -287,6 +300,7 @@ impl Drop for ShmPublish {
             let _ = shm::unlink(self.name.as_c_str());
         }
         self.slot_capacity = 0;
+        self.generation = 0;
         self.enabled = false;
     }
 }
@@ -294,14 +308,7 @@ impl Drop for ShmPublish {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A unique shm name per test process so concurrent runs never collide.
-    fn unique_name(tag: &str) -> String {
-        use std::sync::atomic::AtomicU32;
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("/saffron-test-{tag}-{}-{n}", std::process::id())
-    }
+    use saffron_test_support::unique_shm_name;
 
     /// Reads one header field by index, exactly as the editor's reader does
     /// (`ptr::read_volatile(header.add(i))`).
@@ -313,7 +320,7 @@ mod tests {
     #[test]
     fn header_is_byte_identical_to_the_frozen_layout() {
         let mut shm = ShmPublish::default();
-        shm.enable(&unique_name("header")).expect("enable");
+        shm.enable(&unique_shm_name()).expect("enable");
         let seg = shm.segment_bytes().expect("mapped");
 
         // Magic + field order + the seq=0-until-first-frame rule.
@@ -326,8 +333,10 @@ mod tests {
             header_word(seg, field::SLOT_CAPACITY),
             MIN_SHM_SLOT_CAPACITY as u32
         );
-        assert_eq!(header_word(seg, 6), 0, "trailing reserved word");
-        assert_eq!(header_word(seg, 7), 0, "trailing reserved word");
+        let generation = u64::from(header_word(seg, field::GENERATION_LO))
+            | (u64::from(header_word(seg, field::GENERATION_HI)) << 32);
+        assert_eq!(generation, shm.generation());
+        assert_ne!(generation, 0);
 
         // The total segment is header + ring_slots * capacity.
         assert_eq!(
@@ -339,7 +348,7 @@ mod tests {
     #[test]
     fn published_frame_reads_back_consistently_via_the_reader_seqlock() {
         let mut shm = ShmPublish::default();
-        shm.enable(&unique_name("publish")).expect("enable");
+        shm.enable(&unique_shm_name()).expect("enable");
 
         let (w, h) = (4u32, 2u32);
         // A recognisable BGRA8 pattern: byte i = i as u8.
@@ -367,7 +376,7 @@ mod tests {
     #[test]
     fn seq_walks_the_ring_with_modular_slot_placement() {
         let mut shm = ShmPublish::default();
-        shm.enable(&unique_name("ring")).expect("enable");
+        shm.enable(&unique_shm_name()).expect("enable");
         let (w, h) = (2u32, 2u32);
 
         // Publish more than one ring's worth; each lands in slot (seq) % ring_slots,
@@ -396,7 +405,7 @@ mod tests {
         // the first published frame (seq 1) lands in slot 1, NOT slot 0 — the off-by-one
         // the reader (`seq % slots`) mirrors. A drift to slot 0 would silently misread.
         let mut shm = ShmPublish::default();
-        shm.enable(&unique_name("slot1")).expect("enable");
+        shm.enable(&unique_shm_name()).expect("enable");
 
         let (w, h) = (2u32, 2u32);
         let pixels = vec![0xABu8; (w * h * 4) as usize];
@@ -423,7 +432,7 @@ mod tests {
 
     #[test]
     fn drop_munmaps_and_unlinks_the_segment() {
-        let name = unique_name("drop");
+        let name = unique_shm_name();
         {
             let mut shm = ShmPublish::default();
             shm.enable(&name).expect("enable");
@@ -450,9 +459,10 @@ mod tests {
         // Start a tiny segment by enabling, then publish a frame larger than the floor
         // — except the floor is 4K, so force the grow path with an explicit recreate at
         // a small capacity first.
-        shm.enable(&unique_name("grow")).expect("enable");
+        shm.enable(&unique_shm_name()).expect("enable");
         shm.recreate_segment(64).expect("small segment");
         assert_eq!(shm.slot_capacity(), 64);
+        let small_generation = shm.generation();
 
         let (w, h) = (8u32, 8u32); // 8*8*4 = 256 bytes > 64
         let pixels = vec![0x7fu8; (w * h * 4) as usize];
@@ -460,6 +470,7 @@ mod tests {
 
         // Grow floors at MIN_SHM_SLOT_CAPACITY, so it jumps straight to the floor.
         assert_eq!(shm.slot_capacity(), MIN_SHM_SLOT_CAPACITY);
+        assert_ne!(shm.generation(), small_generation);
         // The recreate resets seq, so this publish is seq=1 again.
         assert_eq!(shm.seq(), 1);
         let seg = shm.segment_bytes().unwrap();
@@ -473,7 +484,7 @@ mod tests {
     #[test]
     fn zero_area_and_short_slices_are_no_ops() {
         let mut shm = ShmPublish::default();
-        shm.enable(&unique_name("noop")).expect("enable");
+        shm.enable(&unique_shm_name()).expect("enable");
         shm.publish(0, 0, &[]);
         assert_eq!(shm.seq(), 0, "zero-area frame never bumps seq");
         shm.publish(4, 4, &[0u8; 8]); // too short for 4*4*4

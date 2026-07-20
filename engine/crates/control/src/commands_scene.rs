@@ -1,4 +1,4 @@
-//! The 42 scene-domain control commands: entity lifecycle (create/add/destroy/copy/
+//! The 54 scene-edit control commands registered here: entity lifecycle (create/add/destroy/copy/
 //! rename/parent), the registry-driven component commands (add/remove/set/set-field/
 //! order), selection (select/deselect/get-selection), picking + inspect + focus +
 //! world-transform, the editor camera + gizmo + fly/script input, the play-state machine
@@ -13,32 +13,52 @@
 //! The `get/set-debug-overlays` commands live in the animation domain
 //! (`commands_animation.rs`), `set-probes` / `recapture-probes` / `list-probes` in the
 //! render domain (`commands_render.rs`), and `quit` / `create-script` /
-//! `get-script-schema` in the asset domain / host. This file holds the remaining 42.
+//! `get-script-schema` in the asset domain / host.
 
-use saffron_assets::{BuiltinMesh, model_render_aabb, pick_entity};
+use saffron_assets::{
+    BuiltinMesh, builtin_environment_profile, builtin_environment_profiles,
+    load_environment_profile, model_render_aabb, pick_entity, sample_scene_surface_field,
+    save_environment_profile, scene_surface_providers, update_environment_profile,
+};
 use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3};
 use saffron_protocol::{
-    AddComponentResult, AddEntityParams, AddEntityPreset, ComponentList, ComponentParams,
-    CreateEntityParams, DeselectResult, DestroyEntityResult, DrainScriptErrorsParams,
-    DrainScriptErrorsResult, DrainScriptLogsParams, DrainScriptLogsResult, EditorCamera,
-    EmptyParams, EntityList, EntityListEntry, EntityParams, EntityRef, EnvironmentDto,
-    FlyInputParams, FlyInputResult, GizmoOpDto, GizmoPointerParams, GizmoPointerPhase,
+    AddComponentResult, AddEntityParams, AddEntityPreset, ApplyEnvironmentProfileParams,
+    AtmosphereSettingsDto, BuiltinEnvironmentProfileDto, CloudSettingsDto, ComponentList,
+    ComponentParams, CreateEntityParams, DeselectResult, DestroyEntityResult,
+    DrainScriptErrorsParams, DrainScriptErrorsResult, DrainScriptLogsParams, DrainScriptLogsResult,
+    EditorCamera, EmptyParams, EntityList, EntityListEntry, EntityParams, EntityRef,
+    EnvironmentDto, EnvironmentProfileListDto, EnvironmentProfileRefDto,
+    EnvironmentProfileSummaryDto, FlyInputParams, FlyInputResult, FogMode as FogModeDto,
+    FogQuality as FogQualityDto, FogSettingsDto, GizmoOpDto, GizmoPointerParams, GizmoPointerPhase,
     GizmoPointerResult, GizmoSpaceDto, GizmoState, InspectResult, PickKind, PickParams, PickResult,
-    PlayStateResult, RemoveComponentResult, RenameEntityParams, ScriptErrorDto, ScriptInputParams,
+    PlayStateResult, RemoveComponentResult, RenameEntityParams, ResidencyCountsDto,
+    ResidencyFacetDto, SaveEnvironmentProfileParams, ScriptErrorDto, ScriptInputParams,
     ScriptInputResult, ScriptLogDto, ScriptStatusResult, SelectionResult, SetAtmosphereParams,
-    SetCameraParams, SetComponentFieldParams, SetComponentFieldResult, SetComponentOrderParams,
-    SetComponentOrderResult, SetComponentParams, SetComponentResult, SetEnvironmentParams,
-    SetFogParams, SetGizmoParams, SetLightParams, SetParentParams, SetScriptOverrideParams,
-    SetScriptOverrideResult, SetTransformParams, StepParams, Uuid as WireUuid, Vec3,
+    SetCameraParams, SetCloudsParams, SetComponentFieldParams, SetComponentFieldResult,
+    SetComponentOrderParams, SetComponentOrderResult, SetComponentParams, SetComponentResult,
+    SetEnvironmentParams, SetFogParams, SetGizmoParams, SetLightParams, SetParentParams,
+    SetScriptOverrideParams, SetScriptOverrideResult, SetTimeOfDayParams, SetTransformParams,
+    SetWindParams, SkyModeDto, SpatialBoundsDto, SpatialCellParams, SpatialCellResult,
+    SpatialFieldChannelDto, SpatialFieldDerivativeDto, SpatialLocalPositionDto,
+    SpatialResidencyCellDto, SpatialResidencyResult, SpatialSampleParams, SpatialSampleResult,
+    SpatialSourceDto, SpatialSourceLevelDto, SpatialTicksDto, SpatialWorldPositionDto, StepParams,
+    SurfaceCapabilitiesDto, SurfaceProviderDto, SurfaceProvidersResult, TimeOfDaySettingsDto,
+    TodCurvePointDto, TodTintSettingsDto, UpdateEnvironmentProfileParams, Uuid as WireUuid, Vec3,
+    WindSettingsDto, WorldCellKeyDto,
 };
 use saffron_scene::{
-    Bone, Camera, CameraView, ComponentTraits, DirectionalLight, Entity, IdComponent, MaterialSet,
-    MaterialSlot, Mesh, Name, PointLight, PreviewGhost, Relationship, Script, SpotLight, Transform,
-    environment_from_json, environment_to_json,
+    AssetType, Bone, Camera, CameraView, CloudSettings, ComponentTraits, DirectionalLight, Entity,
+    FogMode as SceneFogMode, FogQuality as SceneFogQuality, IdComponent, MaterialSet, MaterialSlot,
+    Mesh, Name, PointLight, PreviewGhost, Relationship, SceneEnvironment, Script, SkyMode,
+    SpotLight, TimeOfDaySettings, TodCurve, Transform, WindSettings, environment_from_json,
+    environment_to_json,
 };
 use saffron_sceneedit::{
     GizmoOp, GizmoSpace, NativeGizmoHandle, OrbitState, PlayState, SceneEditCamera,
     SceneEditContext, viewport_project,
+};
+use saffron_spatial::{
+    FieldChannel, FieldDerivative, ResidencyFacet, SurfaceCapabilities, WorldCellKey, WorldPosition,
 };
 use serde_json::{Map, Value, json};
 
@@ -60,9 +80,302 @@ fn from_glam3(v: GlamVec3) -> Vec3 {
     }
 }
 
+fn spatial_ticks_dto(ticks: [i128; 3]) -> SpatialTicksDto {
+    SpatialTicksDto {
+        x: ticks[0].to_string(),
+        y: ticks[1].to_string(),
+        z: ticks[2].to_string(),
+    }
+}
+
+fn world_cell_dto(cell: WorldCellKey) -> WorldCellKeyDto {
+    let coordinates = cell.coordinates();
+    WorldCellKeyDto {
+        x: coordinates[0].to_string(),
+        y: coordinates[1].to_string(),
+        z: coordinates[2].to_string(),
+        level: cell.level(),
+        canonical_hex: cell
+            .canonical_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
+
+fn world_position_dto(position: WorldPosition) -> SpatialWorldPositionDto {
+    let local = position.local().ticks();
+    SpatialWorldPositionDto {
+        cell: world_cell_dto(position.cell()),
+        local: SpatialLocalPositionDto {
+            x: local[0],
+            y: local[1],
+            z: local[2],
+        },
+        global_ticks: spatial_ticks_dto(position.global_ticks()),
+    }
+}
+
+fn surface_capabilities_dto(capabilities: SurfaceCapabilities) -> SurfaceCapabilitiesDto {
+    SurfaceCapabilitiesDto {
+        ray: capabilities.ray,
+        project: capabilities.project,
+        nearest: capabilities.nearest,
+        uv: capabilities.uv,
+        authoritative_attachments: capabilities.authoritative_attachments,
+        authoritative_fields: capabilities.authoritative_fields,
+    }
+}
+
+fn field_channel(
+    channel: SpatialFieldChannelDto,
+    user_channel: Option<&str>,
+) -> crate::Result<FieldChannel> {
+    let ordinary = match channel {
+        SpatialFieldChannelDto::Altitude => Some(FieldChannel::Altitude),
+        SpatialFieldChannelDto::Slope => Some(FieldChannel::Slope),
+        SpatialFieldChannelDto::Curvature => Some(FieldChannel::Curvature),
+        SpatialFieldChannelDto::Concavity => Some(FieldChannel::Concavity),
+        SpatialFieldChannelDto::Drainage => Some(FieldChannel::Drainage),
+        SpatialFieldChannelDto::Moisture => Some(FieldChannel::Moisture),
+        SpatialFieldChannelDto::Temperature => Some(FieldChannel::Temperature),
+        SpatialFieldChannelDto::Precipitation => Some(FieldChannel::Precipitation),
+        SpatialFieldChannelDto::Sunlight => Some(FieldChannel::Sunlight),
+        SpatialFieldChannelDto::Exposure => Some(FieldChannel::Exposure),
+        SpatialFieldChannelDto::WaterDistance => Some(FieldChannel::WaterDistance),
+        SpatialFieldChannelDto::WaterDepth => Some(FieldChannel::WaterDepth),
+        SpatialFieldChannelDto::SignedBlocker => Some(FieldChannel::SignedBlocker),
+        SpatialFieldChannelDto::SplineDistance => Some(FieldChannel::SplineDistance),
+        SpatialFieldChannelDto::User => None,
+    };
+    match (ordinary, user_channel) {
+        (Some(channel), None) => Ok(channel),
+        (Some(_), Some(_)) => Err(Error::command(
+            "userChannel is valid only when channel is 'user'",
+        )),
+        (None, Some(value)) => value
+            .parse::<u64>()
+            .map(FieldChannel::User)
+            .map_err(|_| Error::command("userChannel must be a decimal u64")),
+        (None, None) => Err(Error::command(
+            "userChannel is required when channel is 'user'",
+        )),
+    }
+}
+
+fn field_derivative(derivative: SpatialFieldDerivativeDto) -> FieldDerivative {
+    match derivative {
+        SpatialFieldDerivativeDto::Value => FieldDerivative::Value,
+        SpatialFieldDerivativeDto::Gradient => FieldDerivative::Gradient,
+        SpatialFieldDerivativeDto::Hessian => FieldDerivative::Hessian,
+    }
+}
+
+fn residency_facet_dto(facet: ResidencyFacet) -> ResidencyFacetDto {
+    match facet {
+        ResidencyFacet::Render => ResidencyFacetDto::Render,
+        ResidencyFacet::Physics => ResidencyFacetDto::Physics,
+        ResidencyFacet::Simulation => ResidencyFacetDto::Simulation,
+        ResidencyFacet::Editing => ResidencyFacetDto::Editing,
+        ResidencyFacet::Navigation => ResidencyFacetDto::Navigation,
+        ResidencyFacet::Network => ResidencyFacetDto::Network,
+    }
+}
+
 /// A wire `Vec3` as its `{x,y,z}` JSON object.
 fn vec3_json(v: &Vec3) -> Value {
     json!({ "x": v.x, "y": v.y, "z": v.z })
+}
+
+fn curve_json(points: &[[f32; 2]]) -> Value {
+    Value::Array(
+        points
+            .iter()
+            .map(|point| json!({ "x": point[0], "y": point[1] }))
+            .collect(),
+    )
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
+fn days_in_month(year: i32, month: i32) -> Option<i32> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn validate_curve(name: &str, curve: &TodCurve) -> Result<(), Error> {
+    let mut previous_x = None;
+    for &(x, y) in &curve.0 {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(Error::command(format!(
+                "{name} points must contain finite numbers"
+            )));
+        }
+        if !(0.0..=1.0).contains(&x) {
+            return Err(Error::command(format!(
+                "{name} point x values must be in [0, 1]"
+            )));
+        }
+        if previous_x.is_some_and(|previous| x <= previous) {
+            return Err(Error::command(format!(
+                "{name} point x values must be strictly increasing"
+            )));
+        }
+        previous_x = Some(x);
+    }
+    Ok(())
+}
+
+fn validate_curve_json(name: &str, value: &Value) -> Result<(), Error> {
+    let points = value
+        .as_array()
+        .ok_or_else(|| Error::command(format!("{name} must be an array")))?;
+    for point in points {
+        let point = point
+            .as_object()
+            .ok_or_else(|| Error::command(format!("{name} points must be objects")))?;
+        let x = point.get("x").and_then(Value::as_f64);
+        let y = point.get("y").and_then(Value::as_f64);
+        if point.len() != 2 || x.is_none() || y.is_none() {
+            return Err(Error::command(format!(
+                "{name} points must contain only numeric x and y fields"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_time_of_day_json(value: &Value) -> Result<(), Error> {
+    if let Some(curve) = value.get("exposureCurve") {
+        validate_curve_json("exposureCurve", curve)?;
+    }
+    if let Some(curve) = value.get("coverageCurve") {
+        validate_curve_json("coverageCurve", curve)?;
+    }
+    if let Some(curve) = value.get("cloudTypeCurve") {
+        validate_curve_json("cloudTypeCurve", curve)?;
+    }
+    if let Some(tint) = value.get("tintCurve") {
+        let tint = tint
+            .as_object()
+            .ok_or_else(|| Error::command("tintCurve must be an object"))?;
+        for channel in ["master", "red", "green", "blue"] {
+            if let Some(curve) = tint.get(channel) {
+                validate_curve_json(&format!("tintCurve.{channel}"), curve)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_time_of_day(settings: &TimeOfDaySettings) -> Result<(), Error> {
+    if !settings.time_of_day.is_finite() || !(0.0..=1.0).contains(&settings.time_of_day) {
+        return Err(Error::command("timeOfDay must be in [0, 1]"));
+    }
+    if days_in_month(settings.year, settings.month)
+        .is_none_or(|days| !(1..=days).contains(&settings.day))
+    {
+        return Err(Error::command(
+            "year, month, and day must form a valid Gregorian date",
+        ));
+    }
+    if !settings.latitude.is_finite() || !(-90.0..=90.0).contains(&settings.latitude) {
+        return Err(Error::command("latitude must be in [-90, 90]"));
+    }
+    if !settings.longitude.is_finite() || !(-180.0..=180.0).contains(&settings.longitude) {
+        return Err(Error::command("longitude must be in [-180, 180]"));
+    }
+    if !settings.day_length_seconds.is_finite() || settings.day_length_seconds < 0.0 {
+        return Err(Error::command("dayLengthSeconds must be finite and >= 0"));
+    }
+    validate_curve("exposureCurve", &settings.exposure_curve)?;
+    validate_curve("tintCurve.master", &settings.tint_curve.master)?;
+    validate_curve("tintCurve.red", &settings.tint_curve.red)?;
+    validate_curve("tintCurve.green", &settings.tint_curve.green)?;
+    validate_curve("tintCurve.blue", &settings.tint_curve.blue)?;
+    validate_curve("coverageCurve", &settings.coverage_curve)?;
+    validate_curve("cloudTypeCurve", &settings.cloud_type_curve)
+}
+
+fn validate_clouds(settings: &CloudSettings) -> Result<(), Error> {
+    for (name, value) in [
+        ("coverage", settings.coverage),
+        ("cloudType", settings.cloud_type),
+        ("precipitation", settings.precipitation),
+        ("anvilBias", settings.anvil_bias),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(Error::command(format!("{name} must be in [0, 1]")));
+        }
+    }
+    if !settings.layer_altitude.is_finite() {
+        return Err(Error::command("layerAltitude must be finite"));
+    }
+    for (name, value) in [
+        ("layerHeight", settings.layer_height),
+        ("baseScale", settings.base_scale),
+        ("detailScale", settings.detail_scale),
+        ("weatherScale", settings.weather_scale),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::command(format!("{name} must be finite and > 0")));
+        }
+    }
+    for (name, value) in [
+        ("detailStrength", settings.detail_strength),
+        ("curlStrength", settings.curl_strength),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(Error::command(format!("{name} must be finite and >= 0")));
+        }
+    }
+    if !settings.weather_offset.is_finite() {
+        return Err(Error::command("weatherOffset must be finite"));
+    }
+    if settings.primary_steps == 0 {
+        return Err(Error::command("primarySteps must be >= 1"));
+    }
+    if settings.light_steps == 0 {
+        return Err(Error::command("lightSteps must be >= 1"));
+    }
+    if !settings.droplet_diameter.is_finite() || !(5.0..=50.0).contains(&settings.droplet_diameter)
+    {
+        return Err(Error::command("dropletDiameter must be in [5, 50]"));
+    }
+    if !settings.temporal_factor.is_finite() || !(0.0..=1.0).contains(&settings.temporal_factor) {
+        return Err(Error::command("temporalFactor must be in [0, 1]"));
+    }
+    for (name, value) in [
+        ("cloudShadowStrength", settings.cloud_shadow_strength),
+        (
+            "cloudShadowOnSurfaceStrength",
+            settings.cloud_shadow_on_surface_strength,
+        ),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(Error::command(format!("{name} must be in [0, 1]")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wind(settings: &WindSettings) -> Result<(), Error> {
+    if !settings.orientation.is_finite() {
+        return Err(Error::command("orientation must be finite"));
+    }
+    for (name, value) in [("speed", settings.speed), ("gust", settings.gust)] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(Error::command(format!("{name} must be finite and >= 0")));
+        }
+    }
+    Ok(())
 }
 
 /// The editor fly-camera as its wire DTO.
@@ -79,11 +392,161 @@ fn camera_dto(camera: &SceneEditCamera) -> EditorCamera {
     }
 }
 
+/// A complete scene environment as its wire DTO.
+fn scene_environment_dto(environment: &SceneEnvironment) -> EnvironmentDto {
+    let atmosphere = &environment.atmosphere;
+    let fog = &environment.fog;
+    let cloud = &environment.cloud;
+    let wind = &environment.wind;
+    let time = &environment.time_of_day;
+    EnvironmentDto {
+        sky_mode: match environment.sky_mode {
+            SkyMode::Color => SkyModeDto::Color,
+            SkyMode::Texture => SkyModeDto::Texture,
+            SkyMode::Procedural => SkyModeDto::Procedural,
+        },
+        clear_color: from_glam3(environment.clear_color),
+        sky_texture: environment.sky_texture.into(),
+        sky_intensity: environment.sky_intensity,
+        sky_rotation: environment.sky_rotation,
+        exposure: environment.exposure,
+        visible: environment.visible,
+        use_sky_for_ambient: environment.use_sky_for_ambient,
+        ambient_color: from_glam3(environment.ambient_color),
+        ambient_intensity: environment.ambient_intensity,
+        atmosphere: AtmosphereSettingsDto {
+            enabled: atmosphere.enabled,
+            planet_radius: atmosphere.planet_radius,
+            atmosphere_height: atmosphere.atmosphere_height,
+            rayleigh_scattering: from_glam3(atmosphere.rayleigh_scattering),
+            rayleigh_scale_height: atmosphere.rayleigh_scale_height,
+            mie_scattering: atmosphere.mie_scattering,
+            mie_scale_height: atmosphere.mie_scale_height,
+            mie_anisotropy: atmosphere.mie_anisotropy,
+            ozone_absorption: from_glam3(atmosphere.ozone_absorption),
+            sun_disk_angular_radius: atmosphere.sun_disk_angular_radius,
+            sun_disk_intensity: atmosphere.sun_disk_intensity,
+            moon_disk_angular_radius: atmosphere.moon_disk_angular_radius,
+            moon_disk_intensity: atmosphere.moon_disk_intensity,
+            moon_earthshine: atmosphere.moon_earthshine,
+            per_pixel_transmittance: atmosphere.per_pixel_transmittance,
+            sky_capture_cadence: atmosphere.sky_capture_cadence,
+        },
+        fog: FogSettingsDto {
+            enabled: fog.enabled,
+            mode: match fog.mode {
+                SceneFogMode::Analytic => FogModeDto::Analytic,
+                SceneFogMode::Volumetric => FogModeDto::Volumetric,
+            },
+            quality: match fog.quality {
+                SceneFogQuality::Low => FogQualityDto::Low,
+                SceneFogQuality::Medium => FogQualityDto::Medium,
+                SceneFogQuality::High => FogQualityDto::High,
+            },
+            history_blend: fog.history_blend,
+            neighborhood_clamp: fog.neighborhood_clamp,
+            light_clamp: fog.light_clamp,
+            base_density: fog.base_density,
+            scatter_albedo: fog.scatter_albedo,
+            phase_g: fog.phase_g,
+            density: fog.density,
+            albedo: from_glam3(fog.albedo),
+            height: fog.height,
+            height_falloff: fog.height_falloff,
+            start_distance: fog.start_distance,
+            max_opacity: fog.max_opacity,
+            emissive: from_glam3(fog.emissive),
+            directional_color: from_glam3(fog.directional_color),
+            directional_exponent: fog.directional_exponent,
+            layer2_density: fog.layer2_density,
+            layer2_falloff: fog.layer2_falloff,
+            layer2_height: fog.layer2_height,
+            aerial_perspective: fog.aerial_perspective,
+            aerial_intensity: fog.aerial_intensity,
+        },
+        cloud: CloudSettingsDto {
+            enabled: cloud.enabled,
+            coverage: cloud.coverage,
+            cloud_type: cloud.cloud_type,
+            precipitation: cloud.precipitation,
+            anvil_bias: cloud.anvil_bias,
+            layer_altitude: cloud.layer_altitude,
+            layer_height: cloud.layer_height,
+            base_scale: cloud.base_scale,
+            detail_scale: cloud.detail_scale,
+            detail_strength: cloud.detail_strength,
+            curl_strength: cloud.curl_strength,
+            weather_scale: cloud.weather_scale,
+            weather_offset: from_glam3(cloud.weather_offset),
+            weather_texture: cloud.weather_texture.into(),
+            primary_steps: cloud.primary_steps,
+            light_steps: cloud.light_steps,
+            droplet_diameter: cloud.droplet_diameter,
+            temporal_factor: cloud.temporal_factor,
+            cast_cloud_shadows: cloud.cast_cloud_shadows,
+            cloud_shadow_strength: cloud.cloud_shadow_strength,
+            cloud_shadow_on_surface_strength: cloud.cloud_shadow_on_surface_strength,
+        },
+        wind: WindSettingsDto {
+            orientation: wind.orientation,
+            speed: wind.speed,
+            gust: wind.gust,
+        },
+        time_of_day: TimeOfDaySettingsDto {
+            enabled: time.enabled,
+            manual_override: time.manual_override,
+            time_of_day: time.time_of_day,
+            year: time.year,
+            month: time.month,
+            day: time.day,
+            latitude: time.latitude,
+            longitude: time.longitude,
+            day_length_seconds: time.day_length_seconds,
+            exposure_curve: tod_curve_dto(&time.exposure_curve),
+            tint_curve: TodTintSettingsDto {
+                master: tod_curve_dto(&time.tint_curve.master),
+                red: tod_curve_dto(&time.tint_curve.red),
+                green: tod_curve_dto(&time.tint_curve.green),
+                blue: tod_curve_dto(&time.tint_curve.blue),
+            },
+            coverage_curve: tod_curve_dto(&time.coverage_curve),
+            cloud_type_curve: tod_curve_dto(&time.cloud_type_curve),
+        },
+    }
+}
+
 /// The active scene's environment as its wire DTO.
 fn environment_dto(ctx: &mut EngineContext<'_>) -> EnvironmentDto {
-    EnvironmentDto {
-        value: environment_to_json(&ctx.scene_edit.active_scene().environment),
+    scene_environment_dto(&ctx.scene_edit.active_scene().environment)
+}
+
+fn builtin_environment_profile_key(profile: BuiltinEnvironmentProfileDto) -> &'static str {
+    match profile {
+        BuiltinEnvironmentProfileDto::Neutral => "neutral",
+        BuiltinEnvironmentProfileDto::ClearDay => "clear-day",
+        BuiltinEnvironmentProfileDto::GoldenHour => "golden-hour",
+        BuiltinEnvironmentProfileDto::Overcast => "overcast",
+        BuiltinEnvironmentProfileDto::Night => "night",
     }
+}
+
+fn builtin_environment_profile_dto(key: &str) -> Option<BuiltinEnvironmentProfileDto> {
+    match key {
+        "neutral" => Some(BuiltinEnvironmentProfileDto::Neutral),
+        "clear-day" => Some(BuiltinEnvironmentProfileDto::ClearDay),
+        "golden-hour" => Some(BuiltinEnvironmentProfileDto::GoldenHour),
+        "overcast" => Some(BuiltinEnvironmentProfileDto::Overcast),
+        "night" => Some(BuiltinEnvironmentProfileDto::Night),
+        _ => None,
+    }
+}
+
+fn tod_curve_dto(curve: &TodCurve) -> Vec<TodCurvePointDto> {
+    curve
+        .0
+        .iter()
+        .map(|&(x, y)| TodCurvePointDto { x, y })
+        .collect()
 }
 
 /// Maps the backend-neutral [`GizmoOp`] to its wire spelling.
@@ -163,17 +626,8 @@ fn normalize_script_key(key: &str) -> String {
 
 /// Whether a parent selector means "the scene root" — absent, `0`, `"0"`, or empty: a
 /// detach never resolves entity 0.
-fn is_root_selector(selector: &Value) -> bool {
-    if selector.is_null() {
-        return true;
-    }
-    if let Some(n) = selector.as_u64() {
-        return n == 0;
-    }
-    if let Some(text) = selector.as_str() {
-        return text.is_empty() || text == "0";
-    }
-    false
+fn is_root_selector(selector: &saffron_protocol::EntitySelector) -> bool {
+    selector.id() == Some(0) || selector.name().is_some_and(str::is_empty)
 }
 
 /// Server-side billboard hit-test: the nearest meshless light/camera entity whose
@@ -374,7 +828,8 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     params.component
                 )));
             }
-            (row.add_default)(ctx.scene_edit.active_scene(), entity);
+            (row.add_default)(ctx.scene_edit.active_scene(), entity)
+                .map_err(|error| Error::command(error.to_string()))?;
             // Auto-fit a Collider's shape to the entity mesh AABB on add (the locked
             // decision). The registry add hook can't see the asset/renderer handles, so it
             // runs here.
@@ -649,12 +1104,12 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             let ndc = Vec2::new(u * 2.0 - 1.0, v * 2.0 - 1.0);
             let assets = &mut *ctx.assets;
             let viewport = (width, height);
-            let mut hit = Entity::NULL;
+            let mut hit_result = Ok(Entity::NULL);
             // The borrow split: pick_entity needs the upload seam + the active scene + the
             // asset server at once. The scene is borrowed from scene_edit; take it inside the
             // upload closure so the renderer borrow does not overlap it.
             ctx.renderer.with_gpu_uploader(&mut |gpu| {
-                hit = pick_entity(
+                hit_result = pick_entity(
                     gpu,
                     viewport,
                     ctx.scene_edit.active_scene(),
@@ -663,6 +1118,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     ndc,
                 );
             });
+            let hit = hit_result.map_err(|error| Error::command(error.to_string()))?;
             if hit == Entity::NULL {
                 ctx.scene_edit.set_selection(hit);
                 return Ok(PickResult {
@@ -684,6 +1140,183 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 name: Some(r.name),
                 kind: Some(PickKind::Mesh),
             })
+        },
+    );
+
+    reg.register::<SpatialCellParams, SpatialCellResult>(
+        "spatial-cell",
+        "spatial-cell {world? | ticks?, level?} — canonical position and owner cell",
+        |_ctx, params| {
+            if params.world.is_some() && params.ticks.is_some() {
+                return Err(Error::command("provide world or ticks, not both"));
+            }
+            let position = if let Some(ticks) = params.ticks {
+                let parse = |value: &str| {
+                    value
+                        .parse::<i128>()
+                        .map_err(|_| Error::command("ticks must be signed decimal integers"))
+                };
+                WorldPosition::from_global_ticks([
+                    parse(&ticks.x)?,
+                    parse(&ticks.y)?,
+                    parse(&ticks.z)?,
+                ])
+                .map_err(|error| Error::command(error.to_string()))?
+            } else {
+                let world = params.world.unwrap_or(Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
+                WorldPosition::from_world_meters(saffron_geometry::glam::DVec3::new(
+                    f64::from(world.x),
+                    f64::from(world.y),
+                    f64::from(world.z),
+                ))
+                .map_err(|error| Error::command(error.to_string()))?
+            };
+            let selected_cell = position
+                .cell()
+                .ancestor(params.level.unwrap_or(0))
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(SpatialCellResult {
+                position: world_position_dto(position),
+                selected_cell: world_cell_dto(selected_cell),
+            })
+        },
+    );
+
+    reg.register::<EmptyParams, SurfaceProvidersResult>(
+        "spatial-providers",
+        "spatial-providers — list live surface providers and capabilities",
+        |ctx, _params| {
+            let assets = &mut *ctx.assets;
+            let mut result = Ok(Vec::new());
+            ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                result = scene_surface_providers(gpu, ctx.scene_edit.active_scene(), assets);
+            });
+            let providers = result
+                .map_err(|error| Error::command(error.to_string()))?
+                .into_iter()
+                .map(|provider| {
+                    let descriptor = provider.descriptor;
+                    let (entity, name) = {
+                        let scene = ctx.scene_edit.active_scene();
+                        let reference = entity_ref_dto(scene, provider.entity);
+                        (reference.id, reference.name)
+                    };
+                    SurfaceProviderDto {
+                        id: WireUuid(descriptor.id.0),
+                        entity,
+                        name,
+                        revision: descriptor.revision.0.to_string(),
+                        bounds: SpatialBoundsDto {
+                            min_ticks: spatial_ticks_dto(descriptor.bounds.min_ticks()),
+                            max_ticks_exclusive: spatial_ticks_dto(
+                                descriptor.bounds.max_ticks_exclusive(),
+                            ),
+                        },
+                        primitive_count: descriptor.primitive_count.to_string(),
+                        capabilities: surface_capabilities_dto(descriptor.capabilities),
+                    }
+                })
+                .collect();
+            Ok(SurfaceProvidersResult { providers })
+        },
+    );
+
+    reg.register::<SpatialSampleParams, SpatialSampleResult>(
+        "spatial-sample",
+        "spatial-sample {provider, channel, position, derivative?}",
+        |ctx, params| {
+            let derivative_dto = params.derivative.unwrap_or_default();
+            let channel = field_channel(params.channel, params.user_channel.as_deref())?;
+            let derivative = field_derivative(derivative_dto);
+            let position = WorldPosition::from_world_meters(saffron_geometry::glam::DVec3::new(
+                f64::from(params.position.x),
+                f64::from(params.position.y),
+                f64::from(params.position.z),
+            ))
+            .map_err(|error| Error::command(error.to_string()))?;
+            let provider_id = saffron_spatial::SurfaceProviderId(params.provider.0);
+            let assets = &mut *ctx.assets;
+            let mut result = Ok(None);
+            ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                result = sample_scene_surface_field(
+                    gpu,
+                    ctx.scene_edit.active_scene(),
+                    assets,
+                    provider_id,
+                    channel,
+                    derivative,
+                    position,
+                );
+            });
+            let sample = result
+                .map_err(|error| Error::command(error.to_string()))?
+                .ok_or_else(|| Error::command("surface provider not found"))?;
+            Ok(SpatialSampleResult {
+                provider: params.provider,
+                channel: params.channel,
+                user_channel: params.user_channel,
+                derivative: derivative_dto,
+                value_bits: sample.value.bits(),
+                value: sample.value.to_f64(),
+                revision: sample.revision.0.to_string(),
+            })
+        },
+    );
+
+    reg.register::<EmptyParams, SpatialResidencyResult>(
+        "spatial-residency",
+        "spatial-residency — list spatial sources and per-facet cell references",
+        |ctx, _params| {
+            let sources = ctx
+                .spatial
+                .sources()
+                .into_iter()
+                .map(|source| SpatialSourceDto {
+                    id: source.id.0.to_string(),
+                    revision: source.revision.to_string(),
+                    position: world_position_dto(source.position),
+                    velocity_mps: Vec3 {
+                        x: source.velocity_mps.x as f32,
+                        y: source.velocity_mps.y as f32,
+                        z: source.velocity_mps.z as f32,
+                    },
+                    prediction_seconds: source.prediction_seconds,
+                    levels: source
+                        .levels
+                        .into_iter()
+                        .map(|level| SpatialSourceLevelDto {
+                            level: level.level,
+                            load_radius_cells: level.load_radius_cells,
+                            cleanup_radius_cells: level.cleanup_radius_cells,
+                        })
+                        .collect(),
+                    facets: source.facets.iter().map(residency_facet_dto).collect(),
+                    priority: source.priority,
+                })
+                .collect();
+            let cells = ctx
+                .spatial
+                .snapshots()
+                .map_err(|error| Error::command(error.to_string()))?
+                .into_iter()
+                .map(|snapshot| SpatialResidencyCellDto {
+                    cell: world_cell_dto(snapshot.cell),
+                    reference_counts: ResidencyCountsDto {
+                        render: snapshot.reference_counts[ResidencyFacet::Render as usize],
+                        physics: snapshot.reference_counts[ResidencyFacet::Physics as usize],
+                        simulation: snapshot.reference_counts[ResidencyFacet::Simulation as usize],
+                        editing: snapshot.reference_counts[ResidencyFacet::Editing as usize],
+                        navigation: snapshot.reference_counts[ResidencyFacet::Navigation as usize],
+                        network: snapshot.reference_counts[ResidencyFacet::Network as usize],
+                    },
+                    priority: snapshot.priority,
+                })
+                .collect();
+            Ok(SpatialResidencyResult { sources, cells })
         },
     );
 
@@ -779,6 +1412,120 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
         |ctx, _params| Ok(environment_dto(ctx)),
     );
 
+    reg.register::<EmptyParams, EnvironmentDto>(
+        "get-environment-defaults",
+        "get-environment-defaults — dump the canonical environment defaults",
+        |_ctx, _params| Ok(scene_environment_dto(&SceneEnvironment::default())),
+    );
+
+    reg.register::<EmptyParams, EnvironmentProfileListDto>(
+        "list-environment-profiles",
+        "list-environment-profiles — list built-in and project environment profiles",
+        |ctx, _params| {
+            let mut profiles = builtin_environment_profiles()
+                .into_iter()
+                .filter_map(|profile| {
+                    Some(EnvironmentProfileSummaryDto {
+                        reference: EnvironmentProfileRefDto::Builtin {
+                            profile: builtin_environment_profile_dto(profile.key)?,
+                        },
+                        name: profile.name.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut project_profiles = ctx
+                .assets
+                .catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.asset_type == AssetType::Environment)
+                .map(|entry| EnvironmentProfileSummaryDto {
+                    reference: EnvironmentProfileRefDto::Asset {
+                        id: WireUuid(entry.id.value()),
+                    },
+                    name: entry.name.clone(),
+                })
+                .collect::<Vec<_>>();
+            project_profiles.sort_by(|a, b| a.name.cmp(&b.name));
+            profiles.extend(project_profiles);
+            Ok(EnvironmentProfileListDto { profiles })
+        },
+    );
+
+    reg.register::<SaveEnvironmentProfileParams, EnvironmentProfileSummaryDto>(
+        "save-environment-profile",
+        "save-environment-profile {name, folder?} — save the active environment as a project profile",
+        |ctx, params| {
+            let name = params.name.trim();
+            if name.is_empty() {
+                return Err(Error::command("environment profile name cannot be empty"));
+            }
+            let environment = ctx.scene_edit.active_scene().environment.clone();
+            let id = save_environment_profile(
+                ctx.assets,
+                &environment,
+                name,
+                params.folder.as_deref().unwrap_or_default(),
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let entry = ctx
+                .assets
+                .catalog
+                .find(id)
+                .ok_or_else(|| Error::command("saved environment profile is not in the catalog"))?;
+            Ok(EnvironmentProfileSummaryDto {
+                reference: EnvironmentProfileRefDto::Asset {
+                    id: WireUuid(id.value()),
+                },
+                name: entry.name.clone(),
+            })
+        },
+    );
+
+    reg.register::<UpdateEnvironmentProfileParams, EnvironmentProfileSummaryDto>(
+        "update-environment-profile",
+        "update-environment-profile {profile} — replace a project profile with the active environment",
+        |ctx, params| {
+            let id = params.profile.into();
+            let environment = ctx.scene_edit.active_scene().environment.clone();
+            update_environment_profile(ctx.assets, id, &environment)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let entry = ctx
+                .assets
+                .catalog
+                .find(id)
+                .ok_or_else(|| Error::command("updated environment profile is not in the catalog"))?;
+            Ok(EnvironmentProfileSummaryDto {
+                reference: EnvironmentProfileRefDto::Asset { id: params.profile },
+                name: entry.name.clone(),
+            })
+        },
+    );
+
+    reg.register::<ApplyEnvironmentProfileParams, EnvironmentDto>(
+        "apply-environment-profile",
+        "apply-environment-profile {profile} — apply a complete environment profile",
+        |ctx, params| {
+            let environment = match params.profile {
+                EnvironmentProfileRefDto::Builtin { profile } => {
+                    let key = builtin_environment_profile_key(profile);
+                    builtin_environment_profile(key)
+                        .ok_or_else(|| {
+                            Error::command(format!("unknown environment profile '{key}'"))
+                        })?
+                        .environment
+                }
+                EnvironmentProfileRefDto::Asset { id } => {
+                    load_environment_profile(ctx.assets, id.into())
+                        .map_err(|error| Error::command(error.to_string()))?
+                }
+            };
+            ctx.scene_edit.active_scene().environment = environment;
+            ctx.scene_edit.scene_version += 1;
+            Ok(environment_dto(ctx))
+        },
+    );
+
     // Merges the provided fields over the current environment (same wire shape as the scene
     // file's "environment" block) so unspecified fields are preserved.
     reg.register::<SetEnvironmentParams, EnvironmentDto>(
@@ -835,7 +1582,9 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
         "set-atmosphere",
         "set-atmosphere {--json {...} | enabled?:bool, planetRadius?, atmosphereHeight?, \
          rayleighScattering?:{x,y,z}, rayleighScaleHeight?, mieScattering?, mieScaleHeight?, \
-         mieAnisotropy?, ozoneAbsorption?:{x,y,z}, sunDiskAngularRadius?, sunDiskIntensity?}",
+         mieAnisotropy?, ozoneAbsorption?:{x,y,z}, sunDiskAngularRadius?, sunDiskIntensity?, \
+         moonDiskAngularRadius?, moonDiskIntensity?, moonEarthshine?, \
+         perPixelTransmittance?:bool, skyCaptureCadence?}",
         |ctx, params| {
             let mut body = environment_to_json(&ctx.scene_edit.active_scene().environment);
             let mut atmos = body.get("atmosphere").cloned().unwrap_or_else(|| json!({}));
@@ -876,6 +1625,21 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             }
             if let Some(v) = params.sun_disk_intensity {
                 atmos["sunDiskIntensity"] = json!(v);
+            }
+            if let Some(v) = params.moon_disk_angular_radius {
+                atmos["moonDiskAngularRadius"] = json!(v);
+            }
+            if let Some(v) = params.moon_disk_intensity {
+                atmos["moonDiskIntensity"] = json!(v);
+            }
+            if let Some(v) = params.moon_earthshine {
+                atmos["moonEarthshine"] = json!(v);
+            }
+            if let Some(v) = params.per_pixel_transmittance {
+                atmos["perPixelTransmittance"] = json!(v);
+            }
+            if let Some(v) = params.sky_capture_cadence {
+                atmos["skyCaptureCadence"] = json!(v.clamp(1.0, 60.0));
             }
             body["atmosphere"] = atmos;
             ctx.scene_edit.active_scene().environment = environment_from_json(&body);
@@ -980,6 +1744,202 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             }
             body["fog"] = fog;
             ctx.scene_edit.active_scene().environment = environment_from_json(&body);
+            ctx.scene_edit.scene_version += 1;
+            Ok(environment_dto(ctx))
+        },
+    );
+
+    reg.register::<SetCloudsParams, EnvironmentDto>(
+        "set-clouds",
+        "set-clouds {--json {...} | enabled?:bool, coverage?, cloudType?, precipitation?, \
+         anvilBias?, layerAltitude?, layerHeight?, baseScale?, detailScale?, detailStrength?, \
+         curlStrength?, weatherScale?, weatherOffset?:{x,y,z}, weatherTexture?, primarySteps?, \
+         lightSteps?, dropletDiameter?, temporalFactor?, castCloudShadows?, \
+         cloudShadowStrength?, cloudShadowOnSurfaceStrength?}",
+        |ctx, params| {
+            let mut body = environment_to_json(&ctx.scene_edit.active_scene().environment);
+            let mut cloud = body.get("cloud").cloned().unwrap_or_else(|| json!({}));
+            if let Some(Value::Object(map)) = &params.json {
+                for (key, value) in map {
+                    cloud[key] = value.clone();
+                }
+            }
+            if let Some(value) = params.enabled {
+                cloud["enabled"] = json!(value);
+            }
+            if let Some(value) = params.coverage {
+                cloud["coverage"] = json!(value);
+            }
+            if let Some(value) = params.cloud_type {
+                cloud["cloudType"] = json!(value);
+            }
+            if let Some(value) = params.precipitation {
+                cloud["precipitation"] = json!(value);
+            }
+            if let Some(value) = params.anvil_bias {
+                cloud["anvilBias"] = json!(value);
+            }
+            if let Some(value) = params.layer_altitude {
+                cloud["layerAltitude"] = json!(value);
+            }
+            if let Some(value) = params.layer_height {
+                cloud["layerHeight"] = json!(value);
+            }
+            if let Some(value) = params.base_scale {
+                cloud["baseScale"] = json!(value);
+            }
+            if let Some(value) = params.detail_scale {
+                cloud["detailScale"] = json!(value);
+            }
+            if let Some(value) = params.detail_strength {
+                cloud["detailStrength"] = json!(value);
+            }
+            if let Some(value) = params.curl_strength {
+                cloud["curlStrength"] = json!(value);
+            }
+            if let Some(value) = params.weather_scale {
+                cloud["weatherScale"] = json!(value);
+            }
+            if let Some(value) = &params.weather_offset {
+                cloud["weatherOffset"] = vec3_json(value);
+            }
+            if let Some(value) = params.weather_texture {
+                cloud["weatherTexture"] = json!(value);
+            }
+            if let Some(value) = params.primary_steps {
+                cloud["primarySteps"] = json!(value);
+            }
+            if let Some(value) = params.light_steps {
+                cloud["lightSteps"] = json!(value);
+            }
+            if let Some(value) = params.droplet_diameter {
+                cloud["dropletDiameter"] = json!(value);
+            }
+            if let Some(value) = params.temporal_factor {
+                cloud["temporalFactor"] = json!(value);
+            }
+            if let Some(value) = params.cast_cloud_shadows {
+                cloud["castCloudShadows"] = json!(value);
+            }
+            if let Some(value) = params.cloud_shadow_strength {
+                cloud["cloudShadowStrength"] = json!(value);
+            }
+            if let Some(value) = params.cloud_shadow_on_surface_strength {
+                cloud["cloudShadowOnSurfaceStrength"] = json!(value);
+            }
+
+            body["cloud"] = cloud;
+            let environment = environment_from_json(&body);
+            validate_clouds(&environment.cloud)?;
+            ctx.scene_edit.active_scene().environment = environment;
+            ctx.scene_edit.scene_version += 1;
+            Ok(environment_dto(ctx))
+        },
+    );
+
+    reg.register::<SetWindParams, EnvironmentDto>(
+        "set-wind",
+        "set-wind {--json {...} | orientation?, speed?, gust?}",
+        |ctx, params| {
+            let mut body = environment_to_json(&ctx.scene_edit.active_scene().environment);
+            let mut wind = body.get("wind").cloned().unwrap_or_else(|| json!({}));
+            if let Some(Value::Object(map)) = &params.json {
+                for (key, value) in map {
+                    wind[key] = value.clone();
+                }
+            }
+            if let Some(value) = params.orientation {
+                wind["orientation"] = json!(value);
+            }
+            if let Some(value) = params.speed {
+                wind["speed"] = json!(value);
+            }
+            if let Some(value) = params.gust {
+                wind["gust"] = json!(value);
+            }
+            body["wind"] = wind;
+            let environment = environment_from_json(&body);
+            validate_wind(&environment.wind)?;
+            ctx.scene_edit.active_scene().environment = environment;
+            ctx.scene_edit.scene_version += 1;
+            Ok(environment_dto(ctx))
+        },
+    );
+
+    reg.register::<SetTimeOfDayParams, EnvironmentDto>(
+        "set-time-of-day",
+        "set-time-of-day {--json {...} | enabled?:bool, manualOverride?:bool, timeOfDay?, \
+         year?, month?, day?, latitude?, longitude?, dayLengthSeconds?, \
+         exposureCurve?:[[x,y]], tintCurve?:{master,red,green,blue}, \
+         coverageCurve?:[[x,y]], cloudTypeCurve?:[[x,y]]}",
+        |ctx, params| {
+            let mut body = environment_to_json(&ctx.scene_edit.active_scene().environment);
+            let mut time = body.get("timeOfDay").cloned().unwrap_or_else(|| json!({}));
+            if let Some(Value::Object(map)) = &params.json {
+                for (key, value) in map {
+                    if key == "tintCurve" {
+                        let mut tint = time.get("tintCurve").cloned().unwrap_or_else(|| json!({}));
+                        if let Value::Object(channels) = value {
+                            for (channel, curve) in channels {
+                                tint[channel] = curve.clone();
+                            }
+                            time[key] = tint;
+                            continue;
+                        }
+                    }
+                    time[key] = value.clone();
+                }
+            }
+            if let Some(v) = params.enabled {
+                time["enabled"] = json!(v);
+            }
+            if let Some(v) = params.manual_override {
+                time["manualOverride"] = json!(v);
+            }
+            if let Some(v) = params.time_of_day {
+                time["timeOfDay"] = json!(v);
+            }
+            if let Some(v) = params.year {
+                time["year"] = json!(v);
+            }
+            if let Some(v) = params.month {
+                time["month"] = json!(v);
+            }
+            if let Some(v) = params.day {
+                time["day"] = json!(v);
+            }
+            if let Some(v) = params.latitude {
+                time["latitude"] = json!(v);
+            }
+            if let Some(v) = params.longitude {
+                time["longitude"] = json!(v);
+            }
+            if let Some(v) = params.day_length_seconds {
+                time["dayLengthSeconds"] = json!(v);
+            }
+            if let Some(v) = &params.exposure_curve {
+                time["exposureCurve"] = curve_json(v);
+            }
+            if let Some(v) = &params.tint_curve {
+                time["tintCurve"] = json!({
+                    "master": curve_json(&v.master),
+                    "red": curve_json(&v.red),
+                    "green": curve_json(&v.green),
+                    "blue": curve_json(&v.blue),
+                });
+            }
+            if let Some(v) = &params.coverage_curve {
+                time["coverageCurve"] = curve_json(v);
+            }
+            if let Some(v) = &params.cloud_type_curve {
+                time["cloudTypeCurve"] = curve_json(v);
+            }
+
+            validate_time_of_day_json(&time)?;
+            body["timeOfDay"] = time;
+            let environment = environment_from_json(&body);
+            validate_time_of_day(&environment.time_of_day)?;
+            ctx.scene_edit.active_scene().environment = environment;
             ctx.scene_edit.scene_version += 1;
             Ok(environment_dto(ctx))
         },
@@ -1374,7 +2334,8 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     Error::command(format!("unknown component '{}'", params.component))
                 })?;
             if !(row.has)(ctx.scene_edit.active_scene(), entity) {
-                (row.add_default)(ctx.scene_edit.active_scene(), entity);
+                (row.add_default)(ctx.scene_edit.active_scene(), entity)
+                    .map_err(|error| Error::command(error.to_string()))?;
             }
             let mut body = (row.serialize)(ctx.scene_edit.active_scene(), entity);
             // The CLI passes every value as a string; a fully-numeric one becomes a u64 so
@@ -1670,6 +2631,10 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use saffron_geometry::glam::DVec3;
+    use saffron_spatial::{
+        ResidencyFacet, ResidencyMask, SourceLevel, SpatialSource, SpatialSourceId, WorldPosition,
+    };
     use serde_json::json;
 
     use crate::registry::{CommandRegistry, EngineContext, register_builtin_commands};
@@ -1679,6 +2644,104 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register_builtin_commands(&mut reg);
         reg
+    }
+
+    #[test]
+    fn spatial_cell_reports_exact_negative_face_ownership() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let reply = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "spatial-cell",
+                    "params": { "ticks": { "x": "-1", "y": "-262144", "z": "262144" }, "level": 1 }
+                }),
+            );
+            assert_eq!(reply["ok"], json!(true));
+            assert_eq!(reply["result"]["position"]["cell"]["x"], json!("-1"));
+            assert_eq!(reply["result"]["position"]["cell"]["y"], json!("-1"));
+            assert_eq!(reply["result"]["position"]["cell"]["z"], json!("1"));
+            assert_eq!(reply["result"]["position"]["local"]["x"], json!(262_143));
+            assert_eq!(reply["result"]["selectedCell"]["x"], json!("-1"));
+            assert_eq!(reply["result"]["selectedCell"]["y"], json!("-1"));
+            assert_eq!(reply["result"]["selectedCell"]["z"], json!("0"));
+            assert_eq!(
+                reply["result"]["selectedCell"]["canonicalHex"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                50
+            );
+        });
+    }
+
+    #[test]
+    fn spatial_provider_and_user_channel_diagnostics_are_read_only() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let providers = reg.dispatch(ctx, &json!({ "cmd": "spatial-providers" }));
+            assert_eq!(providers["result"]["providers"], json!([]));
+
+            let missing_user_id = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "spatial-sample",
+                    "params": {
+                        "provider": "1",
+                        "channel": "user",
+                        "position": { "x": 0, "y": 0, "z": 0 }
+                    }
+                }),
+            );
+            assert_eq!(missing_user_id["ok"], json!(false));
+            assert_eq!(
+                missing_user_id["error"],
+                json!("userChannel is required when channel is 'user'")
+            );
+        });
+    }
+
+    #[test]
+    fn spatial_residency_reports_sources_and_facet_counts() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            ctx.spatial
+                .update_source(SpatialSource {
+                    id: SpatialSourceId(19),
+                    revision: 7,
+                    position: WorldPosition::origin(),
+                    velocity_mps: DVec3::new(2.0, 0.0, 0.0),
+                    prediction_seconds: 0.5,
+                    levels: vec![SourceLevel {
+                        level: 0,
+                        load_radius_cells: 0,
+                        cleanup_radius_cells: 1,
+                    }],
+                    facets: ResidencyMask::one(ResidencyFacet::Render)
+                        .with(ResidencyFacet::Editing),
+                    priority: 42,
+                })
+                .unwrap();
+            let reply = reg.dispatch(ctx, &json!({ "cmd": "spatial-residency" }));
+            assert_eq!(reply["ok"], json!(true));
+            assert_eq!(reply["result"]["sources"][0]["id"], json!("19"));
+            assert_eq!(
+                reply["result"]["sources"][0]["facets"],
+                json!(["render", "editing"])
+            );
+            assert_eq!(
+                reply["result"]["cells"][0]["referenceCounts"]["render"],
+                json!(1)
+            );
+            assert_eq!(
+                reply["result"]["cells"][0]["referenceCounts"]["editing"],
+                json!(1)
+            );
+            assert_eq!(reply["result"]["cells"][0]["priority"], json!(42));
+        });
     }
 
     /// `create-entity` then `destroy-entity` round-trips, and the returned `EntityRef.id` is
@@ -1799,6 +2862,75 @@ mod tests {
             assert_eq!(
                 inspect["result"]["components"]["Name"]["name"],
                 json!("Renamed")
+            );
+        });
+    }
+
+    #[test]
+    fn vegetation_field_create_inspect_remove_and_singleton_contract() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            let first = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Vegetation" } }),
+            );
+            let second = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "create-entity", "params": { "name": "Other" } }),
+            );
+            let first_id = first["result"]["id"].as_str().unwrap().to_owned();
+            let second_id = second["result"]["id"].as_str().unwrap().to_owned();
+
+            let added = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "add-component",
+                    "params": { "entity": first_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(added["ok"], json!(true), "add: {added:?}");
+            let inspect = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "inspect", "params": { "entity": first_id } }),
+            );
+            assert_eq!(
+                inspect["result"]["components"]["VegetationField"],
+                json!({ "map": "0", "enabled": true })
+            );
+
+            let duplicate = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "add-component",
+                    "params": { "entity": second_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(duplicate["ok"], json!(false));
+            assert_eq!(
+                duplicate["error"],
+                json!("scene already has a VegetationField component")
+            );
+
+            let removed = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "remove-component",
+                    "params": { "entity": first_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(removed["ok"], json!(true), "remove: {removed:?}");
+            let replacement = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "add-component",
+                    "params": { "entity": second_id, "component": "VegetationField" }
+                }),
+            );
+            assert_eq!(
+                replacement["ok"],
+                json!(true),
+                "replacement: {replacement:?}"
             );
         });
     }

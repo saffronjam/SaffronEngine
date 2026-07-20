@@ -1,8 +1,10 @@
 //! Thumbnail resolution: classify an asset into a preview subject, resolve its content-addressed
 //! cache key, and either return a cache hit or enqueue a main-graph render.
 //!
-//! Every tile — material, texture map, mesh, model, HDRI — renders through the **main forward+
-//! graph** on the offscreen thumbnail view (the interactive previewer's path). [`request_thumbnail`]
+//! Material, texture-map, mesh, model, and HDRI tiles render through the **main forward+
+//! graph** on the offscreen thumbnail view (the interactive previewer's path). Authored vegetation
+//! kinds rasterize their canonical vector type icons synchronously until plant rendering exists.
+//! [`request_thumbnail`]
 //! runs on the main thread: it resolves `{preview subject, content hash, cache path}` — a stored
 //! catalog hash for a mesh/texture/model (self-healing a legacy `0` from the source bytes), a live
 //! resolved hash for a material — then returns a cache hit or enqueues a [`PreviewRenderJob`] onto
@@ -810,6 +812,10 @@ pub fn request_thumbnail(assets: &mut AssetServer, id: Uuid, size: u32) -> Resul
         .ok_or(Error::NotInCatalog(id.value()))?
         .clone();
 
+    if let Some(svg) = vegetation_icon_svg(entry.asset_type) {
+        return vegetation_icon_thumbnail(assets, svg, size);
+    }
+
     // Texture / mesh / model carry a stored content hash: resolve the cache path + preview subject
     // WITHOUT loading the container or building a render payload (the boot-hitch fix; it also skips
     // the model-forest slice). A cache hit returns; a miss enqueues the main-graph render. A material
@@ -858,6 +864,47 @@ pub fn request_thumbnail(assets: &mut AssetServer, id: Uuid, size: u32) -> Resul
     }
     let kind = preview_render_kind(&job.content, job.id);
     Ok(enqueue_preview_render(assets, kind, size, job.cache_path))
+}
+
+fn vegetation_icon_svg(asset_type: AssetType) -> Option<&'static str> {
+    match asset_type {
+        AssetType::Plant => Some(include_str!("../../../assets/icons/sprout.svg")),
+        AssetType::Biome => Some(include_str!("../../../assets/icons/tree-pine.svg")),
+        AssetType::VegetationMap => Some(include_str!("../../../assets/icons/map.svg")),
+        _ => None,
+    }
+}
+
+fn vegetation_icon_thumbnail(
+    assets: &AssetServer,
+    svg: &'static str,
+    size: u32,
+) -> Result<ThumbnailReply> {
+    let content_hash = crate::import::hash_bytes_fnv(svg.as_bytes());
+    let cache_path = assets.thumbnail_content_cache_path(content_hash, size);
+    if let Some(hit) = read_thumbnail_cache(&cache_path) {
+        return Ok(ready_reply(hit));
+    }
+    let tree = usvg::Tree::from_str(svg, &usvg::Options::default())
+        .map_err(|error| Error::Thumbnail(error.to_string()))?;
+    let mut pixmap = tiny_skia::Pixmap::new(size, size)
+        .ok_or_else(|| Error::Thumbnail("thumbnail size is invalid".to_owned()))?;
+    let scale = size as f32 / 24.0;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let png = pixmap
+        .encode_png()
+        .map_err(|error| Error::Thumbnail(error.to_string()))?;
+    write_thumbnail_cache(&cache_path, &png)?;
+    Ok(ThumbnailReply {
+        png,
+        width: size,
+        height: size,
+        pending: false,
+    })
 }
 
 /// The preview subject a texture / mesh / model catalog entry renders as — classified from its type

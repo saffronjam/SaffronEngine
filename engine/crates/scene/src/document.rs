@@ -206,7 +206,7 @@ mod tests {
 
     use crate::component::{
         Camera, IdComponent, Name, PreviewGhost, Relationship, SkinnedMesh, Transform,
-        WorldTransform,
+        VegetationField, WorldTransform,
     };
     use crate::registry::register_builtin_components;
     use crate::scene::{Entity, Scene};
@@ -312,6 +312,46 @@ mod tests {
             "cube translation survives"
         );
         assert_eq!(doc.get("version"), Some(&Value::from(SCENE_VERSION)));
+    }
+
+    #[test]
+    fn vegetation_field_round_trips_and_duplicate_fields_are_rejected() {
+        let reg = registry();
+        let mut scene = Scene::new();
+        let field_owner = scene.create_entity("Vegetation");
+        scene
+            .add_component(
+                field_owner,
+                VegetationField {
+                    map: Uuid(91),
+                    enabled: false,
+                },
+            )
+            .unwrap();
+
+        let doc = scene.scene_to_json(&reg);
+        let mut loaded = Scene::new();
+        loaded.scene_from_json(&reg, &doc).unwrap();
+        let loaded_owner = find_by_name(&mut loaded, "Vegetation");
+        assert_eq!(
+            loaded.component::<VegetationField>(loaded_owner).unwrap(),
+            VegetationField {
+                map: Uuid(91),
+                enabled: false,
+            }
+        );
+
+        let mut duplicate = doc;
+        let entities = duplicate["entities"].as_array_mut().unwrap();
+        let mut second = entities[0].clone();
+        second["id"] = Value::String("92".to_owned());
+        second["components"]["Name"]["name"] = Value::String("Duplicate".to_owned());
+        entities.push(second);
+        let mut rejected = Scene::new();
+        assert!(matches!(
+            rejected.scene_from_json(&reg, &duplicate),
+            Err(crate::Error::Deserialize(message)) if message.contains("VegetationField")
+        ));
     }
 
     /// Hierarchy round-trip: the durable parent uuid survives, the post-loop resolve
@@ -650,15 +690,18 @@ mod tests {
             r#""environment":{"ambientColor":{"x":1.0,"y":1.0,"z":1.0},"ambientIntensity":0.15000000596046448,"#,
             r#""atmosphere":{"atmosphereHeight":100.0,"enabled":false,"mieAnisotropy":0.800000011920929,"#,
             r#""mieScaleHeight":1.2000000476837158,"mieScattering":3.996000051498413,"#,
+            r#""moonDiskAngularRadius":0.0049600000493228436,"moonDiskIntensity":1.0,"moonEarthshine":0.019999999552965164,"#,
             r#""ozoneAbsorption":{"x":0.6499999761581421,"y":1.88100004196167,"z":0.08500000089406967},"#,
-            r#""planetRadius":6360.0,"rayleighScaleHeight":8.0,"#,
+            r#""perPixelTransmittance":false,"planetRadius":6360.0,"rayleighScaleHeight":8.0,"#,
             r#""rayleighScattering":{"x":5.802000045776367,"y":13.557999610900879,"z":33.099998474121094},"#,
-            r#""sunDiskAngularRadius":0.004650000017136335,"sunDiskIntensity":20.0},"#,
+            r#""skyCaptureCadence":9.0,"sunDiskAngularRadius":0.004650000017136335,"sunDiskIntensity":1.0},"#,
             r#""clearColor":{"x":0.05000000074505806,"y":0.05999999865889549,"z":0.07999999821186066},"#,
+            r#""cloud":{"anvilBias":0.0,"baseScale":0.00007999999797903001,"castCloudShadows":true,"cloudShadowOnSurfaceStrength":1.0,"cloudShadowStrength":1.0,"cloudType":0.4000000059604645,"coverage":0.5,"curlStrength":120.0,"detailScale":0.0010000000474974513,"detailStrength":0.3499999940395355,"dropletDiameter":20.0,"enabled":false,"layerAltitude":1500.0,"layerHeight":2500.0,"lightSteps":6,"precipitation":0.0,"primarySteps":64,"temporalFactor":0.10000000149011612,"weatherOffset":{"x":0.0,"y":0.0,"z":0.0},"weatherScale":0.000019999999494757503,"weatherTexture":"0"},"#,
             r#""exposure":1.0,"#,
             r#""fog":{"aerialIntensity":1.0,"aerialPerspective":false,"albedo":{"x":0.5,"y":0.6000000238418579,"z":0.699999988079071},"baseDensity":0.019999999552965164,"density":0.019999999552965164,"directionalColor":{"x":1.0,"y":0.8999999761581421,"z":0.699999988079071},"directionalExponent":8.0,"emissive":{"x":0.0,"y":0.0,"z":0.0},"enabled":false,"height":0.0,"heightFalloff":0.20000000298023224,"historyBlend":0.05000000074505806,"layer2Density":0.0,"layer2Falloff":0.5,"layer2Height":0.0,"lightClamp":0.0,"maxOpacity":1.0,"mode":"analytic","neighborhoodClamp":false,"phaseG":0.6000000238418579,"quality":"medium","scatterAlbedo":0.8999999761581421,"startDistance":0.0},"#,
             r#""skyIntensity":1.0,"skyMode":"procedural","skyRotation":0.0,"skyTexture":"0","#,
-            r#""useSkyForAmbient":true,"visible":true},"#,
+            r#""timeOfDay":{"cloudTypeCurve":[],"coverageCurve":[],"day":21,"dayLengthSeconds":600.0,"enabled":false,"exposureCurve":[],"latitude":0.0,"longitude":0.0,"manualOverride":false,"month":6,"timeOfDay":0.5,"tintCurve":{"blue":[],"green":[],"master":[],"red":[]},"year":2025},"#,
+            r#""useSkyForAmbient":true,"visible":true,"wind":{"gust":0.25,"orientation":0.0,"speed":10.0}},"#,
             r#""version":4}"#
         );
 

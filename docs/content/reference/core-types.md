@@ -6,63 +6,77 @@ math = false
 
 # Core types
 
-The `saffron-core` crate is the DAG root: it exports the `Result`/`Error` model, the `Ref` alias, the `Uuid` and `TimeSpan` value types, logging, and the engine identity constants. Every other crate composes against these.
+The `saffron-core` crate is the dependency root for Anima's shared value types, error vocabulary, and identity constants. This page lists its complete public API.
 
-## Error as value
+## Public API
 
-Fallible functions return `Result<T>`; there are no panics on the engine path. Each library crate exports its own `Result<T>` over its own `thiserror` `Error` enum — the table below is `saffron-core`'s.
-
-| What | File | Symbols |
+| Item | Definition | Behavior |
 |---|---|---|
-| `Result<T>` and the root `Error` | `error.rs` | `Result`, `Error`, `Error::Message` |
-
-`pub type Result<T> = core::result::Result<T, Error>` and `Error` is a `#[derive(thiserror::Error)]` enum whose one variant is `Message(String)`. Downstream crates compose against it with `#[from]` and propagate with `?`.
-
-## Shared references
-
-| What | File | Symbols |
-|---|---|---|
-| The read-shared handle alias | `lib.rs` | `Ref` |
-
-`pub type Ref<T> = std::sync::Arc<T>`. It is a *readability* alias only — the default for a value that is constructed once and then read through every shared handle (loaded meshes, textures, materials). A shared-*mutable* site does not use `Ref`; it spells `Arc<Mutex<T>>` (or `Arc<RwLock<T>>`) explicitly where it occurs, so the exception is visible.
+| `Error` | `enum Error { Message(String) }` | The typed root error. `Message` represents a failure with no more specific structure. |
+| `Result<T>` | `core::result::Result<T, Error>` | The result alias for `saffron-core`. Each downstream library crate defines its own typed error and result alias. |
+| `Ref<T>` | `std::sync::Arc<T>` | A read-shared handle. Shared mutable state spells out `Arc<Mutex<T>>` or `Arc<RwLock<T>>` at its declaration. |
+| `Uuid` | `pub struct Uuid(pub u64)` | A stable identity independent of an ECS entity handle. `Default` is `Uuid(0)`. |
+| `TimeSpan` | `pub struct TimeSpan { pub seconds: f32 }` | A duration stored as seconds. `Default` is zero seconds. |
+| `BlendMode` | `Opaque`, `Masked`, `Blend` | Selects opaque, alpha-tested, or alpha-blended material rendering. `Opaque` is the default. |
+| `HeightMode` | `Bump`, `Parallax`, `Displacement` | Selects shading-normal bump, parallax occlusion, or vertex displacement. `Bump` is the default. |
+| `base64_encode` | `fn(&[u8]) -> String` | Encodes bytes as standard padded [Base64](https://www.rfc-editor.org/rfc/rfc4648#section-4). |
+| `ENGINE_NAME` | `&str` | `"Saffron Anima"` |
+| `ENGINE_VERSION` | `&str` | `"0.1.0-vulkan"` |
 
 ## Identity
 
-| What | File | Symbols |
-|---|---|---|
-| The stable 64-bit id newtype | `uuid.rs` | `Uuid`, `Uuid::new`, `Uuid::value` |
+`Uuid::new()` generates a value at or above `1024`; values below `1024` identify built-in or synthetic assets. `Uuid::value()` returns the underlying `u64`.
 
-`pub struct Uuid(pub u64)`. ECS handles are not stable across a load, so anything serialized carries a `Uuid` instead. `Uuid::new()` mints a fresh id uniformly drawn from `[1024, u64::MAX]` (ids below `1024` are reserved for built-in assets); `value()` returns the raw `u64`. On the JSON wire a `Uuid` is a **decimal string** (ids span the full `u64` range past JavaScript's `2^53` safe-integer limit); the read side accepts a string or a number. That encoding lives once in `saffron-protocol`, not on this newtype.
+`Uuid` implements `Display` and `FromStr` using an unsigned decimal string. Protocol fields serialize that string form so values above JavaScript's safe-integer limit remain exact.
+
+```rust
+use saffron_core::Uuid;
+
+let id = Uuid::new();
+let encoded = id.to_string();
+let decoded: Uuid = encoded.parse().expect("decimal UUID");
+assert_eq!(decoded, id);
+```
 
 ## Time
 
+`TimeSpan::from_seconds(seconds)` constructs a span. `TimeSpan::to_milliseconds()` multiplies the stored seconds by `1000.0`. Both methods are `const fn`.
+
+```rust
+use saffron_core::TimeSpan;
+
+let frame = TimeSpan::from_seconds(0.016);
+assert_eq!(frame.to_milliseconds(), 16.0);
+```
+
+## Material modes
+
+`BlendMode::as_wire()` and `HeightMode::as_wire()` return the tokens used in scene JSON and `.smat` documents. Each `from_wire()` method accepts its listed tokens and returns the default variant for any other value.
+
+| Type | Variant | Wire token |
+|---|---|---|
+| `BlendMode` | `Opaque` | `opaque` |
+| `BlendMode` | `Masked` | `masked` |
+| `BlendMode` | `Blend` | `translucent` |
+| `HeightMode` | `Bump` | `bump` |
+| `HeightMode` | `Parallax` | `parallax` |
+| `HeightMode` | `Displacement` | `displacement` |
+
+## Source map
+
 | What | File | Symbols |
 |---|---|---|
-| A span of time in seconds | `time.rs` | `TimeSpan`, `TimeSpan::from_seconds`, `TimeSpan::to_milliseconds` |
-
-`pub struct TimeSpan { pub seconds: f32 }`. `from_seconds` constructs one; `to_milliseconds` returns `seconds * 1000.0`. Both are `const fn`.
-
-## Logging
-
-Logging is **not** in `saffron-core` — it lives in the leaf `saffron-log` crate, built on
-[`tracing`](https://docs.rs/tracing). Call sites emit with `tracing::{info, warn, error, debug, trace}!`;
-`saffron_log::init_logging()` installs the subscriber once per process and renders the compact line
-`HH:MM:SS.mmm  LEVEL  subsystem  [span fields] message`.
-
-| What | File | Symbols |
-|---|---|---|
-| Subscriber install + format | `engine/crates/log/src/lib.rs` | `init_logging`, `CompactFormatter`, `subsystem_of` |
-
-See the [Logging](../../explanations/core-and-conventions/logging/) explanation for the full design.
-
-## Identity constants
-
-| What | File | Symbols |
-|---|---|---|
-| Engine name and version | `lib.rs` | `ENGINE_NAME` (`"Saffron Anima"`), `ENGINE_VERSION` (`"0.1.0-vulkan"`) |
+| Public exports, shared handle, identity constants | `engine/crates/core/src/lib.rs` | `Ref`, `ENGINE_NAME`, `ENGINE_VERSION` |
+| Root error vocabulary | `engine/crates/core/src/error.rs` | `Error`, `Result` |
+| Stable identity | `engine/crates/core/src/uuid.rs` | `Uuid`, `Uuid::new`, `Uuid::value` |
+| Duration value | `engine/crates/core/src/time.rs` | `TimeSpan`, `TimeSpan::from_seconds`, `TimeSpan::to_milliseconds` |
+| Material alpha behavior | `engine/crates/core/src/blend.rs` | `BlendMode`, `BlendMode::as_wire`, `BlendMode::from_wire` |
+| Material height technique | `engine/crates/core/src/height.rs` | `HeightMode`, `HeightMode::as_wire`, `HeightMode::from_wire` |
+| Binary-to-text encoding | `engine/crates/core/src/base64.rs` | `base64_encode` |
 
 ## Related
 
-- [Error handling](../../explanations/core-and-conventions/error-handling/) — the `Result`/`Error` scheme
-- [Type aliases and primitives](../../explanations/core-and-conventions/type-aliases-and-primitives/) — the foundation spellings
-- [Ownership and RAII](../../explanations/core-and-conventions/ownership-and-raii/) — what `Ref<T>` points at
+- [Error handling](../../explanations/core-and-conventions/error-handling/)
+- [Type aliases and primitives](../../explanations/core-and-conventions/type-aliases-and-primitives/)
+- [Ownership and RAII](../../explanations/core-and-conventions/ownership-and-raii/)
+- [Logging](../../explanations/core-and-conventions/logging/)

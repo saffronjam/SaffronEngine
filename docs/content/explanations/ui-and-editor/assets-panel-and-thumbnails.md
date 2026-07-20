@@ -5,104 +5,92 @@ weight = 8
 
 # Assets panel & thumbnails
 
-The Assets panel is a folder tree plus a tile grid over the project's [asset catalog](../../scene-and-ecs/asset-catalog-in-scene/). Each tile shows a thumbnail and an editable name, and acts as a drag source for the inspector's [pickers](../asset-pickers-and-drag-drop/). Virtual folders group catalog entries without changing the imported files on disk.
+The Assets panel is the editor surface over the project's [asset catalog](../../scene-and-ecs/asset-catalog-in-scene/). A folder tree and tile grid organize catalog entries, while thumbnails identify render assets and vegetation data without opening them.
 
-Thumbnails are PNGs fetched over the control socket and cached as blob URLs, because the engine and the webview share no GPU context. The panel itself is a React component reading `store.assets`.
+## Browsing the catalog
 
-## Navigation
+Virtual folders live in catalog metadata. Moving an entry changes its folder path but leaves the imported asset file in its type-specific directory. The tree presents the complete folder hierarchy; the grid presents the current folder, its child folders, and a parent-folder tile when applicable.
 
-The panel splits into a resizable folder tree on the left and the tile grid on the right, under a shared toolbar. The tree is built client-side from the flat `assetFolders` path list: a pinned Root row plus one expandable row per virtual folder. Clicking a row navigates the grid there; navigating any other way (a folder tile, a breadcrumb, back/forward) expands the tree down to the current folder so the selection is never hidden in a collapsed branch.
+Folder navigation has a history stack. Opening a folder truncates the forward tail, and Back or Forward skips folders that have been deleted. Breadcrumb segments navigate to ancestors and also accept asset or folder drops.
 
-The toolbar holds back/forward buttons over a history stack with browser semantics — navigating truncates the forward tail, and back/forward skip entries whose folder has since been deleted — and clickable breadcrumbs, one segment per level of the current path. Renaming a folder rewrites the affected history entries, so back never lands on a stale name.
+The toolbar sorts assets by name or creation time. `Ctrl+F` opens a local search over the current folder, with a `type:` chip for narrowing results to one catalog kind. Folders keep their name order independently of the asset sort.
 
-## The tile grid
+Selection covers both assets and folders. A plain click replaces the selection, Ctrl or Command toggles an item, Shift selects a range in grid order, and a drag on empty grid space draws a marquee. Dragging a selected item carries the visible selected assets and folders as one catalog operation.
 
-`AssetsPanel` lays the current folder out with a CSS grid (`repeat(auto-fill, minmax(72px, 1fr))`), so tiles reflow to the panel width. Each `AssetTile` is a 72px tile: a square thumbnail on top, an in-place name button beneath. Subfolders show as folder tiles. An empty catalog shows an import and drag-and-drop prompt instead. The list comes from the reconcile poll's `list-assets` refresh, re-fetched eagerly after imports, moves, renames, or deletes.
+```text
+Root / Characters / Hero
+       ^ breadcrumb drop target
 
-Each tile tracks a three-state fetch (`loading` / `ready` / `none`): while the `get-thumbnail` promise is outstanding it shows a `Loader2` spinner over a dimmed type icon, a resolve swaps in the image, and a reject (an unsupported type or a failed render) settles to the bare type icon — a missing thumbnail is not an error. A warm cache starts `ready`, so re-opening a folder never flashes the spinner. The `AssetPicker` swatch and the asset viewer's 512 preview use the same distinction.
-
-Right-clicking the asset background opens commands for **New Folder** and **Import**. Right-clicking a folder — as a grid tile or a tree row — opens **New Folder**, **Rename**, and **Delete**; Delete removes the virtual folder and moves its assets back to Root. Right-clicking an asset opens **View** and **Delete**; Delete asks the engine for `asset-usages` first, shows an in-place confirmation with affected slots, then calls `delete-asset`. The Delete key on a focused tile or tree row (clicking one focuses it) starts the same delete flow as its context menu item; the key is the `assets.delete` binding (default Delete), rebindable in [Editor Settings](../editor-settings/).
-
-Asset selection is local editor state. A click selects one tile, Ctrl-click toggles a tile, Shift-click adds the range from the last clicked tile through the current tile, and dragging on empty panel space draws a marquee that selects intersecting asset tiles. Clicking empty space clears the selection. Dragging any selected tile writes the selected asset ids into the asset drag payload, so a folder drop moves the whole selection.
-
-## Detail panel
-
-Selecting a single asset slides a detail overlay in from the right edge of the grid (`AssetMetadataPanel`). It shows the filename, location, type, on-disk size, vertex and triangle counts (meshes), and the file's modified time. The values come from `probe-asset`, which resolves the asset, reads `file_size`/`last_write_time`, and — for a mesh — the `.smesh` header's vertex/index counts (no full mesh load). The panel re-fetches when the selection changes and slides out when the selection is not exactly one asset.
-
-## Thumbnails over the socket
-
-A thumbnail travels as data rather than a registered descriptor, since no GPU context is shared. `get-thumbnail` renders the asset to a small offscreen and reads it back as a **base64 PNG** in the JSON result; the client decodes it to a `Blob` and an object URL:
-
-- a **texture** asset reads its own decoded image back;
-- a **mesh** asset renders a [3D preview](../mesh-thumbnails/);
-- anything else, or a failed render, falls back to a Lucide type icon in the webview.
-
-The readback is **right-sized to the requested `size`**, not the source resolution. A texture larger than the tile is downscaled on the GPU first — a chained linear halving (mip-style, so a 4k source is not undersampled by a single tap) down to a target that fits `size`×`size` while preserving aspect — and only that small image is copied back and PNG-encoded. So a 128 px thumbnail of a 4096×2048 HDR reads back ~128×64 pixels, not 8.4M, whatever the source. The reply's `width`/`height` report the actual PNG dimensions. `view-asset` (512) takes the same path through the same `size` parameter.
-
-A thumbnail of an **HDR asset** is tonemapped, not clamped. An HDR's radiance runs well past 1.0, so the plain [0,1]×255 clamp used for already-display-range captures blew the preview out to white; the texture branch instead Reinhard-maps + gamma-encodes the small downscaled image (≈16k pixels, cheap on the CPU) so a sky preview shows sky-and-horizon detail. Mesh and material previews render to a display-range offscreen already, so they keep the clamp.
-
-Each `get-thumbnail` call is a GPU→CPU readback plus a PNG encode, so it must not run per frame or per tile. A module-scope frontend cache keyed by asset id holds `{ blob URL, the px size it was fetched at }`, and concurrent requests for the same asset share one in-flight promise. A cached URL is reused synchronously whenever it is at least as large as the requested size, so folder navigation does not ask the backend for thumbnails it already decoded in the current webview session:
-
-```ts
-export async function getThumbnailUrl(assetId: string, size: number): Promise<string> {
-  const cached = thumbnailCache.get(assetId);
-  if (cached && cached.size >= size) return cached.url;     // hit
-  const inflight = thumbnailInflight.get(assetId);
-  if (inflight) return inflight;                            // dedupe
-  // miss → get-thumbnail, decode base64 PNG, store the object URL
-}
+[ ../ ] [ Meshes ] [ HeroModel ] [ Walk ]
+          folder       model       animation
 ```
 
-When the catalog changes, on a project or scene load, every cached blob URL is stale. `invalidateThumbnails` revokes them all, and the lazy cache re-fetches on demand.
+## Catalog actions
 
-### The engine's disk cache
+The panel imports model, image, and authored vegetation formats through the shell's native file
+dialog. An operating-system file drop uses the same extension routing: images call `import-texture`,
+models call `import-model`, and `.splant`, `.sbiome`, or `.svegmap` files call
+`import-vegetation-asset`. An import into a virtual folder moves the returned catalog entry after the
+import finishes.
 
-The webview cache is per-session — wiped on every project load — so on its own a project with ~100 textures pays a full round of generation at every startup. Underneath it the **engine keeps a persistent PNG cache** that survives restarts, because the engine is the right owner: it knows the source files and when they change.
+The context menu changes with its target. Empty space offers Import and New Folder. A folder can be renamed or deleted. An asset can be viewed, renamed, inspected, or deleted; model assets can also be added to the scene. Multi-selection exposes batch viewing and deletion, plus scene instantiation for selected models.
 
-- **Location:** `<projectRoot>/cache/thumbnails/`, next to the project's `assets/` and outside it, so the catalog scan and project save/load never pick it up. One PNG per entry.
-- **Key:** the asset uuid, the requested pixel size, and a *stamp* of the source file — its size and mtime, folded with a cache-format version into the filename `<uuid>-<size>-<stamp>.png`. A hit is a single `exists()` after stating the source; a stale entry (edited source, or a version bump) simply never matches its old stamp again, so there is no explicit invalidation step for edits. Bumping `THUMBNAIL_CACHE_VERSION` invalidates every entry at once when generation behaviour changes.
-- **Flow:** `get-thumbnail` reads the cached PNG bytes straight into the base64 reply on a hit — no GPU work, no encode — and reports the width/height read from the PNG header. On a miss it generates as above and writes the PNG before replying (best-effort: a failed write logs and still replies). So the second start of a project is disk reads, with no multi-second HDR spike.
+Asset deletion first calls `asset-usages`. The confirmation lists component slots that reference the asset, and `delete-asset` clears those usages before removing the catalog entry and imported file. The Details dialog calls `probe-asset` for file size, creation time, and mesh geometry counts.
 
-The stamp keys textures on their imported file and meshes on the `.smesh`; materials stamp on the resolved material state, so editing a parent material reflows every instance's key (see [asset commands](../../tooling-and-control/asset-commands/) for the `thumbnail-cache` command and the delete/orphan cleanup).
+Double-click routes models, meshes, animations, textures, and materials to the [asset editor](../asset-editor/).
+Plant, biome, and vegetation-map rows open the vegetation asset workspace. Other file kinds use the
+flat image viewer. Renaming is inline: Enter or blur commits `rename-asset`, while Escape restores the
+catalog name.
 
-### Off the frame loop
+## Thumbnail request path
 
-A cold cache-miss still has to decode the source, upload it, and render — for a 4k HDR that is ~1 s of work that, run inside the per-frame control drain, would freeze the viewport. So generation runs on a **worker thread**. On a miss the engine enqueues a job and replies `pending: true` immediately; the worker decodes + uploads + renders + readbacks + writes the PNG to the disk cache, and `getThumbnailUrl` re-requests with backoff (keeping the loading spinner) until the retry is a plain disk-cache hit. Pending replies return in microseconds, so the editor's serialized control I/O never queues behind a generation. The worker owns its own Vulkan command pool and shares the graphics queue with the frame loop under a mutex; finished GPU textures/meshes are handed back to the main thread and folded into the in-session caches, so a later draw of the same asset reuses them. A persistent generation failure replies with an error, which settles the tile to the type icon rather than retrying forever.
+Tiles request 128-pixel previews lazily. A tile begins with a spinner, changes to the PNG when ready, and uses its type icon when the asset has no preview. The image viewer requests a separate 512-pixel preview.
 
-## Rename in place
+`getThumbnailUrl` keeps object URLs in a webview cache keyed by asset id and fetched size. A cached image can satisfy a smaller request, and concurrent callers for one asset share the same promise. Project or scene replacement revokes every cached URL so catalog ids cannot retain stale images.
 
-Double-clicking a tile's name turns it into an input bound to a draft string. Enter or blur commits with `rename-asset`; Escape cancels. The engine returns the new `{id, name}`, and the catalog refresh reflects it. Names are UTF-8, so non-Latin names round-trip through the project file; rendering them needs a broader font, a known follow-up.
-
-```ts
-void client.renameAsset(entry.id, next).then(() => refreshAssets());
+```mermaid
+sequenceDiagram
+  participant Tile as AssetTile
+  participant Store as Thumbnail cache
+  participant Control as get-thumbnail
+  participant Host as Preview render queue
+  Tile->>Store: getThumbnailUrl(id, 128)
+  Store->>Control: request PNG
+  Control-->>Store: pending
+  Control->>Host: enqueue by cache path
+  Host->>Host: render Thumbnail view
+  Store->>Control: retry with backoff
+  Control-->>Store: base64 PNG
+  Store-->>Tile: blob URL
 ```
 
-## Import and drag-drop
+A cache miss does not render inside the control request. `request_thumbnail` enqueues a preview job and returns `pending: true`; the client retries with exponential backoff. The host drains at most two jobs per update and renders each furnished preview scene through the main render graph on `ViewId::Thumbnail`. It restores the previous active view without resetting that view's temporal history.
 
-The **Import** button opens the native file dialog (`rfd` XDG portal); the panel is also an **OS file-drop** target via the webview drag-drop event. Both route by extension: images go to `import-texture` (catalog-only, no spawn), everything else to `import-model`, matching the engine's `importToCatalog`. The OS file-drop is hit-tested against the panel's rect, scaled by `devicePixelRatio` because the drop position is in physical pixels. Dropping a model on the *viewport* therefore does not trigger a catalog import here.
+The disk cache lives at `<appDataRoot>/thumbnail-cache/`, outside every project. Filenames combine `THUMBNAIL_CACHE_VERSION`, a content hash, and the requested size. Textures, meshes, models, plants, biomes, and vegetation maps use their catalog content hash; materials hash their resolved state. Identical content can therefore reuse a PNG across assets and projects.
 
-Each tile is also an HTML5 drag *source* on a distinct channel, `application/x-se-asset`, separate from the OS file drop. It carries `{id, type}` so an inspector [picker](../asset-pickers-and-drag-drop/) can type-gate the drop. Folder tiles, tree rows, breadcrumb segments, and the current folder background accept the same payload and call `move-asset`.
+Plant, biome, and vegetation-map thumbnails rasterize canonical vector icons synchronously. Opening
+one of these rows creates a vegetation asset tab backed by `vegetation-asset-summary`, which shows
+the native source, references, package bounds, and ordered layer metadata.
 
-## Asset tabs
-
-Double-clicking a tile opens a closeable titlebar tab for that asset (`view-asset`, the same readback path as `get-thumbnail`). The pinned `Scene` tab owns the native viewport and cannot be closed. Asset tabs show a type icon and can be reordered by drag-drop.
+The cache is capped at 1 GiB. A write above the cap removes the oldest files until usage falls to 80 percent of the cap. The `thumbnail-cache` control command reports cache statistics or clears the directory.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Tile grid + history + import + drop | `editor/src/panels/AssetsPanel.tsx` | `AssetsPanel`, `AssetPanelBody`, `Breadcrumbs`, `FolderTile`, `FolderNameInput`, `importPath`, `isInsidePanel` |
-| Folder tree sidebar | `editor/src/panels/AssetFolderTree.tsx` | `AssetFolderTree`, `buildFolderTree`, `folderAncestorPaths` |
-| Detail panel | `editor/src/components/AssetMetadataPanel.tsx` | `AssetMetadataPanel` |
-| Tile + rename + drag source | `editor/src/components/AssetTile.tsx` | `AssetTile`, `RenameInput`, `ASSET_DND_MIME` |
-| Thumbnail blob-URL cache | `editor/src/state/store.ts` | `getCachedThumbnailUrl`, `getThumbnailUrl`, `invalidateThumbnails`, `thumbnailCache` |
-| Asset tabs | `editor/src/app/WindowTitlebar.tsx` | `TitlebarTab`, `ViewTab`, `openAssetTab` |
-| Preview content | `editor/src/components/AssetViewer.tsx` | `AssetPreview`, `viewAsset` |
-| Readback + metadata (engine) | `engine/crates/control/src/commands_asset.rs` | `get-thumbnail`, `view-asset`, `list-assets`, `probe-asset`, `rename-asset`, `move-asset`, `delete-asset`, `delete-asset-folder` |
+| Browser, history, selection, and catalog actions | `editor/src/panels/AssetsPanel.tsx` | `AssetsPanel`, `AssetPanelBody`, `Breadcrumbs`, `importPath` |
+| Folder hierarchy | `editor/src/panels/AssetFolderTree.tsx` | `AssetFolderTree`, `buildFolderTree`, `folderAncestorPaths` |
+| Tile preview, rename, and drag payload | `editor/src/components/AssetTile.tsx` | `AssetTile`, `ASSET_DND_MIME`, `FOLDER_DND_MIME` |
+| File metadata dialog | `editor/src/components/AssetDetailsDialog.tsx` | `AssetDetailsDialog` |
+| Webview thumbnail cache | `editor/src/state/store.ts` | `getCachedThumbnailUrl`, `getThumbnailUrl`, `invalidateThumbnails` |
+| Thumbnail classification and disk cache | `engine/crates/assets/src/thumbnail.rs` | `request_thumbnail`, `write_thumbnail_cache`, `THUMBNAIL_CACHE_VERSION` |
+| Main-graph preview drain | `engine/crates/host/src/layer.rs` | `drive_preview_render_queue`, `render_preview_scene_to_png` |
+| Control commands | `engine/crates/control/src/commands_asset.rs` | `get-thumbnail`, `view-asset`, `probe-asset`, `asset-usages` |
 
 ## Related
 
-- [Mesh thumbnails](../mesh-thumbnails/) — the 3D preview render behind a mesh tile
-- [Asset pickers](../asset-pickers-and-drag-drop/) — the drop targets these tiles feed
-- [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — the catalog this grid views
-- [Asset commands](../../tooling-and-control/asset-commands/) — import/list/rename + the thumbnail readback
+- [Asset editor](../asset-editor/) — the interactive preview opened from a tile
+- [Vegetation assets](../../geometry-and-assets/vegetation-assets/) — plant, biome, and map catalog formats
+- [Asset pickers and drag-drop](../asset-pickers-and-drag-drop/) — inspector targets for catalog drags
+- [Asset catalog in the scene](../../scene-and-ecs/asset-catalog-in-scene/) — catalog identity and persistence
+- [Asset commands](../../tooling-and-control/asset-commands/) — shell access to asset management and cache operations

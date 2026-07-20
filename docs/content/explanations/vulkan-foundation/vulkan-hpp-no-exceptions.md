@@ -5,67 +5,117 @@ weight = 1
 
 # Ash and the Vulkan seam
 
-`ash` is a thin, unchecked Rust binding over the Vulkan C API. It exposes the raw entry points — `create_instance`, `acquire_next_image`, `queue_submit2`, the VMA FFI — as `unsafe` functions that hand back a `Result<T, vk::Result>`. The rendering crate is the one place in the engine that crosses this seam: every other crate denies `unsafe`, and `saffron-rendering` opts in with a crate-wide `#![allow(unsafe_code)]` because there is no safe way to call a C binding. The seam is confined to the `device`, `swapchain`, and `renderer` modules and wrapped in safe methods (`Device::new`, `Swapchain::new`, `Renderer::render_frame`), so no caller of the crate ever touches a raw handle.
+[`ash`](https://docs.rs/ash/0.38.0+1.3.281/ash/) provides generated Vulkan types, handles, entry-point
+loading, and thin calls into the C API. It does not track object ownership, command-buffer state, or
+external synchronization. The rendering crate therefore treats every ash call as a boundary where
+Anima must establish the Vulkan preconditions.
 
-A Vulkan failure stays a value, never a panic: it becomes a typed [`Error`](../../core-and-conventions/error-handling/) at the call site, exactly like a file-parse or JSON error elsewhere in the engine.
+`saffron-rendering` enables `#![allow(unsafe_code)]` for this boundary. Other safe engine crates consume
+its `Device`, `Renderer`, uploaded-resource, and render-graph APIs without calling Vulkan directly. The
+unsafe blocks remain at the operations that need their proof, across resource, pass, upload, device,
+swapchain, and frame code.
 
-## The error type
+## What an unsafe block proves
 
-Bring-up and per-frame failures are one `thiserror` enum, `Error`. The load-bearing variant is `Error::Vk`, which carries the failing operation's name and the raw `vk::Result`:
+Rust defines an `unsafe` block as an assertion that the caller has discharged the operation's extra
+safety obligations in the [Rust Reference](https://doc.rust-lang.org/reference/unsafe-keyword.html).
+For an ash call, the nearby `// SAFETY:` comment records the relevant facts rather than merely naming
+the FFI boundary.
+
+Typical facts include:
+
+- handles belong to the device and remain alive for the call or recorded command;
+- pointer-backed create-info slices remain valid for the duration of the call;
+- a command buffer is recording and has the required resource states;
+- queue, pool, and descriptor operations satisfy Vulkan's external-synchronization rules;
+- destroy calls run once, after submitted work has finished.
+
+Some helpers are themselves `unsafe fn` because the caller owns part of that proof.
+`record_present_blit`, for example, requires a recording command buffer, live images, and source stage,
+access, and layout values that describe the previous writer. Safe constructors such as
+`PresentSync::new` keep the proof inside the rendering crate and clean up partially created handles on
+failure.
+
+## Fallible Vulkan calls
+
+Ash represents a fallible Vulkan call as `Result<T, vk::Result>`. The rendering error enum preserves
+that raw result together with a static operation label:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("vulkan call '{context}' failed: {result:?}")]
     Vk { context: &'static str, result: vk::Result },
-    // Loader, NoDevice, NoQueueFamily, EmptyMesh, …
+    // Loader, NoDevice, EmptyMesh, and other rendering failures
 }
-
-pub type Result<T> = std::result::Result<T, Error>;
 ```
 
-Keeping the raw `vk::Result` in the variant lets a caller `match` on the exact code — which is what the swapchain path needs, where `ERROR_OUT_OF_DATE_KHR` means "rebuild," not "fail" (see [frame sync](../frame-sync-and-resize/)).
-
-## The `checked` conversion
-
-One free function maps an ash call's `Result<T, vk::Result>` into the engine's typed error, tagging the operation that failed:
+The `checked` helper applies the common conversion. A call site keeps the safety proof, operation name,
+and propagation together:
 
 ```rust
-pub(crate) fn checked<T>(
-    result: std::result::Result<T, vk::Result>,
-    context: &'static str,
-) -> Result<T> {
-    result.map_err(|result| Error::Vk { context, result })
-}
+let command_pool = checked(
+    unsafe { raw.create_command_pool(&pool_info, None) },
+    "present: create_command_pool",
+)?;
 ```
 
-This is the single point that maps the ash seam onto the engine error model. A fallible call reads as `checked(unsafe { … }, "create_swapchain")?` — the `unsafe` block does the FFI, `checked` attaches the label, and `?` propagates. The message a caller sees is the `context` label plus the `vk::Result`, enough to locate a failure without a bespoke error enum per call.
+This preserves the exact [Vulkan result code](https://docs.vulkan.org/spec/latest/chapters/fundamentals.html#fundamentals-errorcodes)
+for diagnostics and control flow. Loader failures use `Error::Loader`, because `ash::Entry::load` returns
+an ash loading error rather than `vk::Result`. Domain failures such as an empty mesh have their own
+variants.
 
-Some sites skip `checked` and build the variant inline — `instance.create_device(…).map_err(|result| Error::Vk { context: "create_device", result })?` — which is the same mapping written by hand where the `context` is more naturally placed next to the call.
+Not every Vulkan command is fallible. Recording calls such as `cmd_pipeline_barrier2`, descriptor
+updates, and destroy calls return no result. Their correctness comes from the established invariants,
+validation-layer checks, and ownership rules, not from `checked`.
 
-## Where the seam is widened, not narrowed
+## Results that drive control flow
 
-A few flows need the raw `vk::Result` even on a non-success code, so they match it directly instead of going through `checked`:
+Some Vulkan statuses describe a recoverable presentation condition. The renderer matches those values
+before it converts remaining failures into `Error::Vk`:
 
-- **Acquire and present.** `acquire_next_image` and `queue_present` return `ERROR_OUT_OF_DATE_KHR` or `SUBOPTIMAL_KHR`, which mean "the swapchain must be rebuilt." `render_frame` matches these to skip the frame and signal a rebuild, treating only other codes as `Error::Vk`.
-- **Loader load.** `ash::Entry::load` fails with its own error type (no `libvulkan` / no ICD); it maps to `Error::Loader`, not `Error::Vk`.
+```rust
+let image_index = match acquire {
+    Ok((index, _suboptimal)) => index,
+    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(false),
+    Err(result) => {
+        return Err(Error::Vk {
+            context: "acquire_next_image",
+            result,
+        });
+    }
+};
+```
 
-## Raw handles and `Drop`
+`Renderer::render_frame` returns `Ok(false)` when acquire reports an out-of-date swapchain, allowing the
+application loop to skip that frame and rebuild on the resize path. Present accepts
+`ERROR_OUT_OF_DATE_KHR` and `SUBOPTIMAL_KHR` as nonfatal statuses. Any other acquire or present error
+retains its `vk::Result` in `Error::Vk`.
 
-ash hands back plain Vulkan handles (`vk::Buffer`, `vk::Image`, `vk::Pipeline`); it does not own them. Ownership is the engine's job, paid by [move-only RAII wrappers](../meta-layer-resources/) whose `Drop` bodies call the matching ash/VMA destroy function. The wrappers hold a shared device+allocator bundle so a resource can free itself in its own `Drop` without a live `&Device`.
+## Handles still need owners
+
+Ash handles are copyable identifiers, not owning Rust values. Resource wrappers pair them with the
+device or VMA allocation required for destruction and release them in `Drop`. Frame and presentation
+rings that borrow device handles instead expose explicit `destroy` methods called after
+`Device::wait_idle`.
+
+The error seam and ownership seam complement each other. Typed errors preserve failed operations;
+partial-construction paths release handles acquired before the failure; successful construction hands
+the complete handle set to one owner.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The crate-wide unsafe opt-in | `lib.rs` | `#![allow(unsafe_code)]` |
-| The error enum + alias | `lib.rs` | `Error`, `Error::Vk`, `Result` |
-| The conversion | `lib.rs` | `checked` |
-| Acquire/present (code-not-failure) | `renderer.rs` | `render_frame` |
-| Loader load | `device.rs` | `Device::new`, `Error::Loader` |
+| Unsafe opt-in and typed errors | `engine/crates/rendering/src/lib.rs` | `#![allow(unsafe_code)]`, `Error`, `Error::Vk`, `Result`, `checked` |
+| Loader and device creation | `engine/crates/rendering/src/device.rs` | `load_entry`, `create_instance`, `create_logical_device` |
+| Safe construction over unsafe calls | `engine/crates/rendering/src/present.rs` | `PresentSync::new`, `PresentSync::create_slot`, `record_present_blit` |
+| Recoverable swapchain statuses | `engine/crates/rendering/src/renderer.rs` | `Renderer::begin_present_frame`, `Renderer::render_frame`, `Renderer::present_active_view_to_swapchain` |
+| Handle ownership | `engine/crates/rendering/src/resources.rs` | `Buffer`, `Image`, `Pipeline`, `AccelerationStructure` |
 
 ## Related
 
-- [Error handling](../../core-and-conventions/error-handling/) — the engine-wide `Result` scheme `checked` feeds into
-- [Meta-layer resources](../meta-layer-resources/) — the wrappers that own ash's raw handles and free them in `Drop`
-- [Frame sync](../frame-sync-and-resize/) — where acquire/present results are rebuild signals, not errors
+- [Error handling](../../core-and-conventions/error-handling/): crate-local error types and propagation
+- [Meta-layer resources](../meta-layer-resources/): ownership for ash and VMA handles
+- [Frame sync and resize](../frame-sync-and-resize/): acquire, submit, present, and swapchain rebuilds
+- [VMA allocator](../vma-allocator/): memory allocation across the same unsafe boundary

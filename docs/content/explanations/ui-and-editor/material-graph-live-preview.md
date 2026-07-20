@@ -5,68 +5,67 @@ weight = 6
 
 # Material-graph live preview
 
-The material-graph editor's preview pane is a **live, orbitable 3D sphere** showing the material you are
-editing under real image-based lighting — not a static thumbnail. Drag to spin it; every graph edit
-morphs the surface on the pane's next frame. It is a mini version of the [asset editor](../asset-editor/)'s
-"View" tab embedded in the graph editor, and it reuses that machinery wholesale rather than standing up
-a parallel preview path.
+The material-graph editor pairs its node canvas with a live sphere rendered by the engine. Graph edits change the same `.smat` asset that scene entities use, so the preview shows the material under the normal forward+ pipeline and [image-based lighting](../../image-based-lighting/).
 
-## One view, reused — not a concurrent one
+## Shared preview view
 
-The host renders exactly one view per frame: a single active view, a single-slot shm publish. A live
-material preview *sounds* like it needs a third concurrent view running alongside the scene, but it does
-not. The material-graph editor is a full-work-area main tab — while it is open, the scene viewport is
-parked anyway. So the preview is never on screen at the same time as the scene, and it can borrow the
-existing modal **`assetPreview`** view the asset editor already owns.
+The material graph is a main work-area tab. While it is active, the scene surface is parked and the graph uses the `assetPreview` view described in the [asset editor](../asset-editor/). The renderer therefore draws one selected editor view per frame.
 
-Both preview-bearing tabs — the asset editor and the material graph — therefore drive the *same* view
-and subsurface. Only one is ever active, so they are a **modal swap, never co-resident**: when a
-material-graph tab becomes active it takes the preview, and the kept-mounted asset editor is released so
-exactly one subject is ever live. `activeRenderView` maps both tab kinds to `assetPreview`; the park
-effect unparks that view and parks the scene, the same handoff a tab switch already performs.
+The asset editor and material graph cannot own the preview scene together. Activating a material-graph tab unmounts the kept asset-editor workspace, which exits its subject. `MaterialGraphEditor` then enters a material preview and sizes the same presented surface to its Preview pane.
 
-## The subject: a sphere that references the material by id
+Leaving the graph tab unmounts its workspace and calls `exit-asset-preview`. That drops the isolated scene and restores the authored camera, selection, overlay settings, and exposure.
 
-Entering the preview is the ordinary [`enter-asset-preview`](../../tooling-and-control/asset-commands/)
-command with a **material** subject. `enter_material_preview` builds an isolated preview scene holding a
-single built-in sphere whose `MaterialSet` slot 0 **references the `.smat` by id** — furnished by the
-shared studio furnisher (floor, key light, procedural sky, framed orbit), identical to the model and
-texture subjects.
+## Material subject
 
-The by-id reference is the whole trick behind live edits. A graph edit debounces to `material-set-graph`,
-which writes the `.smat` and **invalidates the material cache**; because the sphere resolves its material
-by id and the `assetPreview` view redraws every frame, the next frame re-resolves the edited material and
-the sphere updates. There is no readback-to-PNG round trip, so you can keep orbiting while you edit. The
-same `enter_material_preview` path also gives a standalone material a first-class "View" tab (double-click
-a `.smat` in the [Assets panel](../assets-panel-and-thumbnails/)); the graph editor is where you *edit* it.
+`enter_material_preview` creates a built-in sphere whose first `MaterialSet` slot references the selected material by id. The shared preview furnisher adds a procedural sky and key light, frames the camera, and leaves the floor hidden for this subject.
 
-## Pan-only orbit + exposure
+The id reference connects edits to rendering:
 
-The eased orbit — input moves a target, a rAF loop drains current→target with the engine's tau, one
-coalesced `set-camera` in flight — lives in one shared hook (`useOrbitCamera`), used by both the asset
-editor and this pane. The material pane opts out of the wheel dolly (`enableZoom: false`): the framed
-sphere is the whole subject, so you pan around it but never zoom. An **EV** slider sweeps the tonemap
-exposure to judge the material across a stop range; that exposure is stashed on preview enter and
-restored on exit (and on any switch back to the scene), so the sweep never dirties the authored
-viewport's exposure.
+```mermaid
+flowchart LR
+    A[Node or edge edit] --> B[500 ms debounce]
+    B --> C[material-set-graph]
+    C --> D[Rewrite .smat]
+    D --> E[Invalidate material caches]
+    E --> F[Preview resolves material by id]
+    F --> G[Sphere redraws]
+```
 
-The pane is a transparent hole down to the subsurface, exactly like the scene and asset-preview panels:
-the graph editor's root paints no background, and its toolbar, node canvas, and the Preview header each
-paint their own opaque surface, so only the sphere region shows the live frame through.
+The editor converts its node and edge state to the wire graph after 500 ms without another change. `material-set-graph` stores that graph, tries to lower it into ordinary PBR parameters, and returns `foldable`. A foldable graph renders through those parameters.
+
+A graph that cannot fold also compiles a per-material scene-shader variant. The renderer finds that artifact through the material id when it rebuilds the invalidated cache entry. The standalone Compile button invokes `material-compile-graph`, which compiles the graph's self-contained fragment target and reports success in the toolbar.
+
+There is no image readback in the interactive path. The preview scene remains live, and the next rendered frame after the asset update resolves the current material cache entry.
+
+## Editing and history
+
+The graph loads from `material-get` and converts to the node-canvas representation. A new connection replaces any existing source for the same input pin, and self-connections are rejected. The context menu adds nodes at the pointer's graph coordinates.
+
+Undo and redo use a per-tab snapshot history. Each entry stores the graph before and after a settled edit. Replaying an entry updates the node canvas and sends the same `material-set-graph` command, while the following React settle is marked as replayed to prevent a duplicate history entry.
+
+## Preview controls
+
+Drag input orbits around the framed sphere through `useOrbitCamera`. Zoom is disabled because the sphere is the fixed inspection subject. The hook eases current camera state toward the input target and coalesces `set-camera` calls.
+
+The EV slider covers `-6` to `+6` stops through the renderer's exposure control. Preview entry stashes the authored exposure, and preview exit restores it. `useSubsurfaceBounds` sends the Preview pane's bounds to the `assetPreview` surface once the subject and camera are ready.
+
+The Preview pane is transparent so the native presented surface remains visible below the CEF interface. The toolbar, graph canvas, and Preview header paint opaque backgrounds around that region.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Material subject + by-id live reflection (engine) | `engine/crates/control/src/commands_asset.rs` | `enter_material_preview`, the `Material` arm of `enter-asset-preview`, `furnish_preview_scene` |
-| Cache invalidation on edit (engine) | `engine/crates/assets/src/material.rs` · `commands_asset.rs` | `update_material_asset`, `material-set-graph` |
-| The live pane + enter/exit + EV (editor) | `editor/src/panels/MaterialGraphEditor.tsx` | `GraphCanvas`, `hostRef`, `useSubsurfaceBounds`, `onExposure` |
-| Shared eased orbit hook | `editor/src/lib/useOrbitCamera.ts` | `useOrbitCamera` (`enableZoom`, `onClick`, `setFramed`) |
-| Modal swap + view routing (editor) | `editor/src/app/App.tsx` | `activeRenderView`, `assetParked`, `mountedAssetId` |
+| Material preview scene | `engine/crates/control/src/commands_asset.rs` | `enter_material_preview`, `build_preview_scene`, `furnish_preview_scene` |
+| Graph storage and lowering | `engine/crates/control/src/commands_asset.rs` | `material-set-graph`, `lower_graph_to_params`, `material-compile-graph` |
+| Material rewrite and cache invalidation | `engine/crates/assets/src/material.rs`, `engine/crates/assets/src/lib.rs` | `update_material_asset`, `AssetServer::invalidate_material_caches` |
+| Graph workspace and live pane | `editor/src/panels/MaterialGraphEditor.tsx` | `GraphCanvas`, `graphsEqual`, `compile` |
+| Graph conversion | `editor/src/materials/graph.ts` | `flowToGraph`, `graphToFlow`, `NODE_SPECS` |
+| Snapshot undo and redo | `editor/src/lib/useTabSnapshotHistory.ts` | `useTabSnapshotHistory` |
+| View ownership | `editor/src/app/App.tsx` | `previewTabActive`, `activeRenderView`, `mountedAssetId` |
 
 ## Related
 
-- [Asset editor](../asset-editor/) — the preview view + orbit this pane reuses; the model/texture/HDRI subjects
-- [Native materials](../../materials-and-pipelines/native-materials/) — the `.smat` the sphere shades with
-- [Material node-graph codegen](../../materials-and-pipelines/node-graph-codegen/) — how the edited graph becomes the shader the preview renders
-- [Viewport compositing](../viewport-compositing/) — the subsurface-below-the-webview foundation the transparent pane relies on
+- [Asset editor](../asset-editor/) - the isolated preview scene and shared presented view
+- [Native materials](../../materials-and-pipelines/native-materials/) - `.smat` storage and parameter resolution
+- [Material node-graph codegen](../../materials-and-pipelines/node-graph-codegen/) - graph lowering and Slang generation
+- [Viewport compositing](../viewport-compositing/) - how the native preview appears below the web interface

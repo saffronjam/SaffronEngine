@@ -9,12 +9,17 @@ use serde_json::Value;
 use saffron_assets::AssetServer;
 use saffron_physics::World;
 use saffron_sceneedit::SceneEditContext;
+use saffron_spatial::ResidencyManager;
 use saffron_window::Window;
 
 use crate::error::Result;
 use crate::project_loader::ProjectLoader;
-use crate::registry::{CommandRegistry, ControlRenderer, EngineContext, register_builtin_commands};
+use crate::registry::{
+    CommandRegistry, ControlRenderer, EngineContext, VegetationComputeExecutor,
+    register_builtin_commands,
+};
 use crate::server::{ControlServer, control_socket_path, start_control_server};
+use crate::vegetation_jobs::VegetationEvaluationJobs;
 
 /// Owns the command registry and the listening socket. The registry is built
 /// once at startup (it has no per-frame mutation); the `EngineContext` is rebuilt
@@ -27,6 +32,8 @@ pub struct ControlContext {
     server: Option<ControlServer>,
     /// The once-per-frame non-blocking project loader, advanced from the host each frame.
     loader: ProjectLoader,
+    vegetation_jobs: VegetationEvaluationJobs,
+    vegetation_compute: Option<Option<VegetationComputeExecutor>>,
 }
 
 impl Default for ControlContext {
@@ -58,6 +65,8 @@ impl ControlContext {
             registry,
             server,
             loader: ProjectLoader::default(),
+            vegetation_jobs: VegetationEvaluationJobs::default(),
+            vegetation_compute: None,
         }
     }
 
@@ -74,6 +83,7 @@ impl ControlContext {
     /// resolves. Idempotent.
     pub fn shutdown(&mut self) {
         self.server = None;
+        self.vegetation_jobs.shutdown();
     }
 
     /// The command registry (for the manifest / command-palette generators).
@@ -133,6 +143,7 @@ impl ControlContext {
         renderer: &mut dyn ControlRenderer,
         scene_edit: &mut SceneEditContext,
         assets: &mut AssetServer,
+        spatial: &mut ResidencyManager,
         physics: Option<&mut World>,
     ) -> bool {
         let Some(server) = self.server.as_mut() else {
@@ -143,7 +154,10 @@ impl ControlContext {
             renderer,
             scene_edit,
             assets,
+            spatial,
             physics,
+            vegetation_jobs: &mut self.vegetation_jobs,
+            vegetation_compute: &mut self.vegetation_compute,
         };
         let registry = &self.registry;
         let mut mutated = false;

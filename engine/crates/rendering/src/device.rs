@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::resources::DeviceResources;
-use crate::{Error, Result, checked};
+use crate::{Error, GpuQueue, Result};
 
 /// Counts validation/performance messages at warning-or-error severity seen by the
 /// debug callback across the process. The validation-clean smoke reads this before
@@ -134,6 +134,58 @@ pub struct ProfilerFacts {
     pub device_name: String,
 }
 
+/// Exact Vulkan device/profile identity used by cross-device conformance evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VulkanDeviceIdentity {
+    /// Physical-device name.
+    pub name: String,
+    /// Vulkan physical-device class.
+    pub device_type: vk::PhysicalDeviceType,
+    /// PCI/vendor identity reported by Vulkan.
+    pub vendor_id: u32,
+    /// Device identity reported by Vulkan.
+    pub device_id: u32,
+    /// Driver version reported by Vulkan.
+    pub driver_version: u32,
+    /// Vulkan API version exposed by the physical device.
+    pub api_version: u32,
+    /// Vulkan driver implementation identity.
+    pub driver_id: u32,
+    /// Stable Vulkan physical-device UUID.
+    pub device_uuid: [u8; vk::UUID_SIZE],
+    /// Stable Vulkan driver UUID.
+    pub driver_uuid: [u8; vk::UUID_SIZE],
+}
+
+impl VulkanDeviceIdentity {
+    /// Whether this is physical integrated or discrete GPU hardware.
+    #[must_use]
+    pub fn is_physical_gpu(&self) -> bool {
+        matches!(
+            self.device_type,
+            vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::DISCRETE_GPU
+        )
+    }
+
+    /// Stable lowercase Vulkan device-class spelling.
+    #[must_use]
+    pub fn device_type_name(&self) -> &'static str {
+        match self.device_type {
+            vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated-gpu",
+            vk::PhysicalDeviceType::DISCRETE_GPU => "discrete-gpu",
+            vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual-gpu",
+            vk::PhysicalDeviceType::CPU => "cpu",
+            _ => "other",
+        }
+    }
+
+    /// Whether Vulkan reports the MoltenVK driver implementation.
+    #[must_use]
+    pub fn is_molten_vk(&self) -> bool {
+        self.driver_id == vk::DriverId::MOLTENVK.as_raw() as u32
+    }
+}
+
 /// The immutable Vulkan core shared `&Device` by every later sub-state.
 ///
 /// Field order is load-bearing: Rust drops fields top-to-bottom, so the allocator
@@ -146,9 +198,8 @@ pub struct Device {
     pub capabilities: Capabilities,
     /// The graphics-and-present queue family index.
     pub graphics_queue_family: u32,
-    /// The graphics queue (externally synchronized; the README §5 site that the
-    /// thumbnail worker will share behind a mutex in a later phase).
-    pub graphics_queue: vk::Queue,
+    /// The single externally synchronized graphics-and-present queue.
+    pub graphics_queue: GpuQueue,
     /// The surface present mode chosen for the swapchain (FIFO).
     pub surface_format: vk::SurfaceFormatKHR,
 
@@ -196,6 +247,36 @@ pub struct Device {
 const API_VERSION: u32 = vk::API_VERSION_1_3;
 
 impl Device {
+    /// Returns the immutable Vulkan identity used to qualify exact compute semantics.
+    pub fn device_identity(&self) -> VulkanDeviceIdentity {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut id)
+            .push_next(&mut driver);
+        unsafe {
+            self.instance
+                .get_physical_device_properties2(self.physical_device, &mut properties);
+        }
+        VulkanDeviceIdentity {
+            name: properties
+                .properties
+                .device_name_as_c_str()
+                .ok()
+                .and_then(|name| name.to_str().ok())
+                .unwrap_or("")
+                .to_owned(),
+            device_type: properties.properties.device_type,
+            vendor_id: properties.properties.vendor_id,
+            device_id: properties.properties.device_id,
+            driver_version: properties.properties.driver_version,
+            api_version: properties.properties.api_version,
+            driver_id: driver.driver_id.as_raw() as u32,
+            device_uuid: id.device_uuid,
+            driver_uuid: id.driver_uuid,
+        }
+    }
+
     /// Brings up the full Vulkan core against `surface_source`.
     ///
     /// Creates the instance (validation layer in debug), the surface, selects a
@@ -210,10 +291,9 @@ impl Device {
     /// [`Error::NoQueueFamily`] if no graphics+present family exists, or
     /// [`Error::Vk`] for any failing Vulkan call.
     pub fn new(surface_source: &SurfaceSource<'_>) -> Result<Self> {
-        // SAFETY: the ash seam. `Entry::load` dynamically loads `libvulkan`; the
-        // returned entry is held for the whole `Device` lifetime (it owns the
-        // loader the instance/device dispatch through).
-        let entry = unsafe { ash::Entry::load() }.map_err(|err| Error::Loader(err.to_string()))?;
+        // The entry owns the dynamically-loaded `libvulkan`, held for the whole `Device`
+        // lifetime (the instance/device dispatch through it).
+        let entry = load_entry()?;
 
         // Validation runs in debug builds (or when forced) and never in release — it is a
         // heavy per-command CPU cost, not a shipping feature. The instance layer/extension and
@@ -253,7 +333,8 @@ impl Device {
         )?;
         // SAFETY: the family/index pair was just used to create the device with one
         // queue at index 0 of that family.
-        let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
+        let graphics_queue =
+            GpuQueue::new(unsafe { device.get_device_queue(graphics_queue_family, 0) });
 
         let allocator = create_allocator(&instance, &device, physical_device)?;
         let swapchain_loader = swapchain::Device::new(&instance, &device);
@@ -541,11 +622,7 @@ impl Device {
     ///
     /// Returns [`Error::Vk`] if `vkDeviceWaitIdle` fails.
     pub fn wait_idle(&self) -> Result<()> {
-        // SAFETY: the ash seam. The device handle is valid for the call.
-        checked(
-            unsafe { self.bundle().device().device_wait_idle() },
-            "device_wait_idle",
-        )
+        self.graphics_queue.wait_device_idle(self.bundle().device())
     }
 }
 
@@ -594,6 +671,56 @@ impl Drop for Device {
 /// what lets the editor host boot under the NVIDIA ICD: that driver implements no
 /// headless surface, so requesting one would fail `create_instance` with
 /// `ERROR_EXTENSION_NOT_PRESENT`.
+/// Loads the Vulkan loader (`libvulkan`) into an [`ash::Entry`].
+///
+/// Everywhere but macOS this is `Entry::load`, which finds the loader on the system library path.
+/// macOS has no native Vulkan and no default search entry for Homebrew's `/opt/homebrew/lib`
+/// (Apple Silicon) or `/usr/local/lib` (Intel); worse, macOS strips `DYLD_*` env vars across the
+/// editor→host spawn (SIP), so a `DYLD_FALLBACK_LIBRARY_PATH` cannot be relied on to reach here.
+/// On macOS an exported app's bundled MoltenVK library is loaded directly. Development runs try the
+/// known Homebrew Vulkan loader paths so validation layers remain available, then fall back to the
+/// default `Entry::load`.
+fn load_entry() -> Result<ash::Entry> {
+    // SAFETY: the ash seam. `Entry::load*` dynamically loads `libvulkan`; the returned entry owns
+    // the loader for the caller's use.
+    #[cfg(target_os = "macos")]
+    {
+        let mut loader_paths = Vec::new();
+        if let Some(executable_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        {
+            let bundled_moltenvk = executable_dir
+                .join("..")
+                .join("Frameworks")
+                .join("libMoltenVK.dylib");
+            if bundled_moltenvk.is_file()
+                && let Ok(entry) = unsafe { ash::Entry::load_from(&bundled_moltenvk) }
+            {
+                return Ok(entry);
+            }
+        }
+        loader_paths.extend(
+            [
+                "/opt/homebrew/lib/libvulkan.dylib",
+                "/opt/homebrew/lib/libvulkan.1.dylib",
+                "/usr/local/lib/libvulkan.dylib",
+                "/usr/local/lib/libvulkan.1.dylib",
+            ]
+            .into_iter()
+            .map(std::path::PathBuf::from),
+        );
+        for path in loader_paths {
+            if path.is_file()
+                && let Ok(entry) = unsafe { ash::Entry::load_from(&path) }
+            {
+                return Ok(entry);
+            }
+        }
+    }
+    unsafe { ash::Entry::load() }.map_err(|err| Error::Loader(err.to_string()))
+}
+
 fn create_instance(
     entry: &ash::Entry,
     surface_source: &SurfaceSource<'_>,
@@ -630,7 +757,22 @@ fn create_instance(
         layers.push(VALIDATION_LAYER.as_ptr());
     }
 
+    // A portability driver (MoltenVK, the only Vulkan on macOS) is hidden from device
+    // enumeration unless the instance opts in with `VK_KHR_portability_enumeration` plus the
+    // matching create flag. Enable it whenever the loader advertises the extension; on a native
+    // ICD the extension is absent and this is a no-op, so there is one code path for every host.
+    let portability = instance_extension_available(entry, ash::khr::portability_enumeration::NAME);
+    if portability {
+        extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+    }
+    let flags = if portability {
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+    } else {
+        vk::InstanceCreateFlags::empty()
+    };
+
     let create_info = vk::InstanceCreateInfo::default()
+        .flags(flags)
         .application_info(&app_info)
         .enabled_extension_names(&extensions)
         .enabled_layer_names(&layers);
@@ -664,6 +806,19 @@ fn validation_enabled(entry: &ash::Entry) -> bool {
         tracing::warn!("validation layer unavailable — running without it");
         false
     }
+}
+
+/// Reports whether the loader advertises the given instance extension.
+fn instance_extension_available(entry: &ash::Entry, name: &CStr) -> bool {
+    // SAFETY: the ash seam. Enumerates instance extensions; no resource is created.
+    let Ok(extensions) = (unsafe { entry.enumerate_instance_extension_properties(None) }) else {
+        return false;
+    };
+    extensions.iter().any(|ext| {
+        ext.extension_name_as_c_str()
+            .map(|n| n == name)
+            .unwrap_or(false)
+    })
 }
 
 /// Reports whether the Khronos validation layer is installed.
@@ -994,6 +1149,12 @@ fn evaluate_device(
     // SAFETY: the ash seam. Fills the chained feature structs for this device.
     unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
 
+    if features2.features.shader_int64 == 0 {
+        return Err(format!(
+            "{name}: missing required shaderInt64 for authoritative spatial numerics"
+        ));
+    }
+
     if features12.runtime_descriptor_array == 0
         || features12.descriptor_binding_partially_bound == 0
         || features12.descriptor_binding_sampled_image_update_after_bind == 0
@@ -1200,6 +1361,12 @@ fn create_logical_device(
     if has_ext(ash::ext::memory_budget::NAME) {
         device_extensions.push(ash::ext::memory_budget::NAME.as_ptr());
     }
+    // A portability physical device (MoltenVK) that advertises `VK_KHR_portability_subset` MUST
+    // have it enabled at device creation (`VUID-VkDeviceCreateInfo-pProperties-04451`). It is
+    // absent on native drivers, so the presence check keeps one code path across hosts.
+    if has_ext(ash::khr::portability_subset::NAME) {
+        device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+    }
     // VK_EXT_calibrated_timestamps lets the profiler project GPU spans onto the CPU clock.
     // The env var forces the own-axis fallback (testing it on hardware that supports it).
     let enable_calibrated_ts = has_ext(calibrated_timestamps::NAME)
@@ -1215,6 +1382,7 @@ fn create_logical_device(
     // SAFETY: the ash seam. Core feature query on the chosen device.
     let core_features = unsafe { instance.get_physical_device_features(physical_device) };
     let mut enabled_core = vk::PhysicalDeviceFeatures::default();
+    enabled_core = enabled_core.shader_int64(true);
     if core_features.pipeline_statistics_query != 0 {
         enabled_core = enabled_core.pipeline_statistics_query(true);
     }
@@ -1458,14 +1626,11 @@ mod tests {
         assert!(DevicePreference::Discrete > DevicePreference::Cpu);
     }
 
-    /// The feature-probe chain degrades correctly on a software device: the device
-    /// is created regardless of which optional features are present, and the
-    /// optional-feature flags never gate selection. On the toolbox's llvmpipe the
-    /// `software_gpu` flag is set; whether `rt_supported` is true or false (Mesa's
-    /// lavapipe advertises ray-query, so it may be true), the device is still built
-    /// and usable. Skips cleanly when no Vulkan device is obtainable.
+    /// The feature-probe chain creates an offscreen device regardless of which optional features
+    /// are present. Linux may select llvmpipe or a host GPU, while macOS selects MoltenVK; none of
+    /// those choices changes the optional-feature invariants. Skips when no device is obtainable.
     #[test]
-    fn software_device_probe_does_not_gate_selection() {
+    fn offscreen_device_probe_does_not_gate_selection() {
         let device = match Device::new(&SurfaceSource::Offscreen) {
             Ok(device) => device,
             Err(err) => {
@@ -1474,16 +1639,8 @@ mod tests {
             }
         };
 
-        // The offscreen toolbox device is the llvmpipe software rasterizer.
-        assert!(
-            device.capabilities.software_gpu,
-            "the offscreen toolbox device is the llvmpipe software rasterizer"
-        );
-        // RT is optional: whatever its probed value, selection still succeeded — the
-        // device is fully usable. The offscreen device carries no surface (it never
-        // presents), and an idle wait returns cleanly. (`rt_supported` is intentionally
-        // not asserted to a fixed value: lavapipe advertises ray-query, a hardware GPU
-        // may differ.)
+        // RT and software classification are probed properties, not selection gates. The offscreen
+        // device carries no surface, and an idle wait returns cleanly on every backend.
         assert!(
             device.surface().is_none(),
             "the offscreen device creates no surface"

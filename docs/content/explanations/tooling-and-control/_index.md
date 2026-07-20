@@ -6,17 +6,49 @@ bookCollapseSection = true
 
 # Tooling & control
 
-The control plane is a JSON-over-unix-socket protocol that drives a running editor from outside the process. The socket is non-blocking and drained once per frame on the main thread, so commands apply between frames without stalling the render loop. Through it the `sa` CLI creates entities, sets components, imports assets, toggles render features, and grabs screenshots. Each engine feature ships a matching command, which keeps the editor scriptable and visually debuggable from a shell.
+The control plane gives the editor, the `sa` CLI, and test drivers one typed command surface over a
+running host. Requests travel as newline-delimited JSON over a local Unix socket. The host drains the
+socket on the main thread between frames, so handlers can borrow the live scene, renderer, asset
+server, window, and play-mode physics world without shared-state locks.
+
+Each request names a command and carries a parameter object. The reply echoes the request ID and
+contains either a result or a typed error:
+
+```json
+{"id":7,"cmd":"ping","params":{}}
+{"id":7,"ok":true,"result":{"pong":true,"engine":"Saffron Anima","version":"0.1.0-vulkan","pid":4312}}
+```
+
+`CommandRegistry::register<P, R>` deserializes the params DTO, invokes the handler, and serializes
+the result DTO. Those DTOs live in `saffron-protocol`; the protocol generator derives TypeScript,
+OpenRPC, the command manifest, and Luau definitions from the same Rust types. Registry tests compare
+the live command set with that manifest.
+
+The socket is non-blocking, but ordinary handlers are synchronous and must finish within the frame.
+Project loading uses a bounded worker for filesystem parsing and catalog preparation, then installs
+the prepared state on the main thread. While a load is active, the dispatcher admits only the small
+set of commands needed for liveness, progress, cancellation, and viewport readiness.
 
 ## Pages
 
 | Page | Covers | Code |
 |---|---|---|
-| `control-plane-architecture` | the socket, typed `CommandRegistry::register`, the `EngineContext` borrow seam, per-frame drain | `engine/crates/control` |
-| `sa-cli-protocol` | the Rust `sa` bin: JSON request/response shape, `clap` surface, token coercion, the shared wire client | `engine/crates/sa`; `engine/crates/control-client` |
-| `scene-commands` | list/create/destroy/select, parent, set component(-field), transform, material, light, camera, gizmo, pick, focus, inspect | `engine/crates/control/src/commands_scene.rs` |
-| `render-commands` | set-aa / set-clustered / set-ibl / set-ssao / set-ssgi / set-shadows / set-gi / set-exposure / set-depth-prepass, render-stats | `engine/crates/control/src/commands_render.rs` |
-| `asset-commands` | import-model/texture, instantiate-model, catalog + folders, assign-asset, thumbnails, save/load project | `engine/crates/control/src/commands_asset.rs` |
-| `project-loading` | non-blocking project bring-up: phases + boot stages, the off-thread doc worker, the busy gate, `project-status` / `cancel-load` | `engine/crates/control/src/project_loader.rs`; `engine/crates/assets/src/project_load.rs` |
-| `screenshots-and-capture` | viewport vs. window PNG, deferred swapchain capture | `engine/crates/control/src/commands_asset.rs`; `engine/crates/rendering/src/renderer.rs` |
-| `shared-types` | DTO-first wire contract: Rust DTOs → serde / OpenRPC / TS / manifest via `xtask gen-protocol`, the freshness gate, wire invariants | `engine/crates/protocol`; `engine/xtask/src/protocol` |
+| [`control-plane-architecture`](control-plane-architecture/) | Socket framing, dispatch, live borrows, and redraw classification | `ControlServer`, `ControlContext`, `CommandRegistry`, `EngineContext` |
+| [`sa-cli-protocol`](sa-cli-protocol/) | CLI requests, token coercion, output, and host launch | `sa`, `saffron-control-client`, `fold_positional_args` |
+| [`scene-commands`](scene-commands/) | Entities, components, selection, cameras, gizmos, and scripts | `register_scene_commands` |
+| [`render-commands`](render-commands/) | Render settings, statistics, profiling, probes, and view modes | `register_render_commands` |
+| [`asset-commands`](asset-commands/) | Catalog, import, previews, materials, projects, and sessions | `register_asset_commands` |
+| [`screenshots-and-capture`](screenshots-and-capture/) | Viewport and window screenshots at safe frame boundaries | `capture_viewport`, `request_window_capture` |
+| [`shared-types`](shared-types/) | DTOs, wire invariants, schemas, manifests, and generated clients | `COMMANDS`, `gen-protocol`, `WireUuid` |
+| [`project-loading`](project-loading/) | Worker preparation, main-thread installation, progress, and cancellation | `ProjectLoader`, `ProjectDocWorker`, `project-status` |
+
+## In the code
+
+| What | File | Symbols |
+|---|---|---|
+| Socket server | `control/src/server.rs` | `ControlServer`, `start_control_server`, `control_socket_path` |
+| Per-frame orchestration | `control/src/context.rs` | `ControlContext::poll`, `advance_project_load` |
+| Typed dispatch | `control/src/registry.rs` | `CommandRegistry`, `register_builtin_commands`, `EngineContext` |
+| Wire DTOs | `protocol/src/dto.rs` | command parameter and result types |
+| Command inventory | `protocol/src/command.rs` | `COMMANDS`, `CommandSpec` |
+| Protocol generator | `xtask/src/protocol/` | `emit`, `emit_openrpc`, `emit_manifest` |

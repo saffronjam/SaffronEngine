@@ -1,11 +1,11 @@
 +++
-title = 'Saffron Anima'
-description = 'How the Saffron Anima renderer works, concept by concept, with links into the code that implements it.'
+title = 'Anima'
+description = 'How the Anima renderer works, concept by concept, with links into the code that implements it.'
 +++
 
-# Saffron Anima
+# Anima
 
-Saffron Anima is a from-scratch **Vulkan** renderer and game engine written in **Rust**,
+Anima is a from-scratch **Vulkan** renderer and game engine written in **Rust**,
 with a CEF/React editor. These docs explain how it renders, concept by concept, and
 link each explanation to the code behind it.
 

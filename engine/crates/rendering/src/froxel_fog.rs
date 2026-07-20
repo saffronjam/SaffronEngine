@@ -185,8 +185,8 @@ impl FroxelQuality {
     }
 }
 
-/// The froxel-grid params UBO, std140-compatible (two `mat4` + three `vec4` blocks, each 16-byte
-/// aligned). Mirrors [`crate::lighting::ClusterParams`]'s role for the cull: the Phase-3 injection
+/// The froxel-grid params UBO, std140-compatible (three `mat4` + six 16-byte vector blocks).
+/// Mirrors [`crate::lighting::ClusterParams`]'s role for the cull: the injection
 /// reconstructs each froxel center's world position from `inverse_projection`/`inverse_view`, then
 /// reads the containing cull cluster's light list via [`froxel_to_cluster`].
 #[repr(C)]
@@ -211,13 +211,15 @@ pub struct FogGridParams {
     /// clamp enable (`0`/`1`), `w` = per-light in-scatter clamp (`0` = off).
     pub temporal: Vec4,
     /// Sub-froxel jitter: `xy` = this frame's NDC jitter (the same offset TAA advances), `z` = the
-    /// Halton jitter phase index (drives the per-frame Z-slice supersample), `w` pad.
+    /// Halton jitter phase index (drives the per-frame Z-slice supersample), `w` = scene time.
     pub jitter: Vec4,
+    /// Shared wind velocity in `xyz`; `w` is the time-of-day clock in seconds.
+    pub global_wind: Vec4,
 }
 
 const _: () = assert!(
-    size_of::<FogGridParams>() == 272,
-    "FogGridParams must match the std140 shader layout (3 mat4 + 2 uvec4 + 3 vec4 == 272 bytes)"
+    size_of::<FogGridParams>() == 288,
+    "FogGridParams must match the std140 shader layout (3 mat4 + 6 vectors == 288 bytes)"
 );
 
 impl Default for FogGridParams {
@@ -231,6 +233,7 @@ impl Default for FogGridParams {
             z_planes: Vec4::new(0.1, 0.0, FROXEL_FAR, 0.0),
             temporal: Vec4::new(0.05, 0.0, 0.0, 0.0),
             jitter: Vec4::ZERO,
+            global_wind: Vec4::ZERO,
         }
     }
 }
@@ -1036,12 +1039,12 @@ fn init_transition_ap(device: &Device, image: vk::Image) -> crate::Result<()> {
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init; drain with wait_idle below.
-        unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()),
-                "aerial perspective init submit",
-            )?;
-        }
+        device.graphics_queue.submit2(
+            raw,
+            &submits,
+            vk::Fence::null(),
+            "aerial perspective init submit",
+        )?;
         device.wait_idle()?;
         Ok(())
     })();
@@ -1051,7 +1054,7 @@ fn init_transition_ap(device: &Device, image: vk::Image) -> crate::Result<()> {
 }
 
 /// A single-set compute descriptor-set layout from `(binding, type)` pairs.
-fn create_compute_layout(
+pub(crate) fn create_compute_layout(
     raw: &ash::Device,
     bindings: &[(u32, vk::DescriptorType)],
 ) -> crate::Result<vk::DescriptorSetLayout> {
@@ -1282,12 +1285,12 @@ fn init_transition_volumes(
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init; drain with wait_idle below.
-        unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()),
-                "froxel fog init submit",
-            )?;
-        }
+        device.graphics_queue.submit2(
+            raw,
+            &submits,
+            vk::Fence::null(),
+            "froxel fog init submit",
+        )?;
         device.wait_idle()?;
         Ok(())
     })();
@@ -1473,12 +1476,9 @@ fn bake_noise_volume(device: &Device, resources: &Arc<DeviceResources>) -> crate
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init; drain with wait_idle below.
-        unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()),
-                "froxel noise submit",
-            )?;
-        }
+        device
+            .graphics_queue
+            .submit2(raw, &submits, vk::Fence::null(), "froxel noise submit")?;
         device.wait_idle()?;
         Ok(())
     })();
@@ -1521,6 +1521,7 @@ mod tests {
             z_planes: Vec4::new(0.1, 100.0, FROXEL_FAR, 0.0),
             temporal: Vec4::new(0.05, 0.0, 0.0, 0.0),
             jitter: Vec4::ZERO,
+            global_wind: Vec4::ZERO,
         }
     }
 

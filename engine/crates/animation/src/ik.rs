@@ -201,6 +201,21 @@ mod tests {
     }
 
     #[test]
+    fn ik_lifts_the_leg_fixture_without_straightening_it() {
+        let root = Vec3::ZERO;
+        let mid = Vec3::Y;
+        let end = mid + Quat::from_rotation_z(67.5_f32.to_radians()) * Vec3::Y;
+        let target = end + Vec3::new(0.0, 0.08, 0.0);
+        let result = solve_two_bone_ik(root, mid, end, target, -Vec3::X, 1.0, 1.0);
+        let reached = solved_end(root, mid, end, &result);
+
+        assert!(
+            reached.distance(target) < 1.0e-3,
+            "end {reached:?} should reach the lifted target {target:?}"
+        );
+    }
+
+    #[test]
     fn ik_over_reach_clamps() {
         // A target past the chain's reach (distance 5 > max reach 2) straightens
         // the chain toward the target: `|reached-root|` lands within `1e-2` of

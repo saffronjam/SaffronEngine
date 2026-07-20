@@ -5,111 +5,92 @@ weight = 5
 
 # Hierarchy panel
 
-The Hierarchy panel is the editor's outliner: a tree of every entity in the scene with create,
-copy, delete, rename, select, and reparent operations. The engine ships a flat list — each
-`list-entities` entry carries an optional `parentId` — and the client groups it into a forest
-(`buildTree`), so the wire stays cheap to diff and the server never serializes a nested graph.
-A pinned `Environment` row sits above the entities; it is a client-side sentinel for the global
-[scene environment](../../image-based-lighting/), not an entity.
+The Hierarchy panel is the scene outliner. It presents entities as a tree and provides selection, framing, creation, renaming, duplication, deletion, and parent changes from one surface.
 
-The panel renders directly from the store's `entities` slice and never fetches on its own. The
-[reconcile poll](../selection/) keeps that slice current, and the panel re-renders whenever it
-changes.
+The panel renders the store's entity slice and does not fetch on its own. The editor's [reconciliation loop](../selection/) refreshes that slice when the engine's scene version changes.
 
-## A render of the store
+## Building the tree
 
-The rows come from `store.entities`, which the reconcile poll refreshes only when `sceneVersion`
-changes. `buildTree` groups the flat array by `parentId` (absent or `"0"` means root; an unknown
-or self-referencing parent lands the row at the root, so corrupt data cannot loop the client).
-Rows indent by depth and show a twisty only when they have children.
-
-Expand/collapse state (`expandedIds`) is plain UI state, deliberately outside the
-`sceneVersion` keying — a scene mutation never collapses the tree. `setEntities` prunes ids that
-left the scene, selection reveals collapsed ancestors, and the set persists per project path in
-`localStorage`. The context menu and the inline rename input anchor to the sidebar rows, next to
-the content they act on.
-
-A header toggle (default off) additionally shows the **selected** entity's components as
-read-only leaf subrows under its row, sourced from the `inspect` result the poll already keeps
-for the Inspector — never an extra control call, and never for non-selected rows. Clicking a
-subrow keeps the entity selected and scrolls the matching Inspector section into view (a one-shot
-`focusComponent` signal); editing always stays in the Inspector. The subrow list reuses the
-Inspector's `orderedComponentNames`, so the tree leaves and the panel sections share the selected
-entity's stored order and hidden set (`Relationship` never shows in either).
-
-A second header toggle hides skeleton joints: rows flagged `bone` by `list-entities` drop out of
-the rendered tree and their non-bone descendants re-anchor to the nearest visible ancestor
-(`reanchorPastBones`) — a rig's dozens of joint rows collapse away without orphaning the skinned
-mesh. The filter shapes only what renders; drag validity and reparenting still run against the
-real ancestry.
-
-## Selection is optimistic
-
-Clicking a row sets the selection locally and tells the engine in the same step, so the row
-highlights without waiting a poll interval:
+`list-entities` returns a flat array. Each row contains an identifier, name, optional parent identifier, and an optional bone flag. `buildTree` groups those rows into a forest while preserving their engine-provided sibling order.
 
 ```ts
-const onSelect = (entity: EntityListEntry): void => {
-  selectEntity(entity.id);            // optimistic local highlight
-  void client.selectEntity(entity.id).catch(() => {});
-};
+export interface TreeNode {
+  entity: EntityListEntry;
+  children: TreeNode[];
+}
+
+const roots = buildTree(hideBones ? reanchorPastBones(entities) : entities);
 ```
 
-The poll confirms via `selectionVersion`; the engine is authoritative if a newer version arrives.
-See [Selection](../selection/) for the round-trip.
+A missing parent, root identifier, unknown parent, or self-reference places the entity at the forest root. These guards prevent malformed input from creating a client-side traversal loop.
+
+Expansion state lives outside the versioned entity data and persists per project in local storage. Removed identifiers are pruned when the entity list changes. Selection from the viewport or control plane expands every ancestor of the selected row, so an external selection remains visible.
+
+## Display filters
+
+The bone toggle removes rows marked as skeleton joints. `reanchorPastBones` attaches each surviving descendant to its nearest visible ancestor, which keeps meshes and other children reachable when a rig's joint rows are hidden. Reparent validation still uses the unfiltered entity list.
+
+The component toggle makes the selected entity expandable with read-only component rows. These rows reuse the active `inspect` result and the [Inspector](../inspector/) component order, so they make no extra control request. Clicking one opens the Inspector and scrolls its matching component section into view.
+
+## Selection and focus
+
+Clicking an entity writes its identifier to the store before sending `select`. The local row highlights immediately, and `selectionVersion` reconciliation confirms the engine result. Clicking empty panel space clears local selection and sends `deselect`.
+
+The Focus context action sends `focus`, which frames the entity with the [editor camera](../editor-camera/). Double-click starts inline rename; Enter or blur commits a nonempty trimmed name, while Escape cancels.
 
 ## Reparenting
 
-Dragging a row onto another (or the context menu's `Parent to…` / `Unparent`) calls the store's
-`setParent`, which relinks the moved entity's `parentId` optimistically — selection untouched —
-and sends `set-parent` to the engine, holding `dragActive` over the round trip so the poll cannot
-clobber the relink. The engine is authoritative: it refuses self-parents and cycles and rebases
-the child's local transform so its world placement does not move (see the
-[scene hierarchy](../../scene-and-ecs/scene-hierarchy/)). The client pre-filters anyway —
-dropping a row onto itself or its own descendant never fires the command — and a rejected
-reparent rolls the optimistic relink back, since a failed `set-parent` bumps no `sceneVersion`
-for the poll to recover from.
+An entity can be dropped on another row, assigned through Parent to, or detached through Unparent and the root drop strip. The client rejects the dragged entity and every member of its subtree as targets before sending a command.
 
-Drag visuals are in-flow sidebar DOM only (a row ring and a root drop strip); a floating drag
-image or a portal'd indicator over the viewport rect would be painted over by the native child.
+```mermaid
+sequenceDiagram
+    participant Row as Hierarchy row
+    participant Store
+    participant Engine
+    Row->>Store: setParent(entity, parent)
+    Store->>Store: optimistic parentId + dragActive
+    Store->>Engine: set-parent
+    alt accepted
+        Engine-->>Store: entity reference
+        Store->>Store: record undo and redo
+    else rejected
+        Engine-->>Store: typed error
+        Store->>Store: restore previous parentId
+    end
+```
 
-The tree holds entities only. The environment is global `Scene` state, not an entity, and is
-edited solely through the Environment tab in the sidebar — it never appears as a tree row, so
-`get-selection` / `inspect` are never handed a non-entity id.
+The engine rejects cycles and self-parenting, then rebases the child's local transform to preserve its world placement. The store holds `dragActive` across the round trip so reconciliation cannot overwrite the optimistic tree. A successful change records inverse `set-parent` calls for undo and redo.
 
-## Creating entities
+## Creation and asset drops
 
-The Create dropdown maps menu labels to `add-entity` presets — Empty, Cube, Point/Spot/Directional
-Light, Camera. The engine spawns the entity, adds the right component, and auto-selects it. On
-success the panel mirrors that selection locally, and the `sceneVersion` bump refreshes the list.
-The engine resolves and uploads the cube mesh itself behind `add-entity cube`.
+The Add menu offers Empty, Cube, Plane, Sphere, three light types, Camera, Reflection Probe, and Fog Volume. Named Empty opens a compact name form and uses `create-entity`; presets use `add-entity`. The engine selects each new entity, and the client mirrors that identifier before the next list refresh.
 
-## Copy, delete, rename
+Dropping model assets from the Assets panel onto the hierarchy background calls `instantiate-model` for each model in the payload. Other asset types are ignored. Entity reparent drags use a separate MIME type and remain scoped to row and root targets.
 
-Copy and delete go through the engine, so the commands are safe to call directly from a menu
-handler. `copy-entity` is a deep duplicate — every component, a fresh UUID — that joins the
-source's parent as a sibling and selects the copy. `destroy-entity` takes the whole subtree with
-it and clears the engine selection when it sat anywhere inside; the panel clears its local
-selection for the root case in the same step. The Delete key on a focused row (clicking a row
-focuses it) runs the same delete as the context menu item; the key is the `hierarchy.delete`
-binding (default Delete), rebindable in [Editor Settings](../editor-settings/).
+Creation and model instantiation record an undo action that destroys the new entity. Redo is disabled because recreating it would assign a different identifier.
 
-Rename is inline: double-click a row (or use the context menu) to edit in place. Enter or blur
-commits through `rename-entity` with an optimistic row update; Escape cancels.
+## Copy, delete, and rename
+
+`copy-entity` creates a fresh entity, serializes each component from the source into it, preserves component order, and joins the source's parent. The engine selects the copy, while the client records the same destroy-only undo used for entity creation.
+
+`destroy-entity` removes the chosen entity and its subtree. The engine clears selection when the selected entity lies anywhere in that subtree. The focused-row delete binding invokes the same action as the context menu and defaults to Delete.
+
+Rename applies the name optimistically, sends `rename-entity`, and records the previous and new values for undo and redo after success. A rejected command appears through the shared notification path.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The panel shell | `editor/src/panels/HierarchyPanel.tsx` | `HierarchyPanel`, `TreeActions` |
-| Tree, rows, drag, sentinel | `editor/src/panels/HierarchyTree.tsx` | `HierarchyTree`, `TreeRow`, `EnvironmentRow`, `RenameRow` |
-| Tree building + expand-state | `editor/src/state/store.ts` | `buildTree`, `expandedIds`, `setParent`, `selectedSentinel` |
-| Create presets | `editor/src/app/CreateMenu.tsx` | `CREATE_PRESETS`, `CreateMenu` |
-| Commands (engine) | `engine/crates/control/src/commands_scene.rs` | `list-entities`, `set-parent`, `add-entity`, `copy-entity`, `destroy-entity`, `select` |
+| Panel actions | `editor/src/panels/HierarchyPanel.tsx` | `HierarchyPanel`, `TreeActions` |
+| Tree, filters, and drag targets | `editor/src/panels/HierarchyTree.tsx` | `HierarchyTree`, `TreeRow`, `isInSubtree`, `subtreeIds`, `RenameRow` |
+| Tree and optimistic state | `editor/src/state/store.ts` | `buildTree`, `reanchorPastBones`, `setParent`, `expandedIds`, `recordEntityCreation` |
+| Creation menu | `editor/src/app/CreateMenu.tsx` | `CREATE_PRESETS`, `CreateMenu`, `NamedEmptyForm` |
+| Scene command registration | `engine/crates/control/src/commands_scene.rs` | `register_scene_commands`, `list-entities`, `set-parent`, `add-entity`, `copy-entity`, `destroy-entity`, `rename-entity` |
 
 ## Related
 
-- [Scene hierarchy](../../scene-and-ecs/scene-hierarchy/) — the engine-side relationship + world transforms
-- [Inspector](../inspector/) — what shows for the selected entity
-- [Selection](../selection/) — the optimistic select + version reconcile round-trip
-- [Scene commands](../../tooling-and-control/scene-commands/) — the list/create/copy/destroy commands
+- [Scene hierarchy](../../scene-and-ecs/scene-hierarchy/) — explains relationship storage and world-preserving reparenting.
+- [Inspector](../inspector/) — edits the selected entity's component data.
+- [Selection](../selection/) — explains optimistic selection and version reconciliation.
+- [Editor camera](../editor-camera/) — implements entity framing for Focus.
+- [Scene commands](../../tooling-and-control/scene-commands/) — documents the entity control surface.

@@ -5,112 +5,72 @@ weight = 5
 
 # Overview
 
-A one-read map of the whole engine. The [explanation pages](../explanations/) expand each
-topic; follow the links for the full account.
+Anima separates the editor UI, the viewport host, and exported games into distinct processes. They share the scene, asset, simulation, and rendering crates rather than embedding editor code in the engine runtime.
 
-## Shape of a program
+## Runtime shape
 
-A client — the editor or a standalone app — fills an `AppConfig` and calls `run`,
-which owns the window, renderer, UI, and main loop. Clients extend it by attaching
-**layers**. A `Layer` is a trait of optional callbacks: implement only the hooks you need.
+The editor is a CEF/React application inside a native Rust shell. The shell spawns `saffron-host`, sends JSON commands over a Unix socket, and presents the host's offscreen frames beneath transparent UI regions.
 
-```rust
-let config = AppConfig { window, on_create, on_exit };
-return run(config);
+Exported projects run through `saffron-player`. The player loads `app.json` and `project.json`, owns a window and swapchain, and drives animation, physics, and Luau through the same `RuntimeSession` used by editor play mode.
+
+```mermaid
+flowchart LR
+    UI[React UI in CEF] --> Shell[editor shell]
+    Shell -->|JSON control socket| Host[saffron-host]
+    Host -->|BGRA frames in shared memory| Presenter[Wayland or AppKit presenter]
+    Presenter --> Shell
+
+    Export[exported project] --> Player[saffron-player]
+    Host --> Engine[shared engine crates]
+    Player --> Engine
+    Engine --> Vulkan[Vulkan renderer]
 ```
 
-See [the main loop](../explanations/app-lifecycle-and-window/main-loop-and-run/).
+The [editor shell and viewport bridge](../explanations/ui-and-editor/editor-shell-and-viewport-bridge/) explains the process boundary. The [control plane](../explanations/tooling-and-control/control-plane-architecture/) and [viewport compositing](../explanations/ui-and-editor/viewport-compositing/) cover the two cross-process transports.
 
 ## One frame
 
-`run` drives this sequence every frame. The back half does the substantive work: layers
-record GPU work and add render-graph passes, then the renderer derives the barriers and
-executes the frame.
+Both host modes use the `saffron-app` lifecycle. A layer updates engine state, submits direct GPU work, and adds render-graph passes. `end_frame` derives barriers, executes the graph, and either publishes or presents the image.
 
 ```mermaid
 flowchart TD
-    A[poll_events] --> B[layer.on_update dt]
-    B --> C{begin_frame ok?}
-    C -- no, minimized/resize --> A
-    C -- yes --> D[layer.on_render — submit GPU work]
-    D --> E[layer.on_ui]
-    E --> F[begin_frame_graph — cull + scene passes]
-    F --> G[layer.on_render_graph — app adds passes]
-    G --> H[end_frame — derive barriers, execute graph, present]
+    A[poll events and control] --> B[layer on_update]
+    B --> C{redraw requested?}
+    C -- no --> A
+    C -- yes --> D[begin_frame]
+    D --> E[layer on_render and on_ui]
+    E --> F[begin_frame_graph]
+    F --> G[layer on_render_graph]
+    G --> H[end_frame]
     H --> A
 ```
 
-When the loop ends, `run` calls `wait_gpu_idle` before any teardown, so no in-flight
-command buffer still references a resource about to be freed. That ordering anchors the
-engine's [resource ownership model](../explanations/core-and-conventions/).
+Rendering is reactive. Active simulation requests continuous frames, edits request a fresh frame, and an idle scene leaves the last published image in place. Shutdown waits for the GPU before layer teardown and resource destruction.
 
-## Render graph
+## Engine data flow
 
-Each pass **declares** what it does with each resource (`ColorWrite`, `SampledRead`,
-`StorageImageRwCompute`, …) rather than writing barriers by hand. The graph turns those
-declarations into the right image and memory barriers and layout transitions, then
-records each pass body inside its rendering scope.
+Projects serialize a registry-driven `hecs` scene and an asset catalog. Importers turn source models, images, materials, and animation data into engine assets; `RuntimeSession` advances scripts, animation, and physics against a play-scene copy.
 
-Light culling, the scene pass, shadow passes, post-processing, and the present blit to the
-swapchain are all declared passes over imported images. Start at the
-[render graph overview](../explanations/frame-and-render-graph/render-graph-overview/).
+The renderer gathers visible scene data into GPU resources and declares passes in a render graph. Each pass states its image and buffer usage, so the graph derives synchronization and layouts before recording work. The frame then passes through lighting, post-processing, the native overlay, and presentation.
 
-## Crates
+## Code map
 
-The engine is a Cargo workspace in `engine/`, a DAG of crates: leaves at the bottom,
-the host at the top. Each `saffron-<area>` crate owns one subsystem.
-
-```mermaid
-flowchart BT
-    core["saffron-core"]
-    signal["saffron-signal"] --> core
-    json["saffron-json"] --> core
-    window["saffron-window"] --> core
-    window --> signal
-    geometry["saffron-geometry"] --> core
-    scene["saffron-scene"] --> core
-    scene --> json
-    rendering["saffron-rendering"] --> core
-    rendering --> window
-    rendering --> geometry
-    assets["saffron-assets"] --> rendering
-    assets --> scene
-    assets --> geometry
-    sceneedit["saffron-sceneedit"] --> scene
-    sceneedit --> signal
-    control["saffron-control"] --> sceneedit
-    control --> rendering
-    control --> assets
-    app["saffron-app"] --> rendering
-    app --> window
-    host["saffron-host"] --> app
-    host --> control
-    host --> sceneedit
-```
-
-`saffron-rendering` carries the render graph; the larger crates split their subsystem
-across several modules behind one crate boundary. The
-[architecture section](../explanations/architecture-and-conventions/) covers the crate
-layout and the build.
-
-## Subsystems
-
-| Subsystem | What it does | Section |
+| Area | Entry points | Role |
 |---|---|---|
-| Core & conventions | shared aliases, the `Result` error model, reference-counted handles, signals, the coding style | [link](../explanations/core-and-conventions/) |
-| App & window | `run` loop, layers, SDL3 window + typed events | [link](../explanations/app-lifecycle-and-window/) |
-| Vulkan foundation | device/swapchain, VMA, sync2, dynamic rendering, `Drop`-based resource wrappers | [link](../explanations/vulkan-foundation/) |
-| Frame & render graph | declared usage → automatic barriers, per-frame sync | [link](../explanations/frame-and-render-graph/) |
-| Geometry & assets | mesh import, `.smesh`, GPU upload, the asset catalog | [link](../explanations/geometry-and-assets/) |
-| Scene & ECS | the `hecs` scene, the component registry, JSON serialization | [link](../explanations/scene-and-ecs/) |
-| Materials & pipelines | the übershader, the PSO cache, bindless textures | [link](../explanations/materials-and-pipelines/) |
-| Lighting & BRDF | clustered forward, Cook-Torrance, HDR | [link](../explanations/lighting-and-brdf/) |
-| Image-based lighting | sky, irradiance, prefilter, the split-sum BRDF LUT | [link](../explanations/image-based-lighting/) |
-| Shadows & culling | directional/spot/point shadows, the light-cull compute pass | [link](../explanations/shadows-and-culling/) |
-| Screen-space & post | thin G-buffer, GTAO, motion vectors, TAA, tonemap | [link](../explanations/screen-space-and-post/) |
-| Global illumination & ray tracing | DDGI probes, voxel trace, BLAS/TLAS, ray-query shadows, ReSTIR | [link](../explanations/global-illumination-and-raytracing/) |
-| Anti-aliasing | MSAA, FXAA, mode switching | [link](../explanations/anti-aliasing/) |
-| UI & editor | the CEF/React editor shell, the windowless-OSR UI + shm frame transport, the gizmo, the inspector, thumbnails | [link](../explanations/ui-and-editor/) |
-| Tooling & control | the unix-socket control plane and the `sa` CLI | [link](../explanations/tooling-and-control/) |
-| Scripting | the embedded Luau VM, sandboxing, script errors as values | [link](../explanations/scripting/) |
-| Architecture | the crate DAG, the build, the coding conventions | [link](../explanations/architecture-and-conventions/) |
+| App lifecycle | `saffron_app::run`, `Layer`, `step_frame` | Bring-up, reactive frame dispatch, teardown |
+| Editor host | `saffron_host::run_host`, `HostLayer` | Control plane, project session, offscreen frame publishing |
+| Exported game | `saffron-player::main`, `PlayerLayer` | Windowed project runtime and swapchain presentation |
+| Simulation | `saffron_runtime::RuntimeSession` | Shared animation, physics, and Luau play state |
+| Rendering | `Renderer`, `RenderGraph` | Vulkan resources, graph execution, presentation |
+
+## Explore by area
+
+| Area | Sections |
+|---|---|
+| Foundations | [Core conventions](../explanations/core-and-conventions/), [app lifecycle](../explanations/app-lifecycle-and-window/), [Vulkan](../explanations/vulkan-foundation/), [architecture](../explanations/architecture-and-conventions/) |
+| Rendering | [Frame graph](../explanations/frame-and-render-graph/), [materials](../explanations/materials-and-pipelines/), [lighting](../explanations/lighting-and-brdf/), [IBL](../explanations/image-based-lighting/), [shadows](../explanations/shadows-and-culling/) |
+| Image quality | [Screen-space and post](../explanations/screen-space-and-post/), [anti-aliasing](../explanations/anti-aliasing/), [GI and ray tracing](../explanations/global-illumination-and-raytracing/) |
+| Content and simulation | [Geometry and assets](../explanations/geometry-and-assets/), [scene and ECS](../explanations/scene-and-ecs/), [animation](../explanations/animation/), [physics](../explanations/physics/), [scripting](../explanations/scripting/) |
+| Editor and tools | [UI and editor](../explanations/ui-and-editor/), [tooling and control](../explanations/tooling-and-control/), [asset stores](../explanations/asset-store-and-connectors/) |
+
+Use [How-to](../how-to/) for executable recipes, [Reference](../reference/) for lookup tables, and [Tutorials](../tutorials/) for guided builds.

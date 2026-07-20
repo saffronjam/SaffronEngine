@@ -5,132 +5,139 @@ weight = 2
 
 # Device & swapchain
 
-Bringing up Vulkan is the sequence of selecting an instance, a physical device, a logical device with
-the features the renderer needs, a queue, the VMA allocator, and (for the windowed host) a swapchain
-over the window surface. These objects are the foundation every later GPU operation builds on, and each
-step can fail for reasons outside the program's control — no GPU, a missing feature, a surface the
-platform refuses.
+The renderer builds one immutable `Device` that owns the Vulkan instance, selected physical device,
+logical device, graphics queue, optional extension dispatch tables, and VMA allocator. Windowed output
+also gives it a surface and a swapchain loader. Every GPU resource keeps the logical device and
+allocator alive through a shared `DeviceResources` handle.
 
-`Device::new` runs the whole bring-up top to bottom and returns a `Result<Device>`, so any failure
-surfaces as a readable [`Error`](../vulkan-hpp-no-exceptions/) rather than a crash. The bring-up is
-hand-rolled against `ash` — there is no builder helper layer; the ~150-line feature-probe and
-degradation chain is the engine's own.
+Device creation separates requirements from capabilities. A candidate must support the renderer's
+core resource and synchronization model, while optional features select faster or richer paths without
+excluding otherwise usable hardware.
 
-## Surface source, not a fork
+## Surface modes
 
-Bring-up takes a `SurfaceSource`, which is a parameter rather than two code paths. `SurfaceSource::Window`
-enables `VK_KHR_surface` plus the platform surface extension and creates a real surface for the present
-swapchain (the standalone present-only host). `SurfaceSource::Offscreen` enables **no** surface extension
-and creates **no** surface object: it renders into an offscreen image, reads it back, and publishes
-frames to shared memory — the editor native-viewport host, every headless render-and-read-back, and the
-validation-clean smoke. A no-surface instance is what lets the editor host boot under an NVIDIA ICD,
-whose driver implements no headless-surface extension.
+`SurfaceSource` determines whether presentation is part of device qualification:
 
-## Instance and surface
+| Source | Instance surface extensions | Queue requirement | Output |
+|---|---|---|---|
+| `Window` | `VK_KHR_surface` and the platform extension | graphics and present in one family | swapchain |
+| `Offscreen` | none | graphics | offscreen image and readback |
 
-`create_instance` sets the app and engine names, requests API version 1.3, and — in debug builds, or
-when `SAFFRON_FORCE_VALIDATION` is set — enables the Khronos validation layer plus `VK_EXT_debug_utils`.
-The debug messenger routes validation/performance messages into the engine log under the `vulkan`
-subsystem (one `[vulkan] …` line, loader chatter filtered) and bumps `validation_issue_count`, the
-counter the validation-clean gate reads — see [Logging](../../core-and-conventions/logging/).
+The editor-facing host uses `Offscreen` and publishes rendered frames through shared memory. The
+windowed application path uses `Window`, obtains raw display and window handles through `ash-window`,
+and creates a platform surface. Both modes share the same device selection and renderer construction.
 
-For the windowed host, `ash-window` supplies the platform surface extensions from the window's display
-handle (`enumerate_required_extensions`), and `create_window_surface` builds the `vk::SurfaceKHR` from the
-window's raw display+window handle pair.
+## Instance policy
 
-## Feature negotiation
+The instance requests [Vulkan 1.3](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/).
+Debug builds enable `VK_LAYER_KHRONOS_validation` and `VK_EXT_debug_utils` when the layer is installed;
+`SAFFRON_FORCE_VALIDATION` and `SAFFRON_DISABLE_VALIDATION` override that decision. Warning and error
+messages increment `validation_issue_count`, which gives smoke tests a validation-clean assertion.
 
-A bare 1.3 device is not enough. Selection requires specific feature bits across two feature structs and
-rejects a device that lacks any of them, with a clear message rather than a later crash:
+When the loader advertises `VK_KHR_portability_enumeration`, instance creation enables it and sets
+`ENUMERATE_PORTABILITY_KHR`. This exposes portability devices such as MoltenVK through the same
+enumeration path used for native Vulkan drivers.
 
-- **1.3:** `dynamic_rendering` and `synchronization2` — the two pillars the renderer is built on (see
-  [dynamic rendering](../dynamic-rendering/) and [barriers](../synchronization2-and-barriers/)). No
-  render-pass objects, no legacy barriers.
-- **1.2:** descriptor-indexing bits for [bindless textures](../../materials-and-pipelines/bindless-textures/)
-  (`runtime_descriptor_array`, `descriptor_binding_partially_bound`,
-  `descriptor_binding_sampled_image_update_after_bind`, `shader_sampled_image_array_non_uniform_indexing`)
-  plus `buffer_device_address` (needed by KHR acceleration structures).
+## Device qualification
 
-The logical device additionally enables `shader_draw_parameters` (1.1), because Slang's `SV_VertexID`
-fullscreen-triangle shaders emit the SPIR-V `DrawParameters` capability.
+`select_physical_device` evaluates every enumerated device. A candidate needs API version 1.3, a
+graphics queue family, and present support on that same family when a surface exists. The following
+feature bits also gate selection:
 
-## Optional features, probed never gated
+| Feature set | Required bits | Renderer use |
+|---|---|---|
+| Vulkan 1.2 | `runtimeDescriptorArray`, `descriptorBindingPartiallyBound`, `descriptorBindingSampledImageUpdateAfterBind`, `shaderSampledImageArrayNonUniformIndexing` | bindless sampled-image arrays |
+| Vulkan 1.2 | `bufferDeviceAddress` | GPU addresses for acceleration-structure inputs |
+| Vulkan 1.3 | `dynamicRendering` | attachment-based graphics pass recording |
+| Vulkan 1.3 | `synchronization2` | stage, access, and layout barriers |
 
-`probe_optional_features` reads the features that tune the renderer but never gate selection:
-acceleration-structure + ray-query (ray tracing), `fill_mode_non_solid` (the wireframe view mode),
-`VK_EXT_memory_budget` (VRAM telemetry), `pipeline_statistics_query` (the deepest profiler level), and
-whether the device is a software rasterizer (its name contains `llvmpipe` / `lavapipe` / `swiftshader`
-or its type is `CPU`). A software (llvmpipe) device reports `rt_supported == false` and is created and
-used regardless — the degradation a unit test asserts.
+Qualifying devices are ranked discrete, integrated, virtual, then CPU or other. Ranking is a preference,
+so a software rasterizer remains valid when it is the best qualifying device. Devices of the same class
+retain the loader's enumeration order.
 
-When the acceleration-structure and ray-query extensions are both present, `create_logical_device`
-enables them (with `VK_KHR_deferred_host_operations`) and the acceleration-structure dispatch is resolved
-into an `accel::Device` table. On a software device that table stays `None` and every RT path is a no-op.
+The logical device creates one queue from the selected family. It enables the required feature chain
+plus `shaderDrawParameters`, which the fullscreen Slang shaders require for `SV_VertexID`.
 
-## Device preference, never exclusion
+## Optional capabilities
 
-`select_physical_device` ranks every qualifying device by `DevicePreference` (discrete > integrated >
-virtual > cpu) and keeps the highest. With an NVIDIA ICD enumerated next to Mesa's llvmpipe, both qualify
-and the discrete GPU wins on rank; when the only qualifying device is the software rasterizer (the CI
-toolbox), it is still selected. A single graphics queue is fetched along with its family index — the
-engine is single-queue. The windowed host additionally requires that family to support present
-(`require_present`); the offscreen host has no surface, so it gates on a graphics queue alone.
+`probe_optional_features` records capabilities that choose renderer paths:
 
-The MSAA capability is read on demand from `supported_sample_counts`: the intersection of the device's
-framebuffer color/depth sample limits with each attachment format's optimal-tiling sample support, which
-[MSAA](../../anti-aliasing/msaa/) clamps user requests against.
+| Capability | Required support | Effect |
+|---|---|---|
+| Ray queries | acceleration-structure and ray-query extensions and feature bits | resolves the acceleration-structure dispatch |
+| Mesh shaders | `VK_EXT_mesh_shader` with mesh and task shader bits | resolves mesh-task commands |
+| Indirect rendering | `multiDrawIndirect` and `drawIndirectCount` | permits multi-draw and GPU-written draw counts |
+| Indirect AS builds | `accelerationStructureIndirectBuild` | permits GPU-provided primitive counts |
+| Material sampling | `samplerAnisotropy` | caps anisotropy at the lesser of 16 and the device limit |
+| Diagnostics | pipeline statistics and calibrated timestamps | enables deeper counters and CPU/GPU clock correlation |
+| Memory reporting | `VK_EXT_memory_budget` | enables driver-reported budget telemetry |
+| Wireframe | `fillModeNonSolid` | enables line polygon mode |
 
-## Swapchain
+The capability record also identifies software rasterizers and stores
+`minUniformBufferOffsetAlignment`. Extension dispatch tables exist only when their matching capability
+is enabled. `VK_KHR_portability_subset` is enabled whenever the selected device advertises it.
 
-`Swapchain::new` (windowed host only) clamps the requested extent to the surface capabilities, picks a
-`FIFO` present mode (v-sync, always supported), and requests `min_image_count + 1` images (clamped to the
-maximum). It requests a `B8G8R8A8_UNORM` / sRGB-nonlinear format, falling back to the first advertised
-format. Each swapchain image gets a 2D view and a `render_finished` semaphore — one per image, not per
-frame (see [frame sync](../frame-sync-and-resize/)).
+## Surface format and capture
 
-`TRANSFER_SRC` on swapchain images is requested only when the surface capabilities allow it
-(`capture_supported`); a surface that disallows it disables window screenshots instead of failing the
-build. The `Swapchain` is not a `Drop` type — its handles borrow the device — so the renderer calls
-`Swapchain::destroy` after `wait_idle`, and a resize destroys the old swapchain and builds a fresh one.
+The windowed path prefers `B8G8R8A8_UNORM` with `SRGB_NONLINEAR`; if unavailable, it uses the first
+advertised surface format. The offscreen path uses the preferred format directly because it has no
+surface to query.
+
+Window capture requires the surface to allow `TRANSFER_SRC` on swapchain images. That bit becomes
+`capture_supported` and adds `TRANSFER_SRC` to image usage when available. A surface without it still
+presents normally but rejects window-capture requests.
+
+## Swapchain policy
+
+`Swapchain::new` queries [surface capabilities](https://docs.vulkan.org/refpages/latest/refpages/source/VkSurfaceCapabilitiesKHR.html)
+for every construction. A fixed surface extent wins; otherwise the requested size is clamped to the
+advertised minimum and maximum. The image count is one above the minimum, capped by a nonzero maximum.
+
+The swapchain uses `FIFO`, opaque composition, the surface's current transform, exclusive sharing, and
+one array layer. Images support color attachment and transfer destination usage, plus transfer source
+usage when capture is supported. Every returned image receives a 2D view, one render-finished semaphore,
+and one tracked in-flight fence slot.
 
 ```mermaid
 flowchart TD
-    A[create_instance: 1.3 + validation + surface exts] --> B[create_window_surface<br/>or Offscreen: none]
-    B --> C[select_physical_device<br/>require 1.2/1.3 features<br/>rank by DevicePreference]
-    C --> D{AS + ray-query<br/>present?}
-    D -- yes --> E[enable RT + resolve accel dispatch]
-    D -- no --> F[skip RT]
-    E --> G[create_logical_device]
-    F --> G
-    G --> H[graphics queue + family]
-    H --> I[create_allocator: VMA]
-    I --> J[Swapchain::new: FIFO, BGRA8,<br/>per-image view + semaphore]
+    A[SurfaceSource] --> B[Create Vulkan 1.3 instance]
+    B --> C[Create window surface or remain offscreen]
+    C --> D[Evaluate queue and required features]
+    D --> E[Rank qualifying physical devices]
+    E --> F[Probe optional capabilities]
+    F --> G[Create logical device, queue, and VMA]
+    G --> H{Window surface?}
+    H -- yes --> I[Choose format and build swapchain]
+    H -- no --> J[Build offscreen targets]
 ```
 
-## Teardown order
+## Rebuild and teardown
 
-`Device` holds the ash device + VMA allocator behind one `Arc<DeviceResources>` so a resource can free
-itself in its own `Drop`. Rust drops fields top to bottom, and `Device::drop` is explicit: destroy the
-surface + debug messenger, release the shared bundle (which frees the allocator then the device), then
-destroy the instance last. The run loop's `wait_idle` and the owner's resource teardown run first, so
-nothing is freed under a live GPU read.
+`Renderer::recreate_swapchain` ignores zero-sized and offscreen requests. For a windowed resize it waits
+for device idle, clears any remembered acquired image, destroys the swapchain's views and semaphores,
+and constructs the complete swapchain again. Frame-indexed presentation synchronization remains because
+it does not depend on the surface extent.
+
+Teardown waits for device idle before renderer-owned resources are released. `DeviceResources::drop`
+destroys the VMA allocator before the logical device. `Device::drop` destroys the surface and debug
+messenger, releases the shared resource bundle, and destroys the Vulkan instance last.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Whole bring-up | `device.rs` | `Device::new` |
-| Surface parameter | `device.rs` | `SurfaceSource`, `create_window_surface` |
-| Required-feature gate | `device.rs` | `evaluate_device`, `create_logical_device` |
-| Optional-feature probe | `device.rs` | `probe_optional_features`, `Capabilities` |
-| Device ranking | `device.rs` | `select_physical_device`, `DevicePreference` |
-| Allocator creation | `device.rs` | `create_allocator` |
-| Swapchain build | `swapchain.rs` | `Swapchain::new`, `choose_extent`, `choose_image_count` |
-| Teardown order | `device.rs`, `resources.rs` | `Device::drop`, `DeviceResources::drop` |
+| Device ownership and surface modes | `device.rs` | `Device`, `SurfaceSource`, `WindowSurface` |
+| Instance construction | `device.rs` | `API_VERSION`, `create_instance`, `validation_enabled` |
+| Physical-device selection | `device.rs` | `select_physical_device`, `evaluate_device`, `find_graphics_queue_family`, `DevicePreference` |
+| Capability negotiation | `device.rs` | `Capabilities`, `probe_optional_features`, `create_logical_device` |
+| Surface policy | `device.rs` | `choose_surface_format`, `surface_capture_supported` |
+| Swapchain ownership | `swapchain.rs` | `Swapchain`, `new`, `destroy`, `choose_extent`, `choose_image_count` |
+| Resize path | `renderer.rs` | `recreate_swapchain` |
+| Shared device lifetime | `resources.rs` | `DeviceResources`, `drop` |
 
 ## Related
 
-- [Ash and the Vulkan seam](../vulkan-hpp-no-exceptions/) — the `Result`-returning style every step uses
-- [Frame sync](../frame-sync-and-resize/) — the per-image semaphores + swapchain rebuild
-- [Dynamic rendering](../dynamic-rendering/) — the 1.3 feature that removes render passes
-- [VMA allocator](../vma-allocator/) — created right after the device
+- [Dynamic rendering](../dynamic-rendering/) - explains attachment-based pass recording
+- [Synchronization2 and barriers](../synchronization2-and-barriers/) - explains resource ordering
+- [Frame sync](../frame-sync-and-resize/) - covers acquisition, submission, and presentation
+- [VMA allocator](../vma-allocator/) - covers buffer and image allocation

@@ -5,94 +5,140 @@ weight = 4
 
 # Timeline panel
 
-The Timeline panel is the editor's read-only sequencer for the selected rig. It opens in the
-bottom dock and lays out a clip the way every sequencer does: track rows on the left, a time ruler
-across the top, clip bars in the lanes, a playhead you can drag, transport buttons with a Loop
-toggle, and a `Duration · N tracks · N clips` footer. It is a *viewer* — it reflects the engine's
-animation player and lets you scrub to inspect any frame, but it does not author keyframes.
+The Timeline panel is the editor's sequencer for the selected entity's animation: track header on
+the left, a millisecond ruler on top, the clip drawn as a bar with its keyframe ticks, a draggable
+playhead, and a transport bar. It is a viewer of the engine's [playback runtime](../playback-runtime/)
+— the engine owns the pose, the panel mirrors the player's state and drives Edit-mode preview over
+the control plane.
 
-It is the front-end counterpart to the [playback runtime](../playback-runtime/): the engine owns
-the pose, the panel shows where the playhead is and drives Edit-mode preview over the control plane.
+## One surface, two mounts
 
-## Regions
+The panel itself is a thin composition. `TimelineTransport` (the button bar with a clip picker) and
+`TimelineSurface` (headers, canvas lanes, scrub area, footer) live in `components/timeline/` and
+render against a `TimelineTarget`:
 
-The panel composes the universal sequencer layout from four regions:
+```ts
+export interface TimelineTarget {
+  entityId: string | null;            // who the transport commands
+  state: AnimationStateResult | null; // the polled player mirror
+  clips: AnimationClipDto[];          // the clip picker's options
+  enabled: boolean;                   // the rig gate
+}
+```
 
-- **Track headers** (left, fixed column) — one thin row per track with a type-color accent swatch
-  and the clip name. v1 groups one clip under one track row for the bound entity; per-channel and
-  per-bone rows are deferred.
-- **Ruler** (top) — millisecond ticks with auto-thinning labels. Engine time is seconds-native, so
-  ms is the default unit; the tick step is the smallest of a fixed ladder (10ms … 60s) that keeps
-  labels from crowding.
-- **Lanes** (center) — the playing clip drawn as one horizontal bar spanning its duration on its
-  track, tinted with the track accent and labelled inside the bar.
-- **Playhead** — one vertical line spanning the ruler and lanes, with a wide transparent grip for
-  the scrub gesture.
+The dock panel builds its target from the scene selection; the [asset editor](../../ui-and-editor/asset-editor/)
+mounts the same two components against the previewed model and hides the clip picker (its clip list
+panel owns picking). Both targets are entities in the active scene, so the commands are identical.
 
-The ruler, bars, and playhead are all drawn on **one 2D canvas**, not in React. The webview
-composites over the live engine viewport, so editor CPU is not free, and a per-tick React re-render
-of the panel would fight the render-frequency work. The canvas is created once and fed its model and
-playhead position imperatively on `requestAnimationFrame`, the same ownership model as the frame-time
-graph. So the playhead advancing on every poll touches only the canvas; the component tree never
-re-renders for it.
+The header column is 140 px wide and shows one row per track: a teal accent swatch (`TRACK_ACCENT`,
+`#2dd4bf`) and the clip name. A footer summarizes the model, `Duration 1.25s · 1 track · 1 clip`,
+with a monospace `time / duration` readout on the right.
+
+## Canvas, not React
+
+The ruler, clip bars, and playhead draw on one 2D canvas. The webview composites over the live
+engine viewport, so editor CPU competes with render-frequency work; a React re-render per playhead
+move would pay component-tree cost for a one-line redraw. `TimelineCanvas` is created once per
+mount and fed imperatively through `setModel` and `setPlayhead`, which coalesce into a single
+[`requestAnimationFrame`](https://developer.mozilla.org/en-US/docs/Web/API/Window/requestAnimationFrame)
+redraw.
+
+The ruler picks its tick step from a fixed millisecond ladder (10 ms up to 60 s), taking the
+smallest step that keeps ticks at least 64 px apart (`chooseTickStepMs`). A 2 s clip in an 800 px
+lane gives 0.4 px/ms: 100 ms ticks would sit 40 px apart, so the ruler steps up to 250 ms and
+labels every 100 px.
+
+Each clip is one bar spanning its duration, tinted by the track accent with a 2 px accent rail on
+its leading edge. Along the bar's lower edge the canvas draws a short vertical tick at every
+keyframe time of every channel in the active clip — the real per-channel sample times that
+`list-clips` returns in `AnimationChannelDto.times`, clipped to the bar.
 
 ## Reading playback state
 
-The panel never polls on its own. It reads the selected rig's player off the store slice the
-shared reconcile poll fills. The poll runs `get-selection` at ~6 Hz and gates refreshes on version
-stamps; alongside the existing play-state gate it carries an **`animationVersion`** stamp. When that
-stamp bumps — a play, seek, pause, or loop change, whether from this panel or the `sa` CLI — or when
-the selection changes to a different entity, the poll refetches `get-animation-state` and
-`list-clips` for the selected entity and stores them. The returned `time` drives the playhead.
+The panel never calls the wire to read. The store's reconcile poll ticks every 50 ms while the
+editor is focused and the engine ready; each tick runs `get-selection`, whose reply carries an
+`animationVersion` stamp. Every playback mutation bumps it (`play-animation`, `seek-animation`,
+`set-animation-playing`, `set-animation-loop`, `stop-preview`), whatever the origin, so a shell
+command moves this panel too:
 
-`get-animation-state` rejects when the entity has no animation player, which is the *not rigged /
-nothing playing yet* case, so the slice clears silently. A rig that has not been played yet has no
-player but does carry a `SkinnedMesh` component, so the panel gates "is this animatable" on the
-selection's component map (filled by the same poll) rather than on the player alone — otherwise the
-catalog's clips, which `list-clips` returns for any entity, would show a phantom track on an
-unrigged mesh.
+```sh
+sa play-animation <rig> Walk --loop   # the panel's bar, playhead, and Play button follow
+sa seek-animation <rig> 0.5           # the playhead jumps on the next poll
+```
+
+When the stamp bumps, or the selection changes, `refreshAnimation` fetches `get-animation-state`
+and `list-clips` in parallel and writes both into the store slice. `get-animation-state` rejects
+with `entity has no animation player` when the entity carries none; the slice clears silently,
+since an unrigged selection is the normal case, not an error.
+
+`list-clips` returns the whole project catalog for any entity, so the clip list alone cannot gate
+the panel — an unrigged cube would show a phantom track. `isAnimatable` checks the inspected
+component map for `AnimationPlayer`, `SkinnedMesh`, or `Morph`, the three clip-driven sources
+(skeletal, [node-TRS](../node-trs-animation/), and [blend shapes](../morph-targets/)).
+
+## Playhead motion between polls
+
+Time advancing bumps no version, so a playing clip generates zero poll traffic. Instead
+`TimelineSurface` self-advances a local playhead in its own `requestAnimationFrame` loop, stepping
+by frame delta times the player's `speed` and honoring the wrap mode: `once` clamps at the end and
+stops, `loop` wraps, `pingpong` reflects. Whenever the slice changes, the loop snaps to the
+engine's authoritative `time` and re-arms. Each step touches only the canvas; React never renders.
 
 ## Edit-mode preview transport
 
-The transport drives **Edit-mode preview** of the selected entity, decoupled from the game's global
-play state — the same model as UE5 Sequencer and Unity's Timeline window. Play and pause call
-`set-animation-playing` (resume/pause without moving the playhead); picking a clip calls
-`play-animation`, which loads it at frame 0 and sets `preview_in_edit` so the clip previews in the
-viewport without entering Play; the Loop toggle calls `set-animation-loop`; jump-to-start/end seek
-to `0` and `duration`; step nudges the time by one sample interval. During global Play the same panel
-reflects the rig as the simulation drives it. The preview is non-destructive — the pose lands in the
-runtime `PoseOverride`, never the authored bone transforms — so deselecting or `stop-preview` reverts
-the rig to rest.
+The transport drives preview of the selected rig in Edit, decoupled from the global play state.
+Every control is a typed wrapper over one command:
 
-Dragging the playhead scrubs. The grip's position wraps a drag-local scrub value that emits a
-coalesced `seek-animation` (≤1 send in flight, latest wins — intermediate frames are not critical
-for scrubbing), and flushes the final value on release so the wire reads where you let go, not a
-frame-old value. While paused, each seek runs the one-shot evaluator, so the viewport pose updates
-live as you drag.
+| Control | Command | Effect |
+|---|---|---|
+| Play / pause | `set-animation-playing` | resume or pause without moving the playhead |
+| Clip picker | `play-animation` | load the clip at frame 0 and play it with the current wrap |
+| Loop toggle | `set-animation-loop` | `loop` ↔ `once` (a `pingpong` player reads as looping) |
+| Jump to start / end | `seek-animation` | seek to `0` / the clip duration |
+| Step back / forward | `seek-animation` | nudge the playhead ±1/30 s (`STEP_SEC`) |
 
-## Deferred authoring
+The preview commands set the player's `preview_in_edit` flag. In Edit the animation tick samples
+only flagged rigs; in Play it animates every rig, and entering Play resets each player and clears
+the flag. The sampled pose lands in a runtime `PoseOverride` per bone and never touches the
+authored bone `Transform`, so `stop-preview` (clearing the flag) reverts the rig to its rest pose
+on the next tick.
 
-Keyframe **authoring** is out of scope here, mirroring the Timeline-vs-Animation-window split in
-other engines. The lane renderer draws a single clip bar per entity; keyframe authoring, multi-clip
-sequencing, and per-bone lanes would extend the lane model and draw path, reusing the existing
-seconds↔pixels transform and layout.
+## Scrubbing
+
+The lane area is one full-width pointer-capture surface. On drag it converts pointer x to seconds
+(`xToSec`), moves the canvas playhead directly, and pushes the value through two throttles:
+`useScrubValue` keeps a drag-local value and emits at most once per frame, and a `makeCoalescer`
+sends at most one `seek-animation` at a time, 50 ms apart, latest value wins. Release flushes the
+final value so the wire lands where the pointer let go, not a frame earlier.
+
+Each seek passes `seekBlend: 0.05`. The engine treats it as a self-transition that eases the pose
+toward the seeked time, so sparse ~20 Hz seeks read as one continuous drag in the viewport. A
+paused rig scrubs the same way: the Edit tick samples every preview rig at its playhead each
+frame, so the pose follows the drag without playing.
+
+> [!NOTE]
+> The panel edits playback state only: clip choice, playhead, wrap, play/pause. The keyframe
+> ticks visualize the imported clip's channel sample times; there is no keyframe editing surface.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The panel: regions, transport, scrub wiring | `editor/src/panels/TimelinePanel.tsx` | `TimelinePanel`, `isRiggedEntity` |
-| The canvas renderer (ruler, bars, playhead) | `editor/src/lib/timelineCanvas.ts` | `TimelineCanvas`, `TimelineModel` |
-| The poll gate + state slice | `editor/src/state/store.ts` | `startReconcile`, `refreshAnimation`, `setAnimationState` |
-| Typed control wrappers | `editor/src/control/client.ts` | `getAnimationState`, `listClips`, `playAnimation`, `seekAnimation`, `setAnimationLoop` |
-| Scrub + coalesce primitives | `editor/src/lib/useScrubValue.ts`; `editor/src/control/coalesce.ts` | `useScrubValue`, `makeCoalescer` |
-
-> [!NOTE]
-> The panel is read-only. Keyframe editing, multi-clip sequencing, and per-bone lanes are deferred.
+| The panel composition + rig gate | `panels/TimelinePanel.tsx` | `TimelinePanel`, `isAnimatable` |
+| Transport bar | `components/timeline/TimelineTransport.tsx` | `TimelineTransport` |
+| Surface: headers, scrub, playhead loop | `components/timeline/TimelineSurface.tsx` | `TimelineSurface` |
+| Shared target seam + constants | `components/timeline/shared.ts` | `TimelineTarget`, `TRACK_ACCENT`, `STEP_SEC` |
+| Canvas renderer | `lib/timelineCanvas.ts` | `TimelineCanvas`, `TimelineModel`, `chooseTickStepMs` |
+| The poll gate + state slice | `state/store.ts` | `startReconcile`, `refreshAnimation`, `setAnimationState` |
+| Typed control wrappers | `control/client.ts` | `getAnimationState`, `listClips`, `playAnimation`, `seekAnimation`, `setAnimationLoop` |
+| Scrub + coalesce primitives | `lib/useScrubValue.ts`, `control/coalesce.ts` | `useScrubValue`, `makeCoalescer` |
+| Engine command handlers | `control/src/commands_animation.rs` | `register_animation_commands`, `state_of` |
+| Preview evaluation | `animation/src/runtime.rs` | `tick_animation`, `AnimMode` |
 
 ## Related
 
 - [Playback runtime](../playback-runtime/) — the evaluator whose `time` the playhead shows
 - [Skeleton overlay](../skeleton-overlay/) — the viewport bones the preview moves
-- [Animation data model](../animation-data-model/) — the clip and pose types behind the bars
-- [Asset editor](../../ui-and-editor/asset-editor/) — the same transport + surface components, mounted against the previewed model
+- [Animation data model](../animation-data-model/) — the clip and channel types behind the bars
+- [Asset editor](../../ui-and-editor/asset-editor/) — the second mount of the same transport + surface
+- [Control plane](../../tooling-and-control/control-plane-architecture/) — the version-stamp polling model

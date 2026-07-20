@@ -3,9 +3,8 @@
 /// The scene crate error type.
 ///
 /// The component-access surface returns `Result` where the ECS can fail (an
-/// operation on a stale handle, a component query that finds nothing). Later
-/// phases compose `saffron-json` errors into this enum with `#[from]` for the
-/// serde path.
+/// operation on a stale handle, a component query that finds nothing). The serde
+/// path composes `saffron-json` errors into this enum with `#[from]`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An operation referenced an entity handle the world no longer holds.
@@ -14,6 +13,9 @@ pub enum Error {
     /// A component read found no component of the requested type on the entity.
     #[error("entity has no component of the requested type")]
     MissingComponent,
+    /// A second instance of a scene-singleton component was rejected.
+    #[error("scene already has a {0} component")]
+    SingletonComponent(&'static str),
     /// A reparent was rejected (invalid handle, self-parent, or a cycle).
     #[error("reparent rejected: {0}")]
     Reparent(String),

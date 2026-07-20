@@ -6,134 +6,107 @@ math = true
 
 # Scene hierarchy
 
-The world is an ECS that bakes in no parent/child structure. The hierarchy is one component:
-`Relationship` holds a durable parent `Uuid` (`0` means root) plus two runtime caches, the resolved
-`parent_handle` and a `children` vector of live handles. Only the parent uuid is ever serialized or
-copied; ECS handles are index+generation pairs that do not survive a reload, so the caches are
-derived state, rebuilt by `relink_hierarchy` after any structural change (load, reparent, copy).
+The scene hierarchy turns ECS entities into a forest of parented transforms. Each entity stores one
+durable parent identifier, while resolved handles and world matrices remain runtime caches. This
+keeps saved references stable even though `hecs` handles change when a scene is loaded or copied.
 
-Every entity carries a `Relationship` — `create_entity` seeds a root one alongside
-Id/Name/Transform — so the whole scene is one forest and any entity can be reparented without first
-opting in.
+## Durable links and runtime caches
+
+`Relationship` contains the parent's `Uuid`, a resolved `parent_handle`, and a `children` vector. A
+parent value of `0` marks a root. Only the UUID is serialized:
+
+```json
+{
+  "Relationship": {
+    "parent": "142883415"
+  }
+}
+```
+
+`Scene::relink_hierarchy` rebuilds both handle caches after loading or changing structure. It first
+maps every entity UUID to its live handle, then resolves parent links and fills each parent's child
+list. Missing relationships become roots. Dangling links, self-parenting, and cycles are reset to
+root with a warning, so every subsequent traversal sees a valid forest.
+
+The same pass resolves `SkinnedMesh::bone_handles` from the skin's ordered bone UUIDs. Neither
+relationship handles nor bone handles cross a save/load boundary.
 
 ## World transforms
 
-`Transform` stores the local TRS. The world matrix is a second, derived component: once per frame,
-`update_world_transforms` walks the forest roots-first through the `children` caches and writes
-`WorldTransform { matrix: parent_world * local_matrix }` on every transformable entity. Consumers read
-the cache through `world_matrix` / `world_translation` / `world_rotation` instead of re-deriving
-ancestry per call. `local_matrix` prefers an animation `PoseOverride` (composed from its quaternion
-directly, no Euler round-trip) over the authored `Transform`, so Edit-mode preview stays
-non-destructive.
+`Transform` stores local translation, Euler rotation, and scale. Once per frame,
+`update_world_transforms` starts at every root and follows the cached child lists. For an entity $e$
+with parent $p$, it writes:
 
-Two properties carry the design:
+$$
+W_e = W_p L_e
+$$
 
-- ECS query order is unspecified, so the pass never iterates a query for ordering; the children
-  caches are the only source of parent-before-child order.
-- the composition keeps the full `Mat4`, so a non-uniformly scaled parent still yields a correct
-  `normal_matrix = transpose(inverse(mat3(world)))` downstream.
+where $L_e$ is the entity's local matrix. The pass carries a full `Mat4`, so parent rotation and
+non-uniform scale remain part of the child's world transform. `WorldTransform` is unregistered and
+therefore absent from scene documents.
 
-`WorldTransform` is deliberately left unregistered, the same pattern as `IdComponent`:
-`serialize_entity` only emits components that have a registry row, so a derived per-frame matrix
-never lands in a scene file.
-
-`compose_world_matrix` is the exact, uncached variant that walks the parent chain on demand. It
-exists for the one place the cache may lag a just-edited local transform: reparent math.
+Animation can supply a runtime `PoseOverride`. `local_matrix` uses that quaternion-based TRS while
+the override exists, otherwise it uses the authored `Transform`. Consumers read the cached result
+through `world_matrix`, `world_translation`, and `world_rotation`; `world_matrix` composes the parent
+chain directly if the cache is missing.
 
 ## Reparenting
 
-`set_parent(child, new_parent, keep_world)` is the sanctioned way to change the parent. It refuses
-self-parenting and walks the new parent's ancestry to refuse cycles — without that guard, one bad
-link makes every tree traversal loop forever. With `keep_world` (the editor convention) the child's
-local TRS is rebased so its world transform does not move:
+`set_parent(child, new_parent, keep_world)` is the structural mutation entry point. It rejects stale
+handles, self-parenting, and any new parent whose ancestry already contains the child. Passing
+`None` detaches the child to a root.
 
-$$ local' = parentWorld^{-1} \cdot childWorld $$
+The editor reparents with `keep_world = true`. Before changing the link, the scene composes the
+child's exact world matrix. It then derives a new local matrix under the target parent:
 
-The rebased matrix is decomposed back to translation/Euler/scale by `set_local_from_matrix`. The
-Euler angles come from `quat_to_euler_zyx`, the stable $R_z \cdot R_y \cdot R_x$ extraction, because
-`glam`'s quaternion-based `Quat::to_euler` is numerically unstable at $\pm 90°$ yaw — exactly the
-rotation an editor produces all day. The decompose is TRS-only; a sheared parent loses its shear in
-the round trip, which is accepted because `Transform` cannot represent shear anyway.
+$$
+L'_e = W_{newParent}^{-1} W_e
+$$
 
-`destroy_entity` destroys the whole subtree: descendants are gathered through the children caches
-first (despawning invalidates handles), the entity is detached from its parent's cache, then
-everything is despawned.
+`set_local_from_matrix` decomposes the result into translation, rotation, and scale. The rotation
+uses the engine's stable ZYX extraction before storage in `Transform`. A transform cannot represent
+shear, so decomposition drops shear introduced by a rotated, non-uniformly scaled parent.
 
-## Durability and migration
+Destroying an entity destroys its subtree. `destroy_entity` collects descendants before despawning
+anything, removes the root of that subtree from its parent's child cache, then despawns the collected
+handles.
 
-The component registers like any other, but its serde emits only `{ "parent": <uuid> }` — the
-`SceneSerialize` impl for `Relationship` never touches the caches, so the copy-entity
-serialize→deserialize round trip cannot duplicate live handles. The scene loader resolves parent
-uuids only after every entity exists (`relink_hierarchy` at the end of `scene_from_json`), because a
-child's entry may precede its parent in the entities array.
+## Model forests and skeletons
 
-`SCENE_VERSION` is 4. A pre-v3 document has no Relationship key, so `relink_hierarchy` defaults every
-legacy entity to root; a dangling parent uuid downgrades to root with a warning instead of failing
-the load. The same relink also cuts any parent cycle a hand-edited file carries, so a cyclic parent
-written over the wire is reset to root rather than trusted.
+An imported [glTF model](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html) may place meshes,
+an animation player, and joints on different entities under a container root. Hierarchy helpers
+therefore resolve a model as a subtree rather than assuming its root carries every component.
 
-## Skeletons ride the same tree
+- `model_mesh_entities` returns every mesh-bearing entity in the subtree.
+- `model_rig_entity` finds the first entity with `SkinnedMesh`.
+- `model_morph_entity` finds the entity with `MorphComponent`.
+- `model_player` resolves the model root, then its animation authority.
+- `model_root_of` walks upward from a picked child to its `ModelInstance` root.
 
-A skeleton is not a special structure: every glTF joint imports as an ordinary entity (`Bone` is just
-a filter tag), parented through the same `Relationship` as everything else. The renderable carries a
-`SkinnedMesh` — the mesh asset plus the ordered joint list **by uuid** (glTF joint order, parallel to
-the inverse-bind matrices) and a non-serialized `bone_handles` cache that `relink_hierarchy` resolves
-alongside the parent links.
+Skeleton joints are ordinary entities tagged with `Bone`. After world transforms are updated,
+`joint_matrices` constructs the skinning palette in imported joint order:
 
-Skinning consumes the hierarchy's one propagation pass: after `update_world_transforms`,
-`joint_matrices` fills the GPU palette with
+$$
+J_i = W_{bone_i} B_i^{-1}
+$$
 
-$$ joint_i = world(bone_i) \cdot inverseBind_i $$
-
-so at bind pose every palette entry is the identity, and posing a joint is just moving an entity. The
-skinned node's own transform never composes in (per glTF, joints place the vertices entirely), and
-the skinned draw goes through a dedicated PSO that blends the palette per vertex (`vertexMainSkinned`
-in `mesh.slang`, the extra `VertexSkin` vertex stream). Reparenting a joint out of its skeleton is
-allowed (bones are entities) and simply changes its world matrix, hence the deformation.
-
-## Resolving a model's draw set
-
-A spawned model is a forest, not one entity. A single-identity glTF collapses to one entity that
-carries the `Mesh` directly, but a multi-node model spawns a bare container root with the meshes on
-**child** nodes, and a rigged or animated model puts the `SkinnedMesh` on a child while the container
-carries the `AnimationPlayer`. So a display surface that resolves a single entity and asks whether
-*that* entity has a mesh sees only the container — and wrongly concludes the model is empty, frames a
-point at the origin, or draws no skeleton.
-
-Every surface that asks "what does this model render" therefore resolves the **forest**, through
-matched helpers that walk the subtree:
-
-- `model_mesh_entities(root)` — every `Mesh`/`SkinnedMesh`-bearing entity in the subtree (the draw
-  set); `model_has_renderable(root)` is the cheap predicate the asset-preview gate keys off.
-- `model_rig_entity(root)` — the first `SkinnedMesh` entity, the rig the skeleton overlay and the
-  rig-only commands target. Distinct from `animatable_descendant`, which resolves the *animation
-  authority* (`SkinnedMesh` **or** `AnimationPlayer`) and so stops at a player-bearing container.
-- `model_morph_entity(root)` — the `MorphComponent` carrier a morph-weight write targets.
-
-These compose with `model_root_of` (the nearest `ModelInstance` ancestor), which resolves a picked leaf
-back to the whole model. The forest bounds union — every mesh box transformed to world, skinned ones
-through the joint palette — lives in `assets` as `model_render_aabb` (a subtree) and `scene_render_aabb`
-(the whole scene), since it needs the asset server to read each mesh's box. Preview framing, the
-`focus` command, and the preview floor all consume it, so a multi-part model frames around its
-assembled geometry rather than one node.
+Here $B_i^{-1}$ is the imported inverse-bind matrix. Animation, reparenting, and physics all affect
+skinning through the same hierarchy composition.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Relationship + world-transform components | `scene/src/component.rs` | `Relationship`, `WorldTransform` |
-| Forest-aware model resolvers | `scene/src/hierarchy.rs` | `model_mesh_entities`, `model_has_renderable`, `model_rig_entity`, `model_morph_entity`, `model_root_of` |
-| Forest bounds union | `assets/src/render_scene.rs` | `model_render_aabb`, `scene_render_aabb` |
-| Cache rebuild + cycle cut | `scene/src/hierarchy.rs` | `relink_hierarchy` |
-| Per-frame flatten + accessors | `scene/src/hierarchy.rs` | `update_world_transforms`, `world_matrix`, `compose_world_matrix`, `local_matrix` |
-| Reparent + subtree destroy | `scene/src/hierarchy.rs` · `scene/src/scene.rs` | `set_parent`, `set_local_from_matrix`, `destroy_entity` |
-| Skeleton + joint palette | `scene/src/component.rs` · `scene/src/hierarchy.rs` | `SkinnedMesh`, `Bone`, `joint_matrices` |
-| Skin import + bone spawn | `geometry/src/types.rs` · `assets/src/spawn.rs` | `ImportedSkin`, `save_mesh_skinned`, `spawn_skinned_model` |
-| Skinned draw path | `rendering/src/pipelines.rs` · `assets/shaders/mesh.slang` | `request_mesh_pipeline`, `PsoKey::skinned`, `vertexMainSkinned` |
-| Relationship/skin serde | `scene/src/serde.rs` | `SceneSerialize for Relationship`, `SceneSerialize for SkinnedMesh` |
+| Relationship data | `scene/src/component.rs` | `Relationship`, `WorldTransform`, `SkinnedMesh` |
+| Cache rebuild and transforms | `scene/src/hierarchy.rs` | `relink_hierarchy`, `update_world_transforms`, `world_matrix` |
+| Reparenting | `scene/src/hierarchy.rs` | `set_parent`, `set_local_from_matrix`, `compose_world_matrix` |
+| Subtree destruction | `scene/src/scene.rs` | `destroy_entity`, `subtree_entities` |
+| Model subtree resolution | `scene/src/hierarchy.rs` | `model_mesh_entities`, `model_rig_entity`, `model_player`, `model_root_of` |
+| Relationship serialization | `scene/src/serde.rs` | `SceneSerialize for Relationship` |
 
 ## Related
 
-- [Transform and matrices](../transform-and-matrices/) — the local TRS this hierarchy composes.
-- [Serialization](../scene-serialization/) — the uuid-keyed document and the resolve pass.
-- [Component registry](../component-registry/) — why unregistered derived components stay out of files.
+- [Transform and matrices](../transform-and-matrices/) — local TRS conventions and matrix composition.
+- [Scene serialization](../scene-serialization/) — document structure and UUID preservation.
+- [Animation](../../animation/) — runtime pose overrides and joint palettes.
+- [Picking](../picking/) — resolving a hit child to its model root.

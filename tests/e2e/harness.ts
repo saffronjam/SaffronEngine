@@ -20,6 +20,43 @@ export const ENGINE_BIN =
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+const IS_MACOS = process.platform === "darwin";
+
+/// macOS has no Wayland compositor; the offscreen host needs none. It needs MoltenVK's ICD plus
+/// Homebrew's validation-layer manifest and dynamic-library directory. Applied only when Vulkan
+/// discovery is not already configured, so an explicit override still wins.
+function macosVulkanEnv(): Record<string, string> {
+  const candidates = [
+    "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
+    "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",
+  ];
+  const layerCandidates = [
+    {
+      manifest: "/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d",
+      library: "/opt/homebrew/opt/vulkan-validationlayers/lib",
+    },
+    {
+      manifest: "/usr/local/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d",
+      library: "/usr/local/opt/vulkan-validationlayers/lib",
+    },
+  ];
+  const icd = candidates.find((p) => existsSync(p)) ?? candidates[0];
+  // Run the offscreen (no-window) host: macOS has no tested windowed Metal-surface path, and
+  // offscreen is the mode the editor drives anyway.
+  const env: Record<string, string> = { SAFFRON_EDITOR_NATIVE_VIEWPORT: "1" };
+  if (process.env.VK_ICD_FILENAMES === undefined) env.VK_ICD_FILENAMES = icd;
+  const layer = layerCandidates.find(
+    ({ manifest, library }) => existsSync(manifest) && existsSync(library),
+  );
+  if (process.env.VK_LAYER_PATH === undefined && layer !== undefined) {
+    env.VK_LAYER_PATH = layer.manifest;
+    env.DYLD_FALLBACK_LIBRARY_PATH = process.env.DYLD_FALLBACK_LIBRARY_PATH
+      ? `${layer.library}:${process.env.DYLD_FALLBACK_LIBRARY_PATH}`
+      : layer.library;
+  }
+  return env;
+}
+
 async function waitFor(ready: () => boolean, timeoutMs: number, what: string): Promise<void> {
   const start = Date.now();
   while (!ready()) {
@@ -38,7 +75,7 @@ export class Engine {
   /// and never pollute the source tree. A caller that passes its own `SAFFRON_APPDATA_DIR` owns it.
   readonly appdata: string;
   private proc: ChildProcess;
-  private weston: ChildProcess;
+  private weston: ChildProcess | null;
   private exited = false;
   private buf = "";
   private nextId = 1;
@@ -46,7 +83,7 @@ export class Engine {
 
   private constructor(
     proc: ChildProcess,
-    weston: ChildProcess,
+    weston: ChildProcess | null,
     socketPath: string,
     appdata: string,
     ownsAppdata: boolean,
@@ -66,28 +103,40 @@ export class Engine {
   /// Lines the validation layers flagged as errors (empty = clean). The engine's debug
   /// messenger prints them as `<ts>  ERROR  vulkan  [validation] …` (ANSI off when piped).
   validationErrors(): string[] {
-    return this.buf
-      .split("\n")
-      .filter((line) => /ERROR\s+vulkan\s+\[validation\]/.test(line));
+    return this.buf.split("\n").filter((line) => /ERROR\s+vulkan\s+\[validation\]/.test(line));
   }
 
   static async boot(env: Record<string, string> = {}): Promise<Engine> {
     const runtime = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`;
     const stamp = `${process.pid}-${Date.now()}`;
     const wlSocket = `wl-e2e-${stamp}`;
-    const weston = spawn(
-      "weston",
-      ["--backend=headless", "--width=1280", "--height=720", `--socket=${wlSocket}`, "--idle-time=0"],
-      { env: { ...process.env, XDG_RUNTIME_DIR: runtime }, stdio: "ignore" },
-    );
-    await waitFor(() => existsSync(join(runtime, wlSocket)), 10_000, "weston socket");
+    // The offscreen host needs no window surface. On Linux the harness still boots a headless
+    // weston so any Wayland-touching path has a compositor; macOS has no Wayland (the host renders
+    // through MoltenVK offscreen), so there is nothing to spawn.
+    let weston: ChildProcess | null = null;
+    if (!IS_MACOS) {
+      weston = spawn(
+        "weston",
+        [
+          "--backend=headless",
+          "--width=1280",
+          "--height=720",
+          `--socket=${wlSocket}`,
+          "--idle-time=0",
+        ],
+        { env: { ...process.env, XDG_RUNTIME_DIR: runtime }, stdio: "ignore" },
+      );
+      await waitFor(() => existsSync(join(runtime, wlSocket)), 10_000, "weston socket");
+    }
 
     // A per-boot app-data root under the temp dir so a booted project (e.g. SAFFRON_SCRATCH_PROJECT)
     // writes its userdata/ there and never pollutes the source tree — the host runs with cwd=REPO,
     // where the default relative appdata/ would otherwise land. A caller that sets its own
     // SAFFRON_APPDATA_DIR owns cleanup; otherwise the harness removes this dir on shutdown.
     const ownsAppdata = env.SAFFRON_APPDATA_DIR === undefined;
-    const appdata = ownsAppdata ? mkdtempSync(join(tmpdir(), "saffron-e2e-appdata-")) : env.SAFFRON_APPDATA_DIR;
+    const appdata = ownsAppdata
+      ? mkdtempSync(join(tmpdir(), "saffron-e2e-appdata-"))
+      : env.SAFFRON_APPDATA_DIR;
 
     const socketPath = `/tmp/saffron-e2e-${stamp}.sock`;
     const proc = spawn(ENGINE_BIN, [], {
@@ -95,8 +144,10 @@ export class Engine {
       env: {
         ...process.env,
         XDG_RUNTIME_DIR: runtime,
-        WAYLAND_DISPLAY: wlSocket,
-        SDL_VIDEODRIVER: "wayland",
+        // Wayland only matters to the Linux path; macOS renders offscreen through MoltenVK.
+        ...(IS_MACOS
+          ? macosVulkanEnv()
+          : { WAYLAND_DISPLAY: wlSocket, SDL_VIDEODRIVER: "wayland" }),
         SAFFRON_CONTROL_SOCK: socketPath,
         SAFFRON_APPDATA_DIR: appdata,
         ...env,
@@ -144,10 +195,13 @@ export class Engine {
       // Default 15s; overridable for slow environments (a cold pipeline cache on a proxied
       // GPU driver can stall the host's control drain past 15s during first-render PSO
       // compilation) via SAFFRON_E2E_CALL_TIMEOUT_MS.
-      const timer = setTimeout(() => {
-        socket.destroy();
-        reject(new Error(`timeout calling ${cmd}`));
-      }, Number(process.env.SAFFRON_E2E_CALL_TIMEOUT_MS) || 15_000);
+      const timer = setTimeout(
+        () => {
+          socket.destroy();
+          reject(new Error(`timeout calling ${cmd}`));
+        },
+        Number(process.env.SAFFRON_E2E_CALL_TIMEOUT_MS) || 15_000,
+      );
       socket.on("connect", () => socket.write(JSON.stringify({ id, cmd, params }) + "\n"));
       socket.on("data", (chunk) => {
         data += chunk.toString();
@@ -271,7 +325,9 @@ export class Engine {
   async rig(root: string): Promise<string> {
     const { entities } = await this.call<{ entities: { id: string }[] }>("list-entities");
     for (const e of entities) {
-      const info = await this.call<{ components: Record<string, unknown> }>("inspect", { entity: e.id });
+      const info = await this.call<{ components: Record<string, unknown> }>("inspect", {
+        entity: e.id,
+      });
       if (info.components.SkinnedMesh) {
         return e.id;
       }
@@ -286,7 +342,7 @@ export class Engine {
       // already gone, or quit raced the socket close
     }
     this.proc.kill("SIGTERM");
-    this.weston.kill("SIGTERM");
+    this.weston?.kill("SIGTERM");
     await delay(100);
     this.cleanupAppdata();
   }

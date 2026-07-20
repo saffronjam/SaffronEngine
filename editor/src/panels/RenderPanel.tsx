@@ -1,8 +1,5 @@
-/// The Render panel: the project's render configuration — anti-aliasing, quality, resolution, the
-/// view transform, target FPS, the feature toggles, exposure, and debug overlays. These persist with
-/// the project (the engine serializes them into the `renderSettings` block and reapplies them on
-/// load), so they sit beside Environment as scene-presentation config, not in the Stats telemetry
-/// tool. Bloom and the color grade live in the dedicated Post panel.
+/// The Render panel owns rendering algorithms, quality, performance, and diagnostics. Image
+/// formation controls such as view transform, exposure, bloom, and color grading live in Post.
 ///
 /// Values are read with a shallow-selected subset of `renderStats` so the panel only re-renders when
 /// a config field actually changes — not on the 20 Hz render-stats poll that rewrites the full bag. A
@@ -14,7 +11,7 @@ import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
 import { NumberDrag } from "../components/NumberDrag";
 import { errorText, notifyError } from "../lib/flash";
-import type { RenderStats } from "../protocol";
+import type { Environment, RenderStats } from "../protocol";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Switch } from "@/components/ui/switch";
@@ -28,6 +25,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 type AaMode = RenderStats["aa"];
+type EnvironmentQualityBlock = "atmosphere" | "cloud" | "fog";
 
 const AA_MODES: { value: AaMode; label: string }[] = [
   { value: "off", label: "Off" },
@@ -77,14 +75,6 @@ function nearestResolutionPreset(ratio: number): string {
   }
   return best.value;
 }
-
-/// The HDR→display tonemap operator.
-const TONEMAP_OPTIONS: { value: string; label: string }[] = [
-  { value: "aces", label: "ACES" },
-  { value: "agx", label: "AgX" },
-  { value: "pbr-neutral", label: "PBR Neutral" },
-  { value: "reinhard", label: "Reinhard" },
-];
 
 /// Resolves the target-fps mode to a concrete Hz: a fixed mode is itself; `default` rounds the
 /// presenter's reported display refresh, falling back to the engine's current target until known.
@@ -169,6 +159,8 @@ export function RenderPanel() {
   const hasStats = useEditorStore((s) => s.renderStats !== null);
   const setRenderStats = useEditorStore((s) => s.setRenderStats);
   const setDragActive = useEditorStore((s) => s.setDragActive);
+  const environment = useEditorStore((s) => s.environment);
+  const setEnvironment = useEditorStore((s) => s.setEnvironment);
   const debugOverlays = useEditorStore((s) => s.debugOverlays);
   const setDebugOverlays = useEditorStore((s) => s.setDebugOverlays);
   const targetFpsMode = useEditorStore((s) => s.targetFpsMode);
@@ -185,14 +177,12 @@ export function RenderPanel() {
       const r = s.renderStats;
       return {
         aa: (r?.aa ?? "off") as AaMode,
-        exposureEv: r?.exposureEv ?? 0,
         rtSupported: r?.rtSupported ?? false,
         clustered: r?.clustered ?? false,
         depthPrepass: r?.depthPrepass ?? false,
         shadows: r?.shadows ?? false,
         ibl: r?.ibl ?? false,
         quality: r?.quality ?? "high",
-        tonemap: r?.tonemap ?? "aces",
         ddgi: r?.ddgi ?? false,
         rtShadows: r?.rtShadows ?? false,
         restir: r?.restir ?? false,
@@ -208,6 +198,15 @@ export function RenderPanel() {
       setRenderStats({ ...cur, ...patch });
     }
   };
+
+  useEffect(() => {
+    if (ready && environment === null) {
+      void client
+        .getEnvironment()
+        .then(setEnvironment)
+        .catch(() => {});
+    }
+  }, [ready, environment, setEnvironment]);
 
   // Debug overlays persist with the project but are not undoable (view state, not scene content).
   // Fetch once on mount; the render-panel-gated poll keeps them live (and reflects external `sa`).
@@ -281,14 +280,81 @@ export function RenderPanel() {
       });
   };
 
-  // Render settings persist with the project, so their edits are scene-tab undoable. A
-  // toggle/AA records inline (discrete); exposure scrubbing records one entry per gesture.
+  // Render settings persist with the project, so their edits are scene-tab undoable.
   const recordRender = (
     label: string,
     undo: () => Promise<unknown>,
     redo: () => Promise<unknown>,
   ): void => {
     useEditorStore.getState().pushEdit({ label, undo, redo }, "scene");
+  };
+
+  const setEnvironmentQualityBlock = (
+    block: EnvironmentQualityBlock,
+    value: Environment[EnvironmentQualityBlock],
+  ): Promise<Environment> => {
+    switch (block) {
+      case "atmosphere":
+        return client.setAtmosphere(value as Environment["atmosphere"]);
+      case "cloud":
+        return client.setClouds(value as Environment["cloud"]);
+      case "fog":
+        return client.setFog(value as Environment["fog"]);
+    }
+  };
+
+  const qualityPrior = useRef<{
+    block: EnvironmentQualityBlock;
+    label: string;
+    value: Environment[EnvironmentQualityBlock];
+  } | null>(null);
+
+  const onQualityDragStart = (block: EnvironmentQualityBlock, label: string): void => {
+    const current = useEditorStore.getState().environment;
+    if (!current) return;
+    qualityPrior.current = { block, label, value: current[block] };
+    setDragActive(true);
+  };
+
+  const onQualityDragEnd = (): void => {
+    setDragActive(false);
+    const prior = qualityPrior.current;
+    qualityPrior.current = null;
+    const current = useEditorStore.getState().environment;
+    if (!prior || !current) return;
+    const after = current[prior.block];
+    if (JSON.stringify(prior.value) !== JSON.stringify(after)) {
+      recordRender(
+        prior.label,
+        () => setEnvironmentQualityBlock(prior.block, prior.value),
+        () => setEnvironmentQualityBlock(prior.block, after),
+      );
+    }
+  };
+
+  const patchEnvironmentQuality = <B extends EnvironmentQualityBlock>(
+    block: B,
+    patch: Partial<Environment[B]>,
+    label: string,
+  ): void => {
+    const current = useEditorStore.getState().environment;
+    if (!current) return;
+    const prior = current[block];
+    const after = { ...prior, ...patch } as Environment[B];
+    setEnvironment({ ...current, [block]: after });
+    if (qualityPrior.current === null && JSON.stringify(prior) !== JSON.stringify(after)) {
+      recordRender(
+        label,
+        () => setEnvironmentQualityBlock(block, prior),
+        () => setEnvironmentQualityBlock(block, after),
+      );
+    }
+    void setEnvironmentQualityBlock(block, after)
+      .then(setEnvironment)
+      .catch((err: unknown) => {
+        setEnvironment(current);
+        notifyError(errorText(err));
+      });
   };
 
   const onAa = (mode: AaMode): void => {
@@ -349,22 +415,6 @@ export function RenderPanel() {
       .catch((err: unknown) => notifyError(errorText(err)));
   };
 
-  const onTonemap = (mode: string): void => {
-    const prior = useEditorStore.getState().renderStats?.tonemap ?? "aces";
-    optimistic({ tonemap: mode });
-    if (prior !== mode) {
-      recordRender(
-        "Tonemap",
-        () => client.setTonemap(prior as "aces"),
-        () => client.setTonemap(mode as "aces"),
-      );
-    }
-    void client
-      .setTonemap(mode as "aces")
-      .then((res) => optimistic({ tonemap: res.mode }))
-      .catch((err: unknown) => notifyError(errorText(err)));
-  };
-
   const onToggle = (
     field: keyof RenderStats,
     label: string,
@@ -392,47 +442,6 @@ export function RenderPanel() {
         optimistic({ [field]: previous } as Partial<RenderStats>);
         notifyError(errorText(err));
       });
-  };
-
-  // Exposure scrub: capture the prior at drag start, record once at drag end. A typed
-  // edit (no gesture) records inline.
-  const exposurePrior = useRef<number | null>(null);
-  const onExposureDragStart = (): void => {
-    exposurePrior.current = useEditorStore.getState().renderStats?.exposureEv ?? 0;
-    setDragActive(true);
-  };
-  const onExposureDragEnd = (): void => {
-    setDragActive(false);
-    const prior = exposurePrior.current;
-    exposurePrior.current = null;
-    if (prior === null) {
-      return;
-    }
-    const after = useEditorStore.getState().renderStats?.exposureEv ?? 0;
-    if (prior !== after) {
-      recordRender(
-        "Exposure",
-        () => client.setExposure(prior),
-        () => client.setExposure(after),
-      );
-    }
-  };
-  const onExposure = (ev: number): void => {
-    if (exposurePrior.current === null) {
-      const prior = useEditorStore.getState().renderStats?.exposureEv ?? 0;
-      if (prior !== ev) {
-        recordRender(
-          "Exposure",
-          () => client.setExposure(prior),
-          () => client.setExposure(ev),
-        );
-      }
-    }
-    optimistic({ exposureEv: ev });
-    void client
-      .setExposure(ev)
-      .then((res) => optimistic({ exposureEv: res.exposureEv }))
-      .catch((err: unknown) => notifyError(errorText(err)));
   };
 
   if (!hasStats) {
@@ -529,24 +538,6 @@ export function RenderPanel() {
 
           <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
             <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              View transform
-            </Label>
-            <Select value={cfg.tonemap} disabled={!ready} onValueChange={(v) => onTonemap(v)}>
-              <SelectTrigger size="sm" className="h-7 w-[112px] font-mono text-[11px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {TONEMAP_OPTIONS.map((o) => (
-                  <SelectItem key={o.value} value={o.value} className="text-[11px]">
-                    {o.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
-            <Label className="truncate text-[11px] font-normal text-muted-foreground">
               Target FPS
             </Label>
             <Select
@@ -585,20 +576,173 @@ export function RenderPanel() {
             );
           })}
 
-          <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
-            <Label className="truncate text-[11px] font-normal text-muted-foreground">
-              Exposure (EV)
+          <div className="mt-1 border-t border-border pt-2.5">
+            <Label className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Environment quality
             </Label>
-            <NumberDrag
-              value={cfg.exposureEv}
-              min={-8}
-              max={8}
-              step={0.05}
-              onChange={onExposure}
-              onDragStart={onExposureDragStart}
-              onDragEnd={onExposureDragEnd}
-            />
           </div>
+
+          {environment ? (
+            <>
+              <ToggleRow
+                label="Per-pixel transmittance"
+                checked={environment.atmosphere.perPixelTransmittance}
+                disabled={!ready}
+                onCheckedChange={(next) =>
+                  patchEnvironmentQuality(
+                    "atmosphere",
+                    { perPixelTransmittance: next },
+                    "Atmosphere quality",
+                  )
+                }
+              />
+              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Sky capture cadence
+                </Label>
+                <NumberDrag
+                  value={environment.atmosphere.skyCaptureCadence}
+                  min={1}
+                  max={60}
+                  step={1}
+                  onChange={(value) =>
+                    patchEnvironmentQuality(
+                      "atmosphere",
+                      { skyCaptureCadence: Math.round(value) },
+                      "Atmosphere quality",
+                    )
+                  }
+                  onDragStart={() => onQualityDragStart("atmosphere", "Atmosphere quality")}
+                  onDragEnd={onQualityDragEnd}
+                />
+              </div>
+              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Cloud primary steps
+                </Label>
+                <NumberDrag
+                  value={environment.cloud.primarySteps}
+                  min={1}
+                  max={256}
+                  step={1}
+                  onChange={(value) =>
+                    patchEnvironmentQuality(
+                      "cloud",
+                      { primarySteps: Math.round(value) },
+                      "Cloud quality",
+                    )
+                  }
+                  onDragStart={() => onQualityDragStart("cloud", "Cloud quality")}
+                  onDragEnd={onQualityDragEnd}
+                />
+              </div>
+              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Cloud light steps
+                </Label>
+                <NumberDrag
+                  value={environment.cloud.lightSteps}
+                  min={1}
+                  max={32}
+                  step={1}
+                  onChange={(value) =>
+                    patchEnvironmentQuality(
+                      "cloud",
+                      { lightSteps: Math.round(value) },
+                      "Cloud quality",
+                    )
+                  }
+                  onDragStart={() => onQualityDragStart("cloud", "Cloud quality")}
+                  onDragEnd={onQualityDragEnd}
+                />
+              </div>
+              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Cloud temporal factor
+                </Label>
+                <NumberDrag
+                  value={environment.cloud.temporalFactor}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) =>
+                    patchEnvironmentQuality("cloud", { temporalFactor: value }, "Cloud quality")
+                  }
+                  onDragStart={() => onQualityDragStart("cloud", "Cloud quality")}
+                  onDragEnd={onQualityDragEnd}
+                />
+              </div>
+              <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Volumetric fog quality
+                </Label>
+                <Select
+                  value={environment.fog.quality}
+                  disabled={!ready}
+                  onValueChange={(value) =>
+                    patchEnvironmentQuality(
+                      "fog",
+                      { quality: value as Environment["fog"]["quality"] },
+                      "Fog quality",
+                    )
+                  }
+                >
+                  <SelectTrigger size="sm" className="h-7 w-[112px] text-[11px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(["low", "medium", "high"] as const).map((quality) => (
+                      <SelectItem key={quality} value={quality} className="text-[11px] capitalize">
+                        {quality}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Fog history blend
+                </Label>
+                <NumberDrag
+                  value={environment.fog.historyBlend}
+                  min={0}
+                  max={1}
+                  step={0.005}
+                  onChange={(value) =>
+                    patchEnvironmentQuality("fog", { historyBlend: value }, "Fog quality")
+                  }
+                  onDragStart={() => onQualityDragStart("fog", "Fog quality")}
+                  onDragEnd={onQualityDragEnd}
+                />
+              </div>
+              <ToggleRow
+                label="Fog neighborhood clamp"
+                checked={environment.fog.neighborhoodClamp}
+                disabled={!ready}
+                onCheckedChange={(next) =>
+                  patchEnvironmentQuality("fog", { neighborhoodClamp: next }, "Fog quality")
+                }
+              />
+              <div className="grid grid-cols-[1fr_120px] items-center gap-1.5">
+                <Label className="truncate text-[11px] font-normal text-muted-foreground">
+                  Fog light clamp
+                </Label>
+                <NumberDrag
+                  value={environment.fog.lightClamp}
+                  min={0}
+                  max={50}
+                  step={0.1}
+                  onChange={(value) =>
+                    patchEnvironmentQuality("fog", { lightClamp: value }, "Fog quality")
+                  }
+                  onDragStart={() => onQualityDragStart("fog", "Fog quality")}
+                  onDragEnd={onQualityDragEnd}
+                />
+              </div>
+            </>
+          ) : (
+            <span className="text-[11px] text-muted-foreground">Loading environment quality…</span>
+          )}
 
           <div className="mt-1 border-t border-border pt-2.5">
             <Label className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">

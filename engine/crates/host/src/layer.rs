@@ -21,7 +21,7 @@ use saffron_animation::{AnimMode, AnimationRuntime};
 use saffron_app::{App, Layer};
 use saffron_assets::{
     AssetServer, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind, RenderSceneOptions,
-    RendererScene, RendererUploader, render_scene, write_thumbnail_cache,
+    RendererScene, RendererUploader, advance_time_of_day, render_scene, write_thumbnail_cache,
 };
 use saffron_control::{ControlContext, PreviewSubject, build_preview_scene_for_thumbnail};
 use saffron_runtime::RuntimeSession;
@@ -29,10 +29,13 @@ use saffron_runtime::RuntimeSession;
 use crate::control_renderer::HostControlRenderer;
 use saffron_core::TimeSpan;
 use saffron_protocol::{GetScriptSchemaParams, GetScriptSchemaResult, ScriptFieldDto};
-use saffron_rendering::{GpuQueue, Renderer, Uploader};
+use saffron_rendering::{Renderer, Uploader};
 use saffron_scene::{AnimationPlayer, CameraView, Entity, Mesh, Scene};
 use saffron_sceneedit::{PlayState, ProjectPhase, SceneEditContext, update_scene_edit_camera};
 use saffron_signal::SubscriptionId;
+use saffron_spatial::{
+    ResidencyFacet, ResidencyMask, SourceLevel, SpatialSource, SpatialSourceId, WorldPosition,
+};
 use saffron_window::Window;
 
 use crate::overlay::build_scene_edit_overlay;
@@ -50,6 +53,8 @@ pub struct HostLayer {
     assets: AssetServer,
     /// The control plane: the command registry + the once-per-frame socket drain.
     control: ControlContext,
+    /// Shared hierarchical cell residency and source state.
+    spatial: saffron_spatial::ResidencyManager,
     /// The shared play-mode simulation spine: the Jolt world + script VM + animation runtime.
     /// Idle in Edit; `start`/`stop` on the Edit↔Play edge, `tick_animation` (both modes) and
     /// the gated `step` (play only) each frame. The same `RuntimeSession` the standalone
@@ -138,6 +143,7 @@ impl HostLayer {
             editor,
             assets,
             control,
+            spatial: saffron_spatial::ResidencyManager::new(),
             runtime: RuntimeSession::new(),
             last_play_state: PlayState::Edit,
             uploader: None,
@@ -377,6 +383,8 @@ impl HostLayer {
         // Smoothed edits (`set-transform smooth:1`) converge here too.
         self.editor.step_edit_smoothing(dt.seconds);
 
+        advance_time_of_day(self.editor.active_scene(), dt.seconds);
+
         ParentWatch::Alive
     }
 
@@ -389,6 +397,10 @@ impl HostLayer {
         // Physics + scripts advance every frame while Playing (Paused / Edit do not).
         if self.editor.play_state == PlayState::Playing {
             reasons.push("play");
+        }
+        let time_of_day = &self.editor.active_scene().environment.time_of_day;
+        if time_of_day.enabled && time_of_day.day_length_seconds > 0.0 {
+            reasons.push("time-of-day");
         }
         // Smoothed edits (`set-transform smooth:1`) converge over frames.
         if !self.editor.transform_smoothing.is_empty() {
@@ -459,8 +471,59 @@ impl HostLayer {
             &mut control_renderer,
             &mut self.editor,
             &mut self.assets,
+            &mut self.spatial,
             physics.as_mut(),
         )
+    }
+
+    /// Updates the editor viewport's shared predicted residency source.
+    fn update_spatial_source(&mut self) {
+        const EDITOR_VIEW_SOURCE: SpatialSourceId = SpatialSourceId(1);
+        let camera_position = self
+            .editor
+            .render_camera_view()
+            .view
+            .inverse()
+            .w_axis
+            .truncate();
+        let Ok(position) =
+            WorldPosition::from_render_relative(camera_position, WorldPosition::origin())
+        else {
+            self.spatial.remove_source(EDITOR_VIEW_SOURCE);
+            return;
+        };
+        let ticks = position.global_ticks();
+        let revision = ticks
+            .into_iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+                value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+            });
+        let source = SpatialSource {
+            id: EDITOR_VIEW_SOURCE,
+            revision,
+            position,
+            velocity_mps: glam::DVec3::ZERO,
+            prediction_seconds: 0.25,
+            levels: vec![
+                SourceLevel {
+                    level: 0,
+                    load_radius_cells: 4,
+                    cleanup_radius_cells: 6,
+                },
+                SourceLevel {
+                    level: 4,
+                    load_radius_cells: 2,
+                    cleanup_radius_cells: 3,
+                },
+            ],
+            facets: ResidencyMask::one(ResidencyFacet::Render).with(ResidencyFacet::Editing),
+            priority: 100,
+        };
+        if let Err(error) = self.spatial.update_source(source) {
+            tracing::warn!("spatial source rejected: {error}");
+        }
     }
 
     /// Reconciles the play world + script VM against the editor's play state on the Edit↔Playing
@@ -739,7 +802,7 @@ impl HostLayer {
         if self.uploader.is_some() {
             return;
         }
-        let queue = GpuQueue::new(renderer.device().graphics_queue);
+        let queue = renderer.device().graphics_queue.clone();
         match Uploader::new(renderer.device(), &queue) {
             Ok(uploader) => self.uploader = Some(uploader),
             Err(err) => tracing::error!("uploader create failed: {err}"),
@@ -829,6 +892,7 @@ impl Layer for HostLayer {
         // `frame_host` and `window` are distinct `App` fields, so they borrow disjointly.
         let mut mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
+            self.update_spatial_source();
             // Headless editor mode has no window; the control plane still takes a `Window`
             // facade, so a standalone headless window stands in (its size is unused in publish
             // mode and its signals are inert without an event loop).
@@ -910,10 +974,11 @@ impl Layer for HostLayer {
 
 /// Renders a throwaway preview `scene` through the main forward+ graph on the offscreen
 /// [`saffron_rendering::ViewId::Thumbnail`] view and returns the encoded PNG — the one render
-/// primitive both the async Assets-tile queue and the sync `preview-render` seam drive. Converges a
-/// few frames so TAA / SSAO / GI settle to match the interactive previewer's look, then reads the
-/// offscreen back. Restores the prior active view *without* resetting its temporal state, so a
-/// `Scene → Thumbnail → Scene` excursion never wipes the live viewport's accumulated history.
+/// primitive both the async Assets-tile queue and the sync `preview-render` seam drive. Converges
+/// temporal effects and waits for the preview environment's asynchronous IBL refresh and derived
+/// lighting capture before readback. Restores the prior active view *without* resetting its temporal
+/// state, so a `Scene → Thumbnail → Scene` excursion never wipes the live viewport's accumulated
+/// history.
 pub(crate) fn render_preview_scene_to_png(
     renderer: &mut Renderer,
     uploader: &Uploader,
@@ -923,26 +988,40 @@ pub(crate) fn render_preview_scene_to_png(
     camera: &CameraView,
     size: u32,
 ) -> saffron_rendering::Result<saffron_rendering::ThumbnailPng> {
-    /// Frames rendered before read-back so temporal effects converge to the previewer's look.
-    const CONVERGE_FRAMES: u32 = 8;
+    /// Minimum frames rendered before readback so temporal effects converge to the previewer's look.
+    const MIN_CONVERGE_FRAMES: u32 = 8;
+    /// Safety bound for a failed asynchronous environment refresh.
+    const MAX_CONVERGE_FRAMES: u32 = 256;
 
     let prev_view = renderer.active_view_id();
     renderer.set_active_view(saffron_rendering::ViewId::Thumbnail);
-    renderer.set_viewport_desired_size(saffron_rendering::ViewId::Thumbnail, size, size)?;
-    let options = RenderSceneOptions {
-        show_editor_camera_models: false,
-        show_grid: false,
-    };
-    for _ in 0..CONVERGE_FRAMES {
-        {
-            let mut driver = RendererScene::new(renderer, uploader, skinning);
-            render_scene(&mut driver, scene, assets, camera, options);
+    let result = (|| {
+        renderer.set_viewport_desired_size(saffron_rendering::ViewId::Thumbnail, size, size)?;
+        let options = RenderSceneOptions {
+            show_editor_camera_models: false,
+            show_grid: false,
+        };
+        let mut converged = false;
+        for frame in 0..MAX_CONVERGE_FRAMES {
+            {
+                let mut driver = RendererScene::new(renderer, uploader, skinning);
+                render_scene(&mut driver, scene, assets, camera, options);
+            }
+            renderer.render_scene_offscreen()?;
+            if frame + 1 >= MIN_CONVERGE_FRAMES && renderer.active_environment_converged() {
+                converged = true;
+                break;
+            }
         }
-        renderer.render_scene_offscreen()?;
-    }
-    let png = renderer.encode_active_offscreen_png()?;
+        if !converged {
+            return Err(saffron_rendering::Error::ShaderLoad(
+                "thumbnail environment did not converge".to_owned(),
+            ));
+        }
+        renderer.encode_active_offscreen_png()
+    })();
     renderer.restore_active_view_no_reset(prev_view);
-    Ok(png)
+    result
 }
 
 #[cfg(test)]
@@ -1349,7 +1428,7 @@ mod tests {
         use crate::viewport_shm::{ShmView, ShmViewConfig, ViewportShmPublisher};
         use std::ffi::CString;
 
-        let name = format!("/saffron-host-teardown-shm-{}", std::process::id());
+        let name = saffron_test_support::unique_shm_name();
         let mut host = standalone("shm-drop");
         let mut shm = ViewportShmPublisher::new();
         shm.enable(ShmViewConfig {

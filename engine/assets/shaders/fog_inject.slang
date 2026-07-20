@@ -8,10 +8,10 @@
 //
 // Set 0 is the mesh light set (reused verbatim: globals/lights/clusters/clusterParams + shadow maps,
 // with COMPUTE added to its stage flags). Set 1 is the fog volume: the scatter storage image + the
-// froxel-grid UBO. The light/shadow math is the promoted public `lighting` module — one shared copy
-// with the forward mesh path, the HG phase substituting for the surface BRDF.
+// froxel-grid UBO. The binding-free light/shadow math is shared with the forward mesh path, with the
+// HG phase substituting for the surface BRDF.
 
-import lighting;
+import lighting_common;
 
 [[vk::binding(0, 0)]] ConstantBuffer<LightGlobals> globals;
 [[vk::binding(1, 0)]] StructuredBuffer<GpuLight> lights;
@@ -21,8 +21,9 @@ import lighting;
 [[vk::binding(5, 0)]] Sampler2DShadow spotShadowMap;
 [[vk::binding(6, 0)]] SamplerCube pointShadowMap;
 [[vk::binding(7, 0)]] SamplerCube pointShadowMapDynamic;
+[[vk::binding(12, 0)]] Sampler2DArray<float> cloudShadowMap;
 
-// The froxel-grid params UBO (mirrors `froxel_fog::FogGridParams`, 272 B std140).
+// The froxel-grid params UBO (mirrors `froxel_fog::FogGridParams`, 288 B std140).
 struct FogGrid
 {
     float4x4 invProjection; // clip -> view (froxel-center reconstruction)
@@ -33,6 +34,7 @@ struct FogGrid
     float4 zPlanes;         // x near, y far (shared with the cull), z froxel-far coverage
     float4 temporal;        // x historyBlend, y historyValid, z neighborhoodClamp, w lightClamp
     float4 jitter;          // xy sub-froxel NDC jitter, z jitter phase index, w scene time (s)
+    float4 globalWind;      // xyz shared wind velocity, w time-of-day clock (s)
 };
 
 // One local FogVolume (mirrors `froxel_fog::FogVolumeGpu`, std430, 160 B). `localFromWorld` frames the
@@ -159,8 +161,11 @@ float fogVolumeNoise(float3 worldPos, FogVolumeGpu v)
     }
     float scale = v.noiseParams.x;
     float detail = v.noiseParams.z;
-    float3 drift = v.wind.xyz * (v.emissiveSpeed.w * grid.jitter.w);
-    float3 p = worldPos * scale - drift;
+    bool hasLocalWind = dot(v.wind.xyz, v.wind.xyz) > 1e-8;
+    float3 velocity = hasLocalWind ? v.wind.xyz * v.emissiveSpeed.w : grid.globalWind.xyz;
+    float time = hasLocalWind ? grid.jitter.w : grid.globalWind.w;
+    float3 drift = velocity * time;
+    float3 p = (worldPos - drift) * scale;
     float base = noiseTex.SampleLevel(p, 0.0);
     float det = noiseTex.SampleLevel(p * 2.02 + 11.5, 0.0);
     float erosion = saturate(base - detail * det);
@@ -232,6 +237,8 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
 
     float lightClamp = grid.temporal.w;
     float3 inScatter = fogDirectionalInScatter(worldPos, viewDir, phaseG, globals, shadowMap);
+    inScatter *= cloudShadowVisibility(
+        worldPos, cloudShadowMap, globals, globals.cloudShadowMeta.y);
     if (lightClamp > 0.0)
     {
         inScatter = min(inScatter, lightClamp);

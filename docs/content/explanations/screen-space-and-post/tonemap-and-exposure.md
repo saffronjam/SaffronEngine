@@ -44,6 +44,10 @@ Between exposure and the transform the pass folds a scene-linear [color grade](.
 white balance, contrast, saturation, and ASC-CDL — so the operator is the **view/display transform**,
 not the place look is injected. A neutral grade is a mathematical identity, leaving the frame unchanged.
 
+The Post panel's Tone tab owns both exposure and the view transform. Keeping these controls together
+matches their order in the display pipeline; renderer quality and diagnostic controls remain in the
+Render panel.
+
 ## A compute pass, in place
 
 The offscreen is an `rgba16f` storage image. The tonemap shader binds it as an `RWTexture2D` (set 0,
@@ -67,6 +71,7 @@ follows; FXAA uses the same read-modify-write shape.
 | HDR offscreen format | `pipelines.rs` | `OFFSCREEN_COLOR_FORMAT` (`R16G16B16A16_SFLOAT`) |
 | Layout transitions | `render_graph.rs` | `RgUsage::StorageImageRwCompute`, `RgUsage::SampledRead` |
 | Exposure control command | `commands_render.rs` | the `set-exposure` command (EV stops → $2^{EV}$) |
+| Editor controls | `editor/src/panels/PostProcessPanel.tsx` | `PostProcessPanel`, `onTonemap` |
 
 ## Related
 

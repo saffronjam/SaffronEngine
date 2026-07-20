@@ -7,6 +7,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Engine } from "./harness.ts";
+import { prepareScene } from "./test-utils.ts";
 import type {
   BakeLookResult,
   ImportLutResult,
@@ -61,7 +62,7 @@ beforeAll(async () => {
   engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
   // Size the scene view small so the tonemap compute dispatch stays cheap on the software rasterizer
   // the headless (weston) surface may fall back to.
-  await engine.call("set-viewport-size", { view: "scene", width: 480, height: 270 });
+  await prepareScene(engine);
   // A bright cube so the grade has real HDR radiance to act on before the view transform.
   await engine.call("add-entity", { preset: "cube" });
 });

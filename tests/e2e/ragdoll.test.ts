@@ -12,6 +12,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
+import { bootEngine, Cleaner, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
 let meshId = ""; // the imported model root shared by the passive + active sections
@@ -20,7 +21,9 @@ let sharedFloor = "";
 let ankle = "";
 let restAnkleY = 0;
 let beforeY = 0; // the animated ankle height at play start, before physics takes over
-let created: string[] = []; // per-case throwaway entities for the panel + character sections
+const suiteCleaner = new Cleaner();
+const sharedCleaner = new Cleaner();
+const caseCleaner = new Cleaner();
 
 const LEG = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 
@@ -44,36 +47,42 @@ interface MoveResult {
 }
 
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation.y;
+  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation
+    .y;
 
 const world = async (entity: string): Promise<Vec3> =>
   (await engine.call<{ translation: Vec3 }>("get-world-transform", { entity })).translation;
 
 async function spawn(name: string): Promise<string> {
   const id = (await engine.call<{ id: string }>("create-entity", { name })).id;
-  created.push(id);
-  return id;
+  return trackEntity(caseCleaner, engine, id);
 }
 
 async function cleanup(): Promise<void> {
   await engine.call("stop").catch(() => {});
-  for (const id of created) {
-    await engine.call("destroy-entity", { entity: id }).catch(() => {});
-  }
-  created = [];
+  await caseCleaner.cleanup();
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  meshId = (await engine.importEntity(LEG)).id;
+  engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
+  suiteCleaner.defer(() => sharedCleaner.cleanup());
+  suiteCleaner.defer(() => cleanup());
+  meshId = trackEntity(sharedCleaner, engine, (await engine.importEntity(LEG)).id);
   rigId = await engine.rig(meshId); // the rig descendant carries SkinnedMesh + BonePhysics
   const info = await engine.call<Inspect>("inspect", { entity: rigId });
   ankle = info.components.SkinnedMesh!.bones[2]; // hip / knee / ankle — the leaf
   restAnkleY = await worldY(ankle); // authored rest pose (Edit)
 
   // A floor below the leg so the collapsed ragdoll settles rather than falling forever.
-  sharedFloor = (await engine.call<{ id: string }>("create-entity", { name: "Floor" })).id;
-  await engine.call("set-transform", { entity: sharedFloor, translation: { x: 0, y: restAnkleY - 1.5, z: 0 } });
+  sharedFloor = trackEntity(
+    sharedCleaner,
+    engine,
+    (await engine.call<{ id: string }>("create-entity", { name: "Floor" })).id,
+  );
+  await engine.call("set-transform", {
+    entity: sharedFloor,
+    translation: { x: 0, y: restAnkleY - 1.5, z: 0 },
+  });
   await engine.call("add-component", { entity: sharedFloor, component: "Collider" });
   await engine.call("set-component-field", {
     entity: sharedFloor,
@@ -83,7 +92,7 @@ beforeAll(async () => {
   });
 });
 afterAll(async () => {
-  await engine?.shutdown();
+  await suiteCleaner.cleanup();
 });
 
 test("import auto-fits a BonePhysicsComponent (one entry per bone)", async () => {
@@ -96,7 +105,10 @@ test("enable-ragdoll collapses the leaf bone onto the floor; disable restores th
   await engine.settle(200);
   const beforePlayY = await worldY(ankle); // ~rest pose at play start
 
-  const enabled = await engine.call<RagdollResult>("enable-ragdoll", { entity: meshId, enabled: true });
+  const enabled = await engine.call<RagdollResult>("enable-ragdoll", {
+    entity: meshId,
+    enabled: true,
+  });
   expect(enabled.present).toBe(true);
   expect(enabled.bones).toBe(3);
 
@@ -110,7 +122,10 @@ test("enable-ragdoll collapses the leaf bone onto the floor; disable restores th
   expect(Math.abs(settledY - limpY)).toBeLessThan(0.15); // came to rest
 
   // Disable -> the ragdoll is removed; the bone reverts toward the animation/rest pose.
-  const disabled = await engine.call<RagdollResult>("enable-ragdoll", { entity: meshId, enabled: false });
+  const disabled = await engine.call<RagdollResult>("enable-ragdoll", {
+    entity: meshId,
+    enabled: false,
+  });
   expect(disabled.present).toBe(false);
   await engine.settle(400);
   expect(await worldY(ankle)).toBeGreaterThan(limpY + 0.1); // back up toward rest
@@ -125,7 +140,10 @@ test("set-ragdoll auto-creates the ragdoll and reports its blend state", async (
   beforeY = await worldY(ankle); // animated pose at play start, before physics
 
   // No enable-ragdoll round-trip: the first set-ragdoll builds the ragdoll, passive (motors off).
-  const createdRagdoll = await engine.call<RagdollResult>("set-ragdoll", { entity: meshId, bodyWeight: 1 });
+  const createdRagdoll = await engine.call<RagdollResult>("set-ragdoll", {
+    entity: meshId,
+    bodyWeight: 1,
+  });
   expect(createdRagdoll.present).toBe(true);
   expect(createdRagdoll.active).toBe(false);
   expect(createdRagdoll.bones).toBe(3);
@@ -135,43 +153,37 @@ test("set-ragdoll auto-creates the ragdoll and reports its blend state", async (
   expect(got.present).toBe(true);
 });
 
-test(
-  "a hit blends the limb to physics; ramping the weight back to 0 recovers the animation",
-  async () => {
-    // Full physics weight (passive): the leaf bone falls under gravity, diverging from the animation.
-    // SwingTwist motors restore relative joint pose, not the unconstrained root's world height — so a
-    // free ragdoll's recover to the *animated pose* is the weight blend, not the motors (a kinematic
-    // root anchor, the standing recover, is deferred). The motor path runs under the active flag below.
-    await engine.settle(2500);
-    const limpY = await worldY(ankle);
-    expect(limpY).toBeLessThan(beforeY - 0.2); // physics took over and fell
+test("a hit blends the limb to physics; ramping the weight back to 0 recovers the animation", async () => {
+  // Full physics weight (passive): the leaf bone falls under gravity, diverging from the animation.
+  // SwingTwist motors restore relative joint pose, not the unconstrained root's world height — so a
+  // free ragdoll's recover to the *animated pose* is the weight blend, not the motors (a kinematic
+  // root anchor, the standing recover, is deferred). The motor path runs under the active flag below.
+  await engine.settle(2500);
+  const limpY = await worldY(ankle);
+  expect(limpY).toBeLessThan(beforeY - 0.2); // physics took over and fell
 
-    // Motors on: the drive runs every fixed step toward the animation target (covered validation-clean).
-    await engine.call<RagdollResult>("set-ragdoll", { entity: meshId, active: true });
-    expect((await engine.call<RagdollResult>("get-ragdoll", { entity: meshId })).active).toBe(true);
-    await engine.settle(1000);
+  // Motors on: the drive runs every fixed step toward the animation target (covered validation-clean).
+  await engine.call<RagdollResult>("set-ragdoll", { entity: meshId, active: true });
+  expect((await engine.call<RagdollResult>("get-ragdoll", { entity: meshId })).active).toBe(true);
+  await engine.settle(1000);
 
-    // Ramp the physics weight back to 0: the bone follows the animation again (the recover).
-    await engine.call<RagdollResult>("set-ragdoll", { entity: meshId, active: false, bodyWeight: 0 });
-    await engine.settle(600);
-    const recoverY = await worldY(ankle);
-    expect(recoverY).toBeGreaterThan(limpY + 0.1); // back up at the animated pose
-    expect(Math.abs(recoverY - beforeY)).toBeLessThan(0.3);
+  // Ramp the physics weight back to 0: the bone follows the animation again (the recover).
+  await engine.call<RagdollResult>("set-ragdoll", { entity: meshId, active: false, bodyWeight: 0 });
+  await engine.settle(600);
+  const recoverY = await worldY(ankle);
+  expect(recoverY).toBeGreaterThan(limpY + 0.1); // back up at the animated pose
+  expect(Math.abs(recoverY - beforeY)).toBeLessThan(0.3);
 
-    await engine.call("stop");
-    await engine.settle();
+  await engine.call("stop");
+  await engine.settle();
 
-    // The passive + active sections are done with the shared rig; tear it down so the panel +
-    // character cases below start from a clean scene.
-    await engine.call("destroy-entity", { entity: meshId }).catch(() => {});
-    await engine.call("destroy-entity", { entity: sharedFloor }).catch(() => {});
-  },
-  20000,
-);
+  // The passive + active sections are done with the shared rig; tear it down so the panel +
+  // character cases below start from a clean scene.
+  await sharedCleaner.cleanup();
+}, 20000);
 
 test("enable-ragdoll builds a ragdoll and set/get-ragdoll drive its blend", async () => {
-  const leg = await engine.importEntity(LEG);
-  created.push(leg.id);
+  const leg = trackEntity(caseCleaner, engine, await engine.importEntity(LEG));
   await engine.call("play");
   await engine.settle(200);
 
@@ -191,8 +203,7 @@ test("enable-ragdoll builds a ragdoll and set/get-ragdoll drive its blend", asyn
 });
 
 test("the ragdoll commands error before play (the panel play-gates them)", async () => {
-  const leg = await engine.importEntity(LEG);
-  created.push(leg.id);
+  const leg = trackEntity(caseCleaner, engine, await engine.importEntity(LEG));
   // No play: ctx.physics is null, so enable-ragdoll rejects.
   await expect(engine.call("enable-ragdoll", { entity: leg.id })).rejects.toThrow();
   await cleanup();
@@ -248,7 +259,12 @@ test("a capsule character settles on the floor and walks across it", async () =>
   const char = await spawn("Walker");
   await engine.call("set-transform", { entity: char, translation: { x: 0, y: 1.2, z: 0 } });
   await engine.call("add-component", { entity: char, component: "Collider" });
-  await engine.call("set-component-field", { entity: char, component: "Collider", field: "shape", value: "capsule" });
+  await engine.call("set-component-field", {
+    entity: char,
+    component: "Collider",
+    field: "shape",
+    value: "capsule",
+  });
   await engine.call("set-component-field", {
     entity: char,
     component: "Collider",
@@ -263,7 +279,10 @@ test("a capsule character settles on the floor and walks across it", async () =>
   expect(settled.y).toBeGreaterThan(0.1); // standing on the floor, not sunk through
 
   // Walk +X for ~1.5 s.
-  const moved = await engine.call<MoveResult>("move-character", { entity: char, velocity: { x: 2, y: 0, z: 0 } });
+  const moved = await engine.call<MoveResult>("move-character", {
+    entity: char,
+    velocity: { x: 2, y: 0, z: 0 },
+  });
   expect(moved.onGround).toBe(true);
   await engine.settle(1500);
 

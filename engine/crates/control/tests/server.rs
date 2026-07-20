@@ -9,10 +9,10 @@ use std::os::unix::net::UnixStream;
 use saffron_control::start_control_server;
 use serde_json::Value;
 
-/// A unique socket path under the temp dir for one test (avoids cross-test
-/// collisions when run in parallel).
+/// A unique short socket path for one test. Unix-domain socket paths have a small fixed limit, and
+/// macOS's per-user temporary directory already consumes most of it.
 fn temp_socket(tag: &str) -> String {
-    let dir = std::env::temp_dir();
+    let dir = std::path::Path::new("/tmp");
     let unique = format!(
         "saffron-control-{tag}-{}-{}.sock",
         std::process::id(),

@@ -8,9 +8,9 @@
 //! `saffron-protocol` types, so this harness and the `sa` CLI cannot drift on framing or the `Uuid`
 //! decimal-string encoding.
 //!
-//! Boot isolation: each [`TestEngine`] spawns its own headless weston on a per-run Wayland socket
-//! and launches the host pointed at a per-run control socket, so two harnesses never collide. It
-//! honors `SAFFRON_ANIMA_BIN` so it can run against an alternate host binary.
+//! Boot isolation: each [`TestEngine`] launches the host on a per-run control socket. Linux also
+//! gets a per-run headless Weston socket; macOS uses the host's native offscreen path. It honors
+//! `SAFFRON_ANIMA_BIN` so it can run against an alternate host binary.
 
 #![deny(unsafe_code)]
 
@@ -110,7 +110,8 @@ fn value_token(value: &str) -> &str {
     &value[..end]
 }
 
-/// How long to wait for the weston socket file to appear before giving up.
+/// How long to wait for the Weston socket file to appear before giving up.
+#[cfg(target_os = "linux")]
 const WESTON_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to wait for the host's control socket to appear (or the host to exit) after launch.
@@ -142,6 +143,12 @@ pub enum Error {
     /// A control call failed (transport, engine error, or typed decode).
     #[error(transparent)]
     Wire(#[from] WireError),
+    /// The requested startup project reached the failed phase.
+    #[error("project load failed: {message}")]
+    ProjectLoad {
+        /// The loader's error message.
+        message: String,
+    },
 }
 
 /// The crate result alias bound to this crate's [`Error`].
@@ -205,18 +212,16 @@ pub struct TestEngine {
     weston: Option<Captured>,
     log: Arc<Mutex<String>>,
     control_socket: String,
-    wayland_socket_path: PathBuf,
+    wayland_socket_path: Option<PathBuf>,
     appdata_dir: PathBuf,
 }
 
 impl TestEngine {
-    /// Boots a headless engine with `env` merged over the boot defaults, returning a driver bound to
-    /// its control socket: a per-run weston + a per-run control socket, the engine pointed at both,
-    /// stdout+stderr captured for [`validation_errors`].
+    /// Boots an engine with `env` merged over the platform defaults, returning a driver bound to
+    /// its per-run control socket with stdout+stderr captured for [`validation_errors`].
     ///
     /// [`validation_errors`]: TestEngine::validation_errors
     pub fn boot(env: &[(&str, &str)]) -> Result<Self> {
-        let runtime = runtime_dir();
         let stamp = format!(
             "{}-{}",
             std::process::id(),
@@ -226,33 +231,41 @@ impl TestEngine {
                 .as_nanos()
         );
 
-        let wl_socket = format!("wl-e2e-{stamp}");
-        let wayland_socket_path = PathBuf::from(&runtime).join(&wl_socket);
-        let weston_log = Arc::new(Mutex::new(String::new()));
-        let weston_child = Command::new("weston")
-            .args([
-                "--backend=headless",
-                "--width=1280",
-                "--height=720",
-                &format!("--socket={wl_socket}"),
-                "--idle-time=0",
-            ])
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| Error::Spawn {
-                what: "weston",
-                source,
-            })?;
-        let weston = Captured::capture(weston_child, &weston_log);
+        #[cfg(target_os = "linux")]
+        let (mut weston, wayland_socket_path, runtime, wl_socket) = {
+            let runtime = runtime_dir();
+            let wl_socket = format!("wl-e2e-{stamp}");
+            let wayland_socket_path = PathBuf::from(&runtime).join(&wl_socket);
+            let weston_log = Arc::new(Mutex::new(String::new()));
+            let weston_child = Command::new("weston")
+                .args([
+                    "--backend=headless",
+                    "--width=1280",
+                    "--height=720",
+                    &format!("--socket={wl_socket}"),
+                    "--idle-time=0",
+                ])
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|source| Error::Spawn {
+                    what: "weston",
+                    source,
+                })?;
+            let weston = Captured::capture(weston_child, &weston_log);
 
-        if !wait_for(WESTON_TIMEOUT, || wayland_socket_path.exists()) {
-            weston.terminate();
-            return Err(Error::Timeout {
-                what: "weston socket",
-            });
-        }
+            if !wait_for(WESTON_TIMEOUT, || wayland_socket_path.exists()) {
+                weston.terminate();
+                return Err(Error::Timeout {
+                    what: "weston socket",
+                });
+            }
+            (Some(weston), Some(wayland_socket_path), runtime, wl_socket)
+        };
+
+        #[cfg(target_os = "macos")]
+        let (mut weston, wayland_socket_path) = (None::<Captured>, None::<PathBuf>);
 
         let control_socket = format!("/tmp/saffron-e2e-{stamp}.sock");
         let log = Arc::new(Mutex::new(String::new()));
@@ -265,14 +278,18 @@ impl TestEngine {
 
         let mut command = Command::new(engine_binary());
         command
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("WAYLAND_DISPLAY", &wl_socket)
-            .env("SDL_VIDEODRIVER", "wayland")
             .env("SAFFRON_CONTROL_SOCK", &control_socket)
             .env("SAFFRON_APPDATA_DIR", &appdata_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
+        command
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("WAYLAND_DISPLAY", &wl_socket)
+            .env("SDL_VIDEODRIVER", "wayland");
+        #[cfg(target_os = "macos")]
+        configure_macos_host(&mut command);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -290,28 +307,66 @@ impl TestEngine {
         if host_has_exited(&mut host) {
             let captured = current_log(&log);
             host.terminate();
-            weston.terminate();
-            let _ = std::fs::remove_file(&wayland_socket_path);
+            if let Some(weston) = weston.take() {
+                weston.terminate();
+            }
+            if let Some(path) = &wayland_socket_path {
+                let _ = std::fs::remove_file(path);
+            }
             let _ = std::fs::remove_dir_all(&appdata_dir);
             return Err(Error::EngineExited { log: captured });
         }
         if !appeared {
             host.terminate();
-            weston.terminate();
+            if let Some(weston) = weston.take() {
+                weston.terminate();
+            }
             let _ = std::fs::remove_dir_all(&appdata_dir);
             return Err(Error::Timeout {
                 what: "control socket",
             });
         }
 
-        Ok(Self {
+        let mut engine = Self {
             client: Client::new(control_socket.clone()),
             host: Some(host),
-            weston: Some(weston),
+            weston,
             log,
             control_socket,
             wayland_socket_path,
             appdata_dir,
+        };
+        if env.iter().any(|(key, value)| {
+            matches!(*key, "SAFFRON_PROJECT" | "SAFFRON_SCRATCH_PROJECT") && !value.is_empty()
+        }) {
+            if let Err(error) = engine.wait_for_project_ready() {
+                engine.shutdown();
+                return Err(error);
+            }
+        }
+        Ok(engine)
+    }
+
+    fn wait_for_project_ready(&mut self) -> Result<()> {
+        let start = Instant::now();
+        while start.elapsed() < CONTROL_TIMEOUT {
+            let status = self.client.call_raw("project-status", json!({}))?;
+            match status.get("phase").and_then(Value::as_str) {
+                Some("ready") => return Ok(()),
+                Some("failed") => {
+                    return Err(Error::ProjectLoad {
+                        message: status
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown project-load error")
+                            .to_owned(),
+                    });
+                }
+                _ => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        Err(Error::Timeout {
+            what: "project readiness",
         })
     }
 
@@ -368,7 +423,7 @@ impl TestEngine {
         std::thread::sleep(duration);
     }
 
-    /// Tears down cleanly: ask the engine to `quit`, then SIGTERM the host and weston and join the
+    /// Tears down cleanly: ask the engine to `quit`, terminate its child processes, and join the
     /// capture threads. Idempotent — a second call (or the `Drop` backstop) is a no-op.
     pub fn shutdown(&mut self) {
         // Best-effort graceful quit; the engine may already be gone or race the socket close.
@@ -380,14 +435,16 @@ impl TestEngine {
             weston.terminate();
         }
         let _ = std::fs::remove_file(&self.control_socket);
-        let _ = std::fs::remove_file(&self.wayland_socket_path);
+        if let Some(path) = &self.wayland_socket_path {
+            let _ = std::fs::remove_file(path);
+        }
         let _ = std::fs::remove_dir_all(&self.appdata_dir);
     }
 }
 
 impl Drop for TestEngine {
     fn drop(&mut self) {
-        // Backstop for a test that panics before `shutdown`: never leak a host or weston process.
+        // Backstop for a test that panics before `shutdown`: never leak a child process.
         if self.host.is_some() || self.weston.is_some() {
             self.shutdown();
         }
@@ -395,9 +452,53 @@ impl Drop for TestEngine {
 }
 
 /// `XDG_RUNTIME_DIR` if set, else `/run/user/<uid>`.
+#[cfg(target_os = "linux")]
 fn runtime_dir() -> String {
     std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{}", rustix::process::getuid().as_raw()))
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_host(command: &mut Command) {
+    const ICD_CANDIDATES: [&str; 2] = [
+        "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
+        "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",
+    ];
+    const LAYER_CANDIDATES: [(&str, &str); 2] = [
+        (
+            "/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d",
+            "/opt/homebrew/opt/vulkan-validationlayers/lib",
+        ),
+        (
+            "/usr/local/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d",
+            "/usr/local/opt/vulkan-validationlayers/lib",
+        ),
+    ];
+    command.env("SAFFRON_EDITOR_NATIVE_VIEWPORT", "1");
+    if std::env::var_os("VK_ICD_FILENAMES").is_none() {
+        let icd = ICD_CANDIDATES
+            .iter()
+            .find(|path| PathBuf::from(path).exists())
+            .copied()
+            .unwrap_or(ICD_CANDIDATES[0]);
+        command.env("VK_ICD_FILENAMES", icd);
+    }
+    if std::env::var_os("VK_LAYER_PATH").is_none()
+        && let Some((manifest_dir, library_dir)) =
+            LAYER_CANDIDATES.iter().find(|(manifest_dir, library_dir)| {
+                PathBuf::from(manifest_dir).is_dir() && PathBuf::from(library_dir).is_dir()
+            })
+    {
+        command.env("VK_LAYER_PATH", manifest_dir);
+        let mut fallback = std::ffi::OsString::from(library_dir);
+        if let Some(existing) = std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH")
+            && !existing.is_empty()
+        {
+            fallback.push(":");
+            fallback.push(existing);
+        }
+        command.env("DYLD_FALLBACK_LIBRARY_PATH", fallback);
+    }
 }
 
 /// The host binary to spawn: `SAFFRON_ANIMA_BIN` if set, else the `saffron-host` sibling of this

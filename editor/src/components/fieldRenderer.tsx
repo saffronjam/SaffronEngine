@@ -40,15 +40,15 @@ export type FieldKind =
   | "struct";
 
 /// Asset kind a `uuid` field references (the AssetPicker filters the catalog by this).
-export type AssetKind = "mesh" | "texture" | "material" | "model" | "animation";
+export type AssetKind = "mesh" | "texture" | "material" | "model" | "animation" | "vegetation-map";
 
 export interface FieldHint {
   kind: FieldKind;
   min?: number;
   max?: number;
   step?: number;
-  /// Degree semantics: `convertRadians` true converts UI<->wire (Transform.rotation
-  /// only). `unit:"deg"` is a display label/clamp with NO conversion (spot angles).
+  /// Degree semantics: `convertRadians` true converts UI<->wire for radians-backed fields.
+  /// `unit:"deg"` without it is a display label/clamp only.
   unit?: "deg";
   convertRadians?: boolean;
   /// For `uuid` fields: which asset catalog the picker filters to.
@@ -75,6 +75,7 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Transform.rotation": { kind: "vec3", step: 0.5, unit: "deg", convertRadians: true },
 
   "Mesh.mesh": { kind: "uuid", asset: "mesh" },
+  "VegetationField.map": { kind: "uuid", asset: "vegetation-map" },
   "MaterialAsset.material": { kind: "uuid", asset: "material" },
 
   "Camera.fov": { kind: "number", min: 1, max: 179, step: 0.5 },
@@ -115,6 +116,13 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Material.doubleSided": { kind: "bool" },
 
   "DirectionalLight.direction": { kind: "vec3", step: 0.01 },
+  "DirectionalLight.atmosphereRole": {
+    kind: "enum",
+    options: [
+      { value: "sun", label: "Sun" },
+      { value: "moon", label: "Moon" },
+    ],
+  },
   "DirectionalLight.color": { kind: "color3" },
   "DirectionalLight.intensity": { kind: "number", min: 0, max: 50, step: 0.05 },
   "DirectionalLight.ambient": { kind: "slider", min: 0, max: 1, step: 0.01 },

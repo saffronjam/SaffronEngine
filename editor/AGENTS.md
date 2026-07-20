@@ -1,13 +1,15 @@
 # editor — CEF/React editor shell
 
 The editor is a **CEF (Chromium) / React 19 / TypeScript** app: a purpose-built Rust shell
-(`editor/shell`, the `saffron-editor-shell` binary) that owns a winit Wayland toplevel and renders the
-React UI through CEF **windowless OSR** (`on_paint` BGRA → the toplevel `wl_surface`, alpha preserved),
+(`editor/shell`, the `saffron-editor-shell` binary) that owns a winit toplevel and renders the
+React UI through CEF **windowless OSR** (`on_paint` BGRA presented with alpha preserved),
 transparently over the engine's frames. It spawns the Rust `saffron-host` present-only viewport host
-headless, presents the host's shared-memory frames on Wayland subsurfaces below the transparent UI (the
-viewport panel is a hole the render shows through), paced at the monitor's refresh, and drives every
-operation over the JSON-over-unix-socket control plane. The engine renders; this app is the UI shell
-composited over the live viewport.
+headless, presents the host's shared-memory frames below the transparent UI (the viewport panel is a
+hole the render shows through), paced at the monitor's refresh, and drives every operation over the
+JSON-over-unix-socket control plane. The engine renders; this app is the UI shell composited over the
+live viewport. All window-system code is a compile-time backend per OS (`shell/src/backend/`, the
+`std::sys` pattern): Wayland (`wl_shm` UI upload + `wl_subsurface` viewports) on Linux, AppKit
+(IOSurface pools on `CALayer`s, `CADisplayLink` pacing, native decorations, `.app` bundle) on macOS.
 
 ## Layout
 
@@ -31,10 +33,11 @@ src/
   lib/         utilities
   assets/      static assets (fonts + storefront provider logos)
 scripts/gen-protocol.ts   re-runs `cargo run -p xtask -- gen-protocol` → src/protocol/sa-types.ts
-shell/         the CEF/Rust editor shell (`saffron-editor-shell`): a winit Wayland toplevel hosting CEF
-               windowless OSR, the IPC bridge (`cefQuery` → command dispatch), the subsurface presenter
-               (presenter.rs), engine supervision (engine.rs), native dialogs/drag-drop, the connector
-               backend (connectors/, its own AGENTS.md), and the `saffron-img://` scheme (scheme.rs)
+shell/         the CEF/Rust editor shell (`saffron-editor-shell`): a winit toplevel hosting CEF
+               windowless OSR, the IPC bridge (`cefQuery` → command dispatch), per-OS compile-time
+               backends (src/backend/{wayland,appkit}/ — UI compositor, viewport presenter, keys, env),
+               engine supervision (engine.rs), native dialogs/drag-drop, the connector backend
+               (connectors/, its own AGENTS.md), and the `saffron-img://` scheme (scheme.rs)
 ```
 
 Stack (see `package.json` + `shell/Cargo.toml`): CEF (Chromium 149) OSR shell, React 19, Zustand 5, Vite 7, Tailwind v4
@@ -59,7 +62,7 @@ OpenRPC + command-manifest JSON under `schemas/control/`). `index.ts` is the han
 ## Debugging runtime/GUI bugs you can't see (log, then ask)
 
 An agent has **no view of the running editor** — you cannot see the viewport, a flicker, a wrong frame,
-or the Wayland presenter's state. Do **not** guess at a runtime/GUI bug's cause and ship a "fix" on a
+or the presenter's state. Do **not** guess at a runtime/GUI bug's cause and ship a "fix" on a
 hypothesis; that wastes the user's time and erodes trust. When a bug can't be pinned from code + tests
 alone, **instrument first, then ask the user to capture data:**
 
@@ -224,7 +227,7 @@ user confirms it against real output — say "this should fix it, please verify 
 - **Panel bodies render once and are re-parented, never remounted.** Each dockable panel body renders a
   single time at the app root (`components/dock/DockPanelsHost.tsx` `LeafBody`) and is moved into its leaf
   via `appendChild`; **never** render a panel body inside the leaf tree, or a dock move remounts it and
-  destroys its component state, refs, and the live Wayland subsurface. Layout is pure
+  destroys its component state, refs, and the live viewport surface. Layout is pure
   `DockLayout → DockLayout` functions in `state/dockLayout.ts`, not in components. There are two disjoint
   dockspace islands (`DockSpaceKind` `'scene' | 'assetEditor'`, kept apart only by disjoint id sets); a
   `locked` leaf is the transparent viewport hole (rejects drops), a `persistent` leaf can collapse but is
@@ -248,38 +251,49 @@ user confirms it against real output — say "this should fix it, please verify 
   `e.key` literals. Add a shortcut by registering a command. Bindings are rebound in `app/SettingsModal.tsx`
   (capture mode + per-scope conflict detection) and persisted **delta-only** in `appdata/settings.json`. A
   few (the redo alias `Ctrl+Y`, the `Ctrl+P` play family) are intentionally non-rebindable.
-- **Window geometry is remembered state, not a setting — and only size + maximized are acted on.** The
+- **Window geometry is remembered state, not a setting — position restore is a backend decision.** The
   editor window's last size / position / monitor / maximized state lives in `appdata/state.json` (a
   generic "remember where I left it" bucket, separate from `settings.json`; missing file = no memory =
   size to the current monitor). `configure_main_window` (`lib.rs`) restores it before the window is
   shown (no visible jump); a `WindowStateTracker` folds every resize/move into a live snapshot flushed
-  on `ExitRequested`. On **native Wayland** (the `just run` path — GNOME/Mutter in particular) a client
-  cannot place its own toplevel or choose an output, so `configure_main_window` **only re-applies size +
-  maximized**. Position and `monitor` are still *captured and persisted* (they may be useful on a
-  platform that can honor them) but deliberately **never applied** — do not re-add a `set_position` /
-  monitor-clamp restore path. `capture_window_geometry` records size/x/y only while **not** maximized
-  (so a restored maximized window un-maximizes to the right size) and refreshes monitor/scale every
-  event (else an always-maximized window keeps a stale monitor); `outer_position()` may `Err` on
+  on `ExitRequested`. Size + maximized are re-applied everywhere; **position** goes through
+  `backend::window::restore_position` — a no-op on Wayland (GNOME/Mutter gives a client no way to place
+  its own toplevel or choose an output; do not re-add a `set_position` / monitor-clamp path there),
+  `set_outer_position` on AppKit (macOS permits self-placement). Position and `monitor` are captured
+  and persisted on every platform. `capture_window_geometry` records size/x/y only while **not**
+  maximized (so a restored maximized window un-maximizes to the right size) and refreshes monitor/scale
+  every event (else an always-maximized window keeps a stale monitor); `outer_position()` may `Err` on
   Wayland, so it keeps the last-known x/y rather than dropping the snapshot.
 
 ## The CEF shell (`shell/`)
 
-`editor/shell` owns a winit Wayland toplevel and hosts CEF **windowless OSR**: CEF renders the React UI
-off-screen and hands each frame to `on_paint` (BGRA, pre-multiplied), which `compositor.rs` uploads to
-the toplevel `wl_surface` via `wl_shm` (`Argb8888`, alpha preserved), sharing winit's `wl_display`
-through `from_foreign_display`. CEF self-drives at `windowless_frame_rate` = the monitor's refresh
-(picked up from winit's `current_monitor`), so the UI repaints at 144/240 Hz — the whole point of the
-migration off WebKitGTK, which was pinned to ~62.5 Hz on NVIDIA. `on_paint` damages only CEF's dirty
-rects (a full-surface damage every frame stalled Mutter's shm upload at high refresh × large surface).
+`editor/shell` owns a winit toplevel and hosts CEF **windowless OSR**: CEF renders the React UI
+off-screen and hands each frame to `on_paint` (BGRA, pre-multiplied), which the backend's
+`UiCompositor` presents with alpha preserved. CEF self-drives at `windowless_frame_rate` = the
+monitor's refresh (picked up from winit's `current_monitor`), so the UI repaints at 144/240 Hz — the
+whole point of the migration off WebKitGTK, which was pinned to ~62.5 Hz on NVIDIA. `on_paint` damages
+only CEF's dirty rects (a full-surface damage every frame stalled Mutter's shm upload at high refresh
+× large surface).
 
-The shell sets a per-PID socket under `$XDG_RUNTIME_DIR` and a per-PID, per-view shm segment for each
-viewport (scene + asset preview), spawns `$SAFFRON_ANIMA_BIN` (default `engine/target/debug/saffron-host`)
-with `SAFFRON_VIEWPORT_SHM_SCENE` + `SAFFRON_VIEWPORT_SHM_ASSET` (and the NVIDIA `VK_ICD_FILENAMES`
-guard), and presents via `presenter.rs` — a worker thread on its own `from_foreign_display` connection
-creates one `wl_subsurface` per view below the toplevel (above `compositor.rs`'s opaque backdrop, below
-the UI), maps the engine's shm ring, `wp_viewport`-scales each frame to the pane rect, and paces on
-`wl_surface.frame` callbacks with `wp_presentation` feedback. A watchdog flips the UI to an error
-overlay if the engine dies.
+The window-system code lives in `shell/src/backend/` — one self-contained module per OS, selected by
+`cfg(target_os)` in `backend/mod.rs`, whose doc comment is the contract (`Handles`, `UiCompositor`,
+`presenter`, `keys`, `bootstrap`, `env`, `window`). The **wayland** backend uploads UI frames to the
+toplevel `wl_surface` via `wl_shm` (`Argb8888`), sharing winit's `wl_display` through
+`from_foreign_display`. The **appkit** backend runs CEF OSR at the backing scale (Retina 2×;
+`window::osr_scale` feeds `screen_info` and the view rect), copies UI frames into an IOSurface pool
+assigned to a `CALayer`, and loads CEF from `Chromium Embedded Framework.framework` inside the `.app`
+bundle that `cargo run --bin bundle` assembles (`just run` keeps its binaries fresh).
+
+The shell sets a per-PID socket (under `$XDG_RUNTIME_DIR` on Linux, `$TMPDIR` on macOS) and a per-PID,
+per-view shm segment for each viewport (scene + asset preview), spawns `$SAFFRON_ANIMA_BIN` (default
+`engine/target/debug/saffron-host`) with `SAFFRON_VIEWPORT_SHM_SCENE` + `SAFFRON_VIEWPORT_SHM_ASSET`
+(plus `backend::env::engine_env` — the NVIDIA `VK_ICD_FILENAMES` guard on Linux), and presents via the
+backend's `presenter` — on Wayland a worker thread on its own `from_foreign_display` connection creates
+one `wl_subsurface` per view below the toplevel (above the opaque backdrop, below the UI), maps the
+engine's shm ring, `wp_viewport`-scales each frame to the pane rect, and paces on `wl_surface.frame`
+callbacks with `wp_presentation` feedback; on AppKit per-view reader threads copy ring slots into
+IOSurface pools and a `CADisplayLink` tick assigns them to per-view `CALayer`s below the UI layer. A
+watchdog flips the UI to an error overlay if the engine dies.
 
 Input is forwarded winit → CEF: pointer (`send_mouse_*`, with the held-button flag on moves so drags
 register) and keyboard (`send_key_event`: `RAWKEYDOWN` + a `CHAR` per produced UTF-16 unit + `KEYUP`,

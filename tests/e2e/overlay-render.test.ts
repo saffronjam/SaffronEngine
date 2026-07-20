@@ -14,16 +14,17 @@
 // (invalidating entity ids), so nothing that depends on a prior id follows it.
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
+import { bootEngine, captureViewport, Cleaner, prepareScene } from "./test-utils.ts";
 
 let engine: Engine;
 let cubeId = "";
 let rigId = "";
 const FIXTURE = join(REPO, "engine", "assets", "models", "animated-strip.gltf");
-const shots: string[] = [];
 const projectDir = `/tmp/saffron-e2e-overlay-project-${process.pid}`;
+const cleaner = new Cleaner();
 
 interface Ref {
   id: string;
@@ -53,35 +54,20 @@ interface Entry {
 }
 
 async function screenshot(tag: string): Promise<Buffer> {
-  const path = `/tmp/saffron-e2e-overlay-${process.pid}-${tag}.png`;
-  shots.push(path);
-  rmSync(path, { force: true }); // never read a stale frame from a reused tag
-  await engine.call("screenshot", { target: "viewport", path });
-  const deadline = Date.now() + 10_000;
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) {
-      throw new Error(`screenshot ${tag} never landed at ${path}`);
-    }
-    await engine.settle(100);
-  }
-  await engine.settle(200);
-  return readFileSync(path);
+  return captureViewport(engine, cleaner, `overlay-${tag}`);
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  await engine.call("set-camera", { yaw: 0, pitch: 0 });
+  cleaner.defer(() => rmSync(projectDir, { recursive: true, force: true }));
+  engine = await bootEngine(cleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
+  await prepareScene(engine, { camera: { yaw: 0, pitch: 0 } });
   const cube = await engine.call<Ref>("add-entity", { args: ["cube"] });
   cubeId = cube.id;
   await engine.call("focus", { entity: cube.id });
   await engine.settle();
 });
 afterAll(async () => {
-  await engine?.shutdown();
-  for (const shot of shots) {
-    rmSync(shot, { force: true });
-  }
-  rmSync(projectDir, { recursive: true, force: true });
+  await cleaner.cleanup();
 });
 
 test("the default view mode is lit", async () => {
@@ -174,7 +160,11 @@ test("the skeleton overlay is off by default", async () => {
 });
 
 test("set-skeleton-overlay round-trips through get", async () => {
-  const set = await engine.call<OverlayState>("set-skeleton-overlay", { show: true, axes: true, jointSize: 6 });
+  const set = await engine.call<OverlayState>("set-skeleton-overlay", {
+    show: true,
+    axes: true,
+    jointSize: 6,
+  });
   expect(set.show).toBe(true);
   expect(set.axes).toBe(true);
   expect(set.jointSize).toBeCloseTo(6, 4);
@@ -193,7 +183,9 @@ test("turning bones on draws the skeleton over the selected rig", async () => {
   // selected entity's SkinnedMeshComponent, so select the descendant that actually holds the rig.
   const list = (await engine.call<{ entities: Entry[] }>("list-entities")).entities;
   for (const e of list) {
-    const info = await engine.call<{ components: { SkinnedMesh?: unknown } }>("inspect", { entity: e.id });
+    const info = await engine.call<{ components: { SkinnedMesh?: unknown } }>("inspect", {
+      entity: e.id,
+    });
     if (info.components.SkinnedMesh) {
       rigId = e.id;
       break;

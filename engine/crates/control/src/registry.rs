@@ -27,9 +27,13 @@ use saffron_rendering::{
     RenderStatsFull, ViewId, ViewMode,
 };
 use saffron_sceneedit::SceneEditContext;
+use saffron_spatial::ResidencyManager;
 use saffron_window::Window;
 
 use crate::error::{Error, Result};
+
+/// A graph-compute backend that has qualified its active hardware profile.
+pub type VegetationComputeExecutor = Arc<dyn saffron_vegetation::GraphComputeExecutor>;
 
 /// The renderer seam every render-, scene-, and asset-domain command reaches
 /// through.
@@ -376,6 +380,14 @@ pub trait ControlRenderer {
     /// for the ray-cast aspect).
     fn with_gpu_uploader(&mut self, with: &mut dyn FnMut(&dyn GpuUploader));
 
+    /// Creates the qualified graph-compute backend for this renderer.
+    ///
+    /// `Ok(None)` explicitly identifies a renderer without compute support, such as the
+    /// in-memory control test stub. A live renderer returns an error when qualification fails.
+    fn create_vegetation_compute_executor(
+        &self,
+    ) -> std::result::Result<Option<VegetationComputeExecutor>, String>;
+
     /// Renders a material or texture-role preview subject through the **main forward+ graph** on the
     /// offscreen thumbnail view (displacement + procedural sky + floor + key light) and returns the
     /// PNG bytes — the sync `preview-render` seam. Live/uncached, so it reflects unsaved edits. The
@@ -426,8 +438,29 @@ pub struct EngineContext<'a> {
     pub scene_edit: &'a mut SceneEditContext,
     /// The live asset catalog + caches.
     pub assets: &'a mut AssetServer,
+    /// Shared multi-source cell residency state.
+    pub spatial: &'a mut ResidencyManager,
     /// The live play physics world, or `None` in Edit.
     pub physics: Option<&'a mut World>,
+    /// Owned asynchronous vegetation evaluation jobs and retained results.
+    pub(crate) vegetation_jobs: &'a mut crate::vegetation_jobs::VegetationEvaluationJobs,
+    /// Lazily initialized graph-compute capability for the live renderer.
+    pub(crate) vegetation_compute: &'a mut Option<Option<VegetationComputeExecutor>>,
+}
+
+impl EngineContext<'_> {
+    pub(crate) fn vegetation_compute_executor(
+        &mut self,
+    ) -> Result<Option<VegetationComputeExecutor>> {
+        if self.vegetation_compute.is_none() {
+            let executor = self
+                .renderer
+                .create_vegetation_compute_executor()
+                .map_err(Error::command)?;
+            *self.vegetation_compute = Some(executor);
+        }
+        Ok(self.vegetation_compute.as_ref().cloned().flatten())
+    }
 }
 
 /// The boxed handler type: a closure run on the calling (main) thread that maps
@@ -661,13 +694,14 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) {
     });
 
     // The domain groups register in the frozen order render → scene → animation → physics
-    // → asset. `help` and the manifest-completeness check iterate the registry as a set, so
+    // → vegetation → asset. `help` and the manifest-completeness check iterate the registry as a set, so
     // the asset group is the manifest tail (`get-project` … `quit`); the scene group lands
     // between render and animation.
     crate::commands_render::register_render_commands(reg);
     crate::commands_scene::register_scene_commands(reg);
     crate::commands_animation::register_animation_commands(reg);
     crate::commands_physics::register_physics_commands(reg);
+    crate::commands_vegetation::register_vegetation_commands(reg);
     crate::commands_asset::register_asset_commands(reg);
 }
 
@@ -707,6 +741,11 @@ pub fn is_read_only_command(name: &str) -> bool {
         // it sets the selection, which changes the rendered gizmo / skeleton overlay, so a
         // viewport-click select must request a redraw under the reactive loop.
         | "raycast" | "shapecast" | "pick-skeleton-joint"
+        | "spatial-cell" | "spatial-providers" | "spatial-sample" | "spatial-residency"
+        // biome graph compilation/schema and retained evaluation diagnostics do not change the scene
+        | "vegetation-compile-biome" | "vegetation-node-schema"
+        | "vegetation-evaluate-region" | "vegetation-evaluation-status"
+        | "vegetation-cancel-evaluation" | "vegetation-explain-point"
         // project-load phase + progress the editor's loading screen polls each tick
         | "project-status"
     )

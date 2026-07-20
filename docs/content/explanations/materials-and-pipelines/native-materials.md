@@ -5,99 +5,167 @@ weight = 5
 
 # Native materials
 
-A material is a first-class, editable asset. It lives on disk as a `.smat` file, is tracked in the asset catalog like a mesh or texture, can be assigned to an entity, edited in the material panel against a live preview sphere, and — its endgame — authored in a [node graph](../node-graph-codegen/). This page covers what a material *is* once it is a native asset; the codegen page covers how a graph becomes a shader.
+A native material is a catalog asset that describes one renderable surface. It owns the PBR factors,
+texture references, blend and rasterization choices, height treatment, optional node graph, and
+instance inheritance data. Scene entities refer to the asset instead of copying its full contents.
 
-The split that makes this cheap is the same one [PSO selection](../material-and-pso-selection/) relies on: the *shape* of a material (which textures, which features) decides the pipeline; the *values* (base color, roughness, texture indices) live in a buffer the shader reads per draw. Editing a slider is a buffer write, not a recompile.
+The asset model separates durable authoring data from per-frame GPU data. Editing a factor or texture
+invalidates the resolved material cache, and the next frame rebuilds the compact parameter record.
+Only a non-foldable [node graph](../node-graph-codegen/) needs a material-specific shader.
 
-## The asset
+## Asset document
 
-A `.smat` is reference-only JSON: scalar factors plus texture references as decimal-string `Uuid`s into the catalog. It never embeds pixels.
+A standalone material lives at `materials/<uuid>.smat`. Its JSON groups scalar values under
+`factors` and texture UUIDs under `textures`. UUIDs are written as decimal strings, with `"0"`
+representing an unassigned texture.
 
 ```jsonc
 {
+  "version": 2,
+  "shader": "mesh",
   "blend": "opaque",
-  "baseColor": [0.8, 0.8, 0.8, 1.0],
-  "metallic": 0.0, "roughness": 0.7,
-  "albedoTexture": "12876…",   // Uuid into the catalog, or "0" for none
-  "normalTexture": "0",
-  "graph": { /* optional node graph — see codegen */ }
+  "unlit": false,
+  "doubleSided": false,
+  "heightMode": "bump",
+  "normalConvention": "gl",
+  "surfaceModel": "standard",
+  "thinSheetFoliage": null,
+  "factors": {
+    "baseColor": [0.8, 0.8, 0.8, 1.0],
+    "metallic": 0.0,
+    "roughness": 0.7,
+    "emissive": [0.0, 0.0, 0.0],
+    "emissiveStrength": 1.0,
+    "normalStrength": 1.0,
+    "alphaCutoff": 0.5,
+    "heightScale": 0.05,
+    "uvTiling": [1.0, 1.0],
+    "uvOffset": [0.0, 0.0]
+  },
+  "textures": {
+    "albedo": "0",
+    "ormOrMr": "0",
+    "normal": "0",
+    "emissive": "0",
+    "height": "0",
+    "vectorDisplacement": "0"
+  },
+  "graph": {},
+  "parent": "0",
+  "overrides": {}
 }
 ```
 
-`MaterialAsset` (the in-memory form) adds a `parent` `Uuid` and an `overrides` set, so an **instance**
-material inherits a base and overrides only named fields — the UE material-instance model.
-`load_material_asset` resolves the parent chain, applies overrides, then folds any graph.
-`material_asset_to_json` / `material_asset_from_json` are the frozen JSON contract.
+The JSON references texture assets and never contains pixel data. A folder import instead creates a
+self-contained `.smatx` container whose material chunk uses the same JSON shape and whose texture
+chunks hold the maps. Model containers can also carry material chunks with this representation.
 
-## Binding to an entity
+## Surface response
 
-An entity carries exactly one material component,
-[`MaterialSet`](../../scene-and-ecs/built-in-components/) — an ordered list of slots, one per
-submesh. A slot is a **reference plus overrides**: a `.smat` id and a sparse `{ paramName: value }`
-map applied over the referenced material's resolved parameters. A single-material mesh is one slot;
-`material == 0` binds the built-in default.
+`surfaceModel` selects one strict surface union. `standard` requires `thinSheetFoliage` to be null.
+`thin-sheet-foliage` requires a complete parameter object, so a document cannot combine one selector
+with another model's data.
 
-`resolve_entity_materials` is the single resolve path. For each slot it loads the referenced `.smat`
-(parent chain resolved, default when missing), layers the slot's overrides on top with
-`apply_overrides`, and lowers the result to a `SubmeshMaterial`. Each submesh's `material_slot`
-selects a slot, clamped to the last, and the whole-mesh `unlit` flag, proxy albedo, and codegen
-shader follow slot 0. Because a slot references the asset rather than copying its factors, editing a
-`.smat` re-renders every instance; the override map holds only the per-object deviations.
+The thin-sheet object describes front and back response, physical thickness, absorption and
+transmission colors, roughness, normal treatment, and a bounded energy limit. Coverage can come from
+base alpha, a dedicated texture, or a constant. Its mip records store source extent, reference
+cutoff, spatial salt, alpha classification, and per-level hashes so derived coverage remains tied to
+the authored source.
 
-The overridable set is one declared list — the exposed-parameter schema (`pbr_exposed_parameters`,
-`ExposedParamKind`): `baseColor`, `metallic`, `roughness`, `emissive`, `blend`, the texture ids
-(`albedoTexture`, the packed `ormTexture`, `normalTexture`, `emissiveTexture`, `heightTexture`), and
-the remaining PBR knobs. It is the single source of truth that override validation and the inspector's
-override editor share, so the two never drift on what a material exposes.
+Voxel material moments preserve averaged color, transmission, normal, and second-moment data for
+aggregate representations. Optional [Vulkan opacity-micromap](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_opacity_micromap.html)
+settings record subdivision and transparent/opaque thresholds as derivation inputs. These fields are
+material data; hardware support decides whether a renderer can consume the optional acceleration
+form.
 
-## The params buffer and the surface seam
+## Masters and instances
 
-At draw time a material resolves to a `MaterialParamsData` record (96 bytes) in a per-frame SSBO (set
-2, binding 2). Identical materials dedup to one record (`intern_material` hashes the raw bytes);
-`InstanceData.texture.w` carries the material index. The übershader reads it through one seam:
+A material with `parent = "0"` is a master. A nonzero parent makes the document an instance whose
+sparse `overrides` object applies over the resolved parent. Resolution follows at most eight parent
+links, which bounds cycles and malformed chains.
+
+The exposed-parameter schema defines the keys accepted in material-instance and entity-slot
+overrides. It includes PBR colors and scalars, UV controls, blend and raster flags, and the five
+standard texture references. Each key also declares a value kind, allowing `material-set-override`
+and the Inspector to reject an ill-typed value before it reaches rendering.
+
+`heightMode` and `vectorDisplacementTexture` are authored on the material asset rather than through
+the exposed override schema. The material update path edits those fields directly.
+
+## Entity binding
+
+An entity has one `MaterialSet` component containing an ordered `slots` array. Each `MaterialSlot`
+holds a material UUID and a sparse per-object override object. UUID zero selects the built-in white,
+fully rough, non-metallic material.
+
+Each mesh submesh stores a `material_slot` index. Resolution loads every referenced material once,
+applies its parent chain, then applies the slot overrides. A submesh index beyond the available slots
+uses the last slot; an absent or empty `MaterialSet` leaves the draw path on engine defaults.
+
+The resolved `unlit` flag, proxy albedo, and node-graph shader follow slot zero because they apply to
+the whole mesh item. Blend mode and double-sided state remain per submesh and participate in
+[pipeline selection](../material-and-pso-selection/).
+
+## GPU parameter table
+
+Every resolved submesh material lowers to one 96-byte `MaterialParamsData` record in descriptor set
+2, binding 2. The record contains six 16-byte blocks:
+
+| Block | Contents |
+|---|---|
+| `base_color` | Linear RGBA factor |
+| `pbr` | Metallic, roughness, normal strength, alpha cutoff |
+| `emissive` | Emissive radiance and height scale |
+| `uv` | Tiling and offset |
+| `tex0` | Albedo, ORM, normal, and emissive bindless indices |
+| `tex1` | Height index, occlusion index, reserved lane, feature bits |
+
+The renderer hashes these records by their raw bytes and interns identical values into one per-frame
+table entry. `InstanceData.texture.w` carries the resulting material index. Editing one entity's
+override therefore creates a distinct record only when its resolved bytes differ.
+
+Feature bits gate optional shader work for normal, emissive, occlusion, parallax, alpha clipping,
+displacement, and height-bump sampling. They do not create separate pipelines. Unlit, blend,
+double-sided, alpha-to-coverage, and shader identity form the relevant pipeline axes.
+
+## Surface seam
+
+`mesh.slang` reads `MaterialParamsData` and produces a `SurfaceData` value through `evalSurface`.
+The shared lighting module consumes that value without knowing whether it came from the fixed PBR
+path or generated graph code.
 
 ```hlsl
-SurfaceData evalSurface(MaterialInput m);   // material half (mesh.slang)
-// … the lighting module (lighting.slang) consumes SurfaceData unchanged
+SurfaceData surf = evalSurface(makeMaterialInput(input));
+return evalViewMode(input, surf, kUnlit, kTranslucent);
 ```
 
-Everything material-specific lives behind `evalSurface`; the lighting code never changes. Feature
-bits in the params (`FEATURE_NORMAL`, `FEATURE_EMISSIVE_TEX`, `FEATURE_OCCLUSION`, `FEATURE_HEIGHT`,
-`FEATURE_ALPHACLIP`) gate the optional work, so a plain color material pays for none of it.
+The fixed path multiplies base color by the albedo texture, reads roughness and metallic from the ORM
+green and blue channels, and reads occlusion from its red channel. It can also apply normal and
+emissive maps. Missing textures resolve to the default white bindless slot.
 
-## PBR slots
-
-Beyond albedo, a material carries normal, packed ORM (occlusion-R, roughness-G, metallic-B), emissive, and height maps, plus `normalStrength`, `uvTiling`/`uvOffset`, `heightScale`, a `heightMode`, and the `blend` mode + `alphaCutoff`. The shader applies them feature-gated:
-
-- a derivative-based (Schüler) tangent frame perturbs the normal — no per-vertex tangents needed (`perturbNormal`);
-- the one grayscale **Height Map** is realized by the material's `heightMode` — the shape the major engines converge on (one map, a mode selector): **`bump`** (a height-gradient shading normal only — flat silhouette, the artifact-free default), **`parallax`** (parallax occlusion mapping, `parallaxUv`, a multi-step UV march that fakes depth), or **`displacement`** (real per-vertex geometry via the [compute displacement pre-pass](../../frame-and-render-graph/compute-displacement/) — a true silhouette that shadows and the ray-tracer see);
-- the `masked` blend mode alpha-tests against `alphaCutoff` — a hard `discard`, upgraded to derivative-sharpened [alpha-to-coverage](../ubershader-and-specialization/) under MSAA; `translucent` instead draws in the sorted blend pass.
-
-This is what lets an imported Poly-Haven / ambientCG texture set — diffuse + normal + roughness + displacement — render with depth: a provider *Displacement* map imports in `displacement` mode (real relief), a *Height* map in `parallax`, and every other case falls back to the safe `bump`.
-
-## Authoring
-
-`import_material_folder` suffix-detects roles (`detect_material_role`: `_diff`, `_nor`, `_rough`,
-`_disp`, …) and bakes a `.smat` plus catalog entries from a folder of textures. The **material
-panel** picks a material, shows it on a studio-lit preview sphere (`preview-render` →
-`render_material_preview`), and edits factors live (coalesced `material-update` → re-render). Every
-operation has a control command, so the `sa` CLI and the editor drive the same surface.
+Height mode selects one of three treatments. `bump` changes only the shading normal, `parallax`
+marches UVs while keeping a flat silhouette, and `displacement` moves geometry through the
+[compute displacement](../../frame-and-render-graph/compute-displacement/) path. Masked materials
+alpha-test or use alpha-to-coverage under MSAA; translucent materials render in the sorted blend
+pass.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Asset model + IO | `material.rs` | `MaterialAsset`, `apply_overrides`, `load_material_asset`, `save_material_asset` |
-| Exposed-parameter schema | `material_schema.rs` | `pbr_exposed_parameters`, `ExposedParamKind` |
-| Import + role detection | `manage.rs`; `scan.rs` | `import_material_folder`; `detect_material_role` |
-| Entity binding + resolve | `render_material.rs` | `resolve_entity_materials`, `resolve_slot_material`, `build_submesh_material` |
-| Params record + dedup | `gpu_types.rs`; `instancing.rs` | `MaterialParamsData`; `intern_material`, `ensure_material_capacity` |
-| Surface seam + slots | `mesh.slang`; `lighting.slang` | `evalSurface`, `perturbNormal`, `parallaxUv` |
-| Preview render | `thumbnail_render.rs` | `render_material_preview` |
-| Control commands | `commands_asset.rs` | `material-create/-get/-update/-import/-assign/-set-override` |
+| Asset model and JSON | `assets/src/material.rs` | `MaterialAsset`, `material_asset_to_json`, `material_asset_from_json` |
+| Surface and coverage contract | `vegetation/src/material.rs` | `MaterialSurface`, `ThinSheetFoliageParameters`, `CoverageMipMetadata` |
+| Parent and override resolution | `assets/src/material.rs` | `load_catalog_material_asset`, `apply_overrides` |
+| Override vocabulary | `assets/src/material_schema.rs` | `pbr_exposed_parameters`, `ExposedParamKind` |
+| Entity slots | `scene/src/component.rs` | `MaterialSet`, `MaterialSlot` |
+| Render resolution | `assets/src/render_material.rs` | `AssetServer::resolve_entity_materials`, `build_submesh_material` |
+| GPU record and interning | `rendering/src/gpu_types.rs`, `rendering/src/instancing.rs` | `MaterialParamsData`, `intern_material` |
+| Surface evaluation | `assets/shaders/mesh.slang`, `assets/shaders/lighting.slang` | `evalSurface`, `SurfaceData`, `evalLighting` |
 
 ## Related
 
-- [Node-graph codegen](../node-graph-codegen/) — authoring a material as a graph that generates a shader
-- [Übershader](../ubershader-and-specialization/) — the one shader `evalSurface` plugs into
-- [Bindless textures](../bindless-textures/) — how a texture index in the params resolves to a sampler
+- [Node-graph codegen](../node-graph-codegen/) explains foldable graphs and generated shader variants.
+- [Materials and PSOs](../material-and-pso-selection/) covers per-submesh pipeline selection.
+- [Übershader](../ubershader-and-specialization/) covers the fixed shader permutations.
+- [Bindless textures](../bindless-textures/) explains the texture indices stored in the parameter table.
+- [Vegetation assets](../../geometry-and-assets/vegetation-assets/) explains plant-family material slots.

@@ -23,9 +23,21 @@ pub enum Error {
     #[error("render error: {0}")]
     Render(#[from] saffron_rendering::Error),
 
+    /// A calendar value could not be evaluated by the solar ephemeris.
+    #[error("ephemeris error: {0}")]
+    Ephemeris(#[from] solar_positioning::Error),
+
     /// A scene serde / ECS operation failed (the project's `scene` block load).
     #[error("scene error: {0}")]
     Scene(#[from] saffron_scene::Error),
+
+    /// A shared coordinate or surface-field operation failed.
+    #[error("spatial error: {0}")]
+    Spatial(#[from] saffron_spatial::Error),
+
+    /// A vegetation asset, point schema, identity, mutation, or package operation failed.
+    #[error("vegetation error: {0}")]
+    Vegetation(#[from] saffron_vegetation::Error),
 
     /// A runtime `slangc` invocation for a material graph exited non-zero or
     /// produced no `.spv`. The payload names the material / shader.
@@ -38,6 +50,17 @@ pub enum Error {
         /// The version the document declared.
         found: i64,
         /// The version this build accepts.
+        expected: i64,
+    },
+
+    /// A native authored asset declared a version this build does not accept.
+    #[error("unsupported {format} version {found} (expected {expected})")]
+    BadAssetVersion {
+        /// Native asset format name.
+        format: &'static str,
+        /// Version found in the document.
+        found: i64,
+        /// Only accepted version.
         expected: i64,
     },
 

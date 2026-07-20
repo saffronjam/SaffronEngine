@@ -1,4 +1,4 @@
-//! The control-plane DTOs: 236 structs + 17 enums, in field declaration order (the
+//! The control-plane DTOs, in field declaration order (the
 //! positional-CLI-argument / OpenRPC-`required` order).
 //!
 //! Conventions, applied uniformly:
@@ -7,9 +7,8 @@
 //! - `Option<T>` fields carry `skip_serializing_if = "Option::is_none"` so an absent value is
 //!   a *missing key*, not `null`.
 //! - The 17 enums are kebab-case strings; an unknown value is a `Deserialize` error.
-//! - The wire-helpers `EntitySelector` / `AssetSelector` and every `Json`-typed field are
-//!   opaque `serde_json::Value` — their shape is owned by the scene component registry, not
-//!   here. `WireUuid` maps to the [`Uuid`](crate::Uuid) newtype.
+//! - Selector and component/environment wire shapes are typed in this crate. Truly open JSON
+//!   payloads remain `serde_json::Value`. `WireUuid` maps to the [`Uuid`](crate::Uuid) newtype.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -57,12 +56,63 @@ mod coerce {
     }
 }
 
-/// An opaque entity selector blob (a uuid, a name, or `{}` for the current selection),
-/// resolved by the runtime — not a typed sub-DTO.
-pub type EntitySelector = Value;
+/// An entity selector by decimal id or exact name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(untagged)]
+#[ts(export)]
+pub enum EntitySelector {
+    Id(u64),
+    Name(String),
+}
 
-/// An opaque asset selector blob (a uuid or a path), resolved by the runtime.
-pub type AssetSelector = Value;
+impl EntitySelector {
+    /// Returns the numeric selector value, including a decimal string.
+    #[must_use]
+    pub fn id(&self) -> Option<u64> {
+        match self {
+            Self::Id(value) => Some(*value),
+            Self::Name(value) => value.parse().ok(),
+        }
+    }
+
+    /// Returns the string selector value.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Id(_) => None,
+            Self::Name(value) => Some(value),
+        }
+    }
+}
+
+/// An asset selector by decimal id or exact asset name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(untagged)]
+#[ts(export)]
+pub enum AssetSelector {
+    Id(u64),
+    Name(String),
+}
+
+impl AssetSelector {
+    /// Returns the numeric selector value, including a decimal string.
+    #[must_use]
+    pub fn id(&self) -> Option<u64> {
+        match self {
+            Self::Id(value) => Some(*value),
+            Self::Name(value) => value.parse().ok(),
+        }
+    }
+
+    /// Returns the string selector value.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Id(_) => None,
+            Self::Name(value) => Some(value),
+        }
+    }
+}
 
 // Wire-helper structs (`EntityRef`, `Vec3`, `Vec4`) and the 17 enums.
 
@@ -98,7 +148,7 @@ pub struct EntityRef {
 
 /// The standalone app manifest: the window identity + present options the exported
 /// `saffron-player` boots with. It is the project's persisted `app` config block (set in the
-/// editor's Export dialog), written verbatim to `app.json` beside the player binary at export.
+/// editor's Export dialog), written verbatim to the platform's resource directory at export.
 /// `#[serde(default)]` lets a partial or absent `app.json` fall back field-by-field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", default)]
@@ -128,13 +178,13 @@ impl Default for AppManifest {
     }
 }
 
-/// `export-app` params: cook the open project into a standalone app folder at `outputDir`, using
-/// `app` as the runtime manifest (written to `app.json` beside the player binary).
+/// `export-app` params: cook the open project into a platform-native standalone application at
+/// `outputDir`, using `app` as its runtime manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ExportAppParams {
-    /// The destination directory for the staged app (created if absent).
+    /// The destination path for the staged app (created if absent; `.app` is appended on macOS).
     pub output_dir: String,
     /// The runtime manifest to write into the staged `app.json`.
     pub app: AppManifest,
@@ -145,7 +195,7 @@ pub struct ExportAppParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ExportAppResult {
-    /// The staged app directory (the folder containing the player binary + data).
+    /// The staged application root (a `.app` bundle on macOS, a flat directory elsewhere).
     pub path: String,
     /// Non-fatal warnings (e.g. a material that failed to pre-bake), for the editor to surface.
     pub warnings: Vec<String>,
@@ -273,6 +323,7 @@ pub enum ViewModeDto {
     LightComplexity,
     MotionVectors,
     Fog,
+    CloudDensity,
 }
 
 /// The asset slot an `assign-asset` targets.
@@ -298,6 +349,14 @@ pub enum ScreenshotTargetDto {
     Window,
 }
 
+/// The thumbnail image encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum ThumbnailFormatDto {
+    Png,
+}
+
 /// The catalog asset kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "kebab-case")]
@@ -310,6 +369,10 @@ pub enum AssetTypeDto {
     Material,
     Model,
     Lut,
+    Environment,
+    Plant,
+    Biome,
+    VegetationMap,
 }
 
 /// The profiler capture mode.
@@ -396,6 +459,16 @@ pub struct RenderStatsDto {
     pub draw_calls: i32,
     pub batches: i32,
     pub instances: i32,
+    /// CPU time spent gathering the static and skinned draw list for this frame.
+    pub scene_gather_ms: f32,
+    /// Exact bytes written to the frame's `InstanceData` storage buffer.
+    pub instance_upload_bytes: u64,
+    /// Host bytes retained by unique drawn meshes for exact surface queries.
+    pub retained_mesh_cpu_bytes: u64,
+    /// Actual indexed draw invocations across directional, spot, and point shadows.
+    pub shadow_draw_calls: i32,
+    /// Instances published into the active frame TLAS.
+    pub rt_instances: i32,
     pub frame_ms: f32,
     pub fps: f32,
     pub gpu_ms: f32,
@@ -457,6 +530,7 @@ pub struct RenderStatsDto {
     pub color_grading: SetColorGradingParams,
     /// The resolved creative look-up table state (asset + intensity + size), `None` when no look is
     /// assigned. The panel's size/interp readout resolves from here.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub creative_lut: Option<CreativeLutStat>,
     /// Whether the pre-tonemap scene-linear bloom pyramid is enabled.
     pub bloom_enabled: bool,
@@ -2048,6 +2122,7 @@ pub struct MaterialGetParams {
 #[ts(export)]
 pub struct MaterialGetResult {
     pub id: Uuid,
+    pub surface: crate::MaterialSurfaceDto,
     pub blend: String,
     pub unlit: bool,
     pub base_color: Vec4,
@@ -2094,11 +2169,13 @@ pub struct MaterialSchemaResult {
     pub params: Vec<ExposedParamDto>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct MaterialUpdateParams {
     pub material: AssetSelector,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<crate::MaterialSurfaceDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_color: Option<Vec4>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2265,7 +2342,7 @@ pub struct ThumbnailParams {
 #[ts(export)]
 pub struct ThumbnailResult {
     pub id: Uuid,
-    pub format: String,
+    pub format: ThumbnailFormatDto,
     pub width: i32,
     pub height: i32,
     pub base64: String,
@@ -2378,6 +2455,8 @@ pub struct RemoveComponentResult {
 pub struct SetComponentParams {
     pub entity: EntitySelector,
     pub component: String,
+    #[schemars(with = "crate::ComponentBody")]
+    #[ts(type = "ComponentBody")]
     pub json: Value,
 }
 
@@ -2403,7 +2482,7 @@ pub struct SetComponentOrderResult {
     pub components: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct SetTransformParams {
@@ -2463,25 +2542,257 @@ pub struct PickResult {
     pub kind: Option<PickKind>,
 }
 
+/// One exact signed world-tick coordinate encoded as decimal strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialTicksDto {
+    pub x: String,
+    pub y: String,
+    pub z: String,
+}
+
+/// One canonical hierarchical world-cell key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct WorldCellKeyDto {
+    pub x: String,
+    pub y: String,
+    pub z: String,
+    pub level: u8,
+    pub canonical_hex: String,
+}
+
+/// A half-open quantized position inside one base cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialLocalPositionDto {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// An exact world position and its canonical owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialWorldPositionDto {
+    pub cell: WorldCellKeyDto,
+    pub local: SpatialLocalPositionDto,
+    pub global_ticks: SpatialTicksDto,
+}
+
+/// Converts a metre position or exact ticks to a canonical cell hierarchy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialCellParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world: Option<Vec3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticks: Option<SpatialTicksDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
+}
+
+/// Canonical position ownership and the requested ancestor cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialCellResult {
+    pub position: SpatialWorldPositionDto,
+    pub selected_cell: WorldCellKeyDto,
+}
+
+/// Query and authority capabilities of a surface provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SurfaceCapabilitiesDto {
+    pub ray: bool,
+    pub project: bool,
+    pub nearest: bool,
+    pub uv: bool,
+    pub authoritative_attachments: bool,
+    pub authoritative_fields: bool,
+}
+
+/// One exact half-open provider bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialBoundsDto {
+    pub min_ticks: SpatialTicksDto,
+    pub max_ticks_exclusive: SpatialTicksDto,
+}
+
+/// One live surface provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SurfaceProviderDto {
+    pub id: Uuid,
+    pub entity: Uuid,
+    pub name: String,
+    pub revision: String,
+    pub bounds: SpatialBoundsDto,
+    pub primitive_count: String,
+    pub capabilities: SurfaceCapabilitiesDto,
+}
+
+/// Every live surface provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SurfaceProvidersResult {
+    pub providers: Vec<SurfaceProviderDto>,
+}
+
+/// A scalar or vector channel exposed by a surface field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SpatialFieldChannelDto {
+    Altitude,
+    Slope,
+    Curvature,
+    Concavity,
+    Drainage,
+    Moisture,
+    Temperature,
+    Precipitation,
+    Sunlight,
+    Exposure,
+    WaterDistance,
+    WaterDepth,
+    SignedBlocker,
+    SplineDistance,
+    User,
+}
+
+/// The requested field derivative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SpatialFieldDerivativeDto {
+    #[default]
+    Value,
+    Gradient,
+    Hessian,
+}
+
+/// Samples a live provider field at a metre position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialSampleParams {
+    pub provider: Uuid,
+    pub channel: SpatialFieldChannelDto,
+    /// Decimal stable identity required when `channel` is `user`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_channel: Option<String>,
+    pub position: Vec3,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivative: Option<SpatialFieldDerivativeDto>,
+}
+
+/// One canonical scalar field sample.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialSampleResult {
+    pub provider: Uuid,
+    pub channel: SpatialFieldChannelDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_channel: Option<String>,
+    pub derivative: SpatialFieldDerivativeDto,
+    pub value_bits: i32,
+    pub value: f64,
+    pub revision: String,
+}
+
+/// One independently resident cell facet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum ResidencyFacetDto {
+    Render,
+    Physics,
+    Simulation,
+    Editing,
+    Navigation,
+    Network,
+}
+
+/// Load and cleanup radii at one hierarchy level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialSourceLevelDto {
+    pub level: u8,
+    pub load_radius_cells: u32,
+    pub cleanup_radius_cells: u32,
+}
+
+/// One live residency source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialSourceDto {
+    pub id: String,
+    pub revision: String,
+    pub position: SpatialWorldPositionDto,
+    pub velocity_mps: Vec3,
+    pub prediction_seconds: f64,
+    pub levels: Vec<SpatialSourceLevelDto>,
+    pub facets: Vec<ResidencyFacetDto>,
+    pub priority: i32,
+}
+
+/// Per-facet reference counts for one resident cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ResidencyCountsDto {
+    pub render: u32,
+    pub physics: u32,
+    pub simulation: u32,
+    pub editing: u32,
+    pub navigation: u32,
+    pub network: u32,
+}
+
+/// One resolved resident cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialResidencyCellDto {
+    pub cell: WorldCellKeyDto,
+    pub reference_counts: ResidencyCountsDto,
+    pub priority: i32,
+}
+
+/// Complete source and cell residency status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpatialResidencyResult {
+    pub sources: Vec<SpatialSourceDto>,
+    pub cells: Vec<SpatialResidencyCellDto>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct InspectResult {
     pub id: Uuid,
     pub name: String,
+    #[schemars(with = "crate::Components")]
+    #[ts(type = "Components")]
     pub components: Value,
     pub component_order: Vec<String>,
-}
-
-/// The scene environment block on the wire — the bare environment object (its schema is
-/// `$ref Environment`), not a wrapper. `#[serde(transparent)]` so the single
-/// `value` field serializes as the object itself: `set-environment`/`get-environment`/
-/// `set-atmosphere` reply with `{ skyMode, …, atmosphere: {…} }`, never `{ value: {…} }`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(transparent)]
-#[ts(export)]
-pub struct EnvironmentDto {
-    pub value: Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -2491,7 +2802,7 @@ pub struct SetEnvironmentParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sky_mode: Option<String>,
+    pub sky_mode: Option<crate::SkyModeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clear_color: Option<Vec3>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2518,6 +2829,74 @@ pub struct SetEnvironmentParams {
     pub ambient_color: Option<Vec3>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient_intensity: Option<f32>,
+}
+
+/// A built-in complete environment profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum BuiltinEnvironmentProfileDto {
+    Neutral,
+    ClearDay,
+    GoldenHour,
+    Overcast,
+    Night,
+}
+
+/// A typed reference to either a built-in or project environment profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+#[ts(export)]
+pub enum EnvironmentProfileRefDto {
+    Builtin {
+        profile: BuiltinEnvironmentProfileDto,
+    },
+    Asset {
+        id: Uuid,
+    },
+}
+
+/// One environment profile shown in the profile browser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EnvironmentProfileSummaryDto {
+    pub reference: EnvironmentProfileRefDto,
+    pub name: String,
+}
+
+/// Every built-in and project environment profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EnvironmentProfileListDto {
+    pub profiles: Vec<EnvironmentProfileSummaryDto>,
+}
+
+/// Params for saving the active environment as a new project profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SaveEnvironmentProfileParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+/// Params for replacing a project profile with the active environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UpdateEnvironmentProfileParams {
+    pub profile: Uuid,
+}
+
+/// Params for applying a complete environment profile to the active scene.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ApplyEnvironmentProfileParams {
+    pub profile: EnvironmentProfileRefDto,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -2552,10 +2931,24 @@ pub struct SetAtmosphereParams {
     pub sun_disk_angular_radius: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sun_disk_intensity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moon_disk_angular_radius: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moon_disk_intensity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moon_earthshine: Option<f32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub per_pixel_transmittance: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sky_capture_cadence: Option<f32>,
 }
 
 /// A partial merge onto `environment.fog` — the analytic height & distance fog. Each `Some` field
-/// overwrites its key; `json` is an escape hatch merged first. Reply is the opaque [`EnvironmentDto`].
+/// overwrites its key; `json` is an escape hatch merged first.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2620,6 +3013,134 @@ pub struct SetFogParams {
     pub aerial_perspective: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aerial_intensity: Option<f32>,
+}
+
+/// A partial merge onto `environment.cloud`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetCloudsParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_type: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precipitation: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anvil_bias: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_altitude: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_strength: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curl_strength: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weather_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weather_offset: Option<Vec3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weather_texture: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_steps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_steps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub droplet_diameter: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_factor: Option<f32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub cast_cloud_shadows: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_shadow_strength: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_shadow_on_surface_strength: Option<f32>,
+}
+
+/// A partial merge onto `environment.wind`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetWindParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gust: Option<f32>,
+}
+
+/// Master and per-channel time-of-day tint curves.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TodTintCurveDto {
+    pub master: Vec<[f32; 2]>,
+    pub red: Vec<[f32; 2]>,
+    pub green: Vec<[f32; 2]>,
+    pub blue: Vec<[f32; 2]>,
+}
+
+/// A partial merge onto `environment.timeOfDay`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SetTimeOfDayParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub manual_override: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_of_day: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub month: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub day: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub day_length_seconds: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure_curve: Option<Vec<[f32; 2]>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tint_curve: Option<TodTintCurveDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_curve: Option<Vec<[f32; 2]>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_type_curve: Option<Vec<[f32; 2]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

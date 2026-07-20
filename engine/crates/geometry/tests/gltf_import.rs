@@ -157,3 +157,17 @@ fn skinned_strip_round_trips_through_smesh_and_sanim() {
     let back = load_mesh_from_bytes(&unskinned).expect("unskinned round-trip");
     assert_eq!(back.vertices, mesh.vertices);
 }
+
+#[test]
+fn morph_target_names_preserve_mesh_extras() {
+    let model = saffron_geometry::translate_model(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/e2e/fixtures/AnimatedMorphCube.gltf"),
+    )
+    .expect("import named morph fixture");
+    let morph = model.morph.expect("fixture has one morph target");
+
+    assert_eq!(morph.targets.len(), 1);
+    assert_eq!(morph.targets[0].name, "bulge");
+    assert_eq!(morph.targets[0].rest_weight, 0.0);
+}

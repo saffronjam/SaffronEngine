@@ -25,17 +25,18 @@ mod serde;
 mod starter;
 
 pub use component::{
-    AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
-    Collider, ComponentOrder, DirectionalLight, FogShape, FogVolume, FootChain, FootIk,
-    IdComponent, Joint, KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance,
-    MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight, PoseOverride,
-    PreviewGhost, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh,
-    SpotLight, Transform, Transition, WorldTransform, Wrap,
+    AnimationPlayer, AtmosphereRole, Bone, BonePhysics, BonePhysicsComponent, Camera,
+    CharacterController, Collider, ComponentOrder, DirectionalLight, FogShape, FogVolume,
+    FootChain, FootIk, IdComponent, Joint, KinematicBones, MaterialSet, MaterialSlot, Mesh,
+    ModelInstance, MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight,
+    PoseOverride, PreviewGhost, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot,
+    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, WorldTransform, Wrap,
 };
 pub use document::SCENE_VERSION;
 pub use environment::{
-    AssetCatalog, AssetEntry, AssetType, AtmosphereSettings, Attribution, Colorspace, FogMode,
-    FogQuality, FogSettings, SceneEnvironment, SkyMode, TextureRole,
+    AssetCatalog, AssetEntry, AssetType, AtmosphereSettings, Attribution, CloudSettings,
+    Colorspace, FogMode, FogQuality, FogSettings, SceneEnvironment, SkyMode, TextureRole,
+    TimeOfDaySettings, TodCurve, TodTintCurve, WindSettings,
 };
 pub use error::{Error, Result};
 pub use hierarchy::{

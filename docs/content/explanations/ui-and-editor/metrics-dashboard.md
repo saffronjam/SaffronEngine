@@ -5,92 +5,80 @@ weight = 16
 
 # Metrics dashboard
 
-The engine measures performance; the editor's metrics dashboard makes it legible. It consumes the
-telemetry the control plane exposes — the CPU/GPU frame split, per-pass GPU timings, the percentile
-quality metrics, the shared budget config, and the alarm event stream — and renders a live frame-time
-graph, per-pass bars, a VRAM gauge, and the alarm UX. Everything is coloured from the *one* shared
-`PerfConfig`, so the HUD agrees with the engine and the e2e tests on what green, amber, and red mean.
+The metrics dashboard is the editor's live view of engine performance. It combines frame history, per-pass GPU timing, memory pressure, draw statistics, and active alarms in the Stats dock panel.
 
-The dashboard ("Stats") is one of two performance **tools** — alongside the [Profiler](profiler-panel/)
-— opened from the Topbar's **Tools** menu as a [dock panel](dock-system/).
+Stats and the [Profiler](../profiler-panel/) answer different questions. Stats shows the current trend and whether it crosses a budget. Profiler records exact CPU and GPU spans for a bounded capture.
 
-## A separate, gated polling lane
+## Telemetry flow
 
-The reconcile poll already syncs the cheap interactive state at ~20 Hz. Telemetry rides a **second**
-lane at ~10 Hz so it never competes with selection/gizmo latency: alarms are drained every tick (the
-badge stays live even with the panel closed), while the heavier `frame-history` and `pass-timings`
-reads only run while the Stats tool is open (`isPanelOpen(state, "stats")`). Each fetch fills a Zustand slice; the alarm cursor
-(`since`) only advances, so a missed poll just catches up next time and nothing is double-counted.
+The editor keeps performance work off the fast scene-reconciliation path. That path samples cheap state, including `render-stats`, at about 20 Hz. A separate metrics timer wakes every 100 ms and fetches only when the selected refresh interval has elapsed; the default interval is 1 second.
 
-## Charting: Canvas for live, DOM for the rest
+```mermaid
+flowchart LR
+    A[Renderer frame history] --> B[frame-history]
+    C[GPU query readback] --> D[pass-timings]
+    E[Alarm event ring] --> F[drain-alarms]
+    B --> G[Metrics store]
+    D --> G
+    F --> H[Log, toasts, and badge]
+    G --> I[Stats panel]
+```
 
-The webview composites *over* the live engine viewport, so editor CPU is not free. The live frame-time
-graph is therefore **uPlot** (Canvas 2D, ~48 KB), not an SVG charting library where every point is a
-DOM node and every tick a React re-render. The uPlot instance is created once; data is pushed
-imperatively via `setData` on a `requestAnimationFrame` tick — never through React state. A dashed
-budget line is drawn each frame from the shared config.
+The alarm drain and active-alarm list run even when Stats is closed. `frame-history` runs only while the panel is open, and `pass-timings` also requires the GPU profiler to be enabled. The `since` cursor advances to the drain's high-water sequence, so a later poll catches up without repeating events.
 
-Raw per-frame data is far too jittery to read, so the graph never plots it directly. The client
-accumulates a long history (`lib/frameSeries.ts`, a fixed typed-array ring ≈5 min, deduplicated by the
-engine's absolute `frameIndex` since consecutive polls return overlapping windows). The graph then
-downsamples Grafana-style, with three orthogonal knobs in one settings **shadcn Popover** (a compact
-`range · bucket · refresh` chip):
+Pause stops the metrics lane and freezes the panel. Alarm events remain in the engine ring and are drained after resume. The panel samples high-frequency `render-stats` and UI-rate values from the store at the selected refresh interval, which avoids rerendering the entire dashboard at the fast poll rate.
 
-- **Range** — how far back to show (10 s … 5 min), bounded by the ring.
-- **Window** — the bucket / group-by interval (50 ms … 1 s); samples within it are averaged into one
-  point. This is the *smoothness* knob — larger buckets, fewer points, calmer line.
-- **Refresh** — how often the lane fetches (default 1/s); plus Pause, which freezes the whole dashboard.
+## Frame-time graph
 
-Points = `range / bucket`, capped at 200 by coarsening (Grafana's min-interval behaviour). The x axis
-reads as seconds-ago (newest at the right is "now"). The line is a monotone-cubic **spline** (no
-overshoot below 0). The **Y axis is stable**: instead of re-fitting the data max every poll (which made
-it jump), `scales.y.range` keeps a sticky, nice-rounded (1/2/5×10ⁿ), budget-anchored ceiling — it grows
-immediately to fit a spike but shrinks only after the target has sat well below it for a few updates,
-so the dashed budget line stays at a fixed height. Everything else (percentile cards, per-pass bars,
-the VRAM gauge) is plain DOM, updated at the fetch rate.
+`FrameTimeGraph` uses [uPlot](https://github.com/leeoniya/uPlot), a Canvas chart updated through `setData`. A store subscription schedules one update with `requestAnimationFrame` when frame history changes. React state does not carry the plotted samples.
 
-## What it shows
+The client retains 72,000 frames in typed arrays and deduplicates overlapping `frame-history` windows by absolute `frameIndex`. The graph selects the requested range, averages it into time buckets, and coarsens the buckets when needed to stay at or below 200 points.
 
-- **Frame** — the budget-fill bar (frame time / budget), the CPU-bound-vs-GPU-bound call (from
-  `cpuWaitMs` vs `cpuFrameMs`), and the p50/p95/p99/p99.9 lows. p50 is primary; average FPS is absent.
-- **Per-pass GPU** — each pass in ms and %-of-budget, bar-coloured against its share, sorted heaviest
-  first. A note flags that the numbers are relative (passes overlap on the GPU, so the parts do not
-  sum to the frame total).
-- **VRAM** — `usage / budget` of the device-local heaps, green < 80% / amber 80–95% / red ≥ 100%.
-- **Controls** — a **Profiler** switch (`profiler.set-mode`, gating GPU + per-pass + VRAM) and a
-  **Target FPS** dropdown (`set-perf-config`) that re-derives the budget and recolours the whole HUD.
-- **Software-GPU banner** — under llvmpipe, a banner marks the GPU numbers as CPU rasterization time.
+The settings popover separates three controls:
 
-## Alarm UX
+| Control | Choices | Effect |
+|---|---|---|
+| Range | 10 s to 5 min | Amount of retained history shown |
+| Window | 50 ms to 1 s | Averaging interval for each point |
+| Refresh | 250 ms to 5 s | Metrics fetch and panel update interval |
 
-The drained alarm events route by severity, fatigue-aware: **info** stays in the dashboard log only;
-**warning** raises a throttled `sonner` toast (≥ 10 s per fingerprint); **critical** raises a
-persistent toast plus the topbar **active-alarms badge** (red if any critical, amber if any warning).
-A RESOLVED event dismisses the toast its fingerprint raised, so a flapping alarm is one toast and
-recovery clears it without a user dismiss. The badge opens the Stats dashboard, which holds the log.
+The horizontal axis counts down to `now`. Total, CPU, and GPU series use monotone cubic paths. The vertical ceiling is anchored above the frame budget, grows immediately for a spike, and shrinks only after five lower-range updates. A dashed line marks the active budget.
 
-## Color thresholds: one shared module
+## Dashboard sections
 
-`lib/perfThresholds.ts` mirrors the engine's `PerfConfig` rule and returns green/amber/red for a
-value — used by the graph, the numbers, the per-pass bars, and the gauge. No component hardcodes a
-threshold: 🟢 `< 0.8 × budget` and consistent; 🟡 near budget or `1.5–2 × median`; 🔴 over budget,
-`> 2 × median`, or the frozen band.
+The headline section compares mean frame time with the configured budget and labels the current CPU/GPU bottleneck. It also reports p50, p95, p99, p99.9, maximum frame time, and the stutter count from the renderer's rolling history.
+
+Per-pass rows preserve render-graph execution order. Each row shows milliseconds and its share of the whole frame budget. The GPU-total label is the span from the earliest timed scope to the latest; pass durations can overlap and do not add to that value.
+
+The VRAM gauge appears when the renderer reports a device-local memory budget. The remaining counters cover draw calls, batches, instances, triangles, descriptor binds, pipelines, acceleration structures, active rendering features, engine frame rate, editor poll rate, and webview frame rate.
+
+The Profiler switch selects `timestamps` or `off`. Target FPS is shown from the shared performance config; the Render panel owns the control that changes it. A software-rasterizer banner identifies GPU timings that measure CPU rasterization work.
+
+## Thresholds and alarms
+
+`perfThresholds.ts` mirrors the engine's frame-time and VRAM thresholds from `PerfConfig`. Frame-time grading considers the budget, frozen-frame threshold, and multiples of the running median. VRAM grading uses the configured warning and critical fractions.
+
+Per-pass bars use fixed shares of the frame budget: above 25 percent is amber and above 50 percent is red. These shares are editor presentation rules, not fields in `PerfConfig`.
+
+Alarm events have `info`, `warning`, or `critical` severity. Info remains in the Stats log. Warning toasts are limited to one per fingerprint in 10 seconds, while critical toasts remain until resolution. A `resolved` event dismisses the active toast for its fingerprint.
+
+The titlebar badge reflects alarms that are still firing. Frame-wide alarms open Stats; an alarm tied to a render pass opens Profiler for capture and pass inspection.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Gated metrics poll + telemetry/alarm slices | `editor/src/state/store.ts` | `pollMetrics`, `appendAlarmEvents`, `setFrameHistory` |
-| Client wrappers | `editor/src/control/client.ts` | `frameHistory`, `passTimings`, `setProfilerMode`, `setPerfConfig`, `drainAlarms` |
-| Live graph (spline, sticky-Y, time axis) | `editor/src/components/FrameTimeGraph.tsx` | `niceCeil`, `yRange`, budget-line draw hook |
-| History ring + Grafana bucketing | `editor/src/lib/frameSeries.ts` | `appendFrameSamples`, `bucketSeries` |
-| Range / Window / Refresh / Pause control | `editor/src/components/MetricsRefreshControl.tsx` | `MetricsRefreshControl` |
-| Shared thresholds | `editor/src/lib/perfThresholds.ts` | `frameTimeStatus`, `vramStatus`, `passStatus` |
-| Dashboard + per-pass + VRAM + controls | `editor/src/panels/RenderStatsPanel.tsx` | `RenderStatsPanel` |
-| Alarm toasts + badge | `editor/src/lib/alarmToasts.ts` · `components/AlarmBadge.tsx` | `routeAlarmToasts`, `AlarmBadge` |
+| Metrics scheduling and store slices | `editor/src/state/store.ts` | `pollMetrics`, `FRAME_HISTORY_SAMPLES`, `setFrameHistory`, `appendAlarmEvents` |
+| Dashboard | `editor/src/panels/RenderStatsPanel.tsx` | `RenderStatsPanel`, `useThrottledStats` |
+| Frame graph | `editor/src/components/FrameTimeGraph.tsx` | `FrameTimeGraph`, `niceCeil` |
+| Retained samples and bucketing | `editor/src/lib/frameSeries.ts` | `appendFrameSamples`, `bucketSeries`, `resetFrameSeries` |
+| Range, window, refresh, and pause | `editor/src/components/MetricsRefreshControl.tsx` | `MetricsRefreshControl` |
+| Status colors | `editor/src/lib/perfThresholds.ts` | `frameTimeStatus`, `vramStatus`, `passStatus` |
+| Alarm notifications and titlebar badge | `editor/src/lib/alarmToasts.ts`, `editor/src/components/AlarmBadge.tsx` | `routeAlarmToasts`, `AlarmBadge` |
 
 ## Related
 
-- [Performance telemetry](../../frame-and-render-graph/performance-telemetry/) — the engine signals the dashboard reads
-- [Performance alarms](../../frame-and-render-graph/performance-alarms/) — the alarm engine behind the toasts + badge
-- [Editor shell + viewport bridge](../editor-shell-and-viewport-bridge/) — the control passthrough + reconcile poll
+- [Performance telemetry](../../frame-and-render-graph/performance-telemetry/) - renderer measurements and frame-history semantics
+- [Performance alarms](../../frame-and-render-graph/performance-alarms/) - detector thresholds and event lifecycle
+- [Profiler panel](../profiler-panel/) - bounded CPU/GPU capture and trace export
+- [Dock system](../dock-system/) - how the Stats panel opens and moves

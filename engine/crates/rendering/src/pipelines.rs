@@ -92,6 +92,10 @@ pub struct Pipelines {
     shader_dir: PathBuf,
     /// The set layouts every mesh PSO's pipeline layout binds.
     set_layouts: Vec<vk::DescriptorSetLayout>,
+    /// Whether the device supports ray tracing (sets 6/7 present in the mesh layout). When
+    /// false, the übershader loads its `_nort` variant so its declared descriptor interface
+    /// matches the RT-less layout — strict argument-buffer backends (MoltenVK) require the match.
+    rt_enabled: bool,
     fill_mode_non_solid: bool,
     sample_count: vk::SampleCountFlags,
 
@@ -208,7 +212,7 @@ pub struct Pipelines {
     /// passes — downsample / tent-upsample / composite — via the push `pass`/`karis` fields.
     bloom: Option<Arc<Pipeline>>,
 
-    /// The mandatory tonemap compute PSO (tonemap set layout, an 8-byte exposure+mode push),
+    /// The mandatory tonemap compute PSO (tonemap set layout, a 16-byte tonemap push),
     /// built lazily.
     tonemap: Option<Arc<Pipeline>>,
     /// The look-bake compute PSO (reuses the tonemap set layout — a `STORAGE_IMAGE`/UBO/sampler triple
@@ -227,6 +231,18 @@ pub struct Pipelines {
     /// The aerial-perspective fill compute PSO (AP fill set: atmosphere LUTs + params + storage volume,
     /// no push), built lazily.
     aerial: Option<Arc<Pipeline>>,
+    /// The single weather-map resolve compute PSO, built lazily when authored clouds need a refill.
+    cloud_weather: Option<Arc<Pipeline>>,
+    /// The unlit cloud-density visualization compute PSO, built lazily in CloudDensity view mode.
+    cloud_debug: Option<Arc<Pipeline>>,
+    /// The adaptive lit cloud raymarch compute PSO.
+    cloud_raymarch: Option<Arc<Pipeline>>,
+    /// The reduced cloud temporal-reconstruction compute PSO.
+    cloud_reconstruct: Option<Arc<Pipeline>>,
+    /// The bilateral upscale and HDR cloud-composite compute PSO.
+    cloud_upscale: Option<Arc<Pipeline>>,
+    /// The cascaded density-integrated cloud-shadow fill PSO.
+    cloud_shadow: Option<Arc<Pipeline>>,
     /// The fog compute set layout (offscreen storage + params UBO + depth + sky-view LUT).
     fog_set_layout: vk::DescriptorSetLayout,
     /// The depth-upscale graphics PSO (fullscreen triangle, depth-write-always, one fragment
@@ -278,6 +294,13 @@ impl Pipelines {
             descriptors.ssao_mesh_set_layout(),
             descriptors.ddgi_mesh_set_layout(),
         ];
+        let rt_enabled = matches!(
+            (
+                descriptors.rt_mesh_set_layout(),
+                descriptors.restir_mesh_set_layout(),
+            ),
+            (Some(_), Some(_))
+        );
         if let (Some(rt), Some(restir)) = (
             descriptors.rt_mesh_set_layout(),
             descriptors.restir_mesh_set_layout(),
@@ -290,6 +313,7 @@ impl Pipelines {
             resources: Arc::clone(device.resources()),
             shader_dir: resolve_shader_dir(),
             set_layouts,
+            rt_enabled,
             fill_mode_non_solid: device.capabilities.fill_mode_non_solid,
             sample_count,
             cache: HashMap::new(),
@@ -340,6 +364,12 @@ impl Pipelines {
             fog_inject: None,
             fog_integrate: None,
             aerial: None,
+            cloud_weather: None,
+            cloud_debug: None,
+            cloud_raymarch: None,
+            cloud_reconstruct: None,
+            cloud_upscale: None,
+            cloud_shadow: None,
             fog_set_layout: descriptors.fog_set_layout(),
             depth_upscale: None,
             reactive_coverage: None,
@@ -1062,7 +1092,7 @@ impl Pipelines {
         if let Some(pipeline) = &self.tonemap {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_compute("shaders/tonemap.spv", self.tonemap_set_layout, 8) {
+        match self.build_compute("shaders/tonemap.spv", self.tonemap_set_layout, 16) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
                 self.tonemap = Some(Arc::clone(&pipeline));
@@ -1091,6 +1121,138 @@ impl Pipelines {
             }
             Err(err) => {
                 tracing::error!("request_fog: {err}");
+                None
+            }
+        }
+    }
+
+    /// The weather-map resolve compute PSO, built and cached on first use.
+    pub fn request_cloud_weather(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.cloud_weather {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/cloud_weather.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cloud_weather = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_cloud_weather: {err}");
+                None
+            }
+        }
+    }
+
+    /// The unlit density-debug compute PSO, built and cached on first use.
+    pub fn request_cloud_debug(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.cloud_debug {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/cloud_density_debug.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cloud_debug = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_cloud_debug: {err}");
+                None
+            }
+        }
+    }
+
+    /// The adaptive lit cloud raymarch PSO, built and cached on first use.
+    pub fn request_cloud_raymarch(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.cloud_raymarch {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/cloud_raymarch.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cloud_raymarch = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_cloud_raymarch: {err}");
+                None
+            }
+        }
+    }
+
+    /// The reduced cloud temporal reconstruction PSO, built and cached on first use.
+    pub fn request_cloud_reconstruct(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.cloud_reconstruct {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/cloud_reconstruct.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cloud_reconstruct = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_cloud_reconstruct: {err}");
+                None
+            }
+        }
+    }
+
+    /// The bilateral cloud upscale and HDR composite PSO, built and cached on first use.
+    pub fn request_cloud_upscale(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.cloud_upscale {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/cloud_upscale.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cloud_upscale = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_cloud_upscale: {err}");
+                None
+            }
+        }
+    }
+
+    /// The cascaded density-integrated cloud-shadow fill PSO.
+    pub fn request_cloud_shadow(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.cloud_shadow {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/cloud_shadow.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cloud_shadow = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_cloud_shadow: {err}");
                 None
             }
         }
@@ -2676,7 +2838,7 @@ impl Pipelines {
 
     /// Builds a compute PSO from `shader` over `set_layout` with an optional
     /// compute-stage push of `push_size` bytes (0 = none). Entry point `computeMain`.
-    fn build_compute(
+    pub(crate) fn build_compute(
         &self,
         shader: &str,
         set_layout: vk::DescriptorSetLayout,
@@ -3101,6 +3263,15 @@ impl Pipelines {
             self.shader_dir
                 .join(shader.strip_prefix("shaders/").unwrap_or(shader))
         };
+        // On a device without ray tracing, prefer the `_nort` variant when one exists (the
+        // übershader): it omits the RT descriptor sets the RT-less pipeline layout also omits,
+        // so the shader interface matches — required by MoltenVK's argument-buffer backend.
+        let path = if self.rt_enabled {
+            path
+        } else {
+            let nort = nort_variant_path(&path);
+            if nort.is_file() { nort } else { path }
+        };
         let bytes = std::fs::read(&path)
             .map_err(|err| Error::ShaderLoad(format!("cannot read '{}': {err}", path.display())))?;
         if bytes.is_empty() || bytes.len() % 4 != 0 {
@@ -3191,11 +3362,30 @@ fn offset_of_skin_weights() -> u32 {
 /// one (the test binary runs from `target/<profile>/deps/`, one level below the
 /// `shaders/` the xtask emits into `target/<profile>/shaders/`). Shared with the IBL bake
 /// (which builds its own transient compute pipelines off the same dir).
+/// The `_nort` (ray-tracing-off) sibling of a compiled SPIR-V path: `…/mesh.spv` → `…/mesh_nort.spv`.
+/// Only the übershader emits one; for any other path the sibling simply does not exist and the
+/// caller falls back to the base file.
+fn nort_variant_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("spv");
+    path.with_file_name(format!("{stem}_nort.{ext}"))
+}
+
 pub(crate) fn resolve_shader_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SAFFRON_SHADER_DIR") {
         return PathBuf::from(dir);
     }
     if let Ok(exe) = std::env::current_exe() {
+        #[cfg(target_os = "macos")]
+        if let Some(executable_dir) = exe.parent() {
+            let bundled = executable_dir.join("..").join("Resources").join("shaders");
+            if bundled.is_dir() {
+                return bundled;
+            }
+        }
         let mut dir = exe.parent().map(Path::to_path_buf);
         while let Some(candidate) = dir {
             let shaders = candidate.join("shaders");

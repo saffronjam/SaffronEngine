@@ -53,7 +53,7 @@ cxx = "1.0"
 cxx-build = "1.0"
 
 # Importers & images (saffron-geometry, saffron-rendering).
-gltf = "1.4"
+gltf = { version = "1.4", features = ["extras"] }
 tobj = "4.0"
 image = "0.25"
 resvg = "0.44"
@@ -68,6 +68,8 @@ clap_complete = "4"
 
 # Filesystem walk for the asset catalog scan (saffron-assets) — deterministic when sorted.
 walkdir = "2.5"
+atomic-write-file = "0.3"
+sha2 = "0.10"
 
 # GPU struct casts.
 bytemuck = { version = "1", features = ["derive"] }
@@ -91,6 +93,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 nu-ansi-term = "0.50"
+
+# Astronomical time-of-day driver (full NREL Solar Position Algorithm).
+solar-positioning = { version = "0.5.2", default-features = false, features = ["std"] }
 
 # Benchmark harness (dev-only; the ECS go/no-go gate in 03-ecs-and-scene phase 2).
 criterion = "0.7"

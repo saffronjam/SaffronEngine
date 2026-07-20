@@ -35,14 +35,15 @@ use saffron_core::Uuid;
 use saffron_json::{json_bool_or, json_f32_or, json_string_or, json_u64_or, uuid_to_json};
 
 use crate::component::{
-    AnimationPlayer, Bone, BonePhysics, BonePhysicsComponent, Camera, CharacterController,
-    Collider, DirectionalLight, FogShape, FogVolume, FootChain, FootIk, Joint, KinematicBones,
-    MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name, PhysicsMaterial,
-    PointLight, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh,
-    SpotLight, Transform, Transition, Wrap,
+    AnimationPlayer, AtmosphereRole, Bone, BonePhysics, BonePhysicsComponent, Camera,
+    CharacterController, Collider, DirectionalLight, FogShape, FogVolume, FootChain, FootIk, Joint,
+    KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name,
+    PhysicsMaterial, PointLight, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot,
+    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, Wrap,
 };
 use crate::environment::{
-    AtmosphereSettings, FogMode, FogQuality, FogSettings, SceneEnvironment, SkyMode,
+    AtmosphereSettings, CloudSettings, FogMode, FogQuality, FogSettings, SceneEnvironment, SkyMode,
+    TimeOfDaySettings, TodCurve, TodTintCurve, WindSettings,
 };
 use crate::error::Result;
 use crate::registry::SceneSerialize;
@@ -51,6 +52,13 @@ use crate::registry::SceneSerialize;
 /// byte-equality seam — every component scalar is inserted through it.
 fn f32_value(value: f32) -> Value {
     Value::from(f64::from(value))
+}
+
+fn json_i32_or(value: &Value, key: &str, default: i32) -> i32 {
+    field(value, key)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(default)
 }
 
 /// A named-object `vec3` → `{"x","y","z"}`. Never positional — quat/vec storage order is
@@ -207,6 +215,21 @@ impl SceneSerialize for Mesh {
 
     fn load_json(&mut self, value: &Value) -> Result<()> {
         self.mesh = Uuid(json_u64_or(value, "mesh", 0));
+        Ok(())
+    }
+}
+
+impl SceneSerialize for VegetationField {
+    fn to_json(&self) -> Value {
+        object([
+            ("map", uuid_to_json(self.map.value())),
+            ("enabled", Value::Bool(self.enabled)),
+        ])
+    }
+
+    fn load_json(&mut self, value: &Value) -> Result<()> {
+        self.map = Uuid(json_u64_or(value, "map", 0));
+        self.enabled = json_bool_or(value, "enabled", true);
         Ok(())
     }
 }
@@ -379,6 +402,16 @@ impl SceneSerialize for AnimationPlayer {
 impl SceneSerialize for DirectionalLight {
     fn to_json(&self) -> Value {
         object([
+            (
+                "atmosphereRole",
+                Value::String(
+                    match self.atmosphere_role {
+                        AtmosphereRole::Sun => "sun",
+                        AtmosphereRole::Moon => "moon",
+                    }
+                    .to_string(),
+                ),
+            ),
             ("direction", vec3_to_json(self.direction)),
             ("color", vec3_to_json(self.color)),
             ("intensity", f32_value(self.intensity)),
@@ -395,6 +428,11 @@ impl SceneSerialize for DirectionalLight {
     }
 
     fn load_json(&mut self, value: &Value) -> Result<()> {
+        self.atmosphere_role =
+            match json_string_or(value, "atmosphereRole", "sun".to_string()).as_str() {
+                "moon" => AtmosphereRole::Moon,
+                _ => AtmosphereRole::Sun,
+            };
         self.direction = vec3_from_json(&object_field(value, "direction"));
         self.color = vec3_from_json(&object_field(value, "color"));
         self.intensity = json_f32_or(value, "intensity", 1.0);
@@ -692,13 +730,6 @@ impl SceneSerialize for FootIk {
     }
 }
 
-/// Reads an `i32` field, defaulting when absent or non-numeric.
-fn json_i32_or(j: &Value, key: &str, fallback: i32) -> i32 {
-    field(j, key)
-        .and_then(serde_json::Value::as_i64)
-        .map_or(fallback, |v| v as i32)
-}
-
 /// The lowercase wire name for a ragdoll [`Joint`].
 fn joint_name(joint: Joint) -> &'static str {
     match joint {
@@ -919,6 +950,17 @@ fn atmosphere_to_json(a: &AtmosphereSettings) -> Value {
         ("ozoneAbsorption", vec3_to_json(a.ozone_absorption)),
         ("sunDiskAngularRadius", f32_value(a.sun_disk_angular_radius)),
         ("sunDiskIntensity", f32_value(a.sun_disk_intensity)),
+        (
+            "moonDiskAngularRadius",
+            f32_value(a.moon_disk_angular_radius),
+        ),
+        ("moonDiskIntensity", f32_value(a.moon_disk_intensity)),
+        ("moonEarthshine", f32_value(a.moon_earthshine)),
+        (
+            "perPixelTransmittance",
+            Value::Bool(a.per_pixel_transmittance),
+        ),
+        ("skyCaptureCadence", f32_value(a.sky_capture_cadence)),
     ])
 }
 
@@ -943,7 +985,12 @@ fn atmosphere_from_json(j: &Value) -> AtmosphereSettings {
         a.ozone_absorption = vec3_from_json(v);
     }
     a.sun_disk_angular_radius = json_f32_or(j, "sunDiskAngularRadius", 0.00465);
-    a.sun_disk_intensity = json_f32_or(j, "sunDiskIntensity", 20.0);
+    a.sun_disk_intensity = json_f32_or(j, "sunDiskIntensity", 1.0);
+    a.moon_disk_angular_radius = json_f32_or(j, "moonDiskAngularRadius", 0.00496);
+    a.moon_disk_intensity = json_f32_or(j, "moonDiskIntensity", 1.0);
+    a.moon_earthshine = json_f32_or(j, "moonEarthshine", 0.02);
+    a.per_pixel_transmittance = json_bool_or(j, "perPixelTransmittance", false);
+    a.sky_capture_cadence = json_f32_or(j, "skyCaptureCadence", 9.0).clamp(1.0, 60.0);
     a
 }
 
@@ -1022,6 +1069,200 @@ fn fog_from_json(j: &Value) -> FogSettings {
     f
 }
 
+fn cloud_to_json(cloud: &CloudSettings) -> Value {
+    object([
+        ("enabled", Value::Bool(cloud.enabled)),
+        ("coverage", f32_value(cloud.coverage)),
+        ("cloudType", f32_value(cloud.cloud_type)),
+        ("precipitation", f32_value(cloud.precipitation)),
+        ("anvilBias", f32_value(cloud.anvil_bias)),
+        ("layerAltitude", f32_value(cloud.layer_altitude)),
+        ("layerHeight", f32_value(cloud.layer_height)),
+        ("baseScale", f32_value(cloud.base_scale)),
+        ("detailScale", f32_value(cloud.detail_scale)),
+        ("detailStrength", f32_value(cloud.detail_strength)),
+        ("curlStrength", f32_value(cloud.curl_strength)),
+        ("weatherScale", f32_value(cloud.weather_scale)),
+        ("weatherOffset", vec3_to_json(cloud.weather_offset)),
+        (
+            "weatherTexture",
+            uuid_to_json(cloud.weather_texture.value()),
+        ),
+        ("primarySteps", Value::from(cloud.primary_steps)),
+        ("lightSteps", Value::from(cloud.light_steps)),
+        ("dropletDiameter", f32_value(cloud.droplet_diameter)),
+        ("temporalFactor", f32_value(cloud.temporal_factor)),
+        ("castCloudShadows", Value::Bool(cloud.cast_cloud_shadows)),
+        (
+            "cloudShadowStrength",
+            f32_value(cloud.cloud_shadow_strength),
+        ),
+        (
+            "cloudShadowOnSurfaceStrength",
+            f32_value(cloud.cloud_shadow_on_surface_strength),
+        ),
+    ])
+}
+
+fn cloud_from_json(value: &Value) -> CloudSettings {
+    let mut cloud = CloudSettings::default();
+    if !value.is_object() {
+        return cloud;
+    }
+    cloud.enabled = json_bool_or(value, "enabled", cloud.enabled);
+    cloud.coverage = json_f32_or(value, "coverage", cloud.coverage);
+    cloud.cloud_type = json_f32_or(value, "cloudType", cloud.cloud_type);
+    cloud.precipitation = json_f32_or(value, "precipitation", cloud.precipitation);
+    cloud.anvil_bias = json_f32_or(value, "anvilBias", cloud.anvil_bias);
+    cloud.layer_altitude = json_f32_or(value, "layerAltitude", cloud.layer_altitude);
+    cloud.layer_height = json_f32_or(value, "layerHeight", cloud.layer_height);
+    cloud.base_scale = json_f32_or(value, "baseScale", cloud.base_scale);
+    cloud.detail_scale = json_f32_or(value, "detailScale", cloud.detail_scale);
+    cloud.detail_strength = json_f32_or(value, "detailStrength", cloud.detail_strength);
+    cloud.curl_strength = json_f32_or(value, "curlStrength", cloud.curl_strength);
+    cloud.weather_scale = json_f32_or(value, "weatherScale", cloud.weather_scale);
+    if let Some(offset) = field(value, "weatherOffset") {
+        cloud.weather_offset = vec3_from_json(offset);
+    }
+    cloud.weather_texture = Uuid(json_u64_or(
+        value,
+        "weatherTexture",
+        cloud.weather_texture.value(),
+    ));
+    cloud.primary_steps = json_u64_or(value, "primarySteps", u64::from(cloud.primary_steps)) as u32;
+    cloud.light_steps = json_u64_or(value, "lightSteps", u64::from(cloud.light_steps)) as u32;
+    cloud.droplet_diameter = json_f32_or(value, "dropletDiameter", cloud.droplet_diameter);
+    cloud.temporal_factor = json_f32_or(value, "temporalFactor", cloud.temporal_factor);
+    cloud.cast_cloud_shadows = json_bool_or(value, "castCloudShadows", cloud.cast_cloud_shadows);
+    cloud.cloud_shadow_strength =
+        json_f32_or(value, "cloudShadowStrength", cloud.cloud_shadow_strength);
+    cloud.cloud_shadow_on_surface_strength = json_f32_or(
+        value,
+        "cloudShadowOnSurfaceStrength",
+        cloud.cloud_shadow_on_surface_strength,
+    );
+    cloud
+}
+
+fn wind_to_json(wind: &WindSettings) -> Value {
+    object([
+        ("orientation", f32_value(wind.orientation)),
+        ("speed", f32_value(wind.speed)),
+        ("gust", f32_value(wind.gust)),
+    ])
+}
+
+fn wind_from_json(value: &Value) -> WindSettings {
+    let mut wind = WindSettings::default();
+    if !value.is_object() {
+        return wind;
+    }
+    wind.orientation = json_f32_or(value, "orientation", wind.orientation);
+    wind.speed = json_f32_or(value, "speed", wind.speed);
+    wind.gust = json_f32_or(value, "gust", wind.gust);
+    wind
+}
+
+fn tod_curve_to_json(curve: &TodCurve) -> Value {
+    Value::Array(
+        curve
+            .0
+            .iter()
+            .map(|&(x, y)| object([("x", f32_value(x)), ("y", f32_value(y))]))
+            .collect(),
+    )
+}
+
+fn tod_curve_from_json(value: &Value) -> TodCurve {
+    let Some(points) = value.as_array() else {
+        return TodCurve::default();
+    };
+    TodCurve(
+        points
+            .iter()
+            .filter(|point| point.is_object())
+            .map(|point| (json_f32_or(point, "x", 0.0), json_f32_or(point, "y", 0.0)))
+            .collect(),
+    )
+}
+
+fn tint_curve_to_json(curve: &TodTintCurve) -> Value {
+    object([
+        ("master", tod_curve_to_json(&curve.master)),
+        ("red", tod_curve_to_json(&curve.red)),
+        ("green", tod_curve_to_json(&curve.green)),
+        ("blue", tod_curve_to_json(&curve.blue)),
+    ])
+}
+
+fn tint_curve_from_json(value: &Value) -> TodTintCurve {
+    let mut curve = TodTintCurve::default();
+    if let Some(value) = field(value, "master") {
+        curve.master = tod_curve_from_json(value);
+    }
+    if let Some(value) = field(value, "red") {
+        curve.red = tod_curve_from_json(value);
+    }
+    if let Some(value) = field(value, "green") {
+        curve.green = tod_curve_from_json(value);
+    }
+    if let Some(value) = field(value, "blue") {
+        curve.blue = tod_curve_from_json(value);
+    }
+    curve
+}
+
+fn time_of_day_to_json(settings: &TimeOfDaySettings) -> Value {
+    object([
+        ("enabled", Value::Bool(settings.enabled)),
+        ("manualOverride", Value::Bool(settings.manual_override)),
+        ("timeOfDay", f32_value(settings.time_of_day)),
+        ("year", Value::from(settings.year)),
+        ("month", Value::from(settings.month)),
+        ("day", Value::from(settings.day)),
+        ("latitude", f32_value(settings.latitude)),
+        ("longitude", f32_value(settings.longitude)),
+        ("dayLengthSeconds", f32_value(settings.day_length_seconds)),
+        ("exposureCurve", tod_curve_to_json(&settings.exposure_curve)),
+        ("tintCurve", tint_curve_to_json(&settings.tint_curve)),
+        ("coverageCurve", tod_curve_to_json(&settings.coverage_curve)),
+        (
+            "cloudTypeCurve",
+            tod_curve_to_json(&settings.cloud_type_curve),
+        ),
+    ])
+}
+
+fn time_of_day_from_json(value: &Value) -> TimeOfDaySettings {
+    let mut settings = TimeOfDaySettings::default();
+    if !value.is_object() {
+        return settings;
+    }
+    settings.enabled = json_bool_or(value, "enabled", settings.enabled);
+    settings.manual_override = json_bool_or(value, "manualOverride", settings.manual_override);
+    settings.time_of_day = json_f32_or(value, "timeOfDay", settings.time_of_day);
+    settings.year = json_i32_or(value, "year", settings.year);
+    settings.month = json_i32_or(value, "month", settings.month);
+    settings.day = json_i32_or(value, "day", settings.day);
+    settings.latitude = json_f32_or(value, "latitude", settings.latitude);
+    settings.longitude = json_f32_or(value, "longitude", settings.longitude);
+    settings.day_length_seconds =
+        json_f32_or(value, "dayLengthSeconds", settings.day_length_seconds);
+    if let Some(curve) = field(value, "exposureCurve") {
+        settings.exposure_curve = tod_curve_from_json(curve);
+    }
+    if let Some(curve) = field(value, "tintCurve") {
+        settings.tint_curve = tint_curve_from_json(curve);
+    }
+    if let Some(curve) = field(value, "coverageCurve") {
+        settings.coverage_curve = tod_curve_from_json(curve);
+    }
+    if let Some(curve) = field(value, "cloudTypeCurve") {
+        settings.cloud_type_curve = tod_curve_from_json(curve);
+    }
+    settings
+}
+
 /// Serializes the [`SceneEnvironment`] block.
 ///
 /// The scene-document phase writes this under the document's `environment` key; it is a
@@ -1045,6 +1286,9 @@ pub fn environment_to_json(env: &SceneEnvironment) -> Value {
         ("ambientIntensity", f32_value(env.ambient_intensity)),
         ("atmosphere", atmosphere_to_json(&env.atmosphere)),
         ("fog", fog_to_json(&env.fog)),
+        ("cloud", cloud_to_json(&env.cloud)),
+        ("wind", wind_to_json(&env.wind)),
+        ("timeOfDay", time_of_day_to_json(&env.time_of_day)),
     ])
 }
 
@@ -1075,6 +1319,15 @@ pub fn environment_from_json(j: &Value) -> SceneEnvironment {
     }
     if let Some(v) = field(j, "fog") {
         env.fog = fog_from_json(v);
+    }
+    if let Some(v) = field(j, "cloud") {
+        env.cloud = cloud_from_json(v);
+    }
+    if let Some(v) = field(j, "wind") {
+        env.wind = wind_from_json(v);
+    }
+    if let Some(v) = field(j, "timeOfDay") {
+        env.time_of_day = time_of_day_from_json(v);
     }
     env
 }

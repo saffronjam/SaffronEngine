@@ -6,35 +6,73 @@ bookCollapseSection = true
 
 # UI & editor
 
-The editor is a CEF (Chromium) desktop app that drives the engine over a control protocol. A React/TypeScript front-end (shadcn/ui + Tailwind) runs in a webview, while the engine runs as a separate process. The webview never renders the scene. The engine renders headless and publishes frames into shared memory; the editor presents them on a Wayland subsurface below its transparent window, so the web UI composites over the live viewport. The engine carries no UI toolkit — all editor UI is the React front-end.
+Anima's editor is a [React](https://react.dev/) application rendered through the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/wiki/Home) inside a Rust desktop shell. The engine runs as a separate present-only host process and exposes editor operations over its JSON control socket.
 
-Every editor operation rides the JSON-over-unix-socket [control protocol](../tooling-and-control/control-plane-architecture/). A focus-gated reconcile poll keeps a small Zustand store in sync with the running engine.
+The shell owns the native window, CEF off-screen rendering, input translation, host-process supervision, and platform presentation. Linux compiles the Wayland backend; macOS compiles the AppKit and Core Animation backend. Both implement one backend contract used by the shared shell.
+
+## Process and image flow
+
+CEF paints the web UI into a native compositor surface. The engine renders the `scene` and `assetPreview` views offscreen and publishes each view to its own shared-memory frame ring. A platform presenter places the active engine surface below the UI, so transparent viewport regions reveal the live image.
+
+```mermaid
+flowchart LR
+    A["React editor"] -->|CEF query| B["Rust shell"]
+    B -->|JSON socket| C["Engine host"]
+    C -->|scene shm ring| D["Platform presenter"]
+    C -->|assetPreview shm ring| D
+    B -->|CEF OSR paint| E["UI surface"]
+    D --> F["Native window stack"]
+    E --> F
+```
+
+Engine calls use one typed frontend helper and one generic shell command: `call(cmd, params)` invokes `control`, which forwards the request to the host socket. Window actions, file dialogs, viewport geometry, settings, and store connectors terminate in the shell because they operate on native editor resources.
+
+The [Zustand](https://zustand.docs.pmnd.rs/) store holds editor-facing state. Its reconcile loops poll cheap state frequently and fetch heavier entities or component data only when version stamps change. Focus, visibility, drag, and project-load gates keep polling from fighting direct manipulation or inactive windows.
 
 ## Pages
 
 | Page | Covers | Code |
 |---|---|---|
-| `editor-shell-and-viewport-bridge` | CEF/React shell, the one generic control passthrough, engine spawn env (two per-view shm segments), auto-start + crash recovery | `editor/src/control/client.ts` · `App.tsx` · `LoadingOverlay.tsx` |
-| `viewport-compositing` | shm/seqlock/subsurface/dma-buf foundations, offscreen render → pipelined shm ring → wl_subsurface below the transparent toplevel, two views / two subsurfaces + shared backdrop, per-view park, segment-remap traps | `rendering/src/shm_publish.rs` · `editor/shell/src/presenter.rs` |
-| `viewport-panel` | the transparent host div, per-view two-tier bounds-sync over `set_viewport_bounds {view}`, per-view parking, gizmo + pointer-lock fly forwarding | `ViewportPanel.tsx` · `useSubsurfaceBounds.ts` |
-| `editor-camera` | the engine `SceneEditCamera`, fly input streamed over `fly-input`, driven by `get-/set-camera` | `sceneedit/src/camera.rs` |
-| `gizmo` | the engine-rendered overlay gizmo, `gizmo-pointer`, the Topbar T/R/S + world/local | `Topbar.tsx` · `useGizmoShortcuts.ts` |
-| `play-mode` | play/pause/stop/step, scene-duplication discard, camera handover + fallback, live-tune-and-discard tint + locks | `sceneedit/src/play.rs` · `Topbar.tsx` · `state/store.ts` |
-| `debug-visualization` | the transient viewport debug overlays (pick/scene-AABB boxes, light volumes) via `set-debug-overlays`, drawn as depth-tested world-space lines, surfaced in the Render panel's Debug section | `host/src/overlay.rs` · `sceneedit/src/overlay.rs` · `RenderPanel.tsx` |
-| [`asset-editor`](asset-editor/) | the asset-editor tab for every model: the preview scene (Edit/Play/Preview triad), its own AssetPreview view + surface, `set-active-view` park, `get-asset-model` + capability-gated panels, skeleton tree + highlight channel, clip list, the shared timeline, byte-identity | `control/src/commands_asset.rs` · `AssetEditorWorkspace.tsx` · `sceneedit/src/context.rs` |
-| [`material-graph-live-preview`](material-graph-live-preview/) | the material-graph editor's live orbitable sphere: reusing the modal `assetPreview` view (modal swap with the asset editor), the by-id material subject that reflects graph edits, the shared pan-only `useOrbitCamera` hook, EV exposure | `control/src/commands_asset.rs` · `MaterialGraphEditor.tsx` · `lib/useOrbitCamera.ts` |
-| `editor-settings` | the gear-button settings modal, the rebindable-keybinding registry + delta `settings.json`, the `load/save_editor_settings` bridge | `SettingsModal.tsx` · `lib/keybindings.ts` · `shell/src/settings.rs` |
-| `hierarchy-panel` | the React tree outliner (`parentId` → forest), drag-reparent, the Environment sentinel, Create presets | `HierarchyPanel.tsx` · `HierarchyTree.tsx` |
-| `inspector` | the DTO-typed component inspector (fieldRenderer + FIELD_HINTS), RMW writes, add/remove guarded | `InspectorPanel.tsx` · `fieldRenderer.tsx` |
-| `physics-inspector` | the split Rigidbody/Collider sections: the enum/lockAxes/struct field kinds (motion/shape Selects, X/Y/Z lock grid, nested material sliders), Fit-to-mesh, collider-alone-static note, skinned-only rig sidecars | `fieldRenderer.tsx` · `EnumField.tsx` · `LockAxesField.tsx` · `InspectorPanel.tsx` |
-| `asset-pickers-and-drag-drop` | the AssetPicker uuid combo, type-gated HTML5 drag-drop, live viewport placement previews for model assets | `AssetPicker.tsx` · `AssetTile.tsx` · `ViewportPanel.tsx` · `commands_asset.rs` |
-| `assets-panel-and-thumbnails` | the React asset browser, virtual folders, asset tabs, `get-thumbnail` base64 PNG + blob-URL cache, import dialog | `AssetsPanel.tsx` · `AssetTile.tsx` · `AssetViewer.tsx` |
-| `selection` | select/get-selection/deselect, the version-stamped reconcile round-trip, optimistic select | `state/store.ts` · `ViewportPanel.tsx` |
-| `undo-redo` | editor-only inverse-command + per-tab snapshot history, gesture grouping, mouse Back/Forward + Alt-arrow nav suppression, invalidation, the extension recipe | `lib/undo.ts` · `useTabSnapshotHistory.ts` · `state/store.ts` |
-| [`dock-system`](dock-system/) | the per-kind dock tree (`dockLayouts` keyed `scene`/`assetEditor`), per-main-tab isolation (disjoint `DockPanelId` spaces + active-island-only `[data-dock-leaf]` registry), the shared `TabStrip` + tear-out drag, the portal host, the locked live-subsurface leaves, the asset editor as a dock island, per-project persistence | `state/dockLayout.ts` · `components/dock/DockRoot.tsx` · `DockPanelsHost.tsx` · `dockDrag.ts` |
-| `theme-and-fonts` | shadcn theme tokens, font defaults (the layout itself lives in `dock-system`) | `styles.css` |
-| `mesh-thumbnails` | the engine `render_mesh_thumbnail` 3/4 preview, read back as a base64 PNG | `rendering/src/thumbnail_render.rs` |
-| [`metrics-dashboard`](metrics-dashboard/) | the gated metrics poll, the uPlot live frame-time graph, per-pass + VRAM views, shared thresholds, the alarm toasts/log/badge | `RenderStatsPanel.tsx` · `FrameTimeGraph.tsx` · `state/store.ts` |
-| [`profiler-panel`](profiler-panel/) | the capture tab beside Stats, the Start/Stop state machine, the table/flame/icicle views + cross-highlight, Chrome-Trace + Perfetto export | `ProfilerPanel.tsx` · `CaptureControls.tsx` · `lib/captureTree.ts` |
-| `physics-panel` | the play-mode physics diagnostics dock panel: live body counts + the contact/trigger feed (open-AND-playing gated), and the per-selection ragdoll blend + character move controls | `PhysicsPanel.tsx` · `state/store.ts` · `control/src/commands_physics.rs` |
-| [`script-logs-panel`](script-logs-panel/) | the play-mode `sa.log` feed (open-AND-playing drain, windowed list), the `AnimaSearchbar` chip search with an `Entity:` typed verb, and the engine `sa.log` → ring → `drain-script-logs` bridge | `ScriptLogsPanel.tsx` · `components/anima/` · `sceneedit/src/play.rs` · `control/src/commands_scene.rs` |
+| [Editor shell and the viewport bridge](editor-shell-and-viewport-bridge/) | CEF lifecycle, native IPC, host supervision, and platform backends | `App`, `CommandQueryHandler`, `backend`, `start_engine` |
+| [Viewport compositing](viewport-compositing/) | Shared-memory rings and platform surface stacking | `ShmPublish`, `Viewports`, `presenter::install` |
+| [Viewport panel](viewport-panel/) | Bounds sync, parking, picking, gizmo, and fly input | `ViewportPanel`, `useSubsurfaceBounds` |
+| [Editor camera](editor-camera/) | Fly navigation and control-plane camera state | `SceneEditCamera`, `update_scene_edit_camera` |
+| [Transform gizmo](gizmo/) | Native transform handles, modes, and pointer routing | `build_scene_edit_overlay`, `gizmo-pointer` |
+| [Play mode](play-mode/) | Session states, scene duplication, and camera handover | `SceneEditContext::enter_play`, `play_step_dt` |
+| [Debug visualization](debug-visualization/) | Native viewport overlays and Render-panel controls | `build_debug_overlay`, `RenderPanel` |
+| [Asset editor](asset-editor/) | Isolated model preview and rig-focused workspace | `AssetEditorWorkspace`, `enter-asset-preview` |
+| [Material-graph live preview](material-graph-live-preview/) | Graph preview sphere and shared orbit controls | `MaterialGraphEditor`, `useOrbitCamera` |
+| [Editor settings](editor-settings/) | Persisted keybindings and native settings bridge | `SettingsModal`, `load_editor_settings` |
+| [Hierarchy panel](hierarchy-panel/) | Scene tree, reparenting, presets, and Environment row | `HierarchyPanel`, `HierarchyTree` |
+| [Inspector](inspector/) | Typed component fields, ordering, and guarded edits | `InspectorPanel`, `renderField` |
+| [Physics inspector](physics-inspector/) | Collider, rigidbody, controller, and rig field editors | `EnumField`, `LockAxesField`, `InspectorPanel` |
+| [Asset pickers](asset-pickers-and-drag-drop/) | Typed asset selection and viewport placement previews | `AssetPicker`, `AssetTile`, `ViewportPanel` |
+| [Assets panel & thumbnails](assets-panel-and-thumbnails/) | Asset browsing, viewers, imports, and thumbnail caching | `AssetsPanel`, `AssetViewer`, `get-thumbnail` |
+| [Selection](selection/) | Authoritative selection, optimistic clicks, and reconciliation | `selectEntity`, `refreshHeavyState` |
+| [Undo/redo](undo-redo/) | Inverse commands, tab histories, and gesture grouping | `appendEdit`, `takeUndo`, `useTabSnapshotHistory` |
+| [Dock system](dock-system/) | Dock trees, tab isolation, tear-out, and persistence | `DockRoot`, `dockLayouts`, `dockDrag` |
+| [Environment and presentation panels](environment-and-presentation-panels/) | Environment authoring, profiles, quality ownership, and post-processing groups | `EnvironmentPanel`, `RenderPanel`, `PostProcessPanel` |
+| [Theme & fonts](theme-and-fonts/) | Theme tokens, typography, and shared UI styling | `styles.css` |
+| [Mesh thumbnails](mesh-thumbnails/) | Engine-rendered model previews and PNG readback | `render_mesh_thumbnail`, `encode_active_offscreen_png` |
+| [Metrics dashboard](metrics-dashboard/) | Frame graphs, pass timings, memory, and alarms | `RenderStatsPanel`, `FrameTimeGraph` |
+| [Profiler panel](profiler-panel/) | Capture controls, flame views, and trace export | `ProfilerPanel`, `spansToFlameTree` |
+| [Physics panel](physics-panel/) | Live body diagnostics, contacts, and ragdoll controls | `PhysicsPanel`, `physics-state`, `drain-contacts` |
+| [Script logs panel](script-logs-panel/) | Script log draining, filtering, and entity navigation | `ScriptLogsPanel`, `drain-script-logs` |
+
+## In the code
+
+| What | File | Symbols |
+|---|---|---|
+| Editor application | `editor/src/app/App.tsx` | `App`, `startReconcile` |
+| Typed engine client | `editor/src/control/client.ts` | `call`, `client`, `ControlError` |
+| Browser-to-shell IPC | `editor/shell/src/ipc.rs` | `CommandQueryHandler`, `browser_router` |
+| Native command dispatch | `editor/shell/src/commands.rs` | `dispatch` |
+| Platform contract | `editor/shell/src/backend/mod.rs` | `Handles`, `UiCompositor`, `presenter` |
+| View identities and ring ABI | `editor/shell/src/viewport.rs` | `View`, `Viewports`, `SHM_MAGIC` |
+
+## Related
+
+- [Tooling and control](../tooling-and-control/) — host socket, commands, schemas, and CLI
+- [Scene and ECS](../scene-and-ecs/) — scene state presented by the editor
+- [Materials & pipelines](../materials-and-pipelines/) — material authoring and preview rendering
+- [Physics](../physics/) — runtime state exposed through editor panels

@@ -5,65 +5,79 @@ weight = 9
 
 # Selection
 
-Selection is the editor's notion of the one entity currently being edited. It exists in two places at once: the engine holds the authoritative value, and the React store keeps a fast local mirror.
+Selection identifies the one scene entity targeted by the editor's hierarchy, Inspector, gizmo, and focus command. The engine owns the authoritative entity handle, while the editor store mirrors its stable uuid for immediate UI feedback. Asset-grid multi-selection is separate local state in the [Assets panel](../assets-panel-and-thumbnails/).
 
-A user selects in three ways:
+## Selection inputs
 
-- clicking a row in the [hierarchy](../hierarchy-panel/);
-- clicking a light or camera billboard in the viewport;
-- ray-picking a mesh.
+An entity becomes selected through a hierarchy row, a viewport pick, a control command, or an edit that creates or restores an entity. Deselect comes from an empty viewport pick, empty hierarchy space, the configured Deselect shortcut, or the `deselect` command.
 
-Clicking empty space deselects — in the viewport (a pick that misses), in the hierarchy panel below the rows, or with Escape. The two copies stay in agreement through a version-stamped poll, and local writes apply optimistically, so the interface never waits on a round-trip to the engine.
+Hierarchy selection is optimistic. The row writes `selectedId` before sending `select`, so its highlight and dependent UI respond without waiting for the socket. The viewport cannot know the picked uuid in advance; it writes the `pick` result into the store as soon as the command returns instead of waiting for the reconcile poll.
 
-## Optimistic select, then reconcile
-
-A click sets `store.selectedId` immediately, then fires the engine command:
-
-```ts
-selectEntity(id);                              // local highlight, no wait
-void client.selectEntity(id).catch(() => {});  // tell the engine
+```mermaid
+sequenceDiagram
+  participant UI as Hierarchy row
+  participant Store as Editor store
+  participant Engine as Control plane
+  UI->>Store: selectEntity(uuid)
+  UI->>Engine: select { entity: uuid }
+  Engine->>Engine: set_selection(handle)
+  Engine-->>Store: get-selection stamp
+  Store->>Engine: inspect(uuid)
+  Engine-->>Store: component snapshot
 ```
 
-The engine bumps a `selectionVersion` on every selection change, whether from `select`, `deselect`, `pick`, or a destroy that clears it. The reconcile poll reads `get-selection` each tick; it returns `{entity, selectionVersion, sceneVersion}`, and re-applies the selection only when the version or the selected id has changed. The common case (nothing changed) costs one cheap call, while an external change such as `sa select` still propagates back into the store within a tick.
+`SceneEditContext::set_selection` increments `selection_version` and publishes `on_selection_changed`. The same method handles direct selection, deselection, picking, play-state remapping, and asset-preview transitions. Destroying a subtree clears selection when the selected entity is the destroyed root or one of its descendants.
 
-```ts
-const nextSelectedId = selection.entity ? selection.entity.id : null;
-const selectionChanged =
-  selection.selectionVersion !== knownSelectionVersion ||
-  nextSelectedId !== knownSelectedId;
-if (selectionChanged) live.setSelectedId(nextSelectedId);
+## Viewport picking
+
+A left press in the viewport always begins the [gizmo](../gizmo/) gesture. If the pointer stays within three CSS pixels before release, the editor calls `pick` at the original press coordinate. A larger movement is treated as a gizmo drag and does not run the pick.
+
+The command maps viewport UV into the camera ray used for the rendered view. It checks meshless point-light, spot-light, and camera billboards first because their screen glyphs have no mesh surface. A billboard uses a 13-pixel half-size hit region and the nearest matching glyph wins.
+
+Mesh picking has two stages. Static meshes reject misses with a world AABB, then traverse a cached mesh-local BVH for the nearest triangle. Skinned meshes reject against a joint-union box, CPU-skin the vertices with the current joint palette, and test the deformed triangles. Preview-placement ghosts are excluded.
+
+A hit on a mesh inside a model instance resolves through `model_root_of`, so the model container becomes selected rather than an internal mesh or bone entity. A miss sets the engine selection to `Entity::NULL` and returns `hit: false`.
+
+```json
+{
+  "hit": true,
+  "id": "12001",
+  "name": "Hero",
+  "kind": "mesh"
+}
 ```
 
-When the selection or `sceneVersion` changes, the poll re-`inspect`s the new entity into `componentsBySelected`, which the [inspector](../inspector/) renders. Writes are gated off while `dragActive`, so a poll never clobbers a gizmo or scrub drag in progress.
+## Reconcile stamps
 
-## Picking in the viewport
+The focus-gated fast poll reads `get-selection` at a target rate of 20 Hz together with render stats and gizmo state. Its selection payload contains the selected entity plus `selectionVersion` and `sceneVersion`. The store compares both the stamp and uuid against its last accepted values.
 
-A plain left-click in the viewport is a ray-pick: a press that does not travel far enough to count as a [gizmo](../gizmo/) drag. The [viewport panel](../viewport-panel/) maps the click to `{u,v}` in `[0,1]` and calls `pick`:
+A selection change schedules `inspect` for the selected uuid. A scene change also refreshes the hierarchy, assets, and environment. Heavy refreshes are skipped when neither stamp changed, and a pending refresh replaces an older one while another is in flight.
 
-```ts
-const result = await client.pick(u, v);
-if (result.hit && result.id) setSelectedId(result.id);
-else setSelectedId(null);   // empty space deselects
-```
+`dragActive` freezes reconcile writes during gizmo, hierarchy, and inspector gestures. The fast poll resumes after release and applies the authoritative state. `sceneEntitiesLive` adds another gate around asset-preview tab switches, so preview entities and their selection never flash in the Scene hierarchy or Inspector.
 
-The engine builds a ray from the [editor camera](../editor-camera/) through that UV, tests billboards first then the nearest mesh AABB, selects the hit while bumping `selectionVersion`, and returns `{hit, id?, name?}`. A miss returns `{hit:false}` and deselects. The store update is optimistic, and the reconcile poll confirms it through the version it just bumped.
+## Scene transitions
 
-The ray and AABB math, along with the Vulkan-clip caveat, are covered in [Picking](../../scene-and-ecs/picking/). The click-versus-drag split, which makes a click on a gizmo handle drag rather than pick, lives in the viewport panel's pointer gesture.
+Entering Play duplicates the authored scene, then resolves the selected uuid into the play scene and selects that twin. Stopping Play resolves the uuid back into the authored scene; a runtime-created selection with no authored twin becomes empty.
+
+Opening an asset preview stashes the authored selection and selects the preview root. Returning to the Scene view restores the stashed entity when it still exists. These transitions call `set_selection`, so their stamps travel through the same reconcile path as a click or control command.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Selection slice + optimistic select | `editor/src/state/store.ts` | `selectedId`, `selectEntity`, `setSelectedId` |
-| Version-stamped reconcile | `editor/src/state/store.ts` | `startReconcile`, `selectionVersion`, `sceneVersion`, `getSelection` |
-| Hierarchy click | `editor/src/panels/HierarchyPanel.tsx` | `onSelect` |
-| Viewport pick | `editor/src/panels/ViewportPanel.tsx` | `runPick`, `client.pick` |
-| Selection + pick (engine) | `engine/crates/control/src/commands_scene.rs` · `engine/crates/assets/src/render_scene.rs` | `select`, `get-selection`, `deselect`, `pick`; `pick_entity` |
-| Poll counters (engine) | `engine/crates/sceneedit/src/context.rs` | `selection_version`, `scene_version`, `set_selection` |
+| Selection state and signal | `engine/crates/sceneedit/src/context.rs` | `SceneEditContext::selected`, `SceneEditContext::set_selection`, `on_selection_changed` |
+| Selection and pick commands | `engine/crates/control/src/commands_scene.rs` | `select`, `get-selection`, `deselect`, `pick`, `pick_billboard` |
+| Exact mesh picking | `engine/crates/assets/src/render_scene.rs` | `pick_entity`, `pick_scene_surface` |
+| Model-container resolution | `engine/crates/scene/src/hierarchy.rs` | `Scene::model_root_of` |
+| Store mirror and reconcile | `editor/src/state/store.ts` | `selectedId`, `selectEntity`, `startReconcile`, `selectionVersion` |
+| Hierarchy selection | `editor/src/panels/HierarchyPanel.tsx` | `HierarchyPanel`, `onSelect` |
+| Viewport gesture | `editor/src/panels/ViewportPanel.tsx` | `ViewportPanel`, `runPick`, `DRAG_THRESHOLD_PX` |
+| Deselect shortcut | `editor/src/app/useGizmoShortcuts.ts` | `useGizmoShortcuts` |
 
 ## Related
 
-- [Picking](../../scene-and-ecs/picking/) — the ray + AABB math behind click-select
-- [Hierarchy panel](../hierarchy-panel/) — selection by list click
-- [Gizmo](../gizmo/) — why a press is split into click (pick) vs drag (manipulate)
-- [Scene commands](../../tooling-and-control/scene-commands/) — `select`/`get-selection`/`deselect`/`pick` and the poll counters
+- [Picking](../../scene-and-ecs/picking/) — viewport-ray construction and mesh intersection
+- [Hierarchy panel](../hierarchy-panel/) — optimistic row selection and empty-space deselect
+- [Gizmo](../gizmo/) — click-versus-drag arbitration
+- [Inspector](../inspector/) — component snapshot refreshed for the selection
+- [Play mode](../play-mode/) — selection remapping between authored and play scenes

@@ -6,20 +6,17 @@ bookCollapseSection = true
 
 # Materials & pipelines
 
-A material is the surface description a mesh draws with — its shader and its parameters — and a pipeline is the compiled GPU state that renders it. Materials are first-class, editable assets (`.smat`), assignable to entities and authorable in a node graph. These pages explain how a material resolves to a pipeline and how the pipeline count stays small through four mechanisms:
+A material contains the surface parameters and shader identity used for a draw. A pipeline state object (PSO) contains the compiled GPU state that renders it. Anima stores authored materials as `.smat` assets, assigns them to entity submeshes through `MaterialSet`, and resolves them into compact GPU records and cached PSOs.
 
-- One übershader covers every material.
-- A specialization constant adds the unlit variant.
-- A single bindless texture array lets draws that differ only by texture batch together.
-- A node graph folds to params where it can, and only codegens a per-graph shader when it must.
+The shared `mesh.slang` shader covers fixed PBR materials. Specialization constants and PSO state select unlit, alpha-to-coverage, blend, skinning, and wireframe permutations. Texture slots index one bindless descriptor array, so texture identity stays out of the PSO key. A node graph either folds into ordinary parameters or supplies a generated shader identity.
 
 ## Pages
 
 | Page | Covers | Code |
 |---|---|---|
-| `material-and-pso-selection` | the `Material` (shader + variant), alpha-mode axes (blend / alpha-to-coverage), `request_mesh_pipeline`, build-on-miss cache | `pipelines.rs` · `request_mesh_pipeline`, `PsoKey` |
-| `ubershader-and-specialization` | one `mesh.slang`, `[[vk::constant_id]]` unlit + alpha-to-coverage permutations, skinned/wireframe variants | `pipelines.rs` · `build_mesh_pipeline`; `mesh.slang` · `kUnlit`, `kAlphaToCoverage` |
-| `descriptor-sets` | set 0 bindless, set 1 lighting, set 2 instances, set 3 IBL, set 4 screen-space | `lighting.slang` · `vk::binding`; `descriptors.rs` |
-| `bindless-textures` | one albedo array (PARTIALLY_BOUND + UPDATE_AFTER_BIND), `upload_texture` slot, per-instance index | `descriptors.rs` · `claim_slot`, `write_texture`; `upload.rs` · `upload_texture` |
-| `native-materials` | `.smat` assets, the params buffer + `evalSurface` seam, PBR slots, the `MaterialSet` reference+override entity binding, the editor | `material.rs` · `MaterialAsset`; `render_material.rs` · `resolve_entity_materials` |
-| `node-graph-codegen` | graph fold-vs-codegen, the Slang emitter, `slangc` → per-graph PSO, the React Flow editor | `graph.rs` · `emit_graph_surface`; `MaterialGraphEditor.tsx` |
+| [Materials & PSOs](material-and-pso-selection/) | Material flags, typed PSO keys, lazy construction, and cache reuse | `pipelines.rs` · `request_mesh_pipeline`, `PsoKey` |
+| [Übershader](ubershader-and-specialization/) | Shared mesh shader and its specialized pipeline permutations | `pipelines.rs` · `build_mesh_pipeline`; `mesh.slang` · `kUnlit`, `kAlphaToCoverage` |
+| [Descriptor sets](descriptor-sets/) | Mesh resource layout across bindless, lighting, material, and feature sets | `lighting.slang` · `vk::binding`; `pipelines.rs` · `Pipelines::new` |
+| [Bindless textures](bindless-textures/) | Descriptor indexing, slot allocation, reclamation, and per-material texture indices | `descriptors.rs` · `claim_slot`, `write_texture`; `upload.rs` · `upload_texture` |
+| [Native materials](native-materials/) | Material assets, inheritance, entity slots, and GPU parameter records | `material.rs` · `MaterialAsset`; `render_material.rs` · `resolve_entity_materials` |
+| [Node-graph codegen](node-graph-codegen/) | Parameter folding, Slang emission, generated variants, and editor graph flow | `graph.rs` · `lower_graph_to_params`, `emit_graph_surface`; `MaterialGraphEditor.tsx` |

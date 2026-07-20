@@ -3,7 +3,8 @@
 **Status:** PENDING IDEA
 
 > Inspiration backlog — not yet implementable as written. Needs a codebase pass (rides the
-> [gpu-particle-vfx](gpu-particle-vfx.md) keystone + the [wind](wind.md) field; a weather-state
+> [gpu-particle-vfx](gpu-particle-vfx.md) keystone + the shared wind field scheduled in
+> [`foliage-veg` Phase 10](../foliage-veg/phase-10-wind-deformation-phenology.md); a weather-state
 > component/uniform + `set-weather` command; snow/wetness material nodes on the node-graph).
 
 The falling, wind-blown snow that gives the reference scene its storm mood. This has two halves: the
@@ -42,7 +43,8 @@ A weather layer: precipitation particles (snow, rain), their collision splashes,
 ## Dependencies (do these first)
 
 - **[gpu-particle-vfx](gpu-particle-vfx.md)** — the keystone — for the falling particles.
-- **[wind](wind.md)** — for wind-driven advection (sideways snow).
+- **[`foliage-veg` Phase 10](../foliage-veg/phase-10-wind-deformation-phenology.md)** — the one
+  shared wind field used for wind-driven advection (sideways snow).
 - **Accumulation/wetness nodes need nothing new** — they ride the material node-graph.
 - **Collision splashes** reuse RT/TLAS or scene depth (present).
 

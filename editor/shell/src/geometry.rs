@@ -1,8 +1,9 @@
-//! Window-geometry memory on winit. Only SIZE and MAXIMIZED are
-//! acted on; position/monitor are captured but never applied — native Wayland (GNOME/Mutter in
-//! particular) gives a client no way to place its own toplevel or choose an output, so the
-//! compositor owns placement. Persisted to `appdata/state.json` (transient UI memory, not settings):
-//! a missing or corrupt file means no memory, and the window fills the current monitor.
+//! Window-geometry memory on winit. SIZE and MAXIMIZED are acted on everywhere; POSITION is
+//! captured everywhere but re-applied only where the window system permits self-placement
+//! (`backend::window::restore_position` — native Wayland gives a client no way to place its own
+//! toplevel or choose an output, so the compositor owns placement there). Persisted to
+//! `appdata/state.json` (transient UI memory, not settings): a missing or corrupt file means no
+//! memory, and the window fills the current monitor.
 
 use crate::ShellError;
 use serde::{Deserialize, Serialize};
@@ -71,21 +72,16 @@ pub(crate) fn repo_root() -> PathBuf {
 
 /// The app-data root (CEF cache, settings, window state, recent projects). `$SAFFRON_APPDATA_DIR`
 /// when set and non-empty — dev points it at the repo's `appdata/` so its state stays in-tree and
-/// isolated from an installed build; otherwise the XDG data directory (`$XDG_DATA_HOME`, else
-/// `~/.local/share`) under `saffron-anima`, the location an installed build uses. The shell forwards
-/// this to the spawned host via `SAFFRON_APPDATA_DIR`, so both agree on one directory.
+/// isolated from an installed build; otherwise the platform data directory an installed build uses
+/// (`backend::env::platform_data_dir`). The shell forwards this to the spawned host via
+/// `SAFFRON_APPDATA_DIR`, so both agree on one directory.
 pub fn app_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SAFFRON_APPDATA_DIR")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
-    std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("saffron-anima")
+    crate::backend::env::platform_data_dir()
 }
 
 pub(crate) fn userdata_dir() -> PathBuf {
@@ -116,10 +112,13 @@ pub fn write_state_file(state: &RememberedState) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// Re-apply a remembered geometry: SIZE then MAXIMIZED. Size before maximize so the un-maximize
-/// restore-size equals the remembered normal size.
+/// Re-apply a remembered geometry: SIZE, then POSITION where the window system permits
+/// self-placement (`backend::window::restore_position` — a no-op on Wayland, where the compositor
+/// owns placement), then MAXIMIZED. Size before maximize so the un-maximize restore-size equals
+/// the remembered normal size.
 pub fn apply_window_state(window: &Window, want: &WindowState) {
     let _ = window.request_inner_size(PhysicalSize::new(want.width, want.height));
+    crate::backend::window::restore_position(window, want);
     if want.maximized {
         window.set_maximized(true);
     }

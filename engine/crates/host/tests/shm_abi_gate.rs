@@ -35,17 +35,10 @@ use std::sync::Mutex;
 
 use saffron_host::{ShmView, ShmViewConfig, ViewportShmPublisher};
 use saffron_rendering::{SHM_HEADER_BYTES, SHM_MAGIC};
+use saffron_test_support::unique_shm_name;
 
 /// Serializes env-mutating sub-tests: `set_var` / `remove_var` are process-global.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// A unique shm name per run so concurrent test processes never collide.
-fn unique_name(tag: &str) -> String {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("/saffron-gate-{tag}-{}-{n}", std::process::id())
-}
 
 /// Builds a deterministic BGRA8 frame of `width * height` pixels keyed by `seed`, the exact
 /// shape (`B8G8R8A8_UNORM`, tightly packed `w*h*4`) the renderer's offscreen→BGRA8 blit
@@ -182,7 +175,7 @@ fn rust_producer_frames_are_accepted_byte_exact_by_the_reader_oracle() {
     publisher
         .enable(ShmViewConfig {
             view: ShmView::Scene,
-            name: unique_name("scene"),
+            name: unique_shm_name(),
         })
         .expect("enable scene segment");
 
@@ -252,7 +245,7 @@ fn first_frame_in_slot_one_and_dimension_changes_rebuild_buffers() {
     publisher
         .enable(ShmViewConfig {
             view: ShmView::Scene,
-            name: unique_name("dims"),
+            name: unique_shm_name(),
         })
         .expect("enable scene");
     let mut oracle = OracleReader::new();
@@ -312,8 +305,8 @@ fn first_frame_in_slot_one_and_dimension_changes_rebuild_buffers() {
 #[test]
 fn both_view_segments_exist_from_startup_with_seq_zero() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let scene = unique_name("both-scene");
-    let asset = unique_name("both-asset");
+    let scene = unique_shm_name();
+    let asset = unique_shm_name();
     // SAFETY: serialized by ENV_LOCK; no other thread reads these vars concurrently.
     unsafe {
         std::env::set_var(saffron_host::viewport_shm::ENV_SHM_SCENE, &scene);
@@ -329,8 +322,9 @@ fn both_view_segments_exist_from_startup_with_seq_zero() {
     // Both names resolve via the reader's read-only probe (mirrors `stat_shm`): the
     // segment exists and is at least the header size.
     for name in [&scene, &asset] {
-        let (ino, size) = probe_shm(name).unwrap_or_else(|| panic!("segment '{name}' must exist"));
-        assert!(ino != 0, "a real inode backs '{name}'");
+        let (generation, size) =
+            probe_shm(name).unwrap_or_else(|| panic!("segment '{name}' must exist"));
+        assert_ne!(generation, 0, "'{name}' has a generation");
         assert!(size >= SHM_HEADER_BYTES, "'{name}' is at least the header");
     }
 
@@ -376,7 +370,7 @@ fn a_grown_segment_is_still_read_byte_exact() {
     publisher
         .enable(ShmViewConfig {
             view: ShmView::Scene,
-            name: unique_name("grow"),
+            name: unique_shm_name(),
         })
         .expect("enable");
 
@@ -483,7 +477,7 @@ fn malformed_segments_are_rejected_for_the_readers_exact_reasons() {
     }
 }
 
-/// Mirrors the reader's `stat_shm`: a read-only `shm_open` returning the inode + size of
+/// Mirrors the reader's `stat_shm`: a read-only `shm_open` returning the generation + size of
 /// the named segment, or `None` if it does not exist. Uses `rustix`, the producer's seam.
 fn probe_shm(name: &str) -> Option<(u64, usize)> {
     use rustix::fs::fstat;
@@ -491,5 +485,23 @@ fn probe_shm(name: &str) -> Option<(u64, usize)> {
     let cname = CString::new(name).ok()?;
     let fd = shm::open(cname.as_c_str(), OFlags::RDONLY, Mode::empty()).ok()?;
     let st = fstat(&fd).ok()?;
-    Some((st.st_ino, st.st_size as usize))
+    let base = unsafe {
+        rustix::mm::mmap(
+            std::ptr::null_mut(),
+            SHM_HEADER_BYTES,
+            rustix::mm::ProtFlags::READ,
+            rustix::mm::MapFlags::SHARED,
+            &fd,
+            0,
+        )
+        .ok()?
+    }
+    .cast::<u32>();
+    let low = unsafe { std::ptr::read_volatile(base.add(6)) };
+    let high = unsafe { std::ptr::read_volatile(base.add(7)) };
+    unsafe { rustix::mm::munmap(base.cast(), SHM_HEADER_BYTES) }.ok()?;
+    Some((
+        u64::from(low) | (u64::from(high) << 32),
+        st.st_size as usize,
+    ))
 }

@@ -982,7 +982,7 @@ mod tests {
     /// row count and the first/last rows are pinned.
     #[test]
     fn table_order_is_stable() {
-        assert_eq!(BINDINGS.len(), 69);
+        assert_eq!(BINDINGS.len(), 70);
         assert_eq!((BINDINGS[0].class, BINDINGS[0].name), (Some("Vec3"), "x"));
         let last = BINDINGS[BINDINGS.len() - 1];
         assert_eq!((last.class, last.name), (None, "delay"));

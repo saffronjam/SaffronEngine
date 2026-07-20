@@ -1,8 +1,7 @@
-/// The Post panel: the project's pre-tonemap post-processing — the scene-linear bloom pyramid and the
-/// scene-linear color grade folded into the tonemap pass. It sections **Bloom** and **Grade** as the
-/// two top-level tabs; Grade sub-sections (Global / Shadows / Midtones / Highlights / mixer / split /
-/// look) use a Separator + uppercase label. Like Render and Environment these persist with the project
-/// (`renderSettings`), so this panel lives beside them and is scene-tab undoable.
+/// The Post panel owns image formation after scene rendering: tone mapping and exposure, color
+/// grading, and screen-space effects. The three top-level tabs keep those responsibilities distinct;
+/// Color sub-sections use an uppercase section label. Like Render and Environment these settings
+/// persist with the project (`renderSettings`) and are scene-tab undoable.
 ///
 /// Values are read from a shallow-selected subset of `renderStats` so the body re-renders only when a
 /// bloom/grade field changes, never on the 20 Hz stats poll. Writes optimistically fold in the new
@@ -69,6 +68,13 @@ const MIXER_OUTPUTS: { value: string; label: string }[] = [
   { value: "1", label: "Green" },
   { value: "2", label: "Blue" },
 ];
+
+const TONEMAP_OPTIONS = [
+  { value: "aces", label: "ACES" },
+  { value: "agx", label: "AgX" },
+  { value: "pbr-neutral", label: "PBR Neutral" },
+  { value: "reinhard", label: "Reinhard" },
+] as const;
 
 /// The `.cube` the tone curve bakes to; a small 17³ table keeps the import cheap.
 const CURVE_LUT_SIZE = 17;
@@ -169,7 +175,7 @@ export function PostProcessPanel() {
   const hasStats = useEditorStore((s) => s.renderStats !== null);
   const setRenderStats = useEditorStore((s) => s.setRenderStats);
   const setDragActive = useEditorStore((s) => s.setDragActive);
-  const [tab, setTab] = useState<"bloom" | "grade">("grade");
+  const [tab, setTab] = useState<"tone" | "color" | "effects">("tone");
   const [mixerOutput, setMixerOutput] = useState(0);
   const [curve, setCurve] = useState<ToneCurveChannels>(identityChannels);
 
@@ -178,6 +184,8 @@ export function PostProcessPanel() {
       const r = s.renderStats;
       const g = r?.colorGrading;
       return {
+        tonemap: r?.tonemap ?? "aces",
+        exposureEv: r?.exposureEv ?? 0,
         gradeTemperature: g?.temperature ?? 6500,
         gradeTint: g?.tint ?? 0,
         gradeContrast: g?.contrast ?? 1,
@@ -222,6 +230,59 @@ export function PostProcessPanel() {
     redo: () => Promise<unknown>,
   ): void => {
     useEditorStore.getState().pushEdit({ label, undo, redo }, "scene");
+  };
+
+  const onTonemap = (mode: string): void => {
+    const prior = useEditorStore.getState().renderStats?.tonemap ?? "aces";
+    optimistic({ tonemap: mode });
+    if (prior !== mode) {
+      recordRender(
+        "View transform",
+        () => client.setTonemap(prior as "aces"),
+        () => client.setTonemap(mode as "aces"),
+      );
+    }
+    void client
+      .setTonemap(mode as "aces")
+      .then((res) => optimistic({ tonemap: res.mode }))
+      .catch((err: unknown) => notifyError(errorText(err)));
+  };
+
+  const exposurePrior = useRef<number | null>(null);
+  const onExposureDragStart = (): void => {
+    exposurePrior.current = useEditorStore.getState().renderStats?.exposureEv ?? 0;
+    setDragActive(true);
+  };
+  const onExposureDragEnd = (): void => {
+    setDragActive(false);
+    const prior = exposurePrior.current;
+    exposurePrior.current = null;
+    if (prior === null) return;
+    const after = useEditorStore.getState().renderStats?.exposureEv ?? 0;
+    if (prior !== after) {
+      recordRender(
+        "Exposure",
+        () => client.setExposure(prior),
+        () => client.setExposure(after),
+      );
+    }
+  };
+  const onExposure = (ev: number): void => {
+    if (exposurePrior.current === null) {
+      const prior = useEditorStore.getState().renderStats?.exposureEv ?? 0;
+      if (prior !== ev) {
+        recordRender(
+          "Exposure",
+          () => client.setExposure(prior),
+          () => client.setExposure(ev),
+        );
+      }
+    }
+    optimistic({ exposureEv: ev });
+    void client
+      .setExposure(ev)
+      .then((res) => optimistic({ exposureEv: res.exposureEv }))
+      .catch((err: unknown) => notifyError(errorText(err)));
   };
 
   // Bloom is one command over its fields; each gesture reads the current state and writes the full
@@ -541,17 +602,51 @@ export function PostProcessPanel() {
     <div className="flex h-full min-h-0 flex-col">
       <Tabs
         value={tab}
-        onValueChange={(v) => setTab(v as "bloom" | "grade")}
+        onValueChange={(v) => setTab(v as "tone" | "color" | "effects")}
         className="flex min-h-0 flex-1 flex-col gap-0"
       >
         <div className="p-2.5 pb-1.5">
           <TabsList>
-            <TabsTrigger value="bloom">Bloom</TabsTrigger>
-            <TabsTrigger value="grade">Grade</TabsTrigger>
+            <TabsTrigger value="tone">Tone</TabsTrigger>
+            <TabsTrigger value="color">Color</TabsTrigger>
+            <TabsTrigger value="effects">Effects</TabsTrigger>
           </TabsList>
         </div>
 
-        <TabsContent value="bloom" className="min-h-0">
+        <TabsContent value="tone" className="min-h-0">
+          <ScrollArea className="h-full min-h-0">
+            <div className="flex flex-col gap-2 p-2.5 pt-1">
+              <SectionLabel>Display transform</SectionLabel>
+              <FieldRow label="View transform">
+                <Select value={cfg.tonemap} disabled={!ready} onValueChange={onTonemap}>
+                  <SelectTrigger className="h-7 text-[11px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TONEMAP_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value} className="text-[11px]">
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldRow>
+              <FieldRow label="Exposure (EV)">
+                <NumberDrag
+                  value={cfg.exposureEv}
+                  min={-8}
+                  max={8}
+                  step={0.05}
+                  onChange={onExposure}
+                  onDragStart={onExposureDragStart}
+                  onDragEnd={onExposureDragEnd}
+                />
+              </FieldRow>
+            </div>
+          </ScrollArea>
+        </TabsContent>
+
+        <TabsContent value="effects" className="min-h-0">
           <ScrollArea className="h-full min-h-0">
             <div className="flex flex-col gap-2 p-2.5 pt-1">
               <div className="grid grid-cols-[1fr_auto] items-center gap-1.5">
@@ -758,7 +853,7 @@ export function PostProcessPanel() {
           </ScrollArea>
         </TabsContent>
 
-        <TabsContent value="grade" className="min-h-0">
+        <TabsContent value="color" className="min-h-0">
           <ScrollArea className="h-full min-h-0">
             <div className="flex flex-col gap-2 p-2.5 pt-1">
               <SectionLabel>Global</SectionLabel>

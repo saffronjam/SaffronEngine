@@ -6,9 +6,11 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
+import { bootEngine, Cleaner, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
-let created: string[] = [];
+const caseCleaner = new Cleaner();
+const suiteCleaner = new Cleaner();
 const LEG = join(REPO, "tests", "e2e", "fixtures", "leg.gltf");
 
 interface PhysicsState {
@@ -23,26 +25,23 @@ interface KinematicBonesResult {
 }
 
 const worldY = async (entity: string): Promise<number> =>
-  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation.y;
+  (await engine.call<{ translation: { y: number } }>("get-world-transform", { entity })).translation
+    .y;
 
 async function spawn(name: string): Promise<string> {
   const id = (await engine.call<{ id: string }>("create-entity", { name })).id;
-  created.push(id);
-  return id;
+  return trackEntity(caseCleaner, engine, id);
 }
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
+  engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
 });
 afterEach(async () => {
   await engine.call("stop").catch(() => {});
-  for (const id of created) {
-    await engine.call("destroy-entity", { entity: id }).catch(() => {});
-  }
-  created = [];
+  await caseCleaner.cleanup();
 });
 afterAll(async () => {
-  await engine?.shutdown();
+  await suiteCleaner.cleanup();
 });
 
 test("a Kinematic body ignores gravity while a Dynamic one falls", async () => {
@@ -62,7 +61,12 @@ test("a Kinematic body ignores gravity while a Dynamic one falls", async () => {
   await engine.call("set-transform", { entity: kin, translation: { x: 2, y: 5, z: 0 } });
   await engine.call("add-component", { entity: kin, component: "Collider" });
   await engine.call("add-component", { entity: kin, component: "Rigidbody" });
-  await engine.call("set-component-field", { entity: kin, component: "Rigidbody", field: "motion", value: "kinematic" });
+  await engine.call("set-component-field", {
+    entity: kin,
+    component: "Rigidbody",
+    field: "motion",
+    value: "kinematic",
+  });
 
   const dyn = await spawn("Dyn");
   await engine.call("set-transform", { entity: dyn, translation: { x: -2, y: 5, z: 0 } });
@@ -76,8 +80,7 @@ test("a Kinematic body ignores gravity while a Dynamic one falls", async () => {
 });
 
 test("a rig with KinematicBones gets one kinematic body per joint", async () => {
-  const meshId = (await engine.importEntity(LEG)).id;
-  created.push(meshId);
+  const meshId = trackEntity(caseCleaner, engine, (await engine.importEntity(LEG)).id);
   // A skinned model wraps its rig under a container root; the SkinnedMesh + bones live on a
   // descendant. Resolve it for the component add; the command itself accepts the container root.
   const rigId = await engine.rig(meshId);

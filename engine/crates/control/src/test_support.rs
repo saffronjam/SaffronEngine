@@ -706,6 +706,12 @@ impl ControlRenderer for StubRenderer {
         with(&StubGpu);
     }
 
+    fn create_vegetation_compute_executor(
+        &self,
+    ) -> Result<Option<crate::VegetationComputeExecutor>, String> {
+        Ok(None)
+    }
+
     fn render_material_preview_png(
         &mut self,
         _assets: &mut AssetServer,
@@ -739,12 +745,18 @@ pub fn with_stub<T>(
     let mut window = Window::headless();
     let mut scene_edit = SceneEditContext::new();
     let mut assets = AssetServer::new(std::env::temp_dir().join("saffron-control-test"));
+    let mut spatial = saffron_spatial::ResidencyManager::new();
+    let mut vegetation_jobs = crate::vegetation_jobs::VegetationEvaluationJobs::default();
+    let mut vegetation_compute = None;
     let mut ctx = EngineContext {
         window: &mut window,
         renderer,
         scene_edit: &mut scene_edit,
         assets: &mut assets,
+        spatial: &mut spatial,
         physics: None,
+        vegetation_jobs: &mut vegetation_jobs,
+        vegetation_compute: &mut vegetation_compute,
     };
     body(&mut ctx)
 }

@@ -6,9 +6,12 @@ math = true
 
 # Froxel bounds
 
-A froxel bound is the view-space axis-aligned bounding box of one cluster in the froxel grid.
+A froxel bound is the view-space axis-aligned bounding box of one cluster in the 16×9×24 froxel
+grid.
 
-A froxel is a frustum voxel: a screen tile extruded between two depth planes. Because it lives in a perspective frustum, its true shape is a truncated pyramid rather than a box. The bound is the box that encloses that volume. The [light culling](../clustered-light-culling/) sphere test uses that box to decide whether a light touches the cluster, and the cull shader builds it from the froxel's screen tile and its two exponential-Z planes.
+A froxel is a frustum voxel: a screen tile extruded between two depth planes. Perspective makes its
+true shape a truncated pyramid. The [light culling](../clustered-light-culling/) pass encloses that
+volume in a box, then tests each punctual light's bounding sphere against the box.
 
 ## From cluster index to screen tile
 
@@ -26,13 +29,19 @@ float2 maxSS = float2(float(gx + 1), float(gy + 1)) * tileSize;
 
 ## Slicing the rays at the Z planes
 
-The cluster's depth extent comes from the exponential Z formula, which [light culling](../clustered-light-culling/) covers. Each near-plane corner ray is intersected with the two planes $z = z_\text{near}$ and $z = z_\text{far}$. `rayToZ` scales the point so its $z$ lands on the target plane: for an eye-origin ray through $P$, the point at depth $z_d$ is $P \cdot (z_d / P_z)$.
+The cluster's depth extent comes from the exponential Z formula, which
+[light culling](../clustered-light-culling/) covers. Each diagonal corner ray is intersected with
+the two planes $z = z_\text{near}$ and $z = z_\text{far}$. `rayToZ` scales a point $P$ on an
+eye-origin ray by $z_d / P_z$ so it lands on depth plane $z_d$.
 
 ```hlsl
 float3 rayToZ(float3 p, float zDist) { return p * (zDist / p.z); }
 ```
 
-Two corner rays × two Z planes gives four view-space points (the near-quad and far-quad corners). The box is the component-wise min and max of those four.
+Two diagonal rays at two depth planes give four view-space points. At either depth, the two points
+carry the minimum and maximum X/Y components of that tile, so their component-wise minimum and
+maximum also enclose the two unsampled corners. Reducing all four points produces the complete
+view-space AABB.
 
 ```mermaid
 flowchart TD
@@ -40,28 +49,37 @@ flowchart TD
     B --> C[tile min/max screen px]
     C --> D[screenToView at near plane<br/>two corner rays]
     B --> E[exponential tileNear / tileFar]
-    D --> F[rayToZ: 4 froxel corners]
+    D --> F[rayToZ: 4 diagonal points]
     E --> F
     F --> G[min / max = view-space AABB]
 ```
 
-## Design and trade-offs
+## Conservative overlap
 
-The box is a loose fit. The near quad is smaller than the far quad, so the axis-aligned box that encloses all four corners is slightly larger than the true truncated pyramid. The over-estimate means a light can be added to a froxel it does not strictly overlap, so the cull keeps a few extra lights and never misses one. For a visibility cull this is the right bias: a missed light is a visible artifact, while an extra light costs only a little wasted shading. Testing the actual froxel planes would trade more compute for shorter light lists; the AABB is the cheap choice that is correct by over-inclusion. The CPU-side `cluster_aabb` mirrors the same box for the rendering crate's unit tests.
+The AABB includes space outside the truncated pyramid. `light_intersects_cluster` transforms a
+light centre into view space, clamps it to the box, and compares the squared centre-to-box distance
+with the squared light range. A rejected sphere cannot touch the enclosed froxel. An accepted sphere
+may touch only the box's extra volume, producing a false positive.
+
+False positives lengthen a cluster's shading loop and consume slots in its 64-light record. Once
+that record is full, later intersections are omitted in buffer order, so conservative assignments
+can affect which lights survive the cap. The CPU functions `cluster_aabb`,
+`light_intersects_cluster`, and `cull_clusters_cpu` mirror the shader for unit tests.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Unpack index → grid coords | `assets/shaders/light_cull.slang` | `computeMain` (`gx`/`gy`/`gz`) |
-| Screen tile corners | `assets/shaders/light_cull.slang` | `computeMain` (`tileSize`, `minSS`/`maxSS`) |
-| Unproject to view space | `assets/shaders/light_cull.slang` | `screenToView` |
-| Slice rays at Z planes | `assets/shaders/light_cull.slang` | `rayToZ`, `tileNear`/`tileFar` |
-| The view-space AABB | `assets/shaders/light_cull.slang` | `aabbMin`/`aabbMax` |
-| view + inverse_projection inputs | `crates/rendering/src/lighting.rs` | `ClusterParams` (`view`, `inverse_projection`) |
-| CPU mirror for tests | `crates/rendering/src/lighting.rs` | `cluster_aabb` |
+| Unpack index → grid coords | `engine/assets/shaders/light_cull.slang` | `computeMain` (`gx`/`gy`/`gz`) |
+| Screen tile corners | `engine/assets/shaders/light_cull.slang` | `computeMain` (`tileSize`, `minSS`/`maxSS`) |
+| Unproject to view space | `engine/assets/shaders/light_cull.slang` | `screenToView` |
+| Slice rays at Z planes | `engine/assets/shaders/light_cull.slang` | `rayToZ`, `tileNear`/`tileFar` |
+| The view-space AABB | `engine/assets/shaders/light_cull.slang` | `aabbMin`/`aabbMax` |
+| View and inverse-projection inputs | `engine/crates/rendering/src/lighting.rs` | `ClusterParams` (`view`, `inverse_projection`) |
+| CPU mirror for tests | `engine/crates/rendering/src/lighting.rs` | `cluster_aabb`, `light_intersects_cluster`, `cull_clusters_cpu` |
 
 ## Related
 
 - [Light culling](../clustered-light-culling/) — the sphere-vs-AABB test these bounds feed
 - [Clustered forward](../../lighting-and-brdf/clustered-forward/) — the lighting model behind it
+- [Per-cluster cap](../../lighting-and-brdf/per-cluster-cap/) — the 64-slot limit affected by conservative assignments

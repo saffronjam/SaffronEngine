@@ -107,6 +107,7 @@ fn view_mode_to_dto(mode: ViewMode) -> ViewModeDto {
         ViewMode::LightComplexity => ViewModeDto::LightComplexity,
         ViewMode::MotionVectors => ViewModeDto::MotionVectors,
         ViewMode::Fog => ViewModeDto::Fog,
+        ViewMode::CloudDensity => ViewModeDto::CloudDensity,
     }
 }
 
@@ -130,6 +131,7 @@ fn view_mode_from_dto(mode: ViewModeDto) -> ViewMode {
         ViewModeDto::LightComplexity => ViewMode::LightComplexity,
         ViewModeDto::MotionVectors => ViewMode::MotionVectors,
         ViewModeDto::Fog => ViewMode::Fog,
+        ViewModeDto::CloudDensity => ViewMode::CloudDensity,
     }
 }
 
@@ -221,6 +223,11 @@ fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
         draw_calls: stats.draw.draw_calls as i32,
         batches: stats.draw.batches as i32,
         instances: stats.draw.instances as i32,
+        scene_gather_ms: stats.scene_gather_ms,
+        instance_upload_bytes: stats.draw.instance_upload_bytes,
+        retained_mesh_cpu_bytes: stats.draw.retained_mesh_cpu_bytes,
+        shadow_draw_calls: stats.draw.shadow_draw_calls as i32,
+        rt_instances: stats.rt_instances as i32,
         frame_ms: stats.frame_ms,
         fps: stats.fps,
         gpu_ms: stats.gpu_ms,
@@ -1541,6 +1548,11 @@ mod tests {
         assert_eq!(result["viewMode"], json!("albedo"));
         assert_eq!(result["aa"], json!("off"));
         assert_eq!(result["profilerMode"], json!("off"));
+        assert_eq!(result["sceneGatherMs"], json!(0.0));
+        assert_eq!(result["instanceUploadBytes"], json!(0));
+        assert_eq!(result["retainedMeshCpuBytes"], json!(0));
+        assert_eq!(result["shadowDrawCalls"], json!(0));
+        assert_eq!(result["rtInstances"], json!(0));
     }
 
     #[test]

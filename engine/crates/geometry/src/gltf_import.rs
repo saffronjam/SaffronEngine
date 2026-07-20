@@ -193,11 +193,11 @@ pub fn import_gltf_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
     })
 }
 
-/// Fill in a decoded morph target's rest weights (the mesh-level `weights`, else 0) and
-/// names (synthesized `morph_{k}`). Cross-primitive target-count disagreement was already
-/// reconciled per-primitive in [`append_primitive`]; here we only attach the mesh-level
-/// metadata. The canonical count is the mesh `weights` length when it disagrees with the
-/// decoded target count (decisions #6/#7), padding or trimming with a warning.
+/// Fill in a decoded morph target's rest weights and names from mesh-level metadata.
+/// Cross-primitive target-count disagreement was already reconciled per-primitive in
+/// [`append_primitive`]. The canonical count is the mesh `weights` length when it disagrees
+/// with the decoded target count, padding or trimming with a warning. Names come from the
+/// exporter convention `extras.targetNames`; missing entries use `morph_{k}`.
 fn finalize_morph(morph: &mut MorphData, node_mesh: &gltf::Mesh, path: &Path) {
     let weights = node_mesh.weights().unwrap_or(&[]);
     if !weights.is_empty() && weights.len() != morph.targets.len() {
@@ -211,10 +211,53 @@ fn finalize_morph(morph: &mut MorphData, node_mesh: &gltf::Mesh, path: &Path) {
             .targets
             .resize_with(weights.len(), MorphTarget::default);
     }
+    let names = morph_target_names(node_mesh, morph.targets.len(), path);
     for (k, target) in morph.targets.iter_mut().enumerate() {
         target.rest_weight = weights.get(k).copied().unwrap_or(0.0);
-        target.name = format!("morph_{k}");
+        target.name = names
+            .get(k)
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| format!("morph_{k}"));
     }
+}
+
+/// Read the glTF exporter convention `mesh.extras.targetNames`, preserving target order.
+fn morph_target_names(
+    node_mesh: &gltf::Mesh,
+    target_count: usize,
+    path: &Path,
+) -> Vec<Option<String>> {
+    let Some(raw) = node_mesh.extras().as_ref() else {
+        return vec![None; target_count];
+    };
+    let Ok(extras) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+        tracing::warn!(
+            "gltf: '{}' mesh extras are not valid JSON; morph target names were synthesized",
+            path.display()
+        );
+        return vec![None; target_count];
+    };
+    let Some(values) = extras
+        .get("targetNames")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return vec![None; target_count];
+    };
+    if values.len() != target_count {
+        tracing::warn!(
+            "gltf: '{}' morph target name count ({}) disagrees with the target count ({target_count}); missing names were synthesized",
+            path.display(),
+            values.len()
+        );
+    }
+    (0..target_count)
+        .map(|index| {
+            values
+                .get(index)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Build the parent index of every node (`-1` for a root).

@@ -14,6 +14,8 @@ struct AtmosParams
     float4 ozone;
     float4 params0;   // planetRadius, atmosphereHeight, mieScaleHeight, mieAnisotropy
     float4 params1;   // sunDiskAngularRadius, sunDiskIntensity, cameraAltitude, unused
+    float4 moon;
+    float4 moonDisk;
 };
 [[vk::push_constant]] AtmosParams pc;
 

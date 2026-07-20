@@ -1381,7 +1381,9 @@ mod tests {
             raw.end_command_buffer(cmd).expect("end");
             let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
-            raw.queue_submit2(device.graphics_queue, &submit, fence)
+            device
+                .graphics_queue
+                .submit2(raw, &submit, fence, "submit")
                 .expect("submit");
             raw.wait_for_fences(&[fence], true, u64::MAX).expect("wait");
             raw.destroy_fence(fence, None);

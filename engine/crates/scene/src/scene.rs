@@ -5,11 +5,14 @@
 //! directly. That is what keeps the fallback to `bevy_ecs` a one-crate change. `Entity`
 //! is a bare handle, but every consumer goes through the `Scene` methods.
 
+use std::any::TypeId;
 use std::sync::Arc;
 
 use saffron_core::Uuid;
 
-use crate::component::{ComponentOrder, IdComponent, Name, Relationship, Transform};
+use crate::component::{
+    ComponentOrder, IdComponent, Name, Relationship, Transform, VegetationField,
+};
 use crate::environment::{AssetCatalog, SceneEnvironment};
 
 /// The component trait every stored type satisfies.
@@ -78,6 +81,15 @@ impl Scene {
     ///
     /// [`Error::InvalidEntity`](crate::Error::InvalidEntity) if `entity` is stale.
     pub fn add_component<C: Component>(&mut self, entity: Entity, c: C) -> crate::Result<()> {
+        if TypeId::of::<C>() == TypeId::of::<VegetationField>()
+            && self
+                .world
+                .query::<(hecs::Entity, &VegetationField)>()
+                .iter()
+                .any(|(owner, _)| owner != entity.0)
+        {
+            return Err(crate::Error::SingletonComponent("VegetationField"));
+        }
         self.world
             .insert_one(entity.0, c)
             .map_err(|_| crate::Error::InvalidEntity)
@@ -365,6 +377,26 @@ mod tests {
             scene.add_component(e, 7u32),
             Err(crate::Error::InvalidEntity)
         ));
+    }
+
+    #[test]
+    fn vegetation_field_is_a_scene_singleton() {
+        let mut scene = Scene::new();
+        let first = scene.create_entity("Vegetation");
+        let second = scene.create_entity("Competing vegetation");
+        let field = VegetationField {
+            map: Uuid(42),
+            enabled: true,
+        };
+
+        scene.add_component(first, field).unwrap();
+        scene.add_component(first, field).unwrap();
+        assert!(matches!(
+            scene.add_component(second, field),
+            Err(crate::Error::SingletonComponent("VegetationField"))
+        ));
+        assert_eq!(scene.component::<VegetationField>(first).unwrap(), field);
+        assert!(!scene.has_component::<VegetationField>(second));
     }
 
     #[test]

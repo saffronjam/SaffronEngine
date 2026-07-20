@@ -11,50 +11,38 @@
 //   - a normal map assigned to an entity perturbs the shaded scene result.
 
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Engine, REPO } from "./harness.ts";
 import type { EntityRef, InspectResult } from "@saffron/protocol";
+import { bootEngine, captureViewport, Cleaner, prepareScene, trackEntity } from "./test-utils.ts";
 
 let engine: Engine;
 const MAPPED = join(REPO, "tests", "e2e", "fixtures", "mapped-material.glb");
-const shots: string[] = [];
-const placed: string[] = [];
+const suiteCleaner = new Cleaner();
+const caseCleaner = new Cleaner();
 
 beforeAll(async () => {
-  engine = await Engine.boot({ SAFFRON_SCRATCH_PROJECT: "1" });
-  // Only the normal-map case renders the scene; IBL + the starter scene's Sun are harmless to the
-  // preview cases, which render their own studio-lit sphere offscreen.
+  engine = await bootEngine(suiteCleaner, { SAFFRON_SCRATCH_PROJECT: "1" });
+  await prepareScene(engine, {
+    camera: { position: { x: 0.35, y: 0.35, z: 2 }, yaw: 0, pitch: 0 },
+  });
+  // Keep the material-equivalence captures on deterministic direct + image-based lighting. The
+  // stochastic screen-space and distance-field GI passes are covered by their own render suites.
   await engine.call("set-ibl", { args: ["on"] }).catch(() => {});
+  await engine.call("set-render-quality", { args: ["low"] });
+  await engine.call("set-gi", { args: ["off"] });
+  await engine.call("set-sky-occlusion", { args: [0] });
 });
 afterAll(async () => {
-  await engine?.shutdown();
-  for (const shot of shots) {
-    rmSync(shot, { force: true });
-  }
+  await suiteCleaner.cleanup();
 });
 afterEach(async () => {
-  while (placed.length > 0) {
-    const id = placed.pop()!;
-    await engine.call("destroy-entity", { entity: id }).catch(() => {});
-  }
+  await caseCleaner.cleanup();
   await engine.settle(150);
 });
 
 async function screenshot(tag: string): Promise<Buffer> {
-  const path = `/tmp/saffron-e2e-matprev-${process.pid}-${tag}.png`;
-  shots.push(path);
-  rmSync(path, { force: true }); // never read a stale frame from a reused tag
-  await engine.call("screenshot", { target: "viewport", path });
-  const deadline = Date.now() + 10_000;
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) {
-      throw new Error(`screenshot ${tag} never landed`);
-    }
-    await engine.settle(100);
-  }
-  await engine.settle(200);
-  return readFileSync(path);
+  return captureViewport(engine, caseCleaner, `matprev-${tag}`);
 }
 
 test("preview-render returns a PNG that reflects the material's color", async () => {
@@ -158,9 +146,11 @@ test("get-thumbnail renders a material preview PNG", async () => {
 
 test("an assigned normal map perturbs the shaded result", async () => {
   const asset = (await engine.call<{ id: string }>("import-model", { path: MAPPED })).id;
-  const e = await engine.call<EntityRef>("instantiate-model", { asset });
-  placed.push(e.id);
-  await engine.call("set-camera", { position: { x: 0.35, y: 0.35, z: 2 }, yaw: 0, pitch: 0 });
+  const e = trackEntity(
+    caseCleaner,
+    engine,
+    await engine.call<EntityRef>("instantiate-model", { asset }),
+  );
   await engine.settle(300);
 
   // Reuse the fixture's own albedo texture (from the imported model's referenced `.smat`) as a

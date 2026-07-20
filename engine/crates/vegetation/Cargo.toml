@@ -1,0 +1,17 @@
+[package]
+name = "saffron-vegetation"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+saffron-core = { path = "../core" }
+saffron-json = { path = "../json" }
+saffron-geometry = { path = "../geometry" }
+saffron-spatial = { path = "../spatial" }
+thiserror.workspace = true

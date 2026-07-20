@@ -10,14 +10,18 @@ import {
   Image as ImageIcon,
   Maximize2,
   Minus,
+  Map as MapIcon,
   Square,
+  Sprout,
   Store,
+  TreePine,
   Workflow,
   X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import type { MouseEvent, ReactNode } from "react";
+import type { ReactNode } from "react";
+import { DRAG_REGION, IS_MACOS, NO_DRAG_REGION } from "../lib/platform";
 import { useEditorStore, type ViewTab } from "../state/store";
 import { TabStrip } from "@/components/dock/TabStrip";
 import { Button } from "@/components/ui/button";
@@ -70,24 +74,6 @@ export function WindowTitlebar() {
     void appWindow.close();
   };
 
-  const beginTitlebarDrag = (event: MouseEvent<HTMLElement>): void => {
-    if (event.button !== 0) {
-      return;
-    }
-
-    const target = event.target;
-    if (target instanceof Element && target.closest("[data-titlebar-control='true']")) {
-      return;
-    }
-
-    if (event.detail === 2) {
-      void toggleMaximize();
-      return;
-    }
-
-    void appWindow.startDragging();
-  };
-
   const items = tabs.map((tab) => ({
     id: tab.id,
     title: tab.title,
@@ -96,36 +82,45 @@ export function WindowTitlebar() {
   }));
 
   return (
+    // The titlebar's empty areas are a `-webkit-app-region: drag` surface: the shell reads these
+    // rectangles from Chromium and starts a native window drag on a press (double-press maximizes).
+    // Interactive children mark themselves `no-drag` so they stay clickable.
     <header
       className="flex h-9 flex-none items-center border-b border-border bg-card"
-      onMouseDown={beginTitlebarDrag}
+      style={DRAG_REGION}
     >
+      {/* macOS draws native traffic lights at the top-left (transparent titlebar over a
+          full-size content view); keep the tab strip clear of them. */}
+      {IS_MACOS && <div className="w-20 flex-none self-stretch" />}
       <TabStrip
         items={items}
         activeId={activeTabId}
         size="main"
         className="h-full flex-none px-2"
-        containerProps={{ "data-titlebar-control": "true" }}
+        containerProps={{ style: NO_DRAG_REGION }}
         onActivate={(id) => setActiveViewTab(id)}
         onClose={closeViewTab}
         onTabHover={setHoveredTabId}
         drag={{ domain: "view", pinnedIds: ["scene"], onReorder: moveViewTab }}
       />
       <div className="min-w-0 flex-1 self-stretch" />
-      <div className="flex w-33 flex-none justify-end" data-titlebar-control="true">
-        <TitlebarButton label="Minimize" onClick={minimize}>
-          <Minus />
-        </TitlebarButton>
-        <TitlebarButton
-          label={maximized ? "Restore" : "Maximize"}
-          onClick={() => void toggleMaximize()}
-        >
-          {maximized ? <Square /> : <Maximize2 />}
-        </TitlebarButton>
-        <TitlebarButton label="Close" onClick={close} variant="close">
-          <X />
-        </TitlebarButton>
-      </div>
+      {/* The window controls are drawn here only where the window has no native ones. */}
+      {!IS_MACOS && (
+        <div className="flex w-33 flex-none justify-end" style={NO_DRAG_REGION}>
+          <TitlebarButton label="Minimize" onClick={minimize}>
+            <Minus />
+          </TitlebarButton>
+          <TitlebarButton
+            label={maximized ? "Restore" : "Maximize"}
+            onClick={() => void toggleMaximize()}
+          >
+            {maximized ? <Square /> : <Maximize2 />}
+          </TitlebarButton>
+          <TitlebarButton label="Close" onClick={close} variant="close">
+            <X />
+          </TitlebarButton>
+        </div>
+      )}
     </header>
   );
 }
@@ -145,6 +140,15 @@ function tabIcon(tab: ViewTab): LucideIcon {
   }
   if (tab.kind === "store") {
     return Store;
+  }
+  if (tab.kind === "vegetationAsset") {
+    if (tab.assetType === "plant") {
+      return Sprout;
+    }
+    if (tab.assetType === "biome") {
+      return TreePine;
+    }
+    return MapIcon;
   }
   if (tab.assetType === "texture") {
     return ImageIcon;

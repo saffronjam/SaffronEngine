@@ -14,7 +14,7 @@
 //! volume, so the descriptor sets are device-shared (pool-owned), not per-view.
 //!
 //! Built once in [`Ddgi::new`], then borrowed `&Ddgi` by the frame-graph build (its handles are
-//! immutable after init); the camera-centered placement + sun/sky + temporal state are written
+//! immutable after init); the camera-centered placement + sun + temporal state are written
 //! through [`Ddgi::set_scene`] / [`Ddgi::set_enabled`] / [`Ddgi::advance_frame`] (`&mut
 //! self.ddgi`). The renderer carries the sun/sky as plain fields fed from the scene, the same
 //! decoupling as IBL.
@@ -35,7 +35,7 @@ use ash::vk;
 use saffron_geometry::glam::{IVec3, IVec4, UVec4, Vec3, Vec4};
 
 use crate::descriptors::Descriptors;
-use crate::resources::{DeviceResources, Image, ImageDesc};
+use crate::resources::{Buffer, DeviceResources, Image, ImageDesc};
 use crate::{Device, Result, checked};
 
 /// Probes per axis (X) of the camera-centered clipmap.
@@ -81,7 +81,7 @@ pub const DDGI_PROBE_BUDGET: u32 = DDGI_PROBE_TOTAL / 4;
 /// four frames.
 pub const DDGI_PROBE_CYCLE: usize = (DDGI_PROBE_TOTAL / DDGI_PROBE_BUDGET) as usize;
 
-/// The trace push: probe grid + volume + sun/sky + scroll/frame. 112 bytes, matching
+/// The trace push: probe grid + volume + sun + scroll/frame. 112 bytes, matching
 /// `ddgi_trace.slang`'s `Push`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -96,8 +96,8 @@ pub struct TracePush {
     pub sun_dir: Vec4,
     /// `rgb` = sun color, `w` = frame index (rotates the ray set).
     pub sun_color: Vec4,
-    /// `rgb` = ambient sky radiance, `w` = round-robin probe-budget offset (do not reuse).
-    pub sky_color: Vec4,
+    /// `x` = round-robin probe-budget offset.
+    pub budget_offset: Vec4,
     /// `xyz` = toroidal scroll base (`wrapMod(snapBase, count)`), `w` = SDF instance count.
     pub scroll_base: IVec4,
 }
@@ -197,7 +197,6 @@ pub struct Ddgi {
     sun_dir: Vec3,
     sun_color: Vec3,
     sun_intensity: f32,
-    sky_color: Vec3,
 
     sampler: vk::Sampler,
     trace_layout: vk::DescriptorSetLayout,
@@ -310,7 +309,6 @@ impl Ddgi {
             sun_dir: Vec3::new(-0.5, -1.0, -0.3),
             sun_color: Vec3::ONE,
             sun_intensity: 1.0,
-            sky_color: Vec3::new(0.1, 0.13, 0.2),
             sampler,
             trace_layout: layouts.trace,
             blend_irr_layout: layouts.blend_irr,
@@ -479,17 +477,10 @@ impl Ddgi {
         UVec4::new(s.x as u32, s.y as u32, s.z as u32, 0)
     }
 
-    /// Snaps the camera-centered volume to the probe grid and stores the sun/sky for the trace. A
+    /// Snaps the camera-centered volume to the probe grid and stores the sun for the trace. A
     /// no-op when not ready. The volume origin snaps so the cage centers on the camera without
     /// swimming sub-cell; the toroidal scroll base + the per-frame delta drive probe relocation.
-    pub fn set_scene(
-        &mut self,
-        cam_pos: Vec3,
-        sun_dir: Vec3,
-        sun_color: Vec3,
-        sun_intensity: f32,
-        sky_color: Vec3,
-    ) {
+    pub fn set_scene(&mut self, cam_pos: Vec3, sun_dir: Vec3, sun_color: Vec3, sun_intensity: f32) {
         if !self.ready {
             return;
         }
@@ -507,7 +498,6 @@ impl Ddgi {
         self.sun_dir = sun_dir;
         self.sun_color = sun_color;
         self.sun_intensity = sun_intensity;
-        self.sky_color = sky_color;
     }
 
     /// Advances the temporal state after a frame's four passes are recorded: records this frame's
@@ -550,7 +540,7 @@ impl Ddgi {
             volume_extent: self.volume_extent.extend(0.0),
             sun_dir: self.sun_dir.extend(self.sun_intensity),
             sun_color: self.sun_color.extend(self.frame_index as f32),
-            sky_color: self.sky_color.extend(self.round_robin_offset() as f32),
+            budget_offset: Vec4::new(self.round_robin_offset() as f32, 0.0, 0.0, 0.0),
             scroll_base: IVec4::new(s.x, s.y, s.z, sdf_count as i32),
         }
     }
@@ -627,6 +617,20 @@ impl Ddgi {
         );
     }
 
+    /// Binds the live raw-radiance sky SH buffer used for trace misses.
+    pub fn bind_sky_sh(&self, sh: &Buffer) {
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(sh.handle())
+            .offset(0)
+            .range(sh.size())];
+        let write = [vk::WriteDescriptorSet::default()
+            .dst_set(self.trace_set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info)];
+        unsafe { self.resources.device().update_descriptor_sets(&write, &[]) };
+    }
+
     /// Writes the (image never reallocate) static descriptors into the five sets: the
     /// trace/blend/border compute sets + the mesh set 5. The trace set's albedo binding (b0) is
     /// written separately by [`Ddgi::bind_gdf_albedo`] (it lives in the GDF sub-state).
@@ -636,7 +640,7 @@ impl Ddgi {
         let ro = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
         // trace set 2: albedo cache (b0, bind_gdf_albedo) + prev-irradiance sampler (b1) + ray
-        // storage (b2).
+        // storage (b2) + live sky SH (b3, bound by `bind_sky_sh`).
         write_combined_sampler(
             raw,
             self.trace_set,
@@ -796,10 +800,9 @@ impl Ddgi {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. The queue is touched single-threaded at init.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "ddgi init submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "ddgi init submit")?;
                 checked(
                     raw.wait_for_fences(&[fence], true, u64::MAX),
                     "ddgi init wait",
@@ -870,8 +873,9 @@ fn build_layouts(raw: &ash::Device) -> Result<DdgiLayouts> {
     let si = vk::DescriptorType::STORAGE_IMAGE;
     let cs = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
 
-    // trace set 2: albedo cache sampler (b0) + prev-irradiance sampler (b1) + ray storage (b2).
-    let trace = make_compute_layout(raw, &[cs, cs, si])?;
+    // trace set 2: albedo cache sampler (b0) + prev-irradiance sampler (b1) + ray storage (b2) +
+    // live sky SH storage buffer (b3).
+    let trace = make_compute_layout(raw, &[cs, cs, si, vk::DescriptorType::STORAGE_BUFFER])?;
     let blend_irr = match make_compute_layout(raw, &[cs, si]) {
         Ok(layout) => layout,
         Err(err) => {
@@ -1127,7 +1131,6 @@ mod tests {
             Vec3::new(0.0, -1.0, 0.0),
             Vec3::ONE,
             1.0,
-            Vec3::new(0.1, 0.13, 0.2),
         );
         // The volume centres on the camera (extent = count · spacing), snapped to a whole cell.
         let (vmin, vext) = ddgi.volume();

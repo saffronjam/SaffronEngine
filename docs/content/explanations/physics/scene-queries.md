@@ -5,62 +5,95 @@ weight = 7
 
 # Scene queries
 
-Stepping the world is not enough for gameplay — a script needs to *ask* it things: what is under the
-player's feet, what does this shot hit, is there ground ahead. Scene queries answer that by casting a
-ray or sweeping a shape against Jolt's narrow phase and reporting the closest hit, mapped back to the
-entity that owns the body.
+Scene queries test the live physics world without advancing it. A ray or swept sphere reports the
+closest body along a path, which supports sight tests, weapon impacts, and probes that need more
+width than a line.
 
-These are the gameplay counterpart to the editor's `pick` command. `pick` tests render AABBs and
-billboards for *editor selection* in Edit; a query tests *physics shapes at their simulated
-transforms* for gameplay in Play. They serve different surfaces and both stay — this is not a
-duplicate path.
+## Ray and sphere casts
 
-## Ray and sphere sweep
+Both operations use [Jolt's narrow-phase query](https://jrouwe.github.io/JoltPhysicsDocs/5.3.0/class_narrow_phase_query.html)
+and return `RayHit`:
 
-Two casts share one result type (`RayHit`: `hit` flag, owner `entity` uuid, world `point`, world
-`normal`, `distance`):
+| Field | Meaning on a hit |
+|---|---|
+| `hit` | `true` when the cast found a body |
+| `entity` | UUID mapped from the Jolt body ID |
+| `point` | World-space point on the struck body |
+| `normal` | World-space surface normal |
+| `distance` | Hit fraction multiplied by `maxDist` |
 
-- **`World::raycast(origin, dir, max_dist)`** — Jolt's `NarrowPhaseQuery::CastRay` for the single
-  closest hit. `dir` need not be normalized; the cast scales it by `max_dist`, so a caller can pass a
-  velocity vector and read `distance` back in those units. The hit point comes from the ray fraction,
-  and the surface normal from the hit body.
-- **`World::sphere_cast(origin, dir, radius, max_dist)`** — a sphere sweep (`CastShape`) for a
-  thicker probe that tolerates an edge a zero-radius ray slips past — a ground check that doesn't
-  fall through a crack, say.
+`World::raycast` constructs the path as `origin + dir * maxDist` and calls
+`NarrowPhaseQuery::CastRay`. It obtains the hit normal under a Jolt read lock. `World::sphere_cast`
+uses `NarrowPhaseQuery::CastShape` with a sphere whose radius has a `0.001` minimum and a closest-hit
+collector.
 
-Both map the hit `BodyID` back to its entity uuid through the world's body→entity index; a body with
-no entity reports `Uuid(0)`.
+Direction is not normalized by the engine. With a unit direction, `distance` is the physical
+distance from the origin. With a direction of length `L`, the physical displacement to the hit is
+`distance * L`. Callers that need world-unit distances therefore pass a unit vector.
 
-## Read-only, and off the step
+A miss returns `RayHit::default()`: `hit` is false and every numeric or vector field is zero. The
+safe world maps body IDs through its body index. An untracked Jolt body reports entity UUID zero;
+Lua omits the `entity` field in that case.
 
-Both methods take `&self`, so a query touches no body state and never perturbs the deterministic step
-(the cross-platform-deterministic build stays intact). It must run when no Jolt update is in flight:
-control commands run on the main thread between frames, and the Lua binding runs inside `on_update`
-(the `sim_tick` seam, after the step completes) — both clear of the step's job graph. A query is
-never run from a contact callback (that fires *during* the step).
+Queries use Jolt's default query filters, so the API has no per-call layer mask. A
+`CharacterVirtual` has no broad-phase body and does not appear in these casts. The
+[character controller](../character-controller/) performs its own narrow-phase sweeps when it
+updates.
 
-## Three surfaces, one entry point
+## Query timing
 
-- **`raycast` / `shapecast` control commands** read the world through the host's `Option<World>`.
-  The world exists only while Playing/Paused, so — unlike `pick`, which works in Edit — these refuse
-  in Edit with a "no physics world — enter play first" error.
-- **`sa raycast` / `sa shapecast`** print the structured hit from the shell.
-- **`sa.raycast` / `sa.spherecast` Lua bindings** — gameplay scripts call them inside `on_update`:
-  `local hit = sa.raycast(px,py,pz, 0,-1,0, 2); if hit.hit and hit.entity then … end`. Because the
-  crate DAG forbids `saffron-script` depending on `saffron-physics`, the host bridges it:
-  `saffron-script` declares a `ScriptHostBridge` trait with `raycast` / `sphere_cast`, and
-  `HostScriptBridge` implements it over the live `Option<World>`, calling these two methods and
-  flattening `RayHit` into the script-side `ScriptRayHit` (a plain field copy). The Lua binding only
-  ever sees a plain hit struct + a resolved entity.
+`World::raycast` and `World::sphere_cast` take `&self`, and the FFI accepts a shared world reference.
+They do not alter body state. Calls run between physics updates rather than from Jolt's worker-thread
+callbacks.
 
-v1 returns the single closest hit; an all-hits collector, query-time layer masks, and overlap/point
-queries extend this same entry point later.
+Control commands execute on the main thread before the frame's runtime update. Gameplay queries run
+after physics has stepped: `RuntimeSession::step` releases its mutable world borrow before it
+dispatches contact handlers and script `on_update`. Both `on_contact` and `on_update` may therefore
+query the settled world through the script bridge.
 
-## What | File | Symbols
+The editor's `pick` command has a different data source. It tests editor billboards and render mesh
+AABBs at viewport coordinates, while physics casts test live collision shapes at their simulated
+transforms.
+
+## Control and script surfaces
+
+The control plane exposes `raycast` and `shapecast`; `shapecast` is the sphere-sweep operation. Both
+default `maxDist` to `1000` and require a live physics world, which exists while the scene is Playing
+or Paused.
+
+For example, this ray starts two metres above the origin and casts ten metres downward:
+
+```console
+$ sa raycast --origin '{"x":0,"y":2,"z":0}' --dir '{"x":0,"y":-1,"z":0}' --maxDist 10
+hit entity=42  point=(0.000, 0.100, 0.000)  normal=(0.00, 1.00, 0.00)  dist=1.900
+```
+
+The Lua functions take scalar coordinates. `sa.raycast` accepts origin, direction, and maximum
+distance; `sa.spherecast` inserts radius before maximum distance:
+
+```lua
+local hit = sa.raycast(0, 2, 0, 0, -1, 0, 10)
+if hit.hit and hit.entity then
+    hit.entity:send("ground_hit", { distance = hit.distance })
+end
+```
+
+`saffron-script` declares `ScriptHostBridge` so it does not depend on the physics crate.
+`RuntimeScriptBridge` implements that trait over the session's shared `Option<World>`, copies
+`RayHit` into `ScriptRayHit`, and returns a miss when no world exists.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The query entry points | `engine/crates/physics/src/world.rs`, `src/types.rs` | `World::raycast`, `World::sphere_cast`, `RayHit` |
-| The narrow-phase FFI | `engine/crates/physics-sys/src/lib.rs` | `raycast`, `sphere_cast` |
-| Control commands | `engine/crates/control/src/commands_physics.rs` | `raycast`, `shapecast` |
-| Lua bindings + host bridge | `engine/crates/script/src/bindings.rs`, `engine/crates/host/src/script_bridge.rs` | `sa.raycast`, `sa.spherecast`, `ScriptHostBridge`, `HostScriptBridge::raycast` |
+| Public query API and hit mapping | `engine/crates/physics/src/world.rs`, `src/types.rs` | `World::raycast`, `World::sphere_cast`, `World::map_ray_hit`, `RayHit` |
+| Jolt narrow-phase bridge | `engine/crates/physics-sys/src/lib.rs`, `shim/jolt_bridge.cpp` | `raycast`, `sphere_cast`, `jolt_raycast`, `jolt_sphere_cast` |
+| Control protocol | `engine/crates/control/src/commands_physics.rs`, `engine/crates/protocol/src/dto.rs` | `register_physics_commands`, `RaycastParams`, `ShapecastParams`, `RaycastResult` |
+| Lua bindings and POD seam | `engine/crates/script/src/bindings.rs`, `bridge.rs` | `sa.raycast`, `sa.spherecast`, `ScriptHostBridge`, `ScriptRayHit` |
+| Runtime bridge | `engine/crates/runtime/src/bridge.rs`, `session.rs` | `RuntimeScriptBridge`, `RuntimeSession::step` |
+
+## Related
+
+- [Character controller](../character-controller/) explains the controller's separate sweep path.
+- [Collision layers, sensors, and contact events](../collision-layers-and-triggers/) covers body filtering and callback dispatch.
+- [Tooling and control](../../tooling-and-control/) explains the JSON control plane used by `sa`.

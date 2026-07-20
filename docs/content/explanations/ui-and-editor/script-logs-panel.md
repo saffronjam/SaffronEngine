@@ -5,40 +5,69 @@ weight = 9
 
 # Script logs panel
 
-The Script Logs panel is the play-mode window into `sa.log` output from gameplay scripts. It sits in the diagnostics group beside the [Physics panel](../physics-panel/) and [Stats and the Profiler](../metrics-dashboard/) (open it from the Tools → Diagnostics menu) and docks by default in the bottom **Assets and Timeline** group. While the scene is Playing it streams each script's log lines as `<time> [<entity>] <message>` rows; in Edit it shows an empty state and polls nothing — a closed panel or a panel in Edit makes zero control round-trips.
+The Script Logs panel shows `sa.log` output from gameplay scripts. It belongs to **Tools > Diagnostics** and opens in the lower Assets leaf unless the saved dock layout has another location for it.
 
-`sa.log(message)` from a script is captured on the engine side into a bounded ring on the edit context, tagged with the entity whose handler is running (`current_sender`) and a wall-clock timestamp. The line is *also* written to the engine log, but the panel is how you see it inside the editor. The bridge is a host-installed trait object (`ScriptHostBridge::log_sink`, implemented by `HostScriptBridge` in the host crate), so the `script` crate never depends on `sceneedit` — the same bridge pattern the physics bindings use.
+The panel polls only while it is open and Play is active. Closing it or returning to Edit removes its control-plane traffic, while the engine continues to retain its bounded log history.
 
-## Telemetry, gated to matter
+## From a script to the panel
 
-The reconcile poll drains logs only when the panel is **open and play is active** — scripts run only during play:
+The play VM replaces the no-scene `sa.log` binding with a function that performs two writes. It sends the message to the engine log, then calls `ScriptHostBridge::log_sink` with the UUID of the script instance whose handler is running.
 
-```ts
-if (isPanelOpen(state, "scriptLogs") && state.playState !== "edit") {
-  const drained = await client.drainScriptLogs(scriptLogsSince);
-  appendScriptLogs(drained.events, drained.overflowed);
-  scriptLogsSince = Math.max(scriptLogsSince, drained.highWaterSeq);
+`RuntimeScriptBridge` appends that pair to the session's shared sink. After runtime startup and each simulation step, the host drains the sink into `SceneEditContext`. The context adds a monotonic sequence number, the current `play_tick`, and a wall-clock millisecond timestamp used only for display.
+
+The engine ring holds the newest 1,024 lines. `drain-script-logs` accepts a sequence cursor and returns:
+
+```json
+{
+  "events": [],
+  "highWaterSeq": 42,
+  "oldestSeq": 1,
+  "overflowed": false
 }
 ```
 
-`drain-script-logs` returns the lines past a seq cursor with an `overflowed` flag (mirroring `drain-script-errors`/`drain-contacts`); the engine ring is bounded and the editor keeps a deeper newest-at-bottom window. The cursor and the editor buffer **reset on each fresh play**, and the buffer is **retained after Stop** so you can read what happened. The list is windowed — only the visible rows mount, so a long session stays smooth — and it auto-scrolls to the newest line unless you have scrolled up to read history. A wrapped ring surfaces a *lines-dropped* marker.
+An `overflowed` result means the requested cursor predates the oldest surviving line. Sequence numbers remain monotonic across play sessions even though entering Play clears the engine ring, so a client can continue from its previous high-water mark.
 
-## Searching with typed verbs
+## Editor retention and overflow
 
-The search bar is **AnimaSearchbar** — the first of the engine's generic `anima/` components. Instead of a free-text box plus a row of filter buttons, you type a verb and the bar autocompletes it into a **chip**:
+The editor stores lines in chronological order and retains the newest 2,000. When the open panel observes a fresh transition from Edit to Playing, it resets its cursor, visible buffer, and sticky overflow warning. Stop preserves the visible rows for review.
 
-- Type `Entity:` and a dropdown lists the scene's entities; pick one and it becomes an `Entity: Robot` chip that filters the feed to that entity. Multiple `Entity:` chips OR-group (any of them).
-- Anything that is not a chip is **free text**, matched case-insensitively against the message (AND-ed with the chips).
+If the panel is closed when a new session begins, no reset request runs. Opening it later keeps the existing editor rows and appends lines from the active session. This follows from the open-and-playing poll gate; the engine-side sequence cursor still prevents duplicate delivery.
 
-This collapses the "is this free text or a filter?" ambiguity into one bar. `Ctrl+F` focuses the search field while the panel has focus. The chip model (`parseQuery`/`serialize`/`SearchState`) is framework-agnostic and unit-tested; only the view is React.
+An overflow warning appears above the list when the engine reports dropped lines. It remains visible until the editor buffer is cleared at an observed fresh-play edge. The list mounts only the visible 20-pixel rows plus eight rows of overscan on each side, which bounds React work as the buffer grows.
 
-## Code
+The view follows new output while the scroll position is within two rows of the bottom. Scrolling upward disables that behavior until the reader returns to the end. Each row renders local time, the sender entity, and the message:
+
+```text
+14:08:03.127 [Player] grounded
+```
+
+Entity UUID `0` is shown as an em dash. A sender missing from the current entity list falls back to a shortened UUID.
+
+## Find and entity filters
+
+Ctrl/Cmd+F opens a compact find overlay in the panel. Escape or its close button clears the query and dismisses it. The overlay uses `AnimaSearchbar` with two kinds of criteria:
+
+- Free text performs a case-insensitive substring match against the message.
+- An `Entity:` token autocompletes at most 20 matching scene entities and becomes a chip containing the UUID.
+
+Multiple entity chips are ORed together. Free text is ANDed with that entity set, so `Entity: Player grounded` finds messages containing `grounded` from any selected sender. The chip-search parser and serializer are independent of React and have their own unit tests.
+
+## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| The panel | `editor/src/panels/ScriptLogsPanel.tsx` | `ScriptLogsPanel`, the `Entity:` chip config, the windowed list, Ctrl+F |
-| The search component | `editor/src/components/anima/` | `AnimaSearchbar`, `AnimaSearchField`, `chipSearch` (the model + test) |
-| Registration | `editor/src/components/dock/panelRegistry.tsx` · `editor/src/state/dockLayout.ts` | the `scriptLogs` registry entry, `SCENE_PANEL_IDS`, `DEFAULT_LEAF` (`leaf:assets`) |
-| Store state + poll | `editor/src/state/store.ts` | `scriptLogs`, `appendScriptLogs`, the open-AND-playing poll block + `scriptLogsSince` |
-| Typed wrapper | `editor/src/control/client.ts` | `drainScriptLogs` |
-| Engine capture + command | `engine/crates/sceneedit/src/play.rs` · `context.rs` · `engine/crates/script/src/bindings.rs` · `bridge.rs` · `engine/crates/host/src/script_bridge.rs` · `engine/crates/control/src/commands_scene.rs` | `ScriptLog` ring + `push_script_log`, the `sa.log` rebind, `ScriptHostBridge::log_sink`, `HostScriptBridge`, `drain-script-logs` |
+| Panel, filtering, and windowed list | `editor/src/panels/ScriptLogsPanel.tsx` | `ScriptLogsPanel`, `LogRow`, `ROW_HEIGHT`, `OVERSCAN` |
+| Chip search UI and model | `editor/src/components/anima/AnimaSearchbar.tsx` · `editor/src/components/anima/chipSearch.ts` | `AnimaSearchbar`, `SearchState`, `parseQuery`, `serialize` |
+| Dock registration and default reopen target | `editor/src/components/dock/panelRegistry.tsx` · `editor/src/state/dockLayout.ts` | `SCENE_PANEL_REGISTRY.scriptLogs`, `DEFAULT_LEAF.scriptLogs` |
+| Editor buffer and gated polling | `editor/src/state/store.ts` | `SCRIPT_LOG_LIMIT`, `appendScriptLogs`, `clearScriptLogs`, `startReconcile` |
+| Client command wrapper | `editor/src/control/client.ts` | `drainScriptLogs` |
+| Script binding and runtime sink | `engine/crates/script/src/bindings.rs` · `engine/crates/runtime/src/bridge.rs` | `register_scene_globals`, `ScriptHostBridge::log_sink`, `RuntimeScriptBridge` |
+| Engine ring and drain command | `engine/crates/sceneedit/src/play.rs` · `engine/crates/control/src/commands_scene.rs` | `ScriptLog`, `SCRIPT_LOG_RING_CAP`, `push_script_log`, `drain-script-logs` |
+
+## Related
+
+- [Play mode](../play-mode/) - session lifetime, fixed stepping, and automatic pause on script failure
+- [Script components and runtime](../../scripting/script-components-and-runtime/) - script slots and instance ownership
+- [Script-declared fields](../../scripting/script-declared-fields/) - editable instance inputs exposed by scripts
+- [Dock system](../dock-system/) - panel registration, reopen locations, and layout persistence
