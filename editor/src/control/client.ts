@@ -501,6 +501,12 @@ export const client = {
   listAssets(): Promise<AssetList> {
     return call("list-assets");
   },
+  importVegetationAsset(path: string, folder?: string) {
+    return call("import-vegetation-asset", folder ? { path, folder } : { path });
+  },
+  vegetationAssetSummary(asset: string) {
+    return call("vegetation-asset-summary", { asset });
+  },
   getThumbnail(id: string, size?: number): Promise<Thumbnail> {
     return call("get-thumbnail", size === undefined ? { asset: id } : { asset: id, size });
   },
@@ -566,22 +572,7 @@ export const client = {
   /// Edit a material asset's scalar factors in place.
   materialUpdate(
     material: string,
-    patch: {
-      baseColor?: { x: number; y: number; z: number; w: number };
-      metallic?: number;
-      roughness?: number;
-      emissive?: { x: number; y: number; z: number };
-      emissiveStrength?: number;
-      normalStrength?: number;
-      heightScale?: number;
-      heightMode?: string;
-      albedoTexture?: string;
-      ormTexture?: string;
-      normalTexture?: string;
-      emissiveTexture?: string;
-      heightTexture?: string;
-      vectorDisplacementTexture?: string;
-    },
+    patch: Omit<CommandParamsMap["material-update"], "material">,
   ): Promise<unknown> {
     return call("material-update", { material, ...patch });
   },
