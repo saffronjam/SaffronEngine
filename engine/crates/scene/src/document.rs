@@ -206,7 +206,7 @@ mod tests {
 
     use crate::component::{
         Camera, IdComponent, Name, PreviewGhost, Relationship, SkinnedMesh, Transform,
-        WorldTransform,
+        VegetationField, WorldTransform,
     };
     use crate::registry::register_builtin_components;
     use crate::scene::{Entity, Scene};
@@ -312,6 +312,46 @@ mod tests {
             "cube translation survives"
         );
         assert_eq!(doc.get("version"), Some(&Value::from(SCENE_VERSION)));
+    }
+
+    #[test]
+    fn vegetation_field_round_trips_and_duplicate_fields_are_rejected() {
+        let reg = registry();
+        let mut scene = Scene::new();
+        let field_owner = scene.create_entity("Vegetation");
+        scene
+            .add_component(
+                field_owner,
+                VegetationField {
+                    map: Uuid(91),
+                    enabled: false,
+                },
+            )
+            .unwrap();
+
+        let doc = scene.scene_to_json(&reg);
+        let mut loaded = Scene::new();
+        loaded.scene_from_json(&reg, &doc).unwrap();
+        let loaded_owner = find_by_name(&mut loaded, "Vegetation");
+        assert_eq!(
+            loaded.component::<VegetationField>(loaded_owner).unwrap(),
+            VegetationField {
+                map: Uuid(91),
+                enabled: false,
+            }
+        );
+
+        let mut duplicate = doc;
+        let entities = duplicate["entities"].as_array_mut().unwrap();
+        let mut second = entities[0].clone();
+        second["id"] = Value::String("92".to_owned());
+        second["components"]["Name"]["name"] = Value::String("Duplicate".to_owned());
+        entities.push(second);
+        let mut rejected = Scene::new();
+        assert!(matches!(
+            rejected.scene_from_json(&reg, &duplicate),
+            Err(crate::Error::Deserialize(message)) if message.contains("VegetationField")
+        ));
     }
 
     /// Hierarchy round-trip: the durable parent uuid survives, the post-loop resolve
