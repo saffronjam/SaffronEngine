@@ -1,6 +1,6 @@
 //! The native `.smat` material asset: a reference-only property bag over the
-//! übershader, its byte-compatible JSON serde, and the parent + sparse-override
-//! instance model.
+//! übershader, its byte-compatible JSON serde, the physically defined surface-response
+//! union, and the parent + sparse-override instance model.
 //!
 //! [`MaterialAsset`] bakes nothing — texture references are catalog [`Uuid`]s and the
 //! colorspace / normal convention are recorded on the referenced texture's catalog row.
@@ -13,9 +13,10 @@
 //! the editor and the baked-container chunk: the nested `factors` / `textures` objects,
 //! the named-array vectors (`baseColor` 4-elem, `emissive` 3-elem, `uvTiling` / `uvOffset`
 //! 2-elem), the texture key spellings (`albedo`, `ormOrMr`, `normal`, `emissive`,
-//! `height`), `normalConvention`, and the uuid fields emitted as **decimal strings**
-//! (read back from a string *or* a number). `graph` and `overrides` ride as opaque
-//! [`Value`] trees — the editor's node-graph schema is their single source of truth.
+//! `height`), `normalConvention`, the `surfaceModel` tagged union, and the uuid fields
+//! emitted as **decimal strings** (read back from a string *or* a number). `graph` and
+//! `overrides` ride as opaque [`Value`] trees — the editor's node-graph schema is their
+//! single source of truth.
 //!
 //! # Instances
 //!
@@ -33,6 +34,12 @@ use saffron_geometry::{
 };
 use saffron_json::{Value, json_bool_or, json_f32_or, json_string_or, parse_json};
 use saffron_scene::{AssetEntry, AssetType};
+use saffron_spatial::{DecisionScalar, UnitInterval};
+use saffron_vegetation::{
+    AlphaClassification, CoverageMipMetadata, CoverageSource, MaterialSurface,
+    OpacityMicromapDerivation, ThinSheetFoliageParameters, ThinSheetNormalBehavior,
+    VoxelMaterialMoments,
+};
 
 use crate::AssetServer;
 use crate::DEFAULT_MATERIAL_ID;
@@ -51,6 +58,8 @@ const MAX_INSTANCE_DEPTH: u32 = 8;
 /// instance (see the module docs).
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterialAsset {
+    /// Exactly one physically defined surface response family.
+    pub surface: MaterialSurface,
     /// The übershader family selector.
     pub shader: String,
     /// The PSO blend axis: `opaque` | `masked` | `translucent`.
@@ -118,6 +127,7 @@ impl Default for MaterialAsset {
     /// [`default_material_asset`].
     fn default() -> Self {
         Self {
+            surface: MaterialSurface::Standard,
             shader: "mesh".to_owned(),
             blend: "opaque".to_owned(),
             unlit: false,
@@ -189,11 +199,258 @@ fn read_fixed_array<const N: usize>(object: &Value, key: &str) -> Option<[f32; N
     Some(out)
 }
 
+fn hex_hash(hash: &[u8; 32]) -> String {
+    let mut value = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").unwrap();
+    }
+    value
+}
+
+fn parse_hash(value: &Value) -> Result<[u8; 32]> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| Error::Io(".smat coverage hash is not a string".to_owned()))?;
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Io(
+            ".smat coverage hash is not canonical lowercase SHA-256".to_owned(),
+        ));
+    }
+    let mut hash = [0_u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .map_err(|error| Error::Io(error.to_string()))?;
+    }
+    Ok(hash)
+}
+
+fn thin_sheet_to_json(parameters: &ThinSheetFoliageParameters) -> Value {
+    let (coverage_source, coverage_texture) = match parameters.coverage_source {
+        CoverageSource::AlbedoAlpha => ("albedo-alpha", Uuid(0)),
+        CoverageSource::Texture(texture) => ("texture", texture),
+        CoverageSource::ModeledGeometry => ("modeled-geometry", Uuid(0)),
+    };
+    let alpha_classification = match parameters.coverage.classification {
+        AlphaClassification::Opaque => "opaque",
+        AlphaClassification::Masked => "masked",
+        AlphaClassification::Transmissive => "transmissive",
+    };
+    serde_json::json!({
+        "frontAlbedoResponse": parameters.front_albedo_response.bits(),
+        "backAlbedoResponse": parameters.back_albedo_response.bits(),
+        "thicknessBits": parameters.thickness.bits(),
+        "absorptionColorBits": parameters.absorption_color.map(DecisionScalar::bits),
+        "transmissionColorBits": parameters.transmission_color.map(DecisionScalar::bits),
+        "roughness": parameters.roughness.bits(),
+        "normalBehavior": parameters.normal_behavior.as_wire(),
+        "coverageSource": {
+            "kind": coverage_source,
+            "texture": uuid_string(coverage_texture),
+        },
+        "coverage": {
+            "referenceCutoff": parameters.coverage.reference_cutoff.bits(),
+            "sourceExtent": parameters.coverage.source_extent,
+            "spatialHashSalt": parameters.coverage.spatial_hash_salt.to_string(),
+            "classification": alpha_classification,
+            "mipHashes": parameters.coverage.mip_hashes.iter().map(hex_hash).collect::<Vec<_>>(),
+        },
+        "voxelMoments": {
+            "occupancy": parameters.voxel_moments.occupancy.bits(),
+            "albedoMeanBits": parameters.voxel_moments.albedo_mean.map(DecisionScalar::bits),
+            "roughnessMean": parameters.voxel_moments.roughness_mean.bits(),
+            "transmissionMeanBits": parameters.voxel_moments.transmission_mean.map(DecisionScalar::bits),
+            "thicknessMeanBits": parameters.voxel_moments.thickness_mean.bits(),
+            "normalSecondMomentsBits": parameters.voxel_moments.normal_second_moments.map(DecisionScalar::bits),
+        },
+        "opacityMicromap": {
+            "enabled": parameters.opacity_micromap.enabled,
+            "maxSubdivision": parameters.opacity_micromap.max_subdivision,
+            "transparentThreshold": parameters.opacity_micromap.transparent_threshold.bits(),
+            "opaqueThreshold": parameters.opacity_micromap.opaque_threshold.bits(),
+        },
+        "energyLimit": parameters.energy_limit.bits(),
+    })
+}
+
+fn thin_sheet_from_json(value: &Value) -> Result<ThinSheetFoliageParameters> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Io(".smat thinSheetFoliage is not an object".to_owned()))?;
+    let u16_field = |object: &serde_json::Map<String, Value>, key: &str| -> Result<u16> {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| Error::Io(format!(".smat thinSheetFoliage.{key} is invalid")))
+    };
+    let u8_field = |object: &serde_json::Map<String, Value>, key: &str| -> Result<u8> {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| Error::Io(format!(".smat thinSheetFoliage.{key} is invalid")))
+    };
+    let i32_field = |object: &serde_json::Map<String, Value>, key: &str| -> Result<i32> {
+        object
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| Error::Io(format!(".smat thinSheetFoliage.{key} is invalid")))
+    };
+    let fixed_array = |object: &serde_json::Map<String, Value>, key: &str, count: usize| {
+        let values = object
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|values| values.len() == count)
+            .ok_or_else(|| Error::Io(format!(".smat thinSheetFoliage.{key} is invalid")))?;
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .map(DecisionScalar::from_bits)
+                    .ok_or_else(|| Error::Io(format!(".smat thinSheetFoliage.{key} is invalid")))
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+
+    let coverage_source = object
+        .get("coverageSource")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Io(".smat thinSheetFoliage.coverageSource is invalid".to_owned()))?;
+    let coverage_source = match coverage_source.get("kind").and_then(Value::as_str) {
+        Some("albedo-alpha") => CoverageSource::AlbedoAlpha,
+        Some("modeled-geometry") => CoverageSource::ModeledGeometry,
+        Some("texture") => CoverageSource::Texture(
+            coverage_source
+                .get("texture")
+                .map(uuid_from_value)
+                .ok_or_else(|| {
+                    Error::Io(".smat thinSheetFoliage coverage texture is missing".to_owned())
+                })?,
+        ),
+        _ => {
+            return Err(Error::Io(
+                ".smat thinSheetFoliage coverage source is invalid".to_owned(),
+            ));
+        }
+    };
+    let coverage = object
+        .get("coverage")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Io(".smat thinSheetFoliage.coverage is invalid".to_owned()))?;
+    let source_extent = coverage
+        .get("sourceExtent")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 2)
+        .and_then(|values| {
+            Some([
+                u32::try_from(values[0].as_u64()?).ok()?,
+                u32::try_from(values[1].as_u64()?).ok()?,
+            ])
+        })
+        .ok_or_else(|| Error::Io(".smat coverage sourceExtent is invalid".to_owned()))?;
+    let spatial_hash_salt = coverage
+        .get("spatialHashSalt")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| Error::Io(".smat coverage spatialHashSalt is invalid".to_owned()))?;
+    let classification = match coverage.get("classification").and_then(Value::as_str) {
+        Some("opaque") => AlphaClassification::Opaque,
+        Some("masked") => AlphaClassification::Masked,
+        Some("transmissive") => AlphaClassification::Transmissive,
+        _ => {
+            return Err(Error::Io(
+                ".smat coverage classification is invalid".to_owned(),
+            ));
+        }
+    };
+    let mip_hashes = coverage
+        .get("mipHashes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Io(".smat coverage mipHashes is invalid".to_owned()))?
+        .iter()
+        .map(parse_hash)
+        .collect::<Result<Vec<_>>>()?;
+    let voxel = object
+        .get("voxelMoments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Io(".smat thinSheetFoliage.voxelMoments is invalid".to_owned()))?;
+    let albedo_mean: [DecisionScalar; 3] = fixed_array(voxel, "albedoMeanBits", 3)?
+        .try_into()
+        .map_err(|_| Error::Io(".smat voxel albedo mean is invalid".to_owned()))?;
+    let transmission_mean: [DecisionScalar; 3] = fixed_array(voxel, "transmissionMeanBits", 3)?
+        .try_into()
+        .map_err(|_| Error::Io(".smat voxel transmission mean is invalid".to_owned()))?;
+    let normal_second_moments: [DecisionScalar; 6] =
+        fixed_array(voxel, "normalSecondMomentsBits", 6)?
+            .try_into()
+            .map_err(|_| Error::Io(".smat voxel normal moments are invalid".to_owned()))?;
+    let omm = object
+        .get("opacityMicromap")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Io(".smat thinSheetFoliage.opacityMicromap is invalid".to_owned()))?;
+    let absorption_color: [DecisionScalar; 3] = fixed_array(object, "absorptionColorBits", 3)?
+        .try_into()
+        .map_err(|_| Error::Io(".smat absorption color is invalid".to_owned()))?;
+    let transmission_color: [DecisionScalar; 3] = fixed_array(object, "transmissionColorBits", 3)?
+        .try_into()
+        .map_err(|_| Error::Io(".smat transmission color is invalid".to_owned()))?;
+    let parameters = ThinSheetFoliageParameters {
+        front_albedo_response: UnitInterval::from_bits(u16_field(object, "frontAlbedoResponse")?),
+        back_albedo_response: UnitInterval::from_bits(u16_field(object, "backAlbedoResponse")?),
+        thickness: DecisionScalar::from_bits(i32_field(object, "thicknessBits")?),
+        absorption_color,
+        transmission_color,
+        roughness: UnitInterval::from_bits(u16_field(object, "roughness")?),
+        normal_behavior: object
+            .get("normalBehavior")
+            .and_then(Value::as_str)
+            .and_then(ThinSheetNormalBehavior::from_wire)
+            .ok_or_else(|| Error::Io(".smat normalBehavior is invalid".to_owned()))?,
+        coverage_source,
+        coverage: CoverageMipMetadata {
+            reference_cutoff: UnitInterval::from_bits(u16_field(coverage, "referenceCutoff")?),
+            source_extent,
+            spatial_hash_salt,
+            classification,
+            mip_hashes,
+        },
+        voxel_moments: VoxelMaterialMoments {
+            occupancy: UnitInterval::from_bits(u16_field(voxel, "occupancy")?),
+            albedo_mean,
+            roughness_mean: UnitInterval::from_bits(u16_field(voxel, "roughnessMean")?),
+            transmission_mean,
+            thickness_mean: DecisionScalar::from_bits(i32_field(voxel, "thicknessMeanBits")?),
+            normal_second_moments,
+        },
+        opacity_micromap: OpacityMicromapDerivation {
+            enabled: omm
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| Error::Io(".smat OMM enabled is invalid".to_owned()))?,
+            max_subdivision: u8_field(omm, "maxSubdivision")?,
+            transparent_threshold: UnitInterval::from_bits(u16_field(omm, "transparentThreshold")?),
+            opaque_threshold: UnitInterval::from_bits(u16_field(omm, "opaqueThreshold")?),
+        },
+        energy_limit: UnitInterval::from_bits(u16_field(object, "energyLimit")?),
+    };
+    parameters.validate()?;
+    Ok(parameters)
+}
+
 /// Serializes a [`MaterialAsset`] to the frozen `.smat` JSON document.
 ///
-/// Uuid fields are emitted as decimal strings, never numbers; `version` is pinned to `1`;
-/// `graph` / `overrides` ride through verbatim (an empty object when unset). Object key
-/// order is incidental: the `.smat` write path serializes via `dump_json_sorted`
+/// Uuid fields are emitted as decimal strings, never numbers; `version` is pinned to `2`;
+/// `surfaceModel` and `thinSheetFoliage` form one strict tagged union. `graph` /
+/// `overrides` ride through verbatim (an empty object when unset). Object key order is
+/// incidental: the `.smat` write path serializes via `dump_json_sorted`
 /// (alphabetically sorted keys), so the byte shape is stable regardless of insertion order.
 #[must_use]
 pub fn material_asset_to_json(material: &MaterialAsset) -> Value {
@@ -207,8 +464,14 @@ pub fn material_asset_to_json(material: &MaterialAsset) -> Value {
     } else {
         material.overrides.clone()
     };
+    let thin_sheet_foliage = match &material.surface {
+        MaterialSurface::Standard => Value::Null,
+        MaterialSurface::ThinSheetFoliage(parameters) => thin_sheet_to_json(parameters),
+    };
     serde_json::json!({
-        "version": 1,
+        "version": 2,
+        "surfaceModel": material.surface.model().as_wire(),
+        "thinSheetFoliage": thin_sheet_foliage,
         "shader": material.shader,
         "blend": material.blend,
         "unlit": material.unlit,
@@ -246,14 +509,45 @@ pub fn material_asset_to_json(material: &MaterialAsset) -> Value {
     })
 }
 
+/// Encodes the canonical `.smat` text with sorted keys and one trailing newline.
+#[must_use]
+pub fn material_asset_to_text(material: &MaterialAsset, indent: i32) -> String {
+    let mut text = saffron_json::dump_json_sorted(&material_asset_to_json(material), indent);
+    text.push('\n');
+    text
+}
+
 /// Rebuilds a [`MaterialAsset`] from a `.smat` JSON document.
 ///
-/// Lenient: every field defaults to the [`MaterialAsset::default`] value when absent or
-/// mistyped; uuid fields accept a decimal string *or* a number. `features` is not read
-/// (it is a resolved bitset, never serialized).
-#[must_use]
-pub fn material_asset_from_json(doc: &Value) -> MaterialAsset {
+/// The version and surface union are strict. Conventional material properties retain
+/// their defaults when absent; uuid fields accept a decimal string *or* a number.
+/// `features` is not read (it is a resolved bitset, never serialized).
+pub fn material_asset_from_json(doc: &Value) -> Result<MaterialAsset> {
+    let version = doc.get("version").and_then(Value::as_i64).unwrap_or(-1);
+    if version != 2 {
+        return Err(Error::BadAssetVersion {
+            format: ".smat",
+            found: version,
+            expected: 2,
+        });
+    }
+    let surface = match doc.get("surfaceModel").and_then(Value::as_str) {
+        Some("standard") if doc.get("thinSheetFoliage").is_none_or(Value::is_null) => {
+            MaterialSurface::Standard
+        }
+        Some("thin-sheet-foliage") => MaterialSurface::ThinSheetFoliage(thin_sheet_from_json(
+            doc.get("thinSheetFoliage").ok_or_else(|| {
+                Error::Io(".smat thinSheetFoliage parameters are missing".to_owned())
+            })?,
+        )?),
+        _ => {
+            return Err(Error::Io(
+                ".smat surfaceModel and thinSheetFoliage do not form one valid surface".to_owned(),
+            ));
+        }
+    };
     let mut material = MaterialAsset {
+        surface,
         shader: json_string_or(doc, "shader", "mesh".to_owned()),
         blend: json_string_or(doc, "blend", "opaque".to_owned()),
         unlit: json_bool_or(doc, "unlit", false),
@@ -315,7 +609,8 @@ pub fn material_asset_from_json(doc: &Value) -> MaterialAsset {
         material.overrides = overrides.clone();
     }
 
-    material
+    material.surface.validate()?;
+    Ok(material)
 }
 
 /// Whether `value` is a JSON object with at least one member.
@@ -480,7 +775,7 @@ pub fn load_material_asset_raw(assets: &AssetServer, id: Uuid) -> Result<Materia
     let path = assets.root.join(&entry.path);
     let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(e.to_string()))?;
     let doc = parse_json(&text)?;
-    Ok(material_asset_from_json(&doc))
+    material_asset_from_json(&doc)
 }
 
 /// Reads a material catalog row, whether it is a standalone `.smat` or an embedded
@@ -534,7 +829,7 @@ pub fn load_catalog_material_asset_raw(
     let text = std::str::from_utf8(&bytes)
         .map_err(|e| Error::Io(format!("material {} chunk is not UTF-8: {e}", id.value())))?;
     let doc = parse_json(text)?;
-    Ok(material_asset_from_json(&doc))
+    material_asset_from_json(&doc)
 }
 
 /// Reads a `.smat` resolved for rendering.
@@ -611,10 +906,11 @@ pub fn save_material_asset(
     name: &str,
     folder: &str,
 ) -> Result<Uuid> {
+    material.surface.validate()?;
     let id = Uuid::new();
     assets.ensure_asset_directories();
     let relative_path = format!("materials/{}.smat", id.value());
-    let text = saffron_json::dump_json_sorted(&material_asset_to_json(material), 2);
+    let text = material_asset_to_text(material, 2);
     std::fs::write(assets.root.join(&relative_path), text).map_err(|e| Error::Io(e.to_string()))?;
     let unique = assets.catalog.unique_name(name);
     assets.catalog.put(AssetEntry {
@@ -647,6 +943,7 @@ pub fn update_material_asset(
     id: Uuid,
     material: &MaterialAsset,
 ) -> Result<()> {
+    material.surface.validate()?;
     let (container, rel_path) = {
         let entry = assets
             .catalog
@@ -660,7 +957,7 @@ pub fn update_material_asset(
         }
         (entry.container, entry.path.clone())
     };
-    let text = saffron_json::dump_json_sorted(&material_asset_to_json(material), 2);
+    let text = material_asset_to_text(material, 2);
     if container.value() == 0 {
         // Standalone `.smat`: the whole file is the material JSON.
         let path = assets.root.join(&rel_path);
@@ -681,6 +978,7 @@ mod tests {
 
     fn populated_material() -> MaterialAsset {
         MaterialAsset {
+            surface: MaterialSurface::Standard,
             shader: "mesh".to_owned(),
             blend: "masked".to_owned(),
             unlit: true,
@@ -726,8 +1024,80 @@ mod tests {
     #[test]
     fn round_trip_reproduces_every_field() {
         let original = populated_material();
-        let restored = material_asset_from_json(&material_asset_to_json(&original));
+        let restored = material_asset_from_json(&material_asset_to_json(&original)).unwrap();
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn thin_sheet_foliage_round_trip_reproduces_the_complete_union() {
+        let parameters = ThinSheetFoliageParameters {
+            front_albedo_response: UnitInterval::from_bits(20_000),
+            back_albedo_response: UnitInterval::from_bits(19_000),
+            thickness: DecisionScalar::from_bits(1_310),
+            absorption_color: [
+                DecisionScalar::from_bits(4_000),
+                DecisionScalar::from_bits(5_000),
+                DecisionScalar::from_bits(6_000),
+            ],
+            transmission_color: [
+                DecisionScalar::from_bits(25_000),
+                DecisionScalar::from_bits(24_000),
+                DecisionScalar::from_bits(23_000),
+            ],
+            roughness: UnitInterval::from_bits(41_000),
+            normal_behavior: ThinSheetNormalBehavior::Symmetric,
+            coverage_source: CoverageSource::Texture(Uuid(77)),
+            coverage: CoverageMipMetadata {
+                reference_cutoff: UnitInterval::from_bits(31_000),
+                source_extent: [4, 2],
+                spatial_hash_salt: 99,
+                classification: AlphaClassification::Transmissive,
+                mip_hashes: vec![[1; 32], [2; 32], [3; 32]],
+            },
+            voxel_moments: VoxelMaterialMoments {
+                occupancy: UnitInterval::from_bits(30_000),
+                albedo_mean: [DecisionScalar::from_bits(10_000); 3],
+                roughness_mean: UnitInterval::from_bits(40_000),
+                transmission_mean: [DecisionScalar::from_bits(12_000); 3],
+                thickness_mean: DecisionScalar::from_bits(700),
+                normal_second_moments: [DecisionScalar::from_bits(8_000); 6],
+            },
+            opacity_micromap: OpacityMicromapDerivation {
+                enabled: true,
+                max_subdivision: 5,
+                transparent_threshold: UnitInterval::from_bits(5_000),
+                opaque_threshold: UnitInterval::from_bits(60_000),
+            },
+            energy_limit: UnitInterval::from_bits(60_000),
+        };
+        let original = MaterialAsset {
+            surface: MaterialSurface::ThinSheetFoliage(parameters),
+            ..populated_material()
+        };
+
+        let restored = material_asset_from_json(&material_asset_to_json(&original)).unwrap();
+
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn thin_sheet_foliage_rejects_unknown_normal_behavior() {
+        let material = MaterialAsset {
+            surface: MaterialSurface::ThinSheetFoliage(ThinSheetFoliageParameters::default()),
+            ..MaterialAsset::default()
+        };
+        let mut doc = material_asset_to_json(&material);
+        doc["thinSheetFoliage"]["normalBehavior"] = Value::String("unknown".to_owned());
+
+        assert!(material_asset_from_json(&doc).is_err());
+    }
+
+    #[test]
+    fn surface_union_rejects_parameters_for_standard_materials() {
+        let mut doc = material_asset_to_json(&MaterialAsset::default());
+        doc["thinSheetFoliage"] = thin_sheet_to_json(&ThinSheetFoliageParameters::default());
+
+        assert!(material_asset_from_json(&doc).is_err());
     }
 
     #[test]
@@ -739,7 +1109,7 @@ mod tests {
             "edges": [],
         });
         original.overrides = serde_json::json!({ "metallic": 0.9, "albedoTexture": "7" });
-        let restored = material_asset_from_json(&material_asset_to_json(&original));
+        let restored = material_asset_from_json(&material_asset_to_json(&original)).unwrap();
         assert_eq!(restored.graph, original.graph);
         assert_eq!(restored.overrides, original.overrides);
         assert_eq!(restored.parent, Uuid(42));
@@ -766,14 +1136,14 @@ mod tests {
     #[test]
     fn byte_equal_to_captured_smat_fixture() {
         // A `.smat` document: alphabetically-sorted keys (via `dump_json_sorted`), uuid
-        // fields as decimal strings, `version: 1`. The default material with two texture
+        // fields as decimal strings, `version: 2`. The default material with two texture
         // ids assigned.
         let material = MaterialAsset {
             albedo_texture: Uuid(5),
             normal_texture: Uuid(6),
             ..MaterialAsset::default()
         };
-        let serialized = saffron_json::dump_json_sorted(&material_asset_to_json(&material), -1);
+        let serialized = material_asset_to_text(&material, -1);
         // `heightScale` (f32 `0.05`) carries its f64-promoted long decimal (an
         // exactly-representable value like `0.5` stays short).
         let expected = concat!(
@@ -784,9 +1154,10 @@ mod tests {
             r#""metallic":0.0,"normalStrength":1.0,"roughness":1.0,"#,
             r#""uvOffset":[0.0,0.0],"uvTiling":[1.0,1.0]},"#,
             r#""graph":{},"heightMode":"bump","normalConvention":"gl","overrides":{},"parent":"0","#,
-            r#""shader":"mesh","#,
+            r#""shader":"mesh","surfaceModel":"standard","#,
             r#""textures":{"albedo":"5","emissive":"0","height":"0","normal":"6","ormOrMr":"0","vectorDisplacement":"0"},"#,
-            r#""unlit":false,"version":1}"#,
+            r#""thinSheetFoliage":null,"#,
+            "\"unlit\":false,\"version\":2}\n",
         );
         assert_eq!(serialized, expected);
     }
@@ -794,19 +1165,21 @@ mod tests {
     #[test]
     fn from_json_accepts_uuid_string_or_number() {
         let doc = serde_json::json!({
+            "version": 2,
+            "surfaceModel": "standard",
+            "thinSheetFoliage": null,
             "textures": { "albedo": "1234", "ormOrMr": 5678 },
             "parent": 99,
         });
-        let material = material_asset_from_json(&doc);
+        let material = material_asset_from_json(&doc).unwrap();
         assert_eq!(material.albedo_texture, Uuid(1234));
         assert_eq!(material.orm_texture, Uuid(5678));
         assert_eq!(material.parent, Uuid(99));
     }
 
     #[test]
-    fn from_json_defaults_missing_fields() {
-        let material = material_asset_from_json(&serde_json::json!({}));
-        assert_eq!(material, MaterialAsset::default());
+    fn from_json_rejects_missing_version_and_surface_model() {
+        assert!(material_asset_from_json(&serde_json::json!({})).is_err());
     }
 
     #[test]
