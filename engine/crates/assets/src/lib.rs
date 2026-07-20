@@ -36,6 +36,7 @@ mod load;
 mod manage;
 mod material;
 mod material_schema;
+mod mesh_surface;
 mod model;
 mod names;
 mod project;
@@ -50,6 +51,7 @@ mod seam;
 mod spawn;
 mod thumbnail;
 mod time_of_day;
+mod vegetation;
 
 pub use cache::{AssetCache, resolve_cached};
 pub use catalog::{
@@ -78,11 +80,13 @@ pub use manage::{
 pub use material::{
     MaterialAsset, apply_overrides, default_material_asset, load_catalog_material_asset,
     load_catalog_material_asset_raw, load_material_asset, load_material_asset_raw,
-    material_asset_from_json, material_asset_to_json, save_material_asset, update_material_asset,
+    material_asset_from_json, material_asset_to_json, material_asset_to_text, save_material_asset,
+    update_material_asset,
 };
 pub use material_schema::{
     ExposedParam, ExposedParamKind, exposed_parameter, pbr_exposed_parameters,
 };
+pub use mesh_surface::{StaticMeshSurfaceInput, StaticMeshSurfaceProvider};
 pub use model::{
     ByteSource, ContainerMetadata, Import, METADATA_SCHEMA_VERSION, ModelAsset, SubAsset,
     encode_container_metadata, read_container_metadata,
@@ -100,8 +104,10 @@ pub use project::{
 pub use project_load::{DocProgress, DocStage, LoadInput, LoadedDoc, ProjectDocWorker};
 pub use render_material::{ResolvedMaterials, build_submesh_material};
 pub use render_scene::{
-    RendererScene, SceneRenderer, SceneSurfaceHit, model_render_aabb, pick_entity,
-    pick_scene_surface, render_scene, scene_render_aabb, viewport_ray,
+    RendererScene, SceneRenderer, SceneSurfaceHit, SceneSurfaceProvider, model_render_aabb,
+    pick_entity, pick_scene_surface, query_scene_surface_ray, render_scene,
+    sample_scene_surface_field, scene_render_aabb, scene_surface_field_snapshots,
+    scene_surface_providers, viewport_ray,
 };
 pub use scan::{
     colorspace_for_role_explicit, detect_height_mode, detect_material_role, infer_texture_role,
@@ -116,6 +122,15 @@ pub use thumbnail::{
 pub use time_of_day::{
     CelestialPosition, CelestialTime, advance_time_of_day, dir_from_az_el, eval_monotone_curve,
     julian_date, local_sidereal_time, lunar_position, solar_position, world_from_equatorial,
+};
+pub use vegetation::{
+    CatalogBiomeGraphResolver, ResolvedBiomeGraph, VegetationImport,
+    assemble_biome_graph_evaluation_job, compile_catalog_biome_graph,
+    compile_catalog_biome_instance_graph, import_vegetation_asset, load_biome_asset,
+    load_plant_family_asset, load_vegetation_map_asset, load_vegetation_map_chunk,
+    remove_vegetation_map_package, save_biome_asset, save_plant_family_asset,
+    save_vegetation_map_asset, update_biome_asset, update_plant_family_asset,
+    update_vegetation_map_asset, vegetation_graph_dependency_hashes, write_vegetation_map_chunks,
 };
 
 use std::path::{Path, PathBuf};
@@ -330,7 +345,16 @@ impl AssetServer {
     /// creation errors are swallowed: a missing dir surfaces later as the real I/O failure
     /// that needs it.
     pub fn ensure_asset_directories(&self) {
-        for sub in ["models", "textures", "materials", "luts", "environments"] {
+        for sub in [
+            "models",
+            "textures",
+            "materials",
+            "luts",
+            "environments",
+            "vegetation/plants",
+            "vegetation/biomes",
+            "vegetation/maps",
+        ] {
             let _ = std::fs::create_dir_all(self.root.join(sub));
         }
     }
