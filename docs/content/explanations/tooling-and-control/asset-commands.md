@@ -17,10 +17,11 @@ catalog name. Commands that need project storage reject the request until a proj
 |---|---|---|
 | Project | `get-project`, `new-project`, `open-project`, `save-project`, `reload-project` | Project identity, persistence, and lifecycle |
 | Load progress | `project-status`, `cancel-load` | Poll or cancel asynchronous project loading |
-| Import | `import-model`, `import-texture`, `import-lut`, `reimport-model` | Add or refresh baked assets |
+| Import | `import-model`, `import-texture`, `import-lut`, `import-vegetation-asset` | Add native and baked assets |
 | Model containers | `model-info`, `get-asset-model`, `extract-subasset`, `clear-extraction` | Inspect and manage embedded model data |
 | Scene placement | `instantiate-model`, `asset-placement`, `assign-asset` | Create entities and bind catalog assets |
 | Catalog | `list-assets`, `scan-assets`, `probe-asset`, `asset-references` | Browse metadata and dependency edges |
+| Vegetation | `vegetation-asset-summary` | Inspect plant, biome, and map data |
 | Organization | `rename-asset`, `move-asset`, `create-asset-folder` | Maintain names and virtual folders |
 | Cleanup | `asset-usages`, `clean-assets`, `delete-unused`, `delete-asset` | Find references and remove data |
 | Materials | `material-create`, `material-update`, `material-set-graph`, `material-cook` | Author, assign, preview, and compile materials |
@@ -47,6 +48,11 @@ the container identity while reporting updated, added, removed-from-source, and 
 An embedded sub-asset can be promoted to a standalone file with `extract-subasset` and returned to
 container ownership with `clear-extraction`.
 
+`import-vegetation-asset` reads an authored `.splant`, `.sbiome`, or complete `.svegmap` package.
+It preserves the asset's stable identity so references between separately imported families, biomes,
+and maps remain valid. `vegetation-asset-summary` returns the native typed summary and ordered map
+layers used by the editor workspace.
+
 ## Catalog durability and references
 
 Catalog folders are virtual paths stored as metadata. Renaming a folder rewrites that prefix for its
@@ -61,8 +67,9 @@ vertices and triangles. `model-info` reads container import metadata and sub-ass
 `get-asset-model` returns the capabilities, bone tree, and animation clips used by the asset editor.
 
 Two reference queries answer different questions. `asset-usages` scans the active scene for mesh,
-material, and environment-sky assignments. `asset-references` builds the wider asset dependency graph,
-including container and material relationships, and reports both directions plus recursive footprint.
+material, environment-sky, and vegetation-map assignments. `asset-references` builds the wider asset
+dependency graph, including container, material, plant, biome, and map relationships. It reports both
+directions plus recursive footprint.
 
 `clean-assets` analyzes that graph without deleting anything. `delete-unused` accepts explicit IDs
 from the report and requires `confirm: true`; it deletes only entries still classified as unused.
@@ -94,6 +101,9 @@ stores the authored camera, selection, overlay, and exposure so `exit-asset-prev
 A cache hit returns an inline base64 PNG. A miss returns `pending: true` and enqueues a preview render;
 the host drains up to two jobs per update through the main forward+ graph, writes their PNGs, and the
 client polls again.
+
+Plant, biome, and vegetation-map misses rasterize their canonical vector type icons immediately.
+They use the same content-addressed cache and return a completed PNG in the first reply.
 
 The cache is app-wide at `<appDataRoot>/thumbnail-cache`. Its key combines cache version, resolved
 content hash, and requested size, so identical content can share a tile across assets and projects.
@@ -131,3 +141,4 @@ application folder. `screenshot` and `quit` complete scriptable sessions; the
 - [Shared types](../shared-types/) — command DTOs and UUID wire encoding.
 - [Asset editor](../../ui-and-editor/asset-editor/) — the UI built on model and preview commands.
 - [Asset server and catalog](../../geometry-and-assets/asset-server-and-catalog/) — catalog storage and sidecars.
+- [Vegetation assets](../../geometry-and-assets/vegetation-assets/) — native plant, biome, and map packages.

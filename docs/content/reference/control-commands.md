@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 186 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 198 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -89,6 +89,10 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-light` | `SetLightParams` | `EntityRef` | set-light {entity?, direction?, color?, intensity?, ambient?} |
 | `select` | `EntityParams` | `EntityRef` | select {entity} |
 | `pick` | `PickParams` | `PickResult` | pick {u=0.5, v=0.5} |
+| `spatial-cell` | `SpatialCellParams` | `SpatialCellResult` | canonical position ownership and ancestor-cell conversion |
+| `spatial-providers` | `EmptyParams` | `SurfaceProvidersResult` | list live surface providers and capabilities |
+| `spatial-sample` | `SpatialSampleParams` | `SpatialSampleResult` | sample one canonical provider field channel |
+| `spatial-residency` | `EmptyParams` | `SpatialResidencyResult` | list residency sources and per-facet cell references |
 | `inspect` | `EntityParams` | `InspectResult` | inspect {entity} |
 | `focus` | `EntityParams` | `EntityRef` | focus {entity} |
 | `get-world-transform` | `EntityParams` | `WorldTransformResult` | get-world-transform {entity} — the entity's composed world translation + scale |
@@ -166,6 +170,12 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-color-grading` | `SetColorGradingParams` | `SetColorGradingResult` | set-color-grading {temperature} {tint} {contrast} {pivot} {saturation} {slope} {offset} {power} |
 | `bake-look` | `BakeLookParams` | `BakeLookResult` | bake-look [name] — fold grade + view transform + creative LUT into a 33³ .slut |
 | `set-tessellation-quality` | `SetTessellationQualityParams` | `SetTessellationQualityResult` | set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget] |
+| `vegetation-compile-biome` | `VegetationCompileBiomeParams` | `VegetationCompileBiomeResult` | compile a biome graph and inspect dependencies, halo, estimates, and hard caps |
+| `vegetation-node-schema` | `VegetationNodeSchemaParams` | `VegetationNodeSchemaResult` | inspect typed biome-node pins, parameters, seed namespaces, and execution capability |
+| `vegetation-evaluate-region` | `VegetationEvaluateRegionParams` | `VegetationEvaluationJobDto` | start one bounded asynchronous biome evaluation through the canonical evaluator |
+| `vegetation-evaluation-status` | `VegetationEvaluationJobParams` | `VegetationEvaluationStatusDto` | poll an asynchronous vegetation evaluation and its deterministic aggregate |
+| `vegetation-cancel-evaluation` | `VegetationEvaluationJobParams` | `VegetationEvaluationStatusDto` | cancel an asynchronous vegetation evaluation without partial publication |
+| `vegetation-explain-point` | `VegetationExplainPointParams` | `ProvenanceExplanationDto` | trace an accepted plant or rejected candidate through its provenance decision DAG |
 | `get-project` | `EmptyParams` | `ProjectInfoDto` | active project metadata |
 | `project-status` | `EmptyParams` | `ProjectStatusDto` | project-load phase + progress |
 | `cancel-load` | `EmptyParams` | `ProjectStatusDto` | abort the in-flight project load |
