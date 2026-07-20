@@ -74,6 +74,11 @@ The draw path accumulates a `RenderStats` per frame:
 | `batches` | distinct (pipeline, mesh) buckets |
 | `instances` | logical instances drawn |
 | `triangles` | triangles submitted |
+| `sceneGatherMs` | CPU time spent gathering static and skinned draw items |
+| `instanceUploadBytes` | exact bytes written to the frame's `InstanceData` SSBO |
+| `retainedMeshCpuBytes` | unique drawn-mesh bytes retained for exact surface queries |
+| `shadowDrawCalls` | indexed draws recorded across directional, spot, and point shadows |
+| `rtInstances` | instances published into the active frame TLAS |
 | `descriptorBinds` | descriptor-set binds recorded in the scene pass |
 | `commandBuffers` | primary command buffers submitted |
 | `queueSubmits` | `vkQueueSubmit2` calls |
