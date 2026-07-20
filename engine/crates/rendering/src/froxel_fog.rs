@@ -1039,12 +1039,12 @@ fn init_transition_ap(device: &Device, image: vk::Image) -> crate::Result<()> {
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init; drain with wait_idle below.
-        unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()),
-                "aerial perspective init submit",
-            )?;
-        }
+        device.graphics_queue.submit2(
+            raw,
+            &submits,
+            vk::Fence::null(),
+            "aerial perspective init submit",
+        )?;
         device.wait_idle()?;
         Ok(())
     })();
@@ -1285,12 +1285,12 @@ fn init_transition_volumes(
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init; drain with wait_idle below.
-        unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()),
-                "froxel fog init submit",
-            )?;
-        }
+        device.graphics_queue.submit2(
+            raw,
+            &submits,
+            vk::Fence::null(),
+            "froxel fog init submit",
+        )?;
         device.wait_idle()?;
         Ok(())
     })();
@@ -1476,12 +1476,9 @@ fn bake_noise_volume(device: &Device, resources: &Arc<DeviceResources>) -> crate
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos)];
         // SAFETY: the ash seam. The graphics queue is idle at init; drain with wait_idle below.
-        unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()),
-                "froxel noise submit",
-            )?;
-        }
+        device
+            .graphics_queue
+            .submit2(raw, &submits, vk::Fence::null(), "froxel noise submit")?;
         device.wait_idle()?;
         Ok(())
     })();

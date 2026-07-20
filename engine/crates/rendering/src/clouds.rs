@@ -1359,10 +1359,9 @@ fn record_bake(
         }
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cmds)];
-        checked(
-            unsafe { raw.queue_submit2(device.graphics_queue, &submits, vk::Fence::null()) },
-            "cloud bake submit",
-        )?;
+        device
+            .graphics_queue
+            .submit2(raw, &submits, vk::Fence::null(), "cloud bake submit")?;
         device.wait_idle()
     })();
     unsafe { raw.destroy_command_pool(pool, None) };

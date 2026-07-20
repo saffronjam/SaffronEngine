@@ -800,10 +800,9 @@ impl Ddgi {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. The queue is touched single-threaded at init.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "ddgi init submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "ddgi init submit")?;
                 checked(
                     raw.wait_for_fences(&[fence], true, u64::MAX),
                     "ddgi init wait",
