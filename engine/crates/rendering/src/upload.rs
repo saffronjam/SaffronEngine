@@ -67,7 +67,7 @@ unsafe impl Sync for GpuQueue {}
 
 impl GpuQueue {
     /// Wraps the device's graphics queue for shared, externally-synchronized use.
-    pub fn new(queue: vk::Queue) -> Self {
+    pub(crate) fn new(queue: vk::Queue) -> Self {
         Self {
             inner: Arc::new(Mutex::new(queue)),
         }
@@ -79,19 +79,33 @@ impl GpuQueue {
     /// # Errors
     ///
     /// Returns [`Error::Vk`] if `vkQueueSubmit2` fails.
-    fn submit2(
+    pub(crate) fn submit2(
         &self,
         raw: &ash::Device,
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
+        context: &'static str,
     ) -> Result<()> {
         let queue = *self.inner.lock().expect("gpu queue mutex");
         // SAFETY: the ash seam. The queue is externally synchronized by the mutex held
         // here; the submit-infos + fence are valid for the call.
-        checked(
-            unsafe { raw.queue_submit2(queue, submits, fence) },
-            "queue_submit2 (one-off)",
-        )
+        checked(unsafe { raw.queue_submit2(queue, submits, fence) }, context)
+    }
+
+    /// Presents one swapchain image under the same external-synchronization lock as submits.
+    pub(crate) fn present(
+        &self,
+        loader: &ash::khr::swapchain::Device,
+        info: &vk::PresentInfoKHR<'_>,
+    ) -> std::result::Result<bool, vk::Result> {
+        let queue = *self.inner.lock().expect("gpu queue mutex");
+        unsafe { loader.queue_present(queue, info) }
+    }
+
+    /// Waits for the logical device while excluding concurrent queue submissions.
+    pub(crate) fn wait_device_idle(&self, raw: &ash::Device) -> Result<()> {
+        let _queue = self.inner.lock().expect("gpu queue mutex");
+        checked(unsafe { raw.device_wait_idle() }, "device_wait_idle")
     }
 }
 
@@ -227,14 +241,17 @@ impl Uploader {
         let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos);
         let submits = [submit];
 
-        let result = self.queue.submit2(raw, &submits, fence).and_then(|()| {
-            // SAFETY: the ash seam. The fence belongs to this device; the wait blocks
-            // until the one-off submit completes.
-            checked(
-                unsafe { raw.wait_for_fences(&[fence], true, u64::MAX) },
-                "wait_for_fences (one-off)",
-            )
-        });
+        let result = self
+            .queue
+            .submit2(raw, &submits, fence, "queue_submit2 (one-off)")
+            .and_then(|()| {
+                // SAFETY: the ash seam. The fence belongs to this device; the wait blocks
+                // until the one-off submit completes.
+                checked(
+                    unsafe { raw.wait_for_fences(&[fence], true, u64::MAX) },
+                    "wait_for_fences (one-off)",
+                )
+            });
 
         // SAFETY: the ash seam. The fence was waited (or the submit failed before
         // signaling it), so it is idle and destroyed exactly once.
@@ -360,7 +377,7 @@ impl Uploader {
         }
         staging.flush();
 
-        // Compute bounds + the retained CPU copies for triangle-precise picking.
+        // Compute bounds; the complete CPU vertex stream is retained for surface queries.
         let mut bounds_min = Vec3::splat(f32::MAX);
         let mut bounds_max = Vec3::splat(f32::MIN);
         let mut cpu_positions = Vec::with_capacity(mesh.vertices.len());
@@ -568,7 +585,7 @@ impl Uploader {
             submeshes: mesh.submeshes.clone(),
             bounds_min,
             bounds_max,
-            cpu_positions,
+            cpu_vertices: mesh.vertices.clone(),
             cpu_indices: mesh.indices.clone(),
             cpu_skin: skin.to_vec(),
             blas,
@@ -3911,7 +3928,7 @@ mod tests {
         let before = validation_issue_count();
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let mesh = triangle();
 
@@ -3924,8 +3941,8 @@ mod tests {
             plain.skin_buffer().is_none(),
             "no skin stream → null skin buffer"
         );
-        assert_eq!(plain.cpu_indices, mesh.indices);
-        assert_eq!(plain.cpu_positions.len(), 3);
+        assert_eq!(&*plain.cpu_indices, mesh.indices.as_slice());
+        assert_eq!(plain.cpu_vertices.len(), 3);
 
         let skin = vec![VertexSkin::default(); mesh.vertices.len()];
         let skinned = uploader
@@ -3969,7 +3986,7 @@ mod tests {
         let before = validation_issue_count();
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
 
         // A 4×4 sRGB image: mip 0 + a blitted-down chain (mip_count(4,4) == 3).
@@ -4163,7 +4180,7 @@ mod tests {
         let Some(device) = device_or_skip() else {
             return;
         };
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let (positions, indices) = l_prism_geometry();
         let fields = uploader
@@ -4196,7 +4213,7 @@ mod tests {
         let before = validation_issue_count();
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
 
         let (positions, indices) = box_geometry(Vec3::splat(-1.0), Vec3::splat(1.0));
@@ -4265,7 +4282,7 @@ mod tests {
         let Some(device) = device_or_skip() else {
             return;
         };
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let dir = std::env::temp_dir().join(format!("saffron-sdf-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

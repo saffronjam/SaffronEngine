@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::resources::DeviceResources;
-use crate::{Error, Result, checked};
+use crate::{Error, GpuQueue, Result};
 
 /// Counts validation/performance messages at warning-or-error severity seen by the
 /// debug callback across the process. The validation-clean smoke reads this before
@@ -134,6 +134,58 @@ pub struct ProfilerFacts {
     pub device_name: String,
 }
 
+/// Exact Vulkan device/profile identity used by cross-device conformance evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VulkanDeviceIdentity {
+    /// Physical-device name.
+    pub name: String,
+    /// Vulkan physical-device class.
+    pub device_type: vk::PhysicalDeviceType,
+    /// PCI/vendor identity reported by Vulkan.
+    pub vendor_id: u32,
+    /// Device identity reported by Vulkan.
+    pub device_id: u32,
+    /// Driver version reported by Vulkan.
+    pub driver_version: u32,
+    /// Vulkan API version exposed by the physical device.
+    pub api_version: u32,
+    /// Vulkan driver implementation identity.
+    pub driver_id: u32,
+    /// Stable Vulkan physical-device UUID.
+    pub device_uuid: [u8; vk::UUID_SIZE],
+    /// Stable Vulkan driver UUID.
+    pub driver_uuid: [u8; vk::UUID_SIZE],
+}
+
+impl VulkanDeviceIdentity {
+    /// Whether this is physical integrated or discrete GPU hardware.
+    #[must_use]
+    pub fn is_physical_gpu(&self) -> bool {
+        matches!(
+            self.device_type,
+            vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::DISCRETE_GPU
+        )
+    }
+
+    /// Stable lowercase Vulkan device-class spelling.
+    #[must_use]
+    pub fn device_type_name(&self) -> &'static str {
+        match self.device_type {
+            vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated-gpu",
+            vk::PhysicalDeviceType::DISCRETE_GPU => "discrete-gpu",
+            vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual-gpu",
+            vk::PhysicalDeviceType::CPU => "cpu",
+            _ => "other",
+        }
+    }
+
+    /// Whether Vulkan reports the MoltenVK driver implementation.
+    #[must_use]
+    pub fn is_molten_vk(&self) -> bool {
+        self.driver_id == vk::DriverId::MOLTENVK.as_raw() as u32
+    }
+}
+
 /// The immutable Vulkan core shared `&Device` by every later sub-state.
 ///
 /// Field order is load-bearing: Rust drops fields top-to-bottom, so the allocator
@@ -146,9 +198,8 @@ pub struct Device {
     pub capabilities: Capabilities,
     /// The graphics-and-present queue family index.
     pub graphics_queue_family: u32,
-    /// The graphics queue (externally synchronized; the README §5 site that the
-    /// thumbnail worker will share behind a mutex in a later phase).
-    pub graphics_queue: vk::Queue,
+    /// The single externally synchronized graphics-and-present queue.
+    pub graphics_queue: GpuQueue,
     /// The surface present mode chosen for the swapchain (FIFO).
     pub surface_format: vk::SurfaceFormatKHR,
 
@@ -196,6 +247,36 @@ pub struct Device {
 const API_VERSION: u32 = vk::API_VERSION_1_3;
 
 impl Device {
+    /// Returns the immutable Vulkan identity used to qualify exact compute semantics.
+    pub fn device_identity(&self) -> VulkanDeviceIdentity {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut id)
+            .push_next(&mut driver);
+        unsafe {
+            self.instance
+                .get_physical_device_properties2(self.physical_device, &mut properties);
+        }
+        VulkanDeviceIdentity {
+            name: properties
+                .properties
+                .device_name_as_c_str()
+                .ok()
+                .and_then(|name| name.to_str().ok())
+                .unwrap_or("")
+                .to_owned(),
+            device_type: properties.properties.device_type,
+            vendor_id: properties.properties.vendor_id,
+            device_id: properties.properties.device_id,
+            driver_version: properties.properties.driver_version,
+            api_version: properties.properties.api_version,
+            driver_id: driver.driver_id.as_raw() as u32,
+            device_uuid: id.device_uuid,
+            driver_uuid: id.driver_uuid,
+        }
+    }
+
     /// Brings up the full Vulkan core against `surface_source`.
     ///
     /// Creates the instance (validation layer in debug), the surface, selects a
@@ -252,7 +333,8 @@ impl Device {
         )?;
         // SAFETY: the family/index pair was just used to create the device with one
         // queue at index 0 of that family.
-        let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
+        let graphics_queue =
+            GpuQueue::new(unsafe { device.get_device_queue(graphics_queue_family, 0) });
 
         let allocator = create_allocator(&instance, &device, physical_device)?;
         let swapchain_loader = swapchain::Device::new(&instance, &device);
@@ -540,11 +622,7 @@ impl Device {
     ///
     /// Returns [`Error::Vk`] if `vkDeviceWaitIdle` fails.
     pub fn wait_idle(&self) -> Result<()> {
-        // SAFETY: the ash seam. The device handle is valid for the call.
-        checked(
-            unsafe { self.bundle().device().device_wait_idle() },
-            "device_wait_idle",
-        )
+        self.graphics_queue.wait_device_idle(self.bundle().device())
     }
 }
 
@@ -1071,6 +1149,12 @@ fn evaluate_device(
     // SAFETY: the ash seam. Fills the chained feature structs for this device.
     unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
 
+    if features2.features.shader_int64 == 0 {
+        return Err(format!(
+            "{name}: missing required shaderInt64 for authoritative spatial numerics"
+        ));
+    }
+
     if features12.runtime_descriptor_array == 0
         || features12.descriptor_binding_partially_bound == 0
         || features12.descriptor_binding_sampled_image_update_after_bind == 0
@@ -1298,6 +1382,7 @@ fn create_logical_device(
     // SAFETY: the ash seam. Core feature query on the chosen device.
     let core_features = unsafe { instance.get_physical_device_features(physical_device) };
     let mut enabled_core = vk::PhysicalDeviceFeatures::default();
+    enabled_core = enabled_core.shader_int64(true);
     if core_features.pipeline_statistics_query != 0 {
         enabled_core = enabled_core.pipeline_statistics_query(true);
     }
