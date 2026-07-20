@@ -33,6 +33,15 @@ pub struct Mesh {
     pub mesh: Uuid,
 }
 
+/// The scene's single serialized vegetation-world binding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationField {
+    pub map: Uuid,
+    pub enabled: bool,
+}
+
 /// A serialized perspective camera.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -406,6 +415,8 @@ pub struct Components {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Mesh>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub vegetation_field: Option<VegetationField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<Camera>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub material_set: Option<MaterialSet>,
@@ -455,6 +466,7 @@ pub enum ComponentBody {
     Name(Name),
     Transform(Transform),
     Mesh(Mesh),
+    VegetationField(VegetationField),
     Camera(Camera),
     MaterialSet(MaterialSet),
     ModelInstance(ModelInstance),
@@ -671,6 +683,7 @@ pub const COMPONENT_NAMES: &[&str] = &[
     "Name",
     "Transform",
     "Mesh",
+    "VegetationField",
     "Camera",
     "MaterialSet",
     "ModelInstance",
