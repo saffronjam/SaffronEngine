@@ -16,7 +16,7 @@ use saffron_geometry::{
 use saffron_json::Value;
 use saffron_scene::{
     AssetEntry, AssetType, IdComponent, MaterialSet, Mesh as MeshComponent, ModelInstance, Scene,
-    Script, SkinnedMesh,
+    Script, SkinnedMesh, VegetationField,
 };
 
 use crate::import::{
@@ -37,6 +37,9 @@ fn default_extract_dest(asset_type: AssetType, sub_id: Uuid, image_ext: &str) ->
         AssetType::Material => format!("materials/{id}.smat"),
         AssetType::Mesh => format!("models/{id}.smesh"),
         AssetType::Animation => format!("models/{id}.sanim"),
+        AssetType::Plant => format!("vegetation/plants/{id}.splant"),
+        AssetType::Biome => format!("vegetation/biomes/{id}.sbiome"),
+        AssetType::VegetationMap => format!("vegetation/maps/{id}.svegmap"),
         _ => {
             let ext = if image_ext.is_empty() {
                 "png"
@@ -207,7 +210,7 @@ fn resolve_container_material(
     let bytes = source.read().ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let doc = saffron_json::parse_json(&text).ok()?;
-    Some(material_asset_from_json(&doc))
+    material_asset_from_json(&doc).ok()
 }
 
 /// The container file's project-relative path, from its catalog row.
@@ -523,6 +526,8 @@ pub enum RefEdgeKind {
     ContainerChild,
     /// A material references a texture slot.
     MaterialTexture,
+    /// A vegetation map, biome, or plant family references another catalog asset.
+    VegetationDependency,
     /// A scene entity references an asset.
     EntityAsset,
 }
@@ -593,6 +598,9 @@ impl DependencyGraph {
 #[must_use]
 pub fn asset_bytes(assets: &mut AssetServer, entry: &AssetEntry) -> u64 {
     if entry.container.value() == 0 {
+        if entry.asset_type == AssetType::VegetationMap {
+            return crate::vegetation::vegetation_map_package_bytes(assets, entry);
+        }
         return std::fs::metadata(format!("{}/{}", assets.root.display(), entry.path))
             .map(|m| m.len())
             .unwrap_or(0);
@@ -604,6 +612,7 @@ pub fn asset_bytes(assets: &mut AssetServer, entry: &AssetEntry) -> u64 {
         AssetType::Mesh => ChunkKind::Mesh,
         AssetType::Material => ChunkKind::Material,
         AssetType::Animation => ChunkKind::Animation,
+        AssetType::Plant | AssetType::Biome | AssetType::VegetationMap => return 0,
         _ => ChunkKind::Texture,
     };
     model
@@ -629,6 +638,7 @@ fn entity_asset_pairs(scene: &mut Scene) -> Vec<(Uuid, Uuid)> {
         }
     });
     scene.for_each::<&ModelInstance, _>(|entity, instance| refs.push((entity, instance.model_id)));
+    scene.for_each::<&VegetationField, _>(|entity, field| refs.push((entity, field.map)));
 
     let mut out = Vec::new();
     for (entity, asset) in refs {
@@ -696,7 +706,92 @@ pub fn build_dependency_graph(scene: &mut Scene, assets: &mut AssetServer) -> De
                         });
                     }
                 }
+                if let saffron_vegetation::MaterialSurface::ThinSheetFoliage(parameters) =
+                    material.surface
+                    && let saffron_vegetation::CoverageSource::Texture(texture) =
+                        parameters.coverage_source
+                {
+                    graph.edges.push(RefEdge {
+                        from: entry.id,
+                        to: texture,
+                        kind: RefEdgeKind::MaterialTexture,
+                    });
+                }
             }
+        }
+        match entry.asset_type {
+            AssetType::Plant => {
+                if let Ok(plant) = crate::vegetation::load_plant_family_asset(assets, entry.id) {
+                    for dependency in plant.material_slots {
+                        if dependency.value() != 0 {
+                            graph.edges.push(RefEdge {
+                                from: entry.id,
+                                to: dependency,
+                                kind: RefEdgeKind::VegetationDependency,
+                            });
+                        }
+                    }
+                    if let saffron_vegetation::PlantFamilySource::Imported(recipe) = plant.source {
+                        for source in recipe.sources {
+                            if let Some(dependency) = source.asset {
+                                graph.edges.push(RefEdge {
+                                    from: entry.id,
+                                    to: dependency,
+                                    kind: RefEdgeKind::VegetationDependency,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            AssetType::Biome => {
+                if let Ok(biome) = crate::vegetation::load_biome_asset(assets, entry.id) {
+                    let dependencies = biome
+                        .palette
+                        .into_iter()
+                        .map(|item| item.plant)
+                        .chain(
+                            biome
+                                .competition
+                                .into_iter()
+                                .flat_map(|rule| [rule.first, rule.second]),
+                        )
+                        .chain(
+                            biome
+                                .companions
+                                .into_iter()
+                                .flat_map(|rule| [rule.parent, rule.child]),
+                        )
+                        .chain(
+                            biome
+                                .succession
+                                .into_iter()
+                                .flat_map(|rule| [rule.from, rule.to]),
+                        )
+                        .chain(biome.modules.into_iter().map(|item| item.biome));
+                    for dependency in dependencies.filter(|dependency| dependency.value() != 0) {
+                        graph.edges.push(RefEdge {
+                            from: entry.id,
+                            to: dependency,
+                            kind: RefEdgeKind::VegetationDependency,
+                        });
+                    }
+                }
+            }
+            AssetType::VegetationMap => {
+                if let Ok(dependencies) =
+                    crate::vegetation::vegetation_map_dependencies(assets, entry)
+                {
+                    for dependency in dependencies {
+                        graph.edges.push(RefEdge {
+                            from: entry.id,
+                            to: dependency,
+                            kind: RefEdgeKind::VegetationDependency,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
     for (entity_id, asset) in entity_asset_pairs(scene) {
@@ -938,9 +1033,11 @@ pub fn delete_unused(
             );
             continue;
         }
-        let Some(path) = assets.catalog.find(*id).map(|e| e.path.clone()) else {
+        let Some(entry) = assets.catalog.find(*id).cloned() else {
             continue;
         };
+        crate::vegetation::remove_vegetation_map_package(assets, &entry)?;
+        let path = entry.path;
         let full = format!("{}/{path}", assets.root.display());
         let bytes = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&full);
