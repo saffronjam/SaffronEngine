@@ -15,13 +15,14 @@
 //! `pick_entity`, …) for the call's duration.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use saffron_assets::{AssetServer, GpuUploader, PREVIEW_THUMBNAIL_MATERIAL_ID, RendererUploader};
-use saffron_control::ControlRenderer;
+use saffron_control::{ControlRenderer, VegetationComputeExecutor};
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, PassTiming,
     PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe, RenderStatsFull, Renderer, Uploader,
-    ViewId, ViewMode,
+    ViewId, ViewMode, VulkanGraphComputeExecutor,
 };
 use serde_json::Value;
 
@@ -574,6 +575,14 @@ impl ControlRenderer for HostControlRenderer<'_> {
             self.skinning_enabled,
         );
         with(&gpu);
+    }
+
+    fn create_vegetation_compute_executor(
+        &self,
+    ) -> Result<Option<VegetationComputeExecutor>, String> {
+        let executor = VulkanGraphComputeExecutor::new(self.renderer.device_arc())
+            .map_err(|error| error.to_string())?;
+        Ok(Some(Arc::new(executor)))
     }
 
     fn render_material_preview_png(
