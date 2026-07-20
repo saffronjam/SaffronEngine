@@ -126,6 +126,7 @@ export interface ProjectLoadState {
 /// The profiler capture lifecycle, mirrored from the engine's recorder. On-demand: a
 /// capture is armed by a button, never polled on the metrics lane.
 export type CaptureState = "idle" | "arming" | "recording" | "ready";
+export type VegetationAssetType = "plant" | "biome" | "vegetation-map";
 export type ViewTab =
   | { id: "scene"; kind: "scene"; title: "Scene"; closable: false }
   | { id: "flamegraph"; kind: "flamegraph"; title: "Flame graph"; closable: true }
@@ -135,6 +136,14 @@ export type ViewTab =
   // model, its mesh, and any of its clips open or focus the SAME tab — and the engine's one-previewScene
   // constraint can never be violated by two tabs of one model.
   | { id: string; kind: "assetEditor"; assetId: string; title: string; closable: true }
+  | {
+      id: string;
+      kind: "vegetationAsset";
+      assetId: string;
+      title: string;
+      assetType: VegetationAssetType;
+      closable: true;
+    }
   // The image viewer: a passive texture/image preview (distinct from the asset editor's 3D preview).
   | {
       id: string;
@@ -491,6 +500,8 @@ export interface EditorState {
   openStoreTab(): void;
   /// Open (or focus) the node-graph editor for a material as a main tab.
   openMaterialGraphTab(materialId: string): void;
+  /// Open (or focus) the read-only domain summary for an authored vegetation asset.
+  openVegetationAssetTab(assetId: string, title: string, assetType: VegetationAssetType): void;
   /// Open (or focus) the asset editor for a model, keyed by its resolved container uuid. The caller
   /// resolves an asset (model, mesh, or clip) to its model id before opening.
   openAssetEditorTab(assetId: string, title: string): void;
@@ -834,6 +845,10 @@ export const useEditorStore = create<EditorState>((set) => ({
           const model = assets.find((entry) => entry.id === tab.assetId);
           return model ? { ...tab, title: model.name } : tab;
         }
+        if (tab.kind === "vegetationAsset") {
+          const asset = assets.find((entry) => entry.id === tab.assetId);
+          return asset ? { ...tab, title: asset.name } : tab;
+        }
         if (tab.kind !== "imageViewer") {
           return tab;
         }
@@ -1030,6 +1045,20 @@ export const useEditorStore = create<EditorState>((set) => ({
         closable: true,
       };
       const existing = s.viewTabs.some((t) => t.id === id);
+      return recordActivation(s, { viewTabs: existing ? s.viewTabs : [...s.viewTabs, tab] }, id);
+    }),
+  openVegetationAssetTab: (assetId, title, assetType) =>
+    set((s) => {
+      const id = `vegetationAsset:${assetId}`;
+      const tab: ViewTab = {
+        id,
+        kind: "vegetationAsset",
+        assetId,
+        title,
+        assetType,
+        closable: true,
+      };
+      const existing = s.viewTabs.some((candidate) => candidate.id === id);
       return recordActivation(s, { viewTabs: existing ? s.viewTabs : [...s.viewTabs, tab] }, id);
     }),
   openAssetEditorTab: (assetId, title) =>
