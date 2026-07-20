@@ -10,8 +10,11 @@ import {
   Image as ImageIcon,
   Maximize2,
   Minus,
+  Map as MapIcon,
   Square,
+  Sprout,
   Store,
+  TreePine,
   Workflow,
   X,
 } from "lucide-react";
@@ -137,6 +140,15 @@ function tabIcon(tab: ViewTab): LucideIcon {
   }
   if (tab.kind === "store") {
     return Store;
+  }
+  if (tab.kind === "vegetationAsset") {
+    if (tab.assetType === "plant") {
+      return Sprout;
+    }
+    if (tab.assetType === "biome") {
+      return TreePine;
+    }
+    return MapIcon;
   }
   if (tab.assetType === "texture") {
     return ImageIcon;
