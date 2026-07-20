@@ -21,13 +21,15 @@ representing an unassigned texture.
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "shader": "mesh",
   "blend": "opaque",
   "unlit": false,
   "doubleSided": false,
   "heightMode": "bump",
   "normalConvention": "gl",
+  "surfaceModel": "standard",
+  "thinSheetFoliage": null,
   "factors": {
     "baseColor": [0.8, 0.8, 0.8, 1.0],
     "metallic": 0.0,
@@ -57,6 +59,24 @@ representing an unassigned texture.
 The JSON references texture assets and never contains pixel data. A folder import instead creates a
 self-contained `.smatx` container whose material chunk uses the same JSON shape and whose texture
 chunks hold the maps. Model containers can also carry material chunks with this representation.
+
+## Surface response
+
+`surfaceModel` selects one strict surface union. `standard` requires `thinSheetFoliage` to be null.
+`thin-sheet-foliage` requires a complete parameter object, so a document cannot combine one selector
+with another model's data.
+
+The thin-sheet object describes front and back response, physical thickness, absorption and
+transmission colors, roughness, normal treatment, and a bounded energy limit. Coverage can come from
+base alpha, a dedicated texture, or a constant. Its mip records store source extent, reference
+cutoff, spatial salt, alpha classification, and per-level hashes so derived coverage remains tied to
+the authored source.
+
+Voxel material moments preserve averaged color, transmission, normal, and second-moment data for
+aggregate representations. Optional [Vulkan opacity-micromap](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_opacity_micromap.html)
+settings record subdivision and transparent/opaque thresholds as derivation inputs. These fields are
+material data; hardware support decides whether a renderer can consume the optional acceleration
+form.
 
 ## Masters and instances
 
@@ -134,6 +154,7 @@ pass.
 | What | File | Symbols |
 |---|---|---|
 | Asset model and JSON | `assets/src/material.rs` | `MaterialAsset`, `material_asset_to_json`, `material_asset_from_json` |
+| Surface and coverage contract | `vegetation/src/material.rs` | `MaterialSurface`, `ThinSheetFoliageParameters`, `CoverageMipMetadata` |
 | Parent and override resolution | `assets/src/material.rs` | `load_catalog_material_asset`, `apply_overrides` |
 | Override vocabulary | `assets/src/material_schema.rs` | `pbr_exposed_parameters`, `ExposedParamKind` |
 | Entity slots | `scene/src/component.rs` | `MaterialSet`, `MaterialSlot` |
@@ -147,3 +168,4 @@ pass.
 - [Materials and PSOs](../material-and-pso-selection/) covers per-submesh pipeline selection.
 - [Übershader](../ubershader-and-specialization/) covers the fixed shader permutations.
 - [Bindless textures](../bindless-textures/) explains the texture indices stored in the parameter table.
+- [Vegetation assets](../../geometry-and-assets/vegetation-assets/) explains plant-family material slots.
