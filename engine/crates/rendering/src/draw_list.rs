@@ -399,4 +399,10 @@ pub struct RenderStats {
     pub queue_submits: u32,
     /// PSOs compiled this frame (non-zero on a steady-state frame = a compile hitch).
     pub pipelines_created: u32,
+    /// Bytes uploaded to the frame's `InstanceData` storage buffer.
+    pub instance_upload_bytes: u64,
+    /// CPU bytes retained by unique drawn meshes for exact surface queries.
+    pub retained_mesh_cpu_bytes: u64,
+    /// Actual indexed draw invocations recorded across directional, spot, and point shadows.
+    pub shadow_draw_calls: u32,
 }

@@ -4,6 +4,7 @@
 //! holding `&Device`. It drives the per-frame acquire → render-graph → present loop.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ash::vk;
 use saffron_geometry::glam::{Mat4, Vec3, Vec4};
@@ -235,8 +236,12 @@ pub struct RenderStatsFull {
     pub gpu_ms: f32,
     /// CPU busy time (ms).
     pub cpu_frame_ms: f32,
+    /// CPU time spent gathering the static and skinned scene draw list (ms).
+    pub scene_gather_ms: f32,
     /// Fence-wait time (ms).
     pub cpu_wait_ms: f32,
+    /// Instances published into the active frame TLAS.
+    pub rt_instances: u32,
     /// Device-local VRAM usage in bytes (`0` until profiled).
     pub vram_usage_bytes: u64,
     /// Device-local VRAM budget in bytes (`0` until profiled).
@@ -822,6 +827,8 @@ pub struct Renderer {
     frame_ms: f32,
     /// The last frame's CPU busy time (ms); `0` until recorded.
     cpu_frame_ms: f32,
+    /// The last static + skinned draw-list gather time (ms).
+    scene_gather_ms: f32,
     /// A monotonic per-frame counter, gating the profiler's
     /// periodic timestamp re-calibration.
     frame_serial: u64,
@@ -1144,7 +1151,7 @@ impl Renderer {
             // The default white texture takes slot 0 (the first claim) and is seeded
             // into every other bindless slot, so any untextured material samples a valid
             // descriptor. Uploaded through a one-off uploader on the graphics queue.
-            let queue = crate::GpuQueue::new(device.graphics_queue);
+            let queue = device.graphics_queue.clone();
             let uploader = crate::Uploader::new(&device, &queue)?;
             let default_white = uploader.upload_default_white(&descriptors)?;
             // The bindless SDF array (binding 1) is partially bound; seed every slot with a
@@ -1514,6 +1521,7 @@ impl Renderer {
             software_gpu,
             frame_ms: 0.0,
             cpu_frame_ms: 0.0,
+            scene_gather_ms: 0.0,
             frame_serial: 0,
             gpu_frame_ms: 0.0,
             cpu_wait_ms: 0.0,
@@ -4098,8 +4106,10 @@ impl Renderer {
             // SAFETY: the ash seam. The device was idled above, so the single graphics
             // queue is free; the fence belongs to this device.
             unsafe {
-                checked(
-                    raw.queue_submit2(self.device.graphics_queue, &submit, fence),
+                self.device.graphics_queue.submit2(
+                    raw,
+                    &submit,
+                    fence,
                     "capture: queue_submit2",
                 )?;
                 checked(
@@ -4317,8 +4327,10 @@ impl Renderer {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. The device was idled above, so the queue is free.
             unsafe {
-                checked(
-                    raw.queue_submit2(self.device.graphics_queue, &submit, fence),
+                self.device.graphics_queue.submit2(
+                    raw,
+                    &submit,
+                    fence,
                     "window capture: queue_submit2",
                 )?;
                 checked(
@@ -4675,7 +4687,9 @@ impl Renderer {
             fps,
             gpu_ms: self.gpu_frame_ms,
             cpu_frame_ms: self.cpu_frame_ms,
+            scene_gather_ms: self.scene_gather_ms,
             cpu_wait_ms: self.cpu_wait_ms,
+            rt_instances: self.rt.frame_instance_count(),
             vram_usage_bytes: self.vram_usage_bytes,
             vram_budget_bytes: self.vram_budget_bytes,
             software_gpu: self.software_gpu,
@@ -4704,6 +4718,11 @@ impl Renderer {
         self.frame_ms = frame_ms;
         self.cpu_frame_ms = cpu_frame_ms;
         self.cpu_wait_ms = cpu_wait_ms;
+    }
+
+    /// Records the CPU duration of the scene driver's static + skinned draw-list gather.
+    pub fn record_scene_gather(&mut self, elapsed: Duration) {
+        self.scene_gather_ms = elapsed.as_secs_f32() * 1000.0;
     }
 
     /// Folds one frame's wall-clock delta (seconds) into the smoothed `frame_ms` headline the
@@ -5625,6 +5644,39 @@ impl Renderer {
             None
         };
 
+        let batch_shadow_draws = |deformed: Option<bool>| {
+            self.scene_draw_list
+                .batches
+                .iter()
+                .filter(|batch| deformed.is_none_or(|value| batch.deformed == value))
+                .fold(0_u32, |total, batch| {
+                    total.saturating_add(if batch.submeshes.is_empty() {
+                        1
+                    } else {
+                        u32::try_from(batch.submeshes.len()).unwrap_or(u32::MAX)
+                    })
+                })
+        };
+        let all_shadow_draws = batch_shadow_draws(None);
+        let mut shadow_draw_calls = 0_u32;
+        if shadow_pipeline.is_some() {
+            if self.lighting.shadow_pending() {
+                shadow_draw_calls = shadow_draw_calls.saturating_add(all_shadow_draws);
+            }
+            if self.lighting.spot_shadow_pending() {
+                shadow_draw_calls = shadow_draw_calls.saturating_add(all_shadow_draws);
+            }
+        }
+        if point_shadow_pipeline.is_some() {
+            if static_point_shadow_dirty {
+                shadow_draw_calls = shadow_draw_calls
+                    .saturating_add(batch_shadow_draws(Some(false)).saturating_mul(6));
+            }
+            shadow_draw_calls =
+                shadow_draw_calls.saturating_add(batch_shadow_draws(Some(true)).saturating_mul(6));
+        }
+        self.stats.shadow_draw_calls = shadow_draw_calls;
+
         let frame_pipelines = FramePipelines {
             depth_prepass,
             cull: cull_pipeline,
@@ -5750,10 +5802,10 @@ impl Renderer {
         let submit = [submit_info];
         // SAFETY: the ash seam. The queue is externally synchronized; at this phase it
         // is touched from one thread only. The fence was reset in `begin_offscreen_frame`.
-        checked(
-            unsafe {
-                raw.queue_submit2(self.device.graphics_queue, &submit, self.frames.in_flight())
-            },
+        self.device.graphics_queue.submit2(
+            raw,
+            &submit,
+            self.frames.in_flight(),
             "queue_submit2 (scene)",
         )?;
         if let Some(index) = submit_span {
@@ -10546,8 +10598,10 @@ impl Renderer {
             .signal_semaphore_infos(&signal)];
         // SAFETY: the ash seam. The graphics queue is externally synchronized; the fence was
         // reset above.
-        checked(
-            unsafe { raw.queue_submit2(self.device.graphics_queue, &submit, present_fence) },
+        self.device.graphics_queue.submit2(
+            raw,
+            &submit,
+            present_fence,
             "present: queue_submit2",
         )?;
 
@@ -10560,11 +10614,10 @@ impl Renderer {
             .image_indices(&image_indices);
         // SAFETY: the ash seam. The swapchain/image-index are valid; the present waits on
         // render_finished signaled by the submit above.
-        let present = unsafe {
-            self.device
-                .swapchain_loader()
-                .queue_present(self.device.graphics_queue, &present_info)
-        };
+        let present = self
+            .device
+            .graphics_queue
+            .present(self.device.swapchain_loader(), &present_info);
         // A window capture armed by `request_window_capture` reads the just-presented
         // swapchain image (the composited window output) into a PNG, then disarms.
         if self.capture_next_window_path.is_some() {
@@ -10789,14 +10842,10 @@ impl Renderer {
         // SAFETY: the ash seam. The graphics queue is externally synchronized; this
         // submit runs on the render thread (the thumbnail worker submits behind the
         // queue mutex). The fence is freshly reset.
-        checked(
-            unsafe {
-                raw.queue_submit2(
-                    self.device.graphics_queue,
-                    &submits,
-                    self.frames.in_flight(),
-                )
-            },
+        self.device.graphics_queue.submit2(
+            raw,
+            &submits,
+            self.frames.in_flight(),
             "queue_submit2",
         )?;
 
@@ -10810,11 +10859,10 @@ impl Renderer {
 
         // SAFETY: the ash seam. The swapchain/image-index are valid; the present
         // waits on render_finished signaled by the submit above.
-        let present = unsafe {
-            self.device
-                .swapchain_loader()
-                .queue_present(self.device.graphics_queue, &present_info)
-        };
+        let present = self
+            .device
+            .graphics_queue
+            .present(self.device.swapchain_loader(), &present_info);
         match present {
             Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
                 Ok(())
@@ -11256,10 +11304,9 @@ mod tests {
             let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos);
             // SAFETY: the ash seam. Single-threaded queue use in this test.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &[submit], fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &[submit], fence, "submit")?;
                 checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())
@@ -11325,7 +11372,7 @@ mod tests {
         use crate::instancing::Instancing;
         use crate::pipelines::Pipelines;
         use crate::resources::BindlessFreeList;
-        use crate::upload::{GpuQueue, Uploader};
+        use crate::upload::Uploader;
         use crate::view_target::ViewTarget;
         use saffron_geometry::glam::{Mat4, Vec2, Vec3};
         use saffron_geometry::{Mesh, Submesh, Vertex};
@@ -11346,7 +11393,7 @@ mod tests {
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
         let view = ViewTarget::new(&device, 16, 16).expect("ViewTarget");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
         // A clip-space triangle covering the whole viewport (NDC corners), so the depth
@@ -11609,10 +11656,9 @@ mod tests {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. Single-threaded queue use in the test.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "submit")?;
                 checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())
@@ -12021,10 +12067,9 @@ mod tests {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. Single-threaded queue use in the test.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "submit")?;
                 checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())
@@ -12288,10 +12333,9 @@ mod tests {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
             // SAFETY: the ash seam. Single-threaded queue use in the test.
             unsafe {
-                checked(
-                    raw.queue_submit2(device.graphics_queue, &submit, fence),
-                    "submit",
-                )?;
+                device
+                    .graphics_queue
+                    .submit2(raw, &submit, fence, "submit")?;
                 checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
             }
             Ok(())
@@ -12461,7 +12505,9 @@ mod tests {
             raw.end_command_buffer(cmd).expect("end");
             let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
-            raw.queue_submit2(device.graphics_queue, &submit, fence)
+            device
+                .graphics_queue
+                .submit2(raw, &submit, fence, "submit")
                 .expect("submit");
             raw.wait_for_fences(&[fence], true, u64::MAX).expect("wait");
             let slice =
@@ -12514,7 +12560,7 @@ mod tests {
     #[test]
     fn displaced_instance_tessellation_frame_is_validation_clean() {
         use crate::draw_list::{DrawItem, SubmeshMaterial};
-        use crate::upload::{GpuQueue, Uploader};
+        use crate::upload::Uploader;
         use saffron_core::HeightMode;
         use saffron_geometry::glam::{Mat4, Vec2, Vec3};
         use saffron_geometry::{Mesh, Submesh, Vertex};
@@ -12537,7 +12583,7 @@ mod tests {
 
         // Upload a UV'd quad (watertight conditioning is built at upload) + a non-flat height map (whose
         // min/max pyramid drives the per-region factor) into the renderer's bindless descriptors.
-        let queue = GpuQueue::new(renderer.device().graphics_queue);
+        let queue = renderer.device().graphics_queue.clone();
         let uploader = Uploader::new(renderer.device(), &queue).expect("Uploader");
         let vert = |x: f32, z: f32, u: f32, w: f32| Vertex {
             position: Vec3::new(x, 0.0, z),
