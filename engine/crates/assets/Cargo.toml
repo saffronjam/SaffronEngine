@@ -17,10 +17,16 @@ saffron-json = { path = "../json" }
 saffron-geometry = { path = "../geometry" }
 saffron-rendering = { path = "../rendering" }
 saffron-scene = { path = "../scene" }
+saffron-spatial = { path = "../spatial" }
 serde_json.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
+atomic-write-file.workspace = true
 solar-positioning.workspace = true
+saffron-vegetation = { path = "../vegetation" }
+resvg.workspace = true
+usvg.workspace = true
+tiny-skia.workspace = true
 
 [dev-dependencies]
 ash.workspace = true
