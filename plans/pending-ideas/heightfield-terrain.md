@@ -55,8 +55,10 @@ brush.
 
 ## Unlocks (downstream pending ideas)
 
-`foliage-and-vegetation` (canonical "scatter on landscape"), `water-and-ocean` (shorelines, rivers
-carving), and "vehicles on terrain" (vehicles themselves need no terrain). Build before those.
+[`foliage-veg`](../foliage-veg/README.md) (as a shared `SurfaceField` provider, never a separate
+terrain-grass path), `water-and-ocean` (shorelines, rivers
+carving), and "vehicles on terrain" (vehicles themselves need no terrain). Terrain and vegetation
+share the spatial foundation; neither is an implementation prerequisite for the other.
 
 ## Notes & references
 
