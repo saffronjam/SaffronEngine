@@ -136,7 +136,18 @@ fn write_smeta(path: &str, meta: &SmetaData) -> Result<()> {
 /// resolved state, animations have no thumbnail) or an unreadable file. Read once here on a
 /// cold scan — which runs exactly when a file changed — so an in-place edit reflows the key.
 fn standalone_content_hash(asset_type: AssetType, path: &str) -> u64 {
-    if !matches!(asset_type, AssetType::Mesh | AssetType::Texture) {
+    if asset_type == AssetType::VegetationMap {
+        return crate::vegetation::vegetation_map_content_hash_path(std::path::Path::new(path))
+            .unwrap_or(0);
+    }
+    if !matches!(
+        asset_type,
+        AssetType::Mesh
+            | AssetType::Texture
+            | AssetType::Plant
+            | AssetType::Biome
+            | AssetType::VegetationMap
+    ) {
         return 0;
     }
     match std::fs::read(path) {
@@ -259,6 +270,9 @@ pub fn reconcile_catalog_from_disk(
             "smat" => (AssetType::Material, false),
             "sanim" => (AssetType::Animation, false),
             "senv" => (AssetType::Environment, false),
+            "splant" => (AssetType::Plant, false),
+            "sbiome" => (AssetType::Biome, false),
+            "svegmap" => (AssetType::VegetationMap, false),
             "png" | "jpg" | "jpeg" | "tga" | "bmp" => (AssetType::Texture, false),
             "hdr" => (AssetType::Texture, true),
             _ => continue,

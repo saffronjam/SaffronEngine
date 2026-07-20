@@ -19,6 +19,9 @@ pub fn asset_type_name(asset_type: AssetType) -> &'static str {
         AssetType::Mesh => "mesh",
         AssetType::Lut => "lut",
         AssetType::Environment => "environment",
+        AssetType::Plant => "plant",
+        AssetType::Biome => "biome",
+        AssetType::VegetationMap => "vegetation-map",
     }
 }
 
@@ -34,6 +37,9 @@ pub fn asset_type_from_name(name: &str) -> AssetType {
         "model" => AssetType::Model,
         "lut" => AssetType::Lut,
         "environment" => AssetType::Environment,
+        "plant" => AssetType::Plant,
+        "biome" => AssetType::Biome,
+        "vegetation-map" => AssetType::VegetationMap,
         _ => AssetType::Mesh,
     }
 }
@@ -116,6 +122,9 @@ mod tests {
             AssetType::Mesh,
             AssetType::Lut,
             AssetType::Environment,
+            AssetType::Plant,
+            AssetType::Biome,
+            AssetType::VegetationMap,
         ] {
             assert_eq!(asset_type_from_name(asset_type_name(ty)), ty);
         }
