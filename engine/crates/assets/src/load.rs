@@ -292,7 +292,12 @@ impl AssetServer {
     /// triangle of every scene mesh on each cursor move.
     pub fn mesh_pick_bvh(&mut self, sub_id: Uuid, mesh: &GpuMesh) -> Option<Arc<MeshBvh>> {
         crate::cache::resolve_cached(&mut self.mesh_bvh_by_uuid, sub_id.value(), || {
-            MeshBvh::build(&mesh.cpu_positions, &mesh.cpu_indices).map(Arc::new)
+            let positions: Vec<_> = mesh
+                .cpu_vertices
+                .iter()
+                .map(|vertex| vertex.position)
+                .collect();
+            MeshBvh::build(&positions, &mesh.cpu_indices).map(Arc::new)
         })
     }
 
@@ -712,8 +717,7 @@ mod tests {
         ChunkKind, ContainerChunk, Mesh, Submesh, Vertex, save_mesh_to_buffer, write_container,
     };
     use saffron_rendering::{
-        BindlessFreeList, Descriptors, Device, GpuQueue, SurfaceSource, Uploader,
-        validation_issue_count,
+        BindlessFreeList, Descriptors, Device, SurfaceSource, Uploader, validation_issue_count,
     };
     use saffron_scene::{AssetEntry, AssetType, Colorspace};
 
@@ -845,7 +849,7 @@ mod tests {
         };
         let free_list: BindlessFreeList = Arc::new(std::sync::Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         Some(GpuFixture {
             uploader,
