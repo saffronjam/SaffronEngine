@@ -352,6 +352,34 @@
       "fixture": "viewport-center"
     },
     {
+      "name": "spatial-cell",
+      "params": "SpatialCellParams",
+      "result": "SpatialCellResult",
+      "status": "typed",
+      "fixture": "spatial-origin"
+    },
+    {
+      "name": "spatial-providers",
+      "params": "EmptyParams",
+      "result": "SurfaceProvidersResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "spatial-sample",
+      "params": "SpatialSampleParams",
+      "result": "SpatialSampleResult",
+      "status": "typed",
+      "fixture": "spatial-sample-cube"
+    },
+    {
+      "name": "spatial-residency",
+      "params": "EmptyParams",
+      "result": "SpatialResidencyResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
       "name": "inspect",
       "params": "EntityParams",
       "result": "InspectResult",
@@ -891,6 +919,48 @@
       "fixture": "tess-quality"
     },
     {
+      "name": "vegetation-compile-biome",
+      "params": "VegetationCompileBiomeParams",
+      "result": "VegetationCompileBiomeResult",
+      "status": "typed",
+      "skip": "requires an imported biome asset or map-local biome instance"
+    },
+    {
+      "name": "vegetation-node-schema",
+      "params": "VegetationNodeSchemaParams",
+      "result": "VegetationNodeSchemaResult",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "vegetation-evaluate-region",
+      "params": "VegetationEvaluateRegionParams",
+      "result": "VegetationEvaluationJobDto",
+      "status": "typed",
+      "skip": "requires an imported vegetation map and bound biome instance"
+    },
+    {
+      "name": "vegetation-evaluation-status",
+      "params": "VegetationEvaluationJobParams",
+      "result": "VegetationEvaluationStatusDto",
+      "status": "typed",
+      "skip": "requires a prior vegetation evaluation job"
+    },
+    {
+      "name": "vegetation-cancel-evaluation",
+      "params": "VegetationEvaluationJobParams",
+      "result": "VegetationEvaluationStatusDto",
+      "status": "typed",
+      "skip": "requires a running vegetation evaluation job"
+    },
+    {
+      "name": "vegetation-explain-point",
+      "params": "VegetationExplainPointParams",
+      "result": "ProvenanceExplanationDto",
+      "status": "typed",
+      "skip": "requires a completed vegetation evaluation and point identity"
+    },
+    {
       "name": "get-project",
       "params": "EmptyParams",
       "result": "ProjectInfoDto",
@@ -968,11 +1038,25 @@
       "skip": "requires an external .cube fixture path"
     },
     {
+      "name": "import-vegetation-asset",
+      "params": "ImportVegetationAssetParams",
+      "result": "ImportVegetationAssetResult",
+      "status": "typed",
+      "skip": "requires an external authored vegetation asset path"
+    },
+    {
       "name": "list-assets",
       "params": "EmptyParams",
       "result": "AssetList",
       "status": "typed",
       "fixture": "empty"
+    },
+    {
+      "name": "vegetation-asset-summary",
+      "params": "VegetationAssetSummaryParams",
+      "result": "VegetationAssetSummaryResult",
+      "status": "typed",
+      "skip": "needs an imported vegetation asset"
     },
     {
       "name": "scan-assets",
