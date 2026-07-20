@@ -1,8 +1,6 @@
 //! The `sa-types.ts` emitter over the `ts-rs` decls.
 
-use std::collections::HashSet;
-
-use super::{Decl, DtoDecls, command_type_names};
+use super::{Decl, DtoDecls};
 
 /// Build `editor/src/protocol/sa-types.ts` from the Rust DTO declarations.
 pub fn emit_sa_types(decls: &DtoDecls) -> String {
@@ -33,38 +31,14 @@ pub fn emit_sa_types(decls: &DtoDecls) -> String {
     )
 }
 
-/// The declaration emission order, rooted at every command and shared wire helper.
+/// The declaration emission order, matching the complete Rust DTO inventory.
 fn interface_order(decls: &DtoDecls) -> Vec<String> {
-    let mut roots = command_type_names();
-    roots.extend(["Vec3", "Vec4", "ProbeRef", "ComponentBody"]);
-
-    let mut seen = HashSet::new();
-    let mut order = Vec::new();
-    seen.insert("EntityRef".to_owned());
-    order.push("EntityRef".to_owned());
-    for root in roots {
-        for dep in declaration_deps(decls, root) {
-            if seen.insert(dep.clone()) {
-                order.push(dep);
-            }
-        }
-    }
-    order
-}
-
-/// A DFS pre-order of the emitted declarations reachable from `ty`.
-fn declaration_deps(decls: &DtoDecls, ty: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let inner = unwrap_array(strip_nullable(ty));
-    if let Some(Decl::Struct(fields)) = decls.get(inner) {
-        out.push(inner.to_owned());
-        for (_, field_ty) in fields {
-            out.extend(declaration_deps(decls, field_ty));
-        }
-    } else if inner == "ComponentBody" && matches!(decls.get(inner), Some(Decl::Alias(_))) {
-        out.push(inner.to_owned());
-    }
-    out
+    decls
+        .ordered
+        .iter()
+        .filter(|name| name.as_str() != "Uuid")
+        .cloned()
+        .collect()
 }
 
 /// Emit one Rust-derived TypeScript interface or named union.
@@ -87,8 +61,8 @@ fn emit_declaration(decls: &DtoDecls, name: &str) -> String {
 }
 
 /// Map a `ts-rs` type token to its TS spelling, returning `(type, optional)`. `T | null` is
-/// optional; `Array<T>` -> `T[]`; `bigint` -> `number`; `Uuid` -> `WireUuid`; `JsonValue` -> a
-/// `unknown`; a Rust alias inlines its union; structs and primitives pass through.
+/// optional; `Array<T>` -> `T[]`; `bigint` -> `number`; `Uuid` -> `WireUuid`; `JsonValue` ->
+/// `unknown`; named DTOs and primitives pass through.
 fn ts_type(ty: &str) -> (String, bool) {
     let (core, optional) = match ty.strip_suffix("| null") {
         Some(inner) => (inner.trim(), true),
@@ -106,61 +80,14 @@ fn ts_type(ty: &str) -> (String, bool) {
         "bigint" => ("number".to_owned(), optional),
         "Uuid" => ("WireUuid".to_owned(), optional),
         "JsonValue" => ("unknown".to_owned(), optional),
-        other => (resolve_alias_or_passthrough(other), optional),
+        other => (other.to_owned(), optional),
     }
-}
-
-/// Inline Rust-derived primitive and string-literal unions.
-fn resolve_alias_or_passthrough(name: &str) -> String {
-    if name != "ComponentBody"
-        && let Some(union) = TYPE_ALIASES.with(|aliases| aliases.get(name).cloned())
-    {
-        return union;
-    }
-    name.to_owned()
-}
-
-thread_local! {
-    static TYPE_ALIASES: std::collections::HashMap<String, String> = type_aliases();
-}
-
-fn type_aliases() -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    for (ident, decl) in saffron_protocol::ts_decls() {
-        if let Decl::Alias(rhs) = super::parse_decl(&decl) {
-            map.insert(ident.to_owned(), map_alias_rhs(&rhs));
-        }
-    }
-    map
 }
 
 fn map_alias_rhs(rhs: &str) -> String {
-    let mut mapped = rhs.replace("bigint", "number").replace("Uuid", "WireUuid");
-    for (ident, decl) in saffron_protocol::ts_decls() {
-        let Decl::Alias(nested) = super::parse_decl(&decl) else {
-            continue;
-        };
-        // String-literal enums are leaf aliases. Inline them when ts-rs nests one inside a
-        // tagged-enum alias; object unions and component aggregates remain named.
-        if !nested.contains('{') && nested.contains('"') && mapped.contains(ident) {
-            mapped = mapped.replace(ident, &format!("({nested})"));
-        }
-    }
-    mapped
-}
-
-/// `T | null` -> `T`; a bare `T` passes through (the nullable marker the TS walk strips before
-/// resolving a dependency).
-fn strip_nullable(ty: &str) -> &str {
-    ty.strip_suffix("| null").map_or(ty, str::trim)
-}
-
-/// `Array<T>` -> `T` (the element type the dependency walk recurses into); a bare `T` passes
-/// through.
-fn unwrap_array(ty: &str) -> &str {
-    ty.strip_prefix("Array<")
-        .and_then(|s| s.strip_suffix('>'))
-        .map_or(ty, str::trim)
+    rhs.replace("bigint", "number")
+        .replace("Uuid", "WireUuid")
+        .replace("JsonValue", "unknown")
 }
 
 #[cfg(test)]
@@ -186,9 +113,11 @@ mod tests {
 
     #[test]
     fn selector_alias_maps_to_union() {
-        let mapped = resolve_alias_or_passthrough("EntitySelector");
-        assert!(mapped.contains("string"));
-        assert!(mapped.contains("number"));
+        let decls = DtoDecls::load();
+        assert_eq!(
+            emit_declaration(&decls, "EntitySelector"),
+            "export type EntitySelector = number | string;"
+        );
     }
 
     #[test]
@@ -205,20 +134,45 @@ mod tests {
     }
 
     #[test]
-    fn enum_field_inlines_union() {
+    fn enum_field_uses_its_named_declaration() {
         let (mapped, optional) = ts_type("AaModeDto");
-        assert_eq!(
-            mapped,
-            "\"off\" | \"fxaa\" | \"taa\" | \"msaa2\" | \"msaa4\" | \"msaa8\""
-        );
+        assert_eq!(mapped, "AaModeDto");
         assert!(!optional);
     }
 
     #[test]
-    fn tagged_enum_field_inlines_object_union() {
-        let mapped = resolve_alias_or_passthrough("EnvironmentProfileRefDto");
-        assert!(mapped.contains("kind\": \"builtin"));
-        assert!(mapped.contains("kind\": \"asset"));
-        assert!(mapped.contains(" | "));
+    fn tagged_enum_field_uses_its_named_declaration() {
+        let (mapped, optional) = ts_type("EnvironmentProfileRefDto");
+        assert_eq!(mapped, "EnvironmentProfileRefDto");
+        assert!(!optional);
+    }
+
+    #[test]
+    fn tagged_enum_references_emit_named_payload_declarations() {
+        let decls = DtoDecls::load();
+        let output = emit_sa_types(&decls);
+        assert!(output.contains("export interface ThinSheetFoliageParametersDto"));
+        assert!(output.contains("export interface PlantAssetSummaryDto"));
+        assert!(output.contains("export interface BiomeAssetSummaryDto"));
+        assert!(output.contains("export interface VegetationMapSummaryDto"));
+    }
+
+    #[test]
+    fn complete_inventory_emits_opaque_vegetation_contracts() {
+        let output = emit_sa_types(&DtoDecls::load());
+        assert!(output.contains("export type PlantId = string;"));
+        assert!(output.contains("export interface PlantPointDto"));
+        assert!(output.contains("export interface ProvenanceDto"));
+        assert!(output.contains("export interface VegetationBaseManifestDto"));
+        assert!(output.contains("export type VegetationMutationDto ="));
+    }
+
+    #[test]
+    fn tagged_enum_preserves_named_opaque_string_aliases() {
+        let decls = DtoDecls::load();
+        let mapped = emit_declaration(&decls, "VegetationLayerOperatorDto");
+        assert!(mapped.contains("PlantId"));
+        assert!(mapped.contains("VegetationGuid"));
+        assert!(!mapped.contains("Wirestring"));
     }
 }

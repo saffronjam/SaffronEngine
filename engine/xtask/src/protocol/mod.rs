@@ -5,8 +5,8 @@
 //! OpenRPC per-DTO schemas (via [`saffron_protocol::schema_fragments`]). This module assembles
 //! the three editor-facing artifacts:
 //!
-//! - `editor/src/protocol/sa-types.ts` — header, the `WireUuid` alias, the command-reachable DTO
-//!   interfaces, and the `CommandParamsMap`/`CommandResultMap`.
+//! - `editor/src/protocol/sa-types.ts` — header, the `WireUuid` alias, the complete DTO inventory,
+//!   and the `CommandParamsMap`/`CommandResultMap`.
 //! - `schemas/control/openrpc.generated.json` — the `{ openrpc, info, methods, components.schemas
 //!   }` envelope, with methods in command-table order and schemas generated from Rust DTOs.
 //! - `schemas/control/command-manifest.generated.json` — the fixture/skip ledger.
@@ -20,7 +20,6 @@
 //! and `serde_json`'s `preserve_order` keep it.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -96,6 +95,8 @@ pub fn run(repo_root: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// field-metadata model the TS emitter walks. `ts-rs` is the parser; this only re-models its
 /// output.
 pub struct DtoDecls {
+    /// DTO identifiers in the canonical Rust inventory order.
+    ordered: Vec<String>,
     /// `ident -> parsed declaration` for every DTO type (structs + enums + `Uuid`).
     by_ident: HashMap<String, Decl>,
 }
@@ -111,11 +112,13 @@ enum Decl {
 impl DtoDecls {
     /// Parse every protocol DTO's `ts-rs` `decl()` into the field-metadata model.
     fn load() -> Self {
+        let mut ordered = Vec::new();
         let mut by_ident = HashMap::new();
         for (ident, decl) in ts_decls() {
+            ordered.push(ident.to_owned());
             by_ident.insert(ident.to_owned(), parse_decl(&decl));
         }
-        Self { by_ident }
+        Self { ordered, by_ident }
     }
 
     fn get(&self, ident: &str) -> Option<&Decl> {
@@ -309,20 +312,6 @@ fn pretty(value: &Value) -> String {
     let mut text = String::from_utf8(buf).expect("serde_json emits utf-8");
     text.push('\n');
     text
-}
-
-/// The deduped `[params, result]` of every command, in table order — the TS interface-walk roots.
-fn command_type_names() -> Vec<&'static str> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for cmd in COMMANDS {
-        for ty in [cmd.params, cmd.result] {
-            if seen.insert(ty) {
-                out.push(ty);
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
