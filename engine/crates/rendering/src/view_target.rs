@@ -1998,10 +1998,9 @@ fn initialize_screen_space_layouts(device: &Device, images: &[&Image]) -> Result
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
         // SAFETY: the ash seam. The queue is touched single-threaded at the build point.
         unsafe {
-            checked(
-                raw.queue_submit2(device.graphics_queue, &submit, fence),
-                "ssao init submit",
-            )?;
+            device
+                .graphics_queue
+                .submit2(raw, &submit, fence, "ssao init submit")?;
             checked(
                 raw.wait_for_fences(&[fence], true, u64::MAX),
                 "ssao init wait",
@@ -2111,7 +2110,7 @@ mod tests {
         use crate::pipelines::Pipelines;
         use crate::render_graph::{RenderGraph, RgAttachment, RgPass, RgUsage};
         use crate::skinning::Skinning;
-        use crate::upload::{GpuQueue, Uploader};
+        use crate::upload::Uploader;
         use saffron_geometry::glam::{Mat4, Vec2, Vec3};
         use saffron_geometry::{Mesh, Submesh, Vertex};
 
@@ -2130,7 +2129,7 @@ mod tests {
         let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
         let mut skinning = Skinning::new(&device).expect("Skinning");
-        let queue = GpuQueue::new(device.graphics_queue);
+        let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader");
 
         let mut view = ViewTarget::new(&device, 16, 16).expect("view");
@@ -2440,7 +2439,9 @@ mod tests {
             raw.end_command_buffer(cmd).expect("end");
             let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
-            raw.queue_submit2(device.graphics_queue, &submit, fence)
+            device
+                .graphics_queue
+                .submit2(raw, &submit, fence, "submit")
                 .expect("submit");
             raw.wait_for_fences(&[fence], true, u64::MAX).expect("wait");
         }
