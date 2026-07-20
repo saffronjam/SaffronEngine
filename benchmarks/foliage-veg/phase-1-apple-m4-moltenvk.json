@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-19T18:52:33.402Z",
+  "fixture": {
+    "name": "phase-1-heterogeneous-mesh-baseline",
+    "primitiveInstances": 512,
+    "primitiveCycle": ["cube", "plane", "sphere"],
+    "pointLights": 1,
+    "spotLights": 1,
+    "starterDirectionalLights": 1,
+    "captureFrames": 32,
+    "viewport": [1280, 720]
+  },
+  "platform": {
+    "os": "darwin",
+    "osRelease": "25.5.0",
+    "architecture": "arm64",
+    "cpu": "Apple M4",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
+    "revision": "d302d7c0ea95fccc9c3c71b8b860f388f968b1c2",
+    "workingTreeDirty": true,
+    "gpu": "Apple M4",
+    "softwareGpu": false,
+    "rtSupported": false,
+    "profilerMode": "timestamps",
+    "timestampsSupported": true
+  },
+  "observed": {
+    "sceneGatherMs": {
+      "p50": 1.393541,
+      "p95": 1.528167,
+      "p99": 1.528167,
+      "max": 1.528167
+    },
+    "cpuFrameMs": {
+      "p50": 13.440084,
+      "p95": 14.764501,
+      "p99": 51.138004,
+      "max": 51.138004
+    },
+    "gpuFrameMs": {
+      "p50": 15.226166,
+      "p95": 18.869291,
+      "p99": 19.615292,
+      "max": 19.615292
+    },
+    "drawCalls": 4,
+    "batches": 4,
+    "instances": 513,
+    "triangles": 528186,
+    "instanceUploadBytes": 131328,
+    "shadowDrawCalls": 8,
+    "rtInstances": 0,
+    "retainedMeshCpuBytes": 256552,
+    "vramUsageBytes": 0,
+    "vramBudgetBytes": 0
+  },
+  "budgets": {
+    "derivation": "Anima steady-state p95 plus 25% or an absolute noise floor, whichever is larger",
+    "sceneGatherP95Ms": 1.91,
+    "cpuFrameP95Ms": 18.456,
+    "gpuFrameP95Ms": 23.587,
+    "drawCallsMax": 4,
+    "instanceUploadBytesMax": 131328,
+    "retainedMeshCpuBytesMax": 256552
+  },
+  "validationErrors": []
+}
