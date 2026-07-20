@@ -39,7 +39,7 @@ use crate::component::{
     CharacterController, Collider, DirectionalLight, FogShape, FogVolume, FootChain, FootIk, Joint,
     KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name,
     PhysicsMaterial, PointLight, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot,
-    Shape, SkinnedMesh, SpotLight, Transform, Transition, Wrap,
+    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, Wrap,
 };
 use crate::environment::{
     AtmosphereSettings, CloudSettings, FogMode, FogQuality, FogSettings, SceneEnvironment, SkyMode,
@@ -215,6 +215,21 @@ impl SceneSerialize for Mesh {
 
     fn load_json(&mut self, value: &Value) -> Result<()> {
         self.mesh = Uuid(json_u64_or(value, "mesh", 0));
+        Ok(())
+    }
+}
+
+impl SceneSerialize for VegetationField {
+    fn to_json(&self) -> Value {
+        object([
+            ("map", uuid_to_json(self.map.value())),
+            ("enabled", Value::Bool(self.enabled)),
+        ])
+    }
+
+    fn load_json(&mut self, value: &Value) -> Result<()> {
+        self.map = Uuid(json_u64_or(value, "map", 0));
+        self.enabled = json_bool_or(value, "enabled", true);
         Ok(())
     }
 }

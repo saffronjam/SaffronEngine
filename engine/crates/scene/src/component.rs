@@ -1,6 +1,6 @@
 //! The component structs the world holds.
 //!
-//! The 24 serialized components plus the runtime-only caches. Vectors use the matching
+//! The serialized components plus the runtime-only caches. Vectors use the matching
 //! `glam` type, with `Vec3` pinned at 12 bytes (the geometry-area pin) so the downstream
 //! std430/byte layouts stay correct.
 //!
@@ -570,6 +570,27 @@ impl Default for CharacterController {
 pub struct Mesh {
     /// The mesh asset id.
     pub mesh: Uuid,
+}
+
+/// The scene's single authored vegetation-world binding.
+///
+/// Local ecological areas and biome variation are layers inside the referenced map, so a scene
+/// carries at most one of these components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationField {
+    /// Referenced `.svegmap` catalog asset.
+    pub map: Uuid,
+    /// Whether vegetation evaluation, simulation, and presentation are active.
+    pub enabled: bool,
+}
+
+impl Default for VegetationField {
+    fn default() -> Self {
+        Self {
+            map: Uuid(0),
+            enabled: true,
+        }
+    }
 }
 
 /// One material binding for a submesh: a reference to a `.smat` material asset plus a

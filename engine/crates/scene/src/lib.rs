@@ -30,7 +30,7 @@ pub use component::{
     FootChain, FootIk, IdComponent, Joint, KinematicBones, MaterialSet, MaterialSlot, Mesh,
     ModelInstance, MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight,
     PoseOverride, PreviewGhost, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot,
-    Shape, SkinnedMesh, SpotLight, Transform, Transition, WorldTransform, Wrap,
+    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, WorldTransform, Wrap,
 };
 pub use document::SCENE_VERSION;
 pub use environment::{
