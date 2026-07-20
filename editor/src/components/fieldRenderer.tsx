@@ -40,7 +40,7 @@ export type FieldKind =
   | "struct";
 
 /// Asset kind a `uuid` field references (the AssetPicker filters the catalog by this).
-export type AssetKind = "mesh" | "texture" | "material" | "model" | "animation";
+export type AssetKind = "mesh" | "texture" | "material" | "model" | "animation" | "vegetation-map";
 
 export interface FieldHint {
   kind: FieldKind;
@@ -75,6 +75,7 @@ export const FIELD_HINTS: Record<string, FieldHint> = {
   "Transform.rotation": { kind: "vec3", step: 0.5, unit: "deg", convertRadians: true },
 
   "Mesh.mesh": { kind: "uuid", asset: "mesh" },
+  "VegetationField.map": { kind: "uuid", asset: "vegetation-map" },
   "MaterialAsset.material": { kind: "uuid", asset: "material" },
 
   "Camera.fov": { kind: "number", min: 1, max: 179, step: 0.5 },
