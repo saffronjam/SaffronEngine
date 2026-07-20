@@ -16,6 +16,7 @@ mod dto;
 mod scene_dto;
 mod schema;
 mod uuid;
+mod vegetation_dto;
 
 pub use codegen::{schema_fragments, ts_decls};
 pub use command::{
@@ -26,3 +27,4 @@ pub use dto::*;
 pub use scene_dto::*;
 pub use schema::{fragment_for, positional_field_order};
 pub use uuid::Uuid;
+pub use vegetation_dto::*;
