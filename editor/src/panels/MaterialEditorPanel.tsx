@@ -1,16 +1,21 @@
-/// The Material editor: pick a .smat material asset, see it on a studio-lit preview sphere, and
-/// edit its factors live. Reads/writes over the control plane (material-list/get/update/create +
-/// preview-render); edits are coalesced and re-render the preview. Texture-slot picking is the
-/// entity inspector's job (assign-asset); this panel edits the shared material asset's factors.
+/// The Material editor: select a `.smat`, edit its standard or thin-sheet surface data, and render
+/// a studio-lit preview through the control plane.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
 import { renderField, type FieldRenderContext } from "../components/fieldRenderer";
+import { AssetPicker } from "../components/AssetPicker";
+import { ColorField } from "../components/ColorField";
+import { NumberDrag } from "../components/NumberDrag";
+import { SliderField } from "../components/SliderField";
 import { makeCoalescer, type Coalescer } from "../control/coalesce";
 import { errorText, notifyError } from "../lib/flash";
 import { humanizeFieldName } from "../lib/humanize";
+import type { CommandResultMap } from "../protocol";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -33,6 +38,49 @@ const TEXTURE_FIELDS = [
   "emissiveTexture",
   "heightTexture",
 ] as const;
+
+type MaterialSurface = CommandResultMap["material-get"]["surface"];
+type ThinSheetSurface = Extract<MaterialSurface, { model: "thin-sheet-foliage" }>;
+type ThinSheetParameters = ThinSheetSurface["parameters"];
+
+const UNIT_MAX = 65_535;
+const FIXED_SCALE = 65_536;
+const ZERO_HASH = "0".repeat(64);
+const SOURCE_EXTENT_AXES = ["width", "height"] as const;
+const NORMAL_SECOND_MOMENT_LABELS = ["XX", "YY", "ZZ", "XY", "XZ", "YZ"] as const;
+
+const DEFAULT_THIN_SHEET_PARAMETERS: ThinSheetParameters = {
+  frontAlbedoResponse: 30_000,
+  backAlbedoResponse: 30_000,
+  thicknessBits: 655,
+  absorptionColorBits: [0, 0, 0],
+  transmissionColorBits: [30_000, 30_000, 30_000],
+  roughness: 32_768,
+  normalBehavior: "face-forward-back",
+  coverageSource: { kind: "albedo-alpha" },
+  coverage: {
+    referenceCutoff: 32_768,
+    sourceExtent: [1, 1],
+    spatialHashSalt: "1",
+    classification: "masked",
+    mipHashes: [],
+  },
+  voxelMoments: {
+    occupancy: 0,
+    albedoMeanBits: [0, 0, 0],
+    roughnessMean: 0,
+    transmissionMeanBits: [0, 0, 0],
+    thicknessMeanBits: 0,
+    normalSecondMomentsBits: [0, 0, 0, 0, 0, 0],
+  },
+  opacityMicromap: {
+    enabled: false,
+    maxSubdivision: 0,
+    transparentThreshold: 0,
+    opaqueThreshold: 0,
+  },
+  energyLimit: UNIT_MAX,
+};
 
 // The height-map technique (one grayscale Height Map, the mode picks how it is realized — the
 // shape Unity HDRP / Godot / Blender converge on). Shown only when a Height Map is assigned.
@@ -142,10 +190,14 @@ export function MaterialEditorPanel({
       if (!coalescer) {
         coalescer = makeCoalescer<unknown>({
           send: async (latest) => {
-            const patch = { [field]: latest } as Parameters<typeof client.materialUpdate>[1];
-            await client.materialUpdate(id, patch);
-            if (!hidePreview) {
-              previewCoalescer.current?.push(id);
+            try {
+              const patch = { [field]: latest } as Parameters<typeof client.materialUpdate>[1];
+              await client.materialUpdate(id, patch);
+              if (!hidePreview) {
+                previewCoalescer.current?.push(id);
+              }
+            } catch (err) {
+              notifyError(errorText(err));
             }
           },
         });
@@ -170,6 +222,7 @@ export function MaterialEditorPanel({
     onDragStart: () => setDragActive(true),
     onDragEnd: () => setDragActive(false),
   };
+  const surface = fields?.surface as MaterialSurface | undefined;
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3 text-[12px] text-foreground">
@@ -219,6 +272,15 @@ export function MaterialEditorPanel({
           {activeMaterialId ? "Rendering…" : "No material selected"}
         </div>
       )}
+
+      {surface ? (
+        <SurfaceEditor
+          surface={surface}
+          onChange={(next) => editField("surface", next)}
+          onDragStart={ctx.onDragStart}
+          onDragEnd={ctx.onDragEnd}
+        />
+      ) : null}
 
       {fields
         ? FACTOR_FIELDS.map((field) => (
@@ -299,4 +361,604 @@ export function MaterialEditorPanel({
       ) : null}
     </div>
   );
+}
+
+interface SurfaceEditorProps {
+  surface: MaterialSurface;
+  onChange(surface: MaterialSurface): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+}
+
+function SurfaceEditor({ surface, onChange, onDragStart, onDragEnd }: SurfaceEditorProps) {
+  const setModel = (model: MaterialSurface["model"]): void => {
+    onChange(
+      model === "standard"
+        ? { model: "standard" }
+        : { model: "thin-sheet-foliage", parameters: DEFAULT_THIN_SHEET_PARAMETERS },
+    );
+  };
+
+  return (
+    <section className="flex flex-col gap-3 rounded-md border border-border bg-card p-3">
+      <ParameterField label="Surface model">
+        <Select
+          value={surface.model}
+          onValueChange={(value) => setModel(value as MaterialSurface["model"])}
+        >
+          <SelectTrigger size="sm" className="h-7 w-full text-[11px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="standard" className="text-[11px]">
+              Standard
+            </SelectItem>
+            <SelectItem value="thin-sheet-foliage" className="text-[11px]">
+              Thin-sheet foliage
+            </SelectItem>
+          </SelectContent>
+        </Select>
+      </ParameterField>
+      {surface.model === "thin-sheet-foliage" ? (
+        <ThinSheetEditor
+          parameters={surface.parameters}
+          onChange={(parameters) => onChange({ model: "thin-sheet-foliage", parameters })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+interface ThinSheetEditorProps {
+  parameters: ThinSheetParameters;
+  onChange(parameters: ThinSheetParameters): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+}
+
+function ThinSheetEditor({ parameters, onChange, onDragStart, onDragEnd }: ThinSheetEditorProps) {
+  const assets = useEditorStore((state) => state.assets);
+  const textures = assets.filter((asset) => asset.type === "texture");
+  const patch = (next: Partial<ThinSheetParameters>): void => onChange({ ...parameters, ...next });
+  const maxTransmission = Math.max(...parameters.transmissionColorBits);
+  const responseMax = Math.max(0, parameters.energyLimit - maxTransmission);
+  const maxResponse = Math.max(parameters.frontAlbedoResponse, parameters.backAlbedoResponse);
+  const transmissionMax = Math.max(0, parameters.energyLimit - maxResponse);
+  const minimumEnergy = Math.min(UNIT_MAX, maxResponse + maxTransmission);
+
+  const setCoverageSource = (kind: ThinSheetParameters["coverageSource"]["kind"]): void => {
+    if (kind === "albedo-alpha") {
+      patch({ coverageSource: { kind: "albedo-alpha" } });
+      return;
+    }
+    if (kind === "modeled-geometry") {
+      patch({ coverageSource: { kind: "modeled-geometry" } });
+      return;
+    }
+    const current =
+      parameters.coverageSource.kind === "texture" ? parameters.coverageSource.texture : null;
+    const texture = current ?? textures[0]?.id;
+    if (!texture) {
+      notifyError("A dedicated coverage source needs a texture asset");
+      return;
+    }
+    patch({ coverageSource: { kind: "texture", texture } });
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <ParameterGroup title="Optical response">
+        <UnitParameter
+          label="Front albedo response"
+          bits={parameters.frontAlbedoResponse}
+          maxBits={responseMax}
+          onChange={(frontAlbedoResponse) => patch({ frontAlbedoResponse })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+        <UnitParameter
+          label="Back albedo response"
+          bits={parameters.backAlbedoResponse}
+          maxBits={responseMax}
+          onChange={(backAlbedoResponse) => patch({ backAlbedoResponse })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+        <ColorParameter
+          label="Absorption color"
+          bits={parameters.absorptionColorBits}
+          onChange={(absorptionColorBits) => patch({ absorptionColorBits })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+        <ColorParameter
+          label="Transmission color"
+          bits={parameters.transmissionColorBits}
+          maxBits={transmissionMax}
+          onChange={(transmissionColorBits) => patch({ transmissionColorBits })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+        <UnitParameter
+          label="Roughness"
+          bits={parameters.roughness}
+          onChange={(roughness) => patch({ roughness })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+        <ParameterField label="Thickness (m)">
+          <NumberDrag
+            value={parameters.thicknessBits / FIXED_SCALE}
+            min={1 / FIXED_SCALE}
+            step={0.001}
+            onChange={(value) =>
+              patch({ thicknessBits: Math.max(1, Math.round(value * FIXED_SCALE)) })
+            }
+            onDragStart={onDragStart}
+            onDragEnd={onDragEnd}
+          />
+        </ParameterField>
+        <ParameterField label="Normal behavior">
+          <Select
+            value={parameters.normalBehavior}
+            onValueChange={(normalBehavior) =>
+              patch({ normalBehavior: normalBehavior as ThinSheetParameters["normalBehavior"] })
+            }
+          >
+            <SelectTrigger size="sm" className="h-7 w-full text-[11px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="preserve" className="text-[11px]">
+                Preserve
+              </SelectItem>
+              <SelectItem value="face-forward-back" className="text-[11px]">
+                Face forward on back face
+              </SelectItem>
+              <SelectItem value="symmetric" className="text-[11px]">
+                Symmetric
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </ParameterField>
+        <UnitParameter
+          label="Energy limit"
+          bits={parameters.energyLimit}
+          minBits={minimumEnergy}
+          onChange={(energyLimit) => patch({ energyLimit })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+      </ParameterGroup>
+
+      <ParameterGroup title="Coverage">
+        <ParameterField label="Coverage source">
+          <Select
+            value={parameters.coverageSource.kind}
+            onValueChange={(value) =>
+              setCoverageSource(value as ThinSheetParameters["coverageSource"]["kind"])
+            }
+          >
+            <SelectTrigger size="sm" className="h-7 w-full text-[11px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="albedo-alpha" className="text-[11px]">
+                Albedo alpha
+              </SelectItem>
+              <SelectItem value="texture" className="text-[11px]">
+                Dedicated texture
+              </SelectItem>
+              <SelectItem value="modeled-geometry" className="text-[11px]">
+                Modeled geometry
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </ParameterField>
+        {parameters.coverageSource.kind === "texture" ? (
+          <ParameterField label="Coverage texture">
+            <AssetPicker
+              value={parameters.coverageSource.texture}
+              assetType="texture"
+              onChange={(texture) => {
+                if (texture === "0") {
+                  notifyError("A dedicated coverage source cannot be empty");
+                  return;
+                }
+                patch({ coverageSource: { kind: "texture", texture } });
+              }}
+            />
+          </ParameterField>
+        ) : null}
+        <UnitParameter
+          label="Reference cutoff"
+          bits={parameters.coverage.referenceCutoff}
+          onChange={(referenceCutoff) =>
+            patch({ coverage: { ...parameters.coverage, referenceCutoff } })
+          }
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+        <ParameterField label="Source extent">
+          <div className="grid grid-cols-2 gap-2">
+            {SOURCE_EXTENT_AXES.map((axis, index) => (
+              <NumberDrag
+                key={axis}
+                value={parameters.coverage.sourceExtent[index]}
+                min={1}
+                max={4_294_967_295}
+                step={1}
+                onChange={(next) => {
+                  const sourceExtent = [...parameters.coverage.sourceExtent] as [number, number];
+                  sourceExtent[index] = Math.round(next);
+                  patch({ coverage: { ...parameters.coverage, sourceExtent } });
+                }}
+                onDragStart={onDragStart}
+                onDragEnd={onDragEnd}
+              />
+            ))}
+          </div>
+        </ParameterField>
+        <ParameterField label="Spatial hash salt">
+          <CommitTextField
+            value={parameters.coverage.spatialHashSalt}
+            inputMode="numeric"
+            validate={(value) => /^[1-9][0-9]*$/.test(value)}
+            validationMessage="Spatial hash salt must be a positive decimal integer"
+            onCommit={(spatialHashSalt) =>
+              patch({ coverage: { ...parameters.coverage, spatialHashSalt } })
+            }
+          />
+        </ParameterField>
+        <ParameterField label="Alpha classification">
+          <Select
+            value={parameters.coverage.classification}
+            onValueChange={(classification) =>
+              patch({
+                coverage: {
+                  ...parameters.coverage,
+                  classification:
+                    classification as ThinSheetParameters["coverage"]["classification"],
+                },
+              })
+            }
+          >
+            <SelectTrigger size="sm" className="h-7 w-full text-[11px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="opaque" className="text-[11px]">
+                Opaque
+              </SelectItem>
+              <SelectItem value="masked" className="text-[11px]">
+                Masked
+              </SelectItem>
+              <SelectItem value="transmissive" className="text-[11px]">
+                Transmissive
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </ParameterField>
+        <ParameterField label="Coverage mip hashes">
+          <CommitTextField
+            value={parameters.coverage.mipHashes.join(", ")}
+            placeholder={ZERO_HASH}
+            validate={(value) =>
+              value.length === 0 || splitHashes(value).every((hash) => /^[0-9a-f]{64}$/.test(hash))
+            }
+            validationMessage="Coverage hashes must be lowercase 64-digit SHA-256 values"
+            onCommit={(value) =>
+              patch({ coverage: { ...parameters.coverage, mipHashes: splitHashes(value) } })
+            }
+          />
+        </ParameterField>
+      </ParameterGroup>
+
+      <VoxelMomentsEditor
+        parameters={parameters}
+        onChange={patch}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+      <OpacityMicromapEditor
+        parameters={parameters}
+        onChange={patch}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+    </div>
+  );
+}
+
+function VoxelMomentsEditor({
+  parameters,
+  onChange,
+  onDragStart,
+  onDragEnd,
+}: {
+  parameters: ThinSheetParameters;
+  onChange(patch: Partial<ThinSheetParameters>): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+}) {
+  const moments = parameters.voxelMoments;
+  const patch = (next: Partial<ThinSheetParameters["voxelMoments"]>): void =>
+    onChange({ voxelMoments: { ...moments, ...next } });
+  return (
+    <ParameterGroup title="Voxel material moments">
+      <UnitParameter
+        label="Occupancy"
+        bits={moments.occupancy}
+        onChange={(occupancy) => patch({ occupancy })}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+      <ColorParameter
+        label="Mean albedo"
+        bits={moments.albedoMeanBits}
+        onChange={(albedoMeanBits) => patch({ albedoMeanBits })}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+      <UnitParameter
+        label="Mean roughness"
+        bits={moments.roughnessMean}
+        onChange={(roughnessMean) => patch({ roughnessMean })}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+      <ColorParameter
+        label="Mean transmission"
+        bits={moments.transmissionMeanBits}
+        onChange={(transmissionMeanBits) => patch({ transmissionMeanBits })}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+      <ParameterField label="Mean thickness (m)">
+        <NumberDrag
+          value={moments.thicknessMeanBits / FIXED_SCALE}
+          step={0.001}
+          onChange={(value) => patch({ thicknessMeanBits: Math.round(value * FIXED_SCALE) })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+      </ParameterField>
+      <ParameterField label="Normal second moments">
+        <div className="grid grid-cols-3 gap-1.5">
+          {NORMAL_SECOND_MOMENT_LABELS.map((label, index) => (
+            <div key={label} className="flex min-w-0 flex-col gap-1">
+              <span className="text-[9px] text-muted-foreground">{label}</span>
+              <NumberDrag
+                value={moments.normalSecondMomentsBits[index] / FIXED_SCALE}
+                step={0.01}
+                onChange={(value) => {
+                  const normalSecondMomentsBits = [...moments.normalSecondMomentsBits] as [
+                    number,
+                    number,
+                    number,
+                    number,
+                    number,
+                    number,
+                  ];
+                  normalSecondMomentsBits[index] = Math.round(value * FIXED_SCALE);
+                  patch({ normalSecondMomentsBits });
+                }}
+                onDragStart={onDragStart}
+                onDragEnd={onDragEnd}
+              />
+            </div>
+          ))}
+        </div>
+      </ParameterField>
+    </ParameterGroup>
+  );
+}
+
+function OpacityMicromapEditor({
+  parameters,
+  onChange,
+  onDragStart,
+  onDragEnd,
+}: {
+  parameters: ThinSheetParameters;
+  onChange(patch: Partial<ThinSheetParameters>): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+}) {
+  const omm = parameters.opacityMicromap;
+  const patch = (next: Partial<ThinSheetParameters["opacityMicromap"]>): void =>
+    onChange({ opacityMicromap: { ...omm, ...next } });
+  return (
+    <ParameterGroup title="Opacity micromap derivation">
+      <ParameterField label="Enabled" inline>
+        <Switch checked={omm.enabled} onCheckedChange={(enabled) => patch({ enabled })} />
+      </ParameterField>
+      <ParameterField label="Maximum subdivision">
+        <NumberDrag
+          value={omm.maxSubdivision}
+          min={0}
+          max={255}
+          step={1}
+          onChange={(maxSubdivision) => patch({ maxSubdivision: Math.round(maxSubdivision) })}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+        />
+      </ParameterField>
+      <UnitParameter
+        label="Transparent threshold"
+        bits={omm.transparentThreshold}
+        maxBits={omm.opaqueThreshold}
+        onChange={(transparentThreshold) => patch({ transparentThreshold })}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+      <UnitParameter
+        label="Opaque threshold"
+        bits={omm.opaqueThreshold}
+        minBits={omm.transparentThreshold}
+        onChange={(opaqueThreshold) => patch({ opaqueThreshold })}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+    </ParameterGroup>
+  );
+}
+
+function ParameterGroup({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-2 border-t border-border pt-3">
+      <h3 className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        {title}
+      </h3>
+      {children}
+    </div>
+  );
+}
+
+function ParameterField({
+  label,
+  children,
+  inline = false,
+}: {
+  label: string;
+  children: React.ReactNode;
+  inline?: boolean;
+}) {
+  return (
+    <div className={inline ? "flex items-center justify-between gap-3" : "flex flex-col gap-1"}>
+      <Label className="text-[11px] font-normal text-muted-foreground">{label}</Label>
+      <div className={inline ? "flex-none" : "min-w-0"}>{children}</div>
+    </div>
+  );
+}
+
+function UnitParameter({
+  label,
+  bits,
+  minBits = 0,
+  maxBits = UNIT_MAX,
+  onChange,
+  onDragStart,
+  onDragEnd,
+}: {
+  label: string;
+  bits: number;
+  minBits?: number;
+  maxBits?: number;
+  onChange(bits: number): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+}) {
+  return (
+    <ParameterField label={label}>
+      <SliderField
+        value={bits / UNIT_MAX}
+        min={minBits / UNIT_MAX}
+        max={maxBits / UNIT_MAX}
+        step={1 / UNIT_MAX}
+        onChange={(value) => onChange(clampBits(Math.round(value * UNIT_MAX), minBits, maxBits))}
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+    </ParameterField>
+  );
+}
+
+function ColorParameter({
+  label,
+  bits,
+  maxBits = UNIT_MAX,
+  onChange,
+  onDragStart,
+  onDragEnd,
+}: {
+  label: string;
+  bits: [number, number, number];
+  maxBits?: number;
+  onChange(bits: [number, number, number]): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+}) {
+  return (
+    <ParameterField label={label}>
+      <ColorField
+        kind="color3"
+        value={{ x: bits[0] / FIXED_SCALE, y: bits[1] / FIXED_SCALE, z: bits[2] / FIXED_SCALE }}
+        onChange={(color) =>
+          onChange([
+            clampBits(Math.round((color.x ?? 0) * FIXED_SCALE), 0, maxBits),
+            clampBits(Math.round((color.y ?? 0) * FIXED_SCALE), 0, maxBits),
+            clampBits(Math.round((color.z ?? 0) * FIXED_SCALE), 0, maxBits),
+          ])
+        }
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+      />
+    </ParameterField>
+  );
+}
+
+function CommitTextField({
+  value,
+  onCommit,
+  validate,
+  validationMessage,
+  inputMode,
+  placeholder,
+}: {
+  value: string;
+  onCommit(value: string): void;
+  validate(value: string): boolean;
+  validationMessage: string;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
+  placeholder?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const cancel = useRef(false);
+  const finish = (input: HTMLInputElement): void => {
+    const next = input.value.trim();
+    setDraft(null);
+    if (cancel.current) {
+      cancel.current = false;
+      return;
+    }
+    if (!validate(next)) {
+      notifyError(validationMessage);
+      return;
+    }
+    if (next !== value) {
+      onCommit(next);
+    }
+  };
+  return (
+    <Input
+      value={draft ?? value}
+      inputMode={inputMode}
+      placeholder={placeholder}
+      className="h-7 bg-background font-mono text-[11px]"
+      onChange={(event) => setDraft(event.currentTarget.value)}
+      onBlur={(event) => finish(event.currentTarget)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.currentTarget.blur();
+        } else if (event.key === "Escape") {
+          cancel.current = true;
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function splitHashes(value: string): string[] {
+  return value
+    .split(/[\s,]+/)
+    .map((hash) => hash.trim())
+    .filter(Boolean);
+}
+
+function clampBits(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
