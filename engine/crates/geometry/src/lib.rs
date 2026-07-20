@@ -51,8 +51,9 @@ pub use meshlet::{
 };
 pub use obj_import::import_obj_model;
 pub use picking::{
-    MeshBvh, closest_point_on_triangle, generate_normals, ray_aabb_slab, ray_triangle,
-    world_aabb_from_corners,
+    MeshBvh, MeshNearestHit, MeshRayHit, TriangleClosestPoint, TriangleRayHit,
+    closest_point_coordinates, closest_point_on_triangle, generate_normals, ray_aabb_slab,
+    ray_triangle, ray_triangle_coordinates, world_aabb_from_corners,
 };
 pub use primitives::{cube, plane, uv_sphere};
 pub use sanim::{

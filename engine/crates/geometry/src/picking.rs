@@ -26,6 +26,20 @@ const NORMAL_LENGTH_EPS: f32 = 1e-12;
 /// miss. Two-sided: a back-facing strike still reports a forward hit. The forward
 /// gate rejects hits at or behind the origin.
 pub fn ray_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
+    ray_triangle_coordinates(ray, v0, v1, v2).map(|hit| hit.distance)
+}
+
+/// One exact triangle intersection in the triangle's vertex order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TriangleRayHit {
+    /// Ray parameter of the hit.
+    pub distance: f32,
+    /// Barycentric weights for `(v0, v1, v2)`.
+    pub barycentric: [f32; 3],
+}
+
+/// Two-sided Möller–Trumbore intersection with barycentric coordinates.
+pub fn ray_triangle_coordinates(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<TriangleRayHit> {
     let edge1 = v1 - v0;
     let edge2 = v2 - v0;
     let pvec = ray.dir.cross(edge2);
@@ -48,7 +62,10 @@ pub fn ray_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
     if t <= FORWARD_EPS {
         return None;
     }
-    Some(t)
+    Some(TriangleRayHit {
+        distance: t,
+        barycentric: [1.0 - u - v, u, v],
+    })
 }
 
 /// The point on triangle `(a, b, c)` closest to `p` (Ericson, *Real-Time Collision
@@ -58,46 +75,81 @@ pub fn ray_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
 /// Used by the SDF bake's nearest-distance query; the unsigned distance is
 /// `(closest - p).length()`.
 pub fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    closest_point_coordinates(p, a, b, c).point
+}
+
+/// One closest point on a triangle with barycentric coordinates in vertex order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TriangleClosestPoint {
+    /// Closest triangle point.
+    pub point: Vec3,
+    /// Barycentric weights for `(a, b, c)`.
+    pub barycentric: [f32; 3],
+}
+
+/// The closest triangle point and its barycentric coordinates.
+pub fn closest_point_coordinates(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> TriangleClosestPoint {
     let ab = b - a;
     let ac = c - a;
     let ap = p - a;
     let d1 = ab.dot(ap);
     let d2 = ac.dot(ap);
     if d1 <= 0.0 && d2 <= 0.0 {
-        return a; // vertex region A
+        return TriangleClosestPoint {
+            point: a,
+            barycentric: [1.0, 0.0, 0.0],
+        };
     }
     let bp = p - b;
     let d3 = ab.dot(bp);
     let d4 = ac.dot(bp);
     if d3 >= 0.0 && d4 <= d3 {
-        return b; // vertex region B
+        return TriangleClosestPoint {
+            point: b,
+            barycentric: [0.0, 1.0, 0.0],
+        };
     }
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
         let v = d1 / (d1 - d3);
-        return a + ab * v; // edge AB
+        return TriangleClosestPoint {
+            point: a + ab * v,
+            barycentric: [1.0 - v, v, 0.0],
+        };
     }
     let cp = p - c;
     let d5 = ab.dot(cp);
     let d6 = ac.dot(cp);
     if d6 >= 0.0 && d5 <= d6 {
-        return c; // vertex region C
+        return TriangleClosestPoint {
+            point: c,
+            barycentric: [0.0, 0.0, 1.0],
+        };
     }
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
         let w = d2 / (d2 - d6);
-        return a + ac * w; // edge AC
+        return TriangleClosestPoint {
+            point: a + ac * w,
+            barycentric: [1.0 - w, 0.0, w],
+        };
     }
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
         let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        return b + (c - b) * w; // edge BC
+        return TriangleClosestPoint {
+            point: b + (c - b) * w,
+            barycentric: [0.0, 1.0 - w, w],
+        };
     }
     // Interior: barycentric combination of the three edge weights.
     let denom = 1.0 / (va + vb + vc);
     let v = vb * denom;
     let w = vc * denom;
-    a + ab * v + ac * w
+    TriangleClosestPoint {
+        point: a + ab * v + ac * w,
+        barycentric: [1.0 - v - w, v, w],
+    }
 }
 
 /// The squared distance from `p` to the axis-aligned box `[lo, hi]`, `0` when `p` is
@@ -223,7 +275,7 @@ struct BvhNode {
 pub struct MeshBvh {
     nodes: Vec<BvhNode>,
     /// Triangle vertices, reordered by the build so each leaf names a contiguous range.
-    tris: Vec<[Vec3; 3]>,
+    tris: Vec<BvhTriangle>,
     /// Orientation of the triangle winding: `+1` when `cross(b-a, c-a)` points outward
     /// (the signed mesh volume is positive), `-1` when the mesh is wound inward. Multiplied
     /// into the [`nearest_signed_distance`](Self::nearest_signed_distance) sign so the field
@@ -231,13 +283,43 @@ pub struct MeshBvh {
     winding: f32,
 }
 
+#[derive(Clone, Copy)]
+struct BvhTriangle {
+    vertices: [Vec3; 3],
+    source_triangle: u32,
+}
+
+/// A BVH ray hit retaining stable source-triangle identity and barycentrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshRayHit {
+    /// Ray parameter in the BVH's coordinate space.
+    pub distance: f32,
+    /// Triangle ordinal in the source index buffer.
+    pub triangle_index: u32,
+    /// Barycentric weights in source vertex order.
+    pub barycentric: [f32; 3],
+}
+
+/// A BVH nearest-point result retaining stable source-triangle identity and barycentrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshNearestHit {
+    /// Nearest point in the BVH's coordinate space.
+    pub point: Vec3,
+    /// Euclidean distance to the query point.
+    pub distance: f32,
+    /// Triangle ordinal in the source index buffer.
+    pub triangle_index: u32,
+    /// Barycentric weights in source vertex order.
+    pub barycentric: [f32; 3],
+}
+
 impl MeshBvh {
     /// Builds a BVH from a mesh's positions + triangle indices. `None` when there are no
     /// triangles (or the indices are degenerate), matching "nothing to pick".
     #[must_use]
     pub fn build(positions: &[Vec3], indices: &[u32]) -> Option<MeshBvh> {
-        let mut tris: Vec<[Vec3; 3]> = Vec::with_capacity(indices.len() / 3);
-        for tri in indices.chunks_exact(3) {
+        let mut tris: Vec<BvhTriangle> = Vec::with_capacity(indices.len() / 3);
+        for (source_triangle, tri) in indices.chunks_exact(3).enumerate() {
             let a = *positions.get(tri[0] as usize)?;
             let b = *positions.get(tri[1] as usize)?;
             let c = *positions.get(tri[2] as usize)?;
@@ -247,7 +329,10 @@ impl MeshBvh {
             let (e1, e2) = (b - a, c - a);
             let cross = e1.cross(e2);
             if cross.length_squared() > 1e-10 * e1.length_squared() * e2.length_squared() {
-                tris.push([a, b, c]);
+                tris.push(BvhTriangle {
+                    vertices: [a, b, c],
+                    source_triangle: source_triangle as u32,
+                });
             }
         }
         if tris.is_empty() {
@@ -256,9 +341,21 @@ impl MeshBvh {
         // Signed volume (divergence theorem, ×6): positive when the faces are wound so
         // `cross(b-a, c-a)` points outward. Its sign orients the pseudonormal so an
         // inward-wound source still signs as negative inside.
-        let vol6: f32 = tris.iter().map(|t| t[0].dot(t[1].cross(t[2]))).sum();
+        let vol6: f32 = tris
+            .iter()
+            .map(|triangle| {
+                let vertices = triangle.vertices;
+                vertices[0].dot(vertices[1].cross(vertices[2]))
+            })
+            .sum();
         let winding = if vol6 >= 0.0 { 1.0 } else { -1.0 };
-        let centroids: Vec<Vec3> = tris.iter().map(|t| (t[0] + t[1] + t[2]) / 3.0).collect();
+        let centroids: Vec<Vec3> = tris
+            .iter()
+            .map(|triangle| {
+                let vertices = triangle.vertices;
+                (vertices[0] + vertices[1] + vertices[2]) / 3.0
+            })
+            .collect();
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
         let mut nodes: Vec<BvhNode> = Vec::new();
         build_node(&mut nodes, &tris, &centroids, &mut order, 0, tris.len());
@@ -303,9 +400,13 @@ impl MeshBvh {
             let node = self.nodes[idx as usize];
             if node.count > 0 {
                 for tri in &self.tris[node.first as usize..(node.first + node.count) as usize] {
-                    let cp = closest_point_on_triangle(point, tri[0], tri[1], tri[2]);
+                    let vertices = tri.vertices;
+                    let cp =
+                        closest_point_on_triangle(point, vertices[0], vertices[1], vertices[2]);
                     let d = cp.distance_squared(point);
-                    let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+                    let n = (vertices[1] - vertices[0])
+                        .cross(vertices[2] - vertices[0])
+                        .normalize_or_zero();
                     // A relative epsilon on the squared distance gathers triangles that
                     // meet at the same vertex/edge (their closest point is that shared
                     // feature), summing their normals into the pseudonormal.
@@ -356,29 +457,188 @@ impl MeshBvh {
         }
     }
 
+    /// The nearest triangle point with source identity and barycentrics.
+    #[must_use]
+    pub fn nearest_hit(&self, point: Vec3) -> Option<MeshNearestHit> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut best: Option<MeshNearestHit> = None;
+        let mut stack: Vec<(u32, f32)> = vec![(0, 0.0)];
+        while let Some((idx, lower)) = stack.pop() {
+            if best.is_some_and(|hit| lower > hit.distance * hit.distance) {
+                continue;
+            }
+            let node = self.nodes[idx as usize];
+            if node.count > 0 {
+                for triangle in &self.tris[node.first as usize..(node.first + node.count) as usize]
+                {
+                    let vertices = triangle.vertices;
+                    let closest =
+                        closest_point_coordinates(point, vertices[0], vertices[1], vertices[2]);
+                    let distance = closest.point.distance(point);
+                    let candidate = MeshNearestHit {
+                        point: closest.point,
+                        distance,
+                        triangle_index: triangle.source_triangle,
+                        barycentric: closest.barycentric,
+                    };
+                    let replace = best.is_none_or(|current| {
+                        distance < current.distance
+                            || (distance == current.distance
+                                && candidate.triangle_index < current.triangle_index)
+                    });
+                    if replace {
+                        best = Some(candidate);
+                    }
+                }
+            } else {
+                let left = node.first;
+                let right = node.right;
+                let left_distance = aabb_distance_sq(
+                    point,
+                    self.nodes[left as usize].min,
+                    self.nodes[left as usize].max,
+                );
+                let right_distance = aabb_distance_sq(
+                    point,
+                    self.nodes[right as usize].min,
+                    self.nodes[right as usize].max,
+                );
+                if left_distance <= right_distance {
+                    stack.push((right, right_distance));
+                    stack.push((left, left_distance));
+                } else {
+                    stack.push((left, left_distance));
+                    stack.push((right, right_distance));
+                }
+            }
+        }
+        best
+    }
+
+    /// The nearest point after applying an arbitrary affine model transform.
+    ///
+    /// Node boxes are conservatively transformed to world AABBs for pruning and leaf triangles
+    /// are tested in world space. This preserves correct metric ordering under non-uniform scale
+    /// while reusing the cached mesh-local hierarchy.
+    #[must_use]
+    pub fn nearest_hit_transformed(&self, point: Vec3, model: Mat4) -> Option<MeshNearestHit> {
+        if self.nodes.is_empty() || !model.is_finite() || !point.is_finite() {
+            return None;
+        }
+        let mut best: Option<MeshNearestHit> = None;
+        let mut root_min = Vec3::splat(f32::MAX);
+        let mut root_max = Vec3::splat(f32::MIN);
+        world_aabb_from_corners(
+            &model,
+            self.nodes[0].min,
+            self.nodes[0].max,
+            &mut root_min,
+            &mut root_max,
+        );
+        let mut stack = vec![(0_u32, aabb_distance_sq(point, root_min, root_max))];
+        while let Some((idx, lower)) = stack.pop() {
+            if best.is_some_and(|hit| lower > hit.distance * hit.distance) {
+                continue;
+            }
+            let node = self.nodes[idx as usize];
+            if node.count > 0 {
+                for triangle in &self.tris[node.first as usize..(node.first + node.count) as usize]
+                {
+                    let vertices = triangle
+                        .vertices
+                        .map(|vertex| model.transform_point3(vertex));
+                    let closest =
+                        closest_point_coordinates(point, vertices[0], vertices[1], vertices[2]);
+                    let distance = closest.point.distance(point);
+                    let candidate = MeshNearestHit {
+                        point: closest.point,
+                        distance,
+                        triangle_index: triangle.source_triangle,
+                        barycentric: closest.barycentric,
+                    };
+                    let replace = best.is_none_or(|current| {
+                        distance < current.distance
+                            || (distance == current.distance
+                                && candidate.triangle_index < current.triangle_index)
+                    });
+                    if replace {
+                        best = Some(candidate);
+                    }
+                }
+            } else {
+                let distance_to_child = |child: u32| {
+                    let mut minimum = Vec3::splat(f32::MAX);
+                    let mut maximum = Vec3::splat(f32::MIN);
+                    let child_node = self.nodes[child as usize];
+                    world_aabb_from_corners(
+                        &model,
+                        child_node.min,
+                        child_node.max,
+                        &mut minimum,
+                        &mut maximum,
+                    );
+                    aabb_distance_sq(point, minimum, maximum)
+                };
+                let left = node.first;
+                let right = node.right;
+                let left_distance = distance_to_child(left);
+                let right_distance = distance_to_child(right);
+                if left_distance <= right_distance {
+                    stack.push((right, right_distance));
+                    stack.push((left, left_distance));
+                } else {
+                    stack.push((left, left_distance));
+                    stack.push((right, right_distance));
+                }
+            }
+        }
+        best
+    }
+
     /// The nearest forward triangle hit along `ray`, as the ray parameter `t` (the hit point is
     /// `ray.origin + t * ray.dir`), or `None` for a miss. `ray` is in the same space the BVH was
     /// built in (mesh-local).
     #[must_use]
     pub fn raycast(&self, ray: &Ray) -> Option<f32> {
+        self.raycast_hit(ray).map(|hit| hit.distance)
+    }
+
+    /// The nearest forward triangle hit with source identity and barycentrics.
+    #[must_use]
+    pub fn raycast_hit(&self, ray: &Ray) -> Option<MeshRayHit> {
         if self.nodes.is_empty() {
             return None;
         }
-        let mut best = f32::INFINITY;
+        let mut best: Option<MeshRayHit> = None;
         let mut stack: Vec<u32> = vec![0];
         while let Some(idx) = stack.pop() {
             let node = self.nodes[idx as usize];
             // Skip a box the ray misses, or whose entry is already farther than the best hit.
             match ray_aabb_slab(ray, node.min, node.max) {
-                Some((t_enter, _)) if t_enter <= best => {}
+                Some((t_enter, _)) if best.is_none_or(|hit| t_enter <= hit.distance) => {}
                 _ => continue,
             }
             if node.count > 0 {
                 for tri in &self.tris[node.first as usize..(node.first + node.count) as usize] {
-                    if let Some(t) = ray_triangle(ray, tri[0], tri[1], tri[2])
-                        && t < best
+                    let vertices = tri.vertices;
+                    if let Some(hit) =
+                        ray_triangle_coordinates(ray, vertices[0], vertices[1], vertices[2])
                     {
-                        best = t;
+                        let candidate = MeshRayHit {
+                            distance: hit.distance,
+                            triangle_index: tri.source_triangle,
+                            barycentric: hit.barycentric,
+                        };
+                        let replace = best.is_none_or(|current| {
+                            candidate.distance < current.distance
+                                || (candidate.distance == current.distance
+                                    && candidate.triangle_index < current.triangle_index)
+                        });
+                        if replace {
+                            best = Some(candidate);
+                        }
                     }
                 }
             } else {
@@ -386,7 +646,7 @@ impl MeshBvh {
                 stack.push(node.right);
             }
         }
-        best.is_finite().then_some(best)
+        best
     }
 }
 
@@ -395,7 +655,7 @@ impl MeshBvh {
 /// spread; a degenerate split falls back to the midpoint so the recursion always shrinks.
 fn build_node(
     nodes: &mut Vec<BvhNode>,
-    tris: &[[Vec3; 3]],
+    tris: &[BvhTriangle],
     centroids: &[Vec3],
     order: &mut [u32],
     start: usize,
@@ -404,7 +664,7 @@ fn build_node(
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
     for &t in &order[start..end] {
-        for v in tris[t as usize] {
+        for v in tris[t as usize].vertices {
             min = min.min(v);
             max = max.max(v);
         }
