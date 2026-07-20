@@ -34,6 +34,7 @@
   "overrides": {},
   "parent": "1024",
   "shader": "mesh",
+  "surfaceModel": "standard",
   "textures": {
     "albedo": "4242",
     "emissive": "0",
@@ -42,6 +43,7 @@
     "ormOrMr": "0",
     "vectorDisplacement": "0"
   },
+  "thinSheetFoliage": null,
   "unlit": false,
-  "version": 1
+  "version": 2
 }

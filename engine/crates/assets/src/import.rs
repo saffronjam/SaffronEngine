@@ -21,12 +21,13 @@ use saffron_geometry::{
     save_mesh_to_buffer, sub_id_for, translate_model, write_container,
 };
 use saffron_json::{
-    Value, dump_json, dump_json_sorted, json_bool_or, json_f32_or, json_string_or, uuid_to_json,
+    Value, dump_json_sorted, json_bool_or, json_f32_or, json_string_or, uuid_to_json,
 };
 use saffron_scene::{AssetEntry, AssetType, Colorspace};
 
 use crate::AssetServer;
 use crate::error::Result;
+use crate::material::{MaterialAsset, material_asset_to_text};
 use crate::model::{ContainerMetadata, Import, METADATA_SCHEMA_VERSION, SubAsset};
 use crate::names::{colorspace_from_name, colorspace_name};
 
@@ -367,45 +368,27 @@ fn imported_skin_to_json(skin: &ImportedSkin) -> Value {
 /// (decimal strings; `"0"` for an absent slot), and the defaults for the remaining
 /// fields. The byte format is the contract the material loader reads back.
 fn material_chunk_json(material: &ImportedMaterial, textures: &MaterialTextureIds) -> Vec<u8> {
-    let base = material.base_color;
-    let emissive = material.emissive;
     let blend = match material.alpha_mode {
         AlphaMode::Opaque => "opaque",
         AlphaMode::Mask => "masked",
         AlphaMode::Blend => "translucent",
     };
-    let uuid = |id: Uuid| Value::String(id.value().to_string());
-    let doc = serde_json::json!({
-        "version": 1,
-        "shader": "mesh",
-        "blend": blend,
-        "unlit": false,
-        "doubleSided": material.double_sided,
-        "normalConvention": "gl",
-        "factors": {
-            "baseColor": [base.x, base.y, base.z, base.w],
-            "metallic": material.metallic,
-            "roughness": material.roughness,
-            "emissive": [emissive.x, emissive.y, emissive.z],
-            "emissiveStrength": material.emissive_strength,
-            "normalStrength": 1.0,
-            "alphaCutoff": material.alpha_cutoff,
-            "heightScale": 0.05,
-            "uvTiling": [1.0, 1.0],
-            "uvOffset": [0.0, 0.0],
-        },
-        "textures": {
-            "albedo": uuid(textures.albedo),
-            "ormOrMr": uuid(textures.orm),
-            "normal": uuid(textures.normal),
-            "emissive": uuid(textures.emissive),
-            "height": uuid(Uuid(0)),
-        },
-        "graph": Value::Object(serde_json::Map::new()),
-        "parent": "0",
-        "overrides": Value::Object(serde_json::Map::new()),
-    });
-    dump_json(&doc, -1).into_bytes()
+    let asset = MaterialAsset {
+        blend: blend.to_owned(),
+        double_sided: material.double_sided,
+        base_color: material.base_color,
+        metallic: material.metallic,
+        roughness: material.roughness,
+        emissive: material.emissive,
+        emissive_strength: material.emissive_strength,
+        alpha_cutoff: material.alpha_cutoff,
+        albedo_texture: textures.albedo,
+        orm_texture: textures.orm,
+        normal_texture: textures.normal,
+        emissive_texture: textures.emissive,
+        ..MaterialAsset::default()
+    };
+    material_asset_to_text(&asset, -1).into_bytes()
 }
 
 /// The texture sub-ids assigned to a baked material's slots (`0` for an absent slot).
@@ -801,8 +784,7 @@ impl AssetServer {
             }
         }
 
-        let material_bytes =
-            dump_json_sorted(&crate::material::material_asset_to_json(&material), 2).into_bytes();
+        let material_bytes = crate::material::material_asset_to_text(&material, 2).into_bytes();
         pending.push(Pending {
             kind: ChunkKind::Material,
             sub_id: material_id.value(),

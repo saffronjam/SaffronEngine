@@ -11,15 +11,17 @@
 //! float-format or key-order drift surfaces as a hexdump mismatch.
 //! Reseed with `UPDATE_GOLDEN=1` only on an intentional format change.
 
-use saffron_assets::{MaterialAsset, material_asset_to_json};
+use saffron_assets::{MaterialAsset, material_asset_to_text};
 use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3, Vec4};
 use saffron_test_support::assert_bytes_match_golden;
+use saffron_vegetation::MaterialSurface;
 
 /// The populated material the golden fixture covers, field-for-field. `graph`/`overrides`
 /// are `Null` so `material_asset_to_json` emits `{}`.
 fn populated_material() -> MaterialAsset {
     MaterialAsset {
+        surface: MaterialSurface::Standard,
         shader: "mesh".to_owned(),
         blend: "masked".to_owned(),
         unlit: false,
@@ -53,6 +55,6 @@ fn populated_material() -> MaterialAsset {
 fn populated_smat_bytes_match_cpp_golden() {
     // The `.smat` write path serializes with sorted keys + two-space indent — the exact
     // `dump_json_sorted(..., 2)` `save_material_asset` writes to disk.
-    let text = saffron_json::dump_json_sorted(&material_asset_to_json(&populated_material()), 2);
+    let text = material_asset_to_text(&populated_material(), 2);
     assert_bytes_match_golden("material.smat", text.as_bytes());
 }
