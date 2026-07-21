@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use saffron_protocol::ControlFailureDto;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
@@ -34,13 +35,13 @@ pub enum Error {
     /// The reply line was not valid JSON.
     #[error("malformed reply")]
     MalformedReply,
-    /// The engine answered `{ "ok": false, "error": <message> }`.
-    #[error("{cmd}: {message}")]
+    /// The engine answered with a typed failure object.
+    #[error("{cmd}: {failure}")]
     Engine {
         /// The command whose call failed.
         cmd: String,
-        /// The engine's `error` string, verbatim.
-        message: String,
+        /// The engine's structured failure, verbatim.
+        failure: Box<ControlFailureDto>,
     },
     /// The `result` did not deserialize into the requested DTO.
     #[error("decoding {cmd} result: {source}")]
@@ -141,21 +142,34 @@ fn parse_reply(cmd: &str, reply: &str) -> Result<Value> {
     let Ok(response) = serde_json::from_str::<Value>(reply) else {
         return Err(Error::MalformedReply);
     };
-    if response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return Ok(response
-            .get("result")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new())));
+    let Some(object) = response.as_object() else {
+        return Err(Error::MalformedReply);
+    };
+    if !object.contains_key("id") {
+        return Err(Error::MalformedReply);
     }
-    let message = response
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("error")
-        .to_owned();
-    Err(Error::Engine {
-        cmd: cmd.to_owned(),
-        message,
-    })
+    match object.get("ok").and_then(Value::as_bool) {
+        Some(true)
+            if object.len() == 3
+                && object.contains_key("result")
+                && !object.contains_key("error") =>
+        {
+            Ok(object["result"].clone())
+        }
+        Some(false)
+            if object.len() == 3
+                && object.contains_key("error")
+                && !object.contains_key("result") =>
+        {
+            let failure = serde_json::from_value::<ControlFailureDto>(object["error"].clone())
+                .map_err(|_| Error::MalformedReply)?;
+            Err(Error::Engine {
+                cmd: cmd.to_owned(),
+                failure: Box::new(failure),
+            })
+        }
+        _ => Err(Error::MalformedReply),
+    }
 }
 
 /// A control client bound to one socket path, owning the monotonic request-id counter.
@@ -299,22 +313,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_reply_ok_without_result_is_empty_object() {
-        let result = parse_reply("quit", r#"{"id":1,"ok":true}"#).unwrap();
-        assert_eq!(result, json!({}));
+    fn parse_reply_rejects_success_without_result() {
+        assert!(matches!(
+            parse_reply("quit", r#"{"id":1,"ok":true}"#),
+            Err(Error::MalformedReply)
+        ));
     }
 
     #[test]
     fn parse_reply_lifts_engine_error() {
         let err = parse_reply(
             "nope",
-            r#"{"id":1,"ok":false,"error":"unknown command 'nope'"}"#,
+            r#"{"id":1,"ok":false,"error":{"code":"command","message":"unknown command 'nope'"}}"#,
         )
         .expect_err("ok:false must be an error");
         match err {
-            Error::Engine { cmd, message } => {
+            Error::Engine { cmd, failure } => {
                 assert_eq!(cmd, "nope");
-                assert_eq!(message, "unknown command 'nope'");
+                assert_eq!(failure.code(), "command");
+                assert_eq!(failure.message(), "unknown command 'nope'");
             }
             other => panic!("expected an engine error, got {other:?}"),
         }
@@ -329,10 +346,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_reply_missing_ok_is_engine_error() {
-        // No `ok:true` ⇒ treated as a failure; the default message is the generic `error`.
-        let err = parse_reply("ping", r#"{"id":1,"result":{}}"#).expect_err("no ok ⇒ error");
-        assert!(matches!(err, Error::Engine { .. }));
+    fn parse_reply_missing_ok_is_malformed() {
+        let err = parse_reply("ping", r#"{"id":1,"result":{}}"#).expect_err("no ok is invalid");
+        assert!(matches!(err, Error::MalformedReply));
+    }
+
+    #[test]
+    fn parse_reply_preserves_structured_graph_diagnostic() {
+        let err = parse_reply(
+            "vegetation-compile-biome",
+            r#"{"id":4,"ok":false,"error":{"code":"diagnostic","message":"graph candidates limit exceeded: requested 16, limit 4","diagnostic":{"domain":"vegetation-graph","detail":{"category":"limit","resource":"candidates","requested":"16","limit":"4"}}}}"#,
+        )
+        .expect_err("diagnostic reply must be an error");
+        let Error::Engine { failure, .. } = err else {
+            panic!("expected an engine failure")
+        };
+        let ControlFailureDto::Diagnostic { diagnostic, .. } = *failure else {
+            panic!("expected a diagnostic failure")
+        };
+        assert_eq!(
+            diagnostic,
+            saffron_protocol::ControlDiagnosticDto::VegetationGraph(
+                saffron_protocol::VegetationGraphDiagnosticDto::Limit {
+                    resource: "candidates".to_owned(),
+                    requested: "16".to_owned(),
+                    limit: "4".to_owned(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn parse_reply_rejects_the_string_error_shape() {
+        assert!(matches!(
+            parse_reply(
+                "nope",
+                r#"{"id":1,"ok":false,"error":"unknown command 'nope'"}"#,
+            ),
+            Err(Error::MalformedReply)
+        ));
     }
 
     fn test_socket_path(label: &str) -> String {

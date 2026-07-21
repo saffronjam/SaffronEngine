@@ -19,6 +19,7 @@ use std::time::Duration;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
 use saffron_control_client::{self as wire, Client};
+use saffron_protocol::ControlFailureDto;
 use serde_json::{Map, Value};
 
 /// The human-readable vs raw-JSON presentation modes.
@@ -194,23 +195,23 @@ fn coerce(token: &str) -> Value {
         "null" => return Value::Null,
         _ => {}
     }
-    if matches!(token.as_bytes().first(), Some(b'{' | b'[' | b'"')) {
-        if let Ok(value) = serde_json::from_str::<Value>(token) {
-            return value;
-        }
+    if matches!(token.as_bytes().first(), Some(b'{' | b'[' | b'"'))
+        && let Ok(value) = serde_json::from_str::<Value>(token)
+    {
+        return value;
     }
-    if !token.starts_with('-') {
-        if let Ok(unsigned) = token.parse::<u64>() {
-            return Value::from(unsigned);
-        }
+    if !token.starts_with('-')
+        && let Ok(unsigned) = token.parse::<u64>()
+    {
+        return Value::from(unsigned);
     }
     if let Ok(signed) = token.parse::<i64>() {
         return Value::from(signed);
     }
-    if let Ok(float) = token.parse::<f64>() {
-        if let Some(number) = serde_json::Number::from_f64(float) {
-            return Value::Number(number);
-        }
+    if let Ok(float) = token.parse::<f64>()
+        && let Some(number) = serde_json::Number::from_f64(float)
+    {
+        return Value::Number(number);
     }
     Value::String(token.to_owned())
 }
@@ -220,15 +221,30 @@ enum Outcome {
     /// `ok: true` — the result was printed; exit 0.
     Ok,
     /// A runtime failure (connect/parse) or an `ok: false` engine error; exit 1.
-    Error(String),
+    Error {
+        failure: ControlFailureDto,
+        text: String,
+        mode: OutputMode,
+    },
 }
 
 impl Outcome {
     fn code(&self) -> ExitCode {
         match self {
             Outcome::Ok => ExitCode::SUCCESS,
-            Outcome::Error(msg) => {
-                eprintln!("sa: {msg}");
+            Outcome::Error {
+                failure,
+                text,
+                mode,
+            } => {
+                match mode {
+                    OutputMode::Text => eprintln!("sa: {text}"),
+                    OutputMode::Json => {
+                        let json = serde_json::to_string_pretty(failure)
+                            .expect("ControlFailureDto serializes");
+                        eprintln!("{json}");
+                    }
+                }
                 ExitCode::FAILURE
             }
         }
@@ -244,25 +260,49 @@ fn present_outcome(cmd: &str, outcome: wire::Result<Value>, mode: OutputMode) ->
             print_result(cmd, &result, mode);
             Outcome::Ok
         }
-        Err(wire::Error::MalformedReply) => Outcome::Error("malformed reply".to_owned()),
-        Err(wire::Error::Transport { path, source }) => {
-            Outcome::Error(format!("cannot connect to {path}: {source}"))
-        }
-        Err(wire::Error::Decode { source, .. }) => {
-            Outcome::Error(format!("malformed reply: {source}"))
-        }
-        Err(wire::Error::Engine { message, .. }) => {
-            let mut message = message;
+        Err(wire::Error::MalformedReply) => error_outcome(
+            ControlFailureDto::MalformedReply {
+                message: "malformed reply".to_owned(),
+            },
+            mode,
+        ),
+        Err(wire::Error::Transport { path, source }) => error_outcome(
+            ControlFailureDto::Transport {
+                message: format!("cannot connect to {path}: {source}"),
+            },
+            mode,
+        ),
+        Err(wire::Error::Decode { source, .. }) => error_outcome(
+            ControlFailureDto::MalformedReply {
+                message: format!("malformed reply: {source}"),
+            },
+            mode,
+        ),
+        Err(wire::Error::Engine { failure, .. }) => {
+            let mut text = failure.message().to_owned();
             // The CLI never gates a forward (an unknown command still reaches the engine, which
             // answers `unknown command '<name>'`); but when the command is absent from the shared
             // table, offer the nearest registered name as a hint, computed offline from `COMMANDS`.
-            if !is_known_command(cmd) {
-                if let Some(suggestion) = did_you_mean(cmd) {
-                    message.push_str(&format!("  (did you mean '{suggestion}'?)"));
-                }
+            if !is_known_command(cmd)
+                && let Some(suggestion) = did_you_mean(cmd)
+            {
+                text.push_str(&format!("  (did you mean '{suggestion}'?)"));
             }
-            Outcome::Error(message)
+            Outcome::Error {
+                failure: *failure,
+                text,
+                mode,
+            }
         }
+    }
+}
+
+fn error_outcome(failure: ControlFailureDto, mode: OutputMode) -> Outcome {
+    let text = failure.message().to_owned();
+    Outcome::Error {
+        failure,
+        text,
+        mode,
     }
 }
 
@@ -999,7 +1039,12 @@ fn forward(tokens: &[String], mode: OutputMode) -> Outcome {
     let Some((cmd, args)) = tokens.split_first() else {
         // The `external_subcommand` arm only matches with at least one token, so this is
         // unreachable; a truly missing command is the `None` arm handled in `main`.
-        return Outcome::Error("missing command".to_owned());
+        return error_outcome(
+            ControlFailureDto::Bridge {
+                message: "missing command".to_owned(),
+            },
+            mode,
+        );
     };
     let params = build_params(args);
     let mut client = Client::from_env();
@@ -1349,7 +1394,9 @@ mod tests {
     fn engine_err(cmd: &str, message: &str) -> wire::Result<Value> {
         Err(wire::Error::Engine {
             cmd: cmd.to_owned(),
-            message: message.to_owned(),
+            failure: Box::new(ControlFailureDto::Command {
+                message: message.to_owned(),
+            }),
         })
     }
 
@@ -1364,14 +1411,51 @@ mod tests {
 
     #[test]
     fn engine_error_carries_message() {
-        // The engine's `error` string is carried verbatim into the outcome (an unknown command may
+        // The engine's message is carried verbatim into the text outcome (an unknown command may
         // additionally gain a `did you mean` hint, covered by its own test — assert the prefix).
         match present_outcome(
             "nope",
             engine_err("nope", "unknown command 'nope'"),
             OutputMode::Text,
         ) {
-            Outcome::Error(msg) => assert!(msg.starts_with("unknown command 'nope'")),
+            Outcome::Error { text, .. } => {
+                assert!(text.starts_with("unknown command 'nope'"));
+            }
+            Outcome::Ok => panic!("expected an error outcome"),
+        }
+    }
+
+    #[test]
+    fn json_engine_error_preserves_the_complete_diagnostic() {
+        let expected = ControlFailureDto::Diagnostic {
+            message: "graph candidates limit exceeded: requested 16, limit 4".to_owned(),
+            diagnostic: saffron_protocol::ControlDiagnosticDto::VegetationGraph(
+                saffron_protocol::VegetationGraphDiagnosticDto::Limit {
+                    resource: "candidates".to_owned(),
+                    requested: "16".to_owned(),
+                    limit: "4".to_owned(),
+                },
+            ),
+        };
+        let outcome = present_outcome(
+            "vegetation-compile-biome",
+            Err(wire::Error::Engine {
+                cmd: "vegetation-compile-biome".to_owned(),
+                failure: Box::new(expected.clone()),
+            }),
+            OutputMode::Json,
+        );
+
+        match outcome {
+            Outcome::Error {
+                failure,
+                text,
+                mode,
+            } => {
+                assert_eq!(failure, expected);
+                assert_eq!(text, expected.message());
+                assert_eq!(mode, OutputMode::Json);
+            }
             Outcome::Ok => panic!("expected an error outcome"),
         }
     }
@@ -1379,7 +1463,10 @@ mod tests {
     #[test]
     fn malformed_reply_is_error() {
         match present_outcome("ping", Err(wire::Error::MalformedReply), OutputMode::Text) {
-            Outcome::Error(msg) => assert_eq!(msg, "malformed reply"),
+            Outcome::Error { text, failure, .. } => {
+                assert_eq!(text, "malformed reply");
+                assert_eq!(failure.code(), "malformed-reply");
+            }
             Outcome::Ok => panic!("expected a malformed-reply error"),
         }
     }
@@ -1496,9 +1583,9 @@ mod tests {
             engine_err("pign", "unknown command 'pign'"),
             OutputMode::Text,
         ) {
-            Outcome::Error(msg) => {
-                assert!(msg.starts_with("unknown command 'pign'"));
-                assert!(msg.contains("did you mean 'ping'?"), "got: {msg}");
+            Outcome::Error { text, .. } => {
+                assert!(text.starts_with("unknown command 'pign'"));
+                assert!(text.contains("did you mean 'ping'?"), "got: {text}");
             }
             Outcome::Ok => panic!("expected an error outcome"),
         }
@@ -1522,7 +1609,7 @@ mod tests {
             engine_err("get-camera", "no primary camera"),
             OutputMode::Text,
         ) {
-            Outcome::Error(msg) => assert_eq!(msg, "no primary camera"),
+            Outcome::Error { text, .. } => assert_eq!(text, "no primary camera"),
             Outcome::Ok => panic!("expected an error outcome"),
         }
     }
