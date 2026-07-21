@@ -12,19 +12,22 @@
 //! the preview render) lives in `saffron-assets`; these handlers stay thin
 //! orchestration.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use saffron_assets::{
     AssetServer, BUILTIN_SPHERE_MESH_ID, BuiltinMesh, ContainerMetadata, MaterialAsset,
-    PREVIEW_MATERIAL_ID, ProjectHost, ProjectInfo, analyze_clean, asset_bytes, asset_type_name,
-    build_dependency_graph, clear_extraction, colorspace_for_role_explicit, colorspace_name,
-    create_project_script, default_display_name, default_material_asset, delete_unused,
-    exposed_parameter, extract_sub_asset, import_material_folder, import_vegetation_asset,
-    load_biome_asset, load_catalog_material_asset, load_catalog_material_asset_raw,
-    load_plant_family_asset, load_vegetation_map_asset, lower_graph_to_params, model_render_aabb,
-    pbr_exposed_parameters, pick_scene_surface, reimport_model, request_thumbnail,
-    save_material_asset, texture_role_from_hint, texture_role_name, update_material_asset,
-    valid_project_name, viewport_ray,
+    PREVIEW_MATERIAL_ID, PlantRecookOptions, PlantRecookOutcome, PlantValidationOutcome,
+    ProjectHost, ProjectInfo, analyze_clean, asset_bytes, asset_type_name, build_dependency_graph,
+    clear_extraction, colorspace_for_role_explicit, colorspace_name, create_project_script,
+    default_display_name, default_material_asset, delete_unused, exposed_parameter,
+    extract_sub_asset, import_material_folder, import_vegetation_asset, load_biome_asset,
+    load_catalog_material_asset, load_catalog_material_asset_raw, load_plant_family_asset,
+    load_vegetation_map_snapshot, lower_graph_to_params, model_render_aabb, pbr_exposed_parameters,
+    pick_scene_surface, portable_vegetation_platform_profile, recook_plant_family, reimport_model,
+    request_thumbnail, save_material_asset, texture_role_from_hint, texture_role_name,
+    update_material_asset, valid_project_name, validate_plant_family_sources,
+    vegetation_cook_versions, viewport_ray,
 };
 use saffron_core::{HeightMode, Uuid};
 use saffron_geometry::glam::{Vec2, Vec3 as MathVec3};
@@ -35,32 +38,43 @@ use saffron_protocol::{
     AssetReferencesParams, AssetReferencesResult, AssetSelector, AssetSlotDto, AssetTypeDto,
     AssetUsageDto, AssetUsagesParams, AssetUsagesResult, AssignAssetParams, AssignAssetResult,
     BiomeAssetSummaryDto, BiomeRoleDto, BoneDto, BootStageDto, CleanAssetsParams,
-    CleanCandidateDto, CleanReport, ClearExtractionParams, CoverageMipMetadataDto,
-    CoverageSourceDto, CreateAssetFolderParams, CreateScriptParams, CreateScriptResult,
-    DeleteAssetFolderParams, DeleteAssetParams, DeleteAssetResult, DeleteUnusedParams,
-    DeleteUnusedResult, EmptyParams, EntityRef, ExportAppParams, ExportAppResult, ExposedParamDto,
-    ExtractSubAssetParams, FieldBlendOperatorDto, FieldChannelDto, FieldChannelKindDto,
-    GetAssetModelParams, ImportModelParams, ImportModelResult, ImportTextureParams,
-    ImportTextureResult, ImportVegetationAssetParams, ImportVegetationAssetResult,
-    InclusionOperatorDto, InstantiateModelParams, InteractionPolicyDto, LayerCoordinateSpaceDto,
-    MaterialAssignParams, MaterialAssignResult, MaterialCompileParams, MaterialCompileResult,
-    MaterialCookResult, MaterialCreateInstanceParams, MaterialCreateParams, MaterialCreateResult,
-    MaterialGetParams, MaterialGetResult, MaterialImportParams, MaterialImportResultDto,
-    MaterialListResult, MaterialRefDto, MaterialSchemaParams, MaterialSchemaResult,
-    MaterialSetGraphParams, MaterialSetGraphResult, MaterialSetOverrideParams,
-    MaterialSetOverrideResult, MaterialSurfaceDto, MaterialUpdateParams, MaterialUpdateResult,
-    ModelInfoParams, ModelInfoResult, ModelSubAssetDto, MoveAssetParams, NewProjectParams,
-    OpacityMicromapDerivationDto, OptionalPathParams, PathParams, PathResult,
-    PlacementTransformDto, PlantAssetSummaryDto, PlantId, PlantSourceKindDto,
-    PlantStateOverrideDto, PlantTransformOverrideDto, PlayStateResult, PreviewRenderParams,
+    CleanCandidateDto, CleanReport, ClearExtractionParams, ControlDiagnosticDto,
+    CoverageMipMetadataDto, CoverageSourceDto, CreateAssetFolderParams, CreateScriptParams,
+    CreateScriptResult, DeleteAssetFolderParams, DeleteAssetParams, DeleteAssetResult,
+    DeleteUnusedParams, DeleteUnusedResult, EmptyParams, EntityRef, ExportAppParams,
+    ExportAppResult, ExposedParamDto, ExtractSubAssetParams, FieldBlendOperatorDto,
+    FieldChannelDto, FieldChannelKindDto, GetAssetModelParams, ImportModelParams,
+    ImportModelResult, ImportTextureParams, ImportTextureResult, ImportVegetationAssetParams,
+    ImportVegetationAssetResult, InclusionOperatorDto, InstantiateModelParams,
+    InteractionPolicyDto, LayerCoordinateSpaceDto, MaterialAssignParams, MaterialAssignResult,
+    MaterialCompileParams, MaterialCompileResult, MaterialCookResult, MaterialCreateInstanceParams,
+    MaterialCreateParams, MaterialCreateResult, MaterialGetParams, MaterialGetResult,
+    MaterialImportParams, MaterialImportResultDto, MaterialListResult, MaterialRefDto,
+    MaterialSchemaParams, MaterialSchemaResult, MaterialSetGraphParams, MaterialSetGraphResult,
+    MaterialSetOverrideParams, MaterialSetOverrideResult, MaterialSurfaceDto, MaterialUpdateParams,
+    MaterialUpdateResult, ModelInfoParams, ModelInfoResult, ModelSubAssetDto, MoveAssetParams,
+    NewProjectParams, OpacityMicromapDerivationDto, OptionalPathParams, PathParams, PathResult,
+    PlacementTransformDto, PlantAssetSummaryDto, PlantCompileDiagnosticCodeDto,
+    PlantCompileDiagnosticDto, PlantCompileStatisticsDto, PlantId, PlantRecookParams,
+    PlantRecookResult, PlantReimportConflictReasonDto, PlantSemanticDestinationDto,
+    PlantSourceHashUpdateDto, PlantSourceKindDto, PlantSourceLocatorDto, PlantSourceReferenceDto,
+    PlantSourceRoleDto, PlantSourceSelectorDto, PlantStateOverrideDto, PlantTransformOverrideDto,
+    PlantValidateParams, PlantValidationResult, PlayStateResult, PreviewRenderParams,
     PreviewRenderResult, ProjectInfoDto, ProjectPhaseDto, ProjectStatusDto, ProjectStoresDto,
-    QuitResult, ReimportModelParams, ReimportModelResult, RenameAssetFolderParams,
-    RenameAssetParams, ScanAssetsResult, ScreenshotParams, ScreenshotResult, ScreenshotTargetDto,
-    SetActiveViewParams, SetActiveViewResult, SpeciesWeightDto, ThinSheetFoliageParametersDto,
+    QuitResult, ReimportConflictDiagnosticDto, ReimportConflictEntryDto, ReimportModelParams,
+    ReimportModelResult, RenameAssetFolderParams, RenameAssetParams, ScanAssetsResult,
+    ScreenshotParams, ScreenshotResult, ScreenshotTargetDto, SetActiveViewParams,
+    SetActiveViewResult, SpeciesWeightDto, ThinSheetFoliageParametersDto,
     ThinSheetNormalBehaviorDto, ThumbnailCacheParams, ThumbnailCacheResult, ThumbnailFormatDto,
     ThumbnailParams, ThumbnailResult, Uuid as WireUuid, Vec3, Vec4, VegetationAssetSummaryDto,
-    VegetationAssetSummaryParams, VegetationAssetSummaryResult, VegetationGuid, VegetationLayerDto,
-    VegetationLayerOperatorDto, VegetationMapSummaryDto, VoxelMaterialMomentsDto, WorldBoundsDto,
+    VegetationAssetSummaryParams, VegetationAssetSummaryResult,
+    VegetationCandidateRejectionReasonDto, VegetationCookNodeAddressDto,
+    VegetationCookRejectionTotalDto, VegetationCookStatisticsDto, VegetationGuid,
+    VegetationLayerDto, VegetationLayerOperatorDto, VegetationManifestDependencyAddressDto,
+    VegetationManifestDependencyDto, VegetationMapChunkKeyDto, VegetationMapChunkKindDto,
+    VegetationMapSummaryDto, VegetationMapTileKeyDto, VegetationSourceProvenanceDto,
+    VegetationValidationIssueDto, VegetationValidationSeverityDto, VegetationValidationSummaryDto,
+    VoxelMaterialMomentsDto, WorldBoundsDto, WorldCellDto,
 };
 use saffron_rendering::ViewId;
 use saffron_scene::{
@@ -73,10 +87,17 @@ use saffron_sceneedit::{
     ProjectPhase, SceneEditCamera, SceneEditContext,
 };
 use saffron_vegetation::{
-    AlphaClassification, BiomeRole, CoverageMipMetadata, CoverageSource, FieldBlendOperator,
-    InclusionOperator, LayerCoordinateSpace, MaterialSurface, OpacityMicromapDerivation,
-    PlantFamilySource, ThinSheetFoliageParameters, ThinSheetNormalBehavior, VegetationLayer,
-    VegetationLayerOperator, VoxelMaterialMoments,
+    AlphaClassification, BiomeRole, CandidateRejectionReason, ContentHash, CookDependency,
+    CookDependencyAddress, CookGraph, CookNodeAddress, CoverageMipMetadata, CoverageSource,
+    FieldBlendOperator, InclusionOperator, LayerCoordinateSpace, MaterialSurface,
+    OpacityMicromapDerivation, PlantCompileDiagnostic, PlantCompileDiagnosticCode,
+    PlantCompileDiagnosticSeverity, PlantCompileLimits, PlantFamilyAsset, PlantFamilySource,
+    PlantReimportConflict, PlantReimportConflictReason, PlantSemanticDestination,
+    PlantSourceLocator, PlantSourceReference, PlantSourceRole, PlantSourceSelector,
+    SourceProvenance, ThinSheetFoliageParameters, ThinSheetNormalBehavior, VegetationBaseManifest,
+    VegetationCellArtifactIndex, VegetationCellSectionKind, VegetationLayer,
+    VegetationLayerOperator, VegetationMapChunkKind, VegetationMapTileKey, VoxelMaterialMoments,
+    vegetation_rejection_totals,
 };
 use serde_json::{Value, json};
 
@@ -142,6 +163,13 @@ fn world_bounds_dto(bounds: saffron_spatial::WorldBounds) -> WorldBoundsDto {
     }
 }
 
+fn world_cell_dto(cell: saffron_spatial::WorldCellKey) -> WorldCellDto {
+    WorldCellDto {
+        coordinates: cell.coordinates().map(|value| value.to_string()),
+        level: cell.level(),
+    }
+}
+
 fn field_channel_dto(channel: saffron_spatial::FieldChannel) -> FieldChannelDto {
     use saffron_spatial::FieldChannel;
     let (kind, user) = match channel {
@@ -162,6 +190,724 @@ fn field_channel_dto(channel: saffron_spatial::FieldChannel) -> FieldChannelDto 
         FieldChannel::User(value) => (FieldChannelKindDto::User, Some(value.to_string())),
     };
     FieldChannelDto { kind, user }
+}
+
+fn source_provenance_dto(provenance: &SourceProvenance) -> VegetationSourceProvenanceDto {
+    VegetationSourceProvenanceDto {
+        source: provenance.source.clone(),
+        source_uri: provenance.source_uri.clone(),
+        license_id: provenance.license_id.clone(),
+        license_uri: provenance.license_uri.clone(),
+        author: provenance.author.clone(),
+        attribution: provenance.attribution.clone(),
+        requires_attribution: provenance.requires_attribution,
+    }
+}
+
+fn plant_source_selector_dto(selector: &PlantSourceSelector) -> PlantSourceSelectorDto {
+    match selector {
+        PlantSourceSelector::Whole => PlantSourceSelectorDto::Whole,
+        PlantSourceSelector::Element { id, path } => PlantSourceSelectorDto::Element {
+            id: vegetation_guid(*id),
+            path: path.clone(),
+        },
+        PlantSourceSelector::Submesh { element, index } => PlantSourceSelectorDto::Submesh {
+            element: vegetation_guid(*element),
+            index: *index,
+        },
+    }
+}
+
+fn plant_source_selector_text(selector: &PlantSourceSelector) -> String {
+    match selector {
+        PlantSourceSelector::Whole => "whole".to_owned(),
+        PlantSourceSelector::Element { id, path } => format!("element:{id:032x}:{path}"),
+        PlantSourceSelector::Submesh { element, index } => {
+            format!("submesh:{element:032x}:{index}")
+        }
+    }
+}
+
+fn plant_semantic_destination_dto(
+    destination: PlantSemanticDestination,
+) -> PlantSemanticDestinationDto {
+    match destination {
+        PlantSemanticDestination::Part(id) => PlantSemanticDestinationDto::Part {
+            id: vegetation_guid(id),
+        },
+        PlantSemanticDestination::Spine(id) => PlantSemanticDestinationDto::Spine {
+            id: vegetation_guid(id),
+        },
+        PlantSemanticDestination::MaterialSlot(slot) => {
+            PlantSemanticDestinationDto::MaterialSlot { slot }
+        }
+        PlantSemanticDestination::CollisionProxy(id) => {
+            PlantSemanticDestinationDto::CollisionProxy {
+                id: vegetation_guid(id),
+            }
+        }
+        PlantSemanticDestination::NavigationProxy(id) => {
+            PlantSemanticDestinationDto::NavigationProxy {
+                id: vegetation_guid(id),
+            }
+        }
+        PlantSemanticDestination::Phenotype(id) => PlantSemanticDestinationDto::Phenotype { id },
+    }
+}
+
+fn plant_reimport_conflict_dto(conflict: &PlantReimportConflict) -> ReimportConflictEntryDto {
+    ReimportConflictEntryDto {
+        target: vegetation_guid(conflict.target),
+        source: vegetation_guid(conflict.source),
+        selector: plant_source_selector_dto(&conflict.selector),
+        destination: plant_semantic_destination_dto(conflict.destination),
+        reason: match conflict.reason {
+            PlantReimportConflictReason::MissingSource => {
+                PlantReimportConflictReasonDto::MissingSource
+            }
+            PlantReimportConflictReason::MissingElement => {
+                PlantReimportConflictReasonDto::MissingElement
+            }
+        },
+    }
+}
+
+fn plant_diagnostic_code_dto(code: PlantCompileDiagnosticCode) -> PlantCompileDiagnosticCodeDto {
+    match code {
+        PlantCompileDiagnosticCode::MissingSource => PlantCompileDiagnosticCodeDto::MissingSource,
+        PlantCompileDiagnosticCode::DuplicateSource => {
+            PlantCompileDiagnosticCodeDto::DuplicateSource
+        }
+        PlantCompileDiagnosticCode::EmptySelection => PlantCompileDiagnosticCodeDto::EmptySelection,
+        PlantCompileDiagnosticCode::InvalidGeometry => {
+            PlantCompileDiagnosticCodeDto::InvalidGeometry
+        }
+        PlantCompileDiagnosticCode::MissingMaterial => {
+            PlantCompileDiagnosticCodeDto::MissingMaterial
+        }
+        PlantCompileDiagnosticCode::InvalidMaterial => {
+            PlantCompileDiagnosticCodeDto::InvalidMaterial
+        }
+        PlantCompileDiagnosticCode::InvalidSkeleton => {
+            PlantCompileDiagnosticCodeDto::InvalidSkeleton
+        }
+        PlantCompileDiagnosticCode::MissingCoverageUv => {
+            PlantCompileDiagnosticCodeDto::MissingCoverageUv
+        }
+        PlantCompileDiagnosticCode::InvalidLeafOrientation => {
+            PlantCompileDiagnosticCodeDto::InvalidLeafOrientation
+        }
+        PlantCompileDiagnosticCode::BoundsMismatch => PlantCompileDiagnosticCodeDto::BoundsMismatch,
+        PlantCompileDiagnosticCode::LimitExceeded => PlantCompileDiagnosticCodeDto::LimitExceeded,
+        PlantCompileDiagnosticCode::SourceChanged => PlantCompileDiagnosticCodeDto::SourceChanged,
+    }
+}
+
+fn plant_diagnostic_code_text(code: PlantCompileDiagnosticCode) -> &'static str {
+    match code {
+        PlantCompileDiagnosticCode::MissingSource => "missing-source",
+        PlantCompileDiagnosticCode::DuplicateSource => "duplicate-source",
+        PlantCompileDiagnosticCode::EmptySelection => "empty-selection",
+        PlantCompileDiagnosticCode::InvalidGeometry => "invalid-geometry",
+        PlantCompileDiagnosticCode::MissingMaterial => "missing-material",
+        PlantCompileDiagnosticCode::InvalidMaterial => "invalid-material",
+        PlantCompileDiagnosticCode::InvalidSkeleton => "invalid-skeleton",
+        PlantCompileDiagnosticCode::MissingCoverageUv => "missing-coverage-uv",
+        PlantCompileDiagnosticCode::InvalidLeafOrientation => "invalid-leaf-orientation",
+        PlantCompileDiagnosticCode::BoundsMismatch => "bounds-mismatch",
+        PlantCompileDiagnosticCode::LimitExceeded => "limit-exceeded",
+        PlantCompileDiagnosticCode::SourceChanged => "source-changed",
+    }
+}
+
+fn validation_severity_dto(
+    severity: PlantCompileDiagnosticSeverity,
+) -> VegetationValidationSeverityDto {
+    match severity {
+        PlantCompileDiagnosticSeverity::Info => VegetationValidationSeverityDto::Info,
+        PlantCompileDiagnosticSeverity::Warning => VegetationValidationSeverityDto::Warning,
+        PlantCompileDiagnosticSeverity::Error => VegetationValidationSeverityDto::Error,
+    }
+}
+
+fn plant_compile_diagnostic_dto(diagnostic: &PlantCompileDiagnostic) -> PlantCompileDiagnosticDto {
+    PlantCompileDiagnosticDto {
+        severity: validation_severity_dto(diagnostic.severity),
+        code: plant_diagnostic_code_dto(diagnostic.code),
+        source: diagnostic.source.map(vegetation_guid),
+        source_selector: diagnostic.selector.as_ref().map(plant_source_selector_dto),
+        path: diagnostic.path.clone(),
+        message: diagnostic.message.clone(),
+    }
+}
+
+fn plant_validation_summary(outcome: &PlantValidationOutcome) -> VegetationValidationSummaryDto {
+    let mut issues = outcome
+        .compile
+        .diagnostics
+        .iter()
+        .map(|diagnostic| VegetationValidationIssueDto {
+            severity: validation_severity_dto(diagnostic.severity),
+            code: plant_diagnostic_code_text(diagnostic.code).to_owned(),
+            path: diagnostic.path.clone(),
+            message: diagnostic.message.clone(),
+            source_selector: diagnostic.selector.as_ref().map(plant_source_selector_text),
+        })
+        .collect::<Vec<_>>();
+    issues.extend(outcome.compile.conflicts.conflicts.iter().map(|conflict| {
+        VegetationValidationIssueDto {
+            severity: VegetationValidationSeverityDto::Error,
+            code: match conflict.reason {
+                PlantReimportConflictReason::MissingSource => "reimport-missing-source",
+                PlantReimportConflictReason::MissingElement => "reimport-missing-element",
+            }
+            .to_owned(),
+            path: format!("source.semanticTargets.{:032x}", conflict.target),
+            message: "the authored semantic target cannot be preserved during reimport".to_owned(),
+            source_selector: Some(plant_source_selector_text(&conflict.selector)),
+        }
+    }));
+    VegetationValidationSummaryDto {
+        valid: outcome.compile.publishable(),
+        issues,
+    }
+}
+
+fn plant_compile_statistics_dto(
+    statistics: saffron_vegetation::PlantCompileStatistics,
+) -> PlantCompileStatisticsDto {
+    PlantCompileStatisticsDto {
+        sources: statistics.sources.to_string(),
+        meshes: statistics.meshes.to_string(),
+        vertices: statistics.vertices.to_string(),
+        indices: statistics.indices.to_string(),
+        joints: statistics.joints.to_string(),
+        materials: statistics.materials.to_string(),
+        rejected: statistics.rejected.to_string(),
+    }
+}
+
+fn plant_source_reference_dto(
+    source: &PlantSourceReference,
+    updates: &BTreeMap<u128, [u8; 32]>,
+) -> PlantSourceReferenceDto {
+    PlantSourceReferenceDto {
+        id: vegetation_guid(source.id),
+        locator: match &source.locator {
+            PlantSourceLocator::Asset(asset) => PlantSourceLocatorDto::Asset {
+                asset: WireUuid(asset.value()),
+            },
+            PlantSourceLocator::File(uri) => PlantSourceLocatorDto::File { uri: uri.clone() },
+        },
+        role: match source.role {
+            PlantSourceRole::Geometry => PlantSourceRoleDto::Geometry,
+            PlantSourceRole::Material => PlantSourceRoleDto::Material,
+            PlantSourceRole::Skeleton => PlantSourceRoleDto::Skeleton,
+            PlantSourceRole::Collision => PlantSourceRoleDto::Collision,
+            PlantSourceRole::Navigation => PlantSourceRoleDto::Navigation,
+        },
+        selector: plant_source_selector_dto(&source.selector),
+        content_hash: coverage_hash_text(updates.get(&source.id).unwrap_or(&source.content_hash)),
+        provenance: source_provenance_dto(&source.provenance),
+    }
+}
+
+fn plant_sources_dto(
+    asset: &PlantFamilyAsset,
+    outcome: &PlantValidationOutcome,
+) -> Vec<PlantSourceReferenceDto> {
+    let updates = outcome
+        .compile
+        .source_updates
+        .iter()
+        .map(|update| (update.source, update.current))
+        .collect::<BTreeMap<_, _>>();
+    match &asset.source {
+        PlantFamilySource::Imported(recipe) => recipe
+            .sources
+            .iter()
+            .map(|source| plant_source_reference_dto(source, &updates))
+            .collect(),
+        PlantFamilySource::Native(_) => Vec::new(),
+    }
+}
+
+fn plant_source_updates_dto(outcome: &PlantValidationOutcome) -> Vec<PlantSourceHashUpdateDto> {
+    outcome
+        .compile
+        .source_updates
+        .iter()
+        .map(|update| PlantSourceHashUpdateDto {
+            source: vegetation_guid(update.source),
+            previous: coverage_hash_text(&update.previous),
+            current: coverage_hash_text(&update.current),
+        })
+        .collect()
+}
+
+fn vegetation_map_chunk_key_dto(
+    key: saffron_vegetation::VegetationMapChunkKey,
+) -> VegetationMapChunkKeyDto {
+    VegetationMapChunkKeyDto {
+        layer: vegetation_guid(key.layer),
+        tile: match key.tile {
+            VegetationMapTileKey::Global => VegetationMapTileKeyDto::Global,
+            VegetationMapTileKey::Cell(cell) => VegetationMapTileKeyDto::Cell {
+                cell: world_cell_dto(cell),
+            },
+        },
+        kind: match key.kind {
+            VegetationMapChunkKind::Field => VegetationMapChunkKindDto::Field,
+            VegetationMapChunkKind::AnchorOverride => VegetationMapChunkKindDto::AnchorOverride,
+            VegetationMapChunkKind::GraphInstance => VegetationMapChunkKindDto::GraphInstance,
+            VegetationMapChunkKind::LayerMetadata => VegetationMapChunkKindDto::LayerMetadata,
+            VegetationMapChunkKind::EditorMetadata => VegetationMapChunkKindDto::EditorMetadata,
+        },
+    }
+}
+
+fn cook_node_address_dto(address: &CookNodeAddress) -> VegetationCookNodeAddressDto {
+    match address {
+        CookNodeAddress::Plant { family } => VegetationCookNodeAddressDto::Plant {
+            family: WireUuid(family.value()),
+        },
+        CookNodeAddress::GlobalStage {
+            map,
+            biome_instance,
+            stage,
+            owner,
+        } => VegetationCookNodeAddressDto::GlobalStage {
+            map: WireUuid(map.value()),
+            biome_instance: vegetation_guid(*biome_instance),
+            stage: stage.to_string(),
+            owner: world_cell_dto(*owner),
+        },
+        CookNodeAddress::Cell { map, cell } => VegetationCookNodeAddressDto::Cell {
+            map: WireUuid(map.value()),
+            cell: world_cell_dto(*cell),
+        },
+    }
+}
+
+fn manifest_dependency_dto(dependency: &CookDependency) -> VegetationManifestDependencyDto {
+    VegetationManifestDependencyDto {
+        address: match &dependency.address {
+            CookDependencyAddress::SourceAsset { asset } => {
+                VegetationManifestDependencyAddressDto::SourceAsset {
+                    asset: WireUuid(asset.value()),
+                }
+            }
+            CookDependencyAddress::SourceFile { uri } => {
+                VegetationManifestDependencyAddressDto::SourceFile { uri: uri.clone() }
+            }
+            CookDependencyAddress::MaterialCoverage { material } => {
+                VegetationManifestDependencyAddressDto::MaterialCoverage {
+                    material: WireUuid(material.value()),
+                }
+            }
+            CookDependencyAddress::BiomeIr { map, instance } => {
+                VegetationManifestDependencyAddressDto::BiomeIr {
+                    map: WireUuid(map.value()),
+                    instance: vegetation_guid(*instance),
+                }
+            }
+            CookDependencyAddress::MapManifest { map } => {
+                VegetationManifestDependencyAddressDto::MapManifest {
+                    map: WireUuid(map.value()),
+                }
+            }
+            CookDependencyAddress::MapObject { map, key } => {
+                VegetationManifestDependencyAddressDto::MapObject {
+                    map: WireUuid(map.value()),
+                    key: vegetation_map_chunk_key_dto(*key),
+                }
+            }
+            CookDependencyAddress::SurfaceProvider { provider, revision } => {
+                VegetationManifestDependencyAddressDto::SurfaceProvider {
+                    provider: provider.0.to_string(),
+                    revision: revision.0.to_string(),
+                }
+            }
+            CookDependencyAddress::SurfaceTile {
+                provider,
+                revision,
+                channel,
+                bounds,
+            } => VegetationManifestDependencyAddressDto::SurfaceTile {
+                provider: provider.0.to_string(),
+                revision: revision.0.to_string(),
+                channel: channel.map(field_channel_dto),
+                bounds: world_bounds_dto(*bounds),
+            },
+            CookDependencyAddress::Contract { namespace } => {
+                VegetationManifestDependencyAddressDto::Contract {
+                    namespace: namespace.clone(),
+                }
+            }
+            CookDependencyAddress::Node(node) => VegetationManifestDependencyAddressDto::Node {
+                node: cook_node_address_dto(node),
+            },
+        },
+        content_hash: dependency.content_hash.to_string(),
+        bounds: dependency.bounds.map(world_bounds_dto),
+        halo_bits: dependency.halo.bits(),
+        ancestor_level: dependency.ancestor_level,
+    }
+}
+
+fn manifest_dependencies_dto(
+    dependencies: &[CookDependency],
+) -> Vec<VegetationManifestDependencyDto> {
+    dependencies.iter().map(manifest_dependency_dto).collect()
+}
+
+fn validation_error(
+    code: &str,
+    path: &str,
+    message: impl Into<String>,
+) -> VegetationValidationIssueDto {
+    VegetationValidationIssueDto {
+        severity: VegetationValidationSeverityDto::Error,
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+        source_selector: None,
+    }
+}
+
+fn source_asset_dependency(
+    assets: &AssetServer,
+    id: Uuid,
+) -> std::result::Result<VegetationManifestDependencyDto, String> {
+    let entry = assets
+        .catalog
+        .find(id)
+        .ok_or_else(|| format!("catalog asset {} is missing", id.value()))?;
+    let bytes = std::fs::read(assets.root.join(&entry.path)).map_err(|error| error.to_string())?;
+    Ok(VegetationManifestDependencyDto {
+        address: VegetationManifestDependencyAddressDto::SourceAsset {
+            asset: WireUuid(id.value()),
+        },
+        content_hash: ContentHash::of(&bytes).to_string(),
+        bounds: None,
+        halo_bits: 0,
+        ancestor_level: None,
+    })
+}
+
+fn biome_summary_metadata(
+    assets: &AssetServer,
+    root: &saffron_vegetation::BiomeAsset,
+) -> (
+    VegetationValidationSummaryDto,
+    Vec<VegetationManifestDependencyDto>,
+) {
+    fn visit(
+        assets: &AssetServer,
+        biome: &saffron_vegetation::BiomeAsset,
+        active: &mut BTreeSet<u64>,
+        complete: &mut BTreeSet<u64>,
+        dependencies: &mut BTreeMap<u64, VegetationManifestDependencyDto>,
+        issues: &mut Vec<VegetationValidationIssueDto>,
+    ) {
+        if complete.contains(&biome.id.value()) {
+            return;
+        }
+        if !active.insert(biome.id.value()) {
+            issues.push(validation_error(
+                "biome-module-cycle",
+                "modules",
+                format!("biome module cycle reaches asset {}", biome.id.value()),
+            ));
+            return;
+        }
+        match source_asset_dependency(assets, biome.id) {
+            Ok(dependency) => {
+                dependencies.insert(biome.id.value(), dependency);
+            }
+            Err(message) => issues.push(validation_error(
+                "missing-source-asset",
+                "dependencies",
+                message,
+            )),
+        }
+        for palette in &biome.palette {
+            match source_asset_dependency(assets, palette.plant) {
+                Ok(dependency) => {
+                    dependencies.insert(palette.plant.value(), dependency);
+                }
+                Err(message) => issues.push(validation_error(
+                    "missing-plant-dependency",
+                    "palette",
+                    message,
+                )),
+            }
+        }
+        for module in &biome.modules {
+            match load_biome_asset(assets, module.biome) {
+                Ok(module_asset) => visit(
+                    assets,
+                    &module_asset,
+                    active,
+                    complete,
+                    dependencies,
+                    issues,
+                ),
+                Err(error) => issues.push(validation_error(
+                    "invalid-biome-module",
+                    "modules",
+                    error.to_string(),
+                )),
+            }
+        }
+        active.remove(&biome.id.value());
+        complete.insert(biome.id.value());
+    }
+
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    let mut dependencies = BTreeMap::new();
+    let mut issues = Vec::new();
+    visit(
+        assets,
+        root,
+        &mut active,
+        &mut complete,
+        &mut dependencies,
+        &mut issues,
+    );
+    (
+        VegetationValidationSummaryDto {
+            valid: issues.is_empty(),
+            issues,
+        },
+        dependencies.into_values().collect(),
+    )
+}
+
+fn map_authored_metadata(
+    assets: &AssetServer,
+    map: &saffron_vegetation::VegetationMapSnapshot,
+) -> (
+    VegetationValidationSummaryDto,
+    Vec<VegetationManifestDependencyDto>,
+) {
+    let mut issues = Vec::new();
+    let mut dependencies = Vec::with_capacity(map.inventory.len().saturating_add(1));
+    let manifest_hash = assets
+        .catalog
+        .find(map.id)
+        .ok_or_else(|| format!("catalog asset {} is missing", map.id.value()))
+        .and_then(|entry| {
+            std::fs::read(assets.root.join(&entry.path)).map_err(|error| error.to_string())
+        });
+    match manifest_hash {
+        Ok(bytes) => dependencies.push(VegetationManifestDependencyDto {
+            address: VegetationManifestDependencyAddressDto::MapManifest {
+                map: WireUuid(map.id.value()),
+            },
+            content_hash: ContentHash::of(&bytes).to_string(),
+            bounds: Some(world_bounds_dto(map.bounds)),
+            halo_bits: 0,
+            ancestor_level: None,
+        }),
+        Err(message) => issues.push(validation_error("missing-map-manifest", "root", message)),
+    }
+    dependencies.extend(
+        map.inventory
+            .iter()
+            .map(|reference| VegetationManifestDependencyDto {
+                address: VegetationManifestDependencyAddressDto::MapObject {
+                    map: WireUuid(map.id.value()),
+                    key: vegetation_map_chunk_key_dto(reference.key),
+                },
+                content_hash: coverage_hash_text(&reference.content_hash),
+                bounds: None,
+                halo_bits: 0,
+                ancestor_level: None,
+            }),
+    );
+
+    let mut source_assets = map
+        .biome_instances
+        .iter()
+        .map(|instance| instance.biome.value())
+        .collect::<BTreeSet<_>>();
+    for layer in &map.layers {
+        if let VegetationLayerOperator::SpeciesWeights(weights) = &layer.operator {
+            source_assets.extend(weights.iter().map(|weight| weight.family.value()));
+        }
+    }
+    for chunk in &map.chunks {
+        if let saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(payload) =
+            &chunk.payload
+        {
+            source_assets.extend(
+                payload
+                    .explicit_plants
+                    .iter()
+                    .map(|plant| plant.family.value()),
+            );
+        }
+    }
+    for source in source_assets {
+        match source_asset_dependency(assets, Uuid(source)) {
+            Ok(dependency) => dependencies.push(dependency),
+            Err(message) => issues.push(validation_error(
+                "missing-map-source-asset",
+                "dependencies",
+                message,
+            )),
+        }
+    }
+    (
+        VegetationValidationSummaryDto {
+            valid: issues.is_empty(),
+            issues,
+        },
+        dependencies,
+    )
+}
+
+fn rejection_reason_index(reason: CandidateRejectionReason) -> usize {
+    match reason {
+        CandidateRejectionReason::SurfaceMiss => 0,
+        CandidateRejectionReason::Threshold => 1,
+        CandidateRejectionReason::WeightedElimination => 2,
+        CandidateRejectionReason::PriorityExclusion => 3,
+        CandidateRejectionReason::Competition => 4,
+        CandidateRejectionReason::ForeignOwner => 5,
+        CandidateRejectionReason::NoSpecies => 6,
+    }
+}
+
+fn rejection_reason_dto(reason: CandidateRejectionReason) -> VegetationCandidateRejectionReasonDto {
+    match reason {
+        CandidateRejectionReason::SurfaceMiss => VegetationCandidateRejectionReasonDto::SurfaceMiss,
+        CandidateRejectionReason::Threshold => VegetationCandidateRejectionReasonDto::Threshold,
+        CandidateRejectionReason::WeightedElimination => {
+            VegetationCandidateRejectionReasonDto::WeightedElimination
+        }
+        CandidateRejectionReason::PriorityExclusion => {
+            VegetationCandidateRejectionReasonDto::PriorityExclusion
+        }
+        CandidateRejectionReason::Competition => VegetationCandidateRejectionReasonDto::Competition,
+        CandidateRejectionReason::ForeignOwner => {
+            VegetationCandidateRejectionReasonDto::ForeignOwner
+        }
+        CandidateRejectionReason::NoSpecies => VegetationCandidateRejectionReasonDto::NoSpecies,
+    }
+}
+
+fn current_map_cook_metadata(
+    assets: &AssetServer,
+    map: Uuid,
+) -> Result<
+    Option<(
+        Vec<VegetationManifestDependencyDto>,
+        VegetationCookStatisticsDto,
+    )>,
+> {
+    let store = assets.vegetation_artifact_store();
+    let Some(manifest_bytes) = store.read_current_manifest(map).map_err(Error::from)? else {
+        return Ok(None);
+    };
+    let manifest = VegetationBaseManifest::from_canonical_bytes(&manifest_bytes)?;
+    let graph_bytes = store
+        .read_cook_graph(manifest.cook_graph_hash)
+        .map_err(Error::from)?;
+    let graph = CookGraph::from_canonical_bytes(&graph_bytes)?;
+    let mut rejection_totals = [0_u64; 7];
+    for node in &graph.nodes {
+        if !matches!(node.address, CookNodeAddress::Cell { .. }) {
+            continue;
+        }
+        let artifact = store.read_cell(node.output_hash).map_err(Error::from)?;
+        let index = VegetationCellArtifactIndex::open(&artifact)?;
+        let diagnostics = index
+            .section(&artifact, VegetationCellSectionKind::RejectionDiagnostics)?
+            .ok_or_else(|| {
+                Error::command("vegetation cell has no rejection diagnostics section")
+            })?;
+        for (reason, count) in vegetation_rejection_totals(diagnostics)? {
+            let total = &mut rejection_totals[rejection_reason_index(reason)];
+            *total = total.saturating_add(count);
+        }
+    }
+    let rejection_reasons = [
+        CandidateRejectionReason::SurfaceMiss,
+        CandidateRejectionReason::Threshold,
+        CandidateRejectionReason::WeightedElimination,
+        CandidateRejectionReason::PriorityExclusion,
+        CandidateRejectionReason::Competition,
+        CandidateRejectionReason::ForeignOwner,
+        CandidateRejectionReason::NoSpecies,
+    ];
+    let nodes = u64::try_from(graph.nodes.len()).unwrap_or(u64::MAX);
+    let statistics = VegetationCookStatisticsDto {
+        nodes: nodes.to_string(),
+        elapsed_micros: graph
+            .nodes
+            .iter()
+            .fold(0_u64, |total, node| {
+                total.saturating_add(node.actual.elapsed_micros)
+            })
+            .to_string(),
+        peak_memory_bytes: graph
+            .nodes
+            .iter()
+            .map(|node| node.actual.peak_memory_bytes)
+            .max()
+            .unwrap_or(0)
+            .to_string(),
+        input_bytes: graph
+            .nodes
+            .iter()
+            .fold(0_u64, |total, node| {
+                total.saturating_add(node.actual.input_bytes)
+            })
+            .to_string(),
+        output_bytes: graph
+            .nodes
+            .iter()
+            .fold(0_u64, |total, node| {
+                total.saturating_add(node.actual.output_bytes)
+            })
+            .to_string(),
+        cache_hits: graph
+            .nodes
+            .iter()
+            .filter(|node| node.actual.cache_hit)
+            .count()
+            .to_string(),
+        cache_misses: graph
+            .nodes
+            .iter()
+            .filter(|node| !node.actual.cache_hit)
+            .count()
+            .to_string(),
+        published_cells: graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(node.address, CookNodeAddress::Cell { .. }) && !node.actual.cache_hit
+            })
+            .count()
+            .to_string(),
+        rejections: rejection_reasons
+            .into_iter()
+            .zip(rejection_totals)
+            .filter(|(_, count)| *count != 0)
+            .map(|(reason, count)| VegetationCookRejectionTotalDto {
+                reason: rejection_reason_dto(reason),
+                count: count.to_string(),
+            })
+            .collect(),
+    };
+    Ok(Some((
+        manifest_dependencies_dto(&manifest.dependencies),
+        statistics,
+    )))
 }
 
 fn field_blend_dto(operator: FieldBlendOperator) -> FieldBlendOperatorDto {
@@ -531,7 +1277,7 @@ fn selector_id(selector: &AssetSelector) -> u64 {
 
 /// Resolves an [`AssetSelector`](saffron_protocol::AssetSelector) to a catalog entry id,
 /// by id or name.
-fn resolve_asset(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<Uuid> {
+pub(crate) fn resolve_asset(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<Uuid> {
     let by_id = selector_id(selector);
     let name = selector_string(selector);
     for entry in &ctx.assets.catalog.entries {
@@ -1747,6 +2493,136 @@ fn container_clips(
         .collect()
 }
 
+/// Registers plant compiler commands at the vegetation-domain tail of the central table.
+pub fn register_plant_commands(reg: &mut CommandRegistry) {
+    reg.register::<PlantValidateParams, PlantValidationResult>(
+        "plant-validate",
+        "validate one authored plant family and inspect its exact sources",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let outcome =
+                validate_plant_family_sources(ctx.assets, &plant, PlantCompileLimits::default())
+                    .map_err(Error::from)?;
+            Ok(PlantValidationResult {
+                plant: WireUuid(id.value()),
+                validation: plant_validation_summary(&outcome),
+                diagnostics: outcome
+                    .compile
+                    .diagnostics
+                    .iter()
+                    .map(plant_compile_diagnostic_dto)
+                    .collect(),
+                sources: plant_sources_dto(&plant, &outcome),
+                dependencies: manifest_dependencies_dto(&outcome.dependencies),
+                conflicts: outcome
+                    .compile
+                    .conflicts
+                    .conflicts
+                    .iter()
+                    .map(plant_reimport_conflict_dto)
+                    .collect(),
+                source_updates: plant_source_updates_dto(&outcome),
+                family_hash: outcome.compile.family_hash.as_ref().map(coverage_hash_text),
+                statistics: plant_compile_statistics_dto(outcome.compile.statistics),
+            })
+        },
+    );
+
+    reg.register::<PlantRecookParams, PlantRecookResult>(
+        "plant-recook",
+        "normalize and atomically publish one plant family through its retained recipe",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            if params
+                .platform_profile
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                return Err(Error::command("platformProfile cannot be empty"));
+            }
+            let options = PlantRecookOptions {
+                limits: PlantCompileLimits::default(),
+                versions: vegetation_cook_versions(),
+                platform: portable_vegetation_platform_profile(params.platform_profile.as_deref()),
+            };
+            match recook_plant_family(ctx.assets, &plant, &options).map_err(Error::from)? {
+                PlantRecookOutcome::Published(published) => {
+                    let family_hash = published
+                        .validation
+                        .compile
+                        .family_hash
+                        .as_ref()
+                        .map(coverage_hash_text)
+                        .ok_or_else(|| {
+                            Error::command("plant compiler published without a family hash")
+                        })?;
+                    Ok(PlantRecookResult {
+                        plant: WireUuid(id.value()),
+                        family_hash,
+                        artifact_hash: published.publication.content_hash.to_string(),
+                        cache_hit: published.publication.cache_hit,
+                        validation: plant_validation_summary(&published.validation),
+                        diagnostics: published
+                            .validation
+                            .compile
+                            .diagnostics
+                            .iter()
+                            .map(plant_compile_diagnostic_dto)
+                            .collect(),
+                        sources: plant_sources_dto(
+                            &published.accepted_asset,
+                            &published.validation,
+                        ),
+                        dependencies: manifest_dependencies_dto(&published.validation.dependencies),
+                        source_updates: plant_source_updates_dto(&published.validation),
+                        statistics: plant_compile_statistics_dto(
+                            published.validation.compile.statistics,
+                        ),
+                    })
+                }
+                PlantRecookOutcome::Rejected(rejected) => {
+                    let conflicts = rejected
+                        .compile
+                        .conflicts
+                        .conflicts
+                        .iter()
+                        .map(plant_reimport_conflict_dto)
+                        .collect::<Vec<_>>();
+                    if !conflicts.is_empty() {
+                        return Err(Error::Diagnostic {
+                            message: format!("plant family {} has reimport conflicts", id.value()),
+                            diagnostic: Box::new(ControlDiagnosticDto::ReimportConflict(
+                                ReimportConflictDiagnosticDto {
+                                    plant: WireUuid(id.value()),
+                                    conflicts,
+                                },
+                            )),
+                        });
+                    }
+                    let message = rejected
+                        .compile
+                        .diagnostics
+                        .iter()
+                        .find(|diagnostic| {
+                            diagnostic.severity == PlantCompileDiagnosticSeverity::Error
+                        })
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .unwrap_or_else(|| {
+                            format!("plant family {} failed validation", id.value())
+                        });
+                    Err(Error::command(message))
+                }
+            }
+        },
+    );
+}
+
 /// Registers the asset/project-domain commands in the frozen manifest order
 /// (`get-project` … `quit`).
 pub fn register_asset_commands(reg: &mut CommandRegistry) {
@@ -1785,6 +2661,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if !valid_project_name(&name) {
                 return Err(Error::command(format!("invalid project name '{name}'")));
             }
+            ctx.vegetation_cook_jobs.shutdown();
             ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::New(NewProjectSpec {
                 name,
                 display_name: params.display_name.unwrap_or_default(),
@@ -1821,6 +2698,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             if params.path.is_empty() {
                 return Err(Error::command("missing 'path'"));
             }
+            ctx.vegetation_cook_jobs.shutdown();
             ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::Open(params.path.clone()));
             ctx.scene_edit.project_phase = ProjectPhase::Loading;
             Ok(project_status_dto(ctx))
@@ -2011,9 +2889,23 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 AssetType::Plant => {
                     let plant = load_plant_family_asset(ctx.assets, id)
                         .map_err(|error| Error::command(error.to_string()))?;
-                    let source = match plant.source {
+                    let source = match &plant.source {
                         PlantFamilySource::Imported(_) => PlantSourceKindDto::Imported,
                         PlantFamilySource::Native(_) => PlantSourceKindDto::Native,
+                    };
+                    let validation = validate_plant_family_sources(
+                        ctx.assets,
+                        &plant,
+                        PlantCompileLimits::default(),
+                    )
+                    .map_err(Error::from)?;
+                    let provenance = match &plant.source {
+                        PlantFamilySource::Imported(recipe) => recipe
+                            .sources
+                            .iter()
+                            .map(|source| source_provenance_dto(&source.provenance))
+                            .collect(),
+                        PlantFamilySource::Native(_) => Vec::new(),
                     };
                     (
                         VegetationAssetSummaryDto::Plant(PlantAssetSummaryDto {
@@ -2029,6 +2921,10 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                                 .into_iter()
                                 .map(|material| WireUuid(material.value()))
                                 .collect(),
+                            validation: plant_validation_summary(&validation),
+                            provenance,
+                            dependencies: manifest_dependencies_dto(&validation.dependencies),
+                            latest_cook: None,
                         }),
                         Vec::new(),
                     )
@@ -2036,6 +2932,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 AssetType::Biome => {
                     let biome = load_biome_asset(ctx.assets, id)
                         .map_err(|error| Error::command(error.to_string()))?;
+                    let (validation, dependencies) = biome_summary_metadata(ctx.assets, &biome);
                     (
                         VegetationAssetSummaryDto::Biome(BiomeAssetSummaryDto {
                             id: WireUuid(id.value()),
@@ -2057,27 +2954,42 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                                 .collect(),
                             parameter_count: u32::try_from(biome.parameters.len())
                                 .unwrap_or(u32::MAX),
+                            validation,
+                            provenance: Vec::new(),
+                            dependencies,
+                            latest_cook: None,
                         }),
                         Vec::new(),
                     )
                 }
                 AssetType::VegetationMap => {
-                    let map = load_vegetation_map_asset(ctx.assets, id)
+                    let map = load_vegetation_map_snapshot(ctx.assets, id)
                         .map_err(|error| Error::command(error.to_string()))?;
+                    let (validation, authored_dependencies) =
+                        map_authored_metadata(ctx.assets, &map);
+                    let (dependencies, latest_cook) =
+                        match current_map_cook_metadata(ctx.assets, id)? {
+                            Some((dependencies, statistics)) => (dependencies, Some(statistics)),
+                            None => (authored_dependencies, None),
+                        };
                     let layers = map.layers.iter().map(vegetation_layer_dto).collect();
                     (
                         VegetationAssetSummaryDto::VegetationMap(VegetationMapSummaryDto {
                             id: WireUuid(id.value()),
-                            name: map.name,
+                            name: map.name.clone(),
                             version: map.version,
                             bounds: world_bounds_dto(map.bounds),
                             layer_count: u32::try_from(map.layers.len()).unwrap_or(u32::MAX),
                             biome_instances: map
                                 .biome_instances
-                                .into_iter()
+                                .iter()
                                 .map(|instance| WireUuid(instance.biome.value()))
                                 .collect(),
                             chunk_level: map.chunk_layout.level,
+                            validation,
+                            provenance: Vec::new(),
+                            dependencies,
+                            latest_cook,
                         }),
                         layers,
                     )
@@ -3251,6 +4163,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 return Err(Error::command("exit the asset preview first"));
             }
             require_project_loaded(ctx)?;
+            ctx.vegetation_cook_jobs.shutdown();
             ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::Reload);
             ctx.scene_edit.project_phase = ProjectPhase::Loading;
             Ok(project_status_dto(ctx))
@@ -3392,6 +4305,7 @@ fn set_slot0_texture_override(scene: &mut Scene, entity: Entity, key: &str, tex_
 /// (`ProjectLoader::advance`, driven from the host each frame) runs the read/parse/scan off-thread
 /// and installs on the main thread, so the control drain never blocks.
 fn load_project_into(ctx: &mut EngineContext<'_>, path: &str) {
+    ctx.vegetation_cook_jobs.shutdown();
     ctx.scene_edit.project_load_inbox = Some(ProjectLoadRequest::Open(path.to_owned()));
     ctx.scene_edit.project_phase = ProjectPhase::Loading;
 }
@@ -4384,13 +5298,28 @@ fn from_vec4(v: Vec4) -> saffron_geometry::glam::Vec4 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use saffron_assets::{
+        default_material_asset, save_biome_asset, save_material_asset, save_plant_family_asset,
+    };
+    use saffron_protocol::PlantSourceSelectorDto;
     use saffron_scene::{AssetEntry, AssetType, MaterialSet, Mesh, VegetationField};
     use saffron_sceneedit::ProjectPhase;
+    use saffron_spatial::{DecisionScalar, UnitInterval};
+    use saffron_vegetation::{
+        BIOME_ASSET_VERSION, BiomeAsset, BiomeGraphPolicy, BiomePaletteEntry, BiomeRole,
+        InteractionPolicy, MechanicalResponse, NativeBotanicalGraph, PLANT_ASSET_VERSION,
+        PhenotypeRole, PlantDimensions, PlantFamilyAsset, PlantFamilySource, PlantPart,
+        PlantPartSemantic, PlantPhenotype, PlantVariation,
+    };
     use serde_json::json;
 
     use crate::registry::{CommandRegistry, EngineContext, register_builtin_commands};
     use crate::selector::entity_uuid;
     use crate::test_support::{StubRenderer, with_stub};
+
+    use super::plant_source_reference_dto;
 
     fn registry() -> CommandRegistry {
         let mut reg = CommandRegistry::new();
@@ -4422,6 +5351,103 @@ mod tests {
         id.value()
     }
 
+    fn fixed(value: i32) -> DecisionScalar {
+        DecisionScalar::from_integer(value).expect("fixture scalar")
+    }
+
+    fn seed_native_plant(ctx: &mut EngineContext<'_>) -> u64 {
+        let material = save_material_asset(ctx.assets, &default_material_asset(), "Leaf", "plants")
+            .expect("save plant material");
+        let plant = PlantFamilyAsset {
+            version: PLANT_ASSET_VERSION,
+            id: saffron_core::Uuid(9_100),
+            name: "Oak".to_owned(),
+            tags: Vec::new(),
+            source: PlantFamilySource::Native(NativeBotanicalGraph {
+                schema_hash: [1; 32],
+                graph: serde_json::Value::Object(Default::default()),
+            }),
+            parts: vec![PlantPart {
+                id: 12,
+                parent: None,
+                semantic: PlantPartSemantic::Trunk,
+                material_slot: 0,
+                sources: Vec::new(),
+            }],
+            dimensions: PlantDimensions {
+                height: fixed(8),
+                trunk_radius: fixed(1),
+                crown_radius: [fixed(3); 2],
+                root_radius: [fixed(4); 2],
+                local_bounds_min: [fixed(-4), fixed(0), fixed(-4)],
+                local_bounds_max: [fixed(4), fixed(8), fixed(4)],
+            },
+            material_slots: vec![material],
+            spines: Vec::new(),
+            mechanics: MechanicalResponse {
+                stiffness: fixed(2),
+                damping: UnitInterval::from_bits(1),
+                drag: fixed(1),
+                flutter: DecisionScalar::from_bits(1),
+                bend_limit: UnitInterval::from_bits(2),
+                damage_threshold: fixed(3),
+                break_threshold: fixed(4),
+            },
+            variations: vec![PlantVariation {
+                id: 0,
+                name: "Default".to_owned(),
+                sources: Vec::new(),
+                active_parts: Vec::new(),
+            }],
+            phenotypes: vec![PlantPhenotype {
+                id: 0,
+                role: PhenotypeRole::Healthy,
+                variation: 0,
+                material_remap: Vec::new(),
+                active_parts: Vec::new(),
+            }],
+            collision_proxies: Vec::new(),
+            navigation_proxies: Vec::new(),
+            interaction_policy: InteractionPolicy::Structural,
+            habitat: None,
+        };
+        save_plant_family_asset(ctx.assets, plant, "Oak", "plants")
+            .expect("save plant")
+            .value()
+    }
+
+    fn seed_biome(ctx: &mut EngineContext<'_>, plant: u64) -> u64 {
+        let biome = BiomeAsset {
+            version: BIOME_ASSET_VERSION,
+            id: saffron_core::Uuid(9_101),
+            name: "Forest".to_owned(),
+            role: BiomeRole::Root,
+            parameters: Vec::new(),
+            palette: vec![BiomePaletteEntry {
+                plant: saffron_core::Uuid(plant),
+                weight: UnitInterval::ONE,
+                seed_namespace: 23,
+            }],
+            density: fixed(1),
+            clustering: UnitInterval::from_bits(24),
+            suitability: Vec::new(),
+            competition: Vec::new(),
+            companions: Vec::new(),
+            succession: Vec::new(),
+            seed_namespaces: vec![("canopy".to_owned(), 23)],
+            modules: Vec::new(),
+            policy: BiomeGraphPolicy {
+                maximum_recursion: 8,
+                maximum_influence_radius: fixed(64),
+                require_authoritative_fields: true,
+            },
+            graph: serde_json::Value::Object(Default::default()),
+        };
+        save_biome_asset(ctx.assets, biome, "Forest", "biomes")
+            .expect("save biome")
+            .value()
+    }
+
     /// `list-assets` and `scan-assets` round-trip on an empty (just-loaded) project.
     #[test]
     fn list_and_scan_on_empty_project() {
@@ -4451,7 +5477,7 @@ mod tests {
         with_stub(&mut renderer, |ctx| {
             let scan = reg.dispatch(ctx, &json!({ "cmd": "scan-assets" }));
             assert_eq!(scan["ok"], json!(false));
-            assert_eq!(scan["error"], json!("no project loaded"));
+            assert_eq!(scan["error"]["message"], json!("no project loaded"));
         });
     }
 
@@ -4578,7 +5604,7 @@ mod tests {
             );
             assert_eq!(bad["ok"], json!(false));
             assert_eq!(
-                bad["error"],
+                bad["error"]["message"],
                 json!("unknown view 'nope' (expected 'scene' or 'assetPreview')")
             );
         });
@@ -4779,9 +5805,8 @@ mod tests {
                     level: 0,
                     schema_hash: saffron_vegetation::vegetation_map_chunk_schema_hash(),
                 },
-                layers: Vec::new(),
-                biome_instances: Vec::new(),
-                brush_history: Vec::new(),
+                generation: 0,
+                inventory: Vec::new(),
             };
             std::fs::write(
                 &source,
@@ -4814,8 +5839,193 @@ mod tests {
                 summary["result"]["summary"]["asset"]["layerCount"],
                 json!(0)
             );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["validation"],
+                json!({ "valid": true, "issues": [] })
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["dependencies"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                summary["result"]["summary"]["asset"]
+                    .get("latestCook")
+                    .is_none()
+            );
             assert_eq!(summary["result"]["layers"], json!([]));
         });
+    }
+
+    #[test]
+    fn plant_validate_recook_and_summary_share_the_single_compiler_route() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "plant-control");
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
+            let plant = seed_native_plant(ctx);
+
+            let validation = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-validate", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(validation["ok"], json!(true), "validation: {validation:?}");
+            assert_eq!(validation["result"]["plant"], json!(plant.to_string()));
+            assert_eq!(validation["result"]["validation"]["valid"], json!(true));
+            assert_eq!(validation["result"]["sources"], json!([]));
+            assert_eq!(validation["result"]["statistics"]["sources"], json!("1"));
+            assert_eq!(validation["result"]["statistics"]["materials"], json!("1"));
+            assert!(
+                validation["result"]["dependencies"]
+                    .as_array()
+                    .is_some_and(|dependencies| dependencies.len() >= 5)
+            );
+
+            let first = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-recook", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(first["ok"], json!(true), "first recook: {first:?}");
+            assert_eq!(first["result"]["validation"]["valid"], json!(true));
+            assert_eq!(
+                first["result"]["artifactHash"].as_str().map(str::len),
+                Some(64)
+            );
+            assert_eq!(
+                first["result"]["familyHash"].as_str().map(str::len),
+                Some(64)
+            );
+
+            let second = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-recook", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(second["ok"], json!(true), "second recook: {second:?}");
+            assert_eq!(
+                second["result"]["artifactHash"],
+                first["result"]["artifactHash"]
+            );
+            assert_eq!(second["result"]["cacheHit"], json!(true));
+
+            let summary = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "vegetation-asset-summary", "params": { "asset": plant.to_string() } }),
+            );
+            assert_eq!(summary["ok"], json!(true), "summary: {summary:?}");
+            assert_eq!(summary["result"]["summary"]["kind"], json!("plant"));
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["validation"]["valid"],
+                json!(true)
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["provenance"],
+                json!([])
+            );
+            assert!(
+                summary["result"]["summary"]["asset"]["dependencies"]
+                    .as_array()
+                    .is_some_and(|dependencies| dependencies.len() >= 5)
+            );
+            assert!(
+                summary["result"]["summary"]["asset"]
+                    .get("latestCook")
+                    .is_none(),
+                "standalone plant publications have no durable latest pointer"
+            );
+
+            let empty_profile = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "plant-recook",
+                    "params": { "plant": plant.to_string(), "platformProfile": "" }
+                }),
+            );
+            assert_eq!(empty_profile["ok"], json!(false));
+            assert_eq!(
+                empty_profile["error"]["message"],
+                json!("platformProfile cannot be empty")
+            );
+        });
+    }
+
+    #[test]
+    fn biome_summary_reports_recursive_source_validation_and_dependencies() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "biome-summary");
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
+            let plant = seed_native_plant(ctx);
+            let biome = seed_biome(ctx, plant);
+            let summary = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "vegetation-asset-summary", "params": { "asset": biome.to_string() } }),
+            );
+            assert_eq!(summary["ok"], json!(true), "summary: {summary:?}");
+            assert_eq!(summary["result"]["summary"]["kind"], json!("biome"));
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["validation"],
+                json!({ "valid": true, "issues": [] })
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["plantPalette"],
+                json!([plant.to_string()])
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["dependencies"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(2)
+            );
+            assert_eq!(
+                summary["result"]["summary"]["asset"]["provenance"],
+                json!([])
+            );
+            assert!(
+                summary["result"]["summary"]["asset"]
+                    .get("latestCook")
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn plant_source_dto_keeps_observed_hash_and_complete_provenance() {
+        let source = saffron_vegetation::PlantSourceReference {
+            id: 7,
+            locator: saffron_vegetation::PlantSourceLocator::File(
+                "file:///plants/oak.glb".to_owned(),
+            ),
+            role: saffron_vegetation::PlantSourceRole::Geometry,
+            selector: saffron_vegetation::PlantSourceSelector::Element {
+                id: 8,
+                path: "Oak/Trunk".to_owned(),
+            },
+            content_hash: [1; 32],
+            settings: saffron_vegetation::PlantImportSettings::default(),
+            provenance: saffron_vegetation::SourceProvenance {
+                source: "studio-library".to_owned(),
+                source_uri: "https://assets.example/oak".to_owned(),
+                license_id: "CC-BY-4.0".to_owned(),
+                license_uri: "https://creativecommons.org/licenses/by/4.0/".to_owned(),
+                author: "Ada".to_owned(),
+                attribution: "Oak by Ada".to_owned(),
+                requires_attribution: true,
+            },
+        };
+        let dto = plant_source_reference_dto(&source, &BTreeMap::from([(7, [2; 32])]));
+        assert_eq!(dto.content_hash, "02".repeat(32));
+        assert_eq!(dto.provenance.author, "Ada");
+        assert_eq!(dto.provenance.attribution, "Oak by Ada");
+        assert!(dto.provenance.requires_attribution);
+        assert!(matches!(
+            dto.selector,
+            PlantSourceSelectorDto::Element { id, path }
+                if id.0 == "00000000000000000000000000000008" && path == "Oak/Trunk"
+        ));
     }
 
     /// `thumbnail-cache stats` reports a clean cache; an unknown action errors.
@@ -4837,7 +6047,10 @@ mod tests {
                 &json!({ "cmd": "thumbnail-cache", "params": { "action": "nope" } }),
             );
             assert_eq!(bad["ok"], json!(false));
-            assert_eq!(bad["error"], json!("unknown action 'nope' (stats|clear)"));
+            assert_eq!(
+                bad["error"]["message"],
+                json!("unknown action 'nope' (stats|clear)")
+            );
         });
     }
 
@@ -4868,7 +6081,10 @@ mod tests {
                 &json!({ "cmd": "new-project", "params": { "name": "Bad_Name" } }),
             );
             assert_eq!(reply["ok"], json!(false));
-            assert_eq!(reply["error"], json!("invalid project name 'Bad_Name'"));
+            assert_eq!(
+                reply["error"]["message"],
+                json!("invalid project name 'Bad_Name'")
+            );
             assert!(ctx.scene_edit.project_load_inbox.is_none());
         });
     }

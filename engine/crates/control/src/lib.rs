@@ -17,14 +17,18 @@ mod commands_physics;
 mod commands_render;
 mod commands_scene;
 mod commands_vegetation;
+mod commands_vegetation_runtime;
 mod context;
 mod error;
+mod owned_worker;
 mod project_loader;
 mod registry;
 mod selector;
 mod server;
 #[cfg(test)]
 mod test_support;
+mod vegetation_cook_dto;
+mod vegetation_cook_jobs;
 mod vegetation_jobs;
 
 pub use commands_asset::{PreviewSubject, build_preview_scene_for_thumbnail};
