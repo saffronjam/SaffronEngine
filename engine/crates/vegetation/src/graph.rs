@@ -199,6 +199,14 @@ pub enum GraphDependencySource {
     MapLayer(u128),
 }
 
+impl GraphDependencySource {
+    /// Canonical tagged bytes used by dependency identities and ordering.
+    #[must_use]
+    pub fn canonical_bytes(self) -> Vec<u8> {
+        dependency_source_bytes(self)
+    }
+}
+
 impl PartialOrd for GraphDependencySource {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -792,6 +800,60 @@ impl GraphOperator {
         vec![pin(name, domain)]
     }
 
+    fn output_requires_input(self, output: &str, input: &str) -> bool {
+        match self {
+            Self::InterfaceInput
+            | Self::RegionInput
+            | Self::SplineInput
+            | Self::SpeciesInput
+            | Self::CommunityInput
+            | Self::ExplicitAnchors
+            | Self::ModuleCall => false,
+            Self::StratifiedCoverage | Self::BlueNoisePoisson => {
+                output == "candidates" && input == "regions"
+            }
+            Self::SurfaceProjection => {
+                matches!(output, "candidates" | "surface") && input == "candidates"
+            }
+            Self::FieldSample
+            | Self::PaintedTile
+            | Self::Noise
+            | Self::Gradient
+            | Self::DistanceField => output == "field" && input == "candidates",
+            Self::Curve | Self::Remap | Self::Clamp => output == "field" && input == "field",
+            Self::Combine => output == "field" && matches!(input, "left" | "right"),
+            Self::WeightedElimination | Self::FieldImportance | Self::Suitability => {
+                output == "candidates" && matches!(input, "candidates" | "weights")
+            }
+            Self::PriorityExclusion => {
+                output == "candidates" && matches!(input, "candidates" | "weights" | "radius")
+            }
+            Self::VariableSpacing => {
+                output == "candidates" && matches!(input, "candidates" | "radius")
+            }
+            Self::Competition => {
+                output == "candidates" && matches!(input, "candidates" | "communities")
+            }
+            Self::ClusterPatchColony | Self::RecursiveCompanion | Self::SuccessionInput => {
+                output == "candidates" && input == "candidates"
+            }
+            Self::SplineFollow => output == "candidates" && input == "splines",
+            Self::Transform => {
+                output == "candidates"
+                    && matches!(input, "candidates" | "surface" | "scale" | "offset")
+            }
+            Self::BoundsOverlap => output == "candidates" && input == "candidates",
+            Self::CommunityBlend => {
+                output == "candidates" && matches!(input, "candidates" | "communities" | "shade")
+            }
+            Self::MacroOutput => output == "points" && matches!(input, "candidates" | "species"),
+            Self::MicroOutput => output == "micro",
+            Self::DiagnosticOutput => {
+                output == "diagnostics" && matches!(input, "candidates" | "field")
+            }
+        }
+    }
+
     /// Typed parameter schema for this operator.
     #[must_use]
     pub fn parameter_schema(self) -> Vec<GraphParameterDescriptor> {
@@ -1302,7 +1364,7 @@ impl GpuQualificationRegistry {
         artifact: GpuShaderArtifactIdentity,
         mut execute: impl FnMut(
             &crate::GraphGpuProgram,
-            &[crate::GraphGpuInvocation],
+            &crate::GraphGpuInvocationBatch,
         ) -> Result<Vec<crate::GraphGpuOutput>>,
     ) -> Result<Self> {
         if profile.name.is_empty()
@@ -1321,8 +1383,8 @@ impl GpuQualificationRegistry {
         let corpus = crate::graph_gpu::qualification_corpus();
         let mut actual_bytes = Vec::new();
         for (batch_index, batch) in corpus.iter().enumerate() {
-            let actual = execute(&batch.program, &batch.invocations)?;
-            if actual.len() != batch.invocations.len() {
+            let actual = execute(&batch.program, &batch.invocation_batch)?;
+            if actual.len() != batch.invocation_batch.invocation_count() {
                 return Err(graph_document(
                     "gpuQualification.outputs",
                     "qualification executor returned the wrong result count",
@@ -1330,8 +1392,8 @@ impl GpuQualificationRegistry {
             }
             let expected = crate::graph_gpu::evaluate_gpu_program_reference(
                 &batch.program,
-                &batch.invocations,
-            );
+                &batch.invocation_batch,
+            )?;
             if let Some(invocation_index) = actual
                 .iter()
                 .zip(&expected)
@@ -1406,7 +1468,7 @@ pub struct GraphSafetyLimits {
     pub max_output_cells: u64,
     /// Maximum unique ancestor/global stage tiles admitted by one bounded evaluation.
     pub max_global_stage_tiles: u64,
-    /// Maximum authored/precomputed input tiles admitted by one bounded evaluation.
+    /// Maximum caller-supplied plus preparation-generated input tiles.
     pub max_input_tiles: u64,
     /// Maximum candidates admitted by a bounded evaluation.
     pub max_candidates: u64,
@@ -1414,11 +1476,15 @@ pub struct GraphSafetyLimits {
     pub max_macro_points: u64,
     /// Maximum quantized micro samples.
     pub max_micro_samples: u64,
-    /// Maximum estimated live bytes.
+    /// Maximum evaluator-owned requested heap capacities and explicit worker stacks.
+    ///
+    /// The bound includes conservative allocator and ordered-map metadata. Caller-owned graph and
+    /// provider pointees, compute-executor internals, and operating-system or standard-library
+    /// thread bookkeeping are outside the evaluator's ownership boundary.
     pub max_memory_bytes: u64,
     /// Maximum estimated CPU/GPU transfer bytes.
     pub max_transfer_bytes: u64,
-    /// Maximum module recursion depth.
+    /// Maximum nested module-call edges from the root, whose depth is zero.
     pub max_module_depth: u16,
     /// Maximum wall-clock evaluation time in milliseconds.
     pub max_time_ms: u64,
@@ -1602,6 +1668,8 @@ pub enum GraphValueLineage {
 pub struct CompiledGraphNode {
     /// Authored node definition after strict current-version validation.
     pub definition: GraphNodeDefinition,
+    /// Canonical definition hash reused by execution plans and cache identities.
+    pub definition_hash: [u8; 32],
     /// Complete typed inputs.
     pub inputs: Vec<GraphPin>,
     /// Complete typed outputs.
@@ -1614,6 +1682,8 @@ pub struct CompiledGraphNode {
     pub output_authority: BTreeMap<String, GraphAuthority>,
     /// Candidate-stream lineage carried by candidate-indexed output pins.
     pub output_lineage: BTreeMap<String, GraphValueLineage>,
+    /// Conservative estimate for each output pin.
+    pub output_estimates: BTreeMap<String, GraphEstimate>,
     /// Planning estimate after upstream propagation.
     pub estimate: GraphEstimate,
     /// Exact immutable dependency fingerprints read by this node.
@@ -1672,6 +1742,8 @@ pub struct CompiledGraphUnit {
     pub succession: Vec<SuccessionRule>,
     /// Whether missing canonical fields are a compile/evaluation error.
     pub require_authoritative_fields: bool,
+    /// Maximum composed finite influence for demanded outputs.
+    pub maximum_influence_radius: DecisionScalar,
     /// Aggregate planning estimate.
     pub estimate: GraphEstimate,
     output_halo_by_level: BTreeMap<String, [DecisionScalar; 63]>,
@@ -1688,6 +1760,7 @@ pub struct CompiledBiomeGraph {
     pub identity: [u8; 32],
     /// Safety limits used during validation.
     pub limits: GraphSafetyLimits,
+    demand_plan: CompiledDemandPlan,
     spatial_plan: CompiledSpatialPlan,
     required_halo_by_level: [DecisionScalar; 63],
 }
@@ -1712,6 +1785,837 @@ impl CompiledBiomeGraph {
     #[must_use]
     pub fn spatial_plan(&self) -> &CompiledSpatialPlan {
         &self.spatial_plan
+    }
+
+    /// Compiler-owned pin-level demand shared by planners and evaluators.
+    #[must_use]
+    pub(crate) const fn demand_plan(&self) -> &CompiledDemandPlan {
+        &self.demand_plan
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompiledDemandUnitSlice {
+    pub(crate) nodes: Vec<u128>,
+    pub(crate) edges: Vec<GraphEdge>,
+    pub(crate) inputs: BTreeSet<String>,
+    pub(crate) outputs: BTreeSet<String>,
+}
+
+impl CompiledDemandUnitSlice {
+    pub(crate) fn contains_node(&self, node: u128) -> bool {
+        self.nodes.contains(&node)
+    }
+
+    pub(crate) fn contains_edge(&self, edge: &GraphEdge) -> bool {
+        self.edges.iter().any(|candidate| candidate == edge)
+    }
+}
+
+fn compile_demand_slice(
+    root: &CompiledGraphUnit,
+    seeds: impl IntoIterator<Item = QualifiedGraphPin>,
+    stop_pins: &BTreeSet<QualifiedGraphPin>,
+) -> Result<CompiledDemandSlice> {
+    let mut slice = CompiledDemandSlice::default();
+    let mut pending = seeds.into_iter().collect::<Vec<_>>();
+    while let Some(output_pin) = pending.pop() {
+        if !slice.output_pins.insert(output_pin.clone()) {
+            continue;
+        }
+        let module_path = output_pin.node.module_path.as_slice();
+        let unit = compiled_unit_at_path(root, module_path)?;
+        let node = unit
+            .nodes
+            .iter()
+            .find(|node| node.definition.guid == output_pin.node.node)
+            .ok_or_else(|| {
+                graph_document(
+                    "graph.demand.output",
+                    "demanded output node is missing from its compiled unit",
+                )
+            })?;
+        slice.nodes.insert(node.address());
+        {
+            let unit_slice = slice.units.entry(module_path.to_vec()).or_default();
+            if !unit_slice.nodes.contains(&node.definition.guid) {
+                unit_slice.nodes.push(node.definition.guid);
+            }
+        }
+        let exported_outputs = unit
+            .outputs
+            .iter()
+            .filter(|output| output.node == output_pin.node.node && output.pin == output_pin.pin)
+            .filter(|output| {
+                module_path.is_empty()
+                    || slice
+                        .units
+                        .get(module_path)
+                        .is_some_and(|unit| unit.outputs.contains(&output.name))
+            })
+            .map(|output| output.name.clone())
+            .collect::<Vec<_>>();
+        for name in exported_outputs {
+            slice
+                .units
+                .entry(module_path.to_vec())
+                .or_default()
+                .outputs
+                .insert(name.clone());
+            if !module_path.is_empty() {
+                let parent_path = &module_path[..module_path.len() - 1];
+                let parent = compiled_unit_at_path(root, parent_path)?;
+                let call = module_call_by_guid(parent, module_path[module_path.len() - 1])?;
+                pending.push(QualifiedGraphPin {
+                    node: call.address(),
+                    pin: name,
+                });
+            }
+        }
+        if stop_pins.contains(&output_pin) {
+            continue;
+        }
+        slice.executed_nodes.insert(node.address());
+
+        match node.definition.operator {
+            GraphOperator::InterfaceInput => {
+                let Some(GraphParameterValue::String(name)) = node.definition.parameter("name")
+                else {
+                    return Err(graph_document(
+                        "graph.demand.interfaceInput",
+                        "interface input name is missing",
+                    ));
+                };
+                slice
+                    .units
+                    .entry(module_path.to_vec())
+                    .or_default()
+                    .inputs
+                    .insert(name.clone());
+                if module_path.is_empty() {
+                    return Err(graph_document(
+                        "graph.demand.interfaceInput",
+                        "root graph cannot demand an interface input",
+                    ));
+                }
+                let parent_path = &module_path[..module_path.len() - 1];
+                let call_guid = module_path[module_path.len() - 1];
+                let parent = compiled_unit_at_path(root, parent_path)?;
+                let call = module_call_by_guid(parent, call_guid)?;
+                let edge = parent
+                    .edges
+                    .iter()
+                    .find(|edge| {
+                        edge.to_node == call.definition.guid && edge.to_pin.as_str() == name
+                    })
+                    .ok_or_else(|| {
+                        graph_document(
+                            "graph.demand.interfaceInput",
+                            "demanded module input edge is missing",
+                        )
+                    })?;
+                let call_input = QualifiedGraphPin {
+                    node: call.address(),
+                    pin: edge.to_pin.clone(),
+                };
+                slice.input_pins.insert(call_input);
+                let parent_slice = slice.units.entry(parent_path.to_vec()).or_default();
+                if !parent_slice.edges.contains(edge) {
+                    parent_slice.edges.push(edge.clone());
+                }
+                let source = parent
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.definition.guid == edge.from_node)
+                    .ok_or_else(|| {
+                        graph_document(
+                            "graph.demand.interfaceInput",
+                            "module input source node is missing",
+                        )
+                    })?;
+                pending.push(QualifiedGraphPin {
+                    node: source.address(),
+                    pin: edge.from_pin.clone(),
+                });
+            }
+            GraphOperator::ModuleCall => {
+                let module = node.module.as_deref().ok_or_else(|| {
+                    graph_document("graph.demand.moduleCall", "compiled module is missing")
+                })?;
+                let public_output = module
+                    .outputs
+                    .iter()
+                    .find(|output| output.name == output_pin.pin)
+                    .ok_or_else(|| {
+                        graph_document(
+                            "graph.demand.moduleCall",
+                            "demanded module output is missing",
+                        )
+                    })?;
+                let call_guid = module_call_guid(node)?;
+                let mut child_path = module_path.to_vec();
+                child_path.push(call_guid);
+                slice
+                    .units
+                    .entry(child_path.clone())
+                    .or_default()
+                    .outputs
+                    .insert(public_output.name.clone());
+                let source = module
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.definition.guid == public_output.node)
+                    .ok_or_else(|| {
+                        graph_document(
+                            "graph.demand.moduleCall",
+                            "module output source node is missing",
+                        )
+                    })?;
+                pending.push(QualifiedGraphPin {
+                    node: source.address(),
+                    pin: public_output.pin.clone(),
+                });
+            }
+            _ => {
+                for edge in unit
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.to_node == node.definition.guid)
+                    .filter(|edge| {
+                        node.definition
+                            .operator
+                            .output_requires_input(&output_pin.pin, &edge.to_pin)
+                    })
+                {
+                    slice.input_pins.insert(QualifiedGraphPin {
+                        node: node.address(),
+                        pin: edge.to_pin.clone(),
+                    });
+                    let unit_slice = slice.units.entry(module_path.to_vec()).or_default();
+                    if !unit_slice.edges.contains(edge) {
+                        unit_slice.edges.push(edge.clone());
+                    }
+                    let source = unit
+                        .nodes
+                        .iter()
+                        .find(|candidate| candidate.definition.guid == edge.from_node)
+                        .ok_or_else(|| {
+                            graph_document(
+                                "graph.demand.edge",
+                                "demanded edge source node is missing",
+                            )
+                        })?;
+                    pending.push(QualifiedGraphPin {
+                        node: source.address(),
+                        pin: edge.from_pin.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let nested_paths = slice
+        .nodes
+        .iter()
+        .map(|address| address.module_path.clone())
+        .collect::<BTreeSet<_>>();
+    for nested_path in nested_paths {
+        for depth in 0..nested_path.len() {
+            let parent_path = &nested_path[..depth];
+            let parent = compiled_unit_at_path(root, parent_path)?;
+            let call = module_call_by_guid(parent, nested_path[depth])?;
+            slice.nodes.insert(call.address());
+            slice.executed_nodes.insert(call.address());
+            let parent_slice = slice.units.entry(parent_path.to_vec()).or_default();
+            if !parent_slice.nodes.contains(&call.definition.guid) {
+                parent_slice.nodes.push(call.definition.guid);
+            }
+        }
+    }
+    canonicalize_demand_slice(root, &[], &mut slice)?;
+    let mut estimates = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    for pin in slice.output_pins.iter().cloned().collect::<Vec<_>>() {
+        estimate_demand_pin(root, &slice, &pin, &mut estimates, &mut visiting)?;
+    }
+    slice.estimates = estimates;
+    slice.dependencies = demanded_dependencies(root, &slice)?;
+    Ok(slice)
+}
+
+fn demanded_dependencies(
+    root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+) -> Result<Vec<GraphDependencyFingerprint>> {
+    let mut dependencies = BTreeSet::new();
+    for address in &demand.nodes {
+        let unit = compiled_unit_at_path(root, &address.module_path)?;
+        let node = unit
+            .nodes
+            .iter()
+            .find(|node| node.definition.guid == address.node)
+            .ok_or_else(|| graph_document("graph.demand.dependencies", "live node is missing"))?;
+        if node.definition.operator == GraphOperator::ModuleCall {
+            dependencies.extend(
+                node.dependencies
+                    .iter()
+                    .copied()
+                    .filter(|dependency| node.definition.dependencies.contains(&dependency.source)),
+            );
+        } else {
+            dependencies.extend(node.dependencies.iter().copied());
+        }
+    }
+    Ok(dependencies.into_iter().collect())
+}
+
+fn demand_unit_semantic_hash(
+    root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+    module_path: &[u128],
+) -> Result<[u8; 32]> {
+    let unit = compiled_unit_at_path(root, module_path)?;
+    let unit_demand = demand
+        .unit(module_path)
+        .ok_or_else(|| graph_document("graph.demand.identity", "live unit slice is missing"))?;
+    let mut bytes = b"saffron-anima/vegetation-live-unit/v1\0".to_vec();
+    bytes.extend_from_slice(&(module_path.len() as u64).to_be_bytes());
+    for call in module_path {
+        bytes.extend_from_slice(&call.to_be_bytes());
+    }
+    let mut inputs = unit
+        .inputs
+        .iter()
+        .filter(|input| unit_demand.inputs.contains(&input.name))
+        .collect::<Vec<_>>();
+    inputs.sort_by(|left, right| (left.id, &left.name).cmp(&(right.id, &right.name)));
+    append_identity_collection(&mut bytes, "inputs", inputs.len());
+    for input in inputs {
+        bytes.extend_from_slice(&input.id.to_be_bytes());
+        append_identity_text(&mut bytes, &input.name);
+        append_identity_text(&mut bytes, input.domain.as_wire());
+    }
+    let mut outputs = unit
+        .outputs
+        .iter()
+        .filter(|output| unit_demand.outputs.contains(&output.name))
+        .collect::<Vec<_>>();
+    outputs.sort_by(|left, right| (left.id, &left.name).cmp(&(right.id, &right.name)));
+    append_identity_collection(&mut bytes, "outputs", outputs.len());
+    for output in outputs {
+        bytes.extend_from_slice(&output.id.to_be_bytes());
+        append_identity_text(&mut bytes, &output.name);
+        append_identity_text(&mut bytes, output.domain.as_wire());
+        bytes.extend_from_slice(&output.node.to_be_bytes());
+        append_identity_text(&mut bytes, &output.pin);
+    }
+    let nodes = unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+        .collect::<Vec<_>>();
+    append_identity_collection(&mut bytes, "nodes", nodes.len());
+    for node in nodes {
+        bytes.extend_from_slice(&live_node_semantic_hash(unit, node, demand, true)?);
+        if node.definition.operator == GraphOperator::ModuleCall {
+            let mut child_path = module_path.to_vec();
+            child_path.push(module_call_guid(node)?);
+            bytes.extend_from_slice(&demand_unit_semantic_hash(root, demand, &child_path)?);
+        }
+    }
+    append_identity_collection(&mut bytes, "edges", unit_demand.edges.len());
+    for edge in &unit_demand.edges {
+        bytes.extend_from_slice(&edge.from_node.to_be_bytes());
+        append_identity_text(&mut bytes, &edge.from_pin);
+        bytes.extend_from_slice(&edge.to_node.to_be_bytes());
+        append_identity_text(&mut bytes, &edge.to_pin);
+    }
+    Ok(sha256(&bytes))
+}
+
+fn live_node_semantic_hash(
+    unit: &CompiledGraphUnit,
+    node: &CompiledGraphNode,
+    demand: &CompiledDemandSlice,
+    include_ports: bool,
+) -> Result<[u8; 32]> {
+    let mut bytes = b"saffron-anima/vegetation-live-node/v1\0".to_vec();
+    let mut canonical_definition = node.definition.clone();
+    canonical_definition.dependencies.sort();
+    canonical_definition.dependencies.dedup();
+    let definition = canonical_definition.canonical_bytes();
+    bytes.extend_from_slice(&(definition.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&definition);
+    if include_ports {
+        let input_pins = demand
+            .input_pins
+            .iter()
+            .filter(|pin| pin.node == node.address())
+            .collect::<Vec<_>>();
+        append_identity_collection(&mut bytes, "inputs", input_pins.len());
+        for pin in input_pins {
+            append_identity_text(&mut bytes, &pin.pin);
+        }
+        let output_pins = demand
+            .output_pins
+            .iter()
+            .filter(|pin| pin.node == node.address())
+            .collect::<Vec<_>>();
+        append_identity_collection(&mut bytes, "outputs", output_pins.len());
+        for pin in output_pins {
+            append_identity_text(&mut bytes, &pin.pin);
+        }
+    } else {
+        append_identity_collection(&mut bytes, "inputs", 0);
+        append_identity_collection(&mut bytes, "outputs", 0);
+    }
+    let reads_palette = matches!(
+        node.definition.operator,
+        GraphOperator::SpeciesInput | GraphOperator::CommunityBlend
+    );
+    append_identity_collection(
+        &mut bytes,
+        "palette",
+        if reads_palette { unit.palette.len() } else { 0 },
+    );
+    if reads_palette {
+        let mut palette = unit.palette.clone();
+        palette.sort_by_key(|entry| (entry.plant.value(), entry.weight, entry.seed_namespace));
+        for entry in &palette {
+            bytes.extend_from_slice(&entry.plant.value().to_be_bytes());
+            bytes.extend_from_slice(&entry.weight.bits().to_be_bytes());
+            bytes.extend_from_slice(&entry.seed_namespace.to_be_bytes());
+        }
+    }
+    let suitability_count = if node.definition.operator == GraphOperator::Suitability {
+        unit.suitability
+            .iter()
+            .filter(|binding| binding.node_guid == node.definition.guid)
+            .count()
+    } else {
+        0
+    };
+    append_identity_collection(&mut bytes, "suitability", suitability_count);
+    if node.definition.operator == GraphOperator::Suitability {
+        let mut suitability = unit
+            .suitability
+            .iter()
+            .filter(|binding| binding.node_guid == node.definition.guid)
+            .copied()
+            .collect::<Vec<_>>();
+        suitability.sort_by_key(|binding| {
+            (
+                binding.node_guid,
+                binding.channel,
+                binding.minimum,
+                binding.maximum,
+                binding.falloff,
+            )
+        });
+        for binding in suitability {
+            append_identity_text(&mut bytes, &field_channel_wire(binding.channel));
+            bytes.extend_from_slice(&binding.minimum.bits().to_be_bytes());
+            bytes.extend_from_slice(&binding.maximum.bits().to_be_bytes());
+            bytes.extend_from_slice(&binding.falloff.bits().to_be_bytes());
+            bytes.extend_from_slice(&binding.node_guid.to_be_bytes());
+        }
+    }
+    if matches!(node.definition.operator, GraphOperator::CommunityInput) {
+        append_identity_collection(&mut bytes, "competition", unit.competition.len());
+        let mut rules = unit.competition.clone();
+        rules.sort_by_key(|rule| {
+            (
+                rule.first.value(),
+                rule.second.value(),
+                rule.spacing,
+                rule.priority,
+            )
+        });
+        for rule in &rules {
+            bytes.extend_from_slice(&rule.first.value().to_be_bytes());
+            bytes.extend_from_slice(&rule.second.value().to_be_bytes());
+            bytes.extend_from_slice(&rule.spacing.bits().to_be_bytes());
+            bytes.extend_from_slice(&rule.priority.to_be_bytes());
+        }
+    } else {
+        append_identity_collection(&mut bytes, "competition", 0);
+    }
+    if matches!(
+        node.definition.operator,
+        GraphOperator::RecursiveCompanion | GraphOperator::CommunityInput
+    ) {
+        append_identity_collection(&mut bytes, "companions", unit.companions.len());
+        let mut rules = unit.companions.clone();
+        rules.sort_by_key(|rule| {
+            (
+                rule.parent.value(),
+                rule.child.value(),
+                rule.minimum_distance,
+                rule.maximum_distance,
+                rule.probability,
+            )
+        });
+        for rule in &rules {
+            bytes.extend_from_slice(&rule.parent.value().to_be_bytes());
+            bytes.extend_from_slice(&rule.child.value().to_be_bytes());
+            bytes.extend_from_slice(&rule.minimum_distance.bits().to_be_bytes());
+            bytes.extend_from_slice(&rule.maximum_distance.bits().to_be_bytes());
+            bytes.extend_from_slice(&rule.probability.bits().to_be_bytes());
+        }
+    } else {
+        append_identity_collection(&mut bytes, "companions", 0);
+    }
+    if matches!(
+        node.definition.operator,
+        GraphOperator::SuccessionInput | GraphOperator::CommunityInput
+    ) {
+        append_identity_collection(&mut bytes, "succession", unit.succession.len());
+        let mut rules = unit.succession.clone();
+        rules.sort_by_key(|rule| {
+            (
+                rule.from.value(),
+                rule.to.value(),
+                rule.minimum_tick,
+                rule.probability,
+            )
+        });
+        for rule in &rules {
+            bytes.extend_from_slice(&rule.from.value().to_be_bytes());
+            bytes.extend_from_slice(&rule.to.value().to_be_bytes());
+            bytes.extend_from_slice(&rule.minimum_tick.to_be_bytes());
+            bytes.extend_from_slice(&rule.probability.bits().to_be_bytes());
+        }
+    } else {
+        append_identity_collection(&mut bytes, "succession", 0);
+    }
+    if matches!(
+        node.definition.operator,
+        GraphOperator::FieldSample | GraphOperator::PaintedTile
+    ) {
+        bytes.push(unit.require_authoritative_fields.into());
+    } else {
+        bytes.push(0);
+    }
+    let mut dependencies = node
+        .dependencies
+        .iter()
+        .copied()
+        .filter(|dependency| {
+            node.definition.operator != GraphOperator::ModuleCall
+                || node.definition.dependencies.contains(&dependency.source)
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    dependencies.dedup();
+    append_identity_collection(&mut bytes, "dependencies", dependencies.len());
+    for dependency in dependencies {
+        append_dependency_source(&mut bytes, dependency.source);
+        bytes.extend_from_slice(&dependency.content_hash);
+    }
+    Ok(sha256(&bytes))
+}
+
+fn append_identity_text(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn append_identity_collection(bytes: &mut Vec<u8>, name: &str, count: usize) {
+    append_identity_text(bytes, name);
+    bytes.extend_from_slice(&(count as u64).to_be_bytes());
+}
+
+fn live_node_dependencies(
+    node: &CompiledGraphNode,
+) -> impl Iterator<Item = GraphDependencyFingerprint> + '_ {
+    node.dependencies.iter().copied().filter(|dependency| {
+        if node.definition.operator != GraphOperator::ModuleCall {
+            return true;
+        }
+        node.definition.dependencies.contains(&dependency.source)
+    })
+}
+
+fn spatial_node_dependencies(node: &CompiledGraphNode) -> Vec<GraphDependencyFingerprint> {
+    if node.definition.operator != GraphOperator::ModuleCall {
+        return node.dependencies.clone();
+    }
+    node.dependencies
+        .iter()
+        .copied()
+        .filter(|dependency| node.definition.dependencies.contains(&dependency.source))
+        .collect()
+}
+
+fn estimate_demand_pin(
+    root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+    pin: &QualifiedGraphPin,
+    estimates: &mut BTreeMap<QualifiedGraphPin, GraphEstimate>,
+    visiting: &mut BTreeSet<QualifiedGraphPin>,
+) -> Result<GraphEstimate> {
+    if let Some(estimate) = estimates.get(pin).copied() {
+        return Ok(estimate);
+    }
+    if !visiting.insert(pin.clone()) {
+        return Err(Error::GraphCycle {
+            node: pin.node.node,
+        });
+    }
+    let unit = compiled_unit_at_path(root, &pin.node.module_path)?;
+    let node = unit
+        .nodes
+        .iter()
+        .find(|node| node.definition.guid == pin.node.node)
+        .ok_or_else(|| graph_document("graph.demand.estimate", "live output node is missing"))?;
+    let estimate = match node.definition.operator {
+        GraphOperator::InterfaceInput => {
+            let Some(GraphParameterValue::String(name)) = node.definition.parameter("name") else {
+                return Err(graph_document(
+                    "graph.demand.estimate",
+                    "interface input name is missing",
+                ));
+            };
+            let module_path = pin.node.module_path.as_slice();
+            let parent_path = &module_path[..module_path.len() - 1];
+            let parent = compiled_unit_at_path(root, parent_path)?;
+            let call = module_call_by_guid(parent, module_path[module_path.len() - 1])?;
+            let edge = parent
+                .edges
+                .iter()
+                .find(|edge| edge.to_node == call.definition.guid && edge.to_pin.as_str() == name)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.estimate", "live module input edge is missing")
+                })?;
+            let source = parent
+                .nodes
+                .iter()
+                .find(|source| source.definition.guid == edge.from_node)
+                .ok_or_else(|| {
+                    graph_document(
+                        "graph.demand.estimate",
+                        "live module input source is missing",
+                    )
+                })?;
+            estimate_demand_pin(
+                root,
+                demand,
+                &QualifiedGraphPin {
+                    node: source.address(),
+                    pin: edge.from_pin.clone(),
+                },
+                estimates,
+                visiting,
+            )?
+        }
+        GraphOperator::ModuleCall => {
+            let module = node.module.as_deref().ok_or_else(|| {
+                graph_document("graph.demand.estimate", "compiled module is missing")
+            })?;
+            let output = module
+                .outputs
+                .iter()
+                .find(|output| output.name == pin.pin)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.estimate", "live module output is missing")
+                })?;
+            let source = module
+                .nodes
+                .iter()
+                .find(|source| source.definition.guid == output.node)
+                .ok_or_else(|| {
+                    graph_document(
+                        "graph.demand.estimate",
+                        "live module output source is missing",
+                    )
+                })?;
+            estimate_demand_pin(
+                root,
+                demand,
+                &QualifiedGraphPin {
+                    node: source.address(),
+                    pin: output.pin.clone(),
+                },
+                estimates,
+                visiting,
+            )?
+        }
+        _ => {
+            let unit_demand = demand.unit(&pin.node.module_path).ok_or_else(|| {
+                graph_document("graph.demand.estimate", "live unit slice is missing")
+            })?;
+            let mut upstream = GraphEstimate::default();
+            for edge in unit.edges.iter().filter(|edge| {
+                edge.to_node == node.definition.guid
+                    && unit_demand.contains_edge(edge)
+                    && node
+                        .definition
+                        .operator
+                        .output_requires_input(&pin.pin, &edge.to_pin)
+            }) {
+                let source = unit
+                    .nodes
+                    .iter()
+                    .find(|source| source.definition.guid == edge.from_node)
+                    .ok_or_else(|| {
+                        graph_document("graph.demand.estimate", "live edge source node is missing")
+                    })?;
+                upstream = merge_input_estimate(
+                    upstream,
+                    estimate_demand_pin(
+                        root,
+                        demand,
+                        &QualifiedGraphPin {
+                            node: source.address(),
+                            pin: edge.from_pin.clone(),
+                        },
+                        estimates,
+                        visiting,
+                    )?,
+                )?;
+            }
+            estimate_node(&node.definition, upstream)?
+        }
+    };
+    visiting.remove(pin);
+    estimates.insert(pin.clone(), estimate);
+    Ok(estimate)
+}
+
+fn compiled_unit_at_path<'a>(
+    root: &'a CompiledGraphUnit,
+    module_path: &[u128],
+) -> Result<&'a CompiledGraphUnit> {
+    let mut unit = root;
+    for call_guid in module_path {
+        unit = module_call_by_guid(unit, *call_guid)?
+            .module
+            .as_deref()
+            .ok_or_else(|| {
+                graph_document("graph.demand.modulePath", "compiled module is missing")
+            })?;
+    }
+    Ok(unit)
+}
+
+fn module_call_by_guid(unit: &CompiledGraphUnit, call_guid: u128) -> Result<&CompiledGraphNode> {
+    unit.nodes
+        .iter()
+        .find(|node| {
+            node.definition.operator == GraphOperator::ModuleCall
+                && matches!(
+                    node.definition.parameter("callGuid"),
+                    Some(GraphParameterValue::Guid(candidate)) if *candidate == call_guid
+                )
+        })
+        .ok_or_else(|| graph_document("graph.demand.modulePath", "module call is missing"))
+}
+
+fn module_call_guid(node: &CompiledGraphNode) -> Result<u128> {
+    match node.definition.parameter("callGuid") {
+        Some(GraphParameterValue::Guid(call_guid)) => Ok(*call_guid),
+        _ => Err(graph_document(
+            "graph.demand.moduleCall",
+            "module call GUID is missing",
+        )),
+    }
+}
+
+fn canonicalize_demand_slice(
+    unit: &CompiledGraphUnit,
+    module_path: &[u128],
+    slice: &mut CompiledDemandSlice,
+) -> Result<()> {
+    if let Some(unit_slice) = slice.units.get_mut(module_path) {
+        unit_slice.nodes = unit
+            .nodes
+            .iter()
+            .filter(|node| slice.nodes.contains(&node.address()))
+            .map(|node| node.definition.guid)
+            .collect();
+        unit_slice.edges = unit
+            .edges
+            .iter()
+            .filter(|edge| unit_slice.edges.contains(edge))
+            .cloned()
+            .collect();
+    }
+    for node in &unit.nodes {
+        if let Some(module) = node.module.as_deref() {
+            let mut child_path = module_path.to_vec();
+            child_path.push(module_call_guid(node)?);
+            canonicalize_demand_slice(module, &child_path, slice)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompiledDemandSlice {
+    pub(crate) nodes: BTreeSet<GraphNodeAddress>,
+    pub(crate) executed_nodes: BTreeSet<GraphNodeAddress>,
+    pub(crate) input_pins: BTreeSet<QualifiedGraphPin>,
+    pub(crate) output_pins: BTreeSet<QualifiedGraphPin>,
+    pub(crate) estimates: BTreeMap<QualifiedGraphPin, GraphEstimate>,
+    pub(crate) dependencies: Vec<GraphDependencyFingerprint>,
+    pub(crate) units: BTreeMap<Vec<u128>, CompiledDemandUnitSlice>,
+}
+
+impl CompiledDemandSlice {
+    pub(crate) fn unit(&self, module_path: &[u128]) -> Option<&CompiledDemandUnitSlice> {
+        self.units.get(module_path)
+    }
+
+    pub(crate) fn contains_node(&self, address: &GraphNodeAddress) -> bool {
+        self.nodes.contains(address)
+    }
+
+    pub(crate) fn executes_node(&self, address: &GraphNodeAddress) -> bool {
+        self.executed_nodes.contains(address)
+    }
+
+    pub(crate) fn estimate(&self, pin: &QualifiedGraphPin) -> Option<GraphEstimate> {
+        self.estimates.get(pin).copied()
+    }
+
+    pub(crate) fn node_estimate(&self, address: &GraphNodeAddress) -> GraphEstimate {
+        self.estimates
+            .iter()
+            .filter(|(pin, _)| pin.node == *address)
+            .map(|(_, estimate)| *estimate)
+            .fold(GraphEstimate::default(), max_estimate)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompiledDemandPlan {
+    execution: CompiledDemandSlice,
+    public: CompiledDemandSlice,
+    stages: BTreeMap<[u8; 32], CompiledDemandSlice>,
+}
+
+impl CompiledDemandPlan {
+    pub(crate) const fn execution_slice(&self) -> &CompiledDemandSlice {
+        &self.execution
+    }
+
+    pub(crate) const fn public_slice(&self) -> &CompiledDemandSlice {
+        &self.public
+    }
+
+    pub(crate) fn stage_slice(&self, stage: [u8; 32]) -> Option<&CompiledDemandSlice> {
+        self.stages.get(&stage)
+    }
+
+    pub(crate) fn same_scope_membership(
+        &self,
+        left: &GraphNodeAddress,
+        right: &GraphNodeAddress,
+    ) -> bool {
+        self.public.executes_node(left) == self.public.executes_node(right)
+            && self
+                .stages
+                .values()
+                .all(|stage| stage.executes_node(left) == stage.executes_node(right))
     }
 }
 
@@ -1746,23 +2650,100 @@ pub fn compile_biome_graph(
         ));
     }
     let mut stack = Vec::new();
-    let root_unit = compile_unit(root, root_bindings, resolver, &options, &mut stack, &[])?;
-    enforce_limits(root_unit.estimate, options.limits)?;
-    let required_halo_by_level = aggregate_output_halo(&root_unit);
-    let mut identity_bytes = b"saffron-anima/compiled-biome-graph/v1\0".to_vec();
+    let mut root_unit = compile_unit(
+        root,
+        root_bindings,
+        resolver,
+        &mut stack,
+        &[],
+        usize::from(options.limits.max_module_depth),
+    )?;
+    let root_seeds = root_unit
+        .outputs
+        .iter()
+        .map(|output| {
+            let source = root_unit
+                .nodes
+                .iter()
+                .find(|node| node.definition.guid == output.node)
+                .ok_or_else(|| graph_document("graph.outputs", "output source node is missing"))?;
+            Ok(QualifiedGraphPin {
+                node: source.address(),
+                pin: output.pin.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut execution_demand =
+        compile_demand_slice(&root_unit, root_seeds.iter().cloned(), &BTreeSet::new())?;
+    execution_demand
+        .units
+        .entry(Vec::new())
+        .or_default()
+        .outputs
+        .extend(root_unit.outputs.iter().map(|output| output.name.clone()));
+    apply_demanded_estimates(&mut root_unit, &[], &execution_demand)?;
+    root_unit.dependencies = execution_demand.dependencies.clone();
+    let live_estimate = demanded_estimate(&execution_demand);
+    enforce_limits(live_estimate, options.limits)?;
+    enforce_demanded_halo_policies(&root_unit, &execution_demand)?;
+    let required_halo_by_level = demanded_output_halo(&root_unit, &execution_demand, &root_seeds)?;
+    let mut identity_bytes = b"saffron-anima/compiled-biome-execution/v2\0".to_vec();
+    identity_bytes.extend_from_slice(&BIOME_GRAPH_VERSION.to_be_bytes());
+    identity_bytes.extend_from_slice(&BIOME_INTERFACE_VERSION.to_be_bytes());
+    identity_bytes.extend_from_slice(&BIOME_NODE_VERSION.to_be_bytes());
     identity_bytes.extend_from_slice(&root.id.value().to_be_bytes());
-    identity_bytes.extend_from_slice(&root_unit.document_hash);
-    for dependency in &root_unit.dependencies {
+    identity_bytes.extend_from_slice(&demand_unit_semantic_hash(
+        &root_unit,
+        &execution_demand,
+        &[],
+    )?);
+    append_identity_collection(
+        &mut identity_bytes,
+        "dependencies",
+        execution_demand.dependencies.len(),
+    );
+    for dependency in &execution_demand.dependencies {
         append_dependency_source(&mut identity_bytes, dependency.source);
         identity_bytes.extend_from_slice(&dependency.content_hash);
     }
     let identity = sha256(&identity_bytes);
-    let spatial_plan = compile_spatial_plan(identity, &root_unit)?;
+    let spatial_plan = compile_spatial_plan(&root_unit, &execution_demand)?;
+    let global_outputs = spatial_plan
+        .global_stages()
+        .iter()
+        .flat_map(|stage| stage.output_pins.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut public_demand = compile_demand_slice(&root_unit, root_seeds, &global_outputs)?;
+    public_demand
+        .units
+        .entry(Vec::new())
+        .or_default()
+        .outputs
+        .extend(root_unit.outputs.iter().map(|output| output.name.clone()));
+    let stages = spatial_plan
+        .global_stages()
+        .iter()
+        .map(|stage| {
+            Ok((
+                stage.id,
+                compile_demand_slice(
+                    &root_unit,
+                    stage.output_pins.iter().cloned(),
+                    &stage.input_pins.iter().cloned().collect(),
+                )?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(CompiledBiomeGraph {
         root: root_unit,
         biome: root.id,
         identity,
         limits: options.limits,
+        demand_plan: CompiledDemandPlan {
+            execution: execution_demand,
+            public: public_demand,
+            stages,
+        },
         spatial_plan,
         required_halo_by_level,
     })
@@ -1772,29 +2753,28 @@ fn compile_unit(
     asset: &BiomeAsset,
     bindings: &[(u128, Value)],
     resolver: &dyn BiomeGraphResolver,
-    options: &GraphCompileOptions,
     stack: &mut Vec<Uuid>,
     module_path: &[u128],
+    inherited_depth_limit: usize,
 ) -> Result<CompiledGraphUnit> {
     if stack.contains(&asset.id) {
         return Err(Error::GraphCycle {
             node: u128::from(asset.id.value()),
         });
     }
-    if stack.len() >= usize::from(options.limits.max_module_depth)
-        || stack.len() >= usize::from(asset.policy.maximum_recursion)
-    {
+    let module_depth = module_path.len();
+    if module_depth > inherited_depth_limit {
         return Err(Error::GraphLimit {
             resource: "module recursion",
-            requested: stack.len() as u64 + 1,
-            limit: u64::from(
-                options
-                    .limits
-                    .max_module_depth
-                    .min(asset.policy.maximum_recursion),
-            ),
+            requested: u64::try_from(module_depth).map_err(|_| Error::NumericOverflow)?,
+            limit: u64::try_from(inherited_depth_limit).map_err(|_| Error::NumericOverflow)?,
         });
     }
+    let descendant_depth_limit = inherited_depth_limit.min(
+        module_depth
+            .checked_add(usize::from(asset.policy.maximum_recursion))
+            .ok_or(Error::NumericOverflow)?,
+    );
     stack.push(asset.id);
     validate_biome(asset)?;
     let mut document = BiomeGraphDocument::from_json(&asset.graph)?;
@@ -1888,9 +2868,9 @@ fn compile_unit(
                 &module_asset,
                 &module_ref.bindings,
                 resolver,
-                options,
                 stack,
                 &child_path,
+                descendant_depth_limit,
             )?;
             module_units.insert(node.guid, Box::new(unit));
         }
@@ -1977,8 +2957,9 @@ fn compile_unit(
             .values()
             .copied()
             .fold(base_estimate, max_estimate);
-        enforce_limits(estimate, options.limits)?;
+        let definition_hash = sha256(&definition.canonical_bytes());
         compiled_nodes.push(CompiledGraphNode {
+            definition_hash,
             inputs,
             outputs,
             parameter_schema: definition.operator.parameter_schema(),
@@ -1989,6 +2970,7 @@ fn compile_unit(
             },
             output_authority,
             output_lineage,
+            output_estimates,
             estimate,
             dependencies,
             debug_symbol: GraphDebugSymbol {
@@ -2111,12 +3093,7 @@ fn compile_unit(
         .fold(GraphEstimate::default(), |total, node| {
             max_estimate(total, node.estimate)
         });
-    let output_halo_by_level = compile_output_halo(
-        &compiled_nodes,
-        &edges,
-        &document.outputs,
-        asset.policy.maximum_influence_radius,
-    )?;
+    let output_halo_by_level = compile_output_halo(&compiled_nodes, &edges, &document.outputs)?;
     let mut semantic_identity = b"saffron-anima/compiled-biome-unit/v1\0".to_vec();
     semantic_identity.extend_from_slice(&sha256(&crate::write_biome_asset(asset)?));
     semantic_identity.extend_from_slice(&document.identity());
@@ -2145,6 +3122,7 @@ fn compile_unit(
         companions: asset.companions.clone(),
         succession: asset.succession.clone(),
         require_authoritative_fields: asset.policy.require_authoritative_fields,
+        maximum_influence_radius: asset.policy.maximum_influence_radius,
         estimate,
         output_halo_by_level,
     };
@@ -2155,6 +3133,7 @@ fn compile_unit(
 #[derive(Clone)]
 struct SpatialPlanNode {
     address: GraphNodeAddress,
+    semantic_hash: [u8; 32],
     spatial: NodeSpatialPolicy,
     estimate: GraphEstimate,
     dependencies: Vec<GraphDependencyFingerprint>,
@@ -2174,11 +3153,11 @@ struct FlattenedSpatialGraph {
 }
 
 fn compile_spatial_plan(
-    graph_identity: [u8; 32],
     root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
 ) -> Result<CompiledSpatialPlan> {
     let mut flattened = FlattenedSpatialGraph::default();
-    let outputs = flatten_spatial_unit(root, &BTreeMap::new(), &[], &mut flattened)?;
+    let outputs = flatten_spatial_unit(root, &BTreeMap::new(), &[], demand, &mut flattened)?;
     flattened.outputs = root
         .outputs
         .iter()
@@ -2335,13 +3314,24 @@ fn compile_spatial_plan(
             .collect::<Vec<_>>();
         let input_pins = input_pins.into_iter().collect::<Vec<_>>();
         let output_pins = output_pins.into_iter().collect::<Vec<_>>();
-        let id = global_stage_identity(
-            graph_identity,
+        let prerequisite_stages = input_pins
+            .iter()
+            .filter_map(|pin| global_stage_by_node.get(&pin.node).copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let id = global_stage_identity(&GlobalStageIdentityInputs {
+            root_biome: root.biome,
             owner_level,
-            &nodes,
-            &input_pins,
-            &output_pins,
-        );
+            nodes: &nodes,
+            closure: &closure,
+            flattened_nodes: &flattened.nodes,
+            edges: &flattened.edges,
+            input_pins: &input_pins,
+            output_pins: &output_pins,
+            dependencies: &dependencies,
+            prerequisite_stages: &prerequisite_stages,
+        });
         for node in &nodes {
             global_stage_by_node.insert(node.clone(), id);
         }
@@ -2415,11 +3405,26 @@ fn flatten_spatial_unit(
     unit: &CompiledGraphUnit,
     interface_sources: &BTreeMap<String, QualifiedGraphPin>,
     inherited_dependencies: &[GraphDependencyFingerprint],
+    demand: &CompiledDemandSlice,
     flattened: &mut FlattenedSpatialGraph,
 ) -> Result<BTreeMap<String, QualifiedGraphPin>> {
     let incoming = incoming_edges(&unit.edges);
+    let module_path = unit
+        .nodes
+        .first()
+        .map_or_else(Vec::new, |node| node.debug_symbol.module_path.clone());
+    let unit_demand = demand.unit(&module_path).ok_or_else(|| {
+        graph_document(
+            "graph.spatialPlan",
+            "demanded compiled unit slice is missing",
+        )
+    })?;
     let mut aliases = BTreeMap::<(u128, String), QualifiedGraphPin>::new();
-    for node in &unit.nodes {
+    for node in unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
         if node.definition.operator == GraphOperator::InterfaceInput {
             let name = match node.definition.parameter("name") {
                 Some(GraphParameterValue::String(name)) => name,
@@ -2437,6 +3442,13 @@ fn flatten_spatial_unit(
                 )
             })?;
             for output in &node.outputs {
+                let qualified = QualifiedGraphPin {
+                    node: node.address(),
+                    pin: output.name.clone(),
+                };
+                if !demand.output_pins.contains(&qualified) {
+                    continue;
+                }
                 aliases.insert((node.definition.guid, output.name.clone()), source.clone());
             }
             continue;
@@ -2447,8 +3459,16 @@ fn flatten_spatial_unit(
             let module = node.module.as_deref().ok_or_else(|| {
                 graph_document("graph.spatialPlan.moduleCall", "compiled module is missing")
             })?;
+            let direct_dependencies = spatial_node_dependencies(node);
+            let module_dependencies =
+                merged_dependencies(&direct_dependencies, inherited_dependencies);
             let mut module_inputs = BTreeMap::new();
-            for input in &node.inputs {
+            for input in node.inputs.iter().filter(|input| {
+                demand.input_pins.contains(&QualifiedGraphPin {
+                    node: address.clone(),
+                    pin: input.name.clone(),
+                })
+            }) {
                 let edge = incoming
                     .get(&node.definition.guid)
                     .into_iter()
@@ -2463,19 +3483,19 @@ fn flatten_spatial_unit(
                 let source = resolve_spatial_source(edge, &aliases)?;
                 module_inputs.insert(input.name.clone(), source);
             }
-            let mut module_dependencies = inherited_dependencies.to_vec();
-            module_dependencies.extend(node.dependencies.iter().copied().filter(|dependency| {
-                matches!(dependency.source, GraphDependencySource::Asset(id) if id == module.biome)
-            }));
-            module_dependencies.sort();
-            module_dependencies.dedup();
-            let module_outputs =
-                flatten_spatial_unit(module, &module_inputs, &module_dependencies, flattened)?;
+            let module_outputs = flatten_spatial_unit(
+                module,
+                &module_inputs,
+                &module_dependencies,
+                demand,
+                flattened,
+            )?;
             flattened.nodes.push(SpatialPlanNode {
                 address: address.clone(),
+                semantic_hash: live_node_semantic_hash(unit, node, demand, false)?,
                 spatial: node.definition.spatial,
                 estimate: node.estimate,
-                dependencies: merged_dependencies(&node.dependencies, inherited_dependencies),
+                dependencies: merged_dependencies(&direct_dependencies, inherited_dependencies),
             });
             for (name, source) in &module_inputs {
                 flattened.edges.push(SpatialPlanEdge {
@@ -2486,7 +3506,12 @@ fn flatten_spatial_unit(
                     },
                 });
             }
-            for output in &node.outputs {
+            for output in node.outputs.iter().filter(|output| {
+                demand.output_pins.contains(&QualifiedGraphPin {
+                    node: address.clone(),
+                    pin: output.name.clone(),
+                })
+            }) {
                 let source = module_outputs.get(&output.name).cloned().ok_or_else(|| {
                     graph_document(
                         "graph.spatialPlan.moduleCall",
@@ -2506,13 +3531,20 @@ fn flatten_spatial_unit(
             continue;
         }
 
+        let direct_dependencies = spatial_node_dependencies(node);
         flattened.nodes.push(SpatialPlanNode {
             address: address.clone(),
+            semantic_hash: live_node_semantic_hash(unit, node, demand, false)?,
             spatial: node.definition.spatial,
             estimate: node.estimate,
-            dependencies: merged_dependencies(&node.dependencies, inherited_dependencies),
+            dependencies: merged_dependencies(&direct_dependencies, inherited_dependencies),
         });
-        for edge in incoming.get(&node.definition.guid).into_iter().flatten() {
+        for edge in incoming
+            .get(&node.definition.guid)
+            .into_iter()
+            .flatten()
+            .filter(|edge| unit_demand.contains_edge(edge))
+        {
             flattened.edges.push(SpatialPlanEdge {
                 from: resolve_spatial_source(edge, &aliases)?,
                 to: QualifiedGraphPin {
@@ -2521,7 +3553,12 @@ fn flatten_spatial_unit(
                 },
             });
         }
-        for output in &node.outputs {
+        for output in node.outputs.iter().filter(|output| {
+            demand.output_pins.contains(&QualifiedGraphPin {
+                node: address.clone(),
+                pin: output.name.clone(),
+            })
+        }) {
             aliases.insert(
                 (node.definition.guid, output.name.clone()),
                 QualifiedGraphPin {
@@ -2533,6 +3570,7 @@ fn flatten_spatial_unit(
     }
     unit.outputs
         .iter()
+        .filter(|output| unit_demand.outputs.contains(&output.name))
         .map(|output| {
             let source = aliases
                 .get(&(output.node, output.pin.clone()))
@@ -2568,25 +3606,79 @@ fn resolve_spatial_source(
         .ok_or_else(|| graph_document("graph.spatialPlan", "edge source alias is missing"))
 }
 
-fn global_stage_identity(
-    graph_identity: [u8; 32],
+struct GlobalStageIdentityInputs<'a> {
+    root_biome: Uuid,
     owner_level: u8,
-    nodes: &[GraphNodeAddress],
-    input_pins: &[QualifiedGraphPin],
-    output_pins: &[QualifiedGraphPin],
-) -> [u8; 32] {
-    let mut bytes = b"saffron-anima/vegetation-global-stage/v1\0".to_vec();
-    bytes.extend_from_slice(&graph_identity);
+    nodes: &'a [GraphNodeAddress],
+    closure: &'a [GraphNodeAddress],
+    flattened_nodes: &'a [SpatialPlanNode],
+    edges: &'a [SpatialPlanEdge],
+    input_pins: &'a [QualifiedGraphPin],
+    output_pins: &'a [QualifiedGraphPin],
+    dependencies: &'a [GraphDependencyFingerprint],
+    prerequisite_stages: &'a [[u8; 32]],
+}
+
+fn global_stage_identity(inputs: &GlobalStageIdentityInputs<'_>) -> [u8; 32] {
+    let &GlobalStageIdentityInputs {
+        root_biome,
+        owner_level,
+        nodes,
+        closure,
+        flattened_nodes,
+        edges,
+        input_pins,
+        output_pins,
+        dependencies,
+        prerequisite_stages,
+    } = inputs;
+    let mut bytes = b"saffron-anima/vegetation-global-stage/v2\0".to_vec();
+    bytes.extend_from_slice(&BIOME_GRAPH_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&BIOME_INTERFACE_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&BIOME_NODE_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&root_biome.value().to_be_bytes());
     bytes.push(owner_level);
-    bytes.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
-    for node in nodes {
+    append_identity_collection(&mut bytes, "closure", closure.len());
+    for node in closure {
         bytes.extend_from_slice(&node.canonical_bytes());
+        if let Some(compiled) = flattened_nodes
+            .iter()
+            .find(|candidate| candidate.address == *node)
+        {
+            bytes.extend_from_slice(&compiled.semantic_hash);
+        }
     }
-    for pins in [input_pins, output_pins] {
-        bytes.extend_from_slice(&(pins.len() as u64).to_be_bytes());
+    let closure_nodes = closure.iter().collect::<BTreeSet<_>>();
+    let live_edges = edges
+        .iter()
+        .filter(|edge| {
+            closure_nodes.contains(&edge.to.node)
+                && (closure_nodes.contains(&edge.from.node) || input_pins.contains(&edge.from))
+        })
+        .collect::<Vec<_>>();
+    append_identity_collection(&mut bytes, "edges", live_edges.len());
+    for edge in live_edges {
+        bytes.extend_from_slice(&edge.from.canonical_bytes());
+        bytes.extend_from_slice(&edge.to.canonical_bytes());
+    }
+    for (name, pins) in [("inputs", input_pins), ("outputs", output_pins)] {
+        append_identity_collection(&mut bytes, name, pins.len());
         for pin in pins {
             bytes.extend_from_slice(&pin.canonical_bytes());
         }
+    }
+    append_identity_collection(&mut bytes, "dependencies", dependencies.len());
+    for dependency in dependencies {
+        append_dependency_source(&mut bytes, dependency.source);
+        bytes.extend_from_slice(&dependency.content_hash);
+    }
+    append_identity_collection(&mut bytes, "prerequisiteStages", prerequisite_stages.len());
+    for prerequisite in prerequisite_stages {
+        bytes.extend_from_slice(prerequisite);
+    }
+    append_identity_collection(&mut bytes, "members", nodes.len());
+    for node in nodes {
+        bytes.extend_from_slice(&node.canonical_bytes());
     }
     sha256(&bytes)
 }
@@ -3562,7 +4654,6 @@ fn compile_output_halo(
     nodes: &[CompiledGraphNode],
     edges: &[GraphEdge],
     outputs: &[GraphInterfaceOutput],
-    maximum_influence_radius: DecisionScalar,
 ) -> Result<BTreeMap<String, [DecisionScalar; 63]>> {
     let incoming = incoming_edges(edges);
     let zero = DecisionScalar::from_bits(0);
@@ -3606,13 +4697,6 @@ fn compile_output_halo(
                 .get(&(output.node, output.pin.clone()))
                 .copied()
                 .ok_or_else(|| graph_document("graph.outputs", "output support is missing"))?;
-            if support > maximum_influence_radius {
-                return Err(Error::GraphLimit {
-                    resource: "composed influence radius",
-                    requested: u64::try_from(support.bits()).unwrap_or(u64::MAX),
-                    limit: u64::try_from(maximum_influence_radius.bits()).unwrap_or(0),
-                });
-            }
             result.get_mut(&output.name).ok_or_else(|| {
                 graph_document("graph.outputs", "output support table is missing")
             })?[usize::from(output_level)] = support;
@@ -3621,14 +4705,205 @@ fn compile_output_halo(
     Ok(result)
 }
 
-fn aggregate_output_halo(unit: &CompiledGraphUnit) -> [DecisionScalar; 63] {
-    std::array::from_fn(|level| {
-        unit.output_halo_by_level
-            .values()
-            .map(|support| support[level])
-            .max()
-            .unwrap_or(DecisionScalar::from_bits(0))
-    })
+fn demanded_output_halo(
+    root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+    outputs: &[QualifiedGraphPin],
+) -> Result<[DecisionScalar; 63]> {
+    let mut result = [DecisionScalar::from_bits(0); 63];
+    for output_level in 0_u8..=62 {
+        let mut memo = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        for pin in outputs {
+            result[usize::from(output_level)] = result[usize::from(output_level)].max(
+                demanded_pin_halo(root, demand, pin, output_level, &mut memo, &mut visiting)?,
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn enforce_demanded_halo_policies(
+    root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+) -> Result<()> {
+    for (module_path, unit_demand) in &demand.units {
+        let unit = compiled_unit_at_path(root, module_path)?;
+        for output in unit
+            .outputs
+            .iter()
+            .filter(|output| unit_demand.outputs.contains(&output.name))
+        {
+            let source = unit
+                .nodes
+                .iter()
+                .find(|node| node.definition.guid == output.node)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.halo", "unit output source is missing")
+                })?;
+            let pin = QualifiedGraphPin {
+                node: source.address(),
+                pin: output.pin.clone(),
+            };
+            for output_level in 0_u8..=62 {
+                let support = demanded_pin_halo(
+                    root,
+                    demand,
+                    &pin,
+                    output_level,
+                    &mut BTreeMap::new(),
+                    &mut BTreeSet::new(),
+                )?;
+                if support > unit.maximum_influence_radius {
+                    return Err(Error::GraphLimit {
+                        resource: "composed influence radius",
+                        requested: u64::try_from(support.bits()).unwrap_or(u64::MAX),
+                        limit: u64::try_from(unit.maximum_influence_radius.bits()).unwrap_or(0),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn demanded_pin_halo(
+    root: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+    pin: &QualifiedGraphPin,
+    output_level: u8,
+    memo: &mut BTreeMap<QualifiedGraphPin, DecisionScalar>,
+    visiting: &mut BTreeSet<QualifiedGraphPin>,
+) -> Result<DecisionScalar> {
+    if let Some(support) = memo.get(pin).copied() {
+        return Ok(support);
+    }
+    if !visiting.insert(pin.clone()) {
+        return Err(Error::GraphCycle {
+            node: pin.node.node,
+        });
+    }
+    let unit = compiled_unit_at_path(root, &pin.node.module_path)?;
+    let node = unit
+        .nodes
+        .iter()
+        .find(|node| node.definition.guid == pin.node.node)
+        .ok_or_else(|| graph_document("graph.demand.halo", "live output node is missing"))?;
+    let local = match node.definition.spatial {
+        NodeSpatialPolicy::Partitioned {
+            level,
+            influence_radius,
+        } if level >= output_level => influence_radius,
+        _ => DecisionScalar::from_bits(0),
+    };
+    let upstream = match node.definition.operator {
+        GraphOperator::InterfaceInput => {
+            let Some(GraphParameterValue::String(name)) = node.definition.parameter("name") else {
+                return Err(graph_document(
+                    "graph.demand.halo",
+                    "interface input name is missing",
+                ));
+            };
+            let module_path = pin.node.module_path.as_slice();
+            let parent_path = &module_path[..module_path.len() - 1];
+            let parent = compiled_unit_at_path(root, parent_path)?;
+            let call = module_call_by_guid(parent, module_path[module_path.len() - 1])?;
+            let edge = parent
+                .edges
+                .iter()
+                .find(|edge| edge.to_node == call.definition.guid && edge.to_pin.as_str() == name)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.halo", "live module input edge is missing")
+                })?;
+            let source = parent
+                .nodes
+                .iter()
+                .find(|source| source.definition.guid == edge.from_node)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.halo", "live module input source is missing")
+                })?;
+            demanded_pin_halo(
+                root,
+                demand,
+                &QualifiedGraphPin {
+                    node: source.address(),
+                    pin: edge.from_pin.clone(),
+                },
+                output_level,
+                memo,
+                visiting,
+            )?
+        }
+        GraphOperator::ModuleCall => {
+            let module = node
+                .module
+                .as_deref()
+                .ok_or_else(|| graph_document("graph.demand.halo", "compiled module is missing"))?;
+            let output = module
+                .outputs
+                .iter()
+                .find(|output| output.name == pin.pin)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.halo", "live module output is missing")
+                })?;
+            let source = module
+                .nodes
+                .iter()
+                .find(|source| source.definition.guid == output.node)
+                .ok_or_else(|| {
+                    graph_document("graph.demand.halo", "live module output source is missing")
+                })?;
+            demanded_pin_halo(
+                root,
+                demand,
+                &QualifiedGraphPin {
+                    node: source.address(),
+                    pin: output.pin.clone(),
+                },
+                output_level,
+                memo,
+                visiting,
+            )?
+        }
+        _ => {
+            let unit_demand = demand
+                .unit(&pin.node.module_path)
+                .ok_or_else(|| graph_document("graph.demand.halo", "live unit slice is missing"))?;
+            let mut support = DecisionScalar::from_bits(0);
+            for edge in unit.edges.iter().filter(|edge| {
+                edge.to_node == node.definition.guid
+                    && unit_demand.contains_edge(edge)
+                    && node
+                        .definition
+                        .operator
+                        .output_requires_input(&pin.pin, &edge.to_pin)
+            }) {
+                let source = unit
+                    .nodes
+                    .iter()
+                    .find(|source| source.definition.guid == edge.from_node)
+                    .ok_or_else(|| {
+                        graph_document("graph.demand.halo", "live edge source node is missing")
+                    })?;
+                support = support.max(demanded_pin_halo(
+                    root,
+                    demand,
+                    &QualifiedGraphPin {
+                        node: source.address(),
+                        pin: edge.from_pin.clone(),
+                    },
+                    output_level,
+                    memo,
+                    visiting,
+                )?);
+            }
+            support
+        }
+    };
+    let support = upstream.checked_add(local)?;
+    visiting.remove(pin);
+    memo.insert(pin.clone(), support);
+    Ok(support)
 }
 
 fn estimate_node(node: &GraphNodeDefinition, upstream: GraphEstimate) -> Result<GraphEstimate> {
@@ -3757,6 +5032,93 @@ fn max_estimate(left: GraphEstimate, right: GraphEstimate) -> GraphEstimate {
         memory_bytes: left.memory_bytes.max(right.memory_bytes),
         transfer_bytes: left.transfer_bytes.max(right.transfer_bytes),
     }
+}
+
+fn demanded_estimate(demand: &CompiledDemandSlice) -> GraphEstimate {
+    demand
+        .estimates
+        .values()
+        .copied()
+        .fold(GraphEstimate::default(), max_estimate)
+}
+
+fn apply_demanded_estimates(
+    unit: &mut CompiledGraphUnit,
+    module_path: &[u128],
+    demand: &CompiledDemandSlice,
+) -> Result<()> {
+    for node in &mut unit.nodes {
+        let address = node.address();
+        if demand.contains_node(&address) {
+            let mut estimate = GraphEstimate::default();
+            for output in &node.outputs {
+                let pin = QualifiedGraphPin {
+                    node: address.clone(),
+                    pin: output.name.clone(),
+                };
+                if let Some(output_estimate) = demand.estimate(&pin) {
+                    node.output_estimates
+                        .insert(output.name.clone(), output_estimate);
+                    estimate = max_estimate(estimate, output_estimate);
+                }
+            }
+            node.estimate = estimate;
+        }
+        if node.module.is_some() {
+            let call_guid = module_call_guid(node)?;
+            let mut child_path = module_path.to_vec();
+            child_path.push(call_guid);
+            let module = node.module.as_deref_mut().ok_or_else(|| {
+                graph_document("graph.demand.estimate", "compiled module is missing")
+            })?;
+            apply_demanded_estimates(module, &child_path, demand)?;
+        }
+    }
+    for output in &unit.outputs {
+        let source = unit
+            .nodes
+            .iter()
+            .find(|node| node.definition.guid == output.node)
+            .ok_or_else(|| {
+                graph_document(
+                    "graph.demand.estimate",
+                    "unit output source node is missing",
+                )
+            })?;
+        let pin = QualifiedGraphPin {
+            node: source.address(),
+            pin: output.pin.clone(),
+        };
+        if let Some(estimate) = demand.estimate(&pin) {
+            unit.output_estimates.insert(output.name.clone(), estimate);
+        }
+    }
+    unit.estimate = demand
+        .estimates
+        .iter()
+        .filter(|(pin, _)| pin.node.module_path.starts_with(module_path))
+        .map(|(_, estimate)| *estimate)
+        .fold(GraphEstimate::default(), max_estimate);
+    unit.dependencies = demand
+        .nodes
+        .iter()
+        .filter(|address| address.module_path.starts_with(module_path))
+        .flat_map(|address| {
+            compiled_unit_at_path(unit, &address.module_path[module_path.len()..])
+                .ok()
+                .and_then(|owner| {
+                    owner
+                        .nodes
+                        .iter()
+                        .find(|node| node.definition.guid == address.node)
+                })
+                .into_iter()
+                .flat_map(live_node_dependencies)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(())
 }
 
 fn merge_input_estimate(left: GraphEstimate, right: GraphEstimate) -> Result<GraphEstimate> {
@@ -4781,6 +6143,48 @@ mod tests {
         }
     }
 
+    struct SelectiveModuleResolver {
+        module: BiomeAsset,
+        source: GraphDependencySource,
+        content_hash: [u8; 32],
+    }
+
+    impl BiomeGraphResolver for SelectiveModuleResolver {
+        fn resolve_biome(&self, id: Uuid) -> Result<BiomeAsset> {
+            if id == self.module.id {
+                Ok(self.module.clone())
+            } else {
+                Err(graph_document("resolver", "unknown module"))
+            }
+        }
+
+        fn resolve_dependency_hash(&self, source: GraphDependencySource) -> Result<[u8; 32]> {
+            Ok(if source == self.source {
+                self.content_hash
+            } else {
+                [9; 32]
+            })
+        }
+    }
+
+    struct ModuleSetResolver {
+        modules: Vec<BiomeAsset>,
+    }
+
+    impl BiomeGraphResolver for ModuleSetResolver {
+        fn resolve_biome(&self, id: Uuid) -> Result<BiomeAsset> {
+            self.modules
+                .iter()
+                .find(|module| module.id == id)
+                .cloned()
+                .ok_or_else(|| graph_document("resolver", "unknown module"))
+        }
+
+        fn resolve_dependency_hash(&self, _source: GraphDependencySource) -> Result<[u8; 32]> {
+            Ok([9; 32])
+        }
+    }
+
     fn node(guid: u128, operator: GraphOperator) -> GraphNodeDefinition {
         GraphNodeDefinition {
             guid,
@@ -4871,6 +6275,53 @@ mod tests {
         }
     }
 
+    fn module_call_node(guid: u128, call_guid: u128) -> GraphNodeDefinition {
+        let mut call = node(guid, GraphOperator::ModuleCall);
+        call.parameters
+            .insert("callGuid".to_owned(), GraphParameterValue::Guid(call_guid));
+        call
+    }
+
+    fn module_asset(id: u64, child: Option<(u64, u128)>, maximum_recursion: u16) -> BiomeAsset {
+        let mut document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        let module_reference = child.map(|(child_id, call_guid)| {
+            document.nodes.push(module_call_node(call_guid, call_guid));
+            BiomeModuleReference {
+                biome: Uuid(child_id),
+                call_guid,
+                bindings: Vec::new(),
+            }
+        });
+        let mut asset = biome(document);
+        asset.id = Uuid(id);
+        asset.role = BiomeRole::Module;
+        asset.name = format!("Module {id}");
+        asset.policy.maximum_recursion = maximum_recursion;
+        if let Some(module_reference) = module_reference {
+            asset.modules.push(module_reference);
+        }
+        asset
+    }
+
+    fn root_with_module(module: u64, call_guid: u128) -> BiomeAsset {
+        let mut document = simple_document();
+        document.nodes.push(module_call_node(call_guid, call_guid));
+        let mut root = biome(document);
+        root.modules.push(BiomeModuleReference {
+            biome: Uuid(module),
+            call_guid,
+            bindings: Vec::new(),
+        });
+        root
+    }
+
     #[test]
     fn topological_order_counts_one_dependency_per_node_pair() {
         let nodes = [
@@ -4958,6 +6409,173 @@ mod tests {
     }
 
     #[test]
+    fn execution_and_stage_identities_ignore_dead_global_branches() {
+        let mut document = simple_document();
+        document
+            .nodes
+            .iter_mut()
+            .find(|node| node.guid == 2)
+            .unwrap()
+            .spatial = NodeSpatialPolicy::Global { level: 2 };
+        let baseline = compile_biome_graph(
+            &biome(document.clone()),
+            &[],
+            &NoModules,
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        assert_eq!(baseline.spatial_plan().global_stages().len(), 1);
+        let mut other_root = biome(document.clone());
+        other_root.id = Uuid(8);
+        let other_root = compile_biome_graph(
+            &other_root,
+            &[],
+            &NoModules,
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        assert_ne!(
+            baseline.spatial_plan().global_stages()[0].id,
+            other_root.spatial_plan().global_stages()[0].id
+        );
+
+        let dead_region = node(99, GraphOperator::RegionInput);
+        let mut dead_coverage = node(100, GraphOperator::StratifiedCoverage);
+        dead_coverage.spatial = NodeSpatialPolicy::Global { level: 4 };
+        dead_coverage
+            .seed_namespaces
+            .insert("sampling".to_owned(), 11);
+        dead_coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(u32::MAX));
+        dead_coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        document.nodes.extend([dead_region, dead_coverage]);
+        document.edges.push(GraphEdge {
+            from_node: 99,
+            from_pin: "regions".to_owned(),
+            to_node: 100,
+            to_pin: "regions".to_owned(),
+        });
+        let with_dead_branch = compile_biome_graph(
+            &biome(document.clone()),
+            &[],
+            &NoModules,
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        compile_biome_graph(
+            &biome(document.clone()),
+            &[],
+            &NoModules,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_candidates: 16,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(baseline.identity, with_dead_branch.identity);
+        assert_eq!(baseline.dependencies(), with_dead_branch.dependencies());
+        assert_eq!(
+            baseline
+                .spatial_plan()
+                .global_stages()
+                .iter()
+                .map(|stage| stage.id)
+                .collect::<Vec<_>>(),
+            with_dead_branch
+                .spatial_plan()
+                .global_stages()
+                .iter()
+                .map(|stage| stage.id)
+                .collect::<Vec<_>>()
+        );
+
+        document
+            .nodes
+            .iter_mut()
+            .find(|node| node.guid == 2)
+            .unwrap()
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(17));
+        assert!(matches!(
+            compile_biome_graph(
+                &biome(document.clone()),
+                &[],
+                &NoModules,
+                GraphCompileOptions {
+                    limits: GraphSafetyLimits {
+                        max_candidates: 16,
+                        ..GraphSafetyLimits::default()
+                    },
+                },
+            ),
+            Err(Error::GraphLimit {
+                resource: "candidate count",
+                requested: 17,
+                limit: 16,
+            })
+        ));
+        let live_edit = compile_biome_graph(
+            &biome(document),
+            &[],
+            &NoModules,
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        assert_ne!(baseline.identity, live_edit.identity);
+        assert_ne!(
+            baseline.spatial_plan().global_stages()[0].id,
+            live_edit.spatial_plan().global_stages()[0].id
+        );
+    }
+
+    #[test]
+    fn execution_identity_is_invariant_to_dependency_order() {
+        let mut document = simple_document();
+        let live = document
+            .nodes
+            .iter_mut()
+            .find(|node| node.guid == 2)
+            .unwrap();
+        live.spatial = NodeSpatialPolicy::Global { level: 2 };
+        live.dependencies = vec![
+            GraphDependencySource::Asset(Uuid(80)),
+            GraphDependencySource::Asset(Uuid(81)),
+        ];
+        let first = compile_biome_graph(
+            &biome(document.clone()),
+            &[],
+            &HashedDependency(7),
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        document
+            .nodes
+            .iter_mut()
+            .find(|node| node.guid == 2)
+            .unwrap()
+            .dependencies
+            .reverse();
+        let second = compile_biome_graph(
+            &biome(document),
+            &[],
+            &HashedDependency(7),
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        assert_eq!(first.identity, second.identity);
+        assert_eq!(
+            first.spatial_plan().global_stages()[0].id,
+            second.spatial_plan().global_stages()[0].id
+        );
+    }
+
+    #[test]
     fn propagating_operators_require_global_policy_but_competition_is_partitionable() {
         let asset = biome(simple_document());
         for (offset, operator) in [
@@ -4993,6 +6611,59 @@ mod tests {
             competition.operator.spatial_requirement(),
             GraphSpatialRequirement::FiniteSupport
         );
+    }
+
+    #[test]
+    fn public_compiler_rejects_partitioned_propagating_nodes() {
+        let mut document = simple_document();
+        let scatter = document
+            .nodes
+            .iter_mut()
+            .find(|node| node.guid == 2)
+            .unwrap();
+        scatter.operator = GraphOperator::BlueNoisePoisson;
+        scatter.parameters.insert(
+            "radius".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(65_536)),
+        );
+        scatter
+            .parameters
+            .insert("attempts".to_owned(), GraphParameterValue::U32(8));
+
+        assert!(matches!(
+            compile_biome_graph(
+                &biome(document),
+                &[],
+                &NoModules,
+                GraphCompileOptions::canonical(),
+            ),
+            Err(Error::GraphUnboundedInfluence { node: 2 })
+        ));
+    }
+
+    #[test]
+    fn graph_numeric_parameters_reject_fractional_values_at_the_typed_path() {
+        let mut value = simple_document().to_json();
+        let nodes = value
+            .get_mut("nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        let scatter_guid = guid_text(2);
+        let scatter = nodes
+            .iter_mut()
+            .find(|node| node.get("guid").and_then(Value::as_str) == Some(scatter_guid.as_str()))
+            .unwrap();
+        scatter
+            .get_mut("parameters")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("count".to_owned(), Value::from(1.5));
+
+        assert!(matches!(
+            BiomeGraphDocument::from_json(&value),
+            Err(Error::GraphDocument { path, reason })
+                if path.ends_with(".parameters.count") && reason == "expected unsigned integer"
+        ));
     }
 
     #[test]
@@ -5241,7 +6912,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_module_instances_have_distinct_global_stage_addresses_and_ids() {
+    fn unused_module_instance_does_not_create_a_global_stage() {
         let mut interface = node(10, GraphOperator::InterfaceInput);
         interface.parameters.insert(
             "name".to_owned(),
@@ -5293,6 +6964,8 @@ mod tests {
         first_call
             .parameters
             .insert("callGuid".to_owned(), GraphParameterValue::Guid(91));
+        let call_dependency = GraphDependencySource::Asset(Uuid(777));
+        first_call.dependencies.push(call_dependency);
         let mut second_call = node(3, GraphOperator::ModuleCall);
         second_call
             .parameters
@@ -5358,29 +7031,26 @@ mod tests {
         let compiled = compile_biome_graph(
             &root,
             &[],
-            &ModuleResolver { module },
+            &SelectiveModuleResolver {
+                module: module.clone(),
+                source: call_dependency,
+                content_hash: [7; 32],
+            },
             GraphCompileOptions::canonical(),
         )
         .unwrap();
         let stages = compiled.spatial_plan().global_stages();
-        assert_eq!(stages.len(), 2);
+        assert_eq!(stages.len(), 1);
         assert_eq!(
             stages
                 .iter()
                 .map(|stage| stage.nodes.clone())
                 .collect::<Vec<_>>(),
-            vec![
-                vec![GraphNodeAddress {
-                    module_path: vec![91],
-                    node: 11,
-                }],
-                vec![GraphNodeAddress {
-                    module_path: vec![92],
-                    node: 11,
-                }],
-            ]
+            vec![vec![GraphNodeAddress {
+                module_path: vec![91],
+                node: 11,
+            }]]
         );
-        assert_ne!(stages[0].id, stages[1].id);
         for stage in stages {
             assert!(stage.closure.contains(&GraphNodeAddress {
                 module_path: Vec::new(),
@@ -5396,7 +7066,271 @@ mod tests {
                     .map(|candidate| candidate.id),
                 Some(stage.id)
             );
+            assert!(stage.dependencies.contains(&GraphDependencyFingerprint {
+                source: call_dependency,
+                content_hash: [7; 32],
+            }));
         }
+        let changed_dependency = compile_biome_graph(
+            &root,
+            &[],
+            &SelectiveModuleResolver {
+                module,
+                source: call_dependency,
+                content_hash: [8; 32],
+            },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap();
+        assert_ne!(
+            compiled.spatial_plan().global_stages()[0].id,
+            changed_dependency.spatial_plan().global_stages()[0].id
+        );
+    }
+
+    #[test]
+    fn module_demand_prunes_unused_output_branch_and_its_unique_input() {
+        let mut input_a = node(10, GraphOperator::InterfaceInput);
+        input_a.parameters.insert(
+            "name".to_owned(),
+            GraphParameterValue::String("regions-a".to_owned()),
+        );
+        let mut input_b = node(20, GraphOperator::InterfaceInput);
+        input_b.parameters.insert(
+            "name".to_owned(),
+            GraphParameterValue::String("regions-b".to_owned()),
+        );
+        let mut live = node(11, GraphOperator::StratifiedCoverage);
+        live.seed_namespaces.insert("sampling".to_owned(), 11);
+        live.parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        live.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut dead = node(21, GraphOperator::StratifiedCoverage);
+        dead.seed_namespaces.insert("sampling".to_owned(), 11);
+        dead.parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(999));
+        dead.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut dead_transform_a = node(22, GraphOperator::Transform);
+        dead_transform_a.spatial = NodeSpatialPolicy::Partitioned {
+            level: 0,
+            influence_radius: DecisionScalar::from_bits(49_152),
+        };
+        dead_transform_a
+            .seed_namespaces
+            .insert("variation".to_owned(), 11);
+        let mut dead_transform_b = node(23, GraphOperator::Transform);
+        dead_transform_b.spatial = NodeSpatialPolicy::Partitioned {
+            level: 0,
+            influence_radius: DecisionScalar::from_bits(49_152),
+        };
+        dead_transform_b
+            .seed_namespaces
+            .insert("variation".to_owned(), 11);
+        let module_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: BIOME_INTERFACE_VERSION,
+            inputs: vec![
+                GraphInterfaceInput {
+                    id: 2010,
+                    name: "regions-a".to_owned(),
+                    domain: GraphDomain::Regions,
+                },
+                GraphInterfaceInput {
+                    id: 2020,
+                    name: "regions-b".to_owned(),
+                    domain: GraphDomain::Regions,
+                },
+            ],
+            outputs: vec![
+                GraphInterfaceOutput {
+                    id: 2011,
+                    name: "a".to_owned(),
+                    domain: GraphDomain::Candidates,
+                    node: 11,
+                    pin: "candidates".to_owned(),
+                    sink: None,
+                },
+                GraphInterfaceOutput {
+                    id: 2021,
+                    name: "b".to_owned(),
+                    domain: GraphDomain::Candidates,
+                    node: 23,
+                    pin: "candidates".to_owned(),
+                    sink: None,
+                },
+            ],
+            nodes: vec![
+                dead_transform_b,
+                dead_transform_a,
+                dead,
+                live,
+                input_b,
+                input_a,
+            ],
+            edges: vec![
+                GraphEdge {
+                    from_node: 10,
+                    from_pin: "value".to_owned(),
+                    to_node: 11,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 20,
+                    from_pin: "value".to_owned(),
+                    to_node: 21,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 21,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 22,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 22,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 23,
+                    to_pin: "candidates".to_owned(),
+                },
+            ],
+        };
+        let mut module = biome(module_document);
+        module.id = Uuid(88);
+        module.role = BiomeRole::Module;
+
+        let region = node(1, GraphOperator::RegionInput);
+        let mut call = node(2, GraphOperator::ModuleCall);
+        call.parameters
+            .insert("callGuid".to_owned(), GraphParameterValue::Guid(99));
+        let species = node(3, GraphOperator::SpeciesInput);
+        let mut output = node(4, GraphOperator::MacroOutput);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 11);
+        let mut root_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 3004,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 4,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, call, region],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions-a".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions-b".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "a".to_owned(),
+                    to_node: 4,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "species".to_owned(),
+                    to_node: 4,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let compile = |document: &BiomeGraphDocument| {
+            let mut root = biome(document.clone());
+            root.modules.push(BiomeModuleReference {
+                biome: module.id,
+                call_guid: 99,
+                bindings: Vec::new(),
+            });
+            compile_biome_graph(
+                &root,
+                &[],
+                &ModuleResolver {
+                    module: module.clone(),
+                },
+                GraphCompileOptions {
+                    limits: GraphSafetyLimits {
+                        max_candidates: 10,
+                        ..GraphSafetyLimits::default()
+                    },
+                },
+            )
+        };
+        let compiled = compile(&root_document).unwrap();
+        let nested = compiled
+            .demand_plan()
+            .execution_slice()
+            .unit(&[99])
+            .unwrap();
+        assert_eq!(nested.nodes, vec![10, 11]);
+        assert_eq!(nested.inputs, BTreeSet::from(["regions-a".to_owned()]));
+        assert_eq!(nested.outputs, BTreeSet::from(["a".to_owned()]));
+        assert!(
+            !compiled
+                .demand_plan()
+                .execution_slice()
+                .unit(&[])
+                .unwrap()
+                .edges
+                .iter()
+                .any(|edge| edge.to_node == 2 && edge.to_pin == "regions-b")
+        );
+
+        root_document
+            .edges
+            .iter_mut()
+            .find(|edge| edge.to_node == 4 && edge.to_pin == "candidates")
+            .unwrap()
+            .from_pin = "b".to_owned();
+        assert!(matches!(
+            compile(&root_document),
+            Err(Error::GraphLimit {
+                resource: "candidate count",
+                requested: 999,
+                limit: 10,
+            })
+        ));
+        let mut root = biome(root_document);
+        root.modules.push(BiomeModuleReference {
+            biome: module.id,
+            call_guid: 99,
+            bindings: Vec::new(),
+        });
+        assert!(matches!(
+            compile_biome_graph(
+                &root,
+                &[],
+                &ModuleResolver { module },
+                GraphCompileOptions {
+                    limits: GraphSafetyLimits {
+                        max_candidates: 1_000,
+                        ..GraphSafetyLimits::default()
+                    },
+                },
+            ),
+            Err(Error::GraphLimit {
+                resource: "composed influence radius",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -5415,6 +7349,12 @@ mod tests {
         );
         assert_eq!(compiled.root.estimate.candidates, 16);
         assert_eq!(compiled.root.estimate.accepted, 16);
+        for node in &compiled.root.nodes {
+            assert_eq!(
+                node.definition_hash,
+                sha256(&node.definition.canonical_bytes())
+            );
+        }
     }
 
     #[test]
@@ -5565,18 +7505,211 @@ mod tests {
     }
 
     #[test]
+    fn module_depth_counts_call_edges_and_enforces_exact_boundaries() {
+        compile_biome_graph(
+            &biome(simple_document()),
+            &[],
+            &NoModules,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 0,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let leaf = module_asset(90, None, 0);
+        let single_resolver = ModuleSetResolver {
+            modules: vec![leaf.clone()],
+        };
+        let single_root = root_with_module(90, 800);
+        let error = compile_biome_graph(
+            &single_root,
+            &[],
+            &single_resolver,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 0,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "module recursion",
+                requested: 1,
+                limit: 0,
+            }
+        ));
+        compile_biome_graph(
+            &single_root,
+            &[],
+            &single_resolver,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 1,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let branch = module_asset(89, Some((90, 900)), 8);
+        let resolver = ModuleSetResolver {
+            modules: vec![branch, leaf],
+        };
+        let mut root = root_with_module(89, 800);
+        root.policy.maximum_recursion = 8;
+
+        let error = compile_biome_graph(
+            &root,
+            &[],
+            &resolver,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 1,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "module recursion",
+                requested: 2,
+                limit: 1,
+            }
+        ));
+
+        compile_biome_graph(
+            &root,
+            &[],
+            &resolver,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 2,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap();
+
+        root.policy.maximum_recursion = 1;
+        let error = compile_biome_graph(
+            &root,
+            &[],
+            &resolver,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 2,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "module recursion",
+                requested: 2,
+                limit: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn module_policy_is_relative_to_its_entry_depth() {
+        let leaf = module_asset(92, None, 0);
+        let inner = module_asset(91, Some((92, 910)), 8);
+        let outer = module_asset(90, Some((91, 900)), 1);
+        let mut root = root_with_module(90, 800);
+        root.policy.maximum_recursion = 8;
+        let resolver = ModuleSetResolver {
+            modules: vec![outer.clone(), inner.clone(), leaf.clone()],
+        };
+        let options = GraphCompileOptions {
+            limits: GraphSafetyLimits {
+                max_module_depth: 3,
+                ..GraphSafetyLimits::default()
+            },
+        };
+
+        let error = compile_biome_graph(&root, &[], &resolver, options).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "module recursion",
+                requested: 3,
+                limit: 2,
+            }
+        ));
+
+        let mut allowed_outer = outer;
+        allowed_outer.policy.maximum_recursion = 2;
+        let resolver = ModuleSetResolver {
+            modules: vec![allowed_outer, inner, leaf],
+        };
+        compile_biome_graph(
+            &root,
+            &[],
+            &resolver,
+            GraphCompileOptions {
+                limits: GraphSafetyLimits {
+                    max_module_depth: 3,
+                    ..GraphSafetyLimits::default()
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn indirect_module_cycle_returns_the_typed_cycle_error() {
+        let first = module_asset(89, Some((90, 890)), 8);
+        let second = module_asset(90, Some((89, 900)), 8);
+        let resolver = ModuleSetResolver {
+            modules: vec![first, second],
+        };
+        let mut root = root_with_module(89, 800);
+        root.policy.maximum_recursion = 8;
+
+        assert!(matches!(
+            compile_biome_graph(&root, &[], &resolver, GraphCompileOptions::canonical(),),
+            Err(Error::GraphCycle { node: 89 })
+        ));
+    }
+
+    #[test]
     fn graph_cycle_and_hard_count_limit_are_typed_errors() {
         let mut document = simple_document();
-        document.edges.push(GraphEdge {
-            from_node: 4,
-            from_pin: "points".to_owned(),
-            to_node: 2,
-            to_pin: "regions".to_owned(),
-        });
+        let mut first = node(5, GraphOperator::Transform);
+        first.seed_namespaces.insert("variation".to_owned(), 11);
+        let mut second = node(6, GraphOperator::Transform);
+        second.seed_namespaces.insert("variation".to_owned(), 11);
+        document.nodes.extend([first, second]);
+        document.edges.extend([
+            GraphEdge {
+                from_node: 5,
+                from_pin: "candidates".to_owned(),
+                to_node: 6,
+                to_pin: "candidates".to_owned(),
+            },
+            GraphEdge {
+                from_node: 6,
+                from_pin: "candidates".to_owned(),
+                to_node: 5,
+                to_pin: "candidates".to_owned(),
+            },
+        ]);
         let asset = biome(document);
-        assert!(
-            compile_biome_graph(&asset, &[], &NoModules, GraphCompileOptions::canonical()).is_err()
-        );
+        assert!(matches!(
+            compile_biome_graph(&asset, &[], &NoModules, GraphCompileOptions::canonical()),
+            Err(Error::GraphCycle { node: 5 })
+        ));
 
         let asset = biome(simple_document());
         let options = GraphCompileOptions {
@@ -5591,6 +7724,55 @@ mod tests {
                 resource: "candidate count",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn compiler_rejects_numeric_overflow_as_a_typed_error() {
+        let mut document = simple_document();
+        let mut recursive = node(5, GraphOperator::RecursiveCompanion);
+        recursive
+            .seed_namespaces
+            .insert("companions".to_owned(), 11);
+        recursive.spatial = NodeSpatialPolicy::Partitioned {
+            level: 0,
+            influence_radius: DecisionScalar::from_bits(i32::MAX),
+        };
+        recursive
+            .parameters
+            .insert("children".to_owned(), GraphParameterValue::U32(2));
+        recursive.parameters.insert(
+            "radius".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(i32::MAX)),
+        );
+        recursive.parameters.insert(
+            "maximumDepth".to_owned(),
+            GraphParameterValue::U32(u32::MAX),
+        );
+        document.nodes.push(recursive);
+        document
+            .edges
+            .retain(|edge| !(edge.from_node == 2 && edge.to_node == 4));
+        document.edges.extend([
+            GraphEdge {
+                from_node: 2,
+                from_pin: "candidates".to_owned(),
+                to_node: 5,
+                to_pin: "candidates".to_owned(),
+            },
+            GraphEdge {
+                from_node: 5,
+                from_pin: "candidates".to_owned(),
+                to_node: 4,
+                to_pin: "candidates".to_owned(),
+            },
+        ]);
+        let mut asset = biome(document);
+        asset.policy.maximum_influence_radius = DecisionScalar::from_bits(i32::MAX);
+
+        assert!(matches!(
+            compile_biome_graph(&asset, &[], &NoModules, GraphCompileOptions::canonical()),
+            Err(Error::NumericOverflow)
         ));
     }
 }
