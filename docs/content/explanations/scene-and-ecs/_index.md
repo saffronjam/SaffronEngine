@@ -24,4 +24,4 @@ needs editing when a component is added.
 | `asset-catalog-in-scene` | `AssetCatalog` lives here; `Scene` holds an `Arc<AssetCatalog>` handle | `scene/src/environment.rs` · `AssetCatalog` |
 | `picking` | ray vs. mesh triangles (AABB broad-phase), static + skinned, click-to-select | `assets/src/render_scene.rs` · `pick_entity` |
 | `spatial-world` | exact world positions, hierarchical cells, surface fields, deterministic numerics, facet residency | `spatial/src/lib.rs` · `WorldCellKey` · `SurfaceField` |
-| `vegetation-state` | Stable plant identity, point columns, layers, and persistent mutations | `vegetation/src/mutation.rs` · `VegetationState`, `reduce_mutations` |
+| `vegetation-state` | Runtime cells, facet residency, queries, and strict persistence | `vegetation/src/runtime_world.rs` · `VegetationWorld`, `reduce_mutations` |

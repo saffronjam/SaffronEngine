@@ -5,9 +5,9 @@ weight = 9
 
 # Vegetation state
 
-Vegetation state gives authored, procedural, and runtime plants one identity and one persistent
-mutation model. Stable IDs, schema-hashed point columns, ordered layers, and manifest-bound deltas
-keep edits and saves independent from render resources.
+Vegetation state gives authored, procedural, and runtime plants one authority. Stable identities,
+immutable cell generations, and manifest-bound deltas let rendering, simulation, editing, and
+gameplay read the same effective plant state without owning it.
 
 ## Scene binding and ownership
 
@@ -26,6 +26,67 @@ another entity fails with a singleton-component error.
 
 The component is part of the built-in registry and scene document codec. Asset usage and deletion
 analysis treat `map` as a catalog reference.
+
+## Runtime cell generations
+
+`VegetationWorld` binds to one exact [cooked manifest](../../geometry-and-assets/vegetation-cooking/)
+and owns the reduced persistent state for that generation. Each known cell has a
+`GenerationSlot<VegetationCellGeneration>`. A reader receives an `Arc` snapshot, so publication can
+replace the slot while an older reader finishes safely.
+
+A cell load begins with a `GenerationToken` containing the cell, source revision, and monotonic cell
+generation. Staging verifies the artifact hash, cell and payload identities, platform profile, and
+complete section directory against the manifest. It decodes only the requested facets, applies the
+persistent cell delta, builds the macro bounds index, and returns a private generation.
+
+`GenerationSlot::try_publish` swaps that complete value only while the token remains current. A
+source update, cancellation, or newer load invalidates the token, so late work returns without
+changing the published cell. Existing `Arc` snapshots keep the prior generation alive until their
+readers release them.
+
+This trace shows a handle crossing a state change:
+
+```text
+source revision 12 requests Physics for cell (0, 0, 0)
+begin_load                  -> generation token 4
+publish_staged              -> cell generation 4
+find_plant                  -> handle { plant: 01ab..., generation: 4 }
+confirmed Tombstone         -> cell generation 5
+resolve_handle(old handle)  -> StaleGeneration { expected: 4, current: 5 }
+```
+
+The public handle carries `PlantId` and `VegetationCellGenerationId`. Its private `PlantSlot` is only
+a row and generation tag. Row indices can change when the effective columns are rebuilt; stale rows
+therefore cannot escape through an API.
+
+## Facet residency
+
+A [spatial source](../spatial-world/) requests cell facets through velocity prediction, hierarchy
+levels, and separate load and cleanup radii. The cleanup radius supplies hysteresis. Multiple
+sources contribute reference counts to the same cell-facet pair, and removing one source leaves the
+other claims intact.
+
+Logical facets map to these cooked sections:
+
+| Facet | Cell sections |
+|---|---|
+| Render | Macro points, micro fields, render references, render bounds |
+| Physics | Macro points, collision inputs |
+| Simulation | Macro points, micro fields, ecology boundary, ecology checkpoint |
+| Editing | Macro points, provenance, rejection diagnostics, surface attachments and dependencies |
+| Navigation | Macro points, navigation contributions |
+| Network | Macro points, ecology boundary, ecology checkpoint |
+
+Every logical facet includes macro points, which keeps stable plant identity available to its
+adapter. `VegetationResidencyBudgets` sets an independent decoded-byte ceiling for each facet.
+Admission visits cells by source priority and stable cell order. Demand beyond a ceiling remains
+visible in requested-byte accounting without publishing an oversized generation.
+
+`VegetationResidencyReport` separates requested and resident byte counts and lists coalesced missing
+facets. Releasing demand republishes a generation containing only retained sections. Quantized micro
+tiles store density, typed attribute channels, and a reconstruction seed; individual blades are
+cosmetic and do not become runtime records. Persistent disturbance masks remain per-tile state and
+are overlaid whenever a generation is rebuilt.
 
 ## Plant identity
 
@@ -58,6 +119,22 @@ Map inputs use one ordered `VegetationLayer` algebra. Each layer carries a stabl
 space, bounds, dependency set, order, revision, and lock or mute state. Operators cover fields,
 species weights, density, masks, volumes, splines, anchors, pins, overrides, and blockers.
 
+## Runtime queries
+
+Macro queries use a cell-local bounds tree built from the effective `PlantPointColumns`. Bounds,
+radius, ray, and nearest queries scan every CPU-resident macro generation, independent of render or
+collision visibility. Results have stable ordering by `PlantId`, or by distance then `PlantId` where
+distance matters.
+
+`VegetationQueryFilter` can select families, require all listed family tags, and restrict lifecycle
+or interaction policy. A result contains `PlantId`, generation-tagged handle, exact position,
+conservative bounds, family tags, biological state, and interaction policy. Provenance is present
+only when the editing facet supplies its table.
+
+The ray query intersects conservative vegetation bounds. It is not a physics raycast and does not
+claim that a render-only or simulation-only plant has a collision body. Physics queries remain
+limited to collision-resident objects.
+
 ## Persistent mutations
 
 Persistent state has a fixed precedence:
@@ -66,20 +143,41 @@ Persistent state has a fixed precedence:
 authored sources -> cooked base -> confirmed persistent delta -> transient prediction or cosmetics
 ```
 
-`reduce_mutations` is the only reducer for field patches, additions, removals, overrides, planting,
-damage, moisture and fuel, lifecycle changes, harvest, burn, regrowth, promoted state, and disturbance
-masks. Each record carries a cell, transaction, authority, logical tick, idempotency key, and optional
-base revision.
+`VegetationWorld::apply_confirmed_mutations` is the persistent write boundary. It clones the state,
+calls `reduce_mutations`, rebuilds every changed resident cell privately, and publishes the candidate
+only after all work succeeds. `apply_prediction` uses the same reducer for a transient overlay above
+confirmed state. Rejecting a prediction republishes the remaining overlay, while confirmation sends
+that transaction through the persistent write boundary. Snapshots contain confirmed state only.
+
+`reduce_mutations` handles field patches, additions, removals, overrides, planting, damage, moisture
+and fuel, lifecycle changes, harvest, burn, regrowth, promoted state, and disturbance masks. Each
+record carries a cell, transaction, authority, logical tick, idempotency key, and optional base
+revision.
 
 The reducer sorts transactions canonically, verifies exact replays, and rejects reused IDs with
 different contents. It evaluates a multi-cell transaction on a cloned candidate state and publishes
 only after every cell precondition succeeds. Cell revisions and changed-cell output follow canonical
 cell order.
 
-Three envelopes keep transport policy separate from mutation meaning. `EditorJournalEnvelope` holds
-gesture preimages and inverses. `SaveStateEnvelope` binds a compact snapshot and tail to one exact
-base manifest. `NetworkMutationEnvelope` adds transport sequence and an optional snapshot while using
-the same records and reducer.
+## Snapshot and tail persistence
+
+`SaveStateEnvelope` contains a canonical reduced snapshot followed by a canonically ordered mutation
+tail. Reading the envelope applies that tail through `reduce_mutations`; compaction performs the same
+reduction and emits the result as a new snapshot with an empty tail. Duplicate tail transactions are
+accepted only when their canonical signatures match, so replay and compaction produce the same
+state.
+
+The binding includes the exact manifest and cook-graph identities, the schema, compiler, evaluator,
+numeric, and simulation contract versions, and a hash of every named seed namespace. Every field
+must equal the expected runtime binding. A mismatch is an error rather than an inferred migration.
+
+Snapshot and save containers carry format magic, a schema identity, payload length, payload hash,
+and a final commit marker. Their decoders reject truncation, trailing data, corrupt payloads,
+non-canonical ordering, and bytes that do not reproduce under canonical encoding.
+
+`EditorJournalEnvelope` keeps gesture preimages and inverse operations separate from runtime save
+state. `NetworkMutationEnvelope` adds transport sequence and an optional authoritative snapshot.
+Both reuse the same mutation records instead of defining another state transition model.
 
 Biological age advances through monotonic `ecology_tick` values. Phenology remains a separate closed
 value, so changing scene calendar appearance does not reverse age or mortality. Weather and wind do
@@ -93,12 +191,16 @@ not alter persistent placement unless a mutation writes durable state.
 | Point schema and lifecycle | `vegetation/src/point.rs` | `PlantPointColumns`, `POINT_SCHEMA_COLUMNS`, `PlantLifecycle` |
 | Layer algebra and provenance | `vegetation/src/layer.rs` | `VegetationLayer`, `VegetationLayerOperator`, `ProvenanceTable` |
 | Persistent reducer and envelopes | `vegetation/src/mutation.rs` | `VegetationState`, `VegetationMutation`, `reduce_mutations` |
+| Runtime generations and queries | `vegetation/src/runtime_world.rs` | `VegetationWorld`, `VegetationCellGeneration`, `VegetationPlantHandle` |
+| Strict snapshot codecs | `vegetation/src/state_codec.rs` | `VegetationState::from_canonical_bytes`, `SaveStateEnvelope::from_canonical_bytes` |
+| Facet demand and publication | `spatial/src/residency.rs` | `ResidencyManager`, `GenerationToken`, `GenerationSlot` |
 | Scene singleton | `scene/src/component.rs`, `scene.rs` | `VegetationField`, `Scene::add_component` |
 | Generated wire DTOs | `protocol/src/vegetation_dto.rs`, `xtask/src/protocol/ts.rs` | `PlantId`, `VegetationMutationDto`, `emit_sa_types` |
 
 ## Related
 
 - [Vegetation assets](../../geometry-and-assets/vegetation-assets/) — authored family, biome, and map ownership
-- [Spatial world](../spatial-world/) — exact coordinates, owner cells, fields, and deterministic numerics
+- [Vegetation cooking](../../geometry-and-assets/vegetation-cooking/) — immutable cell artifacts and manifest identities
+- [Spatial world](../spatial-world/) — exact coordinates, predictive sources, and generation publication
 - [Scene serialization](../scene-serialization/) — registry-driven component persistence
 - [Shared control types](../../tooling-and-control/shared-types/) — generated Rust, TypeScript, and OpenRPC contracts

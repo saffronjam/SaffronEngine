@@ -747,15 +747,21 @@ pub fn with_stub<T>(
     let mut assets = AssetServer::new(std::env::temp_dir().join("saffron-control-test"));
     let mut spatial = saffron_spatial::ResidencyManager::new();
     let mut vegetation_jobs = crate::vegetation_jobs::VegetationEvaluationJobs::default();
+    let mut vegetation_cook_jobs = crate::vegetation_cook_jobs::VegetationCookJobs::default();
     let mut vegetation_compute = None;
+    let mut vegetation = None;
     let mut ctx = EngineContext {
         window: &mut window,
         renderer,
         scene_edit: &mut scene_edit,
         assets: &mut assets,
         spatial: &mut spatial,
+        vegetation: &mut vegetation,
+        vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus::default(),
+        vegetation_regeneration_cells: Vec::new(),
         physics: None,
         vegetation_jobs: &mut vegetation_jobs,
+        vegetation_cook_jobs: &mut vegetation_cook_jobs,
         vegetation_compute: &mut vegetation_compute,
     };
     body(&mut ctx)
