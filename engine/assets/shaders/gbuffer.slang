@@ -5,6 +5,11 @@
 // The roughness target feeds the specular-occlusion prepass (`specocc.slang`), whose reflection
 // cone widens with roughness.
 
+import coverage;
+import material_params;
+
+[[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
+
 struct Instance
 {
     float4x4 model;
@@ -16,6 +21,7 @@ struct Instance
     float4 emissive;
 };
 [[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;
+[[vk::binding(2, 2)]] StructuredBuffer<MaterialParams> materialParams;
 
 struct Push
 {
@@ -37,6 +43,11 @@ struct VertexOutput
     float3 viewNormal : NORMAL;
     float viewZ : TEXCOORD0;
     float roughness : TEXCOORD1;
+    float3 worldPos : POSITION0;
+    float2 uv0 : TEXCOORD2;
+    nointerpolation uint materialIndex : TEXCOORD3;
+    float3 coverageAnchor : TEXCOORD4;
+    float3 viewDirection : TEXCOORD5;
 };
 
 [shader("vertex")]
@@ -50,7 +61,15 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
     float3 worldNormal = mul((float3x3)inst.normalMatrix, input.normal);
     output.viewNormal = mul((float3x3)pc.view, worldNormal);
     output.viewZ = viewPos.z;
-    output.roughness = inst.pbr.y;
+    MaterialParams mat = materialParams[inst.texture.w];
+    output.roughness = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u
+        ? mat.thinReflection.z
+        : inst.pbr.y;
+    output.worldPos = worldPos.xyz;
+    output.uv0 = input.uv0;
+    output.materialIndex = inst.texture.w;
+    output.coverageAnchor = input.position;
+    output.viewDirection = -viewPos.xyz;
     return output;
 }
 
@@ -64,12 +83,40 @@ struct GbufferOut
 [shader("fragment")]
 GbufferOut fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace)
 {
+    MaterialParams mat = materialParams[input.materialIndex];
+    bool thinSheet = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u;
+    if (thinSheet || (mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
+    {
+        float2 uv = input.uv0 * mat.uv.xy + mat.uv.zw;
+        uint sourceIndex = thinSheet ? mat.coverage.x : mat.tex0.x;
+        CoverageSample coverageSample = sampleCanonicalCoverage(
+            albedoTextures[NonUniformResourceIndex(sourceIndex)],
+            uv,
+            input.coverageAnchor,
+            thinSheet ? mat.coverage.y : COVERAGE_SOURCE_ALBEDO_ALPHA,
+            thinSheet ? mat.coverage.z : COVERAGE_CLASS_MASKED,
+            mat.baseColor.a,
+            thinSheet ? mat.coverageHash.zw : uint2(1u),
+            thinSheet ? mat.coverageHash.xy : uint2(0u),
+            mat.tex1.z,
+            mat.pbr.w,
+            thinSheet,
+            false);
+        if (!coverageSample.covered) { discard; }
+    }
     GbufferOut o;
     // Double-sided geometry rasterizes both faces; invert the back-face normal (glTF) so the
     // screen-space AO/GI/SSR that read this G-buffer see the actually-visible face. Single-sided
     // geometry culls back faces, so `isFront` is always true and this is a no-op.
     float3 viewNormal = normalize(input.viewNormal);
-    if (!isFront) { viewNormal = -viewNormal; }
+    uint normalMode = mat.coverage.w;
+    if ((!isFront && (!thinSheet || normalMode == THIN_NORMAL_FACE_FORWARD_BACK))
+        || (thinSheet
+            && normalMode == THIN_NORMAL_SYMMETRIC
+            && dot(viewNormal, input.viewDirection) < 0.0))
+    {
+        viewNormal = -viewNormal;
+    }
     o.normalZ = float4(viewNormal, input.viewZ);
     o.roughness = input.roughness;
     return o;

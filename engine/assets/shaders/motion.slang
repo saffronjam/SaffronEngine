@@ -12,6 +12,11 @@
 // current clip = curViewProj  * model     * position
 // previous clip = prevViewProj * prevModel * prevPosition
 
+import coverage;
+import material_params;
+
+[[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
+
 struct Instance
 {
     float4x4 model;
@@ -23,6 +28,7 @@ struct Instance
     float4 emissive;
 };
 [[vk::binding(0, 2)]] StructuredBuffer<Instance> instances;
+[[vk::binding(2, 2)]] StructuredBuffer<MaterialParams> materialParams;
 
 struct Push
 {
@@ -44,6 +50,10 @@ struct VertexOutput
     float4 position : SV_Position;
     float4 curClip : TEXCOORD0;
     float4 prevClip : TEXCOORD1;
+    float3 worldPos : POSITION0;
+    float2 uv0 : TEXCOORD2;
+    nointerpolation uint materialIndex : TEXCOORD3;
+    float3 coverageAnchor : TEXCOORD4;
 };
 
 [shader("vertex")]
@@ -56,12 +66,37 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
     output.position = mul(pc.curViewProj, curWorld);
     output.curClip = output.position;
     output.prevClip = mul(pc.prevViewProj, prevWorld);
+    output.worldPos = curWorld.xyz;
+    output.uv0 = input.uv0;
+    output.materialIndex = inst.texture.w;
+    output.coverageAnchor = input.position;
     return output;
 }
 
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target
 {
+    MaterialParams mat = materialParams[input.materialIndex];
+    bool thinSheet = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u;
+    if (thinSheet || (mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
+    {
+        float2 uv = input.uv0 * mat.uv.xy + mat.uv.zw;
+        uint sourceIndex = thinSheet ? mat.coverage.x : mat.tex0.x;
+        CoverageSample coverageSample = sampleCanonicalCoverage(
+            albedoTextures[NonUniformResourceIndex(sourceIndex)],
+            uv,
+            input.coverageAnchor,
+            thinSheet ? mat.coverage.y : COVERAGE_SOURCE_ALBEDO_ALPHA,
+            thinSheet ? mat.coverage.z : COVERAGE_CLASS_MASKED,
+            mat.baseColor.a,
+            thinSheet ? mat.coverageHash.zw : uint2(1u),
+            thinSheet ? mat.coverageHash.xy : uint2(0u),
+            mat.tex1.z,
+            mat.pbr.w,
+            thinSheet,
+            false);
+        if (!coverageSample.covered) { discard; }
+    }
     float2 curNdc = input.curClip.xy / input.curClip.w;
     float2 prevNdc = input.prevClip.xy / input.prevClip.w;
     // NDC -> UV is *0.5 (+0.5); the offset is the NDC delta scaled by 0.5. Both clips use

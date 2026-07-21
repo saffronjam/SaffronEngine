@@ -3,6 +3,8 @@ module lighting;
 import lighting_common;
 import sdf;
 import giprobe;
+__exported import coverage;
+__exported import material_params;
 import sky_sh;
 
 // Instanced mesh shader. Vertex inputs come from an interleaved buffer
@@ -41,7 +43,8 @@ public struct VertexOutput
     public float3 worldPos : POSITION0;
     public float3 worldNormal : NORMAL;
     public float2 uv0 : TEXCOORD0;
-    public nointerpolation uint materialIndex : TEXCOORD1;  // index into materialParams (set 2, binding 2)
+    public float3 coverageAnchor : TEXCOORD1;
+    public nointerpolation uint materialIndex : TEXCOORD2;  // index into materialParams (set 2, binding 2)
 };
 
 struct Camera
@@ -108,15 +111,6 @@ public struct Instance
 // Set 2, binding 2: deduplicated per-material params, indexed by Instance.texture.w (the
 // material index). Many instances of one material share one entry; the fragment reads its
 // texture indices + factors from here. Layout mirrors MaterialParamsData (renderer_types.cppm).
-public struct MaterialParams
-{
-    public float4 baseColor;
-    public float4 pbr;       // x = metallic, y = roughness, z = normalStrength, w = alphaCutoff
-    public float4 emissive;  // rgb = radiance, w = heightScale
-    public float4 uv;        // tiling.xy, offset.xy
-    public uint4 tex0;       // albedo, orm/mr, normal, emissive (bindless indices)
-    public uint4 tex1;       // height, reserved, reserved, featureBits
-};
 [[vk::binding(2, 2)]] public StructuredBuffer<MaterialParams> materialParams;
 
 // Set 3: image-based lighting — raw-radiance sky SH, prefiltered specular cube, and
@@ -282,6 +276,7 @@ public VertexOutput transformVertex(VertexInput input, uint instanceIndex)
     output.position = mul(camera.viewProj, worldPos);
     output.worldNormal = mul((float3x3)inst.normalMatrix, input.normal);
     output.uv0 = input.uv0;
+    output.coverageAnchor = input.position;
     output.materialIndex = inst.texture.w;
     return output;
 }
@@ -306,6 +301,7 @@ public VertexOutput transformVertexSkinned(SkinnedVertexInput input, uint instan
     output.position = mul(camera.viewProj, worldPos);
     output.worldNormal = normalize(mul((float3x3)inst.normalMatrix, skinnedNormal));
     output.uv0 = input.uv0;
+    output.coverageAnchor = skinnedPos.xyz;
     output.materialIndex = inst.texture.w;
     return output;
 }
@@ -357,10 +353,67 @@ float3 brdf(float3 n, float3 v, float3 l, float3 albedo, float metallic, float r
     return (diff + spec) * radiance * ndotl;
 }
 
+// The material seam: evalSurface turns interpolated vertex data + bound textures into the
+// surface inputs the lighting consumes. Its body is the fixed glTF metallic-roughness path,
+// or node-graph codegen; the lighting below it is shared across material variants.
+public struct SurfaceData
+{
+    public float3 albedo;
+    public float metallic;
+    public float roughness;
+    public float3 normal;     // world-space, normalized
+    public float3 emissive;
+    public float occlusion;   // 1.0 = none; multiplies the ambient term
+    public float opacity;
+    public uint surfaceModel; // 0 standard, 1 thin sheet
+    public float frontFace;   // 1 front, 0 back
+    public float frontResponse;
+    public float backResponse;
+    public float thickness;
+    public float3 absorption;
+    public float3 transmission;
+    public float energyLimit;
+};
+
+float3 thinSheetTransmittance(SurfaceData surface, float ndotl)
+{
+    float opticalDepth = surface.thickness / max(abs(ndotl), 0.08);
+    return saturate(surface.transmission) * exp(-max(surface.absorption, 0.0) * opticalDepth);
+}
+
+float3 surfaceDirect(
+    SurfaceData surface,
+    float3 n,
+    float3 v,
+    float3 l,
+    float3 radiance)
+{
+    if (surface.surfaceModel == 0u)
+    {
+        return brdf(n, v, l, surface.albedo, surface.metallic, surface.roughness, radiance);
+    }
+    float signedNdotL = dot(n, l);
+    float response = surface.frontFace > 0.5 ? surface.frontResponse : surface.backResponse;
+    float3 transmittance = thinSheetTransmittance(surface, signedNdotL);
+    float energy = response + max(transmittance.r, max(transmittance.g, transmittance.b));
+    float scale = min(1.0, surface.energyLimit / max(energy, 1e-5));
+    float3 reflected = brdf(
+        n,
+        v,
+        l,
+        surface.albedo,
+        0.0,
+        surface.roughness,
+        radiance) * response;
+    float3 transmitted =
+        surface.albedo * transmittance * radiance * max(-signedNdotL, 0.0) / PI;
+    return (reflected + transmitted) * scale;
+}
+
 // One punctual light's Cook-Torrance contribution at a world-space surface point.
 // `lightIndex` lets the shadowed spot light apply its shadow-map visibility.
 float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 v,
-                float3 albedo, float metallic, float roughness)
+                SurfaceData surface)
 {
     float3 toLight = lt.positionRange.xyz - worldPos;
     float dist = length(toLight);
@@ -396,22 +449,8 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
         shadow = pointShadow(pointShadowMap, pointShadowMapDynamic, globals.pointShadow.xyz, worldPos);
     }
     float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a * attenuation * cone * shadow;
-    return brdf(n, v, l, albedo, metallic, roughness, radiance);
+    return surfaceDirect(surface, n, v, l, radiance);
 }
-
-// The material seam: evalSurface turns interpolated vertex data + bound textures into the
-// surface inputs the lighting consumes. Its body is the fixed glTF metallic-roughness path,
-// or node-graph codegen; the lighting below it is shared across material variants.
-public struct SurfaceData
-{
-    public float3 albedo;
-    public float metallic;
-    public float roughness;
-    public float3 normal;     // world-space, normalized
-    public float3 emissive;
-    public float occlusion;   // 1.0 = none; multiplies the ambient term
-    public float opacity;
-};
 
 public struct MaterialInput
 {
@@ -424,20 +463,13 @@ public struct MaterialInput
 
 // Material feature bits (MaterialParams.tex1.w). Optional samples are taken only when set, so a
 // material without the map pays nothing (a uniform, wave-coherent branch).
-public static const uint FEATURE_NORMAL = 1u;
-public static const uint FEATURE_EMISSIVE_TEX = 2u;
-public static const uint FEATURE_OCCLUSION = 4u;
-public static const uint FEATURE_HEIGHT = 8u;
-public static const uint FEATURE_ALPHACLIP = 16u;
 // The height map drives real geometry displacement (a `displace` compute pre-pass bakes it into the
 // deformed vertex buffer — true silhouette, consistent across every pass, BLAS-able) rather than the
 // fragment parallax march. The fragment still reads it for a height-gradient shading normal. Mutually
 // exclusive with FEATURE_HEIGHT (the material sets exactly one height bit, or none).
-public static const uint FEATURE_DISPLACE = 32u;
 // The height map perturbs only the fragment shading normal (a height-to-normal bump) — no parallax
 // march, no geometry. The safe, flat-silhouette baseline; shares the gradient-normal fragment path
 // with FEATURE_DISPLACE (which additionally moves the vertices in the compute pre-pass).
-public static const uint FEATURE_HEIGHT_BUMP = 64u;
 
 // Per-fragment tangent frame from screen-space derivatives (no stored tangents needed). Schüler's
 // method: solve for the tangent/bitangent that map the UV gradients onto the world-position gradients.
@@ -579,17 +611,25 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     }
     shadow *= cloudShadowVisibility(
         input.worldPos, cloudShadowMap, globals, globals.cloudShadowMeta.z);
-    float3 lo = brdf(n, v, lDir, albedo, metallic, roughness,
-                     globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
+    float3 lo = surfaceDirect(
+        surf,
+        n,
+        v,
+        lDir,
+        globals.colorIntensity.rgb * globals.colorIntensity.a) * shadow;
     float3 moonDir = -normalize(globals.moonDirectionIntensity.xyz);
-    lo += brdf(n, v, moonDir, albedo, metallic, roughness,
-               globals.moonColor.rgb * globals.moonDirectionIntensity.w);
+    lo += surfaceDirect(
+        surf,
+        n,
+        v,
+        moonDir,
+        globals.moonColor.rgb * globals.moonDirectionIntensity.w);
 
     // Punctual lights. ReSTIR (screenFlags.w) replaces the per-light loop with one resolved
     // stochastic many-light direct radiance sample (diffuse term); otherwise loop the
     // froxel cluster's lights (clustered) or every light (reference).
 #ifndef SAFFRON_NO_RT
-    if (globals.screenFlags.w != 0 && !translucent)
+    if (globals.screenFlags.w != 0 && !translucent && surf.surfaceModel == SURFACE_STANDARD)
     {
         // ReSTIR's resolved direct radiance is a screen-space buffer keyed to the opaque G-buffer, so
         // a translucent fragment falls through to the real clustered/reference punctual loop instead.
@@ -607,14 +647,14 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         for (uint i = 0; i < count; i = i + 1)
         {
             uint li = clusters[clusterIndex].indices[i];
-            lo += punctual(lights[li], li, input.worldPos, n, v, albedo, metallic, roughness);
+            lo += punctual(lights[li], li, input.worldPos, n, v, surf);
         }
     }
     else
     {
         for (uint i = 0; i < globals.counts.x; i = i + 1)
         {
-            lo += punctual(lights[i], i, input.worldPos, n, v, albedo, metallic, roughness);
+            lo += punctual(lights[i], i, input.worldPos, n, v, surf);
         }
     }
 
@@ -802,6 +842,36 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
             ambient += ddgi.rgb * ddgi.w * albedo * (1.0 - metallic);
         }
     }
+    if (surf.surfaceModel == SURFACE_THIN_SHEET)
+    {
+        float response = surf.frontFace > 0.5 ? surf.frontResponse : surf.backResponse;
+        float3 transmittance = thinSheetTransmittance(surf, 1.0);
+        float energy = response + max(transmittance.r, max(transmittance.g, transmittance.b));
+        float scale = min(1.0, surf.energyLimit / max(energy, 1e-5));
+        float3 oppositeIrradiance;
+        if (globals.counts.z != 0)
+        {
+            oppositeIrradiance = skyShIrradiance(-n, skyShCoefficients);
+            if (globals.screenFlags.z != 0)
+            {
+                float4 oppositeDdgi = ddgiSampleIrradiance(
+                    ddgiVolumeFromGlobals(),
+                    ddgiIrradiance,
+                    ddgiDistance,
+                    input.worldPos,
+                    -n);
+                oppositeIrradiance = lerp(oppositeIrradiance, oppositeDdgi.rgb, oppositeDdgi.w);
+            }
+        }
+        else
+        {
+            oppositeIrradiance = globals.ambientColor.rgb;
+        }
+        ambient = (ambient * response
+            + oppositeIrradiance * surf.albedo * transmittance / PI) * scale;
+        reflectionSpec *= response * scale;
+    }
+
     // Two view modes peel a single term off the composed result.
     uint channel = debugViewChannel();
     if (channel == 9u)  // Reflections: IBL specular only

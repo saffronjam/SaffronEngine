@@ -161,6 +161,7 @@ void meshMain(
         o.position = mul(push.viewProj, worldPos);
         o.worldNormal = mul((float3x3)inst.normalMatrix, normal);
         o.uv0 = uv0;
+        o.coverageAnchor = position;
         o.materialIndex = inst.texture.w;
         verts[tid] = o;
     }

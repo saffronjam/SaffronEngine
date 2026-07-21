@@ -33,6 +33,15 @@ SurfaceData evalSurface(MaterialInput m)
     }
 
     SurfaceData s;
+    bool thinSheet = (features & FEATURE_THIN_SHEET) != 0u;
+    s.surfaceModel = thinSheet ? SURFACE_THIN_SHEET : SURFACE_STANDARD;
+    s.frontFace = 1.0;
+    s.frontResponse = thinSheet ? mat.thinReflection.x : 1.0;
+    s.backResponse = thinSheet ? mat.thinReflection.y : 1.0;
+    s.thickness = thinSheet ? mat.thinReflection.w : 0.0;
+    s.absorption = thinSheet ? mat.thinAbsorption.rgb : float3(0.0);
+    s.transmission = thinSheet ? mat.thinTransmission.rgb : float3(0.0);
+    s.energyLimit = thinSheet ? mat.thinAbsorption.w : 1.0;
     // Node-graph codegen replaces the block between the markers (see compileMaterialMeshShader); the
     // default below is the fixed glTF metallic-roughness path. `mat`/`uv`/`m`/`albedoTextures` are in scope.
     // @graph-begin
@@ -44,7 +53,8 @@ SurfaceData evalSurface(MaterialInput m)
     // default white texture (when a material has none) leaves the factors unchanged.
     float4 mr = albedoTextures[NonUniformResourceIndex(mat.tex0.y)].Sample(uv);
     s.metallic = saturate(mat.pbr.x * mr.b);
-    s.roughness = clamp(mat.pbr.y * mr.g, 0.045, 1.0);
+    float authoredRoughness = thinSheet ? mat.thinReflection.z : mat.pbr.y;
+    s.roughness = clamp(authoredRoughness * mr.g, 0.045, 1.0);
 
     // Ambient occlusion (AO in R), only when a map is present.
     s.occlusion = 1.0;
@@ -105,15 +115,31 @@ VertexOutput vertexMainSkinned(SkinnedVertexInput input, uint instanceIndex : SV
 // Reads only material params (set 2) + albedo (set 0), never `globals` (set 1), so the prepass PSO
 // binds no light set. The test mirrors `fragmentMain` exactly so the depth matches at edges.
 [shader("fragment")]
-void depthPrepassFragment(VertexOutput input)
+float depthPrepassFragment(VertexOutput input) : SV_Target
 {
     MaterialParams mat = materialParams[input.materialIndex];
-    if ((mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
+    bool thinSheet = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u;
+    if (thinSheet || (mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
     {
         float2 uv = input.uv0 * mat.uv.xy + mat.uv.zw;
-        float alpha = albedoTextures[NonUniformResourceIndex(mat.tex0.x)].Sample(uv).a * mat.baseColor.a;
-        if (alpha < mat.pbr.w) { discard; }
+        uint sourceIndex = thinSheet ? mat.coverage.x : mat.tex0.x;
+        CoverageSample coverage = sampleCanonicalCoverage(
+            albedoTextures[NonUniformResourceIndex(sourceIndex)],
+            uv,
+            input.coverageAnchor,
+            thinSheet ? mat.coverage.y : COVERAGE_SOURCE_ALBEDO_ALPHA,
+            thinSheet ? mat.coverage.z : COVERAGE_CLASS_MASKED,
+            mat.baseColor.a,
+            thinSheet ? mat.coverageHash.zw : uint2(1u),
+            thinSheet ? mat.coverageHash.xy : uint2(0u),
+            mat.tex1.z,
+            mat.pbr.w,
+            thinSheet,
+            kAlphaToCoverage);
+        if (!coverage.covered) { discard; }
+        return coverage.alpha;
     }
+    return 1.0;
 }
 
 // Reactive-coverage fragment: the TAA reactive mask's producer. The reactive-coverage pass draws
@@ -135,27 +161,60 @@ float4 fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace) : SV_Targ
     // IBL along the wrong hemisphere. Single-sided materials cull back faces, so `isFront` is always
     // true for them and this is a no-op. Flip the interpolated normal in this by-value copy so the whole
     // downstream chain (tangent frame, normal-map perturb, the specular horizon term) sees it.
-    if (!isFront) { input.worldNormal = -input.worldNormal; }
+    MaterialParams coverageMaterial = materialParams[input.materialIndex];
+    bool thinSheet = (coverageMaterial.tex1.w & FEATURE_THIN_SHEET) != 0u;
+    uint normalMode = coverageMaterial.coverage.w;
+    float3 viewDirection = makeMaterialInput(input).viewDir;
+    if ((!isFront && (!thinSheet || normalMode == THIN_NORMAL_FACE_FORWARD_BACK))
+        || (thinSheet
+            && normalMode == THIN_NORMAL_SYMMETRIC
+            && dot(input.worldNormal, viewDirection) < 0.0))
+    {
+        input.worldNormal = -input.worldNormal;
+    }
+
+    bool standardMasked = (coverageMaterial.tex1.w & FEATURE_ALPHACLIP) != 0u;
+    CoverageSample canonicalCoverage;
+    canonicalCoverage.alpha = 1.0;
+    canonicalCoverage.covered = true;
+    if (thinSheet || standardMasked)
+    {
+        float2 coverageUv = input.uv0 * coverageMaterial.uv.xy + coverageMaterial.uv.zw;
+        uint sourceIndex = thinSheet ? coverageMaterial.coverage.x : coverageMaterial.tex0.x;
+        uint sourceKind = thinSheet
+            ? coverageMaterial.coverage.y
+            : COVERAGE_SOURCE_ALBEDO_ALPHA;
+        uint classification = thinSheet
+            ? coverageMaterial.coverage.z
+            : COVERAGE_CLASS_MASKED;
+        canonicalCoverage = sampleCanonicalCoverage(
+            albedoTextures[NonUniformResourceIndex(sourceIndex)],
+            coverageUv,
+            input.coverageAnchor,
+            sourceKind,
+            classification,
+            coverageMaterial.baseColor.a,
+            thinSheet ? coverageMaterial.coverageHash.zw : uint2(1u),
+            thinSheet ? coverageMaterial.coverageHash.xy : uint2(0u),
+            coverageMaterial.tex1.z,
+            coverageMaterial.pbr.w,
+            thinSheet,
+            kAlphaToCoverage && classification == COVERAGE_CLASS_MASKED);
+        if (!canonicalCoverage.covered) { discard; }
+    }
     MaterialInput mi = makeMaterialInput(input);
     SurfaceData surf = evalSurface(mi);
-    bool masked = (mi.mat.tex1.w & FEATURE_ALPHACLIP) != 0u;
-    float cutoff = mi.mat.pbr.w;
-    // Alpha-to-coverage (masked + MSAA): rescale alpha around the cutoff by its screen-space
-    // derivative so the transition spans ~one pixel, giving a crisp anti-aliased edge instead of a
-    // hard 1-bit cut. The A2C-enabled PSO reads the returned `.a` as per-sample coverage; a fully
-    // outside fragment (coverage <= 0) is still discarded.
-    if (masked && kAlphaToCoverage)
+    surf.frontFace = isFront ? 1.0 : 0.0;
+    if (thinSheet)
     {
-        float coverage = saturate((surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5);
-        if (coverage <= 0.0) { discard; }
-        float4 lit = evalViewMode(input, surf, kUnlit, kTranslucent);
-        lit.a = coverage;
-        return lit;
+        surf.metallic = 0.0;
+        surf.opacity = canonicalCoverage.alpha;
     }
-    // The hard alpha-test cutout (masked without MSAA, or A2C off): a per-pixel discard.
-    if (masked && (surf.opacity < cutoff))
+    if ((thinSheet || standardMasked) && kAlphaToCoverage)
     {
-        discard;
+        float4 lit = evalViewMode(input, surf, kUnlit, kTranslucent);
+        lit.a = canonicalCoverage.alpha;
+        return lit;
     }
     // Resolve the active view mode (full shading, a debug channel, or the unlit permutation). Debug
     // channels write into the HDR scene color, so tonemap still applies — values are display-referred.
