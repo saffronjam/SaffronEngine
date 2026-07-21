@@ -4,7 +4,7 @@ members = ["crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 version = "0.1.0"
 license = "MIT"
 authors = ["Saffron Anima"]
@@ -59,6 +59,8 @@ image = "0.25"
 resvg = "0.44"
 usvg = "0.44"
 tiny-skia = "0.11"
+optimesh = "1.1.0"
+zstd = "=0.13.3"
 
 # Syscalls & CLI.
 rustix = "0.38"
@@ -113,6 +115,10 @@ all = "warn"
 opt-level = 0
 debug = true
 overflow-checks = true
+incremental = false
+
+[profile.test]
+incremental = false
 
 # Optimize dependencies even in a debug engine build — the idiomatic Rust expression of
 # CMake's implicit "third-party code (glam, Jolt via saffron-physics-sys, ash inlining)
