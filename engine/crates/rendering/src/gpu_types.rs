@@ -161,7 +161,8 @@ impl Default for SdfInstance {
 /// Many instances of one material share one entry (deduplicated per frame by hashing
 /// the raw bytes — so the layout below is load-bearing past correctness).
 ///
-/// Six 16-byte blocks.
+/// Sixteen 16-byte blocks. The final ten blocks are the complete thin-sheet and
+/// aggregate-cluster contract; standard materials leave them zeroed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialParamsData {
@@ -175,13 +176,33 @@ pub struct MaterialParamsData {
     pub uv: Vec4,
     /// Bindless indices: `albedo, orm/mr, normal, emissive`.
     pub tex0: UVec4,
-    /// `height, reserved, reserved, featureBits`.
+    /// `height, occlusion, coverageTemporalPhase, featureBits`.
     pub tex1: UVec4,
+    /// `frontResponse, backResponse, thinRoughness, thicknessMetres`.
+    pub thin_reflection: Vec4,
+    /// `rgb` Beer-Lambert absorption coefficients, `w` energy limit.
+    pub thin_absorption: Vec4,
+    /// `rgb` transmitted-light tint, `w` reserved.
+    pub thin_transmission: Vec4,
+    /// `coverageTexture, sourceKind, classification, normalMode`.
+    pub coverage: UVec4,
+    /// `saltLo, saltHi, sourceWidth, sourceHeight`.
+    pub coverage_hash: UVec4,
+    /// `occupancy, roughnessMean, thicknessMean, reserved`.
+    pub aggregate0: Vec4,
+    /// Coverage-weighted aggregate albedo mean.
+    pub aggregate_albedo: Vec4,
+    /// Coverage-weighted aggregate transmission mean.
+    pub aggregate_transmission: Vec4,
+    /// Aggregate normal second moments `xx, yy, zz, xy`.
+    pub aggregate_normal0: Vec4,
+    /// Aggregate normal second moments `xz, yz, 0, 0`.
+    pub aggregate_normal1: Vec4,
 }
 
 const _: () = assert!(
-    size_of::<MaterialParamsData>() == 96,
-    "MaterialParamsData must match the std430 shader layout (6x 16-byte blocks)"
+    size_of::<MaterialParamsData>() == 256,
+    "MaterialParamsData must match the std430 shader layout (16x 16-byte blocks)"
 );
 
 // The per-frame dedup key is the struct's raw bytes. `glam::Vec4` is float-backed,
@@ -212,6 +233,16 @@ impl Default for MaterialParamsData {
             uv: Vec4::new(1.0, 1.0, 0.0, 0.0),
             tex0: UVec4::ZERO,
             tex1: UVec4::ZERO,
+            thin_reflection: Vec4::ZERO,
+            thin_absorption: Vec4::ZERO,
+            thin_transmission: Vec4::ZERO,
+            coverage: UVec4::ZERO,
+            coverage_hash: UVec4::ZERO,
+            aggregate0: Vec4::ZERO,
+            aggregate_albedo: Vec4::ZERO,
+            aggregate_transmission: Vec4::ZERO,
+            aggregate_normal0: Vec4::ZERO,
+            aggregate_normal1: Vec4::ZERO,
         }
     }
 }
@@ -262,6 +293,7 @@ impl MaterialParamsData {
             uv: Vec4::new(uv_tiling[0], uv_tiling[1], uv_offset[0], uv_offset[1]),
             tex0,
             tex1,
+            ..Self::default()
         }
     }
 }
@@ -271,12 +303,12 @@ mod tests {
     use super::*;
     use std::mem::offset_of;
 
-    /// `MaterialParamsData` is exactly 96 bytes with each field at the std430 offset
+    /// `MaterialParamsData` is exactly 256 bytes with each field at the std430 offset
     /// the Slang shader reads — the contract the per-frame material dedup hashes by
     /// raw bytes (README §3). The phase's named layout gate.
     #[test]
     fn material_params_data_byte_layout_matches_std430() {
-        assert_eq!(size_of::<MaterialParamsData>(), 96);
+        assert_eq!(size_of::<MaterialParamsData>(), 256);
         assert_eq!(align_of::<MaterialParamsData>(), 16);
         assert_eq!(offset_of!(MaterialParamsData, base_color), 0);
         assert_eq!(offset_of!(MaterialParamsData, pbr), 16);
@@ -284,6 +316,16 @@ mod tests {
         assert_eq!(offset_of!(MaterialParamsData, uv), 48);
         assert_eq!(offset_of!(MaterialParamsData, tex0), 64);
         assert_eq!(offset_of!(MaterialParamsData, tex1), 80);
+        assert_eq!(offset_of!(MaterialParamsData, thin_reflection), 96);
+        assert_eq!(offset_of!(MaterialParamsData, thin_absorption), 112);
+        assert_eq!(offset_of!(MaterialParamsData, thin_transmission), 128);
+        assert_eq!(offset_of!(MaterialParamsData, coverage), 144);
+        assert_eq!(offset_of!(MaterialParamsData, coverage_hash), 160);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate0), 176);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_albedo), 192);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_transmission), 208);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_normal0), 224);
+        assert_eq!(offset_of!(MaterialParamsData, aggregate_normal1), 240);
     }
 
     /// `InstanceData` is exactly 256 bytes with each field at the std430 offset the

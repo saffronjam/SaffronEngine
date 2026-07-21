@@ -54,6 +54,8 @@ pub struct DrawListInputs {
     pub wireframe: bool,
     /// The default white bindless slot used for any absent material texture.
     pub default_texture_index: u32,
+    /// Deterministic TAA coverage phase shared by every geometry pass this frame.
+    pub coverage_temporal_phase: u32,
     /// Whether an RT consumer is armed this frame — gates building the skinned RT-instance
     /// list (a non-RT scene pays nothing).
     pub rt_skinned: bool,
@@ -197,6 +199,7 @@ impl Instancing {
             view_proj,
             wireframe,
             default_texture_index,
+            coverage_temporal_phase,
             rt_skinned,
             displace_enabled,
             tess_factor_cap,
@@ -298,6 +301,7 @@ impl Instancing {
                 item,
                 prev_model,
                 default_texture_index,
+                coverage_temporal_phase,
                 &mut material_table,
                 &mut material_dedup,
                 &mut live_textures,
@@ -996,6 +1000,7 @@ fn build_instance_rows(
     item: &DrawItem,
     prev_model: Mat4,
     default_texture_index: u32,
+    coverage_temporal_phase: u32,
     material_table: &mut Vec<MaterialParamsData>,
     material_dedup: &mut HashMap<MaterialParamsData, u32>,
     live_textures: &mut Vec<Arc<crate::GpuTexture>>,
@@ -1008,8 +1013,12 @@ fn build_instance_rows(
             .get(s.min(item.submesh_materials.len().saturating_sub(1)))
             .cloned()
             .unwrap_or_default();
-        let (params, albedo_index, mr_index) =
-            resolve_material(&material, default_texture_index, live_textures);
+        let (params, albedo_index, mr_index) = resolve_material(
+            &material,
+            default_texture_index,
+            coverage_temporal_phase,
+            live_textures,
+        );
         let material_index = intern_material(params, material_table, material_dedup);
 
         rows.push(InstanceData {
@@ -1033,6 +1042,7 @@ fn build_instance_rows(
 fn resolve_material(
     material: &SubmeshMaterial,
     default_texture_index: u32,
+    coverage_temporal_phase: u32,
     live_textures: &mut Vec<Arc<crate::GpuTexture>>,
 ) -> (MaterialParamsData, u32, u32) {
     let mut albedo_index = default_texture_index;
@@ -1041,6 +1051,7 @@ fn resolve_material(
     let mut occlusion_index = default_texture_index;
     let mut emissive_index = default_texture_index;
     let mut height_index = default_texture_index;
+    let mut coverage_index = default_texture_index;
     let mut features = 0u32;
 
     let mut pin = |texture: &Option<Arc<crate::GpuTexture>>, slot: &mut u32| -> bool {
@@ -1078,6 +1089,72 @@ fn resolve_material(
         features |= FEATURE_ALPHACLIP;
     }
 
+    let (thin_reflection, thin_absorption, thin_transmission, coverage, coverage_hash) =
+        if let Some(thin) = material.thin_sheet {
+            features |= FEATURE_THIN_SHEET;
+            pin(&material.coverage_texture, &mut coverage_index);
+            let salt = thin.coverage_hash_salt;
+            (
+                Vec4::new(
+                    thin.front_albedo_response,
+                    thin.back_albedo_response,
+                    thin.roughness,
+                    thin.thickness,
+                ),
+                thin.absorption.extend(thin.energy_limit),
+                thin.transmission.extend(0.0),
+                UVec4::new(
+                    coverage_index,
+                    thin.coverage_source as u32,
+                    thin.coverage_classification as u32,
+                    thin.normal_mode as u32,
+                ),
+                UVec4::new(
+                    salt as u32,
+                    (salt >> 32) as u32,
+                    thin.coverage_source_extent[0],
+                    thin.coverage_source_extent[1],
+                ),
+            )
+        } else {
+            (Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, UVec4::ZERO, UVec4::ZERO)
+        };
+
+    let (
+        aggregate0,
+        aggregate_albedo,
+        aggregate_transmission,
+        aggregate_normal0,
+        aggregate_normal1,
+    ) = material.thin_sheet.map_or(
+        (Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO),
+        |thin| {
+            let moments = thin.aggregate;
+            (
+                Vec4::new(
+                    moments.occupancy,
+                    moments.roughness_mean,
+                    moments.thickness_mean,
+                    0.0,
+                ),
+                moments.albedo_mean.extend(0.0),
+                moments.transmission_mean.extend(0.0),
+                Vec4::from_array([
+                    moments.normal_second_moments[0],
+                    moments.normal_second_moments[1],
+                    moments.normal_second_moments[2],
+                    moments.normal_second_moments[3],
+                ]),
+                Vec4::new(
+                    moments.normal_second_moments[4],
+                    moments.normal_second_moments[5],
+                    0.0,
+                    0.0,
+                ),
+            )
+        },
+    );
+
     let params = MaterialParamsData {
         base_color: material.base_color,
         pbr: Vec4::new(
@@ -1094,7 +1171,22 @@ fn resolve_material(
             material.uv_offset.y,
         ),
         tex0: UVec4::new(albedo_index, mr_index, normal_index, emissive_index),
-        tex1: UVec4::new(height_index, occlusion_index, 0, features),
+        tex1: UVec4::new(
+            height_index,
+            occlusion_index,
+            coverage_temporal_phase,
+            features,
+        ),
+        thin_reflection,
+        thin_absorption,
+        thin_transmission,
+        coverage,
+        coverage_hash,
+        aggregate0,
+        aggregate_albedo,
+        aggregate_transmission,
+        aggregate_normal0,
+        aggregate_normal1,
     };
     (params, albedo_index, mr_index)
 }
@@ -1115,6 +1207,8 @@ const FEATURE_DISPLACE: u32 = 32;
 /// `HEIGHT_BUMP` feature bit: the height map perturbs only the fragment shading normal — no
 /// parallax march, no geometry — the safe, artifact-free baseline.
 const FEATURE_HEIGHT_BUMP: u32 = 64;
+/// `THIN_SHEET` feature bit: the material uses the complete two-sided foliage response.
+const FEATURE_THIN_SHEET: u32 = 128;
 
 /// Interns a material into the frame's deduplicated table, hashing its raw bytes (the
 /// [`MaterialParamsData`] `Hash`/`Eq` are byte-exact), so identical materials collapse
@@ -1273,6 +1367,7 @@ mod tests {
             view_proj: Mat4::IDENTITY,
             wireframe: false,
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
+            coverage_temporal_phase: 0,
             rt_skinned: false,
             displace_enabled: true,
             tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
@@ -1579,7 +1674,7 @@ mod tests {
     /// Re-derives a submesh material's std430 params for the dedup assertion above.
     fn material_params(material: &SubmeshMaterial) -> MaterialParamsData {
         let mut live = Vec::new();
-        resolve_material(material, crate::DEFAULT_WHITE_SLOT, &mut live).0
+        resolve_material(material, crate::DEFAULT_WHITE_SLOT, 0, &mut live).0
     }
 
     /// The grow policy seeds from `initial` when empty, doubles to cover `count`, and

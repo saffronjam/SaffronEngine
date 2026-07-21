@@ -16,9 +16,84 @@ use std::sync::Arc;
 use ash::vk;
 use saffron_core::{BlendMode, HeightMode};
 use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
+use saffron_vegetation::AlphaClassification;
 
 use crate::gpu_types::Material;
 use crate::resources::{GpuMesh, GpuTexture, Pipeline};
+
+/// Canonical coverage source sampled by every foliage raster path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CoverageSourceKind {
+    /// Alpha from the material's base-color texture.
+    #[default]
+    AlbedoAlpha = 0,
+    /// Alpha from a dedicated coverage texture.
+    Texture = 1,
+    /// The modeled silhouette is fully covered.
+    ModeledGeometry = 2,
+}
+
+/// Normal orientation policy for the two faces of a thin sheet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ThinSheetNormalMode {
+    /// Keep the authored geometric/tangent orientation on both faces.
+    Preserve = 0,
+    /// Flip the back face toward the observer while retaining tangent detail.
+    #[default]
+    FaceForwardBack = 1,
+    /// Use an observer-facing symmetric lobe on both faces.
+    Symmetric = 2,
+}
+
+/// Coverage/material statistics consumed by aggregate virtual-geometry clusters.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AggregateMaterialMoments {
+    /// Occupied projected-area fraction.
+    pub occupancy: f32,
+    /// Coverage-weighted albedo mean.
+    pub albedo_mean: Vec3,
+    /// Coverage-weighted roughness mean.
+    pub roughness_mean: f32,
+    /// Coverage-weighted transmitted-energy mean.
+    pub transmission_mean: Vec3,
+    /// Coverage-weighted physical thickness mean in metres.
+    pub thickness_mean: f32,
+    /// Normal second moments in XX/YY/ZZ/XY/XZ/YZ order.
+    pub normal_second_moments: [f32; 6],
+}
+
+/// Render-ready optical and coverage parameters for one thin foliage sheet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThinSheetMaterial {
+    /// Front-face reflected albedo response.
+    pub front_albedo_response: f32,
+    /// Back-face reflected albedo response.
+    pub back_albedo_response: f32,
+    /// Physical sheet thickness in metres.
+    pub thickness: f32,
+    /// Beer-Lambert absorption coefficients.
+    pub absorption: Vec3,
+    /// Transmitted-light tint.
+    pub transmission: Vec3,
+    /// Thin-sheet reflection/transmission lobe roughness.
+    pub roughness: f32,
+    /// Two-sided shading-normal policy.
+    pub normal_mode: ThinSheetNormalMode,
+    /// Where canonical coverage alpha comes from.
+    pub coverage_source: CoverageSourceKind,
+    /// How sampled alpha is classified.
+    pub coverage_classification: AlphaClassification,
+    /// Stable object-space stochastic-coverage salt.
+    pub coverage_hash_salt: u64,
+    /// Source dimensions used to anchor stochastic coverage to texels.
+    pub coverage_source_extent: [u32; 2],
+    /// Upper bound for reflected plus transmitted energy.
+    pub energy_limit: f32,
+    /// Aggregate-cluster material statistics derived from this response.
+    pub aggregate: AggregateMaterialMoments,
+}
 
 /// One submesh's material: its textures (each `None` → the default white slot) plus
 /// the PBR factors that fold into the per-frame [`crate::MaterialParamsData`].
@@ -44,6 +119,8 @@ pub struct SubmeshMaterial {
     /// `displace` pre-pass offsets each vertex through its TBN by this field instead of scalar height,
     /// so overhangs/undercuts become real geometry. `None` → scalar displacement along the normal.
     pub vector_displacement_texture: Option<Arc<GpuTexture>>,
+    /// Coverage-preserving mip chain for thin-sheet alpha classification.
+    pub coverage_texture: Option<Arc<GpuTexture>>,
     /// Base color (RGBA), multiplied with the albedo texture.
     pub base_color: Vec4,
     /// Metallic factor.
@@ -76,6 +153,8 @@ pub struct SubmeshMaterial {
     /// Two-sided (glTF `doubleSided`): the scene pass disables backface culling for this submesh so
     /// both faces shade (curtains, foliage); single-sided submeshes cull `BACK`.
     pub double_sided: bool,
+    /// Physically defined thin-sheet response. `None` selects the standard PBR model.
+    pub thin_sheet: Option<ThinSheetMaterial>,
 }
 
 impl SubmeshMaterial {
@@ -87,6 +166,7 @@ impl SubmeshMaterial {
             metallic_roughness_texture: None,
             normal_texture: None,
             vector_displacement_texture: None,
+            coverage_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
             height_texture: None,
@@ -103,6 +183,7 @@ impl SubmeshMaterial {
             blend_mode: BlendMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
+            thin_sheet: None,
         }
     }
 }
@@ -173,7 +254,7 @@ pub fn normal_matrix(model: Mat4) -> Mat4 {
 }
 
 /// The per-frame handles a tessellated (`HeightMode::Displacement`) batch draws through — the
-/// amplified geometry the Phase-4 emit kernel wrote into `TransientResources`. Filled by
+/// amplified geometry the Phase-4 emit kernel wrote into `RenderGraphResources`. Filled by
 /// [`crate::Renderer`]'s `record_tess_prep` once the per-frame transients are acquired (the base
 /// instance links a batch to its tessellated slice), then read by the raster passes' indirect draw.
 #[derive(Clone, Copy)]
