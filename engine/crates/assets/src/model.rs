@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use saffron_core::Uuid;
 use saffron_geometry::{
-    ChunkKind, ContainerReader, MeshCounts, SModelHeader, mesh_counts_from_bytes, mesh_file_counts,
-    read_container, read_container_header,
+    ChunkKind, ContainerReader, ImportedNode, MeshCounts, SModelHeader, glam::Mat4,
+    mesh_counts_from_bytes, mesh_file_counts, read_container, read_container_header,
 };
 use saffron_json::{
     Value, dump_json_sorted, json_f32_or, json_string_or, json_u64_or, parse_json, uuid_to_json,
@@ -29,6 +29,48 @@ use saffron_scene::{AssetEntry, AssetType};
 use crate::AssetServer;
 use crate::error::{Error, Result};
 use crate::names::{asset_type_from_name, asset_type_name};
+
+/// Composes one validated imported node forest into source-root transforms.
+pub(crate) fn imported_node_world_transforms(nodes: &[ImportedNode]) -> Result<Vec<Mat4>> {
+    let locals = nodes
+        .iter()
+        .map(|node| {
+            let transform =
+                Mat4::from_scale_rotation_translation(node.scale, node.rotation, node.translation);
+            if transform.is_finite() {
+                Ok(transform)
+            } else {
+                Err(Error::Io("model node transform is non-finite".to_owned()))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut world = Vec::with_capacity(nodes.len());
+    for index in 0..nodes.len() {
+        let mut transform = locals[index];
+        let mut parent = nodes[index].parent;
+        let mut active = std::collections::BTreeSet::new();
+        active.insert(index);
+        while parent >= 0 {
+            let parent_index = usize::try_from(parent)
+                .map_err(|_| Error::Io("model node parent is invalid".to_owned()))?;
+            let parent_transform = locals
+                .get(parent_index)
+                .ok_or_else(|| Error::Io("model node parent is out of range".to_owned()))?;
+            if !active.insert(parent_index) {
+                return Err(Error::Io(
+                    "model node hierarchy contains a cycle".to_owned(),
+                ));
+            }
+            transform = *parent_transform * transform;
+            parent = nodes[parent_index].parent;
+        }
+        if parent != -1 {
+            return Err(Error::Io("model node parent is invalid".to_owned()));
+        }
+        world.push(transform);
+    }
+    Ok(world)
+}
 
 /// The metadata-chunk schema version this build writes and accepts. Forward
 /// compatible: a reader ignores unknown keys, so a v1 reader survives a later schema
@@ -480,21 +522,21 @@ impl AssetServer {
         sub_id: Uuid,
     ) -> ByteSource {
         let key = sub_id.value().to_string();
-        if let Some(remap) = model.meta.remap.as_object().and_then(|m| m.get(&key)) {
-            if let Some(external) = remap.get("external").and_then(Value::as_str) {
-                let external_path = format!("{}/{}", self.root.display(), external);
-                if Path::new(&external_path).exists() {
-                    return ByteSource {
-                        path: external_path,
-                        ..ByteSource::default()
-                    };
-                }
-                tracing::warn!(
-                    "model {}: remap target '{external}' for sub-asset {} is missing; using the embedded chunk",
-                    model.meta.model_id.value(),
-                    sub_id.value()
-                );
+        if let Some(remap) = model.meta.remap.as_object().and_then(|m| m.get(&key))
+            && let Some(external) = remap.get("external").and_then(Value::as_str)
+        {
+            let external_path = format!("{}/{}", self.root.display(), external);
+            if Path::new(&external_path).exists() {
+                return ByteSource {
+                    path: external_path,
+                    ..ByteSource::default()
+                };
             }
+            tracing::warn!(
+                "model {}: remap target '{external}' for sub-asset {} is missing; using the embedded chunk",
+                model.meta.model_id.value(),
+                sub_id.value()
+            );
         }
         match model.reader.find(kind, sub_id.value()) {
             Some(entry) => ByteSource {
