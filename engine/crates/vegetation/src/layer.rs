@@ -7,6 +7,7 @@ use saffron_spatial::{
     DecisionScalar, DecisionVec3, FieldChannel, UnitInterval, WorldBounds, WorldPosition,
 };
 
+use crate::memory::{checked_memory_sum, requested_vec_bytes, requested_vec_with, reserve_exact};
 use crate::{Error, GraphOperator, InteractionPolicy, PlantId, Result};
 
 /// Compact handle into a cell/map provenance table.
@@ -85,12 +86,24 @@ pub struct ProvenanceFragmentRemap {
 }
 
 impl ProvenanceTable {
+    pub(crate) fn requested_memory_bytes(&self) -> Result<u64> {
+        checked_memory_sum([
+            requested_vec_with(&self.decisions, |decision| {
+                checked_memory_sum([
+                    requested_vec_bytes::<ProvenanceDecisionHandle>(decision.parents.capacity())?,
+                    requested_vec_bytes::<u128>(decision.subgraph_path.capacity())?,
+                ])
+            })?,
+            requested_vec_bytes::<ProvenanceRecord>(self.records.capacity())?,
+        ])
+    }
+
     /// Interns one decision and returns its stable table-local handle.
     pub fn intern_decision(
         &mut self,
         mut decision: ProvenanceDecision,
     ) -> ProvenanceDecisionHandle {
-        decision.parents.sort();
+        decision.parents.sort_unstable();
         decision.parents.dedup();
         if let Some(index) = self
             .decisions
@@ -125,9 +138,10 @@ impl ProvenanceTable {
         selected: &[ProvenanceHandle],
     ) -> Result<ProvenanceFragmentRemap> {
         let selected = selected.iter().copied().collect::<BTreeSet<_>>();
-        let roots = selected
-            .iter()
-            .map(|handle| {
+        let mut roots = Vec::new();
+        reserve_exact(&mut roots, selected.len(), "provenance import roots")?;
+        for handle in &selected {
+            roots.push(
                 source
                     .get(*handle)
                     .map(|record| record.decision)
@@ -136,13 +150,18 @@ impl ProvenanceTable {
                             format!("records.{}", handle.0),
                             "selected record is missing",
                         )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                    })?,
+            );
+        }
         let mut remap = ProvenanceFragmentRemap {
             decisions: self.import_decision_fragment(source, &roots)?,
             records: BTreeMap::new(),
         };
+        reserve_exact(
+            &mut self.records,
+            selected.len(),
+            "imported provenance records",
+        )?;
 
         for source_handle in selected {
             let source_record = source.get(source_handle).ok_or_else(|| {
@@ -186,6 +205,11 @@ impl ProvenanceTable {
         let selected = selected.iter().copied().collect::<BTreeSet<_>>();
         let decision_order = provenance_fragment_decision_order(source, &selected)?;
         let mut remap = BTreeMap::new();
+        reserve_exact(
+            &mut self.decisions,
+            decision_order.len(),
+            "imported provenance decisions",
+        )?;
         for source_handle in decision_order {
             let source_decision = source.decision(source_handle).ok_or_else(|| {
                 invalid_provenance_reference(
@@ -193,18 +217,20 @@ impl ProvenanceTable {
                     "decision is missing",
                 )
             })?;
-            let parents = source_decision
-                .parents
-                .iter()
-                .map(|parent| {
-                    remap.get(parent).copied().ok_or_else(|| {
-                        invalid_provenance_reference(
-                            format!("decisions.{}.parents.{}", source_handle.0, parent.0),
-                            "parent was not imported before its dependent decision",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut parents = Vec::new();
+            reserve_exact(
+                &mut parents,
+                source_decision.parents.len(),
+                "imported provenance decision parents",
+            )?;
+            for parent in &source_decision.parents {
+                parents.push(remap.get(parent).copied().ok_or_else(|| {
+                    invalid_provenance_reference(
+                        format!("decisions.{}.parents.{}", source_handle.0, parent.0),
+                        "parent was not imported before its dependent decision",
+                    )
+                })?);
+            }
             let destination = self.intern_decision(ProvenanceDecision {
                 parents,
                 subgraph_path: source_decision.subgraph_path.clone(),
@@ -248,22 +274,51 @@ fn provenance_fragment_decision_order(
     selected: &BTreeSet<ProvenanceDecisionHandle>,
 ) -> Result<Vec<ProvenanceDecisionHandle>> {
     let mut reachable = BTreeSet::new();
-    let mut pending = selected.iter().copied().collect::<Vec<_>>();
+    let mut pending = Vec::new();
+    reserve_exact(
+        &mut pending,
+        source.decisions.len(),
+        "provenance traversal pending decisions",
+    )?;
+    pending.extend(selected.iter().copied());
+    reachable.extend(selected.iter().copied());
     while let Some(handle) = pending.pop() {
-        if !reachable.insert(handle) {
-            continue;
-        }
         let decision = source.decision(handle).ok_or_else(|| {
             invalid_provenance_reference(
                 format!("decisions.{}", handle.0),
                 "reachable decision is missing",
             )
         })?;
-        pending.extend(decision.parents.iter().copied());
+        pending.extend(
+            decision
+                .parents
+                .iter()
+                .copied()
+                .filter(|parent| reachable.insert(*parent)),
+        );
     }
 
     let mut unresolved_parents = BTreeMap::new();
-    let mut children = BTreeMap::<ProvenanceDecisionHandle, Vec<ProvenanceDecisionHandle>>::new();
+    let mut child_edges = Vec::new();
+    let parent_edges = reachable.iter().try_fold(0_usize, |total, handle| {
+        source
+            .decision(*handle)
+            .ok_or_else(|| {
+                invalid_provenance_reference(
+                    format!("decisions.{}", handle.0),
+                    "reachable decision is missing",
+                )
+            })?
+            .parents
+            .len()
+            .checked_add(total)
+            .ok_or(Error::NumericOverflow)
+    })?;
+    reserve_exact(
+        &mut child_edges,
+        parent_edges,
+        "provenance traversal child edges",
+    )?;
     for handle in &reachable {
         let decision = source.decision(*handle).ok_or_else(|| {
             invalid_provenance_reference(
@@ -274,38 +329,41 @@ fn provenance_fragment_decision_order(
         let parents = decision.parents.iter().copied().collect::<BTreeSet<_>>();
         unresolved_parents.insert(*handle, parents.len());
         for parent in parents {
-            children.entry(parent).or_default().push(*handle);
+            child_edges.push((parent, *handle));
         }
     }
-    for dependents in children.values_mut() {
-        dependents.sort();
-        dependents.dedup();
-    }
+    child_edges.sort_unstable();
+    child_edges.dedup();
 
     let mut ready = unresolved_parents
         .iter()
         .filter_map(|(handle, count)| (*count == 0).then_some(*handle))
         .collect::<BTreeSet<_>>();
-    let mut order = Vec::with_capacity(reachable.len());
+    let mut order = Vec::new();
+    reserve_exact(
+        &mut order,
+        reachable.len(),
+        "provenance traversal decision order",
+    )?;
     while let Some(handle) = ready.pop_first() {
         order.push(handle);
-        if let Some(dependents) = children.get(&handle) {
-            for dependent in dependents {
-                let unresolved = unresolved_parents.get_mut(dependent).ok_or_else(|| {
-                    invalid_provenance_reference(
-                        format!("decisions.{}", dependent.0),
-                        "dependency accounting is incomplete",
-                    )
-                })?;
-                *unresolved = unresolved.checked_sub(1).ok_or_else(|| {
-                    invalid_provenance_reference(
-                        format!("decisions.{}.parents", dependent.0),
-                        "dependency accounting underflowed",
-                    )
-                })?;
-                if *unresolved == 0 {
-                    ready.insert(*dependent);
-                }
+        let start = child_edges.partition_point(|(parent, _)| *parent < handle);
+        let end = child_edges.partition_point(|(parent, _)| *parent <= handle);
+        for (_, dependent) in &child_edges[start..end] {
+            let unresolved = unresolved_parents.get_mut(dependent).ok_or_else(|| {
+                invalid_provenance_reference(
+                    format!("decisions.{}", dependent.0),
+                    "dependency accounting is incomplete",
+                )
+            })?;
+            *unresolved = unresolved.checked_sub(1).ok_or_else(|| {
+                invalid_provenance_reference(
+                    format!("decisions.{}.parents", dependent.0),
+                    "dependency accounting underflowed",
+                )
+            })?;
+            if *unresolved == 0 {
+                ready.insert(*dependent);
             }
         }
     }

@@ -1,7 +1,10 @@
 //! Canonical reference and parallel biome-graph evaluation.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -9,27 +12,44 @@ use saffron_core::Uuid;
 use saffron_geometry::glam::DVec3;
 use saffron_spatial::{
     BASE_CELL_TICKS, DecisionCurve, DecisionHessian3, DecisionScalar, DecisionVec3,
-    FieldAvailability, FieldChannel, FieldDerivative, LOCAL_TICKS_PER_METER, RandomDomain,
-    RandomStream, SignedUnit, SurfaceAttachment, SurfaceField, SurfaceHit, SurfaceProjection,
-    SurfaceProviderId, SurfaceRevision, SurfaceTileDescriptor, UnitInterval, WeightedSurfaceTag,
-    WorldBounds, WorldCellKey, WorldPosition, div_round_ties_even, world_cells_covering_bounds,
+    FieldAvailability, FieldChannel, FieldDerivative, LOCAL_TICKS_PER_METER, MAX_HIERARCHY_LEVEL,
+    RandomDomain, RandomStream, SignedUnit, SurfaceAttachment, SurfaceField, SurfaceHit,
+    SurfaceProjection, SurfaceProviderDescriptor, SurfaceProviderId, SurfaceRevision,
+    SurfaceTileDescriptor, UnitInterval, WeightedSurfaceTag, WorldBounds, WorldCellKey,
+    WorldPosition, div_round_ties_even, world_cell_count_covering_bounds,
+    world_cells_covering_bounds,
 };
 
-use crate::hash::sha256;
+use crate::binary::BinaryReader;
+use crate::canonical::{ByteSink, CanonicalSink, CountSink};
+use crate::graph::{CompiledDemandSlice, CompiledDemandUnitSlice};
+use crate::hash::{VegetationContentHasher, sha256};
+use crate::memory::{
+    ALLOCATION_OVERHEAD_BYTES, checked_memory_sum as sum_memory_bytes,
+    requested_btree_bytes as memory_requested_btree_bytes,
+    requested_btree_bytes_for_len as memory_requested_btree_bound, requested_btree_with,
+    requested_string_bytes, requested_vec_bytes as memory_requested_vec_bytes,
+    requested_vec_bytes_for_len, requested_vec_bytes_for_len as memory_requested_vec_bytes_for_len,
+    requested_vec_with,
+};
 use crate::{
     CompiledBiomeGraph, CompiledGlobalStage, CompiledGraphNode, CompiledGraphUnit, Error,
-    FieldBlendOperator, GraphAuthority, GraphClusterMode, GraphCombineOperation,
+    FieldBlendOperator, GRAPH_GPU_INSTRUCTION_WORDS, GRAPH_GPU_INVOCATION_WORDS,
+    GRAPH_GPU_MAX_CURVE_POINTS, GRAPH_GPU_MAX_INSTRUCTIONS, GRAPH_GPU_OUTPUT_WORDS,
+    GRAPH_GPU_PROGRAM_HEADER_WORDS, GraphAuthority, GraphClusterMode, GraphCombineOperation,
     GraphComputeExecutor, GraphDependencySource, GraphDistanceSource, GraphDomain,
-    GraphExecutionDomain, GraphExecutionPlan, GraphGpuInstruction, GraphGpuInvocation,
-    GraphGpuProgram, GraphGpuRegister, GraphGpuRegisterType, GraphGpuScheduling, GraphGpuValue,
-    GraphNodeAddress, GraphOperator, GraphParameterValue, IdentityConflictReport,
-    InteractionPolicy, PlantFlags, PlantId, PlantIdCollisionTable, PlantLifecycle, PlantPoint,
-    PlantPointColumns, ProceduralPlantIdentity, ProvenanceDecision, ProvenanceDecisionHandle,
-    ProvenanceDecisionOutcome, ProvenanceHandle, ProvenanceRecord, ProvenanceTable,
-    QualifiedGraphPin, QuantizedOrientation, Result, build_execution_plan, identity_conflicts,
-    GRAPH_GPU_INSTRUCTION_WORDS, GRAPH_GPU_INVOCATION_WORDS, GRAPH_GPU_OUTPUT_WORDS,
-    GRAPH_GPU_PROGRAM_HEADER_WORDS,
+    GraphExecutionBoundary, GraphExecutionDomain, GraphExecutionGroup, GraphExecutionNode,
+    GraphExecutionPlan, GraphGpuInstruction, GraphGpuInvocationBatch, GraphGpuProgram,
+    GraphGpuRegister, GraphGpuRegisterType, GraphGpuScheduling, GraphGpuValue, GraphNodeAddress,
+    GraphOperator, GraphParameterValue, IdentityConflictReport, InteractionPolicy, PlantFlags,
+    PlantId, PlantLifecycle, PlantPoint, PlantPointColumns, ProceduralPlantIdentity,
+    ProvenanceDecision, ProvenanceDecisionHandle, ProvenanceDecisionOutcome, ProvenanceHandle,
+    ProvenanceRecord, ProvenanceTable, QualifiedGraphPin, QuantizedOrientation, Result,
+    VegetationCellSection, VegetationCellSectionKind, build_execution_plan, identity_conflicts,
 };
+
+const EVALUATOR_WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+const HIERARCHY_LEVEL_COUNT: usize = MAX_HIERARCHY_LEVEL as usize + 1;
 
 /// Stable identity assigned before acceptance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -132,7 +152,8 @@ pub struct CandidateStream {
 
 impl CandidateStream {
     fn canonicalize(&mut self) -> Result<()> {
-        self.candidates.sort_by_key(|candidate| candidate.identity);
+        self.candidates
+            .sort_unstable_by_key(|candidate| candidate.identity);
         if self
             .candidates
             .windows(2)
@@ -365,39 +386,6 @@ pub struct QuantizedSurfaceFieldQueryTile {
 }
 
 impl QuantizedSurfaceFieldQueryTile {
-    fn validate(&self) -> Result<()> {
-        let correct_values = self.samples.iter().all(|entry| {
-            matches!(
-                (self.derivative, entry.value),
-                (
-                    FieldDerivative::Value,
-                    QuantizedSurfaceFieldValue::Scalar(_)
-                ) | (
-                    FieldDerivative::Gradient,
-                    QuantizedSurfaceFieldValue::Gradient(_)
-                ) | (
-                    FieldDerivative::Hessian,
-                    QuantizedSurfaceFieldValue::Hessian(_)
-                )
-            )
-        });
-        if self.node == 0
-            || self.node_semantic_revision == 0
-            || self.provider_set_hash == [0; 32]
-            || !correct_values
-            || self.samples.windows(2).any(|pair| {
-                (pair[0].candidate, pair[0].query) >= (pair[1].candidate, pair[1].query)
-            })
-        {
-            return Err(Error::GraphDocument {
-                path: "evaluation.surfaceFieldQueryTiles".to_owned(),
-                reason: "field query tile identity, type, or exact query ordering is invalid"
-                    .to_owned(),
-            });
-        }
-        Ok(())
-    }
-
     fn sample(
         &self,
         candidate: CandidateIdentity,
@@ -465,6 +453,15 @@ pub struct QuantizedSurfaceProjectionEntry {
 /// Computes the canonical immutable identity of a complete surface-provider set.
 pub fn canonical_surface_provider_set_hash(
     providers: &[Arc<dyn SurfaceField>],
+    max_providers: u64,
+) -> Result<[u8; 32]> {
+    canonical_surface_provider_set_hash_guarded(providers, max_providers, None)
+}
+
+fn canonical_surface_provider_set_hash_guarded(
+    providers: &[Arc<dyn SurfaceField>],
+    max_providers: u64,
+    guard: Option<PreflightGuard<'_>>,
 ) -> Result<[u8; 32]> {
     if providers.is_empty() {
         return Err(Error::GraphDocument {
@@ -472,37 +469,58 @@ pub fn canonical_surface_provider_set_hash(
             reason: "surface provider set cannot be empty".to_owned(),
         });
     }
-    let mut descriptors = providers
-        .iter()
-        .map(|provider| provider.descriptor())
-        .collect::<Vec<_>>();
-    descriptors.sort_by_key(|descriptor| descriptor.id);
-    if descriptors.windows(2).any(|pair| pair[0].id == pair[1].id) {
-        return Err(Error::GraphDocument {
-            path: "evaluation.surfaceProviders".to_owned(),
-            reason: "surface provider identities must be unique".to_owned(),
-        });
+    check_limit("input tiles", providers.len() as u64, max_providers)?;
+    let mut descriptors = Vec::new();
+    crate::memory::reserve_exact(
+        &mut descriptors,
+        providers.len(),
+        "surface provider descriptors",
+    )?;
+    for provider in providers {
+        if let Some(guard) = guard {
+            guard.check()?;
+        }
+        descriptors.push(provider.descriptor());
     }
-    let mut bytes = b"saffron-anima/surface-provider-set/v1\0".to_vec();
+    descriptors.sort_unstable_by_key(|descriptor| descriptor.id);
+    for pair in descriptors.windows(2) {
+        if let Some(guard) = guard {
+            guard.check()?;
+        }
+        if pair[0].id == pair[1].id {
+            return Err(Error::GraphDocument {
+                path: "evaluation.surfaceProviders".to_owned(),
+                reason: "surface provider identities must be unique".to_owned(),
+            });
+        }
+    }
+    let mut hasher = VegetationContentHasher::new();
+    hasher.update(b"saffron-anima/surface-provider-set/v1\0")?;
     for descriptor in descriptors {
-        bytes.extend_from_slice(&descriptor.id.0.to_be_bytes());
-        bytes.extend_from_slice(&descriptor.revision.0.to_be_bytes());
+        if let Some(guard) = guard {
+            guard.check()?;
+        }
+        hasher.update(&descriptor.id.0.to_be_bytes())?;
+        hasher.update(&descriptor.revision.0.to_be_bytes())?;
         for value in descriptor.bounds.min_ticks() {
-            bytes.extend_from_slice(&value.to_be_bytes());
+            hasher.update(&value.to_be_bytes())?;
         }
         for value in descriptor.bounds.max_ticks_exclusive() {
-            bytes.extend_from_slice(&value.to_be_bytes());
+            hasher.update(&value.to_be_bytes())?;
         }
-        bytes.extend_from_slice(&descriptor.primitive_count.to_be_bytes());
+        hasher.update(&descriptor.primitive_count.to_be_bytes())?;
+        hasher.update(&descriptor.max_tags_per_hit.to_be_bytes())?;
         let capabilities = descriptor.capabilities;
-        bytes.push(u8::from(capabilities.ray));
-        bytes.push(u8::from(capabilities.project));
-        bytes.push(u8::from(capabilities.nearest));
-        bytes.push(u8::from(capabilities.uv));
-        bytes.push(u8::from(capabilities.authoritative_attachments));
-        bytes.push(u8::from(capabilities.authoritative_fields));
+        hasher.update(&[
+            u8::from(capabilities.ray),
+            u8::from(capabilities.project),
+            u8::from(capabilities.nearest),
+            u8::from(capabilities.uv),
+            u8::from(capabilities.authoritative_attachments),
+            u8::from(capabilities.authoritative_fields),
+        ])?;
     }
-    Ok(sha256(&bytes))
+    hasher.finalize()
 }
 
 impl QuantizedSurfaceProjectionTile {
@@ -565,11 +583,22 @@ pub fn precompute_surface_projection_tile(
                 .to_owned(),
         });
     }
-    let mut queries = queries.to_vec();
-    queries.sort();
-    queries.dedup();
-    let mut samples = Vec::with_capacity(queries.len());
-    for position in queries {
+    let mut canonical_queries = Vec::new();
+    crate::memory::reserve_exact(
+        &mut canonical_queries,
+        queries.len(),
+        "surface projection queries",
+    )?;
+    canonical_queries.extend_from_slice(queries);
+    canonical_queries.sort_unstable();
+    canonical_queries.dedup();
+    let mut samples = Vec::new();
+    crate::memory::reserve_exact(
+        &mut samples,
+        canonical_queries.len(),
+        "surface projection samples",
+    )?;
+    for position in canonical_queries {
         if cancellation.is_cancelled() {
             return Err(Error::GraphCancelled);
         }
@@ -638,7 +667,8 @@ pub fn precompute_surface_field_tile(
     let capacity = usize::try_from(count).map_err(|_| Error::NumericOverflow)?;
     let values = match derivative {
         FieldDerivative::Value => {
-            let mut values = Vec::with_capacity(capacity);
+            let mut values = Vec::new();
+            crate::memory::reserve_exact(&mut values, capacity, "surface scalar field samples")?;
             for index in 0..count {
                 if cancellation.is_cancelled() {
                     return Err(Error::GraphCancelled);
@@ -659,7 +689,8 @@ pub fn precompute_surface_field_tile(
             QuantizedFieldTileValues::Scalar(values)
         }
         FieldDerivative::Gradient => {
-            let mut values = Vec::with_capacity(capacity);
+            let mut values = Vec::new();
+            crate::memory::reserve_exact(&mut values, capacity, "surface gradient field samples")?;
             for index in 0..count {
                 if cancellation.is_cancelled() {
                     return Err(Error::GraphCancelled);
@@ -684,7 +715,8 @@ pub fn precompute_surface_field_tile(
             QuantizedFieldTileValues::Gradient(values)
         }
         FieldDerivative::Hessian => {
-            let mut values = Vec::with_capacity(capacity);
+            let mut values = Vec::new();
+            crate::memory::reserve_exact(&mut values, capacity, "surface Hessian field samples")?;
             for index in 0..count {
                 if cancellation.is_cancelled() {
                     return Err(Error::GraphCancelled);
@@ -855,6 +887,8 @@ impl EvaluationFieldTile {
 pub struct MicroFieldTile {
     /// Canonical owner cell.
     pub cell: WorldCellKey,
+    /// Plant family whose cosmetic population is reconstructed from this tile.
+    pub family: Uuid,
     /// Packed dimensions.
     pub dimensions: [u32; 3],
     /// Authoritative density samples.
@@ -1008,6 +1042,50 @@ pub struct GraphEvaluationDiagnostics {
     pub accepted_count: u64,
 }
 
+/// Validates a complete rejection-diagnostics facet and returns nonzero reason totals.
+pub fn vegetation_rejection_totals(bytes: &[u8]) -> Result<Vec<(CandidateRejectionReason, u64)>> {
+    let mut reader = BinaryReader::new(bytes, "vegetation rejection diagnostics");
+    reader.expect(b"SVEGREJ1", "magic")?;
+    let candidate_count = reader.u64()?;
+    let accepted_count = reader.u64()?;
+    if accepted_count > candidate_count {
+        return Err(Error::ArtifactFormat {
+            format: "vegetation rejection diagnostics",
+            field: "acceptedCount".to_owned(),
+        });
+    }
+    let rejected_count = reader.count(57)?;
+    let mut totals = [0_u64; 7];
+    for _ in 0..rejected_count {
+        skip_candidate_identity(&mut reader)?;
+        let reason = rejection_reason_from_byte(reader.u8()?)?;
+        reader.u32()?;
+        totals[usize::from(rejection_reason_byte(reason))] = totals
+            [usize::from(rejection_reason_byte(reason))]
+        .checked_add(1)
+        .ok_or(Error::NumericOverflow)?;
+    }
+    let stream_count = reader.count(27)?;
+    for _ in 0..stream_count {
+        skip_diagnostic_stream(&mut reader)?;
+    }
+    reader.complete()?;
+    let reasons = [
+        CandidateRejectionReason::SurfaceMiss,
+        CandidateRejectionReason::Threshold,
+        CandidateRejectionReason::WeightedElimination,
+        CandidateRejectionReason::PriorityExclusion,
+        CandidateRejectionReason::Competition,
+        CandidateRejectionReason::ForeignOwner,
+        CandidateRejectionReason::NoSpecies,
+    ];
+    Ok(reasons
+        .into_iter()
+        .zip(totals)
+        .filter(|(_, count)| *count != 0)
+        .collect())
+}
+
 /// Complete result of one reference evaluation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphEvaluationResult {
@@ -1128,269 +1206,708 @@ impl GraphEvaluationResult {
         })
     }
 
+    /// Exact canonical encoding length without allocating the encoded result.
+    pub fn canonical_byte_len(&self) -> Result<usize> {
+        let mut sink = CountSink::new();
+        self.encode_canonical(&mut sink)?;
+        Ok(sink.finish())
+    }
+
     /// Stable result bytes used by determinism and scheduling tests.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = b"SVEGEVAL04".to_vec();
-        bytes.extend_from_slice(&self.cell.canonical_bytes());
-        let macro_bytes = self.macro_points.canonical_bytes()?;
-        push_len(&mut bytes, macro_bytes.len())?;
-        bytes.extend_from_slice(&macro_bytes);
-        let mut micro = self.micro_fields.clone();
-        micro.sort_by_key(|tile| tile.cell);
-        push_len(&mut bytes, micro.len())?;
-        for tile in micro {
-            bytes.extend_from_slice(&tile.cell.canonical_bytes());
-            for dimension in tile.dimensions {
-                bytes.extend_from_slice(&dimension.to_be_bytes());
-            }
-            push_len(&mut bytes, tile.density.len())?;
-            for value in tile.density {
-                bytes.extend_from_slice(&value.to_be_bytes());
-            }
-            push_len(&mut bytes, tile.attributes.len())?;
-            for (channel, values) in tile.attributes {
-                bytes.extend_from_slice(&channel.to_be_bytes());
-                push_len(&mut bytes, values.len())?;
-                for value in values {
-                    bytes.extend_from_slice(&value.to_be_bytes());
-                }
-            }
-            bytes.extend_from_slice(&tile.reconstruction_seed.to_be_bytes());
+        let mut sink = ByteSink::new();
+        self.encode_canonical(&mut sink)?;
+        Ok(sink.finish())
+    }
+
+    /// Streams the exact canonical encoding into a vegetation content digest.
+    pub fn update_content_hasher(&self, hasher: &mut VegetationContentHasher) -> Result<()> {
+        self.encode_canonical(hasher)
+    }
+
+    /// Produces independently resident `.svegcell` facets from the canonical evaluator result.
+    pub fn cell_artifact_sections(&self) -> Result<Vec<VegetationCellSection>> {
+        self.validate_canonical_encoding()?;
+        let macro_points = self.macro_points.canonical_bytes()?;
+
+        let mut micro_fields = ByteSink::new();
+        micro_fields.write(b"SVEGMIC2")?;
+        self.encode_micro_fields(&mut micro_fields)?;
+
+        let mut provenance = ByteSink::new();
+        provenance.write(b"SVEGPRV1")?;
+        self.encode_provenance(&mut provenance)?;
+
+        let mut diagnostics = ByteSink::new();
+        diagnostics.write(b"SVEGREJ1")?;
+        self.encode_rejection_diagnostics(&mut diagnostics)?;
+
+        let mut attachments = ByteSink::new();
+        attachments.write(b"SVEGSAT1")?;
+        self.encode_surface_attachments(&mut attachments)?;
+
+        let mut surface_dependencies = ByteSink::new();
+        surface_dependencies.write(b"SVEGSDE1")?;
+        self.encode_surface_dependencies(&mut surface_dependencies)?;
+
+        let mut render_references = ByteSink::new();
+        render_references.write(b"SVEGRRF1")?;
+        self.encode_render_references(&mut render_references)?;
+
+        let mut render_bounds = ByteSink::new();
+        render_bounds.write(b"SVEGRBD1")?;
+        self.encode_render_bounds(&mut render_bounds)?;
+
+        let mut collision_inputs = ByteSink::new();
+        collision_inputs.write(b"SVEGCOL1")?;
+        self.encode_collision_inputs(&mut collision_inputs)?;
+
+        let mut navigation = ByteSink::new();
+        navigation.write(b"SVEGNAV1")?;
+        self.encode_navigation_contributions(&mut navigation)?;
+
+        let mut ecology_boundary = ByteSink::new();
+        ecology_boundary.write(b"SVEGEBD1")?;
+        self.encode_ecology_boundary(&mut ecology_boundary)?;
+
+        let mut ecology_checkpoint = ByteSink::new();
+        ecology_checkpoint.write(b"SVEGECP1")?;
+        self.encode_ecology_checkpoint(&mut ecology_checkpoint)?;
+
+        Ok(vec![
+            VegetationCellSection::raw(VegetationCellSectionKind::MacroPoints, macro_points),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::MicroFields,
+                micro_fields.finish(),
+            ),
+            VegetationCellSection::raw(VegetationCellSectionKind::Provenance, provenance.finish()),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::RejectionDiagnostics,
+                diagnostics.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::SurfaceAttachments,
+                attachments.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::SurfaceDependencies,
+                surface_dependencies.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::RenderReferences,
+                render_references.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::RenderBounds,
+                render_bounds.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::CollisionInputs,
+                collision_inputs.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::NavigationContributions,
+                navigation.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::EcologyBoundary,
+                ecology_boundary.finish(),
+            ),
+            VegetationCellSection::raw(
+                VegetationCellSectionKind::EcologyCheckpoint,
+                ecology_checkpoint.finish(),
+            ),
+        ])
+    }
+
+    fn encode_canonical<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        self.validate_canonical_encoding()?;
+        sink.write(b"SVEGEVAL05")?;
+        sink.write(&self.cell.canonical_bytes())?;
+        let macro_length = self.macro_points.canonical_byte_len()?;
+        push_len(sink, macro_length)?;
+        self.macro_points.encode_canonical(sink)?;
+        self.encode_micro_fields(sink)?;
+        self.encode_surface_attachments(sink)?;
+        self.encode_surface_dependencies(sink)?;
+        encode_unique_references(sink, &self.ancestor_references)?;
+        self.encode_provenance(sink)?;
+        self.encode_rejection_diagnostics(sink)
+    }
+
+    fn encode_micro_fields<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.micro_fields.len())?;
+        encode_ordered(sink, &self.micro_fields, encode_micro_tile)
+    }
+
+    fn encode_surface_attachments<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.surface_projection_tiles.len())?;
+        encode_ordered(sink, &self.surface_projection_tiles, encode_projection_tile)
+    }
+
+    fn encode_surface_dependencies<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.surface_field_query_tiles.len())?;
+        encode_ordered(
+            sink,
+            &self.surface_field_query_tiles,
+            encode_field_query_tile,
+        )
+    }
+
+    fn encode_render_references<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.macro_points.ids.len())?;
+        for row in 0..self.macro_points.ids.len() {
+            sink.write(&self.macro_points.ids[row].bytes())?;
+            sink.write(&self.macro_points.families[row].value().to_be_bytes())?;
+            sink.write(&self.macro_points.variations[row].to_be_bytes())?;
+            sink.write(&self.macro_points.phenotypes[row].to_be_bytes())?;
+            sink.write(&self.macro_points.representation_classes[row].to_be_bytes())?;
+            sink.write(&(self.macro_points.lifecycles[row] as u32).to_be_bytes())?;
         }
-        let mut projection_tiles = self.surface_projection_tiles.clone();
-        projection_tiles.sort_by_key(|tile| {
-            (
-                tile.node,
-                tile.node_semantic_revision,
-                tile.samples.first().map(|entry| entry.query),
-            )
-        });
-        push_len(&mut bytes, projection_tiles.len())?;
-        for tile in projection_tiles {
-            bytes.extend_from_slice(&tile.node.to_be_bytes());
-            bytes.extend_from_slice(&tile.node_semantic_revision.to_be_bytes());
-            bytes.extend_from_slice(&tile.provider_set_hash);
-            push_len(&mut bytes, tile.samples.len())?;
-            for entry in tile.samples {
-                push_world_position(&mut bytes, entry.query);
-                match entry.sample {
-                    Some(sample) => {
-                        bytes.push(1);
-                        push_world_position(&mut bytes, sample.position);
-                        bytes.extend_from_slice(&sample.attachment.provider.0.to_be_bytes());
-                        bytes.extend_from_slice(&sample.attachment.primitive.0.to_be_bytes());
-                        for barycentric in sample.attachment.barycentric {
-                            bytes.extend_from_slice(&barycentric.bits().to_be_bytes());
-                        }
-                        bytes.extend_from_slice(&sample.attachment.revision.0.to_be_bytes());
-                        for normal in sample.normal {
-                            bytes.extend_from_slice(&normal.bits().to_be_bytes());
-                        }
-                        for projection in sample.projection {
-                            bytes.extend_from_slice(&projection.bits().to_be_bytes());
-                        }
-                        push_len(&mut bytes, sample.tags.len())?;
-                        for tag in sample.tags {
-                            bytes.extend_from_slice(&tag.tag.0.to_be_bytes());
-                            bytes.extend_from_slice(&tag.weight.bits().to_be_bytes());
-                        }
-                    }
-                    None => bytes.push(0),
-                }
+        Ok(())
+    }
+
+    fn encode_render_bounds<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.macro_points.ids.len())?;
+        for row in 0..self.macro_points.ids.len() {
+            sink.write(&self.macro_points.ids[row].bytes())?;
+            encode_world_bounds(sink, self.macro_points.bounds[row])?;
+        }
+        Ok(())
+    }
+
+    fn encode_collision_inputs<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.macro_points.ids.len())?;
+        for row in 0..self.macro_points.ids.len() {
+            sink.write(&self.macro_points.ids[row].bytes())?;
+            sink.write(&self.macro_points.families[row].value().to_be_bytes())?;
+            encode_world_position(sink, self.macro_points.positions[row])?;
+            for lane in self.macro_points.orientations[row].bits() {
+                sink.write(&lane.to_be_bytes())?;
+            }
+            for scale in self.macro_points.scales[row] {
+                sink.write(&scale.canonical_bytes())?;
+            }
+            encode_world_bounds(sink, self.macro_points.bounds[row])?;
+            sink.write(&(self.macro_points.interaction_policies[row] as u32).to_be_bytes())?;
+            sink.write(&(self.macro_points.lifecycles[row] as u32).to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn encode_navigation_contributions<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.macro_points.ids.len())?;
+        for row in 0..self.macro_points.ids.len() {
+            sink.write(&self.macro_points.ids[row].bytes())?;
+            sink.write(&self.macro_points.families[row].value().to_be_bytes())?;
+            encode_world_bounds(sink, self.macro_points.bounds[row])?;
+            sink.write(&(self.macro_points.interaction_policies[row] as u32).to_be_bytes())?;
+            sink.write(&(self.macro_points.lifecycles[row] as u32).to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn encode_ecology_boundary<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        let cell_bounds = self.cell.bounds();
+        let boundary_rows = self
+            .macro_points
+            .bounds
+            .iter()
+            .enumerate()
+            .filter(|(_, bounds)| touches_boundary(**bounds, cell_bounds))
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        push_len(sink, boundary_rows.len())?;
+        for row in boundary_rows {
+            sink.write(&self.macro_points.ids[row].bytes())?;
+            sink.write(&self.macro_points.families[row].value().to_be_bytes())?;
+            encode_world_bounds(sink, self.macro_points.bounds[row])?;
+            sink.write(&self.macro_points.ecology_ticks[row].to_be_bytes())?;
+            sink.write(&self.macro_points.health[row].canonical_bytes())?;
+            sink.write(&self.macro_points.moisture[row].canonical_bytes())?;
+            sink.write(&self.macro_points.fuel[row].canonical_bytes())?;
+            sink.write(&self.macro_points.phenology[row].canonical_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn encode_ecology_checkpoint<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        push_len(sink, self.macro_points.ids.len())?;
+        for row in 0..self.macro_points.ids.len() {
+            sink.write(&self.macro_points.ids[row].bytes())?;
+            sink.write(&self.macro_points.families[row].value().to_be_bytes())?;
+            sink.write(&(self.macro_points.lifecycles[row] as u32).to_be_bytes())?;
+            sink.write(&self.macro_points.phenotypes[row].to_be_bytes())?;
+            sink.write(&self.macro_points.ecology_ticks[row].to_be_bytes())?;
+            sink.write(&self.macro_points.health[row].canonical_bytes())?;
+            sink.write(&self.macro_points.moisture[row].canonical_bytes())?;
+            sink.write(&self.macro_points.fuel[row].canonical_bytes())?;
+            sink.write(&self.macro_points.phenology[row].canonical_bytes())?;
+            sink.write(&self.macro_points.flags[row].bits().to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn encode_provenance<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        encode_provenance(sink, &self.provenance)
+    }
+
+    fn encode_rejection_diagnostics<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        sink.write(&self.diagnostics.candidate_count.to_be_bytes())?;
+        sink.write(&self.diagnostics.accepted_count.to_be_bytes())?;
+        push_len(sink, self.diagnostics.rejected.len())?;
+        encode_ordered(sink, &self.diagnostics.rejected, encode_rejected_candidate)?;
+        push_len(sink, self.diagnostics.streams.len())?;
+        encode_ordered(sink, &self.diagnostics.streams, encode_diagnostic_stream)
+    }
+
+    fn validate_canonical_encoding(&self) -> Result<()> {
+        self.validate_canonical_encoding_with_guard(None)
+    }
+
+    fn validate_canonical_encoding_guarded(&self, guard: PreflightGuard<'_>) -> Result<()> {
+        self.validate_canonical_encoding_with_guard(Some(guard))
+    }
+
+    fn validate_canonical_encoding_with_guard(
+        &self,
+        guard: Option<PreflightGuard<'_>>,
+    ) -> Result<()> {
+        self.macro_points
+            .validate_guarded(|| guard.map_or(Ok(()), PreflightGuard::check))?;
+        for tile in &self.surface_projection_tiles {
+            guard.map_or(Ok(()), PreflightGuard::check)?;
+            if let Some(guard) = guard {
+                validate_projection_tile_guarded(tile, guard)?;
+            } else {
+                tile.validate()?;
             }
         }
-        let mut field_query_tiles = self.surface_field_query_tiles.clone();
-        field_query_tiles.sort_by_key(|tile| {
-            (
-                tile.node,
-                tile.node_semantic_revision,
-                tile.channel,
-                tile.derivative,
-                tile.samples
-                    .first()
-                    .map(|entry| (entry.candidate, entry.query)),
-            )
-        });
-        push_len(&mut bytes, field_query_tiles.len())?;
-        for tile in field_query_tiles {
-            bytes.extend_from_slice(&tile.node.to_be_bytes());
-            bytes.extend_from_slice(&tile.node_semantic_revision.to_be_bytes());
-            push_field_channel(&mut bytes, tile.channel);
-            bytes.push(match tile.derivative {
-                FieldDerivative::Value => 0,
-                FieldDerivative::Gradient => 1,
-                FieldDerivative::Hessian => 2,
+        for tile in &self.surface_field_query_tiles {
+            validate_field_query_tile_with_guard(tile, guard)?;
+        }
+        let ordered =
+            validate_strict_order(&self.micro_fields, guard, |left, right| {
+                (left.cell, left.family.value()) < (right.cell, right.family.value())
+            })? && validate_strict_order(&self.surface_projection_tiles, guard, |left, right| {
+                projection_tile_order_key(left) < projection_tile_order_key(right)
+            })? && validate_strict_order(&self.surface_field_query_tiles, guard, |left, right| {
+                field_query_tile_order_key(left) < field_query_tile_order_key(right)
+            })? && validate_strict_order(&self.ancestor_references, guard, |left, right| {
+                left < right
+            })? && validate_strict_order(&self.diagnostics.rejected, guard, |left, right| {
+                rejected_order_key(left) < rejected_order_key(right)
+            })? && validate_strict_order(&self.diagnostics.streams, guard, |left, right| {
+                diagnostic_stream_order_key(left) < diagnostic_stream_order_key(right)
+            })?;
+        if !ordered {
+            return Err(Error::GraphDocument {
+                path: "evaluation.canonicalEncoding".to_owned(),
+                reason: "result collections are not in canonical order".to_owned(),
             });
-            bytes.extend_from_slice(&tile.provider_set_hash);
-            push_len(&mut bytes, tile.samples.len())?;
-            for entry in tile.samples {
-                push_candidate_identity(&mut bytes, entry.candidate);
-                push_world_position(&mut bytes, entry.query);
-                match entry.value {
-                    QuantizedSurfaceFieldValue::Scalar(value) => {
-                        bytes.push(0);
-                        bytes.extend_from_slice(&value.to_be_bytes());
-                    }
-                    QuantizedSurfaceFieldValue::Gradient(value) => {
-                        bytes.push(1);
-                        for lane in value {
-                            bytes.extend_from_slice(&lane.to_be_bytes());
-                        }
-                    }
-                    QuantizedSurfaceFieldValue::Hessian(value) => {
-                        bytes.push(2);
-                        for lane in value {
-                            bytes.extend_from_slice(&lane.to_be_bytes());
-                        }
-                    }
-                }
+        }
+        for stream in &self.diagnostics.streams {
+            guard.map_or(Ok(()), PreflightGuard::check)?;
+            let candidates_ordered = match &stream.candidates {
+                Some(values) => validate_strict_order(values, guard, |left, right| {
+                    left.identity < right.identity
+                })?,
+                None => true,
+            };
+            let field_ordered = match &stream.field {
+                Some(values) => validate_strict_order(values, guard, |left, right| {
+                    left.candidate < right.candidate
+                })?,
+                None => true,
+            };
+            let rejected_ordered =
+                validate_strict_order(&stream.rejected, guard, |left, right| {
+                    rejected_order_key(left) < rejected_order_key(right)
+                })?;
+            let stream_ordered = candidates_ordered && field_ordered && rejected_ordered;
+            if !stream_ordered {
+                return Err(Error::GraphDocument {
+                    path: "evaluation.canonicalEncoding.streams".to_owned(),
+                    reason: "diagnostic stream samples are not in canonical order".to_owned(),
+                });
             }
         }
-        let mut references = self.ancestor_references.clone();
-        references.sort();
-        references.dedup();
-        push_len(&mut bytes, references.len())?;
-        for reference in references {
-            bytes.extend_from_slice(&reference.canonical_bytes());
-        }
-        push_len(&mut bytes, self.provenance.decisions().len())?;
-        for decision in self.provenance.decisions() {
-            push_len(&mut bytes, decision.parents.len())?;
-            for parent in &decision.parents {
-                bytes.extend_from_slice(&parent.0.to_be_bytes());
-            }
-            push_len(&mut bytes, decision.subgraph_path.len())?;
-            for call in &decision.subgraph_path {
-                bytes.extend_from_slice(&call.to_be_bytes());
-            }
-            bytes.extend_from_slice(&decision.node.to_be_bytes());
-            let operator = decision.operator.as_wire().as_bytes();
-            push_len(&mut bytes, operator.len())?;
-            bytes.extend_from_slice(operator);
-            bytes.extend_from_slice(&decision.candidate.to_be_bytes());
-            bytes.push(provenance_outcome_byte(decision.outcome));
-        }
-        push_len(&mut bytes, self.provenance.records().len())?;
-        for record in self.provenance.records() {
-            bytes.extend_from_slice(&record.map.value().to_be_bytes());
-            bytes.extend_from_slice(&record.layer.to_be_bytes());
-            bytes.extend_from_slice(&record.biome.value().to_be_bytes());
-            bytes.extend_from_slice(&record.decision.0.to_be_bytes());
-            bytes.extend_from_slice(&record.candidate.to_be_bytes());
-            push_optional_uuid(&mut bytes, record.family);
-            match record.plant {
-                Some(plant) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(&plant.bytes());
-                }
-                None => bytes.push(0),
-            }
-            bytes.extend_from_slice(&record.variation.to_be_bytes());
-        }
-        bytes.extend_from_slice(&self.diagnostics.candidate_count.to_be_bytes());
-        bytes.extend_from_slice(&self.diagnostics.accepted_count.to_be_bytes());
-        let mut rejected = self.diagnostics.rejected.clone();
-        rejected.sort_by_key(|candidate| {
-            (
-                candidate.candidate,
-                rejection_reason_byte(candidate.reason),
-                candidate.provenance,
-            )
-        });
-        push_len(&mut bytes, rejected.len())?;
-        for candidate in rejected {
-            push_candidate_identity(&mut bytes, candidate.candidate);
-            bytes.push(rejection_reason_byte(candidate.reason));
-            bytes.extend_from_slice(&candidate.provenance.0.to_be_bytes());
-        }
-        let mut streams = self.diagnostics.streams.clone();
-        streams.sort_by_key(|stream| (stream.node.clone(), stream.label.clone(), stream.scope));
-        push_len(&mut bytes, streams.len())?;
-        for mut stream in streams {
-            let node = stream.node.canonical_bytes();
-            push_len(&mut bytes, node.len())?;
-            bytes.extend_from_slice(&node);
-            push_len(&mut bytes, stream.label.len())?;
-            bytes.extend_from_slice(stream.label.as_bytes());
-            match stream.scope {
-                DiagnosticStreamScope::GlobalSnapshot => bytes.push(0),
-                DiagnosticStreamScope::CandidateLineage(lineage) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(&lineage.0.to_be_bytes());
-                }
-            }
-            match stream.candidates {
-                Some(mut candidates) => {
-                    bytes.push(1);
-                    candidates.sort_by_key(|sample| sample.identity);
-                    push_len(&mut bytes, candidates.len())?;
-                    for sample in candidates {
-                        push_candidate_identity(&mut bytes, sample.identity);
-                        bytes.extend_from_slice(&sample.owner.canonical_bytes());
-                        push_world_position(&mut bytes, sample.position);
-                        push_optional_uuid(&mut bytes, sample.family);
-                        bytes.extend_from_slice(&sample.variation.to_be_bytes());
-                        bytes.extend_from_slice(&sample.priority.bits().to_be_bytes());
-                        bytes.extend_from_slice(&sample.ecology_tick.to_be_bytes());
-                    }
-                }
-                None => bytes.push(0),
-            }
-            match stream.field {
-                Some(mut field) => {
-                    bytes.push(1);
-                    field.sort_by_key(|sample| sample.candidate);
-                    push_len(&mut bytes, field.len())?;
-                    for sample in field {
-                        push_candidate_identity(&mut bytes, sample.candidate);
-                        bytes.extend_from_slice(&sample.value.bits().to_be_bytes());
-                    }
-                }
-                None => bytes.push(0),
-            }
-            stream.rejected.sort_by_key(|candidate| {
-                (
-                    candidate.candidate,
-                    rejection_reason_byte(candidate.reason),
-                    candidate.provenance,
-                )
-            });
-            push_len(&mut bytes, stream.rejected.len())?;
-            for candidate in stream.rejected {
-                push_candidate_identity(&mut bytes, candidate.candidate);
-                bytes.push(rejection_reason_byte(candidate.reason));
-                bytes.extend_from_slice(&candidate.provenance.0.to_be_bytes());
-            }
-        }
-        Ok(bytes)
+        guard.map_or(Ok(()), PreflightGuard::check)
     }
 }
 
-fn push_optional_uuid(bytes: &mut Vec<u8>, value: Option<Uuid>) {
+fn validate_strict_order<T>(
+    values: &[T],
+    guard: Option<PreflightGuard<'_>>,
+    before: impl Fn(&T, &T) -> bool,
+) -> Result<bool> {
+    for pair in values.windows(2) {
+        guard.map_or(Ok(()), PreflightGuard::check)?;
+        if !before(&pair[0], &pair[1]) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn projection_tile_order_key(tile: &QuantizedSurfaceProjectionTile) -> (u128, u32, [u8; 32]) {
+    (
+        tile.node,
+        tile.node_semantic_revision,
+        tile.provider_set_hash,
+    )
+}
+
+fn field_query_tile_order_key(
+    tile: &QuantizedSurfaceFieldQueryTile,
+) -> (u128, u32, FieldChannel, FieldDerivative, [u8; 32]) {
+    (
+        tile.node,
+        tile.node_semantic_revision,
+        tile.channel,
+        tile.derivative,
+        tile.provider_set_hash,
+    )
+}
+
+fn rejected_order_key(rejected: &RejectedCandidate) -> (CandidateIdentity, u8, ProvenanceHandle) {
+    (
+        rejected.candidate,
+        rejection_reason_byte(rejected.reason),
+        rejected.provenance,
+    )
+}
+
+fn diagnostic_stream_order_key(
+    stream: &NamedDiagnosticStream,
+) -> (&GraphNodeAddress, &str, DiagnosticStreamScope) {
+    (&stream.node, stream.label.as_str(), stream.scope)
+}
+
+fn encode_ordered<S, T, E>(sink: &mut S, values: &[T], mut encode: E) -> Result<()>
+where
+    S: CanonicalSink,
+    E: FnMut(&mut S, &T) -> Result<()>,
+{
+    for value in values {
+        encode(sink, value)?;
+    }
+    Ok(())
+}
+
+fn encode_micro_tile<S: CanonicalSink>(sink: &mut S, tile: &MicroFieldTile) -> Result<()> {
+    sink.write(&tile.cell.canonical_bytes())?;
+    sink.write(&tile.family.value().to_be_bytes())?;
+    for dimension in tile.dimensions {
+        sink.write(&dimension.to_be_bytes())?;
+    }
+    push_len(sink, tile.density.len())?;
+    for value in &tile.density {
+        sink.write(&value.to_be_bytes())?;
+    }
+    push_len(sink, tile.attributes.len())?;
+    for (channel, values) in &tile.attributes {
+        sink.write(&channel.to_be_bytes())?;
+        push_len(sink, values.len())?;
+        for value in values {
+            sink.write(&value.to_be_bytes())?;
+        }
+    }
+    sink.write(&tile.reconstruction_seed.to_be_bytes())
+}
+
+fn encode_projection_tile<S: CanonicalSink>(
+    sink: &mut S,
+    tile: &QuantizedSurfaceProjectionTile,
+) -> Result<()> {
+    sink.write(&tile.node.to_be_bytes())?;
+    sink.write(&tile.node_semantic_revision.to_be_bytes())?;
+    sink.write(&tile.provider_set_hash)?;
+    push_len(sink, tile.samples.len())?;
+    for entry in &tile.samples {
+        push_world_position(sink, entry.query)?;
+        match &entry.sample {
+            Some(sample) => {
+                sink.write_byte(1)?;
+                push_world_position(sink, sample.position)?;
+                sink.write(&sample.attachment.provider.0.to_be_bytes())?;
+                sink.write(&sample.attachment.primitive.0.to_be_bytes())?;
+                for barycentric in sample.attachment.barycentric {
+                    sink.write(&barycentric.bits().to_be_bytes())?;
+                }
+                sink.write(&sample.attachment.revision.0.to_be_bytes())?;
+                for normal in sample.normal {
+                    sink.write(&normal.bits().to_be_bytes())?;
+                }
+                for projection in sample.projection {
+                    sink.write(&projection.bits().to_be_bytes())?;
+                }
+                push_len(sink, sample.tags.len())?;
+                for tag in &sample.tags {
+                    sink.write(&tag.tag.0.to_be_bytes())?;
+                    sink.write(&tag.weight.bits().to_be_bytes())?;
+                }
+            }
+            None => sink.write_byte(0)?,
+        }
+    }
+    Ok(())
+}
+
+fn encode_field_query_tile<S: CanonicalSink>(
+    sink: &mut S,
+    tile: &QuantizedSurfaceFieldQueryTile,
+) -> Result<()> {
+    sink.write(&tile.node.to_be_bytes())?;
+    sink.write(&tile.node_semantic_revision.to_be_bytes())?;
+    push_field_channel(sink, tile.channel)?;
+    sink.write_byte(match tile.derivative {
+        FieldDerivative::Value => 0,
+        FieldDerivative::Gradient => 1,
+        FieldDerivative::Hessian => 2,
+    })?;
+    sink.write(&tile.provider_set_hash)?;
+    push_len(sink, tile.samples.len())?;
+    for entry in &tile.samples {
+        push_candidate_identity(sink, entry.candidate)?;
+        push_world_position(sink, entry.query)?;
+        match entry.value {
+            QuantizedSurfaceFieldValue::Scalar(value) => {
+                sink.write_byte(0)?;
+                sink.write(&value.to_be_bytes())?;
+            }
+            QuantizedSurfaceFieldValue::Gradient(value) => {
+                sink.write_byte(1)?;
+                for lane in value {
+                    sink.write(&lane.to_be_bytes())?;
+                }
+            }
+            QuantizedSurfaceFieldValue::Hessian(value) => {
+                sink.write_byte(2)?;
+                for lane in value {
+                    sink.write(&lane.to_be_bytes())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_unique_references<S: CanonicalSink>(
+    sink: &mut S,
+    references: &[WorldCellKey],
+) -> Result<()> {
+    push_len(sink, references.len())?;
+    for reference in references {
+        sink.write(&reference.canonical_bytes())?;
+    }
+    Ok(())
+}
+
+fn encode_provenance<S: CanonicalSink>(sink: &mut S, table: &ProvenanceTable) -> Result<()> {
+    push_len(sink, table.decisions().len())?;
+    for decision in table.decisions() {
+        push_len(sink, decision.parents.len())?;
+        for parent in &decision.parents {
+            sink.write(&parent.0.to_be_bytes())?;
+        }
+        push_len(sink, decision.subgraph_path.len())?;
+        for call in &decision.subgraph_path {
+            sink.write(&call.to_be_bytes())?;
+        }
+        sink.write(&decision.node.to_be_bytes())?;
+        let operator = decision.operator.as_wire().as_bytes();
+        push_len(sink, operator.len())?;
+        sink.write(operator)?;
+        sink.write(&decision.candidate.to_be_bytes())?;
+        sink.write_byte(provenance_outcome_byte(decision.outcome))?;
+    }
+    push_len(sink, table.records().len())?;
+    for record in table.records() {
+        sink.write(&record.map.value().to_be_bytes())?;
+        sink.write(&record.layer.to_be_bytes())?;
+        sink.write(&record.biome.value().to_be_bytes())?;
+        sink.write(&record.decision.0.to_be_bytes())?;
+        sink.write(&record.candidate.to_be_bytes())?;
+        push_optional_uuid(sink, record.family)?;
+        match record.plant {
+            Some(plant) => {
+                sink.write_byte(1)?;
+                sink.write(&plant.bytes())?;
+            }
+            None => sink.write_byte(0)?,
+        }
+        sink.write(&record.variation.to_be_bytes())?;
+    }
+    Ok(())
+}
+
+fn encode_rejected_candidate<S: CanonicalSink>(
+    sink: &mut S,
+    candidate: &RejectedCandidate,
+) -> Result<()> {
+    push_candidate_identity(sink, candidate.candidate)?;
+    sink.write_byte(rejection_reason_byte(candidate.reason))?;
+    sink.write(&candidate.provenance.0.to_be_bytes())
+}
+
+fn encode_diagnostic_stream<S: CanonicalSink>(
+    sink: &mut S,
+    stream: &NamedDiagnosticStream,
+) -> Result<()> {
+    let node_length = 8_usize
+        .checked_add(
+            stream
+                .node
+                .module_path
+                .len()
+                .checked_mul(16)
+                .ok_or(Error::NumericOverflow)?,
+        )
+        .and_then(|length| length.checked_add(16))
+        .ok_or(Error::NumericOverflow)?;
+    push_len(sink, node_length)?;
+    push_len(sink, stream.node.module_path.len())?;
+    for call in &stream.node.module_path {
+        sink.write(&call.to_be_bytes())?;
+    }
+    sink.write(&stream.node.node.to_be_bytes())?;
+    push_len(sink, stream.label.len())?;
+    sink.write(stream.label.as_bytes())?;
+    match stream.scope {
+        DiagnosticStreamScope::GlobalSnapshot => sink.write_byte(0)?,
+        DiagnosticStreamScope::CandidateLineage(lineage) => {
+            sink.write_byte(1)?;
+            sink.write(&lineage.0.to_be_bytes())?;
+        }
+    }
+    match &stream.candidates {
+        Some(candidates) => {
+            sink.write_byte(1)?;
+            push_len(sink, candidates.len())?;
+            encode_ordered(sink, candidates, |sink, sample| {
+                push_candidate_identity(sink, sample.identity)?;
+                sink.write(&sample.owner.canonical_bytes())?;
+                push_world_position(sink, sample.position)?;
+                push_optional_uuid(sink, sample.family)?;
+                sink.write(&sample.variation.to_be_bytes())?;
+                sink.write(&sample.priority.bits().to_be_bytes())?;
+                sink.write(&sample.ecology_tick.to_be_bytes())
+            })?;
+        }
+        None => sink.write_byte(0)?,
+    }
+    match &stream.field {
+        Some(field) => {
+            sink.write_byte(1)?;
+            push_len(sink, field.len())?;
+            encode_ordered(sink, field, |sink, sample| {
+                push_candidate_identity(sink, sample.candidate)?;
+                sink.write(&sample.value.bits().to_be_bytes())
+            })?;
+        }
+        None => sink.write_byte(0)?,
+    }
+    push_len(sink, stream.rejected.len())?;
+    encode_ordered(sink, &stream.rejected, encode_rejected_candidate)
+}
+
+fn push_optional_uuid<S: CanonicalSink>(sink: &mut S, value: Option<Uuid>) -> Result<()> {
     match value {
         Some(value) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&value.value().to_be_bytes());
+            sink.write_byte(1)?;
+            sink.write(&value.value().to_be_bytes())?;
         }
-        None => bytes.push(0),
+        None => sink.write_byte(0)?,
     }
+    Ok(())
 }
 
-fn push_world_position(bytes: &mut Vec<u8>, position: WorldPosition) {
+fn push_world_position<S: CanonicalSink>(sink: &mut S, position: WorldPosition) -> Result<()> {
     for tick in position.global_ticks() {
-        bytes.extend_from_slice(&tick.to_be_bytes());
+        sink.write(&tick.to_be_bytes())?;
     }
+    Ok(())
 }
 
-fn push_candidate_identity(bytes: &mut Vec<u8>, identity: CandidateIdentity) {
-    bytes.extend_from_slice(&identity.node.to_be_bytes());
-    bytes.extend_from_slice(&identity.node_address.to_be_bytes());
-    bytes.extend_from_slice(&identity.node_semantic_revision.to_be_bytes());
-    bytes.extend_from_slice(&identity.ordinal.to_be_bytes());
-    bytes.extend_from_slice(&identity.ancestor.to_be_bytes());
+fn skip_diagnostic_stream(reader: &mut BinaryReader<'_>) -> Result<()> {
+    let node_length = reader.length()?;
+    let mut node = BinaryReader::new(
+        reader.take(node_length)?,
+        "vegetation rejection diagnostics",
+    );
+    let module_count = node.count(16)?;
+    for _ in 0..module_count {
+        node.u128()?;
+    }
+    node.u128()?;
+    node.complete()?;
+    reader.string()?;
+    match reader.u8()? {
+        0 => {}
+        1 => {
+            reader.u128()?;
+        }
+        _ => {
+            return Err(Error::ArtifactFormat {
+                format: "vegetation rejection diagnostics",
+                field: "streams.scope".to_owned(),
+            });
+        }
+    }
+    if reader.bool()? {
+        let count = reader.count(142)?;
+        for _ in 0..count {
+            skip_candidate_identity(reader)?;
+            reader.cell()?;
+            for _ in 0..3 {
+                reader.i128()?;
+            }
+            if reader.bool()? {
+                reader.uuid()?;
+            }
+            reader.u32()?;
+            reader.i32()?;
+            reader.u64()?;
+        }
+    }
+    if reader.bool()? {
+        let count = reader.count(56)?;
+        for _ in 0..count {
+            skip_candidate_identity(reader)?;
+            reader.i32()?;
+        }
+    }
+    let rejected_count = reader.count(57)?;
+    for _ in 0..rejected_count {
+        skip_candidate_identity(reader)?;
+        rejection_reason_from_byte(reader.u8()?)?;
+        reader.u32()?;
+    }
+    Ok(())
 }
 
-fn push_field_channel(bytes: &mut Vec<u8>, channel: FieldChannel) {
+fn skip_candidate_identity(reader: &mut BinaryReader<'_>) -> Result<()> {
+    reader.u128()?;
+    reader.u128()?;
+    reader.u32()?;
+    reader.u64()?;
+    reader.u64()?;
+    Ok(())
+}
+
+fn push_candidate_identity<S: CanonicalSink>(
+    sink: &mut S,
+    identity: CandidateIdentity,
+) -> Result<()> {
+    sink.write(&identity.node.to_be_bytes())?;
+    sink.write(&identity.node_address.to_be_bytes())?;
+    sink.write(&identity.node_semantic_revision.to_be_bytes())?;
+    sink.write(&identity.ordinal.to_be_bytes())?;
+    sink.write(&identity.ancestor.to_be_bytes())
+}
+
+fn push_field_channel<S: CanonicalSink>(sink: &mut S, channel: FieldChannel) -> Result<()> {
     let (tag, user) = match channel {
         FieldChannel::Altitude => (0, None),
         FieldChannel::Slope => (1, None),
@@ -1408,10 +1925,11 @@ fn push_field_channel(bytes: &mut Vec<u8>, channel: FieldChannel) {
         FieldChannel::SplineDistance => (13, None),
         FieldChannel::User(value) => (14, Some(value)),
     };
-    bytes.push(tag);
+    sink.write_byte(tag)?;
     if let Some(value) = user {
-        bytes.extend_from_slice(&value.to_be_bytes());
+        sink.write(&value.to_be_bytes())?;
     }
+    Ok(())
 }
 
 const fn provenance_outcome_byte(outcome: ProvenanceDecisionOutcome) -> u8 {
@@ -1432,6 +1950,22 @@ const fn rejection_reason_byte(reason: CandidateRejectionReason) -> u8 {
         CandidateRejectionReason::Competition => 4,
         CandidateRejectionReason::ForeignOwner => 5,
         CandidateRejectionReason::NoSpecies => 6,
+    }
+}
+
+fn rejection_reason_from_byte(value: u8) -> Result<CandidateRejectionReason> {
+    match value {
+        0 => Ok(CandidateRejectionReason::SurfaceMiss),
+        1 => Ok(CandidateRejectionReason::Threshold),
+        2 => Ok(CandidateRejectionReason::WeightedElimination),
+        3 => Ok(CandidateRejectionReason::PriorityExclusion),
+        4 => Ok(CandidateRejectionReason::Competition),
+        5 => Ok(CandidateRejectionReason::ForeignOwner),
+        6 => Ok(CandidateRejectionReason::NoSpecies),
+        _ => Err(Error::ArtifactFormat {
+            format: "vegetation rejection diagnostics",
+            field: "rejectionReason".to_owned(),
+        }),
     }
 }
 
@@ -1494,9 +2028,33 @@ pub fn preview_graph_identity_edit(
 }
 
 /// Cooperative cancellation token. A cancelled job never publishes a partial result.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct GraphCancellationToken {
     cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    remaining_checks: Arc<AtomicU64>,
+    #[cfg(test)]
+    observed_checks: Arc<AtomicU64>,
+    #[cfg(test)]
+    abort_checkpoint: Arc<AtomicU64>,
+    #[cfg(test)]
+    abort_kind: Arc<AtomicU64>,
+}
+
+impl Default for GraphCancellationToken {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            remaining_checks: Arc::new(AtomicU64::new(u64::MAX)),
+            #[cfg(test)]
+            observed_checks: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            abort_checkpoint: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            abort_kind: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 impl GraphCancellationToken {
@@ -1508,8 +2066,82 @@ impl GraphCancellationToken {
     /// Whether cancellation was requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        if self.cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            self.observed_checks.fetch_add(1, Ordering::Relaxed);
+            match self.remaining_checks.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |remaining| match remaining {
+                    u64::MAX | 0 => None,
+                    _ => Some(remaining - 1),
+                },
+            ) {
+                Ok(_) | Err(u64::MAX) => false,
+                Err(0) => true,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(test))]
+        false
     }
+
+    #[cfg(test)]
+    fn cancel_after_checks(&self, checks: u64) {
+        self.remaining_checks.store(checks, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn observed_checks(&self) -> u64 {
+        self.observed_checks.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn abort_at_checkpoint(&self, checkpoint: TestEvaluationCheckpoint, kind: TestAbortKind) {
+        self.abort_kind.store(kind as u64, Ordering::Release);
+        self.abort_checkpoint
+            .store(checkpoint as u64, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn check_test_checkpoint(
+        &self,
+        checkpoint: TestEvaluationCheckpoint,
+        time_limit_ms: u64,
+    ) -> Result<()> {
+        if self.abort_checkpoint.load(Ordering::Acquire) != checkpoint as u64 {
+            return Ok(());
+        }
+        match self.abort_kind.load(Ordering::Acquire) {
+            value if value == TestAbortKind::Cancelled as u64 => Err(Error::GraphCancelled),
+            value if value == TestAbortKind::Deadline as u64 => Err(Error::GraphLimit {
+                resource: "time milliseconds",
+                requested: time_limit_ms.saturating_add(1),
+                limit: time_limit_ms,
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestEvaluationCheckpoint {
+    AfterPreflight = 1,
+    AfterPreparation = 2,
+    AfterTraversal = 3,
+    BeforeFinalValidation = 4,
+    BeforePublication = 5,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestAbortKind {
+    Cancelled = 1,
+    Deadline = 2,
 }
 
 /// One explicit authored anchor with its stable vegetation-layer ownership.
@@ -1638,6 +2270,41 @@ pub struct GraphEvaluationJobInputs {
     pub global_stages: Vec<GlobalStageEvaluationInputs>,
 }
 
+/// Checked work and retained-memory prediction for one complete atomic graph job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphEvaluationPreflight {
+    /// Partitioned output cells admitted by the job.
+    pub output_cells: u64,
+    /// Unique compiler-owned global-stage tiles admitted by the job.
+    pub global_stage_tiles: u64,
+    /// Caller-supplied and preparation-generated input tiles admitted by the job.
+    pub input_tiles: u64,
+    /// Caller-supplied immutable input allocations retained while the job runs.
+    pub retained_input_bytes: u64,
+    /// Canonical input allocations created by preparation and retained for replay and publication.
+    pub generated_input_bytes: u64,
+    /// Conservative total candidate-stream peak across every evaluated scope.
+    pub candidate_count: u64,
+    /// Conservative total accepted macro points.
+    pub accepted_count: u64,
+    /// Exact total quantized micro samples.
+    pub micro_samples: u64,
+    /// Peak requested evaluator-owned bytes during symbolic admission.
+    pub preflight_peak_bytes: u64,
+    /// Peak requested evaluator-owned bytes during execution and atomic result assembly.
+    pub execution_peak_bytes: u64,
+    /// Greater of the preflight and execution peaks.
+    pub memory_bytes: u64,
+    /// Exact resident-program transfer bytes for the selected execution plan.
+    pub transfer_bytes: u64,
+    /// Bounded cell workers participating in the job.
+    pub worker_count: u16,
+    /// Maximum wall-clock duration admitted for execution.
+    pub time_limit_ms: u64,
+    /// Hard limits enforced by this preflight and the matching evaluator run.
+    pub limits: crate::GraphSafetyLimits,
+}
+
 /// Published result and retained-memory accounting for one global-stage tile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlobalStageEvaluationResult {
@@ -1647,7 +2314,7 @@ pub struct GlobalStageEvaluationResult {
     pub owner: WorldCellKey,
     /// Public macro, micro, provenance, and diagnostic products of the stage.
     pub result: GraphEvaluationResult,
-    /// Exact evaluator-owned bytes retained for downstream replay in this job.
+    /// Conservative evaluator-owned requested bytes retained for downstream replay in this job.
     pub resident_bytes: u64,
 }
 
@@ -1658,6 +2325,86 @@ pub struct GraphEvaluationJobResult {
     pub cells: Vec<GraphEvaluationResult>,
     /// Canonically sorted global-stage tile results, published exactly once.
     pub global_stages: Vec<GlobalStageEvaluationResult>,
+}
+
+fn graph_node_address_memory(address: &GraphNodeAddress) -> Result<u64> {
+    requested_vec_bytes::<u128>(address.module_path.capacity())
+}
+
+fn qualified_graph_pin_memory(pin: &QualifiedGraphPin) -> Result<u64> {
+    checked_memory_sum([
+        graph_node_address_memory(&pin.node)?,
+        requested_string_bytes(&pin.pin)?,
+    ])
+}
+
+fn micro_field_tile_memory(tile: &MicroFieldTile) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes::<u16>(tile.density.capacity())?,
+        requested_btree_with(
+            &tile.attributes,
+            |_| Ok(0),
+            |values| requested_vec_bytes::<i32>(values.capacity()),
+        )?,
+    ])
+}
+
+fn projected_surface_sample_memory(sample: &ProjectedSurfaceSample) -> Result<u64> {
+    requested_vec_bytes::<WeightedSurfaceTag>(sample.tags.capacity())
+}
+
+fn projection_tile_memory(tile: &QuantizedSurfaceProjectionTile) -> Result<u64> {
+    requested_vec_with(&tile.samples, |entry| {
+        entry.sample.as_ref().map_or(Ok(0), |sample| {
+            requested_vec_bytes::<WeightedSurfaceTag>(sample.tags.capacity())
+        })
+    })
+}
+
+fn field_query_tile_memory(tile: &QuantizedSurfaceFieldQueryTile) -> Result<u64> {
+    requested_vec_bytes::<QuantizedSurfaceFieldQueryEntry>(tile.samples.capacity())
+}
+
+fn diagnostic_stream_memory(stream: &NamedDiagnosticStream) -> Result<u64> {
+    checked_memory_sum([
+        graph_node_address_memory(&stream.node)?,
+        requested_string_bytes(&stream.label)?,
+        stream.candidates.as_ref().map_or(Ok(0), |values| {
+            requested_vec_bytes::<DiagnosticCandidateSample>(values.capacity())
+        })?,
+        stream.field.as_ref().map_or(Ok(0), |values| {
+            requested_vec_bytes::<DiagnosticScalarSample>(values.capacity())
+        })?,
+        requested_vec_bytes::<RejectedCandidate>(stream.rejected.capacity())?,
+    ])
+}
+
+fn graph_diagnostics_memory(diagnostics: &GraphEvaluationDiagnostics) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_with(&diagnostics.nodes, |node| {
+            checked_memory_sum([
+                requested_vec_bytes::<u128>(node.module_path.capacity())?,
+                requested_string_bytes(&node.symbol)?,
+            ])
+        })?,
+        requested_vec_with(&diagnostics.gpu_groups, |group| {
+            requested_vec_with(&group.nodes, graph_node_address_memory)
+        })?,
+        requested_vec_bytes::<RejectedCandidate>(diagnostics.rejected.capacity())?,
+        requested_vec_with(&diagnostics.streams, diagnostic_stream_memory)?,
+    ])
+}
+
+fn graph_result_memory(result: &GraphEvaluationResult) -> Result<u64> {
+    checked_memory_sum([
+        result.macro_points.requested_memory_bytes()?,
+        requested_vec_with(&result.micro_fields, micro_field_tile_memory)?,
+        requested_vec_with(&result.surface_projection_tiles, projection_tile_memory)?,
+        requested_vec_with(&result.surface_field_query_tiles, field_query_tile_memory)?,
+        requested_vec_bytes::<WorldCellKey>(result.ancestor_references.capacity())?,
+        result.provenance.requested_memory_bytes()?,
+        graph_diagnostics_memory(&result.diagnostics)?,
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1706,50 +2453,40 @@ impl GraphValue {
         }
     }
 
-    fn estimated_bytes(&self) -> u64 {
+    fn requested_memory_bytes(&self) -> Result<u64> {
         match self {
-            Self::Candidates(stream) => stream.candidates.len() as u64 * 192,
-            Self::Surface(surface) => surface.values.len() as u64 * 128,
-            Self::Scalar(field) => field.values.len() as u64 * 40,
-            Self::Vector(field) => field.values.len() as u64 * 48,
-            Self::Hessian(field) => field.values.len() as u64 * 60,
-            Self::Macro(points) => points.len() as u64 * 256,
-            Self::Micro(tiles) => tiles
-                .iter()
-                .map(|tile| {
-                    let density = (tile.density.len() as u64).saturating_mul(2);
-                    let attributes = tile.attributes.values().fold(0_u64, |total, values| {
-                        total.saturating_add((values.len() as u64).saturating_mul(4))
-                    });
-                    density.saturating_add(attributes)
-                })
-                .fold(0_u64, u64::saturating_add),
-            Self::Regions(regions) => regions.len() as u64 * 64,
-            Self::Splines(splines) => splines
-                .iter()
-                .map(|spline| spline.points.len() as u64 * 64)
-                .sum(),
-            Self::Species(species) => species.len() as u64 * 32,
-            Self::Communities(communities) => communities.estimated_bytes(),
-            Self::Diagnostics(streams) => streams.iter().fold(0_u64, |total, stream| {
-                let candidates = stream.candidates.as_ref().map_or(0, |values| {
-                    (values.len() as u64).saturating_mul(128)
-                });
-                let field = stream.field.as_ref().map_or(0, |values| {
-                    (values.len() as u64).saturating_mul(48)
-                });
-                total
-                    .saturating_add(candidates)
-                    .saturating_add(field)
-                    .saturating_add((stream.rejected.len() as u64).saturating_mul(160))
+            Self::Candidates(stream) => {
+                requested_vec_bytes::<GraphCandidate>(stream.candidates.capacity())
+            }
+            Self::Surface(surface) => {
+                requested_btree_with(&surface.values, |_| Ok(0), projected_surface_sample_memory)
+            }
+            Self::Scalar(field) => {
+                requested_btree_bytes::<CandidateIdentity, DecisionScalar>(field.values.len())
+            }
+            Self::Vector(field) => {
+                requested_btree_bytes::<CandidateIdentity, DecisionVec3>(field.values.len())
+            }
+            Self::Hessian(field) => {
+                requested_btree_bytes::<CandidateIdentity, DecisionHessian3>(field.values.len())
+            }
+            Self::Macro(points) => requested_vec_bytes::<PlantPoint>(points.capacity()),
+            Self::Micro(tiles) => requested_vec_with(tiles, micro_field_tile_memory),
+            Self::Regions(regions) => requested_vec_bytes::<EvaluationRegion>(regions.capacity()),
+            Self::Splines(splines) => requested_vec_with(splines, |spline| {
+                requested_vec_bytes::<WorldPosition>(spline.points.capacity())
             }),
+            Self::Species(species) => {
+                requested_vec_bytes::<crate::BiomePaletteEntry>(species.capacity())
+            }
+            Self::Communities(communities) => communities.requested_memory_bytes(),
+            Self::Diagnostics(streams) => requested_vec_with(streams, diagnostic_stream_memory),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct GlobalStageCacheKey {
-    graph: [u8; 32],
     stage: [u8; 32],
     map: u64,
     biome_instance: u128,
@@ -1812,11 +2549,19 @@ impl GlobalStageStore {
     }
 
     fn resident_bytes(&self) -> Result<u64> {
-        self.tiles.values().try_fold(0_u64, |total, tile| {
-            total
-                .checked_add(tile.resident_bytes)
-                .ok_or(Error::NumericOverflow)
-        })
+        self.tiles.values().try_fold(
+            checked_memory_sum([
+                requested_btree_bytes::<GlobalStageCacheKey, GlobalStageTile>(self.tiles.len())?,
+                requested_btree_bytes::<([u8; 32], WorldCellKey), GlobalStageCacheKey>(
+                    self.by_owner.len(),
+                )?,
+            ])?,
+            |total, tile| {
+                total
+                    .checked_add(tile.resident_bytes)
+                    .ok_or(Error::NumericOverflow)
+            },
+        )
     }
 }
 
@@ -1831,21 +2576,21 @@ enum EvaluationScope<'a> {
     },
 }
 
-impl EvaluationScope<'_> {
-    fn global_store(&self) -> &GlobalStageStore {
+impl<'a> EvaluationScope<'a> {
+    fn global_store(self) -> &'a GlobalStageStore {
         match self {
             Self::Cell { global_store } | Self::Global { global_store, .. } => global_store,
         }
     }
 
-    fn current_global_stage(&self) -> Option<&CompiledGlobalStage> {
+    fn current_global_stage(self) -> Option<&'a CompiledGlobalStage> {
         match self {
             Self::Cell { .. } => None,
             Self::Global { stage, .. } => Some(stage),
         }
     }
 
-    fn is_cell(&self) -> bool {
+    fn is_cell(self) -> bool {
         matches!(self, Self::Cell { .. })
     }
 }
@@ -1858,8 +2603,40 @@ struct CommunityTables {
 }
 
 impl CommunityTables {
-    fn estimated_bytes(&self) -> u64 {
-        (self.competition.len() + self.companions.len() + self.succession.len()) as u64 * 48
+    fn canonicalize(&mut self) {
+        self.competition.sort_unstable_by_key(|rule| {
+            (
+                rule.first.value(),
+                rule.second.value(),
+                rule.spacing,
+                rule.priority,
+            )
+        });
+        self.companions.sort_unstable_by_key(|rule| {
+            (
+                rule.parent.value(),
+                rule.child.value(),
+                rule.minimum_distance,
+                rule.maximum_distance,
+                rule.probability,
+            )
+        });
+        self.succession.sort_unstable_by_key(|rule| {
+            (
+                rule.minimum_tick,
+                rule.from.value(),
+                rule.to.value(),
+                rule.probability,
+            )
+        });
+    }
+
+    fn requested_memory_bytes(&self) -> Result<u64> {
+        checked_memory_sum([
+            requested_vec_bytes::<crate::CompetitionRule>(self.competition.capacity())?,
+            requested_vec_bytes::<crate::CompanionRule>(self.companions.capacity())?,
+            requested_vec_bytes::<crate::SuccessionRule>(self.succession.capacity())?,
+        ])
     }
 }
 
@@ -1928,6 +2705,7 @@ struct EvaluationState<'a> {
     diagnostics: GraphEvaluationDiagnostics,
     rejected_by_lineage: BTreeMap<CandidateLineage, Vec<RejectedCandidate>>,
     materialized_outputs: BTreeMap<QualifiedGraphPin, GraphValue>,
+    current_node_live_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1952,6 +2730,43 @@ pub struct BiomeGraphEvaluator {
     graph: Arc<CompiledBiomeGraph>,
     worker_count: usize,
     compute: Option<Arc<dyn GraphComputeExecutor>>,
+}
+
+struct EvaluationPlans {
+    execution: GraphExecutionPlan,
+    preparation: Option<GraphExecutionPlan>,
+    allocation_bytes: u64,
+}
+
+fn build_evaluation_plans(
+    graph: &CompiledBiomeGraph,
+    parallel_cpu: bool,
+    gpu: Option<GraphGpuScheduling<'_>>,
+    guard: PreflightGuard<'_>,
+) -> Result<EvaluationPlans> {
+    guard.check()?;
+    let one_plan_bytes = execution_plan_allocation_bound(graph)?;
+    let needs_preparation =
+        demand_requires_canonical_preparation(&graph.root, graph.demand_plan().execution_slice())?;
+    let plan_count = 1 + u64::from(needs_preparation);
+    let allocation_bytes = bound_mul(
+        "memory bytes",
+        one_plan_bytes,
+        plan_count,
+        graph.limits.max_memory_bytes,
+    )?;
+    guard.check()?;
+    let execution = build_execution_plan(graph, parallel_cpu, gpu)?;
+    guard.check()?;
+    let preparation = needs_preparation
+        .then(|| build_execution_plan(graph, false, None))
+        .transpose()?;
+    guard.check()?;
+    Ok(EvaluationPlans {
+        execution,
+        preparation,
+        allocation_bytes,
+    })
 }
 
 impl BiomeGraphEvaluator {
@@ -1989,6 +2804,37 @@ impl BiomeGraphEvaluator {
     #[must_use]
     pub fn graph(&self) -> &CompiledBiomeGraph {
         &self.graph
+    }
+
+    /// Predicts and checks the complete job before any worker or GPU dispatch starts.
+    pub fn preflight(
+        &self,
+        inputs: &GraphEvaluationJobInputs,
+        cancellation: &GraphCancellationToken,
+    ) -> Result<GraphEvaluationPreflight> {
+        let deadline = evaluation_deadline(&self.graph)?;
+        let guard = PreflightGuard {
+            cancellation,
+            deadline,
+            time_limit_ms: self.graph.limits.max_time_ms,
+        };
+        guard.check()?;
+        check_job_collection_limits(&self.graph, inputs)?;
+        guard.check()?;
+        let workers = self.worker_count.min(inputs.cells.len().max(1));
+        let gpu = self.compute.as_deref().map(|compute| GraphGpuScheduling {
+            profile: compute.profile(),
+            qualifications: compute.qualifications(),
+        });
+        let plans = build_evaluation_plans(&self.graph, workers > 1, gpu, guard)?;
+        preflight_evaluation_job(
+            &self.graph,
+            inputs,
+            workers,
+            &plans.execution,
+            plans.allocation_bytes,
+            guard,
+        )
     }
 
     /// Evaluates one complete batch and publishes no cells or global tiles on failure.
@@ -2036,103 +2882,14 @@ fn evaluate_cell_planned(
 ) -> Result<PlannedEvaluation> {
     let graph = context.graph;
     let scope = context.scope;
-    let required_halo = fixed_meters_to_ticks(scope.current_global_stage().map_or_else(
-        || graph.required_halo(inputs.output_cell.level()),
-        |stage| stage.upstream_halo,
-    ))?
-    .unsigned_abs() as i128;
-    let required_read_bounds = expand_bounds_checked(inputs.output_bounds, required_halo)?;
-    if !bounds_contains_bounds(inputs.read_bounds, required_read_bounds) {
-        return Err(Error::GraphAuthoritativeInput {
-            node: 0,
-            input: format!(
-                "immutable halo of {} fixed ticks around {}",
-                required_halo, inputs.output_cell
-            ),
-        });
-    }
-    for field in &inputs.fields {
-        field.validate()?;
-        validate_field_dependency(graph, inputs, field)?;
-    }
-    let mut projection_queries = BTreeSet::new();
-    for tile in &inputs.surface_projection_tiles {
-        tile.validate()?;
-        for entry in &tile.samples {
-            if !projection_queries.insert((tile.node, tile.node_semantic_revision, entry.query)) {
-                return Err(Error::GraphDocument {
-                    path: "evaluation.surfaceProjectionTiles".to_owned(),
-                    reason: "an exact projection query is duplicated".to_owned(),
-                });
-            }
-        }
-    }
-    let mut field_queries = BTreeSet::new();
-    for tile in &inputs.surface_field_query_tiles {
-        tile.validate()?;
-        if tile.provider_set_hash != inputs.surface_provider_set_hash {
-            return Err(Error::GraphDocument {
-                path: "evaluation.surfaceFieldQueryTiles".to_owned(),
-                reason: "field query tile does not match the declared provider set".to_owned(),
-            });
-        }
-        for entry in &tile.samples {
-            if !field_queries.insert((
-                tile.node,
-                tile.node_semantic_revision,
-                tile.channel,
-                tile.derivative,
-                entry.candidate,
-                entry.query,
-            )) {
-                return Err(Error::GraphDocument {
-                    path: "evaluation.surfaceFieldQueryTiles".to_owned(),
-                    reason: "an exact field query is duplicated".to_owned(),
-                });
-            }
-        }
-    }
-    if !inputs.surface_providers.is_empty()
-        && canonical_surface_provider_set_hash(&inputs.surface_providers)?
-            != inputs.surface_provider_set_hash
-    {
-        return Err(Error::GraphDocument {
-            path: "evaluation.surfaceProviderSetHash".to_owned(),
-            reason: "surface provider descriptors do not match the declared set identity"
-                .to_owned(),
-        });
-    }
-    for provider in &inputs.surface_providers {
-        let descriptor = provider.descriptor();
-        let source = GraphDependencySource::SurfaceProvider(descriptor.id.0);
-        let Some(dependency) = graph
-            .dependencies()
-            .iter()
-            .find(|dependency| dependency.source == source)
-        else {
-            continue;
-        };
-        let actual = canonical_surface_provider_set_hash(&[Arc::clone(provider)])?;
-        if actual != dependency.content_hash {
-            return Err(Error::GraphAuthoritativeInput {
-                node: 0,
-                input: format!("content hash for {source:?}"),
-            });
-        }
-    }
-    for prototype in &inputs.plant_prototypes {
-        prototype.validate()?;
-    }
-    if inputs
-        .plant_prototypes
-        .windows(2)
-        .any(|pair| pair[0].family.value() >= pair[1].family.value())
-    {
-        return Err(Error::GraphDocument {
-            path: "evaluation.plantPrototypes".to_owned(),
-            reason: "plant prototypes must be sorted by unique family identity".to_owned(),
-        });
-    }
+    let guard = PreflightGuard {
+        cancellation: context.cancellation,
+        deadline: context.deadline,
+        time_limit_ms: graph.limits.max_time_ms,
+    };
+    validate_static_inputs(graph, inputs, scope.current_global_stage(), guard)?;
+    let demand = compiled_demand_slice(graph, scope.current_global_stage())?;
+    let root_demand = root_demand_unit(demand)?;
     let mut state = EvaluationState {
         graph,
         inputs,
@@ -2151,15 +2908,64 @@ fn evaluate_cell_planned(
         diagnostics: GraphEvaluationDiagnostics::default(),
         rejected_by_lineage: BTreeMap::new(),
         materialized_outputs: BTreeMap::new(),
+        current_node_live_bytes: 0,
     };
     state.check_abort()?;
-    let outputs = evaluate_unit(&graph.root, &BTreeMap::new(), &mut state)?;
+    let mut outputs = evaluate_unit(
+        &graph.root,
+        root_demand,
+        demand,
+        &BTreeMap::new(),
+        &mut state,
+    )?;
+    #[cfg(test)]
+    context.cancellation.check_test_checkpoint(
+        TestEvaluationCheckpoint::AfterTraversal,
+        graph.limits.max_time_ms,
+    )?;
     state.check_abort()?;
     let mut macro_points = Vec::new();
     let mut micro_fields = Vec::new();
     let mut diagnostic_streams = Vec::new();
+    let (macro_count, micro_count, stream_count) = graph.root.outputs.iter().try_fold(
+        (0_usize, 0_usize, 0_usize),
+        |(macro_count, micro_count, stream_count), output| -> Result<_> {
+            match outputs.get(&output.name) {
+                Some(GraphValue::Macro(points)) => Ok((
+                    macro_count
+                        .checked_add(points.len())
+                        .ok_or(Error::NumericOverflow)?,
+                    micro_count,
+                    stream_count,
+                )),
+                Some(GraphValue::Micro(tiles)) => Ok((
+                    macro_count,
+                    micro_count
+                        .checked_add(tiles.len())
+                        .ok_or(Error::NumericOverflow)?,
+                    stream_count,
+                )),
+                Some(GraphValue::Diagnostics(streams)) => Ok((
+                    macro_count,
+                    micro_count,
+                    stream_count
+                        .checked_add(streams.len())
+                        .ok_or(Error::NumericOverflow)?,
+                )),
+                _ => Ok((macro_count, micro_count, stream_count)),
+            }
+        },
+    )?;
+    crate::memory::reserve_exact(&mut macro_points, macro_count, "terminal macro points")?;
+    crate::memory::reserve_exact(&mut micro_fields, micro_count, "terminal micro fields")?;
+    crate::memory::reserve_exact(
+        &mut diagnostic_streams,
+        stream_count,
+        "terminal diagnostic streams",
+    )?;
     for output in &graph.root.outputs {
-        let Some(value) = outputs.get(&output.name) else {
+        state.check_abort()?;
+        let Some(value) = outputs.remove(&output.name) else {
             if state.scope.current_global_stage().is_some() {
                 continue;
             }
@@ -2169,89 +2975,343 @@ fn evaluate_cell_planned(
             });
         };
         match value {
-            GraphValue::Macro(points) => macro_points.extend(points.iter().cloned()),
-            GraphValue::Micro(tiles) => micro_fields.extend(tiles.iter().cloned()),
-            GraphValue::Diagnostics(streams) => {
-                diagnostic_streams.extend(streams.iter().cloned());
-            }
+            GraphValue::Macro(mut points) => macro_points.append(&mut points),
+            GraphValue::Micro(mut tiles) => micro_fields.append(&mut tiles),
+            GraphValue::Diagnostics(mut streams) => diagnostic_streams.append(&mut streams),
             _ => {}
         }
     }
-    macro_points.sort_by_key(|point| point.id);
-    let mut collision = PlantIdCollisionTable::default();
-    for point in &macro_points {
-        collision.insert(point.id, point_source_fingerprint(point))?;
-    }
+    drop(outputs);
+    state.check_abort()?;
+    macro_points.sort_unstable_by_key(|point| point.id);
+    micro_fields.sort_unstable_by_key(|tile| (tile.cell, tile.family.value()));
+    state.check_abort()?;
     state.diagnostics.accepted_count = macro_points.len() as u64;
     state
         .diagnostics
         .rejected
-        .sort_by_key(|value| value.candidate);
-    diagnostic_streams.sort_by_key(|stream| (stream.node.clone(), stream.label.clone()));
+        .sort_unstable_by_key(rejected_order_key);
+    for stream in &mut diagnostic_streams {
+        state.check_abort()?;
+        if let Some(candidates) = &mut stream.candidates {
+            candidates.sort_unstable_by_key(|sample| sample.identity);
+        }
+        if let Some(field) = &mut stream.field {
+            field.sort_unstable_by_key(|sample| sample.candidate);
+        }
+        stream.rejected.sort_unstable_by_key(rejected_order_key);
+    }
+    diagnostic_streams.sort_unstable_by(|left, right| {
+        diagnostic_stream_order_key(left).cmp(&diagnostic_stream_order_key(right))
+    });
+    state.check_abort()?;
     state.diagnostics.streams = diagnostic_streams;
     state.check_count(
         "accepted count",
         macro_points.len() as u64,
         graph.limits.max_macro_points,
     )?;
-    let columns = PlantPointColumns::from_points(&macro_points)?;
+    let columns = PlantPointColumns::from_points(macro_points)?;
     state.check_abort()?;
-    let surface_projection_tiles = state
-        .prepared_surface_projections
-        .into_iter()
-        .map(
-            |((node, node_semantic_revision, provider_set_hash), samples)| {
-                QuantizedSurfaceProjectionTile {
-                    node,
-                    node_semantic_revision,
-                    samples: samples
-                        .into_iter()
-                        .map(|(query, sample)| QuantizedSurfaceProjectionEntry { query, sample })
-                        .collect(),
-                    provider_set_hash,
-                }
-            },
-        )
-        .collect();
-    let surface_field_query_tiles = state
-        .prepared_surface_fields
-        .into_iter()
-        .map(
-            |((node, node_semantic_revision, channel, derivative, provider_set_hash), samples)| {
-                QuantizedSurfaceFieldQueryTile {
-                    node,
-                    node_semantic_revision,
-                    channel,
-                    derivative,
-                    samples: samples
-                        .into_iter()
-                        .map(
-                            |((candidate, query), value)| QuantizedSurfaceFieldQueryEntry {
-                                candidate,
-                                query,
-                                value,
-                            },
-                        )
-                        .collect(),
-                    provider_set_hash,
-                }
-            },
-        )
-        .collect();
-    Ok(PlannedEvaluation {
-        result: GraphEvaluationResult {
-            cell: inputs.output_cell,
-            macro_points: columns,
-            micro_fields,
-            surface_projection_tiles,
-            surface_field_query_tiles,
-            ancestor_references: state.ancestor_references.into_iter().collect(),
-            provenance: state.provenance,
-            diagnostics: state.diagnostics,
-        },
+    let mut surface_projection_tiles = Vec::new();
+    crate::memory::reserve_exact(
+        &mut surface_projection_tiles,
+        state.prepared_surface_projections.len(),
+        "prepared surface projection tiles",
+    )?;
+    for ((node, node_semantic_revision, provider_set_hash), samples) in
+        state.prepared_surface_projections
+    {
+        let mut entries = Vec::new();
+        crate::memory::reserve_exact(
+            &mut entries,
+            samples.len(),
+            "prepared surface projection entries",
+        )?;
+        entries.extend(
+            samples
+                .into_iter()
+                .map(|(query, sample)| QuantizedSurfaceProjectionEntry { query, sample }),
+        );
+        surface_projection_tiles.push(QuantizedSurfaceProjectionTile {
+            node,
+            node_semantic_revision,
+            samples: entries,
+            provider_set_hash,
+        });
+    }
+    let mut surface_field_query_tiles = Vec::new();
+    crate::memory::reserve_exact(
+        &mut surface_field_query_tiles,
+        state.prepared_surface_fields.len(),
+        "prepared surface field query tiles",
+    )?;
+    for ((node, node_semantic_revision, channel, derivative, provider_set_hash), samples) in
+        state.prepared_surface_fields
+    {
+        let mut entries = Vec::new();
+        crate::memory::reserve_exact(
+            &mut entries,
+            samples.len(),
+            "prepared surface field query entries",
+        )?;
+        entries.extend(samples.into_iter().map(|((candidate, query), value)| {
+            QuantizedSurfaceFieldQueryEntry {
+                candidate,
+                query,
+                value,
+            }
+        }));
+        surface_field_query_tiles.push(QuantizedSurfaceFieldQueryTile {
+            node,
+            node_semantic_revision,
+            channel,
+            derivative,
+            samples: entries,
+            provider_set_hash,
+        });
+    }
+    let mut ancestor_references = Vec::new();
+    crate::memory::reserve_exact(
+        &mut ancestor_references,
+        state.ancestor_references.len(),
+        "ancestor references",
+    )?;
+    ancestor_references.extend(state.ancestor_references);
+    guard.check()?;
+    let result = GraphEvaluationResult {
+        cell: inputs.output_cell,
+        macro_points: columns,
+        micro_fields,
+        surface_projection_tiles,
+        surface_field_query_tiles,
+        ancestor_references,
+        provenance: state.provenance,
+        diagnostics: state.diagnostics,
+    };
+    #[cfg(test)]
+    context.cancellation.check_test_checkpoint(
+        TestEvaluationCheckpoint::BeforeFinalValidation,
+        graph.limits.max_time_ms,
+    )?;
+    result.validate_canonical_encoding_guarded(guard)?;
+    let evaluated = PlannedEvaluation {
+        result,
         materialized_outputs: state.materialized_outputs,
         candidate_decisions: state.candidate_decisions,
-    })
+    };
+    guard.check()?;
+    Ok(evaluated)
+}
+
+fn validate_projection_tile_guarded(
+    tile: &QuantizedSurfaceProjectionTile,
+    guard: PreflightGuard<'_>,
+) -> Result<()> {
+    if tile.node == 0 || tile.node_semantic_revision == 0 || tile.provider_set_hash == [0; 32] {
+        return Err(Error::GraphDocument {
+            path: "evaluation.surfaceProjectionTiles".to_owned(),
+            reason: "projection tile identity or exact query ordering is invalid".to_owned(),
+        });
+    }
+    let mut previous_query = None;
+    for entry in &tile.samples {
+        guard.check()?;
+        if previous_query.is_some_and(|previous| previous >= entry.query) {
+            return Err(Error::GraphDocument {
+                path: "evaluation.surfaceProjectionTiles".to_owned(),
+                reason: "projection tile identity or exact query ordering is invalid".to_owned(),
+            });
+        }
+        previous_query = Some(entry.query);
+        if let Some(sample) = &entry.sample {
+            for pair in sample.tags.windows(2) {
+                guard.check()?;
+                if pair[0].tag >= pair[1].tag {
+                    return Err(Error::GraphDocument {
+                        path: "evaluation.surfaceProjectionTiles.tags".to_owned(),
+                        reason: "projection sample tags must be sorted and unique".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_query_tile_guarded(
+    tile: &QuantizedSurfaceFieldQueryTile,
+    guard: PreflightGuard<'_>,
+) -> Result<()> {
+    validate_field_query_tile_with_guard(tile, Some(guard))
+}
+
+fn validate_field_query_tile_with_guard(
+    tile: &QuantizedSurfaceFieldQueryTile,
+    guard: Option<PreflightGuard<'_>>,
+) -> Result<()> {
+    guard.map_or(Ok(()), PreflightGuard::check)?;
+    if tile.node == 0 || tile.node_semantic_revision == 0 || tile.provider_set_hash == [0; 32] {
+        return Err(Error::GraphDocument {
+            path: "evaluation.surfaceFieldQueryTiles".to_owned(),
+            reason: "field query tile identity, type, or exact query ordering is invalid"
+                .to_owned(),
+        });
+    }
+    let mut previous_query = None;
+    for entry in &tile.samples {
+        guard.map_or(Ok(()), PreflightGuard::check)?;
+        let type_matches = matches!(
+            (tile.derivative, entry.value),
+            (
+                FieldDerivative::Value,
+                QuantizedSurfaceFieldValue::Scalar(_)
+            ) | (
+                FieldDerivative::Gradient,
+                QuantizedSurfaceFieldValue::Gradient(_)
+            ) | (
+                FieldDerivative::Hessian,
+                QuantizedSurfaceFieldValue::Hessian(_)
+            )
+        );
+        let query = (entry.candidate, entry.query);
+        if !type_matches || previous_query.is_some_and(|previous| previous >= query) {
+            return Err(Error::GraphDocument {
+                path: "evaluation.surfaceFieldQueryTiles".to_owned(),
+                reason: "field query tile identity, type, or exact query ordering is invalid"
+                    .to_owned(),
+            });
+        }
+        previous_query = Some(query);
+    }
+    guard.map_or(Ok(()), PreflightGuard::check)
+}
+
+fn validate_static_inputs(
+    graph: &CompiledBiomeGraph,
+    inputs: &GraphEvaluationInputs,
+    global_stage: Option<&CompiledGlobalStage>,
+    guard: PreflightGuard<'_>,
+) -> Result<()> {
+    guard.check()?;
+    let required_halo = fixed_meters_to_ticks(global_stage.map_or_else(
+        || graph.required_halo(inputs.output_cell.level()),
+        |stage| stage.upstream_halo,
+    ))?
+    .unsigned_abs() as i128;
+    let required_read_bounds = expand_bounds_checked(inputs.output_bounds, required_halo)?;
+    if !bounds_contains_bounds(inputs.read_bounds, required_read_bounds) {
+        return Err(Error::GraphAuthoritativeInput {
+            node: 0,
+            input: format!(
+                "immutable halo of {} fixed ticks around {}",
+                required_halo, inputs.output_cell
+            ),
+        });
+    }
+    for field in &inputs.fields {
+        guard.check()?;
+        field.validate()?;
+        validate_field_dependency(graph, inputs, field)?;
+    }
+    let mut projection_queries = BTreeSet::new();
+    for tile in &inputs.surface_projection_tiles {
+        guard.check()?;
+        validate_projection_tile_guarded(tile, guard)?;
+        if tile.provider_set_hash != inputs.surface_provider_set_hash {
+            return Err(Error::GraphDocument {
+                path: "evaluation.surfaceProjectionTiles".to_owned(),
+                reason: "projection tile does not match the declared provider set".to_owned(),
+            });
+        }
+        for entry in &tile.samples {
+            guard.check()?;
+            if !projection_queries.insert((tile.node, tile.node_semantic_revision, entry.query)) {
+                return Err(Error::GraphDocument {
+                    path: "evaluation.surfaceProjectionTiles".to_owned(),
+                    reason: "an exact projection query is duplicated".to_owned(),
+                });
+            }
+        }
+    }
+    let mut field_queries = BTreeSet::new();
+    for tile in &inputs.surface_field_query_tiles {
+        guard.check()?;
+        validate_field_query_tile_guarded(tile, guard)?;
+        if tile.provider_set_hash != inputs.surface_provider_set_hash {
+            return Err(Error::GraphDocument {
+                path: "evaluation.surfaceFieldQueryTiles".to_owned(),
+                reason: "field query tile does not match the declared provider set".to_owned(),
+            });
+        }
+        for entry in &tile.samples {
+            guard.check()?;
+            if !field_queries.insert((
+                tile.node,
+                tile.node_semantic_revision,
+                tile.channel,
+                tile.derivative,
+                entry.candidate,
+                entry.query,
+            )) {
+                return Err(Error::GraphDocument {
+                    path: "evaluation.surfaceFieldQueryTiles".to_owned(),
+                    reason: "an exact field query is duplicated".to_owned(),
+                });
+            }
+        }
+    }
+    if !inputs.surface_providers.is_empty()
+        && canonical_surface_provider_set_hash_guarded(
+            &inputs.surface_providers,
+            graph.limits.max_input_tiles,
+            Some(guard),
+        )? != inputs.surface_provider_set_hash
+    {
+        return Err(Error::GraphDocument {
+            path: "evaluation.surfaceProviderSetHash".to_owned(),
+            reason: "surface provider descriptors do not match the declared set identity"
+                .to_owned(),
+        });
+    }
+    for provider in &inputs.surface_providers {
+        guard.check()?;
+        let descriptor = provider.descriptor();
+        let source = GraphDependencySource::SurfaceProvider(descriptor.id.0);
+        let Some(dependency) = graph
+            .dependencies()
+            .iter()
+            .find(|dependency| dependency.source == source)
+        else {
+            continue;
+        };
+        let actual = canonical_surface_provider_set_hash_guarded(
+            &[Arc::clone(provider)],
+            graph.limits.max_input_tiles,
+            Some(guard),
+        )?;
+        if actual != dependency.content_hash {
+            return Err(Error::GraphAuthoritativeInput {
+                node: 0,
+                input: format!("content hash for {source:?}"),
+            });
+        }
+    }
+    for prototype in &inputs.plant_prototypes {
+        guard.check()?;
+        prototype.validate()?;
+    }
+    if inputs
+        .plant_prototypes
+        .windows(2)
+        .any(|pair| pair[0].family.value() >= pair[1].family.value())
+    {
+        return Err(Error::GraphDocument {
+            path: "evaluation.plantPrototypes".to_owned(),
+            reason: "plant prototypes must be sorted by unique family identity".to_owned(),
+        });
+    }
+    guard.check()
 }
 
 fn validate_field_dependency(
@@ -2295,74 +3355,89 @@ fn validate_field_dependency(
 }
 
 fn evaluate_cell_atomically(
-    graph: &CompiledBiomeGraph,
-    inputs: &GraphEvaluationInputs,
-    cancellation: &GraphCancellationToken,
-    compute: Option<&dyn GraphComputeExecutor>,
-    execution_plan: &GraphExecutionPlan,
-    scope: EvaluationScope<'_>,
-    deadline: Instant,
+    mut inputs: GraphEvaluationInputs,
+    context: EvaluationContext<'_>,
+    preparation_plan: Option<&GraphExecutionPlan>,
 ) -> Result<PlannedEvaluation> {
-    if !inputs.surface_providers.is_empty() && unit_requires_canonical_preparation(&graph.root) {
-        let preparation_plan = build_execution_plan(graph, false, None)?;
+    let demand = compiled_demand_slice(context.graph, context.scope.current_global_stage())?;
+    if !inputs.surface_providers.is_empty()
+        && demand_requires_canonical_preparation(&context.graph.root, demand)?
+    {
+        let preparation_plan = preparation_plan.ok_or_else(|| Error::GraphDocument {
+            path: "evaluation.preparationPlan".to_owned(),
+            reason: "canonical surface preparation plan is missing".to_owned(),
+        })?;
         let preparation_context = EvaluationContext {
-            graph,
-            cancellation,
+            graph: context.graph,
+            cancellation: context.cancellation,
             compute: None,
-            execution_plan: &preparation_plan,
-            scope,
-            deadline,
+            execution_plan: preparation_plan,
+            scope: context.scope,
+            deadline: context.deadline,
         };
-        let prepared = evaluate_cell_planned(
-            &preparation_context,
-            inputs,
-            EvaluationPass::PrepareCanonicalInputs,
+        let (surface_projection_tiles, surface_field_query_tiles) = {
+            let prepared = evaluate_cell_planned(
+                &preparation_context,
+                &inputs,
+                EvaluationPass::PrepareCanonicalInputs,
+            )?;
+            let GraphEvaluationResult {
+                surface_projection_tiles,
+                surface_field_query_tiles,
+                ..
+            } = prepared.result;
+            (surface_projection_tiles, surface_field_query_tiles)
+        };
+        #[cfg(test)]
+        context.cancellation.check_test_checkpoint(
+            TestEvaluationCheckpoint::AfterPreparation,
+            context.graph.limits.max_time_ms,
         )?;
-        let mut replay_inputs = inputs.clone();
-        replay_inputs.surface_projection_tiles = prepared.result.surface_projection_tiles;
-        replay_inputs.surface_field_query_tiles = prepared.result.surface_field_query_tiles;
+        inputs.surface_projection_tiles = surface_projection_tiles;
+        inputs.surface_field_query_tiles = surface_field_query_tiles;
         check_limit(
             "input tiles",
-            evaluation_input_tile_count(&replay_inputs)?,
-            graph.limits.max_input_tiles,
+            evaluation_input_tile_count(&inputs)?,
+            context.graph.limits.max_input_tiles,
         )?;
-        let replay_context = EvaluationContext {
-            graph,
-            cancellation,
-            compute,
-            execution_plan,
-            scope,
-            deadline,
-        };
-        return evaluate_cell_planned(
-            &replay_context,
-            &replay_inputs,
-            EvaluationPass::AuthoritativeReplay,
-        );
+        return evaluate_cell_planned(&context, &inputs, EvaluationPass::AuthoritativeReplay);
     }
-    let context = EvaluationContext {
-        graph,
-        cancellation,
-        compute,
-        execution_plan,
-        scope,
-        deadline,
-    };
-    evaluate_cell_planned(&context, inputs, EvaluationPass::AuthoritativeReplay)
+    evaluate_cell_planned(&context, &inputs, EvaluationPass::AuthoritativeReplay)
 }
 
-fn unit_requires_canonical_preparation(unit: &CompiledGraphUnit) -> bool {
-    unit.nodes.iter().any(|node| {
-        (node.definition.authority != GraphAuthority::Cosmetic
+fn demand_requires_canonical_preparation(
+    unit: &CompiledGraphUnit,
+    demand: &CompiledDemandSlice,
+) -> Result<bool> {
+    let module_path = unit
+        .nodes
+        .first()
+        .map_or(&[][..], |node| node.debug_symbol.module_path.as_slice());
+    let unit_demand = demand
+        .unit(module_path)
+        .ok_or_else(|| Error::GraphDocument {
+            path: "graph.demandPlan".to_owned(),
+            reason: "live unit has no preparation demand slice".to_owned(),
+        })?;
+    for node in unit.nodes.iter().filter(|node| {
+        unit_demand.contains_node(node.definition.guid) && demand.executes_node(&node.address())
+    }) {
+        if node.definition.authority != GraphAuthority::Cosmetic
             && matches!(
                 node.definition.operator,
                 GraphOperator::SurfaceProjection | GraphOperator::FieldSample
-            ))
-            || node
-                .module
-                .as_deref()
-                .is_some_and(unit_requires_canonical_preparation)
-    })
+            )
+        {
+            return Ok(true);
+        }
+        if let Some(module) = node.module.as_deref()
+            && find_child_demand_unit(demand, node).is_some()
+            && demand_requires_canonical_preparation(module, demand)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn evaluation_deadline(graph: &CompiledBiomeGraph) -> Result<Instant> {
@@ -2371,29 +3446,1289 @@ fn evaluation_deadline(graph: &CompiledBiomeGraph) -> Result<Instant> {
         .ok_or(Error::NumericOverflow)
 }
 
+fn check_job_collection_limits(
+    graph: &CompiledBiomeGraph,
+    inputs: &GraphEvaluationJobInputs,
+) -> Result<()> {
+    check_limit(
+        "output cells",
+        inputs.cells.len() as u64,
+        graph.limits.max_output_cells,
+    )?;
+    check_limit(
+        "global stage tiles",
+        inputs.global_stages.len() as u64,
+        graph.limits.max_global_stage_tiles,
+    )
+}
+
+fn canonicalize_evaluation_input(input: &mut GraphEvaluationInputs) {
+    input.regions.sort_unstable_by_key(|region| {
+        (
+            region.id,
+            region.layer,
+            region.kind as u8,
+            region.hierarchy_namespace,
+            region.seed_cell,
+            region.bounds.min_ticks(),
+            region.bounds.max_ticks_exclusive(),
+        )
+    });
+    input.splines.sort_unstable_by_key(|spline| spline.id);
+    input
+        .anchors
+        .sort_unstable_by_key(|anchor| (anchor.layer, anchor.point.id));
+    input
+        .plant_prototypes
+        .sort_unstable_by_key(|prototype| prototype.family.value());
+    input.fields.sort_unstable_by_key(|tile| {
+        (
+            tile.channel,
+            tile.derivative,
+            tile.layer_order,
+            tile.source,
+            tile.bounds.min_ticks(),
+            tile.bounds.max_ticks_exclusive(),
+            tile.source_hash,
+        )
+    });
+    input.surface_projection_tiles.sort_unstable_by_key(|tile| {
+        (
+            tile.node,
+            tile.node_semantic_revision,
+            tile.samples.first().map(|entry| entry.query),
+            tile.samples.last().map(|entry| entry.query),
+            tile.provider_set_hash,
+        )
+    });
+    input
+        .surface_field_query_tiles
+        .sort_unstable_by_key(|tile| {
+            (
+                tile.node,
+                tile.node_semantic_revision,
+                tile.channel,
+                tile.derivative,
+                tile.samples
+                    .first()
+                    .map(|entry| (entry.candidate, entry.query)),
+                tile.samples
+                    .last()
+                    .map(|entry| (entry.candidate, entry.query)),
+                tile.provider_set_hash,
+            )
+        });
+    input
+        .surface_providers
+        .sort_unstable_by_key(|provider| provider.descriptor().id);
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct SymbolicValueBound {
     domain: Option<GraphDomain>,
     items: u64,
     bytes: u64,
+    diagnostic_candidates: u64,
+    diagnostic_fields: u64,
+    diagnostic_rejected: u64,
+    diagnostic_module_path_items: u64,
+    diagnostic_label_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SymbolicEvaluationBound {
     candidate_peak: u64,
+    candidate_events: u64,
     accepted: u64,
     micro_samples: u64,
     memory_bytes: u64,
     transfer_bytes: u64,
     rejected: u64,
+    provenance_bytes: u64,
+    imported_provenance_records: u64,
+    diagnostic_metadata_bytes: u64,
+    generated_input_tiles: u64,
+    generated_input_bytes: u64,
+    published_input_tiles: u64,
+    published_input_bytes: u64,
+    candidate_decision_scratch_bytes: u64,
 }
 
-fn bound_add(
-    resource: &'static str,
-    left: u64,
-    right: u64,
-    limit: u64,
+#[derive(Default)]
+struct SymbolicGlobalTile {
+    outputs: BTreeMap<QualifiedGraphPin, SymbolicValueBound>,
+    provenance_decisions: u64,
+    provenance_records: u64,
+    provenance_bytes: u64,
+}
+
+impl SymbolicGlobalTile {
+    fn requested_memory_bytes(&self) -> Result<u64> {
+        requested_btree_with(&self.outputs, qualified_graph_pin_memory, |_| Ok(0))
+    }
+}
+
+#[derive(Default)]
+struct SymbolicGlobalStore {
+    tiles: BTreeMap<([u8; 32], WorldCellKey), SymbolicGlobalTile>,
+}
+
+impl SymbolicGlobalStore {
+    fn requested_memory_bytes(&self) -> Result<u64> {
+        requested_btree_with(
+            &self.tiles,
+            |_| Ok(0),
+            SymbolicGlobalTile::requested_memory_bytes,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SymbolicEvaluationScope<'a> {
+    Cell {
+        global_store: &'a SymbolicGlobalStore,
+    },
+    Global {
+        stage: &'a CompiledGlobalStage,
+        global_store: &'a SymbolicGlobalStore,
+    },
+}
+
+impl<'a> SymbolicEvaluationScope<'a> {
+    fn current_global_stage(self) -> Option<&'a CompiledGlobalStage> {
+        match self {
+            Self::Cell { .. } => None,
+            Self::Global { stage, .. } => Some(stage),
+        }
+    }
+
+    fn global_store(self) -> &'a SymbolicGlobalStore {
+        match self {
+            Self::Cell { global_store } | Self::Global { global_store, .. } => global_store,
+        }
+    }
+
+    const fn is_cell(self) -> bool {
+        matches!(self, Self::Cell { .. })
+    }
+}
+
+fn compiled_demand_slice<'a>(
+    graph: &'a CompiledBiomeGraph,
+    stage: Option<&CompiledGlobalStage>,
+) -> Result<&'a CompiledDemandSlice> {
+    match stage {
+        Some(stage) => {
+            graph
+                .demand_plan()
+                .stage_slice(stage.id)
+                .ok_or_else(|| Error::GraphDocument {
+                    path: "graph.demandPlan".to_owned(),
+                    reason: format!("global stage {} has no demand slice", hex_hash(stage.id)),
+                })
+        }
+        None => Ok(graph.demand_plan().public_slice()),
+    }
+}
+
+fn root_demand_unit(demand: &CompiledDemandSlice) -> Result<&CompiledDemandUnitSlice> {
+    demand.unit(&[]).ok_or_else(|| Error::GraphDocument {
+        path: "graph.demandPlan".to_owned(),
+        reason: "root unit has no demand slice".to_owned(),
+    })
+}
+
+fn find_child_demand_unit<'a>(
+    demand: &'a CompiledDemandSlice,
+    node: &CompiledGraphNode,
+) -> Option<&'a CompiledDemandUnitSlice> {
+    let GraphParameterValue::Guid(call_guid) = node.definition.parameter("callGuid")? else {
+        return None;
+    };
+    let parent = node.debug_symbol.module_path.as_slice();
+    demand
+        .units
+        .iter()
+        .find(|(path, _)| {
+            path.len() == parent.len() + 1
+                && path[..parent.len()] == *parent
+                && path[parent.len()] == *call_guid
+        })
+        .map(|(_, unit)| unit)
+}
+
+fn child_demand_unit<'a>(
+    demand: &'a CompiledDemandSlice,
+    node: &CompiledGraphNode,
+) -> Result<&'a CompiledDemandUnitSlice> {
+    find_child_demand_unit(demand, node).ok_or_else(|| Error::GraphDocument {
+        path: "graph.demandPlan".to_owned(),
+        reason: format!(
+            "module call '{}' has no demand slice",
+            node.debug_symbol.label
+        ),
+    })
+}
+
+struct SymbolicPlannedEvaluation {
+    bound: SymbolicEvaluationBound,
+    materialized_outputs: BTreeMap<QualifiedGraphPin, SymbolicValueBound>,
+    public_result_bytes: u64,
+    global_tile_bytes: u64,
+    ancestor_references: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SymbolicTraversalContext<'a> {
+    graph: &'a CompiledBiomeGraph,
+    demand: &'a CompiledDemandSlice,
+    scope: SymbolicEvaluationScope<'a>,
+    inputs: &'a GraphEvaluationInputs,
+    guard: PreflightGuard<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct PreflightGuard<'a> {
+    cancellation: &'a GraphCancellationToken,
+    deadline: Instant,
+    time_limit_ms: u64,
+}
+
+impl PreflightGuard<'_> {
+    fn check(self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(Error::GraphCancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Error::GraphLimit {
+                resource: "time milliseconds",
+                requested: self.time_limit_ms.saturating_add(1),
+                limit: self.time_limit_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SymbolicInputPreflight {
+    input_tiles: u64,
+    retained_input_bytes: u64,
+    generated_input_bytes: u64,
+    candidate_count: u64,
+    accepted_count: u64,
+    micro_samples: u64,
+    transfer_bytes: u64,
+    active_worker_memory: u64,
+    retained_result_bytes: u64,
+}
+
+fn requested_vec_bytes<T>(capacity: usize) -> Result<u64> {
+    memory_requested_vec_bytes::<T>(capacity)
+}
+
+fn requested_slice_bytes<T>(items: usize) -> Result<u64> {
+    memory_requested_vec_bytes_for_len::<T>(
+        u64::try_from(items).map_err(|_| Error::NumericOverflow)?,
+    )
+}
+
+fn requested_btree_bytes<K, V>(entries: usize) -> Result<u64> {
+    memory_requested_btree_bytes::<K, V>(entries)
+}
+
+fn requested_vec_bound<T>(items: u64) -> Result<u64> {
+    memory_requested_vec_bytes_for_len::<T>(items)
+}
+
+fn requested_btree_bound<K, V>(entries: u64) -> Result<u64> {
+    memory_requested_btree_bound::<K, V>(entries)
+}
+
+fn weighted_elimination_scratch_bytes(
+    candidates: u64,
+    target: u64,
+    maximum_neighbours: u64,
 ) -> Result<u64> {
+    let adjacency_row = requested_vec_bytes_for_len::<(usize, u64)>(maximum_neighbours)?;
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<u32>(candidates)?,
+        requested_vec_bytes_for_len::<((i128, i128), usize)>(candidates)?,
+        requested_vec_bytes_for_len::<Vec<(usize, u64)>>(candidates)?,
+        candidates
+            .checked_mul(adjacency_row)
+            .ok_or(Error::NumericOverflow)?,
+        requested_vec_bytes_for_len::<u64>(candidates)?,
+        requested_vec_bytes_for_len::<bool>(candidates)?,
+        requested_vec_bytes_for_len::<EliminationScore>(candidates)?,
+        requested_vec_bytes_for_len::<usize>(candidates)?,
+        requested_vec_bytes_for_len::<GraphCandidate>(target.min(candidates))?,
+    ])
+}
+
+fn micro_output_scratch_bytes(samples: u64, channels: u64) -> Result<u64> {
+    let sum_values = requested_vec_bytes_for_len::<i128>(samples)?;
+    let output_values = requested_vec_bytes_for_len::<i32>(samples)?;
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<u64>(samples)?,
+        requested_vec_bytes_for_len::<(u128, &ScalarFieldSamples)>(channels)?,
+        requested_btree_bound::<u128, Vec<i128>>(channels)?,
+        channels
+            .checked_mul(sum_values)
+            .ok_or(Error::NumericOverflow)?,
+        requested_btree_bound::<u128, Vec<i32>>(channels)?,
+        channels
+            .checked_mul(output_values)
+            .ok_or(Error::NumericOverflow)?,
+    ])
+}
+
+fn blue_noise_scratch_bytes(candidates: u64) -> Result<u64> {
+    requested_vec_bytes_for_len::<GraphCandidate>(
+        candidates.checked_mul(4).ok_or(Error::NumericOverflow)?,
+    )
+}
+
+fn stage_region_scratch_bytes(regions: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_btree_bound::<(u8, u128, WorldCellKey), EvaluationRegion>(regions)?,
+        requested_vec_bound::<EvaluationRegion>(regions)?,
+    ])
+}
+
+fn projection_preparation_cache_bytes(items: u64, tags_per_item: u64) -> Result<u64> {
+    let tag_bytes = requested_vec_bound::<WeightedSurfaceTag>(tags_per_item)?;
+    checked_memory_sum([
+        requested_btree_bound::<
+            SurfaceProjectionCacheKey,
+            BTreeMap<WorldPosition, Option<QuantizedSurfaceProjectionSample>>,
+        >(1)?,
+        requested_btree_bound::<WorldPosition, Option<QuantizedSurfaceProjectionSample>>(items)?,
+        items.checked_mul(tag_bytes).ok_or(Error::NumericOverflow)?,
+    ])
+}
+
+fn field_preparation_cache_bytes(items: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_btree_bound::<
+            SurfaceFieldQueryCacheKey,
+            BTreeMap<(CandidateIdentity, WorldPosition), QuantizedSurfaceFieldValue>,
+        >(1)?,
+        requested_btree_bound::<(CandidateIdentity, WorldPosition), QuantizedSurfaceFieldValue>(
+            items,
+        )?,
+    ])
+}
+
+fn xz_filter_scratch_bytes(candidates: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<(CandidateIdentity, i128)>(candidates)?,
+        requested_vec_bytes_for_len::<GraphCandidate>(
+            candidates.checked_mul(2).ok_or(Error::NumericOverflow)?,
+        )?,
+        requested_btree_bound::<(i128, i128), usize>(candidates)?,
+        requested_vec_bytes_for_len::<Option<usize>>(candidates)?,
+    ])
+}
+
+fn competition_scratch_bytes(candidates: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<(CandidateIdentity, i128)>(candidates)?,
+        requested_vec_bytes_for_len::<((i128, i128), usize)>(candidates)?,
+        requested_vec_bytes_for_len::<GraphCandidate>(candidates)?,
+    ])
+}
+
+fn bounds_overlap_scratch_bytes(candidates: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<(GraphCandidate, WorldBounds, i128)>(
+            candidates.checked_mul(2).ok_or(Error::NumericOverflow)?,
+        )?,
+        requested_btree_bound::<(i128, i128, i128), usize>(candidates)?,
+        requested_vec_bytes_for_len::<Option<usize>>(candidates)?,
+        requested_vec_bytes_for_len::<GraphCandidate>(candidates)?,
+    ])
+}
+
+fn community_blend_scratch_bytes(candidates: u64, palette_entries: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<crate::BiomePaletteEntry>(palette_entries)?,
+        requested_vec_bytes_for_len::<(u64, u64)>(palette_entries)?,
+        requested_vec_bytes_for_len::<GraphCandidate>(candidates)?,
+    ])
+}
+
+fn companion_scratch_bytes(
+    input_candidates: u64,
+    output_candidates: u64,
+    rules: u64,
+) -> Result<u64> {
+    let maximum_generation = output_candidates
+        .checked_sub(input_candidates)
+        .ok_or(Error::NumericOverflow)?;
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<&crate::CompanionRule>(rules)?,
+        requested_vec_bytes_for_len::<GraphCandidate>(
+            maximum_generation
+                .checked_mul(2)
+                .ok_or(Error::NumericOverflow)?,
+        )?,
+        requested_vec_bytes_for_len::<GraphCandidate>(output_candidates)?,
+    ])
+}
+
+fn macro_output_scratch_bytes(candidates: u64) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<(&GraphCandidate, Uuid, PlantId)>(candidates)?,
+        requested_vec_bytes_for_len::<PlantPoint>(candidates)?,
+    ])
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResidentGroupAllocationShape {
+    invocations: u64,
+    inputs: u64,
+    instructions: u64,
+    curve_instructions: u64,
+    curve_points: u64,
+    external_inputs: u64,
+    external_pin_bytes: u64,
+    output_entries: u64,
+    output_pin_bytes: u64,
+    noise_nodes: u64,
+    gradient_nodes: u64,
+    candidate_output: bool,
+    scalar_output: bool,
+}
+
+fn resident_group_scratch_bytes(shape: ResidentGroupAllocationShape) -> Result<u64> {
+    let registers = shape
+        .inputs
+        .checked_add(shape.instructions)
+        .ok_or(Error::NumericOverflow)?;
+    let invocation_values = shape
+        .invocations
+        .checked_mul(shape.inputs)
+        .ok_or(Error::NumericOverflow)?;
+    let curve_allocations = shape
+        .curve_instructions
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    let external_key_allocations = shape
+        .external_inputs
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    let output_key_allocations = shape
+        .output_entries
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    checked_memory_sum([
+        requested_vec_bytes_for_len::<GraphGpuRegisterType>(shape.inputs)?,
+        requested_vec_bytes_for_len::<GraphGpuInstruction>(shape.instructions)?,
+        requested_vec_bytes_for_len::<GraphGpuRegisterType>(registers)?,
+        requested_vec_bytes_for_len::<(u16, i32)>(shape.curve_points)?,
+        curve_allocations,
+        requested_vec_bytes_for_len::<GraphGpuValue>(invocation_values)?,
+        requested_vec_bytes_for_len::<CandidateIdentity>(shape.invocations)?,
+        requested_vec_bytes_for_len::<bool>(shape.invocations)?,
+        requested_vec_bytes_for_len::<crate::GraphGpuOutput>(shape.invocations)?,
+        requested_vec_bytes_for_len::<&CompiledGraphNode>(shape.instructions)?,
+        requested_vec_bytes_for_len::<ResidentInputBinding>(shape.inputs)?,
+        requested_btree_bound::<(u128, String), ()>(shape.external_inputs)?,
+        requested_vec_bytes_for_len::<u8>(shape.external_pin_bytes)?,
+        external_key_allocations,
+        requested_btree_bound::<(u128, String), GraphValue>(shape.output_entries)?,
+        requested_vec_bytes_for_len::<u8>(shape.output_pin_bytes)?,
+        output_key_allocations,
+        requested_btree_bound::<(u128, String), GraphGpuRegister>(shape.external_inputs)?,
+        requested_vec_bytes_for_len::<u8>(shape.external_pin_bytes)?,
+        external_key_allocations,
+        requested_btree_bound::<u128, ([GraphGpuRegister; 8], [GraphGpuRegister; 3])>(
+            shape.noise_nodes,
+        )?,
+        requested_btree_bound::<u128, ([GraphGpuRegister; 3], [GraphGpuRegister; 3])>(
+            shape.gradient_nodes,
+        )?,
+        requested_btree_bound::<(u128, String), GraphGpuRegister>(shape.instructions)?,
+        requested_vec_bytes_for_len::<u8>(
+            shape
+                .instructions
+                .checked_mul(10)
+                .ok_or(Error::NumericOverflow)?,
+        )?,
+        shape
+            .instructions
+            .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+            .ok_or(Error::NumericOverflow)?,
+        if shape.candidate_output {
+            requested_vec_bytes_for_len::<GraphCandidate>(shape.invocations)?
+        } else {
+            0
+        },
+        if shape.scalar_output {
+            requested_btree_bound::<CandidateIdentity, DecisionScalar>(shape.invocations)?
+        } else {
+            0
+        },
+    ])
+}
+
+fn checked_memory_sum(values: impl IntoIterator<Item = u64>) -> Result<u64> {
+    sum_memory_bytes(values)
+}
+
+#[derive(Default)]
+struct ExecutionPlanAllocationShape {
+    nodes: usize,
+    edges: usize,
+    pins: usize,
+    maximum_module_path_words: usize,
+    maximum_pin_name_bytes: usize,
+}
+
+fn execution_plan_allocation_bound(graph: &CompiledBiomeGraph) -> Result<u64> {
+    fn visit(
+        unit: &CompiledGraphUnit,
+        demand: &CompiledDemandSlice,
+        shape: &mut ExecutionPlanAllocationShape,
+    ) -> Result<()> {
+        let module_path = unit
+            .nodes
+            .first()
+            .map_or(&[][..], |node| node.debug_symbol.module_path.as_slice());
+        let unit_demand = demand
+            .unit(module_path)
+            .ok_or_else(|| Error::GraphDocument {
+                path: "graph.demandPlan".to_owned(),
+                reason: "live unit has no execution demand slice".to_owned(),
+            })?;
+        shape.nodes = shape
+            .nodes
+            .checked_add(unit_demand.nodes.len())
+            .ok_or(Error::NumericOverflow)?;
+        shape.edges = shape
+            .edges
+            .checked_add(unit_demand.edges.len())
+            .ok_or(Error::NumericOverflow)?;
+        shape.pins = shape
+            .pins
+            .checked_add(unit_demand.inputs.len())
+            .and_then(|pins| pins.checked_add(unit_demand.outputs.len()))
+            .ok_or(Error::NumericOverflow)?;
+        for edge in &unit_demand.edges {
+            shape.maximum_pin_name_bytes = shape
+                .maximum_pin_name_bytes
+                .max(edge.from_pin.len())
+                .max(edge.to_pin.len());
+        }
+        for name in unit_demand.inputs.iter().chain(&unit_demand.outputs) {
+            shape.maximum_pin_name_bytes = shape.maximum_pin_name_bytes.max(name.len());
+        }
+        for node in unit
+            .nodes
+            .iter()
+            .filter(|node| unit_demand.contains_node(node.definition.guid))
+        {
+            shape.maximum_module_path_words = shape
+                .maximum_module_path_words
+                .max(node.debug_symbol.module_path.len());
+            if let Some(module) = node.module.as_deref()
+                && find_child_demand_unit(demand, node).is_some()
+            {
+                visit(module, demand, shape)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut shape = ExecutionPlanAllocationShape::default();
+    visit(
+        &graph.root,
+        graph.demand_plan().execution_slice(),
+        &mut shape,
+    )?;
+    let boundaries = shape
+        .edges
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(shape.pins))
+        .ok_or(Error::NumericOverflow)?;
+    let address_count = shape
+        .nodes
+        .checked_add(boundaries)
+        .ok_or(Error::NumericOverflow)?;
+    let address_words = address_count
+        .checked_mul(shape.maximum_module_path_words)
+        .ok_or(Error::NumericOverflow)?;
+    let boundary_name_bytes = boundaries
+        .checked_mul(shape.maximum_pin_name_bytes)
+        .ok_or(Error::NumericOverflow)?;
+    let group_inner_allocations = u64::try_from(shape.nodes)
+        .map_err(|_| Error::NumericOverflow)?
+        .checked_mul(3)
+        .and_then(|count| count.checked_mul(ALLOCATION_OVERHEAD_BYTES))
+        .ok_or(Error::NumericOverflow)?;
+    let address_allocations = u64::try_from(address_count)
+        .map_err(|_| Error::NumericOverflow)?
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    let string_allocations = u64::try_from(boundaries)
+        .map_err(|_| Error::NumericOverflow)?
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    let component_inner_allocations = u64::try_from(shape.nodes)
+        .map_err(|_| Error::NumericOverflow)?
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    checked_memory_sum([
+        requested_vec_bytes::<GraphExecutionGroup>(shape.nodes)?,
+        requested_vec_bytes::<GraphExecutionNode>(shape.nodes)?,
+        requested_vec_bytes::<GraphExecutionNode>(shape.nodes)?,
+        requested_vec_bytes::<GraphExecutionBoundary>(boundaries)?,
+        requested_vec_bytes::<Vec<u128>>(shape.nodes)?,
+        requested_vec_bytes::<u128>(shape.nodes)?,
+        requested_vec_bytes::<u128>(shape.nodes)?,
+        requested_vec_bytes::<u128>(address_words)?,
+        requested_vec_bytes::<u8>(boundary_name_bytes)?,
+        requested_btree_bytes::<u128, &CompiledGraphNode>(shape.nodes)?,
+        requested_btree_bytes::<u128, ()>(shape.nodes)?,
+        requested_btree_bytes::<u128, usize>(shape.nodes)?,
+        requested_btree_bytes::<usize, ()>(shape.nodes)?,
+        requested_btree_bytes::<&crate::GraphValueLineage, ()>(shape.edges)?,
+        requested_btree_bytes::<(u128, &str), ()>(boundaries)?,
+        requested_btree_bytes::<(u128, &str), ()>(boundaries)?,
+        requested_btree_bytes::<(u128, &str), ()>(boundaries)?,
+        requested_btree_bytes::<(u128, &str), ()>(boundaries)?,
+        requested_btree_bytes::<GraphExecutionBoundary, ()>(boundaries)?,
+        requested_btree_bytes::<GraphExecutionBoundary, ()>(boundaries)?,
+        group_inner_allocations,
+        address_allocations,
+        string_allocations,
+        component_inner_allocations,
+    ])
+}
+
+struct TraversalAllocationSummary {
+    emitted_pins: usize,
+    emitted_path_words: usize,
+    emitted_path_allocations: usize,
+    emitted_name_bytes: usize,
+    executed_nodes: usize,
+    executed_path_words: usize,
+    executed_path_allocations: usize,
+    ancestor_candidate_levels: [bool; HIERARCHY_LEVEL_COUNT],
+}
+
+impl Default for TraversalAllocationSummary {
+    fn default() -> Self {
+        Self {
+            emitted_pins: 0,
+            emitted_path_words: 0,
+            emitted_path_allocations: 0,
+            emitted_name_bytes: 0,
+            executed_nodes: 0,
+            executed_path_words: 0,
+            executed_path_allocations: 0,
+            ancestor_candidate_levels: [false; HIERARCHY_LEVEL_COUNT],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NodeOutputDemand<'a> {
+    demand: &'a CompiledDemandSlice,
+    node: &'a CompiledGraphNode,
+}
+
+impl<'a> NodeOutputDemand<'a> {
+    const fn new(demand: &'a CompiledDemandSlice, node: &'a CompiledGraphNode) -> Self {
+        Self { demand, node }
+    }
+
+    fn contains(self, output: &str) -> bool {
+        self.demand.output_pins.iter().any(|pin| {
+            pin.node.node == self.node.definition.guid
+                && pin.node.module_path == self.node.debug_symbol.module_path
+                && pin.pin == output
+        })
+    }
+}
+
+struct NodeOutputBuilder<'a, T> {
+    demand: NodeOutputDemand<'a>,
+    outputs: BTreeMap<String, T>,
+}
+
+impl<'a, T> NodeOutputBuilder<'a, T> {
+    fn new(demand: NodeOutputDemand<'a>) -> Self {
+        Self {
+            demand,
+            outputs: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, output: String, value: T) -> Result<()> {
+        if !self
+            .demand
+            .node
+            .outputs
+            .iter()
+            .any(|schema| schema.name == output)
+        {
+            return Err(Error::GraphDocument {
+                path: self.demand.node.debug_symbol.label.clone(),
+                reason: format!("operator emitted unknown pin '{output}'"),
+            });
+        }
+        if !self.demand.contains(&output) {
+            return Err(Error::GraphDocument {
+                path: self.demand.node.debug_symbol.label.clone(),
+                reason: format!("operator emitted undemanded pin '{output}'"),
+            });
+        }
+        if self.outputs.insert(output.clone(), value).is_some() {
+            return Err(Error::GraphDocument {
+                path: self.demand.node.debug_symbol.label.clone(),
+                reason: format!("operator emitted duplicate pin '{output}'"),
+            });
+        }
+        Ok(())
+    }
+
+    fn extend(&mut self, outputs: BTreeMap<String, T>) -> Result<()> {
+        for (output, value) in outputs {
+            self.insert(output, value)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<BTreeMap<String, T>> {
+        for output in self
+            .demand
+            .node
+            .outputs
+            .iter()
+            .filter(|output| self.demand.contains(&output.name))
+        {
+            if !self.outputs.contains_key(&output.name) {
+                return Err(Error::GraphDocument {
+                    path: self.demand.node.debug_symbol.label.clone(),
+                    reason: format!("operator omitted demanded pin '{}'", output.name),
+                });
+            }
+        }
+        Ok(self.outputs)
+    }
+}
+
+fn traversal_allocation_summary(
+    graph: &CompiledBiomeGraph,
+    demand: &CompiledDemandSlice,
+) -> Result<TraversalAllocationSummary> {
+    fn visit(
+        unit: &CompiledGraphUnit,
+        demand: &CompiledDemandSlice,
+        summary: &mut TraversalAllocationSummary,
+    ) -> Result<()> {
+        let module_path = unit
+            .nodes
+            .first()
+            .map_or(&[][..], |node| node.debug_symbol.module_path.as_slice());
+        let unit_demand = demand
+            .unit(module_path)
+            .ok_or_else(|| Error::GraphDocument {
+                path: "graph.demandPlan".to_owned(),
+                reason: "live unit has no demand slice".to_owned(),
+            })?;
+        for node in unit
+            .nodes
+            .iter()
+            .filter(|node| unit_demand.contains_node(node.definition.guid))
+        {
+            if demand.estimates.keys().any(|pin| {
+                pin.node.node == node.definition.guid
+                    && pin.node.module_path == node.debug_symbol.module_path
+                    && node.outputs.iter().any(|output| {
+                        output.name == pin.pin
+                            && (output.domain == GraphDomain::Candidates
+                                || node.definition.operator == GraphOperator::MacroOutput)
+                    })
+            }) {
+                summary.ancestor_candidate_levels[usize::from(node.definition.spatial.level())] =
+                    true;
+            }
+            if demand.executes_node(&node.address()) {
+                summary.executed_nodes = summary
+                    .executed_nodes
+                    .checked_add(1)
+                    .ok_or(Error::NumericOverflow)?;
+                summary.executed_path_words = summary
+                    .executed_path_words
+                    .checked_add(node.debug_symbol.module_path.len())
+                    .ok_or(Error::NumericOverflow)?;
+                summary.executed_path_allocations = summary
+                    .executed_path_allocations
+                    .checked_add(usize::from(!node.debug_symbol.module_path.is_empty()))
+                    .ok_or(Error::NumericOverflow)?;
+            }
+            for output in node
+                .outputs
+                .iter()
+                .filter(|output| NodeOutputDemand::new(demand, node).contains(&output.name))
+            {
+                summary.emitted_pins = summary
+                    .emitted_pins
+                    .checked_add(1)
+                    .ok_or(Error::NumericOverflow)?;
+                summary.emitted_path_words = summary
+                    .emitted_path_words
+                    .checked_add(node.debug_symbol.module_path.len())
+                    .ok_or(Error::NumericOverflow)?;
+                summary.emitted_path_allocations = summary
+                    .emitted_path_allocations
+                    .checked_add(usize::from(!node.debug_symbol.module_path.is_empty()))
+                    .ok_or(Error::NumericOverflow)?;
+                summary.emitted_name_bytes = summary
+                    .emitted_name_bytes
+                    .checked_add(output.name.len())
+                    .ok_or(Error::NumericOverflow)?;
+            }
+            if let Some(module) = node.module.as_deref()
+                && find_child_demand_unit(demand, node).is_some()
+            {
+                visit(module, demand, summary)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut summary = TraversalAllocationSummary::default();
+    visit(&graph.root, demand, &mut summary)?;
+    Ok(summary)
+}
+
+fn qualified_output_domain(
+    unit: &CompiledGraphUnit,
+    pin: &QualifiedGraphPin,
+) -> Option<GraphDomain> {
+    for node in &unit.nodes {
+        if node.definition.guid == pin.node.node
+            && node.debug_symbol.module_path == pin.node.module_path
+        {
+            return node
+                .outputs
+                .iter()
+                .find(|output| output.name == pin.pin)
+                .map(|output| output.domain);
+        }
+        if let Some(domain) = node
+            .module
+            .as_deref()
+            .and_then(|module| qualified_output_domain(module, pin))
+        {
+            return Some(domain);
+        }
+    }
+    None
+}
+
+fn global_stage_has_macro_output(
+    graph: &CompiledBiomeGraph,
+    stage: &CompiledGlobalStage,
+) -> Result<bool> {
+    let mut has_macro_output = false;
+    for pin in &stage.output_pins {
+        let domain =
+            qualified_output_domain(&graph.root, pin).ok_or_else(|| Error::GraphDocument {
+                path: "graph.spatialPlan".to_owned(),
+                reason: "global-stage output pin is absent from the compiled graph".to_owned(),
+            })?;
+        has_macro_output |= domain == GraphDomain::MacroPoints;
+    }
+    Ok(has_macro_output)
+}
+
+fn ancestor_reference_upper_bound(
+    graph: &CompiledBiomeGraph,
+    inputs: &GraphEvaluationInputs,
+    include_global_stage_owners: bool,
+) -> Result<u64> {
+    let summary = traversal_allocation_summary(graph, graph.demand_plan().execution_slice())?;
+    let mut global_macro_levels = [false; HIERARCHY_LEVEL_COUNT];
+    if include_global_stage_owners {
+        for stage in graph.spatial_plan().global_stages() {
+            if global_stage_has_macro_output(graph, stage)? {
+                global_macro_levels[usize::from(stage.owner_level)] = true;
+            }
+        }
+    }
+
+    let mut references = 0_u64;
+    for level in 0..=MAX_HIERARCHY_LEVEL {
+        if global_macro_levels[usize::from(level)] {
+            references = references
+                .checked_add(world_cell_count_covering_bounds(
+                    inputs.read_bounds,
+                    level,
+                    graph.limits.max_global_stage_tiles,
+                )?)
+                .ok_or(Error::NumericOverflow)?;
+        } else if level > inputs.output_cell.level()
+            && summary.ancestor_candidate_levels[usize::from(level)]
+        {
+            references = references.checked_add(1).ok_or(Error::NumericOverflow)?;
+        }
+    }
+    Ok(references)
+}
+
+fn separately_allocated_storage<T>(items: usize, allocations: usize) -> Result<u64> {
+    let item_bytes = u64::try_from(items)
+        .map_err(|_| Error::NumericOverflow)?
+        .checked_mul(std::mem::size_of::<T>() as u64)
+        .ok_or(Error::NumericOverflow)?;
+    let allocation_bytes = u64::try_from(allocations)
+        .map_err(|_| Error::NumericOverflow)?
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    item_bytes
+        .checked_add(allocation_bytes)
+        .ok_or(Error::NumericOverflow)
+}
+
+fn named_btree_allocation<K, V>(entries: usize, name_bytes: usize) -> Result<u64> {
+    checked_memory_sum([
+        requested_btree_bytes::<K, V>(entries)?,
+        separately_allocated_storage::<u8>(name_bytes, entries)?,
+    ])
+}
+
+fn unit_demand_slice<'a>(
+    unit: &CompiledGraphUnit,
+    demand: &'a CompiledDemandSlice,
+) -> Result<&'a CompiledDemandUnitSlice> {
+    let module_path = unit
+        .nodes
+        .first()
+        .map_or(&[][..], |node| node.debug_symbol.module_path.as_slice());
+    demand
+        .unit(module_path)
+        .ok_or_else(|| Error::GraphDocument {
+            path: "graph.demandPlan".to_owned(),
+            reason: "live unit has no traversal demand slice".to_owned(),
+        })
+}
+
+fn emitted_output_stats(
+    node: &CompiledGraphNode,
+    demand: &CompiledDemandSlice,
+) -> Result<(usize, usize)> {
+    node.outputs
+        .iter()
+        .filter(|output| NodeOutputDemand::new(demand, node).contains(&output.name))
+        .try_fold((0_usize, 0_usize), |(entries, bytes), output| {
+            Ok((
+                entries.checked_add(1).ok_or(Error::NumericOverflow)?,
+                bytes
+                    .checked_add(output.name.len())
+                    .ok_or(Error::NumericOverflow)?,
+            ))
+        })
+}
+
+fn retained_output_stats(
+    unit: &CompiledGraphUnit,
+    unit_demand: &CompiledDemandUnitSlice,
+    demand: &CompiledDemandSlice,
+) -> Result<(usize, usize)> {
+    unit.nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+        .flat_map(|node| {
+            node.outputs.iter().filter(move |output| {
+                NodeOutputDemand::new(demand, node).contains(&output.name)
+                    && (unit_demand.edges.iter().any(|edge| {
+                        edge.from_node == node.definition.guid && edge.from_pin == output.name
+                    }) || unit.outputs.iter().any(|unit_output| {
+                        unit_demand.outputs.contains(&unit_output.name)
+                            && unit_output.node == node.definition.guid
+                            && unit_output.pin == output.name
+                    }))
+            })
+        })
+        .try_fold((0_usize, 0_usize), |(entries, bytes), output| {
+            Ok((
+                entries.checked_add(1).ok_or(Error::NumericOverflow)?,
+                bytes
+                    .checked_add(output.name.len())
+                    .ok_or(Error::NumericOverflow)?,
+            ))
+        })
+}
+
+fn node_input_stats(
+    node: &CompiledGraphNode,
+    unit_demand: &CompiledDemandUnitSlice,
+) -> Result<(usize, usize)> {
+    unit_demand
+        .edges
+        .iter()
+        .filter(|edge| edge.to_node == node.definition.guid)
+        .try_fold((0_usize, 0_usize), |(entries, bytes), edge| {
+            Ok((
+                entries.checked_add(1).ok_or(Error::NumericOverflow)?,
+                bytes
+                    .checked_add(edge.to_pin.len())
+                    .ok_or(Error::NumericOverflow)?,
+            ))
+        })
+}
+
+fn unit_output_stats(
+    unit: &CompiledGraphUnit,
+    unit_demand: &CompiledDemandUnitSlice,
+) -> Result<(usize, usize)> {
+    unit.outputs
+        .iter()
+        .filter(|output| unit_demand.outputs.contains(&output.name))
+        .try_fold((0_usize, 0_usize), |(entries, bytes), output| {
+            Ok((
+                entries.checked_add(1).ok_or(Error::NumericOverflow)?,
+                bytes
+                    .checked_add(output.name.len())
+                    .ok_or(Error::NumericOverflow)?,
+            ))
+        })
+}
+
+fn incoming_allocation_bytes(
+    unit: &CompiledGraphUnit,
+    unit_demand: &CompiledDemandUnitSlice,
+) -> Result<u64> {
+    let nested = unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+        .try_fold(0_u64, |total, node| {
+            let edges = unit_demand
+                .edges
+                .iter()
+                .filter(|edge| edge.to_node == node.definition.guid)
+                .count();
+            total
+                .checked_add(requested_vec_bytes::<&crate::GraphEdge>(edges)?)
+                .ok_or(Error::NumericOverflow)
+        })?;
+    checked_memory_sum([
+        requested_btree_bytes::<u128, Vec<&crate::GraphEdge>>(unit_demand.nodes.len())?,
+        nested,
+    ])
+}
+
+fn runtime_traversal_allocation_bound(
+    graph: &CompiledBiomeGraph,
+    demand: &CompiledDemandSlice,
+    plan: &GraphExecutionPlan,
+    ancestor_references: u64,
+) -> Result<u64> {
+    fn visit(
+        unit: &CompiledGraphUnit,
+        demand: &CompiledDemandSlice,
+        plan: &GraphExecutionPlan,
+    ) -> Result<u64> {
+        let unit_demand = unit_demand_slice(unit, demand)?;
+        let (retained_entries, retained_name_bytes) =
+            retained_output_stats(unit, unit_demand, demand)?;
+        let resident_nodes = unit
+            .nodes
+            .iter()
+            .filter(|node| {
+                unit_demand.contains_node(node.definition.guid)
+                    && demand.executes_node(&node.address())
+                    && plan.domain_for(&node.debug_symbol.module_path, node.definition.guid)
+                        == Some(GraphExecutionDomain::SlangCompute)
+            })
+            .count();
+        let base = checked_memory_sum([
+            incoming_allocation_bytes(unit, unit_demand)?,
+            named_btree_allocation::<(u128, String), u64>(retained_entries, retained_name_bytes)?,
+            named_btree_allocation::<(u128, String), GraphValue>(
+                retained_entries,
+                retained_name_bytes,
+            )?,
+            requested_btree_bytes::<u128, ()>(resident_nodes)?,
+        ])?;
+        let (unit_output_entries, unit_output_name_bytes) = unit_output_stats(unit, unit_demand)?;
+        let mut peak = named_btree_allocation::<String, GraphValue>(
+            unit_output_entries,
+            unit_output_name_bytes,
+        )?;
+        for node in unit
+            .nodes
+            .iter()
+            .filter(|node| unit_demand.contains_node(node.definition.guid))
+        {
+            let (input_entries, input_name_bytes) = node_input_stats(node, unit_demand)?;
+            let inputs =
+                named_btree_allocation::<String, GraphValue>(input_entries, input_name_bytes)?;
+            let node_peak = if demand.executes_node(&node.address())
+                && plan.domain_for(&node.debug_symbol.module_path, node.definition.guid)
+                    == Some(GraphExecutionDomain::SlangCompute)
+            {
+                let group =
+                    plan.group_for(&node.address())
+                        .ok_or_else(|| Error::GraphDocument {
+                            path: node.debug_symbol.label.clone(),
+                            reason: "resident node has no execution group".to_owned(),
+                        })?;
+                let group_contains = |guid| {
+                    group.nodes.iter().any(|member| {
+                        member.address.module_path == node.debug_symbol.module_path
+                            && member.address.node == guid
+                    })
+                };
+                let (boundary_entries, boundary_name_bytes) = unit_demand
+                    .edges
+                    .iter()
+                    .filter(|edge| !group_contains(edge.from_node) && group_contains(edge.to_node))
+                    .try_fold((0_usize, 0_usize), |(entries, bytes), edge| {
+                        Ok::<_, Error>((
+                            entries.checked_add(1).ok_or(Error::NumericOverflow)?,
+                            bytes
+                                .checked_add(edge.from_pin.len())
+                                .ok_or(Error::NumericOverflow)?,
+                        ))
+                    })?;
+                let (output_entries, output_name_bytes) = group
+                    .outputs
+                    .iter()
+                    .filter(|output| output.pin.node.module_path == node.debug_symbol.module_path)
+                    .try_fold((0_usize, 0_usize), |(entries, bytes), output| {
+                        Ok::<_, Error>((
+                            entries.checked_add(1).ok_or(Error::NumericOverflow)?,
+                            bytes
+                                .checked_add(output.pin.pin.len())
+                                .ok_or(Error::NumericOverflow)?,
+                        ))
+                    })?;
+                checked_memory_sum([
+                    named_btree_allocation::<(u128, String), GraphValue>(
+                        boundary_entries,
+                        boundary_name_bytes,
+                    )?,
+                    named_btree_allocation::<(u128, String), GraphValue>(
+                        output_entries,
+                        output_name_bytes,
+                    )?,
+                ])?
+            } else if let Some(module) = node.module.as_deref()
+                && find_child_demand_unit(demand, node).is_some()
+                && demand.executes_node(&node.address())
+            {
+                inputs
+                    .checked_add(visit(module, demand, plan)?)
+                    .ok_or(Error::NumericOverflow)?
+            } else {
+                let (output_entries, output_name_bytes) = emitted_output_stats(node, demand)?;
+                checked_memory_sum([
+                    inputs,
+                    named_btree_allocation::<String, GraphValue>(
+                        output_entries,
+                        output_name_bytes,
+                    )?,
+                ])?
+            };
+            peak = peak.max(node_peak);
+        }
+        base.checked_add(peak).ok_or(Error::NumericOverflow)
+    }
+
+    checked_memory_sum([
+        visit(&graph.root, demand, plan)?,
+        requested_vec_bytes_for_len::<WorldCellKey>(ancestor_references)?,
+    ])
+}
+
+fn symbolic_traversal_allocation_bound(
+    graph: &CompiledBiomeGraph,
+    demand: &CompiledDemandSlice,
+) -> Result<u64> {
+    fn visit(unit: &CompiledGraphUnit, demand: &CompiledDemandSlice) -> Result<u64> {
+        let unit_demand = unit_demand_slice(unit, demand)?;
+        let (emitted_entries, emitted_name_bytes) = unit
+            .nodes
+            .iter()
+            .filter(|node| unit_demand.contains_node(node.definition.guid))
+            .try_fold((0_usize, 0_usize), |(entries, bytes), node| {
+                let (node_entries, node_bytes) = emitted_output_stats(node, demand)?;
+                Ok::<_, Error>((
+                    entries
+                        .checked_add(node_entries)
+                        .ok_or(Error::NumericOverflow)?,
+                    bytes
+                        .checked_add(node_bytes)
+                        .ok_or(Error::NumericOverflow)?,
+                ))
+            })?;
+        let base = checked_memory_sum([
+            incoming_allocation_bytes(unit, unit_demand)?,
+            named_btree_allocation::<(u128, String), SymbolicValueBound>(
+                emitted_entries,
+                emitted_name_bytes,
+            )?,
+        ])?;
+        let (unit_output_entries, unit_output_name_bytes) = unit_output_stats(unit, unit_demand)?;
+        let mut peak = named_btree_allocation::<String, SymbolicValueBound>(
+            unit_output_entries,
+            unit_output_name_bytes,
+        )?;
+        for node in unit
+            .nodes
+            .iter()
+            .filter(|node| unit_demand.contains_node(node.definition.guid))
+        {
+            let (output_entries, output_name_bytes) = emitted_output_stats(node, demand)?;
+            let outputs = named_btree_allocation::<String, SymbolicValueBound>(
+                output_entries,
+                output_name_bytes,
+            )?;
+            let node_peak = if let Some(module) = node.module.as_deref()
+                && find_child_demand_unit(demand, node).is_some()
+                && demand.executes_node(&node.address())
+            {
+                let (input_entries, input_name_bytes) = node_input_stats(node, unit_demand)?;
+                checked_memory_sum([
+                    named_btree_allocation::<String, SymbolicValueBound>(
+                        input_entries,
+                        input_name_bytes,
+                    )?,
+                    visit(module, demand)?,
+                ])?
+            } else {
+                outputs
+            };
+            peak = peak.max(node_peak);
+        }
+        base.checked_add(peak).ok_or(Error::NumericOverflow)
+    }
+
+    let summary = traversal_allocation_summary(graph, demand)?;
+    checked_memory_sum([
+        visit(&graph.root, demand)?,
+        requested_btree_bytes::<QualifiedGraphPin, SymbolicValueBound>(summary.emitted_pins)?,
+        separately_allocated_storage::<u128>(
+            summary.emitted_path_words,
+            summary.emitted_path_allocations,
+        )?,
+        separately_allocated_storage::<u8>(summary.emitted_name_bytes, summary.emitted_pins)?,
+        requested_btree_bytes::<GraphNodeAddress, ()>(summary.executed_nodes)?,
+        separately_allocated_storage::<u128>(
+            summary.executed_path_words,
+            summary.executed_path_allocations,
+        )?,
+    ])
+}
+
+fn bound_add(resource: &'static str, left: u64, right: u64, limit: u64) -> Result<u64> {
     let requested = u128::from(left) + u128::from(right);
     if requested > u128::from(limit) {
         return Err(Error::GraphLimit {
@@ -2405,12 +4740,7 @@ fn bound_add(
     Ok(requested as u64)
 }
 
-fn bound_mul(
-    resource: &'static str,
-    left: u64,
-    right: u64,
-    limit: u64,
-) -> Result<u64> {
+fn bound_mul(resource: &'static str, left: u64, right: u64, limit: u64) -> Result<u64> {
     let requested = u128::from(left) * u128::from(right);
     if requested > u128::from(limit) {
         return Err(Error::GraphLimit {
@@ -2422,21 +4752,268 @@ fn bound_mul(
     Ok(requested as u64)
 }
 
-fn symbolic_linear_value(
-    domain: GraphDomain,
-    items: u64,
-    bytes_per_item: u64,
+fn symbolic_should_load_global_node(
+    graph: &CompiledBiomeGraph,
+    scope: SymbolicEvaluationScope<'_>,
+    address: &GraphNodeAddress,
+) -> bool {
+    let Some(owner) = graph.spatial_plan().global_stage_for_node(address) else {
+        return false;
+    };
+    scope
+        .current_global_stage()
+        .is_none_or(|current| current.id != owner.id)
+}
+
+fn symbolic_merge_value(
+    current: Option<SymbolicValueBound>,
+    incoming: SymbolicValueBound,
     limits: crate::GraphSafetyLimits,
 ) -> Result<SymbolicValueBound> {
+    let Some(current) = current else {
+        return Ok(incoming);
+    };
+    if current.domain != incoming.domain {
+        return Err(Error::GraphDocument {
+            path: "graph.symbolicBound.global".to_owned(),
+            reason: "global boundary values have different domains".to_owned(),
+        });
+    }
+    let item_limit = match current.domain {
+        Some(GraphDomain::Candidates) => limits.max_candidates,
+        Some(GraphDomain::MacroPoints) => limits.max_macro_points,
+        Some(GraphDomain::MicroField) => limits.max_micro_samples,
+        _ => u64::MAX,
+    };
+    Ok(SymbolicValueBound {
+        domain: current.domain,
+        items: bound_add(
+            match current.domain {
+                Some(GraphDomain::Candidates) => "candidate count",
+                Some(GraphDomain::MacroPoints) => "accepted count",
+                Some(GraphDomain::MicroField) => "micro samples",
+                _ => "symbolic items",
+            },
+            current.items,
+            incoming.items,
+            item_limit,
+        )?,
+        bytes: bound_add(
+            "memory bytes",
+            current.bytes,
+            incoming.bytes,
+            limits.max_memory_bytes,
+        )?,
+        diagnostic_candidates: current
+            .diagnostic_candidates
+            .checked_add(incoming.diagnostic_candidates)
+            .ok_or(Error::NumericOverflow)?,
+        diagnostic_fields: current
+            .diagnostic_fields
+            .checked_add(incoming.diagnostic_fields)
+            .ok_or(Error::NumericOverflow)?,
+        diagnostic_rejected: current
+            .diagnostic_rejected
+            .checked_add(incoming.diagnostic_rejected)
+            .ok_or(Error::NumericOverflow)?,
+        diagnostic_module_path_items: current
+            .diagnostic_module_path_items
+            .checked_add(incoming.diagnostic_module_path_items)
+            .ok_or(Error::NumericOverflow)?,
+        diagnostic_label_bytes: current
+            .diagnostic_label_bytes
+            .checked_add(incoming.diagnostic_label_bytes)
+            .ok_or(Error::NumericOverflow)?,
+    })
+}
+
+fn symbolic_import_global_value(
+    mut value: SymbolicValueBound,
+    scope: SymbolicEvaluationScope<'_>,
+) -> SymbolicValueBound {
+    if (scope.is_cell() && value.domain == Some(GraphDomain::MacroPoints))
+        || value.domain == Some(GraphDomain::Diagnostics)
+    {
+        value.items = 0;
+        value.bytes = 0;
+        value.diagnostic_candidates = 0;
+        value.diagnostic_fields = 0;
+        value.diagnostic_rejected = 0;
+        value.diagnostic_module_path_items = 0;
+        value.diagnostic_label_bytes = 0;
+    }
+    value
+}
+
+fn global_import_scratch_bytes(
+    candidate_identities: u64,
+    provenance_decisions: u64,
+    provenance_records: u64,
+    provenance_bytes: u64,
+) -> Result<u64> {
+    let handle_bytes = u64::try_from(std::mem::size_of::<ProvenanceDecisionHandle>())
+        .map_err(|_| Error::NumericOverflow)?;
+    let traversal_handles = provenance_decisions
+        .checked_add(provenance_bytes / handle_bytes.max(1))
+        .ok_or(Error::NumericOverflow)?;
+    checked_memory_sum([
+        requested_btree_bound::<CandidateIdentity, ()>(candidate_identities)?,
+        requested_vec_bound::<ProvenanceDecisionHandle>(candidate_identities)?,
+        requested_btree_bound::<ProvenanceDecisionHandle, ()>(candidate_identities)?,
+        requested_btree_bound::<ProvenanceDecisionHandle, ()>(provenance_decisions)?,
+        requested_vec_bound::<ProvenanceDecisionHandle>(traversal_handles)?,
+        requested_btree_bound::<ProvenanceDecisionHandle, usize>(provenance_decisions)?,
+        requested_vec_bound::<(ProvenanceDecisionHandle, ProvenanceDecisionHandle)>(
+            traversal_handles,
+        )?,
+        requested_btree_bound::<ProvenanceDecisionHandle, ()>(provenance_decisions)?,
+        requested_vec_bound::<ProvenanceDecisionHandle>(provenance_decisions)?,
+        requested_btree_bound::<ProvenanceDecisionHandle, ProvenanceDecisionHandle>(
+            provenance_decisions,
+        )?,
+        requested_vec_bound::<ProvenanceDecisionHandle>(provenance_records)?,
+        requested_btree_bound::<ProvenanceHandle, ()>(provenance_records)?,
+        requested_btree_bound::<ProvenanceHandle, ProvenanceHandle>(provenance_records)?,
+        requested_vec_bound::<ProvenanceHandle>(provenance_records)?,
+        provenance_bytes,
+    ])
+}
+
+fn symbolic_import_global_provenance(
+    bound: &mut SymbolicEvaluationBound,
+    tile: &SymbolicGlobalTile,
+    candidate_identities: u64,
+    limits: crate::GraphSafetyLimits,
+) -> Result<()> {
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        global_import_scratch_bytes(
+            candidate_identities,
+            tile.provenance_decisions,
+            tile.provenance_records,
+            tile.provenance_bytes,
+        )?,
+        limits.max_memory_bytes,
+    )?;
+    bound.candidate_events = bound_add(
+        "diagnostic samples",
+        bound.candidate_events,
+        tile.provenance_decisions,
+        u64::MAX,
+    )?;
+    bound.imported_provenance_records = bound_add(
+        "diagnostic samples",
+        bound.imported_provenance_records,
+        tile.provenance_records,
+        u64::MAX,
+    )?;
+    bound.provenance_bytes = bound_add(
+        "memory bytes",
+        bound.provenance_bytes,
+        tile.provenance_bytes,
+        limits.max_memory_bytes,
+    )?;
+    Ok(())
+}
+
+fn symbolic_load_global_node_outputs(
+    graph: &CompiledBiomeGraph,
+    demand: &CompiledDemandSlice,
+    scope: SymbolicEvaluationScope<'_>,
+    inputs: &GraphEvaluationInputs,
+    node: &CompiledGraphNode,
+    bound: &mut SymbolicEvaluationBound,
+) -> Result<BTreeMap<String, SymbolicValueBound>> {
+    let address = node.address();
+    let stage = graph
+        .spatial_plan()
+        .global_stage_for_node(&address)
+        .ok_or_else(|| Error::GraphDocument {
+            path: node.debug_symbol.label.clone(),
+            reason: "global node is absent from the symbolic spatial plan".to_owned(),
+        })?;
+    let owners = world_cells_covering_bounds(
+        inputs.read_bounds,
+        stage.owner_level,
+        graph.limits.max_global_stage_tiles,
+    )?;
+    let mut outputs = BTreeMap::new();
+    for output in node.outputs.iter().filter(|output| {
+        NodeOutputDemand::new(demand, node).contains(&output.name)
+            && stage.output_pins.contains(&QualifiedGraphPin {
+                node: address.clone(),
+                pin: output.name.clone(),
+            })
+    }) {
+        let pin = QualifiedGraphPin {
+            node: address.clone(),
+            pin: output.name.clone(),
+        };
+        let mut merged = None;
+        for owner in &owners {
+            let tile = scope
+                .global_store()
+                .tiles
+                .get(&(stage.id, *owner))
+                .ok_or_else(|| Error::GraphAuthoritativeInput {
+                    node: node.definition.guid,
+                    input: format!(
+                        "symbolic global stage {} owner {}",
+                        hex_hash(stage.id),
+                        owner
+                    ),
+                })?;
+            let value = tile
+                .outputs
+                .get(&pin)
+                .copied()
+                .ok_or_else(|| Error::GraphDocument {
+                    path: node.debug_symbol.label.clone(),
+                    reason: format!(
+                        "symbolic global stage omitted boundary pin '{}'",
+                        output.name
+                    ),
+                })?;
+            symbolic_import_global_provenance(bound, tile, value.items, graph.limits)?;
+            let imported = symbolic_import_global_value(value, scope);
+            if let Some(current) = merged {
+                bound.memory_bytes = bound_add(
+                    "memory bytes",
+                    bound.memory_bytes,
+                    symbolic_global_merge_scratch_bytes(current, imported)?,
+                    graph.limits.max_memory_bytes,
+                )?;
+            }
+            merged = Some(symbolic_merge_value(merged, imported, graph.limits)?);
+        }
+        outputs.insert(
+            output.name.clone(),
+            merged.ok_or_else(|| Error::GraphAuthoritativeInput {
+                node: node.definition.guid,
+                input: format!(
+                    "symbolic global stage {} output '{}'",
+                    hex_hash(stage.id),
+                    output.name
+                ),
+            })?,
+        );
+    }
+    Ok(outputs)
+}
+
+fn symbolic_vec_value<T>(
+    domain: GraphDomain,
+    items: u64,
+    limits: crate::GraphSafetyLimits,
+) -> Result<SymbolicValueBound> {
+    let bytes = requested_vec_bound::<T>(items)?;
+    check_limit("memory bytes", bytes, limits.max_memory_bytes)?;
     Ok(SymbolicValueBound {
         domain: Some(domain),
         items,
-        bytes: bound_mul(
-            "memory bytes",
-            items,
-            bytes_per_item,
-            limits.max_memory_bytes,
-        )?,
+        bytes,
+        ..SymbolicValueBound::default()
     })
 }
 
@@ -2445,7 +5022,7 @@ fn symbolic_candidate_value(
     limits: crate::GraphSafetyLimits,
 ) -> Result<SymbolicValueBound> {
     check_limit("candidate count", items, limits.max_candidates)?;
-    symbolic_linear_value(GraphDomain::Candidates, items, 192, limits)
+    symbolic_vec_value::<GraphCandidate>(GraphDomain::Candidates, items, limits)
 }
 
 fn symbolic_field_value(
@@ -2453,11 +5030,19 @@ fn symbolic_field_value(
     items: u64,
     limits: crate::GraphSafetyLimits,
 ) -> Result<SymbolicValueBound> {
-    let bytes_per_item = match domain {
-        GraphDomain::ScalarField => 40,
-        GraphDomain::VectorField => 48,
-        GraphDomain::HessianField => 60,
-        GraphDomain::SurfaceField => 128,
+    let bytes = match domain {
+        GraphDomain::ScalarField => {
+            requested_btree_bound::<CandidateIdentity, DecisionScalar>(items)?
+        }
+        GraphDomain::VectorField => {
+            requested_btree_bound::<CandidateIdentity, DecisionVec3>(items)?
+        }
+        GraphDomain::HessianField => {
+            requested_btree_bound::<CandidateIdentity, DecisionHessian3>(items)?
+        }
+        GraphDomain::SurfaceField => {
+            requested_btree_bound::<CandidateIdentity, ProjectedSurfaceSample>(items)?
+        }
         _ => {
             return Err(Error::GraphDocument {
                 path: "graph.symbolicBound".to_owned(),
@@ -2465,7 +5050,92 @@ fn symbolic_field_value(
             });
         }
     };
-    symbolic_linear_value(domain, items, bytes_per_item, limits)
+    check_limit("memory bytes", bytes, limits.max_memory_bytes)?;
+    Ok(SymbolicValueBound {
+        domain: Some(domain),
+        items,
+        bytes,
+        ..SymbolicValueBound::default()
+    })
+}
+
+fn symbolic_surface_tags_per_hit(
+    node: &CompiledGraphNode,
+    inputs: &GraphEvaluationInputs,
+) -> Result<u64> {
+    let authoritative = node.definition.authority != GraphAuthority::Cosmetic;
+    let provider_filter = u64_parameter(node, "provider", 0)?;
+    let provider_tags = inputs
+        .surface_providers
+        .iter()
+        .map(|provider| provider.descriptor())
+        .filter(|descriptor| {
+            descriptor.capabilities.project
+                && (!authoritative || descriptor.capabilities.authoritative_attachments)
+                && (provider_filter == 0 || descriptor.id.0 == provider_filter)
+        })
+        .map(|descriptor| u64::from(descriptor.max_tags_per_hit))
+        .max()
+        .unwrap_or(0);
+    let tile_tags = inputs
+        .surface_projection_tiles
+        .iter()
+        .filter(|tile| {
+            tile.node == node.definition.guid
+                && tile.node_semantic_revision == node.definition.semantic_revision
+        })
+        .flat_map(|tile| tile.samples.iter())
+        .filter_map(|entry| entry.sample.as_ref())
+        .map(|sample| sample.tags.len() as u64)
+        .max()
+        .unwrap_or(0);
+    Ok(provider_tags.max(tile_tags))
+}
+
+fn symbolic_add_generated_input(
+    bound: &mut SymbolicEvaluationBound,
+    bytes: u64,
+    limits: crate::GraphSafetyLimits,
+) -> Result<()> {
+    bound.generated_input_tiles = bound_add(
+        "input tiles",
+        bound.generated_input_tiles,
+        1,
+        limits.max_input_tiles,
+    )?;
+    bound.generated_input_bytes = bound_add(
+        "memory bytes",
+        bound.generated_input_bytes,
+        bytes,
+        limits.max_memory_bytes,
+    )?;
+    Ok(())
+}
+
+fn symbolic_add_published_input(
+    bound: &mut SymbolicEvaluationBound,
+    bytes: u64,
+    limits: crate::GraphSafetyLimits,
+) -> Result<()> {
+    bound.published_input_tiles = bound_add(
+        "input tiles",
+        bound.published_input_tiles,
+        1,
+        limits.max_input_tiles,
+    )?;
+    bound.published_input_bytes = bound_add(
+        "memory bytes",
+        bound.published_input_bytes,
+        bytes,
+        limits.max_memory_bytes,
+    )?;
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        bytes,
+        limits.max_memory_bytes,
+    )?;
+    Ok(())
 }
 
 fn symbolic_input<'a>(
@@ -2508,10 +5178,67 @@ fn required_symbolic_items(
     )
 }
 
+fn symbolic_stage_region_count(
+    node: &CompiledGraphNode,
+    inputs: &GraphEvaluationInputs,
+    scope: SymbolicEvaluationScope<'_>,
+    bound: &mut SymbolicEvaluationBound,
+    limits: crate::GraphSafetyLimits,
+) -> Result<u64> {
+    let level = node.definition.spatial.level();
+    let minimum_input_level = scope
+        .current_global_stage()
+        .map_or(inputs.output_cell.level(), |stage| {
+            stage.minimum_input_level
+        });
+    if level < minimum_input_level {
+        return Ok(0);
+    }
+    if inputs.regions.is_empty() {
+        return u64::try_from(cell_region_count(inputs.read_bounds, level)?)
+            .map_err(|_| Error::NumericOverflow);
+    }
+    let region_upper = inputs
+        .regions
+        .iter()
+        .filter(|region| region.kind == EvaluationRegionKind::Biome)
+        .count() as u64;
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        requested_btree_bound::<(u8, u128, WorldCellKey), ()>(region_upper)?,
+        limits.max_memory_bytes,
+    )?;
+    let mut canonical = BTreeSet::new();
+    for region in inputs
+        .regions
+        .iter()
+        .filter(|region| region.kind == EvaluationRegionKind::Biome)
+    {
+        if region.seed_cell.level() > level {
+            return Err(Error::GraphDocument {
+                path: node.debug_symbol.label.clone(),
+                reason: "region seed cell is coarser than the node stage".to_owned(),
+            });
+        }
+        let stage_cell = region.seed_cell.ancestor(level)?;
+        if intersect_bounds(region.bounds, stage_cell.bounds())?.is_none() {
+            continue;
+        }
+        canonical.insert(if let Some(namespace) = region.hierarchy_namespace {
+            (0_u8, namespace, stage_cell)
+        } else {
+            (1_u8, region.id, stage_cell)
+        });
+    }
+    u64::try_from(canonical.len()).map_err(|_| Error::NumericOverflow)
+}
+
 fn symbolic_spline_candidate_count(
     node: &CompiledGraphNode,
     inputs: &GraphEvaluationInputs,
     limits: crate::GraphSafetyLimits,
+    bound: &mut SymbolicEvaluationBound,
 ) -> Result<u64> {
     let spacing = fixed_parameter(node, "spacing", DecisionScalar::from_bits(0))?;
     let spacing_ticks = fixed_meters_to_ticks(spacing)?.unsigned_abs() as i128;
@@ -2521,13 +5248,29 @@ fn symbolic_spline_candidate_count(
             reason: "spline spacing must be positive".to_owned(),
         });
     }
+    let maximum_points = inputs
+        .splines
+        .iter()
+        .map(|spline| spline.points.len() as u64)
+        .max()
+        .unwrap_or(0);
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        checked_memory_sum([
+            requested_vec_bound::<[i128; 3]>(maximum_points)?,
+            requested_vec_bound::<SplineSegment>(maximum_points)?,
+        ])?,
+        limits.max_memory_bytes,
+    )?;
     inputs.splines.iter().try_fold(0_u64, |total, spline| {
         let segments = spline_segments(&spline.points)?;
         if segments.is_empty() {
             return Ok(total);
         }
         let length = segments.iter().try_fold(0_i128, |sum, segment| {
-            sum.checked_add(segment.length).ok_or(Error::NumericOverflow)
+            sum.checked_add(segment.length)
+                .ok_or(Error::NumericOverflow)
         })?;
         let samples = u64::try_from(length / spacing_ticks)
             .map_err(|_| Error::NumericOverflow)?
@@ -2537,16 +5280,46 @@ fn symbolic_spline_candidate_count(
     })
 }
 
+fn symbolic_provenance_bytes_per_decision(node: &CompiledGraphNode) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bound::<ProvenanceDecisionHandle>(3)?,
+        requested_vec_bound::<u128>(node.debug_symbol.module_path.len() as u64)?,
+    ])
+}
+
+fn symbolic_add_rejections(
+    bound: &mut SymbolicEvaluationBound,
+    node: &CompiledGraphNode,
+    items: u64,
+    limits: crate::GraphSafetyLimits,
+) -> Result<()> {
+    bound.rejected = bound_add("diagnostic samples", bound.rejected, items, u64::MAX)?;
+    let provenance = bound_mul(
+        "memory bytes",
+        items,
+        symbolic_provenance_bytes_per_decision(node)?,
+        limits.max_memory_bytes,
+    )?;
+    bound.provenance_bytes = bound_add(
+        "memory bytes",
+        bound.provenance_bytes,
+        provenance,
+        limits.max_memory_bytes,
+    )?;
+    Ok(())
+}
+
 fn symbolic_node_outputs(
+    context: SymbolicTraversalContext<'_>,
     unit: &CompiledGraphUnit,
     node: &CompiledGraphNode,
     incoming: &BTreeMap<u128, Vec<&crate::GraphEdge>>,
     values: &BTreeMap<(u128, String), SymbolicValueBound>,
-    inputs: &GraphEvaluationInputs,
     bound: &mut SymbolicEvaluationBound,
-    limits: crate::GraphSafetyLimits,
 ) -> Result<BTreeMap<String, SymbolicValueBound>> {
     use GraphOperator as O;
+    let inputs = context.inputs;
+    let limits = context.graph.limits;
     let candidate_input = || required_symbolic_items(node, incoming, values, "candidates");
     let field_input = |pin| required_symbolic_items(node, incoming, values, pin);
     let candidate = |items| symbolic_candidate_value(items, limits);
@@ -2556,7 +5329,7 @@ fn symbolic_node_outputs(
         O::InterfaceInput | O::ModuleCall => unreachable!("handled by symbolic unit traversal"),
         O::RegionInput => {
             let regions = if inputs.regions.is_empty() {
-                canonical_cell_regions(inputs.read_bounds, inputs.output_cell.level(), 0)?.len()
+                cell_region_count(inputs.read_bounds, inputs.output_cell.level())?
             } else {
                 inputs
                     .regions
@@ -2566,7 +5339,11 @@ fn symbolic_node_outputs(
             };
             singleton(
                 "regions",
-                symbolic_linear_value(GraphDomain::Regions, regions as u64, 64, limits)?,
+                symbolic_vec_value::<EvaluationRegion>(
+                    GraphDomain::Regions,
+                    regions as u64,
+                    limits,
+                )?,
             )
         }
         O::SplineInput => {
@@ -2583,34 +5360,44 @@ fn symbolic_node_outputs(
                 SymbolicValueBound {
                     domain: Some(GraphDomain::Splines),
                     items: inputs.splines.len() as u64,
-                    bytes: bound_mul("memory bytes", points, 64, limits.max_memory_bytes)?,
+                    bytes: checked_memory_sum([
+                        requested_vec_bound::<EvaluationSpline>(inputs.splines.len() as u64)?,
+                        requested_vec_bound::<WorldPosition>(points)?,
+                        (inputs.splines.len() as u64)
+                            .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+                            .ok_or(Error::NumericOverflow)?,
+                    ])?,
+                    ..SymbolicValueBound::default()
                 },
             )
         }
         O::SpeciesInput => singleton(
             "species",
-            symbolic_linear_value(
+            symbolic_vec_value::<crate::BiomePaletteEntry>(
                 GraphDomain::SpeciesTable,
                 unit.palette.len() as u64,
-                32,
                 limits,
             )?,
         ),
-        O::CommunityInput => {
-            let tables = CommunityTables {
-                competition: unit.competition.clone(),
-                companions: unit.companions.clone(),
-                succession: unit.succession.clone(),
-            };
-            singleton(
-                "communities",
-                SymbolicValueBound {
-                    domain: Some(GraphDomain::CommunityTable),
-                    items: 1,
-                    bytes: tables.estimated_bytes(),
-                },
-            )
-        }
+        O::CommunityInput => singleton(
+            "communities",
+            SymbolicValueBound {
+                domain: Some(GraphDomain::CommunityTable),
+                items: 1,
+                bytes: checked_memory_sum([
+                    requested_vec_bytes_for_len::<crate::CompetitionRule>(
+                        unit.competition.len() as u64
+                    )?,
+                    requested_vec_bytes_for_len::<crate::CompanionRule>(
+                        unit.companions.len() as u64
+                    )?,
+                    requested_vec_bytes_for_len::<crate::SuccessionRule>(
+                        unit.succession.len() as u64
+                    )?,
+                ])?,
+                ..SymbolicValueBound::default()
+            },
+        ),
         O::ExplicitAnchors => {
             let layer = guid_parameter(node, "layer", 0)?;
             let count = inputs
@@ -2622,27 +5409,91 @@ fn symbolic_node_outputs(
                 .count() as u64;
             singleton("candidates", candidate(count)?)
         }
-        O::StratifiedCoverage | O::BlueNoisePoisson => {
-            let regions = required_symbolic_items(node, incoming, values, "regions")?;
+        O::StratifiedCoverage => {
+            let region_inputs = required_symbolic_items(node, incoming, values, "regions")?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                stage_region_scratch_bytes(region_inputs)?,
+                limits.max_memory_bytes,
+            )?;
+            let regions = symbolic_stage_region_count(node, inputs, context.scope, bound, limits)?;
             let count = u64::from(u32_parameter(node, "count", 0)?);
             let items = bound_mul("candidate count", regions, count, limits.max_candidates)?;
             singleton("candidates", candidate(items)?)
         }
+        O::BlueNoisePoisson => {
+            let region_inputs = required_symbolic_items(node, incoming, values, "regions")?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                stage_region_scratch_bytes(region_inputs)?,
+                limits.max_memory_bytes,
+            )?;
+            let regions = symbolic_stage_region_count(node, inputs, context.scope, bound, limits)?;
+            let count = u64::from(u32_parameter(node, "count", 0)?);
+            let items = bound_mul("candidate count", regions, count, limits.max_candidates)?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                blue_noise_scratch_bytes(items)?,
+                limits.max_memory_bytes,
+            )?;
+            singleton("candidates", candidate(items)?)
+        }
         O::SurfaceProjection => {
             let items = candidate_input()?;
-            bound.rejected = bound_add(
-                "diagnostic samples",
-                bound.rejected,
-                items,
-                u64::MAX,
-            )?;
-            BTreeMap::from([
-                ("candidates".to_owned(), candidate(items)?),
-                (
-                    "surface".to_owned(),
-                    symbolic_field_value(GraphDomain::SurfaceField, items, limits)?,
-                ),
-            ])
+            let output_demand = NodeOutputDemand::new(context.demand, node);
+            symbolic_add_rejections(bound, node, items, limits)?;
+            let tags_per_hit = symbolic_surface_tags_per_hit(node, inputs)?;
+            let tag_bytes = requested_vec_bound::<WeightedSurfaceTag>(tags_per_hit)?;
+            let has_matching_tile = inputs.surface_projection_tiles.iter().any(|tile| {
+                tile.node == node.definition.guid
+                    && tile.node_semantic_revision == node.definition.semantic_revision
+            });
+            if items > 0 && node.definition.authority != GraphAuthority::Cosmetic {
+                let tile_bytes_per_item =
+                    requested_vec_bound::<QuantizedSurfaceProjectionEntry>(1)?;
+                let tile_bytes_per_item = bound_add(
+                    "memory bytes",
+                    tile_bytes_per_item,
+                    tag_bytes,
+                    limits.max_memory_bytes,
+                )?;
+                let tile_bytes = bound_mul(
+                    "memory bytes",
+                    items,
+                    tile_bytes_per_item,
+                    limits.max_memory_bytes,
+                )?;
+                if !inputs.surface_providers.is_empty() || has_matching_tile {
+                    bound.memory_bytes = bound_add(
+                        "memory bytes",
+                        bound.memory_bytes,
+                        projection_preparation_cache_bytes(items, tags_per_hit)?,
+                        limits.max_memory_bytes,
+                    )?;
+                    symbolic_add_published_input(bound, tile_bytes, limits)?;
+                }
+                if !inputs.surface_providers.is_empty() {
+                    symbolic_add_generated_input(bound, tile_bytes, limits)?;
+                }
+            }
+            let mut outputs = BTreeMap::new();
+            if output_demand.contains("candidates") {
+                outputs.insert("candidates".to_owned(), candidate(items)?);
+            }
+            if output_demand.contains("surface") {
+                let mut surface = symbolic_field_value(GraphDomain::SurfaceField, items, limits)?;
+                surface.bytes = bound_add(
+                    "memory bytes",
+                    surface.bytes,
+                    bound_mul("memory bytes", items, tag_bytes, limits.max_memory_bytes)?,
+                    limits.max_memory_bytes,
+                )?;
+                outputs.insert("surface".to_owned(), surface);
+            }
+            outputs
         }
         O::FieldSample => {
             let items = candidate_input()?;
@@ -2655,6 +5506,25 @@ fn symbolic_node_outputs(
                     path: node.debug_symbol.label.clone(),
                     reason: "field-sample output schema is missing".to_owned(),
                 })?;
+            let has_matching_tile = inputs.surface_field_query_tiles.iter().any(|tile| {
+                tile.node == node.definition.guid
+                    && tile.node_semantic_revision == node.definition.semantic_revision
+            });
+            if items > 0 && node.definition.authority != GraphAuthority::Cosmetic {
+                let tile_bytes = requested_vec_bound::<QuantizedSurfaceFieldQueryEntry>(items)?;
+                if !inputs.surface_providers.is_empty() || has_matching_tile {
+                    bound.memory_bytes = bound_add(
+                        "memory bytes",
+                        bound.memory_bytes,
+                        field_preparation_cache_bytes(items)?,
+                        limits.max_memory_bytes,
+                    )?;
+                    symbolic_add_published_input(bound, tile_bytes, limits)?;
+                }
+                if !inputs.surface_providers.is_empty() {
+                    symbolic_add_generated_input(bound, tile_bytes, limits)?;
+                }
+            }
             singleton("field", symbolic_field_value(domain, items, limits)?)
         }
         O::PaintedTile | O::Noise | O::Gradient | O::DistanceField => {
@@ -2668,40 +5538,67 @@ fn symbolic_node_outputs(
         O::WeightedElimination => {
             let input = candidate_input()?;
             let items = input.min(u64::from(u32_parameter(node, "targetCount", 0)?));
-            let adjacency = bound_mul(
-                "memory bytes",
+            let scratch = weighted_elimination_scratch_bytes(
                 input,
+                items,
                 u64::from(u32_parameter(node, "maximumNeighbours", 0)?),
-                limits.max_memory_bytes / 16,
             )?;
             bound.memory_bytes = bound_add(
                 "memory bytes",
                 bound.memory_bytes,
-                bound_mul("memory bytes", adjacency, 16, limits.max_memory_bytes)?,
+                scratch,
                 limits.max_memory_bytes,
             )?;
-            bound.rejected = bound_add(
-                "diagnostic samples",
-                bound.rejected,
-                input,
-                u64::MAX,
-            )?;
+            symbolic_add_rejections(bound, node, input, limits)?;
             singleton("candidates", candidate(items)?)
         }
-        O::VariableSpacing
-        | O::FieldImportance
-        | O::PriorityExclusion
-        | O::BoundsOverlap
-        | O::Competition
-        | O::Suitability
-        | O::CommunityBlend => {
+        O::VariableSpacing | O::PriorityExclusion => {
             let items = candidate_input()?;
-            bound.rejected = bound_add(
-                "diagnostic samples",
-                bound.rejected,
-                items,
-                u64::MAX,
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                xz_filter_scratch_bytes(items)?,
+                limits.max_memory_bytes,
             )?;
+            symbolic_add_rejections(bound, node, items, limits)?;
+            singleton("candidates", candidate(items)?)
+        }
+        O::Competition => {
+            let items = candidate_input()?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                competition_scratch_bytes(items)?,
+                limits.max_memory_bytes,
+            )?;
+            symbolic_add_rejections(bound, node, items, limits)?;
+            singleton("candidates", candidate(items)?)
+        }
+        O::BoundsOverlap => {
+            let items = candidate_input()?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                bounds_overlap_scratch_bytes(items)?,
+                limits.max_memory_bytes,
+            )?;
+            symbolic_add_rejections(bound, node, items, limits)?;
+            singleton("candidates", candidate(items)?)
+        }
+        O::CommunityBlend => {
+            let items = candidate_input()?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                community_blend_scratch_bytes(items, unit.palette.len() as u64)?,
+                limits.max_memory_bytes,
+            )?;
+            symbolic_add_rejections(bound, node, items, limits)?;
+            singleton("candidates", candidate(items)?)
+        }
+        O::FieldImportance | O::Suitability => {
+            let items = candidate_input()?;
+            symbolic_add_rejections(bound, node, items, limits)?;
             singleton("candidates", candidate(items)?)
         }
         O::ClusterPatchColony => {
@@ -2726,12 +5623,7 @@ fn symbolic_node_outputs(
                     children,
                     limits.max_candidates,
                 )?;
-                factor = bound_add(
-                    "candidate count",
-                    factor,
-                    generation,
-                    limits.max_candidates,
-                )?;
+                factor = bound_add("candidate count", factor, generation, limits.max_candidates)?;
             }
             let items = bound_mul(
                 "candidate count",
@@ -2739,45 +5631,105 @@ fn symbolic_node_outputs(
                 factor,
                 limits.max_candidates,
             )?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                companion_scratch_bytes(candidate_input()?, items, unit.companions.len() as u64)?,
+                limits.max_memory_bytes,
+            )?;
             singleton("candidates", candidate(items)?)
         }
-        O::SplineFollow => singleton(
-            "candidates",
-            candidate(symbolic_spline_candidate_count(node, inputs, limits)?)?,
-        ),
+        O::SplineFollow => {
+            let items = symbolic_spline_candidate_count(node, inputs, limits, bound)?;
+            let region_inputs = if inputs.regions.is_empty() {
+                u64::try_from(cell_region_count(
+                    inputs.read_bounds,
+                    inputs.output_cell.level(),
+                )?)
+                .map_err(|_| Error::NumericOverflow)?
+            } else {
+                inputs.regions.len() as u64
+            };
+            let stage_regions =
+                symbolic_stage_region_count(node, inputs, context.scope, bound, limits)?;
+            let points = inputs.splines.iter().try_fold(0_u64, |total, spline| {
+                total
+                    .checked_add(spline.points.len() as u64)
+                    .ok_or(Error::NumericOverflow)
+            })?;
+            let scratch = checked_memory_sum([
+                stage_region_scratch_bytes(region_inputs)?,
+                requested_vec_bound::<EvaluationRegion>(stage_regions)?,
+                requested_vec_bound::<[i128; 3]>(points)?,
+                requested_vec_bound::<SplineSegment>(points)?,
+                requested_vec_bound::<[i128; 3]>(items)?,
+                requested_vec_bound::<GraphCandidate>(items)?,
+            ])?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                scratch,
+                limits.max_memory_bytes,
+            )?;
+            singleton("candidates", candidate(items)?)
+        }
         O::Transform | O::SuccessionInput => {
             singleton("candidates", candidate(candidate_input()?)?)
         }
         O::MacroOutput => {
             let items = candidate_input()?;
             check_limit("accepted count", items, limits.max_macro_points)?;
-            bound.rejected = bound_add(
-                "diagnostic samples",
-                bound.rejected,
-                items,
-                u64::MAX,
+            symbolic_add_rejections(bound, node, items, limits)?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                macro_output_scratch_bytes(items)?,
+                limits.max_memory_bytes,
             )?;
             singleton(
                 "points",
-                symbolic_linear_value(GraphDomain::MacroPoints, items, 256, limits)?,
+                symbolic_vec_value::<PlantPoint>(GraphDomain::MacroPoints, items, limits)?,
             )
         }
         O::MicroOutput => {
             let dimensions = u32_vec3_parameter(node, "dimensions")?;
-            let mut samples = 1_u64;
+            let mut samples_per_family = 1_u64;
             for dimension in dimensions {
-                samples = bound_mul(
+                samples_per_family = bound_mul(
                     "micro samples",
-                    samples,
+                    samples_per_family,
                     u64::from(dimension),
                     limits.max_micro_samples,
                 )?;
             }
+            let families = candidate_input()?;
+            let samples = bound_mul(
+                "micro samples",
+                samples_per_family,
+                families,
+                limits.max_micro_samples,
+            )?;
             let channels = guid_list_parameter(node, "attributeChannels")?.len() as u64;
-            let bytes_per_sample = bound_add(
+            let attribute_maps = channels
+                .checked_mul(families)
+                .ok_or(Error::NumericOverflow)?;
+            let attribute_values = bound_mul(
                 "memory bytes",
-                10,
-                bound_mul("memory bytes", channels, 20, limits.max_memory_bytes)?,
+                channels,
+                requested_vec_bound::<i32>(samples)?,
+                limits.max_memory_bytes,
+            )?;
+            let bytes = checked_memory_sum([
+                requested_vec_bound::<MicroFieldTile>(families)?,
+                requested_vec_bound::<u16>(samples)?,
+                requested_btree_bound::<u128, Vec<i32>>(attribute_maps)?,
+                attribute_values,
+            ])?;
+            check_limit("memory bytes", bytes, limits.max_memory_bytes)?;
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                micro_output_scratch_bytes(samples, channels)?,
                 limits.max_memory_bytes,
             )?;
             singleton(
@@ -2785,51 +5737,41 @@ fn symbolic_node_outputs(
                 SymbolicValueBound {
                     domain: Some(GraphDomain::MicroField),
                     items: samples,
-                    bytes: bound_mul(
-                        "memory bytes",
-                        samples,
-                        bytes_per_sample,
-                        limits.max_memory_bytes,
-                    )?,
+                    bytes,
+                    ..SymbolicValueBound::default()
                 },
             )
         }
         O::DiagnosticOutput => {
             let candidates = symbolic_input(node, incoming, values, "candidates")?
                 .map_or(0, |value| value.items);
-            let field = symbolic_input(node, incoming, values, "field")?
-                .map_or(0, |value| value.items);
-            let candidate_bytes = bound_mul(
-                "memory bytes",
-                candidates,
-                128,
-                limits.max_memory_bytes,
-            )?;
-            let field_bytes =
-                bound_mul("memory bytes", field, 48, limits.max_memory_bytes)?;
-            let rejected_bytes = bound_mul(
-                "memory bytes",
-                bound.rejected,
-                160,
-                limits.max_memory_bytes,
-            )?;
-            let bytes = bound_add(
-                "memory bytes",
-                bound_add(
-                    "memory bytes",
-                    candidate_bytes,
-                    field_bytes,
-                    limits.max_memory_bytes,
-                )?,
-                rejected_bytes,
-                limits.max_memory_bytes,
-            )?;
+            let field =
+                symbolic_input(node, incoming, values, "field")?.map_or(0, |value| value.items);
+            let candidate_bytes = requested_vec_bound::<DiagnosticCandidateSample>(candidates)?;
+            let field_bytes = requested_vec_bound::<DiagnosticScalarSample>(field)?;
+            let rejected_bytes = requested_vec_bound::<RejectedCandidate>(bound.rejected)?;
+            let label_bytes = string_parameter(node, "label", "")?.len() as u64;
+            let container_bytes = checked_memory_sum([
+                requested_vec_bound::<NamedDiagnosticStream>(1)?,
+                requested_vec_bound::<u128>(node.debug_symbol.module_path.len() as u64)?,
+                requested_vec_bound::<u8>(label_bytes)?,
+            ])?;
             singleton(
                 "diagnostics",
                 SymbolicValueBound {
                     domain: Some(GraphDomain::Diagnostics),
                     items: 1,
-                    bytes,
+                    bytes: checked_memory_sum([
+                        candidate_bytes,
+                        field_bytes,
+                        rejected_bytes,
+                        container_bytes,
+                    ])?,
+                    diagnostic_candidates: candidates,
+                    diagnostic_fields: field,
+                    diagnostic_rejected: bound.rejected,
+                    diagnostic_module_path_items: node.debug_symbol.module_path.len() as u64,
+                    diagnostic_label_bytes: label_bytes,
                 },
             )
         }
@@ -2838,77 +5780,208 @@ fn symbolic_node_outputs(
 }
 
 fn symbolic_evaluate_unit(
+    context: SymbolicTraversalContext<'_>,
     unit: &CompiledGraphUnit,
+    unit_demand: &CompiledDemandUnitSlice,
     interface_values: &BTreeMap<String, SymbolicValueBound>,
-    inputs: &GraphEvaluationInputs,
-    plan: &GraphExecutionPlan,
-    limits: crate::GraphSafetyLimits,
     bound: &mut SymbolicEvaluationBound,
     values_by_pin: &mut BTreeMap<QualifiedGraphPin, SymbolicValueBound>,
+    executed_nodes: &mut BTreeSet<GraphNodeAddress>,
 ) -> Result<BTreeMap<String, SymbolicValueBound>> {
-    let incoming = unit
-        .edges
+    let graph = context.graph;
+    let scope = context.scope;
+    let inputs = context.inputs;
+    let limits = graph.limits;
+    let mut incoming = BTreeMap::<u128, Vec<_>>::new();
+    for node in unit
+        .nodes
         .iter()
-        .fold(BTreeMap::<u128, Vec<_>>::new(), |mut map, edge| {
-            map.entry(edge.to_node).or_default().push(edge);
-            map
-        });
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
+        let edge_count = unit_demand
+            .edges
+            .iter()
+            .filter(|edge| edge.to_node == node.definition.guid)
+            .count();
+        let mut edges = Vec::new();
+        crate::memory::reserve_exact(&mut edges, edge_count, "symbolic incoming graph edges")?;
+        incoming.insert(node.definition.guid, edges);
+    }
+    for edge in &unit_demand.edges {
+        incoming
+            .get_mut(&edge.to_node)
+            .ok_or_else(|| Error::GraphDocument {
+                path: "graph.symbolicBound".to_owned(),
+                reason: "compiled graph edge targets an unknown node".to_owned(),
+            })?
+            .push(edge);
+    }
     let mut values = BTreeMap::<(u128, String), SymbolicValueBound>::new();
-    for node in &unit.nodes {
-        let outputs = match node.definition.operator {
-            GraphOperator::InterfaceInput => {
-                let name = string_parameter(node, "name", "")?;
-                BTreeMap::from([(
-                    "value".to_owned(),
-                    *interface_values.get(&name).ok_or_else(|| Error::GraphDocument {
-                        path: node.debug_symbol.label.clone(),
-                        reason: format!("symbolic module input '{name}' is missing"),
-                    })?,
-                )])
-            }
-            GraphOperator::ModuleCall => {
-                let module = node.module.as_deref().ok_or_else(|| Error::GraphDocument {
-                    path: node.debug_symbol.label.clone(),
-                    reason: "compiled module is missing".to_owned(),
+    for node in unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
+        context.guard.check()?;
+        let loads_global = symbolic_should_load_global_node(graph, scope, &node.address());
+        if !loads_global {
+            let input_clone_bytes = incoming
+                .get(&node.definition.guid)
+                .into_iter()
+                .flatten()
+                .try_fold(0_u64, |total, edge| {
+                    let value = values
+                        .get(&(edge.from_node, edge.from_pin.clone()))
+                        .ok_or_else(|| Error::GraphDocument {
+                            path: node.debug_symbol.label.clone(),
+                            reason: format!("symbolic input '{}' is missing", edge.to_pin),
+                        })?;
+                    bound_add("memory bytes", total, value.bytes, limits.max_memory_bytes)
                 })?;
-                let module_inputs = incoming
-                    .get(&node.definition.guid)
-                    .into_iter()
-                    .flatten()
-                    .map(|edge| {
-                        Ok((
-                            edge.to_pin.clone(),
-                            *values
-                                .get(&(edge.from_node, edge.from_pin.clone()))
-                                .ok_or_else(|| Error::GraphDocument {
-                                    path: node.debug_symbol.label.clone(),
-                                    reason: format!(
-                                        "symbolic module input '{}' is missing",
-                                        edge.to_pin
-                                    ),
-                                })?,
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                symbolic_evaluate_unit(
-                    module,
-                    &module_inputs,
-                    inputs,
-                    plan,
-                    limits,
-                    bound,
-                    values_by_pin,
-                )?
-            }
-            _ => symbolic_node_outputs(unit, node, &incoming, &values, inputs, bound, limits)?,
+            bound.memory_bytes = bound_add(
+                "memory bytes",
+                bound.memory_bytes,
+                input_clone_bytes,
+                limits.max_memory_bytes,
+            )?;
+        }
+        let outputs = if loads_global {
+            symbolic_load_global_node_outputs(graph, context.demand, scope, inputs, node, bound)?
+        } else {
+            executed_nodes.insert(node.address());
+            let produced = match node.definition.operator {
+                GraphOperator::InterfaceInput => {
+                    let name = string_parameter(node, "name", "")?;
+                    BTreeMap::from([(
+                        "value".to_owned(),
+                        *interface_values
+                            .get(name)
+                            .ok_or_else(|| Error::GraphDocument {
+                                path: node.debug_symbol.label.clone(),
+                                reason: format!("symbolic module input '{name}' is missing"),
+                            })?,
+                    )])
+                }
+                GraphOperator::ModuleCall => {
+                    let module = node.module.as_deref().ok_or_else(|| Error::GraphDocument {
+                        path: node.debug_symbol.label.clone(),
+                        reason: "compiled module is missing".to_owned(),
+                    })?;
+                    let module_inputs = incoming
+                        .get(&node.definition.guid)
+                        .into_iter()
+                        .flatten()
+                        .map(|edge| {
+                            Ok((
+                                edge.to_pin.clone(),
+                                *values
+                                    .get(&(edge.from_node, edge.from_pin.clone()))
+                                    .ok_or_else(|| Error::GraphDocument {
+                                        path: node.debug_symbol.label.clone(),
+                                        reason: format!(
+                                            "symbolic module input '{}' is missing",
+                                            edge.to_pin
+                                        ),
+                                    })?,
+                            ))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                    let child_demand = child_demand_unit(context.demand, node)?;
+                    symbolic_evaluate_unit(
+                        context,
+                        module,
+                        child_demand,
+                        &module_inputs,
+                        bound,
+                        values_by_pin,
+                        executed_nodes,
+                    )?
+                }
+                _ => symbolic_node_outputs(context, unit, node, &incoming, &values, bound)?,
+            };
+            let mut outputs = NodeOutputBuilder::new(NodeOutputDemand::new(context.demand, node));
+            outputs.extend(produced)?;
+            outputs.finish()?
         };
+        if !loads_global {
+            let metadata_bytes = checked_memory_sum([
+                requested_vec_bound::<NodeEvaluationDiagnostic>(1)?,
+                requested_vec_bound::<u128>(node.debug_symbol.module_path.len() as u64)?,
+                requested_vec_bound::<u8>(node.debug_symbol.label.len() as u64)?,
+            ])?;
+            bound.diagnostic_metadata_bytes = bound_add(
+                "memory bytes",
+                bound.diagnostic_metadata_bytes,
+                metadata_bytes,
+                limits.max_memory_bytes,
+            )?;
+        }
+        let projection_decision_items =
+            if !loads_global && node.definition.operator == GraphOperator::SurfaceProjection {
+                outputs.values().map(|value| value.items).max().unwrap_or(0)
+            } else {
+                0
+            };
+        if projection_decision_items != 0 {
+            bound.candidate_decision_scratch_bytes =
+                bound
+                    .candidate_decision_scratch_bytes
+                    .max(requested_btree_bound::<CandidateIdentity, ()>(
+                        projection_decision_items,
+                    )?);
+            bound.candidate_events = bound_add(
+                "diagnostic samples",
+                bound.candidate_events,
+                projection_decision_items,
+                u64::MAX,
+            )?;
+            let provenance = bound_mul(
+                "memory bytes",
+                projection_decision_items,
+                symbolic_provenance_bytes_per_decision(node)?,
+                limits.max_memory_bytes,
+            )?;
+            bound.provenance_bytes = bound_add(
+                "memory bytes",
+                bound.provenance_bytes,
+                provenance,
+                limits.max_memory_bytes,
+            )?;
+        }
         for (pin, value) in outputs {
             let candidate_items = if value.domain == Some(GraphDomain::Candidates) {
                 value.items
             } else {
                 0
             };
+            if candidate_items != 0 {
+                bound.candidate_decision_scratch_bytes = bound
+                    .candidate_decision_scratch_bytes
+                    .max(requested_btree_bound::<CandidateIdentity, ()>(
+                        candidate_items,
+                    )?);
+            }
             bound.candidate_peak = bound.candidate_peak.max(candidate_items);
+            if !loads_global && node.definition.operator != GraphOperator::SurfaceProjection {
+                bound.candidate_events = bound_add(
+                    "diagnostic samples",
+                    bound.candidate_events,
+                    candidate_items,
+                    u64::MAX,
+                )?;
+                let provenance = bound_mul(
+                    "memory bytes",
+                    candidate_items,
+                    symbolic_provenance_bytes_per_decision(node)?,
+                    limits.max_memory_bytes,
+                )?;
+                bound.provenance_bytes = bound_add(
+                    "memory bytes",
+                    bound.provenance_bytes,
+                    provenance,
+                    limits.max_memory_bytes,
+                )?;
+            }
             bound.memory_bytes = bound_add(
                 "memory bytes",
                 bound.memory_bytes,
@@ -2925,21 +5998,29 @@ fn symbolic_evaluate_unit(
             values.insert((node.definition.guid, pin), value);
         }
     }
-    let outputs = unit
-        .outputs
-        .iter()
-        .map(|output| {
-            Ok((
-                output.name.clone(),
-                *values
-                    .get(&(output.node, output.pin.clone()))
-                    .ok_or_else(|| Error::GraphDocument {
-                        path: format!("graph.outputs.{}", output.name),
-                        reason: "symbolic output is missing".to_owned(),
-                    })?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut outputs = BTreeMap::new();
+    for output in &unit.outputs {
+        if !unit_demand.outputs.contains(&output.name) {
+            continue;
+        }
+        if let Some(value) = values.get(&(output.node, output.pin.clone())) {
+            outputs.insert(output.name.clone(), *value);
+        } else {
+            return Err(Error::GraphDocument {
+                path: format!("graph.outputs.{}", output.name),
+                reason: "symbolic output is missing".to_owned(),
+            });
+        }
+    }
+    let unit_output_clone_bytes = outputs.values().try_fold(0_u64, |total, value| {
+        bound_add("memory bytes", total, value.bytes, limits.max_memory_bytes)
+    })?;
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        unit_output_clone_bytes,
+        limits.max_memory_bytes,
+    )?;
     if unit.role == crate::BiomeRole::Root {
         for value in outputs.values() {
             match value.domain {
@@ -2963,7 +6044,6 @@ fn symbolic_evaluate_unit(
             }
         }
     }
-    let _ = plan;
     Ok(outputs)
 }
 
@@ -2971,35 +6051,135 @@ fn symbolic_evaluation_bound(
     graph: &CompiledBiomeGraph,
     inputs: &GraphEvaluationInputs,
     plan: &GraphExecutionPlan,
-) -> Result<SymbolicEvaluationBound> {
+    scope: SymbolicEvaluationScope<'_>,
+    guard: PreflightGuard<'_>,
+) -> Result<SymbolicPlannedEvaluation> {
+    guard.check()?;
+    let ancestor_references = ancestor_reference_upper_bound(graph, inputs, scope.is_cell())?;
     let mut bound = SymbolicEvaluationBound::default();
     let mut values_by_pin = BTreeMap::new();
-    symbolic_evaluate_unit(
-        &graph.root,
-        &BTreeMap::new(),
+    let mut executed_nodes = BTreeSet::new();
+    let demand = compiled_demand_slice(graph, scope.current_global_stage())?;
+    let context = SymbolicTraversalContext {
+        graph,
+        demand,
+        scope,
         inputs,
-        plan,
-        graph.limits,
+        guard,
+    };
+    let public_outputs = symbolic_evaluate_unit(
+        context,
+        &graph.root,
+        root_demand_unit(demand)?,
+        &BTreeMap::new(),
         &mut bound,
         &mut values_by_pin,
+        &mut executed_nodes,
     )?;
-    let rejection_bytes = bound_mul(
+    let terminal_micro_tiles = public_outputs
+        .values()
+        .filter(|value| value.domain == Some(GraphDomain::MicroField))
+        .try_fold(0_u64, |total, value| {
+            total.checked_add(value.items).ok_or(Error::NumericOverflow)
+        })?;
+    let terminal_diagnostic_streams = public_outputs
+        .values()
+        .filter(|value| value.domain == Some(GraphDomain::Diagnostics))
+        .try_fold(0_u64, |total, value| {
+            total.checked_add(value.items).ok_or(Error::NumericOverflow)
+        })?;
+    let result_assembly_bytes = checked_memory_sum([
+        requested_vec_bound::<PlantPoint>(bound.accepted)?,
+        requested_vec_bound::<MicroFieldTile>(terminal_micro_tiles)?,
+        requested_vec_bound::<NamedDiagnosticStream>(terminal_diagnostic_streams)?,
+        requested_vec_bound::<QuantizedSurfaceProjectionTile>(bound.published_input_tiles)?,
+        requested_vec_bound::<QuantizedSurfaceFieldQueryTile>(bound.published_input_tiles)?,
+        requested_vec_bound::<WorldCellKey>(ancestor_references)?,
+    ])?;
+    bound.memory_bytes = bound_add(
         "memory bytes",
-        bound.rejected,
-        160,
+        bound.memory_bytes,
+        result_assembly_bytes,
+        graph.limits.max_memory_bytes,
+    )?;
+    let rejection_bytes = requested_vec_bound::<RejectedCandidate>(bound.rejected)?;
+    let rejection_lineage_bytes = checked_memory_sum([
+        requested_btree_bound::<CandidateLineage, Vec<RejectedCandidate>>(bound.rejected)?,
+        requested_vec_bound::<RejectedCandidate>(bound.rejected)?,
+        bound
+            .rejected
+            .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+            .ok_or(Error::NumericOverflow)?,
+    ])?;
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        bound.candidate_decision_scratch_bytes,
         graph.limits.max_memory_bytes,
     )?;
     bound.memory_bytes = bound_add(
         "memory bytes",
         bound.memory_bytes,
-        rejection_bytes,
+        checked_memory_sum([rejection_bytes, rejection_lineage_bytes])?,
         graph.limits.max_memory_bytes,
     )?;
-    for group in plan
-        .groups
-        .iter()
-        .filter(|group| group.domain == GraphExecutionDomain::SlangCompute)
-    {
+    let provenance_records = bound
+        .accepted
+        .checked_add(bound.rejected)
+        .and_then(|records| records.checked_add(bound.imported_provenance_records))
+        .ok_or(Error::NumericOverflow)?;
+    let retained_state_bytes = checked_memory_sum([
+        requested_vec_bound::<ProvenanceDecision>(bound.candidate_events)?,
+        requested_vec_bound::<ProvenanceRecord>(provenance_records)?,
+        bound.provenance_bytes,
+        requested_btree_bound::<CandidateIdentity, ProvenanceDecisionHandle>(
+            bound.candidate_events,
+        )?,
+        requested_btree_bound::<WorldCellKey, ()>(ancestor_references)?,
+        bound.diagnostic_metadata_bytes,
+    ])?;
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        retained_state_bytes,
+        graph.limits.max_memory_bytes,
+    )?;
+    for group in plan.groups.iter().filter(|group| {
+        group.domain == GraphExecutionDomain::SlangCompute
+            && group
+                .nodes
+                .iter()
+                .any(|node| executed_nodes.contains(&node.address))
+    }) {
+        if group
+            .nodes
+            .iter()
+            .any(|node| !executed_nodes.contains(&node.address))
+        {
+            return Err(Error::GraphDocument {
+                path: "graph.symbolicBound.gpuGroup".to_owned(),
+                reason: "resident group crosses the active symbolic spatial boundary".to_owned(),
+            });
+        }
+        let group_metadata = group.nodes.iter().try_fold(
+            checked_memory_sum([
+                requested_vec_bound::<GpuGroupEvaluationDiagnostic>(1)?,
+                requested_vec_bound::<GraphNodeAddress>(group.nodes.len() as u64)?,
+            ])?,
+            |total, node| {
+                total
+                    .checked_add(requested_vec_bound::<u128>(
+                        node.address.module_path.len() as u64
+                    )?)
+                    .ok_or(Error::NumericOverflow)
+            },
+        )?;
+        bound.diagnostic_metadata_bytes = bound_add(
+            "memory bytes",
+            bound.diagnostic_metadata_bytes,
+            group_metadata,
+            graph.limits.max_memory_bytes,
+        )?;
         let invocations = group
             .inputs
             .iter()
@@ -3026,12 +6206,60 @@ fn symbolic_evaluation_bound(
         let input_count = scalar_inputs
             .checked_add(synthetic_inputs)
             .ok_or(Error::NumericOverflow)?;
+        let curve_instructions = group
+            .nodes
+            .iter()
+            .filter(|node| node.operator == GraphOperator::Curve)
+            .count() as u64;
+        let allocation_shape = ResidentGroupAllocationShape {
+            invocations,
+            inputs: input_count,
+            instructions: group.nodes.len() as u64,
+            curve_instructions,
+            curve_points: curve_instructions
+                .checked_mul(GRAPH_GPU_MAX_CURVE_POINTS as u64)
+                .ok_or(Error::NumericOverflow)?,
+            external_inputs: group.inputs.len() as u64,
+            external_pin_bytes: group.inputs.iter().try_fold(0_u64, |total, input| {
+                total
+                    .checked_add(input.pin.pin.len() as u64)
+                    .ok_or(Error::NumericOverflow)
+            })?,
+            output_entries: group.outputs.len() as u64,
+            output_pin_bytes: group.outputs.iter().try_fold(0_u64, |total, output| {
+                total
+                    .checked_add(output.pin.pin.len() as u64)
+                    .ok_or(Error::NumericOverflow)
+            })?,
+            noise_nodes: group
+                .nodes
+                .iter()
+                .filter(|node| node.operator == GraphOperator::Noise)
+                .count() as u64,
+            gradient_nodes: group
+                .nodes
+                .iter()
+                .filter(|node| node.operator == GraphOperator::Gradient)
+                .count() as u64,
+            candidate_output: group
+                .outputs
+                .iter()
+                .any(|output| output.domain == GraphDomain::Candidates),
+            scalar_output: group
+                .outputs
+                .iter()
+                .any(|output| output.domain == GraphDomain::ScalarField),
+        };
+        bound.memory_bytes = bound_add(
+            "memory bytes",
+            bound.memory_bytes,
+            resident_group_scratch_bytes(allocation_shape)?,
+            graph.limits.max_memory_bytes,
+        )?;
         let program_words = (GRAPH_GPU_PROGRAM_HEADER_WORDS as u64)
             .checked_add(input_count)
             .and_then(|words| {
-                words.checked_add(
-                    (group.nodes.len() as u64) * (GRAPH_GPU_INSTRUCTION_WORDS as u64),
-                )
+                words.checked_add((group.nodes.len() as u64) * (GRAPH_GPU_INSTRUCTION_WORDS as u64))
             })
             .ok_or(Error::NumericOverflow)?;
         let invocation_words = bound_mul(
@@ -3059,12 +6287,7 @@ fn symbolic_evaluation_bound(
             output_words,
             graph.limits.max_transfer_bytes / 4,
         )?;
-        let bytes = bound_mul(
-            "transfer bytes",
-            words,
-            4,
-            graph.limits.max_transfer_bytes,
-        )?;
+        let bytes = bound_mul("transfer bytes", words, 4, graph.limits.max_transfer_bytes)?;
         bound.transfer_bytes = bound_add(
             "transfer bytes",
             bound.transfer_bytes,
@@ -3072,7 +6295,106 @@ fn symbolic_evaluation_bound(
             graph.limits.max_transfer_bytes,
         )?;
     }
-    Ok(bound)
+    let materialized_outputs = scope
+        .current_global_stage()
+        .map_or_else(BTreeMap::new, |stage| {
+            stage
+                .output_pins
+                .iter()
+                .filter_map(|pin| {
+                    values_by_pin
+                        .get(pin)
+                        .copied()
+                        .map(|value| (pin.clone(), value))
+                })
+                .collect()
+        });
+    let rejection_history_bytes = requested_vec_bound::<RejectedCandidate>(bound.rejected)?;
+    let terminal_value_bytes = public_outputs
+        .values()
+        .filter(|value| {
+            matches!(
+                value.domain,
+                Some(GraphDomain::MicroField | GraphDomain::Diagnostics)
+            )
+        })
+        .try_fold(0_u64, |total, value| {
+            bound_add(
+                "memory bytes",
+                total,
+                value.bytes,
+                graph.limits.max_memory_bytes,
+            )
+        })?;
+    let public_result_bytes = checked_memory_sum([
+        PlantPointColumns::requested_memory_bytes_for_rows(bound.accepted)?,
+        terminal_value_bytes,
+        bound.published_input_bytes,
+        requested_vec_bound::<QuantizedSurfaceProjectionTile>(bound.published_input_tiles)?,
+        requested_vec_bound::<QuantizedSurfaceFieldQueryTile>(bound.published_input_tiles)?,
+        requested_vec_bound::<WorldCellKey>(ancestor_references)?,
+        requested_vec_bound::<ProvenanceDecision>(bound.candidate_events)?,
+        requested_vec_bound::<ProvenanceRecord>(provenance_records)?,
+        bound.provenance_bytes,
+        rejection_history_bytes,
+        bound.diagnostic_metadata_bytes,
+    ])?;
+    check_limit(
+        "memory bytes",
+        public_result_bytes,
+        graph.limits.max_memory_bytes,
+    )?;
+    let materialized_bytes = materialized_outputs
+        .values()
+        .try_fold(0_u64, |total, value| {
+            bound_add(
+                "memory bytes",
+                total,
+                value.bytes,
+                graph.limits.max_memory_bytes,
+            )
+        })?;
+    let candidate_decision_bytes = requested_btree_bound::<
+        CandidateIdentity,
+        ProvenanceDecisionHandle,
+    >(bound.candidate_events)?;
+    let materialized_key_bytes = materialized_outputs.keys().try_fold(0_u64, |total, pin| {
+        total
+            .checked_add(qualified_graph_pin_memory(pin)?)
+            .ok_or(Error::NumericOverflow)
+    })?;
+    let materialized_container_bytes = checked_memory_sum([
+        requested_btree_bound::<QualifiedGraphPin, GraphValue>(materialized_outputs.len() as u64)?,
+        materialized_key_bytes,
+    ])?;
+    bound.memory_bytes = bound_add(
+        "memory bytes",
+        bound.memory_bytes,
+        checked_memory_sum([materialized_bytes, materialized_container_bytes])?,
+        graph.limits.max_memory_bytes,
+    )?;
+    let cloned_provenance_bytes = checked_memory_sum([
+        requested_vec_bound::<ProvenanceDecision>(bound.candidate_events)?,
+        requested_vec_bound::<ProvenanceRecord>(provenance_records)?,
+        bound.provenance_bytes,
+    ])?;
+    let global_tile_bytes = [
+        public_result_bytes,
+        candidate_decision_bytes,
+        materialized_container_bytes,
+        cloned_provenance_bytes,
+    ]
+    .into_iter()
+    .try_fold(materialized_bytes, |total, bytes| {
+        bound_add("memory bytes", total, bytes, graph.limits.max_memory_bytes)
+    })?;
+    Ok(SymbolicPlannedEvaluation {
+        bound,
+        materialized_outputs,
+        public_result_bytes,
+        global_tile_bytes,
+        ancestor_references,
+    })
 }
 
 fn preflight_evaluation_inputs(
@@ -3080,7 +6402,10 @@ fn preflight_evaluation_inputs(
     inputs: &[GraphEvaluationInputs],
     worker_count: usize,
     plan: &GraphExecutionPlan,
-) -> Result<()> {
+    global_store: &SymbolicGlobalStore,
+    guard: PreflightGuard<'_>,
+) -> Result<SymbolicInputPreflight> {
+    guard.check()?;
     check_limit(
         "output cells",
         inputs.len() as u64,
@@ -3088,137 +6413,306 @@ fn preflight_evaluation_inputs(
     )?;
     let mut cells = BTreeSet::new();
     let mut input_tiles = 0_u64;
-    let mut input_bytes = 0_u64;
+    let mut retained_input_bytes = 0_u64;
+    let mut generated_input_bytes = 0_u64;
     let mut candidate_count = 0_u64;
     let mut accepted_count = 0_u64;
     let mut micro_samples = 0_u64;
     let mut transfer_bytes = 0_u64;
-    let mut worker_memory = Vec::with_capacity(inputs.len());
+    let mut retained_result_bytes = 0_u64;
+    let mut worker_memory = BinaryHeap::with_capacity(worker_count);
     for input in inputs {
+        guard.check()?;
         if !cells.insert(input.output_cell) {
             return Err(Error::GraphDocument {
                 path: "evaluation.outputCells".to_owned(),
                 reason: format!("output cell {} is duplicated", input.output_cell),
             });
         }
-        input_tiles = input_tiles
-            .checked_add(evaluation_input_tile_count(input)?)
-            .ok_or(Error::NumericOverflow)?;
-        input_bytes = input_bytes
-            .checked_add(estimated_input_bytes(input)?)
-            .ok_or(Error::NumericOverflow)?;
-        let bound = symbolic_evaluation_bound(graph, input, plan)?;
+        input_tiles = bound_add(
+            "input tiles",
+            input_tiles,
+            evaluation_input_tile_count(input)?,
+            graph.limits.max_input_tiles,
+        )?;
+        retained_input_bytes = bound_add(
+            "memory bytes",
+            retained_input_bytes,
+            estimated_input_bytes(input, guard)?,
+            graph.limits.max_memory_bytes,
+        )?;
+        validate_static_inputs(graph, input, None, guard)?;
+        guard.check()?;
+        let symbolic = symbolic_evaluation_bound(
+            graph,
+            input,
+            plan,
+            SymbolicEvaluationScope::Cell { global_store },
+            guard,
+        )?;
+        input_tiles = bound_add(
+            "input tiles",
+            input_tiles,
+            symbolic.bound.generated_input_tiles,
+            graph.limits.max_input_tiles,
+        )?;
+        generated_input_bytes = bound_add(
+            "memory bytes",
+            generated_input_bytes,
+            symbolic.bound.generated_input_bytes,
+            graph.limits.max_memory_bytes,
+        )?;
+        retained_result_bytes = bound_add(
+            "memory bytes",
+            retained_result_bytes,
+            symbolic.public_result_bytes,
+            graph.limits.max_memory_bytes,
+        )?;
+        let ancestor_references = symbolic.ancestor_references;
+        let bound = symbolic.bound;
         let estimated_candidates = bound.candidate_peak;
-        candidate_count = candidate_count
-            .checked_add(estimated_candidates)
-            .ok_or(Error::NumericOverflow)?;
-        accepted_count = accepted_count
-            .checked_add(
-                bound.accepted,
-            )
-            .ok_or(Error::NumericOverflow)?;
-        micro_samples = micro_samples
-            .checked_add(bound.micro_samples)
-            .ok_or(Error::NumericOverflow)?;
-        transfer_bytes = transfer_bytes
-            .checked_add(
-                bound.transfer_bytes,
-            )
-            .ok_or(Error::NumericOverflow)?;
-        worker_memory.push(
+        candidate_count = bound_add(
+            "candidate count",
+            candidate_count,
+            estimated_candidates,
+            graph.limits.max_candidates,
+        )?;
+        accepted_count = bound_add(
+            "accepted count",
+            accepted_count,
+            bound.accepted,
+            graph.limits.max_macro_points,
+        )?;
+        micro_samples = bound_add(
+            "micro samples",
+            micro_samples,
+            bound.micro_samples,
+            graph.limits.max_micro_samples,
+        )?;
+        transfer_bytes = bound_add(
+            "transfer bytes",
+            transfer_bytes,
+            bound.transfer_bytes,
+            graph.limits.max_transfer_bytes,
+        )?;
+        let point_column_peak = PlantPointColumns::requested_memory_bytes_for_rows(bound.accepted)?;
+        let worker_bytes = checked_memory_sum([
             bound.memory_bytes,
-        );
+            input_validation_scratch_bytes(input)?,
+            point_column_peak,
+            runtime_traversal_allocation_bound(
+                graph,
+                graph.demand_plan().public_slice(),
+                plan,
+                ancestor_references,
+            )?,
+        ])?;
+        check_limit("memory bytes", worker_bytes, graph.limits.max_memory_bytes)?;
+        if worker_memory.len() < worker_count {
+            worker_memory.push(Reverse(worker_bytes));
+        } else if worker_memory
+            .peek()
+            .is_some_and(|minimum| worker_bytes > minimum.0)
+        {
+            worker_memory.pop();
+            worker_memory.push(Reverse(worker_bytes));
+        }
     }
-    check_limit("input tiles", input_tiles, graph.limits.max_input_tiles)?;
-    check_limit(
-        "candidate count",
+    let active_worker_memory =
+        worker_memory
+            .into_iter()
+            .try_fold(0_u64, |total, Reverse(value)| {
+                bound_add("memory bytes", total, value, graph.limits.max_memory_bytes)
+            })?;
+    Ok(SymbolicInputPreflight {
+        input_tiles,
+        retained_input_bytes,
+        generated_input_bytes,
         candidate_count,
-        graph.limits.max_candidates,
-    )?;
-    check_limit(
-        "accepted count",
         accepted_count,
-        graph.limits.max_macro_points,
-    )?;
-    check_limit(
-        "micro samples",
         micro_samples,
-        graph.limits.max_micro_samples,
-    )?;
-    check_limit(
-        "transfer bytes",
         transfer_bytes,
-        graph.limits.max_transfer_bytes,
-    )?;
-    worker_memory.sort_unstable_by(|left, right| right.cmp(left));
-    let active_memory = worker_memory
-        .into_iter()
-        .take(worker_count)
-        .try_fold(input_bytes, |total, value| {
-            total.checked_add(value).ok_or(Error::NumericOverflow)
-        })?;
-    check_limit("memory bytes", active_memory, graph.limits.max_memory_bytes)
+        active_worker_memory,
+        retained_result_bytes,
+    })
 }
 
-fn estimated_input_bytes(input: &GraphEvaluationInputs) -> Result<u64> {
-    let field_bytes = input.fields.iter().try_fold(0_u64, |total, tile| {
-        let bytes = match &tile.values {
-            QuantizedFieldTileValues::Scalar(values) => checked_len_bytes(values.len(), 4)?,
-            QuantizedFieldTileValues::Gradient(values) => checked_len_bytes(values.len(), 12)?,
-            QuantizedFieldTileValues::Hessian(values) => checked_len_bytes(values.len(), 24)?,
+fn estimated_input_bytes(input: &GraphEvaluationInputs, guard: PreflightGuard<'_>) -> Result<u64> {
+    let mut bytes = checked_memory_sum([
+        requested_vec_bytes::<EvaluationFieldTile>(input.fields.capacity())?,
+        requested_vec_bytes::<QuantizedSurfaceProjectionTile>(
+            input.surface_projection_tiles.capacity(),
+        )?,
+        requested_vec_bytes::<QuantizedSurfaceFieldQueryTile>(
+            input.surface_field_query_tiles.capacity(),
+        )?,
+        requested_vec_bytes::<EvaluationRegion>(input.regions.capacity())?,
+        requested_vec_bytes::<EvaluationSpline>(input.splines.capacity())?,
+        requested_vec_bytes::<EvaluationAnchor>(input.anchors.capacity())?,
+        requested_vec_bytes::<PlantPrototype>(input.plant_prototypes.capacity())?,
+        requested_vec_bytes::<Arc<dyn SurfaceField>>(input.surface_providers.capacity())?,
+    ])?;
+    for tile in &input.fields {
+        guard.check()?;
+        let values = match &tile.values {
+            QuantizedFieldTileValues::Scalar(values) => {
+                requested_vec_bytes::<i32>(values.capacity())?
+            }
+            QuantizedFieldTileValues::Gradient(values) => {
+                requested_vec_bytes::<[i32; 3]>(values.capacity())?
+            }
+            QuantizedFieldTileValues::Hessian(values) => {
+                requested_vec_bytes::<[i32; 6]>(values.capacity())?
+            }
         };
-        total.checked_add(bytes).ok_or(Error::NumericOverflow)
-    })?;
-    let projection_bytes =
+        bytes = bytes.checked_add(values).ok_or(Error::NumericOverflow)?;
+    }
+    for tile in &input.surface_projection_tiles {
+        guard.check()?;
+        bytes = bytes
+            .checked_add(requested_vec_bytes::<QuantizedSurfaceProjectionEntry>(
+                tile.samples.capacity(),
+            )?)
+            .ok_or(Error::NumericOverflow)?;
+        for entry in &tile.samples {
+            guard.check()?;
+            if let Some(sample) = &entry.sample {
+                bytes = bytes
+                    .checked_add(requested_vec_bytes::<WeightedSurfaceTag>(
+                        sample.tags.capacity(),
+                    )?)
+                    .ok_or(Error::NumericOverflow)?;
+            }
+        }
+    }
+    for tile in &input.surface_field_query_tiles {
+        guard.check()?;
+        bytes = bytes
+            .checked_add(requested_vec_bytes::<QuantizedSurfaceFieldQueryEntry>(
+                tile.samples.capacity(),
+            )?)
+            .ok_or(Error::NumericOverflow)?;
+    }
+    for spline in &input.splines {
+        guard.check()?;
+        bytes = bytes
+            .checked_add(requested_vec_bytes::<WorldPosition>(
+                spline.points.capacity(),
+            )?)
+            .ok_or(Error::NumericOverflow)?;
+    }
+    guard.check()?;
+    Ok(bytes)
+}
+
+fn input_validation_scratch_bytes(input: &GraphEvaluationInputs) -> Result<u64> {
+    let projection_queries =
         input
             .surface_projection_tiles
             .iter()
-            .try_fold(0_u64, |total, tile| {
-                tile.samples.iter().try_fold(total, |total, entry| {
-                    let tags = entry
-                        .sample
-                        .as_ref()
-                        .map(|sample| checked_len_bytes(sample.tags.len(), 16))
-                        .transpose()?
-                        .unwrap_or(0);
-                    total
-                        .checked_add(192)
-                        .and_then(|value| value.checked_add(tags))
-                        .ok_or(Error::NumericOverflow)
-                })
+            .try_fold(0_usize, |total, tile| {
+                total
+                    .checked_add(tile.samples.len())
+                    .ok_or(Error::NumericOverflow)
             })?;
-    let field_query_bytes =
+    let field_queries =
         input
             .surface_field_query_tiles
             .iter()
-            .try_fold(0_u64, |total, tile| {
+            .try_fold(0_usize, |total, tile| {
                 total
-                    .checked_add(
-                        (tile.samples.len() as u64)
-                            .checked_mul(160)
-                            .ok_or(Error::NumericOverflow)?,
-                    )
+                    .checked_add(tile.samples.len())
                     .ok_or(Error::NumericOverflow)
             })?;
-    let spline_points = input.splines.iter().try_fold(0_u64, |total, spline| {
-        total
-            .checked_add(u64::try_from(spline.points.len()).map_err(|_| Error::NumericOverflow)?)
-            .ok_or(Error::NumericOverflow)
-    })?;
-    let region_bytes = checked_len_bytes(input.regions.len(), 64)?;
-    let spline_bytes = spline_points
-        .checked_mul(64)
+    checked_memory_sum([
+        requested_btree_bytes::<(u128, u32, WorldPosition), ()>(projection_queries)?,
+        requested_btree_bytes::<
+            (
+                u128,
+                u32,
+                FieldChannel,
+                FieldDerivative,
+                CandidateIdentity,
+                WorldPosition,
+            ),
+            (),
+        >(field_queries)?,
+        requested_vec_bytes::<SurfaceProviderDescriptor>(input.surface_providers.len())?,
+    ])
+}
+
+fn preflight_scratch_bytes(
+    graph: &CompiledBiomeGraph,
+    inputs: &GraphEvaluationJobInputs,
+    worker_count: usize,
+) -> Result<u64> {
+    let maximum_expected_global = inputs.global_stages.len();
+    let guarded_expected_global = maximum_expected_global
+        .checked_add(1)
         .ok_or(Error::NumericOverflow)?;
-    let anchor_bytes = checked_len_bytes(input.anchors.len(), 256)?;
-    let prototype_bytes = checked_len_bytes(input.plant_prototypes.len(), 128)?;
-    field_bytes
-        .checked_add(projection_bytes)
-        .and_then(|value| value.checked_add(field_query_bytes))
-        .and_then(|value| value.checked_add(region_bytes))
-        .and_then(|value| value.checked_add(spline_bytes))
-        .and_then(|value| value.checked_add(anchor_bytes))
-        .and_then(|value| value.checked_add(prototype_bytes))
-        .ok_or(Error::NumericOverflow)
+    let stage_count = graph.spatial_plan().global_stages().len();
+    let validation_scratch = inputs
+        .cells
+        .iter()
+        .chain(inputs.global_stages.iter().map(|stage| &stage.inputs))
+        .try_fold(0_u64, |maximum, input| {
+            Ok::<_, Error>(maximum.max(input_validation_scratch_bytes(input)?))
+        })?;
+    checked_memory_sum([
+        requested_btree_bytes::<([u8; 32], WorldCellKey), ()>(guarded_expected_global)?,
+        requested_btree_bytes::<([u8; 32], WorldCellKey), ()>(guarded_expected_global)?,
+        requested_btree_bytes::<([u8; 32], u8), ()>(stage_count)?,
+        requested_vec_bytes::<WorldCellKey>(guarded_expected_global)?,
+        requested_btree_bytes::<([u8; 32], WorldCellKey), ()>(inputs.global_stages.len())?,
+        requested_vec_bytes::<&GlobalStageEvaluationInputs>(inputs.global_stages.len())?,
+        requested_btree_bytes::<WorldCellKey, ()>(inputs.cells.len())?,
+        requested_vec_bytes::<u64>(worker_count)?,
+        symbolic_traversal_allocation_bound(graph, graph.demand_plan().execution_slice())?,
+        validation_scratch,
+    ])
+}
+
+fn job_input_container_bytes(inputs: &GraphEvaluationJobInputs) -> Result<u64> {
+    checked_memory_sum([
+        requested_vec_bytes::<GraphEvaluationInputs>(inputs.cells.capacity())?,
+        requested_vec_bytes::<GlobalStageEvaluationInputs>(inputs.global_stages.capacity())?,
+    ])
+}
+
+fn runtime_job_allocation_bytes(
+    inputs: &GraphEvaluationJobInputs,
+    worker_count: usize,
+    plan_allocation_bytes: u64,
+) -> Result<u64> {
+    let worker_count_u64 = u64::try_from(worker_count).map_err(|_| Error::NumericOverflow)?;
+    let shard_allocations = worker_count_u64
+        .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+        .ok_or(Error::NumericOverflow)?;
+    let worker_stacks = worker_count_u64
+        .checked_mul(EVALUATOR_WORKER_STACK_BYTES as u64)
+        .ok_or(Error::NumericOverflow)?;
+    checked_memory_sum([
+        plan_allocation_bytes,
+        worker_stacks,
+        requested_vec_bytes::<Vec<(usize, GraphEvaluationInputs)>>(worker_count)?,
+        requested_slice_bytes::<(usize, GraphEvaluationInputs)>(inputs.cells.len())?,
+        shard_allocations,
+        requested_vec_bytes::<
+            std::thread::ScopedJoinHandle<
+                'static,
+                Result<Vec<(usize, Result<GraphEvaluationResult>)>>,
+            >,
+        >(worker_count)?,
+        requested_slice_bytes::<(usize, Result<GraphEvaluationResult>)>(inputs.cells.len())?,
+        shard_allocations,
+        requested_vec_bytes::<(usize, Result<GraphEvaluationResult>)>(inputs.cells.len())?,
+        requested_vec_bytes::<GraphEvaluationResult>(inputs.cells.len())?,
+        requested_vec_bytes::<GlobalStageEvaluationResult>(inputs.global_stages.len())?,
+        requested_btree_bytes::<GlobalStageCacheKey, GlobalStageTile>(inputs.global_stages.len())?,
+        requested_btree_bytes::<([u8; 32], WorldCellKey), GlobalStageCacheKey>(
+            inputs.global_stages.len(),
+        )?,
+    ])
 }
 
 fn evaluation_input_tile_count(input: &GraphEvaluationInputs) -> Result<u64> {
@@ -3228,6 +6722,7 @@ fn evaluation_input_tile_count(input: &GraphEvaluationInputs) -> Result<u64> {
         input.surface_field_query_tiles.len(),
         input.regions.len(),
         input.splines.len(),
+        input.surface_providers.len(),
     ]
     .into_iter()
     .try_fold(0_u64, |total, count| {
@@ -3235,13 +6730,6 @@ fn evaluation_input_tile_count(input: &GraphEvaluationInputs) -> Result<u64> {
             .checked_add(u64::try_from(count).map_err(|_| Error::NumericOverflow)?)
             .ok_or(Error::NumericOverflow)
     })
-}
-
-fn checked_len_bytes(len: usize, bytes_per_item: u64) -> Result<u64> {
-    u64::try_from(len)
-        .map_err(|_| Error::NumericOverflow)?
-        .checked_mul(bytes_per_item)
-        .ok_or(Error::NumericOverflow)
 }
 
 fn check_limit(resource: &'static str, requested: u64, limit: u64) -> Result<()> {
@@ -3255,13 +6743,30 @@ fn check_limit(resource: &'static str, requested: u64, limit: u64) -> Result<()>
     Ok(())
 }
 
+fn global_stage_order(graph: &CompiledBiomeGraph, stage_id: [u8; 32]) -> usize {
+    graph
+        .spatial_plan()
+        .global_stages()
+        .iter()
+        .position(|stage| stage.id == stage_id)
+        .unwrap_or(usize::MAX)
+}
+
 fn preflight_evaluation_job(
     graph: &CompiledBiomeGraph,
     inputs: &GraphEvaluationJobInputs,
     worker_count: usize,
     plan: &GraphExecutionPlan,
-) -> Result<()> {
-    preflight_evaluation_inputs(graph, &inputs.cells, worker_count, plan)?;
+    plan_allocation_bytes: u64,
+    guard: PreflightGuard<'_>,
+) -> Result<GraphEvaluationPreflight> {
+    guard.check()?;
+    let preflight_scratch = preflight_scratch_bytes(graph, inputs, worker_count)?;
+    check_limit(
+        "memory bytes",
+        checked_memory_sum([plan_allocation_bytes, preflight_scratch])?,
+        graph.limits.max_memory_bytes,
+    )?;
     let mut job_identity = None;
     for input in inputs
         .cells
@@ -3286,16 +6791,39 @@ fn preflight_evaluation_job(
         graph.limits.max_global_stage_tiles,
     )?;
 
-    let expected = expected_global_stage_tiles(graph, &inputs.cells)?;
+    let expected = expected_global_stage_tiles_guarded(
+        graph,
+        &inputs.cells,
+        Some(guard),
+        inputs.global_stages.len(),
+    )?;
     let mut actual = BTreeSet::new();
     let mut global_input_tiles = 0_u64;
-    let mut global_input_bytes = 0_u64;
-    let mut global_memory = 0_u64;
+    let mut global_retained_input_bytes = 0_u64;
+    let mut global_generated_input_bytes = 0_u64;
+    let mut global_resident_memory = 0_u64;
+    let mut global_peak_memory = 0_u64;
     let mut global_candidates = 0_u64;
     let mut global_accepted = 0_u64;
     let mut global_micro_samples = 0_u64;
     let mut global_transfer_bytes = 0_u64;
-    for input in &inputs.global_stages {
+    let mut symbolic_global_store = SymbolicGlobalStore::default();
+    let mut ordered_global_inputs = Vec::new();
+    crate::memory::reserve_exact(
+        &mut ordered_global_inputs,
+        inputs.global_stages.len(),
+        "ordered global-stage inputs",
+    )?;
+    ordered_global_inputs.extend(inputs.global_stages.iter());
+    ordered_global_inputs.sort_unstable_by_key(|input| {
+        (
+            global_stage_order(graph, input.stage),
+            input.owner,
+            input.input_snapshot,
+        )
+    });
+    for input in ordered_global_inputs {
+        guard.check()?;
         let stage = graph
             .spatial_plan()
             .global_stage(input.stage)
@@ -3329,28 +6857,138 @@ fn preflight_evaluation_job(
                 ),
             });
         }
-        global_input_tiles = global_input_tiles
-            .checked_add(evaluation_input_tile_count(&input.inputs)?)
+        global_input_tiles = bound_add(
+            "input tiles",
+            global_input_tiles,
+            evaluation_input_tile_count(&input.inputs)?,
+            graph.limits.max_input_tiles,
+        )?;
+        global_retained_input_bytes = bound_add(
+            "memory bytes",
+            global_retained_input_bytes,
+            estimated_input_bytes(&input.inputs, guard)?,
+            graph.limits.max_memory_bytes,
+        )?;
+        validate_static_inputs(graph, &input.inputs, Some(stage), guard)?;
+        guard.check()?;
+        let symbolic = symbolic_evaluation_bound(
+            graph,
+            &input.inputs,
+            plan,
+            SymbolicEvaluationScope::Global {
+                stage,
+                global_store: &symbolic_global_store,
+            },
+            guard,
+        )?;
+        global_input_tiles = bound_add(
+            "input tiles",
+            global_input_tiles,
+            symbolic.bound.generated_input_tiles,
+            graph.limits.max_input_tiles,
+        )?;
+        global_generated_input_bytes = bound_add(
+            "memory bytes",
+            global_generated_input_bytes,
+            symbolic.bound.generated_input_bytes,
+            graph.limits.max_memory_bytes,
+        )?;
+        if symbolic.materialized_outputs.len() != stage.output_pins.len() {
+            return Err(Error::GraphDocument {
+                path: "evaluation.globalStages".to_owned(),
+                reason: format!(
+                    "symbolic stage {} did not materialize every boundary output",
+                    hex_hash(stage.id)
+                ),
+            });
+        }
+        let stage_retained_bytes = symbolic.global_tile_bytes;
+        check_limit(
+            "memory bytes",
+            stage_retained_bytes,
+            graph.limits.max_memory_bytes,
+        )?;
+        let ancestor_references = symbolic.ancestor_references;
+        let bound = symbolic.bound;
+        let global_worker_bytes = checked_memory_sum([
+            bound.memory_bytes,
+            input_validation_scratch_bytes(&input.inputs)?,
+            PlantPointColumns::requested_memory_bytes_for_rows(bound.accepted)?,
+            runtime_traversal_allocation_bound(
+                graph,
+                graph
+                    .demand_plan()
+                    .stage_slice(stage.id)
+                    .ok_or_else(|| Error::GraphDocument {
+                        path: "graph.demandPlan".to_owned(),
+                        reason: "global stage has no demand slice".to_owned(),
+                    })?,
+                plan,
+                ancestor_references,
+            )?,
+        ])?;
+        let live_during_stage = bound_add(
+            "memory bytes",
+            global_resident_memory,
+            global_worker_bytes,
+            graph.limits.max_memory_bytes,
+        )?;
+        let resident_with_stage = bound_add(
+            "memory bytes",
+            global_resident_memory,
+            stage_retained_bytes,
+            graph.limits.max_memory_bytes,
+        );
+        let resident_with_stage = resident_with_stage?;
+        global_peak_memory = global_peak_memory
+            .max(live_during_stage)
+            .max(resident_with_stage);
+        global_candidates = bound_add(
+            "candidate count",
+            global_candidates,
+            bound.candidate_peak,
+            graph.limits.max_candidates,
+        )?;
+        global_accepted = bound_add(
+            "accepted count",
+            global_accepted,
+            bound.accepted,
+            graph.limits.max_macro_points,
+        )?;
+        global_micro_samples = bound_add(
+            "micro samples",
+            global_micro_samples,
+            bound.micro_samples,
+            graph.limits.max_micro_samples,
+        )?;
+        global_transfer_bytes = bound_add(
+            "transfer bytes",
+            global_transfer_bytes,
+            bound.transfer_bytes,
+            graph.limits.max_transfer_bytes,
+        )?;
+        global_resident_memory = resident_with_stage;
+        let provenance_records = bound
+            .accepted
+            .checked_add(bound.rejected)
+            .and_then(|records| records.checked_add(bound.imported_provenance_records))
             .ok_or(Error::NumericOverflow)?;
-        global_input_bytes = global_input_bytes
-            .checked_add(estimated_input_bytes(&input.inputs)?)
-            .ok_or(Error::NumericOverflow)?;
-        let bound = symbolic_evaluation_bound(graph, &input.inputs, plan)?;
-        global_memory = global_memory
-            .checked_add(bound.memory_bytes)
-            .ok_or(Error::NumericOverflow)?;
-        global_candidates = global_candidates
-            .checked_add(bound.candidate_peak)
-            .ok_or(Error::NumericOverflow)?;
-        global_accepted = global_accepted
-            .checked_add(bound.accepted)
-            .ok_or(Error::NumericOverflow)?;
-        global_micro_samples = global_micro_samples
-            .checked_add(bound.micro_samples)
-            .ok_or(Error::NumericOverflow)?;
-        global_transfer_bytes = global_transfer_bytes
-            .checked_add(bound.transfer_bytes)
-            .ok_or(Error::NumericOverflow)?;
+        let symbolic_tile = SymbolicGlobalTile {
+            outputs: symbolic.materialized_outputs,
+            provenance_decisions: bound.candidate_events,
+            provenance_records,
+            provenance_bytes: bound.provenance_bytes,
+        };
+        if symbolic_global_store
+            .tiles
+            .insert((stage.id, input.owner), symbolic_tile)
+            .is_some()
+        {
+            return Err(Error::GraphDocument {
+                path: "evaluation.globalStages".to_owned(),
+                reason: "symbolic global-stage owner tile is duplicated".to_owned(),
+            });
+        }
     }
     if actual != expected {
         let missing = expected.difference(&actual).count();
@@ -3363,80 +7001,156 @@ fn preflight_evaluation_job(
         });
     }
 
-    let cell_input_tiles = inputs.cells.iter().try_fold(0_u64, |total, input| {
-        total
-            .checked_add(evaluation_input_tile_count(input)?)
-            .ok_or(Error::NumericOverflow)
-    })?;
-    check_limit(
+    let cells = preflight_evaluation_inputs(
+        graph,
+        &inputs.cells,
+        worker_count,
+        plan,
+        &symbolic_global_store,
+        guard,
+    )?;
+    let input_tiles = bound_add(
         "input tiles",
-        cell_input_tiles
-            .checked_add(global_input_tiles)
-            .ok_or(Error::NumericOverflow)?,
+        cells.input_tiles,
+        global_input_tiles,
         graph.limits.max_input_tiles,
     )?;
-    check_limit(
+    let candidate_count = bound_add(
         "candidate count",
+        cells.candidate_count,
         global_candidates,
         graph.limits.max_candidates,
     )?;
-    check_limit(
+    let accepted_count = bound_add(
         "accepted count",
+        cells.accepted_count,
         global_accepted,
         graph.limits.max_macro_points,
     )?;
-    check_limit(
+    let micro_samples = bound_add(
         "micro samples",
+        cells.micro_samples,
         global_micro_samples,
         graph.limits.max_micro_samples,
     )?;
-    check_limit(
+    let transfer_bytes = bound_add(
         "transfer bytes",
+        cells.transfer_bytes,
         global_transfer_bytes,
         graph.limits.max_transfer_bytes,
     )?;
 
-    let cell_input_bytes = inputs.cells.iter().try_fold(0_u64, |total, input| {
-        total
-            .checked_add(estimated_input_bytes(input)?)
-            .ok_or(Error::NumericOverflow)
-    })?;
-    let mut worker_memory = inputs
-        .cells
-        .iter()
-        .map(|input| symbolic_evaluation_bound(graph, input, plan).map(|bound| bound.memory_bytes))
-        .collect::<Result<Vec<_>>>()?;
-    worker_memory.sort_unstable_by(|left, right| right.cmp(left));
-    let active_memory = worker_memory.into_iter().take(worker_count).try_fold(
-        cell_input_bytes
-            .checked_add(global_input_bytes)
-            .and_then(|value| value.checked_add(global_memory))
-            .ok_or(Error::NumericOverflow)?,
-        |total, value| total.checked_add(value).ok_or(Error::NumericOverflow),
+    let retained_results_memory = bound_add(
+        "memory bytes",
+        global_resident_memory,
+        cells.retained_result_bytes,
+        graph.limits.max_memory_bytes,
     )?;
-    check_limit("memory bytes", active_memory, graph.limits.max_memory_bytes)
+    let runtime_peak_memory = global_peak_memory.max(bound_add(
+        "memory bytes",
+        retained_results_memory,
+        cells.active_worker_memory,
+        graph.limits.max_memory_bytes,
+    )?);
+    let nested_retained_input_bytes = bound_add(
+        "memory bytes",
+        cells.retained_input_bytes,
+        global_retained_input_bytes,
+        graph.limits.max_memory_bytes,
+    )?;
+    let retained_input_bytes = bound_add(
+        "memory bytes",
+        nested_retained_input_bytes,
+        job_input_container_bytes(inputs)?,
+        graph.limits.max_memory_bytes,
+    )?;
+    let generated_input_bytes = bound_add(
+        "memory bytes",
+        cells.generated_input_bytes,
+        global_generated_input_bytes,
+        graph.limits.max_memory_bytes,
+    )?;
+    let runtime_allocations =
+        runtime_job_allocation_bytes(inputs, worker_count, plan_allocation_bytes)?;
+    let execution_peak_bytes = checked_memory_sum([
+        retained_input_bytes,
+        runtime_peak_memory,
+        runtime_allocations,
+    ])?;
+    let preflight_peak_bytes = checked_memory_sum([
+        retained_input_bytes,
+        plan_allocation_bytes,
+        preflight_scratch,
+        symbolic_global_store.requested_memory_bytes()?,
+    ])?;
+    let memory_bytes = execution_peak_bytes.max(preflight_peak_bytes);
+    check_limit("memory bytes", memory_bytes, graph.limits.max_memory_bytes)?;
+    let preflight = GraphEvaluationPreflight {
+        output_cells: inputs.cells.len() as u64,
+        global_stage_tiles: inputs.global_stages.len() as u64,
+        input_tiles,
+        retained_input_bytes,
+        generated_input_bytes,
+        candidate_count,
+        accepted_count,
+        micro_samples,
+        preflight_peak_bytes,
+        execution_peak_bytes,
+        memory_bytes,
+        transfer_bytes,
+        worker_count: u16::try_from(worker_count).map_err(|_| Error::NumericOverflow)?,
+        time_limit_ms: graph.limits.max_time_ms,
+        limits: graph.limits,
+    };
+    guard.check()?;
+    Ok(preflight)
 }
 
+#[cfg(test)]
 fn expected_global_stage_tiles(
     graph: &CompiledBiomeGraph,
     cells: &[GraphEvaluationInputs],
 ) -> Result<BTreeSet<([u8; 32], WorldCellKey)>> {
+    expected_global_stage_tiles_guarded(
+        graph,
+        cells,
+        None,
+        usize::try_from(graph.limits.max_global_stage_tiles).map_err(|_| Error::NumericOverflow)?,
+    )
+}
+
+fn expected_global_stage_tiles_guarded(
+    graph: &CompiledBiomeGraph,
+    cells: &[GraphEvaluationInputs],
+    guard: Option<PreflightGuard<'_>>,
+    maximum_expected: usize,
+) -> Result<BTreeSet<([u8; 32], WorldCellKey)>> {
+    let guarded_expected = maximum_expected
+        .checked_add(1)
+        .ok_or(Error::NumericOverflow)?;
     let mut expected = BTreeSet::new();
     for stage in graph.spatial_plan().global_stages() {
         for cell in cells {
+            if let Some(guard) = guard {
+                guard.check()?;
+            }
             for owner in world_cells_covering_bounds(
                 cell.read_bounds,
                 stage.owner_level,
-                graph.limits.max_global_stage_tiles,
+                u64::try_from(guarded_expected).map_err(|_| Error::NumericOverflow)?,
             )? {
                 expected.insert((stage.id, owner));
+                ensure_expected_global_tile_capacity(&expected, maximum_expected)?;
             }
         }
     }
 
     loop {
-        let mut additions = Vec::new();
+        let mut additions = BTreeSet::new();
         for (stage_id, owner) in expected.iter().copied() {
+            if let Some(guard) = guard {
+                guard.check()?;
+            }
             let stage = graph.spatial_plan().global_stage(stage_id).ok_or_else(|| {
                 Error::GraphDocument {
                     path: "graph.spatialPlan".to_owned(),
@@ -3457,10 +7171,22 @@ fn expected_global_stage_tiles(
                 for prerequisite_owner in world_cells_covering_bounds(
                     read_bounds,
                     owner_level,
-                    graph.limits.max_global_stage_tiles,
+                    u64::try_from(guarded_expected).map_err(|_| Error::NumericOverflow)?,
                 )? {
                     if !expected.contains(&(prerequisite, prerequisite_owner)) {
-                        additions.push((prerequisite, prerequisite_owner));
+                        additions.insert((prerequisite, prerequisite_owner));
+                        if expected
+                            .len()
+                            .checked_add(additions.len())
+                            .ok_or(Error::NumericOverflow)?
+                            > maximum_expected
+                        {
+                            return Err(Error::GraphDocument {
+                                path: "evaluation.globalStages".to_owned(),
+                                reason: "global-stage tile set is not closed (missing tiles)"
+                                    .to_owned(),
+                            });
+                        }
                     }
                 }
             }
@@ -3469,33 +7195,42 @@ fn expected_global_stage_tiles(
             break;
         }
         expected.extend(additions);
-        check_limit(
-            "global stage tiles",
-            expected.len() as u64,
-            graph.limits.max_global_stage_tiles,
-        )?;
+        ensure_expected_global_tile_capacity(&expected, maximum_expected)?;
     }
     Ok(expected)
 }
 
-fn retained_global_tile_bytes(evaluated: &PlannedEvaluation) -> Result<u64> {
-    let outputs = evaluated
-        .materialized_outputs
-        .values()
-        .try_fold(0_u64, |total, value| {
-            total
-                .checked_add(value.estimated_bytes())
-                .ok_or(Error::NumericOverflow)
-        })?;
-    let result_bytes = u64::try_from(evaluated.result.canonical_bytes()?.len())
-        .map_err(|_| Error::NumericOverflow)?;
-    let decisions = checked_len_bytes(evaluated.candidate_decisions.len(), 64)?;
-    outputs
-        .checked_add(result_bytes)
-        .and_then(|value| value.checked_add(decisions))
-        .ok_or(Error::NumericOverflow)
+fn ensure_expected_global_tile_capacity(
+    expected: &BTreeSet<([u8; 32], WorldCellKey)>,
+    maximum_expected: usize,
+) -> Result<()> {
+    if expected.len() > maximum_expected {
+        return Err(Error::GraphDocument {
+            path: "evaluation.globalStages".to_owned(),
+            reason: "global-stage tile set is not closed (missing tiles)".to_owned(),
+        });
+    }
+    Ok(())
 }
 
+fn retained_global_tile_bytes(evaluated: &PlannedEvaluation) -> Result<u64> {
+    checked_memory_sum([
+        requested_btree_with(
+            &evaluated.materialized_outputs,
+            qualified_graph_pin_memory,
+            GraphValue::requested_memory_bytes,
+        )?,
+        retained_result_bytes(&evaluated.result)?,
+        evaluated.result.provenance.requested_memory_bytes()?,
+        requested_btree_bytes::<CandidateIdentity, ProvenanceDecisionHandle>(
+            evaluated.candidate_decisions.len(),
+        )?,
+    ])
+}
+
+fn retained_result_bytes(result: &GraphEvaluationResult) -> Result<u64> {
+    graph_result_memory(result)
+}
 fn evaluate_job(
     graph: &CompiledBiomeGraph,
     mut inputs: GraphEvaluationJobInputs,
@@ -3510,55 +7245,92 @@ fn evaluate_job(
             limit: 1,
         });
     }
-    inputs.cells.sort_by_key(|input| input.output_cell);
-    let stage_order = graph
-        .spatial_plan()
-        .global_stages()
-        .iter()
-        .enumerate()
-        .map(|(index, stage)| (stage.id, index))
-        .collect::<BTreeMap<_, _>>();
-    inputs.global_stages.sort_by_key(|input| {
+    let deadline = evaluation_deadline(graph)?;
+    let guard = PreflightGuard {
+        cancellation,
+        deadline,
+        time_limit_ms: graph.limits.max_time_ms,
+    };
+    guard.check()?;
+    check_job_collection_limits(graph, &inputs)?;
+    guard.check()?;
+    for input in &mut inputs.cells {
+        canonicalize_evaluation_input(input);
+    }
+    for stage in &mut inputs.global_stages {
+        canonicalize_evaluation_input(&mut stage.inputs);
+    }
+    inputs.cells.sort_unstable_by_key(|input| input.output_cell);
+    guard.check()?;
+    inputs.global_stages.sort_unstable_by_key(|input| {
         (
-            stage_order.get(&input.stage).copied().unwrap_or(usize::MAX),
+            global_stage_order(graph, input.stage),
             input.owner,
             input.input_snapshot,
         )
     });
+    guard.check()?;
     let workers = worker_count.min(inputs.cells.len().max(1));
     let gpu = compute.map(|compute| GraphGpuScheduling {
         profile: compute.profile(),
         qualifications: compute.qualifications(),
     });
-    let execution_plan = build_execution_plan(graph, workers > 1, gpu)?;
-    preflight_evaluation_job(graph, &inputs, worker_count, &execution_plan)?;
-    let deadline = evaluation_deadline(graph)?;
+    let plans = build_evaluation_plans(graph, workers > 1, gpu, guard)?;
+    let execution_plan = &plans.execution;
+    let preparation_plan = plans.preparation.as_ref();
+    preflight_evaluation_job(
+        graph,
+        &inputs,
+        workers,
+        execution_plan,
+        plans.allocation_bytes,
+        guard,
+    )?;
+    #[cfg(test)]
+    cancellation.check_test_checkpoint(
+        TestEvaluationCheckpoint::AfterPreflight,
+        graph.limits.max_time_ms,
+    )?;
     let mut global_store = GlobalStageStore::default();
-    let mut global_results = Vec::with_capacity(inputs.global_stages.len());
+    let mut global_results = Vec::new();
+    crate::memory::reserve_exact(
+        &mut global_results,
+        inputs.global_stages.len(),
+        "global stage results",
+    )?;
     for input in inputs.global_stages {
-        if cancellation.is_cancelled() {
-            return Err(Error::GraphCancelled);
-        }
-        let stage = graph
-            .spatial_plan()
-            .global_stage(input.stage)
-            .ok_or_else(|| Error::GraphDocument {
-                path: "evaluation.globalStages".to_owned(),
-                reason: "global-stage identity is absent from the compiled graph".to_owned(),
-            })?;
-        let evaluated = evaluate_cell_atomically(
+        guard.check()?;
+        let GlobalStageEvaluationInputs {
+            stage: stage_id,
+            owner,
+            input_snapshot,
+            inputs: stage_inputs,
+            ..
+        } = input;
+        let stage =
+            graph
+                .spatial_plan()
+                .global_stage(stage_id)
+                .ok_or_else(|| Error::GraphDocument {
+                    path: "evaluation.globalStages".to_owned(),
+                    reason: "global-stage identity is absent from the compiled graph".to_owned(),
+                })?;
+        let map = stage_inputs.map.value();
+        let biome_instance = stage_inputs.biome_instance;
+        let context = EvaluationContext {
             graph,
-            &input.inputs,
             cancellation,
             compute,
-            &execution_plan,
-            EvaluationScope::Global {
+            execution_plan,
+            scope: EvaluationScope::Global {
                 stage,
                 global_store: &global_store,
             },
             deadline,
-        )?;
+        };
+        let evaluated = evaluate_cell_atomically(stage_inputs, context, preparation_plan)?;
         for output in &stage.output_pins {
+            guard.check()?;
             if !evaluated.materialized_outputs.contains_key(output) {
                 return Err(Error::GraphDocument {
                     path: "evaluation.globalStages".to_owned(),
@@ -3570,16 +7342,17 @@ fn evaluate_job(
                 });
             }
         }
+        guard.check()?;
         let resident_bytes = retained_global_tile_bytes(&evaluated)?;
+        guard.check()?;
         let public_result = evaluated.result;
         let tile = GlobalStageTile {
             key: GlobalStageCacheKey {
-                graph: graph.identity,
-                stage: input.stage,
-                map: input.inputs.map.value(),
-                biome_instance: input.inputs.biome_instance,
-                owner: input.owner,
-                input_snapshot: input.input_snapshot,
+                stage: stage_id,
+                map,
+                biome_instance,
+                owner,
+                input_snapshot,
             },
             outputs: evaluated.materialized_outputs,
             provenance: public_result.provenance.clone(),
@@ -3587,97 +7360,123 @@ fn evaluate_job(
             resident_bytes,
         };
         global_store.insert(tile)?;
+        guard.check()?;
         check_limit(
             "memory bytes",
             global_store.resident_bytes()?,
             graph.limits.max_memory_bytes,
         )?;
         global_results.push(GlobalStageEvaluationResult {
-            stage: input.stage,
-            owner: input.owner,
+            stage: stage_id,
+            owner,
             result: public_result,
             resident_bytes,
         });
     }
+    guard.check()?;
 
-    let mut indexed = inputs.cells.into_iter().enumerate().collect::<Vec<_>>();
-    let mut shards = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
-    for (index, input) in indexed.drain(..) {
+    let cell_count = inputs.cells.len();
+    let mut shards = Vec::new();
+    crate::memory::reserve_exact(&mut shards, workers, "cell worker shards")?;
+    for worker in 0..workers {
+        let capacity = cell_count
+            .checked_add(workers - 1 - worker)
+            .ok_or(Error::NumericOverflow)?
+            / workers;
+        let mut shard = Vec::new();
+        crate::memory::reserve_exact(&mut shard, capacity, "cell worker shard")?;
+        shards.push(shard);
+    }
+    for (index, input) in inputs.cells.into_iter().enumerate() {
+        guard.check()?;
         shards[index % workers].push((index, input));
     }
-    let execution_plan = &execution_plan;
+    guard.check()?;
     let global_store = &global_store;
-    let mut results = std::thread::scope(|scope| {
-        let handles = shards
-            .into_iter()
-            .map(|shard| {
-                scope.spawn(move || {
-                    shard
-                        .into_iter()
-                        .map(|(index, input)| {
-                            (
-                                index,
-                                evaluate_cell_atomically(
-                                    graph,
-                                    &input,
-                                    cancellation,
-                                    compute,
-                                    execution_plan,
-                                    EvaluationScope::Cell { global_store },
-                                    deadline,
-                                ),
-                            )
-                        })
-                        .collect::<Vec<_>>()
+    let mut results = std::thread::scope(|scope| -> Result<Vec<_>> {
+        let mut handles = Vec::new();
+        crate::memory::reserve_exact(&mut handles, workers, "cell worker handles")?;
+        for (worker, shard) in shards.into_iter().enumerate() {
+            let handle = std::thread::Builder::new()
+                .name(format!("vegetation-graph-{worker}"))
+                .stack_size(EVALUATOR_WORKER_STACK_BYTES)
+                .spawn_scoped(scope, move || -> Result<Vec<_>> {
+                    let mut worker_results = Vec::new();
+                    crate::memory::reserve_exact(
+                        &mut worker_results,
+                        shard.len(),
+                        "cell worker results",
+                    )?;
+                    for (index, input) in shard {
+                        let context = EvaluationContext {
+                            graph,
+                            cancellation,
+                            compute,
+                            execution_plan,
+                            scope: EvaluationScope::Cell { global_store },
+                            deadline,
+                        };
+                        worker_results.push((
+                            index,
+                            evaluate_cell_atomically(input, context, preparation_plan)
+                                .map(|planned| planned.result),
+                        ));
+                    }
+                    Ok(worker_results)
                 })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle.join().map_err(|_| Error::GraphDocument {
-                    path: "parallel-evaluator".to_owned(),
-                    reason: "worker thread panicked".to_owned(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()
-    })?
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    results.sort_by_key(|(index, _)| *index);
-    let cell_results = results
-        .into_iter()
-        .map(|(_, result)| result.map(|evaluated| evaluated.result))
-        .collect::<Result<Vec<_>>>()?;
-    let mut all_results = global_results
-        .iter()
-        .map(|global| &global.result)
-        .collect::<Vec<_>>();
-    all_results.extend(cell_results.iter());
+                .map_err(|source| Error::GraphWorkerSpawn { source })?;
+            handles.push(handle);
+        }
+        let mut joined = Vec::new();
+        crate::memory::reserve_exact(&mut joined, cell_count, "joined cell results")?;
+        for handle in handles {
+            let mut worker_results = handle.join().map_err(|_| Error::GraphWorkerPanicked)??;
+            joined.append(&mut worker_results);
+        }
+        Ok(joined)
+    })?;
+    guard.check()?;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    guard.check()?;
+    let mut cell_results = Vec::new();
+    crate::memory::reserve_exact(&mut cell_results, results.len(), "cell results")?;
+    for (_, result) in results {
+        guard.check()?;
+        cell_results.push(result?);
+    }
+    guard.check()?;
     validate_result_totals(
         graph,
-        all_results
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .as_slice(),
+        global_results
+            .iter()
+            .map(|global| &global.result)
+            .chain(cell_results.iter()),
+        guard,
     )?;
-    Ok(GraphEvaluationJobResult {
+    let evaluated = GraphEvaluationJobResult {
         cells: cell_results,
         global_stages: global_results,
-    })
+    };
+    guard.check()?;
+    #[cfg(test)]
+    cancellation.check_test_checkpoint(
+        TestEvaluationCheckpoint::BeforePublication,
+        graph.limits.max_time_ms,
+    )?;
+    Ok(evaluated)
 }
 
-fn validate_result_totals(
+fn validate_result_totals<'a>(
     graph: &CompiledBiomeGraph,
-    results: &[GraphEvaluationResult],
+    results: impl IntoIterator<Item = &'a GraphEvaluationResult>,
+    guard: PreflightGuard<'_>,
 ) -> Result<()> {
     let mut candidates = 0_u64;
     let mut accepted = 0_u64;
     let mut micro_samples = 0_u64;
     let mut transfer_bytes = 0_u64;
     for result in results {
+        guard.check()?;
         candidates = candidates
             .checked_add(result.diagnostics.candidate_count)
             .ok_or(Error::NumericOverflow)?;
@@ -3685,16 +7484,19 @@ fn validate_result_totals(
             .checked_add(result.diagnostics.accepted_count)
             .ok_or(Error::NumericOverflow)?;
         for tile in &result.micro_fields {
+            guard.check()?;
             micro_samples = micro_samples
                 .checked_add(tile.density.len() as u64)
                 .ok_or(Error::NumericOverflow)?;
         }
         for node in &result.diagnostics.nodes {
+            guard.check()?;
             transfer_bytes = transfer_bytes
                 .checked_add(node.transfer_bytes)
                 .ok_or(Error::NumericOverflow)?;
         }
         for group in &result.diagnostics.gpu_groups {
+            guard.check()?;
             transfer_bytes = transfer_bytes
                 .checked_add(group.transfer_bytes)
                 .ok_or(Error::NumericOverflow)?;
@@ -3711,7 +7513,8 @@ fn validate_result_totals(
         "transfer bytes",
         transfer_bytes,
         graph.limits.max_transfer_bytes,
-    )
+    )?;
+    guard.check()
 }
 
 #[derive(Clone, Debug)]
@@ -3734,7 +7537,7 @@ struct ResidentGroupEvaluation {
 
 fn resident_source_register(
     unit: &CompiledGraphUnit,
-    members: &BTreeSet<u128>,
+    group: &GraphExecutionGroup,
     external_registers: &BTreeMap<(u128, String), GraphGpuRegister>,
     result_registers: &BTreeMap<(u128, String), GraphGpuRegister>,
     node: u128,
@@ -3748,7 +7551,7 @@ fn resident_source_register(
             path: format!("graphGpuGroup.{node:032x}.{pin}"),
             reason: "resident input edge is missing".to_owned(),
         })?;
-    if members.contains(&edge.from_node) {
+    if resident_group_contains(group, edge.from_node) {
         result_registers
             .get(&(edge.from_node, edge.from_pin.clone()))
             .copied()
@@ -3763,6 +7566,10 @@ fn resident_source_register(
     })
 }
 
+fn resident_group_contains(group: &GraphExecutionGroup, node: u128) -> bool {
+    group.nodes.iter().any(|member| member.address.node == node)
+}
+
 fn evaluate_resident_group(
     unit: &CompiledGraphUnit,
     group: &crate::GraphExecutionGroup,
@@ -3773,16 +7580,13 @@ fn evaluate_resident_group(
         path: "graphGpuGroup.executor".to_owned(),
         reason: "execution plan selected Slang without a compute executor".to_owned(),
     })?;
-    let members = group
-        .nodes
-        .iter()
-        .map(|node| node.address.node)
-        .collect::<BTreeSet<_>>();
-    let nodes = unit
-        .nodes
-        .iter()
-        .filter(|node| members.contains(&node.definition.guid))
-        .collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    crate::memory::reserve_exact(&mut nodes, group.nodes.len(), "resident group nodes")?;
+    nodes.extend(
+        unit.nodes
+            .iter()
+            .filter(|node| resident_group_contains(group, node.definition.guid)),
+    );
     if nodes.len() != group.nodes.len() {
         return Err(Error::GraphDocument {
             path: "graphGpuGroup.nodes".to_owned(),
@@ -3820,8 +7624,25 @@ fn evaluate_resident_group(
         });
     }
 
-    let mut input_types = vec![GraphGpuRegisterType::CandidateMask];
-    let mut bindings = vec![ResidentInputBinding::CandidateMask];
+    let noise_node_count = nodes
+        .iter()
+        .filter(|node| node.definition.operator == GraphOperator::Noise)
+        .count();
+    let gradient_node_count = nodes
+        .iter()
+        .filter(|node| node.definition.operator == GraphOperator::Gradient)
+        .count();
+    let input_capacity = 1_usize
+        .checked_add(external_scalar_keys.len())
+        .and_then(|count| count.checked_add(noise_node_count.checked_mul(11)?))
+        .and_then(|count| count.checked_add(gradient_node_count.checked_mul(6)?))
+        .ok_or(Error::NumericOverflow)?;
+    let mut input_types = Vec::new();
+    crate::memory::reserve_exact(&mut input_types, input_capacity, "resident input types")?;
+    input_types.push(GraphGpuRegisterType::CandidateMask);
+    let mut bindings = Vec::new();
+    crate::memory::reserve_exact(&mut bindings, input_capacity, "resident input bindings")?;
+    bindings.push(ResidentInputBinding::CandidateMask);
     let mut external_registers = BTreeMap::new();
     external_registers.extend(boundary_values.iter().filter_map(|(key, value)| {
         matches!(value, GraphValue::Candidates(_)).then_some((key.clone(), GraphGpuRegister(0)))
@@ -3882,7 +7703,12 @@ fn evaluate_resident_group(
         }
     }
 
-    let mut instructions = Vec::with_capacity(nodes.len());
+    let mut instructions = Vec::new();
+    crate::memory::reserve_exact(
+        &mut instructions,
+        nodes.len(),
+        "resident graph instructions",
+    )?;
     let mut result_registers = BTreeMap::new();
     let mut field_importance_index = None;
     for (index, node) in nodes.iter().enumerate() {
@@ -3924,22 +7750,28 @@ fn evaluate_resident_group(
                 }
             }
             GraphOperator::Curve => {
-                let curve = DecisionCurve::new(curve_parameter(node, "curve")?)?;
+                let curve = curve_parameter(node, "curve")?;
+                DecisionCurve::validate_points(curve)?;
                 GraphGpuInstruction::Curve {
                     destination,
                     input: resident_source_register(
                         unit,
-                        &members,
+                        group,
                         &external_registers,
                         &result_registers,
                         node.definition.guid,
                         "field",
                     )?,
-                    points: curve
-                        .points()
-                        .iter()
-                        .map(|(x, y)| (x.bits(), y.bits()))
-                        .collect(),
+                    points: {
+                        let mut points = Vec::new();
+                        crate::memory::reserve_exact(
+                            &mut points,
+                            curve.len(),
+                            "resident curve points",
+                        )?;
+                        points.extend(curve.iter().map(|(x, y)| (x.bits(), y.bits())));
+                        points
+                    },
                 }
             }
             GraphOperator::Remap => {
@@ -3951,7 +7783,7 @@ fn evaluate_resident_group(
                     destination,
                     input: resident_source_register(
                         unit,
-                        &members,
+                        group,
                         &external_registers,
                         &result_registers,
                         node.definition.guid,
@@ -3967,7 +7799,7 @@ fn evaluate_resident_group(
                 destination,
                 left: resident_source_register(
                     unit,
-                    &members,
+                    group,
                     &external_registers,
                     &result_registers,
                     node.definition.guid,
@@ -3975,7 +7807,7 @@ fn evaluate_resident_group(
                 )?,
                 right: resident_source_register(
                     unit,
-                    &members,
+                    group,
                     &external_registers,
                     &result_registers,
                     node.definition.guid,
@@ -3987,7 +7819,7 @@ fn evaluate_resident_group(
                 destination,
                 input: resident_source_register(
                     unit,
-                    &members,
+                    group,
                     &external_registers,
                     &result_registers,
                     node.definition.guid,
@@ -4002,7 +7834,7 @@ fn evaluate_resident_group(
                     destination,
                     candidates: resident_source_register(
                         unit,
-                        &members,
+                        group,
                         &external_registers,
                         &result_registers,
                         node.definition.guid,
@@ -4010,7 +7842,7 @@ fn evaluate_resident_group(
                     )?,
                     weights: resident_source_register(
                         unit,
-                        &members,
+                        group,
                         &external_registers,
                         &result_registers,
                         node.definition.guid,
@@ -4055,32 +7887,31 @@ fn evaluate_resident_group(
     });
     let program = GraphGpuProgram::new(input_types, instructions, output_register, terminal_mask)?;
 
-    let identities = if let Some(stream) = candidate_stream {
-        stream
-            .candidates
-            .iter()
-            .map(|candidate| candidate.identity)
-            .collect::<Vec<_>>()
-    } else {
-        boundary_values
-            .values()
-            .find_map(|value| match value {
-                GraphValue::Scalar(field) => Some(field.values.keys().copied().collect()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    };
-    let candidates = candidate_stream
-        .into_iter()
-        .flat_map(|stream| &stream.candidates)
-        .map(|candidate| (candidate.identity, candidate))
-        .collect::<BTreeMap<_, _>>();
-    let node_by_guid = nodes
-        .iter()
-        .map(|node| (node.definition.guid, *node))
-        .collect::<BTreeMap<_, _>>();
-    let mut invocations = Vec::with_capacity(identities.len());
-    let mut base_masks = Vec::with_capacity(identities.len());
+    let identity_count = candidate_stream.map_or_else(
+        || {
+            boundary_values
+                .values()
+                .find_map(|value| match value {
+                    GraphValue::Scalar(field) => Some(field.values.len()),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        },
+        |stream| stream.candidates.len(),
+    );
+    let mut identities = Vec::new();
+    crate::memory::reserve_exact(&mut identities, identity_count, "resident identities")?;
+    if let Some(stream) = candidate_stream {
+        identities.extend(stream.candidates.iter().map(|candidate| candidate.identity));
+    } else if let Some(field) = boundary_values.values().find_map(|value| match value {
+        GraphValue::Scalar(field) => Some(field),
+        _ => None,
+    }) {
+        identities.extend(field.values.keys().copied());
+    }
+    let mut invocations = GraphGpuInvocationBatch::with_capacity(&program, identities.len())?;
+    let mut base_masks = Vec::new();
+    crate::memory::reserve_exact(&mut base_masks, identities.len(), "resident base masks")?;
     for identity in &identities {
         let base_mask = external_scalar_keys.iter().all(|key| {
             boundary_values.get(key).is_some_and(|value| match value {
@@ -4089,33 +7920,41 @@ fn evaluate_resident_group(
             })
         });
         base_masks.push(base_mask);
-        let candidate = candidates.get(identity).copied();
-        let mut noise_components = BTreeMap::new();
+        let candidate = candidate_stream.and_then(|stream| {
+            stream
+                .candidates
+                .binary_search_by_key(identity, |candidate| candidate.identity)
+                .ok()
+                .and_then(|index| stream.candidates.get(index))
+        });
+        let mut noise_components = [None; GRAPH_GPU_MAX_INSTRUCTIONS];
+        let mut noise_component_count = 0_usize;
         for node in noise_inputs.keys() {
+            let compiled = nodes
+                .iter()
+                .find(|candidate| candidate.definition.guid == *node)
+                .ok_or(Error::NumericOverflow)?;
             let candidate = candidate.ok_or_else(|| Error::GraphDocument {
-                path: node_by_guid[node].debug_symbol.label.clone(),
+                path: compiled.debug_symbol.label.clone(),
                 reason: "resident noise input has no candidate position".to_owned(),
             })?;
-            let frequency = fixed_parameter(
-                node_by_guid[node],
-                "frequency",
-                DecisionScalar::from_bits(65_536),
-            )?;
-            let channel = u32_parameter(node_by_guid[node], "channel", 0)?;
-            noise_components.insert(
+            let frequency =
+                fixed_parameter(compiled, "frequency", DecisionScalar::from_bits(65_536))?;
+            let channel = u32_parameter(compiled, "channel", 0)?;
+            noise_components[noise_component_count] = Some((
                 *node,
                 coherent_value_noise_components(
-                    node_by_guid[node],
+                    compiled,
                     state,
                     candidate.position,
                     frequency,
                     channel,
                 )?,
-            );
+            ));
+            noise_component_count += 1;
         }
-        let mut values = Vec::with_capacity(bindings.len());
-        for binding in &bindings {
-            values.push(match binding {
+        invocations.push(bindings.iter().map(|binding| -> Result<GraphGpuValue> {
+            Ok(match binding {
                 ResidentInputBinding::CandidateMask => GraphGpuValue::CandidateMask(base_mask),
                 ResidentInputBinding::ExternalScalar(key) => {
                     let value = boundary_values.get(key).and_then(|value| match value {
@@ -4125,25 +7964,82 @@ fn evaluate_resident_group(
                     GraphGpuValue::FixedScalar(value.map_or(0, |value| value.bits()))
                 }
                 ResidentInputBinding::NoiseCorner { node, corner } => {
-                    GraphGpuValue::FixedScalar(noise_components[node].0[*corner].bits())
+                    let components = noise_components[..noise_component_count]
+                        .iter()
+                        .flatten()
+                        .find(|(candidate, _)| candidate == node)
+                        .ok_or(Error::NumericOverflow)?;
+                    GraphGpuValue::FixedScalar(components.1.0[*corner].bits())
                 }
                 ResidentInputBinding::NoiseBlend { node, axis } => {
-                    GraphGpuValue::Unit(noise_components[node].1[*axis].bits())
+                    let components = noise_components[..noise_component_count]
+                        .iter()
+                        .flatten()
+                        .find(|(candidate, _)| candidate == node)
+                        .ok_or(Error::NumericOverflow)?;
+                    GraphGpuValue::Unit(components.1.1[*axis].bits())
                 }
                 ResidentInputBinding::GradientPosition { node, axis } => {
+                    let compiled = nodes
+                        .iter()
+                        .find(|candidate| candidate.definition.guid == *node)
+                        .ok_or(Error::NumericOverflow)?;
                     let candidate = candidate.ok_or_else(|| Error::GraphDocument {
-                        path: node_by_guid[node].debug_symbol.label.clone(),
+                        path: compiled.debug_symbol.label.clone(),
                         reason: "resident gradient input has no candidate position".to_owned(),
                     })?;
                     GraphGpuValue::WorldTick(candidate.position.global_ticks()[*axis])
                 }
                 ResidentInputBinding::GradientOrigin { node, axis } => GraphGpuValue::WorldTick(
-                    world_position_parameter(node_by_guid[node], "exactOrigin")?[*axis],
+                    world_position_parameter(
+                        nodes
+                            .iter()
+                            .find(|candidate| candidate.definition.guid == *node)
+                            .ok_or(Error::NumericOverflow)?,
+                        "exactOrigin",
+                    )?[*axis],
                 ),
-            });
-        }
-        invocations.push(GraphGpuInvocation::new(&program, values)?);
+            })
+        }))?;
     }
+    let allocation_shape = ResidentGroupAllocationShape {
+        invocations: identities.len() as u64,
+        inputs: input_capacity as u64,
+        instructions: nodes.len() as u64,
+        curve_instructions: nodes
+            .iter()
+            .filter(|node| node.definition.operator == GraphOperator::Curve)
+            .count() as u64,
+        curve_points: nodes
+            .iter()
+            .filter(|node| node.definition.operator == GraphOperator::Curve)
+            .count()
+            .checked_mul(GRAPH_GPU_MAX_CURVE_POINTS)
+            .ok_or(Error::NumericOverflow)? as u64,
+        external_inputs: boundary_values.len() as u64,
+        external_pin_bytes: boundary_values.keys().try_fold(0_u64, |total, (_, pin)| {
+            total
+                .checked_add(pin.len() as u64)
+                .ok_or(Error::NumericOverflow)
+        })?,
+        output_entries: group.outputs.len() as u64,
+        output_pin_bytes: group.outputs.iter().try_fold(0_u64, |total, output| {
+            total
+                .checked_add(output.pin.pin.len() as u64)
+                .ok_or(Error::NumericOverflow)
+        })?,
+        noise_nodes: noise_node_count as u64,
+        gradient_nodes: gradient_node_count as u64,
+        candidate_output: group
+            .outputs
+            .iter()
+            .any(|output| output.domain == GraphDomain::Candidates),
+        scalar_output: group
+            .outputs
+            .iter()
+            .any(|output| output.domain == GraphDomain::ScalarField),
+    };
+    state.check_transient_memory(resident_group_scratch_bytes(allocation_shape)?)?;
     let gpu_outputs = execute_compute_program(state, compute, &program, &invocations)?;
     let final_candidate_count = gpu_outputs
         .iter()
@@ -4189,6 +8085,11 @@ fn evaluate_resident_group(
             reason: "resident candidate mask has no candidate metadata".to_owned(),
         })?;
         let mut accepted = Vec::new();
+        crate::memory::reserve_exact(
+            &mut accepted,
+            stream.candidates.len(),
+            "resident accepted candidates",
+        )?;
         for (candidate, output) in stream.candidates.iter().zip(&gpu_outputs) {
             if output.candidate_mask {
                 accepted.push(candidate.clone());
@@ -4201,28 +8102,16 @@ fn evaluate_resident_group(
                     candidate.family,
                     candidate.variation,
                     state,
-                );
+                )?;
             }
         }
         let accepted = CandidateStream {
             lineage: stream.lineage,
             candidates: accepted,
         };
-        let decision_inputs = boundary_values
-            .values()
-            .filter_map(|value| match value {
-                GraphValue::Candidates(stream) => Some((
-                    "candidates".to_owned(),
-                    GraphValue::Candidates(stream.clone()),
-                )),
-                GraphValue::Scalar(field) => {
-                    Some(("weights".to_owned(), GraphValue::Scalar(field.clone())))
-                }
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-        let decision_outputs = singleton("candidates", GraphValue::Candidates(accepted.clone()));
-        record_candidate_decisions(node, &decision_inputs, &decision_outputs, state);
+        for candidate in &accepted.candidates {
+            record_candidate_decision(node, candidate, boundary_values.values(), state);
+        }
         if let Some(boundary) = group
             .outputs
             .iter()
@@ -4240,107 +8129,84 @@ fn evaluate_resident_group(
         base_candidate_count: identities.len() as u64,
         final_candidate_count,
         field_importance_index,
-        invocation_count: invocations.len() as u64,
+        invocation_count: invocations.invocation_count() as u64,
     })
 }
 
 fn evaluate_unit(
     unit: &CompiledGraphUnit,
+    unit_demand: &CompiledDemandUnitSlice,
+    demand: &CompiledDemandSlice,
     interface_values: &BTreeMap<String, GraphValue>,
     state: &mut EvaluationState<'_>,
 ) -> Result<BTreeMap<String, GraphValue>> {
-    let node_addresses = unit
+    let mut incoming = BTreeMap::<u128, Vec<_>>::new();
+    for node in unit
         .nodes
         .iter()
-        .map(|node| (node.definition.guid, node.address()))
-        .collect::<BTreeMap<_, _>>();
-    let mut active_nodes = unit
-        .nodes
-        .iter()
-        .filter(|node| state.should_visit_node(node))
-        .map(|node| node.definition.guid)
-        .collect::<BTreeSet<_>>();
-    loop {
-        let mut changed = false;
-        let active_destinations = active_nodes.clone();
-        for edge in unit
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
+        let edge_count = unit_demand
             .edges
             .iter()
-            .filter(|edge| active_destinations.contains(&edge.to_node))
-        {
-            let address =
-                node_addresses
-                    .get(&edge.from_node)
-                    .ok_or_else(|| Error::GraphDocument {
-                        path: "graph.spatialPlan".to_owned(),
-                        reason: "upstream node address is missing".to_owned(),
-                    })?;
-            if state.should_load_global_node(address) {
-                continue;
-            }
-            changed |= active_nodes.insert(edge.from_node);
-        }
-        if !changed {
-            break;
-        }
+            .filter(|edge| edge.to_node == node.definition.guid)
+            .count();
+        let mut edges = Vec::new();
+        crate::memory::reserve_exact(&mut edges, edge_count, "incoming graph edges")?;
+        incoming.insert(node.definition.guid, edges);
     }
-    let incoming = unit
-        .edges
-        .iter()
-        .filter(|edge| active_nodes.contains(&edge.to_node))
-        .fold(BTreeMap::<u128, Vec<_>>::new(), |mut map, edge| {
-            map.entry(edge.to_node).or_default().push(edge);
-            map
-        });
+    for edge in &unit_demand.edges {
+        incoming
+            .get_mut(&edge.to_node)
+            .ok_or_else(|| Error::GraphDocument {
+                path: "graph.execution".to_owned(),
+                reason: "active graph node has no incoming-edge bucket".to_owned(),
+            })?
+            .push(edge);
+    }
     let mut remaining_uses = BTreeMap::<(u128, String), u64>::new();
-    for edge in unit.edges.iter().filter(|edge| {
-        active_nodes.contains(&edge.from_node) && active_nodes.contains(&edge.to_node)
-    }) {
+    for edge in &unit_demand.edges {
         *remaining_uses
             .entry((edge.from_node, edge.from_pin.clone()))
             .or_default() += 1;
     }
-    for output in unit
-        .outputs
-        .iter()
-        .filter(|output| active_nodes.contains(&output.node))
-    {
-        *remaining_uses
-            .entry((output.node, output.pin.clone()))
-            .or_default() += 1;
+    for output in &unit.outputs {
+        if unit_demand.outputs.contains(&output.name) {
+            *remaining_uses
+                .entry((output.node, output.pin.clone()))
+                .or_default() += 1;
+        }
     }
     let mut values: BTreeMap<(u128, String), GraphValue> = BTreeMap::new();
     let mut live_bytes = 0_u64;
     let mut executed_resident_nodes = BTreeSet::new();
-    for node in &unit.nodes {
-        if !active_nodes.contains(&node.definition.guid) {
-            continue;
-        }
+    let execution_plan = state.execution_plan;
+    for node in unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
         state.check_abort()?;
+        state.current_node_live_bytes = live_bytes;
         let address = node.address();
-        let scheduled_group = state
-            .execution_plan
-            .group_for(&address)
-            .cloned()
-            .ok_or_else(|| Error::GraphDocument {
-                path: node.debug_symbol.label.clone(),
-                reason: "execution plan omitted the compiled node".to_owned(),
-            })?;
-        if scheduled_group.domain == GraphExecutionDomain::SlangCompute {
+        let loads_global = state.should_load_global_node(&address);
+        let scheduled_group =
+            execution_plan
+                .group_for(&address)
+                .ok_or_else(|| Error::GraphDocument {
+                    path: node.debug_symbol.label.clone(),
+                    reason: "execution plan omitted the compiled node".to_owned(),
+                })?;
+        if !loads_global && scheduled_group.domain == GraphExecutionDomain::SlangCompute {
             if executed_resident_nodes.contains(&node.definition.guid) {
                 continue;
             }
-            let members = scheduled_group
-                .nodes
-                .iter()
-                .map(|member| member.address.node)
-                .collect::<BTreeSet<_>>();
-            if members.iter().any(|member| {
-                !active_nodes.contains(member)
+            if scheduled_group.nodes.iter().any(|member| {
+                !unit_demand.contains_node(member.address.node)
                     || unit
                         .nodes
                         .iter()
-                        .find(|candidate| candidate.definition.guid == *member)
+                        .find(|candidate| candidate.definition.guid == member.address.node)
                         .is_none_or(|candidate| state.should_load_global_node(&candidate.address()))
             }) {
                 return Err(Error::GraphDocument {
@@ -4350,8 +8216,9 @@ fn evaluate_unit(
                 });
             }
             let mut boundary_values = BTreeMap::new();
-            for edge in unit.edges.iter().filter(|edge| {
-                !members.contains(&edge.from_node) && members.contains(&edge.to_node)
+            for edge in unit_demand.edges.iter().filter(|edge| {
+                !resident_group_contains(scheduled_group, edge.from_node)
+                    && resident_group_contains(scheduled_group, edge.to_node)
             }) {
                 let value = if let Some(value) = values
                     .get(&(edge.from_node, edge.from_pin.clone()))
@@ -4368,7 +8235,7 @@ fn evaluate_unit(
                             reason: "resident upstream compiled node is missing".to_owned(),
                         })?;
                     state
-                        .load_global_node_outputs(source_node)?
+                        .load_global_node_outputs(source_node, demand)?
                         .remove(&edge.from_pin)
                         .ok_or_else(|| Error::GraphDocument {
                             path: node.debug_symbol.label.clone(),
@@ -4377,14 +8244,18 @@ fn evaluate_unit(
                 };
                 boundary_values.insert((edge.from_node, edge.from_pin.clone()), value);
             }
-            let input_bytes = boundary_values.values().try_fold(0_u64, |total, value| {
+            let input_value_bytes = boundary_values.values().try_fold(0_u64, |total, value| {
                 total
-                    .checked_add(value.estimated_bytes())
+                    .checked_add(value.requested_memory_bytes()?)
                     .ok_or(Error::NumericOverflow)
             })?;
             let started = Instant::now();
             let transferred_before = state.transferred_bytes;
-            let result = evaluate_resident_group(unit, &scheduled_group, &boundary_values, state)?;
+            state.current_node_live_bytes = live_bytes
+                .checked_add(input_value_bytes)
+                .ok_or(Error::NumericOverflow)?;
+            let result = evaluate_resident_group(unit, scheduled_group, &boundary_values, state)?;
+            state.current_node_live_bytes = 0;
             state.check_abort()?;
             let transfer_bytes = state
                 .transferred_bytes
@@ -4392,11 +8263,11 @@ fn evaluate_unit(
                 .ok_or(Error::NumericOverflow)?;
             let output_bytes = result.outputs.values().try_fold(0_u64, |total, value| {
                 total
-                    .checked_add(value.estimated_bytes())
+                    .checked_add(value.requested_memory_bytes()?)
                     .ok_or(Error::NumericOverflow)
             })?;
             let transient_bytes = live_bytes
-                .checked_add(input_bytes)
+                .checked_add(input_value_bytes)
                 .and_then(|bytes| bytes.checked_add(output_bytes))
                 .ok_or(Error::NumericOverflow)?;
             state.check_count(
@@ -4464,7 +8335,7 @@ fn evaluate_unit(
                     .filter(|((source, _), _)| *source == member.address.node)
                     .try_fold(0_u64, |total, (_, value)| {
                         total
-                            .checked_add(value.estimated_bytes())
+                            .checked_add(value.requested_memory_bytes()?)
                             .ok_or(Error::NumericOverflow)
                     })?;
                 state.diagnostics.nodes.push(NodeEvaluationDiagnostic {
@@ -4480,13 +8351,7 @@ fn evaluate_unit(
                     elapsed_micros: 0,
                     execution_domain: GraphExecutionDomain::SlangCompute,
                 });
-                let node_outputs = result
-                    .outputs
-                    .iter()
-                    .filter(|((source, _), _)| *source == member.address.node)
-                    .map(|((_, pin), value)| (pin.clone(), value.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                state.capture_global_outputs(compiled, &node_outputs)?;
+                state.capture_resident_global_outputs(compiled, &result.outputs)?;
             }
             for ((source, pin), value) in result.outputs {
                 let source_node = unit
@@ -4514,13 +8379,14 @@ fn evaluate_unit(
                 let key = (source, pin);
                 if remaining_uses.get(&key).copied().unwrap_or(0) != 0 {
                     live_bytes = live_bytes
-                        .checked_add(value.estimated_bytes())
+                        .checked_add(value.requested_memory_bytes()?)
                         .ok_or(Error::NumericOverflow)?;
                     values.insert(key, value);
                 }
             }
-            for edge in unit.edges.iter().filter(|edge| {
-                !members.contains(&edge.from_node) && members.contains(&edge.to_node)
+            for edge in unit_demand.edges.iter().filter(|edge| {
+                !resident_group_contains(scheduled_group, edge.from_node)
+                    && resident_group_contains(scheduled_group, edge.to_node)
             }) {
                 let key = (edge.from_node, edge.from_pin.clone());
                 let Some(uses) = remaining_uses.get_mut(&key) else {
@@ -4530,15 +8396,20 @@ fn evaluate_unit(
                     path: node.debug_symbol.label.clone(),
                     reason: "resident input live range was consumed more than once".to_owned(),
                 })?;
-                if *uses == 0 {
-                    if let Some(value) = values.remove(&key) {
-                        live_bytes = live_bytes
-                            .checked_sub(value.estimated_bytes())
-                            .ok_or(Error::NumericOverflow)?;
-                    }
+                if *uses == 0
+                    && let Some(value) = values.remove(&key)
+                {
+                    live_bytes = live_bytes
+                        .checked_sub(value.requested_memory_bytes()?)
+                        .ok_or(Error::NumericOverflow)?;
                 }
             }
-            executed_resident_nodes.extend(members);
+            executed_resident_nodes.extend(
+                scheduled_group
+                    .nodes
+                    .iter()
+                    .map(|member| member.address.node),
+            );
             continue;
         }
         let loads_global = state.should_load_global_node(&node.address());
@@ -4555,21 +8426,6 @@ fn evaluate_unit(
             {
                 value
             } else {
-                let address =
-                    node_addresses
-                        .get(&edge.from_node)
-                        .ok_or_else(|| Error::GraphDocument {
-                            path: node.debug_symbol.label.clone(),
-                            reason: "upstream node address is missing".to_owned(),
-                        })?;
-                let stage = state
-                    .graph
-                    .spatial_plan()
-                    .global_stage_for_node(address)
-                    .ok_or_else(|| Error::GraphDocument {
-                        path: node.debug_symbol.label.clone(),
-                        reason: "upstream value is missing".to_owned(),
-                    })?;
                 let source_node = unit
                     .nodes
                     .iter()
@@ -4577,6 +8433,14 @@ fn evaluate_unit(
                     .ok_or_else(|| Error::GraphDocument {
                         path: node.debug_symbol.label.clone(),
                         reason: "upstream compiled node is missing".to_owned(),
+                    })?;
+                let stage = state
+                    .graph
+                    .spatial_plan()
+                    .global_stage_for_node(&source_node.address())
+                    .ok_or_else(|| Error::GraphDocument {
+                        path: node.debug_symbol.label.clone(),
+                        reason: "upstream value is missing".to_owned(),
                     })?;
                 if state
                     .scope
@@ -4589,7 +8453,7 @@ fn evaluate_unit(
                     });
                 }
                 state
-                    .load_global_node_outputs(source_node)?
+                    .load_global_node_outputs(source_node, demand)?
                     .remove(&edge.from_pin)
                     .ok_or_else(|| Error::GraphDocument {
                         path: node.debug_symbol.label.clone(),
@@ -4603,20 +8467,38 @@ fn evaluate_unit(
             .map(GraphValue::candidate_count)
             .max()
             .unwrap_or(0) as u64;
-        let input_bytes = inputs.values().try_fold(0_u64, |total, value| {
+        let input_value_bytes = inputs.values().try_fold(0_u64, |total, value| {
             total
-                .checked_add(value.estimated_bytes())
+                .checked_add(value.requested_memory_bytes()?)
                 .ok_or(Error::NumericOverflow)
         })?;
         let started = Instant::now();
         let transferred_before = state.transferred_bytes;
+        state.current_node_live_bytes = live_bytes
+            .checked_add(input_value_bytes)
+            .ok_or(Error::NumericOverflow)?;
         let (outputs, execution_domain, loaded_global) =
-            evaluate_node_scheduled(unit, node, &inputs, interface_values, state)?;
+            evaluate_node_scheduled(unit, node, &inputs, interface_values, demand, state)?;
         state.check_abort()?;
         if !loaded_global {
-            record_candidate_decisions(node, &inputs, &outputs, state);
+            let decision_candidates = outputs
+                .values()
+                .map(GraphValue::candidate_count)
+                .max()
+                .unwrap_or(0) as u64;
+            let decision_output_bytes = outputs.values().try_fold(0_u64, |total, value| {
+                total
+                    .checked_add(value.requested_memory_bytes()?)
+                    .ok_or(Error::NumericOverflow)
+            })?;
+            state.check_transient_memory(checked_memory_sum([
+                decision_output_bytes,
+                requested_btree_bound::<CandidateIdentity, ()>(decision_candidates)?,
+            ])?)?;
+            record_candidate_decisions(node, &inputs, &outputs, state)?;
             state.capture_global_outputs(node, &outputs)?;
         }
+        state.current_node_live_bytes = 0;
         let output_candidates = outputs
             .values()
             .map(GraphValue::candidate_count)
@@ -4624,7 +8506,7 @@ fn evaluate_unit(
             .unwrap_or(0) as u64;
         let output_bytes = outputs.values().try_fold(0_u64, |total, value| {
             total
-                .checked_add(value.estimated_bytes())
+                .checked_add(value.requested_memory_bytes()?)
                 .ok_or(Error::NumericOverflow)
         })?;
         state.check_count(
@@ -4633,7 +8515,7 @@ fn evaluate_unit(
             state.graph.limits.max_candidates,
         )?;
         let transient_bytes = live_bytes
-            .checked_add(input_bytes)
+            .checked_add(input_value_bytes)
             .and_then(|value| value.checked_add(output_bytes))
             .ok_or(Error::NumericOverflow)?;
         if transient_bytes > state.graph.limits.max_memory_bytes {
@@ -4687,7 +8569,7 @@ fn evaluate_unit(
             let key = (node.definition.guid, pin);
             if remaining_uses.get(&key).copied().unwrap_or(0) != 0 {
                 live_bytes = live_bytes
-                    .checked_add(value.estimated_bytes())
+                    .checked_add(value.requested_memory_bytes()?)
                     .ok_or(Error::NumericOverflow)?;
                 values.insert(key, value);
             }
@@ -4701,20 +8583,23 @@ fn evaluate_unit(
                 path: node.debug_symbol.label.clone(),
                 reason: "input live range was consumed more than once".to_owned(),
             })?;
-            if *uses == 0 {
-                if let Some(value) = values.remove(&key) {
-                    live_bytes = live_bytes
-                        .checked_sub(value.estimated_bytes())
-                        .ok_or(Error::NumericOverflow)?;
-                }
+            if *uses == 0
+                && let Some(value) = values.remove(&key)
+            {
+                live_bytes = live_bytes
+                    .checked_sub(value.requested_memory_bytes()?)
+                    .ok_or(Error::NumericOverflow)?;
             }
         }
     }
     let mut outputs = BTreeMap::new();
     for output in &unit.outputs {
+        if !unit_demand.outputs.contains(&output.name) {
+            continue;
+        }
         if let Some(value) = values.get(&(output.node, output.pin.clone())).cloned() {
             outputs.insert(output.name.clone(), value);
-        } else if state.scope.current_global_stage().is_none() {
+        } else {
             return Err(Error::GraphDocument {
                 path: format!("graph.outputs.{}", output.name),
                 reason: "source value is missing".to_owned(),
@@ -4729,57 +8614,99 @@ fn record_candidate_decisions(
     inputs: &BTreeMap<String, GraphValue>,
     outputs: &BTreeMap<String, GraphValue>,
     state: &mut EvaluationState<'_>,
-) {
-    let mut candidates = BTreeMap::new();
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
     for value in outputs.values() {
-        if let GraphValue::Candidates(stream) = value {
-            for candidate in &stream.candidates {
-                candidates.entry(candidate.identity).or_insert(candidate);
-            }
-        }
-    }
-    for candidate in candidates.into_values() {
-        let previous = state.candidate_decisions.get(&candidate.identity).copied();
-        let mut parents = BTreeSet::new();
-        if let Some(previous) = previous {
-            parents.insert(previous);
-        }
-        for reference in [candidate.parent, candidate.colony].into_iter().flatten() {
-            if let Some(parent) = state.candidate_decisions.get(&reference.identity) {
-                parents.insert(*parent);
-            }
-        }
-        if parents.is_empty() && candidate.identity.ancestor != 0 {
-            for stream in inputs.values().filter_map(|value| match value {
-                GraphValue::Candidates(stream) => Some(stream),
-                _ => None,
-            }) {
-                for ancestor in &stream.candidates {
-                    if ancestor.identity.ordinal == candidate.identity.ancestor {
-                        if let Some(parent) = state.candidate_decisions.get(&ancestor.identity) {
-                            parents.insert(*parent);
-                        }
+        match value {
+            GraphValue::Candidates(stream) => {
+                for candidate in &stream.candidates {
+                    if seen.insert(candidate.identity) {
+                        record_candidate_decision(node, candidate, inputs.values(), state);
                     }
                 }
             }
+            GraphValue::Surface(surface)
+                if node.definition.operator == GraphOperator::SurfaceProjection =>
+            {
+                for identity in surface.values.keys() {
+                    if !seen.insert(*identity) {
+                        continue;
+                    }
+                    let candidate = inputs
+                        .values()
+                        .filter_map(|value| match value {
+                            GraphValue::Candidates(stream) => Some(stream),
+                            _ => None,
+                        })
+                        .find_map(|stream| {
+                            stream
+                                .candidates
+                                .binary_search_by_key(identity, |candidate| candidate.identity)
+                                .ok()
+                                .and_then(|index| stream.candidates.get(index))
+                        })
+                        .ok_or_else(|| Error::GraphDocument {
+                            path: node.debug_symbol.label.clone(),
+                            reason: format!(
+                                "projected surface sample {:?} has no input candidate",
+                                identity
+                            ),
+                        })?;
+                    record_candidate_decision(node, candidate, inputs.values(), state);
+                }
+            }
+            _ => {}
         }
-        let outcome = if previous.is_none() && parents.is_empty() {
-            ProvenanceDecisionOutcome::Produced
-        } else {
-            ProvenanceDecisionOutcome::Retained
-        };
-        let decision = state.provenance.intern_decision(ProvenanceDecision {
-            parents: parents.into_iter().collect(),
-            subgraph_path: node.debug_symbol.module_path.clone(),
-            node: node.definition.guid,
-            operator: node.definition.operator,
-            candidate: candidate.identity.ordinal,
-            outcome,
-        });
-        state
-            .candidate_decisions
-            .insert(candidate.identity, decision);
     }
+    Ok(())
+}
+
+fn record_candidate_decision<'a>(
+    node: &CompiledGraphNode,
+    candidate: &GraphCandidate,
+    inputs: impl IntoIterator<Item = &'a GraphValue>,
+    state: &mut EvaluationState<'_>,
+) {
+    let previous = state.candidate_decisions.get(&candidate.identity).copied();
+    let mut parents = BTreeSet::new();
+    if let Some(previous) = previous {
+        parents.insert(previous);
+    }
+    for reference in [candidate.parent, candidate.colony].into_iter().flatten() {
+        if let Some(parent) = state.candidate_decisions.get(&reference.identity) {
+            parents.insert(*parent);
+        }
+    }
+    if parents.is_empty() && candidate.identity.ancestor != 0 {
+        for stream in inputs.into_iter().filter_map(|value| match value {
+            GraphValue::Candidates(stream) => Some(stream),
+            _ => None,
+        }) {
+            for ancestor in &stream.candidates {
+                if ancestor.identity.ordinal == candidate.identity.ancestor
+                    && let Some(parent) = state.candidate_decisions.get(&ancestor.identity)
+                {
+                    parents.insert(*parent);
+                }
+            }
+        }
+    }
+    let outcome = if previous.is_none() && parents.is_empty() {
+        ProvenanceDecisionOutcome::Produced
+    } else {
+        ProvenanceDecisionOutcome::Retained
+    };
+    let decision = state.provenance.intern_decision(ProvenanceDecision {
+        parents: parents.into_iter().collect(),
+        subgraph_path: node.debug_symbol.module_path.clone(),
+        node: node.definition.guid,
+        operator: node.definition.operator,
+        candidate: candidate.identity.ordinal,
+        outcome,
+    });
+    state
+        .candidate_decisions
+        .insert(candidate.identity, decision);
 }
 
 fn evaluate_node_scheduled(
@@ -4787,11 +8714,12 @@ fn evaluate_node_scheduled(
     node: &CompiledGraphNode,
     inputs: &BTreeMap<String, GraphValue>,
     interface_values: &BTreeMap<String, GraphValue>,
+    demand: &CompiledDemandSlice,
     state: &mut EvaluationState<'_>,
 ) -> Result<(BTreeMap<String, GraphValue>, GraphExecutionDomain, bool)> {
     if state.should_load_global_node(&node.address()) {
         return Ok((
-            state.load_global_node_outputs(node)?,
+            state.load_global_node_outputs(node, demand)?,
             GraphExecutionDomain::ReferenceCpu,
             true,
         ));
@@ -4809,12 +8737,12 @@ fn evaluate_node_scheduled(
             reason: "resident groups must execute at the unit scheduler boundary".to_owned(),
         }),
         GraphExecutionDomain::ReferenceCpu => Ok((
-            evaluate_node(unit, node, inputs, interface_values, state)?,
+            evaluate_node(unit, node, inputs, interface_values, demand, state)?,
             GraphExecutionDomain::ReferenceCpu,
             false,
         )),
         GraphExecutionDomain::ParallelCpu => Ok((
-            evaluate_node(unit, node, inputs, interface_values, state)?,
+            evaluate_node(unit, node, inputs, interface_values, demand, state)?,
             GraphExecutionDomain::ParallelCpu,
             false,
         )),
@@ -4825,26 +8753,21 @@ fn execute_compute_program(
     state: &mut EvaluationState<'_>,
     compute: &dyn GraphComputeExecutor,
     program: &GraphGpuProgram,
-    invocations: &[GraphGpuInvocation],
+    invocations: &GraphGpuInvocationBatch,
 ) -> Result<Vec<crate::GraphGpuOutput>> {
-    if invocations.is_empty() {
+    if invocations.invocation_count() == 0 {
         return Ok(Vec::new());
     }
     state.check_abort()?;
-    let invocation_words = invocations.iter().try_fold(0_u64, |total, invocation| {
-        total
-            .checked_add(
-                u64::try_from(invocation.words().len()).map_err(|_| Error::NumericOverflow)?,
-            )
-            .ok_or(Error::NumericOverflow)
-    })?;
-    let output_words = u64::try_from(invocations.len())
+    let invocation_words =
+        u64::try_from(invocations.encoded_word_count()).map_err(|_| Error::NumericOverflow)?;
+    let output_words = u64::try_from(invocations.invocation_count())
         .map_err(|_| Error::NumericOverflow)?
         .checked_mul(
             u64::try_from(crate::GRAPH_GPU_OUTPUT_WORDS).map_err(|_| Error::NumericOverflow)?,
         )
         .ok_or(Error::NumericOverflow)?;
-    let transfer_bytes = u64::try_from(program.words().len())
+    let transfer_bytes = u64::try_from(program.encoded_word_count())
         .map_err(|_| Error::NumericOverflow)?
         .checked_add(invocation_words)
         .and_then(|words| words.checked_add(output_words))
@@ -4863,7 +8786,7 @@ fn execute_compute_program(
         compute.execute_program(program, invocations, state.cancellation, state.deadline)?;
     state.transferred_bytes = requested;
     state.check_abort()?;
-    if outputs.len() != invocations.len() {
+    if outputs.len() != invocations.invocation_count() {
         return Err(Error::GraphDocument {
             path: "slang-compute.outputs".to_owned(),
             reason: "compute executor returned the wrong result count".to_owned(),
@@ -4887,15 +8810,17 @@ fn evaluate_node(
     node: &CompiledGraphNode,
     inputs: &BTreeMap<String, GraphValue>,
     interface_values: &BTreeMap<String, GraphValue>,
+    demand: &CompiledDemandSlice,
     state: &mut EvaluationState<'_>,
 ) -> Result<BTreeMap<String, GraphValue>> {
     use GraphOperator as O;
-    let output = match node.definition.operator {
+    let output_demand = NodeOutputDemand::new(demand, node);
+    let produced = match node.definition.operator {
         O::InterfaceInput => {
             let name = string_parameter(node, "name", "")?;
             let value =
                 interface_values
-                    .get(&name)
+                    .get(name)
                     .cloned()
                     .ok_or_else(|| Error::GraphDocument {
                         path: node.debug_symbol.label.clone(),
@@ -4912,25 +8837,36 @@ fn evaluate_node(
                     0,
                 )?
             } else {
-                state
+                let count = state
                     .inputs
                     .regions
                     .iter()
                     .filter(|region| region.kind == EvaluationRegionKind::Biome)
-                    .copied()
-                    .collect()
+                    .count();
+                let mut regions = Vec::new();
+                crate::memory::reserve_exact(&mut regions, count, "biome input regions")?;
+                regions.extend(
+                    state
+                        .inputs
+                        .regions
+                        .iter()
+                        .filter(|region| region.kind == EvaluationRegionKind::Biome)
+                        .copied(),
+                );
+                regions
             }),
         ),
         O::SplineInput => singleton("splines", GraphValue::Splines(state.inputs.splines.clone())),
         O::SpeciesInput => singleton("species", GraphValue::Species(unit.palette.clone())),
-        O::CommunityInput => singleton(
-            "communities",
-            GraphValue::Communities(CommunityTables {
+        O::CommunityInput => {
+            let mut tables = CommunityTables {
                 competition: unit.competition.clone(),
                 companions: unit.companions.clone(),
                 succession: unit.succession.clone(),
-            }),
-        ),
+            };
+            tables.canonicalize();
+            singleton("communities", GraphValue::Communities(tables))
+        }
         O::ExplicitAnchors => singleton(
             "candidates",
             GraphValue::Candidates(explicit_anchor_candidates(node, state)?),
@@ -4952,16 +8888,15 @@ fn evaluate_node(
             )?),
         ),
         O::SurfaceProjection => {
-            let (surface, retained) =
-                project_candidates(node, candidates_input(inputs, "candidates")?, state)?;
-            state.diagnostics.candidate_count = state
-                .diagnostics
-                .candidate_count
-                .max(retained.candidates.len() as u64);
-            BTreeMap::from([
-                ("candidates".to_owned(), GraphValue::Candidates(retained)),
-                ("surface".to_owned(), GraphValue::Surface(surface)),
-            ])
+            let (outputs, retained_count) = project_candidates(
+                node,
+                candidates_input(inputs, "candidates")?,
+                output_demand,
+                state,
+            )?;
+            state.diagnostics.candidate_count =
+                state.diagnostics.candidate_count.max(retained_count);
+            outputs
         }
         O::FieldSample => singleton(
             "field",
@@ -5147,10 +9082,18 @@ fn evaluate_node(
                 path: node.debug_symbol.label.clone(),
                 reason: "compiled module is missing".to_owned(),
             })?;
-            evaluate_unit(module, inputs, state)?
+            evaluate_unit(
+                module,
+                child_demand_unit(demand, node)?,
+                demand,
+                inputs,
+                state,
+            )?
         }
     };
-    Ok(output)
+    let mut outputs = NodeOutputBuilder::new(output_demand);
+    outputs.extend(produced)?;
+    outputs.finish()
 }
 
 fn explicit_anchor_candidates(
@@ -5163,7 +9106,20 @@ fn explicit_anchor_candidates(
         state.inputs.anchors.len() as u64,
         state.graph.limits.max_candidates,
     )?;
+    let candidate_count = state
+        .inputs
+        .anchors
+        .iter()
+        .filter(|anchor| {
+            anchor.layer == layer && state.inputs.read_bounds.contains(anchor.point.position)
+        })
+        .count();
     let mut candidates = Vec::new();
+    crate::memory::reserve_exact(
+        &mut candidates,
+        candidate_count,
+        "explicit anchor candidates",
+    )?;
     for anchor in state.inputs.anchors.iter().filter(|anchor| {
         anchor.layer == layer && state.inputs.read_bounds.contains(anchor.point.position)
     }) {
@@ -5179,7 +9135,7 @@ fn explicit_anchor_candidates(
                     &node_execution_address(node, state).to_be_bytes(),
                     &node.definition.semantic_revision.to_be_bytes(),
                     &point.id.bytes(),
-                ]),
+                ])?,
                 ancestor: 0,
             },
             owner: canonical_owner(point.position, node.definition.spatial.level())?,
@@ -5215,6 +9171,7 @@ fn stratified_candidates(
     state: &EvaluationState<'_>,
 ) -> Result<CandidateStream> {
     let count = u64::from(u32_parameter(node, "count", 0)?);
+    state.check_transient_memory(stage_region_scratch_bytes(regions.len() as u64)?)?;
     let regions = stage_regions(node, regions, state)?;
     if count == 0 || regions.is_empty() {
         return Ok(CandidateStream {
@@ -5231,13 +9188,17 @@ fn stratified_candidates(
         requested,
         state.graph.limits.max_candidates,
     )?;
-    let mut candidates =
-        Vec::with_capacity(usize::try_from(requested).map_err(|_| Error::NumericOverflow)?);
+    let mut candidates = Vec::new();
+    crate::memory::reserve_exact(
+        &mut candidates,
+        usize::try_from(requested).map_err(|_| Error::NumericOverflow)?,
+        "stratified candidates",
+    )?;
     for region in regions {
         let side = integer_sqrt_ceil(count);
         for local in 0..count {
             state.check_abort()?;
-            let ordinal = candidate_ordinal(node, state, region.id, local, 0);
+            let ordinal = candidate_ordinal(node, state, region.id, local, 0)?;
             let x = local % side;
             let z = local / side;
             let stream = random_stream(
@@ -5268,6 +9229,7 @@ fn blue_noise_candidates(
     let count = u64::from(u32_parameter(node, "count", 0)?);
     let radius = fixed_parameter(node, "radius", DecisionScalar::from_bits(0))?;
     let attempts = u64::from(u32_parameter(node, "attempts", 30)?).max(1);
+    state.check_transient_memory(stage_region_scratch_bytes(regions.len() as u64)?)?;
     let regions = stage_regions(node, regions, state)?;
     if count == 0 || regions.is_empty() || radius.bits() <= 0 {
         return Ok(CandidateStream {
@@ -5286,9 +9248,21 @@ fn blue_noise_candidates(
     let radius_squared = radius_ticks
         .checked_mul(radius_ticks)
         .ok_or(Error::NumericOverflow)?;
+    let count = usize::try_from(count).map_err(|_| Error::NumericOverflow)?;
+    let maximum_candidates = count
+        .checked_mul(regions.len())
+        .ok_or(Error::NumericOverflow)?;
+    state.check_transient_memory(blue_noise_scratch_bytes(
+        u64::try_from(maximum_candidates).map_err(|_| Error::NumericOverflow)?,
+    )?)?;
     let mut accepted = Vec::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        maximum_candidates,
+        "blue-noise accepted candidates",
+    )?;
     for region in regions {
-        let seed_ordinal = candidate_ordinal(node, state, region.id, 0, 1);
+        let seed_ordinal = candidate_ordinal(node, state, region.id, 0, 1)?;
         let seed_stream = random_stream(
             node,
             state,
@@ -5303,15 +9277,19 @@ fn blue_noise_candidates(
             uniform_position(region.bounds, seed_stream, 0)?,
         )?;
         seed.source_layer = region.layer;
-        let mut region_points = vec![seed.clone()];
-        let mut active = vec![seed];
+        let mut region_points = Vec::new();
+        crate::memory::reserve_exact(&mut region_points, count, "blue-noise region candidates")?;
+        region_points.push(seed.clone());
+        let mut active = Vec::new();
+        crate::memory::reserve_exact(&mut active, count, "blue-noise active candidates")?;
+        active.push(seed);
         let mut proposal = 1_u64;
-        while !active.is_empty() && (region_points.len() as u64) < count {
+        while !active.is_empty() && region_points.len() < count {
             state.check_abort()?;
             let parent = active.remove(0);
             let mut produced = false;
             for attempt in 0..attempts {
-                let ordinal = candidate_ordinal(node, state, region.id, proposal, 1);
+                let ordinal = candidate_ordinal(node, state, region.id, proposal, 1)?;
                 proposal = proposal.checked_add(1).ok_or(Error::NumericOverflow)?;
                 let stream = random_stream(
                     node,
@@ -5338,7 +9316,7 @@ fn blue_noise_candidates(
                 region_points.push(candidate.clone());
                 active.push(candidate);
                 produced = true;
-                if region_points.len() as u64 >= count {
+                if region_points.len() >= count {
                     break;
                 }
             }
@@ -5348,8 +9326,13 @@ fn blue_noise_candidates(
         }
         accepted.extend(region_points);
     }
-    accepted.sort_by_key(|candidate| candidate.identity);
+    accepted.sort_unstable_by_key(|candidate| candidate.identity);
     let mut globally_spaced: Vec<GraphCandidate> = Vec::new();
+    crate::memory::reserve_exact(
+        &mut globally_spaced,
+        accepted.len(),
+        "blue-noise globally spaced candidates",
+    )?;
     for candidate in accepted {
         let mut conflicts = false;
         for other in &globally_spaced {
@@ -5373,28 +9356,20 @@ fn blue_noise_candidates(
 fn project_candidates(
     node: &CompiledGraphNode,
     candidates: &CandidateStream,
+    output_demand: NodeOutputDemand<'_>,
     state: &mut EvaluationState<'_>,
-) -> Result<(ProjectedSurfaceSamples, CandidateStream)> {
+) -> Result<(BTreeMap<String, GraphValue>, u64)> {
     let authoritative = node.definition.authority != GraphAuthority::Cosmetic;
-    let mut tiles = state
-        .inputs
-        .surface_projection_tiles
-        .iter()
-        .filter(|tile| {
-            tile.node == node.definition.guid
-                && tile.node_semantic_revision == node.definition.semantic_revision
-        })
-        .collect::<Vec<_>>();
-    tiles.sort_by_key(|tile| {
-        (
-            tile.samples.first().map(|entry| entry.query),
-            tile.samples.last().map(|entry| entry.query),
-        )
-    });
     if authoritative
         && (state.inputs.surface_provider_set_hash == [0; 32]
-            || tiles
+            || state
+                .inputs
+                .surface_projection_tiles
                 .iter()
+                .filter(|tile| {
+                    tile.node == node.definition.guid
+                        && tile.node_semantic_revision == node.definition.semantic_revision
+                })
                 .any(|tile| tile.provider_set_hash != state.inputs.surface_provider_set_hash))
     {
         return Err(Error::GraphAuthoritativeInput {
@@ -5402,13 +9377,27 @@ fn project_candidates(
             input: "canonical surface projection tiles".to_owned(),
         });
     }
-    let mut values = BTreeMap::new();
-    let mut retained = Vec::new();
+    let mut values = output_demand.contains("surface").then(BTreeMap::new);
+    let mut retained = output_demand.contains("candidates").then(Vec::new);
+    if let Some(retained) = retained.as_mut() {
+        crate::memory::reserve_exact(
+            retained,
+            candidates.candidates.len(),
+            "surface-projected retained candidates",
+        )?;
+    }
+    let mut retained_count = 0_u64;
     for candidate in &candidates.candidates {
         state.check_abort()?;
         let projected = if authoritative {
-            let sample = if let Some(sample) = tiles
+            let sample = if let Some(sample) = state
+                .inputs
+                .surface_projection_tiles
                 .iter()
+                .filter(|tile| {
+                    tile.node == node.definition.guid
+                        && tile.node_semantic_revision == node.definition.semantic_revision
+                })
                 .find_map(|tile| tile.sample(candidate.position))
             {
                 sample.clone()
@@ -5476,8 +9465,15 @@ fn project_candidates(
                 projected.position.global_ticks(),
             )?);
             ensure_support_ticks(node, displacement)?;
-            values.insert(candidate.identity, projected);
-            retained.push(candidate.clone());
+            retained_count = retained_count
+                .checked_add(1)
+                .ok_or(Error::NumericOverflow)?;
+            if let Some(values) = values.as_mut() {
+                values.insert(candidate.identity, projected);
+            }
+            if let Some(retained) = retained.as_mut() {
+                retained.push(candidate.clone());
+            }
         } else {
             reject_candidate(
                 node,
@@ -5487,19 +9483,29 @@ fn project_candidates(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         }
     }
-    Ok((
-        ProjectedSurfaceSamples {
-            lineage: candidates.lineage,
-            values,
-        },
-        CandidateStream {
-            lineage: candidates.lineage,
-            candidates: retained,
-        },
-    ))
+    let mut outputs = BTreeMap::new();
+    if let Some(retained) = retained {
+        outputs.insert(
+            "candidates".to_owned(),
+            GraphValue::Candidates(CandidateStream {
+                lineage: candidates.lineage,
+                candidates: retained,
+            }),
+        );
+    }
+    if let Some(values) = values {
+        outputs.insert(
+            "surface".to_owned(),
+            GraphValue::Surface(ProjectedSurfaceSamples {
+                lineage: candidates.lineage,
+                values,
+            }),
+        );
+    }
+    Ok((outputs, retained_count))
 }
 
 fn select_surface_hit(
@@ -5519,10 +9525,8 @@ fn select_surface_hit(
     let required_tags = tag_list_parameter(node, "tags")?;
     let required_material_tags = tag_list_parameter(node, "materialTags")?;
     let query = SurfaceProjection::new(position, direction, max_distance.to_f64())?;
-    let mut ordered = providers.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|provider| provider.descriptor().id);
     let mut best: Option<((u64, u64), SurfaceHit)> = None;
-    for provider in ordered {
+    for provider in providers {
         let descriptor = provider.descriptor();
         if !descriptor.capabilities.project
             || (authoritative_only && !descriptor.capabilities.authoritative_attachments)
@@ -5533,8 +9537,9 @@ fn select_surface_hit(
         let Some(hit) = provider.project(&query)? else {
             continue;
         };
-        if !contains_required_tags(&hit.tags, &required_tags)
-            || !contains_required_tags(&hit.tags, &required_material_tags)
+        validate_surface_hit_contract(node, &descriptor, &hit)?;
+        if !contains_required_tags(&hit.tags, required_tags)
+            || !contains_required_tags(&hit.tags, required_material_tags)
         {
             continue;
         }
@@ -5546,22 +9551,41 @@ fn select_surface_hit(
     Ok(best.map(|(_, hit)| hit))
 }
 
+fn validate_surface_hit_contract(
+    node: &CompiledGraphNode,
+    descriptor: &SurfaceProviderDescriptor,
+    hit: &SurfaceHit,
+) -> Result<()> {
+    if hit.provider != descriptor.id || hit.revision != descriptor.revision {
+        return Err(Error::GraphDocument {
+            path: node.debug_symbol.label.clone(),
+            reason: "surface hit identity does not match its provider descriptor".to_owned(),
+        });
+    }
+    if let Some(attachment) = hit.attachment
+        && (attachment.provider != descriptor.id || attachment.revision != descriptor.revision)
+    {
+        return Err(Error::GraphDocument {
+            path: node.debug_symbol.label.clone(),
+            reason: "surface attachment identity does not match its provider descriptor".to_owned(),
+        });
+    }
+    check_limit(
+        "surface tags per hit",
+        hit.tags.len() as u64,
+        u64::from(descriptor.max_tags_per_hit),
+    )?;
+    validate_canonical_tags(&hit.tags)
+}
+
 fn quantize_surface_normal(normal: [f32; 3]) -> Result<[SignedUnit; 3]> {
-    normal
-        .map(|value| SignedUnit::from_f64(f64::from(value)))
-        .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .try_into()
-        .map_err(|_| Error::NumericOverflow)
+    let [x, y, z] = normal.map(|value| SignedUnit::from_f64(f64::from(value)));
+    Ok([x?, y?, z?])
 }
 
 fn quantize_surface_projection(projection: [f64; 3]) -> Result<[DecisionScalar; 3]> {
-    projection
-        .map(DecisionScalar::from_f64)
-        .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .try_into()
-        .map_err(|_| Error::NumericOverflow)
+    let [x, y, z] = projection.map(DecisionScalar::from_f64);
+    Ok([x?, y?, z?])
 }
 
 fn validate_canonical_tags(tags: &[WeightedSurfaceTag]) -> Result<()> {
@@ -5583,24 +9607,6 @@ fn sample_field(
     let channel = field_parameter(node, "channel")?;
     let derivative = field_derivative_parameter(node, "derivative", FieldDerivative::Value)?;
     let authoritative = node.definition.authority != GraphAuthority::Cosmetic;
-    let mut tiles = state
-        .inputs
-        .fields
-        .iter()
-        .filter(|tile| {
-            matches!(tile.source, EvaluationFieldSource::SurfaceProvider { .. })
-                && tile.channel == channel
-                && tile.derivative == derivative
-        })
-        .collect::<Vec<_>>();
-    tiles.sort_by_key(|tile| {
-        (
-            tile.bounds.min_ticks(),
-            tile.bounds.max_ticks_exclusive(),
-            tile.source,
-            tile.source_hash,
-        )
-    });
     let mut sampling = FieldSamplingContext {
         node,
         candidates,
@@ -5608,7 +9614,6 @@ fn sample_field(
         require_authoritative,
         channel,
         derivative,
-        tiles: &tiles,
         state,
     };
     match derivative {
@@ -5710,7 +9715,6 @@ struct FieldSamplingContext<'a, 'b> {
     require_authoritative: bool,
     channel: FieldChannel,
     derivative: FieldDerivative,
-    tiles: &'a [&'a EvaluationFieldTile],
     state: &'a mut EvaluationState<'b>,
 }
 
@@ -5723,45 +9727,32 @@ impl FieldSamplingContext<'_, '_> {
         encode_query: impl Fn(T) -> QuantizedSurfaceFieldValue,
         cosmetic_default: T,
     ) -> Result<BTreeMap<CandidateIdentity, T>> {
-        let mut providers = self
-            .state
-            .inputs
-            .surface_providers
-            .iter()
-            .collect::<Vec<_>>();
-        providers.sort_by_key(|provider| provider.descriptor().id);
-        let mut query_tiles = self
-            .state
-            .inputs
-            .surface_field_query_tiles
-            .iter()
-            .filter(|tile| {
-                tile.node == self.node.definition.guid
-                    && tile.node_semantic_revision == self.node.definition.semantic_revision
-                    && tile.channel == self.channel
-                    && tile.derivative == self.derivative
-            })
-            .collect::<Vec<_>>();
-        query_tiles.sort_by_key(|tile| {
-            (
-                tile.samples
-                    .first()
-                    .map(|entry| (entry.candidate, entry.query)),
-                tile.samples
-                    .last()
-                    .map(|entry| (entry.candidate, entry.query)),
-            )
-        });
         let mut values = BTreeMap::new();
         for candidate in &self.candidates.candidates {
             let sample = if self.authoritative {
-                let exact = query_tiles
+                let exact = self
+                    .state
+                    .inputs
+                    .surface_field_query_tiles
                     .iter()
+                    .filter(|tile| {
+                        tile.node == self.node.definition.guid
+                            && tile.node_semantic_revision == self.node.definition.semantic_revision
+                            && tile.channel == self.channel
+                            && tile.derivative == self.derivative
+                    })
                     .find_map(|tile| tile.sample(candidate.identity, candidate.position))
                     .and_then(&decode_query);
                 let tiled = self
-                    .tiles
+                    .state
+                    .inputs
+                    .fields
                     .iter()
+                    .filter(|tile| {
+                        matches!(tile.source, EvaluationFieldSource::SurfaceProvider { .. })
+                            && tile.channel == self.channel
+                            && tile.derivative == self.derivative
+                    })
                     .find_map(|tile| sample_tile(tile, candidate.position));
                 if exact.is_some() && tiled.is_some() && exact != tiled {
                     return Err(Error::GraphDocument {
@@ -5776,7 +9767,7 @@ impl FieldSamplingContext<'_, '_> {
                     Some(value)
                 } else if self.state.pass == EvaluationPass::PrepareCanonicalInputs {
                     let mut prepared = None;
-                    for provider in &providers {
+                    for provider in &self.state.inputs.surface_providers {
                         let descriptor = provider.descriptor();
                         if !descriptor.capabilities.authoritative_fields
                             || provider.availability(
@@ -5800,17 +9791,21 @@ impl FieldSamplingContext<'_, '_> {
                     None
                 }
             } else {
-                providers.iter().find_map(|provider| {
-                    if provider.availability(
-                        self.channel,
-                        self.derivative,
-                        self.state.inputs.read_bounds,
-                    ) == FieldAvailability::Unavailable
-                    {
-                        return None;
-                    }
-                    sample_provider(provider.as_ref(), candidate.position).ok()
-                })
+                self.state
+                    .inputs
+                    .surface_providers
+                    .iter()
+                    .find_map(|provider| {
+                        if provider.availability(
+                            self.channel,
+                            self.derivative,
+                            self.state.inputs.read_bounds,
+                        ) == FieldAvailability::Unavailable
+                        {
+                            return None;
+                        }
+                        sample_provider(provider.as_ref(), candidate.position).ok()
+                    })
             };
             if let Some(value) = sample {
                 if self.authoritative && self.state.pass == EvaluationPass::PrepareCanonicalInputs {
@@ -5869,28 +9864,16 @@ fn sample_painted_tile(
     let authoritative = node.definition.authority != GraphAuthority::Cosmetic;
     let channel = field_parameter(node, "channel")?;
     let layer = guid_parameter(node, "layer", 0)?;
-    let mut tiles = state
-        .inputs
-        .fields
-        .iter()
-        .filter(|tile| {
-            tile.source == EvaluationFieldSource::MapLayer(layer)
-                && tile.channel == channel
-                && tile.derivative == FieldDerivative::Value
-        })
-        .collect::<Vec<_>>();
-    tiles.sort_by_key(|tile| {
-        (
-            tile.layer_order,
-            tile.bounds.min_ticks(),
-            tile.bounds.max_ticks_exclusive(),
-            tile.source,
-            tile.source_hash,
-        )
-    });
     let mut values = BTreeMap::new();
     for candidate in &candidates.candidates {
-        if let Some(value) = sample_ordered_scalar_tiles(&tiles, candidate.position)? {
+        if let Some(value) = sample_ordered_scalar_tiles(
+            state.inputs.fields.iter().filter(|tile| {
+                tile.source == EvaluationFieldSource::MapLayer(layer)
+                    && tile.channel == channel
+                    && tile.derivative == FieldDerivative::Value
+            }),
+            candidate.position,
+        )? {
             values.insert(candidate.identity, value);
         } else if authoritative || require_authoritative {
             return Err(Error::GraphAuthoritativeInput {
@@ -5910,8 +9893,8 @@ fn sample_painted_tile(
     })
 }
 
-fn sample_ordered_scalar_tiles(
-    tiles: &[&EvaluationFieldTile],
+fn sample_ordered_scalar_tiles<'a>(
+    tiles: impl IntoIterator<Item = &'a EvaluationFieldTile>,
     position: WorldPosition,
 ) -> Result<Option<DecisionScalar>> {
     let mut result = None;
@@ -6040,7 +10023,7 @@ fn coherent_value_noise_components(
         let y = coordinate[1].to_be_bytes();
         let z = coordinate[2].to_be_bytes();
         let channel_bytes = channel.to_be_bytes();
-        let ordinal = stable_ordinal(&[&address, &x, &y, &z, &channel_bytes]);
+        let ordinal = stable_ordinal(&[&address, &x, &y, &z, &channel_bytes])?;
         let stream = RandomStream::new(RandomDomain {
             map: u128::from(state.inputs.map.value()),
             node_guid: node_execution_address(node, state),
@@ -6105,13 +10088,15 @@ fn gradient_field(
 
 fn curve_field(node: &CompiledGraphNode, input: &ScalarFieldSamples) -> Result<ScalarFieldSamples> {
     let curve = curve_parameter(node, "curve")?;
-    let curve = DecisionCurve::new(curve)?;
     let values = input
         .values
         .iter()
         .map(|(identity, value)| {
             let bits = value.bits().clamp(0, i32::from(u16::MAX)) as u16;
-            Ok((*identity, curve.sample(UnitInterval::from_bits(bits))?))
+            Ok((
+                *identity,
+                DecisionCurve::sample_points(curve, UnitInterval::from_bits(bits))?,
+            ))
         })
         .collect::<Result<_>>()?;
     Ok(ScalarFieldSamples {
@@ -6224,12 +10209,16 @@ fn distance_field(
                         source_guid == 0 || spline.id == source_guid || spline.layer == source_guid
                     })
                     .flat_map(|spline| spline.points.windows(2))
-                    .map(|segment| {
-                        point_segment_distance_ticks(candidate.position, segment[0], segment[1])
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .min()
+                    .try_fold(None, |minimum, segment| {
+                        let distance = point_segment_distance_ticks(
+                            candidate.position,
+                            segment[0],
+                            segment[1],
+                        )?;
+                        Ok::<_, Error>(Some(
+                            minimum.map_or(distance, |value: i128| value.min(distance)),
+                        ))
+                    })?
                     .unwrap_or(i128::MAX);
                 DecisionScalar::from_bits(ticks_to_fixed_meters(
                     distance_ticks.min(maximum_distance),
@@ -6246,10 +10235,13 @@ fn distance_field(
                                 || region.id == source_guid
                                 || region.layer == source_guid)
                     })
-                    .map(|region| point_bounds_distance_ticks(candidate.position, region.bounds))
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .min()
+                    .try_fold(None, |minimum, region| {
+                        let distance =
+                            point_bounds_distance_ticks(candidate.position, region.bounds)?;
+                        Ok::<_, Error>(Some(
+                            minimum.map_or(distance, |value: i128| value.min(distance)),
+                        ))
+                    })?
                     .unwrap_or(i128::MAX);
                 DecisionScalar::from_bits(ticks_to_fixed_meters(
                     distance_ticks.min(maximum_distance),
@@ -6261,24 +10253,18 @@ fn distance_field(
                 } else {
                     FieldChannel::SignedBlocker
                 };
-                let mut tiles = state
-                    .inputs
-                    .fields
-                    .iter()
-                    .filter(|tile| {
-                        tile.channel == channel
-                            && tile.derivative == FieldDerivative::Value
-                            && match tile.source {
-                                EvaluationFieldSource::MapLayer(layer) => {
-                                    source_guid == 0 || layer == source_guid
-                                }
-                                EvaluationFieldSource::SurfaceProvider { .. } => source_guid == 0,
+                let tiles = state.inputs.fields.iter().filter(|tile| {
+                    tile.channel == channel
+                        && tile.derivative == FieldDerivative::Value
+                        && match tile.source {
+                            EvaluationFieldSource::MapLayer(layer) => {
+                                source_guid == 0 || layer == source_guid
                             }
-                    })
-                    .collect::<Vec<_>>();
-                tiles.sort_by_key(|tile| tile.layer_order);
+                            EvaluationFieldSource::SurfaceProvider { .. } => source_guid == 0,
+                        }
+                });
                 let sampled =
-                    sample_ordered_scalar_tiles(&tiles, candidate.position)?.ok_or_else(|| {
+                    sample_ordered_scalar_tiles(tiles, candidate.position)?.ok_or_else(|| {
                         Error::GraphAuthoritativeInput {
                             node: node.definition.guid,
                             input: format!("{} distance field", field_channel_name(channel)),
@@ -6339,51 +10325,81 @@ fn weighted_elimination(
         });
     }
     ensure_support_ticks(node, radius)?;
-    let candidate_weights = candidates
-        .candidates
-        .iter()
-        .map(|candidate| {
-            let weight = weights
-                .values
-                .get(&candidate.identity)
-                .copied()
-                .ok_or_else(|| Error::GraphAuthoritativeInput {
-                    node: node.definition.guid,
-                    input: "weighted-elimination sample".to_owned(),
-                })?;
-            let weight = u32::try_from(weight.bits()).map_err(|_| Error::GraphDocument {
+    let candidate_count = candidates.candidates.len();
+    state.check_transient_memory(weighted_elimination_scratch_bytes(
+        candidate_count as u64,
+        target as u64,
+        maximum_neighbours as u64,
+    )?)?;
+    let mut candidate_weights = Vec::new();
+    crate::memory::reserve_exact(
+        &mut candidate_weights,
+        candidate_count,
+        "weighted elimination weights",
+    )?;
+    for candidate in &candidates.candidates {
+        let weight = weights
+            .values
+            .get(&candidate.identity)
+            .copied()
+            .ok_or_else(|| Error::GraphAuthoritativeInput {
+                node: node.definition.guid,
+                input: "weighted-elimination sample".to_owned(),
+            })?;
+        let weight = u32::try_from(weight.bits()).map_err(|_| Error::GraphDocument {
+            path: node.debug_symbol.label.clone(),
+            reason: "weighted-elimination weights must be positive".to_owned(),
+        })?;
+        if weight == 0 {
+            return Err(Error::GraphDocument {
                 path: node.debug_symbol.label.clone(),
                 reason: "weighted-elimination weights must be positive".to_owned(),
-            })?;
-            if weight == 0 {
-                return Err(Error::GraphDocument {
-                    path: node.debug_symbol.label.clone(),
-                    reason: "weighted-elimination weights must be positive".to_owned(),
-                });
-            }
-            Ok(weight)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            });
+        }
+        candidate_weights.push(weight);
+    }
     let radius_squared = radius.checked_mul(radius).ok_or(Error::NumericOverflow)?;
-    let mut buckets: BTreeMap<(i128, i128), Vec<usize>> = BTreeMap::new();
+    let mut bucket_entries = Vec::new();
+    crate::memory::reserve_exact(
+        &mut bucket_entries,
+        candidate_count,
+        "weighted elimination spatial index",
+    )?;
     for (index, candidate) in candidates.candidates.iter().enumerate() {
         let ticks = candidate.position.global_ticks();
-        buckets
-            .entry((ticks[0].div_euclid(radius), ticks[2].div_euclid(radius)))
-            .or_default()
-            .push(index);
+        bucket_entries.push((
+            (ticks[0].div_euclid(radius), ticks[2].div_euclid(radius)),
+            index,
+        ));
     }
-    let mut adjacency = vec![Vec::<(usize, u64)>::new(); candidates.candidates.len()];
-    let mut edge_count = 0_u64;
+    bucket_entries.sort_unstable();
+    let mut adjacency = Vec::new();
+    crate::memory::reserve_exact(
+        &mut adjacency,
+        candidate_count,
+        "weighted elimination adjacency headers",
+    )?;
+    for _ in 0..candidate_count {
+        let mut neighbours = Vec::new();
+        crate::memory::reserve_exact(
+            &mut neighbours,
+            maximum_neighbours,
+            "weighted elimination adjacency",
+        )?;
+        adjacency.push(neighbours);
+    }
     for (index, candidate) in candidates.candidates.iter().enumerate() {
         let ticks = candidate.position.global_ticks();
         let bucket = (ticks[0].div_euclid(radius), ticks[2].div_euclid(radius));
         for x in -1..=1 {
             for z in -1..=1 {
-                let Some(neighbours) = buckets.get(&(bucket.0 + x, bucket.1 + z)) else {
-                    continue;
-                };
-                for &other_index in neighbours.iter().filter(|other| **other > index) {
+                let neighbour_bucket = (bucket.0 + x, bucket.1 + z);
+                let start = bucket_entries.partition_point(|(key, _)| *key < neighbour_bucket);
+                let end = bucket_entries.partition_point(|(key, _)| *key <= neighbour_bucket);
+                for &(_, other_index) in bucket_entries[start..end]
+                    .iter()
+                    .filter(|(_, other)| *other > index)
+                {
                     let other = &candidates.candidates[other_index];
                     let distance_squared = distance_squared_xz(candidate.position, other.position)?;
                     if distance_squared >= radius_squared {
@@ -6393,88 +10409,78 @@ fn weighted_elimination(
                     let contribution =
                         u64::try_from(radius.checked_sub(distance).ok_or(Error::NumericOverflow)?)
                             .map_err(|_| Error::NumericOverflow)?;
-                    adjacency[index].push((other_index, contribution));
-                    adjacency[other_index].push((index, contribution));
-                    if adjacency[index].len() > maximum_neighbours
-                        || adjacency[other_index].len() > maximum_neighbours
+                    if adjacency[index].len() == maximum_neighbours
+                        || adjacency[other_index].len() == maximum_neighbours
                     {
                         return Err(Error::GraphLimit {
                             resource: "weighted-elimination neighbours",
-                            requested: u64::try_from(
-                                adjacency[index].len().max(adjacency[other_index].len()),
-                            )
-                            .unwrap_or(u64::MAX),
+                            requested: u64::try_from(maximum_neighbours)
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(1),
                             limit: u64::try_from(maximum_neighbours).unwrap_or(u64::MAX),
                         });
                     }
-                    edge_count = edge_count.checked_add(1).ok_or(Error::NumericOverflow)?;
-                    let adjacency_bytes =
-                        edge_count.checked_mul(32).ok_or(Error::NumericOverflow)?;
-                    if adjacency_bytes > state.graph.limits.max_memory_bytes {
-                        return Err(Error::GraphLimit {
-                            resource: "weighted-elimination adjacency bytes",
-                            requested: adjacency_bytes,
-                            limit: state.graph.limits.max_memory_bytes,
-                        });
-                    }
+                    adjacency[index].push((other_index, contribution));
+                    adjacency[other_index].push((index, contribution));
                 }
             }
         }
     }
     let baseline = u64::try_from(radius).map_err(|_| Error::NumericOverflow)?;
-    let mut crowding = adjacency
-        .iter()
-        .map(|neighbours| {
+    let mut crowding = Vec::new();
+    crate::memory::reserve_exact(
+        &mut crowding,
+        candidate_count,
+        "weighted elimination crowding",
+    )?;
+    for neighbours in &adjacency {
+        crowding.push(
             neighbours
                 .iter()
                 .try_fold(baseline, |sum, (_, contribution)| {
                     sum.checked_add(*contribution).ok_or(Error::NumericOverflow)
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut generations = vec![0_u32; candidates.candidates.len()];
-    let mut active = vec![true; candidates.candidates.len()];
-    let mut heap = BinaryHeap::new();
+                })?,
+        );
+    }
+    let mut active = Vec::new();
+    crate::memory::reserve_exact(
+        &mut active,
+        candidate_count,
+        "weighted elimination active mask",
+    )?;
+    active.resize(candidate_count, true);
+    let mut queue = IndexedEliminationQueue::with_capacity(candidate_count)?;
     for (index, candidate) in candidates.candidates.iter().enumerate() {
-        heap.push(EliminationScore {
+        queue.push(EliminationScore {
             crowding: crowding[index],
             weight: candidate_weights[index],
             identity: candidate.identity,
-            generation: 0,
             index,
-        });
+        })?;
     }
     let mut active_count = candidates.candidates.len();
     while active_count > target {
         state.check_abort()?;
-        let score = loop {
-            let score = heap.pop().ok_or_else(|| Error::GraphDocument {
-                path: node.debug_symbol.label.clone(),
-                reason: "weighted-elimination heap exhausted".to_owned(),
-            })?;
-            if active[score.index] && generations[score.index] == score.generation {
-                break score;
-            }
-        };
+        let score = queue.pop_max().ok_or_else(|| Error::GraphDocument {
+            path: node.debug_symbol.label.clone(),
+            reason: "weighted-elimination queue exhausted".to_owned(),
+        })?;
         active[score.index] = false;
         active_count -= 1;
         for &(neighbour, contribution) in &adjacency[score.index] {
             if !active[neighbour] {
                 continue;
             }
-            crowding[neighbour] = crowding[neighbour]
+            let next_crowding = crowding[neighbour]
                 .checked_sub(contribution)
                 .ok_or(Error::NumericOverflow)?;
-            generations[neighbour] = generations[neighbour]
-                .checked_add(1)
-                .ok_or(Error::NumericOverflow)?;
-            heap.push(EliminationScore {
-                crowding: crowding[neighbour],
+            crowding[neighbour] = next_crowding;
+            queue.update(EliminationScore {
+                crowding: next_crowding,
                 weight: candidate_weights[neighbour],
                 identity: candidates.candidates[neighbour].identity,
-                generation: generations[neighbour],
                 index: neighbour,
-            });
+            })?;
         }
     }
     for (index, candidate) in candidates.candidates.iter().enumerate() {
@@ -6487,19 +10493,22 @@ fn weighted_elimination(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         }
     }
-    let mut result = CandidateStream {
-        lineage: candidates.lineage,
-        candidates: candidates
+    let mut retained = Vec::new();
+    crate::memory::reserve_exact(&mut retained, target, "weighted elimination result")?;
+    retained.extend(
+        candidates
             .candidates
             .iter()
             .enumerate()
             .filter(|(index, _)| active[*index])
-            .map(|(_, candidate)| candidate)
-            .cloned()
-            .collect(),
+            .map(|(_, candidate)| candidate.clone()),
+    );
+    let mut result = CandidateStream {
+        lineage: candidates.lineage,
+        candidates: retained,
     };
     result.canonicalize()?;
     Ok(result)
@@ -6510,7 +10519,6 @@ struct EliminationScore {
     crowding: u64,
     weight: u32,
     identity: CandidateIdentity,
-    generation: u32,
     index: usize,
 }
 
@@ -6519,7 +10527,107 @@ impl Ord for EliminationScore {
         (u128::from(self.crowding) * u128::from(other.weight))
             .cmp(&(u128::from(other.crowding) * u128::from(self.weight)))
             .then_with(|| self.identity.cmp(&other.identity))
-            .then_with(|| self.generation.cmp(&other.generation))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+struct IndexedEliminationQueue {
+    heap: Vec<EliminationScore>,
+    positions: Vec<usize>,
+}
+
+impl IndexedEliminationQueue {
+    fn with_capacity(capacity: usize) -> Result<Self> {
+        let mut heap = Vec::new();
+        crate::memory::reserve_exact(&mut heap, capacity, "weighted elimination queue")?;
+        let mut positions = Vec::new();
+        crate::memory::reserve_exact(&mut positions, capacity, "weighted elimination queue index")?;
+        positions.resize(capacity, usize::MAX);
+        Ok(Self { heap, positions })
+    }
+
+    fn push(&mut self, score: EliminationScore) -> Result<()> {
+        if score.index >= self.positions.len() || self.positions[score.index] != usize::MAX {
+            return Err(elimination_queue_error());
+        }
+        let position = self.heap.len();
+        self.heap.push(score);
+        self.positions[score.index] = position;
+        self.sift_up(position);
+        Ok(())
+    }
+
+    fn pop_max(&mut self) -> Option<EliminationScore> {
+        let last = self.heap.len().checked_sub(1)?;
+        self.swap_nodes(0, last);
+        let removed = self.heap.pop()?;
+        self.positions[removed.index] = usize::MAX;
+        if !self.heap.is_empty() {
+            self.sift_down(0);
+        }
+        Some(removed)
+    }
+
+    fn update(&mut self, score: EliminationScore) -> Result<()> {
+        let position = *self
+            .positions
+            .get(score.index)
+            .ok_or_else(elimination_queue_error)?;
+        let previous = *self
+            .heap
+            .get(position)
+            .ok_or_else(elimination_queue_error)?;
+        self.heap[position] = score;
+        if score > previous {
+            self.sift_up(position);
+        } else {
+            self.sift_down(position);
+        }
+        Ok(())
+    }
+
+    fn sift_up(&mut self, mut position: usize) {
+        while position > 0 {
+            let parent = (position - 1) / 2;
+            if self.heap[parent] >= self.heap[position] {
+                break;
+            }
+            self.swap_nodes(parent, position);
+            position = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut position: usize) {
+        loop {
+            let left = position * 2 + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < self.heap.len() && self.heap[right] > self.heap[left] {
+                right
+            } else {
+                left
+            };
+            if self.heap[position] >= self.heap[child] {
+                break;
+            }
+            self.swap_nodes(position, child);
+            position = child;
+        }
+    }
+
+    fn swap_nodes(&mut self, left: usize, right: usize) {
+        self.heap.swap(left, right);
+        self.positions[self.heap[left].index] = left;
+        self.positions[self.heap[right].index] = right;
+    }
+}
+
+fn elimination_queue_error() -> Error {
+    Error::GraphDocument {
+        path: "weightedElimination.queue".to_owned(),
+        reason: "indexed elimination queue is inconsistent".to_owned(),
     }
 }
 
@@ -6536,42 +10644,50 @@ fn variable_spacing(
     state: &mut EvaluationState<'_>,
 ) -> Result<CandidateStream> {
     ensure_lineage(node, "radius", candidates.lineage, radii.lineage)?;
+    state.check_transient_memory(xz_filter_scratch_bytes(candidates.candidates.len() as u64)?)?;
     let prototype_aware = bool_parameter(node, "prototypeAware", false)?;
-    let effective_radii = candidates
-        .candidates
+    let mut effective_radii = Vec::new();
+    crate::memory::reserve_exact(
+        &mut effective_radii,
+        candidates.candidates.len(),
+        "variable-spacing radii",
+    )?;
+    for candidate in &candidates.candidates {
+        let authored = radii
+            .values
+            .get(&candidate.identity)
+            .copied()
+            .unwrap_or(candidate.crown_radius.max(candidate.root_radius));
+        let radius = if prototype_aware {
+            let family = candidate
+                .family
+                .ok_or_else(|| Error::GraphAuthoritativeInput {
+                    node: node.definition.guid,
+                    input: "plant family before prototype-aware spacing".to_owned(),
+                })?;
+            let prototype = prototype_for_family(state, family)?;
+            authored.max(
+                prototype
+                    .crown_radius
+                    .into_iter()
+                    .chain(prototype.root_radius)
+                    .max()
+                    .unwrap(),
+            )
+        } else {
+            authored
+        };
+        effective_radii.push((
+            candidate.identity,
+            nonnegative_radius_ticks(node, "variable-spacing radius sample", radius)?,
+        ));
+    }
+    effective_radii.sort_unstable_by_key(|(identity, _)| *identity);
+    let maximum_radius = effective_radii
         .iter()
-        .map(|candidate| {
-            let authored = radii
-                .values
-                .get(&candidate.identity)
-                .copied()
-                .unwrap_or(candidate.crown_radius.max(candidate.root_radius));
-            let radius = if prototype_aware {
-                let family = candidate
-                    .family
-                    .ok_or_else(|| Error::GraphAuthoritativeInput {
-                        node: node.definition.guid,
-                        input: "plant family before prototype-aware spacing".to_owned(),
-                    })?;
-                let prototype = prototype_for_family(state, family)?;
-                authored.max(
-                    prototype
-                        .crown_radius
-                        .into_iter()
-                        .chain(prototype.root_radius)
-                        .max()
-                        .unwrap(),
-                )
-            } else {
-                authored
-            };
-            Ok((
-                candidate.identity,
-                nonnegative_radius_ticks(node, "variable-spacing radius sample", radius)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let maximum_radius = effective_radii.values().copied().max().unwrap_or(0);
+        .map(|(_, radius)| *radius)
+        .max()
+        .unwrap_or(0);
     let maximum_support = if prototype_aware {
         maximum_radius
             .checked_mul(2)
@@ -6581,40 +10697,57 @@ fn variable_spacing(
     };
     ensure_support_ticks(node, maximum_support)?;
     let bucket_size = maximum_support.max(1);
-    let mut immutable = candidates.candidates.clone();
-    immutable.sort_by(|left, right| {
+    let mut immutable = Vec::new();
+    crate::memory::reserve_exact(
+        &mut immutable,
+        candidates.candidates.len(),
+        "variable-spacing candidates",
+    )?;
+    immutable.extend(candidates.candidates.iter().cloned());
+    immutable.sort_unstable_by(|left, right| {
         right
             .priority
             .cmp(&left.priority)
             .then_with(|| left.identity.cmp(&right.identity))
     });
     let mut accepted: Vec<GraphCandidate> = Vec::new();
-    let mut buckets = BTreeMap::<(i128, i128), Vec<usize>>::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        candidates.candidates.len(),
+        "variable-spacing accepted candidates",
+    )?;
+    let mut bucket_heads = BTreeMap::<(i128, i128), usize>::new();
+    let mut bucket_links = Vec::<Option<usize>>::new();
+    crate::memory::reserve_exact(
+        &mut bucket_links,
+        candidates.candidates.len(),
+        "variable-spacing bucket links",
+    )?;
     for candidate in immutable {
-        let radius_ticks = *effective_radii.get(&candidate.identity).ok_or_else(|| {
-            Error::GraphAuthoritativeInput {
-                node: node.definition.guid,
-                input: "variable-spacing radius sample".to_owned(),
-            }
-        })?;
+        let radius_ticks = lookup_candidate_radius(
+            &effective_radii,
+            candidate.identity,
+            node,
+            "variable-spacing radius sample",
+        )?;
         ensure_support_ticks(node, radius_ticks)?;
         let mut wins = true;
         let bucket = xz_bucket(candidate.position, bucket_size);
         'neighbours: for x in -1..=1 {
             for z in -1..=1 {
                 let key = offset_xz_bucket(bucket, x, z)?;
-                for index in buckets.get(&key).into_iter().flatten() {
-                    let other = accepted.get(*index).ok_or_else(|| Error::GraphDocument {
+                let mut index = bucket_heads.get(&key).copied();
+                while let Some(current) = index {
+                    let other = accepted.get(current).ok_or_else(|| Error::GraphDocument {
                         path: node.debug_symbol.label.clone(),
                         reason: "variable-spacing spatial index is invalid".to_owned(),
                     })?;
-                    let other_radius_ticks =
-                        *effective_radii.get(&other.identity).ok_or_else(|| {
-                            Error::GraphAuthoritativeInput {
-                                node: node.definition.guid,
-                                input: "variable-spacing radius sample".to_owned(),
-                            }
-                        })?;
+                    let other_radius_ticks = lookup_candidate_radius(
+                        &effective_radii,
+                        other.identity,
+                        node,
+                        "variable-spacing radius sample",
+                    )?;
                     let required = if prototype_aware {
                         radius_ticks
                             .checked_add(other_radius_ticks)
@@ -6630,11 +10763,18 @@ fn variable_spacing(
                         wins = false;
                         break 'neighbours;
                     }
+                    index = *bucket_links
+                        .get(current)
+                        .ok_or_else(|| Error::GraphDocument {
+                            path: node.debug_symbol.label.clone(),
+                            reason: "variable-spacing spatial index is invalid".to_owned(),
+                        })?;
                 }
             }
         }
         if wins {
-            buckets.entry(bucket).or_default().push(accepted.len());
+            let index = accepted.len();
+            bucket_links.push(bucket_heads.insert(bucket, index));
             accepted.push(candidate);
         } else {
             reject_candidate(
@@ -6645,7 +10785,7 @@ fn variable_spacing(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         }
     }
     let mut result = CandidateStream {
@@ -6656,12 +10796,31 @@ fn variable_spacing(
     Ok(result)
 }
 
+fn lookup_candidate_radius(
+    radii: &[(CandidateIdentity, i128)],
+    identity: CandidateIdentity,
+    node: &CompiledGraphNode,
+    input: &'static str,
+) -> Result<i128> {
+    radii
+        .binary_search_by_key(&identity, |(candidate, _)| *candidate)
+        .ok()
+        .map(|index| radii[index].1)
+        .ok_or_else(|| Error::GraphAuthoritativeInput {
+            node: node.definition.guid,
+            input: input.to_owned(),
+        })
+}
+
 fn competition_claims(
     node: &CompiledGraphNode,
     candidates: &CandidateStream,
     communities: &CommunityTables,
     state: &mut EvaluationState<'_>,
 ) -> Result<CandidateStream> {
+    state.check_transient_memory(competition_scratch_bytes(
+        candidates.candidates.len() as u64
+    )?)?;
     let crown_weight = unit_parameter(node, "crownWeight", UnitInterval::ZERO)?;
     let root_weight = unit_parameter(node, "rootWeight", UnitInterval::ZERO)?;
     if crown_weight == UnitInterval::ZERO && root_weight == UnitInterval::ZERO {
@@ -6670,66 +10829,69 @@ fn competition_claims(
             reason: "competition crown and root weights cannot both be zero".to_owned(),
         });
     }
-    let radii = candidates
-        .candidates
-        .iter()
-        .map(|candidate| {
-            let family = candidate
-                .family
-                .ok_or_else(|| Error::GraphAuthoritativeInput {
-                    node: node.definition.guid,
-                    input: "plant family before competition".to_owned(),
-                })?;
-            let prototype = prototype_for_family(state, family)?;
-            let crown = prototype.crown_radius[0].max(prototype.crown_radius[1]);
-            let root = prototype.root_radius[0].max(prototype.root_radius[1]);
-            let crown =
-                crown.checked_mul(DecisionScalar::from_bits(i32::from(crown_weight.bits())))?;
-            let root =
-                root.checked_mul(DecisionScalar::from_bits(i32::from(root_weight.bits())))?;
-            Ok((
-                candidate.identity,
-                fixed_meters_to_ticks(crown.checked_add(root)?)?.unsigned_abs() as i128,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let maximum_radius = radii.values().copied().max().unwrap_or(0);
-    let maximum_pair_spacing = communities
-        .competition
-        .iter()
-        .map(|rule| fixed_meters_to_ticks(rule.spacing).map(|value| value.unsigned_abs() as i128))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let mut radii = Vec::new();
+    crate::memory::reserve_exact(&mut radii, candidates.candidates.len(), "competition radii")?;
+    for candidate in &candidates.candidates {
+        let family = candidate
+            .family
+            .ok_or_else(|| Error::GraphAuthoritativeInput {
+                node: node.definition.guid,
+                input: "plant family before competition".to_owned(),
+            })?;
+        let prototype = prototype_for_family(state, family)?;
+        let crown = prototype.crown_radius[0].max(prototype.crown_radius[1]);
+        let root = prototype.root_radius[0].max(prototype.root_radius[1]);
+        let crown = crown.checked_mul(DecisionScalar::from_bits(i32::from(crown_weight.bits())))?;
+        let root = root.checked_mul(DecisionScalar::from_bits(i32::from(root_weight.bits())))?;
+        radii.push((
+            candidate.identity,
+            fixed_meters_to_ticks(crown.checked_add(root)?)?.unsigned_abs() as i128,
+        ));
+    }
+    radii.sort_unstable_by_key(|(identity, _)| *identity);
+    let maximum_radius = radii.iter().map(|(_, radius)| *radius).max().unwrap_or(0);
+    let maximum_pair_spacing =
+        communities
+            .competition
+            .iter()
+            .try_fold(0_i128, |maximum, rule| {
+                Ok::<_, Error>(
+                    maximum.max(fixed_meters_to_ticks(rule.spacing)?.unsigned_abs() as i128),
+                )
+            })?;
     let maximum_support = maximum_radius
         .checked_mul(2)
         .ok_or(Error::NumericOverflow)?
         .max(maximum_pair_spacing);
     ensure_support_ticks(node, maximum_support)?;
     let bucket_size = maximum_support.max(1);
-    let mut buckets = BTreeMap::<(i128, i128), Vec<usize>>::new();
+    let mut buckets = Vec::<((i128, i128), usize)>::new();
+    crate::memory::reserve_exact(
+        &mut buckets,
+        candidates.candidates.len(),
+        "competition spatial index",
+    )?;
     for (index, candidate) in candidates.candidates.iter().enumerate() {
-        buckets
-            .entry(xz_bucket(candidate.position, bucket_size))
-            .or_default()
-            .push(index);
+        buckets.push((xz_bucket(candidate.position, bucket_size), index));
     }
+    buckets.sort_unstable();
     let mut accepted = Vec::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        candidates.candidates.len(),
+        "competition accepted candidates",
+    )?;
     for candidate in &candidates.candidates {
         let candidate_radius =
-            *radii
-                .get(&candidate.identity)
-                .ok_or_else(|| Error::GraphAuthoritativeInput {
-                    node: node.definition.guid,
-                    input: "competition radius".to_owned(),
-                })?;
+            lookup_candidate_radius(&radii, candidate.identity, node, "competition radius")?;
         let mut loses = false;
         let bucket = xz_bucket(candidate.position, bucket_size);
         'neighbours: for x in -1..=1 {
             for z in -1..=1 {
                 let key = offset_xz_bucket(bucket, x, z)?;
-                for index in buckets.get(&key).into_iter().flatten() {
+                let start = buckets.partition_point(|(bucket, _)| *bucket < key);
+                let end = buckets.partition_point(|(bucket, _)| *bucket <= key);
+                for (_, index) in &buckets[start..end] {
                     let other =
                         candidates
                             .candidates
@@ -6741,12 +10903,12 @@ fn competition_claims(
                     if candidate.identity == other.identity {
                         continue;
                     }
-                    let other_radius = *radii.get(&other.identity).ok_or_else(|| {
-                        Error::GraphAuthoritativeInput {
-                            node: node.definition.guid,
-                            input: "competition radius".to_owned(),
-                        }
-                    })?;
+                    let other_radius = lookup_candidate_radius(
+                        &radii,
+                        other.identity,
+                        node,
+                        "competition radius",
+                    )?;
                     let mut required = candidate_radius
                         .checked_add(other_radius)
                         .ok_or(Error::NumericOverflow)?;
@@ -6802,7 +10964,7 @@ fn competition_claims(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         } else {
             accepted.push(candidate.clone());
         }
@@ -6824,6 +10986,11 @@ fn threshold_candidates(
     ensure_lineage(node, "weights", candidates.lineage, weights.lineage)?;
     let threshold = i32::from(unit_parameter(node, "threshold", UnitInterval::ZERO)?.bits());
     let mut accepted = Vec::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        candidates.candidates.len(),
+        "threshold retained candidates",
+    )?;
     for candidate in &candidates.candidates {
         if weights
             .values
@@ -6840,7 +11007,7 @@ fn threshold_candidates(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         }
     }
     Ok(CandidateStream {
@@ -6867,6 +11034,11 @@ fn suitability_candidates(
         })?;
     let threshold = unit_parameter(node, "threshold", UnitInterval::ZERO)?;
     let mut accepted = Vec::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        candidates.candidates.len(),
+        "suitability retained candidates",
+    )?;
     for candidate in &candidates.candidates {
         let value = weights
             .values
@@ -6887,7 +11059,7 @@ fn suitability_candidates(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         }
     }
     Ok(CandidateStream {
@@ -6933,11 +11105,28 @@ fn expand_cluster(
     let radius = fixed_parameter(node, "radius", DecisionScalar::from_bits(0))?;
     let radius_ticks = fixed_meters_to_ticks(radius)?.unsigned_abs() as i128;
     let mode = cluster_mode_parameter(node, "mode")?;
-    let mut expanded = candidates.candidates.clone();
+    let maximum_output = candidates
+        .candidates
+        .len()
+        .checked_mul(
+            usize::try_from(children)
+                .map_err(|_| Error::NumericOverflow)?
+                .checked_add(1)
+                .ok_or(Error::NumericOverflow)?,
+        )
+        .ok_or(Error::NumericOverflow)?;
+    state.check_count(
+        "candidate count",
+        u64::try_from(maximum_output).map_err(|_| Error::NumericOverflow)?,
+        state.graph.limits.max_candidates,
+    )?;
+    let mut expanded = Vec::new();
+    crate::memory::reserve_exact(&mut expanded, maximum_output, "expanded cluster candidates")?;
+    expanded.extend(candidates.candidates.iter().cloned());
     for parent in &candidates.candidates {
         for child in 0..children {
             let ordinal =
-                candidate_ordinal(node, state, candidate_key_u128(parent.identity), child, 3);
+                candidate_ordinal(node, state, candidate_key_u128(parent.identity), child, 3)?;
             let stream = random_stream(
                 node,
                 state,
@@ -7002,17 +11191,61 @@ fn expand_companions(
         DecisionScalar::from_bits(0),
     )?)?
     .unsigned_abs() as i128;
-    let mut rules = unit.companions.clone();
-    rules.sort_by_key(|rule| (rule.parent.value(), rule.child.value()));
-    let mut expanded = candidates.candidates.clone();
-    let mut frontier = candidates.candidates.clone();
+    let mut rules: Vec<&crate::CompanionRule> = Vec::new();
+    crate::memory::reserve_exact(&mut rules, unit.companions.len(), "companion rules")?;
+    rules.extend(&unit.companions);
+    rules.sort_unstable_by_key(|rule| {
+        (
+            rule.parent.value(),
+            rule.child.value(),
+            rule.minimum_distance,
+            rule.maximum_distance,
+            rule.probability,
+        )
+    });
+    let mut maximum_output = candidates.candidates.len() as u64;
+    let mut generation = candidates.candidates.len() as u64;
+    for _ in 0..maximum_depth {
+        generation = generation
+            .checked_mul(children)
+            .ok_or(Error::NumericOverflow)?;
+        maximum_output = maximum_output
+            .checked_add(generation)
+            .ok_or(Error::NumericOverflow)?;
+    }
+    state.check_count(
+        "candidate count",
+        maximum_output,
+        state.graph.limits.max_candidates,
+    )?;
+    state.check_transient_memory(companion_scratch_bytes(
+        candidates.candidates.len() as u64,
+        maximum_output,
+        unit.companions.len() as u64,
+    )?)?;
+    let maximum_output = usize::try_from(maximum_output).map_err(|_| Error::NumericOverflow)?;
+    let mut expanded = Vec::new();
+    crate::memory::reserve_exact(&mut expanded, maximum_output, "expanded companions")?;
+    expanded.extend(candidates.candidates.iter().cloned());
+    let mut frontier = Vec::new();
+    crate::memory::reserve_exact(
+        &mut frontier,
+        candidates.candidates.len(),
+        "companion frontier",
+    )?;
+    frontier.extend(candidates.candidates.iter().cloned());
     for depth in 1..=maximum_depth {
         let mut next = Vec::new();
+        let next_capacity = frontier
+            .len()
+            .checked_mul(usize::try_from(children).map_err(|_| Error::NumericOverflow)?)
+            .ok_or(Error::NumericOverflow)?;
+        crate::memory::reserve_exact(&mut next, next_capacity, "companion frontier")?;
         for parent in &frontier {
-            let eligible = rules
+            let eligible_count = rules
                 .iter()
                 .filter(|rule| parent.family.is_some_and(|family| rule.parent == family))
-                .collect::<Vec<_>>();
+                .count();
             for child in 0..children {
                 let ordinal = candidate_ordinal(
                     node,
@@ -7020,7 +11253,7 @@ fn expand_companions(
                     candidate_key_u128(parent.identity),
                     child,
                     u32::try_from(depth).map_err(|_| Error::NumericOverflow)?,
-                );
+                )?;
                 let stream = random_stream(
                     node,
                     state,
@@ -7030,15 +11263,17 @@ fn expand_companions(
                         .with_species(parent.family.map_or(0, |family| u128::from(family.value())))
                         .with_channel(u32::try_from(depth).map_err(|_| Error::NumericOverflow)?),
                 )?;
-                let rule = if eligible.is_empty() {
+                let rule = if eligible_count == 0 {
                     None
                 } else {
-                    Some(
-                        eligible[usize::try_from(
-                            u64::from(stream.lane(0, 0)) % eligible.len() as u64,
-                        )
-                        .map_err(|_| Error::NumericOverflow)?],
-                    )
+                    let selected =
+                        usize::try_from(u64::from(stream.lane(0, 0)) % eligible_count as u64)
+                            .map_err(|_| Error::NumericOverflow)?;
+                    rules
+                        .iter()
+                        .filter(|rule| parent.family.is_some_and(|family| rule.parent == family))
+                        .nth(selected)
+                        .copied()
                 };
                 if rule.is_some_and(|rule| !stream.chance(0, 1, rule.probability)) {
                     continue;
@@ -7080,7 +11315,7 @@ fn expand_companions(
                 next.push(candidate);
             }
         }
-        next.sort_by_key(|candidate| candidate.identity);
+        next.sort_unstable_by_key(|candidate| candidate.identity);
         expanded.extend(next.iter().cloned());
         frontier = next;
     }
@@ -7110,17 +11345,60 @@ fn follow_splines(
         "edgeOffset",
         DecisionScalar::from_bits(0),
     )?)?;
+    let region_upper = if state.inputs.regions.is_empty() {
+        cell_region_count(state.inputs.read_bounds, state.inputs.output_cell.level())? as u64
+    } else {
+        state.inputs.regions.len() as u64
+    };
+    state.check_transient_memory(stage_region_scratch_bytes(region_upper)?)?;
     let stage_regions = stage_regions(node, &state.inputs.regions, state)?;
-    let mut ordered = splines.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|spline| spline.id);
-    if ordered.windows(2).any(|pair| pair[0].id == pair[1].id) {
+    if splines.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err(Error::GraphDocument {
             path: node.debug_symbol.label.clone(),
             reason: "spline identities must be unique".to_owned(),
         });
     }
+    let mut maximum_candidates = 0_usize;
+    for spline in splines {
+        let segments = spline_segments(&spline.points)?;
+        let total_length = segments.iter().try_fold(0_i128, |total, segment| {
+            total
+                .checked_add(segment.length)
+                .ok_or(Error::NumericOverflow)
+        })?;
+        maximum_candidates = maximum_candidates
+            .checked_add(
+                usize::try_from(total_length / spacing_ticks)
+                    .map_err(|_| Error::NumericOverflow)?
+                    .checked_add(1)
+                    .ok_or(Error::NumericOverflow)?,
+            )
+            .ok_or(Error::NumericOverflow)?;
+    }
+    state.check_count(
+        "candidate count",
+        maximum_candidates as u64,
+        state.graph.limits.max_candidates,
+    )?;
+    let spline_points = splines.iter().try_fold(0_u64, |total, spline| {
+        total
+            .checked_add(spline.points.len() as u64)
+            .ok_or(Error::NumericOverflow)
+    })?;
+    state.check_transient_memory(checked_memory_sum([
+        requested_vec_bound::<EvaluationRegion>(stage_regions.len() as u64)?,
+        requested_vec_bound::<[i128; 3]>(spline_points)?,
+        requested_vec_bound::<SplineSegment>(spline_points)?,
+        requested_vec_bound::<[i128; 3]>(maximum_candidates as u64)?,
+        requested_vec_bound::<GraphCandidate>(maximum_candidates as u64)?,
+    ])?)?;
     let mut candidates = Vec::new();
-    for spline in ordered {
+    crate::memory::reserve_exact(
+        &mut candidates,
+        maximum_candidates,
+        "spline-follow candidates",
+    )?;
+    for spline in splines {
         let segments = spline_segments(&spline.points)?;
         for (sample_index, ticks) in sample_spline_segments(&segments, spacing_ticks, edge_offset)?
             .into_iter()
@@ -7137,7 +11415,7 @@ fn follow_splines(
                     spline.id,
                     u64::try_from(sample_index).map_err(|_| Error::NumericOverflow)?,
                     2,
-                );
+                )?;
                 let mut candidate = default_candidate(node, state, ordinal, 0, position)?;
                 candidate.source_layer = spline.layer;
                 candidates.push(candidate);
@@ -7168,12 +11446,12 @@ fn sample_spline_segments(
     let mut segment_index = 0_usize;
     let mut segment_start_distance = 0_i128;
     let sample_count = total_length / spacing_ticks;
-    let mut samples = Vec::with_capacity(
-        usize::try_from(sample_count)
-            .ok()
-            .and_then(|count| count.checked_add(1))
-            .ok_or(Error::NumericOverflow)?,
-    );
+    let sample_capacity = usize::try_from(sample_count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or(Error::NumericOverflow)?;
+    let mut samples = Vec::new();
+    crate::memory::reserve_exact(&mut samples, sample_capacity, "spline samples")?;
     for sample_index in 0..=sample_count {
         let distance = sample_index
             .checked_mul(spacing_ticks)
@@ -7228,6 +11506,7 @@ struct SplineSegment {
 
 fn spline_segments(points: &[WorldPosition]) -> Result<Vec<SplineSegment>> {
     let mut canonical = Vec::<[i128; 3]>::new();
+    crate::memory::reserve_exact(&mut canonical, points.len(), "canonical spline points")?;
     for point in points {
         let point = point.global_ticks();
         if canonical.last() == Some(&point) {
@@ -7247,6 +11526,11 @@ fn spline_segments(points: &[WorldPosition]) -> Result<Vec<SplineSegment>> {
     }
 
     let mut segments = Vec::new();
+    crate::memory::reserve_exact(
+        &mut segments,
+        canonical.len().saturating_sub(1),
+        "spline segments",
+    )?;
     let mut previous_lateral = None;
     for points in canonical.windows(2) {
         let start = points[0];
@@ -7378,6 +11662,11 @@ fn transform_candidates(
         }
     }
     let mut transformed = Vec::new();
+    crate::memory::reserve_exact(
+        &mut transformed,
+        candidates.candidates.len(),
+        "transformed candidates",
+    )?;
     for candidate in &candidates.candidates {
         let mut candidate = candidate.clone();
         if let Some(projected) = surface.and_then(|surface| surface.values.get(&candidate.identity))
@@ -7389,10 +11678,9 @@ fn transform_candidates(
             candidate.surface_projection = projected.projection;
         }
         if let Some(offset) = offsets.and_then(|field| field.values.get(&candidate.identity)) {
-            let offset_ticks = [offset.x, offset.y, offset.z]
-                .map(fixed_meters_to_ticks)
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
+            let [offset_x, offset_y, offset_z] =
+                [offset.x, offset.y, offset.z].map(fixed_meters_to_ticks);
+            let offset_ticks = [offset_x?, offset_y?, offset_z?];
             let offset_length = integer_sqrt(distance_squared(
                 [0; 3],
                 [offset_ticks[0], offset_ticks[1], offset_ticks[2]],
@@ -7447,8 +11735,15 @@ fn priority_exclusion(
 ) -> Result<CandidateStream> {
     ensure_lineage(node, "weights", candidates.lineage, weights.lineage)?;
     ensure_lineage(node, "radius", candidates.lineage, radii.lineage)?;
+    state.check_transient_memory(xz_filter_scratch_bytes(candidates.candidates.len() as u64)?)?;
     let keep_highest = bool_parameter(node, "keepHighest", true)?;
-    let mut transformed = candidates.candidates.clone();
+    let mut transformed = Vec::new();
+    crate::memory::reserve_exact(
+        &mut transformed,
+        candidates.candidates.len(),
+        "priority-exclusion candidates",
+    )?;
+    transformed.extend(candidates.candidates.iter().cloned());
     for candidate in &mut transformed {
         if let Some(weight) = weights.values.get(&candidate.identity) {
             candidate.priority = if keep_highest {
@@ -7460,64 +11755,79 @@ fn priority_exclusion(
             };
         }
     }
-    let radius_ticks = candidates
-        .candidates
-        .iter()
-        .map(|candidate| {
-            let radius = radii
-                .values
-                .get(&candidate.identity)
-                .copied()
-                .ok_or_else(|| Error::GraphAuthoritativeInput {
-                    node: node.definition.guid,
-                    input: "priority-exclusion radius sample".to_owned(),
-                })?;
-            Ok((
-                candidate.identity,
-                nonnegative_radius_ticks(node, "priority-exclusion radius sample", radius)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut radius_ticks = Vec::new();
+    crate::memory::reserve_exact(
+        &mut radius_ticks,
+        candidates.candidates.len(),
+        "priority-exclusion radii",
+    )?;
+    for candidate in &candidates.candidates {
+        let radius = radii
+            .values
+            .get(&candidate.identity)
+            .copied()
+            .ok_or_else(|| Error::GraphAuthoritativeInput {
+                node: node.definition.guid,
+                input: "priority-exclusion radius sample".to_owned(),
+            })?;
+        radius_ticks.push((
+            candidate.identity,
+            nonnegative_radius_ticks(node, "priority-exclusion radius sample", radius)?,
+        ));
+    }
+    radius_ticks.sort_unstable_by_key(|(identity, _)| *identity);
     let maximum_support = radius_ticks
-        .values()
-        .copied()
+        .iter()
+        .map(|(_, radius)| *radius)
         .max()
         .unwrap_or(0)
         .checked_mul(2)
         .ok_or(Error::NumericOverflow)?;
     ensure_support_ticks(node, maximum_support)?;
     let bucket_size = maximum_support.max(1);
-    transformed.sort_by(|left, right| {
+    transformed.sort_unstable_by(|left, right| {
         right
             .priority
             .cmp(&left.priority)
             .then_with(|| left.identity.cmp(&right.identity))
     });
     let mut accepted: Vec<GraphCandidate> = Vec::new();
-    let mut buckets = BTreeMap::<(i128, i128), Vec<usize>>::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        candidates.candidates.len(),
+        "priority-exclusion accepted candidates",
+    )?;
+    let mut bucket_heads = BTreeMap::<(i128, i128), usize>::new();
+    let mut bucket_links = Vec::<Option<usize>>::new();
+    crate::memory::reserve_exact(
+        &mut bucket_links,
+        candidates.candidates.len(),
+        "priority-exclusion bucket links",
+    )?;
     for candidate in transformed {
-        let radius = *radius_ticks.get(&candidate.identity).ok_or_else(|| {
-            Error::GraphAuthoritativeInput {
-                node: node.definition.guid,
-                input: "priority-exclusion radius sample".to_owned(),
-            }
-        })?;
+        let radius = lookup_candidate_radius(
+            &radius_ticks,
+            candidate.identity,
+            node,
+            "priority-exclusion radius sample",
+        )?;
         let mut excluded = false;
         let bucket = xz_bucket(candidate.position, bucket_size);
         'neighbours: for x in -1..=1 {
             for z in -1..=1 {
                 let key = offset_xz_bucket(bucket, x, z)?;
-                for index in buckets.get(&key).into_iter().flatten() {
-                    let other = accepted.get(*index).ok_or_else(|| Error::GraphDocument {
+                let mut index = bucket_heads.get(&key).copied();
+                while let Some(current) = index {
+                    let other = accepted.get(current).ok_or_else(|| Error::GraphDocument {
                         path: node.debug_symbol.label.clone(),
                         reason: "priority-exclusion spatial index is invalid".to_owned(),
                     })?;
-                    let other_radius = *radius_ticks.get(&other.identity).ok_or_else(|| {
-                        Error::GraphAuthoritativeInput {
-                            node: node.definition.guid,
-                            input: "priority-exclusion radius sample".to_owned(),
-                        }
-                    })?;
+                    let other_radius = lookup_candidate_radius(
+                        &radius_ticks,
+                        other.identity,
+                        node,
+                        "priority-exclusion radius sample",
+                    )?;
                     let required = radius
                         .checked_add(other_radius)
                         .ok_or(Error::NumericOverflow)?;
@@ -7530,6 +11840,12 @@ fn priority_exclusion(
                         excluded = true;
                         break 'neighbours;
                     }
+                    index = *bucket_links
+                        .get(current)
+                        .ok_or_else(|| Error::GraphDocument {
+                            path: node.debug_symbol.label.clone(),
+                            reason: "priority-exclusion spatial index is invalid".to_owned(),
+                        })?;
                 }
             }
         }
@@ -7542,9 +11858,10 @@ fn priority_exclusion(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         } else {
-            buckets.entry(bucket).or_default().push(accepted.len());
+            let index = accepted.len();
+            bucket_links.push(bucket_heads.insert(bucket, index));
             accepted.push(candidate);
         }
     }
@@ -7573,20 +11890,23 @@ fn bounds_overlap(
     candidates: &CandidateStream,
     state: &mut EvaluationState<'_>,
 ) -> Result<CandidateStream> {
+    state.check_transient_memory(bounds_overlap_scratch_bytes(
+        candidates.candidates.len() as u64
+    )?)?;
     let padding = fixed_parameter(node, "padding", DecisionScalar::from_bits(0))?;
     let padding_ticks = fixed_meters_to_ticks(padding)?.unsigned_abs() as i128;
-    let mut ordered = candidates
-        .candidates
-        .iter()
-        .cloned()
-        .map(|candidate| {
-            let bounds =
-                expand_bounds_checked(candidate_bounds(&candidate, state)?, padding_ticks)?;
-            let radius = bounds_support_radius(candidate.position, bounds)?;
-            ensure_support_ticks(node, radius)?;
-            Ok((candidate, bounds, radius))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut ordered = Vec::new();
+    crate::memory::reserve_exact(
+        &mut ordered,
+        candidates.candidates.len(),
+        "bounds-overlap candidates",
+    )?;
+    for candidate in candidates.candidates.iter().cloned() {
+        let bounds = expand_bounds_checked(candidate_bounds(&candidate, state)?, padding_ticks)?;
+        let radius = bounds_support_radius(candidate.position, bounds)?;
+        ensure_support_ticks(node, radius)?;
+        ordered.push((candidate, bounds, radius));
+    }
     let maximum_support = ordered
         .iter()
         .map(|(_, _, radius)| *radius)
@@ -7596,7 +11916,7 @@ fn bounds_overlap(
         .ok_or(Error::NumericOverflow)?;
     ensure_support_ticks(node, maximum_support)?;
     let bucket_size = maximum_support.max(1);
-    ordered.sort_by(|left, right| {
+    ordered.sort_unstable_by(|left, right| {
         right
             .0
             .priority
@@ -7604,7 +11924,18 @@ fn bounds_overlap(
             .then_with(|| left.0.identity.cmp(&right.0.identity))
     });
     let mut accepted: Vec<(GraphCandidate, WorldBounds, i128)> = Vec::new();
-    let mut buckets = BTreeMap::<(i128, i128, i128), Vec<usize>>::new();
+    crate::memory::reserve_exact(
+        &mut accepted,
+        candidates.candidates.len(),
+        "bounds-overlap accepted candidates",
+    )?;
+    let mut bucket_heads = BTreeMap::<(i128, i128, i128), usize>::new();
+    let mut bucket_links = Vec::<Option<usize>>::new();
+    crate::memory::reserve_exact(
+        &mut bucket_links,
+        candidates.candidates.len(),
+        "bounds-overlap bucket links",
+    )?;
     for (candidate, bounds, radius) in ordered {
         let mut overlaps = false;
         let bucket = xyz_bucket(candidate.position, bucket_size);
@@ -7612,9 +11943,10 @@ fn bounds_overlap(
             for y in -1..=1 {
                 for z in -1..=1 {
                     let key = offset_xyz_bucket(bucket, x, y, z)?;
-                    for index in buckets.get(&key).into_iter().flatten() {
+                    let mut index = bucket_heads.get(&key).copied();
+                    while let Some(current) = index {
                         let (_, other_bounds, other_radius) =
-                            accepted.get(*index).ok_or_else(|| Error::GraphDocument {
+                            accepted.get(current).ok_or_else(|| Error::GraphDocument {
                                 path: node.debug_symbol.label.clone(),
                                 reason: "bounds-overlap spatial index is invalid".to_owned(),
                             })?;
@@ -7626,6 +11958,12 @@ fn bounds_overlap(
                             overlaps = true;
                             break 'neighbours;
                         }
+                        index = *bucket_links
+                            .get(current)
+                            .ok_or_else(|| Error::GraphDocument {
+                                path: node.debug_symbol.label.clone(),
+                                reason: "bounds-overlap spatial index is invalid".to_owned(),
+                            })?;
                     }
                 }
             }
@@ -7639,18 +11977,23 @@ fn bounds_overlap(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
         } else {
-            buckets.entry(bucket).or_default().push(accepted.len());
+            let index = accepted.len();
+            bucket_links.push(bucket_heads.insert(bucket, index));
             accepted.push((candidate, bounds, radius));
         }
     }
+    let mut retained = Vec::new();
+    crate::memory::reserve_exact(
+        &mut retained,
+        accepted.len(),
+        "bounds-overlap retained candidates",
+    )?;
+    retained.extend(accepted.into_iter().map(|(candidate, _, _)| candidate));
     let mut result = CandidateStream {
         lineage: candidates.lineage,
-        candidates: accepted
-            .into_iter()
-            .map(|(candidate, _, _)| candidate)
-            .collect(),
+        candidates: retained,
     };
     result.canonicalize()?;
     Ok(result)
@@ -7669,38 +12012,55 @@ fn community_blend(
     if let Some(shade) = shade {
         ensure_lineage(node, "shade", candidates.lineage, shade.lineage)?;
     }
+    state.check_transient_memory(community_blend_scratch_bytes(
+        candidates.candidates.len() as u64,
+        unit.palette.len() as u64,
+    )?)?;
+    let mut palette = Vec::new();
+    crate::memory::reserve_exact(&mut palette, unit.palette.len(), "community palette")?;
+    palette.extend(unit.palette.iter().cloned());
+    palette.sort_unstable_by_key(|entry| entry.plant.value());
+    let mut weights = Vec::new();
+    crate::memory::reserve_exact(&mut weights, palette.len(), "community weights")?;
     let mut result = Vec::new();
+    crate::memory::reserve_exact(
+        &mut result,
+        candidates.candidates.len(),
+        "community candidates",
+    )?;
     for source_candidate in &candidates.candidates {
         let mut candidate = source_candidate.clone();
         let shade_value = shade
             .and_then(|field| field.values.get(&candidate.identity))
             .map_or(0, |value| value.bits().clamp(0, i32::from(u16::MAX)) as u16);
-        let mut weights =
-            unit.palette
-                .iter()
-                .try_fold(BTreeMap::<u64, u64>::new(), |mut weights, entry| {
-                    let prototype = prototype_for_family(state, entry.plant)?;
-                    let tolerance = prototype
-                        .shade_tolerance
-                        .bits()
-                        .saturating_add(shade_bias.bits());
-                    let shade_scale =
-                        u64::from(u16::MAX.saturating_sub(shade_value.saturating_sub(tolerance)));
-                    weights.insert(
-                        entry.plant.value(),
-                        u64::from(entry.weight.bits())
-                            .checked_mul(shade_scale)
-                            .ok_or(Error::NumericOverflow)?,
-                    );
-                    Ok::<_, Error>(weights)
-                })?;
-        let mut succession = communities.succession.clone();
-        succession.sort_by_key(|rule| (rule.minimum_tick, rule.from.value(), rule.to.value()));
-        for rule in succession
+        weights.clear();
+        for entry in &palette {
+            let prototype = prototype_for_family(state, entry.plant)?;
+            let tolerance = prototype
+                .shade_tolerance
+                .bits()
+                .saturating_add(shade_bias.bits());
+            let shade_scale =
+                u64::from(u16::MAX.saturating_sub(shade_value.saturating_sub(tolerance)));
+            weights.push((
+                entry.plant.value(),
+                u64::from(entry.weight.bits())
+                    .checked_mul(shade_scale)
+                    .ok_or(Error::NumericOverflow)?,
+            ));
+        }
+        for rule in communities
+            .succession
             .iter()
             .filter(|rule| state.inputs.ecology_tick >= rule.minimum_tick)
         {
-            let from = weights.get(&rule.from.value()).copied().unwrap_or(0);
+            let from_index = weights
+                .binary_search_by_key(&rule.from.value(), |(family, _)| *family)
+                .map_err(|_| Error::NumericOverflow)?;
+            let to_index = weights
+                .binary_search_by_key(&rule.to.value(), |(family, _)| *family)
+                .map_err(|_| Error::NumericOverflow)?;
+            let from = weights[from_index].1;
             let transfer = from
                 .checked_mul(u64::from(rule.probability.bits()))
                 .ok_or(Error::NumericOverflow)?
@@ -7708,29 +12068,30 @@ fn community_blend(
             if transfer == 0 {
                 continue;
             }
-            weights.insert(rule.from.value(), from - transfer);
-            let to = weights.get(&rule.to.value()).copied().unwrap_or(0);
-            weights.insert(
-                rule.to.value(),
-                to.checked_add(transfer).ok_or(Error::NumericOverflow)?,
-            );
+            weights[from_index].1 = from - transfer;
+            weights[to_index].1 = weights[to_index]
+                .1
+                .checked_add(transfer)
+                .ok_or(Error::NumericOverflow)?;
         }
         if let Some(parent) = candidate.parent.and_then(|parent| parent.family) {
-            let mut companions = communities.companions.clone();
-            companions.sort_by_key(|rule| (rule.parent.value(), rule.child.value()));
-            for rule in companions.iter().filter(|rule| rule.parent == parent) {
-                let child = weights.get(&rule.child.value()).copied().unwrap_or(0);
+            for rule in communities
+                .companions
+                .iter()
+                .filter(|rule| rule.parent == parent)
+            {
+                let child_index = weights
+                    .binary_search_by_key(&rule.child.value(), |(family, _)| *family)
+                    .map_err(|_| Error::NumericOverflow)?;
+                let child = weights[child_index].1;
                 let boost = child
                     .checked_mul(u64::from(rule.probability.bits()))
                     .ok_or(Error::NumericOverflow)?
                     / u64::from(u16::MAX);
-                weights.insert(
-                    rule.child.value(),
-                    child.checked_add(boost).ok_or(Error::NumericOverflow)?,
-                );
+                weights[child_index].1 = child.checked_add(boost).ok_or(Error::NumericOverflow)?;
             }
         }
-        let total = weights.values().try_fold(0_u64, |total, weight| {
+        let total = weights.iter().try_fold(0_u64, |total, (_, weight)| {
             total.checked_add(*weight).ok_or(Error::NumericOverflow)
         })?;
         if total == 0 {
@@ -7742,7 +12103,7 @@ fn community_blend(
                 source_candidate.family,
                 source_candidate.variation,
                 state,
-            );
+            )?;
             continue;
         }
         let stream = random_stream(
@@ -7754,7 +12115,7 @@ fn community_blend(
                 .with_channel(3),
         )?;
         let mut selection = u64::from(stream.lane(0, 0)) % total;
-        for (family, weight) in weights {
+        for &(family, weight) in &weights {
             if selection < weight {
                 let family = Uuid(family);
                 let prototype = prototype_for_family(state, family)?;
@@ -7779,15 +12140,14 @@ fn succession_input(
     unit: &CompiledGraphUnit,
     state: &EvaluationState<'_>,
 ) -> Result<CandidateStream> {
-    let mut rules = unit.succession.clone();
-    rules.sort_by_key(|rule| (rule.from.value(), rule.minimum_tick, rule.to.value()));
     let mut result = candidates.clone();
     for candidate in &mut result.candidates {
         let Some(family) = candidate.family else {
             candidate.ecology_tick = state.inputs.ecology_tick;
             continue;
         };
-        if let Some(rule) = rules
+        if let Some(rule) = unit
+            .succession
             .iter()
             .filter(|rule| rule.from == family && rule.minimum_tick <= state.inputs.ecology_tick)
             .max_by_key(|rule| (rule.minimum_tick, rule.to.value()))
@@ -7798,7 +12158,7 @@ fn succession_input(
                 &rule.to.value().to_be_bytes(),
                 &rule.minimum_tick.to_be_bytes(),
                 &state.inputs.ecology_tick.to_be_bytes(),
-            ]);
+            ])?;
             let stream = random_stream(
                 node,
                 state,
@@ -7810,8 +12170,7 @@ fn succession_input(
             if stream.chance(0, 0, rule.probability) {
                 let prototype = prototype_for_family(state, rule.to)?;
                 candidate.family = Some(rule.to);
-                candidate.crown_radius =
-                    prototype.crown_radius[0].max(prototype.crown_radius[1]);
+                candidate.crown_radius = prototype.crown_radius[0].max(prototype.crown_radius[1]);
                 candidate.root_radius = prototype.root_radius[0].max(prototype.root_radius[1]);
             }
         }
@@ -7838,7 +12197,7 @@ fn diagnostic_output(
     };
     let label = string_parameter(node, "label", "")?;
     let label = if label.is_empty() {
-        node.debug_symbol.label.clone()
+        node.debug_symbol.label.as_str()
     } else {
         label
     };
@@ -7858,7 +12217,7 @@ fn diagnostic_output(
     );
     Ok(NamedDiagnosticStream {
         node: node.address(),
-        label,
+        label: label.to_owned(),
         scope,
         candidates: candidates.map(|stream| {
             stream
@@ -7903,6 +12262,9 @@ fn macro_output(
         );
     }
     let candidates = candidates_input(inputs, "candidates")?;
+    state.check_transient_memory(macro_output_scratch_bytes(
+        candidates.candidates.len() as u64
+    )?)?;
     let species = species_input(inputs, "species")?;
     let representation_class = match node.definition.parameter("representationClass") {
         Some(GraphParameterValue::U32(value)) => Some(*value),
@@ -7914,7 +12276,12 @@ fn macro_output(
         Some(_) => return wrong_parameter(node, "phenotype"),
         None => None,
     };
-    let mut owned = Vec::new();
+    let mut resolved = Vec::new();
+    crate::memory::reserve_exact(
+        &mut resolved,
+        candidates.candidates.len(),
+        "macro resolved candidates",
+    )?;
     for candidate in &candidates.candidates {
         if candidate.owner != state.inputs.output_cell {
             if candidate.owner.level() > state.inputs.output_cell.level()
@@ -7935,14 +12302,9 @@ fn macro_output(
                 candidate.family,
                 candidate.variation,
                 state,
-            );
+            )?;
             continue;
         }
-        owned.push(candidate);
-    }
-
-    let mut resolved = Vec::with_capacity(owned.len());
-    for candidate in owned {
         let family = match candidate.family {
             Some(family) => Some(family),
             None => select_species(node, candidate.owner, candidate.identity, species, state)?,
@@ -7956,7 +12318,7 @@ fn macro_output(
                 None,
                 candidate.variation,
                 state,
-            );
+            )?;
             continue;
         };
         let seed_namespace = species_seed_namespace(node, family, species)?;
@@ -7978,18 +12340,16 @@ fn macro_output(
         );
         resolved.push((candidate, family, id));
     }
-    let ids_by_candidate = resolved
-        .iter()
-        .map(|(candidate, _, id)| (candidate.identity, *id))
-        .collect::<BTreeMap<_, _>>();
 
-    let mut points = Vec::with_capacity(resolved.len());
-    for (candidate, family, id) in resolved {
+    let mut points = Vec::new();
+    crate::memory::reserve_exact(&mut points, resolved.len(), "macro plant points")?;
+    for &(candidate, family, id) in &resolved {
         let authored = candidate.authored_point.as_ref();
         let parent = match candidate.parent {
-            Some(reference) => ids_by_candidate
-                .get(&reference.identity)
-                .copied()
+            Some(reference) => resolved
+                .binary_search_by_key(&reference.identity, |candidate| candidate.0.identity)
+                .ok()
+                .and_then(|index| resolved.get(index).map(|(_, _, id)| *id))
                 .map(Some)
                 .unwrap_or(resolve_candidate_reference(
                     node, reference, species, state,
@@ -7997,9 +12357,10 @@ fn macro_output(
             None => authored.and_then(|point| point.parent),
         };
         let colony = match candidate.colony {
-            Some(reference) => ids_by_candidate
-                .get(&reference.identity)
-                .copied()
+            Some(reference) => resolved
+                .binary_search_by_key(&reference.identity, |candidate| candidate.0.identity)
+                .ok()
+                .and_then(|index| resolved.get(index).map(|(_, _, id)| *id))
                 .map(Some)
                 .unwrap_or(resolve_candidate_reference(
                     node, reference, species, state,
@@ -8094,128 +12455,168 @@ fn micro_output(
     }
     let dimensions = u32_vec3_parameter(node, "dimensions")?;
     let channels = guid_list_parameter(node, "attributeChannels")?;
-    let count = dimensions.iter().try_fold(1_u64, |product, value| {
+    let samples_per_family = dimensions.iter().try_fold(1_u64, |product, value| {
         product
             .checked_mul(u64::from(*value))
             .ok_or(Error::NumericOverflow)
     })?;
-    state.check_count("micro samples", count, state.graph.limits.max_micro_samples)?;
-    let bytes_per_sample = (channels.len() as u64)
-        .checked_mul(20)
-        .and_then(|value| value.checked_add(10))
-        .ok_or(Error::NumericOverflow)?;
-    state.check_count(
-        "memory bytes",
-        count
-            .checked_mul(bytes_per_sample)
-            .ok_or(Error::NumericOverflow)?,
-        state.graph.limits.max_memory_bytes,
+    let mut families = Vec::new();
+    crate::memory::reserve_exact(
+        &mut families,
+        candidates.candidates.len(),
+        "micro candidate families",
     )?;
-    let sample_count = usize::try_from(count).map_err(|_| Error::NumericOverflow)?;
-    let mut samples = vec![0_u16; sample_count];
-    let mut attribute_weights = vec![0_u64; sample_count];
-    let attribute_fields = channels
-        .iter()
-        .map(|channel| {
-            let name = format!("attribute-{channel:032x}");
-            let field = scalar_input(inputs, &name)?;
-            ensure_lineage(node, &name, candidates.lineage, field.lineage)?;
-            Ok((*channel, field))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut attribute_sums = channels
-        .iter()
-        .map(|channel| (*channel, vec![0_i128; sample_count]))
-        .collect::<BTreeMap<_, _>>();
-    let bounds = state.inputs.output_bounds;
     for candidate in &candidates.candidates {
         if candidate.owner != state.inputs.output_cell {
             continue;
         }
-        let index = tile_index(candidate.position, bounds, dimensions)?;
-        let value = density
-            .and_then(|field| field.values.get(&candidate.identity))
-            .map_or(u16::MAX, |value| {
-                value.bits().clamp(0, i32::from(u16::MAX)) as u16
-            });
-        samples[index] = samples[index].saturating_add(value);
-        attribute_weights[index] = attribute_weights[index]
-            .checked_add(u64::from(value))
-            .ok_or(Error::NumericOverflow)?;
-        for (channel, field) in &attribute_fields {
-            let attribute = field.values.get(&candidate.identity).ok_or_else(|| {
-                Error::GraphAuthoritativeInput {
+        families.push(
+            candidate
+                .family
+                .ok_or_else(|| Error::GraphAuthoritativeInput {
                     node: node.definition.guid,
-                    input: format!("micro attribute {channel:032x}"),
-                }
-            })?;
-            let weighted = i128::from(attribute.bits())
-                .checked_mul(i128::from(value))
-                .ok_or(Error::NumericOverflow)?;
-            let sums = attribute_sums
-                .get_mut(channel)
-                .ok_or_else(|| Error::GraphDocument {
-                    path: format!("{}.parameters.attributeChannels", node.debug_symbol.label),
-                    reason: format!("micro attribute channel {channel:032x} was not allocated"),
-                })?;
-            sums[index] = sums[index]
-                .checked_add(weighted)
-                .ok_or(Error::NumericOverflow)?;
-        }
+                    input: "micro candidate family".to_owned(),
+                })?,
+        );
     }
-    let attributes = attribute_sums
-        .into_iter()
-        .map(|(channel, sums)| {
-            let values = sums
-                .into_iter()
-                .zip(&attribute_weights)
-                .map(|(sum, weight)| {
-                    if *weight == 0 {
-                        return Ok(0);
+    families.sort_unstable_by_key(|family| family.value());
+    families.dedup_by_key(|family| family.value());
+    let family_count = u64::try_from(families.len()).map_err(|_| Error::NumericOverflow)?;
+    let total_samples = samples_per_family
+        .checked_mul(family_count)
+        .ok_or(Error::NumericOverflow)?;
+    state.check_count(
+        "micro samples",
+        total_samples,
+        state.graph.limits.max_micro_samples,
+    )?;
+    state.check_transient_memory(micro_output_scratch_bytes(
+        total_samples,
+        channels.len() as u64,
+    )?)?;
+    let sample_count = usize::try_from(samples_per_family).map_err(|_| Error::NumericOverflow)?;
+    let mut attribute_fields = Vec::new();
+    crate::memory::reserve_exact(
+        &mut attribute_fields,
+        channels.len(),
+        "micro attribute fields",
+    )?;
+    for channel in channels {
+        let name = format!("attribute-{channel:032x}");
+        let field = scalar_input(inputs, &name)?;
+        ensure_lineage(node, &name, candidates.lineage, field.lineage)?;
+        attribute_fields.push((*channel, field));
+    }
+    let bounds = state.inputs.output_bounds;
+    let mut tiles = Vec::new();
+    crate::memory::reserve_exact(&mut tiles, families.len(), "micro family tiles")?;
+    for family in families {
+        let mut samples = Vec::new();
+        crate::memory::reserve_exact(&mut samples, sample_count, "micro density")?;
+        samples.resize(sample_count, 0_u16);
+        let mut attribute_weights = Vec::new();
+        crate::memory::reserve_exact(
+            &mut attribute_weights,
+            sample_count,
+            "micro attribute weights",
+        )?;
+        attribute_weights.resize(sample_count, 0_u64);
+        let mut attribute_sums = BTreeMap::new();
+        for (channel, _) in &attribute_fields {
+            let mut sums = Vec::new();
+            crate::memory::reserve_exact(&mut sums, sample_count, "micro attribute sums")?;
+            sums.resize(sample_count, 0_i128);
+            attribute_sums.insert(*channel, sums);
+        }
+        for candidate in &candidates.candidates {
+            if candidate.owner != state.inputs.output_cell || candidate.family != Some(family) {
+                continue;
+            }
+            let index = tile_index(candidate.position, bounds, dimensions)?;
+            let value = density
+                .and_then(|field| field.values.get(&candidate.identity))
+                .map_or(u16::MAX, |value| {
+                    value.bits().clamp(0, i32::from(u16::MAX)) as u16
+                });
+            samples[index] = samples[index].saturating_add(value);
+            attribute_weights[index] = attribute_weights[index]
+                .checked_add(u64::from(value))
+                .ok_or(Error::NumericOverflow)?;
+            for (channel, field) in &attribute_fields {
+                let attribute = field.values.get(&candidate.identity).ok_or_else(|| {
+                    Error::GraphAuthoritativeInput {
+                        node: node.definition.guid,
+                        input: format!("micro attribute {channel:032x}"),
                     }
-                    i32::try_from(div_round_ties_even(sum, i128::from(*weight))?)
-                        .map_err(|_| Error::NumericOverflow)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok((channel, values))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    Ok(vec![MicroFieldTile {
-        cell: state.inputs.output_cell,
-        dimensions,
-        density: samples,
-        attributes,
-        reconstruction_seed: seed_namespace(node, "reconstruction")?,
-    }])
+                })?;
+                let weighted = i128::from(attribute.bits())
+                    .checked_mul(i128::from(value))
+                    .ok_or(Error::NumericOverflow)?;
+                let sums = attribute_sums
+                    .get_mut(channel)
+                    .ok_or_else(|| Error::GraphDocument {
+                        path: format!("{}.parameters.attributeChannels", node.debug_symbol.label),
+                        reason: format!("micro attribute channel {channel:032x} was not allocated"),
+                    })?;
+                sums[index] = sums[index]
+                    .checked_add(weighted)
+                    .ok_or(Error::NumericOverflow)?;
+            }
+        }
+        let attributes = attribute_sums
+            .into_iter()
+            .map(|(channel, sums)| {
+                let mut values = Vec::new();
+                crate::memory::reserve_exact(&mut values, sample_count, "micro attributes")?;
+                for (sum, weight) in sums.into_iter().zip(&attribute_weights) {
+                    let value = if *weight == 0 {
+                        0
+                    } else {
+                        i32::try_from(div_round_ties_even(sum, i128::from(*weight))?)
+                            .map_err(|_| Error::NumericOverflow)?
+                    };
+                    values.push(value);
+                }
+                Ok((channel, values))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        tiles.push(MicroFieldTile {
+            cell: state.inputs.output_cell,
+            family,
+            dimensions,
+            density: samples,
+            attributes,
+            reconstruction_seed: micro_reconstruction_seed(node, family)?,
+        });
+    }
+    Ok(tiles)
+}
+
+fn micro_reconstruction_seed(node: &CompiledGraphNode, family: Uuid) -> Result<u128> {
+    let hash = sha256(
+        &[
+            b"saffron-anima/micro-reconstruction-family/v1\0".as_slice(),
+            seed_namespace(node, "reconstruction")?
+                .to_be_bytes()
+                .as_slice(),
+            family.value().to_be_bytes().as_slice(),
+        ]
+        .concat(),
+    );
+    Ok(u128::from_be_bytes(hash[..16].try_into().unwrap()))
 }
 
 impl EvaluationState<'_> {
-    fn should_visit_node(&self, node: &CompiledGraphNode) -> bool {
-        let address = node.address();
-        let Some(stage) = self.scope.current_global_stage() else {
-            return self
-                .graph
-                .spatial_plan()
-                .global_stage_for_node(&address)
-                .is_none_or(|global| {
-                    global
-                        .output_pins
-                        .iter()
-                        .any(|output| output.node == address)
-                });
-        };
-        if stage.closure.contains(&address) {
-            return true;
-        }
-        if node.definition.operator != GraphOperator::ModuleCall {
-            return false;
-        }
-        let mut nested_path = address.module_path;
-        nested_path.push(address.node);
-        stage
-            .closure
-            .iter()
-            .any(|candidate| candidate.module_path.starts_with(&nested_path))
+    fn check_transient_memory(&self, additional_bytes: u64) -> Result<()> {
+        let requested = self
+            .current_node_live_bytes
+            .checked_add(additional_bytes)
+            .ok_or(Error::NumericOverflow)?;
+        self.check_count(
+            "memory bytes",
+            requested,
+            self.graph.limits.max_memory_bytes,
+        )
     }
 
     fn should_load_global_node(&self, address: &GraphNodeAddress) -> bool {
@@ -8230,6 +12631,7 @@ impl EvaluationState<'_> {
     fn load_global_node_outputs(
         &mut self,
         node: &CompiledGraphNode,
+        demand: &CompiledDemandSlice,
     ) -> Result<BTreeMap<String, GraphValue>> {
         let address = node.address();
         let stage = self
@@ -8245,23 +12647,22 @@ impl EvaluationState<'_> {
             stage.owner_level,
             self.graph.limits.max_global_stage_tiles,
         )?;
-        let tiles = owners
-            .into_iter()
-            .map(|owner| self.scope.global_store().tile(stage.id, owner).cloned())
-            .collect::<Result<Vec<_>>>()?;
+        let global_store = self.scope.global_store();
         let mut outputs = BTreeMap::new();
         for output in node.outputs.iter().filter(|output| {
-            stage.output_pins.contains(&QualifiedGraphPin {
-                node: address.clone(),
-                pin: output.name.clone(),
-            })
+            NodeOutputDemand::new(demand, node).contains(&output.name)
+                && stage.output_pins.contains(&QualifiedGraphPin {
+                    node: address.clone(),
+                    pin: output.name.clone(),
+                })
         }) {
             let pin = QualifiedGraphPin {
                 node: address.clone(),
                 pin: output.name.clone(),
             };
-            let mut merged = None;
-            for tile in &tiles {
+            let mut merged: Option<GraphValue> = None;
+            for owner in &owners {
+                let tile = global_store.tile(stage.id, *owner)?;
                 let value = tile.outputs.get(&pin).ok_or_else(|| Error::GraphDocument {
                     path: node.debug_symbol.label.clone(),
                     reason: format!(
@@ -8269,7 +12670,25 @@ impl EvaluationState<'_> {
                         output.name
                     ),
                 })?;
+                let candidate_identities = graph_value_candidate_identity_upper_bound(value)?;
+                let import_scratch = global_import_scratch_bytes(
+                    candidate_identities,
+                    tile.provenance.decisions().len() as u64,
+                    tile.provenance.records().len() as u64,
+                    tile.provenance.requested_memory_bytes()?,
+                )?;
+                self.check_transient_memory(checked_memory_sum([
+                    value.requested_memory_bytes()?,
+                    import_scratch,
+                ])?)?;
                 let value = import_global_value(value.clone(), tile, self)?;
+                if let Some(current) = merged.as_ref() {
+                    self.check_transient_memory(checked_memory_sum([
+                        current.requested_memory_bytes()?,
+                        value.requested_memory_bytes()?,
+                        graph_value_merge_scratch_bytes(current, &value)?,
+                    ])?)?;
+                }
                 merge_graph_value(&mut merged, value, node)?;
             }
             let value = merged.ok_or_else(|| Error::GraphAuthoritativeInput {
@@ -8311,11 +12730,38 @@ impl EvaluationState<'_> {
         Ok(())
     }
 
+    fn capture_resident_global_outputs(
+        &mut self,
+        node: &CompiledGraphNode,
+        outputs: &BTreeMap<(u128, String), GraphValue>,
+    ) -> Result<()> {
+        let Some(stage) = self.scope.current_global_stage() else {
+            return Ok(());
+        };
+        let address = node.address();
+        for output in &stage.output_pins {
+            if output.node != address {
+                continue;
+            }
+            let value = outputs
+                .iter()
+                .find(|((source, pin), _)| *source == node.definition.guid && pin == &output.pin)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| Error::GraphDocument {
+                    path: node.debug_symbol.label.clone(),
+                    reason: format!("global boundary output '{}' is missing", output.pin),
+                })?;
+            let value = clip_global_value(value, self.inputs.output_bounds)?;
+            self.materialized_outputs.insert(output.clone(), value);
+        }
+        Ok(())
+    }
+
     fn check_abort(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(Error::GraphCancelled);
         }
-        if Instant::now() > self.deadline {
+        if Instant::now() >= self.deadline {
             return Err(Error::GraphLimit {
                 resource: "time milliseconds",
                 requested: self.graph.limits.max_time_ms.saturating_add(1),
@@ -8357,6 +12803,7 @@ fn clip_global_value(mut value: GraphValue, solve_bounds: WorldBounds) -> Result
         }
         GraphValue::Regions(regions) => {
             let mut clipped = Vec::new();
+            crate::memory::reserve_exact(&mut clipped, regions.len(), "clipped global regions")?;
             for mut region in regions.drain(..) {
                 if let Some(bounds) = intersect_bounds(region.bounds, solve_bounds)? {
                     region.bounds = bounds;
@@ -8389,10 +12836,17 @@ fn import_global_value(
     state: &mut EvaluationState<'_>,
 ) -> Result<GraphValue> {
     let candidate_ids = graph_value_candidate_identities(&value);
-    let decision_roots = candidate_ids
-        .iter()
-        .filter_map(|identity| tile.candidate_decisions.get(identity).copied())
-        .collect::<Vec<_>>();
+    let mut decision_roots = Vec::new();
+    crate::memory::reserve_exact(
+        &mut decision_roots,
+        candidate_ids.len(),
+        "global provenance decision roots",
+    )?;
+    decision_roots.extend(
+        candidate_ids
+            .iter()
+            .filter_map(|identity| tile.candidate_decisions.get(identity).copied()),
+    );
     let decision_remap = state
         .provenance
         .import_decision_fragment(&tile.provenance, &decision_roots)?;
@@ -8413,11 +12867,8 @@ fn import_global_value(
         {
             if provenance_decision_descends_from(&state.provenance, destination, existing)? {
                 state.candidate_decisions.insert(identity, destination);
-            } else if !provenance_decision_descends_from(
-                &state.provenance,
-                existing,
-                destination,
-            )? {
+            } else if !provenance_decision_descends_from(&state.provenance, existing, destination)?
+            {
                 return Err(Error::GraphDocument {
                     path: "evaluation.globalStages.provenance".to_owned(),
                     reason: "one candidate resolved to conflicting global-stage decisions"
@@ -8429,18 +12880,35 @@ fn import_global_value(
         }
     }
 
-    let record_handles = match &value {
-        GraphValue::Macro(points) => points
-            .iter()
-            .map(|point| ProvenanceHandle(point.provenance))
-            .collect::<Vec<_>>(),
-        GraphValue::Diagnostics(streams) => streams
-            .iter()
-            .flat_map(|stream| stream.rejected.iter())
-            .map(|rejected| rejected.provenance)
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
+    let record_count = match &value {
+        GraphValue::Macro(points) => points.len(),
+        GraphValue::Diagnostics(streams) => streams.iter().try_fold(0_usize, |total, stream| {
+            total
+                .checked_add(stream.rejected.len())
+                .ok_or(Error::NumericOverflow)
+        })?,
+        _ => 0,
     };
+    let mut record_handles = Vec::new();
+    crate::memory::reserve_exact(
+        &mut record_handles,
+        record_count,
+        "global provenance record handles",
+    )?;
+    match &value {
+        GraphValue::Macro(points) => record_handles.extend(
+            points
+                .iter()
+                .map(|point| ProvenanceHandle(point.provenance)),
+        ),
+        GraphValue::Diagnostics(streams) => record_handles.extend(
+            streams
+                .iter()
+                .flat_map(|stream| stream.rejected.iter())
+                .map(|rejected| rejected.provenance),
+        ),
+        _ => {}
+    }
     let record_remap = state
         .provenance
         .import_fragment(&tile.provenance, &record_handles)?;
@@ -8487,24 +12955,55 @@ fn provenance_decision_descends_from(
     descendant: ProvenanceDecisionHandle,
     ancestor: ProvenanceDecisionHandle,
 ) -> Result<bool> {
-    let mut pending = vec![descendant];
+    let mut pending = Vec::new();
+    crate::memory::reserve_exact(
+        &mut pending,
+        table.decisions().len(),
+        "global provenance ancestry traversal",
+    )?;
+    pending.push(descendant);
     let mut visited = BTreeSet::new();
+    visited.insert(descendant);
     while let Some(handle) = pending.pop() {
         if handle == ancestor {
             return Ok(true);
         }
-        if !visited.insert(handle) {
-            continue;
-        }
-        let decision = table
-            .decision(handle)
-            .ok_or_else(|| Error::GraphDocument {
-                path: "evaluation.globalStages.provenance".to_owned(),
-                reason: "candidate decision handle is missing".to_owned(),
-            })?;
-        pending.extend(decision.parents.iter().copied());
+        let decision = table.decision(handle).ok_or_else(|| Error::GraphDocument {
+            path: "evaluation.globalStages.provenance".to_owned(),
+            reason: "candidate decision handle is missing".to_owned(),
+        })?;
+        pending.extend(
+            decision
+                .parents
+                .iter()
+                .copied()
+                .filter(|parent| visited.insert(*parent)),
+        );
     }
     Ok(false)
+}
+
+fn graph_value_candidate_identity_upper_bound(value: &GraphValue) -> Result<u64> {
+    let count = match value {
+        GraphValue::Candidates(stream) => stream.candidates.len(),
+        GraphValue::Scalar(field) => field.values.len(),
+        GraphValue::Vector(field) => field.values.len(),
+        GraphValue::Hessian(field) => field.values.len(),
+        GraphValue::Surface(field) => field.values.len(),
+        GraphValue::Diagnostics(streams) => streams.iter().try_fold(0_usize, |total, stream| {
+            total
+                .checked_add(stream.candidates.as_ref().map_or(0, Vec::len))
+                .and_then(|count| count.checked_add(stream.field.as_ref().map_or(0, Vec::len)))
+                .ok_or(Error::NumericOverflow)
+        })?,
+        GraphValue::Macro(_)
+        | GraphValue::Micro(_)
+        | GraphValue::Regions(_)
+        | GraphValue::Splines(_)
+        | GraphValue::Species(_)
+        | GraphValue::Communities(_) => 0,
+    };
+    u64::try_from(count).map_err(|_| Error::NumericOverflow)
 }
 
 fn graph_value_candidate_identities(value: &GraphValue) -> BTreeSet<CandidateIdentity> {
@@ -8526,16 +13025,200 @@ fn graph_value_candidate_identities(value: &GraphValue) -> BTreeSet<CandidateIde
                     .iter()
                     .flatten()
                     .map(|sample| sample.identity)
-                    .chain(
-                        stream
-                            .field
-                            .iter()
-                            .flatten()
-                            .map(|sample| sample.candidate),
-                    )
+                    .chain(stream.field.iter().flatten().map(|sample| sample.candidate))
             })
             .collect(),
         _ => BTreeSet::new(),
+    }
+}
+
+type DiagnosticStreamMergeKey = (GraphNodeAddress, String, DiagnosticStreamScope);
+
+#[derive(Clone, Copy, Default)]
+struct DiagnosticMergeShape {
+    streams: u64,
+    candidates: u64,
+    fields: u64,
+    rejected: u64,
+    module_path_items: u64,
+    label_bytes: u64,
+}
+
+impl DiagnosticMergeShape {
+    fn symbolic(value: SymbolicValueBound) -> Self {
+        Self {
+            streams: value.items,
+            candidates: value.diagnostic_candidates,
+            fields: value.diagnostic_fields,
+            rejected: value.diagnostic_rejected,
+            module_path_items: value.diagnostic_module_path_items,
+            label_bytes: value.diagnostic_label_bytes,
+        }
+    }
+
+    fn actual(streams: &[NamedDiagnosticStream]) -> Result<Self> {
+        streams.iter().try_fold(Self::default(), |shape, stream| {
+            shape.checked_add(Self {
+                streams: 1,
+                candidates: stream.candidates.as_ref().map_or(0, Vec::len) as u64,
+                fields: stream.field.as_ref().map_or(0, Vec::len) as u64,
+                rejected: stream.rejected.len() as u64,
+                module_path_items: stream.node.module_path.len() as u64,
+                label_bytes: stream.label.len() as u64,
+            })
+        })
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            streams: self
+                .streams
+                .checked_add(other.streams)
+                .ok_or(Error::NumericOverflow)?,
+            candidates: self
+                .candidates
+                .checked_add(other.candidates)
+                .ok_or(Error::NumericOverflow)?,
+            fields: self
+                .fields
+                .checked_add(other.fields)
+                .ok_or(Error::NumericOverflow)?,
+            rejected: self
+                .rejected
+                .checked_add(other.rejected)
+                .ok_or(Error::NumericOverflow)?,
+            module_path_items: self
+                .module_path_items
+                .checked_add(other.module_path_items)
+                .ok_or(Error::NumericOverflow)?,
+            label_bytes: self
+                .label_bytes
+                .checked_add(other.label_bytes)
+                .ok_or(Error::NumericOverflow)?,
+        })
+    }
+
+    fn scratch_bytes(self) -> Result<u64> {
+        checked_memory_sum([
+            requested_btree_bound::<DiagnosticStreamMergeKey, NamedDiagnosticStream>(self.streams)?,
+            disjoint_vec_bound::<u128>(self.module_path_items, self.streams)?,
+            disjoint_vec_bound::<u8>(self.label_bytes, self.streams)?,
+            requested_vec_bound::<NamedDiagnosticStream>(self.streams)?,
+            requested_btree_bound::<CandidateIdentity, DiagnosticCandidateSample>(self.candidates)?,
+            disjoint_vec_bound::<DiagnosticCandidateSample>(self.candidates, self.streams)?,
+            requested_btree_bound::<CandidateIdentity, DiagnosticScalarSample>(self.fields)?,
+            disjoint_vec_bound::<DiagnosticScalarSample>(self.fields, self.streams)?,
+            disjoint_vec_bound::<RejectedCandidate>(self.rejected, self.streams)?,
+        ])
+    }
+}
+
+fn disjoint_vec_bound<T>(items: u64, allocations: u64) -> Result<u64> {
+    items
+        .checked_mul(std::mem::size_of::<T>() as u64)
+        .and_then(|bytes| {
+            allocations
+                .checked_mul(ALLOCATION_OVERHEAD_BYTES)
+                .and_then(|overhead| bytes.checked_add(overhead))
+        })
+        .ok_or(Error::NumericOverflow)
+}
+
+fn symbolic_global_merge_scratch_bytes(
+    left: SymbolicValueBound,
+    right: SymbolicValueBound,
+) -> Result<u64> {
+    let items = left
+        .items
+        .checked_add(right.items)
+        .ok_or(Error::NumericOverflow)?;
+    match left.domain {
+        Some(GraphDomain::Candidates) => checked_memory_sum([
+            requested_btree_bound::<CandidateIdentity, GraphCandidate>(items)?,
+            requested_vec_bound::<GraphCandidate>(items)?,
+        ]),
+        Some(GraphDomain::MacroPoints) => checked_memory_sum([
+            requested_btree_bound::<PlantId, PlantPoint>(items)?,
+            requested_vec_bound::<PlantPoint>(items)?,
+        ]),
+        Some(GraphDomain::MicroField) => checked_memory_sum([
+            requested_btree_bound::<(WorldCellKey, u64), MicroFieldTile>(items)?,
+            requested_vec_bound::<MicroFieldTile>(items)?,
+        ]),
+        Some(GraphDomain::Regions) => checked_memory_sum([
+            requested_btree_bound::<(u128, WorldCellKey), EvaluationRegion>(items)?,
+            requested_vec_bound::<EvaluationRegion>(items)?,
+        ]),
+        Some(GraphDomain::Splines) => checked_memory_sum([
+            requested_btree_bound::<u128, EvaluationSpline>(items)?,
+            requested_vec_bound::<EvaluationSpline>(items)?,
+        ]),
+        Some(GraphDomain::Diagnostics) => DiagnosticMergeShape::symbolic(left)
+            .checked_add(DiagnosticMergeShape::symbolic(right))?
+            .scratch_bytes(),
+        _ => Ok(0),
+    }
+}
+
+fn graph_value_merge_scratch_bytes(left: &GraphValue, right: &GraphValue) -> Result<u64> {
+    match (left, right) {
+        (GraphValue::Candidates(left), GraphValue::Candidates(right)) => {
+            let items = left
+                .candidates
+                .len()
+                .checked_add(right.candidates.len())
+                .ok_or(Error::NumericOverflow)?;
+            checked_memory_sum([
+                requested_btree_bytes::<CandidateIdentity, GraphCandidate>(items)?,
+                requested_vec_bytes::<GraphCandidate>(items)?,
+            ])
+        }
+        (GraphValue::Macro(left), GraphValue::Macro(right)) => {
+            let items = left
+                .len()
+                .checked_add(right.len())
+                .ok_or(Error::NumericOverflow)?;
+            checked_memory_sum([
+                requested_btree_bytes::<PlantId, PlantPoint>(items)?,
+                requested_vec_bytes::<PlantPoint>(items)?,
+            ])
+        }
+        (GraphValue::Micro(left), GraphValue::Micro(right)) => {
+            let items = left
+                .len()
+                .checked_add(right.len())
+                .ok_or(Error::NumericOverflow)?;
+            checked_memory_sum([
+                requested_btree_bytes::<(WorldCellKey, u64), MicroFieldTile>(items)?,
+                requested_vec_bytes::<MicroFieldTile>(items)?,
+            ])
+        }
+        (GraphValue::Regions(left), GraphValue::Regions(right)) => {
+            let items = left
+                .len()
+                .checked_add(right.len())
+                .ok_or(Error::NumericOverflow)?;
+            checked_memory_sum([
+                requested_btree_bytes::<(u128, WorldCellKey), EvaluationRegion>(items)?,
+                requested_vec_bytes::<EvaluationRegion>(items)?,
+            ])
+        }
+        (GraphValue::Splines(left), GraphValue::Splines(right)) => {
+            let items = left
+                .len()
+                .checked_add(right.len())
+                .ok_or(Error::NumericOverflow)?;
+            checked_memory_sum([
+                requested_btree_bytes::<u128, EvaluationSpline>(items)?,
+                requested_vec_bytes::<EvaluationSpline>(items)?,
+            ])
+        }
+        (GraphValue::Diagnostics(left), GraphValue::Diagnostics(right)) => {
+            DiagnosticMergeShape::actual(left)?
+                .checked_add(DiagnosticMergeShape::actual(right)?)?
+                .scratch_bytes()
+        }
+        _ => Ok(0),
     }
 }
 
@@ -8559,7 +13242,7 @@ fn merge_graph_value(
             for candidate in right.candidates {
                 insert_identical(&mut candidates, candidate.identity, candidate, node)?;
             }
-            left.candidates = candidates.into_values().collect();
+            left.candidates = btree_values_vec(candidates, "merged global candidates")?;
         }
         (GraphValue::Scalar(left), GraphValue::Scalar(right)) => {
             require_lineage(node, left.lineage, right.lineage)?;
@@ -8585,17 +13268,17 @@ fn merge_graph_value(
             for point in right {
                 insert_identical(&mut points, point.id, point, node)?;
             }
-            *left = points.into_values().collect();
+            *left = btree_values_vec(points, "merged global macro points")?;
         }
         (GraphValue::Micro(left), GraphValue::Micro(right)) => {
             let mut tiles = left
                 .drain(..)
-                .map(|tile| (tile.cell, tile))
+                .map(|tile| ((tile.cell, tile.family.value()), tile))
                 .collect::<BTreeMap<_, _>>();
             for tile in right {
-                insert_identical(&mut tiles, tile.cell, tile, node)?;
+                insert_identical(&mut tiles, (tile.cell, tile.family.value()), tile, node)?;
             }
-            *left = tiles.into_values().collect();
+            *left = btree_values_vec(tiles, "merged global micro tiles")?;
         }
         (GraphValue::Regions(left), GraphValue::Regions(right)) => {
             let mut regions = left
@@ -8605,7 +13288,7 @@ fn merge_graph_value(
             for region in right {
                 insert_identical(&mut regions, (region.id, region.seed_cell), region, node)?;
             }
-            *left = regions.into_values().collect();
+            *left = btree_values_vec(regions, "merged global regions")?;
         }
         (GraphValue::Splines(left), GraphValue::Splines(right)) => {
             let mut splines = left
@@ -8615,7 +13298,7 @@ fn merge_graph_value(
             for spline in right {
                 insert_identical(&mut splines, spline.id, spline, node)?;
             }
-            *left = splines.into_values().collect();
+            *left = btree_values_vec(splines, "merged global splines")?;
         }
         (GraphValue::Species(left), GraphValue::Species(right)) => {
             if *left != right {
@@ -8675,7 +13358,7 @@ fn merge_diagnostic_streams(
                 for sample in right {
                     insert_identical(&mut candidates, sample.identity, sample, node)?;
                 }
-                *left = candidates.into_values().collect();
+                *left = btree_values_vec(candidates, "merged diagnostic candidates")?;
             }
             (None, None) => {}
             _ => return Err(global_merge_conflict(node)),
@@ -8689,13 +13372,18 @@ fn merge_diagnostic_streams(
                 for sample in right {
                     insert_identical(&mut field, sample.candidate, sample, node)?;
                 }
-                *left = field.into_values().collect();
+                *left = btree_values_vec(field, "merged diagnostic fields")?;
             }
             (None, None) => {}
             _ => return Err(global_merge_conflict(node)),
         }
+        crate::memory::reserve_exact(
+            &mut existing.rejected,
+            stream.rejected.len(),
+            "merged diagnostic rejections",
+        )?;
         existing.rejected.append(&mut stream.rejected);
-        existing.rejected.sort_by_key(|value| {
+        existing.rejected.sort_unstable_by_key(|value| {
             (
                 value.candidate,
                 rejection_reason_byte(value.reason),
@@ -8704,8 +13392,15 @@ fn merge_diagnostic_streams(
         });
         existing.rejected.dedup();
     }
-    *destination = streams.into_values().collect();
+    *destination = btree_values_vec(streams, "merged diagnostic streams")?;
     Ok(())
+}
+
+fn btree_values_vec<K, V>(values: BTreeMap<K, V>, resource: &'static str) -> Result<Vec<V>> {
+    let mut result = Vec::new();
+    crate::memory::reserve_exact(&mut result, values.len(), resource)?;
+    result.extend(values.into_values());
+    Ok(result)
 }
 
 fn merge_identical_maps<K: Ord, V: PartialEq>(
@@ -8757,7 +13452,7 @@ fn reject_candidate(
     family: Option<Uuid>,
     variation: u32,
     state: &mut EvaluationState<'_>,
-) {
+) -> Result<()> {
     let parents = state
         .candidate_decisions
         .get(&candidate.identity)
@@ -8787,12 +13482,16 @@ fn reject_candidate(
         reason,
         provenance,
     };
+    crate::memory::reserve_exact(
+        &mut state.diagnostics.rejected,
+        1,
+        "rejected candidate diagnostics",
+    )?;
     state.diagnostics.rejected.push(rejected.clone());
-    state
-        .rejected_by_lineage
-        .entry(lineage)
-        .or_default()
-        .push(rejected);
+    let lineage_rejections = state.rejected_by_lineage.entry(lineage).or_default();
+    crate::memory::reserve_exact(lineage_rejections, 1, "lineage rejection history")?;
+    lineage_rejections.push(rejected);
+    Ok(())
 }
 
 fn select_species(
@@ -8802,8 +13501,6 @@ fn select_species(
     species: &[crate::BiomePaletteEntry],
     state: &EvaluationState<'_>,
 ) -> Result<Option<Uuid>> {
-    let mut species = species.to_vec();
-    species.sort_by_key(|entry| entry.plant.value());
     let total: u64 = species
         .iter()
         .map(|entry| u64::from(entry.weight.bits()))
@@ -8820,12 +13517,22 @@ fn select_species(
             .with_channel(4),
     )?;
     let mut selection = u64::from(stream.lane(0, 0)) % total;
-    for entry in species {
+    let mut previous = None;
+    for _ in 0..species.len() {
+        let entry = species
+            .iter()
+            .filter(|entry| previous.is_none_or(|plant| entry.plant.value() > plant))
+            .min_by_key(|entry| entry.plant.value())
+            .ok_or_else(|| Error::GraphDocument {
+                path: node.debug_symbol.label.clone(),
+                reason: "biome palette ordering is incomplete".to_owned(),
+            })?;
         let weight = u64::from(entry.weight.bits());
         if selection < weight {
             return Ok(Some(entry.plant));
         }
         selection -= weight;
+        previous = Some(entry.plant.value());
     }
     Ok(None)
 }
@@ -8984,6 +13691,35 @@ fn canonical_owner(position: WorldPosition, level: u8) -> Result<WorldCellKey> {
     position.cell().ancestor(level).map_err(Into::into)
 }
 
+fn cell_region_count(bounds: WorldBounds, level: u8) -> Result<usize> {
+    let edge = i128::from(BASE_CELL_TICKS)
+        .checked_mul(
+            1_i128
+                .checked_shl(u32::from(level))
+                .ok_or(Error::NumericOverflow)?,
+        )
+        .ok_or(Error::NumericOverflow)?;
+    let minimum = bounds.min_ticks().map(|value| value.div_euclid(edge));
+    let maximum = bounds
+        .max_ticks_exclusive()
+        .map(|value| (value - 1).div_euclid(edge));
+    minimum
+        .into_iter()
+        .zip(maximum)
+        .try_fold(1_i128, |count, (minimum, maximum)| {
+            count
+                .checked_mul(
+                    maximum
+                        .checked_sub(minimum)
+                        .and_then(|extent| extent.checked_add(1))
+                        .ok_or(Error::NumericOverflow)?,
+                )
+                .ok_or(Error::NumericOverflow)
+        })?
+        .try_into()
+        .map_err(|_| Error::NumericOverflow)
+}
+
 fn canonical_cell_regions(
     bounds: WorldBounds,
     level: u8,
@@ -9001,6 +13737,11 @@ fn canonical_cell_regions(
         .max_ticks_exclusive()
         .map(|value| (value - 1).div_euclid(edge));
     let mut regions = Vec::new();
+    crate::memory::reserve_exact(
+        &mut regions,
+        cell_region_count(bounds, level)?,
+        "canonical cell regions",
+    )?;
     for x in minimum[0]..=maximum[0] {
         for y in minimum[1]..=maximum[1] {
             for z in minimum[2]..=maximum[2] {
@@ -9088,7 +13829,10 @@ fn stage_regions(
             }
         }
     }
-    Ok(result.into_values().collect())
+    let mut regions = Vec::new();
+    crate::memory::reserve_exact(&mut regions, result.len(), "canonical stage regions")?;
+    regions.extend(result.into_values());
+    Ok(regions)
 }
 
 fn hierarchical_region_identity(namespace: u128, cell: WorldCellKey) -> u128 {
@@ -9160,13 +13904,19 @@ fn bounds_contains_bounds(container: WorldBounds, contained: WorldBounds) -> boo
     })
 }
 
-fn stable_ordinal(parts: &[&[u8]]) -> u64 {
-    let mut bytes = b"saffron-anima/vegetation-candidate/v1\0".to_vec();
+fn stable_ordinal(parts: &[&[u8]]) -> Result<u64> {
+    let mut hasher = VegetationContentHasher::new();
+    hasher.update(b"saffron-anima/vegetation-candidate/v1\0")?;
     for part in parts {
-        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(part);
+        hasher.update(
+            &u64::try_from(part.len())
+                .map_err(|_| Error::NumericOverflow)?
+                .to_be_bytes(),
+        )?;
+        hasher.update(part)?;
     }
-    u64::from_be_bytes(sha256(&bytes)[..8].try_into().unwrap())
+    let digest = hasher.finalize()?;
+    Ok(u64::from_be_bytes(digest[..8].try_into().unwrap()))
 }
 
 fn candidate_ordinal(
@@ -9175,7 +13925,7 @@ fn candidate_ordinal(
     source: u128,
     local: u64,
     channel: u32,
-) -> u64 {
+) -> Result<u64> {
     stable_ordinal(&[
         &node_execution_address(node, state).to_be_bytes(),
         &node.definition.semantic_revision.to_be_bytes(),
@@ -9414,12 +14164,9 @@ fn prototype_bounds(prototype: &PlantPrototype, candidate: &GraphCandidate) -> R
             maximum[axis] = maximum[axis].max(world);
         }
     }
-    let maximum = maximum.map(|value| value.checked_add(1).ok_or(Error::NumericOverflow));
-    let maximum = maximum
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .try_into()
-        .map_err(|_| Error::NumericOverflow)?;
+    let [maximum_x, maximum_y, maximum_z] =
+        maximum.map(|value| value.checked_add(1).ok_or(Error::NumericOverflow));
+    let maximum = [maximum_x?, maximum_y?, maximum_z?];
     WorldBounds::new(minimum, maximum).map_err(Into::into)
 }
 
@@ -9465,6 +14212,32 @@ fn bounds_intersect(left: WorldBounds, right: WorldBounds) -> bool {
     (0..3).all(|axis| {
         left_minimum[axis] < right_maximum[axis] && right_minimum[axis] < left_maximum[axis]
     })
+}
+
+fn touches_boundary(bounds: WorldBounds, cell: WorldBounds) -> bool {
+    let minimum = bounds.min_ticks();
+    let maximum = bounds.max_ticks_exclusive();
+    let cell_minimum = cell.min_ticks();
+    let cell_maximum = cell.max_ticks_exclusive();
+    (0..3).any(|axis| minimum[axis] <= cell_minimum[axis] || maximum[axis] >= cell_maximum[axis])
+}
+
+fn encode_world_bounds<S: CanonicalSink>(sink: &mut S, bounds: WorldBounds) -> Result<()> {
+    for tick in bounds.min_ticks() {
+        sink.write(&tick.to_be_bytes())?;
+    }
+    for tick in bounds.max_ticks_exclusive() {
+        sink.write(&tick.to_be_bytes())?;
+    }
+    Ok(())
+}
+
+fn encode_world_position<S: CanonicalSink>(sink: &mut S, position: WorldPosition) -> Result<()> {
+    sink.write(&position.cell().canonical_bytes())?;
+    for tick in position.local().ticks() {
+        sink.write(&tick.to_be_bytes())?;
+    }
+    Ok(())
 }
 
 fn tile_index(position: WorldPosition, bounds: WorldBounds, dimensions: [u32; 3]) -> Result<usize> {
@@ -9973,21 +14746,12 @@ fn candidate_key_u128(identity: CandidateIdentity) -> u128 {
     u128::from_be_bytes(hash[..16].try_into().unwrap())
 }
 
-fn point_source_fingerprint(point: &PlantPoint) -> [u8; 32] {
-    let mut bytes = [0_u8; 32];
-    bytes[..16].copy_from_slice(&point.deterministic_key.to_be_bytes());
-    bytes[16..24].copy_from_slice(&point.candidate.to_be_bytes());
-    bytes[24..32].copy_from_slice(&point.family.value().to_be_bytes());
-    bytes
-}
-
-fn push_len(bytes: &mut Vec<u8>, value: usize) -> Result<()> {
-    bytes.extend_from_slice(
+fn push_len<S: CanonicalSink>(sink: &mut S, value: usize) -> Result<()> {
+    sink.write(
         &u64::try_from(value)
             .map_err(|_| Error::NumericOverflow)?
             .to_be_bytes(),
-    );
-    Ok(())
+    )
 }
 
 fn singleton(name: &str, value: GraphValue) -> BTreeMap<String, GraphValue> {
@@ -10187,20 +14951,24 @@ fn u32_vec3_parameter(node: &CompiledGraphNode, name: &str) -> Result<[u32; 3]> 
     }
 }
 
-fn string_parameter(node: &CompiledGraphNode, name: &str, fallback: &str) -> Result<String> {
+fn string_parameter<'a>(
+    node: &'a CompiledGraphNode,
+    name: &str,
+    fallback: &'a str,
+) -> Result<&'a str> {
     match node.definition.parameter(name) {
-        Some(GraphParameterValue::String(value)) => Ok(value.clone()),
+        Some(GraphParameterValue::String(value)) => Ok(value),
         Some(_) => wrong_parameter(node, name),
-        None => Ok(fallback.to_owned()),
+        None => Ok(fallback),
     }
 }
 
-fn curve_parameter(
-    node: &CompiledGraphNode,
+fn curve_parameter<'a>(
+    node: &'a CompiledGraphNode,
     name: &str,
-) -> Result<Vec<(UnitInterval, DecisionScalar)>> {
+) -> Result<&'a [(UnitInterval, DecisionScalar)]> {
     match node.definition.parameter(name) {
-        Some(GraphParameterValue::Curve(value)) => Ok(value.clone()),
+        Some(GraphParameterValue::Curve(value)) => Ok(value),
         _ => wrong_parameter(node, name),
     }
 }
@@ -10248,19 +15016,19 @@ fn cluster_mode_parameter(node: &CompiledGraphNode, name: &str) -> Result<GraphC
     }
 }
 
-fn tag_list_parameter(node: &CompiledGraphNode, name: &str) -> Result<Vec<u64>> {
+fn tag_list_parameter<'a>(node: &'a CompiledGraphNode, name: &str) -> Result<&'a [u64]> {
     match node.definition.parameter(name) {
-        Some(GraphParameterValue::TagList(value)) => Ok(value.clone()),
+        Some(GraphParameterValue::TagList(value)) => Ok(value),
         Some(_) => wrong_parameter(node, name),
-        None => Ok(Vec::new()),
+        None => Ok(&[]),
     }
 }
 
-fn guid_list_parameter(node: &CompiledGraphNode, name: &str) -> Result<Vec<u128>> {
+fn guid_list_parameter<'a>(node: &'a CompiledGraphNode, name: &str) -> Result<&'a [u128]> {
     match node.definition.parameter(name) {
-        Some(GraphParameterValue::GuidList(value)) => Ok(value.clone()),
+        Some(GraphParameterValue::GuidList(value)) => Ok(value),
         Some(_) => wrong_parameter(node, name),
-        None => Ok(Vec::new()),
+        None => Ok(&[]),
     }
 }
 
@@ -10279,11 +15047,16 @@ mod tests {
     use super::*;
     use crate::{
         BIOME_ASSET_VERSION, BIOME_GRAPH_VERSION, BIOME_NODE_VERSION, BiomeAsset,
-        BiomeGraphDocument, BiomeGraphPolicy, BiomeGraphResolver, BiomePaletteEntry, BiomeRole,
-        GpuExecutionProfile, GpuQualificationRegistry, GpuShaderArtifactIdentity,
-        GraphCompileOptions, GraphDependencySource, GraphEdge, GraphInterfaceOutput,
-        GraphNodeDefinition, GraphParameterValue, GraphSink, NodeSpatialPolicy,
-        compile_biome_graph, evaluate_gpu_program_reference,
+        BiomeGraphDocument, BiomeGraphPolicy, BiomeGraphResolver, BiomeModuleReference,
+        BiomePaletteEntry, BiomeRole, GpuExecutionProfile, GpuQualificationRegistry,
+        GpuShaderArtifactIdentity, GraphCompileOptions, GraphDependencySource, GraphEdge,
+        GraphInterfaceInput, GraphInterfaceOutput, GraphNodeDefinition, GraphParameterValue,
+        GraphSink, NodeSpatialPolicy, VegetationCellFacet, compile_biome_graph,
+        decode_vegetation_cell_facet, evaluate_gpu_program_reference,
+    };
+    use saffron_spatial::{
+        FieldSample, HessianFieldSample, SurfaceCapabilities, SurfaceDirtyRegion,
+        SurfaceNearestQuery, SurfaceRay, VectorFieldSample,
     };
     use std::sync::atomic::AtomicUsize;
 
@@ -10300,6 +15073,173 @@ mod tests {
         dispatches: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct TestSurfaceField {
+        descriptor: SurfaceProviderDescriptor,
+        failing_cell_x: Option<i64>,
+        project_hits: bool,
+        successful_samples: Arc<AtomicUsize>,
+    }
+
+    impl SurfaceField for TestSurfaceField {
+        fn descriptor(&self) -> SurfaceProviderDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn field_channels(&self) -> Vec<FieldChannel> {
+            vec![FieldChannel::Moisture]
+        }
+
+        fn raycast(&self, _query: &SurfaceRay) -> saffron_spatial::Result<Option<SurfaceHit>> {
+            Ok(None)
+        }
+
+        fn project(
+            &self,
+            query: &SurfaceProjection,
+        ) -> saffron_spatial::Result<Option<SurfaceHit>> {
+            if !self.project_hits {
+                return Ok(None);
+            }
+            self.successful_samples.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(SurfaceHit {
+                provider: self.descriptor.id,
+                position: query.origin,
+                distance_m: 0.0,
+                frame: saffron_spatial::SurfaceFrame::from_normal(saffron_geometry::glam::Vec3::Y)?,
+                coordinates: saffron_spatial::SurfaceCoordinates::default(),
+                attachment: Some(SurfaceAttachment::new(
+                    self.descriptor.id,
+                    saffron_spatial::SurfacePrimitiveId(0),
+                    [UnitInterval::ONE, UnitInterval::ZERO, UnitInterval::ZERO],
+                    self.descriptor.revision,
+                )?),
+                tags: Vec::new(),
+                revision: self.descriptor.revision,
+            }))
+        }
+
+        fn nearest(
+            &self,
+            _query: &SurfaceNearestQuery,
+        ) -> saffron_spatial::Result<Option<SurfaceHit>> {
+            Ok(None)
+        }
+
+        fn availability(
+            &self,
+            channel: FieldChannel,
+            derivative: FieldDerivative,
+            _bounds: WorldBounds,
+        ) -> FieldAvailability {
+            if channel == FieldChannel::Moisture && derivative == FieldDerivative::Value {
+                FieldAvailability::Complete
+            } else {
+                FieldAvailability::Unavailable
+            }
+        }
+
+        fn estimated_samples(&self, _channel: FieldChannel, _bounds: WorldBounds) -> u64 {
+            24
+        }
+
+        fn sample_scalar(
+            &self,
+            channel: FieldChannel,
+            derivative: FieldDerivative,
+            position: WorldPosition,
+        ) -> saffron_spatial::Result<FieldSample> {
+            if self
+                .failing_cell_x
+                .is_some_and(|x| position.cell().coordinates()[0] == x)
+            {
+                return Err(saffron_spatial::Error::FieldUnavailable);
+            }
+            self.successful_samples.fetch_add(1, Ordering::SeqCst);
+            Ok(FieldSample {
+                channel,
+                derivative,
+                value: DecisionScalar::from_bits(65_535),
+                revision: self.descriptor.revision,
+            })
+        }
+
+        fn sample_vector(
+            &self,
+            channel: FieldChannel,
+            derivative: FieldDerivative,
+            _position: WorldPosition,
+        ) -> saffron_spatial::Result<VectorFieldSample> {
+            Ok(VectorFieldSample {
+                channel,
+                derivative,
+                value: DecisionVec3::default(),
+                revision: self.descriptor.revision,
+            })
+        }
+
+        fn sample_hessian(
+            &self,
+            channel: FieldChannel,
+            _position: WorldPosition,
+        ) -> saffron_spatial::Result<HessianFieldSample> {
+            Ok(HessianFieldSample {
+                channel,
+                derivative: FieldDerivative::Hessian,
+                value: DecisionHessian3::default(),
+                revision: self.descriptor.revision,
+            })
+        }
+
+        fn authoritative_tiles(
+            &self,
+            _channel: FieldChannel,
+            _bounds: WorldBounds,
+        ) -> Vec<SurfaceTileDescriptor> {
+            Vec::new()
+        }
+
+        fn changes_since(&self, _revision: SurfaceRevision) -> Vec<SurfaceDirtyRegion> {
+            Vec::new()
+        }
+
+        fn reproject_attachment(
+            &self,
+            _attachment: SurfaceAttachment,
+        ) -> saffron_spatial::Result<Option<SurfaceHit>> {
+            Ok(None)
+        }
+    }
+
+    struct SurfaceDependencies {
+        provider_hash: [u8; 32],
+    }
+
+    impl BiomeGraphResolver for SurfaceDependencies {
+        fn resolve_biome(&self, id: Uuid) -> Result<BiomeAsset> {
+            Err(Error::GraphDocument {
+                path: "test.resolver".to_owned(),
+                reason: format!("unexpected module {}", id.value()),
+            })
+        }
+
+        fn resolve_dependency_hash(&self, source: GraphDependencySource) -> Result<[u8; 32]> {
+            match source {
+                GraphDependencySource::Asset(Uuid(702)) => Ok([7; 32]),
+                GraphDependencySource::Field(FieldChannel::Moisture) => Ok([2; 32]),
+                GraphDependencySource::SurfaceProvider(77) => Ok(self.provider_hash),
+                _ => Err(Error::GraphDocument {
+                    path: "test.resolver".to_owned(),
+                    reason: format!("unexpected dependency {source:?}"),
+                }),
+            }
+        }
+
+        fn available_dependencies(&self) -> Vec<GraphDependencySource> {
+            vec![GraphDependencySource::SurfaceProvider(77)]
+        }
+    }
+
     impl GraphComputeExecutor for ReferenceCompute {
         fn profile(&self) -> &GpuExecutionProfile {
             &self.profile
@@ -10312,7 +15252,7 @@ mod tests {
         fn execute_program(
             &self,
             program: &GraphGpuProgram,
-            invocations: &[GraphGpuInvocation],
+            invocations: &GraphGpuInvocationBatch,
             cancellation: &GraphCancellationToken,
             deadline: Instant,
         ) -> Result<Vec<crate::GraphGpuOutput>> {
@@ -10326,7 +15266,7 @@ mod tests {
                     limit: 0,
                 });
             }
-            Ok(evaluate_gpu_program_reference(program, invocations))
+            evaluate_gpu_program_reference(program, invocations)
         }
     }
 
@@ -10342,7 +15282,7 @@ mod tests {
         fn execute_program(
             &self,
             program: &GraphGpuProgram,
-            invocations: &[GraphGpuInvocation],
+            invocations: &GraphGpuInvocationBatch,
             cancellation: &GraphCancellationToken,
             deadline: Instant,
         ) -> Result<Vec<crate::GraphGpuOutput>> {
@@ -10357,7 +15297,7 @@ mod tests {
                 });
             }
             self.dispatches.fetch_add(1, Ordering::SeqCst);
-            Ok(evaluate_gpu_program_reference(program, invocations))
+            evaluate_gpu_program_reference(program, invocations)
         }
     }
 
@@ -10381,7 +15321,7 @@ mod tests {
                 spirv_hash: [10; 32],
                 compiler_identity_hash: [11; 32],
             },
-            |program, invocations| Ok(evaluate_gpu_program_reference(program, invocations)),
+            evaluate_gpu_program_reference,
         )
         .unwrap();
         Arc::new(ReferenceCompute {
@@ -10410,7 +15350,7 @@ mod tests {
                 spirv_hash: [10; 32],
                 compiler_identity_hash: [11; 32],
             },
-            |program, invocations| Ok(evaluate_gpu_program_reference(program, invocations)),
+            evaluate_gpu_program_reference,
         )
         .unwrap();
         Arc::new(CountingCompute {
@@ -10431,6 +15371,7 @@ mod tests {
         fn resolve_dependency_hash(&self, source: GraphDependencySource) -> Result<[u8; 32]> {
             match source {
                 GraphDependencySource::Asset(Uuid(702)) => Ok([7; 32]),
+                GraphDependencySource::MapLayer(42) => Ok([4; 32]),
                 _ => Err(Error::GraphDocument {
                     path: "test.resolver".to_owned(),
                     reason: format!("unexpected dependency {source:?}"),
@@ -10698,6 +15639,16 @@ mod tests {
             "threshold".to_owned(),
             GraphParameterValue::Unit(UnitInterval::from_bits(16_384)),
         );
+        let mut dead_clamp = node(15, GraphOperator::Clamp, level);
+        dead_clamp.authority = GraphAuthority::EquivalentGpu;
+        dead_clamp.parameters.insert(
+            "minimum".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(0)),
+        );
+        dead_clamp.parameters.insert(
+            "maximum".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(65_535)),
+        );
         let document = BiomeGraphDocument {
             version: BIOME_GRAPH_VERSION,
             interface_version: crate::BIOME_INTERFACE_VERSION,
@@ -10711,7 +15662,8 @@ mod tests {
                 sink: Some(GraphSink::Macro),
             }],
             nodes: vec![
-                output, importance, clamp, combine, remap, curve, noise, species, coverage, region,
+                dead_clamp, output, importance, clamp, combine, remap, curve, noise, species,
+                coverage, region,
             ],
             edges: vec![
                 GraphEdge {
@@ -10736,6 +15688,12 @@ mod tests {
                     from_node: 6,
                     from_pin: "field".to_owned(),
                     to_node: 11,
+                    to_pin: "field".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 6,
+                    from_pin: "field".to_owned(),
+                    to_node: 15,
                     to_pin: "field".to_owned(),
                 },
                 GraphEdge {
@@ -10829,6 +15787,1441 @@ mod tests {
         .unwrap()
     }
 
+    fn compile_same_level_macro_stages_fixture() -> CompiledBiomeGraph {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut outputs = Vec::new();
+        for branch in 0_u128..2 {
+            let base = branch * 10;
+            let region = node(base + 1, GraphOperator::RegionInput, 0);
+            let mut coverage = node(base + 2, GraphOperator::StratifiedCoverage, 1);
+            coverage.spatial = NodeSpatialPolicy::Global { level: 1 };
+            coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+            coverage
+                .parameters
+                .insert("count".to_owned(), GraphParameterValue::U32(1));
+            coverage.parameters.insert(
+                "jitter".to_owned(),
+                GraphParameterValue::Unit(UnitInterval::ZERO),
+            );
+            let species = node(base + 3, GraphOperator::SpeciesInput, 0);
+            let mut output = node(base + 4, GraphOperator::MacroOutput, 1);
+            output.spatial = NodeSpatialPolicy::Global { level: 1 };
+            output
+                .seed_namespaces
+                .insert("species-selection".to_owned(), 13);
+            nodes.extend([output, species, coverage, region]);
+            edges.extend([
+                GraphEdge {
+                    from_node: base + 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: base + 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: base + 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: base + 4,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: base + 3,
+                    from_pin: "species".to_owned(),
+                    to_node: base + 4,
+                    to_pin: "species".to_owned(),
+                },
+            ]);
+            outputs.push(GraphInterfaceOutput {
+                id: 1_004 + base,
+                name: format!("macro-{branch}"),
+                domain: GraphDomain::MacroPoints,
+                node: base + 4,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            });
+        }
+        compile_document(BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs,
+            nodes,
+            edges,
+        })
+    }
+
+    fn compile_candidate_only_global_fixture() -> CompiledBiomeGraph {
+        let mut document = recursive_document();
+        document
+            .nodes
+            .iter_mut()
+            .find(|node| node.guid == 3)
+            .unwrap()
+            .spatial = NodeSpatialPolicy::Global { level: 1 };
+        compile_document(document)
+    }
+
+    fn compile_split_surface_projection_fixture(provider_hash: [u8; 32]) -> CompiledBiomeGraph {
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut projection = node(3, GraphOperator::SurfaceProjection, 0);
+        projection.spatial = NodeSpatialPolicy::Global { level: 0 };
+        projection.parameters.insert(
+            "direction".to_owned(),
+            GraphParameterValue::FixedVec3([
+                DecisionScalar::from_bits(0),
+                DecisionScalar::from_bits(-65_536),
+                DecisionScalar::from_bits(0),
+            ]),
+        );
+        projection.parameters.insert(
+            "maxDistance".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_integer(10).unwrap()),
+        );
+        projection
+            .parameters
+            .insert("provider".to_owned(), GraphParameterValue::U64(77));
+        let mut transform = node(4, GraphOperator::Transform, 2);
+        transform.spatial = NodeSpatialPolicy::Global { level: 2 };
+        transform.seed_namespaces.insert("variation".to_owned(), 13);
+        transform.parameters.insert(
+            "orientToSurface".to_owned(),
+            GraphParameterValue::Boolean(true),
+        );
+        let species = node(5, GraphOperator::SpeciesInput, 0);
+        let mut direct_output = node(6, GraphOperator::MacroOutput, 0);
+        direct_output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 17);
+        let mut transformed_output = node(7, GraphOperator::MacroOutput, 0);
+        transformed_output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 19);
+        let document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![
+                GraphInterfaceOutput {
+                    id: 1006,
+                    name: "direct".to_owned(),
+                    domain: GraphDomain::MacroPoints,
+                    node: 6,
+                    pin: "points".to_owned(),
+                    sink: Some(GraphSink::Macro),
+                },
+                GraphInterfaceOutput {
+                    id: 1007,
+                    name: "transformed".to_owned(),
+                    domain: GraphDomain::MacroPoints,
+                    node: 7,
+                    pin: "points".to_owned(),
+                    sink: Some(GraphSink::Macro),
+                },
+            ],
+            nodes: vec![
+                transformed_output,
+                direct_output,
+                species,
+                transform,
+                projection,
+                coverage,
+                regions,
+            ],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 4,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "surface".to_owned(),
+                    to_node: 4,
+                    to_pin: "surface".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 6,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 4,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 7,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 5,
+                    from_pin: "species".to_owned(),
+                    to_node: 6,
+                    to_pin: "species".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 5,
+                    from_pin: "species".to_owned(),
+                    to_node: 7,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let mut asset = fixture_asset(0);
+        asset.graph = document.to_json();
+        compile_biome_graph(
+            &asset,
+            &[],
+            &SurfaceDependencies { provider_hash },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_projection_output_demand_fixture(
+        provider_hash: [u8; 32],
+        surface_only: bool,
+    ) -> CompiledBiomeGraph {
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut projection = node(3, GraphOperator::SurfaceProjection, 0);
+        projection.spatial = NodeSpatialPolicy::Partitioned {
+            level: 0,
+            influence_radius: DecisionScalar::from_integer(1).unwrap(),
+        };
+        projection.parameters.insert(
+            "direction".to_owned(),
+            GraphParameterValue::FixedVec3([
+                DecisionScalar::from_bits(0),
+                DecisionScalar::from_bits(-65_536),
+                DecisionScalar::from_bits(0),
+            ]),
+        );
+        projection.parameters.insert(
+            "maxDistance".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_integer(1).unwrap()),
+        );
+        projection
+            .parameters
+            .insert("provider".to_owned(), GraphParameterValue::U64(77));
+        let species = node(4, GraphOperator::SpeciesInput, 0);
+        let mut output = node(5, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        let mut nodes = vec![output, species, projection, coverage, regions];
+        let mut edges = vec![
+            GraphEdge {
+                from_node: 1,
+                from_pin: "regions".to_owned(),
+                to_node: 2,
+                to_pin: "regions".to_owned(),
+            },
+            GraphEdge {
+                from_node: 2,
+                from_pin: "candidates".to_owned(),
+                to_node: 3,
+                to_pin: "candidates".to_owned(),
+            },
+            GraphEdge {
+                from_node: 4,
+                from_pin: "species".to_owned(),
+                to_node: 5,
+                to_pin: "species".to_owned(),
+            },
+        ];
+        if surface_only {
+            let mut transform = node(6, GraphOperator::Transform, 0);
+            transform.seed_namespaces.insert("variation".to_owned(), 17);
+            transform.parameters.insert(
+                "orientToSurface".to_owned(),
+                GraphParameterValue::Boolean(true),
+            );
+            nodes.push(transform);
+            edges.extend([
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 6,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "surface".to_owned(),
+                    to_node: 6,
+                    to_pin: "surface".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 6,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+            ]);
+        } else {
+            edges.push(GraphEdge {
+                from_node: 3,
+                from_pin: "candidates".to_owned(),
+                to_node: 5,
+                to_pin: "candidates".to_owned(),
+            });
+        }
+        let document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1005,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 5,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes,
+            edges,
+        };
+        let mut asset = fixture_asset(0);
+        asset.graph = document.to_json();
+        compile_biome_graph(
+            &asset,
+            &[],
+            &SurfaceDependencies { provider_hash },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_document(document: BiomeGraphDocument) -> CompiledBiomeGraph {
+        let mut asset = fixture_asset(0);
+        asset.graph = document.to_json();
+        compile_biome_graph(
+            &asset,
+            &[],
+            &NoDependencies,
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_surface_field_fixture(provider_hash: [u8; 32]) -> CompiledBiomeGraph {
+        let level = 0;
+        let region = node(1, GraphOperator::RegionInput, level);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, level);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let species = node(3, GraphOperator::SpeciesInput, level);
+        let mut output = node(4, GraphOperator::MacroOutput, level);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        let mut field = node(5, GraphOperator::FieldSample, level);
+        field.parameters.insert(
+            "channel".to_owned(),
+            GraphParameterValue::FieldChannel(FieldChannel::Moisture),
+        );
+        field.parameters.insert(
+            "derivative".to_owned(),
+            GraphParameterValue::FieldDerivative(FieldDerivative::Value),
+        );
+        let mut importance = node(6, GraphOperator::FieldImportance, level);
+        importance.parameters.insert(
+            "threshold".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1004,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 4,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, importance, field, species, coverage, region],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 6,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 5,
+                    from_pin: "field".to_owned(),
+                    to_node: 6,
+                    to_pin: "weights".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 6,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 4,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "species".to_owned(),
+                    to_node: 4,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let mut asset = fixture_asset(level);
+        asset.graph = document.to_json();
+        compile_biome_graph(
+            &asset,
+            &[],
+            &SurfaceDependencies { provider_hash },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_dead_surface_branch_fixture(
+        provider_hash: [u8; 32],
+        include_dead_branch: bool,
+    ) -> CompiledBiomeGraph {
+        let mut document = fixture_document(0);
+        if include_dead_branch {
+            let mut field = node(20, GraphOperator::FieldSample, 0);
+            field.parameters.insert(
+                "channel".to_owned(),
+                GraphParameterValue::FieldChannel(FieldChannel::Moisture),
+            );
+            field.parameters.insert(
+                "derivative".to_owned(),
+                GraphParameterValue::FieldDerivative(FieldDerivative::Value),
+            );
+            document.nodes.push(field);
+            document.edges.push(GraphEdge {
+                from_node: 2,
+                from_pin: "candidates".to_owned(),
+                to_node: 20,
+                to_pin: "candidates".to_owned(),
+            });
+        }
+        let mut asset = fixture_asset(0);
+        asset.graph = document.to_json();
+        compile_biome_graph(
+            &asset,
+            &[],
+            &SurfaceDependencies { provider_hash },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn explicit_anchor_document() -> BiomeGraphDocument {
+        let mut anchors = node(1, GraphOperator::ExplicitAnchors, 0);
+        anchors
+            .parameters
+            .insert("layer".to_owned(), GraphParameterValue::Guid(42));
+        let species = node(2, GraphOperator::SpeciesInput, 0);
+        let mut output = node(3, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1003,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 3,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, anchors],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "species".to_owned(),
+                    to_node: 3,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn spline_document() -> BiomeGraphDocument {
+        let splines = node(1, GraphOperator::SplineInput, 0);
+        let mut follow = node(2, GraphOperator::SplineFollow, 0);
+        follow.parameters.insert(
+            "spacing".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_integer(1).unwrap()),
+        );
+        follow.parameters.insert(
+            "edgeOffset".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(0)),
+        );
+        let species = node(3, GraphOperator::SpeciesInput, 0);
+        let mut output = node(4, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1004,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 4,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, follow, splines],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "splines".to_owned(),
+                    to_node: 2,
+                    to_pin: "splines".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 4,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "species".to_owned(),
+                    to_node: 4,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn recursive_document() -> BiomeGraphDocument {
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(2));
+        let mut recursive = node(3, GraphOperator::RecursiveCompanion, 0);
+        recursive.spatial = NodeSpatialPolicy::Global { level: 0 };
+        recursive
+            .seed_namespaces
+            .insert("companions".to_owned(), 17);
+        recursive
+            .parameters
+            .insert("children".to_owned(), GraphParameterValue::U32(2));
+        recursive
+            .parameters
+            .insert("maximumDepth".to_owned(), GraphParameterValue::U32(2));
+        recursive.parameters.insert(
+            "radius".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(1)),
+        );
+        let species = node(4, GraphOperator::SpeciesInput, 0);
+        let mut output = node(5, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1005,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 5,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, recursive, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 4,
+                    from_pin: "species".to_owned(),
+                    to_node: 5,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn micro_document() -> BiomeGraphDocument {
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(1));
+        let mut output = node(3, GraphOperator::MicroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("reconstruction".to_owned(), 13);
+        output.parameters.insert(
+            "dimensions".to_owned(),
+            GraphParameterValue::U32Vec3([4, 4, 4]),
+        );
+        output.parameters.insert(
+            "attributeChannels".to_owned(),
+            GraphParameterValue::GuidList(Vec::new()),
+        );
+        let communities = node(4, GraphOperator::CommunityInput, 0);
+        let mut blend = node(5, GraphOperator::CommunityBlend, 0);
+        blend.seed_namespaces.insert("community".to_owned(), 19);
+        BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1003,
+                name: "micro".to_owned(),
+                domain: GraphDomain::MicroField,
+                node: 3,
+                pin: "micro".to_owned(),
+                sink: Some(GraphSink::Micro),
+            }],
+            nodes: vec![blend, communities, output, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 4,
+                    from_pin: "communities".to_owned(),
+                    to_node: 5,
+                    to_pin: "communities".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 5,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn explicit_family_micro_document() -> BiomeGraphDocument {
+        let mut anchors = node(1, GraphOperator::ExplicitAnchors, 0);
+        anchors
+            .parameters
+            .insert("layer".to_owned(), GraphParameterValue::Guid(42));
+        let mut output = node(2, GraphOperator::MicroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("reconstruction".to_owned(), 13);
+        output.parameters.insert(
+            "dimensions".to_owned(),
+            GraphParameterValue::U32Vec3([2, 1, 1]),
+        );
+        output.parameters.insert(
+            "attributeChannels".to_owned(),
+            GraphParameterValue::GuidList(Vec::new()),
+        );
+        BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1002,
+                name: "micro".to_owned(),
+                domain: GraphDomain::MicroField,
+                node: 2,
+                pin: "micro".to_owned(),
+                sink: Some(GraphSink::Micro),
+            }],
+            nodes: vec![output, anchors],
+            edges: vec![GraphEdge {
+                from_node: 1,
+                from_pin: "candidates".to_owned(),
+                to_node: 2,
+                to_pin: "candidates".to_owned(),
+            }],
+        }
+    }
+
+    fn micro_attribute_document(channel: u128) -> BiomeGraphDocument {
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(1));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut noise = node(3, GraphOperator::Noise, 0);
+        noise.seed_namespaces.insert("noise".to_owned(), 13);
+        noise.parameters.insert(
+            "frequency".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(65_536)),
+        );
+        noise.parameters.insert(
+            "amplitude".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(65_536)),
+        );
+        noise
+            .parameters
+            .insert("channel".to_owned(), GraphParameterValue::U32(7));
+        let mut output = node(4, GraphOperator::MicroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("reconstruction".to_owned(), 17);
+        output.parameters.insert(
+            "dimensions".to_owned(),
+            GraphParameterValue::U32Vec3([2, 2, 2]),
+        );
+        output.parameters.insert(
+            "attributeChannels".to_owned(),
+            GraphParameterValue::GuidList(vec![channel]),
+        );
+        let communities = node(5, GraphOperator::CommunityInput, 0);
+        let mut blend = node(6, GraphOperator::CommunityBlend, 0);
+        blend.seed_namespaces.insert("community".to_owned(), 19);
+        BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 1004,
+                name: "micro".to_owned(),
+                domain: GraphDomain::MicroField,
+                node: 4,
+                pin: "micro".to_owned(),
+                sink: Some(GraphSink::Micro),
+            }],
+            nodes: vec![blend, communities, output, noise, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 6,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 5,
+                    from_pin: "communities".to_owned(),
+                    to_node: 6,
+                    to_pin: "communities".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 6,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 4,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "field".to_owned(),
+                    to_node: 4,
+                    to_pin: format!("attribute-{channel:032x}"),
+                },
+            ],
+        }
+    }
+
+    struct OneModuleResolver {
+        module: BiomeAsset,
+    }
+
+    impl BiomeGraphResolver for OneModuleResolver {
+        fn resolve_biome(&self, id: Uuid) -> Result<BiomeAsset> {
+            if id == self.module.id {
+                Ok(self.module.clone())
+            } else {
+                Err(Error::GraphDocument {
+                    path: "test.resolver".to_owned(),
+                    reason: "unknown module".to_owned(),
+                })
+            }
+        }
+
+        fn resolve_dependency_hash(&self, source: GraphDependencySource) -> Result<[u8; 32]> {
+            match source {
+                GraphDependencySource::Asset(Uuid(702)) => Ok([7; 32]),
+                _ => Ok([9; 32]),
+            }
+        }
+    }
+
+    fn compile_module_fixture() -> CompiledBiomeGraph {
+        compile_module_fixture_with_dead_sibling(false)
+    }
+
+    fn compile_module_fixture_with_dead_sibling(include_dead_sibling: bool) -> CompiledBiomeGraph {
+        let mut interface = node(10, GraphOperator::InterfaceInput, 0);
+        interface.parameters.insert(
+            "name".to_owned(),
+            GraphParameterValue::String("candidates".to_owned()),
+        );
+        let mut cluster = node(11, GraphOperator::ClusterPatchColony, 0);
+        cluster.spatial = NodeSpatialPolicy::Partitioned {
+            level: 0,
+            influence_radius: DecisionScalar::from_bits(1),
+        };
+        cluster.seed_namespaces.insert("cluster".to_owned(), 17);
+        cluster
+            .parameters
+            .insert("children".to_owned(), GraphParameterValue::U32(2));
+        cluster.parameters.insert(
+            "radius".to_owned(),
+            GraphParameterValue::Fixed(DecisionScalar::from_bits(1)),
+        );
+        cluster.parameters.insert(
+            "mode".to_owned(),
+            GraphParameterValue::ClusterMode(GraphClusterMode::Cluster),
+        );
+        let mut module_outputs = vec![GraphInterfaceOutput {
+            id: 2011,
+            name: "candidates".to_owned(),
+            domain: GraphDomain::Candidates,
+            node: 11,
+            pin: "candidates".to_owned(),
+            sink: None,
+        }];
+        if include_dead_sibling {
+            module_outputs.push(GraphInterfaceOutput {
+                id: 2012,
+                name: "unused-sibling-output-with-an-intentionally-long-name".to_owned(),
+                domain: GraphDomain::Candidates,
+                node: 10,
+                pin: "value".to_owned(),
+                sink: None,
+            });
+        }
+        let module_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: vec![GraphInterfaceInput {
+                id: 2010,
+                name: "candidates".to_owned(),
+                domain: GraphDomain::Candidates,
+            }],
+            outputs: module_outputs,
+            nodes: vec![cluster, interface],
+            edges: vec![GraphEdge {
+                from_node: 10,
+                from_pin: "value".to_owned(),
+                to_node: 11,
+                to_pin: "candidates".to_owned(),
+            }],
+        };
+        let mut module = fixture_asset(0);
+        module.id = Uuid(880);
+        module.role = BiomeRole::Module;
+        module.graph = module_document.to_json();
+
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(3));
+        let mut call = node(3, GraphOperator::ModuleCall, 0);
+        call.parameters
+            .insert("callGuid".to_owned(), GraphParameterValue::Guid(99));
+        let species = node(4, GraphOperator::SpeciesInput, 0);
+        let mut output = node(5, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        let root_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 3005,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 5,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, call, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 4,
+                    from_pin: "species".to_owned(),
+                    to_node: 5,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let mut root = fixture_asset(0);
+        root.graph = root_document.to_json();
+        root.modules = vec![BiomeModuleReference {
+            biome: module.id,
+            call_guid: 99,
+            bindings: Vec::new(),
+        }];
+        compile_biome_graph(
+            &root,
+            &[],
+            &OneModuleResolver { module },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_module_global_prerequisite_fixture(resident_source: bool) -> CompiledBiomeGraph {
+        let mut interface = node(10, GraphOperator::InterfaceInput, 0);
+        interface.parameters.insert(
+            "name".to_owned(),
+            GraphParameterValue::String("candidates".to_owned()),
+        );
+        let (module_nodes, module_edges, module_output_node) = if resident_source {
+            let mut noise = node(11, GraphOperator::Noise, 0);
+            noise.authority = GraphAuthority::EquivalentGpu;
+            noise.spatial = NodeSpatialPolicy::Global { level: 0 };
+            noise.seed_namespaces.insert("noise".to_owned(), 17);
+            noise.parameters.insert(
+                "frequency".to_owned(),
+                GraphParameterValue::Fixed(DecisionScalar::from_bits(32_768)),
+            );
+            noise.parameters.insert(
+                "amplitude".to_owned(),
+                GraphParameterValue::Fixed(DecisionScalar::from_bits(65_536)),
+            );
+            noise
+                .parameters
+                .insert("channel".to_owned(), GraphParameterValue::U32(3));
+            let mut importance = node(12, GraphOperator::FieldImportance, 0);
+            importance.authority = GraphAuthority::EquivalentGpu;
+            importance.spatial = NodeSpatialPolicy::Global { level: 0 };
+            importance.parameters.insert(
+                "threshold".to_owned(),
+                GraphParameterValue::Unit(UnitInterval::ZERO),
+            );
+            (
+                vec![importance, noise, interface],
+                vec![
+                    GraphEdge {
+                        from_node: 10,
+                        from_pin: "value".to_owned(),
+                        to_node: 11,
+                        to_pin: "candidates".to_owned(),
+                    },
+                    GraphEdge {
+                        from_node: 10,
+                        from_pin: "value".to_owned(),
+                        to_node: 12,
+                        to_pin: "candidates".to_owned(),
+                    },
+                    GraphEdge {
+                        from_node: 11,
+                        from_pin: "field".to_owned(),
+                        to_node: 12,
+                        to_pin: "weights".to_owned(),
+                    },
+                ],
+                12,
+            )
+        } else {
+            let mut transform = node(11, GraphOperator::Transform, 0);
+            transform.spatial = NodeSpatialPolicy::Global { level: 0 };
+            transform.seed_namespaces.insert("variation".to_owned(), 17);
+            (
+                vec![transform, interface],
+                vec![GraphEdge {
+                    from_node: 10,
+                    from_pin: "value".to_owned(),
+                    to_node: 11,
+                    to_pin: "candidates".to_owned(),
+                }],
+                11,
+            )
+        };
+        let module_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: vec![GraphInterfaceInput {
+                id: 2010,
+                name: "candidates".to_owned(),
+                domain: GraphDomain::Candidates,
+            }],
+            outputs: vec![GraphInterfaceOutput {
+                id: 2011,
+                name: "candidates".to_owned(),
+                domain: GraphDomain::Candidates,
+                node: module_output_node,
+                pin: "candidates".to_owned(),
+                sink: None,
+            }],
+            nodes: module_nodes,
+            edges: module_edges,
+        };
+        let mut module = fixture_asset(0);
+        module.id = Uuid(881);
+        module.role = BiomeRole::Module;
+        module.graph = module_document.to_json();
+
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut call = node(3, GraphOperator::ModuleCall, 0);
+        call.parameters
+            .insert("callGuid".to_owned(), GraphParameterValue::Guid(99));
+        let mut coarse = node(6, GraphOperator::Transform, 2);
+        coarse.spatial = NodeSpatialPolicy::Global { level: 2 };
+        coarse.seed_namespaces.insert("variation".to_owned(), 17);
+        let species = node(4, GraphOperator::SpeciesInput, 0);
+        let mut output = node(5, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        let root_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 3005,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 5,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, coarse, call, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 6,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 6,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 4,
+                    from_pin: "species".to_owned(),
+                    to_node: 5,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let mut root = fixture_asset(0);
+        root.graph = root_document.to_json();
+        root.modules = vec![BiomeModuleReference {
+            biome: module.id,
+            call_guid: 99,
+            bindings: Vec::new(),
+        }];
+        compile_biome_graph(
+            &root,
+            &[],
+            &OneModuleResolver { module },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_module_global_surface_fixture() -> CompiledBiomeGraph {
+        let mut interface = node(10, GraphOperator::InterfaceInput, 0);
+        interface.parameters.insert(
+            "name".to_owned(),
+            GraphParameterValue::String("candidates".to_owned()),
+        );
+        let mut field = node(11, GraphOperator::FieldSample, 0);
+        field.spatial = NodeSpatialPolicy::Global { level: 0 };
+        field.parameters.insert(
+            "channel".to_owned(),
+            GraphParameterValue::FieldChannel(FieldChannel::Moisture),
+        );
+        field.parameters.insert(
+            "derivative".to_owned(),
+            GraphParameterValue::FieldDerivative(FieldDerivative::Value),
+        );
+        let mut importance = node(12, GraphOperator::FieldImportance, 0);
+        importance.spatial = NodeSpatialPolicy::Global { level: 0 };
+        importance.parameters.insert(
+            "threshold".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let module_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: vec![GraphInterfaceInput {
+                id: 2010,
+                name: "candidates".to_owned(),
+                domain: GraphDomain::Candidates,
+            }],
+            outputs: vec![GraphInterfaceOutput {
+                id: 2012,
+                name: "candidates".to_owned(),
+                domain: GraphDomain::Candidates,
+                node: 12,
+                pin: "candidates".to_owned(),
+                sink: None,
+            }],
+            nodes: vec![importance, field, interface],
+            edges: vec![
+                GraphEdge {
+                    from_node: 10,
+                    from_pin: "value".to_owned(),
+                    to_node: 11,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 10,
+                    from_pin: "value".to_owned(),
+                    to_node: 12,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 11,
+                    from_pin: "field".to_owned(),
+                    to_node: 12,
+                    to_pin: "weights".to_owned(),
+                },
+            ],
+        };
+        let mut module = fixture_asset(0);
+        module.id = Uuid(883);
+        module.role = BiomeRole::Module;
+        module.graph = module_document.to_json();
+
+        let regions = node(1, GraphOperator::RegionInput, 0);
+        let mut coverage = node(2, GraphOperator::StratifiedCoverage, 0);
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let mut call = node(3, GraphOperator::ModuleCall, 0);
+        call.parameters
+            .insert("callGuid".to_owned(), GraphParameterValue::Guid(99));
+        let species = node(4, GraphOperator::SpeciesInput, 0);
+        let mut output = node(5, GraphOperator::MacroOutput, 0);
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        let root_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 3005,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 5,
+                pin: "points".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![output, species, call, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 1,
+                    from_pin: "regions".to_owned(),
+                    to_node: 2,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 2,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 3,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 3,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 5,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 4,
+                    from_pin: "species".to_owned(),
+                    to_node: 5,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let mut root = fixture_asset(0);
+        root.graph = root_document.to_json();
+        root.modules = vec![BiomeModuleReference {
+            biome: module.id,
+            call_guid: 99,
+            bindings: Vec::new(),
+        }];
+        compile_biome_graph(
+            &root,
+            &[],
+            &OneModuleResolver { module },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn compile_stage_materialized_module_output_fixture() -> CompiledBiomeGraph {
+        let regions = node(10, GraphOperator::RegionInput, 0);
+        let mut coverage = node(11, GraphOperator::StratifiedCoverage, 0);
+        coverage.spatial = NodeSpatialPolicy::Global { level: 2 };
+        coverage.seed_namespaces.insert("sampling".to_owned(), 11);
+        coverage
+            .parameters
+            .insert("count".to_owned(), GraphParameterValue::U32(4));
+        coverage.parameters.insert(
+            "jitter".to_owned(),
+            GraphParameterValue::Unit(UnitInterval::ZERO),
+        );
+        let species = node(12, GraphOperator::SpeciesInput, 0);
+        let unrelated = node(14, GraphOperator::RegionInput, 0);
+        let mut output = node(13, GraphOperator::MacroOutput, 0);
+        output.spatial = NodeSpatialPolicy::Global { level: 2 };
+        output
+            .seed_namespaces
+            .insert("species-selection".to_owned(), 13);
+        let module_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 2013,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 13,
+                pin: "points".to_owned(),
+                sink: None,
+            }],
+            nodes: vec![unrelated, output, species, coverage, regions],
+            edges: vec![
+                GraphEdge {
+                    from_node: 10,
+                    from_pin: "regions".to_owned(),
+                    to_node: 11,
+                    to_pin: "regions".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 11,
+                    from_pin: "candidates".to_owned(),
+                    to_node: 13,
+                    to_pin: "candidates".to_owned(),
+                },
+                GraphEdge {
+                    from_node: 12,
+                    from_pin: "species".to_owned(),
+                    to_node: 13,
+                    to_pin: "species".to_owned(),
+                },
+            ],
+        };
+        let mut module = fixture_asset(0);
+        module.id = Uuid(882);
+        module.role = BiomeRole::Module;
+        module.graph = module_document.to_json();
+
+        let mut call = node(3, GraphOperator::ModuleCall, 0);
+        call.parameters
+            .insert("callGuid".to_owned(), GraphParameterValue::Guid(99));
+        let root_document = BiomeGraphDocument {
+            version: BIOME_GRAPH_VERSION,
+            interface_version: crate::BIOME_INTERFACE_VERSION,
+            inputs: Vec::new(),
+            outputs: vec![GraphInterfaceOutput {
+                id: 3003,
+                name: "macro".to_owned(),
+                domain: GraphDomain::MacroPoints,
+                node: 3,
+                pin: "macro".to_owned(),
+                sink: Some(GraphSink::Macro),
+            }],
+            nodes: vec![call],
+            edges: Vec::new(),
+        };
+        let mut root = fixture_asset(0);
+        root.graph = root_document.to_json();
+        root.modules = vec![BiomeModuleReference {
+            biome: module.id,
+            call_guid: 99,
+            bindings: Vec::new(),
+        }];
+        compile_biome_graph(
+            &root,
+            &[],
+            &OneModuleResolver { module },
+            GraphCompileOptions::canonical(),
+        )
+        .unwrap()
+    }
+
+    fn explicit_point(candidate: u64, layer: u128, position: WorldPosition) -> EvaluationAnchor {
+        let ticks = position.global_ticks();
+        EvaluationAnchor {
+            layer,
+            point: PlantPoint {
+                id: PlantId::explicit([candidate as u8 + 1; 16]).unwrap(),
+                owner: position.cell(),
+                position,
+                orientation: QuantizedOrientation::identity(),
+                scale: [DecisionScalar::from_integer(1).unwrap(); 3],
+                bounds: WorldBounds::new(
+                    [ticks[0] - 1, ticks[1] - 1, ticks[2] - 1],
+                    [ticks[0] + 2, ticks[1] + 2, ticks[2] + 2],
+                )
+                .unwrap(),
+                family: Uuid(702),
+                variation: 0,
+                lifecycle: PlantLifecycle::Mature,
+                phenotype: 0,
+                representation_class: 0,
+                deterministic_key: u128::from(candidate),
+                candidate,
+                parent: None,
+                colony: None,
+                ecology_tick: 0,
+                health: UnitInterval::ONE,
+                moisture: UnitInterval::ONE,
+                fuel: UnitInterval::ONE,
+                phenology: UnitInterval::ZERO,
+                flags: PlantFlags::default(),
+                interaction_policy: InteractionPolicy::Decorative,
+                provenance: 0,
+                attachment: None,
+                surface_projection: [DecisionScalar::from_bits(0); 3],
+            },
+        }
+    }
+
     fn input(cell: WorldCellKey, halo: DecisionScalar) -> GraphEvaluationInputs {
         let mut input = GraphEvaluationInputs::for_cell(Uuid(801), 91, cell, halo).unwrap();
         input.plant_prototypes.push(PlantPrototype {
@@ -10850,11 +17243,56 @@ mod tests {
         input
     }
 
+    fn projection_provider() -> (Arc<dyn SurfaceField>, [u8; 32]) {
+        let descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: WorldCellKey::new(0, 0, 0, 2).unwrap().bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 0,
+            capabilities: SurfaceCapabilities {
+                project: true,
+                authoritative_attachments: true,
+                ..SurfaceCapabilities::default()
+            },
+        };
+        let provider: Arc<dyn SurfaceField> = Arc::new(TestSurfaceField {
+            descriptor,
+            failing_cell_x: None,
+            project_hits: true,
+            successful_samples: Arc::new(AtomicUsize::new(0)),
+        });
+        let provider_hash = canonical_surface_provider_set_hash(
+            &[Arc::clone(&provider)],
+            crate::GraphSafetyLimits::default().max_input_tiles,
+        )
+        .unwrap();
+        (provider, provider_hash)
+    }
+
+    fn projection_job(
+        graph: &CompiledBiomeGraph,
+        provider: Arc<dyn SurfaceField>,
+        provider_hash: [u8; 32],
+    ) -> GraphEvaluationJobInputs {
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs.surface_provider_set_hash = provider_hash;
+        inputs.surface_providers.push(provider);
+        job(vec![inputs])
+    }
+
     fn job(cells: Vec<GraphEvaluationInputs>) -> GraphEvaluationJobInputs {
         GraphEvaluationJobInputs {
             cells,
             global_stages: Vec::new(),
         }
+    }
+
+    fn assert_graph_limit(error: Error, resource: &'static str) {
+        assert!(
+            matches!(error, Error::GraphLimit { resource: actual, .. } if actual == resource),
+            "expected {resource} limit, got {error:?}"
+        );
     }
 
     fn global_job(
@@ -10943,24 +17381,1906 @@ mod tests {
         let graph = compile_fixture(0);
         let inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
         let plan = build_execution_plan(&graph, false, None).unwrap();
-        let bound = symbolic_evaluation_bound(&graph, &inputs, &plan).unwrap();
-        let actual = evaluate_cell_reference(
+        let global_store = SymbolicGlobalStore::default();
+        let cancellation = GraphCancellationToken::default();
+        let guard = PreflightGuard {
+            cancellation: &cancellation,
+            deadline: evaluation_deadline(&graph).unwrap(),
+            time_limit_ms: graph.limits.max_time_ms,
+        };
+        let bound = symbolic_evaluation_bound(
             &graph,
             &inputs,
-            &GraphCancellationToken::default(),
+            &plan,
+            SymbolicEvaluationScope::Cell {
+                global_store: &global_store,
+            },
+            guard,
         )
-        .unwrap();
+        .unwrap()
+        .bound;
+        let actual =
+            evaluate_cell_reference(&graph, &inputs, &GraphCancellationToken::default()).unwrap();
         let actual_node_bytes = actual
             .diagnostics
             .nodes
             .iter()
             .map(|node| node.output_bytes)
             .sum::<u64>();
+        let canonical_bytes = actual.canonical_bytes().unwrap();
+        let mut hasher = VegetationContentHasher::new();
+        actual.update_content_hasher(&mut hasher).unwrap();
 
+        assert_eq!(actual.canonical_byte_len().unwrap(), canonical_bytes.len());
+        assert_eq!(hasher.finalize().unwrap(), sha256(&canonical_bytes));
         assert!(bound.candidate_peak >= actual.diagnostics.candidate_count);
         assert!(bound.accepted >= actual.macro_points.row_count().unwrap() as u64);
         assert!(bound.memory_bytes >= actual_node_bytes);
+        assert_eq!(bound.rejected, bound.candidate_peak * 3);
+        assert!(bound.rejected >= actual.diagnostics.rejected.len() as u64);
         assert_eq!(bound.transfer_bytes, 0);
+    }
+
+    #[test]
+    fn public_preflight_matches_anchor_spline_recursive_and_module_bounds() {
+        let cancellation = GraphCancellationToken::default();
+
+        let graph = Arc::new(compile_document(explicit_anchor_document()));
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs.anchors = vec![
+            explicit_point(0, 42, WorldPosition::from_global_ticks([0, 0, 0]).unwrap()),
+            explicit_point(
+                1,
+                42,
+                WorldPosition::from_global_ticks([i128::from(LOCAL_TICKS_PER_METER), 0, 0])
+                    .unwrap(),
+            ),
+            explicit_point(
+                2,
+                7,
+                WorldPosition::from_global_ticks([2 * i128::from(LOCAL_TICKS_PER_METER), 0, 0])
+                    .unwrap(),
+            ),
+        ];
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 4).unwrap();
+        let anchor_job = job(vec![inputs]);
+        let bound = evaluator.preflight(&anchor_job, &cancellation).unwrap();
+        let actual = evaluator.evaluate(anchor_job, &cancellation).unwrap();
+        assert_eq!((bound.candidate_count, bound.accepted_count), (2, 2));
+        assert_eq!(bound.worker_count, 1);
+        assert_eq!(actual.cells[0].macro_points.row_count().unwrap(), 2);
+
+        let graph = Arc::new(compile_document(spline_document()));
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs.splines.push(EvaluationSpline {
+            id: 1,
+            layer: 1,
+            points: vec![
+                WorldPosition::from_global_ticks([0, 0, 0]).unwrap(),
+                WorldPosition::from_global_ticks([10 * i128::from(LOCAL_TICKS_PER_METER), 0, 0])
+                    .unwrap(),
+            ],
+        });
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        let spline_job = job(vec![inputs]);
+        let bound = evaluator.preflight(&spline_job, &cancellation).unwrap();
+        let actual = evaluator.evaluate(spline_job, &cancellation).unwrap();
+        assert_eq!((bound.candidate_count, bound.accepted_count), (11, 11));
+        assert_eq!(actual.cells[0].macro_points.row_count().unwrap(), 11);
+
+        let graph = Arc::new(compile_document(recursive_document()));
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs
+            .set_hierarchical_region(71, inputs.output_bounds)
+            .unwrap();
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        let recursive_job = global_job(&graph, vec![inputs]);
+        let bound = evaluator.preflight(&recursive_job, &cancellation).unwrap();
+        let actual = evaluator.evaluate(recursive_job, &cancellation).unwrap();
+        assert_eq!((bound.candidate_count, bound.accepted_count), (28, 14));
+        assert_eq!(actual.cells[0].macro_points.row_count().unwrap(), 14);
+
+        let graph = Arc::new(compile_module_fixture());
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs
+            .set_hierarchical_region(72, inputs.output_bounds)
+            .unwrap();
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        let module_job = job(vec![inputs]);
+        let bound = evaluator.preflight(&module_job, &cancellation).unwrap();
+        let actual = evaluator.evaluate(module_job, &cancellation).unwrap();
+        assert_eq!((bound.candidate_count, bound.accepted_count), (9, 9));
+        assert_eq!(actual.cells[0].macro_points.row_count().unwrap(), 9);
+    }
+
+    #[test]
+    fn module_output_demand_reaches_nested_earlier_global_stage_sources() {
+        let graph = Arc::new(compile_module_global_prerequisite_fixture(false));
+        let stages = graph.spatial_plan().global_stages();
+        assert_eq!(stages.len(), 2);
+        assert_eq!((stages[0].owner_level, stages[1].owner_level), (0, 2));
+        assert!(stages[1].input_pins.contains(&QualifiedGraphPin {
+            node: GraphNodeAddress {
+                module_path: vec![99],
+                node: 11,
+            },
+            pin: "candidates".to_owned(),
+        }));
+
+        let inputs = global_job(
+            &graph,
+            vec![input(WorldCellKey::base(0, 0, 0), graph.required_halo(0))],
+        );
+        let cancellation = GraphCancellationToken::default();
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        evaluator.preflight(&inputs, &cancellation).unwrap();
+        let result = evaluator.evaluate(inputs, &cancellation).unwrap();
+        let later_stage = result
+            .global_stages
+            .iter()
+            .find(|tile| tile.stage == stages[1].id)
+            .unwrap();
+        assert!(later_stage.result.diagnostics.nodes.iter().any(|node| {
+            node.module_path.is_empty()
+                && node.node == 6
+                && node.operator == GraphOperator::Transform
+        }));
+        assert!(!later_stage.result.diagnostics.nodes.iter().any(|node| {
+            node.module_path == [99] && node.node == 11 && node.operator == GraphOperator::Transform
+        }));
+    }
+
+    #[test]
+    fn global_module_load_boundary_does_not_request_cell_preparation() {
+        let graph = compile_module_global_surface_fixture();
+        assert!(
+            demand_requires_canonical_preparation(
+                &graph.root,
+                graph.demand_plan().execution_slice(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !demand_requires_canonical_preparation(
+                &graph.root,
+                graph.demand_plan().public_slice(),
+            )
+            .unwrap()
+        );
+        let stage = &graph.spatial_plan().global_stages()[0];
+        assert!(
+            demand_requires_canonical_preparation(
+                &graph.root,
+                graph.demand_plan().stage_slice(stage.id).unwrap(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn split_scope_global_loads_only_the_demanded_surface_projection_pin() {
+        let descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: WorldCellKey::new(0, 0, 0, 2).unwrap().bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 0,
+            capabilities: SurfaceCapabilities {
+                project: true,
+                authoritative_attachments: true,
+                ..SurfaceCapabilities::default()
+            },
+        };
+        let provider: Arc<dyn SurfaceField> = Arc::new(TestSurfaceField {
+            descriptor,
+            failing_cell_x: None,
+            project_hits: false,
+            successful_samples: Arc::new(AtomicUsize::new(0)),
+        });
+        let provider_hash = canonical_surface_provider_set_hash(
+            &[Arc::clone(&provider)],
+            crate::GraphSafetyLimits::default().max_input_tiles,
+        )
+        .unwrap();
+        let graph = compile_split_surface_projection_fixture(provider_hash);
+        let projection = GraphNodeAddress {
+            module_path: Vec::new(),
+            node: 3,
+        };
+        let transform = GraphNodeAddress {
+            module_path: Vec::new(),
+            node: 4,
+        };
+        let projection_stage = graph
+            .spatial_plan()
+            .global_stage_for_node(&projection)
+            .unwrap();
+        let transform_stage = graph
+            .spatial_plan()
+            .global_stage_for_node(&transform)
+            .unwrap();
+        assert_ne!(projection_stage.id, transform_stage.id);
+        let projection_candidates = QualifiedGraphPin {
+            node: projection.clone(),
+            pin: "candidates".to_owned(),
+        };
+        let projection_surface = QualifiedGraphPin {
+            node: projection,
+            pin: "surface".to_owned(),
+        };
+        assert!(
+            graph
+                .demand_plan()
+                .public_slice()
+                .output_pins
+                .contains(&projection_candidates)
+        );
+        assert!(
+            !graph
+                .demand_plan()
+                .public_slice()
+                .output_pins
+                .contains(&projection_surface)
+        );
+        let later_demand = graph.demand_plan().stage_slice(transform_stage.id).unwrap();
+        assert!(later_demand.output_pins.contains(&projection_candidates));
+        assert!(later_demand.output_pins.contains(&projection_surface));
+
+        let cell = WorldCellKey::base(0, 0, 0);
+        let mut cell_input = input(cell, graph.required_halo(0));
+        cell_input.surface_provider_set_hash = provider_hash;
+        let mut inputs = global_job(&graph, vec![cell_input]);
+        for stage_input in &mut inputs.global_stages {
+            stage_input.inputs.surface_provider_set_hash = provider_hash;
+            if stage_input.stage == projection_stage.id {
+                stage_input
+                    .inputs
+                    .surface_providers
+                    .push(Arc::clone(&provider));
+            }
+        }
+        let cancellation = GraphCancellationToken::default();
+        let baseline = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap();
+        let result = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .evaluate(inputs.clone(), &cancellation)
+            .unwrap();
+        assert!(result.cells[0].surface_projection_tiles.is_empty());
+        assert!(
+            result
+                .global_stages
+                .iter()
+                .filter(|tile| tile.stage == transform_stage.id)
+                .all(|tile| tile
+                    .result
+                    .diagnostics
+                    .nodes
+                    .iter()
+                    .any(|node| { node.node == 4 && node.operator == GraphOperator::Transform }))
+        );
+
+        let mut exact_graph = graph.clone();
+        exact_graph.limits.max_memory_bytes = baseline.memory_bytes;
+        BiomeGraphEvaluator::new(Arc::new(exact_graph), 1)
+            .unwrap()
+            .evaluate(inputs.clone(), &cancellation)
+            .unwrap();
+        let mut rejected_graph = graph;
+        rejected_graph.limits.max_memory_bytes = baseline.memory_bytes - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(rejected_graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "memory bytes",
+                requested,
+                limit,
+            } if requested == baseline.memory_bytes && limit == baseline.memory_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn surface_projection_candidates_only_materializes_exact_demand() {
+        let (provider, provider_hash) = projection_provider();
+        let graph = compile_projection_output_demand_fixture(provider_hash, false);
+        let projection = graph
+            .root
+            .nodes
+            .iter()
+            .find(|node| node.definition.guid == 3)
+            .unwrap();
+        let demand = NodeOutputDemand::new(graph.demand_plan().public_slice(), projection);
+        assert!(demand.contains("candidates"));
+        assert!(!demand.contains("surface"));
+
+        let inputs = projection_job(&graph, provider, provider_hash);
+        let cancellation = GraphCancellationToken::default();
+        let baseline = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap();
+        let result = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .evaluate(inputs.clone(), &cancellation)
+            .unwrap();
+        let cell = &result.cells[0];
+        assert_eq!(cell.macro_points.row_count().unwrap(), 4);
+        assert_eq!(cell.surface_projection_tiles.len(), 1);
+        let diagnostic = cell
+            .diagnostics
+            .nodes
+            .iter()
+            .find(|diagnostic| diagnostic.node == 3)
+            .unwrap();
+        assert_eq!(diagnostic.output_candidates, 108);
+        assert_eq!(
+            diagnostic.output_bytes,
+            requested_vec_bytes::<GraphCandidate>(
+                usize::try_from(diagnostic.output_candidates).unwrap()
+            )
+            .unwrap()
+        );
+        let explanation = cell.explain_plant(cell.macro_points.ids[0]).unwrap();
+        assert!(explanation.decisions.iter().any(|(_, decision)| {
+            decision.node == 3 && decision.operator == GraphOperator::SurfaceProjection
+        }));
+
+        let mut exact_graph = graph.clone();
+        exact_graph.limits.max_memory_bytes = baseline.memory_bytes;
+        BiomeGraphEvaluator::new(Arc::new(exact_graph), 1)
+            .unwrap()
+            .evaluate(inputs.clone(), &cancellation)
+            .unwrap();
+        let mut rejected_graph = graph;
+        rejected_graph.limits.max_memory_bytes = baseline.memory_bytes - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(rejected_graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "memory bytes",
+                requested,
+                limit,
+            } if requested == baseline.memory_bytes && limit == baseline.memory_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn surface_projection_surface_only_materializes_exact_demand() {
+        let (provider, provider_hash) = projection_provider();
+        let graph = compile_projection_output_demand_fixture(provider_hash, true);
+        let projection = graph
+            .root
+            .nodes
+            .iter()
+            .find(|node| node.definition.guid == 3)
+            .unwrap();
+        let demand = NodeOutputDemand::new(graph.demand_plan().public_slice(), projection);
+        assert!(!demand.contains("candidates"));
+        assert!(demand.contains("surface"));
+
+        let inputs = projection_job(&graph, provider, provider_hash);
+        let cancellation = GraphCancellationToken::default();
+        let baseline = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap();
+        let result = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .evaluate(inputs.clone(), &cancellation)
+            .unwrap();
+        let cell = &result.cells[0];
+        assert_eq!(cell.macro_points.row_count().unwrap(), 4);
+        assert_eq!(cell.surface_projection_tiles.len(), 1);
+        let diagnostic = cell
+            .diagnostics
+            .nodes
+            .iter()
+            .find(|diagnostic| diagnostic.node == 3)
+            .unwrap();
+        assert_eq!(diagnostic.output_candidates, 108);
+        assert_eq!(
+            diagnostic.output_bytes,
+            requested_btree_bytes::<CandidateIdentity, ProjectedSurfaceSample>(
+                usize::try_from(diagnostic.output_candidates).unwrap()
+            )
+            .unwrap()
+        );
+        let explanation = cell.explain_plant(cell.macro_points.ids[0]).unwrap();
+        assert!(explanation.decisions.iter().any(|(_, decision)| {
+            decision.node == 3 && decision.operator == GraphOperator::SurfaceProjection
+        }));
+
+        let mut exact_graph = graph.clone();
+        exact_graph.limits.max_memory_bytes = baseline.memory_bytes;
+        BiomeGraphEvaluator::new(Arc::new(exact_graph), 1)
+            .unwrap()
+            .evaluate(inputs.clone(), &cancellation)
+            .unwrap();
+        let mut rejected_graph = graph;
+        rejected_graph.limits.max_memory_bytes = baseline.memory_bytes - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(rejected_graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "memory bytes",
+                requested,
+                limit,
+            } if requested == baseline.memory_bytes && limit == baseline.memory_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn micro_output_replays_its_live_dynamic_attribute_channel() {
+        let channel = 77_u128;
+        let graph = Arc::new(compile_document(micro_attribute_document(channel)));
+        let inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        let result = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .evaluate(job(vec![inputs]), &GraphCancellationToken::default())
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        let tile = &result.micro_fields[0];
+        assert_eq!(tile.density.len(), 8);
+        assert_eq!(tile.attributes[&channel].len(), 8);
+        assert!(result.diagnostics.nodes.iter().any(|node| {
+            node.node == 3 && node.operator == GraphOperator::Noise && node.output_bytes > 0
+        }));
+    }
+
+    #[test]
+    fn micro_output_emits_one_canonical_tile_per_assigned_family() {
+        let graph = Arc::new(compile_document(explicit_family_micro_document()));
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        let mut second =
+            explicit_point(1, 42, WorldPosition::from_global_ticks([1, 0, 0]).unwrap());
+        second.point.family = Uuid(703);
+        inputs.anchors = vec![
+            explicit_point(0, 42, WorldPosition::from_global_ticks([0, 0, 0]).unwrap()),
+            second,
+        ];
+
+        let result = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .evaluate(job(vec![inputs]), &GraphCancellationToken::default())
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            result
+                .micro_fields
+                .iter()
+                .map(|tile| tile.family.value())
+                .collect::<Vec<_>>(),
+            vec![702, 703]
+        );
+        assert_ne!(
+            result.micro_fields[0].reconstruction_seed,
+            result.micro_fields[1].reconstruction_seed
+        );
+        assert!(result.canonical_bytes().is_ok());
+    }
+
+    #[test]
+    fn stage_materialized_module_output_is_demanded_without_a_consumer_edge() {
+        let graph = Arc::new(compile_stage_materialized_module_output_fixture());
+        assert!(graph.root.edges.is_empty());
+        let stages = graph.spatial_plan().global_stages();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].owner_level, 2);
+        assert_eq!(
+            stages[0].nodes.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                GraphNodeAddress {
+                    module_path: vec![99],
+                    node: 11,
+                },
+                GraphNodeAddress {
+                    module_path: vec![99],
+                    node: 13,
+                },
+            ])
+        );
+        assert!(stages[0].output_pins.contains(&QualifiedGraphPin {
+            node: GraphNodeAddress {
+                module_path: vec![99],
+                node: 13,
+            },
+            pin: "points".to_owned(),
+        }));
+
+        let inputs = global_job(
+            &graph,
+            vec![input(WorldCellKey::base(0, 0, 0), graph.required_halo(0))],
+        );
+        let cancellation = GraphCancellationToken::default();
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        evaluator.preflight(&inputs, &cancellation).unwrap();
+        let result = evaluator.evaluate(inputs, &cancellation).unwrap();
+        assert!(result.global_stages.iter().all(|tile| {
+            tile.result
+                .diagnostics
+                .nodes
+                .iter()
+                .any(|node| node.module_path == [99] && node.node == 13)
+        }));
+        assert!(result.global_stages.iter().all(|tile| {
+            tile.result
+                .diagnostics
+                .nodes
+                .iter()
+                .all(|node| !(node.module_path == [99] && node.node == 14))
+        }));
+        assert!(
+            result
+                .global_stages
+                .iter()
+                .all(|tile| tile.resident_bytes > 0)
+        );
+        assert!(
+            result.cells[0]
+                .diagnostics
+                .nodes
+                .iter()
+                .all(|node| node.module_path != [99])
+        );
+    }
+
+    #[test]
+    fn dead_module_output_sibling_has_zero_bytes_and_preserves_the_exact_cap() {
+        let baseline_graph = compile_module_fixture_with_dead_sibling(false);
+        let sibling_graph = compile_module_fixture_with_dead_sibling(true);
+        let baseline_inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            baseline_graph.required_halo(0),
+        )]);
+        let sibling_inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            sibling_graph.required_halo(0),
+        )]);
+        let cancellation = GraphCancellationToken::default();
+        let baseline = BiomeGraphEvaluator::new(Arc::new(baseline_graph), 1)
+            .unwrap()
+            .preflight(&baseline_inputs, &cancellation)
+            .unwrap();
+        let sibling = BiomeGraphEvaluator::new(Arc::new(sibling_graph.clone()), 1)
+            .unwrap()
+            .preflight(&sibling_inputs, &cancellation)
+            .unwrap();
+        assert_eq!(sibling, baseline);
+
+        let mut exact_graph = sibling_graph.clone();
+        exact_graph.limits.max_memory_bytes = baseline.memory_bytes;
+        let exact = BiomeGraphEvaluator::new(Arc::new(exact_graph), 1).unwrap();
+        assert_eq!(
+            exact
+                .evaluate(sibling_inputs.clone(), &cancellation)
+                .unwrap()
+                .cells[0]
+                .macro_points
+                .row_count()
+                .unwrap(),
+            9
+        );
+
+        let mut rejected_graph = sibling_graph;
+        rejected_graph.limits.max_memory_bytes = baseline.memory_bytes - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(rejected_graph), 1)
+            .unwrap()
+            .preflight(&sibling_inputs, &cancellation)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "memory bytes",
+                requested,
+                limit,
+            } if requested == baseline.memory_bytes && limit == baseline.memory_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn resident_earlier_module_stage_is_loaded_without_redispatch() {
+        let graph = Arc::new(compile_module_global_prerequisite_fixture(true));
+        let stages = graph.spatial_plan().global_stages();
+        assert_eq!(stages.len(), 2);
+        assert_eq!((stages[0].owner_level, stages[1].owner_level), (0, 2));
+        assert_eq!(
+            stages[0].nodes.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                GraphNodeAddress {
+                    module_path: vec![99],
+                    node: 11,
+                },
+                GraphNodeAddress {
+                    module_path: vec![99],
+                    node: 12,
+                },
+            ])
+        );
+
+        let inputs = global_job(
+            &graph,
+            vec![input(WorldCellKey::base(0, 0, 0), graph.required_halo(0))],
+        );
+        let earlier_stage_tiles = inputs
+            .global_stages
+            .iter()
+            .filter(|tile| tile.stage == stages[0].id)
+            .count();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let cancellation = GraphCancellationToken::default();
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .with_compute_executor(counting_compute(Arc::clone(&dispatches)));
+        evaluator.preflight(&inputs, &cancellation).unwrap();
+        let result = evaluator.evaluate(inputs, &cancellation).unwrap();
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), earlier_stage_tiles);
+        assert!(
+            result
+                .global_stages
+                .iter()
+                .filter(|tile| tile.stage == stages[0].id)
+                .all(|tile| tile.result.diagnostics.gpu_groups.len() == 1)
+        );
+        assert!(
+            result
+                .global_stages
+                .iter()
+                .filter(|tile| tile.stage == stages[1].id)
+                .all(|tile| tile.result.diagnostics.gpu_groups.is_empty())
+        );
+        assert!(
+            result
+                .cells
+                .iter()
+                .all(|cell| cell.diagnostics.gpu_groups.is_empty())
+        );
+    }
+
+    #[test]
+    fn public_preflight_global_work_is_aggregated_once_per_owner() {
+        let graph = Arc::new(compile_global_fixture());
+        let halo = graph.required_halo(0);
+        let first = input(WorldCellKey::base(0, 0, 0), halo);
+        let second = input(WorldCellKey::base(1, 0, 0), halo);
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 2).unwrap();
+        let cancellation = GraphCancellationToken::default();
+        let first_bound = evaluator
+            .preflight(&global_job(&graph, vec![first.clone()]), &cancellation)
+            .unwrap();
+        let second_bound = evaluator
+            .preflight(&global_job(&graph, vec![second.clone()]), &cancellation)
+            .unwrap();
+        let combined_job = global_job(&graph, vec![first, second]);
+        let combined_bound = evaluator.preflight(&combined_job, &cancellation).unwrap();
+        let actual = evaluator.evaluate(combined_job, &cancellation).unwrap();
+
+        assert_eq!(
+            combined_bound.global_stage_tiles as usize,
+            actual.global_stages.len()
+        );
+        assert!(
+            combined_bound.global_stage_tiles
+                < first_bound.global_stage_tiles + second_bound.global_stage_tiles
+        );
+        assert!(
+            combined_bound.candidate_count
+                < first_bound.candidate_count + second_bound.candidate_count
+        );
+    }
+
+    #[test]
+    fn public_preflight_bounds_complete_retained_job_results() {
+        let graph = Arc::new(compile_global_fixture());
+        let halo = graph.required_halo(0);
+        let inputs = global_job(
+            &graph,
+            vec![
+                input(WorldCellKey::base(0, 0, 0), halo),
+                input(WorldCellKey::base(1, 0, 0), halo),
+            ],
+        );
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 2).unwrap();
+        let cancellation = GraphCancellationToken::default();
+        let bound = evaluator.preflight(&inputs, &cancellation).unwrap();
+        let actual = evaluator.evaluate(inputs, &cancellation).unwrap();
+        let result_bytes = actual
+            .cells
+            .iter()
+            .map(|result| result.canonical_bytes().unwrap().len() as u64)
+            .chain(actual.global_stages.iter().map(|tile| {
+                tile.resident_bytes + tile.result.canonical_bytes().unwrap().len() as u64
+            }))
+            .sum::<u64>();
+        let candidates = actual
+            .cells
+            .iter()
+            .map(|result| result.diagnostics.candidate_count)
+            .chain(
+                actual
+                    .global_stages
+                    .iter()
+                    .map(|tile| tile.result.diagnostics.candidate_count),
+            )
+            .sum::<u64>();
+        assert!(bound.memory_bytes >= bound.retained_input_bytes + result_bytes);
+        assert!(bound.candidate_count >= candidates);
+    }
+
+    #[test]
+    fn public_preflight_enforces_every_job_resource_cap() {
+        let cancellation = GraphCancellationToken::default();
+
+        let mut graph = compile_fixture(0);
+        graph.limits.max_workers = 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 2).err().unwrap();
+        assert_graph_limit(error, "worker count");
+
+        let mut graph = compile_fixture(0);
+        let halo = graph.required_halo(0);
+        let inputs = job(vec![
+            input(WorldCellKey::base(0, 0, 0), halo),
+            input(WorldCellKey::base(1, 0, 0), halo),
+        ]);
+        graph.limits.max_output_cells = 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "output cells");
+
+        let mut graph = compile_document(recursive_document());
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs
+            .set_hierarchical_region(81, inputs.output_bounds)
+            .unwrap();
+        graph.limits.max_candidates = 13;
+        let inputs = global_job(&graph, vec![inputs]);
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "candidate count");
+
+        let mut graph = compile_document(explicit_anchor_document());
+        let mut inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        inputs.anchors = vec![
+            explicit_point(0, 42, WorldPosition::from_global_ticks([0, 0, 0]).unwrap()),
+            explicit_point(
+                1,
+                42,
+                WorldPosition::from_global_ticks([i128::from(LOCAL_TICKS_PER_METER), 0, 0])
+                    .unwrap(),
+            ),
+        ];
+        graph.limits.max_macro_points = 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&job(vec![inputs]), &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "accepted count");
+
+        let mut graph = compile_document(micro_document());
+        let inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        graph.limits.max_micro_samples = 63;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&job(vec![inputs]), &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "micro samples");
+
+        let graph = Arc::new(compile_fixture(0));
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        let memory = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap()
+            .memory_bytes;
+        let mut limited = (*graph).clone();
+        limited.limits.max_memory_bytes = memory - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(limited), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "memory bytes");
+
+        let graph = Arc::new(compile_resident_branch_fixture());
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        let compute = reference_compute();
+        let transfer = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .with_compute_executor(Arc::clone(&compute))
+            .preflight(&inputs, &cancellation)
+            .unwrap()
+            .transfer_bytes;
+        assert!(transfer > 0);
+        let mut limited = (*graph).clone();
+        limited.limits.max_transfer_bytes = transfer - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(limited), 1)
+            .unwrap()
+            .with_compute_executor(compute)
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "transfer bytes");
+
+        let mut graph = compile_fixture(0);
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        graph.limits.max_time_ms = 0;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "time milliseconds");
+
+        let mut graph = compile_fixture(0);
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        graph.limits.max_input_tiles = 0;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "input tiles");
+
+        let mut graph = compile_global_fixture();
+        let inputs = global_job(
+            &graph,
+            vec![input(WorldCellKey::base(0, 0, 0), graph.required_halo(0))],
+        );
+        graph.limits.max_global_stage_tiles = inputs.global_stages.len() as u64 - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(graph), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "global stage tiles");
+    }
+
+    #[test]
+    fn ancestor_reference_memory_is_input_specific_and_keeps_the_exact_gate() {
+        let graph = compile_fixture(0);
+        assert_eq!(graph.limits.max_global_stage_tiles, 1_000_000);
+        let cell = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        assert_eq!(
+            ancestor_reference_upper_bound(&graph, &cell, true).unwrap(),
+            0
+        );
+        let inputs = job(vec![cell]);
+        let cancellation = GraphCancellationToken::default();
+        let baseline = BiomeGraphEvaluator::new(Arc::new(graph.clone()), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap();
+
+        let mut no_global_tiles = graph;
+        no_global_tiles.limits.max_global_stage_tiles = 0;
+        let uncharged = BiomeGraphEvaluator::new(Arc::new(no_global_tiles.clone()), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap();
+        assert_eq!(uncharged.memory_bytes, baseline.memory_bytes);
+
+        let mut exact = no_global_tiles.clone();
+        exact.limits.max_memory_bytes = uncharged.memory_bytes;
+        assert!(
+            BiomeGraphEvaluator::new(Arc::new(exact), 1)
+                .unwrap()
+                .preflight(&inputs, &cancellation)
+                .is_ok()
+        );
+
+        no_global_tiles.limits.max_memory_bytes = uncharged.memory_bytes - 1;
+        let error = BiomeGraphEvaluator::new(Arc::new(no_global_tiles), 1)
+            .unwrap()
+            .preflight(&inputs, &cancellation)
+            .unwrap_err();
+        assert_graph_limit(error, "memory bytes");
+    }
+
+    #[test]
+    fn ancestor_reference_bound_deduplicates_same_level_macro_stages() {
+        let graph = compile_same_level_macro_stages_fixture();
+        let stages = graph.spatial_plan().global_stages();
+        assert_eq!(stages.len(), 2);
+        assert!(
+            stages
+                .iter()
+                .all(|stage| global_stage_has_macro_output(&graph, stage).unwrap())
+        );
+        let inputs = input(WorldCellKey::base(0, 0, 0), graph.required_halo(0));
+        let covered = world_cell_count_covering_bounds(
+            inputs.read_bounds,
+            stages[0].owner_level,
+            graph.limits.max_global_stage_tiles,
+        )
+        .unwrap();
+        assert_eq!(
+            ancestor_reference_upper_bound(&graph, &inputs, true).unwrap(),
+            covered
+        );
+    }
+
+    #[test]
+    fn candidate_global_stage_charges_one_coarse_owner_and_global_scope_charges_no_imports() {
+        let candidate_graph = compile_candidate_only_global_fixture();
+        let candidate_stage = &candidate_graph.spatial_plan().global_stages()[0];
+        assert!(!global_stage_has_macro_output(&candidate_graph, candidate_stage).unwrap());
+        let mut cell = input(
+            WorldCellKey::base(0, 0, 0),
+            candidate_graph.required_halo(0),
+        );
+        let edge = i128::from(BASE_CELL_TICKS);
+        cell.read_bounds = WorldBounds::new([-1; 3], [edge + 1; 3]).unwrap();
+        assert!(
+            world_cell_count_covering_bounds(
+                cell.read_bounds,
+                candidate_stage.owner_level,
+                candidate_graph.limits.max_global_stage_tiles,
+            )
+            .unwrap()
+                > 1
+        );
+        assert_eq!(
+            ancestor_reference_upper_bound(&candidate_graph, &cell, true).unwrap(),
+            1
+        );
+
+        let macro_graph = compile_global_fixture();
+        let macro_job = global_job(
+            &macro_graph,
+            vec![input(
+                WorldCellKey::base(0, 0, 0),
+                macro_graph.required_halo(0),
+            )],
+        );
+        for stage in &macro_job.global_stages {
+            assert_eq!(
+                ancestor_reference_upper_bound(&macro_graph, &stage.inputs, false).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn memory_peak_boundary_is_exact_and_rejects_before_gpu_dispatch() {
+        let graph = Arc::new(compile_resident_branch_fixture());
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        let cancellation = GraphCancellationToken::default();
+        let baseline = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .with_compute_executor(reference_compute())
+            .preflight(&inputs, &cancellation)
+            .unwrap();
+        assert_eq!(
+            baseline.memory_bytes,
+            baseline
+                .preflight_peak_bytes
+                .max(baseline.execution_peak_bytes)
+        );
+        assert!(baseline.preflight_peak_bytes > 0);
+        assert!(baseline.execution_peak_bytes > 0);
+
+        let mut exact_graph = (*graph).clone();
+        exact_graph.limits.max_memory_bytes = baseline.memory_bytes;
+        let exact_dispatches = Arc::new(AtomicUsize::new(0));
+        let exact = BiomeGraphEvaluator::new(Arc::new(exact_graph), 1)
+            .unwrap()
+            .with_compute_executor(counting_compute(Arc::clone(&exact_dispatches)));
+        let exact_preflight = exact.preflight(&inputs, &cancellation).unwrap();
+        assert_eq!(exact_preflight.memory_bytes, baseline.memory_bytes);
+        exact.evaluate(inputs.clone(), &cancellation).unwrap();
+        assert_eq!(exact_dispatches.load(Ordering::SeqCst), 1);
+
+        let mut rejected_graph = (*graph).clone();
+        rejected_graph.limits.max_memory_bytes = baseline.memory_bytes - 1;
+        let rejected_dispatches = Arc::new(AtomicUsize::new(0));
+        let rejected = BiomeGraphEvaluator::new(Arc::new(rejected_graph), 1)
+            .unwrap()
+            .with_compute_executor(counting_compute(Arc::clone(&rejected_dispatches)));
+        let error = rejected.preflight(&inputs, &cancellation).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphLimit {
+                resource: "memory bytes",
+                requested,
+                limit,
+            } if requested == baseline.memory_bytes && limit == baseline.memory_bytes - 1
+        ));
+        assert!(matches!(
+            rejected.evaluate(inputs, &cancellation),
+            Err(Error::GraphLimit {
+                resource: "memory bytes",
+                ..
+            })
+        ));
+        assert_eq!(rejected_dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preflight_separates_live_provider_generation_from_replay_retention() {
+        let cell = WorldCellKey::base(0, 0, 0);
+        let descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: cell.bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 0,
+            capabilities: SurfaceCapabilities {
+                authoritative_fields: true,
+                ..SurfaceCapabilities::default()
+            },
+        };
+        let provider: Arc<dyn SurfaceField> = Arc::new(TestSurfaceField {
+            descriptor,
+            failing_cell_x: None,
+            project_hits: false,
+            successful_samples: Arc::new(AtomicUsize::new(0)),
+        });
+        let provider_set_hash = canonical_surface_provider_set_hash(
+            &[Arc::clone(&provider)],
+            crate::GraphSafetyLimits::default().max_input_tiles,
+        )
+        .unwrap();
+        let graph = Arc::new(compile_surface_field_fixture(provider_set_hash));
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        let cancellation = GraphCancellationToken::default();
+
+        let mut live_input = input(cell, graph.required_halo(0));
+        live_input.surface_provider_set_hash = provider_set_hash;
+        live_input.surface_providers.push(provider);
+        let retained_live_tiles = evaluation_input_tile_count(&live_input).unwrap();
+        let live_job = job(vec![live_input]);
+        let live_preflight = evaluator.preflight(&live_job, &cancellation).unwrap();
+        assert!(live_preflight.generated_input_bytes > 0);
+        assert_eq!(live_preflight.input_tiles, retained_live_tiles + 1);
+        let live_result = evaluator
+            .evaluate(live_job, &cancellation)
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        assert_eq!(live_result.surface_field_query_tiles.len(), 1);
+
+        let mut replay_input = input(cell, graph.required_halo(0));
+        replay_input.surface_provider_set_hash = provider_set_hash;
+        replay_input.surface_field_query_tiles = live_result.surface_field_query_tiles.clone();
+        let retained_replay_tiles = evaluation_input_tile_count(&replay_input).unwrap();
+        let replay_job = job(vec![replay_input]);
+        let replay_preflight = evaluator.preflight(&replay_job, &cancellation).unwrap();
+        assert_eq!(replay_preflight.generated_input_bytes, 0);
+        assert_eq!(replay_preflight.input_tiles, retained_replay_tiles);
+        assert!(replay_preflight.retained_input_bytes > live_preflight.retained_input_bytes);
+        let replay_result = evaluator
+            .evaluate(replay_job, &cancellation)
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        assert_eq!(
+            live_result.canonical_bytes().unwrap(),
+            replay_result.canonical_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn dead_authoritative_surface_branch_has_zero_work_and_zero_plan_cost() {
+        let cell = WorldCellKey::base(0, 0, 0);
+        let successful_samples = Arc::new(AtomicUsize::new(0));
+        let descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: cell.bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 0,
+            capabilities: SurfaceCapabilities {
+                authoritative_fields: true,
+                ..SurfaceCapabilities::default()
+            },
+        };
+        let provider: Arc<dyn SurfaceField> = Arc::new(TestSurfaceField {
+            descriptor,
+            failing_cell_x: None,
+            project_hits: false,
+            successful_samples: Arc::clone(&successful_samples),
+        });
+        let provider_set_hash = canonical_surface_provider_set_hash(
+            &[Arc::clone(&provider)],
+            crate::GraphSafetyLimits::default().max_input_tiles,
+        )
+        .unwrap();
+        let baseline_graph = Arc::new(compile_dead_surface_branch_fixture(
+            provider_set_hash,
+            false,
+        ));
+        let dead_graph = Arc::new(compile_dead_surface_branch_fixture(provider_set_hash, true));
+        let make_job = |graph: &CompiledBiomeGraph| {
+            let mut inputs = input(cell, graph.required_halo(0));
+            inputs.surface_provider_set_hash = provider_set_hash;
+            inputs.surface_providers.push(Arc::clone(&provider));
+            job(vec![inputs])
+        };
+        let cancellation = GraphCancellationToken::default();
+        let baseline_evaluator = BiomeGraphEvaluator::new(Arc::clone(&baseline_graph), 1).unwrap();
+        let dead_evaluator = BiomeGraphEvaluator::new(Arc::clone(&dead_graph), 1).unwrap();
+        let baseline_job = make_job(&baseline_graph);
+        let dead_job = make_job(&dead_graph);
+        assert_eq!(
+            baseline_evaluator
+                .preflight(&baseline_job, &cancellation)
+                .unwrap(),
+            dead_evaluator.preflight(&dead_job, &cancellation).unwrap()
+        );
+        let baseline = baseline_evaluator
+            .evaluate(baseline_job, &cancellation)
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        let dead = dead_evaluator
+            .evaluate(dead_job, &cancellation)
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        assert_eq!(successful_samples.load(Ordering::SeqCst), 0);
+        assert!(dead.surface_projection_tiles.is_empty());
+        assert!(dead.surface_field_query_tiles.is_empty());
+        assert_eq!(
+            baseline.canonical_bytes().unwrap(),
+            dead.canonical_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn cancellation_and_deadline_abort_deterministically_at_every_publication_phase() {
+        let cell = WorldCellKey::base(0, 0, 0);
+        let descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: cell.bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 0,
+            capabilities: SurfaceCapabilities {
+                authoritative_fields: true,
+                ..SurfaceCapabilities::default()
+            },
+        };
+        let provider: Arc<dyn SurfaceField> = Arc::new(TestSurfaceField {
+            descriptor,
+            failing_cell_x: None,
+            project_hits: false,
+            successful_samples: Arc::new(AtomicUsize::new(0)),
+        });
+        let provider_set_hash = canonical_surface_provider_set_hash(
+            &[Arc::clone(&provider)],
+            crate::GraphSafetyLimits::default().max_input_tiles,
+        )
+        .unwrap();
+        let graph = Arc::new(compile_surface_field_fixture(provider_set_hash));
+        let evaluator = BiomeGraphEvaluator::new(Arc::clone(&graph), 1).unwrap();
+        let mut inputs = input(cell, graph.required_halo(0));
+        inputs.surface_provider_set_hash = provider_set_hash;
+        inputs.surface_providers.push(provider);
+        let inputs = job(vec![inputs]);
+
+        for checkpoint in [
+            TestEvaluationCheckpoint::AfterPreflight,
+            TestEvaluationCheckpoint::AfterPreparation,
+            TestEvaluationCheckpoint::AfterTraversal,
+            TestEvaluationCheckpoint::BeforeFinalValidation,
+            TestEvaluationCheckpoint::BeforePublication,
+        ] {
+            let cancellation = GraphCancellationToken::default();
+            cancellation.abort_at_checkpoint(checkpoint, TestAbortKind::Cancelled);
+            assert!(matches!(
+                evaluator.evaluate(inputs.clone(), &cancellation),
+                Err(Error::GraphCancelled)
+            ));
+
+            let deadline = GraphCancellationToken::default();
+            deadline.abort_at_checkpoint(checkpoint, TestAbortKind::Deadline);
+            assert!(matches!(
+                evaluator.evaluate(inputs.clone(), &deadline),
+                Err(Error::GraphLimit {
+                    resource: "time milliseconds",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn check_budget_cancels_the_final_tail_without_timing() {
+        let graph = Arc::new(compile_fixture(0));
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        let evaluator = BiomeGraphEvaluator::new(graph, 1).unwrap();
+        let observed = GraphCancellationToken::default();
+        evaluator.evaluate(inputs.clone(), &observed).unwrap();
+        let check_count = observed.observed_checks();
+        assert!(check_count > 1);
+
+        let cancellation = GraphCancellationToken::default();
+        cancellation.cancel_after_checks(check_count - 1);
+        assert!(matches!(
+            evaluator.evaluate(inputs, &cancellation),
+            Err(Error::GraphCancelled)
+        ));
+    }
+
+    #[test]
+    fn multi_cell_runtime_failure_discards_earlier_completed_work() {
+        let successful_samples = Arc::new(AtomicUsize::new(0));
+        let descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: WorldCellKey::new(0, 0, 0, 1).unwrap().bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 0,
+            capabilities: SurfaceCapabilities {
+                authoritative_fields: true,
+                ..SurfaceCapabilities::default()
+            },
+        };
+        let provider: Arc<dyn SurfaceField> = Arc::new(TestSurfaceField {
+            descriptor,
+            failing_cell_x: Some(1),
+            project_hits: false,
+            successful_samples: Arc::clone(&successful_samples),
+        });
+        let provider_set_hash = canonical_surface_provider_set_hash(
+            &[Arc::clone(&provider)],
+            crate::GraphSafetyLimits::default().max_input_tiles,
+        )
+        .unwrap();
+        let graph = Arc::new(compile_surface_field_fixture(provider_set_hash));
+        let mut cells = Vec::new();
+        for cell in [WorldCellKey::base(0, 0, 0), WorldCellKey::base(1, 0, 0)] {
+            let mut cell_input = input(cell, graph.required_halo(0));
+            cell_input.surface_provider_set_hash = provider_set_hash;
+            cell_input.surface_providers.push(Arc::clone(&provider));
+            cells.push(cell_input);
+        }
+        let error = BiomeGraphEvaluator::new(graph, 1)
+            .unwrap()
+            .evaluate(job(cells), &GraphCancellationToken::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Spatial(saffron_spatial::Error::FieldUnavailable)
+        ));
+        assert_eq!(successful_samples.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn stable_ordinal_streaming_hash_is_pinned() {
+        assert_eq!(
+            stable_ordinal(&[b"a", b"bc", b""]).unwrap(),
+            0xc5db_f3ec_4ecc_a82f
+        );
+    }
+
+    #[test]
+    fn diagnostic_merge_structurally_bounds_small_stream_maps() {
+        let identity = |ordinal| CandidateIdentity {
+            node: 1,
+            node_address: 2,
+            node_semantic_revision: 1,
+            ordinal,
+            ancestor: 0,
+        };
+        let stream = |ordinal| NamedDiagnosticStream {
+            node: GraphNodeAddress {
+                module_path: vec![7],
+                node: 1,
+            },
+            label: "x".to_owned(),
+            scope: DiagnosticStreamScope::GlobalSnapshot,
+            candidates: Some(vec![DiagnosticCandidateSample {
+                identity: identity(ordinal),
+                owner: WorldCellKey::base(0, 0, 0),
+                position: WorldPosition::origin(),
+                family: Some(Uuid(702)),
+                variation: 0,
+                priority: DecisionScalar::from_bits(1),
+                ecology_tick: 0,
+            }]),
+            field: Some(vec![DiagnosticScalarSample {
+                candidate: identity(ordinal),
+                value: DecisionScalar::from_bits(1),
+            }]),
+            rejected: Vec::new(),
+        };
+        let left_stream = stream(1);
+        let right_stream = stream(2);
+        let left = GraphValue::Diagnostics(vec![left_stream.clone()]);
+        let right = GraphValue::Diagnostics(vec![right_stream.clone()]);
+        let runtime_scratch = graph_value_merge_scratch_bytes(&left, &right).unwrap();
+        let previous_payload_heuristic = left
+            .requested_memory_bytes()
+            .unwrap()
+            .checked_add(right.requested_memory_bytes().unwrap())
+            .and_then(|bytes| bytes.checked_mul(3))
+            .unwrap();
+        assert!(runtime_scratch > previous_payload_heuristic);
+
+        let symbolic = |stream: &NamedDiagnosticStream| SymbolicValueBound {
+            domain: Some(GraphDomain::Diagnostics),
+            items: 1,
+            bytes: diagnostic_stream_memory(stream).unwrap(),
+            diagnostic_candidates: 1,
+            diagnostic_fields: 1,
+            diagnostic_rejected: 0,
+            diagnostic_module_path_items: 1,
+            diagnostic_label_bytes: 1,
+        };
+        assert_eq!(
+            symbolic_global_merge_scratch_bytes(symbolic(&left_stream), symbolic(&right_stream))
+                .unwrap(),
+            runtime_scratch
+        );
+
+        let graph = compile_fixture(0);
+        let mut destination = Some(left);
+        merge_graph_value(&mut destination, right, &graph.root.nodes[0]).unwrap();
+        let Some(GraphValue::Diagnostics(streams)) = destination else {
+            panic!("diagnostic merge returned another domain");
+        };
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].candidates.as_ref().unwrap().len(), 2);
+        assert_eq!(streams[0].field.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn canonical_validation_rejects_duplicate_result_and_provider_query_entries() {
+        let position = WorldPosition::origin();
+        let projection = QuantizedSurfaceProjectionTile {
+            node: 1,
+            node_semantic_revision: 1,
+            samples: vec![
+                QuantizedSurfaceProjectionEntry {
+                    query: position,
+                    sample: None,
+                },
+                QuantizedSurfaceProjectionEntry {
+                    query: position,
+                    sample: None,
+                },
+            ],
+            provider_set_hash: [1; 32],
+        };
+        assert!(matches!(
+            projection.validate(),
+            Err(Error::GraphDocument { path, .. })
+                if path == "evaluation.surfaceProjectionTiles"
+        ));
+        let later_position = WorldPosition::from_global_ticks([1, 0, 0]).unwrap();
+        let reversed_projection = QuantizedSurfaceProjectionTile {
+            node: 1,
+            node_semantic_revision: 1,
+            samples: vec![
+                QuantizedSurfaceProjectionEntry {
+                    query: later_position,
+                    sample: None,
+                },
+                QuantizedSurfaceProjectionEntry {
+                    query: position,
+                    sample: None,
+                },
+            ],
+            provider_set_hash: [1; 32],
+        };
+        assert!(matches!(
+            reversed_projection.validate(),
+            Err(Error::GraphDocument { path, .. })
+                if path == "evaluation.surfaceProjectionTiles"
+        ));
+
+        let identity = CandidateIdentity {
+            node: 1,
+            node_address: 1,
+            node_semantic_revision: 1,
+            ordinal: 1,
+            ancestor: 0,
+        };
+        let field = QuantizedSurfaceFieldQueryTile {
+            node: 1,
+            node_semantic_revision: 1,
+            channel: FieldChannel::Moisture,
+            derivative: FieldDerivative::Value,
+            samples: vec![
+                QuantizedSurfaceFieldQueryEntry {
+                    candidate: identity,
+                    query: position,
+                    value: QuantizedSurfaceFieldValue::Scalar(1),
+                },
+                QuantizedSurfaceFieldQueryEntry {
+                    candidate: identity,
+                    query: position,
+                    value: QuantizedSurfaceFieldValue::Scalar(1),
+                },
+            ],
+            provider_set_hash: [1; 32],
+        };
+        assert!(matches!(
+            validate_field_query_tile_with_guard(&field, None),
+            Err(Error::GraphDocument { path, .. })
+                if path == "evaluation.surfaceFieldQueryTiles"
+        ));
+        let mut later_identity = identity;
+        later_identity.ordinal = 2;
+        let reversed_field = QuantizedSurfaceFieldQueryTile {
+            samples: vec![
+                QuantizedSurfaceFieldQueryEntry {
+                    candidate: later_identity,
+                    query: position,
+                    value: QuantizedSurfaceFieldValue::Scalar(1),
+                },
+                QuantizedSurfaceFieldQueryEntry {
+                    candidate: identity,
+                    query: position,
+                    value: QuantizedSurfaceFieldValue::Scalar(1),
+                },
+            ],
+            ..field
+        };
+        assert!(matches!(
+            validate_field_query_tile_with_guard(&reversed_field, None),
+            Err(Error::GraphDocument { path, .. })
+                if path == "evaluation.surfaceFieldQueryTiles"
+        ));
+
+        let graph = Arc::new(compile_document(micro_document()));
+        let mut result = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .evaluate(
+                job(vec![input(
+                    WorldCellKey::base(0, 0, 0),
+                    graph.required_halo(0),
+                )]),
+                &GraphCancellationToken::default(),
+            )
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        let mut duplicate_result = result.clone();
+        duplicate_result
+            .micro_fields
+            .push(duplicate_result.micro_fields[0].clone());
+        assert!(matches!(
+            duplicate_result.canonical_bytes(),
+            Err(Error::GraphDocument { path, .. }) if path == "evaluation.canonicalEncoding"
+        ));
+
+        let mut later_tile = result.micro_fields[0].clone();
+        later_tile.cell = WorldCellKey::base(1, 0, 0);
+        result.micro_fields.push(later_tile);
+        assert!(result.canonical_bytes().is_ok());
+        let sections = result.cell_artifact_sections().unwrap();
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                VegetationCellSectionKind::MacroPoints,
+                VegetationCellSectionKind::MicroFields,
+                VegetationCellSectionKind::Provenance,
+                VegetationCellSectionKind::RejectionDiagnostics,
+                VegetationCellSectionKind::SurfaceAttachments,
+                VegetationCellSectionKind::SurfaceDependencies,
+                VegetationCellSectionKind::RenderReferences,
+                VegetationCellSectionKind::RenderBounds,
+                VegetationCellSectionKind::CollisionInputs,
+                VegetationCellSectionKind::NavigationContributions,
+                VegetationCellSectionKind::EcologyBoundary,
+                VegetationCellSectionKind::EcologyCheckpoint,
+            ]
+        );
+        assert_eq!(
+            sections[0].bytes,
+            result.macro_points.canonical_bytes().unwrap()
+        );
+        assert!(sections[1].bytes.starts_with(b"SVEGMIC2"));
+        assert!(sections[6].bytes.starts_with(b"SVEGRRF1"));
+        assert!(sections[7].bytes.starts_with(b"SVEGRBD1"));
+        assert!(sections[8].bytes.starts_with(b"SVEGCOL1"));
+        assert!(sections[9].bytes.starts_with(b"SVEGNAV1"));
+        assert!(sections[10].bytes.starts_with(b"SVEGEBD1"));
+        assert!(sections[11].bytes.starts_with(b"SVEGECP1"));
+        result.micro_fields.reverse();
+        assert!(matches!(
+            result.canonical_bytes(),
+            Err(Error::GraphDocument { path, .. }) if path == "evaluation.canonicalEncoding"
+        ));
+    }
+
+    #[test]
+    fn every_cell_facet_strictly_decodes_the_canonical_encoder_output() {
+        let graph = Arc::new(compile_fixture(0));
+        let mut result = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
+            .unwrap()
+            .evaluate(
+                job(vec![input(
+                    WorldCellKey::base(0, 0, 0),
+                    graph.required_halo(0),
+                )]),
+                &GraphCancellationToken::default(),
+            )
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        let micro_graph = Arc::new(compile_document(micro_document()));
+        let micro_result = BiomeGraphEvaluator::new(Arc::clone(&micro_graph), 1)
+            .unwrap()
+            .evaluate(
+                job(vec![input(
+                    WorldCellKey::base(0, 0, 0),
+                    micro_graph.required_halo(0),
+                )]),
+                &GraphCancellationToken::default(),
+            )
+            .unwrap()
+            .cells
+            .pop()
+            .unwrap();
+        result.micro_fields = micro_result.micro_fields;
+        let query = WorldPosition::origin();
+        let candidate = CandidateIdentity {
+            node: 1,
+            node_address: 1,
+            node_semantic_revision: 1,
+            ordinal: 1,
+            ancestor: 0,
+        };
+        result.surface_projection_tiles = vec![QuantizedSurfaceProjectionTile {
+            node: 1,
+            node_semantic_revision: 1,
+            samples: vec![QuantizedSurfaceProjectionEntry {
+                query,
+                sample: Some(QuantizedSurfaceProjectionSample {
+                    position: query,
+                    attachment: SurfaceAttachment::new(
+                        SurfaceProviderId(7),
+                        saffron_spatial::SurfacePrimitiveId(1),
+                        [UnitInterval::ONE, UnitInterval::ZERO, UnitInterval::ZERO],
+                        SurfaceRevision(3),
+                    )
+                    .unwrap(),
+                    normal: [
+                        SignedUnit::from_bits(0).unwrap(),
+                        SignedUnit::from_bits(i16::MAX).unwrap(),
+                        SignedUnit::from_bits(0).unwrap(),
+                    ],
+                    projection: [DecisionScalar::from_bits(3); 3],
+                    tags: vec![WeightedSurfaceTag {
+                        tag: saffron_spatial::SurfaceTagId(5),
+                        weight: UnitInterval::ONE,
+                    }],
+                }),
+            }],
+            provider_set_hash: [1; 32],
+        }];
+        result.surface_field_query_tiles = vec![QuantizedSurfaceFieldQueryTile {
+            node: 2,
+            node_semantic_revision: 1,
+            channel: FieldChannel::Moisture,
+            derivative: FieldDerivative::Value,
+            samples: vec![QuantizedSurfaceFieldQueryEntry {
+                candidate,
+                query,
+                value: QuantizedSurfaceFieldValue::Scalar(7),
+            }],
+            provider_set_hash: [1; 32],
+        }];
+        result.diagnostics.streams = vec![NamedDiagnosticStream {
+            node: GraphNodeAddress {
+                module_path: vec![3],
+                node: 4,
+            },
+            label: "accepted".to_owned(),
+            scope: DiagnosticStreamScope::CandidateLineage(CandidateLineage(5)),
+            candidates: Some(vec![DiagnosticCandidateSample {
+                identity: candidate,
+                owner: result.cell,
+                position: query,
+                family: Some(Uuid(702)),
+                variation: 1,
+                priority: DecisionScalar::from_bits(7),
+                ecology_tick: 9,
+            }]),
+            field: Some(vec![DiagnosticScalarSample {
+                candidate,
+                value: DecisionScalar::from_bits(11),
+            }]),
+            rejected: Vec::new(),
+        }];
+
+        let sections = result.cell_artifact_sections().unwrap();
+        assert_eq!(sections.len(), VegetationCellSectionKind::ALL.len());
+        for section in &sections {
+            let decoded = decode_vegetation_cell_facet(section.kind, &section.bytes).unwrap();
+            match decoded {
+                VegetationCellFacet::MacroPoints(points) => {
+                    assert_eq!(*points, result.macro_points);
+                    assert_eq!(points.point(0).unwrap().id, points.ids[0]);
+                }
+                VegetationCellFacet::MicroFields(tiles) => {
+                    assert_eq!(tiles, result.micro_fields);
+                }
+                VegetationCellFacet::Provenance(table) => {
+                    assert_eq!(table, result.provenance);
+                }
+                VegetationCellFacet::RejectionDiagnostics(diagnostics) => {
+                    assert_eq!(
+                        diagnostics.candidate_count,
+                        result.diagnostics.candidate_count
+                    );
+                    assert_eq!(
+                        diagnostics.accepted_count,
+                        result.diagnostics.accepted_count
+                    );
+                    assert_eq!(diagnostics.rejected, result.diagnostics.rejected);
+                    assert_eq!(diagnostics.streams, result.diagnostics.streams);
+                }
+                VegetationCellFacet::SurfaceAttachments(tiles) => {
+                    assert_eq!(tiles, result.surface_projection_tiles);
+                }
+                VegetationCellFacet::SurfaceDependencies(tiles) => {
+                    assert_eq!(tiles, result.surface_field_query_tiles);
+                }
+                VegetationCellFacet::RenderReferences(rows) => {
+                    assert_eq!(rows.len(), result.macro_points.ids.len());
+                    assert_eq!(rows[0].plant, result.macro_points.ids[0]);
+                    assert_eq!(rows[0].family, result.macro_points.families[0]);
+                }
+                VegetationCellFacet::RenderBounds(rows) => {
+                    assert_eq!(rows.len(), result.macro_points.ids.len());
+                    assert_eq!(rows[0].bounds, result.macro_points.bounds[0]);
+                }
+                VegetationCellFacet::CollisionInputs(rows) => {
+                    assert_eq!(rows.len(), result.macro_points.ids.len());
+                    assert_eq!(rows[0].position, result.macro_points.positions[0]);
+                }
+                VegetationCellFacet::NavigationContributions(rows) => {
+                    assert_eq!(rows.len(), result.macro_points.ids.len());
+                    assert_eq!(rows[0].bounds, result.macro_points.bounds[0]);
+                }
+                VegetationCellFacet::EcologyBoundary(rows) => {
+                    assert!(rows.len() <= result.macro_points.ids.len());
+                    for row in rows {
+                        assert!(result.macro_points.ids.contains(&row.plant));
+                    }
+                }
+                VegetationCellFacet::EcologyCheckpoint(rows) => {
+                    assert_eq!(rows.len(), result.macro_points.ids.len());
+                    assert_eq!(rows[0].ecology_tick, result.macro_points.ecology_ticks[0]);
+                }
+            }
+
+            let mut corrupt = section.bytes.clone();
+            corrupt[0] ^= 0xff;
+            assert!(matches!(
+                decode_vegetation_cell_facet(section.kind, &corrupt),
+                Err(Error::ArtifactFormat { field, .. }) if field == "magic"
+            ));
+            let mut truncated = section.bytes.clone();
+            truncated.pop();
+            assert!(decode_vegetation_cell_facet(section.kind, &truncated).is_err());
+            let mut trailing = section.bytes.clone();
+            trailing.push(0);
+            assert!(matches!(
+                decode_vegetation_cell_facet(section.kind, &trailing),
+                Err(Error::ArtifactFormat { field, .. }) if field == "trailingBytes"
+            ));
+        }
+
+        let dependencies = sections
+            .iter()
+            .find(|section| section.kind == VegetationCellSectionKind::SurfaceDependencies)
+            .unwrap();
+        let mut wrong_domain = dependencies.bytes.clone();
+        wrong_domain[37] = 1;
+        assert!(matches!(
+            decode_vegetation_cell_facet(dependencies.kind, &wrong_domain),
+            Err(Error::ArtifactFormat { field, .. }) if field == "samples.valueType"
+        ));
+    }
+
+    #[test]
+    fn rejection_facet_summary_validates_the_complete_payload() {
+        let candidate = |ordinal| CandidateIdentity {
+            node: 1,
+            node_address: 2,
+            node_semantic_revision: 1,
+            ordinal,
+            ancestor: 0,
+        };
+        let result = GraphEvaluationResult {
+            cell: WorldCellKey::base(-1, 0, 2),
+            macro_points: PlantPointColumns::default(),
+            micro_fields: Vec::new(),
+            surface_projection_tiles: Vec::new(),
+            surface_field_query_tiles: Vec::new(),
+            ancestor_references: Vec::new(),
+            provenance: ProvenanceTable::default(),
+            diagnostics: GraphEvaluationDiagnostics {
+                rejected: vec![
+                    RejectedCandidate {
+                        candidate: candidate(1),
+                        reason: CandidateRejectionReason::Threshold,
+                        provenance: ProvenanceHandle(0),
+                    },
+                    RejectedCandidate {
+                        candidate: candidate(2),
+                        reason: CandidateRejectionReason::NoSpecies,
+                        provenance: ProvenanceHandle(0),
+                    },
+                ],
+                candidate_count: 2,
+                accepted_count: 0,
+                ..GraphEvaluationDiagnostics::default()
+            },
+        };
+        let mut bytes = result
+            .cell_artifact_sections()
+            .unwrap()
+            .into_iter()
+            .find(|section| section.kind == VegetationCellSectionKind::RejectionDiagnostics)
+            .unwrap()
+            .bytes;
+        assert_eq!(
+            vegetation_rejection_totals(&bytes).unwrap(),
+            vec![
+                (CandidateRejectionReason::Threshold, 1),
+                (CandidateRejectionReason::NoSpecies, 1),
+            ]
+        );
+        bytes.push(0);
+        assert!(matches!(
+            vegetation_rejection_totals(&bytes),
+            Err(Error::ArtifactFormat { field, .. }) if field == "trailingBytes"
+        ));
+    }
+
+    #[test]
+    fn public_preflight_observes_entry_cancellation() {
+        let graph = Arc::new(compile_fixture(0));
+        let inputs = job(vec![input(
+            WorldCellKey::base(0, 0, 0),
+            graph.required_halo(0),
+        )]);
+        let cancellation = GraphCancellationToken::default();
+        cancellation.cancel();
+        assert!(matches!(
+            BiomeGraphEvaluator::new(graph, 1)
+                .unwrap()
+                .preflight(&inputs, &cancellation),
+            Err(Error::GraphCancelled)
+        ));
+    }
+
+    #[test]
+    fn surface_hit_contract_enforces_declared_tags_and_identity() {
+        let graph = compile_document(explicit_anchor_document());
+        let node = &graph.root.nodes[0];
+        let mut descriptor = SurfaceProviderDescriptor {
+            id: SurfaceProviderId(77),
+            revision: SurfaceRevision(3),
+            bounds: WorldCellKey::base(0, 0, 0).bounds(),
+            primitive_count: 1,
+            max_tags_per_hit: 1,
+            capabilities: saffron_spatial::SurfaceCapabilities::default(),
+        };
+        let mut hit = SurfaceHit {
+            provider: descriptor.id,
+            position: WorldPosition::origin(),
+            distance_m: 0.0,
+            frame: saffron_spatial::SurfaceFrame::from_normal(saffron_geometry::glam::Vec3::Y)
+                .unwrap(),
+            coordinates: saffron_spatial::SurfaceCoordinates::default(),
+            attachment: Some(
+                SurfaceAttachment::new(
+                    descriptor.id,
+                    saffron_spatial::SurfacePrimitiveId(1),
+                    [UnitInterval::ONE, UnitInterval::ZERO, UnitInterval::ZERO],
+                    descriptor.revision,
+                )
+                .unwrap(),
+            ),
+            tags: vec![
+                WeightedSurfaceTag {
+                    tag: saffron_spatial::SurfaceTagId(5),
+                    weight: UnitInterval::ONE,
+                },
+                WeightedSurfaceTag {
+                    tag: saffron_spatial::SurfaceTagId(9),
+                    weight: UnitInterval::ONE,
+                },
+            ],
+            revision: descriptor.revision,
+        };
+        assert_graph_limit(
+            validate_surface_hit_contract(node, &descriptor, &hit).unwrap_err(),
+            "surface tags per hit",
+        );
+        descriptor.max_tags_per_hit = 2;
+        validate_surface_hit_contract(node, &descriptor, &hit).unwrap();
+
+        let valid = hit.clone();
+        hit.provider = SurfaceProviderId(78);
+        assert!(matches!(
+            validate_surface_hit_contract(node, &descriptor, &hit),
+            Err(Error::GraphDocument { .. })
+        ));
+
+        hit = valid.clone();
+        hit.revision = SurfaceRevision(4);
+        assert!(matches!(
+            validate_surface_hit_contract(node, &descriptor, &hit),
+            Err(Error::GraphDocument { .. })
+        ));
+
+        hit = valid.clone();
+        hit.attachment.as_mut().unwrap().provider = SurfaceProviderId(78);
+        assert!(matches!(
+            validate_surface_hit_contract(node, &descriptor, &hit),
+            Err(Error::GraphDocument { .. })
+        ));
+
+        hit = valid.clone();
+        hit.attachment.as_mut().unwrap().revision = SurfaceRevision(4);
+        assert!(matches!(
+            validate_surface_hit_contract(node, &descriptor, &hit),
+            Err(Error::GraphDocument { .. })
+        ));
+
+        hit = valid.clone();
+        hit.tags.swap(0, 1);
+        assert!(matches!(
+            validate_surface_hit_contract(node, &descriptor, &hit),
+            Err(Error::GraphDocument { .. })
+        ));
+
+        hit = valid;
+        hit.tags[1].tag = hit.tags[0].tag;
+        assert!(matches!(
+            validate_surface_hit_contract(node, &descriptor, &hit),
+            Err(Error::GraphDocument { .. })
+        ));
     }
 
     #[test]
@@ -10983,14 +19303,17 @@ mod tests {
             .unwrap()
             .evaluate(job(vec![inputs]), &GraphCancellationToken::default())
             .unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::GraphLimit {
-                resource: "candidate count",
-                requested,
-                limit: 30,
-            } if *requested == expected
-        ), "{error:?}");
+        assert!(
+            matches!(
+                &error,
+                Error::GraphLimit {
+                    resource: "candidate count",
+                    requested,
+                    limit: 30,
+                } if *requested == expected
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -11019,14 +19342,28 @@ mod tests {
             }),
         )
         .unwrap();
-        let bound = symbolic_evaluation_bound(&graph, &inputs, &plan).unwrap();
+        let global_store = SymbolicGlobalStore::default();
+        let cancellation = GraphCancellationToken::default();
+        let guard = PreflightGuard {
+            cancellation: &cancellation,
+            deadline: evaluation_deadline(&graph).unwrap(),
+            time_limit_ms: graph.limits.max_time_ms,
+        };
+        let bound = symbolic_evaluation_bound(
+            &graph,
+            &inputs,
+            &plan,
+            SymbolicEvaluationScope::Cell {
+                global_store: &global_store,
+            },
+            guard,
+        )
+        .unwrap()
+        .bound;
         let actual = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
             .unwrap()
             .with_compute_executor(compute)
-            .evaluate(
-                job(vec![inputs]),
-                &GraphCancellationToken::default(),
-            )
+            .evaluate(job(vec![inputs]), &GraphCancellationToken::default())
             .unwrap()
             .cells
             .pop()
@@ -11089,6 +19426,15 @@ mod tests {
             input(WorldCellKey::base(0, 0, 0), halo),
             input(WorldCellKey::base(1, 0, 0), halo),
         ];
+        let reference_bounds = cells
+            .iter()
+            .map(|inputs| {
+                (
+                    inputs.output_cell,
+                    ancestor_reference_upper_bound(&graph, inputs, true).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let expected_tiles = expected_global_stage_tiles(&graph, &cells).unwrap();
         let result = BiomeGraphEvaluator::new(Arc::clone(&graph), 2)
             .unwrap()
@@ -11124,6 +19470,7 @@ mod tests {
             );
             assert_eq!(cell.macro_points.row_count().unwrap(), 0);
             assert!(!cell.ancestor_references.is_empty());
+            assert!(cell.ancestor_references.capacity() as u64 <= reference_bounds[&cell.cell]);
         }
         let mut plant_ids = BTreeSet::new();
         for tile in &result.global_stages {
@@ -11151,7 +19498,7 @@ mod tests {
 
     #[test]
     fn qualified_compute_nodes_match_reference_bytes_through_the_single_facade() {
-        let graph = Arc::new(compile_fixture(0));
+        let graph = Arc::new(compile_resident_branch_fixture());
         let halo = graph.required_halo(0);
         let inputs = input(WorldCellKey::base(0, 0, 0), halo);
         let reference = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
@@ -11194,6 +19541,17 @@ mod tests {
     #[test]
     fn branched_resident_subgraph_dispatches_once_and_matches_reference() {
         let graph = Arc::new(compile_resident_branch_fixture());
+        let qualification = reference_compute();
+        let plan = build_execution_plan(
+            &graph,
+            false,
+            Some(GraphGpuScheduling {
+                profile: qualification.profile(),
+                qualifications: qualification.qualifications(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(plan.domain_for(&[], 15), None);
         let halo = graph.required_halo(0);
         let inputs = input(WorldCellKey::base(0, 0, 0), halo);
         let reference = BiomeGraphEvaluator::new(Arc::clone(&graph), 1)
@@ -11398,13 +19756,7 @@ mod tests {
         let samples = sample_spline_segments(&spline_segments(&points).unwrap(), 5, 0).unwrap();
         assert_eq!(
             samples,
-            vec![
-                [0, 0, 0],
-                [5, 0, 0],
-                [10, 0, 0],
-                [10, 0, 5],
-                [10, 0, 10],
-            ]
+            vec![[0, 0, 0], [5, 0, 0], [10, 0, 0], [10, 0, 5], [10, 0, 10],]
         );
     }
 
