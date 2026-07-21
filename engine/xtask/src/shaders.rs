@@ -67,6 +67,12 @@ const CLOUDS_STEM: &str = "clouds";
 const CLOUD_LIGHTING_STEM: &str = "cloud_lighting";
 /// The resource-parameterized bounded atmosphere march shared by AP fill and cloud compositing.
 const ATMOS_AP_STEM: &str = "atmos_ap";
+/// The canonical coverage classifier shared by every geometry raster pass.
+const COVERAGE_STEM: &str = "coverage";
+/// The byte-locked material ABI shared by every geometry raster pass.
+const MATERIAL_PARAMS_STEM: &str = "material_params";
+/// The byte-locked global GPU table and draw-record ABI.
+const GLOBAL_GPU_DATA_STEM: &str = "global_gpu_data";
 
 /// The forward/gbuffer übershader stem. It alone gets an RT-off variant (see the fan-out).
 const MESH_STEM: &str = "mesh";
@@ -281,6 +287,21 @@ pub fn run(config: &Config) -> Result<Report> {
             atmos_ap_src.display()
         );
     }
+    let coverage_src = config.shader_src_dir.join("coverage.slang");
+    if !coverage_src.is_file() {
+        bail!(
+            "shared coverage source not found: {}",
+            coverage_src.display()
+        );
+    }
+    validate_coverage_class_constants(&coverage_src)?;
+    let material_params_src = config.shader_src_dir.join("material_params.slang");
+    if !material_params_src.is_file() {
+        bail!(
+            "shared material parameters source not found: {}",
+            material_params_src.display()
+        );
+    }
 
     let shader_sources = shader_sources(&config.shader_src_dir)?;
     for (stem, path) in &shader_sources {
@@ -339,6 +360,8 @@ pub fn run(config: &Config) -> Result<Report> {
                 &octahedral_src,
                 &giprobe_src,
                 &sky_sh_src,
+                &coverage_src,
+                &material_params_src,
             ],
         )?
     {
@@ -472,7 +495,34 @@ fn is_shared_source(stem: &str) -> bool {
             | CLOUDS_STEM
             | CLOUD_LIGHTING_STEM
             | ATMOS_AP_STEM
+            | COVERAGE_STEM
+            | MATERIAL_PARAMS_STEM
+            | GLOBAL_GPU_DATA_STEM
     )
+}
+
+fn validate_coverage_class_constants(path: &Path) -> Result<()> {
+    use saffron_vegetation::AlphaClassification;
+
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("reading canonical coverage source {}", path.display()))?;
+    for (name, value) in [
+        ("COVERAGE_CLASS_OPAQUE", AlphaClassification::Opaque as u32),
+        ("COVERAGE_CLASS_MASKED", AlphaClassification::Masked as u32),
+        (
+            "COVERAGE_CLASS_TRANSMISSIVE",
+            AlphaClassification::Transmissive as u32,
+        ),
+    ] {
+        let declaration = format!("public static const uint {name} = {value}u;");
+        if !source.contains(&declaration) {
+            bail!(
+                "{} must declare `{declaration}` from AlphaClassification",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn slangc_version(slangc: &Path) -> Result<String> {
@@ -1033,6 +1083,15 @@ mod tests {
         let sources = vec![
             ("zeta".to_owned(), PathBuf::from("zeta.slang")),
             (LIGHTING_STEM.to_owned(), PathBuf::from("lighting.slang")),
+            (COVERAGE_STEM.to_owned(), PathBuf::from("coverage.slang")),
+            (
+                MATERIAL_PARAMS_STEM.to_owned(),
+                PathBuf::from("material_params.slang"),
+            ),
+            (
+                GLOBAL_GPU_DATA_STEM.to_owned(),
+                PathBuf::from("global_gpu_data.slang"),
+            ),
             (MESH_STEM.to_owned(), PathBuf::from("mesh.slang")),
             ("alpha".to_owned(), PathBuf::from("alpha.slang")),
         ];
@@ -1047,6 +1106,27 @@ mod tests {
             ["alpha", "mesh", "mesh_nort", "zeta"]
         );
         assert_eq!(variants[2].defines, [NO_RT_DEFINE]);
+    }
+
+    #[test]
+    fn geometry_passes_use_the_canonical_coverage_module() -> Result<()> {
+        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/shaders");
+        for shader in [
+            "mesh.slang",
+            "gbuffer.slang",
+            "motion.slang",
+            "point_shadow.slang",
+        ] {
+            let source = std::fs::read_to_string(shader_dir.join(shader))?;
+            assert!(
+                source.contains("sampleCanonicalCoverage("),
+                "{shader} bypasses the canonical coverage sampler"
+            );
+        }
+
+        let meshlet = std::fs::read_to_string(shader_dir.join("meshlet.slang"))?;
+        assert!(meshlet.contains("o.coverageAnchor = position;"));
+        Ok(())
     }
 
     #[test]
