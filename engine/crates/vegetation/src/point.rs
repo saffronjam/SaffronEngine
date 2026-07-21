@@ -1,14 +1,18 @@
 //! The schema-hashed canonical vegetation point vocabulary.
 
-use std::collections::BTreeSet;
-
 use saffron_core::Uuid;
 use saffron_spatial::{
-    DecisionScalar, SignedUnit, SurfaceAttachment, UnitInterval, WorldBounds, WorldCellKey,
-    WorldPosition,
+    DecisionScalar, QuantizedLocalPosition, SignedUnit, SurfaceAttachment, SurfacePrimitiveId,
+    SurfaceProviderId, SurfaceRevision, UnitInterval, WorldBounds, WorldCellKey, WorldPosition,
 };
 
-use crate::hash::sha256;
+use crate::binary::BinaryReader;
+use crate::canonical::{ByteSink, CanonicalSink, CountSink};
+use crate::hash::VegetationContentHasher;
+use crate::memory::{
+    checked_memory_sum, requested_vec_bytes, requested_vec_bytes_for_len, requested_vec_with,
+    reserve_exact,
+};
 use crate::{Error, PlantId, Result};
 
 /// A registered point-column identifier.
@@ -106,14 +110,21 @@ const fn column(
 /// The SHA-256 identity of the fixed point schema.
 #[must_use]
 pub fn point_schema_hash() -> [u8; 32] {
-    let mut bytes = b"saffron-anima/vegetation-point-schema/v1\0".to_vec();
+    let mut hasher = VegetationContentHasher::new();
+    hasher
+        .update(b"saffron-anima/vegetation-point-schema/v1\0")
+        .expect("the fixed point schema fits the SHA-256 message bound");
     for column in POINT_SCHEMA_COLUMNS {
-        bytes.extend_from_slice(&column.id.0.to_be_bytes());
-        bytes.push(column.element_type as u8);
-        bytes.extend_from_slice(&(column.name.len() as u16).to_be_bytes());
-        bytes.extend_from_slice(column.name.as_bytes());
+        hasher
+            .update(&column.id.0.to_be_bytes())
+            .and_then(|()| hasher.update(&[column.element_type as u8]))
+            .and_then(|()| hasher.update(&(column.name.len() as u16).to_be_bytes()))
+            .and_then(|()| hasher.update(column.name.as_bytes()))
+            .expect("the fixed point schema fits the SHA-256 message bound");
     }
-    sha256(&bytes)
+    hasher
+        .finalize()
+        .expect("the fixed point schema fits the SHA-256 message bound")
 }
 
 /// A quantized unit quaternion in canonical XYZW order.
@@ -367,6 +378,26 @@ pub struct ExtensionColumn {
     pub bytes: Vec<u8>,
 }
 
+/// One extension-column value projected for a single macro-point row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlantPointExtensionValue<'a> {
+    /// Registered extension identity.
+    pub id: PointColumnId,
+    /// Packed element type.
+    pub element_type: PointColumnType,
+    /// Exact canonical bytes for this row.
+    pub bytes: &'a [u8],
+}
+
+/// One complete macro-point row with its registered extension values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlantPointRow<'a> {
+    /// Fixed-schema point value.
+    pub point: PlantPoint,
+    /// Extension values in canonical column-ID order.
+    pub extensions: Vec<PlantPointExtensionValue<'a>>,
+}
+
 /// Structure-of-arrays canonical CPU point table.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlantPointColumns {
@@ -425,15 +456,179 @@ pub struct PlantPointColumns {
 }
 
 impl PlantPointColumns {
-    /// Converts validated rows to the canonical structure-of-arrays table.
-    pub fn from_points(points: &[PlantPoint]) -> Result<Self> {
+    /// Decodes the one canonical macro-point payload accepted by this build.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut reader = BinaryReader::new(bytes, "vegetation macro points");
+        reader.expect(b"SVEGPT01", "magic")?;
+        reader.expect(&point_schema_hash(), "schemaHash")?;
+        let rows = reader.count(285)?;
         let mut columns = Self::default();
-        let mut ids = BTreeSet::new();
+        columns.reserve_rows(rows)?;
+        for _ in 0..rows {
+            columns.ids.push(PlantId::from_bytes(reader.array()?)?);
+            columns.owner_cells.push(reader.cell()?);
+            let position_cell = reader.cell()?;
+            let local = QuantizedLocalPosition::new([reader.u32()?, reader.u32()?, reader.u32()?])?;
+            columns
+                .positions
+                .push(WorldPosition::new(position_cell, local)?);
+            columns.orientations.push(QuantizedOrientation::new([
+                reader.u16()? as i16,
+                reader.u16()? as i16,
+                reader.u16()? as i16,
+                reader.u16()? as i16,
+            ])?);
+            columns.scales.push([
+                DecisionScalar::from_bits(reader.i32()?),
+                DecisionScalar::from_bits(reader.i32()?),
+                DecisionScalar::from_bits(reader.i32()?),
+            ]);
+            columns.bounds.push(reader.bounds()?);
+            columns.families.push(reader.uuid()?);
+            columns.variations.push(reader.u32()?);
+            columns
+                .lifecycles
+                .push(PlantLifecycle::try_from(reader.u32()?)?);
+            columns.phenotypes.push(reader.u32()?);
+            columns.representation_classes.push(reader.u32()?);
+            columns.deterministic_keys.push(reader.u128()?);
+            columns.candidates.push(reader.u64()?);
+            columns.parents.push(read_optional_plant_id(&mut reader)?);
+            columns.colonies.push(read_optional_plant_id(&mut reader)?);
+            columns.ecology_ticks.push(reader.u64()?);
+            columns.health.push(UnitInterval::from_bits(reader.u16()?));
+            columns
+                .moisture
+                .push(UnitInterval::from_bits(reader.u16()?));
+            columns.fuel.push(UnitInterval::from_bits(reader.u16()?));
+            columns
+                .phenology
+                .push(UnitInterval::from_bits(reader.u16()?));
+            columns.flags.push(PlantFlags::from_bits(reader.u32()?)?);
+            columns
+                .interaction_policies
+                .push(InteractionPolicy::try_from(reader.u32()?)?);
+            columns.provenance.push(reader.u32()?);
+            columns.attachments.push(read_attachment(&mut reader)?);
+            columns.surface_projections.push([
+                DecisionScalar::from_bits(reader.i32()?),
+                DecisionScalar::from_bits(reader.i32()?),
+                DecisionScalar::from_bits(reader.i32()?),
+            ]);
+        }
+        let extension_count = usize::try_from(reader.u32()?).map_err(|_| Error::NumericOverflow)?;
+        if extension_count > reader.remaining() / 17 {
+            return Err(Error::ArtifactTruncated {
+                format: "vegetation macro points",
+            });
+        }
+        columns
+            .extensions
+            .try_reserve_exact(extension_count)
+            .map_err(|source| Error::MemoryReservation {
+                resource: "decoded vegetation point extensions",
+                source,
+            })?;
+        for _ in 0..extension_count {
+            let id = PointColumnId(reader.u32()?);
+            let element_type = point_column_type(reader.u8()?)?;
+            let stride = reader.u32()?;
+            let byte_length = reader.length()?;
+            columns.extensions.push(ExtensionColumn {
+                id,
+                element_type,
+                stride,
+                bytes: reader.take(byte_length)?.to_vec(),
+            });
+        }
+        reader.complete()?;
+        columns.validate()?;
+        for row in 0..rows {
+            columns.point_unchecked(row).validate()?;
+        }
+        Ok(columns)
+    }
+
+    /// Projects one validated column index into its complete canonical row.
+    pub fn point(&self, row: usize) -> Result<PlantPoint> {
+        self.validate()?;
+        if row >= self.ids.len() {
+            return Err(Error::PointSchema(
+                "point row index is out of bounds".to_owned(),
+            ));
+        }
+        let point = self.point_unchecked(row);
+        point.validate()?;
+        Ok(point)
+    }
+
+    /// Projects one validated column index including every registered extension value.
+    pub fn row(&self, row: usize) -> Result<PlantPointRow<'_>> {
+        let point = self.point(row)?;
+        let mut extensions = Vec::new();
+        reserve_exact(
+            &mut extensions,
+            self.extensions.len(),
+            "projected plant point extensions",
+        )?;
+        for column in &self.extensions {
+            let stride = usize::try_from(column.stride).map_err(|_| Error::NumericOverflow)?;
+            let start = row.checked_mul(stride).ok_or(Error::NumericOverflow)?;
+            let end = start.checked_add(stride).ok_or(Error::NumericOverflow)?;
+            let bytes = column.bytes.get(start..end).ok_or_else(|| {
+                Error::PointSchema("extension row range is out of bounds".to_owned())
+            })?;
+            extensions.push(PlantPointExtensionValue {
+                id: column.id,
+                element_type: column.element_type,
+                bytes,
+            });
+        }
+        Ok(PlantPointRow { point, extensions })
+    }
+
+    fn point_unchecked(&self, row: usize) -> PlantPoint {
+        PlantPoint {
+            id: self.ids[row],
+            owner: self.owner_cells[row],
+            position: self.positions[row],
+            orientation: self.orientations[row],
+            scale: self.scales[row],
+            bounds: self.bounds[row],
+            family: self.families[row],
+            variation: self.variations[row],
+            lifecycle: self.lifecycles[row],
+            phenotype: self.phenotypes[row],
+            representation_class: self.representation_classes[row],
+            deterministic_key: self.deterministic_keys[row],
+            candidate: self.candidates[row],
+            parent: self.parents[row],
+            colony: self.colonies[row],
+            ecology_tick: self.ecology_ticks[row],
+            health: self.health[row],
+            moisture: self.moisture[row],
+            fuel: self.fuel[row],
+            phenology: self.phenology[row],
+            flags: self.flags[row],
+            interaction_policy: self.interaction_policies[row],
+            provenance: self.provenance[row],
+            attachment: self.attachments[row],
+            surface_projection: self.surface_projections[row],
+        }
+    }
+
+    /// Converts validated rows to the canonical structure-of-arrays table.
+    pub fn from_points(mut points: Vec<PlantPoint>) -> Result<Self> {
+        let mut columns = Self::default();
+        points.sort_unstable_by_key(|point| point.id);
+        for pair in points.windows(2) {
+            if pair[0].id == pair[1].id {
+                return Err(Error::DuplicatePlantId(pair[0].id.to_string()));
+            }
+        }
+        columns.reserve_rows(points.len())?;
         for point in points {
             point.validate()?;
-            if !ids.insert(point.id) {
-                return Err(Error::DuplicatePlantId(point.id.to_string()));
-            }
             columns.ids.push(point.id);
             columns.owner_cells.push(point.owner);
             columns.positions.push(point.position);
@@ -464,6 +659,113 @@ impl PlantPointColumns {
         }
         columns.validate()?;
         Ok(columns)
+    }
+
+    pub(crate) fn reserve_rows(&mut self, rows: usize) -> Result<()> {
+        reserve_exact(&mut self.ids, rows, "plant point ids")?;
+        reserve_exact(&mut self.owner_cells, rows, "plant point owner cells")?;
+        reserve_exact(&mut self.positions, rows, "plant point positions")?;
+        reserve_exact(&mut self.orientations, rows, "plant point orientations")?;
+        reserve_exact(&mut self.scales, rows, "plant point scales")?;
+        reserve_exact(&mut self.bounds, rows, "plant point bounds")?;
+        reserve_exact(&mut self.families, rows, "plant point families")?;
+        reserve_exact(&mut self.variations, rows, "plant point variations")?;
+        reserve_exact(&mut self.lifecycles, rows, "plant point lifecycles")?;
+        reserve_exact(&mut self.phenotypes, rows, "plant point phenotypes")?;
+        reserve_exact(
+            &mut self.representation_classes,
+            rows,
+            "plant point representation classes",
+        )?;
+        reserve_exact(
+            &mut self.deterministic_keys,
+            rows,
+            "plant point deterministic keys",
+        )?;
+        reserve_exact(&mut self.candidates, rows, "plant point candidates")?;
+        reserve_exact(&mut self.parents, rows, "plant point parents")?;
+        reserve_exact(&mut self.colonies, rows, "plant point colonies")?;
+        reserve_exact(&mut self.ecology_ticks, rows, "plant point ecology ticks")?;
+        reserve_exact(&mut self.health, rows, "plant point health")?;
+        reserve_exact(&mut self.moisture, rows, "plant point moisture")?;
+        reserve_exact(&mut self.fuel, rows, "plant point fuel")?;
+        reserve_exact(&mut self.phenology, rows, "plant point phenology")?;
+        reserve_exact(&mut self.flags, rows, "plant point flags")?;
+        reserve_exact(
+            &mut self.interaction_policies,
+            rows,
+            "plant point interaction policies",
+        )?;
+        reserve_exact(&mut self.provenance, rows, "plant point provenance")?;
+        reserve_exact(&mut self.attachments, rows, "plant point attachments")?;
+        reserve_exact(
+            &mut self.surface_projections,
+            rows,
+            "plant point surface projections",
+        )
+    }
+
+    pub(crate) fn requested_memory_bytes(&self) -> Result<u64> {
+        checked_memory_sum([
+            requested_vec_bytes::<PlantId>(self.ids.capacity())?,
+            requested_vec_bytes::<WorldCellKey>(self.owner_cells.capacity())?,
+            requested_vec_bytes::<WorldPosition>(self.positions.capacity())?,
+            requested_vec_bytes::<QuantizedOrientation>(self.orientations.capacity())?,
+            requested_vec_bytes::<[DecisionScalar; 3]>(self.scales.capacity())?,
+            requested_vec_bytes::<WorldBounds>(self.bounds.capacity())?,
+            requested_vec_bytes::<Uuid>(self.families.capacity())?,
+            requested_vec_bytes::<u32>(self.variations.capacity())?,
+            requested_vec_bytes::<PlantLifecycle>(self.lifecycles.capacity())?,
+            requested_vec_bytes::<u32>(self.phenotypes.capacity())?,
+            requested_vec_bytes::<u32>(self.representation_classes.capacity())?,
+            requested_vec_bytes::<u128>(self.deterministic_keys.capacity())?,
+            requested_vec_bytes::<u64>(self.candidates.capacity())?,
+            requested_vec_bytes::<Option<PlantId>>(self.parents.capacity())?,
+            requested_vec_bytes::<Option<PlantId>>(self.colonies.capacity())?,
+            requested_vec_bytes::<u64>(self.ecology_ticks.capacity())?,
+            requested_vec_bytes::<UnitInterval>(self.health.capacity())?,
+            requested_vec_bytes::<UnitInterval>(self.moisture.capacity())?,
+            requested_vec_bytes::<UnitInterval>(self.fuel.capacity())?,
+            requested_vec_bytes::<UnitInterval>(self.phenology.capacity())?,
+            requested_vec_bytes::<PlantFlags>(self.flags.capacity())?,
+            requested_vec_bytes::<InteractionPolicy>(self.interaction_policies.capacity())?,
+            requested_vec_bytes::<u32>(self.provenance.capacity())?,
+            requested_vec_bytes::<Option<SurfaceAttachment>>(self.attachments.capacity())?,
+            requested_vec_bytes::<[DecisionScalar; 3]>(self.surface_projections.capacity())?,
+            requested_vec_with(&self.extensions, |column| {
+                requested_vec_bytes::<u8>(column.bytes.capacity())
+            })?,
+        ])
+    }
+
+    pub(crate) fn requested_memory_bytes_for_rows(rows: u64) -> Result<u64> {
+        checked_memory_sum([
+            requested_vec_bytes_for_len::<PlantId>(rows)?,
+            requested_vec_bytes_for_len::<WorldCellKey>(rows)?,
+            requested_vec_bytes_for_len::<WorldPosition>(rows)?,
+            requested_vec_bytes_for_len::<QuantizedOrientation>(rows)?,
+            requested_vec_bytes_for_len::<[DecisionScalar; 3]>(rows)?,
+            requested_vec_bytes_for_len::<WorldBounds>(rows)?,
+            requested_vec_bytes_for_len::<Uuid>(rows)?,
+            requested_vec_bytes_for_len::<u32>(rows)?,
+            requested_vec_bytes_for_len::<PlantLifecycle>(rows)?,
+            requested_vec_bytes_for_len::<u32>(rows)?,
+            requested_vec_bytes_for_len::<u32>(rows)?,
+            requested_vec_bytes_for_len::<u128>(rows)?,
+            requested_vec_bytes_for_len::<u64>(rows)?,
+            requested_vec_bytes_for_len::<Option<PlantId>>(rows)?,
+            requested_vec_bytes_for_len::<Option<PlantId>>(rows)?,
+            requested_vec_bytes_for_len::<u64>(rows)?,
+            requested_vec_bytes_for_len::<UnitInterval>(rows)?,
+            requested_vec_bytes_for_len::<UnitInterval>(rows)?,
+            requested_vec_bytes_for_len::<UnitInterval>(rows)?,
+            requested_vec_bytes_for_len::<UnitInterval>(rows)?,
+            requested_vec_bytes_for_len::<PlantFlags>(rows)?,
+            requested_vec_bytes_for_len::<InteractionPolicy>(rows)?,
+            requested_vec_bytes_for_len::<u32>(rows)?,
+            requested_vec_bytes_for_len::<Option<SurfaceAttachment>>(rows)?,
+            requested_vec_bytes_for_len::<[DecisionScalar; 3]>(rows)?,
+        ])
     }
 
     /// Number of point rows after validating every column length.
@@ -499,12 +801,20 @@ impl PlantPointColumns {
             ));
         }
         self.extensions.push(column);
-        self.extensions.sort_by_key(|column| column.id);
+        self.extensions.sort_unstable_by_key(|column| column.id);
         Ok(())
     }
 
-    /// Validates fixed/extension column lengths and identity uniqueness.
+    /// Validates fixed/extension column lengths and canonical identity ordering.
     pub fn validate(&self) -> Result<()> {
+        self.validate_guarded(|| Ok(()))
+    }
+
+    pub(crate) fn validate_guarded<F>(&self, mut guard: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        guard()?;
         let rows = self.ids.len();
         let lengths = [
             self.owner_cells.len(),
@@ -537,17 +847,19 @@ impl PlantPointColumns {
                 "fixed point columns have different row counts".to_owned(),
             ));
         }
-        let unique: BTreeSet<PlantId> = self.ids.iter().copied().collect();
-        if unique.len() != rows {
-            return Err(Error::PointSchema(
-                "point identity column contains duplicates".to_owned(),
-            ));
+        for pair in self.ids.windows(2) {
+            guard()?;
+            if pair[0] >= pair[1] {
+                return Err(Error::PointSchema(
+                    "point identity column is not sorted and unique".to_owned(),
+                ));
+            }
         }
-        let mut extension_ids = BTreeSet::new();
-        for column in &self.extensions {
+        for (index, column) in self.extensions.iter().enumerate() {
+            guard()?;
             if column.id.0 < 0x8000_0000
                 || column.stride == 0
-                || !extension_ids.insert(column.id)
+                || index > 0 && self.extensions[index - 1].id >= column.id
                 || column.bytes.len() != rows.saturating_mul(column.stride as usize)
             {
                 return Err(Error::PointSchema(
@@ -555,92 +867,162 @@ impl PlantPointColumns {
                 ));
             }
         }
-        Ok(())
+        guard()
     }
 
     /// Canonical big-endian packed bytes, used by cooks, manifests, and equality tests.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"SVEGPT01");
-        bytes.extend_from_slice(&point_schema_hash());
-        bytes.extend_from_slice(&(self.ids.len() as u64).to_be_bytes());
+        let mut sink = ByteSink::new();
+        self.encode_canonical(&mut sink)?;
+        Ok(sink.finish())
+    }
+
+    pub(crate) fn canonical_byte_len(&self) -> Result<usize> {
+        self.validate()?;
+        let mut sink = CountSink::new();
+        self.encode_canonical(&mut sink)?;
+        Ok(sink.finish())
+    }
+
+    pub(crate) fn encode_canonical<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
+        sink.write(b"SVEGPT01")?;
+        sink.write(&point_schema_hash())?;
+        sink.write(&(self.ids.len() as u64).to_be_bytes())?;
         for row in 0..self.ids.len() {
-            bytes.extend_from_slice(&self.ids[row].bytes());
-            bytes.extend_from_slice(&self.owner_cells[row].canonical_bytes());
-            bytes.extend_from_slice(&self.positions[row].cell().canonical_bytes());
+            sink.write(&self.ids[row].bytes())?;
+            sink.write(&self.owner_cells[row].canonical_bytes())?;
+            sink.write(&self.positions[row].cell().canonical_bytes())?;
             for tick in self.positions[row].local().ticks() {
-                bytes.extend_from_slice(&tick.to_be_bytes());
+                sink.write(&tick.to_be_bytes())?;
             }
             for lane in self.orientations[row].bits() {
-                bytes.extend_from_slice(&lane.to_be_bytes());
+                sink.write(&lane.to_be_bytes())?;
             }
             for scale in self.scales[row] {
-                bytes.extend_from_slice(&scale.canonical_bytes());
+                sink.write(&scale.canonical_bytes())?;
             }
             for tick in self.bounds[row].min_ticks() {
-                bytes.extend_from_slice(&tick.to_be_bytes());
+                sink.write(&tick.to_be_bytes())?;
             }
             for tick in self.bounds[row].max_ticks_exclusive() {
-                bytes.extend_from_slice(&tick.to_be_bytes());
+                sink.write(&tick.to_be_bytes())?;
             }
-            bytes.extend_from_slice(&self.families[row].value().to_be_bytes());
-            bytes.extend_from_slice(&self.variations[row].to_be_bytes());
-            bytes.extend_from_slice(&(self.lifecycles[row] as u32).to_be_bytes());
-            bytes.extend_from_slice(&self.phenotypes[row].to_be_bytes());
-            bytes.extend_from_slice(&self.representation_classes[row].to_be_bytes());
-            bytes.extend_from_slice(&self.deterministic_keys[row].to_be_bytes());
-            bytes.extend_from_slice(&self.candidates[row].to_be_bytes());
-            push_optional_id(&mut bytes, self.parents[row]);
-            push_optional_id(&mut bytes, self.colonies[row]);
-            bytes.extend_from_slice(&self.ecology_ticks[row].to_be_bytes());
-            bytes.extend_from_slice(&self.health[row].canonical_bytes());
-            bytes.extend_from_slice(&self.moisture[row].canonical_bytes());
-            bytes.extend_from_slice(&self.fuel[row].canonical_bytes());
-            bytes.extend_from_slice(&self.phenology[row].canonical_bytes());
-            bytes.extend_from_slice(&self.flags[row].bits().to_be_bytes());
-            bytes.extend_from_slice(&(self.interaction_policies[row] as u32).to_be_bytes());
-            bytes.extend_from_slice(&self.provenance[row].to_be_bytes());
-            push_attachment(&mut bytes, self.attachments[row]);
+            sink.write(&self.families[row].value().to_be_bytes())?;
+            sink.write(&self.variations[row].to_be_bytes())?;
+            sink.write(&(self.lifecycles[row] as u32).to_be_bytes())?;
+            sink.write(&self.phenotypes[row].to_be_bytes())?;
+            sink.write(&self.representation_classes[row].to_be_bytes())?;
+            sink.write(&self.deterministic_keys[row].to_be_bytes())?;
+            sink.write(&self.candidates[row].to_be_bytes())?;
+            push_optional_id(sink, self.parents[row])?;
+            push_optional_id(sink, self.colonies[row])?;
+            sink.write(&self.ecology_ticks[row].to_be_bytes())?;
+            sink.write(&self.health[row].canonical_bytes())?;
+            sink.write(&self.moisture[row].canonical_bytes())?;
+            sink.write(&self.fuel[row].canonical_bytes())?;
+            sink.write(&self.phenology[row].canonical_bytes())?;
+            sink.write(&self.flags[row].bits().to_be_bytes())?;
+            sink.write(&(self.interaction_policies[row] as u32).to_be_bytes())?;
+            sink.write(&self.provenance[row].to_be_bytes())?;
+            push_attachment(sink, self.attachments[row])?;
             for coordinate in self.surface_projections[row] {
-                bytes.extend_from_slice(&coordinate.canonical_bytes());
+                sink.write(&coordinate.canonical_bytes())?;
             }
         }
-        bytes.extend_from_slice(&(self.extensions.len() as u32).to_be_bytes());
+        sink.write(&(self.extensions.len() as u32).to_be_bytes())?;
         for column in &self.extensions {
-            bytes.extend_from_slice(&column.id.0.to_be_bytes());
-            bytes.push(column.element_type as u8);
-            bytes.extend_from_slice(&column.stride.to_be_bytes());
-            bytes.extend_from_slice(&(column.bytes.len() as u64).to_be_bytes());
-            bytes.extend_from_slice(&column.bytes);
+            sink.write(&column.id.0.to_be_bytes())?;
+            sink.write_byte(column.element_type as u8)?;
+            sink.write(&column.stride.to_be_bytes())?;
+            sink.write(&(column.bytes.len() as u64).to_be_bytes())?;
+            sink.write(&column.bytes)?;
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 
-fn push_optional_id(bytes: &mut Vec<u8>, id: Option<PlantId>) {
+fn read_optional_plant_id(reader: &mut BinaryReader<'_>) -> Result<Option<PlantId>> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(PlantId::from_bytes(reader.array()?)?)),
+        _ => Err(Error::ArtifactFormat {
+            format: "vegetation macro points",
+            field: "optionalPlantId".to_owned(),
+        }),
+    }
+}
+
+fn read_attachment(reader: &mut BinaryReader<'_>) -> Result<Option<SurfaceAttachment>> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(SurfaceAttachment::new(
+            SurfaceProviderId(reader.u64()?),
+            SurfacePrimitiveId(reader.u64()?),
+            [
+                UnitInterval::from_bits(reader.u16()?),
+                UnitInterval::from_bits(reader.u16()?),
+                UnitInterval::from_bits(reader.u16()?),
+            ],
+            SurfaceRevision(reader.u64()?),
+        )?)),
+        _ => Err(Error::ArtifactFormat {
+            format: "vegetation macro points",
+            field: "surfaceAttachment".to_owned(),
+        }),
+    }
+}
+
+fn point_column_type(value: u8) -> Result<PointColumnType> {
+    match value {
+        1 => Ok(PointColumnType::Id128),
+        2 => Ok(PointColumnType::WorldCell),
+        4 => Ok(PointColumnType::Orientation),
+        5 => Ok(PointColumnType::FixedVec3),
+        6 => Ok(PointColumnType::WorldBounds),
+        7 => Ok(PointColumnType::AssetUuid),
+        8 => Ok(PointColumnType::U32),
+        9 => Ok(PointColumnType::U64),
+        10 => Ok(PointColumnType::OptionalId128),
+        11 => Ok(PointColumnType::Unit),
+        12 => Ok(PointColumnType::SurfaceProjection),
+        13 => Ok(PointColumnType::OptionalSurfaceAttachment),
+        14 => Ok(PointColumnType::WorldPosition),
+        _ => Err(Error::ArtifactFormat {
+            format: "vegetation macro points",
+            field: "extension.elementType".to_owned(),
+        }),
+    }
+}
+
+fn push_optional_id<S: CanonicalSink>(sink: &mut S, id: Option<PlantId>) -> Result<()> {
     match id {
         Some(id) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&id.bytes());
+            sink.write_byte(1)?;
+            sink.write(&id.bytes())?;
         }
-        None => bytes.push(0),
+        None => sink.write_byte(0)?,
     }
+    Ok(())
 }
 
-fn push_attachment(bytes: &mut Vec<u8>, attachment: Option<SurfaceAttachment>) {
+fn push_attachment<S: CanonicalSink>(
+    sink: &mut S,
+    attachment: Option<SurfaceAttachment>,
+) -> Result<()> {
     match attachment {
         Some(attachment) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&attachment.provider.0.to_be_bytes());
-            bytes.extend_from_slice(&attachment.primitive.0.to_be_bytes());
+            sink.write_byte(1)?;
+            sink.write(&attachment.provider.0.to_be_bytes())?;
+            sink.write(&attachment.primitive.0.to_be_bytes())?;
             for weight in attachment.barycentric {
-                bytes.extend_from_slice(&weight.canonical_bytes());
+                sink.write(&weight.canonical_bytes())?;
             }
-            bytes.extend_from_slice(&attachment.revision.0.to_be_bytes());
+            sink.write(&attachment.revision.0.to_be_bytes())?;
         }
-        None => bytes.push(0),
+        None => sink.write_byte(0)?,
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -709,15 +1091,15 @@ mod tests {
 
     #[test]
     fn columns_are_canonical_and_schema_hashed() {
-        let a = PlantPointColumns::from_points(&[point(1), point(2)]).unwrap();
-        let b = PlantPointColumns::from_points(&[point(1), point(2)]).unwrap();
+        let a = PlantPointColumns::from_points(vec![point(1), point(2)]).unwrap();
+        let b = PlantPointColumns::from_points(vec![point(1), point(2)]).unwrap();
         assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
         assert_eq!(&a.canonical_bytes().unwrap()[8..40], &point_schema_hash());
     }
 
     #[test]
     fn extensions_are_registered_sorted_and_row_sized() {
-        let mut columns = PlantPointColumns::from_points(&[point(1), point(2)]).unwrap();
+        let mut columns = PlantPointColumns::from_points(vec![point(1), point(2)]).unwrap();
         columns
             .add_extension(ExtensionColumn {
                 id: PointColumnId(0x8000_0002),
@@ -748,8 +1130,33 @@ mod tests {
     }
 
     #[test]
+    fn canonical_decoder_projects_fixed_and_extension_rows() {
+        let mut columns = PlantPointColumns::from_points(vec![point(1), point(2)]).unwrap();
+        columns
+            .add_extension(ExtensionColumn {
+                id: PointColumnId(0x8000_0001),
+                element_type: PointColumnType::U32,
+                stride: 4,
+                bytes: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            })
+            .unwrap();
+        let bytes = columns.canonical_bytes().unwrap();
+        let decoded = PlantPointColumns::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, columns);
+        assert_eq!(decoded.row(1).unwrap().point, columns.point(1).unwrap());
+        assert_eq!(decoded.row(1).unwrap().extensions[0].bytes, &[4, 5, 6, 7]);
+
+        let mut wrong_schema = bytes.clone();
+        wrong_schema[8] ^= 0xff;
+        assert!(matches!(
+            PlantPointColumns::from_canonical_bytes(&wrong_schema),
+            Err(Error::ArtifactFormat { field, .. }) if field == "schemaHash"
+        ));
+    }
+
+    #[test]
     fn duplicate_identity_is_rejected_before_publication() {
         let duplicate = point(1);
-        assert!(PlantPointColumns::from_points(&[duplicate.clone(), duplicate]).is_err());
+        assert!(PlantPointColumns::from_points(vec![duplicate.clone(), duplicate]).is_err());
     }
 }

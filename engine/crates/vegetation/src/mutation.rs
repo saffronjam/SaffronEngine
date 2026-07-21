@@ -6,8 +6,8 @@ use saffron_spatial::{DecisionScalar, FieldChannel, UnitInterval, WorldCellKey, 
 
 use crate::hash::sha256;
 use crate::{
-    Error, InteractionPolicy, PlantId, PlantLifecycle, PlantPoint, PlantPointColumns,
-    QuantizedOrientation, Result,
+    ContentHash, CookVersionSet, Error, InteractionPolicy, PlantId, PlantLifecycle, PlantPoint,
+    PlantPointColumns, QuantizedOrientation, Result,
 };
 
 /// Common ordering, authority, idempotency, and optimistic-concurrency metadata.
@@ -282,49 +282,25 @@ impl VegetationState {
         &self.cells
     }
 
-    /// Canonical bytes used for compaction equivalence and deterministic persistence tests.
+    pub(crate) fn applied_transactions(&self) -> &BTreeMap<u128, [u8; 32]> {
+        &self.applied_transactions
+    }
+
+    pub(crate) fn from_canonical_parts(
+        manifest_identity: [u8; 32],
+        cells: BTreeMap<WorldCellKey, VegetationCellState>,
+        applied_transactions: BTreeMap<u128, [u8; 32]>,
+    ) -> Self {
+        Self {
+            manifest_identity,
+            cells,
+            applied_transactions,
+        }
+    }
+
+    /// Writes the canonical, interruption-detecting snapshot container.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = b"SVEGSTATE01".to_vec();
-        bytes.extend_from_slice(&self.manifest_identity);
-        push_len(&mut bytes, self.cells.len())?;
-        for (cell, state) in &self.cells {
-            bytes.extend_from_slice(&cell.canonical_bytes());
-            bytes.extend_from_slice(&state.revision.to_be_bytes());
-            push_len(&mut bytes, state.field_tiles.len())?;
-            for (key, tile) in &state.field_tiles {
-                bytes.extend_from_slice(&key.layer.to_be_bytes());
-                push_field_channel(&mut bytes, key.channel);
-                bytes.extend_from_slice(&key.tile.to_be_bytes());
-                for dimension in tile.dimensions {
-                    bytes.extend_from_slice(&dimension.to_be_bytes());
-                }
-                bytes.extend_from_slice(&tile.quantum_bits.to_be_bytes());
-                push_len(&mut bytes, tile.values.len())?;
-                for value in &tile.values {
-                    bytes.extend_from_slice(&value.to_be_bytes());
-                }
-            }
-            push_len(&mut bytes, state.plants.len())?;
-            for (id, plant) in &state.plants {
-                bytes.extend_from_slice(&id.bytes());
-                push_plant_state(&mut bytes, plant)?;
-            }
-            push_len(&mut bytes, state.disturbance_masks.len())?;
-            for (key, values) in &state.disturbance_masks {
-                bytes.extend_from_slice(&key.categories.to_be_bytes());
-                bytes.extend_from_slice(&key.tile.to_be_bytes());
-                push_len(&mut bytes, values.len())?;
-                for value in values {
-                    bytes.extend_from_slice(&value.to_be_bytes());
-                }
-            }
-        }
-        push_len(&mut bytes, self.applied_transactions.len())?;
-        for (transaction, signature) in &self.applied_transactions {
-            bytes.extend_from_slice(&transaction.to_be_bytes());
-            bytes.extend_from_slice(signature);
-        }
-        Ok(bytes)
+        crate::state_codec::encode_state(self)
     }
 }
 
@@ -453,11 +429,24 @@ pub struct EditorJournalEnvelope {
     pub inverse: Vec<VegetationMutationRecord>,
 }
 
+/// Exact compatibility identity required by a persistent vegetation state container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationStateBinding {
+    /// Exact immutable world-manifest identity.
+    pub manifest_identity: ContentHash,
+    /// Exact canonical graph compiled into the manifest.
+    pub cook_graph_identity: ContentHash,
+    /// Complete schema/compiler/evaluator/numeric/simulation contract.
+    pub versions: CookVersionSet,
+    /// Canonical identity of every named seed namespace.
+    pub seed_namespaces_identity: ContentHash,
+}
+
 /// Compact save envelope: canonical snapshot plus a bounded mutation tail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaveStateEnvelope {
-    /// Exact base manifest required by both snapshot and tail.
-    pub manifest_identity: [u8; 32],
+    /// Exact immutable-generation and deterministic-simulation contract.
+    pub binding: VegetationStateBinding,
     /// Compact canonical snapshot.
     pub snapshot: VegetationState,
     /// Mutations after the snapshot boundary.
@@ -465,15 +454,22 @@ pub struct SaveStateEnvelope {
 }
 
 impl SaveStateEnvelope {
-    /// Reduces the tail and returns a new envelope with an empty tail.
-    pub fn compact(self) -> Result<Self> {
-        if self.snapshot.manifest_identity != self.manifest_identity {
+    /// Reduces the tail over a clone of the snapshot.
+    pub fn reduced_state(&self) -> Result<VegetationState> {
+        let manifest_identity = self.binding.manifest_identity.bytes();
+        if self.snapshot.manifest_identity != manifest_identity {
             return Err(Error::ManifestMismatch);
         }
-        let mut snapshot = self.snapshot;
-        reduce_mutations(&mut snapshot, self.manifest_identity, &self.tail)?;
+        let mut state = self.snapshot.clone();
+        reduce_mutations(&mut state, manifest_identity, &self.tail)?;
+        Ok(state)
+    }
+
+    /// Reduces the tail and returns a new envelope with an empty tail.
+    pub fn compact(self) -> Result<Self> {
+        let snapshot = self.reduced_state()?;
         Ok(Self {
-            manifest_identity: self.manifest_identity,
+            binding: self.binding,
             snapshot,
             tail: Vec::new(),
         })
@@ -778,7 +774,9 @@ fn add_point(cell: &mut VegetationCellState, point: &PlantPoint) -> Result<()> {
     Ok(())
 }
 
-fn record_order_key(record: &VegetationMutationRecord) -> ([u8; 25], u8, [u8; 16], u128) {
+pub(crate) fn record_order_key(
+    record: &VegetationMutationRecord,
+) -> ([u8; 25], u8, [u8; 16], u128) {
     (
         record.header.cell.canonical_bytes(),
         mutation_tag(&record.mutation),
@@ -827,7 +825,7 @@ fn push_record(bytes: &mut Vec<u8>, record: &VegetationMutationRecord) -> Result
         }
         VegetationMutation::AnchorAddition(point) | VegetationMutation::Planting(point) => {
             bytes.extend_from_slice(
-                &PlantPointColumns::from_points(std::slice::from_ref(point))?.canonical_bytes()?,
+                &PlantPointColumns::from_points(vec![point.clone()])?.canonical_bytes()?,
             );
         }
         VegetationMutation::Tombstone { plant } => bytes.extend_from_slice(&plant.bytes()),
@@ -932,7 +930,7 @@ fn push_record(bytes: &mut Vec<u8>, record: &VegetationMutationRecord) -> Result
     Ok(())
 }
 
-fn mutation_tag(mutation: &VegetationMutation) -> u8 {
+pub(crate) fn mutation_tag(mutation: &VegetationMutation) -> u8 {
     match mutation {
         VegetationMutation::FieldTilePatch { .. } => 0,
         VegetationMutation::AnchorAddition(_) => 1,
@@ -970,43 +968,6 @@ fn mutation_plant_id(mutation: &VegetationMutation) -> Option<PlantId> {
             None
         }
     }
-}
-
-fn push_plant_state(bytes: &mut Vec<u8>, state: &PlantPersistentState) -> Result<()> {
-    match &state.addition {
-        Some(point) => {
-            bytes.push(1);
-            bytes.extend_from_slice(
-                &PlantPointColumns::from_points(std::slice::from_ref(point))?.canonical_bytes()?,
-            );
-        }
-        None => bytes.push(0),
-    }
-    bytes.push(u8::from(state.tombstoned));
-    match state.transform {
-        Some((position, orientation, scale)) => {
-            bytes.push(1);
-            push_position(bytes, position);
-            push_orientation(bytes, orientation);
-            push_scale(bytes, scale);
-        }
-        None => bytes.push(0),
-    }
-    push_option_u32(bytes, state.lifecycle.map(|value| value as u32));
-    push_option_u32(bytes, state.phenotype);
-    push_option_u64(bytes, state.ecology_tick);
-    push_option_unit(bytes, state.health);
-    push_option_unit(bytes, state.moisture);
-    push_option_unit(bytes, state.fuel);
-    push_option_u32(bytes, state.interaction_policy.map(|value| value as u32));
-    match state.promotion_origin {
-        Some(value) => {
-            bytes.push(1);
-            push_promotion(bytes, value);
-        }
-        None => bytes.push(0),
-    }
-    Ok(())
 }
 
 fn push_promotion(bytes: &mut Vec<u8>, state: PromotionOriginState) {
@@ -1254,7 +1215,12 @@ mod tests {
         reduce_mutations(&mut full, manifest, &[planting.clone(), moisture.clone()]).unwrap();
 
         let compacted = SaveStateEnvelope {
-            manifest_identity: manifest,
+            binding: VegetationStateBinding {
+                manifest_identity: ContentHash::new(manifest),
+                cook_graph_identity: ContentHash::new([9; 32]),
+                versions: CookVersionSet::current(),
+                seed_namespaces_identity: ContentHash::new([10; 32]),
+            },
             snapshot: VegetationState::new(manifest),
             tail: vec![moisture.clone(), planting.clone(), moisture, planting],
         }
