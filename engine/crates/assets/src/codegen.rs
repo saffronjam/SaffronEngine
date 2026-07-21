@@ -169,12 +169,12 @@ fn write_and_compile(
 }
 
 /// The self-contained fragment shader for a material graph: a `[[vk::push_constant]] Mat`
-/// push, bindless `textures[]`, and the 5-field `SurfaceData`, with `evalSurface` filled
+/// push, bindless `textures[]`, and the complete `SurfaceData`, with `evalSurface` filled
 /// by the emitted surface body.
 fn graph_shader_source(surface_body: &str) -> String {
     format!(
         "[[vk::binding(0, 0)]] Sampler2D textures[1024];\n\
-         struct SurfaceData {{ float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; }};\n\
+         struct SurfaceData {{ float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; float occlusion; float opacity; uint surfaceModel; float frontFace; float frontResponse; float backResponse; float thickness; float3 absorption; float3 transmission; float energyLimit; }};\n\
          struct Mat {{ float4 baseColor; uint4 tex; }};\n\
          [[vk::push_constant]] Mat mat;\n\
          SurfaceData evalSurface(float2 uv)\n{{\n    SurfaceData s;\n\
@@ -513,7 +513,7 @@ mod tests {
         // Byte-for-byte the graph shader template (empty surfaceBody).
         let expected = concat!(
             "[[vk::binding(0, 0)]] Sampler2D textures[1024];\n",
-            "struct SurfaceData { float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; };\n",
+            "struct SurfaceData { float3 albedo; float metallic; float roughness; float3 normal; float3 emissive; float occlusion; float opacity; uint surfaceModel; float frontFace; float frontResponse; float backResponse; float thickness; float3 absorption; float3 transmission; float energyLimit; };\n",
             "struct Mat { float4 baseColor; uint4 tex; };\n",
             "[[vk::push_constant]] Mat mat;\n",
             "SurfaceData evalSurface(float2 uv)\n{\n    SurfaceData s;\n",

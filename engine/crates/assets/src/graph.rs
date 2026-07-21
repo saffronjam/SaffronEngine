@@ -163,10 +163,10 @@ pub fn lower_graph_to_params(graph: &Value, material: &mut MaterialAsset) -> boo
 /// assignments.
 ///
 /// `mesh == false` targets the self-contained preview/shell shader (a `Mat mat` push +
-/// `textures[]` + a `uv` param, the 5-field `SurfaceData`); `mesh == true` targets the
+/// `textures[]` + a `uv` param); `mesh == true` targets the
 /// übershader's `evalSurface(MaterialInput m)` — `m.mat`, `albedoTextures[]`, a `uv` local
-/// the splice template provides, and the 7-field `SurfaceData` (world normal + occlusion /
-/// opacity). An empty or non-object graph emits the default passthrough body.
+/// the splice template provides. Both emit the complete `SurfaceData` field contract.
+/// An empty or non-object graph emits the default passthrough body.
 #[must_use]
 pub fn emit_graph_surface(graph: &Value, mesh: bool) -> String {
     let base_color = if mesh {
@@ -174,15 +174,32 @@ pub fn emit_graph_surface(graph: &Value, mesh: bool) -> String {
     } else {
         "mat.baseColor"
     };
+    let roughness = if mesh {
+        "((m.mat.tex1.w & FEATURE_THIN_SHEET) != 0u ? m.mat.thinReflection.z : 1.0)"
+    } else {
+        "1.0"
+    };
     let mut body = format!(
-        "    s.albedo = {base_color}.rgb;\n    s.metallic = 0.0;\n    s.roughness = 1.0;\n    s.emissive = float3(0.0);\n"
+        "    s.albedo = {base_color}.rgb;\n    s.metallic = 0.0;\n    s.roughness = {roughness};\n    s.emissive = float3(0.0);\n"
     );
     if mesh {
         body += &format!(
             "    s.normal = normalize(m.worldNormal);\n    s.occlusion = 1.0;\n    s.opacity = {base_color}.a;\n"
         );
     } else {
-        body += "    s.normal = float3(0.0, 0.0, 1.0);\n";
+        body += concat!(
+            "    s.normal = float3(0.0, 0.0, 1.0);\n",
+            "    s.occlusion = 1.0;\n",
+            "    s.opacity = mat.baseColor.a;\n",
+            "    s.surfaceModel = 0u;\n",
+            "    s.frontFace = 1.0;\n",
+            "    s.frontResponse = 1.0;\n",
+            "    s.backResponse = 1.0;\n",
+            "    s.thickness = 0.0;\n",
+            "    s.absorption = float3(0.0);\n",
+            "    s.transmission = float3(0.0);\n",
+            "    s.energyLimit = 1.0;\n",
+        );
     }
     if !graph.is_object() {
         return body;
@@ -269,6 +286,33 @@ pub fn emit_graph_surface(graph: &Value, mesh: bool) -> String {
     if let Some(s) = src_for("emissive") {
         body += &format!("    s.emissive = n_{s}.rgb;\n");
     }
+    if let Some(s) = src_for("occlusion") {
+        body += &format!("    s.occlusion = saturate(n_{s}.r);\n");
+    }
+    if let Some(s) = src_for("normal") {
+        body += &format!("    s.normal = normalize(n_{s}.rgb);\n");
+    }
+    if let Some(s) = src_for("opacity") {
+        body += &format!("    s.opacity = saturate(n_{s}.r);\n");
+    }
+    if let Some(s) = src_for("frontAlbedoResponse") {
+        body += &format!("    s.frontResponse = saturate(n_{s}.r);\n");
+    }
+    if let Some(s) = src_for("backAlbedoResponse") {
+        body += &format!("    s.backResponse = saturate(n_{s}.r);\n");
+    }
+    if let Some(s) = src_for("thickness") {
+        body += &format!("    s.thickness = max(n_{s}.r, 1e-5);\n");
+    }
+    if let Some(s) = src_for("absorption") {
+        body += &format!("    s.absorption = max(n_{s}.rgb, float3(0.0));\n");
+    }
+    if let Some(s) = src_for("transmission") {
+        body += &format!("    s.transmission = saturate(n_{s}.rgb);\n");
+    }
+    if let Some(s) = src_for("energyLimit") {
+        body += &format!("    s.energyLimit = saturate(n_{s}.r);\n");
+    }
     body
 }
 
@@ -323,21 +367,30 @@ mod tests {
     use super::*;
     use crate::material::default_material_asset;
 
-    /// The default passthrough body for the self-contained preview/shell shader
-    /// (5-field `SurfaceData`).
+    /// The complete default passthrough body for the self-contained preview shader.
     const PREVIEW_PASSTHROUGH: &str = concat!(
         "    s.albedo = mat.baseColor.rgb;\n",
         "    s.metallic = 0.0;\n",
         "    s.roughness = 1.0;\n",
         "    s.emissive = float3(0.0);\n",
         "    s.normal = float3(0.0, 0.0, 1.0);\n",
+        "    s.occlusion = 1.0;\n",
+        "    s.opacity = mat.baseColor.a;\n",
+        "    s.surfaceModel = 0u;\n",
+        "    s.frontFace = 1.0;\n",
+        "    s.frontResponse = 1.0;\n",
+        "    s.backResponse = 1.0;\n",
+        "    s.thickness = 0.0;\n",
+        "    s.absorption = float3(0.0);\n",
+        "    s.transmission = float3(0.0);\n",
+        "    s.energyLimit = 1.0;\n",
     );
 
-    /// The default passthrough body for the übershader (7-field `SurfaceData`).
+    /// The default graph-owned fields for the complete übershader surface.
     const MESH_PASSTHROUGH: &str = concat!(
         "    s.albedo = m.mat.baseColor.rgb;\n",
         "    s.metallic = 0.0;\n",
-        "    s.roughness = 1.0;\n",
+        "    s.roughness = ((m.mat.tex1.w & FEATURE_THIN_SHEET) != 0u ? m.mat.thinReflection.z : 1.0);\n",
         "    s.emissive = float3(0.0);\n",
         "    s.normal = normalize(m.worldNormal);\n",
         "    s.occlusion = 1.0;\n",
@@ -387,6 +440,16 @@ mod tests {
             "    s.roughness = 1.0;\n",
             "    s.emissive = float3(0.0);\n",
             "    s.normal = float3(0.0, 0.0, 1.0);\n",
+            "    s.occlusion = 1.0;\n",
+            "    s.opacity = mat.baseColor.a;\n",
+            "    s.surfaceModel = 0u;\n",
+            "    s.frontFace = 1.0;\n",
+            "    s.frontResponse = 1.0;\n",
+            "    s.backResponse = 1.0;\n",
+            "    s.thickness = 0.0;\n",
+            "    s.absorption = float3(0.0);\n",
+            "    s.transmission = float3(0.0);\n",
+            "    s.energyLimit = 1.0;\n",
             "    float4 n_c1 = float4(0.5, 0.25, 1, 1);\n",
             "    float4 n_tx = textures[NonUniformResourceIndex(mat.tex.z)].Sample(uv);\n",
             "    float4 n_mul = n_c1 * n_tx;\n",
@@ -400,7 +463,7 @@ mod tests {
         let golden = concat!(
             "    s.albedo = m.mat.baseColor.rgb;\n",
             "    s.metallic = 0.0;\n",
-            "    s.roughness = 1.0;\n",
+            "    s.roughness = ((m.mat.tex1.w & FEATURE_THIN_SHEET) != 0u ? m.mat.thinReflection.z : 1.0);\n",
             "    s.emissive = float3(0.0);\n",
             "    s.normal = normalize(m.worldNormal);\n",
             "    s.occlusion = 1.0;\n",
@@ -442,7 +505,7 @@ mod tests {
 
     #[test]
     fn texture_slot_index_mapping_matches_per_slot() {
-        // Preview (5-field) context: only x/y/z/w on `mat.tex`.
+        // Preview context: only x/y/z/w on `mat.tex`.
         assert_eq!(texture_slot_index("albedo", false), "mat.tex.x");
         assert_eq!(texture_slot_index("metallicRoughness", false), "mat.tex.y");
         assert_eq!(texture_slot_index("mr", false), "mat.tex.y");
@@ -452,7 +515,7 @@ mod tests {
         assert_eq!(texture_slot_index("height", false), "mat.tex.x");
         assert_eq!(texture_slot_index("occlusion", false), "mat.tex.x");
 
-        // Mesh (7-field) context: tex0 + tex1, with height/occlusion on tex1.
+        // Mesh context: tex0 + tex1, with height/occlusion on tex1.
         assert_eq!(texture_slot_index("albedo", true), "m.mat.tex0.x");
         assert_eq!(
             texture_slot_index("metallicRoughness", true),
