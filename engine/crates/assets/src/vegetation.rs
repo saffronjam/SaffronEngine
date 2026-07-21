@@ -1,6 +1,7 @@
 //! Asset-server I/O for canonical vegetation assets and sparse map packages.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,12 +20,15 @@ use saffron_vegetation::{
     GraphCompileOptions, GraphDependencyFingerprint, GraphDependencySource, GraphEvaluationInputs,
     GraphEvaluationJobInputs, PlantFamilyAsset, PlantPointColumns, PlantPrototype,
     QuantizedFieldTileValues, VegetationLayerOperator, VegetationMapAsset, VegetationMapChunk,
+    VegetationMapChunkKind, VegetationMapChunkPayload, VegetationMapChunkReference,
+    VegetationMapSnapshot, VegetationMapTileKey, VegetationMapTileSnapshot,
     canonical_surface_provider_set_hash, compile_biome_graph, read_biome_asset, read_plant_asset,
     read_vegetation_map_asset as decode_map, read_vegetation_map_chunk, vegetation_content_hash,
     write_biome_asset, write_plant_asset, write_vegetation_map_asset as encode_map,
     write_vegetation_map_chunk,
 };
 
+use crate::cook_reader::CookAssetAccess;
 use crate::import::hash_bytes_fnv;
 use crate::{AssetServer, Error, Result};
 
@@ -37,6 +41,17 @@ pub struct VegetationImport {
     pub name: String,
     /// Imported logical asset kind.
     pub asset_type: AssetType,
+}
+
+/// One optimistic multi-object authored map transaction.
+#[derive(Clone, Debug)]
+pub struct VegetationMapTransaction {
+    /// Root generation captured before editing began.
+    pub expected_generation: u64,
+    /// Complete immutable replacements for logical object keys.
+    pub upserts: Vec<VegetationMapChunk>,
+    /// Logical object keys removed from the sparse root inventory.
+    pub removals: Vec<saffron_vegetation::VegetationMapChunkKey>,
 }
 
 /// A catalog-resolved graph and the complete family prototype table it can emit.
@@ -54,6 +69,51 @@ pub struct ResolvedBiomeGraph {
 pub struct CatalogBiomeGraphResolver<'a> {
     assets: &'a AssetServer,
     external_dependencies: &'a BTreeMap<GraphDependencySource, [u8; 32]>,
+}
+
+struct CookBiomeGraphResolver<'a> {
+    assets: &'a dyn CookAssetAccess,
+    external_dependencies: &'a BTreeMap<GraphDependencySource, [u8; 32]>,
+}
+
+impl BiomeGraphResolver for CookBiomeGraphResolver<'_> {
+    fn resolve_biome(
+        &self,
+        id: Uuid,
+    ) -> std::result::Result<BiomeAsset, saffron_vegetation::Error> {
+        load_biome_asset_from(self.assets, id)
+            .map_err(|error| dependency_error(GraphDependencySource::Asset(id), error))
+    }
+
+    fn resolve_dependency_hash(
+        &self,
+        source: GraphDependencySource,
+    ) -> std::result::Result<[u8; 32], saffron_vegetation::Error> {
+        if let GraphDependencySource::Asset(id) = source {
+            let entry = self.assets.catalog().find(id).ok_or_else(|| {
+                saffron_vegetation::Error::GraphDocument {
+                    path: dependency_path(source),
+                    reason: "catalog asset is missing".to_owned(),
+                }
+            })?;
+            let bytes = self
+                .assets
+                .read_file(&self.assets.root().join(&entry.path))
+                .map_err(|error| dependency_error(source, error))?;
+            return Ok(vegetation_content_hash(&bytes));
+        }
+        self.external_dependencies
+            .get(&source)
+            .copied()
+            .ok_or_else(|| saffron_vegetation::Error::GraphDocument {
+                path: dependency_path(source),
+                reason: "canonical external dependency identity is missing".to_owned(),
+            })
+    }
+
+    fn available_dependencies(&self) -> Vec<GraphDependencySource> {
+        self.external_dependencies.keys().copied().collect()
+    }
 }
 
 impl<'a> CatalogBiomeGraphResolver<'a> {
@@ -116,15 +176,28 @@ pub fn compile_catalog_biome_graph(
     external_dependencies: &BTreeMap<GraphDependencySource, [u8; 32]>,
     options: GraphCompileOptions,
 ) -> Result<ResolvedBiomeGraph> {
-    let root = load_biome_asset(assets, biome)?;
-    let resolver = CatalogBiomeGraphResolver::new(assets, external_dependencies);
+    compile_catalog_biome_graph_from(assets, biome, root_bindings, external_dependencies, options)
+}
+
+pub(crate) fn compile_catalog_biome_graph_from(
+    assets: &dyn CookAssetAccess,
+    biome: Uuid,
+    root_bindings: &[(u128, serde_json::Value)],
+    external_dependencies: &BTreeMap<GraphDependencySource, [u8; 32]>,
+    options: GraphCompileOptions,
+) -> Result<ResolvedBiomeGraph> {
+    let root = load_biome_asset_from(assets, biome)?;
+    let resolver = CookBiomeGraphResolver {
+        assets,
+        external_dependencies,
+    };
     let graph = compile_biome_graph(&root, root_bindings, &resolver, options)?;
     let mut families = BTreeSet::new();
     collect_graph_families(&graph.root, &mut families);
     let plant_prototypes = families
         .into_iter()
         .map(|family| {
-            let asset = load_plant_family_asset(assets, Uuid(family))?;
+            let asset = load_plant_family_asset_from(assets, Uuid(family))?;
             Ok(PlantPrototype::from_family(&asset)?)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -143,7 +216,23 @@ pub fn compile_catalog_biome_instance_graph(
     external_dependencies: &BTreeMap<GraphDependencySource, [u8; 32]>,
     options: GraphCompileOptions,
 ) -> Result<ResolvedBiomeGraph> {
-    let map_asset = load_vegetation_map_asset(assets, map)?;
+    compile_catalog_biome_instance_graph_from(
+        assets,
+        map,
+        biome_instance,
+        external_dependencies,
+        options,
+    )
+}
+
+pub(crate) fn compile_catalog_biome_instance_graph_from(
+    assets: &dyn CookAssetAccess,
+    map: Uuid,
+    biome_instance: u128,
+    external_dependencies: &BTreeMap<GraphDependencySource, [u8; 32]>,
+    options: GraphCompileOptions,
+) -> Result<ResolvedBiomeGraph> {
+    let map_asset = load_vegetation_map_snapshot_from(assets, map)?;
     let instance = map_asset
         .biome_instances
         .iter()
@@ -151,7 +240,7 @@ pub fn compile_catalog_biome_instance_graph(
         .ok_or_else(|| {
             Error::Io("vegetation biome instance is not present in the map".to_owned())
         })?;
-    let mut resolved = compile_catalog_biome_graph(
+    let mut resolved = compile_catalog_biome_graph_from(
         assets,
         instance.biome,
         &instance.bindings,
@@ -171,10 +260,28 @@ pub fn assemble_biome_graph_evaluation_job(
     ecology_tick: u64,
     surface_providers: Vec<Arc<dyn SurfaceField>>,
 ) -> Result<GraphEvaluationJobInputs> {
+    assemble_biome_graph_evaluation_job_from(
+        assets,
+        resolved,
+        map,
+        requested_cells,
+        ecology_tick,
+        surface_providers,
+    )
+}
+
+pub(crate) fn assemble_biome_graph_evaluation_job_from(
+    assets: &dyn CookAssetAccess,
+    resolved: &ResolvedBiomeGraph,
+    map: Uuid,
+    requested_cells: &[WorldCellKey],
+    ecology_tick: u64,
+    surface_providers: Vec<Arc<dyn SurfaceField>>,
+) -> Result<GraphEvaluationJobInputs> {
     let biome_instance = resolved.biome_instance.ok_or_else(|| {
         Error::Io("graph evaluation requires a map-local biome instance".to_owned())
     })?;
-    let map_asset = load_vegetation_map_asset(assets, map)?;
+    let map_asset = load_vegetation_map_snapshot_from(assets, map)?;
     let instance = map_asset
         .biome_instances
         .iter()
@@ -196,6 +303,13 @@ pub fn assemble_biome_graph_evaluation_job(
             resource: "output cells",
             requested: cells.len() as u64,
             limit: resolved.graph.limits.max_output_cells,
+        }));
+    }
+    if surface_providers.len() as u64 > resolved.graph.limits.max_input_tiles {
+        return Err(Error::Vegetation(saffron_vegetation::Error::GraphLimit {
+            resource: "input tiles",
+            requested: surface_providers.len() as u64,
+            limit: resolved.graph.limits.max_input_tiles,
         }));
     }
     let context = GraphInputAssemblyContext {
@@ -372,10 +486,10 @@ pub fn assemble_biome_graph_evaluation_job(
 }
 
 struct GraphInputAssemblyContext<'a> {
-    assets: &'a AssetServer,
+    assets: &'a dyn CookAssetAccess,
     resolved: &'a ResolvedBiomeGraph,
     map: Uuid,
-    map_asset: &'a VegetationMapAsset,
+    map_asset: &'a VegetationMapSnapshot,
     biome_instance: u128,
     instance_bounds: WorldBounds,
     instance_namespace: u128,
@@ -473,7 +587,8 @@ fn assemble_graph_input_scope(
     let mut tile_count = 0_u64;
     let mut anchor_ids = BTreeSet::new();
     for chunk_cell in chunk_cells {
-        let Some(chunk) = load_vegetation_map_chunk(context.assets, context.map, chunk_cell)?
+        let Some(chunk) =
+            load_vegetation_map_tile_snapshot_from(context.assets, context.map, chunk_cell)?
         else {
             continue;
         };
@@ -600,7 +715,10 @@ fn assemble_graph_input_scope(
         .collect::<Vec<_>>();
     surface_providers.sort_by_key(|provider| provider.descriptor().id);
     if !surface_providers.is_empty() {
-        inputs.surface_provider_set_hash = canonical_surface_provider_set_hash(&surface_providers)?;
+        inputs.surface_provider_set_hash = canonical_surface_provider_set_hash(
+            &surface_providers,
+            context.resolved.graph.limits.max_input_tiles,
+        )?;
         inputs.surface_providers = surface_providers;
     }
     let mut layers = context.map_asset.layers.iter().collect::<Vec<_>>();
@@ -668,70 +786,60 @@ pub fn vegetation_graph_dependency_hashes(
     map: Uuid,
     surface_providers: &[Arc<dyn SurfaceField>],
 ) -> Result<BTreeMap<GraphDependencySource, [u8; 32]>> {
-    let entry = typed_entry(assets, map, AssetType::VegetationMap, "vegetation map")?;
-    let map_asset = load_vegetation_map_asset(assets, map)?;
-    let map_bytes = encode_map(&map_asset)?;
+    vegetation_graph_dependency_hashes_from(assets, map, surface_providers)
+}
+
+pub(crate) fn vegetation_graph_dependency_hashes_from(
+    assets: &dyn CookAssetAccess,
+    map: Uuid,
+    surface_providers: &[Arc<dyn SurfaceField>],
+) -> Result<BTreeMap<GraphDependencySource, [u8; 32]>> {
+    let map_asset = load_vegetation_map_snapshot_from(assets, map)?;
+    let mut result = BTreeMap::new();
     let layer_ids = map_asset
         .layers
         .iter()
         .map(|layer| layer.id)
         .collect::<BTreeSet<_>>();
-    let mut preimages = BTreeMap::<GraphDependencySource, Vec<u8>>::new();
     for layer in &map_asset.layers {
-        let preimage = preimages
-            .entry(GraphDependencySource::MapLayer(layer.id))
-            .or_insert_with(|| b"saffron-anima/map-layer-dependency/v1\0".to_vec());
-        preimage.extend_from_slice(&map_bytes);
-        preimage.extend_from_slice(&layer.id.to_be_bytes());
+        let reference = map_asset
+            .inventory
+            .iter()
+            .find(|reference| {
+                reference.key.layer == layer.id
+                    && reference.key.kind == VegetationMapChunkKind::LayerMetadata
+                    && reference.key.tile == VegetationMapTileKey::Global
+            })
+            .ok_or_else(|| Error::Io("vegetation-map layer object is missing".to_owned()))?;
+        result.insert(
+            GraphDependencySource::MapLayer(layer.id),
+            reference.content_hash,
+        );
     }
-    let directory = assets.root.join(chunk_directory(&entry.path));
-    if directory.is_dir() {
-        let mut chunks = std::fs::read_dir(directory)
-            .map_err(|error| Error::Io(error.to_string()))?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("chunk"))
-            .collect::<Vec<_>>();
-        chunks.sort();
-        for path in chunks {
-            let bytes = std::fs::read(path).map_err(|error| Error::Io(error.to_string()))?;
-            let chunk = read_vegetation_map_chunk(&bytes)?;
-            if chunk.map != map {
-                return Err(Error::Io(
-                    "vegetation chunk package contains a foreign map identity".to_owned(),
-                ));
-            }
-            let chunk_hash = vegetation_content_hash(&bytes);
-            for field in chunk.fields.iter().chain(&chunk.blockers) {
+    for chunk in &map_asset.chunks {
+        if let VegetationMapChunkPayload::Field(payload) = &chunk.payload {
+            for field in payload.fields.iter().chain(&payload.blockers) {
                 if !layer_ids.contains(&field.layer) {
                     return Err(Error::Io(
                         "authored field references a layer absent from its vegetation map"
                             .to_owned(),
                     ));
                 }
-                for source in [
-                    GraphDependencySource::MapLayer(field.layer),
-                    GraphDependencySource::Field(field.channel),
-                ] {
-                    let preimage = preimages.entry(source).or_insert_with(|| {
-                        b"saffron-anima/vegetation-external-dependency/v1\0".to_vec()
-                    });
-                    preimage.extend_from_slice(&chunk.cell.canonical_bytes());
-                    preimage.extend_from_slice(&chunk_hash);
-                    preimage.extend_from_slice(&field.layer.to_be_bytes());
-                }
+                let channel = field.channel;
+                let source = GraphDependencySource::Field(channel);
+                let mut preimage = b"saffron-anima/map-field-contract/v1\0".to_vec();
+                preimage.extend_from_slice(&source.canonical_bytes());
+                result
+                    .entry(source)
+                    .or_insert_with(|| vegetation_content_hash(&preimage));
             }
         }
     }
-    let mut result = preimages
-        .into_iter()
-        .map(|(source, preimage)| (source, vegetation_content_hash(&preimage)))
-        .collect::<BTreeMap<_, _>>();
     let mut ordered_providers = surface_providers.iter().collect::<Vec<_>>();
     ordered_providers.sort_by_key(|provider| provider.descriptor().id);
     for provider in ordered_providers {
         let descriptor = provider.descriptor();
-        let hash = canonical_surface_provider_set_hash(&[Arc::clone(provider)])?;
+        let hash = canonical_surface_provider_set_hash(&[Arc::clone(provider)], 1)?;
         if result
             .insert(
                 GraphDependencySource::SurfaceProvider(descriptor.id.0),
@@ -946,7 +1054,7 @@ fn global_stage_input_snapshot(
         .iter()
         .map(|anchor| anchor.point.clone())
         .collect::<Vec<_>>();
-    let anchor_bytes = PlantPointColumns::from_points(&anchor_points)?.canonical_bytes()?;
+    let anchor_bytes = PlantPointColumns::from_points(anchor_points)?.canonical_bytes()?;
     bytes.extend_from_slice(&(anchor_bytes.len() as u64).to_be_bytes());
     bytes.extend_from_slice(&anchor_bytes);
 
@@ -1181,12 +1289,14 @@ pub fn import_vegetation_asset(
             let asset = decode_map(&bytes)?;
             let chunks = read_source_map_chunks(source, &asset)?;
             let path = format!("vegetation/maps/{}.svegmap", asset.id.value());
-            if assets.root.join(chunk_directory(&path)).exists() {
+            let package = assets.root.join(map_package_directory(&path));
+            if package.exists() {
                 return Err(Error::Io(format!(
                     "vegetation asset identity {} already has a map package in the project",
                     asset.id.value()
                 )));
             }
+            publish_imported_map_objects(&package, &asset, &chunks)?;
             let id = import_typed_asset(
                 assets,
                 asset.id,
@@ -1195,15 +1305,10 @@ pub fn import_vegetation_asset(
                 AssetType::VegetationMap,
                 path.clone(),
                 &bytes,
-            )?;
-            if let Err(error) = std::fs::create_dir_all(assets.root.join(chunk_directory(&path))) {
-                rollback_new_asset(assets, id);
-                return Err(Error::Io(error.to_string()));
-            }
-            if let Err(error) = write_vegetation_map_chunks(assets, id, &chunks) {
-                rollback_new_asset(assets, id);
-                return Err(error);
-            }
+            )
+            .inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&package);
+            })?;
             (id, AssetType::VegetationMap)
         }
         "splantc" | "svegcell" => {
@@ -1231,7 +1336,14 @@ pub fn import_vegetation_asset(
 
 /// Reads a complete `.splant` from the catalog.
 pub fn load_plant_family_asset(assets: &AssetServer, id: Uuid) -> Result<PlantFamilyAsset> {
-    let bytes = read_typed_asset(assets, id, AssetType::Plant, "plant")?;
+    load_plant_family_asset_from(assets, id)
+}
+
+pub(crate) fn load_plant_family_asset_from(
+    assets: &dyn CookAssetAccess,
+    id: Uuid,
+) -> Result<PlantFamilyAsset> {
+    let bytes = read_typed_asset_from(assets, id, AssetType::Plant, "plant")?;
     Ok(read_plant_asset(&bytes)?)
 }
 
@@ -1272,7 +1384,11 @@ pub fn update_plant_family_asset(
 
 /// Reads a complete `.sbiome` from the catalog.
 pub fn load_biome_asset(assets: &AssetServer, id: Uuid) -> Result<BiomeAsset> {
-    let bytes = read_typed_asset(assets, id, AssetType::Biome, "biome")?;
+    load_biome_asset_from(assets, id)
+}
+
+pub(crate) fn load_biome_asset_from(assets: &dyn CookAssetAccess, id: Uuid) -> Result<BiomeAsset> {
+    let bytes = read_typed_asset_from(assets, id, AssetType::Biome, "biome")?;
     Ok(read_biome_asset(&bytes)?)
 }
 
@@ -1309,13 +1425,77 @@ pub fn update_biome_asset(assets: &mut AssetServer, id: Uuid, asset: &BiomeAsset
     update_typed_asset(assets, id, AssetType::Biome, "biome", &bytes)
 }
 
-/// Reads a complete `.svegmap` manifest from the catalog.
-pub fn load_vegetation_map_asset(assets: &AssetServer, id: Uuid) -> Result<VegetationMapAsset> {
-    let bytes = read_typed_asset(assets, id, AssetType::VegetationMap, "vegetation map")?;
+/// Reads the atomically visible `.svegmap` root from the catalog.
+pub fn load_vegetation_map_root(assets: &AssetServer, id: Uuid) -> Result<VegetationMapAsset> {
+    load_vegetation_map_root_from(assets, id)
+}
+
+pub(crate) fn load_vegetation_map_root_from(
+    assets: &dyn CookAssetAccess,
+    id: Uuid,
+) -> Result<VegetationMapAsset> {
+    let bytes = read_typed_asset_from(assets, id, AssetType::VegetationMap, "vegetation map")?;
     Ok(decode_map(&bytes)?)
 }
 
-/// Writes a new `.svegmap` manifest, creates its sparse package directory, and registers it.
+/// Resolves one complete authored map snapshot from its root and immutable object inventory.
+pub fn load_vegetation_map_snapshot(
+    assets: &AssetServer,
+    id: Uuid,
+) -> Result<VegetationMapSnapshot> {
+    load_vegetation_map_snapshot_from(assets, id)
+}
+
+pub(crate) fn load_vegetation_map_snapshot_from(
+    assets: &dyn CookAssetAccess,
+    id: Uuid,
+) -> Result<VegetationMapSnapshot> {
+    let entry = typed_entry_from(assets, id, AssetType::VegetationMap, "vegetation map")?;
+    let root = load_vegetation_map_root_from(assets, id)?;
+    let package = assets.root().join(map_package_directory(&entry.path));
+    let mut chunks = Vec::with_capacity(root.inventory.len());
+    for reference in &root.inventory {
+        chunks.push(read_map_object_from(assets, &package, id, reference)?);
+    }
+    let mut layers = Vec::new();
+    let mut biome_instances = Vec::new();
+    let mut brush_history = Vec::new();
+    for chunk in &chunks {
+        match &chunk.payload {
+            VegetationMapChunkPayload::LayerMetadata(layer) => layers.push(layer.clone()),
+            VegetationMapChunkPayload::GraphInstance(instance) => {
+                biome_instances.push(instance.clone());
+            }
+            VegetationMapChunkPayload::EditorMetadata(gestures) => {
+                brush_history.extend(gestures.iter().cloned());
+            }
+            VegetationMapChunkPayload::Field(_) | VegetationMapChunkPayload::AnchorOverride(_) => {}
+        }
+    }
+    layers.sort_by_key(saffron_vegetation::VegetationLayer::order_key);
+    biome_instances.sort_by_key(|instance| instance.id);
+    brush_history.sort_by_key(|gesture| (gesture.layer, gesture.gesture));
+    let layer_ids = layers.iter().map(|layer| layer.id).collect::<BTreeSet<_>>();
+    if chunks.iter().any(|chunk| match chunk.key.kind {
+        VegetationMapChunkKind::Field
+        | VegetationMapChunkKind::AnchorOverride
+        | VegetationMapChunkKind::EditorMetadata => !layer_ids.contains(&chunk.key.layer),
+        VegetationMapChunkKind::GraphInstance | VegetationMapChunkKind::LayerMetadata => false,
+    }) {
+        return Err(Error::Io(
+            "vegetation-map object references missing layer metadata".to_owned(),
+        ));
+    }
+    Ok(VegetationMapSnapshot {
+        root,
+        layers,
+        biome_instances,
+        brush_history,
+        chunks,
+    })
+}
+
+/// Writes a new empty `.svegmap` root and registers it.
 pub fn save_vegetation_map_asset(
     assets: &mut AssetServer,
     mut asset: VegetationMapAsset,
@@ -1323,6 +1503,11 @@ pub fn save_vegetation_map_asset(
     folder: &str,
 ) -> Result<Uuid> {
     asset.id = Uuid::new();
+    if asset.generation != 0 || !asset.inventory.is_empty() {
+        return Err(Error::Io(
+            "a new vegetation-map root must have generation zero and an empty inventory".to_owned(),
+        ));
+    }
     let bytes = encode_map(&asset)?;
     let path = format!("vegetation/maps/{}.svegmap", asset.id.value());
     let id = save_typed_asset(
@@ -1334,14 +1519,19 @@ pub fn save_vegetation_map_asset(
         path.clone(),
         &bytes,
     )?;
-    if let Err(error) = std::fs::create_dir_all(assets.root.join(chunk_directory(&path))) {
+    if let Err(error) = std::fs::create_dir_all(
+        assets
+            .root
+            .join(map_package_directory(&path))
+            .join("objects"),
+    ) {
         rollback_new_asset(assets, id);
         return Err(Error::Io(error.to_string()));
     }
     Ok(id)
 }
 
-/// Rewrites only an existing `.svegmap` manifest; authored chunks remain untouched.
+/// Atomically updates root metadata while retaining the committed object inventory.
 pub fn update_vegetation_map_asset(
     assets: &mut AssetServer,
     id: Uuid,
@@ -1352,70 +1542,272 @@ pub fn update_vegetation_map_asset(
             "vegetation-map identity does not match catalog row".to_owned(),
         ));
     }
-    let bytes = encode_map(asset)?;
-    update_typed_asset(
-        assets,
-        id,
-        AssetType::VegetationMap,
-        "vegetation map",
-        &bytes,
-    )?;
-    refresh_map_content_hash(assets, id)
+    let entry = typed_entry(assets, id, AssetType::VegetationMap, "vegetation map")?.clone();
+    let package = assets.root.join(map_package_directory(&entry.path));
+    std::fs::create_dir_all(&package).map_err(|error| Error::Io(error.to_string()))?;
+    let _lock = lock_map_package(&package)?;
+    let current = load_vegetation_map_root(assets, id)?;
+    if asset.generation != current.generation
+        || asset.inventory != current.inventory
+        || asset.chunk_layout != current.chunk_layout
+    {
+        return Err(Error::Io(
+            "vegetation-map root metadata update is based on a stale or altered inventory"
+                .to_owned(),
+        ));
+    }
+    let mut next = current;
+    next.name.clone_from(&asset.name);
+    next.bounds = asset.bounds;
+    next.generation = next.generation.checked_add(1).ok_or(Error::Vegetation(
+        saffron_vegetation::Error::NumericOverflow,
+    ))?;
+    let bytes = encode_map(&next)?;
+    atomic_write(&assets.root.join(&entry.path), &bytes)?;
+    assets.catalog.set_content_hash(id, hash_bytes_fnv(&bytes));
+    Ok(())
 }
 
-/// Atomically writes exactly the supplied sparse chunks and leaves every other chunk untouched.
-pub fn write_vegetation_map_chunks(
+/// Commits one optimistic authored-map transaction and publishes its root last.
+pub fn commit_vegetation_map_transaction(
     assets: &mut AssetServer,
     map: Uuid,
-    chunks: &[VegetationMapChunk],
+    transaction: VegetationMapTransaction,
 ) -> Result<()> {
     let entry = typed_entry(assets, map, AssetType::VegetationMap, "vegetation map")?.clone();
-    let manifest = load_vegetation_map_asset(assets, map)?;
-    let directory = assets.root.join(chunk_directory(&entry.path));
-    std::fs::create_dir_all(&directory).map_err(|error| Error::Io(error.to_string()))?;
-    let mut cells = BTreeSet::new();
-    let mut encoded = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        if chunk.map != map
-            || chunk.cell.level() != manifest.chunk_layout.level
-            || !cells.insert(chunk.cell)
-        {
+    let package = assets.root.join(map_package_directory(&entry.path));
+    let objects = package.join("objects");
+    std::fs::create_dir_all(&objects).map_err(|error| Error::Io(error.to_string()))?;
+    let _lock = lock_map_package(&package)?;
+    let mut root = load_vegetation_map_root(assets, map)?;
+    if root.generation != transaction.expected_generation {
+        return Err(Error::VegetationMapGenerationConflict {
+            expected: transaction.expected_generation,
+            actual: root.generation,
+        });
+    }
+
+    let mut keys = BTreeSet::new();
+    let mut encoded = Vec::with_capacity(transaction.upserts.len());
+    for chunk in &transaction.upserts {
+        if chunk.map != map || !keys.insert(chunk.key) {
             return Err(Error::Io(
-                "map chunk identity, level, or batch uniqueness is invalid".to_owned(),
+                "map object identity or batch key uniqueness is invalid".to_owned(),
             ));
         }
-        encoded.push((chunk.cell, write_vegetation_map_chunk(chunk)?));
+        if let VegetationMapTileKey::Cell(cell) = chunk.key.tile
+            && cell.level() != root.chunk_layout.level
+        {
+            return Err(Error::Io(
+                "map object cell level does not match its root".to_owned(),
+            ));
+        }
+        let bytes = write_vegetation_map_chunk(chunk)?;
+        let reference = map_object_reference(chunk, &bytes)?;
+        encoded.push((reference, bytes));
     }
-    for (cell, bytes) in encoded {
-        atomic_write(&directory.join(chunk_filename(cell)), &bytes)?;
+    let mut removals = transaction.removals;
+    removals.sort_unstable();
+    if removals.iter().any(|key| !keys.insert(*key))
+        || removals.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err(Error::Io(
+            "map transaction contains duplicate or contradictory logical keys".to_owned(),
+        ));
     }
-    refresh_map_content_hash(assets, map)
+    encoded.sort_by_key(|(reference, _)| reference.order_key());
+
+    let previous = root
+        .inventory
+        .iter()
+        .map(|reference| (reference.key, *reference))
+        .collect::<BTreeMap<_, _>>();
+    let mut inventory = previous.clone();
+    for key in removals {
+        inventory.remove(&key);
+    }
+    let mut published = Vec::new();
+    for (reference, bytes) in &encoded {
+        let path = map_object_path(&package, &reference.content_hash);
+        if path.exists() {
+            let existing = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    rollback_map_objects(&published);
+                    return Err(Error::Io(error.to_string()));
+                }
+            };
+            if existing != *bytes {
+                rollback_map_objects(&published);
+                return Err(Error::VegetationMapObjectCollision {
+                    path: path.display().to_string(),
+                });
+            }
+            read_map_object_from(assets, &package, map, reference)?;
+        } else if let Err(error) = atomic_write(&path, bytes) {
+            rollback_map_objects(&published);
+            return Err(error);
+        } else {
+            published.push(path);
+        }
+        inventory.insert(reference.key, *reference);
+    }
+    let layer_ids = inventory
+        .keys()
+        .filter(|key| key.kind == VegetationMapChunkKind::LayerMetadata)
+        .map(|key| key.layer)
+        .collect::<BTreeSet<_>>();
+    if inventory.keys().any(|key| {
+        matches!(
+            key.kind,
+            VegetationMapChunkKind::Field
+                | VegetationMapChunkKind::AnchorOverride
+                | VegetationMapChunkKind::EditorMetadata
+        ) && !layer_ids.contains(&key.layer)
+    }) {
+        rollback_map_objects(&published);
+        return Err(Error::Io(
+            "vegetation-map transaction leaves an object without layer metadata".to_owned(),
+        ));
+    }
+    if inventory == previous {
+        rollback_map_objects(&published);
+        return Ok(());
+    }
+    root.inventory = inventory.into_values().collect();
+    root.generation = root.generation.checked_add(1).ok_or(Error::Vegetation(
+        saffron_vegetation::Error::NumericOverflow,
+    ))?;
+    let root_bytes = match encode_map(&root) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            rollback_map_objects(&published);
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = atomic_write(&assets.root.join(&entry.path), &root_bytes) {
+        rollback_map_objects(&published);
+        return Err(error);
+    }
+    assets
+        .catalog
+        .set_content_hash(map, hash_bytes_fnv(&root_bytes));
+    Ok(())
 }
 
-/// Reads one authored sparse chunk, returning `None` when that cell has no authored bytes.
-pub fn load_vegetation_map_chunk(
+/// Resolves all typed authored objects that contribute to one spatial map tile.
+pub fn load_vegetation_map_tile_snapshot(
     assets: &AssetServer,
     map: Uuid,
     cell: WorldCellKey,
-) -> Result<Option<VegetationMapChunk>> {
-    let entry = typed_entry(assets, map, AssetType::VegetationMap, "vegetation map")?;
-    let path = assets
-        .root
-        .join(chunk_directory(&entry.path))
-        .join(chunk_filename(cell));
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let chunk = read_vegetation_map_chunk(&bytes)?;
-            if chunk.map != map || chunk.cell != cell {
+) -> Result<Option<VegetationMapTileSnapshot>> {
+    load_vegetation_map_tile_snapshot_from(assets, map, cell)
+}
+
+fn load_vegetation_map_tile_snapshot_from(
+    assets: &dyn CookAssetAccess,
+    map: Uuid,
+    cell: WorldCellKey,
+) -> Result<Option<VegetationMapTileSnapshot>> {
+    let entry = typed_entry_from(assets, map, AssetType::VegetationMap, "vegetation map")?;
+    let root = load_vegetation_map_root_from(assets, map)?;
+    if cell.level() != root.chunk_layout.level {
+        return Err(Error::Io(
+            "requested vegetation-map tile level does not match its root".to_owned(),
+        ));
+    }
+    let package = assets.root().join(map_package_directory(&entry.path));
+    let references = root
+        .inventory
+        .iter()
+        .filter(|reference| reference.key.tile == VegetationMapTileKey::Cell(cell));
+    let mut snapshot = VegetationMapTileSnapshot {
+        map,
+        cell,
+        fields: Vec::new(),
+        blockers: Vec::new(),
+        explicit_plants: Vec::new(),
+        pins: Vec::new(),
+        transform_overrides: Vec::new(),
+        state_overrides: Vec::new(),
+        provenance: Default::default(),
+    };
+    let mut found = false;
+    for reference in references {
+        found = true;
+        let chunk = read_map_object(&package, map, reference)?;
+        match chunk.payload {
+            VegetationMapChunkPayload::Field(payload) => {
+                snapshot.fields.extend(payload.fields);
+                snapshot.blockers.extend(payload.blockers);
+            }
+            VegetationMapChunkPayload::AnchorOverride(payload) => {
+                let handles = (0..payload.provenance.records().len())
+                    .map(|index| saffron_vegetation::ProvenanceHandle(index as u32))
+                    .collect::<Vec<_>>();
+                let remap = snapshot
+                    .provenance
+                    .import_fragment(&payload.provenance, &handles)?;
+                for mut anchor in payload.explicit_plants {
+                    let source = saffron_vegetation::ProvenanceHandle(anchor.point.provenance);
+                    anchor.point.provenance = remap
+                        .records
+                        .get(&source)
+                        .ok_or_else(|| {
+                            Error::Io("explicit map anchor provenance was not imported".to_owned())
+                        })?
+                        .0;
+                    snapshot.explicit_plants.push(anchor);
+                }
+                snapshot.pins.extend(payload.pins);
+                snapshot
+                    .transform_overrides
+                    .extend(payload.transform_overrides);
+                snapshot.state_overrides.extend(payload.state_overrides);
+            }
+            VegetationMapChunkPayload::GraphInstance(_)
+            | VegetationMapChunkPayload::LayerMetadata(_)
+            | VegetationMapChunkPayload::EditorMetadata(_) => {
                 return Err(Error::Io(
-                    "map chunk identity does not match its path".to_owned(),
+                    "global vegetation-map metadata was addressed as a spatial tile".to_owned(),
                 ));
             }
-            Ok(Some(chunk))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::Io(error.to_string())),
     }
+    if !found {
+        return Ok(None);
+    }
+    snapshot
+        .fields
+        .sort_by_key(|field| (field.layer, field.channel));
+    snapshot
+        .blockers
+        .sort_by_key(|field| (field.layer, field.channel));
+    snapshot.explicit_plants.sort_by_key(|anchor| anchor.id);
+    snapshot.pins.sort_unstable();
+    snapshot
+        .transform_overrides
+        .sort_by_key(|value| value.plant);
+    snapshot.state_overrides.sort_by_key(|value| value.plant);
+    if snapshot
+        .explicit_plants
+        .windows(2)
+        .any(|pair| pair[0].id == pair[1].id)
+        || snapshot.pins.windows(2).any(|pair| pair[0] == pair[1])
+        || snapshot
+            .transform_overrides
+            .windows(2)
+            .any(|pair| pair[0].plant == pair[1].plant)
+        || snapshot
+            .state_overrides
+            .windows(2)
+            .any(|pair| pair[0].plant == pair[1].plant)
+    {
+        return Err(Error::Io(
+            "vegetation-map tile contains duplicate cross-layer identities".to_owned(),
+        ));
+    }
+    Ok(Some(snapshot))
 }
 
 /// Removes the internal authored chunk directory owned by a vegetation-map catalog row.
@@ -1423,7 +1815,7 @@ pub fn remove_vegetation_map_package(assets: &AssetServer, entry: &AssetEntry) -
     if entry.asset_type != AssetType::VegetationMap || entry.path.is_empty() {
         return Ok(());
     }
-    let directory = assets.root.join(chunk_directory(&entry.path));
+    let directory = assets.root.join(map_package_directory(&entry.path));
     match std::fs::remove_dir_all(directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1434,10 +1826,20 @@ pub fn remove_vegetation_map_package(assets: &AssetServer, entry: &AssetEntry) -
 pub(crate) fn vegetation_map_package_bytes(assets: &AssetServer, entry: &AssetEntry) -> u64 {
     let manifest = assets.root.join(&entry.path);
     let mut bytes = std::fs::metadata(&manifest).map_or(0, |metadata| metadata.len());
-    let directory = assets.root.join(chunk_directory(&entry.path));
-    if let Ok(entries) = std::fs::read_dir(directory) {
-        for path in entries.filter_map(std::result::Result::ok) {
-            bytes = bytes.saturating_add(path.metadata().map_or(0, |metadata| metadata.len()));
+    let objects = assets
+        .root
+        .join(map_package_directory(&entry.path))
+        .join("objects");
+    if let Ok(entries) = std::fs::read_dir(objects) {
+        for object in entries.filter_map(std::result::Result::ok) {
+            if object
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "svegmapc")
+            {
+                bytes =
+                    bytes.saturating_add(object.metadata().map_or(0, |metadata| metadata.len()));
+            }
         }
     }
     bytes
@@ -1447,7 +1849,7 @@ pub(crate) fn vegetation_map_dependencies(
     assets: &AssetServer,
     entry: &AssetEntry,
 ) -> Result<Vec<Uuid>> {
-    let map = load_vegetation_map_asset(assets, entry.id)?;
+    let map = load_vegetation_map_snapshot(assets, entry.id)?;
     let mut dependencies: BTreeSet<u64> = map
         .biome_instances
         .iter()
@@ -1461,28 +1863,10 @@ pub(crate) fn vegetation_map_dependencies(
         }
     }
 
-    let directory = assets.root.join(chunk_directory(&entry.path));
-    if directory.is_dir() {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
-            .map_err(|error| Error::Io(error.to_string()))?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "chunk")
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            let bytes = std::fs::read(path).map_err(|error| Error::Io(error.to_string()))?;
-            let chunk = read_vegetation_map_chunk(&bytes)?;
-            if chunk.map != entry.id {
-                return Err(Error::Io(
-                    "vegetation-map chunk belongs to a different map".to_owned(),
-                ));
-            }
+    for chunk in map.chunks {
+        if let VegetationMapChunkPayload::AnchorOverride(payload) = chunk.payload {
             dependencies.extend(
-                chunk
+                payload
                     .explicit_plants
                     .into_iter()
                     .map(|anchor| anchor.family.value()),
@@ -1493,14 +1877,14 @@ pub(crate) fn vegetation_map_dependencies(
     Ok(dependencies.into_iter().map(Uuid).collect())
 }
 
-fn read_typed_asset(
-    assets: &AssetServer,
+fn read_typed_asset_from(
+    assets: &dyn CookAssetAccess,
     id: Uuid,
     asset_type: AssetType,
     wanted: &'static str,
 ) -> Result<Vec<u8>> {
-    let entry = typed_entry(assets, id, asset_type, wanted)?;
-    std::fs::read(assets.root.join(&entry.path)).map_err(|error| Error::Io(error.to_string()))
+    let entry = typed_entry_from(assets, id, asset_type, wanted)?;
+    assets.read_file(&assets.root().join(&entry.path))
 }
 
 fn typed_entry<'a>(
@@ -1509,8 +1893,17 @@ fn typed_entry<'a>(
     asset_type: AssetType,
     wanted: &'static str,
 ) -> Result<&'a AssetEntry> {
+    typed_entry_from(assets, id, asset_type, wanted)
+}
+
+fn typed_entry_from<'a>(
+    assets: &'a dyn CookAssetAccess,
+    id: Uuid,
+    asset_type: AssetType,
+    wanted: &'static str,
+) -> Result<&'a AssetEntry> {
     let entry = assets
-        .catalog
+        .catalog()
         .find(id)
         .ok_or(Error::NotInCatalog(id.value()))?;
     if entry.asset_type != asset_type {
@@ -1600,51 +1993,154 @@ fn read_source_map_chunks(
     source: &Path,
     map: &VegetationMapAsset,
 ) -> Result<Vec<VegetationMapChunk>> {
-    let source_text = source
-        .to_str()
-        .ok_or_else(|| Error::Io("vegetation-map source path is not UTF-8".to_owned()))?;
-    let directory = PathBuf::from(chunk_directory(source_text));
-    if !directory.exists() {
+    let package = map_package_path(source);
+    if map.inventory.is_empty() && !package.exists() {
         return Ok(Vec::new());
     }
-    if !directory.is_dir() {
+    if !package.is_dir() {
         return Err(Error::Io(
-            "vegetation-map chunk package is not a directory".to_owned(),
+            "vegetation-map object package is missing or is not a directory".to_owned(),
         ));
     }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
-        .map_err(|error| Error::Io(error.to_string()))?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|error| Error::Io(error.to_string()))?;
-    paths.sort();
-    let mut cells = BTreeSet::new();
-    let mut chunks = Vec::with_capacity(paths.len());
-    for path in paths {
-        if !path.is_file()
-            || path
-                .extension()
-                .is_none_or(|extension| extension != "chunk")
-        {
-            return Err(Error::Io(
-                "vegetation-map package contains a non-chunk entry".to_owned(),
-            ));
-        }
-        let bytes = std::fs::read(&path).map_err(|error| Error::Io(error.to_string()))?;
-        let chunk = read_vegetation_map_chunk(&bytes)?;
-        let expected_name = chunk_filename(chunk.cell);
-        if chunk.map != map.id
-            || chunk.cell.level() != map.chunk_layout.level
-            || path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
-            || !cells.insert(chunk.cell)
-        {
-            return Err(Error::Io(
-                "vegetation-map source chunk identity is invalid".to_owned(),
-            ));
-        }
-        chunks.push(chunk);
+    let mut chunks = Vec::with_capacity(map.inventory.len());
+    for reference in &map.inventory {
+        chunks.push(read_map_object(&package, map.id, reference)?);
     }
     Ok(chunks)
+}
+
+fn publish_imported_map_objects(
+    package: &Path,
+    map: &VegetationMapAsset,
+    chunks: &[VegetationMapChunk],
+) -> Result<()> {
+    if chunks.len() != map.inventory.len() {
+        return Err(Error::Io(
+            "vegetation-map import object count does not match its root inventory".to_owned(),
+        ));
+    }
+    std::fs::create_dir_all(package.join("objects"))
+        .map_err(|error| Error::Io(error.to_string()))?;
+    for (reference, chunk) in map.inventory.iter().zip(chunks) {
+        let bytes = write_vegetation_map_chunk(chunk)?;
+        if map_object_reference(chunk, &bytes)? != *reference {
+            let _ = std::fs::remove_dir_all(package);
+            return Err(Error::Io(
+                "vegetation-map import object does not match its root inventory".to_owned(),
+            ));
+        }
+        if let Err(error) = atomic_write(&map_object_path(package, &reference.content_hash), &bytes)
+        {
+            let _ = std::fs::remove_dir_all(package);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn map_object_reference(
+    chunk: &VegetationMapChunk,
+    bytes: &[u8],
+) -> Result<VegetationMapChunkReference> {
+    Ok(VegetationMapChunkReference {
+        key: chunk.key,
+        content_hash: vegetation_content_hash(bytes),
+        byte_length: u64::try_from(bytes.len())
+            .map_err(|_| Error::Vegetation(saffron_vegetation::Error::NumericOverflow))?,
+        revision: chunk.revision,
+    })
+}
+
+fn read_map_object(
+    package: &Path,
+    map: Uuid,
+    reference: &VegetationMapChunkReference,
+) -> Result<VegetationMapChunk> {
+    let path = map_object_path(package, &reference.content_hash);
+    let bytes = std::fs::read(&path).map_err(|error| Error::Io(error.to_string()))?;
+    validate_map_object_bytes(map, reference, &bytes)
+}
+
+fn validate_map_object_bytes(
+    map: Uuid,
+    reference: &VegetationMapChunkReference,
+    bytes: &[u8],
+) -> Result<VegetationMapChunk> {
+    if u64::try_from(bytes.len()).ok() != Some(reference.byte_length) {
+        return Err(Error::Vegetation(
+            saffron_vegetation::Error::ArtifactFormat {
+                format: ".svegmap object",
+                field: "root.inventory.byteLength".to_owned(),
+            },
+        ));
+    }
+    if vegetation_content_hash(bytes) != reference.content_hash {
+        return Err(Error::Vegetation(
+            saffron_vegetation::Error::ArtifactHashMismatch {
+                format: ".svegmap object",
+                subject: "root.inventory.contentHash".to_owned(),
+            },
+        ));
+    }
+    let chunk = read_vegetation_map_chunk(bytes)?;
+    if chunk.map != map || chunk.key != reference.key || chunk.revision != reference.revision {
+        return Err(Error::Vegetation(
+            saffron_vegetation::Error::ArtifactFormat {
+                format: ".svegmap object",
+                field: "root.inventory.identity".to_owned(),
+            },
+        ));
+    }
+    Ok(chunk)
+}
+
+fn read_map_object_from(
+    assets: &dyn CookAssetAccess,
+    package: &Path,
+    map: Uuid,
+    reference: &VegetationMapChunkReference,
+) -> Result<VegetationMapChunk> {
+    let path = map_object_path(package, &reference.content_hash);
+    let bytes = assets.read_file(&path)?;
+    validate_map_object_bytes(map, reference, &bytes)
+}
+
+fn lock_map_package(package: &Path) -> Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(package.join("write.lock"))
+        .map_err(|error| Error::Io(error.to_string()))?;
+    file.lock().map_err(|error| Error::Io(error.to_string()))?;
+    Ok(file)
+}
+
+fn rollback_map_objects(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn map_package_directory(map_path: &str) -> String {
+    format!("{map_path}.data")
+}
+
+fn map_package_path(map_path: &Path) -> PathBuf {
+    let mut value = map_path.as_os_str().to_os_string();
+    value.push(".data");
+    PathBuf::from(value)
+}
+
+fn map_object_path(package: &Path, hash: &[u8; 32]) -> PathBuf {
+    let mut name = String::with_capacity(64 + ".svegmapc".len());
+    for byte in hash {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").unwrap();
+    }
+    name.push_str(".svegmapc");
+    package.join("objects").join(name)
 }
 
 fn rollback_new_asset(assets: &mut AssetServer, id: Uuid) {
@@ -1659,42 +2155,14 @@ fn rollback_new_asset(assets: &mut AssetServer, id: Uuid) {
     assets.catalog.remove(id);
 }
 
-fn refresh_map_content_hash(assets: &mut AssetServer, map: Uuid) -> Result<()> {
-    let entry = typed_entry(assets, map, AssetType::VegetationMap, "vegetation map")?.clone();
-    let hash = vegetation_map_content_hash_path(&assets.root.join(&entry.path))?;
-    assets.catalog.set_content_hash(map, hash);
-    Ok(())
-}
-
 pub(crate) fn vegetation_map_content_hash_path(path: &Path) -> Result<u64> {
-    let mut logical_bytes = std::fs::read(path).map_err(|error| Error::Io(error.to_string()))?;
-    let path_text = path
-        .to_str()
-        .ok_or_else(|| Error::Io("vegetation-map path is not UTF-8".to_owned()))?;
-    let directory = PathBuf::from(chunk_directory(path_text));
-    if directory.is_dir() {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
-            .map_err(|error| Error::Io(error.to_string()))?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "chunk")
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| Error::Io("map chunk has a non-UTF-8 filename".to_owned()))?;
-            logical_bytes.extend_from_slice(name.as_bytes());
-            logical_bytes.extend_from_slice(
-                &std::fs::read(path).map_err(|error| Error::Io(error.to_string()))?,
-            );
-        }
+    let root_bytes = std::fs::read(path).map_err(|error| Error::Io(error.to_string()))?;
+    let root = decode_map(&root_bytes)?;
+    let package = map_package_path(path);
+    for reference in &root.inventory {
+        read_map_object(&package, root.id, reference)?;
     }
-    Ok(hash_bytes_fnv(&logical_bytes))
+    Ok(hash_bytes_fnv(&root_bytes))
 }
 
 fn validate_biome_cycles(assets: &AssetServer, candidate: &BiomeAsset) -> Result<()> {
@@ -1749,20 +2217,6 @@ fn visit_biome(
     Ok(())
 }
 
-fn chunk_directory(map_path: &str) -> String {
-    format!("{map_path}.chunks")
-}
-
-fn chunk_filename(cell: WorldCellKey) -> String {
-    let mut name = String::with_capacity(56);
-    for byte in cell.canonical_bytes() {
-        use std::fmt::Write as _;
-        write!(&mut name, "{byte:02x}").unwrap();
-    }
-    name.push_str(".chunk");
-    name
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1771,17 +2225,18 @@ mod tests {
     use saffron_scene::Scene;
     use saffron_spatial::{DecisionScalar, FieldChannel, UnitInterval, WorldBounds, WorldCellKey};
     use saffron_vegetation::{
-        BIOME_ASSET_VERSION, BIOME_GRAPH_VERSION, BIOME_INTERFACE_VERSION, BIOME_NODE_VERSION,
-        BiomeAsset, BiomeGraphDocument, BiomeGraphEvaluator, BiomeGraphPolicy,
+        AuthoredFieldTile, BIOME_ASSET_VERSION, BIOME_GRAPH_VERSION, BIOME_INTERFACE_VERSION,
+        BIOME_NODE_VERSION, BiomeAsset, BiomeGraphDocument, BiomeGraphEvaluator, BiomeGraphPolicy,
         BiomeModuleReference, BiomePaletteEntry, BiomeRole, FieldBlendOperator, FieldTileLayer,
         GraphAuthority, GraphCancellationToken, GraphDomain, GraphEdge, GraphInterfaceOutput,
         GraphNodeDefinition, GraphOperator, GraphParameterValue, GraphSink, HabitatPreferences,
         InteractionPolicy, LocalBiomeInstance, MechanicalResponse, NativeBotanicalGraph,
         NodeSpatialPolicy, PLANT_ASSET_VERSION, PlantDimensions, PlantFamilyAsset,
-        PlantFamilySource, PlantPart, PlantPartSemantic, ProvenanceTable,
-        VEGETATION_MAP_CHUNK_VERSION, VEGETATION_MAP_VERSION, VegetationLayer,
-        VegetationLayerOperator, VegetationMapAsset, VegetationMapChunk, VegetationMapChunkLayout,
-        vegetation_map_chunk_schema_hash,
+        PlantFamilySource, PlantPart, PlantPartSemantic, VEGETATION_MAP_CHUNK_VERSION,
+        VEGETATION_MAP_VERSION, VegetationLayer, VegetationLayerOperator, VegetationMapAsset,
+        VegetationMapChunk, VegetationMapChunkKey, VegetationMapChunkKind,
+        VegetationMapChunkLayout, VegetationMapChunkPayload, VegetationMapFieldChunk,
+        VegetationMapTileKey, vegetation_map_chunk_schema_hash,
     };
     use serde_json::Value;
 
@@ -1826,6 +2281,7 @@ mod tests {
             version: PLANT_ASSET_VERSION,
             id,
             name: name.to_owned(),
+            tags: Vec::new(),
             source: PlantFamilySource::Native(NativeBotanicalGraph {
                 schema_hash: [1; 32],
                 graph: Value::Object(Default::default()),
@@ -1856,7 +2312,19 @@ mod tests {
                 damage_threshold: fixed(3),
                 break_threshold: fixed(4),
             },
-            phenotypes: Vec::new(),
+            variations: vec![saffron_vegetation::PlantVariation {
+                id: 0,
+                name: "Default".to_owned(),
+                sources: Vec::new(),
+                active_parts: Vec::new(),
+            }],
+            phenotypes: vec![saffron_vegetation::PlantPhenotype {
+                id: 0,
+                role: saffron_vegetation::PhenotypeRole::Healthy,
+                variation: 0,
+                material_remap: Vec::new(),
+                active_parts: Vec::new(),
+            }],
             collision_proxies: Vec::new(),
             navigation_proxies: Vec::new(),
             interaction_policy: InteractionPolicy::Structural,
@@ -1908,25 +2376,56 @@ mod tests {
                 level: 0,
                 schema_hash: vegetation_map_chunk_schema_hash(),
             },
-            layers: vec![VegetationLayer {
-                id: 32,
-                name: "Density".to_owned(),
-                coordinate_space: saffron_vegetation::LayerCoordinateSpace::World,
-                bounds,
-                operator: VegetationLayerOperator::Density(FieldTileLayer {
-                    channel: FieldChannel::Moisture,
-                    tile_set: 33,
-                    blend: FieldBlendOperator::Multiply,
-                    weight: UnitInterval::ONE,
-                }),
-                dependencies: Vec::new(),
-                order: 0,
-                locked: false,
-                muted: false,
-                revision: 1,
-            }],
-            biome_instances: Vec::new(),
-            brush_history: Vec::new(),
+            generation: 0,
+            inventory: Vec::new(),
+        }
+    }
+
+    fn layer_fixture(bounds: WorldBounds) -> VegetationLayer {
+        VegetationLayer {
+            id: 32,
+            name: "Density".to_owned(),
+            coordinate_space: saffron_vegetation::LayerCoordinateSpace::World,
+            bounds,
+            operator: VegetationLayerOperator::Density(FieldTileLayer {
+                channel: FieldChannel::Moisture,
+                tile_set: 33,
+                blend: FieldBlendOperator::Multiply,
+                weight: UnitInterval::ONE,
+            }),
+            dependencies: Vec::new(),
+            order: 0,
+            locked: false,
+            muted: false,
+            revision: 1,
+        }
+    }
+
+    fn layer_chunk(map: Uuid, layer: VegetationLayer) -> VegetationMapChunk {
+        VegetationMapChunk {
+            version: VEGETATION_MAP_CHUNK_VERSION,
+            map,
+            key: VegetationMapChunkKey {
+                layer: layer.id,
+                tile: VegetationMapTileKey::Global,
+                kind: VegetationMapChunkKind::LayerMetadata,
+            },
+            revision: layer.revision,
+            payload: VegetationMapChunkPayload::LayerMetadata(layer),
+        }
+    }
+
+    fn graph_instance_chunk(map: Uuid, instance: LocalBiomeInstance) -> VegetationMapChunk {
+        VegetationMapChunk {
+            version: VEGETATION_MAP_CHUNK_VERSION,
+            map,
+            key: VegetationMapChunkKey {
+                layer: instance.id,
+                tile: VegetationMapTileKey::Global,
+                kind: VegetationMapChunkKind::GraphInstance,
+            },
+            revision: instance.revision,
+            payload: VegetationMapChunkPayload::GraphInstance(instance),
         }
     }
 
@@ -1934,16 +2433,37 @@ mod tests {
         VegetationMapChunk {
             version: VEGETATION_MAP_CHUNK_VERSION,
             map,
-            cell,
+            key: VegetationMapChunkKey {
+                layer: 32,
+                tile: VegetationMapTileKey::Cell(cell),
+                kind: VegetationMapChunkKind::Field,
+            },
             revision,
-            fields: Vec::new(),
-            explicit_plants: Vec::new(),
-            pins: Vec::new(),
-            transform_overrides: Vec::new(),
-            state_overrides: Vec::new(),
-            blockers: Vec::new(),
-            provenance: ProvenanceTable::default(),
+            payload: VegetationMapChunkPayload::Field(VegetationMapFieldChunk {
+                fields: vec![AuthoredFieldTile {
+                    channel: FieldChannel::Moisture,
+                    layer: 32,
+                    dimensions: [1, 1, 1],
+                    quantum_bits: 1,
+                    values: vec![0],
+                }],
+                blockers: Vec::new(),
+            }),
         }
+    }
+
+    fn commit_chunks(assets: &mut AssetServer, map: Uuid, upserts: Vec<VegetationMapChunk>) {
+        let expected_generation = load_vegetation_map_root(assets, map).unwrap().generation;
+        commit_vegetation_map_transaction(
+            assets,
+            map,
+            VegetationMapTransaction {
+                expected_generation,
+                upserts,
+                removals: Vec::new(),
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1976,12 +2496,15 @@ mod tests {
         let map_id =
             save_vegetation_map_asset(&mut assets, map_fixture(Uuid(3), "World"), "World", "maps")
                 .expect("save map");
-        let mut expected_map = map_fixture(map_id, "World");
-        expected_map.id = map_id;
-        assert_eq!(
-            load_vegetation_map_asset(&assets, map_id).unwrap(),
-            expected_map
+        let bounds = WorldBounds::new([0; 3], [1024; 3]).unwrap();
+        commit_chunks(
+            &mut assets,
+            map_id,
+            vec![layer_chunk(map_id, layer_fixture(bounds))],
         );
+        let snapshot = load_vegetation_map_snapshot(&assets, map_id).unwrap();
+        assert_eq!(snapshot.name, "World");
+        assert_eq!(snapshot.layers, vec![layer_fixture(bounds)]);
 
         for (id, encoder) in [
             (
@@ -1994,7 +2517,7 @@ mod tests {
             ),
             (
                 map_id,
-                encode_map(&load_vegetation_map_asset(&assets, map_id).unwrap()).unwrap(),
+                encode_map(&load_vegetation_map_root(&assets, map_id).unwrap()).unwrap(),
             ),
         ] {
             let entry = assets.catalog.find(id).unwrap();
@@ -2003,60 +2526,93 @@ mod tests {
 
         let first = WorldCellKey::base(0, 0, 0);
         let second = WorldCellKey::base(1, 0, 0);
-        write_vegetation_map_chunks(
+        commit_chunks(
             &mut assets,
             map_id,
-            &[
+            vec![
                 chunk_fixture(map_id, first, 1),
                 chunk_fixture(map_id, second, 1),
             ],
-        )
-        .expect("write initial chunks");
+        );
         let entry = assets.catalog.find(map_id).unwrap().clone();
         let manifest_path = root.join(&entry.path);
-        let directory = root.join(chunk_directory(&entry.path));
-        let first_path = directory.join(chunk_filename(first));
-        let second_path = directory.join(chunk_filename(second));
+        let package = root.join(map_package_directory(&entry.path));
+        let root_before = load_vegetation_map_root(&assets, map_id).unwrap();
+        let first_reference = root_before
+            .inventory
+            .iter()
+            .find(|reference| reference.key.tile == VegetationMapTileKey::Cell(first))
+            .copied()
+            .unwrap();
+        let second_reference = root_before
+            .inventory
+            .iter()
+            .find(|reference| reference.key.tile == VegetationMapTileKey::Cell(second))
+            .copied()
+            .unwrap();
+        let first_path = map_object_path(&package, &first_reference.content_hash);
+        let second_path = map_object_path(&package, &second_reference.content_hash);
+        let dependencies_before = vegetation_graph_dependency_hashes(&assets, map_id, &[]).unwrap();
         let manifest_before = std::fs::read(&manifest_path).unwrap();
         let second_before = std::fs::read(&second_path).unwrap();
-        #[cfg(unix)]
-        let manifest_inode_before =
-            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&manifest_path).unwrap());
         #[cfg(unix)]
         let second_inode_before =
             std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&second_path).unwrap());
 
-        write_vegetation_map_chunks(&mut assets, map_id, &[chunk_fixture(map_id, first, 2)])
-            .expect("rewrite one chunk");
-        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+        commit_chunks(&mut assets, map_id, vec![chunk_fixture(map_id, first, 2)]);
+        assert_ne!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+        assert!(first_path.exists());
         assert_eq!(std::fs::read(&second_path).unwrap(), second_before);
+        let root_after = load_vegetation_map_root(&assets, map_id).unwrap();
+        let dependencies_after = vegetation_graph_dependency_hashes(&assets, map_id, &[]).unwrap();
+        assert_eq!(dependencies_after, dependencies_before);
+        assert_eq!(root_after.generation, root_before.generation + 1);
         assert_eq!(
-            load_vegetation_map_chunk(&assets, map_id, first)
-                .unwrap()
+            root_after
+                .inventory
+                .iter()
+                .find(|reference| reference.key.tile == VegetationMapTileKey::Cell(first))
                 .unwrap()
                 .revision,
             2
         );
+        assert_ne!(
+            root_after
+                .inventory
+                .iter()
+                .find(|reference| reference.key.tile == VegetationMapTileKey::Cell(first))
+                .unwrap()
+                .content_hash,
+            first_reference.content_hash
+        );
         assert_eq!(
-            load_vegetation_map_chunk(&assets, map_id, second)
+            root_after
+                .inventory
+                .iter()
+                .find(|reference| reference.key.tile == VegetationMapTileKey::Cell(second))
+                .unwrap(),
+            &second_reference
+        );
+        assert!(
+            load_vegetation_map_tile_snapshot(&assets, map_id, first)
                 .unwrap()
-                .unwrap()
-                .revision,
-            1
+                .is_some()
         );
         #[cfg(unix)]
         {
-            assert_eq!(
-                std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&manifest_path).unwrap()),
-                manifest_inode_before
-            );
             assert_eq!(
                 std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&second_path).unwrap()),
                 second_inode_before
             );
         }
 
-        let authored_paths = [manifest_path, first_path, second_path];
+        let current_first_reference = root_after
+            .inventory
+            .iter()
+            .find(|reference| reference.key.tile == VegetationMapTileKey::Cell(first))
+            .unwrap();
+        let current_first_path = map_object_path(&package, &current_first_reference.content_hash);
+        let authored_paths = [manifest_path, current_first_path, second_path];
         let authored_bytes: Vec<Vec<u8>> = authored_paths
             .iter()
             .map(|path| std::fs::read(path).unwrap())
@@ -2075,6 +2631,146 @@ mod tests {
         for (path, expected) in authored_paths.iter().zip(authored_bytes) {
             assert_eq!(std::fs::read(path).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn stale_map_transactions_publish_nothing() {
+        let scratch = Scratch::new("stale-transaction");
+        let root = scratch.path().join("assets");
+        let mut assets = AssetServer::new(&root);
+        let map =
+            save_vegetation_map_asset(&mut assets, map_fixture(Uuid(1), "World"), "World", "")
+                .unwrap();
+        let chunk = chunk_fixture(map, WorldCellKey::base(0, 0, 0), 1);
+        let reference = chunk.reference().unwrap();
+        let entry = assets.catalog.find(map).unwrap().clone();
+        let root_path = root.join(&entry.path);
+        let package = root.join(map_package_directory(&entry.path));
+        let before = std::fs::read(&root_path).unwrap();
+
+        let error = commit_vegetation_map_transaction(
+            &mut assets,
+            map,
+            VegetationMapTransaction {
+                expected_generation: 1,
+                upserts: vec![chunk],
+                removals: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::VegetationMapGenerationConflict {
+                expected: 1,
+                actual: 0
+            }
+        ));
+        assert_eq!(std::fs::read(root_path).unwrap(), before);
+        assert!(!map_object_path(&package, &reference.content_hash).exists());
+    }
+
+    #[test]
+    fn failed_multi_object_transaction_rolls_back_before_root_publication() {
+        let scratch = Scratch::new("transaction-rollback");
+        let root = scratch.path().join("assets");
+        let mut assets = AssetServer::new(&root);
+        let map =
+            save_vegetation_map_asset(&mut assets, map_fixture(Uuid(1), "World"), "World", "")
+                .unwrap();
+        let bounds = WorldBounds::new([0; 3], [1024; 3]).unwrap();
+        let metadata = layer_chunk(map, layer_fixture(bounds));
+        let first = chunk_fixture(map, WorldCellKey::base(0, 0, 0), 1);
+        let second = chunk_fixture(map, WorldCellKey::base(1, 0, 0), 1);
+        let metadata_reference = metadata.reference().unwrap();
+        let first_reference = first.reference().unwrap();
+        let second_reference = second.reference().unwrap();
+        let entry = assets.catalog.find(map).unwrap().clone();
+        let root_path = root.join(&entry.path);
+        let package = root.join(map_package_directory(&entry.path));
+        let before = std::fs::read(&root_path).unwrap();
+        std::fs::create_dir(map_object_path(&package, &second_reference.content_hash)).unwrap();
+
+        assert!(
+            commit_vegetation_map_transaction(
+                &mut assets,
+                map,
+                VegetationMapTransaction {
+                    expected_generation: 0,
+                    upserts: vec![second, first, metadata],
+                    removals: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(root_path).unwrap(), before);
+        assert!(!map_object_path(&package, &metadata_reference.content_hash).exists());
+        assert!(!map_object_path(&package, &first_reference.content_hash).exists());
+        assert!(
+            load_vegetation_map_root(&assets, map)
+                .unwrap()
+                .inventory
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sparse_removal_hides_old_immutable_object_and_corruption_is_typed() {
+        let scratch = Scratch::new("remove-corruption");
+        let root = scratch.path().join("assets");
+        let mut assets = AssetServer::new(&root);
+        let map =
+            save_vegetation_map_asset(&mut assets, map_fixture(Uuid(1), "World"), "World", "")
+                .unwrap();
+        let cell = WorldCellKey::base(-1, 2, 0);
+        let chunk = chunk_fixture(map, cell, 1);
+        let bounds = WorldBounds::new([0; 3], [1024; 3]).unwrap();
+        commit_chunks(
+            &mut assets,
+            map,
+            vec![layer_chunk(map, layer_fixture(bounds)), chunk.clone()],
+        );
+        let reference = load_vegetation_map_root(&assets, map)
+            .unwrap()
+            .inventory
+            .into_iter()
+            .find(|reference| reference.key == chunk.key)
+            .unwrap();
+        let entry = assets.catalog.find(map).unwrap().clone();
+        let package = root.join(map_package_directory(&entry.path));
+        let path = map_object_path(&package, &reference.content_hash);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(matches!(
+            load_vegetation_map_snapshot(&assets, map),
+            Err(Error::Vegetation(
+                saffron_vegetation::Error::ArtifactFormat { .. }
+            ))
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        commit_vegetation_map_transaction(
+            &mut assets,
+            map,
+            VegetationMapTransaction {
+                expected_generation: 1,
+                upserts: Vec::new(),
+                removals: vec![chunk.key],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_vegetation_map_root(&assets, map)
+                .unwrap()
+                .inventory
+                .len(),
+            1
+        );
+        assert!(
+            load_vegetation_map_tile_snapshot(&assets, map, cell)
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.exists());
     }
 
     #[test]
@@ -2110,12 +2806,17 @@ mod tests {
             entry.folder = folder.to_owned();
             writer.write_asset_sidecar(id).unwrap();
         }
-        write_vegetation_map_chunks(
+        commit_chunks(
             &mut writer,
             map,
-            &[chunk_fixture(map, WorldCellKey::base(-1, 2, 0), 1)],
-        )
-        .unwrap();
+            vec![
+                layer_chunk(
+                    map,
+                    layer_fixture(WorldBounds::new([0; 3], [1024; 3]).unwrap()),
+                ),
+                chunk_fixture(map, WorldCellKey::base(-1, 2, 0), 1),
+            ],
+        );
         let expected_map_hash = writer.catalog.find(map).unwrap().content_hash;
         std::fs::write(root.join("vegetation/plants/999.splantc"), b"generated").unwrap();
         std::fs::write(root.join("vegetation/maps/998.svegcell"), b"generated").unwrap();
@@ -2188,16 +2889,14 @@ mod tests {
             write_biome_asset(&biome_fixture(Uuid(4_102), "Forest", Uuid(4_101))).unwrap(),
         )
         .unwrap();
-        let source_map = map_fixture(Uuid(4_103), "World");
-        std::fs::write(&map_path, encode_map(&source_map).unwrap()).unwrap();
-        let source_chunks = PathBuf::from(chunk_directory(map_path.to_str().unwrap()));
-        std::fs::create_dir_all(&source_chunks).unwrap();
+        let mut source_map = map_fixture(Uuid(4_103), "World");
         let cell = WorldCellKey::base(4, -2, 0);
-        std::fs::write(
-            source_chunks.join(chunk_filename(cell)),
-            write_vegetation_map_chunk(&chunk_fixture(source_map.id, cell, 7)).unwrap(),
-        )
-        .unwrap();
+        let source_chunk = chunk_fixture(source_map.id, cell, 7);
+        source_map.inventory = vec![source_chunk.reference().unwrap()];
+        source_map.generation = 1;
+        std::fs::write(&map_path, encode_map(&source_map).unwrap()).unwrap();
+        publish_imported_map_objects(&map_package_path(&map_path), &source_map, &[source_chunk])
+            .unwrap();
 
         let mut assets = AssetServer::new(&project_root);
         let imported_plant = import_vegetation_asset(&mut assets, &plant_path, "imports").unwrap();
@@ -2216,11 +2915,17 @@ mod tests {
                 .plant,
             imported_plant.id
         );
-        let imported_chunk = load_vegetation_map_chunk(&assets, imported_map.id, cell)
+        let imported_chunk = load_vegetation_map_tile_snapshot(&assets, imported_map.id, cell)
             .unwrap()
             .unwrap();
         assert_eq!(imported_chunk.map, imported_map.id);
-        assert_eq!(imported_chunk.revision, 7);
+        assert_eq!(
+            load_vegetation_map_root(&assets, imported_map.id)
+                .unwrap()
+                .inventory[0]
+                .revision,
+            7
+        );
 
         let generated = source_root.join("compiled.splantc");
         std::fs::write(&generated, b"generated").unwrap();
@@ -2255,27 +2960,32 @@ mod tests {
     }
 
     #[test]
-    fn deleting_unused_map_removes_manifest_and_authored_chunk_package() {
+    fn deleting_unused_map_removes_root_and_authored_object_package() {
         let scratch = Scratch::new("delete-package");
         let root = scratch.path().join("assets");
         let mut assets = AssetServer::new(&root);
         let map =
             save_vegetation_map_asset(&mut assets, map_fixture(Uuid(1), "World"), "World", "")
                 .unwrap();
-        write_vegetation_map_chunks(
+        commit_chunks(
             &mut assets,
             map,
-            &[chunk_fixture(map, WorldCellKey::base(0, 0, 0), 1)],
-        )
-        .unwrap();
+            vec![
+                layer_chunk(
+                    map,
+                    layer_fixture(WorldBounds::new([0; 3], [1024; 3]).unwrap()),
+                ),
+                chunk_fixture(map, WorldCellKey::base(0, 0, 0), 1),
+            ],
+        );
         let entry = assets.catalog.find(map).unwrap().clone();
         let manifest = root.join(&entry.path);
-        let chunks = root.join(chunk_directory(&entry.path));
+        let package = root.join(map_package_directory(&entry.path));
         let mut scene = Scene::new();
         let deleted = crate::delete_unused(&mut assets, &mut scene, &[map], true).unwrap();
         assert_eq!(deleted.deleted, 1);
         assert!(!manifest.exists());
-        assert!(!chunks.exists());
+        assert!(!package.exists());
         assert!(assets.catalog.find(map).is_none());
     }
 
@@ -2350,15 +3060,21 @@ mod tests {
         let cell = WorldCellKey::base(0, 0, 0);
         let mut map_asset = map_fixture(Uuid(3), "World");
         map_asset.bounds = cell.bounds();
-        map_asset.layers[0].bounds = cell.bounds();
-        map_asset.biome_instances = vec![LocalBiomeInstance {
+        let map = save_vegetation_map_asset(&mut assets, map_asset, "World", "").unwrap();
+        let mut layer = layer_fixture(cell.bounds());
+        layer.bounds = cell.bounds();
+        let instance = LocalBiomeInstance {
             id: 91,
             biome,
             bounds: cell.bounds(),
             bindings: Vec::new(),
             revision: 1,
-        }];
-        let map = save_vegetation_map_asset(&mut assets, map_asset, "World", "").unwrap();
+        };
+        commit_chunks(
+            &mut assets,
+            map,
+            vec![layer_chunk(map, layer), graph_instance_chunk(map, instance)],
+        );
         let dependencies = vegetation_graph_dependency_hashes(&assets, map, &[]).unwrap();
         let resolved = compile_catalog_biome_instance_graph(
             &assets,
@@ -2495,15 +3211,21 @@ mod tests {
         let biome_bounds = WorldCellKey::new(0, 0, 0, 2).unwrap().bounds();
         let mut map_asset = map_fixture(Uuid(3), "World");
         map_asset.bounds = biome_bounds;
-        map_asset.layers[0].bounds = biome_bounds;
-        map_asset.biome_instances = vec![LocalBiomeInstance {
+        let map = save_vegetation_map_asset(&mut assets, map_asset, "World", "").unwrap();
+        let mut layer = layer_fixture(biome_bounds);
+        layer.bounds = biome_bounds;
+        let instance = LocalBiomeInstance {
             id: 91,
             biome,
             bounds: biome_bounds,
             bindings: Vec::new(),
             revision: 1,
-        }];
-        let map = save_vegetation_map_asset(&mut assets, map_asset, "World", "").unwrap();
+        };
+        commit_chunks(
+            &mut assets,
+            map,
+            vec![layer_chunk(map, layer), graph_instance_chunk(map, instance)],
+        );
         let dependencies = vegetation_graph_dependency_hashes(&assets, map, &[]).unwrap();
         let resolved = compile_catalog_biome_instance_graph(
             &assets,
