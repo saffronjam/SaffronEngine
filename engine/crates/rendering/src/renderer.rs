@@ -14,7 +14,7 @@ use crate::ddgi::DDGI_RAYS_PER_PROBE;
 use crate::descriptors::Descriptors;
 use crate::device::SurfaceSource;
 use crate::draw_list::{DrawItem, RenderStats, SceneDrawList};
-use crate::frame::FrameRing;
+use crate::frame::{FrameRing, FrameTimelinePoint};
 use crate::frame_history::{
     ActiveAlarm, AlarmDrain, AlarmInputs, AlarmState, FrameHistory, FrameHistoryStats, FrameSample,
     PerfConfig,
@@ -39,7 +39,10 @@ use crate::profiler::{
 };
 use crate::quality::RenderQuality;
 use crate::reactive::{PowerState, ReactiveState};
-use crate::render_graph::{RenderGraph, RgAttachment, RgPass, RgResource, RgUsage};
+use crate::render_graph::{
+    RenderGraph, RgAttachment, RgBatchCommandBuffers, RgPass, RgQueueAssignment, RgRecordedBatch,
+    RgResource, RgUsage,
+};
 use crate::resources::BindlessFreeList;
 use crate::scene_pass::{
     PointShadowTarget, record_depth_prepass, record_gbuffer, record_point_shadow,
@@ -49,7 +52,7 @@ use crate::skinning::Skinning;
 use crate::ssao::Ssao;
 use crate::targets::Targets;
 use crate::tessellation::Tessellation;
-use crate::transient::TransientResources;
+use crate::transient::RenderGraphResources;
 use crate::view_target::ViewTarget;
 use crate::{Device, Error, Result, Swapchain, checked};
 
@@ -406,6 +409,11 @@ struct FramePipelines {
     /// grow-only buffer is prepared before the graph build so the pass captures only the
     /// resolved handle). `None` when no overlay geometry is queued.
     overlay_draw: Option<OverlayDraw>,
+}
+
+struct RecordedSceneGraph {
+    batches: Vec<RgRecordedBatch>,
+    tail: vk::CommandBuffer,
 }
 
 /// The four DDGI trace/blend/border PSOs, resolved together — the `doDdgi` gate requires all four,
@@ -791,14 +799,6 @@ pub struct Renderer {
     /// the frame itself.
     frame_begun: bool,
 
-    /// Set by [`Renderer::render_scene_offscreen`] when it signals the windowed present path's
-    /// scene-finished semaphore, and consumed (cleared) by
-    /// [`Renderer::present_active_view_to_swapchain`]. The present blit only waits the
-    /// scene-finished semaphore when it was actually signaled this frame; if the host skipped
-    /// the offscreen render (a size-0 view or a render error), the present blits the prior
-    /// frame's offscreen without waiting an unsignaled semaphore (which would deadlock).
-    present_scene_signaled: bool,
-
     /// The debug render-output mode. Transient; drives the
     /// wireframe PSO permutation + the mesh fragment's debug-channel output.
     view_mode: ViewMode,
@@ -857,10 +857,6 @@ pub struct Renderer {
     cpu_profiler: CpuProfiler,
     /// The capture recorder driven by `profiler.capture-start/stop`.
     capture: CaptureRecorder,
-    /// The frame slot whose CPU/GPU spans the next [`Renderer::finalize_frame_telemetry`]
-    /// folds into the capture: the slot `render_scene_offscreen` just recorded into, before
-    /// `frames.advance()` moved `frames.index()` on.
-    last_rendered_slot: usize,
     /// Wall-clock ns of the last [`Renderer::finalize_frame_telemetry`], for the alarm tick's
     /// irregular-interval dt.
     last_frame_ns: u64,
@@ -970,7 +966,7 @@ pub struct Renderer {
     meshlet_raster: Option<MeshletRaster>,
     /// Whether the meshlet raster path is enabled this run (`SAFFRON_MESH_SHADER` + device support).
     meshlet_enabled: bool,
-    transient: TransientResources,
+    transient: RenderGraphResources,
     pipelines: Pipelines,
     ibl: Ibl,
     /// A second IBL baked once to the fixed procedural preview environment, bound only when the
@@ -1122,7 +1118,7 @@ impl Renderer {
             Tessellation,
             Option<MeshletRaster>,
             bool,
-            TransientResources,
+            RenderGraphResources,
             Ibl,
             Ibl,
             Sky,
@@ -1185,7 +1181,7 @@ impl Renderer {
                     "meshlet raster path enabled (VK_EXT_mesh_shader + SAFFRON_MESH_SHADER)"
                 );
             }
-            let transient = TransientResources::new(device.resources().clone());
+            let transient = RenderGraphResources::new(device.resources().clone());
 
             // IBL: the cubes + LUT sampler + set 3, then the first (procedural) bake so set
             // 3 is valid before the first frame. The sky reuses the env cube; the reflection
@@ -1511,7 +1507,6 @@ impl Renderer {
             show_grid: false,
             present_viewport_only: false,
             frame_begun: false,
-            present_scene_signaled: false,
             view_mode: ViewMode::Lit,
             skinning_enabled: true,
             displacement_enabled: true,
@@ -1533,7 +1528,6 @@ impl Renderer {
             alarms: AlarmState::default(),
             gpu_profiler,
             cpu_profiler: CpuProfiler::default(),
-            last_rendered_slot: 0,
             last_frame_ns: 0,
             capture: CaptureRecorder::default(),
             device_name,
@@ -2462,13 +2456,23 @@ impl Renderer {
         // The AS-build-input flag the RT BLAS requires on the geometry buffers it references by device
         // address (Phase 7 builds the tessellated BLAS from the transient VB/IB).
         let accel_input = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
-        let acquire = |t: &mut TransientResources,
+        let acquire = |graph: &mut RenderGraph,
+                       t: &mut RenderGraphResources,
                        key: &'static str,
                        bytes: u64,
                        usage|
          -> Option<vk::Buffer> {
-            match t.acquire_buffer(frame, key, bytes.max(16), usage) {
-                Ok(buffer) => Some(buffer),
+            match graph.create_buffer(
+                t,
+                frame,
+                key,
+                crate::RgBufferDesc {
+                    size: bytes.max(16),
+                    usage,
+                    lifetime: crate::RgBufferLifetime::Transient,
+                },
+            ) {
+                Ok(resource) => Some(graph.buffer(resource)),
                 Err(err) => {
                     tracing::error!("tess prep: acquire {key}: {err}");
                     None
@@ -2478,31 +2482,41 @@ impl Renderer {
         let counters_bytes = instance_rows as u64 * 8;
         let (Some(pertri), Some(counters), Some(global), Some(seeds), Some(prims), Some(dispatch)) = (
             acquire(
+                graph,
                 &mut self.transient,
                 "tess.pertri",
                 tri_cur as u64 * 16,
                 storage,
             ),
             acquire(
+                graph,
                 &mut self.transient,
                 "tess.counters",
                 counters_bytes,
                 storage_cleared,
             ),
-            acquire(&mut self.transient, "tess.global", 8, storage_cleared),
             acquire(
+                graph,
+                &mut self.transient,
+                "tess.global",
+                8,
+                storage_cleared,
+            ),
+            acquire(
+                graph,
                 &mut self.transient,
                 "tess.seeds",
                 instance_rows as u64 * 20,
                 indirect,
             ),
             acquire(
+                graph,
                 &mut self.transient,
                 "tess.prims",
                 instance_rows as u64 * 4,
                 storage,
             ),
-            acquire(&mut self.transient, "tess.dispatch", 12, indirect),
+            acquire(graph, &mut self.transient, "tess.dispatch", 12, indirect),
         ) else {
             return None;
         };
@@ -2527,9 +2541,22 @@ impl Renderer {
         // indirect), so it needs neither a device address nor index usage.
         let prev_vb_usage = storage | vk::BufferUsageFlags::VERTEX_BUFFER;
         let (Some(out_vb), Some(out_ib), Some(out_prev_vb)) = (
-            acquire(&mut self.transient, "tess.vb", vb_cur as u64 * 48, vb_usage),
-            acquire(&mut self.transient, "tess.ib", ib_cur as u64 * 4, ib_usage),
             acquire(
+                graph,
+                &mut self.transient,
+                "tess.vb",
+                vb_cur as u64 * 48,
+                vb_usage,
+            ),
+            acquire(
+                graph,
+                &mut self.transient,
+                "tess.ib",
+                ib_cur as u64 * 4,
+                ib_usage,
+            ),
+            acquire(
+                graph,
                 &mut self.transient,
                 "tess.vb.prev",
                 vb_cur as u64 * 48,
@@ -2671,16 +2698,16 @@ impl Renderer {
         let args_set =
             crate::tessellation::wire_storage_set(raw, pool, args_layout, &[global, dispatch])?;
 
-        let factors_res = graph.import_buffer(factors);
-        let pertri_res = graph.import_buffer(pertri);
-        let counters_res = graph.import_buffer(counters);
-        let global_res = graph.import_buffer(global);
-        let seeds_res = graph.import_buffer(seeds);
-        let prims_res = graph.import_buffer(prims);
-        let dispatch_res = graph.import_buffer(dispatch);
-        let out_vb_res = graph.import_buffer(out_vb);
-        let out_ib_res = graph.import_buffer(out_ib);
-        let out_prev_vb_res = graph.import_buffer(out_prev_vb);
+        let factors_res = graph.import_buffer(factors, None);
+        let pertri_res = graph.import_buffer(pertri, None);
+        let counters_res = graph.import_buffer(counters, None);
+        let global_res = graph.import_buffer(global, None);
+        let seeds_res = graph.import_buffer(seeds, None);
+        let prims_res = graph.import_buffer(prims, None);
+        let dispatch_res = graph.import_buffer(dispatch, None);
+        let out_vb_res = graph.import_buffer(out_vb, None);
+        let out_ib_res = graph.import_buffer(out_ib, None);
+        let out_prev_vb_res = graph.import_buffer(out_prev_vb, None);
 
         // Factor: one thread per unique base edge writes its shared fractional factor. Bindless set 0
         // (the min/max pyramid tap) is bound once; each instance binds its edge set (set 1) + push.
@@ -3014,37 +3041,49 @@ impl Renderer {
                 Some(out_prev_vb_rt),
             ) = (
                 acquire(
+                    graph,
                     &mut self.transient,
                     "tess.factor.rt",
                     r_edge as u64 * 4,
                     storage,
                 ),
                 acquire(
+                    graph,
                     &mut self.transient,
                     "tess.pertri.rt",
                     r_tri as u64 * 16,
                     storage,
                 ),
                 acquire(
+                    graph,
                     &mut self.transient,
                     "tess.counters.rt",
                     counters_bytes,
                     storage_cleared,
                 ),
-                acquire(&mut self.transient, "tess.global.rt", 8, storage_cleared),
                 acquire(
+                    graph,
+                    &mut self.transient,
+                    "tess.global.rt",
+                    8,
+                    storage_cleared,
+                ),
+                acquire(
+                    graph,
                     &mut self.transient,
                     "tess.vb.rt",
                     r_vb as u64 * 48,
                     rt_as_usage,
                 ),
                 acquire(
+                    graph,
                     &mut self.transient,
                     "tess.ib.rt",
                     rt_ib_bytes,
                     rt_as_usage | vk::BufferUsageFlags::TRANSFER_DST,
                 ),
                 acquire(
+                    graph,
                     &mut self.transient,
                     "tess.vb.rt.prev",
                     r_vb as u64 * 48,
@@ -3185,13 +3224,13 @@ impl Renderer {
                 ));
             }
 
-            let factors_rt_res = graph.import_buffer(factors_rt);
-            let pertri_rt_res = graph.import_buffer(pertri_rt);
-            let counters_rt_res = graph.import_buffer(counters_rt);
-            let global_rt_res = graph.import_buffer(global_rt);
-            let out_vb_rt_res = graph.import_buffer(out_vb_rt);
-            let out_ib_rt_res = graph.import_buffer(out_ib_rt);
-            let out_prev_vb_rt_res = graph.import_buffer(out_prev_vb_rt);
+            let factors_rt_res = graph.import_buffer(factors_rt, None);
+            let pertri_rt_res = graph.import_buffer(pertri_rt, None);
+            let counters_rt_res = graph.import_buffer(counters_rt, None);
+            let global_rt_res = graph.import_buffer(global_rt, None);
+            let out_vb_rt_res = graph.import_buffer(out_vb_rt, None);
+            let out_ib_rt_res = graph.import_buffer(out_ib_rt, None);
+            let out_prev_vb_rt_res = graph.import_buffer(out_prev_vb_rt, None);
 
             // Coarse factor: one thread per unique base edge, coarse LOD target + coarse cap.
             {
@@ -5033,6 +5072,7 @@ impl Renderer {
             view_proj,
             wireframe: self.wireframe,
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
+            coverage_temporal_phase: self.views[self.active_view.index()].jitter_index,
             // Track skinned RT instances when an RT consumer is armed (ray-query shadows or
             // reflections on, on an RT device) — they feed the per-frame refit BLAS the
             // `tlas-build` reads.
@@ -5127,16 +5167,7 @@ impl Renderer {
             unsafe { raw.reset_fences(&[in_flight]) },
             "reset_fences (begin)",
         )?;
-        // SAFETY: the ash seam. The slot's fence was waited, so the pool may be reset.
-        checked(
-            unsafe {
-                raw.reset_command_pool(
-                    self.frames.command_pool(),
-                    vk::CommandPoolResetFlags::empty(),
-                )
-            },
-            "reset_command_pool (begin)",
-        )?;
+        self.frames.reset_command_pools(&self.device)?;
         self.frame_begun = true;
         Ok(())
     }
@@ -5202,7 +5233,7 @@ impl Renderer {
             self.begin_offscreen_frame()?;
         }
         self.frame_begun = false;
-        let raw = self.device.raw();
+        let raw = self.device.raw().clone();
         let frame = self.frames.index();
         let command_buffer = self.frames.command_buffer();
         self.reflection.prepare_frame(frame);
@@ -5261,7 +5292,11 @@ impl Renderer {
             None
         };
         let static_point_shadow_dirty = if point_shadow_pipeline.is_some() {
-            let key = self.lighting.point_shadow_key();
+            let key = self
+                .lighting
+                .point_shadow_key()
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ u64::from(self.views[self.active_view.index()].jitter_index);
             let cube = self.targets.point_shadow.image();
             if self.last_point_shadow_key == Some(key) && self.last_point_shadow_cube == cube {
                 false
@@ -5747,28 +5782,40 @@ impl Renderer {
         // messenger prefix, no validation layer) would let the planted error pass unseen and
         // a test asserts it does NOT. The bad viewport is overwritten by every pass's own
         // viewport set inside its render pass, so the rendered output stays correct.
-        plant_validation_error(raw, command_buffer);
+        plant_validation_error(&raw, command_buffer);
 
         // Timestamp queries are uninitialized until reset; reset this slot's pool(s) before the
         // graph writes into it (reading an unreset pool risks device loss). A no-op when the
         // profiler is `Off`.
         self.reset_profiler_pools(command_buffer, frame);
 
-        self.record_scene_graph(command_buffer, frame, frame_pipelines);
+        // This prefix owns query-pool resets and the validation probe. Every async-compute
+        // batch waits for its timeline point before writing timestamps.
+        checked(
+            unsafe { raw.end_command_buffer(command_buffer) },
+            "end_command_buffer (scene prefix)",
+        )?;
+
+        let recorded = self.record_scene_graph(frame, frame_pipelines)?;
+
+        checked(
+            unsafe { raw.begin_command_buffer(recorded.tail, &begin_info) },
+            "begin_command_buffer (scene tail)",
+        )?;
 
         // Fold the active view's BGRA8 shm-publish readback into THIS frame's command buffer
         // when the view's shm publish is enabled — one submit covers it, with no separate
         // submit and no synchronous wait.
         if self.shm_publish_enabled[self.active_view.index()] {
-            self.record_shm_copy(command_buffer, frame)?;
+            self.record_shm_copy(recorded.tail, frame)?;
         }
 
         // Re-borrow the device after the `&mut self` graph build above.
         let raw = self.device.raw();
         // SAFETY: the ash seam. Ends the recording opened above.
         checked(
-            unsafe { raw.end_command_buffer(command_buffer) },
-            "end_command_buffer (scene)",
+            unsafe { raw.end_command_buffer(recorded.tail) },
+            "end_command_buffer (scene tail)",
         )?;
 
         // CPU span over the frame's queue submit. A no-op when the profiler is `Off`.
@@ -5779,66 +5826,115 @@ impl Renderer {
         } else {
             None
         };
-        let raw = self.device.raw();
-
-        let cmd = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
-        // The windowed present-only host blits this offscreen onto the swapchain in
-        // `present_active_view_to_swapchain`; signal the slot's scene-finished semaphore so
-        // that blit submit waits for the scene render to complete on the GPU. The
-        // editor/headless host has no present sync and never signals it.
-        let signal = self.present_sync.as_ref().map(|present_sync| {
-            [vk::SemaphoreSubmitInfo::default()
-                .semaphore(present_sync.scene_finished(frame))
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
-        });
-        // Latch that this frame's offscreen was submitted + signaled the scene-finished
-        // semaphore, so the present blit waits on it (and not on an unsignaled semaphore when
-        // the host skips the offscreen render).
-        self.present_scene_signaled = signal.is_some();
-        let mut submit_info = vk::SubmitInfo2::default().command_buffer_infos(&cmd);
-        if let Some(signal) = signal.as_ref() {
-            submit_info = submit_info.signal_semaphore_infos(signal);
-        }
-        let submit = [submit_info];
-        // SAFETY: the ash seam. The queue is externally synchronized; at this phase it
-        // is touched from one thread only. The fence was reset in `begin_offscreen_frame`.
-        self.device.graphics_queue.submit2(
-            raw,
-            &submit,
-            self.frames.in_flight(),
-            "queue_submit2 (scene)",
-        )?;
+        let queue_submits = self.submit_scene_graph(frame, command_buffer, recorded)?;
         if let Some(index) = submit_span {
             let CpuProfiler { buffers, .. } = &mut self.cpu_profiler;
             buffers[frame].end_span(index, cpu_now_ns());
         }
-        // One primary command buffer recorded + one submit2 this frame. The offscreen /
-        // shm-publish host path submits exactly once per frame.
-        self.stats.command_buffers = 1;
-        self.stats.queue_submits = 1;
-        // The slot just recorded into is the one `finalize_frame_telemetry` reads this frame
-        // (its CPU spans + the GPU read-back land in the capture); record it before `advance`
-        // rolls `frames.index()` to the next slot.
-        self.last_rendered_slot = frame;
+        self.stats.command_buffers = queue_submits;
+        self.stats.queue_submits = queue_submits;
         self.frames.advance();
         Ok(())
     }
 
-    /// Builds and executes the depth-prepass + scene render graph for `frame` into the
+    fn submit_scene_graph(
+        &mut self,
+        frame: usize,
+        prefix: vk::CommandBuffer,
+        recorded: RecordedSceneGraph,
+    ) -> Result<u32> {
+        let prefix_point = self.frames.reserve_timeline(RgQueueAssignment::Graphics)?;
+        submit_graph_command(
+            &self.device,
+            RgQueueAssignment::Graphics,
+            prefix,
+            &[],
+            &[prefix_point],
+            None,
+            vk::Fence::null(),
+            "queue_submit2 (scene prefix)",
+        )?;
+
+        let mut batch_points = Vec::with_capacity(recorded.batches.len());
+        for batch in &recorded.batches {
+            let point = self.frames.reserve_timeline(batch.queue)?;
+            let mut waits = Vec::new();
+            if batch.queue == RgQueueAssignment::AsyncCompute {
+                merge_timeline_point(&mut waits, prefix_point);
+            }
+            for &source_batch in &batch.wait_for_batches {
+                let source = *batch_points.get(source_batch).ok_or_else(|| {
+                    Error::InvalidUploadData(
+                        "render-graph batch dependency does not precede its consumer".into(),
+                    )
+                })?;
+                merge_timeline_point(&mut waits, source);
+            }
+            submit_graph_command(
+                &self.device,
+                batch.queue,
+                batch.command_buffer,
+                &waits,
+                &[point],
+                None,
+                vk::Fence::null(),
+                "queue_submit2 (render-graph batch)",
+            )?;
+            batch_points.push(point);
+        }
+
+        let mut tail_waits = Vec::new();
+        if let Some(point) =
+            recorded
+                .batches
+                .iter()
+                .zip(&batch_points)
+                .rev()
+                .find_map(|(batch, point)| {
+                    (batch.queue == RgQueueAssignment::AsyncCompute).then_some(*point)
+                })
+        {
+            merge_timeline_point(&mut tail_waits, point);
+        }
+        let present_signal = match self.present_sync.as_ref() {
+            Some(present_sync) => present_sync.scene_finished_to_signal(frame)?,
+            None => None,
+        };
+        submit_graph_command(
+            &self.device,
+            RgQueueAssignment::Graphics,
+            recorded.tail,
+            &tail_waits,
+            &[],
+            present_signal,
+            self.frames.in_flight(),
+            "queue_submit2 (scene tail)",
+        )?;
+        if present_signal.is_some()
+            && let Some(present_sync) = self.present_sync.as_mut()
+        {
+            present_sync.mark_scene_finished_signaled(frame)?;
+        }
+
+        u32::try_from(recorded.batches.len().saturating_add(2)).map_err(|_| {
+            Error::InvalidUploadData("render-graph submit count exceeds u32".to_owned())
+        })
+    }
+
+    /// Builds and records the depth-prepass + scene render graph for `frame` into the
     /// active view's offscreen target. The pass bodies capture resolved handles + the
     /// moved draw list / submissions, never `&mut self`.
     ///
     /// Pass order (the `beginFrameGraph` slice this phase fills): `light-cull` (compute)
     /// → `shadow` / `spot-shadow` (depth-only graphics, `DepthWrite → ShaderReadOnly`) →
-    /// `point-shadow` (a compute-kind body driving 6 face draws) → optional
+    /// `point-shadow` (graphics commands driving 6 declared face draws) → optional
     /// `depth-prepass` → `scene`. The graph derives every barrier from the declared
     /// usage; the shadow maps' cross-frame layout rides external slots.
     fn record_scene_graph(
         &mut self,
-        cmd: vk::CommandBuffer,
         frame: usize,
         pipelines: FramePipelines,
-    ) {
+    ) -> Result<RecordedSceneGraph> {
         // CPU span over this frame's render-graph CONSTRUCTION (cull + scene/lighting/post
         // pass declarations), closed just before `execute-render-graph` opens — a top-level
         // sibling of it. A no-op when the profiler is `Off`.
@@ -5855,6 +5951,7 @@ impl Renderer {
         let extent = view.scaled_render_extent();
         let color_image = view.offscreen.handle();
         let color_view = view.offscreen.view();
+        let offscreen_state = view.offscreen.graph_state();
         let depth_image = view.depth.handle();
         let depth_view = view.depth.view();
 
@@ -5867,7 +5964,7 @@ impl Renderer {
         let mut graph = RenderGraph::new();
         let ibl_live = self.scene_ibl_mut().add_live_capture_passes(&mut graph);
         let ddgi_sh = if self.active_view == ViewId::Thumbnail {
-            graph.import_buffer(self.ibl.sh_coefficients().handle())
+            graph.import_buffer(self.ibl.sh_coefficients().handle(), None)
         } else {
             ibl_live.sh
         };
@@ -5876,7 +5973,7 @@ impl Renderer {
         // emits the compute→fragment barrier on the cluster buffer from the declared
         // StorageWriteCompute usage (the scene fragment reads it as a storage buffer).
         if let Some(cull) = &pipelines.cull {
-            let cluster_buffer = graph.import_buffer(self.lighting.cluster_buffer(frame));
+            let cluster_buffer = graph.import_buffer(self.lighting.cluster_buffer(frame), None);
             let cull_set = self.lighting.cluster_set(frame);
             let cull = Arc::clone(cull);
             let cull_pipeline = cull.handle();
@@ -5938,9 +6035,9 @@ impl Renderer {
             None
         };
         let (deformed_res, prev_deformed_res) = if do_deform {
-            let deformed = graph.import_buffer(deformed_handle.expect("deformed buffer"));
+            let deformed = graph.import_buffer(deformed_handle.expect("deformed buffer"), None);
             let prev_deformed =
-                graph.import_buffer(prev_deformed_handle.expect("prev-deformed buffer"));
+                graph.import_buffer(prev_deformed_handle.expect("prev-deformed buffer"), None);
 
             // Morph pre-pass: scatter each active blend-shape's sparse deltas into the
             // deformed (current weights) + prev-deformed (previous weights) buffers, then
@@ -6063,7 +6160,9 @@ impl Renderer {
         let mut spot_res: Option<RgResource> = None;
         if let Some(shadow) = &pipelines.shadow {
             if self.lighting.shadow_pending() {
-                let slot = graph.alloc_external_layout(self.directional_shadow_layout);
+                let slot = graph.alloc_external_state(crate::RgExternalState::new(
+                    self.directional_shadow_layout,
+                ));
                 directional_slot = Some(slot);
                 let res = graph.import_image(
                     self.targets.directional_shadow.handle(),
@@ -6078,6 +6177,7 @@ impl Renderer {
                     "shadow",
                     res,
                     shadow,
+                    bindless_set,
                     instance_set,
                     self.lighting.shadow_view_proj(),
                     deformed_res,
@@ -6085,7 +6185,8 @@ impl Renderer {
                 );
             }
             if self.lighting.spot_shadow_pending() {
-                let slot = graph.alloc_external_layout(self.spot_shadow_layout);
+                let slot = graph
+                    .alloc_external_state(crate::RgExternalState::new(self.spot_shadow_layout));
                 spot_slot = Some(slot);
                 let res = graph.import_image(
                     self.targets.spot_shadow.handle(),
@@ -6100,6 +6201,7 @@ impl Renderer {
                     "spot-shadow",
                     res,
                     shadow,
+                    bindless_set,
                     instance_set,
                     self.lighting.spot_shadow_view_proj(),
                     deformed_res,
@@ -6108,9 +6210,12 @@ impl Renderer {
             }
         }
 
-        // Point shadow: a compute-kind pass whose body opens its own 6 face rendering
-        // scopes + manages the cube's layout (the cube's 6 layers exceed the graph's
-        // single-layer barrier).
+        let mut point_static_slots: Option<(usize, Option<usize>)> = None;
+        let mut point_dynamic_slots: Option<(usize, usize)> = None;
+        let mut point_shadow_sampled = Vec::with_capacity(2);
+
+        // Point shadow: each graphics-command pass opens six face rendering scopes while
+        // the graph synchronizes the complete layered color and depth images.
         if let Some(point) = &pipelines.point_shadow {
             let faces = point_shadow_face_matrices(
                 self.lighting.point_shadow_pos(),
@@ -6121,61 +6226,108 @@ impl Renderer {
             let point_pipeline = point.handle();
             let point_layout = point.layout();
 
+            let static_slot = graph.alloc_external_state(self.targets.point_shadow.graph_state());
+            let static_cube = graph.import_image(
+                self.targets.point_shadow.image(),
+                self.targets.point_shadow.cube_view(),
+                vk::ImageAspectFlags::COLOR,
+                self.targets.point_shadow.graph_state().layout,
+                Some(static_slot),
+            );
+            point_shadow_sampled.push(static_cube);
+
             // Static cube: non-deformed casters, rendered only when its content key / image
             // changed. Skipped frames sample the cached cube (it persists ShaderReadOnly).
             if pipelines.static_point_shadow_dirty {
                 let target = PointShadowTarget {
-                    cube_image: self.targets.point_shadow.image(),
                     face_views: std::array::from_fn(|f| self.targets.point_shadow.face_view(f)),
-                    depth_image: self.targets.point_shadow.depth_image(),
-                    depth_view: self.targets.point_shadow.depth_view(),
+                    depth_views: std::array::from_fn(|f| {
+                        self.targets.point_shadow.depth_face_view(f)
+                    }),
                     extent: self.targets.point_shadow.extent,
                 };
+                let depth_slot =
+                    graph.alloc_external_state(self.targets.point_shadow.depth_graph_state());
+                let depth = graph.import_image(
+                    self.targets.point_shadow.depth_image(),
+                    self.targets.point_shadow.depth_face_view(0),
+                    vk::ImageAspectFlags::DEPTH,
+                    self.targets.point_shadow.depth_graph_state().layout,
+                    Some(depth_slot),
+                );
                 let list = self.scene_draw_list.shallow_clone();
                 let point_static = Arc::clone(point);
                 let raw_body = raw.clone();
-                graph.add_pass(RgPass::compute("point-shadow-static").body(
-                    move |cmd, _scopes: &mut NestedScopeRecorder| {
-                        record_point_shadow(
-                            &raw_body,
-                            cmd,
-                            &list,
-                            point_pipeline,
-                            point_layout,
-                            instance_set,
-                            &target,
-                            &faces,
-                            light_pos,
-                            far_plane,
-                            None, // static casters never read the deformed buffer
-                            false,
-                        );
-                        drop(point_static);
-                    },
-                ));
-                self.targets.point_shadow.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                graph.add_pass(
+                    RgPass::graphics_commands("point-shadow-static")
+                        .access(static_cube, RgUsage::ColorWrite)
+                        .access(depth, RgUsage::DepthWrite)
+                        .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                            record_point_shadow(
+                                &raw_body,
+                                cmd,
+                                &list,
+                                point_pipeline,
+                                point_layout,
+                                bindless_set,
+                                instance_set,
+                                &target,
+                                &faces,
+                                light_pos,
+                                far_plane,
+                                None,
+                                false,
+                            );
+                            drop(point_static);
+                        }),
+                );
+                point_static_slots = Some((static_slot, Some(depth_slot)));
+            } else {
+                point_static_slots = Some((static_slot, None));
             }
 
             // Dynamic cube: deformed (skinned / morph) casters, re-rendered every active frame so a
             // moving character's shadow tracks it against the cached static environment cube.
+            let dynamic_slot =
+                graph.alloc_external_state(self.targets.point_shadow_dynamic.graph_state());
+            let dynamic_cube = graph.import_image(
+                self.targets.point_shadow_dynamic.image(),
+                self.targets.point_shadow_dynamic.cube_view(),
+                vk::ImageAspectFlags::COLOR,
+                self.targets.point_shadow_dynamic.graph_state().layout,
+                Some(dynamic_slot),
+            );
+            point_shadow_sampled.push(dynamic_cube);
+            let dynamic_depth_slot =
+                graph.alloc_external_state(self.targets.point_shadow_dynamic.depth_graph_state());
+            let dynamic_depth = graph.import_image(
+                self.targets.point_shadow_dynamic.depth_image(),
+                self.targets.point_shadow_dynamic.depth_face_view(0),
+                vk::ImageAspectFlags::DEPTH,
+                self.targets.point_shadow_dynamic.depth_graph_state().layout,
+                Some(dynamic_depth_slot),
+            );
             let dyn_target = PointShadowTarget {
-                cube_image: self.targets.point_shadow_dynamic.image(),
                 face_views: std::array::from_fn(|f| self.targets.point_shadow_dynamic.face_view(f)),
-                depth_image: self.targets.point_shadow_dynamic.depth_image(),
-                depth_view: self.targets.point_shadow_dynamic.depth_view(),
+                depth_views: std::array::from_fn(|f| {
+                    self.targets.point_shadow_dynamic.depth_face_view(f)
+                }),
                 extent: self.targets.point_shadow_dynamic.extent,
             };
             let list = self.scene_draw_list.shallow_clone();
             let point_dynamic = Arc::clone(point);
             let raw_body = raw.clone();
-            let mut pass = RgPass::compute("point-shadow-dynamic").body(
-                move |cmd, _scopes: &mut NestedScopeRecorder| {
+            let mut pass = RgPass::graphics_commands("point-shadow-dynamic")
+                .access(dynamic_cube, RgUsage::ColorWrite)
+                .access(dynamic_depth, RgUsage::DepthWrite)
+                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                     record_point_shadow(
                         &raw_body,
                         cmd,
                         &list,
                         point_pipeline,
                         point_layout,
+                        bindless_set,
                         instance_set,
                         &dyn_target,
                         &faces,
@@ -6185,16 +6337,14 @@ impl Renderer {
                         true,
                     );
                     drop(point_dynamic);
-                },
-            );
+                });
             // A skinned batch draws the deformed buffer into the cube faces; declare the
             // read so the graph orders it after the skin compute write.
             if let Some(deformed) = deformed_res {
                 pass = pass.access(deformed, RgUsage::VertexInputRead);
             }
             graph.add_pass(pass);
-            // Each cube self-manages its layout, ending ShaderReadOnly for the scene sample.
-            self.targets.point_shadow_dynamic.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            point_dynamic_slots = Some((dynamic_slot, dynamic_depth_slot));
         }
 
         // The offscreen color + 1× depth are always imported (the present blit samples the
@@ -6206,7 +6356,7 @@ impl Renderer {
         // enters UNDEFINED — but its *exit* layout must be tracked so the shm read-back's
         // entry barrier uses the right `old_layout`. An external slot seeded at UNDEFINED
         // carries the resolved exit layout back into `view.offscreen.layout` after execute.
-        let offscreen_slot = graph.alloc_external_layout(vk::ImageLayout::UNDEFINED);
+        let offscreen_slot = graph.alloc_external_state(offscreen_state);
         let color = graph.import_image(
             color_image,
             color_view,
@@ -6284,6 +6434,7 @@ impl Renderer {
         let (motion_resource, motion_depth_resource) = match self.add_motion_pass(
             &mut graph,
             &pipelines,
+            bindless_set,
             instance_set,
             (deformed_res, deformed_handle),
             (prev_deformed_res, prev_deformed_handle),
@@ -6362,6 +6513,7 @@ impl Renderer {
         let screen = self.add_screen_space_passes(
             &mut graph,
             &pipelines,
+            bindless_set,
             instance_set,
             motion_resource,
             (deformed_res, deformed_handle),
@@ -6698,6 +6850,9 @@ impl Renderer {
         if let Some(res) = spot_res {
             scene = scene.access(res, RgUsage::SampledRead);
         }
+        for res in point_shadow_sampled {
+            scene = scene.access(res, RgUsage::SampledRead);
+        }
         if let Some(cloud) = cloud_frame {
             scene = scene.access(cloud.shadow, RgUsage::SampledRead);
         }
@@ -6863,6 +7018,13 @@ impl Renderer {
         );
         self.add_grid_overlay_passes(&mut graph, &pipelines, color, overlay_depth);
 
+        let plan = graph.submission_plan(self.device.render_graph_queue_families());
+        let commands = self.frames.prepare_graph_commands(
+            &self.device,
+            plan.graphics_batch_count(),
+            plan.compute_batch_count(),
+        )?;
+
         // Arm the per-frame GPU timestamp recorder (a cheap no-op when the profiler is `Off`):
         // each pass body is then bracketed by a timestamp scope, written into this slot's pool
         // (reset at the top of the frame). The recorder is owned here, threaded through the
@@ -6892,35 +7054,63 @@ impl Renderer {
         } else {
             None
         };
-        {
+        let recorded_batches = {
             // Scope the recorders so their `&mut` borrows of `recorder` / `cpu_*` release
             // before `cpu_buffer.end_span` re-borrows the buffer and `recorder` is stashed.
             let mut recorders = crate::render_graph::ProfileRecorders {
                 gpu: recorder.armed().then_some(&mut recorder),
                 cpu: profile_cpu.then_some((&mut *cpu_registry, &mut *cpu_buffer)),
             };
-            graph.execute_profiled(&self.device, cmd, &mut recorders);
-        }
+            graph.record_submission_plan_profiled(
+                &self.device,
+                plan,
+                RgBatchCommandBuffers {
+                    graphics: &commands.graphics,
+                    compute: &commands.compute,
+                },
+                &mut recorders,
+            )?
+        };
         if let Some(index) = exec_span {
             cpu_buffer.end_span(index, cpu_now_ns());
         }
         self.gpu_profiler.stash_recorder(frame, recorder);
+        self.transient.resolve_buffer_states(&graph);
 
         // Track the offscreen color's resolved exit layout (COLOR_ATTACHMENT after the post
         // chain's overlay/grid pass) so the shm read-back's entry barrier uses the right
         // `old_layout` — otherwise a stale tracked layout mis-transitions the image and the
         // next submit flags a layout mismatch (`VUID-vkCmdDraw-None-09600`).
-        self.views[self.active_view.index()].offscreen.layout =
-            graph.external_layout(offscreen_slot);
+        self.views[self.active_view.index()]
+            .offscreen
+            .set_graph_state(graph.external_state(offscreen_slot));
 
         // Read back the shadow maps' resolved exit layouts for the next frame's seed (the
         // graph wrote each external slot to the map's final layout — ShaderReadOnly after
         // a depth-write pass that the next frame's sample waits on).
         if let Some(slot) = directional_slot {
-            self.directional_shadow_layout = graph.external_layout(slot);
+            self.directional_shadow_layout = graph.external_state(slot).layout;
         }
         if let Some(slot) = spot_slot {
-            self.spot_shadow_layout = graph.external_layout(slot);
+            self.spot_shadow_layout = graph.external_state(slot).layout;
+        }
+        if let Some((cube_slot, depth_slot)) = point_static_slots {
+            self.targets
+                .point_shadow
+                .set_graph_state(graph.external_state(cube_slot));
+            if let Some(depth_slot) = depth_slot {
+                self.targets
+                    .point_shadow
+                    .set_depth_graph_state(graph.external_state(depth_slot));
+            }
+        }
+        if let Some((cube_slot, depth_slot)) = point_dynamic_slots {
+            self.targets
+                .point_shadow_dynamic
+                .set_graph_state(graph.external_state(cube_slot));
+            self.targets
+                .point_shadow_dynamic
+                .set_depth_graph_state(graph.external_state(depth_slot));
         }
 
         // Read back the DDGI images' resolved exit layouts (the ray image + the two atlases each
@@ -6928,13 +7118,15 @@ impl Renderer {
         // index, commit the scroll base, clear the history-reset flag) — but only when the chain
         // actually ran this frame.
         if let Some(slot) = ddgi.rays_slot {
-            self.ddgi.set_rays_layout(graph.external_layout(slot));
+            self.ddgi.set_rays_layout(graph.external_state(slot).layout);
         }
         if let Some(slot) = ddgi.irradiance_slot {
-            self.ddgi.set_irradiance_layout(graph.external_layout(slot));
+            self.ddgi
+                .set_irradiance_layout(graph.external_state(slot).layout);
         }
         if let Some(slot) = ddgi.distance_slot {
-            self.ddgi.set_distance_layout(graph.external_layout(slot));
+            self.ddgi
+                .set_distance_layout(graph.external_state(slot).layout);
         }
         if ddgi.irradiance.is_some() {
             self.ddgi.advance_frame();
@@ -6948,12 +7140,12 @@ impl Renderer {
             for c in 0..crate::GDF_CASCADES {
                 if let Some(slot) = gdf.cascade_slots[c as usize] {
                     self.global_sdf
-                        .set_cascade_layout(c, graph.external_layout(slot));
+                        .set_cascade_layout(c, graph.external_state(slot).layout);
                 }
             }
             if let Some(slot) = gdf.albedo_slot {
                 self.global_sdf
-                    .set_albedo_layout(graph.external_layout(slot));
+                    .set_albedo_layout(graph.external_state(slot).layout);
             }
             self.global_sdf.advance_frame();
         }
@@ -6964,34 +7156,40 @@ impl Renderer {
         // frame — the just-written volume becomes next frame's reprojection history.
         if let Some((write_slot, history_slot, integration_slot)) = froxel_slots {
             self.froxel
-                .set_scatter_write_layout(graph.external_layout(write_slot));
+                .set_scatter_write_layout(graph.external_state(write_slot).layout);
             self.froxel
-                .set_scatter_history_layout(graph.external_layout(history_slot));
+                .set_scatter_history_layout(graph.external_state(history_slot).layout);
             self.froxel
-                .set_integration_layout(graph.external_layout(integration_slot));
+                .set_integration_layout(graph.external_state(integration_slot).layout);
             self.froxel.advance_frame();
         }
 
         // Read back the aerial-perspective volume's resolved exit layout (it rode an external slot,
         // ending ShaderReadOnly after the composite's sampled read).
         if let Some(slot) = aerial_slot {
-            self.aerial.set_volume_layout(graph.external_layout(slot));
+            self.aerial
+                .set_volume_layout(graph.external_state(slot).layout);
         }
 
         if let Some(slot) = cloud_slots.base {
-            self.clouds.set_base_layout(graph.external_layout(slot));
+            self.clouds
+                .set_base_layout(graph.external_state(slot).layout);
         }
         if let Some(slot) = cloud_slots.detail {
-            self.clouds.set_detail_layout(graph.external_layout(slot));
+            self.clouds
+                .set_detail_layout(graph.external_state(slot).layout);
         }
         if let Some(slot) = cloud_slots.curl {
-            self.clouds.set_curl_layout(graph.external_layout(slot));
+            self.clouds
+                .set_curl_layout(graph.external_state(slot).layout);
         }
         if let Some(slot) = cloud_slots.weather {
-            self.clouds.set_weather_layout(graph.external_layout(slot));
+            self.clouds
+                .set_weather_layout(graph.external_state(slot).layout);
         }
         if let Some(slot) = cloud_slots.shadow {
-            self.clouds.set_shadow_layout(graph.external_layout(slot));
+            self.clouds
+                .set_shadow_layout(graph.external_state(slot).layout);
         }
         {
             let view = &mut self.views[self.active_view.index()];
@@ -7000,26 +7198,26 @@ impl Renderer {
                     view.cloud_reduced[index]
                         .as_mut()
                         .expect("cloud reduced built")
-                        .layout = graph.external_layout(*slot);
+                        .set_graph_state(graph.external_state(*slot));
                 }
             }
             if let Some(slot) = cloud_slots.reduced_depth {
                 view.cloud_reduced_depth
                     .as_mut()
                     .expect("cloud reduced depth built")
-                    .layout = graph.external_layout(slot);
+                    .set_graph_state(graph.external_state(slot));
             }
             if let Some(slot) = cloud_slots.full_depth {
                 view.cloud_full_depth
                     .as_mut()
                     .expect("cloud full depth built")
-                    .layout = graph.external_layout(slot);
+                    .set_graph_state(graph.external_state(slot));
             }
             if let Some(slot) = cloud_slots.full_color {
                 view.cloud_full_color
                     .as_mut()
                     .expect("cloud full color built")
-                    .layout = graph.external_layout(slot);
+                    .set_graph_state(graph.external_state(slot));
             }
         }
 
@@ -7027,7 +7225,7 @@ impl Renderer {
         // slot, ending ShaderReadOnly after the scene's SampledRead). The per-view temporal
         // state was already advanced inside `add_restir_passes`, before execute.
         if let Some(slot) = restir.radiance_slot {
-            let layout = graph.external_layout(slot);
+            let layout = graph.external_state(slot).layout;
             self.views[self.active_view.index()]
                 .restir
                 .set_radiance_layout(layout);
@@ -7058,7 +7256,7 @@ impl Renderer {
         if let (Some(slot), Some(resolved)) =
             (screen.ssgi_resolved_slot, view.ssgi_resolved.as_mut())
         {
-            resolved.layout = graph.external_layout(slot);
+            resolved.set_graph_state(graph.external_state(slot));
         }
         if let Some(slots) = &screen.dfao_history_slots {
             writeback_dfao_history_layout(view, &graph, &slots.read);
@@ -7067,10 +7265,10 @@ impl Renderer {
         if let (Some(slot), Some(resolved)) =
             (screen.dfao_resolved_slot, view.dfao_resolved.as_mut())
         {
-            resolved.layout = graph.external_layout(slot);
+            resolved.set_graph_state(graph.external_state(slot));
         }
         if let (Some(slot), Some(ssr_map)) = (screen.ssr_map_slot, view.ssr_map.as_mut()) {
-            ssr_map.layout = graph.external_layout(slot);
+            ssr_map.set_graph_state(graph.external_state(slot));
         }
 
         // TAA and/or SSGI accumulation consumed this frame's history parity; mark it valid
@@ -7089,6 +7287,10 @@ impl Renderer {
         if taa_active || cloud_slots.temporal {
             view.advance_jitter();
         }
+        Ok(RecordedSceneGraph {
+            batches: recorded_batches,
+            tail: commands.tail,
+        })
     }
 
     /// Builds the four DDGI compute passes into `graph` when the chain runs this frame (DDGI on +
@@ -7119,7 +7321,7 @@ impl Renderer {
         let raw = self.device.raw().clone();
 
         let (ray_image, ray_view, ray_layout) = self.ddgi.rays();
-        let rays_slot = graph.alloc_external_layout(ray_layout);
+        let rays_slot = graph.alloc_external_state(crate::RgExternalState::new(ray_layout));
         let ray_res = graph.import_image(
             ray_image,
             ray_view,
@@ -7129,7 +7331,7 @@ impl Renderer {
         );
 
         let (irr_image, irr_view, irr_layout) = self.ddgi.irradiance();
-        let irr_slot = graph.alloc_external_layout(irr_layout);
+        let irr_slot = graph.alloc_external_state(crate::RgExternalState::new(irr_layout));
         let irr_res = graph.import_image(
             irr_image,
             irr_view,
@@ -7139,7 +7341,7 @@ impl Renderer {
         );
 
         let (dist_image, dist_view, dist_layout) = self.ddgi.distance();
-        let dist_slot = graph.alloc_external_layout(dist_layout);
+        let dist_slot = graph.alloc_external_state(crate::RgExternalState::new(dist_layout));
         let dist_res = graph.import_image(
             dist_image,
             dist_view,
@@ -7314,19 +7516,19 @@ impl Renderer {
         // Import this frame slot's cull-list buffer (the cull writes it, the composite reads it) +
         // each cascade volume (the composite writes them, the downstream consumers sample them). The
         // cull list is per-frame-in-flight so frame N+1's clear/rebuild never races frame N's reads.
-        let cull_res = graph.import_buffer(self.global_sdf.cull_buffer(frame));
+        let cull_res = graph.import_buffer(self.global_sdf.cull_buffer(frame), None);
         let mut cascade_res = [RgResource { index: 0 }; crate::GDF_CASCADES as usize];
         let mut cascade_slots = [None; crate::GDF_CASCADES as usize];
         for c in 0..crate::GDF_CASCADES {
             let (image, view, layout) = self.global_sdf.cascade(c);
-            let slot = graph.alloc_external_layout(layout);
+            let slot = graph.alloc_external_state(crate::RgExternalState::new(layout));
             cascade_res[c as usize] = graph.import_image_3d(image, view, layout, Some(slot));
             cascade_slots[c as usize] = Some(slot);
         }
         // The lite albedo cache (the composite splats it for the finest cascade; the DDGI trace
         // samples it at hit points).
         let (albedo_image, albedo_view, albedo_layout) = self.global_sdf.albedo_cache();
-        let albedo_slot = graph.alloc_external_layout(albedo_layout);
+        let albedo_slot = graph.alloc_external_state(crate::RgExternalState::new(albedo_layout));
         let albedo_res =
             graph.import_image_3d(albedo_image, albedo_view, albedo_layout, Some(albedo_slot));
 
@@ -7570,8 +7772,8 @@ impl Renderer {
         // RAW barriers the graph derives from StorageWrite → StorageRead on it. The radiance
         // image rides an external slot for the cross-frame
         // General ↔ ShaderReadOnly write-back.
-        let sentinel = graph.import_buffer(combined);
-        let radiance_slot = graph.alloc_external_layout(rad_layout);
+        let sentinel = graph.import_buffer(combined, None);
+        let radiance_slot = graph.alloc_external_state(crate::RgExternalState::new(rad_layout));
         let radiance_res = graph.import_image(
             rad_image,
             rad_view,
@@ -7679,6 +7881,7 @@ impl Renderer {
         &self,
         graph: &mut RenderGraph,
         pipelines: &FramePipelines,
+        bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
         motion: Option<RgResource>,
         deformed: (Option<RgResource>, Option<vk::Buffer>),
@@ -7757,6 +7960,7 @@ impl Renderer {
                         &list,
                         gbuffer_pipeline,
                         gbuffer_layout,
+                        bindless_set,
                         instance_set,
                         &push,
                         deformed_handle,
@@ -7778,8 +7982,8 @@ impl Renderer {
                 vk::ImageLayout::UNDEFINED,
                 None,
             );
-            let ao_map_slot =
-                graph.alloc_external_layout(view.ao_map.as_ref().expect("ao_map built").layout);
+            let ao_map_slot = graph
+                .alloc_external_state(view.ao_map.as_ref().expect("ao_map built").graph_state());
             let ao_map = graph.import_image(
                 view.ao_map.as_ref().expect("ao_map built").handle(),
                 view.ao_map.as_ref().expect("ao_map built").view(),
@@ -7821,8 +8025,11 @@ impl Renderer {
 
         // Directional contact shadows: g_normal → contact_map.
         if let Some(contact) = &pipelines.contact {
-            let contact_slot = graph.alloc_external_layout(
-                view.contact_map.as_ref().expect("contact_map built").layout,
+            let contact_slot = graph.alloc_external_state(
+                view.contact_map
+                    .as_ref()
+                    .expect("contact_map built")
+                    .graph_state(),
             );
             let contact_map = graph.import_image(
                 view.contact_map
@@ -7872,8 +8079,12 @@ impl Renderer {
         // One-bounce SSGI: g_normal + prevColor → ssgi_map → ssgi_denoised.
         if let (Some(ssgi), Some(ssgi_blur)) = (&pipelines.ssgi, &pipelines.ssgi_blur) {
             let prev_color = prev_color.expect("prev_color imported when SSGI on");
-            let ssgi_slot =
-                graph.alloc_external_layout(view.ssgi_map.as_ref().expect("ssgi_map built").layout);
+            let ssgi_slot = graph.alloc_external_state(
+                view.ssgi_map
+                    .as_ref()
+                    .expect("ssgi_map built")
+                    .graph_state(),
+            );
             let ssgi_map = graph.import_image(
                 view.ssgi_map.as_ref().expect("ssgi_map built").handle(),
                 view.ssgi_map.as_ref().expect("ssgi_map built").view(),
@@ -7881,11 +8092,11 @@ impl Renderer {
                 view.ssgi_map.as_ref().expect("ssgi_map built").layout,
                 Some(ssgi_slot),
             );
-            let denoised_slot = graph.alloc_external_layout(
+            let denoised_slot = graph.alloc_external_state(
                 view.ssgi_denoised
                     .as_ref()
                     .expect("ssgi_denoised built")
-                    .layout,
+                    .graph_state(),
             );
             let ssgi_denoised = graph.import_image(
                 view.ssgi_denoised
@@ -7943,11 +8154,11 @@ impl Renderer {
             // whichever map this declares).
             if let (Some(accum), Some(motion)) = (&pipelines.ssgi_accum, motion) {
                 let p = view.history_index;
-                let ssgi_resolved_slot = graph.alloc_external_layout(
+                let ssgi_resolved_slot = graph.alloc_external_state(
                     view.ssgi_resolved
                         .as_ref()
                         .expect("ssgi_resolved built")
-                        .layout,
+                        .graph_state(),
                 );
                 let ssgi_resolved = graph.import_image(
                     view.ssgi_resolved
@@ -8119,11 +8330,11 @@ impl Renderer {
             //    motion, neighborhood-clamp, EMA into the stable dfao_resolved the mesh samples.
             if let (Some(accum), Some(motion)) = (&pipelines.dfao_accum, motion) {
                 let p = view.history_index;
-                let dfao_resolved_slot = graph.alloc_external_layout(
+                let dfao_resolved_slot = graph.alloc_external_state(
                     view.dfao_resolved
                         .as_ref()
                         .expect("dfao_resolved built")
-                        .layout,
+                        .graph_state(),
                 );
                 let dfao_resolved = graph.import_image(
                     view.dfao_resolved
@@ -8190,8 +8401,11 @@ impl Renderer {
             // External-layout slot so the graph transitions gi_indirect GENERAL (this pass's storage
             // write) → SHADER_READ_ONLY for the scene pass's `SampledRead` (fully rewritten each frame,
             // so the start layout harmlessly discards).
-            let gi_slot = graph.alloc_external_layout(
-                view.gi_indirect.as_ref().expect("gi_indirect built").layout,
+            let gi_slot = graph.alloc_external_state(
+                view.gi_indirect
+                    .as_ref()
+                    .expect("gi_indirect built")
+                    .graph_state(),
             );
             let gi_indirect = graph.import_image(
                 view.gi_indirect
@@ -8340,8 +8554,8 @@ impl Renderer {
         // so only smooth surfaces use it. No separate denoise — TAA cleans the march jitter.
         if let Some(ssr) = &pipelines.ssr {
             let prev_color = prev_color.expect("prev_color imported when SSR on");
-            let ssr_slot =
-                graph.alloc_external_layout(view.ssr_map.as_ref().expect("ssr_map built").layout);
+            let ssr_slot = graph
+                .alloc_external_state(view.ssr_map.as_ref().expect("ssr_map built").graph_state());
             let ssr_map = graph.import_image(
                 view.ssr_map.as_ref().expect("ssr_map built").handle(),
                 view.ssr_map.as_ref().expect("ssr_map built").view(),
@@ -8400,6 +8614,7 @@ impl Renderer {
         &self,
         graph: &mut RenderGraph,
         pipelines: &FramePipelines,
+        bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
         deformed: (Option<RgResource>, Option<vk::Buffer>),
         prev_deformed: (Option<RgResource>, Option<vk::Buffer>),
@@ -8455,6 +8670,7 @@ impl Renderer {
                     &list,
                     motion_handle,
                     motion_layout,
+                    bindless_set,
                     instance_set,
                     &push,
                     deformed_handle,
@@ -8698,8 +8914,8 @@ impl Renderer {
         // The two history images carry their layout across frames (the graph internally
         // pings ShaderReadOnly → General for the write and back), so each rides an external
         // slot whose resolved exit layout is read back after execute.
-        let read_slot = graph.alloc_external_layout(history_read.layout);
-        let write_slot = graph.alloc_external_layout(history_write.layout);
+        let read_slot = graph.alloc_external_state(history_read.graph_state());
+        let write_slot = graph.alloc_external_state(history_write.graph_state());
         let hist_read = graph.import_image(
             history_read.handle(),
             history_read.view(),
@@ -8720,8 +8936,8 @@ impl Renderer {
             (Some(read), Some(write)) => (read, write),
             _ => return None,
         };
-        let lock_read_slot = graph.alloc_external_layout(lock_read.layout);
-        let lock_write_slot = graph.alloc_external_layout(lock_write.layout);
+        let lock_read_slot = graph.alloc_external_state(lock_read.graph_state());
+        let lock_write_slot = graph.alloc_external_state(lock_write.graph_state());
         let lock_read_res = graph.import_image(
             lock_read.handle(),
             lock_read.view(),
@@ -9221,19 +9437,19 @@ impl Renderer {
         // ShaderReadOnly). Both scatter volumes ride external slots so their per-volume GENERAL ↔
         // ShaderReadOnly layouts survive the frame boundary (the ping-pong swaps their roles).
         let (write_img, write_view, write_layout) = self.froxel.scatter_write_import();
-        let write_slot = graph.alloc_external_layout(write_layout);
+        let write_slot = graph.alloc_external_state(crate::RgExternalState::new(write_layout));
         let write_res =
             graph.import_image_3d(write_img, write_view, write_layout, Some(write_slot));
         let (hist_img, hist_view, hist_layout) = self.froxel.scatter_history_import();
-        let hist_slot = graph.alloc_external_layout(hist_layout);
+        let hist_slot = graph.alloc_external_state(crate::RgExternalState::new(hist_layout));
         let hist_res = graph.import_image_3d(hist_img, hist_view, hist_layout, Some(hist_slot));
         let (integ_img, integ_view, integ_layout) = self.froxel.integration_import();
-        let integ_slot = graph.alloc_external_layout(integ_layout);
+        let integ_slot = graph.alloc_external_state(crate::RgExternalState::new(integ_layout));
         let integ_res =
             graph.import_image_3d(integ_img, integ_view, integ_layout, Some(integ_slot));
-        let cluster_res = graph.import_buffer(self.lighting.cluster_buffer(frame));
+        let cluster_res = graph.import_buffer(self.lighting.cluster_buffer(frame), None);
         let (light_buf, _) = self.lighting.light_list_buffer(frame);
-        let light_res = graph.import_buffer(light_buf);
+        let light_res = graph.import_buffer(light_buf, None);
 
         let light_set = self.lighting.light_set(frame);
         let volume_set = self.froxel.inject_set();
@@ -9333,7 +9549,7 @@ impl Renderer {
         self.aerial.update_params(&params);
 
         let (vol_img, vol_view, vol_layout) = self.aerial.volume_import();
-        let vol_slot = graph.alloc_external_layout(vol_layout);
+        let vol_slot = graph.alloc_external_state(crate::RgExternalState::new(vol_layout));
         let vol_res = graph.import_image_3d(vol_img, vol_view, vol_layout, Some(vol_slot));
 
         let fill_set = self.aerial.fill_set();
@@ -9453,11 +9669,11 @@ impl Renderer {
         let params_offset = self.clouds.params_offset(view_index, frame);
 
         let base = self.clouds.base_noise();
-        let base_slot = graph.alloc_external_layout(base.layout);
+        let base_slot = graph.alloc_external_state(base.graph_state());
         let base_res =
             graph.import_image_3d(base.handle(), base.view(), base.layout, Some(base_slot));
         let detail = self.clouds.detail_noise();
-        let detail_slot = graph.alloc_external_layout(detail.layout);
+        let detail_slot = graph.alloc_external_state(detail.graph_state());
         let detail_res = graph.import_image_3d(
             detail.handle(),
             detail.view(),
@@ -9465,7 +9681,7 @@ impl Renderer {
             Some(detail_slot),
         );
         let curl = self.clouds.curl_noise();
-        let curl_slot = graph.alloc_external_layout(curl.layout);
+        let curl_slot = graph.alloc_external_state(curl.graph_state());
         let curl_res = graph.import_image(
             curl.handle(),
             curl.view(),
@@ -9474,7 +9690,7 @@ impl Renderer {
             Some(curl_slot),
         );
         let weather = self.clouds.weather_map();
-        let weather_slot = graph.alloc_external_layout(weather.layout);
+        let weather_slot = graph.alloc_external_state(weather.graph_state());
         let weather_res = graph.import_image(
             weather.handle(),
             weather.view(),
@@ -9483,7 +9699,7 @@ impl Renderer {
             Some(weather_slot),
         );
         let shadow = self.clouds.cloud_shadow();
-        let shadow_slot = graph.alloc_external_layout(shadow.layout);
+        let shadow_slot = graph.alloc_external_state(shadow.graph_state());
         let shadow_res = graph.import_image(
             shadow.handle(),
             shadow.view(),
@@ -9669,7 +9885,7 @@ impl Renderer {
         let mut reduced_resources = [None, None];
         for (index, image) in view.cloud_reduced.iter().enumerate() {
             let image = image.as_ref().expect("cloud reduced built");
-            let slot = graph.alloc_external_layout(image.layout);
+            let slot = graph.alloc_external_state(image.graph_state());
             reduced_resources[index] = Some(graph.import_image(
                 image.handle(),
                 image.view(),
@@ -9684,7 +9900,7 @@ impl Renderer {
             .cloud_reduced_depth
             .as_ref()
             .expect("cloud reduced depth built");
-        let reduced_depth_slot = graph.alloc_external_layout(reduced_depth.layout);
+        let reduced_depth_slot = graph.alloc_external_state(reduced_depth.graph_state());
         let reduced_depth_res = graph.import_image(
             reduced_depth.handle(),
             reduced_depth.view(),
@@ -9697,7 +9913,7 @@ impl Renderer {
             .cloud_full_color
             .as_ref()
             .expect("cloud full color built");
-        let full_color_slot = graph.alloc_external_layout(full_color.layout);
+        let full_color_slot = graph.alloc_external_state(full_color.graph_state());
         let full_color_res = graph.import_image(
             full_color.handle(),
             full_color.view(),
@@ -9711,7 +9927,7 @@ impl Renderer {
             .cloud_full_depth
             .as_ref()
             .expect("cloud full depth built");
-        let full_depth_slot = graph.alloc_external_layout(full_depth.layout);
+        let full_depth_slot = graph.alloc_external_state(full_depth.graph_state());
         let full_depth_res = graph.import_image(
             full_depth.handle(),
             full_depth.view(),
@@ -10295,6 +10511,7 @@ impl Renderer {
         name: &'static str,
         resource: RgResource,
         pipeline: &Arc<crate::Pipeline>,
+        bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
         light_view_proj: Mat4,
         deformed_res: Option<RgResource>,
@@ -10318,6 +10535,7 @@ impl Renderer {
                     &list,
                     shadow_pipeline,
                     shadow_layout,
+                    bindless_set,
                     instance_set,
                     light_view_proj,
                     deformed_handle,
@@ -10352,10 +10570,10 @@ impl Renderer {
             return Ok(());
         }
         self.device.wait_idle()?;
-        // The old image indices are about to be invalid; drop any index a skipped
-        // out-of-date frame left acquired so the next present starts clean.
-        if let Some(present_sync) = self.present_sync.as_mut() {
-            let _ = present_sync.take_acquired_image();
+        // Rebuilds run between frames. An outstanding acquisition owns a binary semaphore and
+        // must be presented rather than discarded, so enforce the transaction boundary.
+        if let Some(present_sync) = self.present_sync.as_ref() {
+            present_sync.ensure_no_acquired_frame()?;
         }
         if let Some(mut swapchain) = self.swapchain.take() {
             swapchain.destroy(&self.device);
@@ -10434,7 +10652,7 @@ impl Renderer {
             }
         };
         if let Some(present_sync) = self.present_sync.as_mut() {
-            present_sync.set_acquired_image(image_index);
+            present_sync.set_acquired_frame(image_index, self.frames.index())?;
         }
 
         // Wait + reset this slot's fence and command pool so the slot is idle before the
@@ -10458,20 +10676,16 @@ impl Renderer {
     ///
     /// Returns [`Error::Vk`] for any failing fence / record / submit / present call.
     pub fn present_active_view_to_swapchain(&mut self) -> Result<()> {
-        // The offscreen submit advanced the ring, so the slot that just rendered (and whose
-        // image-available / scene-finished semaphores carry this frame) is `last_rendered_slot`.
-        let slot = self.last_rendered_slot;
-        let Some(image_index) = self
+        let Some(acquired) = self
             .present_sync
             .as_mut()
-            .and_then(PresentSync::take_acquired_image)
+            .and_then(PresentSync::take_acquired_frame)
         else {
             return Ok(()); // No image acquired (out-of-date swapchain): skip the present.
         };
-
-        // Whether the offscreen render signaled the scene-finished semaphore this frame; if it
-        // did not (the host skipped the offscreen render), the blit must not wait on it.
-        let scene_signaled = std::mem::take(&mut self.present_scene_signaled);
+        let slot = acquired.slot;
+        let image_index = acquired.image_index;
+        let scene_signaled = acquired.scene_finished_signaled;
 
         let raw = self.device.raw();
         let present_sync = self
@@ -10484,33 +10698,28 @@ impl Renderer {
         let scene_finished = present_sync.scene_finished(slot);
         let image_available = self.frames.image_available_for(slot);
 
-        // The slot's prior present must complete before its blit buffer + fence are reused.
-        // SAFETY: the ash seam. The fence belongs to this device (created signaled).
-        checked(
-            unsafe { raw.wait_for_fences(&[present_fence], true, u64::MAX) },
-            "present: wait_for_fences",
-        )?;
-        // SAFETY: the ash seam. The waited fence is unsignaled and reset before resubmit.
-        checked(
-            unsafe { raw.reset_fences(&[present_fence]) },
-            "present: reset_fences",
-        )?;
-
         let swapchain = self.present_swapchain();
         let swap_image = swapchain.image(image_index as usize);
         let swap_extent = swapchain.extent;
         let render_finished = swapchain.render_finished(image_index as usize);
         let tracking = swapchain.image_in_flight(image_index as usize);
 
-        // A fence still tracking this swapchain image (from an earlier present) must signal
-        // before its render-finished semaphore is reused.
-        if tracking != vk::Fence::null() {
-            // SAFETY: the ash seam. The tracking fence belongs to this device.
-            checked(
-                unsafe { raw.wait_for_fences(&[tracking], true, u64::MAX) },
-                "present: wait_for_fences(image)",
-            )?;
-        }
+        // Both the slot's prior present and the acquired image's prior present must complete
+        // before their resources are reused. They may be the same fence, so deduplicate and wait
+        // before resetting the slot fence; resetting first would turn the alias case into an
+        // infinite wait on the newly-unsignaled fence.
+        let (reuse_fences, reuse_fence_count) =
+            crate::present::reuse_fences(present_fence, tracking);
+        // SAFETY: the ash seam. Every returned fence belongs to this device.
+        checked(
+            unsafe { raw.wait_for_fences(&reuse_fences[..reuse_fence_count], true, u64::MAX) },
+            "present: wait_for_fences(reuse)",
+        )?;
+        // SAFETY: the ash seam. The slot fence was waited above and is reset before resubmit.
+        checked(
+            unsafe { raw.reset_fences(&[present_fence]) },
+            "present: reset_fences",
+        )?;
         self.swapchain
             .as_mut()
             .expect("present swapchain in windowed mode")
@@ -10984,7 +11193,7 @@ fn import_ssgi_history(
     image: &Option<crate::Image>,
 ) -> (usize, RgResource) {
     let image = image.as_ref().expect("ssgi history built");
-    let slot = graph.alloc_external_layout(image.layout);
+    let slot = graph.alloc_external_state(image.graph_state());
     let resource = graph.import_image(
         image.handle(),
         image.view(),
@@ -10999,7 +11208,7 @@ fn import_ssgi_history(
 /// `(history-index, slot)` selects the image in `view.history` and the slot to read.
 fn writeback_history_layout(view: &mut ViewTarget, graph: &RenderGraph, slot: &(usize, usize)) {
     if let Some(image) = view.history[slot.0].as_mut() {
-        image.layout = graph.external_layout(slot.1);
+        image.set_graph_state(graph.external_state(slot.1));
     }
 }
 
@@ -11007,7 +11216,7 @@ fn writeback_history_layout(view: &mut ViewTarget, graph: &RenderGraph, slot: &(
 /// `(lock-index, slot)` selects the image in `view.lock` and the slot to read.
 fn writeback_lock_layout(view: &mut ViewTarget, graph: &RenderGraph, slot: &(usize, usize)) {
     if let Some(image) = view.lock[slot.0].as_mut() {
-        image.layout = graph.external_layout(slot.1);
+        image.set_graph_state(graph.external_state(slot.1));
     }
 }
 
@@ -11019,7 +11228,7 @@ fn writeback_ssgi_history_layout(
     slot: &(usize, usize),
 ) {
     if let Some(image) = view.ssgi_history[slot.0].as_mut() {
-        image.layout = graph.external_layout(slot.1);
+        image.set_graph_state(graph.external_state(slot.1));
     }
 }
 
@@ -11031,8 +11240,68 @@ fn writeback_dfao_history_layout(
     slot: &(usize, usize),
 ) {
     if let Some(image) = view.dfao_history[slot.0].as_mut() {
-        image.layout = graph.external_layout(slot.1);
+        image.set_graph_state(graph.external_state(slot.1));
     }
+}
+
+fn merge_timeline_point(points: &mut Vec<FrameTimelinePoint>, point: FrameTimelinePoint) {
+    if let Some(existing) = points
+        .iter_mut()
+        .find(|existing| existing.semaphore == point.semaphore)
+    {
+        existing.value = existing.value.max(point.value);
+    } else {
+        points.push(point);
+    }
+}
+
+fn submit_graph_command(
+    device: &Device,
+    queue: RgQueueAssignment,
+    command_buffer: vk::CommandBuffer,
+    waits: &[FrameTimelinePoint],
+    signals: &[FrameTimelinePoint],
+    binary_signal: Option<vk::Semaphore>,
+    fence: vk::Fence,
+    context: &'static str,
+) -> Result<()> {
+    let wait_infos = waits
+        .iter()
+        .map(|point| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(point.semaphore)
+                .value(point.value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        })
+        .collect::<Vec<_>>();
+    let mut signal_infos = signals
+        .iter()
+        .map(|point| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(point.semaphore)
+                .value(point.value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        })
+        .collect::<Vec<_>>();
+    if let Some(semaphore) = binary_signal {
+        signal_infos.push(
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        );
+    }
+    let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+    let submits = [vk::SubmitInfo2::default()
+        .wait_semaphore_infos(&wait_infos)
+        .command_buffer_infos(&commands)
+        .signal_semaphore_infos(&signal_infos)];
+    let queue = match queue {
+        RgQueueAssignment::Graphics => &device.graphics_queue,
+        RgQueueAssignment::AsyncCompute => device.compute_queue.as_ref().ok_or(
+            Error::PresentState("async-compute batch has no async-compute queue"),
+        )?,
+    };
+    queue.submit2(device.raw(), &submits, fence, context)
 }
 
 /// The validation-clean gate's regression probe seam: when
@@ -11427,6 +11696,7 @@ mod tests {
             view_proj: Mat4::IDENTITY,
             wireframe: false,
             default_texture_index: crate::DEFAULT_WHITE_SLOT,
+            coverage_temporal_phase: 0,
             rt_skinned: false,
             displace_enabled: true,
             tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
