@@ -89,14 +89,14 @@ pub fn imported_nodes_from_json(nodes: &Value) -> Vec<ImportedNode> {
         if let Some(t) = vec3_from(record.get("t")) {
             node.translation = t;
         }
-        if let Some(r) = record.get("r").and_then(Value::as_array) {
-            if r.len() == 4 {
-                let w = f32_at(r, 0);
-                let x = f32_at(r, 1);
-                let y = f32_at(r, 2);
-                let z = f32_at(r, 3);
-                node.rotation = Quat::from_xyzw(x, y, z, w);
-            }
+        if let Some(r) = record.get("r").and_then(Value::as_array)
+            && r.len() == 4
+        {
+            let w = f32_at(r, 0);
+            let x = f32_at(r, 1);
+            let y = f32_at(r, 2);
+            let z = f32_at(r, 3);
+            node.rotation = Quat::from_xyzw(x, y, z, w);
         }
         if let Some(s) = vec3_from(record.get("s")) {
             node.scale = s;

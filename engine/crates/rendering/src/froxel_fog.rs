@@ -1497,11 +1497,9 @@ mod tests {
     /// periodic-lattice octaves wrap), and the fBm stays in range.
     #[test]
     fn tiling_noise_wraps_and_is_bounded() {
-        for &(a, b) in &[(0.0_f32, 1.0_f32)] {
-            let lo = tiling_fbm(a, 0.3, 0.7);
-            let hi = tiling_fbm(b - 1e-6, 0.3, 0.7);
-            assert!((lo - hi).abs() < 0.05, "noise wraps across the tiling seam");
-        }
+        let lo = tiling_fbm(0.0, 0.3, 0.7);
+        let hi = tiling_fbm(1.0 - 1e-6, 0.3, 0.7);
+        assert!((lo - hi).abs() < 0.05, "noise wraps across the tiling seam");
         for &p in &[0.0_f32, 0.25, 0.5, 0.75, 0.9] {
             let n = tiling_fbm(p, p * 0.5, 1.0 - p);
             assert!((0.0..=1.0).contains(&n), "fBm stays in [0,1]");

@@ -859,16 +859,17 @@ pub fn load_catalog_material_asset(assets: &mut AssetServer, id: Uuid) -> Result
 /// The depth-tracked recursion behind [`load_material_asset`].
 fn load_material_asset_at(assets: &AssetServer, id: Uuid, depth: u32) -> Result<MaterialAsset> {
     let material = load_material_asset_raw(assets, id)?;
-    if material.parent.value() != 0 && depth < MAX_INSTANCE_DEPTH {
-        if let Ok(parent_resolved) = load_material_asset_at(assets, material.parent, depth + 1) {
-            let mut base = parent_resolved;
-            apply_overrides(&mut base, &material.overrides);
-            base.parent = material.parent;
-            base.overrides = material.overrides;
-            return Ok(base);
-        }
-        // A missing or cyclic parent falls back to this material's own stored params.
+    if material.parent.value() != 0
+        && depth < MAX_INSTANCE_DEPTH
+        && let Ok(parent_resolved) = load_material_asset_at(assets, material.parent, depth + 1)
+    {
+        let mut base = parent_resolved;
+        apply_overrides(&mut base, &material.overrides);
+        base.parent = material.parent;
+        base.overrides = material.overrides;
+        return Ok(base);
     }
+    // A missing or cyclic parent falls back to this material's own stored params.
     Ok(material)
 }
 
@@ -878,16 +879,16 @@ fn load_catalog_material_asset_at(
     depth: u32,
 ) -> Result<MaterialAsset> {
     let material = load_catalog_material_asset_raw(assets, id)?;
-    if material.parent.value() != 0 && depth < MAX_INSTANCE_DEPTH {
-        if let Ok(parent_resolved) =
+    if material.parent.value() != 0
+        && depth < MAX_INSTANCE_DEPTH
+        && let Ok(parent_resolved) =
             load_catalog_material_asset_at(assets, material.parent, depth + 1)
-        {
-            let mut base = parent_resolved;
-            apply_overrides(&mut base, &material.overrides);
-            base.parent = material.parent;
-            base.overrides = material.overrides;
-            return Ok(base);
-        }
+    {
+        let mut base = parent_resolved;
+        apply_overrides(&mut base, &material.overrides);
+        base.parent = material.parent;
+        base.overrides = material.overrides;
+        return Ok(base);
     }
     Ok(material)
 }

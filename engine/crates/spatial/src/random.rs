@@ -129,19 +129,13 @@ impl RandomStream {
 
     /// Accepts a probability against the full 32-bit random lane.
     #[must_use]
-    pub fn chance(
-        self,
-        sample_index: u64,
-        lane: usize,
-        probability: crate::UnitInterval,
-    ) -> bool {
+    pub fn chance(self, sample_index: u64, lane: usize, probability: crate::UnitInterval) -> bool {
         chance_from_draw(self.lane(sample_index, lane), probability)
     }
 }
 
 const fn chance_from_draw(draw: u32, probability: crate::UnitInterval) -> bool {
-    draw as u64 * (u16::MAX as u64)
-        < probability.bits() as u64 * (u32::MAX as u64 + 1)
+    draw as u64 * (u16::MAX as u64) < probability.bits() as u64 * (u32::MAX as u64 + 1)
 }
 
 fn append_u64(words: &mut Vec<u32>, value: u64) {

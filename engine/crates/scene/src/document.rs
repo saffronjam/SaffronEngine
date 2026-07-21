@@ -136,10 +136,10 @@ impl Scene {
             }
             let entity = self.spawn_with_id(Uuid(uuid));
 
-            if let Some(components) = entry.as_object().and_then(|m| m.get("components")) {
-                if components.is_object() {
-                    reg.deserialize_entity(self, entity, components)?;
-                }
+            if let Some(components) = entry.as_object().and_then(|m| m.get("components"))
+                && components.is_object()
+            {
+                reg.deserialize_entity(self, entity, components)?;
             }
 
             let order = entry.as_object().and_then(|m| m.get("componentOrder"));

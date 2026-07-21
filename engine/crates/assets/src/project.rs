@@ -279,10 +279,10 @@ pub fn ensure_script_src(root: &Path) {
         return;
     }
     let example = src.join("example.lua");
-    if !example.exists() {
-        if let Err(err) = std::fs::write(&example, STARTER_SCRIPT) {
-            tracing::warn!("project example.lua not written: {err}");
-        }
+    if !example.exists()
+        && let Err(err) = std::fs::write(&example, STARTER_SCRIPT)
+    {
+        tracing::warn!("project example.lua not written: {err}");
     }
 }
 
@@ -303,10 +303,10 @@ pub fn ensure_script_library(root: &Path, sa_lua_defs: &str) {
         tracing::warn!("project sa.lua not written: {err}");
     }
     let luarc = root.join(".luarc.json");
-    if !luarc.exists() {
-        if let Err(err) = std::fs::write(&luarc, LUARC_JSON) {
-            tracing::warn!("project .luarc.json not written: {err}");
-        }
+    if !luarc.exists()
+        && let Err(err) = std::fs::write(&luarc, LUARC_JSON)
+    {
+        tracing::warn!("project .luarc.json not written: {err}");
     }
 }
 
@@ -429,10 +429,10 @@ impl AssetServer {
         }
 
         let target_path = Path::new(target);
-        if let Some(parent) = target_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+        if let Some(parent) = target_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
         }
         std::fs::write(target_path, dump_json(&Value::Object(doc), 2))
             .map_err(|err| Error::Io(format!("write failed for '{target}': {err}")))

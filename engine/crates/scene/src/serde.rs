@@ -632,12 +632,12 @@ impl SceneSerialize for SkinnedMesh {
             for mat in mats {
                 let mut cols = [0.0f32; 16];
                 cols.copy_from_slice(&Mat4::IDENTITY.to_cols_array());
-                if let Value::Array(elems) = mat {
-                    if elems.len() == 16 {
-                        for (i, e) in elems.iter().enumerate() {
-                            if let Some(f) = e.as_f64() {
-                                cols[i] = f as f32;
-                            }
+                if let Value::Array(elems) = mat
+                    && elems.len() == 16
+                {
+                    for (i, e) in elems.iter().enumerate() {
+                        if let Some(f) = e.as_f64() {
+                            cols[i] = f as f32;
                         }
                     }
                 }

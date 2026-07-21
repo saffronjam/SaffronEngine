@@ -596,10 +596,10 @@ fn decode_clips(
                 times,
                 values,
             };
-            if let Some(&last) = track.times.last() {
-                if last > clip.duration {
-                    clip.duration = last;
-                }
+            if let Some(&last) = track.times.last()
+                && last > clip.duration
+            {
+                clip.duration = last;
             }
             clip.tracks.push(track);
         }

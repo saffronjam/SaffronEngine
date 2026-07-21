@@ -150,10 +150,11 @@ fn reachable(interfaces: &HashMap<String, Vec<Field>>) -> BTreeSet<String> {
         };
         reach.insert(name);
         for field in fields {
-            if let Some(reference) = referenced(&field.ty) {
-                if interfaces.contains_key(reference) && !reach.contains(reference) {
-                    queue.push(reference.to_owned());
-                }
+            if let Some(reference) = referenced(&field.ty)
+                && interfaces.contains_key(reference)
+                && !reach.contains(reference)
+            {
+                queue.push(reference.to_owned());
             }
         }
     }
