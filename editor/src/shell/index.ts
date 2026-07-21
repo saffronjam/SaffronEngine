@@ -4,6 +4,8 @@
 /// executing `window.__saffronShellEvent(name, payload)` in this frame. There is exactly one bridge
 /// and one code path.
 
+import type { ControlFailureDto } from "../protocol/sa-types";
+
 interface CefQuery {
   request: string;
   onSuccess: (response: string) => void;
@@ -20,49 +22,97 @@ declare global {
   }
 }
 
-/// A rejected `invoke`, carrying the engine's machine-readable `code` when present. Shaped so
-/// `control/client.ts`'s `toControlError` recovers both `message` and `code`, and `lib/flash.ts`'s
-/// `errorText` (Error → `.message`) reads it directly.
+const SIMPLE_FAILURE_CODES = new Set<ControlFailureDto["code"]>([
+  "command",
+  "params",
+  "busy-loading",
+  "invalid-request",
+  "transport",
+  "malformed-reply",
+  "bridge",
+]);
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function isControlFailure(value: unknown): value is ControlFailureDto {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  const failure = value as Record<string, unknown>;
+  if (typeof failure.code !== "string" || typeof failure.message !== "string") {
+    return false;
+  }
+  if (SIMPLE_FAILURE_CODES.has(failure.code as ControlFailureDto["code"])) {
+    return hasExactKeys(failure, ["code", "message"]);
+  }
+  return (
+    failure.code === "diagnostic" &&
+    hasExactKeys(failure, ["code", "message", "diagnostic"]) &&
+    failure.diagnostic !== null &&
+    typeof failure.diagnostic === "object"
+  );
+}
+
+function bridgeFailure(message: string): ControlFailureDto {
+  return { code: "bridge", message };
+}
+
+function malformedFailure(message: string): ControlFailureDto {
+  return { code: "malformed-reply", message };
+}
+
+export function parseFailure(payload: string): ControlFailureDto {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (isControlFailure(parsed)) {
+      return parsed;
+    }
+  } catch {
+    return malformedFailure(`native bridge returned a non-JSON failure: ${payload}`);
+  }
+  return malformedFailure("native bridge returned an invalid failure object");
+}
+
+/// A rejected `invoke` carrying the exact shared control failure.
 export class InvokeError extends Error {
-  readonly code?: string;
-  constructor(message: string, code?: string) {
-    super(message);
+  readonly failure: ControlFailureDto;
+  constructor(failure: ControlFailureDto) {
+    super(failure.message);
     this.name = "InvokeError";
-    this.code = code;
+    this.failure = failure;
+  }
+
+  get code(): ControlFailureDto["code"] {
+    return this.failure.code;
   }
 }
 
 /// Call a native command by name with JSON args: resolves with the JSON result,
 /// rejects with an [`InvokeError`]. Args are sent as `{ command, args }`; the reply is the handler's
-/// JSON (or the `{ message, code }` failure the router passed to `onFailure`).
+/// JSON or the shared failure object passed to `onFailure`.
 export function invoke<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     if (typeof window.cefQuery !== "function") {
-      reject(new InvokeError("cefQuery unavailable — not running inside the CEF shell"));
+      reject(
+        new InvokeError(bridgeFailure("cefQuery unavailable — not running inside the CEF shell")),
+      );
       return;
     }
     window.cefQuery({
       request: JSON.stringify({ command, args: args ?? {} }),
       onSuccess: (response) => {
-        resolve((response ? JSON.parse(response) : null) as T);
+        try {
+          resolve((response ? JSON.parse(response) : null) as T);
+        } catch {
+          reject(new InvokeError(malformedFailure("native bridge returned malformed JSON")));
+        }
       },
       onFailure: (_code, message) => {
-        try {
-          const parsed: unknown = JSON.parse(message);
-          if (parsed && typeof parsed === "object" && "message" in parsed) {
-            const obj = parsed as { message?: unknown; code?: unknown };
-            reject(
-              new InvokeError(
-                typeof obj.message === "string" ? obj.message : message,
-                typeof obj.code === "string" ? obj.code : undefined,
-              ),
-            );
-            return;
-          }
-        } catch {
-          // Not JSON — fall through to the raw string.
-        }
-        reject(new InvokeError(message));
+        reject(new InvokeError(parseFailure(message)));
       },
     });
   });

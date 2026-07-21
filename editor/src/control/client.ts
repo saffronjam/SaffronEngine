@@ -6,7 +6,7 @@
 ///
 /// Ids are `string` end-to-end (engine Uuids are u64 and can exceed 2^53). NEVER
 /// `Number()` an id.
-import { invoke } from "../shell";
+import { InvokeError, invoke } from "../shell";
 import type { MaterialGraph } from "../materials/graph";
 import type {
   ActiveAlarmsDto,
@@ -17,6 +17,7 @@ import type {
   CaptureStartResult,
   CaptureStatusResult,
   CaptureStopResult,
+  ControlFailureDto,
   PhysicsStateResult,
   PhysicsBodiesResult,
   DrainContactsResult,
@@ -138,16 +139,21 @@ type EmptyCommandName = {
   [C in CommandName]: keyof CommandParamsMap[C] extends never ? C : never;
 }[CommandName];
 
-/// A rejected control call, carrying the engine's machine-readable `code` (present on every
-/// `ok:false` reply) alongside the human message. The Rust bridge rejects the `control`
-/// passthrough with a `{ message, code }` object; `call()` normalizes it to this one Error type so
-/// callers can `isBusyLoading(err)` and `errorText(err)` uniformly.
+/// A rejected control call carrying the exact shared failure object.
 export class ControlError extends Error {
-  code?: string;
-  constructor(message: string, code?: string) {
-    super(message);
+  readonly failure: ControlFailureDto;
+  constructor(failure: ControlFailureDto) {
+    super(failure.message);
     this.name = "ControlError";
-    this.code = code;
+    this.failure = failure;
+  }
+
+  get code(): ControlFailureDto["code"] {
+    return this.failure.code;
+  }
+
+  get diagnostic(): Extract<ControlFailureDto, { code: "diagnostic" }>["diagnostic"] | null {
+    return this.failure.code === "diagnostic" ? this.failure.diagnostic : null;
   }
 }
 
@@ -157,20 +163,18 @@ export function isBusyLoading(err: unknown): boolean {
   return err instanceof ControlError && err.code === "busy-loading";
 }
 
-/// Coerce whatever `invoke` rejected with (the serialized bridge `{ message, code }`, or a bare
-/// string when the bridge layer itself failed) into a `ControlError`.
+/// Converts the one native bridge error type into the control client's public error type.
 function toControlError(raw: unknown): ControlError {
   if (raw instanceof ControlError) {
     return raw;
   }
-  if (raw && typeof raw === "object" && "message" in raw) {
-    const obj = raw as { message?: unknown; code?: unknown };
-    return new ControlError(
-      typeof obj.message === "string" ? obj.message : String(raw),
-      typeof obj.code === "string" ? obj.code : undefined,
-    );
+  if (raw instanceof InvokeError) {
+    return new ControlError(raw.failure);
   }
-  return new ControlError(typeof raw === "string" ? raw : String(raw));
+  return new ControlError({
+    code: "bridge",
+    message: raw instanceof Error ? raw.message : String(raw),
+  });
 }
 
 function call<C extends EmptyCommandName>(cmd: C): Promise<CommandResultMap[C]>;

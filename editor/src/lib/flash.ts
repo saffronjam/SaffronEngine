@@ -20,8 +20,8 @@ export function notifyError(message: string, ms = 8000): void {
   toast.error(message, { duration: ms });
 }
 
-/// Normalize a rejected control call into a readable message. The Rust passthrough
-/// rejects with the engine's error string (e.g. "ray tracing not supported …").
+/// Normalize a rejected control call into a readable message. A typed `ControlError` exposes its
+/// shared failure message through the standard `Error` surface.
 export function errorText(err: unknown): string {
   if (typeof err === "string") {
     return err;

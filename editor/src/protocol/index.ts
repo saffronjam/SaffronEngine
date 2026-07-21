@@ -15,6 +15,9 @@ import type {
 export type {
   ActiveAlarmDto,
   ActiveAlarmsDto,
+  ControlDiagnosticDto,
+  ControlFailureDto,
+  VegetationGraphDiagnosticDto,
   AddEntityParams,
   AlarmEventDto,
   AppManifest,
@@ -199,12 +202,6 @@ export type ProjectPhase = ProjectStatusDto["phase"];
 export type BootStage = ProjectStatusDto["stage"];
 export type RenderStats = RenderStatsDto;
 export type Thumbnail = ThumbnailResult;
-
-export interface Envelope {
-  ok: boolean;
-  error?: string;
-  result?: unknown;
-}
 
 export type Environment = EnvironmentDto;
 export type Selection = SelectionResult;
