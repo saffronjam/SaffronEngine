@@ -81,9 +81,10 @@ page covers the surrounding order.
 
 On the `Renderer` host the frame is already rendered and submitted by then, inside `on_ui`, so
 its `begin_frame_graph` adds nothing to the loop's graph. In windowed mode `end_frame` blits the
-finished offscreen onto the swapchain via `present_active_view_to_swapchain`, which waits the
-scene-finished semaphore the offscreen submit signalled; the headless editor host publishes its
-frame over shared memory from `on_ui` instead.
+finished offscreen onto the swapchain via `present_active_view_to_swapchain`. An offscreen submit
+signals the scene-finished semaphore once when it belongs to an active acquire-to-present
+transaction; internal offscreen renders never signal it. The headless editor host publishes its frame
+over shared memory from `on_ui` instead.
 
 A pass appended to the loop's graph is not part of the renderer's submission — layer GPU work
 goes through `Renderer::submit` and `submit_overlay`, described in

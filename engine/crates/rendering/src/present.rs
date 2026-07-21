@@ -19,7 +19,7 @@
 use ash::vk;
 
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
-use crate::{Device, Result, checked};
+use crate::{Device, Error, Result, checked};
 
 /// The per-frame-slot sync + command resources for the windowed present blit.
 ///
@@ -31,9 +31,20 @@ use crate::{Device, Result, checked};
 /// is torn down.
 pub struct PresentSync {
     slots: Vec<PresentSlot>,
-    /// The swapchain image index acquired by [`PresentSync::acquire`], consumed by
-    /// [`crate::Renderer::present_active_view_to_swapchain`]. `None` between presents.
-    acquired_image: Option<u32>,
+    /// The swapchain acquisition currently owned by the frame loop. Internal offscreen renders
+    /// run outside this state and therefore cannot signal a present semaphore.
+    acquired_frame: Option<AcquiredPresentFrame>,
+}
+
+/// One acquire-to-present transaction and its binary-semaphore state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcquiredPresentFrame {
+    /// The acquired swapchain image.
+    pub image_index: u32,
+    /// The frame-ring slot whose image-available and present resources own the transaction.
+    pub slot: usize,
+    /// Whether an offscreen submit signaled this slot's scene-finished semaphore.
+    pub scene_finished_signaled: bool,
 }
 
 /// One present-ring slot's resources.
@@ -74,7 +85,7 @@ impl PresentSync {
         }
         Ok(Self {
             slots,
-            acquired_image: None,
+            acquired_frame: None,
         })
     }
 
@@ -162,15 +173,103 @@ impl PresentSync {
         self.slots[index].present_fence
     }
 
-    /// Records the acquired swapchain image index for this frame.
-    pub fn set_acquired_image(&mut self, image_index: u32) {
-        self.acquired_image = Some(image_index);
+    /// Opens one acquire-to-present transaction for `slot`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PresentState`] when a prior acquisition has not been presented.
+    pub fn set_acquired_frame(&mut self, image_index: u32, slot: usize) -> Result<()> {
+        if self.acquired_frame.is_some() {
+            return Err(Error::PresentState(
+                "cannot acquire before presenting the active frame",
+            ));
+        }
+        self.acquired_frame = Some(AcquiredPresentFrame {
+            image_index,
+            slot,
+            scene_finished_signaled: false,
+        });
+        Ok(())
     }
 
-    /// Takes the acquired swapchain image index (cleared after consumption).
-    pub fn take_acquired_image(&mut self) -> Option<u32> {
-        self.acquired_image.take()
+    /// Verifies that no acquire-to-present transaction is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PresentState`] when an acquired swapchain image has not been presented.
+    pub fn ensure_no_acquired_frame(&self) -> Result<()> {
+        if self.acquired_frame.is_some() {
+            return Err(Error::PresentState(
+                "cannot rebuild the swapchain during an active acquired frame",
+            ));
+        }
+        Ok(())
     }
+
+    /// Returns the scene-finished semaphore when `slot` owns an acquired frame. Internal
+    /// offscreen renders return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PresentState`] when an active acquisition belongs to another slot or its
+    /// scene-finished semaphore was already signaled.
+    pub fn scene_finished_to_signal(&self, slot: usize) -> Result<Option<vk::Semaphore>> {
+        let Some(frame) = self.acquired_frame else {
+            return Ok(None);
+        };
+        if frame.slot != slot {
+            return Err(Error::PresentState(
+                "offscreen render does not own the active acquired frame slot",
+            ));
+        }
+        if frame.scene_finished_signaled {
+            return Err(Error::PresentState(
+                "cannot signal scene completion twice for one acquired frame",
+            ));
+        }
+        Ok(Some(self.scene_finished(slot)))
+    }
+
+    /// Records that `slot`'s scene-finished semaphore was submitted for signaling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PresentState`] when `slot` does not own the active acquisition or its
+    /// semaphore was already signaled.
+    pub fn mark_scene_finished_signaled(&mut self, slot: usize) -> Result<()> {
+        let Some(frame) = self
+            .acquired_frame
+            .as_mut()
+            .filter(|frame| frame.slot == slot && !frame.scene_finished_signaled)
+        else {
+            return Err(Error::PresentState(
+                "scene signal does not belong to the active acquired frame",
+            ));
+        };
+        frame.scene_finished_signaled = true;
+        Ok(())
+    }
+
+    /// Takes the acquired frame transaction for presentation.
+    pub fn take_acquired_frame(&mut self) -> Option<AcquiredPresentFrame> {
+        self.acquired_frame.take()
+    }
+}
+
+/// Builds the deduplicated fence set that must complete before a present slot and swapchain image
+/// can be reused. All returned fences must be waited before `slot_fence` is reset.
+pub(crate) fn reuse_fences(
+    slot_fence: vk::Fence,
+    image_fence: vk::Fence,
+) -> ([vk::Fence; 2], usize) {
+    let mut fences = [slot_fence, vk::Fence::null()];
+    let count = if image_fence != vk::Fence::null() && image_fence != slot_fence {
+        fences[1] = image_fence;
+        2
+    } else {
+        1
+    };
+    (fences, count)
 }
 
 /// Records the offscreen → swapchain blit into `cmd` (already begun): transition the
@@ -340,4 +439,108 @@ unsafe fn barrier(
     let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
     // SAFETY: forwarded from this function's contract — the image outlives the command.
     unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk::Handle;
+
+    use super::*;
+
+    fn sync_state() -> PresentSync {
+        let slot = || PresentSlot {
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            scene_finished: vk::Semaphore::null(),
+            present_fence: vk::Fence::null(),
+        };
+        PresentSync {
+            slots: vec![slot(), slot()],
+            acquired_frame: None,
+        }
+    }
+
+    #[test]
+    fn internal_offscreen_renders_never_signal_present_semaphores() {
+        let sync = sync_state();
+
+        assert!(sync.scene_finished_to_signal(0).expect("query").is_none());
+        assert!(sync.scene_finished_to_signal(1).expect("query").is_none());
+    }
+
+    #[test]
+    fn acquired_frame_signals_its_slot_once_and_carries_it_to_present() {
+        let mut sync = sync_state();
+        sync.set_acquired_frame(7, 1).expect("acquire");
+
+        assert!(matches!(
+            sync.scene_finished_to_signal(0),
+            Err(Error::PresentState(_))
+        ));
+        assert!(sync.scene_finished_to_signal(1).expect("query").is_some());
+        sync.mark_scene_finished_signaled(1).expect("mark signal");
+        assert!(matches!(
+            sync.scene_finished_to_signal(1),
+            Err(Error::PresentState(_))
+        ));
+        assert_eq!(
+            sync.take_acquired_frame(),
+            Some(AcquiredPresentFrame {
+                image_index: 7,
+                slot: 1,
+                scene_finished_signaled: true,
+            })
+        );
+        assert!(sync.take_acquired_frame().is_none());
+    }
+
+    #[test]
+    fn acquired_frame_without_scene_render_preserves_its_own_slot() {
+        let mut sync = sync_state();
+        sync.set_acquired_frame(3, 0).expect("acquire");
+
+        assert_eq!(
+            sync.take_acquired_frame(),
+            Some(AcquiredPresentFrame {
+                image_index: 3,
+                slot: 0,
+                scene_finished_signaled: false,
+            })
+        );
+    }
+
+    #[test]
+    fn double_acquire_is_rejected_in_release_builds() {
+        let mut sync = sync_state();
+        sync.set_acquired_frame(3, 0).expect("first acquire");
+
+        assert!(matches!(
+            sync.set_acquired_frame(4, 1),
+            Err(Error::PresentState(_))
+        ));
+        assert!(matches!(
+            sync.ensure_no_acquired_frame(),
+            Err(Error::PresentState(_))
+        ));
+        assert_eq!(
+            sync.take_acquired_frame()
+                .expect("active frame")
+                .image_index,
+            3
+        );
+        sync.ensure_no_acquired_frame().expect("idle after present");
+    }
+
+    #[test]
+    fn present_reuse_waits_aliasing_slot_and_image_fence_once() {
+        let slot = vk::Fence::from_raw(41);
+        let other = vk::Fence::from_raw(82);
+
+        let (same, same_count) = reuse_fences(slot, slot);
+        assert_eq!(&same[..same_count], &[slot]);
+        let (none, none_count) = reuse_fences(slot, vk::Fence::null());
+        assert_eq!(&none[..none_count], &[slot]);
+        let (distinct, distinct_count) = reuse_fences(slot, other);
+        assert_eq!(&distinct[..distinct_count], &[slot, other]);
+    }
 }

@@ -38,8 +38,9 @@ wait makes the readback host-visible before publication.
 ## Windowed present ring
 
 Windowed rendering adds a `PresentSync` slot beside each `FrameRing` slot. A present slot owns a blit
-command pool and buffer, a `scene_finished` semaphore, and a `present_fence`. The offscreen submit
-signals `scene_finished`; the blit submit waits for it before reading the offscreen image.
+command pool and buffer, a `scene_finished` semaphore, and a `present_fence`. `PresentSync` also owns
+the active acquire-to-present transaction: its swapchain image, frame slot, and one-shot scene signal
+state stay together until presentation consumes them.
 
 `begin_present_frame` follows this order:
 
@@ -52,12 +53,14 @@ Acquisition occurs before the scene fence reset. If acquire returns `ERROR_OUT_O
 can return early without leaving an unsignaled scene fence that the next frame would wait for.
 
 The scene render then submits its offscreen command buffer, signals `scene_finished`, fences
-`in_flight`, and advances `FrameRing`. `last_rendered_slot` retains the slot index needed by the
-windowed end-of-frame path.
+`in_flight`, and advances `FrameRing`. The signal is emitted once and only when that slot owns an
+active swapchain acquisition. Thumbnail, IBL convergence, and other internal offscreen renders run
+outside the transaction and never touch presentation semaphores.
 
 ## Blit and present
 
-`present_active_view_to_swapchain` records a second command buffer for the completed slot. It
+`present_active_view_to_swapchain` takes the active transaction and records a second command buffer
+for its exact slot. It
 transitions the offscreen image to `TRANSFER_SRC_OPTIMAL`, transitions the acquired swapchain image
 from `UNDEFINED` to `TRANSFER_DST_OPTIMAL`, blits, and leaves the swapchain image in
 `PRESENT_SRC_KHR`.
@@ -90,7 +93,10 @@ in-flight frame.
 
 `Swapchain::images_in_flight` stores the `present_fence` that last submitted each image. After an
 image is acquired, the renderer waits for that tracking fence before reusing the image's
-`render_finished` semaphore, then records the current slot's present fence in its place.
+`render_finished` semaphore, then records the current slot's present fence in its place. The image's
+tracking fence can equal the current slot's fence. The renderer deduplicates the two handles and
+waits for the complete set before resetting the slot fence, so an alias cannot become an unsignaled
+second wait.
 
 `ERROR_OUT_OF_DATE_KHR` during acquire skips the frame. `ERROR_OUT_OF_DATE_KHR` and
 `SUBOPTIMAL_KHR` from present are nonfatal; the window resize event drives swapchain recreation.
@@ -112,11 +118,11 @@ their VMA allocations through RAII after the device-idle boundary.
 
 ## Swapchain resize
 
-`recreate_swapchain` waits for the device to become idle, clears any acquired image index, destroys
-the old swapchain, and creates a new one for the requested surface extent. Image views,
-`render_finished` semaphores, and `images_in_flight` tracking are recreated with the image set.
-`PresentSync` remains because its per-slot command and synchronization resources do not depend on the
-surface extent.
+`recreate_swapchain` waits for the device to become idle and verifies that no acquire-to-present
+transaction is active. It destroys the old swapchain and creates one for the requested surface
+extent. Image views, `render_finished` semaphores, and `images_in_flight` tracking are recreated with
+the image set. `PresentSync` remains because its per-slot command and synchronization resources do
+not depend on the surface extent.
 
 In the standalone windowed host, `FrameHost::resized` rebuilds the swapchain and applies the same size
 to the active offscreen view. A zero extent represents a minimized window and does not trigger
