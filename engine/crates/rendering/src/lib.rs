@@ -17,9 +17,11 @@
 
 mod aa;
 mod budget;
+mod canonical_coverage;
 mod clouds;
 mod compute_dispatch;
 mod conformance;
+mod count_scan_scatter;
 mod ddgi;
 mod descriptors;
 mod device;
@@ -27,6 +29,7 @@ mod draw_list;
 mod frame;
 mod frame_history;
 mod froxel_fog;
+mod global_gpu_data;
 mod global_sdf;
 mod gpu_types;
 mod ibl;
@@ -69,11 +72,15 @@ pub use aa::{
     Aa, MOTION_FORMAT, MotionPush, REACTIVE_FORMAT, TAA_JITTER_PHASES, TaaParams, TaaPush,
     clamp_sample_count, jitter_offset, jitter_phase_count, record_motion,
 };
+pub use canonical_coverage::*;
 pub use clouds::{CloudRenderSettings, Clouds};
 pub use conformance::{
     ComputeConformanceEvidence, GraphProgramEvidence, QualifiedOperatorEvidence,
     ShaderArtifactEvidence, SpatialNumericEvidence, ValidationEvidence, VulkanProfileEvidence,
     capture_compute_conformance,
+};
+pub use count_scan_scatter::{
+    CountScanScatterError, CountScanScatterOutcome, CountScanScatterOverflow, CountScanScatterPlan,
 };
 pub use ddgi::{
     BlendPush as DdgiBlendPush, BorderPush as DdgiBorderPush, DDGI_DIST_FORMAT, DDGI_DIST_INTERIOR,
@@ -89,8 +96,9 @@ pub use device::{
     validation_issue_count,
 };
 pub use draw_list::{
-    DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
-    SkinDispatch, SubmeshMaterial, TessDraw, TessRtSlice, normal_matrix,
+    AggregateMaterialMoments, CoverageSourceKind, DeformedRtInstance, DrawBatch, DrawItem,
+    MorphDispatch, RenderStats, SceneDrawList, SkinDispatch, SubmeshMaterial, TessDraw,
+    TessRtSlice, ThinSheetMaterial, ThinSheetNormalMode, normal_matrix,
 };
 pub use frame::MAX_FRAMES_IN_FLIGHT;
 pub use frame_history::{
@@ -103,6 +111,24 @@ pub use froxel_fog::{
     FROXEL_FAR, FROXEL_FORMAT, FROXEL_GRID_X, FROXEL_GRID_Y, FROXEL_GRID_Z, FogGridParams,
     FogVolumeGpu, FogVolumeUpload, FroxelFog, FroxelQuality, MAX_FOG_VOLUMES, ap_slice_view_z,
     froxel_slice_view_z, froxel_to_cluster,
+};
+pub use global_gpu_data::{
+    ClusterArena, CoverageTable, DeformationParameterArena, DeformationProviderArena,
+    FrameUploadRing, GLOBAL_GPU_DATA_ABI_VERSION, GPU_MATERIAL_COVERAGE_SHIFT,
+    GPU_MATERIAL_SIDEDNESS_SHIFT, GPU_MATERIAL_SURFACE_MODEL_SHIFT,
+    GPU_MATERIAL_TRANSPARENCY_SHIFT, GPU_PSO_COVERAGE_SHIFT, GPU_PSO_DEFORMATION_SHIFT,
+    GPU_PSO_MATERIAL_SHIFT, GPU_PSO_PASS_SHIFT, GPU_PSO_REPRESENTATION_SHIFT,
+    GPU_PSO_SIDEDNESS_SHIFT, GPU_PSO_SURFACE_MODEL_SHIFT, GPU_PSO_TRANSPARENCY_SHIFT,
+    GeometryTable, GlobalGpuArena, GlobalGpuData, GpuArenaGrowth, GpuArenaRange, GpuBufferUpload,
+    GpuCoverageRecord, GpuDeformation, GpuDeformationProviderRecord, GpuDrawRecord,
+    GpuGeometryRecord, GpuHandle, GpuInverseBindRecord, GpuMaterialClass, GpuMaterialTableRecord,
+    GpuPageRecord, GpuPassClass, GpuPrototypeRecord, GpuPsoBin, GpuRangeAllocator,
+    GpuRecordRetirement, GpuRepresentation, GpuSidedness, GpuSkeletonJointRecord,
+    GpuSkeletonRecord, GpuTableSlotHeader, GpuTextureTableRecord, GpuTransparency,
+    ImmutableGpuTable, IndexArena, InverseBindArena, MaterialParameterArena, MaterialTable,
+    PageArena, PageDependencyArena, PageTable, PartArena, PrototypeMaterialArena, PrototypeTable,
+    ResidentGpuTable, SkeletonJointArena, SkeletonTable, TextureTable, UploadSlice, VertexArena,
+    VoxelArena,
 };
 pub use global_sdf::{
     GDF_BAND_FRACTION, GDF_CASCADE0_EXTENT, GDF_CASCADES, GDF_EXPONENT, GDF_FORMAT, GDF_MAX_CULLED,
@@ -138,7 +164,10 @@ pub use profiler::{
 pub use quality::{QualityTier, RenderQuality};
 pub use reactive::{PowerState, ReactiveState};
 pub use render_graph::{
-    ProfileRecorders, RenderGraph, RgAccess, RgAttachment, RgPass, RgPassKind, RgResource, RgUsage,
+    ProfileRecorders, RenderGraph, RgAccess, RgAttachment, RgBatchCommandBuffers, RgBufferDesc,
+    RgBufferLifetime, RgBufferRange, RgBufferRangeError, RgBufferResource, RgExternalState, RgPass,
+    RgPassBarriers, RgPassBatch, RgPassKind, RgQueueAssignment, RgQueueFamilies, RgQueuePreference,
+    RgRecordedBatch, RgResource, RgSubmissionPlan, RgUsage,
 };
 pub use renderer::{FogRenderSettings, RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
 pub use resources::{
@@ -187,8 +216,8 @@ pub use tessellation::{
 pub use thumbnail::{
     PngTransfer, ThumbnailPng, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
-pub use transient::{FROXEL_VOLUME_KEYS, TransientResources};
-pub use upload::{GpuQueue, SdfBake, Uploader};
+pub use transient::{FROXEL_VOLUME_KEYS, RenderGraphResources};
+pub use upload::{GpuQueue, SdfBake, TextureMipLevel, Uploader};
 pub use vegetation_compute::VulkanGraphComputeExecutor;
 pub use view_target::ViewTarget;
 
@@ -221,6 +250,10 @@ pub enum Error {
     /// The surface exposed no usable graphics-and-present queue family.
     #[error("no graphics+present queue family on the selected device")]
     NoQueueFamily,
+
+    /// The acquire-to-present state machine received an operation out of order.
+    #[error("invalid present state: {0}")]
+    PresentState(&'static str),
 
     /// The window could not hand out a surface handle (e.g. headless winit mode
     /// without a headless-surface fallback).
@@ -272,6 +305,10 @@ pub enum Error {
     /// on the one-off dispatch/readback failed).
     #[error("look bake failed: {0}")]
     LutBake(String),
+
+    /// A per-queue timeline semaphore exhausted its monotonic value space.
+    #[error("render-graph timeline semaphore value overflowed")]
+    TimelineValueOverflow,
 }
 
 /// A `Result` whose error is this crate's [`Error`].
