@@ -40,8 +40,8 @@ sequenceDiagram
     UI->>CEF: invoke("control", {cmd, params})
     CEF->>Shell: CommandQueryHandler
     Shell->>Host: newline-delimited JSON
-    Host-->>Shell: result or error code
-    Shell-->>UI: Promise resolve or reject
+    Host-->>Shell: result or typed failure object
+    Shell-->>UI: result or the same typed failure
 ```
 
 Shell events travel in the other direction. Worker threads post an event to the main-thread inbox; the main loop evaluates `window.__saffronShellEvent(name, payload)`, and `listen` fans it out to frontend subscribers.
@@ -57,7 +57,14 @@ return await invoke<CommandResultMap[C]>("control", {
 });
 ```
 
-The shell's `control_request_with_params` writes one request envelope to the Unix socket and reads one response. A mutex permits only one outstanding socket round trip, matching the host's frame-driven control drain. An engine error retains its message and machine-readable code through the Rust and TypeScript error types.
+The shell's `control_request_with_params` writes one request envelope to the Unix socket and reads one
+response. A mutex permits only one outstanding socket round trip, matching the host's frame-driven
+control drain. An engine failure retains its complete generated `ControlFailureDto` through the Rust
+shell, CEF rejection, `InvokeError`, and `ControlError`.
+
+The bridge uses `transport`, `malformed-reply`, or `bridge` for failures created outside engine
+dispatch. It rejects string-only failures and unknown object fields, so every caller observes one
+closed error contract. A domain diagnostic reaches the panel with its exact nested fields intact.
 
 Adding an engine command does not require another shell dispatch arm. The protocol DTOs provide the frontend parameter and result types, while a client method can give panels a domain-specific name.
 

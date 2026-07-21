@@ -70,7 +70,7 @@ to match the editor.
 The client id is read from `SAFFRON_SKETCHFAB_CLIENT_ID`; no secret ships with the editor, and an
 empty id fails at once with `OAuthError::NotConfigured`. The webview never sees the token:
 `connector_login` is a shell command that runs the flow on a blocking worker thread and returns
-only success or an error string.
+only success or a typed bridge failure.
 
 ## The Sketchfab connector
 

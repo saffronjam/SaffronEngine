@@ -19,10 +19,11 @@ there is no hand-written parser — the derives read the struct at compile time.
 gen-protocol` assembles the editor-facing artifacts from those derives:
 
 ```
-engine/crates/protocol/src/dto.rs          (DTO source of truth)
+engine/crates/protocol/src/                 (DTO source of truth)
         |
         `-- cargo run -p xtask -- gen-protocol
               |-- editor/src/protocol/sa-types.ts
+              |-- schemas/control/envelope.schema.json
               |-- schemas/control/openrpc.generated.json
               |-- schemas/control/command-manifest.generated.json
               `-- schemas/control/sa.generated.luau
@@ -35,11 +36,9 @@ to build the OpenRPC `methods` and the manifest. Registry and table are joined b
 `#[test]` asserting the live registry and the manifest carry the same command set.
 
 The freshness gate is a byte-identity test: the xtask re-emits each artifact and asserts it equals the
-committed file. A DTO change that is not regenerated fails the test. The only hand-authored schema is
-`schemas/control/envelope.schema.json`, because the `{ok,error,result,id}` wrapper is owned by
-dispatch rather than by a command DTO; and the component shapes (the opaque scene-component blobs) are
-hand-authored in the protocol crate's `component_schemas`, since they are not DTO structs with a
-derive to read.
+committed file. A DTO change that is not regenerated fails the test. The generated envelope schema
+embeds `ControlFailureDto`, while the generated OpenRPC document contains the params and result
+schemas for registered commands.
 
 ## Wire invariants
 
@@ -55,26 +54,30 @@ These hold across the whole protocol:
 - **`Transform.rotation` is Euler XYZ radians.** UIs that show degrees convert at the edge.
 - **Spot-light angles are degrees.** `innerAngle` and `outerAngle` stay degrees on the wire.
 - **Camera uses `near`/`far`.** ECS cameras and the editor fly-camera use the same key names.
+- **Failures are closed tagged unions.** Every failure carries `code` and `message`; code
+  `diagnostic` also carries a tagged domain payload. Rust clients, the native shell, and the schema
+  reject unknown fields, while every boundary rejects string-only errors.
 
-Component bodies and the scene environment use the hand-authored component shapes. `inspect.components`
-is validated as a registry-keyed map of component DTOs, and `set-component.json` is the
+Component bodies and the scene environment come from the Rust scene DTOs. `inspect.components` is
+validated as a registry-keyed map of component DTOs, and `set-component.json` is the generated
 `ComponentBody` union, so a generic `set-component` write accepts any registry-shaped record.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| DTO source of truth | `engine/crates/protocol/src/dto.rs` | the params/result DTO structs + enums |
+| DTO source of truth | `engine/crates/protocol/src/` | the params/result DTOs and `ControlFailureDto` |
 | Wire id newtype | `engine/crates/protocol/src/uuid.rs` | `Uuid` (decimal-string serde + `JsonSchema`) |
 | Static command table | `engine/crates/protocol/src/command.rs` | `COMMANDS`, `CommandSpec`, `COMMAND_FIXTURES`, `COMMAND_SKIPS` |
-| OpenRPC + positional order | `engine/crates/protocol/src/schema.rs` | `fragment_for`, `positional_field_order`, `component_schemas`, `SELECTOR_FIELDS` |
-| Codegen surface | `engine/crates/protocol/src/codegen.rs` | `ts_decls`, `struct_fragments` |
+| OpenRPC + positional order | `engine/crates/protocol/src/schema.rs` | `fragment_for`, `positional_field_order`, `standalone_schema_for` |
+| Codegen surface | `engine/crates/protocol/src/codegen.rs` | `ts_decls`, `schema_fragments` |
 | Typed command registration | `engine/crates/control/src/registry.rs` | `CommandRegistry::register`, `fold_positional_args` |
-| Generator (xtask) | `engine/xtask/src/protocol/mod.rs` | `emit`, `emit_openrpc`, `emit_manifest` |
+| Generator (xtask) | `engine/xtask/src/protocol/mod.rs` | `emit`, `emit_envelope_schema`, `emit_openrpc`, `emit_manifest` |
 | Editor protocol types | `editor/src/protocol/sa-types.ts` | `WireUuid`, `CommandParamsMap`, `CommandResultMap` |
 | Contract / freshness tests | `engine/crates/protocol/tests/`, `engine/crates/e2e/tests/contract_u64.rs` | `inventory`, `wire`, `schema_fragments`, the byte-identity tests, `contract_u64` |
 
 ## Related
+
 - [sa CLI](../sa-cli-protocol/) — the request/response shape and token coercion these types describe
 - [Scene commands](../scene-commands/) — component editing and selection counters
 - [Asset commands](../asset-commands/) — project, catalog, and thumbnail commands

@@ -41,13 +41,40 @@ A request contains a command name, parameters, and an optional correlation ID:
 {"id": 7, "cmd": "ping", "params": {}}
 ```
 
-The reply echoes `id`, always includes `ok`, and carries either `result` or `error`. Command failures also include a machine-readable `code`.
+The reply echoes `id`, always includes `ok`, and carries either `result` or `error`. A failure is a
+typed object with a stable `code` and a human-readable `message`.
 
 ```json
 {"id": 7, "ok": true, "result": {"pong": true, "engine": "Saffron Anima", "version": "0.1.0-vulkan", "pid": 1234}}
 ```
 
+Domain failures use code `diagnostic` and retain exact machine-readable fields:
+
+```json
+{
+  "id": 7,
+  "ok": false,
+  "error": {
+    "code": "diagnostic",
+    "message": "graph estimate exceeds the candidate limit",
+    "diagnostic": {
+      "domain": "vegetation-graph",
+      "detail": {
+        "category": "limit",
+        "resource": "candidates",
+        "requested": "1000001",
+        "limit": "1000000"
+      }
+    }
+  }
+}
+```
+
 An absent ID is echoed as `null`. An unknown command returns code `command`; invalid typed parameters return `params`; commands rejected during project loading return `busy-loading`. A line that is not valid JSON receives the fixed invalid-request envelope.
+
+The envelope schema rejects unknown fields and the former string-only error shape. Socket clients,
+the native editor bridge, and TypeScript preserve the same failure object rather than translating it
+into another error format.
 
 Entity and asset IDs use decimal JSON strings in DTO fields, preserving the full `u64` range across JavaScript clients. Selector inputs accept an ID or exact name where the command contract declares a selector.
 
@@ -113,7 +140,8 @@ Command handlers must keep synchronous work bounded. Operations such as project 
 | Command rows, typed dispatch, and redraw classification | `engine/crates/control/src/registry.rs` | `CommandRegistry`, `EngineContext`, `is_read_only_command` |
 | Socket framing and path lifecycle | `engine/crates/control/src/server.rs` | `ControlServer`, `start_control_server`, `control_socket_path` |
 | Per-frame assembly and polling | `engine/crates/control/src/context.rs` | `ControlContext::poll`, `ControlContext::advance_project_load` |
-| Error codes | `engine/crates/control/src/error.rs` | `Error`, `Error::code` |
+| Failure conversion | `engine/crates/control/src/error.rs` | `Error`, `Error::into_failure` |
+| Wire failure DTOs | `engine/crates/protocol/src/control_dto.rs` | `ControlFailureDto`, `ControlDiagnosticDto`, `VegetationGraphDiagnosticDto` |
 | Host loop integration | `engine/crates/host/src/layer.rs` | `poll_control`, `advance_project_load` |
 | Editor version reconciliation | `editor/src/state/store.ts` | `startReconcile` |
 
