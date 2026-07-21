@@ -18,7 +18,7 @@ const MAP_CHUNK_MAGIC: &[u8; 8] = b"SVEGCH01";
 /// SHA-256 identity of the `.splant` binary field vocabulary.
 #[must_use]
 pub fn plant_asset_schema_hash() -> [u8; 32] {
-    sha256(b"saffron-anima/splant/schema/v2/source+parts+dimensions+materials+spines+mechanics+phenotypes+collision+navigation+interaction+habitat-shade-tolerance")
+    sha256(b"saffron-anima/splant/schema/v4/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotypes+collision+navigation+interaction+habitat")
 }
 
 /// SHA-256 identity of the `.sbiome` binary field vocabulary.
@@ -30,13 +30,13 @@ pub fn biome_asset_schema_hash() -> [u8; 32] {
 /// SHA-256 identity of the `.svegmap` manifest field vocabulary.
 #[must_use]
 pub fn vegetation_map_schema_hash() -> [u8; 32] {
-    sha256(b"saffron-anima/svegmap/schema/v1/identity+bounds+chunk-layout+layers+biome-instances+brush-history")
+    sha256(b"saffron-anima/svegmap/schema/v2/identity+bounds+chunk-layout+generation+canonical-content-addressed-inventory")
 }
 
 /// SHA-256 identity of one authored sparse map-chunk field vocabulary.
 #[must_use]
 pub fn vegetation_map_chunk_schema_hash() -> [u8; 32] {
-    sha256(b"saffron-anima/svegmap-chunk/schema/v2/map+cell+revision+fields+layered-explicit+pins+transform+state+blockers+provenance-decision-dag+family+optional-plant-id")
+    sha256(b"saffron-anima/svegmap-object/schema/v3/map+layer+global-or-cell+typed-field-anchor-graph-layer-editor-payload+revision+provenance")
 }
 
 /// Writes one plant family to canonical `.splant` bytes.
@@ -45,6 +45,10 @@ pub fn write_plant_asset(asset: &PlantFamilyAsset) -> Result<Vec<u8>> {
     let mut writer = Writer::with_header(PLANT_MAGIC, asset.version, plant_asset_schema_hash());
     writer.uuid(asset.id);
     writer.string(&asset.name)?;
+    writer.vec(&asset.tags, |writer, tag| {
+        writer.u64(tag.value());
+        Ok(())
+    })?;
     write_plant_source(&mut writer, &asset.source)?;
     writer.vec(&asset.parts, |writer, part| {
         writer.u128(part.id);
@@ -66,6 +70,18 @@ pub fn write_plant_asset(asset: &PlantFamilyAsset) -> Result<Vec<u8>> {
     })?;
     writer.vec(&asset.spines, write_spine)?;
     write_mechanics(&mut writer, asset.mechanics);
+    writer.vec(&asset.variations, |writer, variation| {
+        writer.u32(variation.id);
+        writer.string(&variation.name)?;
+        writer.vec(&variation.sources, |writer, source| {
+            writer.u128(*source);
+            Ok(())
+        })?;
+        writer.vec(&variation.active_parts, |writer, part| {
+            writer.u128(*part);
+            Ok(())
+        })
+    })?;
     writer.vec(&asset.phenotypes, |writer, phenotype| {
         writer.u32(phenotype.id);
         writer.u8(phenotype_role_tag(phenotype.role));
@@ -130,6 +146,7 @@ pub fn read_plant_asset(bytes: &[u8]) -> Result<PlantFamilyAsset> {
         version: PLANT_ASSET_VERSION,
         id: reader.uuid()?,
         name: reader.string()?,
+        tags: reader.vec(|reader| PlantTagId::new(reader.u64()?))?,
         source: read_plant_source(&mut reader)?,
         parts: reader.vec(|reader| {
             Ok(PlantPart {
@@ -144,6 +161,14 @@ pub fn read_plant_asset(bytes: &[u8]) -> Result<PlantFamilyAsset> {
         material_slots: reader.vec(Reader::uuid)?,
         spines: reader.vec(read_spine)?,
         mechanics: read_mechanics(&mut reader)?,
+        variations: reader.vec(|reader| {
+            Ok(PlantVariation {
+                id: reader.u32()?,
+                name: reader.string()?,
+                sources: reader.vec(Reader::u128)?,
+                active_parts: reader.vec(Reader::u128)?,
+            })
+        })?,
         phenotypes: reader.vec(|reader| {
             Ok(PlantPhenotype {
                 id: reader.u32()?,
@@ -193,26 +218,21 @@ fn write_plant_source(writer: &mut Writer, source: &PlantFamilySource) -> Result
             writer.u8(0);
             writer.vec(&recipe.sources, |writer, source| {
                 writer.u128(source.id);
-                writer.option(source.asset, |writer, value| {
-                    writer.uuid(value);
-                    Ok(())
-                })?;
-                writer.string(&source.uri)?;
+                write_source_locator(writer, &source.locator)?;
+                writer.u8(source_role_tag(source.role));
+                write_source_selector(writer, &source.selector)?;
                 writer.bytes(&source.content_hash);
+                write_import_settings(writer, &source.settings)?;
+                write_source_provenance(writer, &source.provenance)?;
                 Ok(())
             })?;
-            writer.u8(source_units_tag(recipe.settings.units));
-            writer.u8(source_axis_tag(recipe.settings.up_axis));
-            writer.u8(source_axis_tag(recipe.settings.forward_axis));
-            writer.fixed(recipe.settings.scale);
-            writer.bool(recipe.settings.merge_identical_parts);
-            writer.bool(recipe.settings.generate_tangents);
-            writer.vec(&recipe.semantic_part_mapping, |writer, (name, id)| {
-                writer.string(name)?;
-                writer.u128(*id);
+            writer.vec(&recipe.semantic_targets, |writer, target| {
+                writer.u128(target.id);
+                writer.u128(target.source);
+                write_source_selector(writer, &target.selector)?;
+                write_semantic_destination(writer, target.destination);
                 Ok(())
-            })?;
-            write_source_provenance(writer, &recipe.provenance)
+            })
         }
         PlantFamilySource::Native(graph) => {
             writer.u8(1);
@@ -228,21 +248,22 @@ fn read_plant_source(reader: &mut Reader<'_>) -> Result<PlantFamilySource> {
             sources: reader.vec(|reader| {
                 Ok(PlantSourceReference {
                     id: reader.u128()?,
-                    asset: reader.option(Reader::uuid)?,
-                    uri: reader.string()?,
+                    locator: read_source_locator(reader)?,
+                    role: source_role(reader.u8()?)?,
+                    selector: read_source_selector(reader)?,
                     content_hash: reader.array()?,
+                    settings: read_import_settings(reader)?,
+                    provenance: read_source_provenance(reader)?,
                 })
             })?,
-            settings: PlantImportSettings {
-                units: source_units(reader.u8()?)?,
-                up_axis: source_axis(reader.u8()?)?,
-                forward_axis: source_axis(reader.u8()?)?,
-                scale: reader.fixed()?,
-                merge_identical_parts: reader.bool()?,
-                generate_tangents: reader.bool()?,
-            },
-            semantic_part_mapping: reader.vec(|reader| Ok((reader.string()?, reader.u128()?)))?,
-            provenance: read_source_provenance(reader)?,
+            semantic_targets: reader.vec(|reader| {
+                Ok(PlantManualSemanticTarget {
+                    id: reader.u128()?,
+                    source: reader.u128()?,
+                    selector: read_source_selector(reader)?,
+                    destination: read_semantic_destination(reader)?,
+                })
+            })?,
         })),
         1 => Ok(PlantFamilySource::Native(NativeBotanicalGraph {
             schema_hash: reader.array()?,
@@ -256,7 +277,9 @@ fn write_source_provenance(writer: &mut Writer, value: &SourceProvenance) -> Res
     writer.string(&value.source)?;
     writer.string(&value.source_uri)?;
     writer.string(&value.license_id)?;
+    writer.string(&value.license_uri)?;
     writer.string(&value.author)?;
+    writer.string(&value.attribution)?;
     writer.bool(value.requires_attribution);
     Ok(())
 }
@@ -266,9 +289,162 @@ fn read_source_provenance(reader: &mut Reader<'_>) -> Result<SourceProvenance> {
         source: reader.string()?,
         source_uri: reader.string()?,
         license_id: reader.string()?,
+        license_uri: reader.string()?,
         author: reader.string()?,
+        attribution: reader.string()?,
         requires_attribution: reader.bool()?,
     })
+}
+
+fn write_source_locator(writer: &mut Writer, locator: &PlantSourceLocator) -> Result<()> {
+    match locator {
+        PlantSourceLocator::Asset(asset) => {
+            writer.u8(0);
+            writer.uuid(*asset);
+        }
+        PlantSourceLocator::File(uri) => {
+            writer.u8(1);
+            writer.string(uri)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_source_locator(reader: &mut Reader<'_>) -> Result<PlantSourceLocator> {
+    match reader.u8()? {
+        0 => Ok(PlantSourceLocator::Asset(reader.uuid()?)),
+        1 => Ok(PlantSourceLocator::File(reader.string()?)),
+        _ => Err(reader.invalid("source.locator")),
+    }
+}
+
+fn write_source_selector(writer: &mut Writer, selector: &PlantSourceSelector) -> Result<()> {
+    match selector {
+        PlantSourceSelector::Whole => writer.u8(0),
+        PlantSourceSelector::Element { id, path } => {
+            writer.u8(1);
+            writer.u128(*id);
+            writer.string(path)?;
+        }
+        PlantSourceSelector::Submesh { element, index } => {
+            writer.u8(2);
+            writer.u128(*element);
+            writer.u32(*index);
+        }
+    }
+    Ok(())
+}
+
+fn read_source_selector(reader: &mut Reader<'_>) -> Result<PlantSourceSelector> {
+    match reader.u8()? {
+        0 => Ok(PlantSourceSelector::Whole),
+        1 => Ok(PlantSourceSelector::Element {
+            id: reader.u128()?,
+            path: reader.string()?,
+        }),
+        2 => Ok(PlantSourceSelector::Submesh {
+            element: reader.u128()?,
+            index: reader.u32()?,
+        }),
+        _ => Err(reader.invalid("source.selector")),
+    }
+}
+
+fn write_import_settings(writer: &mut Writer, settings: &PlantImportSettings) -> Result<()> {
+    writer.u8(source_units_tag(settings.units));
+    writer.u8(source_axis_tag(settings.up_axis));
+    writer.u8(source_axis_tag(settings.forward_axis));
+    writer.u8(source_handedness_tag(settings.handedness));
+    writer.fixed(settings.scale);
+    write_plant_pivot(writer, &settings.pivot);
+    writer.u8(source_winding_tag(settings.winding));
+    writer.u8(source_uv_origin_tag(settings.uv_origin));
+    writer.fixed2(settings.uv_scale);
+    writer.fixed2(settings.uv_offset);
+    writer.u8(tangent_policy_tag(settings.tangent_policy));
+    Ok(())
+}
+
+fn read_import_settings(reader: &mut Reader<'_>) -> Result<PlantImportSettings> {
+    Ok(PlantImportSettings {
+        units: source_units(reader.u8()?)?,
+        up_axis: source_axis(reader.u8()?)?,
+        forward_axis: source_axis(reader.u8()?)?,
+        handedness: source_handedness(reader.u8()?)?,
+        scale: reader.fixed()?,
+        pivot: read_plant_pivot(reader)?,
+        winding: source_winding(reader.u8()?)?,
+        uv_origin: source_uv_origin(reader.u8()?)?,
+        uv_scale: reader.fixed2()?,
+        uv_offset: reader.fixed2()?,
+        tangent_policy: tangent_policy(reader.u8()?)?,
+    })
+}
+
+fn write_plant_pivot(writer: &mut Writer, pivot: &PlantPivot) {
+    match pivot {
+        PlantPivot::SourceOrigin => writer.u8(0),
+        PlantPivot::BoundsBaseCenter => writer.u8(1),
+        PlantPivot::Explicit(position) => {
+            writer.u8(2);
+            writer.fixed3(*position);
+        }
+        PlantPivot::SemanticPart(part) => {
+            writer.u8(3);
+            writer.u128(*part);
+        }
+    }
+}
+
+fn read_plant_pivot(reader: &mut Reader<'_>) -> Result<PlantPivot> {
+    match reader.u8()? {
+        0 => Ok(PlantPivot::SourceOrigin),
+        1 => Ok(PlantPivot::BoundsBaseCenter),
+        2 => Ok(PlantPivot::Explicit(reader.fixed3()?)),
+        3 => Ok(PlantPivot::SemanticPart(reader.u128()?)),
+        _ => Err(reader.invalid("source.settings.pivot")),
+    }
+}
+
+fn write_semantic_destination(writer: &mut Writer, destination: PlantSemanticDestination) {
+    match destination {
+        PlantSemanticDestination::Part(id) => {
+            writer.u8(0);
+            writer.u128(id);
+        }
+        PlantSemanticDestination::Spine(id) => {
+            writer.u8(1);
+            writer.u128(id);
+        }
+        PlantSemanticDestination::MaterialSlot(slot) => {
+            writer.u8(2);
+            writer.u32(slot);
+        }
+        PlantSemanticDestination::CollisionProxy(id) => {
+            writer.u8(3);
+            writer.u128(id);
+        }
+        PlantSemanticDestination::NavigationProxy(id) => {
+            writer.u8(4);
+            writer.u128(id);
+        }
+        PlantSemanticDestination::Phenotype(id) => {
+            writer.u8(5);
+            writer.u32(id);
+        }
+    }
+}
+
+fn read_semantic_destination(reader: &mut Reader<'_>) -> Result<PlantSemanticDestination> {
+    match reader.u8()? {
+        0 => Ok(PlantSemanticDestination::Part(reader.u128()?)),
+        1 => Ok(PlantSemanticDestination::Spine(reader.u128()?)),
+        2 => Ok(PlantSemanticDestination::MaterialSlot(reader.u32()?)),
+        3 => Ok(PlantSemanticDestination::CollisionProxy(reader.u128()?)),
+        4 => Ok(PlantSemanticDestination::NavigationProxy(reader.u128()?)),
+        5 => Ok(PlantSemanticDestination::Phenotype(reader.u32()?)),
+        _ => Err(reader.invalid("source.semanticTargets.destination")),
+    }
 }
 
 fn write_dimensions(writer: &mut Writer, value: PlantDimensions) {
@@ -526,7 +702,7 @@ fn biome_parameter_type(value: u8) -> Result<BiomeParameterType> {
     }
 }
 
-/// Writes one vegetation-map manifest to canonical `.svegmap` bytes.
+/// Writes one vegetation-map root to canonical `.svegmap` bytes.
 pub fn write_vegetation_map_asset(asset: &VegetationMapAsset) -> Result<Vec<u8>> {
     validate_vegetation_map(asset)?;
     let mut writer = Writer::with_header(MAP_MAGIC, asset.version, vegetation_map_schema_hash());
@@ -535,30 +711,18 @@ pub fn write_vegetation_map_asset(asset: &VegetationMapAsset) -> Result<Vec<u8>>
     writer.bounds(asset.bounds);
     writer.u8(asset.chunk_layout.level);
     writer.bytes(&asset.chunk_layout.schema_hash);
-    writer.vec(&asset.layers, write_layer)?;
-    writer.vec(&asset.biome_instances, |writer, instance| {
-        writer.u128(instance.id);
-        writer.uuid(instance.biome);
-        writer.bounds(instance.bounds);
-        writer.vec(&instance.bindings, |writer, (parameter, value)| {
-            writer.u128(*parameter);
-            writer.value(value)
-        })?;
-        writer.u64(instance.revision);
+    writer.u64(asset.generation);
+    writer.vec(&asset.inventory, |writer, reference| {
+        write_map_chunk_key(writer, reference.key);
+        writer.bytes(&reference.content_hash);
+        writer.u64(reference.byte_length);
+        writer.u64(reference.revision);
         Ok(())
-    })?;
-    writer.vec(&asset.brush_history, |writer, gesture| {
-        writer.u128(gesture.gesture);
-        writer.u128(gesture.layer);
-        writer.vec(&gesture.samples, |writer, sample| {
-            writer.position(*sample);
-            Ok(())
-        })
     })?;
     Ok(writer.finish())
 }
 
-/// Reads and strictly validates one canonical `.svegmap` manifest byte stream.
+/// Reads and strictly validates one canonical `.svegmap` root byte stream.
 pub fn read_vegetation_map_asset(bytes: &[u8]) -> Result<VegetationMapAsset> {
     let mut reader = Reader::with_header(
         bytes,
@@ -576,21 +740,13 @@ pub fn read_vegetation_map_asset(bytes: &[u8]) -> Result<VegetationMapAsset> {
             level: reader.u8()?,
             schema_hash: reader.array()?,
         },
-        layers: reader.vec(read_layer)?,
-        biome_instances: reader.vec(|reader| {
-            Ok(LocalBiomeInstance {
-                id: reader.u128()?,
-                biome: reader.uuid()?,
-                bounds: reader.bounds()?,
-                bindings: reader.vec(|reader| Ok((reader.u128()?, reader.value()?)))?,
+        generation: reader.u64()?,
+        inventory: reader.vec(|reader| {
+            Ok(VegetationMapChunkReference {
+                key: read_map_chunk_key(reader)?,
+                content_hash: reader.array()?,
+                byte_length: reader.u64()?,
                 revision: reader.u64()?,
-            })
-        })?,
-        brush_history: reader.vec(|reader| {
-            Ok(BrushGestureMetadata {
-                gesture: reader.u128()?,
-                layer: reader.u128()?,
-                samples: reader.vec(Reader::position)?,
             })
         })?,
     };
@@ -599,55 +755,82 @@ pub fn read_vegetation_map_asset(bytes: &[u8]) -> Result<VegetationMapAsset> {
     Ok(asset)
 }
 
-/// Writes one sparse authored map chunk to canonical internal bytes.
+/// Writes one typed immutable authored map object to canonical internal bytes.
 pub fn write_vegetation_map_chunk(chunk: &VegetationMapChunk) -> Result<Vec<u8>> {
     validate_map_chunk(chunk)?;
+    let mut chunk = chunk.clone();
+    canonicalize_map_chunk(&mut chunk);
     let mut writer = Writer::with_header(
         MAP_CHUNK_MAGIC,
         chunk.version,
         vegetation_map_chunk_schema_hash(),
     );
     writer.uuid(chunk.map);
-    writer.cell(chunk.cell);
+    write_map_chunk_key(&mut writer, chunk.key);
     writer.u64(chunk.revision);
-    writer.vec(&chunk.fields, write_authored_field)?;
-    writer.vec(&chunk.explicit_plants, |writer, anchor| {
-        writer.plant_id(anchor.id);
-        writer.u128(anchor.layer);
-        writer.uuid(anchor.family);
-        write_plant_point(writer, &anchor.point)
-    })?;
-    writer.vec(&chunk.pins, |writer, plant| {
-        writer.plant_id(*plant);
-        Ok(())
-    })?;
-    writer.vec(&chunk.transform_overrides, |writer, value| {
-        writer.plant_id(value.plant);
-        writer.position(value.position);
-        writer.fixed3(value.scale);
-        Ok(())
-    })?;
-    writer.vec(&chunk.state_overrides, |writer, value| {
-        writer.plant_id(value.plant);
-        writer.option(value.health, |writer, value| {
-            writer.unit(value);
-            Ok(())
-        })?;
-        writer.option(value.moisture, |writer, value| {
-            writer.unit(value);
-            Ok(())
-        })?;
-        writer.option(value.fuel, |writer, value| {
-            writer.unit(value);
-            Ok(())
-        })?;
-        writer.option(value.interaction_policy, |writer, value| {
-            writer.u32(value as u32);
-            Ok(())
-        })
-    })?;
-    writer.vec(&chunk.blockers, write_authored_field)?;
-    writer.vec(chunk.provenance.decisions(), |writer, decision| {
+    match &chunk.payload {
+        VegetationMapChunkPayload::Field(payload) => {
+            writer.vec(&payload.fields, write_authored_field)?;
+            writer.vec(&payload.blockers, write_authored_field)?;
+        }
+        VegetationMapChunkPayload::AnchorOverride(payload) => {
+            writer.vec(&payload.explicit_plants, |writer, anchor| {
+                writer.plant_id(anchor.id);
+                writer.u128(anchor.layer);
+                writer.uuid(anchor.family);
+                write_plant_point(writer, &anchor.point)
+            })?;
+            writer.vec(&payload.pins, |writer, plant| {
+                writer.plant_id(*plant);
+                Ok(())
+            })?;
+            writer.vec(&payload.transform_overrides, |writer, value| {
+                writer.plant_id(value.plant);
+                writer.position(value.position);
+                writer.fixed3(value.scale);
+                Ok(())
+            })?;
+            writer.vec(&payload.state_overrides, |writer, value| {
+                writer.plant_id(value.plant);
+                writer.option(value.health, |writer, value| {
+                    writer.unit(value);
+                    Ok(())
+                })?;
+                writer.option(value.moisture, |writer, value| {
+                    writer.unit(value);
+                    Ok(())
+                })?;
+                writer.option(value.fuel, |writer, value| {
+                    writer.unit(value);
+                    Ok(())
+                })?;
+                writer.option(value.interaction_policy, |writer, value| {
+                    writer.u32(value as u32);
+                    Ok(())
+                })
+            })?;
+            write_provenance(&mut writer, &payload.provenance)?;
+        }
+        VegetationMapChunkPayload::GraphInstance(instance) => {
+            write_local_biome_instance(&mut writer, instance)?;
+        }
+        VegetationMapChunkPayload::LayerMetadata(layer) => write_layer(&mut writer, layer)?,
+        VegetationMapChunkPayload::EditorMetadata(gestures) => {
+            writer.vec(gestures, |writer, gesture| {
+                writer.u128(gesture.gesture);
+                writer.u128(gesture.layer);
+                writer.vec(&gesture.samples, |writer, sample| {
+                    writer.position(*sample);
+                    Ok(())
+                })
+            })?;
+        }
+    }
+    Ok(writer.finish())
+}
+
+fn write_provenance(writer: &mut Writer, provenance: &ProvenanceTable) -> Result<()> {
+    writer.vec(provenance.decisions(), |writer, decision| {
         writer.vec(&decision.parents, |writer, parent| {
             writer.u32(parent.0);
             Ok(())
@@ -662,7 +845,7 @@ pub fn write_vegetation_map_chunk(chunk: &VegetationMapChunk) -> Result<Vec<u8>>
         writer.u8(provenance_outcome_tag(decision.outcome));
         Ok(())
     })?;
-    writer.vec(chunk.provenance.records(), |writer, record| {
+    writer.vec(provenance.records(), |writer, record| {
         writer.uuid(record.map);
         writer.u128(record.layer);
         writer.uuid(record.biome);
@@ -678,11 +861,10 @@ pub fn write_vegetation_map_chunk(chunk: &VegetationMapChunk) -> Result<Vec<u8>>
         })?;
         writer.u32(record.variation);
         Ok(())
-    })?;
-    Ok(writer.finish())
+    })
 }
 
-/// Reads and strictly validates one canonical sparse authored map chunk.
+/// Reads and strictly validates one canonical immutable authored map object.
 pub fn read_vegetation_map_chunk(bytes: &[u8]) -> Result<VegetationMapChunk> {
     let mut reader = Reader::with_header(
         bytes,
@@ -692,36 +874,79 @@ pub fn read_vegetation_map_chunk(bytes: &[u8]) -> Result<VegetationMapChunk> {
         ".svegmap chunk",
     )?;
     let map = reader.uuid()?;
-    let cell = reader.cell()?;
+    let key = read_map_chunk_key(&mut reader)?;
     let revision = reader.u64()?;
-    let fields = reader.vec(read_authored_field)?;
-    let explicit_plants = reader.vec(|reader| {
-        Ok(ExplicitPlantAnchor {
-            id: reader.plant_id()?,
-            layer: reader.u128()?,
-            family: reader.uuid()?,
-            point: read_plant_point(reader)?,
-        })
-    })?;
-    let pins = reader.vec(Reader::plant_id)?;
-    let transform_overrides = reader.vec(|reader| {
-        Ok(PlantTransformOverride {
-            plant: reader.plant_id()?,
-            position: reader.position()?,
-            scale: reader.fixed3()?,
-        })
-    })?;
-    let state_overrides = reader.vec(|reader| {
-        Ok(PlantStateOverride {
-            plant: reader.plant_id()?,
-            health: reader.option(Reader::unit)?,
-            moisture: reader.option(Reader::unit)?,
-            fuel: reader.option(Reader::unit)?,
-            interaction_policy: reader
-                .option(|reader| InteractionPolicy::try_from(reader.u32()?))?,
-        })
-    })?;
-    let blockers = reader.vec(read_authored_field)?;
+    let payload = match key.kind {
+        VegetationMapChunkKind::Field => {
+            VegetationMapChunkPayload::Field(VegetationMapFieldChunk {
+                fields: reader.vec(read_authored_field)?,
+                blockers: reader.vec(read_authored_field)?,
+            })
+        }
+        VegetationMapChunkKind::AnchorOverride => {
+            let explicit_plants = reader.vec(|reader| {
+                Ok(ExplicitPlantAnchor {
+                    id: reader.plant_id()?,
+                    layer: reader.u128()?,
+                    family: reader.uuid()?,
+                    point: read_plant_point(reader)?,
+                })
+            })?;
+            let pins = reader.vec(Reader::plant_id)?;
+            let transform_overrides = reader.vec(|reader| {
+                Ok(PlantTransformOverride {
+                    plant: reader.plant_id()?,
+                    position: reader.position()?,
+                    scale: reader.fixed3()?,
+                })
+            })?;
+            let state_overrides = reader.vec(|reader| {
+                Ok(PlantStateOverride {
+                    plant: reader.plant_id()?,
+                    health: reader.option(Reader::unit)?,
+                    moisture: reader.option(Reader::unit)?,
+                    fuel: reader.option(Reader::unit)?,
+                    interaction_policy: reader
+                        .option(|reader| InteractionPolicy::try_from(reader.u32()?))?,
+                })
+            })?;
+            VegetationMapChunkPayload::AnchorOverride(VegetationMapAnchorChunk {
+                explicit_plants,
+                pins,
+                transform_overrides,
+                state_overrides,
+                provenance: read_provenance(&mut reader)?,
+            })
+        }
+        VegetationMapChunkKind::GraphInstance => {
+            VegetationMapChunkPayload::GraphInstance(read_local_biome_instance(&mut reader)?)
+        }
+        VegetationMapChunkKind::LayerMetadata => {
+            VegetationMapChunkPayload::LayerMetadata(read_layer(&mut reader)?)
+        }
+        VegetationMapChunkKind::EditorMetadata => {
+            VegetationMapChunkPayload::EditorMetadata(reader.vec(|reader| {
+                Ok(BrushGestureMetadata {
+                    gesture: reader.u128()?,
+                    layer: reader.u128()?,
+                    samples: reader.vec(Reader::position)?,
+                })
+            })?)
+        }
+    };
+    let chunk = VegetationMapChunk {
+        version: VEGETATION_MAP_CHUNK_VERSION,
+        map,
+        key,
+        revision,
+        payload,
+    };
+    reader.complete()?;
+    validate_map_chunk(&chunk)?;
+    Ok(chunk)
+}
+
+fn read_provenance(reader: &mut Reader<'_>) -> Result<ProvenanceTable> {
     let decisions: Vec<ProvenanceDecision> = reader.vec(|reader| {
         Ok(ProvenanceDecision {
             parents: reader.vec(|reader| Ok(ProvenanceDecisionHandle(reader.u32()?)))?,
@@ -758,22 +983,7 @@ pub fn read_vegetation_map_chunk(bytes: &[u8]) -> Result<VegetationMapChunk> {
             return Err(reader.invalid("provenance.records"));
         }
     }
-    let chunk = VegetationMapChunk {
-        version: VEGETATION_MAP_CHUNK_VERSION,
-        map,
-        cell,
-        revision,
-        fields,
-        explicit_plants,
-        pins,
-        transform_overrides,
-        state_overrides,
-        blockers,
-        provenance,
-    };
-    reader.complete()?;
-    validate_map_chunk(&chunk)?;
-    Ok(chunk)
+    Ok(provenance)
 }
 
 fn validate_map_chunk(chunk: &VegetationMapChunk) -> Result<()> {
@@ -784,75 +994,259 @@ fn validate_map_chunk(chunk: &VegetationMapChunk) -> Result<()> {
             expected: VEGETATION_MAP_CHUNK_VERSION,
         });
     }
-    if chunk.map.value() == 0 {
+    if chunk.map.value() == 0
+        || chunk.key.layer == 0
+        || chunk.key.kind != chunk.payload.kind()
+        || !matches!(
+            (chunk.key.kind, chunk.key.tile),
+            (
+                VegetationMapChunkKind::Field | VegetationMapChunkKind::AnchorOverride,
+                VegetationMapTileKey::Cell(_)
+            ) | (
+                VegetationMapChunkKind::GraphInstance
+                    | VegetationMapChunkKind::LayerMetadata
+                    | VegetationMapChunkKind::EditorMetadata,
+                VegetationMapTileKey::Global
+            )
+        )
+    {
         return Err(Error::InvalidFormat {
             format: ".svegmap chunk",
-            field: "map".to_owned(),
+            field: "map/key/payload".to_owned(),
         });
     }
-    let mut field_keys = std::collections::BTreeSet::new();
-    for field in chunk.fields.iter().chain(&chunk.blockers) {
-        let sample_count = field
-            .dimensions
-            .iter()
-            .try_fold(1_u64, |product, dimension| {
-                product
-                    .checked_mul(u64::from(*dimension))
-                    .ok_or(Error::NumericOverflow)
-            })?;
-        if field.layer == 0
-            || field.quantum_bits <= 0
-            || field.dimensions.contains(&0)
-            || usize::try_from(sample_count).ok() != Some(field.values.len())
-            || !field_keys.insert((field.layer, field.channel))
-        {
-            return Err(Error::InvalidFormat {
-                format: ".svegmap chunk",
-                field: "fields/blockers".to_owned(),
-            });
-        }
-    }
-    let mut anchor_ids = std::collections::BTreeSet::new();
-    for anchor in &chunk.explicit_plants {
-        anchor.point.validate()?;
-        if anchor.id != anchor.point.id
-            || anchor.layer == 0
-            || anchor.family != anchor.point.family
-            || !chunk.cell.bounds().contains(anchor.point.position)
-            || anchor.id.namespace()? != PlantIdNamespace::Explicit
-            || !anchor_ids.insert(anchor.id)
-        {
-            return Err(Error::InvalidFormat {
-                format: ".svegmap chunk",
-                field: "explicitPlants".to_owned(),
-            });
-        }
-    }
-    for (index, decision) in chunk.provenance.decisions().iter().enumerate() {
-        if decision.node == 0
-            || decision
-                .parents
+    match &chunk.payload {
+        VegetationMapChunkPayload::Field(payload) => {
+            if payload.fields.is_empty() && payload.blockers.is_empty() {
+                return Err(Error::InvalidFormat {
+                    format: ".svegmap chunk",
+                    field: "fields/blockers".to_owned(),
+                });
+            }
+            let mut field_keys = std::collections::BTreeSet::new();
+            for (blocker, field) in payload
+                .fields
                 .iter()
-                .any(|parent| usize::try_from(parent.0).map_or(true, |parent| parent >= index))
-        {
-            return Err(Error::InvalidFormat {
-                format: ".svegmap chunk",
-                field: "provenance.decisions".to_owned(),
-            });
+                .map(|field| (false, field))
+                .chain(payload.blockers.iter().map(|field| (true, field)))
+            {
+                let sample_count =
+                    field
+                        .dimensions
+                        .iter()
+                        .try_fold(1_u64, |product, dimension| {
+                            product
+                                .checked_mul(u64::from(*dimension))
+                                .ok_or(Error::NumericOverflow)
+                        })?;
+                if field.layer != chunk.key.layer
+                    || field.quantum_bits <= 0
+                    || field.dimensions.contains(&0)
+                    || usize::try_from(sample_count).ok() != Some(field.values.len())
+                    || !field_keys.insert((blocker, field.channel))
+                {
+                    return Err(Error::InvalidFormat {
+                        format: ".svegmap chunk",
+                        field: "fields/blockers".to_owned(),
+                    });
+                }
+            }
         }
-    }
-    for record in chunk.provenance.records() {
-        if record.map != chunk.map
-            || chunk.provenance.decision(record.decision).is_none()
-            || record.plant.is_some() && record.family.is_none()
-        {
-            return Err(Error::InvalidFormat {
-                format: ".svegmap chunk",
-                field: "provenance.records".to_owned(),
-            });
+        VegetationMapChunkPayload::AnchorOverride(payload) => {
+            let VegetationMapTileKey::Cell(cell) = chunk.key.tile else {
+                unreachable!();
+            };
+            if payload.explicit_plants.is_empty()
+                && payload.pins.is_empty()
+                && payload.transform_overrides.is_empty()
+                && payload.state_overrides.is_empty()
+                && payload.provenance.records().is_empty()
+            {
+                return Err(Error::InvalidFormat {
+                    format: ".svegmap chunk",
+                    field: "anchorOverrides".to_owned(),
+                });
+            }
+            let mut anchor_ids = std::collections::BTreeSet::new();
+            for anchor in &payload.explicit_plants {
+                anchor.point.validate()?;
+                if anchor.id != anchor.point.id
+                    || anchor.layer != chunk.key.layer
+                    || anchor.family != anchor.point.family
+                    || !cell.bounds().contains(anchor.point.position)
+                    || anchor.id.namespace()? != PlantIdNamespace::Explicit
+                    || payload
+                        .provenance
+                        .get(ProvenanceHandle(anchor.point.provenance))
+                        .is_none()
+                    || !anchor_ids.insert(anchor.id)
+                {
+                    return Err(Error::InvalidFormat {
+                        format: ".svegmap chunk",
+                        field: "explicitPlants".to_owned(),
+                    });
+                }
+            }
+            if !all_unique(payload.pins.iter().copied())
+                || !all_unique(payload.transform_overrides.iter().map(|value| value.plant))
+                || !all_unique(payload.state_overrides.iter().map(|value| value.plant))
+            {
+                return Err(Error::InvalidFormat {
+                    format: ".svegmap chunk",
+                    field: "pins/transformOverrides/stateOverrides".to_owned(),
+                });
+            }
+            for (index, decision) in payload.provenance.decisions().iter().enumerate() {
+                if decision.node == 0
+                    || decision.parents.iter().any(|parent| {
+                        usize::try_from(parent.0).map_or(true, |parent| parent >= index)
+                    })
+                {
+                    return Err(Error::InvalidFormat {
+                        format: ".svegmap chunk",
+                        field: "provenance.decisions".to_owned(),
+                    });
+                }
+            }
+            for record in payload.provenance.records() {
+                if record.map != chunk.map
+                    || record.layer != chunk.key.layer
+                    || payload.provenance.decision(record.decision).is_none()
+                    || record.plant.is_some() && record.family.is_none()
+                {
+                    return Err(Error::InvalidFormat {
+                        format: ".svegmap chunk",
+                        field: "provenance.records".to_owned(),
+                    });
+                }
+            }
+        }
+        VegetationMapChunkPayload::GraphInstance(instance) => {
+            if instance.id != chunk.key.layer
+                || instance.biome.value() == 0
+                || !all_unique(instance.bindings.iter().map(|(parameter, _)| *parameter))
+            {
+                return Err(Error::InvalidFormat {
+                    format: ".svegmap chunk",
+                    field: "graphInstance".to_owned(),
+                });
+            }
+        }
+        VegetationMapChunkPayload::LayerMetadata(layer) => {
+            if layer.id != chunk.key.layer
+                || !all_unique(layer.dependencies.iter().copied())
+                || layer.dependencies.contains(&layer.id)
+            {
+                return Err(Error::InvalidFormat {
+                    format: ".svegmap chunk",
+                    field: "layerMetadata.id".to_owned(),
+                });
+            }
+        }
+        VegetationMapChunkPayload::EditorMetadata(gestures) => {
+            let mut ids = std::collections::BTreeSet::new();
+            if gestures.is_empty()
+                || gestures.iter().any(|gesture| {
+                    gesture.gesture == 0
+                        || gesture.layer != chunk.key.layer
+                        || !ids.insert(gesture.gesture)
+                })
+            {
+                return Err(Error::InvalidFormat {
+                    format: ".svegmap chunk",
+                    field: "editorMetadata".to_owned(),
+                });
+            }
         }
     }
     Ok(())
+}
+
+fn canonicalize_map_chunk(chunk: &mut VegetationMapChunk) {
+    match &mut chunk.payload {
+        VegetationMapChunkPayload::Field(payload) => {
+            payload.fields.sort_by_key(|field| field.channel);
+            payload.blockers.sort_by_key(|field| field.channel);
+        }
+        VegetationMapChunkPayload::AnchorOverride(payload) => {
+            payload.explicit_plants.sort_by_key(|anchor| anchor.id);
+            payload.pins.sort_unstable();
+            payload.transform_overrides.sort_by_key(|value| value.plant);
+            payload.state_overrides.sort_by_key(|value| value.plant);
+        }
+        VegetationMapChunkPayload::GraphInstance(instance) => {
+            instance.bindings.sort_by_key(|(parameter, _)| *parameter);
+        }
+        VegetationMapChunkPayload::LayerMetadata(layer) => {
+            layer.dependencies.sort_unstable();
+        }
+        VegetationMapChunkPayload::EditorMetadata(gestures) => {
+            gestures.sort_by_key(|gesture| gesture.gesture);
+        }
+    }
+}
+
+fn all_unique<T: Ord>(values: impl IntoIterator<Item = T>) -> bool {
+    let mut unique = std::collections::BTreeSet::new();
+    values.into_iter().all(|value| unique.insert(value))
+}
+
+fn write_local_biome_instance(writer: &mut Writer, instance: &LocalBiomeInstance) -> Result<()> {
+    writer.u128(instance.id);
+    writer.uuid(instance.biome);
+    writer.bounds(instance.bounds);
+    writer.vec(&instance.bindings, |writer, (parameter, value)| {
+        writer.u128(*parameter);
+        writer.value(value)
+    })?;
+    writer.u64(instance.revision);
+    Ok(())
+}
+
+fn read_local_biome_instance(reader: &mut Reader<'_>) -> Result<LocalBiomeInstance> {
+    Ok(LocalBiomeInstance {
+        id: reader.u128()?,
+        biome: reader.uuid()?,
+        bounds: reader.bounds()?,
+        bindings: reader.vec(|reader| Ok((reader.u128()?, reader.value()?)))?,
+        revision: reader.u64()?,
+    })
+}
+
+fn write_map_chunk_key(writer: &mut Writer, key: VegetationMapChunkKey) {
+    writer.u128(key.layer);
+    match key.tile {
+        VegetationMapTileKey::Global => writer.u8(0),
+        VegetationMapTileKey::Cell(cell) => {
+            writer.u8(1);
+            writer.cell(cell);
+        }
+    }
+    writer.u8(match key.kind {
+        VegetationMapChunkKind::Field => 0,
+        VegetationMapChunkKind::AnchorOverride => 1,
+        VegetationMapChunkKind::GraphInstance => 2,
+        VegetationMapChunkKind::LayerMetadata => 3,
+        VegetationMapChunkKind::EditorMetadata => 4,
+    });
+}
+
+fn read_map_chunk_key(reader: &mut Reader<'_>) -> Result<VegetationMapChunkKey> {
+    let layer = reader.u128()?;
+    let tile = match reader.u8()? {
+        0 => VegetationMapTileKey::Global,
+        1 => VegetationMapTileKey::Cell(reader.cell()?),
+        _ => return Err(invalid_enum(".svegmap chunk", "key.tile")),
+    };
+    let kind = match reader.u8()? {
+        0 => VegetationMapChunkKind::Field,
+        1 => VegetationMapChunkKind::AnchorOverride,
+        2 => VegetationMapChunkKind::GraphInstance,
+        3 => VegetationMapChunkKind::LayerMetadata,
+        4 => VegetationMapChunkKind::EditorMetadata,
+        _ => return Err(invalid_enum(".svegmap chunk", "key.kind")),
+    };
+    Ok(VegetationMapChunkKey { layer, tile, kind })
 }
 
 fn write_authored_field(writer: &mut Writer, field: &AuthoredFieldTile) -> Result<()> {
@@ -1314,6 +1708,89 @@ fn source_axis(value: u8) -> Result<SourceAxis> {
     }
 }
 
+fn source_role_tag(value: PlantSourceRole) -> u8 {
+    match value {
+        PlantSourceRole::Geometry => 0,
+        PlantSourceRole::Material => 1,
+        PlantSourceRole::Skeleton => 2,
+        PlantSourceRole::Collision => 3,
+        PlantSourceRole::Navigation => 4,
+    }
+}
+
+fn source_role(value: u8) -> Result<PlantSourceRole> {
+    match value {
+        0 => Ok(PlantSourceRole::Geometry),
+        1 => Ok(PlantSourceRole::Material),
+        2 => Ok(PlantSourceRole::Skeleton),
+        3 => Ok(PlantSourceRole::Collision),
+        4 => Ok(PlantSourceRole::Navigation),
+        _ => Err(invalid_enum(".splant", "source.role")),
+    }
+}
+
+fn source_handedness_tag(value: SourceHandedness) -> u8 {
+    match value {
+        SourceHandedness::Right => 0,
+        SourceHandedness::Left => 1,
+    }
+}
+
+fn source_handedness(value: u8) -> Result<SourceHandedness> {
+    match value {
+        0 => Ok(SourceHandedness::Right),
+        1 => Ok(SourceHandedness::Left),
+        _ => Err(invalid_enum(".splant", "source.settings.handedness")),
+    }
+}
+
+fn source_winding_tag(value: SourceWinding) -> u8 {
+    match value {
+        SourceWinding::CounterClockwise => 0,
+        SourceWinding::Clockwise => 1,
+    }
+}
+
+fn source_winding(value: u8) -> Result<SourceWinding> {
+    match value {
+        0 => Ok(SourceWinding::CounterClockwise),
+        1 => Ok(SourceWinding::Clockwise),
+        _ => Err(invalid_enum(".splant", "source.settings.winding")),
+    }
+}
+
+fn source_uv_origin_tag(value: SourceUvOrigin) -> u8 {
+    match value {
+        SourceUvOrigin::TopLeft => 0,
+        SourceUvOrigin::BottomLeft => 1,
+    }
+}
+
+fn source_uv_origin(value: u8) -> Result<SourceUvOrigin> {
+    match value {
+        0 => Ok(SourceUvOrigin::TopLeft),
+        1 => Ok(SourceUvOrigin::BottomLeft),
+        _ => Err(invalid_enum(".splant", "source.settings.uvOrigin")),
+    }
+}
+
+fn tangent_policy_tag(value: PlantTangentPolicy) -> u8 {
+    match value {
+        PlantTangentPolicy::Require => 0,
+        PlantTangentPolicy::GenerateMissing => 1,
+        PlantTangentPolicy::Regenerate => 2,
+    }
+}
+
+fn tangent_policy(value: u8) -> Result<PlantTangentPolicy> {
+    match value {
+        0 => Ok(PlantTangentPolicy::Require),
+        1 => Ok(PlantTangentPolicy::GenerateMissing),
+        2 => Ok(PlantTangentPolicy::Regenerate),
+        _ => Err(invalid_enum(".splant", "source.settings.tangentPolicy")),
+    }
+}
+
 fn plant_part_semantic_tag(value: PlantPartSemantic) -> u8 {
     match value {
         PlantPartSemantic::Trunk => 0,
@@ -1768,6 +2245,7 @@ mod tests {
             version: PLANT_ASSET_VERSION,
             id: Uuid(11),
             name: "Oak".to_owned(),
+            tags: vec![PlantTagId::new(7).unwrap(), PlantTagId::new(19).unwrap()],
             source: PlantFamilySource::Native(NativeBotanicalGraph {
                 schema_hash: [1; 32],
                 graph: Value::Object(Default::default()),
@@ -1798,7 +2276,19 @@ mod tests {
                 damage_threshold: fixed(3),
                 break_threshold: fixed(4),
             },
-            phenotypes: Vec::new(),
+            variations: vec![PlantVariation {
+                id: 0,
+                name: "Default".to_owned(),
+                sources: Vec::new(),
+                active_parts: Vec::new(),
+            }],
+            phenotypes: vec![PlantPhenotype {
+                id: 0,
+                role: PhenotypeRole::Healthy,
+                variation: 0,
+                material_remap: Vec::new(),
+                active_parts: Vec::new(),
+            }],
             collision_proxies: Vec::new(),
             navigation_proxies: Vec::new(),
             interaction_policy: InteractionPolicy::Structural,
@@ -1817,6 +2307,22 @@ mod tests {
         let decoded = read_plant_asset(&bytes).unwrap();
         assert_eq!(decoded, asset);
         assert_eq!(write_plant_asset(&decoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn plant_asset_rejects_noncanonical_family_tags() {
+        let mut asset = plant();
+        asset.tags.swap(0, 1);
+        assert!(matches!(
+            write_plant_asset(&asset),
+            Err(Error::InvalidFormat { field, .. }) if field == "tags"
+        ));
+
+        asset.tags = vec![PlantTagId::new(7).unwrap(); 2];
+        assert!(matches!(
+            write_plant_asset(&asset),
+            Err(Error::InvalidFormat { field, .. }) if field == "tags"
+        ));
     }
 
     #[test]
@@ -1859,8 +2365,67 @@ mod tests {
     }
 
     #[test]
-    fn map_manifest_and_sparse_chunk_round_trip_canonical_bytes() {
+    fn map_root_and_typed_objects_round_trip_canonical_bytes() {
         let bounds = WorldBounds::new([0; 3], [1024; 3]).unwrap();
+        let layer = VegetationLayer {
+            id: 32,
+            name: "Density".to_owned(),
+            coordinate_space: LayerCoordinateSpace::World,
+            bounds,
+            operator: VegetationLayerOperator::Density(FieldTileLayer {
+                channel: FieldChannel::Moisture,
+                tile_set: 33,
+                blend: FieldBlendOperator::Multiply,
+                weight: UnitInterval::ONE,
+            }),
+            dependencies: Vec::new(),
+            order: 0,
+            locked: false,
+            muted: false,
+            revision: 1,
+        };
+        let layer_chunk = VegetationMapChunk {
+            version: VEGETATION_MAP_CHUNK_VERSION,
+            map: Uuid(31),
+            key: VegetationMapChunkKey {
+                layer: layer.id,
+                tile: VegetationMapTileKey::Global,
+                kind: VegetationMapChunkKind::LayerMetadata,
+            },
+            revision: layer.revision,
+            payload: VegetationMapChunkPayload::LayerMetadata(layer),
+        };
+        let field_chunk = VegetationMapChunk {
+            version: VEGETATION_MAP_CHUNK_VERSION,
+            map: Uuid(31),
+            key: VegetationMapChunkKey {
+                layer: 32,
+                tile: VegetationMapTileKey::Cell(WorldCellKey::base(0, 0, 0)),
+                kind: VegetationMapChunkKind::Field,
+            },
+            revision: 2,
+            payload: VegetationMapChunkPayload::Field(VegetationMapFieldChunk {
+                fields: vec![AuthoredFieldTile {
+                    channel: FieldChannel::Moisture,
+                    layer: 32,
+                    dimensions: [2, 1, 1],
+                    quantum_bits: 1,
+                    values: vec![4, 5],
+                }],
+                blockers: Vec::new(),
+            }),
+        };
+        for chunk in [&layer_chunk, &field_chunk] {
+            let bytes = write_vegetation_map_chunk(chunk).unwrap();
+            let decoded = read_vegetation_map_chunk(&bytes).unwrap();
+            assert_eq!(&decoded, chunk);
+            assert_eq!(write_vegetation_map_chunk(&decoded).unwrap(), bytes);
+        }
+        let mut inventory = vec![
+            field_chunk.reference().unwrap(),
+            layer_chunk.reference().unwrap(),
+        ];
+        inventory.sort_by_key(VegetationMapChunkReference::order_key);
         let map = VegetationMapAsset {
             version: VEGETATION_MAP_VERSION,
             id: Uuid(31),
@@ -1870,52 +2435,63 @@ mod tests {
                 level: 0,
                 schema_hash: vegetation_map_chunk_schema_hash(),
             },
-            layers: vec![VegetationLayer {
-                id: 32,
-                name: "Density".to_owned(),
-                coordinate_space: LayerCoordinateSpace::World,
-                bounds,
-                operator: VegetationLayerOperator::Density(FieldTileLayer {
-                    channel: FieldChannel::Moisture,
-                    tile_set: 33,
-                    blend: FieldBlendOperator::Multiply,
-                    weight: UnitInterval::ONE,
-                }),
-                dependencies: Vec::new(),
-                order: 0,
-                locked: false,
-                muted: false,
-                revision: 1,
-            }],
-            biome_instances: Vec::new(),
-            brush_history: Vec::new(),
+            generation: 1,
+            inventory,
         };
         let map_bytes = write_vegetation_map_asset(&map).unwrap();
         assert_eq!(read_vegetation_map_asset(&map_bytes).unwrap(), map);
+        assert_eq!(write_vegetation_map_asset(&map).unwrap(), map_bytes);
+    }
+
+    #[test]
+    fn map_codecs_reject_truncation_corruption_and_old_versions() {
+        let root = VegetationMapAsset {
+            version: VEGETATION_MAP_VERSION,
+            id: Uuid(31),
+            name: "World vegetation".to_owned(),
+            bounds: WorldBounds::new([0; 3], [1024; 3]).unwrap(),
+            chunk_layout: VegetationMapChunkLayout {
+                level: 0,
+                schema_hash: vegetation_map_chunk_schema_hash(),
+            },
+            generation: 0,
+            inventory: Vec::new(),
+        };
+        let root_bytes = write_vegetation_map_asset(&root).unwrap();
+        assert!(read_vegetation_map_asset(&root_bytes[..root_bytes.len() - 1]).is_err());
+        let mut old_root = root_bytes;
+        old_root[11] = (VEGETATION_MAP_VERSION - 1) as u8;
+        assert!(matches!(
+            read_vegetation_map_asset(&old_root),
+            Err(Error::FormatVersion { .. })
+        ));
 
         let chunk = VegetationMapChunk {
             version: VEGETATION_MAP_CHUNK_VERSION,
-            map: map.id,
-            cell: WorldCellKey::base(0, 0, 0),
-            revision: 2,
-            fields: vec![AuthoredFieldTile {
-                channel: FieldChannel::Moisture,
+            map: Uuid(31),
+            key: VegetationMapChunkKey {
                 layer: 32,
-                dimensions: [2, 1, 1],
-                quantum_bits: 1,
-                values: vec![4, 5],
-            }],
-            explicit_plants: Vec::new(),
-            pins: Vec::new(),
-            transform_overrides: Vec::new(),
-            state_overrides: Vec::new(),
-            blockers: Vec::new(),
-            provenance: ProvenanceTable::default(),
+                tile: VegetationMapTileKey::Global,
+                kind: VegetationMapChunkKind::EditorMetadata,
+            },
+            revision: 1,
+            payload: VegetationMapChunkPayload::EditorMetadata(vec![BrushGestureMetadata {
+                gesture: 1,
+                layer: 32,
+                samples: Vec::new(),
+            }]),
         };
-        let chunk_bytes = write_vegetation_map_chunk(&chunk).unwrap();
-        let decoded = read_vegetation_map_chunk(&chunk_bytes).unwrap();
-        assert_eq!(decoded, chunk);
-        assert_eq!(write_vegetation_map_chunk(&decoded).unwrap(), chunk_bytes);
+        let bytes = write_vegetation_map_chunk(&chunk).unwrap();
+        assert!(read_vegetation_map_chunk(&bytes[..bytes.len() - 1]).is_err());
+        let mut corrupt_schema = bytes.clone();
+        corrupt_schema[12] ^= 1;
+        assert!(read_vegetation_map_chunk(&corrupt_schema).is_err());
+        let mut old_version = bytes;
+        old_version[11] = (VEGETATION_MAP_CHUNK_VERSION - 1) as u8;
+        assert!(matches!(
+            read_vegetation_map_chunk(&old_version),
+            Err(Error::FormatVersion { .. })
+        ));
     }
 
     #[test]
@@ -1926,5 +2502,11 @@ mod tests {
         let mut bytes = write_plant_asset(&plant()).unwrap();
         bytes[12] ^= 1;
         assert!(read_plant_asset(&bytes).is_err());
+        let mut old_version = write_plant_asset(&plant()).unwrap();
+        old_version[11] = (PLANT_ASSET_VERSION - 1) as u8;
+        assert!(matches!(
+            read_plant_asset(&old_version),
+            Err(Error::FormatVersion { .. })
+        ));
     }
 }

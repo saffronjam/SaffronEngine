@@ -1,4 +1,4 @@
-//! The three authored vegetation asset models and immutable base-manifest contract.
+//! The three authored vegetation asset models.
 
 use saffron_core::Uuid;
 use saffron_json::Value;
@@ -6,22 +6,19 @@ use saffron_spatial::{
     DecisionScalar, FieldChannel, SurfaceProviderId, UnitInterval, WorldBounds, WorldCellKey,
 };
 
-use crate::hash::sha256;
 use crate::{
     BrushGestureMetadata, InteractionPolicy, PlantId, PlantPoint, PlantStateOverride,
-    PlantTransformOverride, ProvenanceTable, Result, VegetationLayer, point_schema_hash,
+    PlantTransformOverride, ProvenanceTable, Result, VegetationLayer,
 };
 
 /// Current `.splant` document version.
-pub const PLANT_ASSET_VERSION: u32 = 2;
+pub const PLANT_ASSET_VERSION: u32 = 4;
 /// Current `.sbiome` document version.
 pub const BIOME_ASSET_VERSION: u32 = 1;
 /// Current `.svegmap` manifest version.
-pub const VEGETATION_MAP_VERSION: u32 = 1;
+pub const VEGETATION_MAP_VERSION: u32 = 2;
 /// Current sparse authored map-chunk version.
-pub const VEGETATION_MAP_CHUNK_VERSION: u32 = 2;
-/// Current immutable base-manifest version.
-pub const VEGETATION_BASE_MANIFEST_VERSION: u32 = 1;
+pub const VEGETATION_MAP_CHUNK_VERSION: u32 = 3;
 
 /// Asset/source licensing and provenance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,10 +29,60 @@ pub struct SourceProvenance {
     pub source_uri: String,
     /// SPDX-style license identifier.
     pub license_id: String,
+    /// Canonical license document URI.
+    pub license_uri: String,
     /// Human author/creator.
     pub author: String,
+    /// Attribution text shipped with an exported product when required.
+    pub attribution: String,
     /// Whether visible attribution is required.
     pub requires_attribution: bool,
+}
+
+/// Exactly one durable locator for a plant-family source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlantSourceLocator {
+    /// Project catalog asset containing canonical imported bytes.
+    Asset(Uuid),
+    /// Canonical source URI or project-relative file URI.
+    File(String),
+}
+
+/// Semantic contribution made by one imported-family source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlantSourceRole {
+    /// Renderable plant geometry and its material-slot topology.
+    Geometry,
+    /// Material definitions or atlases referenced by geometry.
+    Material,
+    /// Structural joints, spines, and vertex weights.
+    Skeleton,
+    /// Collision and breakage derivation geometry.
+    Collision,
+    /// Navigation footprint or cost derivation geometry.
+    Navigation,
+}
+
+/// Format-erased stable selection within one source snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlantSourceSelector {
+    /// The complete source contribution.
+    #[default]
+    Whole,
+    /// One stable source element, with a human-readable path for diagnostics.
+    Element {
+        /// Stable source-local element identity.
+        id: u128,
+        /// Canonical source hierarchy path.
+        path: String,
+    },
+    /// One material-homogeneous submesh of a stable source element.
+    Submesh {
+        /// Stable source-local element identity.
+        element: u128,
+        /// Zero-based submesh index.
+        index: u32,
+    },
 }
 
 /// Coordinate units declared by an imported plant-family recipe.
@@ -70,17 +117,79 @@ pub enum SourceAxis {
     NegativeZ,
 }
 
+/// Source coordinate-system handedness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceHandedness {
+    /// Right-handed source basis.
+    #[default]
+    Right,
+    /// Left-handed source basis.
+    Left,
+}
+
+/// Source triangle winding before coordinate normalization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceWinding {
+    /// Counter-clockwise front faces.
+    #[default]
+    CounterClockwise,
+    /// Clockwise front faces.
+    Clockwise,
+}
+
+/// Source UV vertical origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceUvOrigin {
+    /// V=0 is the top edge.
+    #[default]
+    TopLeft,
+    /// V=0 is the bottom edge and is flipped during normalization.
+    BottomLeft,
+}
+
+/// Tangent-frame treatment during normalization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlantTangentPolicy {
+    /// Require every source tangent frame to be finite and orthonormal.
+    Require,
+    /// Generate tangent frames only when the source frame is missing or invalid.
+    #[default]
+    GenerateMissing,
+    /// Rebuild every tangent frame from normalized geometry and UVs.
+    Regenerate,
+}
+
+/// Family-local origin selected after source coordinates become canonical metres.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PlantPivot {
+    /// Preserve the normalized source origin.
+    SourceOrigin,
+    /// Center X/Z on the family bounds and place the lowest point at Y=0.
+    #[default]
+    BoundsBaseCenter,
+    /// Subtract an explicit canonical-metre position.
+    Explicit([DecisionScalar; 3]),
+    /// Use the base center of geometry mapped to this semantic part.
+    SemanticPart(u128),
+}
+
 /// One source asset referenced by an imported-family recipe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlantSourceReference {
     /// Stable source identity inside the recipe.
     pub id: u128,
-    /// Project/catalog source asset when imported into the project.
-    pub asset: Option<Uuid>,
-    /// Canonical source URI/path.
-    pub uri: String,
-    /// SHA-256 content identity.
+    /// Durable source location.
+    pub locator: PlantSourceLocator,
+    /// Semantic contribution supplied by this source.
+    pub role: PlantSourceRole,
+    /// Stable source subset selected for this contribution.
+    pub selector: PlantSourceSelector,
+    /// SHA-256 content identity accepted by the authored recipe.
     pub content_hash: [u8; 32],
+    /// Source-specific coordinate and attribute normalization.
+    pub settings: PlantImportSettings,
+    /// Source-specific licensing and attribution.
+    pub provenance: SourceProvenance,
 }
 
 /// Settings that normalize an imported family into Anima's plant vocabulary.
@@ -92,12 +201,70 @@ pub struct PlantImportSettings {
     pub up_axis: SourceAxis,
     /// Source forward axis.
     pub forward_axis: SourceAxis,
+    /// Source coordinate-system handedness.
+    pub handedness: SourceHandedness,
     /// Uniform Q15.16 post-unit scale.
     pub scale: DecisionScalar,
-    /// Merge geometrically identical semantic parts.
-    pub merge_identical_parts: bool,
-    /// Generate missing tangent frames at cook time.
-    pub generate_tangents: bool,
+    /// Family origin policy after coordinate normalization.
+    pub pivot: PlantPivot,
+    /// Source front-face winding.
+    pub winding: SourceWinding,
+    /// Source UV vertical origin.
+    pub uv_origin: SourceUvOrigin,
+    /// Q15.16 UV scale applied after vertical-origin normalization.
+    pub uv_scale: [DecisionScalar; 2],
+    /// Q15.16 UV offset applied after scaling.
+    pub uv_offset: [DecisionScalar; 2],
+    /// Tangent-frame normalization policy.
+    pub tangent_policy: PlantTangentPolicy,
+}
+
+impl Default for PlantImportSettings {
+    fn default() -> Self {
+        Self {
+            units: SourceUnits::Meters,
+            up_axis: SourceAxis::PositiveY,
+            forward_axis: SourceAxis::NegativeZ,
+            handedness: SourceHandedness::Right,
+            scale: DecisionScalar::from_bits(1 << 16),
+            pivot: PlantPivot::BoundsBaseCenter,
+            winding: SourceWinding::CounterClockwise,
+            uv_origin: SourceUvOrigin::TopLeft,
+            uv_scale: [DecisionScalar::from_bits(1 << 16); 2],
+            uv_offset: [DecisionScalar::from_bits(0); 2],
+            tangent_policy: PlantTangentPolicy::GenerateMissing,
+        }
+    }
+}
+
+/// Authored semantic destination of one stable source selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlantSemanticDestination {
+    /// Normalized semantic part.
+    Part(u128),
+    /// Structural spine.
+    Spine(u128),
+    /// Family material slot.
+    MaterialSlot(u32),
+    /// Collision proxy declaration.
+    CollisionProxy(u128),
+    /// Navigation proxy declaration.
+    NavigationProxy(u128),
+    /// Phenotype declaration.
+    Phenotype(u32),
+}
+
+/// One manual source-to-family semantic binding that reimport must preserve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlantManualSemanticTarget {
+    /// Stable binding identity.
+    pub id: u128,
+    /// Referenced imported source.
+    pub source: u128,
+    /// Stable source element or submesh.
+    pub selector: PlantSourceSelector,
+    /// Authored family destination.
+    pub destination: PlantSemanticDestination,
 }
 
 /// One imported-family source recipe.
@@ -105,12 +272,8 @@ pub struct PlantImportSettings {
 pub struct ImportedPlantFamilyRecipe {
     /// Source files/assets.
     pub sources: Vec<PlantSourceReference>,
-    /// Reimport normalization settings.
-    pub settings: PlantImportSettings,
-    /// Source semantic-name to stable part ID mapping.
-    pub semantic_part_mapping: Vec<(String, u128)>,
-    /// Licensing and origin.
-    pub provenance: SourceProvenance,
+    /// Manual semantic bindings preserved across reimport.
+    pub semantic_targets: Vec<PlantManualSemanticTarget>,
 }
 
 /// Embedded native botanical graph source.
@@ -248,6 +411,19 @@ pub struct PlantPhenotype {
     pub active_parts: Vec<u128>,
 }
 
+/// One coherent family variation available to lifecycle phenotypes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlantVariation {
+    /// Stable family-local variation identity.
+    pub id: u32,
+    /// Human-readable variation name.
+    pub name: String,
+    /// Imported source identities contributing to the variation.
+    pub sources: Vec<u128>,
+    /// Parts present in the variation; empty means all parts.
+    pub active_parts: Vec<u128>,
+}
+
 /// Authoritative collision-proxy primitive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlantCollisionShape {
@@ -311,6 +487,8 @@ pub struct PlantFamilyAsset {
     pub id: Uuid,
     /// Human-readable family name.
     pub name: String,
+    /// Canonically sorted unique family classification identities.
+    pub tags: Vec<crate::PlantTagId>,
     /// Exactly one recook source.
     pub source: PlantFamilySource,
     /// Normalized semantic parts.
@@ -323,6 +501,8 @@ pub struct PlantFamilyAsset {
     pub spines: Vec<StructuralSpine>,
     /// Mechanical response.
     pub mechanics: MechanicalResponse,
+    /// Coherent family variations.
+    pub variations: Vec<PlantVariation>,
     /// Lifecycle/phenotype variants.
     pub phenotypes: Vec<PlantPhenotype>,
     /// Collision and breakage proxies.
@@ -456,7 +636,7 @@ pub struct BiomeModuleReference {
 /// Graph-level evaluator policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BiomeGraphPolicy {
-    /// Maximum permitted module recursion depth.
+    /// Maximum descendant module-call edges relative to this asset's entry depth.
     pub maximum_recursion: u16,
     /// Maximum finite influence radius in Q15.16 metres.
     pub maximum_influence_radius: DecisionScalar,
@@ -502,7 +682,7 @@ pub struct BiomeAsset {
 }
 
 /// One local biome instance and its typed parameter bindings.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalBiomeInstance {
     /// Stable layer/instance identity.
     pub id: u128,
@@ -525,8 +705,64 @@ pub struct VegetationMapChunkLayout {
     pub schema_hash: [u8; 32],
 }
 
-/// One logical `.svegmap` catalog manifest.
-#[derive(Clone, Debug, PartialEq)]
+/// Address class for one immutable authored map object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VegetationMapChunkKind {
+    /// Quantized field and blocker samples.
+    Field,
+    /// Explicit anchors, pins, state, transforms, and their provenance.
+    AnchorOverride,
+    /// One local biome-graph instance.
+    GraphInstance,
+    /// One ordered layer definition.
+    LayerMetadata,
+    /// Optional non-authoritative editor gesture metadata.
+    EditorMetadata,
+}
+
+/// Spatial address of one immutable authored map object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VegetationMapTileKey {
+    /// Map-global metadata.
+    Global,
+    /// One sparse authored world tile.
+    Cell(WorldCellKey),
+}
+
+/// Stable logical address resolved through the `.svegmap` root inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VegetationMapChunkKey {
+    /// Stable layer or instance identity.
+    pub layer: u128,
+    /// Global or spatial tile address.
+    pub tile: VegetationMapTileKey,
+    /// Typed payload vocabulary.
+    pub kind: VegetationMapChunkKind,
+}
+
+/// Root reference to one immutable content-addressed authored map object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationMapChunkReference {
+    /// Logical address replaced by a newer transaction.
+    pub key: VegetationMapChunkKey,
+    /// SHA-256 of the exact canonical object bytes.
+    pub content_hash: [u8; 32],
+    /// Exact canonical byte length.
+    pub byte_length: u64,
+    /// Monotonic authored object revision.
+    pub revision: u64,
+}
+
+impl VegetationMapChunkReference {
+    /// Canonical inventory order.
+    #[must_use]
+    pub fn order_key(&self) -> VegetationMapChunkKey {
+        self.key
+    }
+}
+
+/// One logical `.svegmap` catalog root.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VegetationMapAsset {
     /// Format version.
     pub version: u32,
@@ -538,12 +774,10 @@ pub struct VegetationMapAsset {
     pub bounds: WorldBounds,
     /// Sparse authored chunk policy. Chunk inventory is intentionally external.
     pub chunk_layout: VegetationMapChunkLayout,
-    /// One ordered authored layer algebra.
-    pub layers: Vec<VegetationLayer>,
-    /// Local root-biome instances.
-    pub biome_instances: Vec<LocalBiomeInstance>,
-    /// Non-authoritative optional brush history.
-    pub brush_history: Vec<BrushGestureMetadata>,
+    /// Monotonic committed root generation.
+    pub generation: u64,
+    /// Canonically ordered logical-address to immutable-object references.
+    pub inventory: Vec<VegetationMapChunkReference>,
 }
 
 /// One quantized authored field tile inside a sparse map chunk.
@@ -574,19 +808,18 @@ pub struct ExplicitPlantAnchor {
     pub point: PlantPoint,
 }
 
-/// One sparse authored `.svegmap` internal chunk.
+/// Quantized authored truth for one layer and spatial tile.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VegetationMapChunk {
-    /// Chunk format version.
-    pub version: u32,
-    /// Owning map.
-    pub map: Uuid,
-    /// Exact canonical owner cell.
-    pub cell: WorldCellKey,
-    /// Monotonic authored revision.
-    pub revision: u64,
+pub struct VegetationMapFieldChunk {
     /// Quantized scalar/vector/species fields.
     pub fields: Vec<AuthoredFieldTile>,
+    /// Signed blocker tile/category data.
+    pub blockers: Vec<AuthoredFieldTile>,
+}
+
+/// Anchors, pins, authored overrides, and provenance for one layer and spatial tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VegetationMapAnchorChunk {
     /// Explicit authored plants/anchors.
     pub explicit_plants: Vec<ExplicitPlantAnchor>,
     /// Procedural pins.
@@ -595,73 +828,111 @@ pub struct VegetationMapChunk {
     pub transform_overrides: Vec<PlantTransformOverride>,
     /// Authored state overrides.
     pub state_overrides: Vec<PlantStateOverride>,
-    /// Signed blocker tile/category data.
-    pub blockers: Vec<AuthoredFieldTile>,
     /// Chunk-local compact provenance.
     pub provenance: ProvenanceTable,
 }
 
-/// One immutable input dependency in a cooked base manifest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManifestDependency {
-    /// Asset/source identity.
-    pub id: Uuid,
-    /// Exact canonical content hash.
-    pub content_hash: [u8; 32],
-}
-
-/// Immutable identity binding authored sources, schemas, and cooked base cells.
+/// One typed immutable authored map-object payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VegetationBaseManifest {
-    /// Manifest format version.
-    pub version: u32,
-    /// Vegetation map.
-    pub map: Uuid,
-    /// Map manifest hash.
-    pub map_hash: [u8; 32],
-    /// Plant/biome/surface/source dependencies, sorted by identity.
-    pub dependencies: Vec<ManifestDependency>,
-    /// Canonical point-schema hash.
-    pub point_schema_hash: [u8; 32],
-    /// Evaluator semantic version.
-    pub evaluator_version: u32,
-    /// Cooker semantic version.
-    pub cooker_version: u32,
+pub enum VegetationMapChunkPayload {
+    /// Quantized field and blocker samples.
+    Field(VegetationMapFieldChunk),
+    /// Explicit anchors, pins, overrides, and provenance.
+    AnchorOverride(VegetationMapAnchorChunk),
+    /// One local root-biome graph instance.
+    GraphInstance(LocalBiomeInstance),
+    /// One ordered layer definition.
+    LayerMetadata(VegetationLayer),
+    /// Optional non-authoritative editor gesture metadata.
+    EditorMetadata(Vec<BrushGestureMetadata>),
 }
 
-impl VegetationBaseManifest {
-    /// Canonical identity of the complete base manifest.
+impl VegetationMapChunkPayload {
+    /// Address kind required by this payload.
     #[must_use]
-    pub fn identity(&self) -> [u8; 32] {
-        let mut bytes = b"saffron-anima/vegetation-base-manifest/v1\0".to_vec();
-        bytes.extend_from_slice(&self.version.to_be_bytes());
-        bytes.extend_from_slice(&self.map.value().to_be_bytes());
-        bytes.extend_from_slice(&self.map_hash);
-        let mut dependencies = self.dependencies.clone();
-        dependencies.sort_by_key(|dependency| dependency.id.value());
-        for dependency in dependencies {
-            bytes.extend_from_slice(&dependency.id.value().to_be_bytes());
-            bytes.extend_from_slice(&dependency.content_hash);
+    pub fn kind(&self) -> VegetationMapChunkKind {
+        match self {
+            Self::Field(_) => VegetationMapChunkKind::Field,
+            Self::AnchorOverride(_) => VegetationMapChunkKind::AnchorOverride,
+            Self::GraphInstance(_) => VegetationMapChunkKind::GraphInstance,
+            Self::LayerMetadata(_) => VegetationMapChunkKind::LayerMetadata,
+            Self::EditorMetadata(_) => VegetationMapChunkKind::EditorMetadata,
         }
-        bytes.extend_from_slice(&self.point_schema_hash);
-        bytes.extend_from_slice(&self.evaluator_version.to_be_bytes());
-        bytes.extend_from_slice(&self.cooker_version.to_be_bytes());
-        sha256(&bytes)
     }
+}
 
-    /// Constructs a manifest with the current canonical point schema.
-    #[must_use]
-    pub fn current(map: Uuid, map_hash: [u8; 32]) -> Self {
-        Self {
-            version: VEGETATION_BASE_MANIFEST_VERSION,
-            map,
-            map_hash,
-            dependencies: Vec::new(),
-            point_schema_hash: point_schema_hash(),
-            evaluator_version: 1,
-            cooker_version: 1,
-        }
+/// One immutable content-addressed authored `.svegmap` object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VegetationMapChunk {
+    /// Chunk format version.
+    pub version: u32,
+    /// Owning map.
+    pub map: Uuid,
+    /// Exact logical object address.
+    pub key: VegetationMapChunkKey,
+    /// Monotonic authored revision.
+    pub revision: u64,
+    /// Typed object payload.
+    pub payload: VegetationMapChunkPayload,
+}
+
+impl VegetationMapChunk {
+    /// Builds the exact root reference for these canonical object bytes.
+    pub fn reference(&self) -> Result<VegetationMapChunkReference> {
+        let bytes = crate::write_vegetation_map_chunk(self)?;
+        Ok(VegetationMapChunkReference {
+            key: self.key,
+            content_hash: crate::vegetation_content_hash(&bytes),
+            byte_length: u64::try_from(bytes.len()).map_err(|_| crate::Error::NumericOverflow)?,
+            revision: self.revision,
+        })
     }
+}
+
+/// Fully resolved logical map used by authoring and evaluation callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VegetationMapSnapshot {
+    /// Atomically visible root generation.
+    pub root: VegetationMapAsset,
+    /// Ordered layer algebra reconstructed from layer-metadata objects.
+    pub layers: Vec<VegetationLayer>,
+    /// Local biome instances reconstructed from graph-instance objects.
+    pub biome_instances: Vec<LocalBiomeInstance>,
+    /// Optional editor-only gesture records.
+    pub brush_history: Vec<BrushGestureMetadata>,
+    /// Canonically addressed immutable object set.
+    pub chunks: Vec<VegetationMapChunk>,
+}
+
+impl std::ops::Deref for VegetationMapSnapshot {
+    type Target = VegetationMapAsset;
+
+    fn deref(&self) -> &Self::Target {
+        &self.root
+    }
+}
+
+/// Resolved spatial authored truth assembled from typed objects at one cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VegetationMapTileSnapshot {
+    /// Owning map.
+    pub map: Uuid,
+    /// Exact canonical tile.
+    pub cell: WorldCellKey,
+    /// Quantized scalar/vector/species fields.
+    pub fields: Vec<AuthoredFieldTile>,
+    /// Signed blocker tile/category data.
+    pub blockers: Vec<AuthoredFieldTile>,
+    /// Explicit authored plants/anchors.
+    pub explicit_plants: Vec<ExplicitPlantAnchor>,
+    /// Procedural pins.
+    pub pins: Vec<PlantId>,
+    /// Authored transform overrides.
+    pub transform_overrides: Vec<PlantTransformOverride>,
+    /// Authored state overrides.
+    pub state_overrides: Vec<PlantStateOverride>,
+    /// Tile-local compact provenance.
+    pub provenance: ProvenanceTable,
 }
 
 /// Pins/overrides invalidated by an identity-affecting seed/topology edit.
@@ -721,15 +992,21 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
             expected: PLANT_ASSET_VERSION,
         });
     }
-    if asset.id.value() == 0 || asset.name.is_empty() || asset.parts.is_empty() {
+    if asset.id.value() == 0 || asset.name.trim().is_empty() || asset.parts.is_empty() {
         return Err(crate::Error::InvalidFormat {
             format: ".splant",
             field: "id/name/parts".to_owned(),
         });
     }
+    if asset.tags.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "tags".to_owned(),
+        });
+    }
     let mut part_ids = std::collections::BTreeSet::new();
     for part in &asset.parts {
-        if !part_ids.insert(part.id) {
+        if part.id == 0 || !part_ids.insert(part.id) {
             return Err(crate::Error::InvalidFormat {
                 format: ".splant",
                 field: "parts.id".to_owned(),
@@ -745,14 +1022,48 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
             field: "parts.parent".to_owned(),
         });
     }
+    validate_parent_forest(
+        asset.parts.iter().map(|part| (part.id, part.parent)),
+        "parts.parent",
+    )?;
     match &asset.source {
         PlantFamilySource::Imported(recipe) => {
-            let source_ids: std::collections::BTreeSet<_> =
-                recipe.sources.iter().map(|source| source.id).collect();
+            let source_by_id = recipe
+                .sources
+                .iter()
+                .map(|source| (source.id, source))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let source_ids = source_by_id
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let duplicate_contribution =
+                recipe.sources.iter().enumerate().any(|(index, source)| {
+                    recipe.sources[..index].iter().any(|previous| {
+                        previous.locator == source.locator
+                            && previous.role == source.role
+                            && previous.selector == source.selector
+                    })
+                });
             if recipe.sources.is_empty()
                 || source_ids.len() != recipe.sources.len()
+                || duplicate_contribution
                 || recipe.sources.iter().any(|source| {
-                    source.id == 0 || source.uri.is_empty() || source.content_hash == [0; 32]
+                    source.id == 0
+                        || source.content_hash == [0; 32]
+                        || source.settings.scale.bits() <= 0
+                        || source
+                            .settings
+                            .uv_scale
+                            .iter()
+                            .any(|value| value.bits() == 0)
+                        || !source_axes_are_orthogonal(
+                            source.settings.up_axis,
+                            source.settings.forward_axis,
+                        )
+                        || !valid_source_locator(&source.locator)
+                        || !valid_source_selector(&source.selector)
+                        || !valid_source_provenance(&source.provenance)
                 })
             {
                 return Err(crate::Error::InvalidFormat {
@@ -760,9 +1071,78 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
                     field: "source.imported.sources".to_owned(),
                 });
             }
+            let target_ids = recipe
+                .semantic_targets
+                .iter()
+                .map(|target| target.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            let duplicate_binding =
+                recipe
+                    .semantic_targets
+                    .iter()
+                    .enumerate()
+                    .any(|(index, target)| {
+                        recipe.semantic_targets[..index].iter().any(|previous| {
+                            previous.source == target.source
+                                && previous.selector == target.selector
+                                && previous.destination == target.destination
+                        })
+                    });
+            if target_ids.len() != recipe.semantic_targets.len()
+                || target_ids.contains(&0)
+                || duplicate_binding
+                || recipe.semantic_targets.iter().any(|target| {
+                    !valid_source_selector(&target.selector)
+                        || !source_by_id.get(&target.source).is_some_and(|source| {
+                            source_selector_contains(&source.selector, &target.selector)
+                                && source_role_supports_destination(source.role, target.destination)
+                        })
+                        || !semantic_destination_exists(target.destination, &part_ids, asset)
+                })
+                || recipe.sources.iter().any(|source| {
+                    !recipe
+                        .semantic_targets
+                        .iter()
+                        .any(|target| target.source == source.id)
+                        || matches!(source.settings.pivot, PlantPivot::SemanticPart(part) if
+                        !part_ids.contains(&part)
+                            || !recipe.semantic_targets.iter().any(|target| {
+                                target.source == source.id
+                                    && target.destination
+                                        == PlantSemanticDestination::Part(part)
+                            }))
+                })
+                || asset.parts.iter().any(|part| {
+                    part.sources.is_empty()
+                        || part
+                            .sources
+                            .iter()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
+                            != part.sources.len()
+                        || part.sources.iter().any(|source| {
+                            !source_by_id
+                                .get(source)
+                                .is_some_and(|source| source.role == PlantSourceRole::Geometry)
+                        })
+                        || !recipe.semantic_targets.iter().any(|target| {
+                            part.sources.contains(&target.source)
+                                && target.destination == PlantSemanticDestination::Part(part.id)
+                        })
+                })
+            {
+                return Err(crate::Error::InvalidFormat {
+                    format: ".splant",
+                    field: "source.imported.semanticTargets".to_owned(),
+                });
+            }
         }
         PlantFamilySource::Native(graph) => {
-            if graph.schema_hash == [0; 32] || !graph.graph.is_object() {
+            if graph.schema_hash == [0; 32]
+                || !graph.graph.is_object()
+                || asset.parts.iter().any(|part| !part.sources.is_empty())
+            {
                 return Err(crate::Error::InvalidFormat {
                     format: ".splant",
                     field: "source.native.graph".to_owned(),
@@ -775,6 +1155,14 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
             .parts
             .iter()
             .any(|part| part.material_slot as usize >= asset.material_slots.len())
+        || asset.material_slots.contains(&Uuid(0))
+        || asset
+            .material_slots
+            .iter()
+            .map(|material| material.value())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != asset.material_slots.len()
         || asset.dimensions.height.bits() <= 0
         || asset.dimensions.trunk_radius.bits() < 0
         || asset
@@ -786,6 +1174,14 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
         || (0..3).any(|axis| {
             asset.dimensions.local_bounds_min[axis] >= asset.dimensions.local_bounds_max[axis]
         })
+        || asset.dimensions.local_bounds_min[1].bits() > 0
+        || asset.dimensions.local_bounds_max[1] < asset.dimensions.height
+        || asset.dimensions.crown_radius[0]
+            > asset.dimensions.local_bounds_max[0]
+                .checked_sub(asset.dimensions.local_bounds_min[0])?
+        || asset.dimensions.crown_radius[1]
+            > asset.dimensions.local_bounds_max[2]
+                .checked_sub(asset.dimensions.local_bounds_min[2])?
     {
         return Err(crate::Error::InvalidFormat {
             format: ".splant",
@@ -795,10 +1191,12 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
     let spine_ids: std::collections::BTreeSet<_> =
         asset.spines.iter().map(|spine| spine.id).collect();
     if spine_ids.len() != asset.spines.len()
+        || spine_ids.contains(&0)
         || asset.spines.iter().any(|spine| {
             !part_ids.contains(&spine.part)
                 || spine.rest_points.len() < 2
                 || spine.rest_points.len() != spine.radii.len()
+                || spine.radii.iter().any(|radius| radius.bits() <= 0)
                 || spine
                     .parent
                     .is_some_and(|parent| !spine_ids.contains(&parent))
@@ -809,23 +1207,351 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
             field: "spines".to_owned(),
         });
     }
+    validate_parent_forest(
+        asset.spines.iter().map(|spine| (spine.id, spine.parent)),
+        "spines.parent",
+    )?;
+    if asset.mechanics.stiffness.bits() < 0
+        || asset.mechanics.drag.bits() < 0
+        || asset.mechanics.flutter.bits() < 0
+        || asset.mechanics.damage_threshold.bits() < 0
+        || asset.mechanics.break_threshold < asset.mechanics.damage_threshold
+    {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "mechanics".to_owned(),
+        });
+    }
+    let variation_ids = asset
+        .variations
+        .iter()
+        .map(|variation| variation.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let imported_source_ids = match &asset.source {
+        PlantFamilySource::Imported(recipe) => Some(
+            recipe
+                .sources
+                .iter()
+                .map(|source| source.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+        ),
+        PlantFamilySource::Native(_) => None,
+    };
+    if asset.variations.is_empty()
+        || variation_ids.len() != asset.variations.len()
+        || asset.variations.iter().any(|variation| {
+            let variation_sources = variation
+                .sources
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let active_parts = variation
+                .active_parts
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            variation.name.trim().is_empty()
+                || variation_sources.len() != variation.sources.len()
+                || active_parts.len() != variation.active_parts.len()
+                || variation
+                    .active_parts
+                    .iter()
+                    .any(|part| !part_ids.contains(part))
+                || imported_source_ids.as_ref().is_some_and(|sources| {
+                    variation.sources.is_empty()
+                        || variation
+                            .sources
+                            .iter()
+                            .any(|source| !sources.contains(source))
+                        || asset.parts.iter().any(|part| {
+                            (variation.active_parts.is_empty() || active_parts.contains(&part.id))
+                                && !part
+                                    .sources
+                                    .iter()
+                                    .any(|source| variation_sources.contains(source))
+                        })
+                })
+                || imported_source_ids.is_none() && !variation.sources.is_empty()
+        })
+        || imported_source_ids.as_ref().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                !asset
+                    .variations
+                    .iter()
+                    .any(|variation| variation.sources.contains(source))
+            })
+        })
+    {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "variations".to_owned(),
+        });
+    }
     let phenotype_ids: std::collections::BTreeSet<_> = asset
         .phenotypes
         .iter()
         .map(|phenotype| phenotype.id)
         .collect();
-    if phenotype_ids.len() != asset.phenotypes.len()
-        || asset
-            .collision_proxies
-            .iter()
-            .any(|proxy| !part_ids.contains(&proxy.part))
+    let duplicate_phenotype_role = asset
+        .phenotypes
+        .iter()
+        .enumerate()
+        .any(|(index, phenotype)| {
+            asset.phenotypes[..index].iter().any(|previous| {
+                previous.variation == phenotype.variation && previous.role == phenotype.role
+            })
+        });
+    if asset.phenotypes.is_empty()
+        || phenotype_ids.len() != asset.phenotypes.len()
+        || duplicate_phenotype_role
+        || asset.variations.iter().any(|variation| {
+            asset
+                .phenotypes
+                .iter()
+                .filter(|phenotype| {
+                    phenotype.variation == variation.id && phenotype.role == PhenotypeRole::Healthy
+                })
+                .count()
+                != 1
+        })
+        || asset.phenotypes.iter().any(|phenotype| {
+            let material_sources = phenotype
+                .material_remap
+                .iter()
+                .map(|(from, _)| *from)
+                .collect::<std::collections::BTreeSet<_>>();
+            let active_parts = phenotype
+                .active_parts
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let variation = asset
+                .variations
+                .iter()
+                .find(|variation| variation.id == phenotype.variation);
+            !variation_ids.contains(&phenotype.variation)
+                || material_sources.len() != phenotype.material_remap.len()
+                || active_parts.len() != phenotype.active_parts.len()
+                || phenotype.material_remap.iter().any(|(from, to)| {
+                    *from as usize >= asset.material_slots.len()
+                        || *to as usize >= asset.material_slots.len()
+                        || from == to
+                })
+                || phenotype
+                    .active_parts
+                    .iter()
+                    .any(|part| !part_ids.contains(part))
+                || variation.is_some_and(|variation| {
+                    !variation.active_parts.is_empty()
+                        && phenotype
+                            .active_parts
+                            .iter()
+                            .any(|part| !variation.active_parts.contains(part))
+                })
+        })
     {
         return Err(crate::Error::InvalidFormat {
             format: ".splant",
-            field: "phenotypes/collisionProxies".to_owned(),
+            field: "phenotypes".to_owned(),
+        });
+    }
+    let collision_ids = asset
+        .collision_proxies
+        .iter()
+        .map(|proxy| proxy.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if collision_ids.len() != asset.collision_proxies.len()
+        || collision_ids.contains(&0)
+        || asset.collision_proxies.iter().any(|proxy| {
+            !part_ids.contains(&proxy.part)
+                || proxy
+                    .dimensions
+                    .iter()
+                    .any(|dimension| dimension.bits() <= 0)
+        })
+    {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "collisionProxies".to_owned(),
+        });
+    }
+    let navigation_ids = asset
+        .navigation_proxies
+        .iter()
+        .map(|proxy| proxy.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if navigation_ids.len() != asset.navigation_proxies.len()
+        || navigation_ids.contains(&0)
+        || asset.navigation_proxies.iter().any(|proxy| {
+            proxy.footprint.len() < 3
+                || proxy.height.bits() <= 0
+                || polygon_area_twice(&proxy.footprint) == 0
+        })
+    {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "navigationProxies".to_owned(),
+        });
+    }
+    if let Some(habitat) = &asset.habitat
+        && habitat
+            .fields
+            .iter()
+            .any(|(_, minimum, maximum)| minimum > maximum)
+    {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "habitat.fields".to_owned(),
         });
     }
     Ok(())
+}
+
+fn source_axis_vector(axis: SourceAxis) -> [i8; 3] {
+    match axis {
+        SourceAxis::PositiveX => [1, 0, 0],
+        SourceAxis::NegativeX => [-1, 0, 0],
+        SourceAxis::PositiveY => [0, 1, 0],
+        SourceAxis::NegativeY => [0, -1, 0],
+        SourceAxis::PositiveZ => [0, 0, 1],
+        SourceAxis::NegativeZ => [0, 0, -1],
+    }
+}
+
+fn source_axes_are_orthogonal(up: SourceAxis, forward: SourceAxis) -> bool {
+    let up = source_axis_vector(up);
+    let forward = source_axis_vector(forward);
+    up.into_iter()
+        .zip(forward)
+        .map(|(first, second)| i16::from(first) * i16::from(second))
+        .sum::<i16>()
+        == 0
+}
+
+fn valid_source_locator(locator: &PlantSourceLocator) -> bool {
+    match locator {
+        PlantSourceLocator::Asset(id) => id.value() != 0,
+        PlantSourceLocator::File(uri) => !uri.trim().is_empty(),
+    }
+}
+
+fn valid_source_provenance(provenance: &SourceProvenance) -> bool {
+    !provenance.source.trim().is_empty()
+        && !provenance.source_uri.trim().is_empty()
+        && !provenance.license_id.trim().is_empty()
+        && !provenance.license_uri.trim().is_empty()
+        && (!provenance.requires_attribution
+            || (!provenance.author.trim().is_empty() && !provenance.attribution.trim().is_empty()))
+}
+
+fn valid_source_selector(selector: &PlantSourceSelector) -> bool {
+    match selector {
+        PlantSourceSelector::Whole => true,
+        PlantSourceSelector::Element { id, path } => *id != 0 && !path.trim().is_empty(),
+        PlantSourceSelector::Submesh { element, .. } => *element != 0,
+    }
+}
+
+fn source_selector_contains(source: &PlantSourceSelector, target: &PlantSourceSelector) -> bool {
+    match source {
+        PlantSourceSelector::Whole => true,
+        PlantSourceSelector::Element { id, .. } => match target {
+            PlantSourceSelector::Whole => false,
+            PlantSourceSelector::Element { id: target, .. }
+            | PlantSourceSelector::Submesh {
+                element: target, ..
+            } => id == target,
+        },
+        PlantSourceSelector::Submesh { element, index } => {
+            matches!(target, PlantSourceSelector::Submesh {
+                element: target_element,
+                index: target_index,
+            } if element == target_element && index == target_index)
+        }
+    }
+}
+
+fn source_role_supports_destination(
+    role: PlantSourceRole,
+    destination: PlantSemanticDestination,
+) -> bool {
+    matches!(
+        (role, destination),
+        (
+            PlantSourceRole::Geometry,
+            PlantSemanticDestination::Part(_) | PlantSemanticDestination::Phenotype(_)
+        ) | (
+            PlantSourceRole::Material,
+            PlantSemanticDestination::MaterialSlot(_) | PlantSemanticDestination::Phenotype(_)
+        ) | (
+            PlantSourceRole::Skeleton,
+            PlantSemanticDestination::Spine(_)
+        ) | (
+            PlantSourceRole::Collision,
+            PlantSemanticDestination::CollisionProxy(_)
+        ) | (
+            PlantSourceRole::Navigation,
+            PlantSemanticDestination::NavigationProxy(_)
+        )
+    )
+}
+
+fn semantic_destination_exists(
+    destination: PlantSemanticDestination,
+    part_ids: &std::collections::BTreeSet<u128>,
+    asset: &PlantFamilyAsset,
+) -> bool {
+    match destination {
+        PlantSemanticDestination::Part(id) => part_ids.contains(&id),
+        PlantSemanticDestination::Spine(id) => asset.spines.iter().any(|spine| spine.id == id),
+        PlantSemanticDestination::MaterialSlot(slot) => {
+            (slot as usize) < asset.material_slots.len()
+        }
+        PlantSemanticDestination::CollisionProxy(id) => {
+            asset.collision_proxies.iter().any(|proxy| proxy.id == id)
+        }
+        PlantSemanticDestination::NavigationProxy(id) => {
+            asset.navigation_proxies.iter().any(|proxy| proxy.id == id)
+        }
+        PlantSemanticDestination::Phenotype(id) => {
+            asset.phenotypes.iter().any(|phenotype| phenotype.id == id)
+        }
+    }
+}
+
+fn validate_parent_forest(
+    entries: impl IntoIterator<Item = (u128, Option<u128>)>,
+    field: &str,
+) -> Result<()> {
+    let parents = entries
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for start in parents.keys().copied() {
+        let mut active = std::collections::BTreeSet::new();
+        let mut current = Some(start);
+        while let Some(id) = current {
+            if !active.insert(id) {
+                return Err(crate::Error::InvalidFormat {
+                    format: ".splant",
+                    field: field.to_owned(),
+                });
+            }
+            current = parents.get(&id).copied().flatten();
+        }
+    }
+    Ok(())
+}
+
+fn polygon_area_twice(points: &[[DecisionScalar; 2]]) -> i128 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(first, second)| {
+            i128::from(first[0].bits()) * i128::from(second[1].bits())
+                - i128::from(second[0].bits()) * i128::from(first[1].bits())
+        })
+        .sum()
 }
 
 /// Validates one biome asset's interface and bounded module policy.
@@ -839,7 +1565,6 @@ pub fn validate_biome(asset: &BiomeAsset) -> Result<()> {
     }
     if asset.id.value() == 0
         || asset.name.is_empty()
-        || asset.policy.maximum_recursion == 0
         || asset.policy.maximum_influence_radius.bits() < 0
     {
         return Err(crate::Error::InvalidFormat {
@@ -947,7 +1672,7 @@ pub fn validate_biome(asset: &BiomeAsset) -> Result<()> {
     Ok(())
 }
 
-/// Validates one map manifest without reading its sparse chunks.
+/// Validates one map root without reading its immutable authored objects.
 pub fn validate_vegetation_map(asset: &VegetationMapAsset) -> Result<()> {
     if asset.version != VEGETATION_MAP_VERSION {
         return Err(crate::Error::FormatVersion {
@@ -966,30 +1691,36 @@ pub fn validate_vegetation_map(asset: &VegetationMapAsset) -> Result<()> {
             field: "identity/chunkLayout".to_owned(),
         });
     }
-    let mut layer_ids = std::collections::BTreeSet::new();
-    for layer in &asset.layers {
-        if layer.id == 0 || !layer_ids.insert(layer.id) {
+    let mut previous = None;
+    for reference in &asset.inventory {
+        if reference.key.layer == 0
+            || reference.byte_length == 0
+            || previous.is_some_and(|key| key >= reference.key)
+        {
             return Err(crate::Error::InvalidFormat {
                 format: ".svegmap",
-                field: "layers.id".to_owned(),
+                field: "inventory".to_owned(),
             });
         }
-    }
-    let instance_ids: std::collections::BTreeSet<_> = asset
-        .biome_instances
-        .iter()
-        .map(|instance| instance.id)
-        .collect();
-    if instance_ids.len() != asset.biome_instances.len()
-        || asset
-            .biome_instances
-            .iter()
-            .any(|instance| instance.id == 0 || instance.biome.value() == 0)
-    {
-        return Err(crate::Error::InvalidFormat {
-            format: ".svegmap",
-            field: "biomeInstances".to_owned(),
-        });
+        match (reference.key.kind, reference.key.tile) {
+            (
+                VegetationMapChunkKind::Field | VegetationMapChunkKind::AnchorOverride,
+                VegetationMapTileKey::Cell(cell),
+            ) if cell.level() == asset.chunk_layout.level => {}
+            (
+                VegetationMapChunkKind::GraphInstance
+                | VegetationMapChunkKind::LayerMetadata
+                | VegetationMapChunkKind::EditorMetadata,
+                VegetationMapTileKey::Global,
+            ) => {}
+            _ => {
+                return Err(crate::Error::InvalidFormat {
+                    format: ".svegmap",
+                    field: "inventory.key".to_owned(),
+                });
+            }
+        }
+        previous = Some(reference.key);
     }
     Ok(())
 }
@@ -998,24 +1729,6 @@ pub fn validate_vegetation_map(asset: &VegetationMapAsset) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{PlantId, ProceduralPlantIdentity};
-
-    #[test]
-    fn manifest_identity_sorts_dependencies() {
-        let mut a = VegetationBaseManifest::current(Uuid(1), [2; 32]);
-        a.dependencies = vec![
-            ManifestDependency {
-                id: Uuid(9),
-                content_hash: [3; 32],
-            },
-            ManifestDependency {
-                id: Uuid(4),
-                content_hash: [5; 32],
-            },
-        ];
-        let mut b = a.clone();
-        b.dependencies.reverse();
-        assert_eq!(a.identity(), b.identity());
-    }
 
     #[test]
     fn topology_changes_report_affected_pins_and_overrides() {

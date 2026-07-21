@@ -26,11 +26,47 @@ pub enum PlantIdNamespace {
     Runtime = 2,
 }
 
+/// A stable non-zero plant-family classification identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct PlantTagId(u64);
+
+impl PlantTagId {
+    /// Constructs a validated plant-family tag identity.
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 {
+            return Err(Error::InvalidPlantTagId);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the canonical numeric identity.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for PlantTagId {
+    type Error = Error;
+
+    fn try_from(value: u64) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
 /// A stable opaque 128-bit plant identity.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlantId([u8; 16]);
 
 impl PlantId {
+    /// Decodes the canonical identity bytes and validates the encoded namespace.
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self> {
+        let id = Self(bytes);
+        id.namespace()?;
+        Ok(id)
+    }
+
     /// Constructs a procedural identity from the complete canonical identity vocabulary.
     #[must_use]
     pub fn procedural(input: ProceduralPlantIdentity) -> Self {
@@ -139,9 +175,7 @@ impl FromStr for PlantId {
             *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
                 .map_err(|_| Error::InvalidPlantId)?;
         }
-        let id = Self(bytes);
-        id.namespace()?;
-        Ok(id)
+        Self::from_bytes(bytes)
     }
 }
 
@@ -232,6 +266,12 @@ mod tests {
         assert_ne!(explicit, runtime);
         assert_eq!(explicit.namespace().unwrap(), PlantIdNamespace::Explicit);
         assert_eq!(runtime.namespace().unwrap(), PlantIdNamespace::Runtime);
+    }
+
+    #[test]
+    fn plant_tag_identity_rejects_zero() {
+        assert!(matches!(PlantTagId::new(0), Err(Error::InvalidPlantTagId)));
+        assert_eq!(PlantTagId::new(41).unwrap().value(), 41);
     }
 
     #[test]
