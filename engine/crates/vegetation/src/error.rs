@@ -24,6 +24,9 @@ pub enum Error {
     /// A plant ID string or namespace is not canonical.
     #[error("invalid plant identity")]
     InvalidPlantId,
+    /// A plant-family tag identity is zero.
+    #[error("invalid plant-family tag identity")]
+    InvalidPlantTagId,
     /// Two source records produced the same plant identity.
     #[error("duplicate plant identity {0}")]
     DuplicatePlantId(String),
@@ -36,9 +39,172 @@ pub enum Error {
     /// Persistent state is bound to a different immutable base manifest.
     #[error("vegetation manifest mismatch")]
     ManifestMismatch,
+    /// A runtime operation referenced a cell outside the bound immutable manifest.
+    #[error("vegetation cell {cell} is not present in the bound manifest")]
+    UnknownRuntimeCell {
+        /// Missing canonical cell.
+        cell: saffron_spatial::WorldCellKey,
+    },
+    /// A runtime plant lookup referenced an identity absent from every resident macro facet.
+    #[error("vegetation plant {plant} is not resident")]
+    PlantNotResident {
+        /// Missing stable plant identity.
+        plant: String,
+    },
+    /// A generation-tagged handle was used after its immutable cell generation was replaced.
+    #[error("stale vegetation generation for cell {cell}: expected {expected}, current {current}")]
+    StaleGeneration {
+        /// Canonical cell owning the handle.
+        cell: saffron_spatial::WorldCellKey,
+        /// Generation carried by the handle.
+        expected: u64,
+        /// Currently published generation.
+        current: u64,
+    },
+    /// A requested runtime facet is not resident in the published cell generation.
+    #[error("vegetation {facet} facet is not resident for cell {cell}")]
+    FacetNotResident {
+        /// Canonical cell.
+        cell: saffron_spatial::WorldCellKey,
+        /// Stable logical facet name.
+        facet: &'static str,
+    },
+    /// Reading or seeking a derived artifact failed before validation completed.
+    #[error("{format} artifact I/O failed")]
+    ArtifactIo {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Underlying filesystem or stream failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A derived artifact ended before its declared structure was complete.
+    #[error("truncated {format} artifact")]
+    ArtifactTruncated {
+        /// Logical artifact format.
+        format: &'static str,
+    },
+    /// A derived artifact's schema identity is not understood by this build.
+    #[error("unsupported {format} schema")]
+    ArtifactSchema {
+        /// Logical artifact format.
+        format: &'static str,
+    },
+    /// A derived artifact contains a section kind outside its exact format vocabulary.
+    #[error("unknown {format} section kind {section}")]
+    ArtifactUnknownSection {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Numeric section kind read from the TOC.
+        section: u16,
+    },
+    /// A derived artifact requests a codec outside its exact format vocabulary.
+    #[error("unknown {format} section codec {codec}")]
+    ArtifactUnknownCodec {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Numeric codec identifier read from the TOC.
+        codec: u8,
+    },
+    /// Encoding or decoding a recognized artifact section codec failed.
+    #[error("{format} section {section} codec failed")]
+    ArtifactCodec {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Numeric section kind being encoded or decoded.
+        section: u16,
+        /// Underlying codec failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A declared artifact section size exceeds the bounded container contract.
+    #[error(
+        "{format} section {section} {size_kind} size {requested} exceeds limit {limit}"
+    )]
+    ArtifactSectionLimit {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Numeric section kind from the TOC.
+        section: u16,
+        /// Whether the stored or decoded size exceeded its bound.
+        size_kind: &'static str,
+        /// Declared byte count.
+        requested: u64,
+        /// Maximum accepted byte count.
+        limit: u64,
+    },
+    /// The sum of decoded artifact sections exceeds the bounded container contract.
+    #[error("{format} decoded size {requested} exceeds limit {limit}")]
+    ArtifactDecodedLimit {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Declared decoded byte count across every section.
+        requested: u64,
+        /// Maximum accepted byte count.
+        limit: u64,
+    },
+    /// A derived artifact declares one section kind more than once.
+    #[error("duplicate {format} section kind {section}")]
+    ArtifactDuplicateSection {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Duplicated numeric section kind.
+        section: u16,
+    },
+    /// A derived artifact section violates its declared canonical alignment.
+    #[error("misaligned {format} section kind {section}")]
+    ArtifactMisalignedSection {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Misaligned numeric section kind.
+        section: u16,
+    },
+    /// Two derived artifact section spans overlap.
+    #[error("overlapping {format} section kind {section}")]
+    ArtifactOverlappingSection {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Numeric section kind whose span overlaps a prior span.
+        section: u16,
+    },
+    /// A derived artifact or section digest does not match its canonical bytes.
+    #[error("{format} content hash mismatch at {subject}")]
+    ArtifactHashMismatch {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Stable header, payload, section, or manifest subject.
+        subject: String,
+    },
+    /// A derived artifact violates a structural invariant not represented by the narrower errors.
+    #[error("invalid {format} artifact at '{field}'")]
+    ArtifactFormat {
+        /// Logical artifact format.
+        format: &'static str,
+        /// Exact structural field that failed validation.
+        field: String,
+    },
     /// A checked integer or fixed-point operation overflowed.
     #[error("vegetation numeric operation overflowed")]
     NumericOverflow,
+    /// A vegetation-owned collection could not reserve its checked capacity.
+    #[error("vegetation memory reservation failed for {resource}")]
+    MemoryReservation {
+        /// Stable evaluator collection or stage name.
+        resource: &'static str,
+        /// Allocation failure reported by the standard collection.
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+    /// An evaluator worker could not be created with its bounded stack.
+    #[error("failed to spawn vegetation graph worker")]
+    GraphWorkerSpawn {
+        /// Thread creation failure reported by the standard library.
+        #[source]
+        source: std::io::Error,
+    },
+    /// An evaluator worker panicked before returning its atomic cell results.
+    #[error("vegetation graph worker panicked")]
+    GraphWorkerPanicked,
     /// A typed biome-graph document is malformed.
     #[error("invalid biome graph at '{path}': {reason}")]
     GraphDocument {
