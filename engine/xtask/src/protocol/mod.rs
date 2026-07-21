@@ -1,12 +1,13 @@
-//! `xtask gen-protocol`: the TS / OpenRPC / manifest emitters.
+//! `xtask gen-protocol`: the TypeScript, envelope, OpenRPC, manifest, and Luau emitters.
 //!
 //! The DTO crate (`saffron-protocol`) is the single source of truth: its `ts-rs` derives give
 //! the field metadata (via [`saffron_protocol::ts_decls`]) and its `schemars` fragments give the
 //! OpenRPC per-DTO schemas (via [`saffron_protocol::schema_fragments`]). This module assembles
-//! the three editor-facing artifacts:
+//! the five editor-facing artifacts:
 //!
 //! - `editor/src/protocol/sa-types.ts` — header, the `WireUuid` alias, the complete DTO inventory,
 //!   and the `CommandParamsMap`/`CommandResultMap`.
+//! - `schemas/control/envelope.schema.json` — the shared success/failure reply envelope.
 //! - `schemas/control/openrpc.generated.json` — the `{ openrpc, info, methods, components.schemas
 //!   }` envelope, with methods in command-table order and schemas generated from Rust DTOs.
 //! - `schemas/control/command-manifest.generated.json` — the fixture/skip ledger.
@@ -23,7 +24,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use saffron_protocol::{COMMANDS, fixture_for, schema_fragments, skip_for, ts_decls};
+use saffron_protocol::{
+    COMMANDS, ControlFailureDto, fixture_for, schema_fragments, skip_for, standalone_schema_for,
+    ts_decls,
+};
 use serde_json::{Map, Value, json};
 
 pub mod luau;
@@ -36,6 +40,8 @@ pub const GENERATED_BY: &str = "cargo run -p xtask -- gen-protocol";
 pub struct Artifacts {
     /// `editor/src/protocol/sa-types.ts`.
     pub sa_types: String,
+    /// `schemas/control/envelope.schema.json`.
+    pub envelope_schema: String,
     /// `schemas/control/openrpc.generated.json`.
     pub openrpc: String,
     /// `schemas/control/command-manifest.generated.json`.
@@ -51,6 +57,7 @@ pub fn emit() -> Artifacts {
     let decls = DtoDecls::load();
     Artifacts {
         sa_types: ts::emit_sa_types(&decls),
+        envelope_schema: emit_envelope_schema(),
         openrpc: emit_openrpc(),
         manifest: emit_manifest(),
         luau_defs: luau::emit_defs(),
@@ -64,6 +71,10 @@ pub fn run(repo_root: &Path) -> Result<Vec<std::path::PathBuf>> {
         (
             repo_root.join("editor/src/protocol/sa-types.ts"),
             artifacts.sa_types,
+        ),
+        (
+            repo_root.join("schemas/control/envelope.schema.json"),
+            artifacts.envelope_schema,
         ),
         (
             repo_root.join("schemas/control/openrpc.generated.json"),
@@ -89,6 +100,49 @@ pub fn run(repo_root: &Path) -> Result<Vec<std::path::PathBuf>> {
         written.push(path);
     }
     Ok(written)
+}
+
+/// The generated control reply envelope. The failure branch is the standalone schemars model for
+/// [`ControlFailureDto`]; the open success payload remains unconstrained for command-specific DTOs.
+fn emit_envelope_schema() -> String {
+    let Value::Object(mut failure) = standalone_schema_for::<ControlFailureDto>() else {
+        unreachable!("ControlFailureDto schema is an object")
+    };
+    let definitions = failure.remove("$defs").unwrap_or_else(|| json!({}));
+    failure.remove("$schema");
+    failure.remove("title");
+
+    let document = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "envelope.schema.json",
+        "$comment": GENERATED_BY,
+        "title": "ControlReplyEnvelope",
+        "description": "Outer response envelope for every control-protocol reply.",
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "id": {},
+                    "ok": { "const": true },
+                    "result": {},
+                },
+                "required": ["id", "ok", "result"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "id": {},
+                    "ok": { "const": false },
+                    "error": Value::Object(failure),
+                },
+                "required": ["id", "ok", "error"],
+            },
+        ],
+        "$defs": definitions,
+    });
+    pretty(&document)
 }
 
 /// The parsed `ts-rs` declarations, indexed by ident, plus the parsed enum-union strings — the
@@ -333,6 +387,14 @@ mod tests {
             std::fs::read_to_string(repo_root().join("editor/src/protocol/sa-types.ts"))
                 .expect("committed sa-types.ts");
         assert_eq!(emit().sa_types, committed);
+    }
+
+    #[test]
+    fn envelope_schema_is_byte_identical_to_committed() {
+        let committed =
+            std::fs::read_to_string(repo_root().join("schemas/control/envelope.schema.json"))
+                .expect("committed envelope.schema.json");
+        assert_eq!(emit().envelope_schema, committed);
     }
 
     #[test]
