@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use saffron_vegetation::{
     GRAPH_GPU_INVOCATION_WORDS, GRAPH_GPU_OUTPUT_WORDS, GpuExecutionProfile,
     GpuQualificationRegistry, GpuShaderArtifactIdentity, GraphCancellationToken,
-    GraphComputeExecutor, GraphGpuInvocation, GraphGpuOutput, GraphGpuProgram,
+    GraphComputeExecutor, GraphGpuInvocationBatch, GraphGpuOutput, GraphGpuProgram,
     GraphGpuRegisterType,
 };
 
@@ -75,6 +75,7 @@ impl VulkanGraphComputeExecutor {
             profile.clone(),
             qualification_artifact,
             |program, invocations| {
+                invocations.validate_program(program)?;
                 execute_program(
                     &mut dispatcher,
                     &profile.name,
@@ -135,12 +136,13 @@ impl GraphComputeExecutor for VulkanGraphComputeExecutor {
     fn execute_program(
         &self,
         program: &GraphGpuProgram,
-        invocations: &[GraphGpuInvocation],
+        invocation_batch: &GraphGpuInvocationBatch,
         cancellation: &GraphCancellationToken,
         deadline: Instant,
     ) -> saffron_vegetation::Result<Vec<GraphGpuOutput>> {
         check_abort(cancellation, deadline)?;
-        if invocations.is_empty() {
+        invocation_batch.validate_program(program)?;
+        if invocation_batch.invocation_count() == 0 {
             return Ok(Vec::new());
         }
         let mut dispatcher = self.lock_dispatcher(cancellation, deadline)?;
@@ -148,7 +150,7 @@ impl GraphComputeExecutor for VulkanGraphComputeExecutor {
             &mut dispatcher,
             &self.profile.name,
             program,
-            invocations,
+            invocation_batch,
             self.dispatch_limits,
             cancellation,
             deadline,
@@ -160,15 +162,15 @@ fn execute_program(
     dispatcher: &mut ComputeDispatch,
     profile: &str,
     program: &GraphGpuProgram,
-    invocations: &[GraphGpuInvocation],
+    invocation_batch: &GraphGpuInvocationBatch,
     limits: GraphDispatchLimits,
     cancellation: &GraphCancellationToken,
     deadline: Instant,
 ) -> saffron_vegetation::Result<Vec<GraphGpuOutput>> {
-    if invocations.is_empty() {
+    if invocation_batch.invocation_count() == 0 {
         return Ok(Vec::new());
     }
-    let program_bytes = words_to_le_bytes(&program.words())?;
+    let program_bytes = words_to_le_bytes(profile, &program.encoded_words()?)?;
     let max_invocations = dispatch_invocation_limit(
         limits,
         program_bytes.len(),
@@ -182,11 +184,14 @@ fn execute_program(
     })?;
     let mut outputs = Vec::new();
     outputs
-        .try_reserve_exact(invocations.len())
+        .try_reserve_exact(invocation_batch.invocation_count())
         .map_err(|error| {
             execution_error(profile, format!("cannot reserve GPU results: {error}"))
         })?;
-    for chunk in invocations.chunks(max_invocations) {
+    let values_per_chunk = max_invocations
+        .checked_mul(invocation_batch.input_stride())
+        .ok_or(saffron_vegetation::Error::NumericOverflow)?;
+    for chunk in invocation_batch.flat_inputs().chunks(values_per_chunk) {
         check_abort(cancellation, deadline)?;
         outputs.extend(execute_program_chunk(
             dispatcher,
@@ -206,7 +211,7 @@ fn execute_program_chunk(
     profile: &str,
     program: &GraphGpuProgram,
     program_bytes: &[u8],
-    invocations: &[GraphGpuInvocation],
+    invocation_inputs: &[saffron_vegetation::GraphGpuValue],
     cancellation: &GraphCancellationToken,
     deadline: Instant,
 ) -> saffron_vegetation::Result<Vec<GraphGpuOutput>> {
@@ -215,8 +220,14 @@ fn execute_program_chunk(
         .len()
         .checked_mul(GRAPH_GPU_INVOCATION_WORDS)
         .ok_or(saffron_vegetation::Error::NumericOverflow)?;
-    let invocation_byte_count = invocations
-        .len()
+    if invocation_inputs.len() % program.input_types().len() != 0 {
+        return Err(execution_error(
+            profile,
+            "flat invocation chunk does not match the resident program stride",
+        ));
+    }
+    let invocation_count = invocation_inputs.len() / program.input_types().len();
+    let invocation_byte_count = invocation_count
         .checked_mul(words_per_invocation)
         .and_then(|words| words.checked_mul(size_of::<u32>()))
         .ok_or(saffron_vegetation::Error::NumericOverflow)?;
@@ -226,8 +237,8 @@ fn execute_program_chunk(
         .map_err(|error| {
             execution_error(profile, format!("cannot reserve GPU invocations: {error}"))
         })?;
-    for invocation in invocations {
-        for word in invocation.words() {
+    for input in invocation_inputs {
+        for word in input.words() {
             invocation_bytes.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -237,14 +248,13 @@ fn execute_program_chunk(
             "packed invocation byte length does not match the resident program signature",
         ));
     }
-    let output_byte_count = invocations
-        .len()
+    let output_byte_count = invocation_count
         .checked_mul(GRAPH_GPU_OUTPUT_WORDS)
         .and_then(|words| words.checked_mul(size_of::<u32>()))
         .ok_or(saffron_vegetation::Error::NumericOverflow)?;
-    let invocation_count = u32::try_from(invocations.len())
+    let invocation_count_u32 = u32::try_from(invocation_count)
         .map_err(|_| execution_error(profile, "GPU invocation chunk exceeds Vulkan dimensions"))?;
-    let workgroups = invocation_count.div_ceil(GRAPH_GPU_WORKGROUP_SIZE as u32);
+    let workgroups = invocation_count_u32.div_ceil(GRAPH_GPU_WORKGROUP_SIZE as u32);
     let outcome = dispatcher
         .run_interruptible(
             vec![
@@ -267,7 +277,7 @@ fn execute_program_chunk(
     let output_bytes = buffers
         .get(2)
         .ok_or_else(|| execution_error(profile, "compute executor omitted its output buffer"))?;
-    decode_outputs(profile, program, output_bytes, invocations.len())
+    decode_outputs(profile, program, output_bytes, invocation_count)
 }
 
 fn decode_outputs(
@@ -356,15 +366,18 @@ const fn decode_register_type(word: u32) -> Option<Option<GraphGpuRegisterType>>
     })
 }
 
-fn words_to_le_bytes(words: &[u32]) -> saffron_vegetation::Result<Vec<u8>> {
+fn words_to_le_bytes(profile: &str, words: &[u32]) -> saffron_vegetation::Result<Vec<u8>> {
     let byte_count = words
         .len()
         .checked_mul(size_of::<u32>())
         .ok_or(saffron_vegetation::Error::NumericOverflow)?;
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(byte_count)
-        .map_err(|_| saffron_vegetation::Error::NumericOverflow)?;
+    bytes.try_reserve_exact(byte_count).map_err(|error| {
+        execution_error(
+            profile,
+            format!("cannot reserve resident program bytes: {error}"),
+        )
+    })?;
     for word in words {
         bytes.extend_from_slice(&word.to_le_bytes());
     }

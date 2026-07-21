@@ -302,7 +302,10 @@ fn capture_graph_program(
         ));
     }
     let corpus = qualification_corpus();
-    let corpus_invocation_count = corpus.iter().map(|batch| batch.invocations.len()).sum();
+    let corpus_invocation_count = corpus
+        .iter()
+        .map(|batch| batch.invocation_batch.invocation_count())
+        .sum();
     Ok(GraphProgramEvidence {
         abi_version: GRAPH_GPU_ABI_VERSION,
         abi_sha256: hex_bytes(&graph_gpu_abi_hash()),

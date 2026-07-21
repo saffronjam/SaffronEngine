@@ -1,6 +1,7 @@
 //! Resident graph-program ABI, Rust reference execution, qualification, and scheduling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
 use std::time::Instant;
 
 use saffron_spatial::{
@@ -8,6 +9,7 @@ use saffron_spatial::{
 };
 
 use crate::hash::sha256;
+use crate::memory::{requested_vec_bytes, reserve_exact};
 use crate::{
     CompiledBiomeGraph, CompiledGraphNode, CompiledGraphUnit, Error, GpuExecutionProfile,
     GpuQualificationRegistry, GraphAuthority, GraphCancellationToken, GraphCombineOperation,
@@ -394,7 +396,13 @@ impl GraphGpuProgram {
                 "register count exceeds the ABI bound",
             ));
         }
-        let mut register_types = input_types.clone();
+        let mut register_types = Vec::new();
+        reserve_exact(
+            &mut register_types,
+            register_count,
+            "resident graph register types",
+        )?;
+        register_types.extend_from_slice(&input_types);
         for (index, instruction) in instructions.iter().enumerate() {
             let expected = input_types.len() + index;
             if usize::try_from(instruction.destination().0).ok() != Some(expected) {
@@ -463,16 +471,59 @@ impl GraphGpuProgram {
         self.candidate_mask
     }
 
-    /// Exact tightly packed program-buffer words consumed by Slang.
+    /// Exact encoded word count without materializing the program buffer.
     #[must_use]
-    pub fn words(&self) -> Vec<u32> {
+    pub fn encoded_word_count(&self) -> usize {
+        GRAPH_GPU_PROGRAM_HEADER_WORDS
+            + self.input_types.len()
+            + self.instructions.len() * GRAPH_GPU_INSTRUCTION_WORDS
+    }
+
+    /// Exact encoded byte count without materializing the program buffer.
+    pub fn encoded_byte_count(&self) -> Result<usize> {
+        self.encoded_word_count()
+            .checked_mul(size_of::<u32>())
+            .ok_or(Error::NumericOverflow)
+    }
+
+    /// Retained heap bytes requested by the program's actual vector capacities.
+    pub fn requested_memory_bytes(&self) -> Result<u64> {
+        let mut bytes = requested_vec_bytes::<GraphGpuRegisterType>(self.input_types.capacity())?;
+        bytes = bytes
+            .checked_add(requested_vec_bytes::<GraphGpuInstruction>(
+                self.instructions.capacity(),
+            )?)
+            .ok_or(Error::NumericOverflow)?;
+        bytes = bytes
+            .checked_add(requested_vec_bytes::<GraphGpuRegisterType>(
+                self.register_types.capacity(),
+            )?)
+            .ok_or(Error::NumericOverflow)?;
+        for instruction in &self.instructions {
+            if let GraphGpuInstruction::Curve { points, .. } = instruction {
+                bytes = bytes
+                    .checked_add(requested_vec_bytes::<(u16, i32)>(points.capacity())?)
+                    .ok_or(Error::NumericOverflow)?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Exact tightly packed program-buffer words consumed by Slang.
+    pub fn encoded_words(&self) -> Result<Vec<u32>> {
+        let mut words = Vec::new();
+        reserve_exact(
+            &mut words,
+            self.encoded_word_count(),
+            "resident graph program words",
+        )?;
+        self.for_each_encoded_word(|word| words.push(word));
+        Ok(words)
+    }
+
+    fn for_each_encoded_word(&self, mut append: impl FnMut(u32)) {
         let output_type = self.output_type().map_or(0, |kind| kind as u32);
-        let mut words = Vec::with_capacity(
-            GRAPH_GPU_PROGRAM_HEADER_WORDS
-                + self.input_types.len()
-                + self.instructions.len() * GRAPH_GPU_INSTRUCTION_WORDS,
-        );
-        words.extend([
+        for word in [
             GRAPH_GPU_MAGIC,
             GRAPH_GPU_ABI_VERSION,
             self.input_types.len() as u32,
@@ -482,48 +533,173 @@ impl GraphGpuProgram {
                 .map_or(GRAPH_GPU_NO_REGISTER, |register| register.0),
             output_type,
             self.candidate_mask.0,
-        ]);
-        words.extend(self.input_types.iter().map(|kind| *kind as u32));
-        for instruction in &self.instructions {
-            words.extend(instruction.words());
+        ] {
+            append(word);
         }
-        words
+        for kind in &self.input_types {
+            append(*kind as u32);
+        }
+        for instruction in &self.instructions {
+            for word in instruction.words() {
+                append(word);
+            }
+        }
     }
 }
 
-/// One validated per-candidate invocation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GraphGpuInvocation {
+/// One validated flat candidate batch for a single resident-program input schema.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GraphGpuInvocationBatch {
+    input_types: [GraphGpuRegisterType; GRAPH_GPU_MAX_INPUTS],
+    input_stride: usize,
+    invocation_count: usize,
+    invocation_capacity: usize,
     inputs: Vec<GraphGpuValue>,
 }
 
-impl GraphGpuInvocation {
-    /// Validates exact input count and register kinds for one program.
-    pub fn new(program: &GraphGpuProgram, inputs: Vec<GraphGpuValue>) -> Result<Self> {
-        if inputs.len() != program.input_types.len()
-            || inputs
-                .iter()
-                .zip(&program.input_types)
-                .any(|(value, expected)| value.register_type() != *expected)
-        {
-            return Err(program_error(
-                "invocation.inputs",
-                "invocation inputs do not match the program register signature",
-            ));
-        }
-        Ok(Self { inputs })
+impl GraphGpuInvocationBatch {
+    /// Requested flat-buffer bytes for a batch capacity before allocation.
+    pub fn requested_memory_bytes_for_capacity(
+        program: &GraphGpuProgram,
+        invocation_capacity: usize,
+    ) -> Result<u64> {
+        let value_capacity = invocation_capacity
+            .checked_mul(program.input_types.len())
+            .ok_or(Error::NumericOverflow)?;
+        value_capacity
+            .checked_mul(GRAPH_GPU_INVOCATION_WORDS)
+            .and_then(|words| words.checked_mul(size_of::<u32>()))
+            .ok_or(Error::NumericOverflow)?;
+        requested_vec_bytes::<GraphGpuValue>(value_capacity)
     }
 
-    /// Typed inputs in program register order.
+    /// Reserves one flat buffer for an exact maximum number of invocations.
+    pub fn with_capacity(program: &GraphGpuProgram, invocation_capacity: usize) -> Result<Self> {
+        let input_stride = program.input_types.len();
+        let value_capacity = invocation_capacity
+            .checked_mul(input_stride)
+            .ok_or(Error::NumericOverflow)?;
+        Self::requested_memory_bytes_for_capacity(program, invocation_capacity)?;
+        let mut input_types = [GraphGpuRegisterType::FixedScalar; GRAPH_GPU_MAX_INPUTS];
+        input_types[..input_stride].copy_from_slice(&program.input_types);
+        let mut inputs = Vec::new();
+        reserve_exact(
+            &mut inputs,
+            value_capacity,
+            "resident graph invocation batch",
+        )?;
+        Ok(Self {
+            input_types,
+            input_stride,
+            invocation_count: 0,
+            invocation_capacity,
+            inputs,
+        })
+    }
+
+    /// Appends one fallibly produced invocation after validating its exact register signature.
+    pub fn push(&mut self, inputs: impl IntoIterator<Item = Result<GraphGpuValue>>) -> Result<()> {
+        if self.invocation_count == self.invocation_capacity {
+            return Err(program_error(
+                "invocationBatch.capacity",
+                "invocation count exceeds the reserved batch capacity",
+            ));
+        }
+        let mut validated = [GraphGpuValue::FixedScalar(0); GRAPH_GPU_MAX_INPUTS];
+        let mut input_count = 0;
+        for value in inputs {
+            let value = value?;
+            if input_count == self.input_stride
+                || value.register_type() != self.input_types[input_count]
+            {
+                return Err(program_error(
+                    "invocationBatch.inputs",
+                    "invocation inputs do not match the batch register signature",
+                ));
+            }
+            validated[input_count] = value;
+            input_count += 1;
+        }
+        if input_count != self.input_stride {
+            return Err(program_error(
+                "invocationBatch.inputs",
+                "invocation inputs do not match the batch register signature",
+            ));
+        }
+        self.inputs
+            .extend_from_slice(&validated[..self.input_stride]);
+        self.invocation_count += 1;
+        Ok(())
+    }
+
+    /// Program input signature carried by every invocation.
     #[must_use]
-    pub fn inputs(&self) -> &[GraphGpuValue] {
+    pub fn input_types(&self) -> &[GraphGpuRegisterType] {
+        &self.input_types[..self.input_stride]
+    }
+
+    /// Typed value count in each invocation.
+    #[must_use]
+    pub const fn input_stride(&self) -> usize {
+        self.input_stride
+    }
+
+    /// Number of validated invocations currently stored.
+    #[must_use]
+    pub const fn invocation_count(&self) -> usize {
+        self.invocation_count
+    }
+
+    /// Maximum number of invocations admitted by this allocation.
+    #[must_use]
+    pub const fn invocation_capacity(&self) -> usize {
+        self.invocation_capacity
+    }
+
+    /// Actual flat value capacity retained by the backing vector.
+    #[must_use]
+    pub fn value_capacity(&self) -> usize {
+        self.inputs.capacity()
+    }
+
+    /// All typed invocation inputs in invocation-major register order.
+    #[must_use]
+    pub fn flat_inputs(&self) -> &[GraphGpuValue] {
         &self.inputs
     }
 
-    /// Exact tightly packed invocation-buffer words consumed by Slang.
+    /// Ordered fixed-stride invocation views.
+    pub fn invocations(&self) -> impl ExactSizeIterator<Item = &[GraphGpuValue]> + Clone {
+        self.inputs.chunks_exact(self.input_stride)
+    }
+
+    /// Exact encoded word count without materializing the invocation buffer.
     #[must_use]
-    pub fn words(&self) -> Vec<u32> {
-        self.inputs.iter().flat_map(|input| input.words()).collect()
+    pub fn encoded_word_count(&self) -> usize {
+        self.inputs.len() * GRAPH_GPU_INVOCATION_WORDS
+    }
+
+    /// Exact encoded byte count without materializing the invocation buffer.
+    pub fn encoded_byte_count(&self) -> Result<usize> {
+        self.encoded_word_count()
+            .checked_mul(size_of::<u32>())
+            .ok_or(Error::NumericOverflow)
+    }
+
+    /// Retained heap bytes requested by the flat input vector's actual capacity.
+    pub fn requested_memory_bytes(&self) -> Result<u64> {
+        requested_vec_bytes::<GraphGpuValue>(self.inputs.capacity())
+    }
+
+    /// Validates that the batch carries the resident program's exact input schema.
+    pub fn validate_program(&self, program: &GraphGpuProgram) -> Result<()> {
+        if self.input_types() != program.input_types() {
+            return Err(program_error(
+                "invocationBatch.schema",
+                "invocation batch does not match the program register signature",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -557,12 +733,12 @@ impl GraphGpuOutput {
 }
 
 /// One multi-instruction qualification batch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct GraphGpuQualificationBatch {
     /// Resident program under test.
     pub program: GraphGpuProgram,
     /// Edge, normal, mask, and overflow invocations.
-    pub invocations: Vec<GraphGpuInvocation>,
+    pub invocation_batch: GraphGpuInvocationBatch,
 }
 
 /// Canonical multi-instruction corpus covering every resident opcode and failure semantics.
@@ -620,7 +796,7 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
         GraphGpuRegister(16),
     )
     .unwrap();
-    let chain_invocations = [
+    let chain_inputs = [
         (
             [0, 8_192, 16_384, 24_576, 32_768, 40_960, 49_152, 65_536],
             [0, 0, 0],
@@ -632,18 +808,17 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
             true,
         ),
         ([0; 8], [32_768; 3], false),
-    ]
-    .into_iter()
-    .map(|(corners, blend, live)| {
+    ];
+    let mut chain_batch =
+        GraphGpuInvocationBatch::with_capacity(&chain, chain_inputs.len()).unwrap();
+    for (corners, blend, live) in chain_inputs {
         let inputs = corners
             .into_iter()
             .map(GraphGpuValue::FixedScalar)
             .chain(blend.into_iter().map(GraphGpuValue::Unit))
-            .chain([GraphGpuValue::CandidateMask(live)])
-            .collect();
-        GraphGpuInvocation::new(&chain, inputs).unwrap()
-    })
-    .collect();
+            .chain([GraphGpuValue::CandidateMask(live)]);
+        chain_batch.push(inputs.map(Ok)).unwrap();
+    }
 
     let branch = GraphGpuProgram::new(
         vec![scalar, scalar, mask],
@@ -684,24 +859,25 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
         GraphGpuRegister(7),
     )
     .unwrap();
-    let branch_invocations = [
+    let branch_inputs = [
         (10_000, 20_000, true),
         (i32::MAX, 0, true),
         (0, -65_536, false),
-    ]
-    .into_iter()
-    .map(|(left, right, live)| {
-        GraphGpuInvocation::new(
-            &branch,
-            vec![
-                GraphGpuValue::FixedScalar(left),
-                GraphGpuValue::FixedScalar(right),
-                GraphGpuValue::CandidateMask(live),
-            ],
-        )
-        .unwrap()
-    })
-    .collect();
+    ];
+    let mut branch_batch =
+        GraphGpuInvocationBatch::with_capacity(&branch, branch_inputs.len()).unwrap();
+    for (left, right, live) in branch_inputs {
+        branch_batch
+            .push(
+                [
+                    GraphGpuValue::FixedScalar(left),
+                    GraphGpuValue::FixedScalar(right),
+                    GraphGpuValue::CandidateMask(live),
+                ]
+                .map(Ok),
+            )
+            .unwrap();
+    }
 
     let gradient = GraphGpuProgram::new(
         vec![
@@ -727,7 +903,7 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
         GraphGpuRegister(6),
     )
     .unwrap();
-    let gradient_invocations = [
+    let gradient_inputs = [
         ([10_000_i128, -20_000, 30_000], [0_i128; 3]),
         (
             [i128::MAX - 1_000, i128::MAX - 2_000, i128::MAX - 3_000],
@@ -739,24 +915,25 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
         ),
         ([1_i128 << 80, -(1_i128 << 81), 0], [0_i128; 3]),
         ([i128::MAX, 1, 1], [0_i128; 3]),
-    ]
-    .into_iter()
-    .map(|(position, origin)| {
-        GraphGpuInvocation::new(
-            &gradient,
-            vec![
-                GraphGpuValue::WorldTick(position[0]),
-                GraphGpuValue::WorldTick(position[1]),
-                GraphGpuValue::WorldTick(position[2]),
-                GraphGpuValue::WorldTick(origin[0]),
-                GraphGpuValue::WorldTick(origin[1]),
-                GraphGpuValue::WorldTick(origin[2]),
-                GraphGpuValue::CandidateMask(true),
-            ],
-        )
-        .unwrap()
-    })
-    .collect();
+    ];
+    let mut gradient_batch =
+        GraphGpuInvocationBatch::with_capacity(&gradient, gradient_inputs.len()).unwrap();
+    for (position, origin) in gradient_inputs {
+        gradient_batch
+            .push(
+                [
+                    GraphGpuValue::WorldTick(position[0]),
+                    GraphGpuValue::WorldTick(position[1]),
+                    GraphGpuValue::WorldTick(position[2]),
+                    GraphGpuValue::WorldTick(origin[0]),
+                    GraphGpuValue::WorldTick(origin[1]),
+                    GraphGpuValue::WorldTick(origin[2]),
+                    GraphGpuValue::CandidateMask(true),
+                ]
+                .map(Ok),
+            )
+            .unwrap();
+    }
 
     let multiply = GraphGpuProgram::new(
         vec![scalar, scalar, mask],
@@ -770,56 +947,57 @@ pub fn qualification_corpus() -> Vec<GraphGpuQualificationBatch> {
         GraphGpuRegister(2),
     )
     .unwrap();
-    let multiply_invocations = [(98_304, 43_691), (i32::MAX, i32::MAX)]
-        .into_iter()
-        .map(|(left, right)| {
-            GraphGpuInvocation::new(
-                &multiply,
-                vec![
+    let multiply_inputs = [(98_304, 43_691), (i32::MAX, i32::MAX)];
+    let mut multiply_batch =
+        GraphGpuInvocationBatch::with_capacity(&multiply, multiply_inputs.len()).unwrap();
+    for (left, right) in multiply_inputs {
+        multiply_batch
+            .push(
+                [
                     GraphGpuValue::FixedScalar(left),
                     GraphGpuValue::FixedScalar(right),
                     GraphGpuValue::CandidateMask(true),
-                ],
+                ]
+                .map(Ok),
             )
-            .unwrap()
-        })
-        .collect();
+            .unwrap();
+    }
 
     vec![
         GraphGpuQualificationBatch {
             program: chain,
-            invocations: chain_invocations,
+            invocation_batch: chain_batch,
         },
         GraphGpuQualificationBatch {
             program: branch,
-            invocations: branch_invocations,
+            invocation_batch: branch_batch,
         },
         GraphGpuQualificationBatch {
             program: gradient,
-            invocations: gradient_invocations,
+            invocation_batch: gradient_batch,
         },
         GraphGpuQualificationBatch {
             program: multiply,
-            invocations: multiply_invocations,
+            invocation_batch: multiply_batch,
         },
     ]
 }
 
 /// Executes one resident program through canonical Rust semantics.
-#[must_use]
 pub fn evaluate_gpu_program_reference(
     program: &GraphGpuProgram,
-    invocations: &[GraphGpuInvocation],
-) -> Vec<GraphGpuOutput> {
-    invocations
-        .iter()
+    invocation_batch: &GraphGpuInvocationBatch,
+) -> Result<Vec<GraphGpuOutput>> {
+    invocation_batch.validate_program(program)?;
+    Ok(invocation_batch
+        .invocations()
         .map(|invocation| evaluate_gpu_invocation_reference(program, invocation))
-        .collect()
+        .collect())
 }
 
 fn evaluate_gpu_invocation_reference(
     program: &GraphGpuProgram,
-    invocation: &GraphGpuInvocation,
+    invocation: &[GraphGpuValue],
 ) -> GraphGpuOutput {
     let value_type = program
         .output
@@ -843,10 +1021,10 @@ fn evaluate_gpu_invocation_reference(
 
 fn evaluate_gpu_invocation_reference_inner(
     program: &GraphGpuProgram,
-    invocation: &GraphGpuInvocation,
+    invocation: &[GraphGpuValue],
 ) -> Result<(bool, u32)> {
     let mut registers = [GraphGpuValue::FixedScalar(0); GRAPH_GPU_MAX_REGISTERS];
-    registers[..invocation.inputs.len()].copy_from_slice(&invocation.inputs);
+    registers[..invocation.len()].copy_from_slice(invocation);
     for instruction in &program.instructions {
         let value = match instruction {
             GraphGpuInstruction::Noise {
@@ -1041,20 +1219,24 @@ pub fn graph_gpu_abi_hash() -> [u8; 32] {
 pub fn qualification_corpus_hash() -> [u8; 32] {
     let mut bytes = b"saffron-anima/vegetation-graph-gpu-corpus/v2\0".to_vec();
     for batch in qualification_corpus() {
-        append_words(&mut bytes, &batch.program.words());
-        bytes.extend_from_slice(&(batch.invocations.len() as u64).to_be_bytes());
-        for invocation in batch.invocations {
-            append_words(&mut bytes, &invocation.words());
+        append_program_words(&mut bytes, &batch.program);
+        bytes.extend_from_slice(&(batch.invocation_batch.invocation_count() as u64).to_be_bytes());
+        for invocation in batch.invocation_batch.invocations() {
+            let word_count = invocation.len() * GRAPH_GPU_INVOCATION_WORDS;
+            bytes.extend_from_slice(&(word_count as u64).to_be_bytes());
+            for word in invocation.iter().flat_map(|value| value.words()) {
+                bytes.extend_from_slice(&word.to_be_bytes());
+            }
         }
     }
     sha256(&bytes)
 }
 
-fn append_words(bytes: &mut Vec<u8>, words: &[u32]) {
-    bytes.extend_from_slice(&(words.len() as u64).to_be_bytes());
-    for word in words {
+fn append_program_words(bytes: &mut Vec<u8>, program: &GraphGpuProgram) {
+    bytes.extend_from_slice(&(program.encoded_word_count() as u64).to_be_bytes());
+    program.for_each_encoded_word(|word| {
         bytes.extend_from_slice(&word.to_be_bytes());
-    }
+    });
 }
 
 /// Canonical Rust output bytes for the complete qualification corpus.
@@ -1062,7 +1244,9 @@ fn append_words(bytes: &mut Vec<u8>, words: &[u32]) {
 pub fn qualification_reference_bytes() -> Vec<u8> {
     let mut bytes = Vec::new();
     for batch in qualification_corpus() {
-        for output in evaluate_gpu_program_reference(&batch.program, &batch.invocations) {
+        for output in evaluate_gpu_program_reference(&batch.program, &batch.invocation_batch)
+            .expect("canonical qualification batch matches its resident program")
+        {
             for word in output.words() {
                 bytes.extend_from_slice(&word.to_be_bytes());
             }
@@ -1087,7 +1271,7 @@ pub trait GraphComputeExecutor: Send + Sync {
     fn execute_program(
         &self,
         program: &GraphGpuProgram,
-        invocations: &[GraphGpuInvocation],
+        invocation_batch: &GraphGpuInvocationBatch,
         cancellation: &GraphCancellationToken,
         deadline: Instant,
     ) -> Result<Vec<GraphGpuOutput>>;
@@ -1193,8 +1377,45 @@ pub fn build_execution_plan(
     parallel_cpu: bool,
     gpu: Option<GraphGpuScheduling<'_>>,
 ) -> Result<GraphExecutionPlan> {
+    let demand_plan = graph.demand_plan();
+    let demand = demand_plan.execution_slice();
+    fn compiled_node_count(
+        unit: &CompiledGraphUnit,
+        demand: &crate::graph::CompiledDemandSlice,
+    ) -> Result<usize> {
+        let unit_demand = demand
+            .unit(
+                unit.nodes
+                    .first()
+                    .map_or(&[][..], |node| node.debug_symbol.module_path.as_slice()),
+            )
+            .ok_or_else(|| program_error("schedule.demand", "compiled demand slice is missing"))?;
+        unit.nodes
+            .iter()
+            .filter(|node| unit_demand.contains_node(node.definition.guid))
+            .try_fold(unit_demand.nodes.len(), |total, node| {
+                node.module.as_deref().map_or(Ok(total), |module| {
+                    total
+                        .checked_add(compiled_node_count(module, demand)?)
+                        .ok_or(Error::NumericOverflow)
+                })
+            })
+    }
+
     let mut groups = Vec::new();
-    schedule_unit(&graph.root, parallel_cpu, gpu, &mut groups)?;
+    reserve_exact(
+        &mut groups,
+        compiled_node_count(&graph.root, demand)?,
+        "graph execution groups",
+    )?;
+    schedule_unit(
+        &graph.root,
+        demand_plan,
+        demand,
+        parallel_cpu,
+        gpu,
+        &mut groups,
+    )?;
     let predicted_transfer_bytes = groups.iter().try_fold(0_u64, |total, group| {
         total
             .checked_add(group.transfer_in_bytes)
@@ -1208,31 +1429,53 @@ pub fn build_execution_plan(
 
 fn schedule_unit(
     unit: &CompiledGraphUnit,
+    demand_plan: &crate::graph::CompiledDemandPlan,
+    demand: &crate::graph::CompiledDemandSlice,
     parallel_cpu: bool,
     gpu: Option<GraphGpuScheduling<'_>>,
     groups: &mut Vec<GraphExecutionGroup>,
 ) -> Result<()> {
-    for node in &unit.nodes {
+    let module_path = unit
+        .nodes
+        .first()
+        .map_or(&[][..], |node| node.debug_symbol.module_path.as_slice());
+    let unit_demand = demand
+        .unit(module_path)
+        .ok_or_else(|| program_error("schedule.demand", "compiled demand slice is missing"))?;
+    for node in unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
         if let Some(module) = node.module.as_deref() {
-            schedule_unit(module, parallel_cpu, gpu, groups)?;
+            schedule_unit(module, demand_plan, demand, parallel_cpu, gpu, groups)?;
         }
     }
     let nodes = unit
         .nodes
         .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
         .map(|node| (node.definition.guid, node))
         .collect::<BTreeMap<_, _>>();
     let gpu_nodes = unit
         .nodes
         .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
         .filter(|node| node_gpu_admitted(node, gpu))
         .map(|node| node.definition.guid)
         .collect::<BTreeSet<_>>();
-    let mut components = gpu_nodes
-        .iter()
-        .copied()
-        .map(|node| vec![node])
-        .collect::<Vec<_>>();
+    let mut components = Vec::new();
+    reserve_exact(
+        &mut components,
+        gpu_nodes.len(),
+        "GPU scheduling components",
+    )?;
+    for node in gpu_nodes.iter().copied() {
+        let mut component = Vec::new();
+        reserve_exact(&mut component, 1, "GPU scheduling component")?;
+        component.push(node);
+        components.push(component);
+    }
     let mut component_by_node = components
         .iter()
         .enumerate()
@@ -1240,9 +1483,17 @@ fn schedule_unit(
         .collect::<BTreeMap<_, _>>();
     loop {
         let mut merged = false;
-        for edge in &unit.edges {
+        for edge in unit
+            .edges
+            .iter()
+            .filter(|edge| unit_demand.contains_edge(edge))
+        {
             if gpu_nodes.contains(&edge.from_node)
                 && gpu_nodes.contains(&edge.to_node)
+                && demand_plan.same_scope_membership(
+                    &nodes[&edge.from_node].address(),
+                    &nodes[&edge.to_node].address(),
+                )
                 && program_edge_compatible(nodes[&edge.from_node], nodes[&edge.to_node], edge)
             {
                 let source = component_by_node[&edge.from_node];
@@ -1250,18 +1501,22 @@ fn schedule_unit(
                 if source == destination {
                     continue;
                 }
-                let proposed_members = components[source]
-                    .iter()
-                    .chain(&components[destination])
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                let proposed = unit
-                    .nodes
-                    .iter()
-                    .map(|node| node.definition.guid)
-                    .filter(|node| proposed_members.contains(node))
-                    .collect::<Vec<_>>();
-                if component_topology_supported(unit, &nodes, &proposed) {
+                let proposed_capacity = components[source]
+                    .len()
+                    .checked_add(components[destination].len())
+                    .ok_or(Error::NumericOverflow)?;
+                let mut proposed = Vec::new();
+                reserve_exact(
+                    &mut proposed,
+                    proposed_capacity,
+                    "GPU scheduling proposed component",
+                )?;
+                proposed.extend(unit.nodes.iter().map(|node| node.definition.guid).filter(
+                    |node| {
+                        components[source].contains(node) || components[destination].contains(node)
+                    },
+                ));
+                if component_topology_supported(unit, unit_demand, &nodes, &proposed) {
                     components[source] = proposed;
                     components[destination].clear();
                     for node in &components[source] {
@@ -1284,7 +1539,11 @@ fn schedule_unit(
     }
 
     let mut emitted_components = BTreeSet::new();
-    for node in &unit.nodes {
+    for node in unit
+        .nodes
+        .iter()
+        .filter(|node| unit_demand.contains_node(node.definition.guid))
+    {
         let guid = node.definition.guid;
         if let Some(component) = component_by_node.get(&guid).copied() {
             if !emitted_components.insert(component) {
@@ -1292,6 +1551,8 @@ fn schedule_unit(
             }
             groups.push(execution_group(
                 unit,
+                demand,
+                unit_demand,
                 &nodes,
                 &components[component],
                 GraphExecutionDomain::SlangCompute,
@@ -1303,7 +1564,7 @@ fn schedule_unit(
                 GraphExecutionDomain::ReferenceCpu
             };
             let singleton = [guid];
-            let group = execution_group(unit, &nodes, &singleton, domain)?;
+            let group = execution_group(unit, demand, unit_demand, &nodes, &singleton, domain)?;
             if let Some(previous) = groups.last_mut().filter(|previous| {
                 previous.domain == domain
                     && previous
@@ -1311,6 +1572,11 @@ fn schedule_unit(
                         .iter()
                         .any(|output| group.inputs.iter().any(|input| input.pin == output.pin))
             }) {
+                reserve_exact(
+                    &mut previous.nodes,
+                    group.nodes.len(),
+                    "coalesced CPU execution group nodes",
+                )?;
                 previous.nodes.extend(group.nodes);
                 previous.outputs = group.outputs;
                 previous.predicted_output_bytes = previous
@@ -1383,10 +1649,11 @@ fn program_edge_compatible(
 
 fn component_topology_supported(
     unit: &CompiledGraphUnit,
+    demand: &crate::graph::CompiledDemandUnitSlice,
     nodes: &BTreeMap<u128, &CompiledGraphNode>,
     component: &[u128],
 ) -> bool {
-    let members = component.iter().copied().collect::<BTreeSet<_>>();
+    let is_member = |node| component.contains(&node);
     if component.len() > GRAPH_GPU_MAX_INSTRUCTIONS
         || component
             .iter()
@@ -1409,8 +1676,8 @@ fn component_topology_supported(
             _ => 0,
         };
     }
-    for edge in &unit.edges {
-        if !members.contains(&edge.from_node) && members.contains(&edge.to_node) {
+    for edge in unit.edges.iter().filter(|edge| demand.contains_edge(edge)) {
+        if !is_member(edge.from_node) && is_member(edge.to_node) {
             let Some(pin) = nodes[&edge.from_node]
                 .outputs
                 .iter()
@@ -1420,23 +1687,19 @@ fn component_topology_supported(
             };
             match pin.domain {
                 GraphDomain::ScalarField => {
-                    external_scalar_inputs.insert((edge.from_node, edge.from_pin.clone()));
+                    external_scalar_inputs.insert((edge.from_node, edge.from_pin.as_str()));
                 }
                 GraphDomain::Candidates => {
-                    external_candidate_inputs.insert((edge.from_node, edge.from_pin.clone()));
+                    external_candidate_inputs.insert((edge.from_node, edge.from_pin.as_str()));
                 }
                 _ => return false,
             }
-            let Some(lineage) = nodes[&edge.from_node]
-                .output_lineage
-                .get(&edge.from_pin)
-                .cloned()
-            else {
+            let Some(lineage) = nodes[&edge.from_node].output_lineage.get(&edge.from_pin) else {
                 return false;
             };
             input_lineages.insert(lineage);
         }
-        if members.contains(&edge.from_node) && !members.contains(&edge.to_node) {
+        if is_member(edge.from_node) && !is_member(edge.to_node) {
             let Some(pin) = nodes[&edge.from_node]
                 .outputs
                 .iter()
@@ -1446,23 +1709,27 @@ fn component_topology_supported(
             };
             match pin.domain {
                 GraphDomain::ScalarField => {
-                    field_outputs.insert((edge.from_node, edge.from_pin.clone()));
+                    field_outputs.insert((edge.from_node, edge.from_pin.as_str()));
                 }
                 GraphDomain::Candidates => {
-                    candidate_outputs.insert((edge.from_node, edge.from_pin.clone()));
+                    candidate_outputs.insert((edge.from_node, edge.from_pin.as_str()));
                 }
                 _ => return false,
             }
         }
     }
-    for output in &unit.outputs {
-        if members.contains(&output.node) {
+    for output in unit
+        .outputs
+        .iter()
+        .filter(|output| demand.outputs.contains(&output.name))
+    {
+        if is_member(output.node) {
             match output.domain {
                 GraphDomain::ScalarField => {
-                    field_outputs.insert((output.node, output.pin.clone()));
+                    field_outputs.insert((output.node, output.pin.as_str()));
                 }
                 GraphDomain::Candidates => {
-                    candidate_outputs.insert((output.node, output.pin.clone()));
+                    candidate_outputs.insert((output.node, output.pin.as_str()));
                 }
                 _ => return false,
             }
@@ -1479,15 +1746,17 @@ fn component_topology_supported(
 
 fn execution_group(
     unit: &CompiledGraphUnit,
+    live: &crate::graph::CompiledDemandSlice,
+    demand: &crate::graph::CompiledDemandUnitSlice,
     nodes: &BTreeMap<u128, &CompiledGraphNode>,
     members: &[u128],
     domain: GraphExecutionDomain,
 ) -> Result<GraphExecutionGroup> {
-    let member_set = members.iter().copied().collect::<BTreeSet<_>>();
+    let is_member = |node| members.contains(&node);
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
-    for edge in &unit.edges {
-        if !member_set.contains(&edge.from_node) && member_set.contains(&edge.to_node) {
+    for edge in unit.edges.iter().filter(|edge| demand.contains_edge(edge)) {
+        if !is_member(edge.from_node) && is_member(edge.to_node) {
             let source = nodes[&edge.from_node];
             let pin = source
                 .outputs
@@ -1502,7 +1771,7 @@ fn execution_group(
                 domain: pin.domain,
             });
         }
-        if member_set.contains(&edge.from_node) && !member_set.contains(&edge.to_node) {
+        if is_member(edge.from_node) && !is_member(edge.to_node) {
             let source = nodes[&edge.from_node];
             let pin = source
                 .outputs
@@ -1518,8 +1787,12 @@ fn execution_group(
             });
         }
     }
-    for output in &unit.outputs {
-        if member_set.contains(&output.node) {
+    for output in unit
+        .outputs
+        .iter()
+        .filter(|output| demand.outputs.contains(&output.name))
+    {
+        if is_member(output.node) {
             let source = nodes[&output.node];
             outputs.insert(GraphExecutionBoundary {
                 pin: QualifiedGraphPin {
@@ -1532,7 +1805,7 @@ fn execution_group(
     }
     let predicted_output_bytes = members
         .iter()
-        .map(|node| nodes[node].estimate.memory_bytes)
+        .map(|node| live.node_estimate(&nodes[node].address()).memory_bytes)
         .max()
         .unwrap_or(0);
     let transfer_in_bytes = if domain == GraphExecutionDomain::SlangCompute {
@@ -1540,22 +1813,40 @@ fn execution_group(
     } else {
         0
     };
+    let mut scheduled_nodes = Vec::new();
+    reserve_exact(
+        &mut scheduled_nodes,
+        members.len(),
+        "scheduled execution nodes",
+    )?;
+    for guid in members {
+        let node = nodes[guid];
+        scheduled_nodes.push(GraphExecutionNode {
+            address: node.address(),
+            operator: node.definition.operator,
+            authority: node.definition.authority,
+            node_hash: node.definition_hash,
+        });
+    }
+    let mut scheduled_inputs = Vec::new();
+    reserve_exact(
+        &mut scheduled_inputs,
+        inputs.len(),
+        "scheduled execution inputs",
+    )?;
+    scheduled_inputs.extend(inputs);
+    let mut scheduled_outputs = Vec::new();
+    reserve_exact(
+        &mut scheduled_outputs,
+        outputs.len(),
+        "scheduled execution outputs",
+    )?;
+    scheduled_outputs.extend(outputs);
     Ok(GraphExecutionGroup {
         domain,
-        nodes: members
-            .iter()
-            .map(|guid| {
-                let node = nodes[guid];
-                GraphExecutionNode {
-                    address: node.address(),
-                    operator: node.definition.operator,
-                    authority: node.definition.authority,
-                    node_hash: sha256(&node.definition.canonical_bytes()),
-                }
-            })
-            .collect(),
-        inputs: inputs.into_iter().collect(),
-        outputs: outputs.into_iter().collect(),
+        nodes: scheduled_nodes,
+        inputs: scheduled_inputs,
+        outputs: scheduled_outputs,
         transfer_in_bytes,
         predicted_output_bytes,
     })
@@ -1800,19 +2091,142 @@ mod tests {
     }
 
     #[test]
+    fn flat_invocation_batch_enforces_one_schema_capacity_and_encoding() {
+        let corpus = qualification_corpus();
+        let program = &corpus[3].program;
+        let mut batch = GraphGpuInvocationBatch::with_capacity(program, 2).unwrap();
+        assert_eq!(batch.input_stride(), 3);
+        assert_eq!(batch.invocation_count(), 0);
+        assert_eq!(batch.invocation_capacity(), 2);
+        assert_eq!(batch.encoded_word_count(), 0);
+        assert_eq!(batch.encoded_byte_count().unwrap(), 0);
+        assert!(
+            batch
+                .push(
+                    [
+                        GraphGpuValue::FixedScalar(1),
+                        GraphGpuValue::CandidateMask(true),
+                        GraphGpuValue::CandidateMask(true),
+                    ]
+                    .map(Ok)
+                )
+                .is_err()
+        );
+        assert!(
+            batch
+                .push([
+                    Ok(GraphGpuValue::FixedScalar(1)),
+                    Ok(GraphGpuValue::FixedScalar(2)),
+                ])
+                .is_err()
+        );
+        assert_eq!(batch.invocation_count(), 0);
+        for left in [1, 2] {
+            batch
+                .push(
+                    [
+                        GraphGpuValue::FixedScalar(left),
+                        GraphGpuValue::FixedScalar(3),
+                        GraphGpuValue::CandidateMask(true),
+                    ]
+                    .map(Ok),
+                )
+                .unwrap();
+        }
+        assert!(
+            batch
+                .push(
+                    [
+                        GraphGpuValue::FixedScalar(4),
+                        GraphGpuValue::FixedScalar(5),
+                        GraphGpuValue::CandidateMask(true),
+                    ]
+                    .map(Ok)
+                )
+                .is_err()
+        );
+        assert_eq!(batch.invocation_count(), 2);
+        assert_eq!(batch.invocations().len(), 2);
+        assert_eq!(batch.flat_inputs().len(), 6);
+        assert_eq!(batch.encoded_word_count(), 24);
+        assert_eq!(batch.encoded_byte_count().unwrap(), 96);
+        assert!(batch.validate_program(&corpus[0].program).is_err());
+        let mut failed_batch = GraphGpuInvocationBatch::with_capacity(program, 1).unwrap();
+        assert!(matches!(
+            failed_batch.push(std::iter::once(Err(Error::NumericOverflow))),
+            Err(Error::NumericOverflow)
+        ));
+        assert_eq!(failed_batch.invocation_count(), 0);
+    }
+
+    #[test]
+    fn gpu_program_and_batch_report_checked_retained_capacity_bytes() {
+        let corpus = qualification_corpus();
+        let program = &corpus[0].program;
+        let mut expected_program_bytes =
+            requested_vec_bytes::<GraphGpuRegisterType>(program.input_types.capacity())
+                .unwrap()
+                .checked_add(
+                    requested_vec_bytes::<GraphGpuInstruction>(program.instructions.capacity())
+                        .unwrap(),
+                )
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        requested_vec_bytes::<GraphGpuRegisterType>(
+                            program.register_types.capacity(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .unwrap();
+        for instruction in &program.instructions {
+            if let GraphGpuInstruction::Curve { points, .. } = instruction {
+                expected_program_bytes = expected_program_bytes
+                    .checked_add(requested_vec_bytes::<(u16, i32)>(points.capacity()).unwrap())
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            program.requested_memory_bytes().unwrap(),
+            expected_program_bytes
+        );
+        assert_eq!(
+            program.encoded_byte_count().unwrap(),
+            program.encoded_word_count() * size_of::<u32>()
+        );
+        let requested =
+            GraphGpuInvocationBatch::requested_memory_bytes_for_capacity(program, 3).unwrap();
+        let batch = GraphGpuInvocationBatch::with_capacity(program, 3).unwrap();
+        assert!(batch.requested_memory_bytes().unwrap() >= requested);
+        assert_eq!(
+            batch.requested_memory_bytes().unwrap(),
+            requested_vec_bytes::<GraphGpuValue>(batch.value_capacity()).unwrap()
+        );
+        assert!(matches!(
+            GraphGpuInvocationBatch::requested_memory_bytes_for_capacity(program, usize::MAX),
+            Err(Error::NumericOverflow)
+        ));
+    }
+
+    #[test]
     fn branching_and_terminal_masks_preserve_exact_semantics() {
         let corpus = qualification_corpus();
         let batch = &corpus[1];
-        let outputs = evaluate_gpu_program_reference(&batch.program, &batch.invocations);
+        let outputs =
+            evaluate_gpu_program_reference(&batch.program, &batch.invocation_batch).unwrap();
         assert!(outputs[0].valid);
         assert!(outputs[1].valid);
         assert!(!outputs[2].candidate_mask);
-        let overflow = evaluate_gpu_program_reference(&corpus[3].program, &corpus[3].invocations);
+        let overflow =
+            evaluate_gpu_program_reference(&corpus[3].program, &corpus[3].invocation_batch)
+                .unwrap();
         assert!(
             !overflow[1].valid,
             "overflow invalidates the complete invocation"
         );
-        let gradient = evaluate_gpu_program_reference(&corpus[2].program, &corpus[2].invocations);
+        let gradient =
+            evaluate_gpu_program_reference(&corpus[2].program, &corpus[2].invocation_batch)
+                .unwrap();
         assert!(gradient[..4].iter().all(|output| output.valid));
         assert_eq!(gradient[3].value as i32, 1_024);
         assert!(!gradient[4].valid);
@@ -1856,7 +2270,7 @@ mod tests {
         let artifact = qualification_artifact();
         let registry =
             GpuQualificationRegistry::qualify(profile.clone(), artifact, |program, invocations| {
-                Ok(evaluate_gpu_program_reference(program, invocations))
+                evaluate_gpu_program_reference(program, invocations)
             })
             .unwrap();
         assert_eq!(registry.evidence().len(), 7);
@@ -1869,7 +2283,7 @@ mod tests {
 
         let mismatch =
             GpuQualificationRegistry::qualify(profile.clone(), artifact, |program, invocations| {
-                let mut outputs = evaluate_gpu_program_reference(program, invocations);
+                let mut outputs = evaluate_gpu_program_reference(program, invocations)?;
                 outputs[0].value ^= 1;
                 Ok(outputs)
             })

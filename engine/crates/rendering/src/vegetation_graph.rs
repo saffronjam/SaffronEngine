@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use saffron_vegetation::{
-    BIOME_NODE_VERSION, GraphCancellationToken, GraphComputeExecutor, GraphOperator,
-    evaluate_gpu_program_reference, qualification_corpus,
+    BIOME_NODE_VERSION, GraphCancellationToken, GraphComputeExecutor, GraphGpuInvocationBatch,
+    GraphOperator, evaluate_gpu_program_reference, qualification_corpus,
 };
 
 use crate::{Device, SurfaceSource, VulkanGraphComputeExecutor, validation_issue_count};
@@ -38,11 +38,12 @@ fn every_resident_program_matches_rust_and_is_qualified_on_the_exact_artifact() 
     assert_ne!(artifact_identity.record_sha256().bytes(), [0; 32]);
 
     for batch in qualification_corpus() {
-        let expected = evaluate_gpu_program_reference(&batch.program, &batch.invocations);
+        let expected = evaluate_gpu_program_reference(&batch.program, &batch.invocation_batch)
+            .expect("canonical resident graph reference execution");
         let actual = executor
             .execute_program(
                 &batch.program,
-                &batch.invocations,
+                &batch.invocation_batch,
                 &GraphCancellationToken::default(),
                 Instant::now() + Duration::from_secs(30),
             )
@@ -79,18 +80,19 @@ fn resident_program_chunks_invocations_and_preserves_order() {
     let executor = VulkanGraphComputeExecutor::new(Arc::clone(&device))
         .expect("resident vegetation graph qualification");
     let batch = qualification_corpus().into_iter().next().unwrap();
-    let invocations = batch
-        .invocations
-        .iter()
-        .cloned()
-        .cycle()
-        .take(65_537)
-        .collect::<Vec<_>>();
-    let expected = evaluate_gpu_program_reference(&batch.program, &invocations);
+    let mut invocation_batch = GraphGpuInvocationBatch::with_capacity(&batch.program, 65_537)
+        .expect("flat chunking test batch");
+    for invocation in batch.invocation_batch.invocations().cycle().take(65_537) {
+        invocation_batch
+            .push(invocation.iter().copied().map(Ok))
+            .expect("valid repeated invocation");
+    }
+    let expected = evaluate_gpu_program_reference(&batch.program, &invocation_batch)
+        .expect("chunked resident graph reference execution");
     let actual = executor
         .execute_program(
             &batch.program,
-            &invocations,
+            &invocation_batch,
             &GraphCancellationToken::default(),
             Instant::now() + Duration::from_secs(30),
         )
@@ -102,7 +104,7 @@ fn resident_program_chunks_invocations_and_preserves_order() {
     assert!(matches!(
         executor.execute_program(
             &batch.program,
-            &batch.invocations,
+            &batch.invocation_batch,
             &cancellation,
             Instant::now() + Duration::from_secs(30)
         ),
@@ -111,7 +113,7 @@ fn resident_program_chunks_invocations_and_preserves_order() {
     assert!(matches!(
         executor.execute_program(
             &batch.program,
-            &batch.invocations,
+            &batch.invocation_batch,
             &GraphCancellationToken::default(),
             Instant::now() - Duration::from_millis(1),
         ),
