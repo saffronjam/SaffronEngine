@@ -452,7 +452,7 @@ mod tests {
             );
             assert_eq!(raycast["ok"], json!(false));
             assert_eq!(
-                raycast["error"],
+                raycast["error"]["message"],
                 json!("no physics world — enter play first")
             );
 
@@ -465,7 +465,7 @@ mod tests {
             );
             assert_eq!(impulse["ok"], json!(false));
             assert_eq!(
-                impulse["error"],
+                impulse["error"]["message"],
                 json!("no physics world — enter play first")
             );
         });
@@ -485,7 +485,7 @@ mod tests {
                 &json!({ "cmd": "fit-collider", "params": { "entity": uuid.to_string() } }),
             );
             assert_eq!(reply["ok"], json!(false));
-            assert_eq!(reply["error"], json!("entity has no Collider"));
+            assert_eq!(reply["error"]["message"], json!("entity has no Collider"));
         });
     }
 }

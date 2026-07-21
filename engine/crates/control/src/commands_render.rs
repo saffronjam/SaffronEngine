@@ -1401,7 +1401,7 @@ mod tests {
         let shadows = run(&mut stub, "set-rt-shadows", json!({ "enabled": true }));
         assert_eq!(shadows["ok"], json!(false));
         assert_eq!(
-            shadows["error"],
+            shadows["error"]["message"],
             json!("ray tracing not supported on this device")
         );
 
@@ -1620,7 +1620,7 @@ mod tests {
             json!({ "view": "nope", "width": 800, "height": 600 }),
         );
         assert_eq!(reply["ok"], json!(false));
-        assert_eq!(reply["error"], json!("unknown view 'nope'"));
+        assert_eq!(reply["error"]["message"], json!("unknown view 'nope'"));
     }
 
     #[test]

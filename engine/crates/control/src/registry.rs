@@ -440,10 +440,18 @@ pub struct EngineContext<'a> {
     pub assets: &'a mut AssetServer,
     /// Shared multi-source cell residency state.
     pub spatial: &'a mut ResidencyManager,
+    /// The sole runtime vegetation authority, bound to one exact cooked manifest when available.
+    pub vegetation: &'a mut Option<saffron_vegetation::VegetationWorld>,
+    /// Closed binding state reported by the RuntimeSession scheduler.
+    pub vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus,
+    /// Cells whose deleted disposable artifact is queued through the shared cooker.
+    pub vegetation_regeneration_cells: Vec<saffron_spatial::WorldCellKey>,
     /// The live play physics world, or `None` in Edit.
     pub physics: Option<&'a mut World>,
     /// Owned asynchronous vegetation evaluation jobs and retained results.
     pub(crate) vegetation_jobs: &'a mut crate::vegetation_jobs::VegetationEvaluationJobs,
+    /// Owned asynchronous vegetation cook jobs and automatic commit handoff.
+    pub(crate) vegetation_cook_jobs: &'a mut crate::vegetation_cook_jobs::VegetationCookJobs,
     /// Lazily initialized graph-compute capability for the live renderer.
     pub(crate) vegetation_compute: &'a mut Option<Option<VegetationComputeExecutor>>,
 }
@@ -566,12 +574,7 @@ impl CommandRegistry {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let command = request.get("cmd").and_then(Value::as_str).unwrap_or("");
         let Some(row) = self.find(command) else {
-            return json!({
-                "id": id,
-                "ok": false,
-                "error": format!("unknown command '{command}'"),
-                "code": "command",
-            });
+            return failure_reply(id, Error::command(format!("unknown command '{command}'")));
         };
         // `help` reflects over the live registry, so it is served here rather
         // than from a captured snapshot that would go stale as later phases
@@ -585,15 +588,12 @@ impl CommandRegistry {
         if ctx.scene_edit.project_phase == saffron_sceneedit::ProjectPhase::Loading
             && !is_loading_safe_command(command)
         {
-            let error = Error::Busy;
-            return json!({ "id": id, "ok": false, "error": error.to_string(), "code": error.code() });
+            return failure_reply(id, Error::Busy);
         }
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
         match row.run(ctx, &params) {
             Ok(result) => json!({ "id": id, "ok": true, "result": result }),
-            Err(error) => {
-                json!({ "id": id, "ok": false, "error": error.to_string(), "code": error.code() })
-            }
+            Err(error) => failure_reply(id, error),
         }
     }
 
@@ -607,6 +607,11 @@ impl CommandRegistry {
             .collect();
         json!({ "commands": commands })
     }
+}
+
+/// Builds the single failure envelope used by parsed and invalid requests alike.
+pub(crate) fn failure_reply(id: Value, error: Error) -> Value {
+    json!({ "id": id, "ok": false, "error": error.into_failure() })
 }
 
 /// `params[name]` if present, else the index-th element of `params["args"]`,
@@ -702,6 +707,7 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) {
     crate::commands_animation::register_animation_commands(reg);
     crate::commands_physics::register_physics_commands(reg);
     crate::commands_vegetation::register_vegetation_commands(reg);
+    crate::commands_asset::register_plant_commands(reg);
     crate::commands_asset::register_asset_commands(reg);
 }
 
@@ -744,8 +750,15 @@ pub fn is_read_only_command(name: &str) -> bool {
         | "spatial-cell" | "spatial-providers" | "spatial-sample" | "spatial-residency"
         // biome graph compilation/schema and retained evaluation diagnostics do not change the scene
         | "vegetation-compile-biome" | "vegetation-node-schema"
-        | "vegetation-evaluate-region" | "vegetation-evaluation-status"
+        | "vegetation-preflight-region" | "vegetation-start-evaluation"
+        | "vegetation-evaluation-status"
         | "vegetation-cancel-evaluation" | "vegetation-explain-point"
+        | "vegetation-cook-status" | "vegetation-cancel-cook"
+        | "vegetation-cell-inspect" | "vegetation-manifest"
+        | "vegetation-runtime-status" | "vegetation-runtime-cell"
+        | "vegetation-runtime-query" | "vegetation-runtime-inspect"
+        | "vegetation-state-export"
+        | "plant-validate"
         // project-load phase + progress the editor's loading screen polls each tick
         | "project-status"
     )
@@ -863,8 +876,9 @@ mod tests {
         // No id in the request → null in the reply.
         assert_eq!(reply["id"], Value::Null);
         assert_eq!(reply["ok"], json!(false));
-        assert_eq!(reply["error"], json!("unknown command 'nope'"));
-        assert_eq!(reply["code"], json!("command"));
+        assert_eq!(reply["error"]["code"], json!("command"));
+        assert_eq!(reply["error"]["message"], json!("unknown command 'nope'"));
+        assert!(reply.get("code").is_none());
         assert!(reply.get("result").is_none());
     }
 
@@ -877,7 +891,7 @@ mod tests {
             // A mutating command is discarded with the busy code while Loading.
             let blocked = reg.dispatch(ctx, &json!({ "id": 1, "cmd": "add-entity" }));
             assert_eq!(blocked["ok"], json!(false));
-            assert_eq!(blocked["code"], json!("busy-loading"));
+            assert_eq!(blocked["error"]["code"], json!("busy-loading"));
             assert_eq!(blocked["id"], json!(1));
 
             // Allow-listed liveness / identity commands stay serviceable.
@@ -904,7 +918,39 @@ mod tests {
             )
         });
         assert_eq!(reply["ok"], json!(false));
-        assert_eq!(reply["code"], json!("params"));
+        assert_eq!(reply["error"]["code"], json!("params"));
+    }
+
+    #[test]
+    fn graph_limit_failure_preserves_exact_diagnostic_fields() {
+        let reply = failure_reply(
+            json!(9),
+            Error::from(saffron_vegetation::Error::GraphLimit {
+                resource: "candidates",
+                requested: 16,
+                limit: 4,
+            }),
+        );
+        assert_eq!(
+            reply,
+            json!({
+                "id": 9,
+                "ok": false,
+                "error": {
+                    "code": "diagnostic",
+                    "message": "graph candidates limit exceeded: requested 16, limit 4",
+                    "diagnostic": {
+                        "domain": "vegetation-graph",
+                        "detail": {
+                            "category": "limit",
+                            "resource": "candidates",
+                            "requested": "16",
+                            "limit": "4",
+                        },
+                    },
+                },
+            })
+        );
     }
 
     #[test]
@@ -925,7 +971,7 @@ mod tests {
         let reg = builtins();
         let reply = with_ctx(|ctx| reg.dispatch(ctx, &json!({ "id": 3 })));
         assert_eq!(reply["ok"], json!(false));
-        assert_eq!(reply["error"], json!("unknown command ''"));
+        assert_eq!(reply["error"]["message"], json!("unknown command ''"));
     }
 
     #[test]
