@@ -58,10 +58,12 @@ and random-access sample counter depend on them.
 ## Surfaces and fields
 
 `SurfaceField` is the query contract for geometry and environmental data. Every provider publishes a
-stable provider ID, revision, exact bounds, primitive count, and capabilities before work is
-dispatched. Ray, directional projection, and nearest queries return an exact world position,
-geometric tangent frame, UV or projection coordinates, weighted tags, revision, and a stable
-primitive attachment with canonical barycentrics when the provider can preserve it.
+stable provider ID, revision, exact bounds, primitive count, maximum weighted tags per hit, and
+capabilities before work is dispatched. The query boundary rejects a hit that exceeds the declared
+tag maximum.
+Ray, directional projection, and nearest queries return an exact world position, geometric tangent
+frame, UV or projection coordinates, weighted tags, revision, and a stable primitive attachment with
+canonical barycentrics when the provider can preserve it.
 
 The initial static-mesh provider uses the mesh's cached BVH for arbitrary-direction queries. It
 handles non-uniform affine scale in world metric and reports authoritative attachments. A skinned

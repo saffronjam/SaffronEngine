@@ -223,6 +223,8 @@ pub struct SurfaceProviderDescriptor {
     pub bounds: WorldBounds,
     /// Stable primitive count at this revision.
     pub primitive_count: u64,
+    /// Maximum weighted tags returned by any query hit.
+    pub max_tags_per_hit: u32,
     /// Query and authority capabilities.
     pub capabilities: SurfaceCapabilities,
 }
@@ -334,6 +336,30 @@ pub enum FieldChannel {
     SplineDistance,
     /// A stable user-defined channel.
     User(u64),
+}
+
+impl FieldChannel {
+    /// Returns the stable canonical tag and user payload used by persisted vegetation formats.
+    #[must_use]
+    pub const fn canonical_code(self) -> (u8, u64) {
+        match self {
+            Self::Altitude => (0, 0),
+            Self::Slope => (1, 0),
+            Self::Curvature => (2, 0),
+            Self::Concavity => (3, 0),
+            Self::Drainage => (4, 0),
+            Self::Moisture => (5, 0),
+            Self::Temperature => (6, 0),
+            Self::Precipitation => (7, 0),
+            Self::Sunlight => (8, 0),
+            Self::Exposure => (9, 0),
+            Self::WaterDistance => (10, 0),
+            Self::WaterDepth => (11, 0),
+            Self::SignedBlocker => (12, 0),
+            Self::SplineDistance => (13, 0),
+            Self::User(value) => (14, value),
+        }
+    }
 }
 
 /// Which derivative is requested for a field channel.

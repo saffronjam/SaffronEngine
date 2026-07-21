@@ -327,10 +327,16 @@ pub struct DecisionCurve {
 impl DecisionCurve {
     /// Validates and stores a canonical curve. The caller must supply the stable order.
     pub fn new(points: Vec<(UnitInterval, DecisionScalar)>) -> Result<Self> {
+        Self::validate_points(&points)?;
+        Ok(Self { points })
+    }
+
+    /// Validates canonical borrowed curve points without taking ownership.
+    pub fn validate_points(points: &[(UnitInterval, DecisionScalar)]) -> Result<()> {
         if points.is_empty() || points.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return Err(Error::CurveOrder);
         }
-        Ok(Self { points })
+        Ok(())
     }
 
     /// The canonical points.
@@ -341,15 +347,24 @@ impl DecisionCurve {
 
     /// Samples with endpoint clamping and ties-to-even linear interpolation.
     pub fn sample(&self, x: UnitInterval) -> Result<DecisionScalar> {
-        if x <= self.points[0].0 {
-            return Ok(self.points[0].1);
+        Self::sample_points(&self.points, x)
+    }
+
+    /// Samples validated borrowed curve points without allocating an owned curve.
+    pub fn sample_points(
+        points: &[(UnitInterval, DecisionScalar)],
+        x: UnitInterval,
+    ) -> Result<DecisionScalar> {
+        Self::validate_points(points)?;
+        if x <= points[0].0 {
+            return Ok(points[0].1);
         }
-        if x >= self.points[self.points.len() - 1].0 {
-            return Ok(self.points[self.points.len() - 1].1);
+        if x >= points[points.len() - 1].0 {
+            return Ok(points[points.len() - 1].1);
         }
-        let index = self.points.partition_point(|(point_x, _)| *point_x < x);
-        let (x0, y0) = self.points[index - 1];
-        let (x1, y1) = self.points[index];
+        let index = points.partition_point(|(point_x, _)| *point_x < x);
+        let (x0, y0) = points[index - 1];
+        let (x1, y1) = points[index];
         let numerator = u32::from(x.bits() - x0.bits());
         let denominator = u32::from(x1.bits() - x0.bits());
         let weight_bits = div_round_ties_even(

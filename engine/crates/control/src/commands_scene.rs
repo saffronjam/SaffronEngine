@@ -1217,6 +1217,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                             ),
                         },
                         primitive_count: descriptor.primitive_count.to_string(),
+                        max_tags_per_hit: descriptor.max_tags_per_hit,
                         capabilities: surface_capabilities_dto(descriptor.capabilities),
                     }
                 })
@@ -2697,7 +2698,7 @@ mod tests {
             );
             assert_eq!(missing_user_id["ok"], json!(false));
             assert_eq!(
-                missing_user_id["error"],
+                missing_user_id["error"]["message"],
                 json!("userChannel is required when channel is 'user'")
             );
         });
@@ -2802,7 +2803,10 @@ mod tests {
                 &json!({ "cmd": "select", "params": { "entity": "ghost" } }),
             );
             assert_eq!(missing["ok"], json!(false));
-            assert_eq!(missing["error"], json!("entity not found: \"ghost\""));
+            assert_eq!(
+                missing["error"]["message"],
+                json!("entity not found: \"ghost\"")
+            );
         });
     }
 
@@ -2832,7 +2836,10 @@ mod tests {
                 &json!({ "cmd": "add-component", "params": { "entity": id, "component": "Camera" } }),
             );
             assert_eq!(again["ok"], json!(false));
-            assert_eq!(again["error"], json!("entity already has 'Camera'"));
+            assert_eq!(
+                again["error"]["message"],
+                json!("entity already has 'Camera'")
+            );
 
             // An unknown component name is a typed error.
             let unknown = reg.dispatch(
@@ -2840,7 +2847,10 @@ mod tests {
                 &json!({ "cmd": "add-component", "params": { "entity": id, "component": "Nope" } }),
             );
             assert_eq!(unknown["ok"], json!(false));
-            assert_eq!(unknown["error"], json!("unknown component 'Nope'"));
+            assert_eq!(
+                unknown["error"]["message"],
+                json!("unknown component 'Nope'")
+            );
 
             // set-component-field merges one field on the Name component (the string value
             // passes through, not parsed as a number).
@@ -2908,7 +2918,7 @@ mod tests {
             );
             assert_eq!(duplicate["ok"], json!(false));
             assert_eq!(
-                duplicate["error"],
+                duplicate["error"]["message"],
                 json!("scene already has a VegetationField component")
             );
 

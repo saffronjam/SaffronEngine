@@ -116,12 +116,7 @@ impl WorldCellKey {
             )
             .map_err(|_| Error::CellOverflow)
         };
-        Self::new(
-            coordinate(0)?,
-            coordinate(1)?,
-            coordinate(2)?,
-            target_level,
-        )
+        Self::new(coordinate(0)?, coordinate(1)?, coordinate(2)?, target_level)
     }
 
     /// The ancestor at `target_level`.
@@ -213,12 +208,13 @@ impl WorldCellKey {
     }
 }
 
-/// Enumerates exact hierarchy cells intersecting a half-open bound under a hard count cap.
-pub fn world_cells_covering_bounds(
-    bounds: WorldBounds,
-    level: u8,
-    limit: u64,
-) -> Result<Vec<WorldCellKey>> {
+struct CoveringCellExtent {
+    minimum: [i64; 3],
+    maximum: [i64; 3],
+    count: u64,
+}
+
+fn covering_cell_extent(bounds: WorldBounds, level: u8) -> Result<CoveringCellExtent> {
     if level > MAX_HIERARCHY_LEVEL {
         return Err(Error::HierarchyLevel(level));
     }
@@ -248,19 +244,45 @@ pub fn world_cells_covering_bounds(
             .ok_or(Error::NumericOverflow)?;
         count.checked_mul(axis_count).ok_or(Error::NumericOverflow)
     })?;
+    Ok(CoveringCellExtent {
+        minimum,
+        maximum,
+        count,
+    })
+}
+
+fn check_cell_enumeration_limit(count: u64, limit: u64) -> Result<()> {
     if count > limit {
         return Err(Error::CellEnumerationLimit {
             requested: count,
             limit,
         });
     }
+    Ok(())
+}
+
+/// Counts exact hierarchy cells intersecting a half-open bound under a hard count cap.
+pub fn world_cell_count_covering_bounds(bounds: WorldBounds, level: u8, limit: u64) -> Result<u64> {
+    let extent = covering_cell_extent(bounds, level)?;
+    check_cell_enumeration_limit(extent.count, limit)?;
+    Ok(extent.count)
+}
+
+/// Enumerates exact hierarchy cells intersecting a half-open bound under a hard count cap.
+pub fn world_cells_covering_bounds(
+    bounds: WorldBounds,
+    level: u8,
+    limit: u64,
+) -> Result<Vec<WorldCellKey>> {
+    let extent = covering_cell_extent(bounds, level)?;
+    check_cell_enumeration_limit(extent.count, limit)?;
     let mut cells = Vec::new();
     cells
-        .try_reserve_exact(usize::try_from(count).map_err(|_| Error::NumericOverflow)?)
+        .try_reserve_exact(usize::try_from(extent.count).map_err(|_| Error::NumericOverflow)?)
         .map_err(|_| Error::NumericOverflow)?;
-    for x in minimum[0]..=maximum[0] {
-        for y in minimum[1]..=maximum[1] {
-            for z in minimum[2]..=maximum[2] {
+    for x in extent.minimum[0]..=extent.maximum[0] {
+        for y in extent.minimum[1]..=extent.maximum[1] {
+            for z in extent.minimum[2]..=extent.maximum[2] {
                 cells.push(WorldCellKey::new(x, y, z, level)?);
             }
         }
@@ -690,6 +712,14 @@ mod tests {
         );
         assert_eq!(
             world_cells_covering_bounds(bounds, 0, 3),
+            Err(Error::CellEnumerationLimit {
+                requested: 4,
+                limit: 3,
+            })
+        );
+        assert_eq!(world_cell_count_covering_bounds(bounds, 0, 4), Ok(4));
+        assert_eq!(
+            world_cell_count_covering_bounds(bounds, 0, 3),
             Err(Error::CellEnumerationLimit {
                 requested: 4,
                 limit: 3,

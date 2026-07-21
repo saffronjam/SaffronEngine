@@ -17,7 +17,7 @@ mod surface;
 pub use coordinate::{
     BASE_CELL_EDGE_METERS, BASE_CELL_TICKS, LOCAL_FRACTION_BITS, LOCAL_TICKS_PER_METER,
     MAX_HIERARCHY_LEVEL, QuantizedLocalPosition, WorldBounds, WorldCellKey, WorldPosition,
-    world_cells_covering_bounds,
+    world_cell_count_covering_bounds, world_cells_covering_bounds,
 };
 pub use error::{Error, Result};
 pub use fixture::{FOREST_BASELINE_SPEC, ForestBaselineSpec, SpatialFixture};

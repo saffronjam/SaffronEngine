@@ -2639,6 +2639,7 @@ pub struct SurfaceProviderDto {
     pub revision: String,
     pub bounds: SpatialBoundsDto,
     pub primitive_count: String,
+    pub max_tags_per_hit: u32,
     pub capabilities: SurfaceCapabilitiesDto,
 }
 

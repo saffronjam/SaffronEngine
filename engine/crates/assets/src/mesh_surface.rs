@@ -97,6 +97,7 @@ impl StaticMeshSurfaceProvider {
                 revision,
                 bounds,
                 primitive_count: indices.len() as u64 / 3,
+                max_tags_per_hit: 1,
                 capabilities: SurfaceCapabilities {
                     ray: true,
                     project: true,

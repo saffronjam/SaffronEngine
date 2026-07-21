@@ -44,13 +44,14 @@ test("the built-in cube is one authoritative static-mesh surface provider", asyn
     entity: cube.id,
     name: "Cube",
     primitiveCount: "12",
+    maxTagsPerHit: 1,
     capabilities: {
       ray: true,
       project: true,
       nearest: true,
       uv: true,
       authoritativeAttachments: true,
-      authoritativeFields: false,
+      authoritativeFields: true,
     },
   });
 });
