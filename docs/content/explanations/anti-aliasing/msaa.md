@@ -89,16 +89,19 @@ sequence.
 MSAA also upgrades masked (alpha-tested) materials. Under any other mode a masked fragment is a
 hard per-pixel `discard`, which aliases exactly like a geometric edge. With a sample count above
 1× the PSO cache mints an alpha-to-coverage permutation (`PsoKey.alpha_to_coverage`), and the
-fragment sharpens its alpha into a coverage value the hardware spreads across the samples:
+fragment passes a canonical coverage value to the hardware sample mask:
 
 ```hlsl
-float coverage = saturate((surf.opacity - cutoff) / max(fwidth(surf.opacity), 1e-4) + 0.5);
+CoverageSample coverage = sampleCanonicalCoverage(
+    source, uv, coverageAnchor, sourceKind, classification, baseColorAlpha,
+    sourceExtent, salt, temporalPhase, cutoff, canonicalProbability, true
+);
 ```
 
-Rescaling alpha around the cutoff by its screen-space derivative makes the lit-to-clipped
-transition span about one pixel, so foliage and cutout edges resolve as smoothly as triangle
-edges. A masked material at 1× shares the plain opaque PSO; the permutation exists only where the
-samples do.
+Standard alpha is rescaled around the cutoff by its screen-space derivative. Thin-sheet coverage
+textures already store probability at each mip and bypass that reconstruction. Both paths give the
+hardware a continuous value, so foliage and cutout edges resolve as smoothly as triangle edges. A
+masked material at 1× shares the plain opaque PSO; the permutation exists only where the samples do.
 
 ## In the code
 
@@ -109,7 +112,7 @@ samples do.
 | Scene attachment + resolve wiring | `renderer.rs` | `record_scene_graph`, `scene_output`, `add_scene_resolve_pass` |
 | Resolve in the graph | `render_graph.rs` | `RgAttachment.resolve`, `derive_pass_barriers` |
 | Sample count in PSOs | `pipelines.rs` | `PsoKey`, `Pipelines::set_sample_count`, `Pipelines::request_mesh_pipeline` |
-| Alpha-to-coverage cutout | `mesh.slang` | `fragmentMain`, `kAlphaToCoverage` |
+| Alpha-to-coverage cutout | `mesh.slang`, `coverage.slang` | `fragmentMain`, `sampleCanonicalCoverage` |
 
 ## Related
 

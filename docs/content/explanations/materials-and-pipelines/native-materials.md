@@ -68,9 +68,14 @@ with another model's data.
 
 The thin-sheet object describes front and back response, physical thickness, absorption and
 transmission colors, roughness, normal treatment, and a bounded energy limit. Coverage can come from
-base alpha, a dedicated texture, or a constant. Its mip records store source extent, reference
+base alpha, a dedicated texture, or modeled geometry. Its mip records store source extent, reference
 cutoff, spatial salt, alpha classification, and per-level hashes so derived coverage remains tied to
 the authored source.
+
+Modeled geometry is the preferred silhouette for leaves and blades. Alpha coverage remains useful
+for small holes and serrations that would be wasteful to model. Dedicated and base-alpha coverage
+textures receive a deterministic mip chain: each level integrates alpha over exact normalized
+footprints, filters RGB in premultiplied form, and keeps the authored cutoff mapped to half coverage.
 
 Voxel material moments preserve averaged color, transmission, normal, and second-moment data for
 aggregate representations. Optional [Vulkan opacity-micromap](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_opacity_micromap.html)
@@ -108,8 +113,8 @@ the whole mesh item. Blend mode and double-sided state remain per submesh and pa
 
 ## GPU parameter table
 
-Every resolved submesh material lowers to one 96-byte `MaterialParamsData` record in descriptor set
-2, binding 2. The record contains six 16-byte blocks:
+Every resolved submesh material lowers to one 256-byte `MaterialParamsData` record in descriptor set
+2, binding 2. The record contains sixteen 16-byte blocks:
 
 | Block | Contents |
 |---|---|
@@ -118,7 +123,17 @@ Every resolved submesh material lowers to one 96-byte `MaterialParamsData` recor
 | `emissive` | Emissive radiance and height scale |
 | `uv` | Tiling and offset |
 | `tex0` | Albedo, ORM, normal, and emissive bindless indices |
-| `tex1` | Height index, occlusion index, reserved lane, feature bits |
+| `tex1` | Height index, occlusion index, temporal coverage phase, feature bits |
+| `thin_reflection` | Front response, back response, thin-sheet roughness, thickness |
+| `thin_absorption` | Beer-Lambert absorption and energy limit |
+| `thin_transmission` | Transmission tint |
+| `coverage` | Coverage texture, source, classification, and normal policy |
+| `coverage_hash` | Stable salt and source extent |
+| `aggregate0` | Occupancy, mean roughness, and mean thickness |
+| `aggregate_albedo` | Coverage-weighted mean albedo |
+| `aggregate_transmission` | Coverage-weighted mean transmission |
+| `aggregate_normal0` | Normal moments XX, YY, ZZ, and XY |
+| `aggregate_normal1` | Normal moments XZ and YZ |
 
 The renderer hashes these records by their raw bytes and interns identical values into one per-frame
 table entry. `InstanceData.texture.w` carries the resulting material index. Editing one entity's
@@ -127,6 +142,10 @@ override therefore creates a distinct record only when its resolved bytes differ
 Feature bits gate optional shader work for normal, emissive, occlusion, parallax, alpha clipping,
 displacement, and height-bump sampling. They do not create separate pipelines. Unlit, blend,
 double-sided, alpha-to-coverage, and shader identity form the relevant pipeline axes.
+
+The thin-sheet surface derives blend routing from its coverage classification and always renders
+two-sided. Its front and back reflection responses share an energy budget with Beer-Lambert
+transmission. Direct, clustered, sky, and DDGI light all consume the same `SurfaceData` fields.
 
 ## Surface seam
 
@@ -149,6 +168,12 @@ marches UVs while keeping a flat silhouette, and `displacement` moves geometry t
 alpha-test or use alpha-to-coverage under MSAA; translucent materials render in the sorted blend
 pass.
 
+`coverage.slang` is the single classification function for forward color, depth, directional and
+spot shadows, point shadows, the thin G-buffer, and motion vectors. Masked coverage uses a stable
+object-space and UV hash. TAA advances its temporal phase deterministically, while every pass in one
+frame reads the same phase. Under MSAA, masked forward and depth pipelines pass the same probability
+to alpha-to-coverage instead of making a pixel-wide binary decision.
+
 ## In the code
 
 | What | File | Symbols |
@@ -160,6 +185,8 @@ pass.
 | Entity slots | `scene/src/component.rs` | `MaterialSet`, `MaterialSlot` |
 | Render resolution | `assets/src/render_material.rs` | `AssetServer::resolve_entity_materials`, `build_submesh_material` |
 | GPU record and interning | `rendering/src/gpu_types.rs`, `rendering/src/instancing.rs` | `MaterialParamsData`, `intern_material` |
+| Coverage mip derivation and upload | `assets/src/coverage.rs`, `assets/src/load.rs` | `coverage_preserving_mips`, `load_coverage_texture_asset` |
+| Coverage classification | `assets/shaders/coverage.slang`, `rendering/src/canonical_coverage.rs` | `sampleCanonicalCoverage`, `classify_canonical_coverage` |
 | Surface evaluation | `assets/shaders/mesh.slang`, `assets/shaders/lighting.slang` | `evalSurface`, `SurfaceData`, `evalLighting` |
 
 ## Related
