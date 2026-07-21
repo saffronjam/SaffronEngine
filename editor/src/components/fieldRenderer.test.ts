@@ -179,9 +179,10 @@ describe("FIELD_HINTS parity table sanity", () => {
     const uuids = Object.entries(FIELD_HINTS).filter(([, h]) => h.kind === "uuid");
     expect(uuids.length).toBeGreaterThan(0);
     for (const [key, hint] of uuids) {
-      expect(["mesh", "texture", "material", "model", "animation"], `${key} asset`).toContain(
-        hint.asset as string,
-      );
+      expect(
+        ["mesh", "texture", "material", "model", "animation", "vegetation-map"],
+        `${key} asset`,
+      ).toContain(hint.asset as string);
     }
   });
 
