@@ -3,28 +3,28 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread::JoinHandle;
 
 use saffron_protocol::{
-    Uuid as WireUuid, VegetationCandidateIdentityDto, VegetationDiagnosticCandidateSampleDto,
-    VegetationDiagnosticProvenanceIdDto, VegetationDiagnosticRejectionDto,
-    VegetationDiagnosticResultSourceDto, VegetationDiagnosticScalarSampleDto,
-    VegetationDiagnosticStreamScopeDto, VegetationEvaluationJobDto,
-    VegetationEvaluationJobStateDto, VegetationEvaluationStatusDto, VegetationEvaluationSummaryDto,
-    VegetationExecutionDomainDto, VegetationGpuGroupEvaluationDiagnosticDto,
-    VegetationGraphNodeAddressDto, VegetationNamedDiagnosticStreamDto,
-    VegetationNodeEvaluationDiagnosticDto, WorldCellDto,
+    ControlFailureDto, Uuid as WireUuid, VegetationCandidateIdentityDto,
+    VegetationDiagnosticCandidateSampleDto, VegetationDiagnosticProvenanceIdDto,
+    VegetationDiagnosticRejectionDto, VegetationDiagnosticResultSourceDto,
+    VegetationDiagnosticScalarSampleDto, VegetationDiagnosticStreamScopeDto,
+    VegetationEvaluationJobDto, VegetationEvaluationJobStateDto, VegetationEvaluationPreflightDto,
+    VegetationEvaluationStatusDto, VegetationEvaluationSummaryDto, VegetationExecutionDomainDto,
+    VegetationGpuGroupEvaluationDiagnosticDto, VegetationGraphNodeAddressDto,
+    VegetationNamedDiagnosticStreamDto, VegetationNodeEvaluationDiagnosticDto, WorldCellDto,
 };
 use saffron_spatial::WorldCellKey;
 use saffron_vegetation::{
     BiomeGraphEvaluator, CandidateIdentity, CandidateRejectionReason, DiagnosticCandidateSample,
     DiagnosticScalarSample, DiagnosticStreamScope, GraphCancellationToken,
-    GraphEvaluationJobInputs, GraphEvaluationJobResult, GraphEvaluationResult,
-    GraphExecutionDomain, GraphNodeAddress, GraphOperator, NamedDiagnosticStream, PlantId,
-    ProvenanceExplanation, RejectedCandidate, vegetation_content_hash,
+    GraphEvaluationJobInputs, GraphEvaluationJobResult, GraphEvaluationPreflight,
+    GraphEvaluationResult, GraphExecutionDomain, GraphNodeAddress, GraphOperator,
+    NamedDiagnosticStream, PlantId, ProvenanceExplanation, RejectedCandidate,
+    VegetationContentHasher,
 };
 
+use crate::owned_worker::{OwnedWorker, WorkerFailure, WorkerPoll};
 use crate::{Error, Result};
 
 #[derive(Default)]
@@ -63,26 +63,41 @@ struct DiagnosticStreamAggregate {
 
 type EvaluationOutcome = saffron_vegetation::Result<GraphEvaluationJobResult>;
 
-const MAX_ACTIVE_JOBS: usize = 16;
+const MAX_LIVE_JOBS: usize = 16;
 const MAX_TERMINAL_JOBS: usize = 128;
+const MAX_RETAINED_PREPARED_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_RETAINED_CANONICAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-enum JobTerminal {
-    Running,
+enum EvaluationJobState {
+    Prepared {
+        evaluator: BiomeGraphEvaluator,
+        inputs: GraphEvaluationJobInputs,
+    },
+    Running {
+        worker: OwnedWorker<EvaluationOutcome>,
+    },
     Completed {
         results: Arc<GraphEvaluationJobResult>,
         summary: Box<VegetationEvaluationSummaryDto>,
         canonical_bytes: u64,
     },
     Cancelled,
-    Failed(String),
+    Failed(ControlFailureDto),
+}
+
+impl EvaluationJobState {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Cancelled | Self::Failed(_)
+        )
+    }
 }
 
 struct EvaluationJob {
     cancellation: GraphCancellationToken,
-    receiver: Option<Receiver<EvaluationOutcome>>,
-    worker: Option<JoinHandle<()>>,
-    terminal: JobTerminal,
+    preflight: GraphEvaluationPreflight,
+    state: EvaluationJobState,
 }
 
 /// Owns every bounded evaluator worker and its atomically published result.
@@ -101,58 +116,96 @@ impl Default for VegetationEvaluationJobs {
 }
 
 impl VegetationEvaluationJobs {
-    /// Starts one worker whose result becomes visible only when every cell completes.
-    pub(crate) fn start(
+    /// Retains one exact preflighted job without starting an evaluation worker.
+    pub(crate) fn prepare(
         &mut self,
         evaluator: BiomeGraphEvaluator,
         inputs: GraphEvaluationJobInputs,
     ) -> Result<VegetationEvaluationJobDto> {
         self.maintain(None)?;
-        let active = self
+        let live = self
             .jobs
             .values()
-            .filter(|job| matches!(job.terminal, JobTerminal::Running))
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    EvaluationJobState::Prepared { .. } | EvaluationJobState::Running { .. }
+                )
+            })
             .count();
-        if active >= MAX_ACTIVE_JOBS {
+        if live >= MAX_LIVE_JOBS {
             return Err(Error::command(format!(
-                "vegetation evaluation active-job limit exceeded: requested {}, limit {}",
-                active + 1,
-                MAX_ACTIVE_JOBS
+                "vegetation evaluation live-job limit exceeded: requested {}, limit {}",
+                live + 1,
+                MAX_LIVE_JOBS
             )));
         }
         let job_id = self.next_job;
         let next_job = job_id
             .checked_add(1)
             .ok_or_else(|| Error::command("vegetation evaluation job identity overflowed"))?;
-        let cell_count = u64::try_from(inputs.cells.len())
-            .map_err(|_| Error::command("vegetation evaluation cell count overflowed"))?;
         let cancellation = GraphCancellationToken::default();
-        let worker_cancellation = cancellation.clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name(format!("saffron-vegetation-{job_id}"))
-            .spawn(move || {
-                let outcome = evaluator.evaluate(inputs, &worker_cancellation);
-                let _ = sender.send(outcome);
-            })
-            .map_err(|error| {
-                Error::command(format!("could not start vegetation evaluation: {error}"))
+        let preflight = evaluator
+            .preflight(&inputs, &cancellation)
+            .map_err(Error::from)?;
+        let retained_prepared_bytes = self
+            .jobs
+            .values()
+            .filter(|job| matches!(job.state, EvaluationJobState::Prepared { .. }))
+            .try_fold(preflight.retained_input_bytes, |total, job| {
+                total
+                    .checked_add(job.preflight.retained_input_bytes)
+                    .ok_or_else(|| {
+                        Error::command("retained prepared vegetation input size overflowed")
+                    })
             })?;
+        if retained_prepared_bytes > MAX_RETAINED_PREPARED_INPUT_BYTES {
+            return Err(Error::command(format!(
+                "vegetation evaluation prepared-input limit exceeded: requested {retained_prepared_bytes}, limit {MAX_RETAINED_PREPARED_INPUT_BYTES}"
+            )));
+        }
+        let job = EvaluationJob {
+            cancellation,
+            preflight,
+            state: EvaluationJobState::Prepared { evaluator, inputs },
+        };
+        let dto = job_dto(job_id, &job);
         self.next_job = next_job;
-        self.jobs.insert(
-            job_id,
-            EvaluationJob {
-                cancellation,
-                receiver: Some(receiver),
-                worker: Some(worker),
-                terminal: JobTerminal::Running,
-            },
+        self.jobs.insert(job_id, job);
+        Ok(dto)
+    }
+
+    /// Starts the exact evaluator and inputs retained by one prepared job.
+    pub(crate) fn start(&mut self, job_id: u64) -> Result<VegetationEvaluationJobDto> {
+        self.maintain(Some(job_id))?;
+        let job = self.job_mut(job_id)?;
+        let state = std::mem::replace(
+            &mut job.state,
+            EvaluationJobState::Failed(ControlFailureDto::Command {
+                message: "evaluation worker did not start".to_owned(),
+            }),
         );
-        Ok(VegetationEvaluationJobDto {
-            job: job_id.to_string(),
-            state: VegetationEvaluationJobStateDto::Running,
-            cells: cell_count.to_string(),
-        })
+        let EvaluationJobState::Prepared { evaluator, inputs } = state else {
+            job.state = state;
+            return Err(Error::command(format!(
+                "vegetation evaluation job {job_id} is not prepared"
+            )));
+        };
+        let worker_cancellation = job.cancellation.clone();
+        let worker = match OwnedWorker::spawn(format!("saffron-vegetation-{job_id}"), move || {
+            evaluator.evaluate(inputs, &worker_cancellation)
+        }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let failure =
+                    Error::from(saffron_vegetation::Error::GraphWorkerSpawn { source: error })
+                        .into_failure();
+                job.state = EvaluationJobState::Failed(failure.clone());
+                return Err(Error::Failure(Box::new(failure)));
+            }
+        };
+        job.state = EvaluationJobState::Running { worker };
+        Ok(job_dto(job_id, job))
     }
 
     /// Cancels and joins every worker during control-plane shutdown.
@@ -161,7 +214,10 @@ impl VegetationEvaluationJobs {
             job.cancellation.cancel();
         }
         for job in self.jobs.values_mut() {
-            let _ = finish_worker(job);
+            if matches!(job.state, EvaluationJobState::Prepared { .. }) {
+                job.state = EvaluationJobState::Cancelled;
+            }
+            let _ = finish_running_worker(job);
             refresh(job);
         }
     }
@@ -177,8 +233,15 @@ impl VegetationEvaluationJobs {
     pub(crate) fn cancel(&mut self, job_id: u64) -> Result<VegetationEvaluationStatusDto> {
         self.maintain(Some(job_id))?;
         let job = self.job_mut(job_id)?;
-        if matches!(&job.terminal, JobTerminal::Running) {
-            job.cancellation.cancel();
+        match &job.state {
+            EvaluationJobState::Prepared { .. } => {
+                job.cancellation.cancel();
+                job.state = EvaluationJobState::Cancelled;
+            }
+            EvaluationJobState::Running { .. } => job.cancellation.cancel(),
+            EvaluationJobState::Completed { .. }
+            | EvaluationJobState::Cancelled
+            | EvaluationJobState::Failed(_) => {}
         }
         Ok(status_dto(job_id, job))
     }
@@ -230,13 +293,18 @@ impl VegetationEvaluationJobs {
     fn completed_results(&mut self, job_id: u64) -> Result<&GraphEvaluationJobResult> {
         self.maintain(Some(job_id))?;
         let job = self.job_mut(job_id)?;
-        match &job.terminal {
-            JobTerminal::Completed { results, .. } => Ok(results),
-            JobTerminal::Running => Err(Error::command("vegetation evaluation is still running")),
-            JobTerminal::Cancelled => Err(Error::command("vegetation evaluation was cancelled")),
-            JobTerminal::Failed(error) => Err(Error::command(format!(
-                "vegetation evaluation failed: {error}"
-            ))),
+        match &job.state {
+            EvaluationJobState::Completed { results, .. } => Ok(results),
+            EvaluationJobState::Prepared { .. } => {
+                Err(Error::command("vegetation evaluation has not started"))
+            }
+            EvaluationJobState::Running { .. } => {
+                Err(Error::command("vegetation evaluation is still running"))
+            }
+            EvaluationJobState::Cancelled => {
+                Err(Error::command("vegetation evaluation was cancelled"))
+            }
+            EvaluationJobState::Failed(error) => Err(Error::Failure(Box::new(error.clone()))),
         }
     }
 
@@ -254,11 +322,11 @@ impl VegetationEvaluationJobs {
             let terminal_count = self
                 .jobs
                 .values()
-                .filter(|job| !matches!(job.terminal, JobTerminal::Running))
+                .filter(|job| job.state.is_terminal())
                 .count();
             let retained_bytes = self.jobs.values().try_fold(0_u64, |total, job| {
-                let bytes = match &job.terminal {
-                    JobTerminal::Completed {
+                let bytes = match &job.state {
+                    EvaluationJobState::Completed {
                         canonical_bytes, ..
                     } => *canonical_bytes,
                     _ => 0,
@@ -275,14 +343,13 @@ impl VegetationEvaluationJobs {
                 .jobs
                 .iter()
                 .find_map(|(job_id, job)| {
-                    (Some(*job_id) != protected && !matches!(job.terminal, JobTerminal::Running))
-                        .then_some(*job_id)
+                    (Some(*job_id) != protected && job.state.is_terminal()).then_some(*job_id)
                 })
                 .or_else(|| {
                     protected.filter(|job_id| {
                         self.jobs
                             .get(job_id)
-                            .is_some_and(|job| !matches!(job.terminal, JobTerminal::Running))
+                            .is_some_and(|job| job.state.is_terminal())
                     })
                 })
                 .ok_or_else(|| Error::command("vegetation job retention limit cannot be met"))?;
@@ -302,9 +369,7 @@ impl Drop for VegetationEvaluationJobs {
             job.cancellation.cancel();
         }
         for job in self.jobs.values_mut() {
-            if let Some(worker) = job.worker.take() {
-                let _ = worker.join();
-            }
+            let _ = finish_running_worker(job);
         }
     }
 }
@@ -327,52 +392,58 @@ fn matching_results(
 }
 
 fn refresh(job: &mut EvaluationJob) {
-    if !matches!(&job.terminal, JobTerminal::Running) {
-        return;
-    }
-    let outcome = match job.receiver.as_ref().map(Receiver::try_recv) {
-        Some(Ok(outcome)) => Some(outcome),
-        Some(Err(TryRecvError::Empty)) => return,
-        Some(Err(TryRecvError::Disconnected)) | None => {
-            let _ = finish_worker(job);
-            job.terminal = JobTerminal::Failed(
-                "evaluation worker disconnected before publishing a result".to_owned(),
-            );
-            job.receiver = None;
-            return;
-        }
+    let outcome = match &mut job.state {
+        EvaluationJobState::Running { worker } => match worker.poll() {
+            Ok(WorkerPoll::Complete(outcome)) => outcome,
+            Ok(WorkerPoll::Pending) => return,
+            Err(WorkerFailure::Disconnected | WorkerFailure::Panicked) => {
+                job.state = EvaluationJobState::Failed(ControlFailureDto::Diagnostic {
+                    message: "vegetation graph worker disconnected before publishing a result"
+                        .to_owned(),
+                    diagnostic: saffron_protocol::ControlDiagnosticDto::VegetationGraph(
+                        saffron_protocol::VegetationGraphDiagnosticDto::WorkerPanicked,
+                    ),
+                });
+                return;
+            }
+        },
+        EvaluationJobState::Prepared { .. }
+        | EvaluationJobState::Completed { .. }
+        | EvaluationJobState::Cancelled
+        | EvaluationJobState::Failed(_) => return,
     };
-    job.receiver = None;
-    if finish_worker(job).is_err() {
-        job.terminal = JobTerminal::Failed("evaluation worker panicked".to_owned());
-        return;
-    }
     match outcome {
-        Some(Ok(_results)) if job.cancellation.is_cancelled() => {
-            job.terminal = JobTerminal::Cancelled;
+        Ok(_results) if job.cancellation.is_cancelled() => {
+            job.state = EvaluationJobState::Cancelled;
         }
-        Some(Ok(results)) => match summarize(&results) {
+        Ok(results) => match summarize(&results) {
             Ok((summary, canonical_bytes)) => {
-                job.terminal = JobTerminal::Completed {
+                job.state = EvaluationJobState::Completed {
                     results: Arc::new(results),
                     summary: Box::new(summary),
                     canonical_bytes,
                 };
             }
-            Err(error) => job.terminal = JobTerminal::Failed(error.to_string()),
+            Err(error) => {
+                job.state = EvaluationJobState::Failed(Error::from(error).into_failure());
+            }
         },
-        Some(Err(saffron_vegetation::Error::GraphCancelled)) => {
-            job.terminal = JobTerminal::Cancelled;
+        Err(saffron_vegetation::Error::GraphCancelled) => {
+            job.state = EvaluationJobState::Cancelled;
         }
-        Some(Err(error)) => job.terminal = JobTerminal::Failed(error.to_string()),
-        None => {}
+        Err(error) => {
+            job.state = EvaluationJobState::Failed(Error::from(error).into_failure());
+        }
     }
 }
 
-fn finish_worker(job: &mut EvaluationJob) -> std::thread::Result<()> {
-    match job.worker.take() {
-        Some(worker) => worker.join(),
-        None => Ok(()),
+fn finish_running_worker(job: &mut EvaluationJob) -> std::result::Result<(), WorkerFailure> {
+    match &mut job.state {
+        EvaluationJobState::Running { worker } => worker.finish(),
+        EvaluationJobState::Prepared { .. }
+        | EvaluationJobState::Completed { .. }
+        | EvaluationJobState::Cancelled
+        | EvaluationJobState::Failed(_) => Ok(()),
     }
 }
 
@@ -477,27 +548,79 @@ fn rejection_reason_order(reason: CandidateRejectionReason) -> u8 {
     }
 }
 
+struct CanonicalJobDigest {
+    hasher: VegetationContentHasher,
+    byte_len: u64,
+}
+
+impl CanonicalJobDigest {
+    fn new() -> Self {
+        Self {
+            hasher: VegetationContentHasher::new(),
+            byte_len: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> saffron_vegetation::Result<()> {
+        let fragment_len =
+            u64::try_from(bytes.len()).map_err(|_| saffron_vegetation::Error::NumericOverflow)?;
+        let byte_len = self
+            .byte_len
+            .checked_add(fragment_len)
+            .ok_or(saffron_vegetation::Error::NumericOverflow)?;
+        self.hasher.update(bytes)?;
+        self.byte_len = byte_len;
+        Ok(())
+    }
+
+    fn update_result(
+        &mut self,
+        result: &GraphEvaluationResult,
+        encoded_len: u64,
+    ) -> saffron_vegetation::Result<()> {
+        let byte_len = self
+            .byte_len
+            .checked_add(encoded_len)
+            .ok_or(saffron_vegetation::Error::NumericOverflow)?;
+        result.update_content_hasher(&mut self.hasher)?;
+        self.byte_len = byte_len;
+        Ok(())
+    }
+
+    fn finalize(self) -> saffron_vegetation::Result<([u8; 32], u64)> {
+        Ok((self.hasher.finalize()?, self.byte_len))
+    }
+}
+
 fn summarize(
     results: &GraphEvaluationJobResult,
 ) -> saffron_vegetation::Result<(VegetationEvaluationSummaryDto, u64)> {
-    let mut canonical = b"saffron-anima/vegetation-evaluation-job/v2\0".to_vec();
-    canonical.extend_from_slice(&(results.cells.len() as u64).to_be_bytes());
+    let mut canonical = CanonicalJobDigest::new();
+    canonical.update(b"saffron-anima/vegetation-evaluation-job/v2\0")?;
+    let cell_count = u64::try_from(results.cells.len())
+        .map_err(|_| saffron_vegetation::Error::NumericOverflow)?;
+    canonical.update(&cell_count.to_be_bytes())?;
     for result in &results.cells {
-        let bytes = result.canonical_bytes()?;
-        canonical.push(0);
-        canonical.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        canonical.extend_from_slice(&bytes);
+        let encoded_len = u64::try_from(result.canonical_byte_len()?)
+            .map_err(|_| saffron_vegetation::Error::NumericOverflow)?;
+        canonical.update(&[0])?;
+        canonical.update(&encoded_len.to_be_bytes())?;
+        canonical.update_result(result, encoded_len)?;
     }
-    canonical.extend_from_slice(&(results.global_stages.len() as u64).to_be_bytes());
+    let global_stage_count = u64::try_from(results.global_stages.len())
+        .map_err(|_| saffron_vegetation::Error::NumericOverflow)?;
+    canonical.update(&global_stage_count.to_be_bytes())?;
     for stage in &results.global_stages {
-        let bytes = stage.result.canonical_bytes()?;
-        canonical.push(1);
-        canonical.extend_from_slice(&stage.stage);
-        canonical.extend_from_slice(&stage.owner.canonical_bytes());
-        canonical.extend_from_slice(&stage.resident_bytes.to_be_bytes());
-        canonical.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        canonical.extend_from_slice(&bytes);
+        let encoded_len = u64::try_from(stage.result.canonical_byte_len()?)
+            .map_err(|_| saffron_vegetation::Error::NumericOverflow)?;
+        canonical.update(&[1])?;
+        canonical.update(&stage.stage)?;
+        canonical.update(&stage.owner.canonical_bytes())?;
+        canonical.update(&stage.resident_bytes.to_be_bytes())?;
+        canonical.update(&encoded_len.to_be_bytes())?;
+        canonical.update_result(&stage.result, encoded_len)?;
     }
+    let (canonical_hash, canonical_bytes) = canonical.finalize()?;
     let mut candidates = 0_u64;
     let mut accepted = 0_u64;
     let mut micro_tiles = 0_u64;
@@ -618,7 +741,7 @@ fn summarize(
             accepted: accepted.to_string(),
             micro_tiles: micro_tiles.to_string(),
             rejected: rejected.to_string(),
-            canonical_hash: hex_hash(vegetation_content_hash(&canonical)),
+            canonical_hash: hex_hash(canonical_hash),
             nodes: nodes
                 .into_iter()
                 .map(
@@ -689,7 +812,7 @@ fn summarize(
                 )
                 .collect(),
         },
-        u64::try_from(canonical.len()).map_err(|_| saffron_vegetation::Error::NumericOverflow)?,
+        canonical_bytes,
     ))
 }
 
@@ -795,24 +918,55 @@ fn execution_domain_dto(domain: GraphExecutionDomain) -> VegetationExecutionDoma
     }
 }
 
+fn job_dto(job_id: u64, job: &EvaluationJob) -> VegetationEvaluationJobDto {
+    VegetationEvaluationJobDto {
+        job: job_id.to_string(),
+        state: job_state_dto(&job.state),
+        preflight: preflight_dto(job.preflight),
+    }
+}
+
+fn job_state_dto(state: &EvaluationJobState) -> VegetationEvaluationJobStateDto {
+    match state {
+        EvaluationJobState::Prepared { .. } => VegetationEvaluationJobStateDto::Prepared,
+        EvaluationJobState::Running { .. } => VegetationEvaluationJobStateDto::Running,
+        EvaluationJobState::Completed { .. } => VegetationEvaluationJobStateDto::Completed,
+        EvaluationJobState::Cancelled => VegetationEvaluationJobStateDto::Cancelled,
+        EvaluationJobState::Failed(_) => VegetationEvaluationJobStateDto::Failed,
+    }
+}
+
+fn preflight_dto(preflight: GraphEvaluationPreflight) -> VegetationEvaluationPreflightDto {
+    VegetationEvaluationPreflightDto {
+        output_cells: preflight.output_cells.to_string(),
+        global_stage_tiles: preflight.global_stage_tiles.to_string(),
+        input_tiles: preflight.input_tiles.to_string(),
+        retained_input_bytes: preflight.retained_input_bytes.to_string(),
+        generated_input_bytes: preflight.generated_input_bytes.to_string(),
+        candidate_count: preflight.candidate_count.to_string(),
+        accepted_count: preflight.accepted_count.to_string(),
+        micro_samples: preflight.micro_samples.to_string(),
+        preflight_peak_bytes: preflight.preflight_peak_bytes.to_string(),
+        execution_peak_bytes: preflight.execution_peak_bytes.to_string(),
+        memory_bytes: preflight.memory_bytes.to_string(),
+        transfer_bytes: preflight.transfer_bytes.to_string(),
+        worker_count: preflight.worker_count,
+        time_limit_ms: preflight.time_limit_ms.to_string(),
+        limits: crate::commands_vegetation::graph_limits_dto(preflight.limits),
+    }
+}
+
 fn status_dto(job_id: u64, job: &EvaluationJob) -> VegetationEvaluationStatusDto {
-    let (state, summary, error) = match &job.terminal {
-        JobTerminal::Running => (VegetationEvaluationJobStateDto::Running, None, None),
-        JobTerminal::Completed { summary, .. } => (
-            VegetationEvaluationJobStateDto::Completed,
-            Some((**summary).clone()),
-            None,
-        ),
-        JobTerminal::Cancelled => (VegetationEvaluationJobStateDto::Cancelled, None, None),
-        JobTerminal::Failed(error) => (
-            VegetationEvaluationJobStateDto::Failed,
-            None,
-            Some(error.clone()),
-        ),
+    let (summary, error) = match &job.state {
+        EvaluationJobState::Prepared { .. } | EvaluationJobState::Running { .. } => (None, None),
+        EvaluationJobState::Completed { summary, .. } => (Some((**summary).clone()), None),
+        EvaluationJobState::Cancelled => (None, None),
+        EvaluationJobState::Failed(error) => (None, Some(error.clone())),
     };
     VegetationEvaluationStatusDto {
         job: job_id.to_string(),
-        state,
+        state: job_state_dto(&job.state),
+        preflight: preflight_dto(job.preflight),
         summary,
         error,
     }
@@ -833,14 +987,14 @@ mod tests {
     use saffron_vegetation::{
         CandidateLineage, DiagnosticCandidateSample, DiagnosticScalarSample,
         GlobalStageEvaluationResult, GpuGroupEvaluationDiagnostic, GraphEvaluationDiagnostics,
-        GraphNodeAddress, NamedDiagnosticStream, PlantPointColumns, ProvenanceHandle,
-        ProvenanceTable, RejectedCandidate,
+        GraphNodeAddress, GraphSafetyLimits, NamedDiagnosticStream, PlantPointColumns,
+        ProvenanceHandle, ProvenanceTable, RejectedCandidate, vegetation_content_hash,
     };
 
     fn empty_result(cell: WorldCellKey) -> GraphEvaluationResult {
         GraphEvaluationResult {
             cell,
-            macro_points: PlantPointColumns::from_points(&[]).unwrap(),
+            macro_points: PlantPointColumns::from_points(Vec::new()).unwrap(),
             micro_fields: Vec::new(),
             surface_projection_tiles: Vec::new(),
             surface_field_query_tiles: Vec::new(),
@@ -854,22 +1008,42 @@ mod tests {
         cancellation: GraphCancellationToken,
         outcome: EvaluationOutcome,
     ) -> EvaluationJob {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(outcome).unwrap();
         EvaluationJob {
             cancellation,
-            receiver: Some(receiver),
-            worker: None,
-            terminal: JobTerminal::Running,
+            preflight: sample_preflight(),
+            state: EvaluationJobState::Running {
+                worker: OwnedWorker::completed(outcome),
+            },
         }
     }
 
     fn failed_job(error: impl Into<String>) -> EvaluationJob {
         EvaluationJob {
             cancellation: GraphCancellationToken::default(),
-            receiver: None,
-            worker: None,
-            terminal: JobTerminal::Failed(error.into()),
+            preflight: sample_preflight(),
+            state: EvaluationJobState::Failed(ControlFailureDto::Command {
+                message: error.into(),
+            }),
+        }
+    }
+
+    fn sample_preflight() -> GraphEvaluationPreflight {
+        GraphEvaluationPreflight {
+            output_cells: 1,
+            global_stage_tiles: 2,
+            input_tiles: 3,
+            retained_input_bytes: 4,
+            generated_input_bytes: 5,
+            candidate_count: 6,
+            accepted_count: 7,
+            micro_samples: 8,
+            preflight_peak_bytes: 9,
+            execution_peak_bytes: 10,
+            memory_bytes: 10,
+            transfer_bytes: 11,
+            worker_count: 1,
+            time_limit_ms: 12,
+            limits: GraphSafetyLimits::default(),
         }
     }
 
@@ -879,14 +1053,39 @@ mod tests {
         assert!(measured_bytes > 0);
         EvaluationJob {
             cancellation: GraphCancellationToken::default(),
-            receiver: None,
-            worker: None,
-            terminal: JobTerminal::Completed {
+            preflight: sample_preflight(),
+            state: EvaluationJobState::Completed {
                 results: Arc::new(results),
                 summary: Box::new(summary),
                 canonical_bytes,
             },
         }
+    }
+
+    fn reference_job_canonical_bytes(results: &GraphEvaluationJobResult) -> Vec<u8> {
+        let mut canonical = b"saffron-anima/vegetation-evaluation-job/v2\0".to_vec();
+        canonical.extend_from_slice(&u64::try_from(results.cells.len()).unwrap().to_be_bytes());
+        for result in &results.cells {
+            let bytes = result.canonical_bytes().unwrap();
+            canonical.push(0);
+            canonical.extend_from_slice(&u64::try_from(bytes.len()).unwrap().to_be_bytes());
+            canonical.extend_from_slice(&bytes);
+        }
+        canonical.extend_from_slice(
+            &u64::try_from(results.global_stages.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        for stage in &results.global_stages {
+            let bytes = stage.result.canonical_bytes().unwrap();
+            canonical.push(1);
+            canonical.extend_from_slice(&stage.stage);
+            canonical.extend_from_slice(&stage.owner.canonical_bytes());
+            canonical.extend_from_slice(&stage.resident_bytes.to_be_bytes());
+            canonical.extend_from_slice(&u64::try_from(bytes.len()).unwrap().to_be_bytes());
+            canonical.extend_from_slice(&bytes);
+        }
+        canonical
     }
 
     #[test]
@@ -929,7 +1128,7 @@ mod tests {
 
         refresh(&mut job);
 
-        assert!(matches!(&job.terminal, JobTerminal::Cancelled));
+        assert!(matches!(&job.state, EvaluationJobState::Cancelled));
     }
 
     #[test]
@@ -946,9 +1145,16 @@ mod tests {
         let status = jobs.cancel(1).unwrap();
 
         assert_eq!(status.state, VegetationEvaluationJobStateDto::Completed);
+        assert_eq!(status.preflight.output_cells, "1");
+        assert_eq!(status.preflight.global_stage_tiles, "2");
+        assert_eq!(status.preflight.retained_input_bytes, "4");
+        assert_eq!(status.preflight.generated_input_bytes, "5");
+        assert_eq!(status.preflight.preflight_peak_bytes, "9");
+        assert_eq!(status.preflight.execution_peak_bytes, "10");
+        assert_eq!(status.preflight.memory_bytes, "10");
         assert!(matches!(
-            &jobs.jobs.get(&1).unwrap().terminal,
-            JobTerminal::Completed { .. }
+            &jobs.jobs.get(&1).unwrap().state,
+            EvaluationJobState::Completed { .. }
         ));
     }
 
@@ -964,11 +1170,16 @@ mod tests {
                 resident_bytes: 4096,
             }],
         };
+        let reference = reference_job_canonical_bytes(&results);
         let (summary, retained) = summarize(&results).unwrap();
         assert_eq!(summary.cells, "1");
         assert_eq!(summary.global_stages, "1");
         assert_eq!(summary.global_resident_bytes, "4096");
-        assert!(retained > 0);
+        assert_eq!(
+            summary.canonical_hash,
+            hex_hash(vegetation_content_hash(&reference))
+        );
+        assert_eq!(retained, u64::try_from(reference.len()).unwrap());
 
         let mut changed = results;
         changed.global_stages[0].stage[0] ^= 1;
