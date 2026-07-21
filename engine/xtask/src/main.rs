@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 mod protocol;
 mod shaders;
 mod stars;
+mod vegetation_fixture;
 
 fn main() -> ExitCode {
     match run() {
@@ -27,12 +28,31 @@ fn run() -> Result<()> {
     match task.as_deref() {
         Some("shaders") => run_shaders(args.collect()),
         Some("gen-protocol") => run_gen_protocol(),
+        Some("gen-vegetation-e2e-fixture") => run_gen_vegetation_e2e_fixture(args.collect()),
         Some("bake-stars") => run_bake_stars(args.collect()),
-        Some(other) => bail!("unknown task '{other}' (known: shaders, gen-protocol, bake-stars)"),
+        Some(other) => bail!(
+            "unknown task '{other}' (known: shaders, gen-protocol, gen-vegetation-e2e-fixture, bake-stars)"
+        ),
         None => {
-            bail!("usage: cargo run -p xtask <task>  (known: shaders, gen-protocol, bake-stars)")
+            bail!(
+                "usage: cargo run -p xtask <task>  (known: shaders, gen-protocol, gen-vegetation-e2e-fixture, bake-stars)"
+            )
         }
     }
+}
+
+/// `xtask gen-vegetation-e2e-fixture` — emit the current canonical authored vegetation package.
+fn run_gen_vegetation_e2e_fixture(args: Vec<String>) -> Result<()> {
+    if !args.is_empty() {
+        bail!("usage: cargo run -p xtask -- gen-vegetation-e2e-fixture");
+    }
+    let output = workspace_root_repo()?.join("tests/e2e/fixtures/vegetation-phase3.json");
+    vegetation_fixture::write(&output)?;
+    println!(
+        "xtask gen-vegetation-e2e-fixture: wrote {}",
+        output.display()
+    );
+    Ok(())
 }
 
 /// `xtask bake-stars <ybsc5>` — bake the fixed-width Yale BSC5 catalog into the runtime table.
@@ -49,8 +69,8 @@ fn run_bake_stars(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// `xtask gen-protocol` — emit the editor-facing protocol artifacts (`sa-types.ts`, the OpenRPC
-/// schema, the command manifest) from the `saffron-protocol` DTO crate.
+/// `xtask gen-protocol` — emit the editor-facing TypeScript, Luau, envelope, OpenRPC, and manifest
+/// artifacts from the `saffron-protocol` DTO crate.
 fn run_gen_protocol() -> Result<()> {
     let written = protocol::run(&workspace_root_repo()?)?;
     for path in &written {
