@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use saffron_core::Uuid;
 use saffron_geometry::{
-    AnimClip, ChunkKind, Mesh, MeshBvh, decode_image_from_memory, decode_image_from_memory_hdr,
-    load_animation, load_animation_from_bytes, load_mesh_from_bytes, load_mesh_morph_from_bytes,
-    load_mesh_skin_from_bytes, translate_model,
+    AnimClip, ChunkKind, Mesh, MeshBvh, VertexSkin, decode_image_from_memory,
+    decode_image_from_memory_hdr, load_animation, load_animation_from_bytes, load_mesh_from_bytes,
+    load_mesh_morph_from_bytes, load_mesh_skin_from_bytes, translate_model,
 };
 use saffron_rendering::{GpuMesh, GpuTexture, SdfBake};
 use saffron_scene::{AssetType, Colorspace};
@@ -34,6 +34,12 @@ use crate::error::{Error, Result};
 use crate::gpu::GpuUploader;
 use crate::model::ByteSource;
 use crate::{AssetServer, PREVIEW_FLOOR_MESH_ID};
+
+/// Complete CPU payload resolved from one catalog mesh row.
+pub(crate) struct CpuMeshSource {
+    pub(crate) mesh: Mesh,
+    pub(crate) skin: Vec<VertexSkin>,
+}
 
 /// The `Colorspace` a `.smodel` texture chunk's `flags` word encodes.
 ///
@@ -358,6 +364,51 @@ impl AssetServer {
         self.load_texture_asset_role(gpu, id, true)
     }
 
+    /// Resolves a texture into its canonical cutoff-preserving coverage mip chain.
+    ///
+    /// Coverage variants are distinct from color and height textures because their
+    /// mips are exact alpha-area integrals and the reference cutoff is part of the
+    /// material's canonical identity.
+    pub fn load_coverage_texture_asset(
+        &mut self,
+        gpu: &dyn GpuUploader,
+        id: Uuid,
+        cutoff_bits: u16,
+    ) -> Option<Arc<GpuTexture>> {
+        let key = (id.value(), cutoff_bits);
+        if let Some(cached) = self.coverage_texture_by_uuid.get(&key) {
+            return cached.clone();
+        }
+        let (container, path) = match self.catalog.find(id) {
+            Some(entry) if entry.asset_type == AssetType::Texture => {
+                (entry.container, entry.path.clone())
+            }
+            _ => {
+                tracing::warn!(
+                    "coverage texture {} not in catalog; using default",
+                    id.value()
+                );
+                self.coverage_texture_by_uuid.insert(key, None);
+                return None;
+            }
+        };
+        let source = if container.value() == 0 {
+            ByteSource {
+                path: format!("{}/{}", self.root.display(), path),
+                ..ByteSource::default()
+            }
+        } else {
+            let Some(model) = self.load_model_asset(container) else {
+                self.coverage_texture_by_uuid.insert(key, None);
+                return None;
+            };
+            self.chunk_source_for(&model, ChunkKind::Texture, id)
+        };
+        let loaded = upload_coverage_texture_from_source(gpu, id, &source, cutoff_bits);
+        self.coverage_texture_by_uuid.insert(key, loaded.clone());
+        loaded
+    }
+
     /// The role-aware core behind [`Self::load_texture_asset`] / [`Self::load_height_texture_asset`]:
     /// one resolution (catalog → embedded/standalone fork, colorspace), with `as_height` selecting the
     /// pyramid-building upload + the separate height cache.
@@ -475,6 +526,12 @@ impl AssetServer {
     /// non-mesh entry, [`Error::Io`] if the container is unloadable or the sub-asset
     /// absent, or [`Error::Geometry`] for malformed mesh bytes.
     pub fn load_mesh_cpu_asset(&mut self, id: Uuid) -> Result<Mesh> {
+        Ok(self.load_mesh_cpu_source(id)?.mesh)
+    }
+
+    /// Decodes a mesh and its optional parallel skin stream through the catalog's single
+    /// embedded-or-standalone source resolver.
+    pub(crate) fn load_mesh_cpu_source(&mut self, id: Uuid) -> Result<CpuMeshSource> {
         let entry = self
             .catalog
             .find(id)
@@ -503,7 +560,10 @@ impl AssetServer {
                 });
             }
             let bytes = source.read()?;
-            return Ok(load_mesh_from_bytes(&bytes)?);
+            return Ok(CpuMeshSource {
+                mesh: load_mesh_from_bytes(&bytes)?,
+                skin: load_mesh_skin_from_bytes(&bytes)?,
+            });
         }
         let path = self.standalone_mesh_path(&rel_path);
         let bytes = ByteSource {
@@ -511,7 +571,10 @@ impl AssetServer {
             ..ByteSource::default()
         }
         .read()?;
-        Ok(load_mesh_from_bytes(&bytes)?)
+        Ok(CpuMeshSource {
+            mesh: load_mesh_from_bytes(&bytes)?,
+            skin: load_mesh_skin_from_bytes(&bytes)?,
+        })
     }
 
     /// Seeds the asset-preview floor mesh (a unit cube) into the GPU mesh cache under the
@@ -626,10 +689,10 @@ impl AssetServer {
     /// (where the importer writes baked `.smesh` siblings).
     fn standalone_mesh_path(&self, rel: &str) -> String {
         let full_path = format!("{}/{}", self.root.display(), rel);
-        if !Path::new(&full_path).exists() {
-            if let Some(suffix) = rel.strip_prefix("meshes/") {
-                return format!("{}/models/{suffix}", self.root.display());
-            }
+        if !Path::new(&full_path).exists()
+            && let Some(suffix) = rel.strip_prefix("meshes/")
+        {
+            return format!("{}/models/{suffix}", self.root.display());
         }
         full_path
     }
@@ -703,6 +766,40 @@ fn upload_texture_from_source(
             None
         }
     }
+}
+
+fn upload_coverage_texture_from_source(
+    gpu: &dyn GpuUploader,
+    id: Uuid,
+    source: &ByteSource,
+    cutoff_bits: u16,
+) -> Option<Arc<GpuTexture>> {
+    let bytes = source
+        .read()
+        .map_err(|error| {
+            tracing::warn!("coverage texture {}: {error}", id.value());
+        })
+        .ok()?;
+    let decoded = decode_image_from_memory(&bytes)
+        .map_err(|error| {
+            tracing::warn!("coverage texture {}: {error}", id.value());
+        })
+        .ok()?;
+    let mips =
+        crate::coverage_preserving_mips(&decoded.rgba, decoded.width, decoded.height, cutoff_bits);
+    let levels = mips
+        .iter()
+        .map(|mip| saffron_rendering::TextureMipLevel {
+            rgba: &mip.rgba,
+            width: mip.width,
+            height: mip.height,
+        })
+        .collect::<Vec<_>>();
+    gpu.upload_texture_mips(&levels, false)
+        .map_err(|error| {
+            tracing::warn!("coverage texture {}: {error}", id.value());
+        })
+        .ok()
 }
 
 #[cfg(test)]

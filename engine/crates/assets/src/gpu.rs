@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use saffron_geometry::{Mesh, MorphData, VertexSkin};
-use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, SdfBake, Uploader};
+use saffron_rendering::{Descriptors, GpuMesh, GpuTexture, SdfBake, TextureMipLevel, Uploader};
 
 /// The GPU-facing operations the resolve/load paths drive.
 ///
@@ -55,6 +55,21 @@ pub trait GpuUploader {
         height: u32,
         srgb: bool,
     ) -> saffron_rendering::Result<Arc<GpuTexture>>;
+
+    /// Uploads a complete prefiltered RGBA8 mip chain.
+    ///
+    /// The default uploads level zero through [`Self::upload_texture`], which keeps
+    /// non-GPU test doubles small. Live renderers override it and preserve every level.
+    fn upload_texture_mips(
+        &self,
+        mips: &[TextureMipLevel<'_>],
+        srgb: bool,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        let Some(base) = mips.first() else {
+            return Err(saffron_rendering::Error::ZeroSizedImage);
+        };
+        self.upload_texture(base.rgba, base.width, base.height, srgb)
+    }
 
     /// Uploads tightly packed linear-float RGBA as an `R16G16B16A16_SFLOAT` sampled
     /// texture (HDR panoramas / env sources).
@@ -171,6 +186,15 @@ impl GpuUploader for RendererUploader<'_> {
     ) -> saffron_rendering::Result<Arc<GpuTexture>> {
         self.uploader
             .upload_texture_float(self.descriptors, rgba, width, height)
+    }
+
+    fn upload_texture_mips(
+        &self,
+        mips: &[TextureMipLevel<'_>],
+        srgb: bool,
+    ) -> saffron_rendering::Result<Arc<GpuTexture>> {
+        self.uploader
+            .upload_texture_mips(self.descriptors, mips, srgb)
     }
 
     fn upload_height_texture(

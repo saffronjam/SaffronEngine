@@ -48,6 +48,34 @@ pub struct SdfBake {
     pub cache_dir: Option<PathBuf>,
 }
 
+/// One prefiltered RGBA8 mip supplied to [`Uploader::upload_texture_mips`].
+#[derive(Clone, Copy, Debug)]
+pub struct TextureMipLevel<'a> {
+    /// Tightly packed RGBA8 texels.
+    pub rgba: &'a [u8],
+    /// Level width.
+    pub width: u32,
+    /// Level height.
+    pub height: u32,
+}
+
+fn valid_prefiltered_mip_chain(mips: &[TextureMipLevel<'_>]) -> bool {
+    let Some(base) = mips.first() else {
+        return false;
+    };
+    base.width != 0
+        && base.height != 0
+        && mips.len() == mip_count(base.width, base.height) as usize
+        && mips.iter().enumerate().all(|(level, mip)| {
+            let expected_bytes = (mip.width as usize)
+                .checked_mul(mip.height as usize)
+                .and_then(|texels| texels.checked_mul(4));
+            mip.width == base.width.checked_shr(level as u32).unwrap_or(0).max(1)
+                && mip.height == base.height.checked_shr(level as u32).unwrap_or(0).max(1)
+                && expected_bytes == Some(mip.rgba.len())
+        })
+}
+
 /// The externally-synchronized graphics queue, shared behind a mutex.
 ///
 /// README §5's first `Arc<Mutex>` site: the frame loop's submit/present and the worker
@@ -106,6 +134,12 @@ impl GpuQueue {
     pub(crate) fn wait_device_idle(&self, raw: &ash::Device) -> Result<()> {
         let _queue = self.inner.lock().expect("gpu queue mutex");
         checked(unsafe { raw.device_wait_idle() }, "device_wait_idle")
+    }
+
+    /// Waits for this queue alone under its external-synchronization lock.
+    pub(crate) fn wait_queue_idle(&self, raw: &ash::Device) -> Result<()> {
+        let queue = *self.inner.lock().expect("gpu queue mutex");
+        checked(unsafe { raw.queue_wait_idle(queue) }, "queue_wait_idle")
     }
 }
 
@@ -170,7 +204,7 @@ impl Uploader {
             queue: queue.clone(),
             command_pool,
             accel: device.accel_dispatch().cloned(),
-            mesh_shader: device.mesh_shader_supported(),
+            mesh_shader: device.mesh_shader_enabled(),
             bake,
         })
     }
@@ -2176,6 +2210,97 @@ impl Uploader {
             return Err(err);
         }
 
+        self.finish_texture(descriptors, uploaded, None)
+    }
+
+    /// Uploads an explicit, prefiltered RGBA8 mip chain into one bindless texture.
+    ///
+    /// This is the canonical coverage path: every level is CPU-derived and copied
+    /// exactly, so driver blit filtering cannot change thin-sheet classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ZeroSizedImage`] for an empty/malformed chain or [`Error::Vk`]
+    /// for a failing Vulkan/VMA operation.
+    pub fn upload_texture_mips(
+        &self,
+        descriptors: &Descriptors,
+        mips: &[TextureMipLevel<'_>],
+        srgb: bool,
+    ) -> Result<Arc<GpuTexture>> {
+        let Some(base) = mips.first() else {
+            return Err(Error::ZeroSizedImage);
+        };
+        if !valid_prefiltered_mip_chain(mips) {
+            return Err(Error::ZeroSizedImage);
+        }
+        let total = mips.iter().map(|mip| mip.rgba.len()).sum::<usize>();
+        let mut staging = StagingBuffer::new(self.allocator(), total as vk::DeviceSize)?;
+        let mut offsets = Vec::with_capacity(mips.len());
+        let mut offset = 0_usize;
+        for mip in mips {
+            offsets.push(offset as vk::DeviceSize);
+            staging.mapped_slice()[offset..offset + mip.rgba.len()].copy_from_slice(mip.rgba);
+            offset += mip.rgba.len();
+        }
+        staging.flush();
+
+        let format = if srgb {
+            vk::Format::R8G8B8A8_SRGB
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        let uploaded =
+            self.create_sampled_image(base.width, base.height, mips.len() as u32, format)?;
+        let image = uploaded.image;
+        let recorded = self.with_one_off_commands(|cmd| {
+            // SAFETY: the image/staging buffer and mip slices outlive the submit-wait.
+            unsafe {
+                transition_image(
+                    self.raw(),
+                    cmd,
+                    image,
+                    mips.len() as u32,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+                for (level, (mip, &mip_offset)) in mips.iter().zip(&offsets).enumerate() {
+                    copy_buffer_to_image_mip(
+                        self.raw(),
+                        cmd,
+                        staging.handle(),
+                        image,
+                        mip_offset,
+                        level as u32,
+                        vk::Extent2D {
+                            width: mip.width,
+                            height: mip.height,
+                        },
+                    );
+                }
+                transition_image(
+                    self.raw(),
+                    cmd,
+                    image,
+                    mips.len() as u32,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                );
+            }
+        });
+        drop(staging);
+        if let Err(error) = recorded {
+            self.destroy_image(uploaded.image, uploaded.allocation);
+            return Err(error);
+        }
         self.finish_texture(descriptors, uploaded, None)
     }
 
@@ -4325,6 +4450,46 @@ mod tests {
         assert_eq!(mip_count(1024, 512), 11);
         assert_eq!(mip_count(512, 1024), 11);
         assert_eq!(mip_count(7, 1), 3); // 7 -> 3 -> 1
+    }
+
+    #[test]
+    fn explicit_mip_chain_requires_every_level_exactly_once() {
+        let base = vec![0_u8; 7 * 3 * 4];
+        let middle = vec![0_u8; 3 * 4];
+        let tail = vec![0_u8; 4];
+        let valid = [
+            TextureMipLevel {
+                rgba: &base,
+                width: 7,
+                height: 3,
+            },
+            TextureMipLevel {
+                rgba: &middle,
+                width: 3,
+                height: 1,
+            },
+            TextureMipLevel {
+                rgba: &tail,
+                width: 1,
+                height: 1,
+            },
+        ];
+        assert!(valid_prefiltered_mip_chain(&valid));
+        assert!(!valid_prefiltered_mip_chain(&valid[..2]));
+
+        let extra = [valid[0], valid[1], valid[2], valid[2]];
+        assert!(!valid_prefiltered_mip_chain(&extra));
+        let malformed = [
+            valid[0],
+            TextureMipLevel {
+                rgba: &tail,
+                width: 2,
+                height: 1,
+            },
+            valid[2],
+        ];
+        assert!(!valid_prefiltered_mip_chain(&malformed));
+        assert!(!valid_prefiltered_mip_chain(&[]));
     }
 
     /// `float_to_half` reproduces the known IEEE half encodings: the exact
