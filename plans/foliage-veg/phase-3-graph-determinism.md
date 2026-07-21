@@ -21,9 +21,10 @@ persistent plants.
 - [x] Compile `.sbiome` roots and modules into one validated IR with typed module interfaces, cycle
   rejection, bounded recursion, strict current-version validation, dependency hashes, and stable
   debug symbols. Noncurrent graph and node versions are rejected; there is no migration path.
-- [ ] Show predicted candidate/accepted counts, memory, transfer cost, and hard caps before execution.
-  Unbounded operators are rejected; global operators run at an ancestor/global stage and emit tiled
-  immutable results.
+- [x] Show predicted candidate/accepted counts, retained and evaluator-generated input bytes,
+  preflight and execution allocation peaks, `memoryBytes` as their maximum, transfer cost, and hard
+  caps before execution. Unbounded operators are rejected; global operators run at an ancestor/global
+  stage and emit tiled immutable results.
 
 ## Authority and taint
 
@@ -73,8 +74,9 @@ blades are cosmetic and need not be cross-vendor bit-identical.
   CPU/GPU byte-equivalence qualification.
 - [x] Compile one IR; CPU/GPU scheduling groups are execution plans, not different semantics. Transfer
   boundaries and estimated/actual bytes/timing are visible diagnostics.
-- [ ] Add cancellation checks and hard count/memory/time safety caps without silently lowering density
-  or quality. Cancellation publishes nothing.
+- [x] Add cancellation and deadline checks plus hard count/memory/transfer/time safety caps without
+  silently lowering density or quality. Recheck the matching job before final publication;
+  cancellation or failure publishes nothing.
 
 ## Initial surface inputs
 
@@ -84,10 +86,12 @@ channels; no terrain node or terrain grass output is added here.
 
 ## Control and diagnostics seam
 
-Add generated commands and `sa` surfaces to compile a biome, evaluate a bounded region, inspect a
-node's typed input/output schema, list dependencies/halo, return candidate/accepted/rejected counts,
-and explain one point's provenance/rejection. These are real evaluator calls shared with the future
-editor, not a second debug interpreter.
+Add generated commands and `sa` surfaces to compile a biome, preflight a bounded region into a
+prepared job, explicitly start/status/cancel that exact job, inspect a node's typed input/output
+schema, list dependencies/halo, return candidate/accepted/rejected counts, and explain one point's
+provenance/rejection. Preflight reports retained and generated input bytes, separate symbolic
+admission and execution peaks, and their maximum as the concrete-job memory bound. These are real
+evaluator calls shared with the future editor, not a second debug interpreter.
 
 ## Acceptance
 
@@ -98,10 +102,14 @@ editor, not a second debug interpreter.
 - [x] Cross-cell competition is identical whether neighbours cook serially, reversed, or in parallel.
 - [ ] Every dual-domain node passes Rust/Slang equivalence on NVIDIA, AMD, and MoltenVK before it can
   carry `EquivalentGpu`.
-- [ ] The compiler rejects cosmetic-to-authoritative dependencies, unbounded local influence,
-  cycles, runaway counts, and NaN/overflow inputs with typed diagnostics.
+- [x] The compiler rejects cosmetic-to-authoritative dependencies, unbounded local influence, cycles,
+  and NaN/overflow inputs with typed diagnostics.
+- [x] Concrete-job preflight exposes retained/generated inputs and admission/execution peaks, defines
+  memory as their maximum, and rejects every count, memory, transfer, worker, tile, and deadline
+  excess. The matching evaluator publishes only a complete result within the admitted boundary.
 - [x] `sa` provenance/rejection output traces map→layer→biome→node→candidate→plant.
-- [ ] Standard milestone gate and graph/evaluator docs are green.
+- [x] Standard milestone gate, generated protocol checks, real-host preflight lifecycle, and
+  graph/evaluator docs are green.
 
 ## NO-LEGACY gate
 
@@ -116,3 +124,20 @@ point formats.
   `benchmarks/foliage-veg/compute-conformance-apple-m4-moltenvk.json`.
 - NVIDIA: pending access to a physical supported GPU.
 - AMD: pending access to a physical supported GPU.
+
+## Progress
+
+- 2026-07-21: All locally executable Phase-3 work and gates are green: `just engine`,
+  `just prepare-for-commit`, the 207-command live schema contract, `just test`, the 301-case live
+  E2E suite, the schema-harness unit tests, strict all-target rendering Clippy, and the docs
+  build/link/style checks.
+- The live schema gate exposed and verified two presentation defects. Presentation semaphores are
+  owned by a typed acquire-to-present transaction, internal offscreen renders cannot signal them,
+  and aliased slot/image fences are deduplicated and waited before reset. Seven consecutive
+  post-fix schema runs passed 207/207 without a timeout or Vulkan validation issue.
+- Physical NVIDIA and AMD CPU/Slang conformance records remain deferred verification work. They do
+  not block feature implementation. The next implementation step is Phase 4, followed by every
+  remaining phase in dependency order; the deferred platform records stay visible and unchecked
+  until the required hardware is available.
+- Work paused at the Codex weekly usage guard (90%). The reported reset is
+  `2026-07-27T22:26:57+02:00`.
