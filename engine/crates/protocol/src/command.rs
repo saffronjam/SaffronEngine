@@ -3,7 +3,7 @@
 //! `register_*_commands` joins this table to handler fns by name to dispatch, and the
 //! OpenRPC/manifest emitters read the same slice to emit `methods`.
 //!
-//! [`COMMANDS`] holds exactly the **192 typed commands** in the frozen wire order (the committed
+//! [`COMMANDS`] holds exactly the **206 typed commands** in the frozen wire order (the committed
 //! `schemas/control/command-manifest.generated.json` order, `ping` first, `quit` last) — the order
 //! is load-bearing: it is the manifest's `commands` order and the OpenRPC `methods` order, so the
 //! emitters reproduce the committed artifacts byte-for-byte. The lone untyped reflective builtin
@@ -32,7 +32,7 @@ pub struct CommandSpec {
     pub result: &'static str,
 }
 
-/// The 192 typed commands in frozen wire order (`help` excluded — see module docs).
+/// The 206 typed commands in frozen wire order (`help` excluded — see module docs).
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ping",
@@ -833,9 +833,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         result: "VegetationNodeSchemaResult",
     },
     CommandSpec {
-        name: "vegetation-evaluate-region",
-        summary: "start one bounded asynchronous biome evaluation through the canonical evaluator",
-        params: "VegetationEvaluateRegionParams",
+        name: "vegetation-preflight-region",
+        summary: "assemble, comprehensively bound, and retain one biome evaluation without starting a worker",
+        params: "VegetationPreflightRegionParams",
+        result: "VegetationEvaluationJobDto",
+    },
+    CommandSpec {
+        name: "vegetation-start-evaluation",
+        summary: "start the exact evaluator and inputs retained by a prepared vegetation job",
+        params: "VegetationEvaluationJobParams",
         result: "VegetationEvaluationJobDto",
     },
     CommandSpec {
@@ -855,6 +861,84 @@ pub static COMMANDS: &[CommandSpec] = &[
         summary: "trace an accepted plant or rejected candidate through its provenance decision DAG",
         params: "VegetationExplainPointParams",
         result: "ProvenanceExplanationDto",
+    },
+    CommandSpec {
+        name: "vegetation-cook",
+        summary: "start one deterministic content-addressed vegetation cook",
+        params: "VegetationCookParams",
+        result: "VegetationCookJobDto",
+    },
+    CommandSpec {
+        name: "vegetation-cook-status",
+        summary: "poll an asynchronous vegetation cook and its terminal manifest",
+        params: "VegetationCookJobParams",
+        result: "VegetationCookStatusDto",
+    },
+    CommandSpec {
+        name: "vegetation-cancel-cook",
+        summary: "cancel a vegetation cook without publishing partial or superseded output",
+        params: "VegetationCookJobParams",
+        result: "VegetationCookStatusDto",
+    },
+    CommandSpec {
+        name: "vegetation-cell-inspect",
+        summary: "inspect one validated immutable vegetation cell header and section table",
+        params: "VegetationCellInspectParams",
+        result: "VegetationCellInspectResult",
+    },
+    CommandSpec {
+        name: "vegetation-manifest",
+        summary: "inspect the current or one exact immutable vegetation base manifest",
+        params: "VegetationManifestParams",
+        result: "VegetationManifestResult",
+    },
+    CommandSpec {
+        name: "vegetation-runtime-status",
+        summary: "report the exact runtime vegetation generation, state, queues, residency, and budgets",
+        params: "EmptyParams",
+        result: "VegetationRuntimeStatusDto",
+    },
+    CommandSpec {
+        name: "vegetation-runtime-cell",
+        summary: "inspect one immutable CPU-resident vegetation cell generation",
+        params: "VegetationRuntimeCellParams",
+        result: "VegetationRuntimeCellResult",
+    },
+    CommandSpec {
+        name: "vegetation-runtime-query",
+        summary: "query CPU-resident macro vegetation by bounds, radius, ray, or nearest",
+        params: "VegetationRuntimeQueryParams",
+        result: "VegetationRuntimeQueryResult",
+    },
+    CommandSpec {
+        name: "vegetation-runtime-inspect",
+        summary: "inspect one stable plant's effective row, persistent state, and resident provenance",
+        params: "VegetationRuntimePlantInspectParams",
+        result: "VegetationRuntimePlantInspectResult",
+    },
+    CommandSpec {
+        name: "vegetation-state-export",
+        summary: "export the canonical strict runtime vegetation state snapshot",
+        params: "EmptyParams",
+        result: "VegetationStateSnapshotDto",
+    },
+    CommandSpec {
+        name: "vegetation-state-import",
+        summary: "verify and atomically import one exact runtime vegetation state snapshot",
+        params: "VegetationStateImportParams",
+        result: "VegetationStateSnapshotDto",
+    },
+    CommandSpec {
+        name: "plant-validate",
+        summary: "validate one authored plant family and inspect its exact sources",
+        params: "PlantValidateParams",
+        result: "PlantValidationResult",
+    },
+    CommandSpec {
+        name: "plant-recook",
+        summary: "normalize and atomically publish one plant family through its retained recipe",
+        params: "PlantRecookParams",
+        result: "PlantRecookResult",
     },
     CommandSpec {
         name: "get-project",
@@ -1372,8 +1456,12 @@ pub static COMMAND_SKIPS: &[(&str, &str)] = &[
         "requires an imported biome asset or map-local biome instance",
     ),
     (
-        "vegetation-evaluate-region",
+        "vegetation-preflight-region",
         "requires an imported vegetation map and bound biome instance",
+    ),
+    (
+        "vegetation-start-evaluation",
+        "requires a prepared vegetation evaluation job",
     ),
     (
         "vegetation-evaluation-status",
@@ -1386,6 +1474,55 @@ pub static COMMAND_SKIPS: &[(&str, &str)] = &[
     (
         "vegetation-explain-point",
         "requires a completed vegetation evaluation and point identity",
+    ),
+    (
+        "vegetation-cook",
+        "requires an imported vegetation map and its exact source dependencies",
+    ),
+    (
+        "vegetation-cook-status",
+        "requires a prior vegetation cook job",
+    ),
+    (
+        "vegetation-cancel-cook",
+        "requires a running vegetation cook job",
+    ),
+    (
+        "vegetation-cell-inspect",
+        "requires a completed manifest and content-addressed cell artifact",
+    ),
+    (
+        "vegetation-manifest",
+        "requires a completed vegetation cook",
+    ),
+    (
+        "vegetation-runtime-status",
+        "requires an enabled VegetationField and completed vegetation cook",
+    ),
+    (
+        "vegetation-runtime-cell",
+        "requires a CPU-resident cooked vegetation cell",
+    ),
+    (
+        "vegetation-runtime-query",
+        "requires CPU-resident cooked macro vegetation",
+    ),
+    (
+        "vegetation-runtime-inspect",
+        "requires a resident plant or persistent plant delta",
+    ),
+    (
+        "vegetation-state-export",
+        "requires an exact bound vegetation runtime generation",
+    ),
+    (
+        "vegetation-state-import",
+        "requires an exact bound vegetation runtime generation and snapshot",
+    ),
+    ("plant-validate", "requires an imported plant-family asset"),
+    (
+        "plant-recook",
+        "requires an imported plant family and its retained source recipe",
     ),
     ("import-model", "requires an external model fixture path"),
     (
@@ -1635,8 +1772,9 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "VegetationGraphParameterDto",
     "VegetationNodeSchemaDto",
     "VegetationNodeSchemaResult",
-    "VegetationEvaluateRegionParams",
+    "VegetationPreflightRegionParams",
     "VegetationEvaluationJobStateDto",
+    "VegetationEvaluationPreflightDto",
     "VegetationEvaluationJobDto",
     "VegetationEvaluationJobParams",
     "VegetationExecutionDomainDto",
@@ -1664,6 +1802,20 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "ThinSheetFoliageParametersDto",
     "MaterialSurfaceDto",
     "PlantSourceKindDto",
+    "VegetationValidationSeverityDto",
+    "VegetationValidationIssueDto",
+    "VegetationValidationSummaryDto",
+    "VegetationSourceProvenanceDto",
+    "PlantSourceLocatorDto",
+    "PlantSourceRoleDto",
+    "PlantSourceSelectorDto",
+    "PlantSemanticDestinationDto",
+    "PlantCompileDiagnosticCodeDto",
+    "PlantCompileDiagnosticDto",
+    "PlantReimportConflictReasonDto",
+    "PlantSourceHashUpdateDto",
+    "PlantCompileStatisticsDto",
+    "PlantSourceReferenceDto",
     "PlantAssetSummaryDto",
     "BiomeRoleDto",
     "BiomeAssetSummaryDto",
@@ -1677,8 +1829,65 @@ pub static DTO_TYPE_NAMES: &[&str] = &[
     "PlantStateOverrideDto",
     "VegetationLayerOperatorDto",
     "VegetationLayerDto",
+    "VegetationCookVersionSetDto",
+    "VegetationCookPlatformProfileDto",
+    "VegetationCookWorkEstimateDto",
+    "VegetationCookWorkActualDto",
+    "VegetationCookRejectionTotalDto",
+    "VegetationCookStatisticsDto",
+    "VegetationCookNodeAddressDto",
+    "VegetationMapChunkKindDto",
+    "VegetationMapTileKeyDto",
+    "VegetationMapChunkKeyDto",
+    "VegetationManifestDependencyAddressDto",
     "VegetationManifestDependencyDto",
+    "VegetationSeedNamespaceDto",
+    "VegetationPointColumnTypeDto",
+    "VegetationManifestPointColumnDto",
+    "VegetationManifestPlantDto",
+    "VegetationManifestCellDependencyRoleDto",
+    "VegetationManifestCellDependencyDto",
+    "VegetationSpeciesCountDto",
+    "VegetationManifestCellSectionDto",
+    "VegetationManifestCellDto",
     "VegetationBaseManifestDto",
+    "VegetationCookScopeDto",
+    "VegetationCookParams",
+    "VegetationCookJobParams",
+    "VegetationCookJobStateDto",
+    "VegetationCookProgressDto",
+    "VegetationCookJobDto",
+    "VegetationCookStatusDto",
+    "VegetationManifestParams",
+    "VegetationManifestResult",
+    "VegetationCellInspectParams",
+    "VegetationCellSectionKindDto",
+    "VegetationArtifactSectionCodecDto",
+    "VegetationCellSectionDto",
+    "VegetationCellSummaryDto",
+    "VegetationCellInspectResult",
+    "VegetationRuntimeQueryFilterDto",
+    "VegetationRuntimeQueryDto",
+    "VegetationRuntimeQueryParams",
+    "VegetationRuntimePlantDto",
+    "VegetationRuntimeQueryHitDto",
+    "VegetationRuntimeQueryResult",
+    "VegetationRuntimePendingCellDto",
+    "VegetationRuntimeFacetBytesDto",
+    "VegetationRuntimeUnavailableReasonDto",
+    "VegetationRuntimeAvailableStatusDto",
+    "VegetationRuntimeStatusDto",
+    "VegetationRuntimeCellParams",
+    "VegetationRuntimeCellResult",
+    "VegetationRuntimePlantInspectParams",
+    "VegetationRuntimePlantStateDto",
+    "VegetationRuntimePlantInspectResult",
+    "VegetationStateSnapshotDto",
+    "VegetationStateImportParams",
+    "PlantValidateParams",
+    "PlantValidationResult",
+    "PlantRecookParams",
+    "PlantRecookResult",
     "VegetationMutationHeaderDto",
     "PlantTransformDto",
     "VegetationMutationDto",
@@ -2100,7 +2309,7 @@ mod tests {
         assert_eq!(*physics.first().unwrap(), "physics-state");
         assert_eq!(*physics.last().unwrap(), "get-ragdoll");
         assert_eq!(*vegetation.first().unwrap(), "vegetation-compile-biome");
-        assert_eq!(*vegetation.last().unwrap(), "vegetation-explain-point");
+        assert_eq!(*vegetation.last().unwrap(), "plant-recook");
     }
 
     /// Every command has exactly one of a fixture or a skip, so a new command without
@@ -2373,10 +2582,24 @@ mod tests {
         &[
             "vegetation-compile-biome",
             "vegetation-node-schema",
-            "vegetation-evaluate-region",
+            "vegetation-preflight-region",
+            "vegetation-start-evaluation",
             "vegetation-evaluation-status",
             "vegetation-cancel-evaluation",
             "vegetation-explain-point",
+            "vegetation-cook",
+            "vegetation-cook-status",
+            "vegetation-cancel-cook",
+            "vegetation-cell-inspect",
+            "vegetation-manifest",
+            "vegetation-runtime-status",
+            "vegetation-runtime-cell",
+            "vegetation-runtime-query",
+            "vegetation-runtime-inspect",
+            "vegetation-state-export",
+            "vegetation-state-import",
+            "plant-validate",
+            "plant-recook",
         ]
     }
 }
