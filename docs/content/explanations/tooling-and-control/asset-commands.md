@@ -11,7 +11,7 @@ catalog name. Commands that need project storage reject the request until a proj
 
 ## Command families
 
-`register_asset_commands` contains several related surfaces rather than one flat import API:
+The asset control module contains several related surfaces rather than one flat import API:
 
 | Family | Representative commands | Purpose |
 |---|---|---|
@@ -21,7 +21,7 @@ catalog name. Commands that need project storage reject the request until a proj
 | Model containers | `model-info`, `get-asset-model`, `extract-subasset`, `clear-extraction` | Inspect and manage embedded model data |
 | Scene placement | `instantiate-model`, `asset-placement`, `assign-asset` | Create entities and bind catalog assets |
 | Catalog | `list-assets`, `scan-assets`, `probe-asset`, `asset-references` | Browse metadata and dependency edges |
-| Vegetation | `vegetation-asset-summary` | Inspect plant, biome, and map data |
+| Vegetation | `vegetation-cook`, `vegetation-manifest`, `plant-recook` | Cook and inspect plant, biome, and map data |
 | Organization | `rename-asset`, `move-asset`, `create-asset-folder` | Maintain names and virtual folders |
 | Cleanup | `asset-usages`, `clean-assets`, `delete-unused`, `delete-asset` | Find references and remove data |
 | Materials | `material-create`, `material-update`, `material-set-graph`, `material-cook` | Author, assign, preview, and compile materials |
@@ -51,7 +51,23 @@ container ownership with `clear-extraction`.
 `import-vegetation-asset` reads an authored `.splant`, `.sbiome`, or complete `.svegmap` package.
 It preserves the asset's stable identity so references between separately imported families, biomes,
 and maps remain valid. `vegetation-asset-summary` returns the native typed summary and ordered map
-layers used by the editor workspace.
+layers used by the editor workspace. Each summary includes validation, source attribution, exact
+dependency identities, and attributable cook statistics.
+
+`plant-validate` resolves the retained source recipe through the plant compiler without publishing.
+Its result contains structured diagnostics, observed source hashes, license provenance, reimport
+conflicts, and the exact dependencies used for the cook key. `plant-recook` runs the same compiler,
+publishes a validated `.splantc`, and accepts changed source hashes only after publication succeeds.
+
+`vegetation-cook` queues the single staged world-cooking route for an entire map, explicit bounds, or
+an explicit cell set. `vegetation-cook-status` reports monotonic progress and terminal output;
+`vegetation-cancel-cook` requests cooperative cancellation. A newer cook for the same map supersedes
+the older queued or running job.
+
+`vegetation-manifest` reads the current generation or an exact immutable manifest identity.
+`vegetation-cell-inspect` validates one cell through that manifest and returns its header, content
+identity, counts, and complete section table. These inspection commands do not make generated
+`.splantc` or `.svegcell` files catalog assets.
 
 ## Catalog durability and references
 
@@ -127,6 +143,8 @@ application folder. `screenshot` and `quit` complete scriptable sessions; the
 | What | File | Symbols |
 |---|---|---|
 | Command registration | `control/src/commands_asset.rs` | `register_asset_commands`, `resolve_asset` |
+| Vegetation cook commands | `control/src/commands_vegetation.rs` | `register_vegetation_commands` |
+| Vegetation cook jobs | `control/src/vegetation_cook_jobs.rs` | `VegetationCookJobs` |
 | Model and dependency management | `assets/src/manage.rs` | `reimport_model`, `extract_sub_asset`, `build_dependency_graph`, `analyze_clean` |
 | Import pipeline | `assets/src/import.rs` | `AssetServer::import_model`, `AssetServer::import_texture` |
 | Interactive preview | `control/src/commands_asset.rs` | `enter_asset_preview`, `install_preview_scene`, `PreviewSubject` |

@@ -172,10 +172,18 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-tessellation-quality` | `SetTessellationQualityParams` | `SetTessellationQualityResult` | set-tessellation-quality [factorCap] [minFactor] [edgeLengthTarget] |
 | `vegetation-compile-biome` | `VegetationCompileBiomeParams` | `VegetationCompileBiomeResult` | compile a biome graph and inspect dependencies, halo, estimates, and hard caps |
 | `vegetation-node-schema` | `VegetationNodeSchemaParams` | `VegetationNodeSchemaResult` | inspect typed biome-node pins, parameters, seed namespaces, and execution capability |
-| `vegetation-evaluate-region` | `VegetationEvaluateRegionParams` | `VegetationEvaluationJobDto` | start one bounded asynchronous biome evaluation through the canonical evaluator |
+| `vegetation-preflight-region` | `VegetationPreflightRegionParams` | `VegetationEvaluationJobDto` | bound and retain one evaluation; report retained/generated inputs and both memory peaks |
+| `vegetation-start-evaluation` | `VegetationEvaluationJobParams` | `VegetationEvaluationJobDto` | start the exact evaluator and inputs retained by a prepared job |
 | `vegetation-evaluation-status` | `VegetationEvaluationJobParams` | `VegetationEvaluationStatusDto` | poll an asynchronous vegetation evaluation and its deterministic aggregate |
 | `vegetation-cancel-evaluation` | `VegetationEvaluationJobParams` | `VegetationEvaluationStatusDto` | cancel an asynchronous vegetation evaluation without partial publication |
 | `vegetation-explain-point` | `VegetationExplainPointParams` | `ProvenanceExplanationDto` | trace an accepted plant or rejected candidate through its provenance decision DAG |
+| `vegetation-cook` | `VegetationCookParams` | `VegetationCookJobDto` | start a staged content-addressed map cook for all, bounds, or explicit cells |
+| `vegetation-cook-status` | `VegetationCookJobParams` | `VegetationCookStatusDto` | poll cook progress, terminal statistics, manifest, or failure |
+| `vegetation-cancel-cook` | `VegetationCookJobParams` | `VegetationCookStatusDto` | request cooperative cancellation of one vegetation cook |
+| `vegetation-cell-inspect` | `VegetationCellInspectParams` | `VegetationCellInspectResult` | validate and inspect one immutable cell header and section directory |
+| `vegetation-manifest` | `VegetationManifestParams` | `VegetationManifestResult` | inspect the current or an exact immutable generation manifest |
+| `plant-validate` | `PlantValidateParams` | `PlantValidationResult` | validate one retained plant source recipe without publication |
+| `plant-recook` | `PlantRecookParams` | `PlantRecookResult` | compile and publish one validated plant-family artifact |
 | `get-project` | `EmptyParams` | `ProjectInfoDto` | active project metadata |
 | `project-status` | `EmptyParams` | `ProjectStatusDto` | project-load phase + progress |
 | `cancel-load` | `EmptyParams` | `ProjectStatusDto` | abort the in-flight project load |
@@ -187,7 +195,9 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `asset-placement` | `AssetPlacementParams` | `AssetPlacementResult` | asset-placement {phase, asset?, u?, v?} — preview, commit, or clear a viewport model drop |
 | `import-texture` | `ImportTextureParams` | `ImportTextureResult` | import-texture {path} [colorspace] |
 | `import-lut` | `ImportLutParams` | `ImportLutResult` | import-lut {path} — import a creative .cube look as a LUT asset |
+| `import-vegetation-asset` | `ImportVegetationAssetParams` | `ImportVegetationAssetResult` | import an authored plant, biome, or complete vegetation-map package |
 | `list-assets` | `EmptyParams` | `AssetList` | list project asset catalog |
+| `vegetation-asset-summary` | `VegetationAssetSummaryParams` | `VegetationAssetSummaryResult` | inspect authored vegetation metadata, validation, dependencies, and cook statistics |
 | `scan-assets` | `EmptyParams` | `ScanAssetsResult` | rescan assets/ and reconcile the catalog from disk |
 | `extract-subasset` | `ExtractSubAssetParams` | `AssetRef` | extract-subasset {asset, subAsset} [dest] — slice an embedded sub-asset to a standalone file |
 | `clear-extraction` | `ClearExtractionParams` | `AssetRef` | clear-extraction {asset, subAsset} — revert an extracted sub-asset to the embedded chunk |
