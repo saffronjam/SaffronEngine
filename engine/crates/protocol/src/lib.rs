@@ -12,6 +12,7 @@
 
 mod codegen;
 mod command;
+mod control_dto;
 mod dto;
 mod scene_dto;
 mod schema;
@@ -23,8 +24,9 @@ pub use command::{
     COMMAND_FIXTURES, COMMAND_SKIPS, COMMANDS, CommandSpec, DTO_TYPE_NAMES, HELP_COMMAND,
     HELP_SKIP_REASON, fixture_for, skip_for,
 };
+pub use control_dto::*;
 pub use dto::*;
 pub use scene_dto::*;
-pub use schema::{fragment_for, positional_field_order};
+pub use schema::{fragment_for, positional_field_order, standalone_schema_for};
 pub use uuid::Uuid;
 pub use vegetation_dto::*;
