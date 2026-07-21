@@ -26,6 +26,8 @@
 mod cache;
 mod catalog;
 mod codegen;
+mod cook_reader;
+mod coverage;
 mod cube;
 mod environment_profile;
 mod error;
@@ -39,6 +41,7 @@ mod material_schema;
 mod mesh_surface;
 mod model;
 mod names;
+mod plant_cook;
 mod project;
 mod project_load;
 mod render_material;
@@ -52,12 +55,16 @@ mod spawn;
 mod thumbnail;
 mod time_of_day;
 mod vegetation;
+mod vegetation_cooker;
+mod vegetation_store;
 
 pub use cache::{AssetCache, resolve_cached};
 pub use catalog::{
     catalog_folders_from_json, catalog_folders_to_json, catalog_from_json, catalog_to_json,
 };
 pub use codegen::find_slangc;
+pub use cook_reader::{AuthoredInputGuard, CookProjectView};
+pub use coverage::{CoverageMip, coverage_preserving_mips};
 pub use cube::{BakedLut, CubeError, CubeLut, parse_cube};
 pub use environment_profile::{
     BuiltinEnvironmentProfile, builtin_environment_profile, builtin_environment_profiles,
@@ -95,6 +102,11 @@ pub use names::{
     asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name,
     texture_role_from_name, texture_role_name,
 };
+pub use plant_cook::{
+    PlantRecookOptions, PlantRecookOutcome, PlantValidationOutcome, PreparedPlantFamily,
+    PublishedPlantRecook, prepare_plant_family_sources, recook_plant_family,
+    validate_plant_family_sources,
+};
 pub use project::{
     LUARC_JSON, NewProject, PROJECT_VERSION, ProjectHost, ProjectInfo, ProjectSidecar,
     STARTER_SCRIPT, app_data_root, create_project_script, default_display_name,
@@ -124,13 +136,22 @@ pub use time_of_day::{
     julian_date, local_sidereal_time, lunar_position, solar_position, world_from_equatorial,
 };
 pub use vegetation::{
-    CatalogBiomeGraphResolver, ResolvedBiomeGraph, VegetationImport,
-    assemble_biome_graph_evaluation_job, compile_catalog_biome_graph,
-    compile_catalog_biome_instance_graph, import_vegetation_asset, load_biome_asset,
-    load_plant_family_asset, load_vegetation_map_asset, load_vegetation_map_chunk,
-    remove_vegetation_map_package, save_biome_asset, save_plant_family_asset,
-    save_vegetation_map_asset, update_biome_asset, update_plant_family_asset,
-    update_vegetation_map_asset, vegetation_graph_dependency_hashes, write_vegetation_map_chunks,
+    CatalogBiomeGraphResolver, ResolvedBiomeGraph, VegetationImport, VegetationMapTransaction,
+    assemble_biome_graph_evaluation_job, commit_vegetation_map_transaction,
+    compile_catalog_biome_graph, compile_catalog_biome_instance_graph, import_vegetation_asset,
+    load_biome_asset, load_plant_family_asset, load_vegetation_map_root,
+    load_vegetation_map_snapshot, load_vegetation_map_tile_snapshot, remove_vegetation_map_package,
+    save_biome_asset, save_plant_family_asset, save_vegetation_map_asset, update_biome_asset,
+    update_plant_family_asset, update_vegetation_map_asset, vegetation_graph_dependency_hashes,
+};
+pub use vegetation_cooker::{
+    PlantSourceAcceptance, StagedVegetationCook, VegetationCookEvent, VegetationCookOutput,
+    VegetationCookRequest, VegetationCookStatistics, commit_staged_vegetation_cook,
+    portable_vegetation_platform_profile, stage_vegetation_cook, vegetation_cook_versions,
+};
+pub use vegetation_store::{
+    VegetationArtifactKind, VegetationArtifactPublication, VegetationArtifactStore,
+    VegetationAuthoredLock, VegetationGenerationLock,
 };
 
 use std::path::{Path, PathBuf};
@@ -246,6 +267,14 @@ pub struct RenderSceneOptions {
     pub show_grid: bool,
 }
 
+fn project_vegetation_cache_root(asset_root: &Path) -> PathBuf {
+    asset_root
+        .parent()
+        .unwrap_or(asset_root)
+        .join("cache")
+        .join("vegetation")
+}
+
 /// Owns the project's asset catalog plus uuid-keyed GPU caches so entities sharing an
 /// id upload once.
 ///
@@ -274,6 +303,9 @@ pub struct AssetServer {
     /// tessellation factor kernel), independent of the same image used as a plain albedo/data texture.
     /// `None` = negative marker.
     pub height_texture_by_uuid: AssetCache<GpuTexture>,
+    /// Coverage-preserving texture variants keyed by `(texture id, reference cutoff bits)`.
+    /// Each variant owns an exact CPU-derived mip chain used by every foliage coverage pass.
+    pub coverage_texture_by_uuid: std::collections::HashMap<(u64, u16), Option<Arc<GpuTexture>>>,
     /// GPU creative-LUT cache, keyed by LUT asset id. `None` = negative marker. Holds the `GpuLut`
     /// (a 3D image, no bindless slot) a `.cube` import or baked `.slut` resolves to.
     pub lut_by_uuid: AssetCache<saffron_rendering::GpuLut>,
@@ -290,6 +322,11 @@ pub struct AssetServer {
     /// [`render_material`](crate::render_material)'s `codegen_shader_for` so the per-frame resolve
     /// stops probing the disk. Invalidated with [`Self::material_by_uuid`].
     pub material_shader_by_uuid: AssetCache<String>,
+    /// Monotonic invalidation epoch for render-derived asset content.
+    ///
+    /// Static shadow caches fold this into their content key so a material, texture, or mesh
+    /// replacement invalidates cached silhouettes even when catalog ids and transforms are stable.
+    render_content_revision: u64,
     /// The editor-camera gizmo's mesh visual.
     pub editor_camera_model: SystemMeshVisual,
     /// The app-level, content-addressed thumbnail cache dir, defaulted from
@@ -297,6 +334,9 @@ pub struct AssetServer {
     /// (it is *not* repointed by [`Self::set_asset_root`]). Overridable so a test can isolate
     /// its cache to a temp dir.
     pub thumbnail_cache_root: PathBuf,
+    /// Project-local derived vegetation CAS. It is a sibling of `assets/`, never catalogued or
+    /// serialized as authored project state.
+    pub vegetation_cache_root: PathBuf,
     /// Every thumbnail renders through the **main forward+ graph**, which lives only on the render
     /// thread: [`request_thumbnail`] classifies and enqueues each here, and the host drains them in
     /// `on_update` (build the preview scene → render on the offscreen thumbnail view → write the disk
@@ -312,19 +352,24 @@ impl AssetServer {
     /// subdirectories and an empty catalog. The catalog is populated from a project
     /// file via `load_project`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let vegetation_cache_root = project_vegetation_cache_root(&root);
         let assets = Self {
-            root: root.into(),
+            root,
             catalog: AssetCatalog::default(),
             mesh_by_uuid: AssetCache::new(),
             mesh_bvh_by_uuid: AssetCache::new(),
             texture_by_uuid: AssetCache::new(),
             height_texture_by_uuid: AssetCache::new(),
+            coverage_texture_by_uuid: std::collections::HashMap::new(),
             lut_by_uuid: AssetCache::new(),
             model_by_uuid: AssetCache::new(),
             material_by_uuid: AssetCache::new(),
             material_shader_by_uuid: AssetCache::new(),
+            render_content_revision: 1,
             editor_camera_model: SystemMeshVisual::default(),
             thumbnail_cache_root: Path::new(&app_data_root()).join("thumbnail-cache"),
+            vegetation_cache_root,
             preview_render_queue: std::collections::VecDeque::new(),
             preview_render_in_flight: std::collections::HashSet::new(),
         };
@@ -335,7 +380,14 @@ impl AssetServer {
     /// Repoints the asset root and (re)creates its standard subdirectories.
     pub fn set_asset_root(&mut self, root: impl Into<PathBuf>) {
         self.root = root.into();
+        self.vegetation_cache_root = project_vegetation_cache_root(&self.root);
         self.ensure_asset_directories();
+    }
+
+    /// Returns the derived vegetation artifact store for the active project.
+    #[must_use]
+    pub fn vegetation_artifact_store(&self) -> VegetationArtifactStore {
+        VegetationArtifactStore::new(&self.vegetation_cache_root)
     }
 
     /// Creates the standard asset subdirectories under the root, idempotently.
@@ -385,6 +437,7 @@ impl AssetServer {
         self.mesh_bvh_by_uuid.clear();
         self.texture_by_uuid.clear();
         self.height_texture_by_uuid.clear();
+        self.coverage_texture_by_uuid.clear();
         self.lut_by_uuid.clear();
         self.model_by_uuid.clear();
         self.invalidate_material_caches();
@@ -405,6 +458,21 @@ impl AssetServer {
     pub fn invalidate_material_caches(&mut self) {
         self.material_by_uuid.clear();
         self.material_shader_by_uuid.clear();
+        self.render_content_revision = self.render_content_revision.wrapping_add(1).max(1);
+    }
+
+    /// Asset-content epoch used by camera-independent render caches.
+    #[must_use]
+    pub fn render_content_revision(&self) -> u64 {
+        self.render_content_revision
+    }
+
+    /// Drops every GPU texture representation derived from one catalog texture.
+    pub(crate) fn invalidate_texture_caches(&mut self, id: Uuid) {
+        self.texture_by_uuid.remove(&id.value());
+        self.height_texture_by_uuid.remove(&id.value());
+        self.coverage_texture_by_uuid
+            .retain(|(texture, _), _| *texture != id.value());
     }
 
     /// Abandons queued main-graph preview renders + their dedup set on a project switch, so tiles
