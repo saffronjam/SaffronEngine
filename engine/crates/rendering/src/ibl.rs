@@ -1349,8 +1349,9 @@ impl Ibl {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             None,
         );
-        let sh = graph.import_buffer(self.live.sh_coefficients.handle());
-        let prefiltered_layout_slot = graph.alloc_external_layout(self.live.prefiltered_layout);
+        let sh = graph.import_buffer(self.live.sh_coefficients.handle(), None);
+        let prefiltered_layout_slot =
+            graph.alloc_external_state(crate::RgExternalState::new(self.live.prefiltered_layout));
         let prefiltered = graph.import_image(
             self.live.prefiltered.image,
             self.live.prefiltered.view,
@@ -1447,7 +1448,9 @@ impl Ibl {
         graph: &RenderGraph,
         resources: IblGraphResources,
     ) {
-        self.live.prefiltered_layout = graph.external_layout(resources.prefiltered_layout_slot);
+        self.live.prefiltered_layout = graph
+            .external_state(resources.prefiltered_layout_slot)
+            .layout;
     }
 
     fn scheduled_prefilter_slices(&mut self) -> Vec<u32> {

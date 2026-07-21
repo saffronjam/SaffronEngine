@@ -108,6 +108,7 @@ pub struct Buffer {
     allocation: vk_mem::Allocation,
     mapped: *mut u8,
     size: vk::DeviceSize,
+    graph_state: Mutex<crate::RgExternalBufferState>,
 }
 
 // SAFETY: the raw `mapped` pointer is into VMA-owned, allocation-lifetime memory;
@@ -152,6 +153,7 @@ impl Buffer {
             allocation,
             mapped,
             size,
+            graph_state: Mutex::new(crate::RgExternalBufferState::default()),
         })
     }
 
@@ -163,6 +165,22 @@ impl Buffer {
     /// The buffer size in bytes.
     pub fn size(&self) -> vk::DeviceSize {
         self.size
+    }
+
+    /// Complete cross-frame render-graph state for this buffer.
+    pub fn graph_state(&self) -> crate::RgExternalBufferState {
+        self.graph_state
+            .lock()
+            .expect("buffer graph-state mutex poisoned")
+            .clone()
+    }
+
+    /// Stores the byte-range state resolved by the render graph.
+    pub fn set_graph_state(&self, state: crate::RgExternalBufferState) {
+        *self
+            .graph_state
+            .lock()
+            .expect("buffer graph-state mutex poisoned") = state;
     }
 
     /// The persistent host-mapped pointer, or null when the buffer was not created
@@ -274,6 +292,7 @@ pub struct Image {
     pub format: vk::Format,
     /// The current image layout, tracked across frames by the render graph.
     pub layout: vk::ImageLayout,
+    graph_state: crate::RgExternalState,
 }
 
 // SAFETY: the image/view/allocation handles carry no thread-affine state and
@@ -353,6 +372,7 @@ impl Image {
             extent: desc.extent,
             format: desc.format,
             layout: vk::ImageLayout::UNDEFINED,
+            graph_state: crate::RgExternalState::new(vk::ImageLayout::UNDEFINED),
         })
     }
 
@@ -401,6 +421,7 @@ impl Image {
             extent: desc.extent,
             format: desc.format,
             layout: vk::ImageLayout::UNDEFINED,
+            graph_state: crate::RgExternalState::new(vk::ImageLayout::UNDEFINED),
         })
     }
 
@@ -412,6 +433,17 @@ impl Image {
     /// The full-subresource image view.
     pub fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    /// Complete cross-frame render-graph state for this image.
+    pub fn graph_state(&self) -> crate::RgExternalState {
+        self.graph_state.with_layout(self.layout)
+    }
+
+    /// Stores the image state resolved by the render graph.
+    pub fn set_graph_state(&mut self, state: crate::RgExternalState) {
+        self.layout = state.layout;
+        self.graph_state = state;
     }
 }
 
@@ -442,6 +474,7 @@ pub struct Image3D {
     pub format: vk::Format,
     /// The current image layout, tracked across frames by the render graph.
     pub layout: vk::ImageLayout,
+    graph_state: crate::RgExternalState,
 }
 
 // SAFETY: as [`Image`] — no thread-affine state; vk-mem `Allocation` is Send.
@@ -516,6 +549,7 @@ impl Image3D {
             extent,
             format,
             layout: vk::ImageLayout::UNDEFINED,
+            graph_state: crate::RgExternalState::new(vk::ImageLayout::UNDEFINED),
         })
     }
 
@@ -527,6 +561,17 @@ impl Image3D {
     /// The `TYPE_3D` image view.
     pub fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    /// Complete cross-frame render-graph state for this image.
+    pub fn graph_state(&self) -> crate::RgExternalState {
+        self.graph_state.with_layout(self.layout)
+    }
+
+    /// Stores the image state resolved by the render graph.
+    pub fn set_graph_state(&mut self, state: crate::RgExternalState) {
+        self.layout = state.layout;
+        self.graph_state = state;
     }
 }
 

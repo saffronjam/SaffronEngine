@@ -374,7 +374,7 @@ struct FrameTess {
 
 /// The tessellation subsystem: the five compute set layouts (factor/scan/finalize/args prep + the
 /// Phase-4 emit) + a per-frame descriptor pool. The transient VB/IB/args/count buffers are owned by
-/// [`crate::transient::TransientResources`]; this wires the dispatches that write them.
+/// [`crate::transient::RenderGraphResources`]; this wires the dispatches that write them.
 pub struct Tessellation {
     resources: Arc<DeviceResources>,
     factor_layout: vk::DescriptorSetLayout,
@@ -901,7 +901,7 @@ mod tests {
         for &f in &[12.0f32, 13.0, 22.0, 30.0, 44.0, 64.0, 100.0, 500.0, 1000.0] {
             let (subs, leaf) = dice_plan(f);
             assert!(
-                leaf >= 1 && leaf <= TESS_MAX_DICE_FACTOR,
+                (1..=TESS_MAX_DICE_FACTOR).contains(&leaf),
                 "leaf {leaf} within cap at {f}"
             );
             assert!(
