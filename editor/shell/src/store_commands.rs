@@ -149,10 +149,9 @@ pub fn dispatch(
                 .map(|_| Value::Null)
                 .map_err(|err| ControlError::from(err.to_string()))
         }
-        other => Err(ControlError::coded(
-            format!("unknown store command '{other}'"),
-            "unknown-command",
-        )),
+        other => Err(ControlError::bridge(format!(
+            "unknown store command '{other}'"
+        ))),
     }
 }
 

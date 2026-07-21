@@ -54,6 +54,7 @@ tracing = "0.1"
 # facade; `saffron-log::init_logging` installs the subscriber. Path dep across the editor/engine
 # boundary — a deliberate, sanctioned coupling for one consistent log format.
 saffron-log = { path = "../../engine/crates/log" }
+saffron-protocol = { path = "../../engine/crates/protocol" }
 
 # The Wayland backend (`src/backend/wayland/`): CEF's OSR buffer composites onto the toplevel
 # wl_surface via wl_shm, sharing winit's wl_display through libwayland (`client_system` →

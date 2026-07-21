@@ -8,6 +8,7 @@
 //! context, lives in `ipc_render.rs` so the macOS helper binary can include it too.
 
 use crate::commands;
+use crate::control::ControlError;
 use crate::state::ShellState;
 use cef::wrapper::message_router::{
     BrowserSideCallback, BrowserSideHandler, BrowserSideRouter, MessageRouterBrowserSide,
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 /// Handles every `cefQuery`: `{ command, args }` → [`commands::dispatch`] → `onSuccess(result)` /
-/// `onFailure(code, { message, code })`.
+/// `onFailure(code, ControlFailureDto)`.
 struct CommandQueryHandler {
     state: Arc<ShellState>,
 }
@@ -41,8 +42,11 @@ impl BrowserSideHandler for CommandQueryHandler {
             let parsed: Value = match serde_json::from_str(&request) {
                 Ok(value) => value,
                 Err(err) => {
+                    let failure = ControlError::bridge(format!("bad query json: {err}"));
+                    let payload =
+                        serde_json::to_string(&failure).expect("ControlFailureDto serializes");
                     if let Ok(cb) = callback.lock() {
-                        cb.failure(-1, &format!("bad query json: {err}"));
+                        cb.failure(-1, &payload);
                     }
                     return;
                 }
@@ -56,7 +60,8 @@ impl BrowserSideHandler for CommandQueryHandler {
                     }
                 }
                 Err(err) => {
-                    let payload = serde_json::to_string(&err).unwrap_or_else(|_| err.to_string());
+                    let payload =
+                        serde_json::to_string(&err).expect("ControlFailureDto serializes");
                     if let Ok(cb) = callback.lock() {
                         cb.failure(1, &payload);
                     }

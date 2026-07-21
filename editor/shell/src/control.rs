@@ -1,10 +1,11 @@
 //! The control-plane passthrough: the one socket round-trip the whole shell IPC is built on.
-//! Newline-delimited JSON over the per-PID unix socket; the engine's `ok:false` reply becomes a
-//! typed error (message + envelope `code`). It is
+//! Newline-delimited JSON over the per-PID unix socket; the engine's `ok:false` reply becomes
+//! the shared typed failure object. It is
 //! shell-agnostic (`UnixStream` + `serde_json`); the caller is the CEF
 //! query handler, wired next). Consumed by the CEF message-router query handler and by the
 //! lifecycle/teardown path (Phase 6).
 
+use saffron_protocol::ControlFailureDto;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -18,46 +19,64 @@ use std::time::Duration;
 /// caller. The guarded data is `()`, so a poisoned lock is recovered rather than fatal.
 static CONTROL_IO: Mutex<()> = Mutex::new(());
 
-/// A control-plane failure surfaced to the UI: the engine's human message plus the machine-readable
-/// envelope `code` (present on every `ok:false`), so the typed client can match on `code` — e.g.
-/// drop a `busy-loading` reply on a background poll lane instead of toasting it.
+/// The shared control failure surfaced to the UI.
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)] // fields read by the JS client via the serialized reply (Phase 4/5)
+#[serde(transparent)]
 pub struct ControlError {
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+    failure: Box<ControlFailureDto>,
 }
 
 impl From<String> for ControlError {
     fn from(message: String) -> Self {
-        Self {
-            message,
-            code: None,
-        }
+        Self::bridge(message)
     }
 }
 
 impl ControlError {
-    /// A failure carrying an explicit machine-readable `code` the typed client can match on.
-    pub fn coded(message: impl Into<String>, code: impl Into<String>) -> Self {
+    /// A native editor command failure outside the engine control socket.
+    pub fn bridge(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
-            code: Some(code.into()),
+            failure: Box::new(ControlFailureDto::Bridge {
+                message: message.into(),
+            }),
         }
+    }
+
+    /// A socket connection, write, timeout, or read failure.
+    fn transport(message: impl Into<String>) -> Self {
+        Self {
+            failure: Box::new(ControlFailureDto::Transport {
+                message: message.into(),
+            }),
+        }
+    }
+
+    /// A reply that did not match the generated envelope contract.
+    fn malformed_reply(message: impl Into<String>) -> Self {
+        Self {
+            failure: Box::new(ControlFailureDto::MalformedReply {
+                message: message.into(),
+            }),
+        }
+    }
+
+    /// The exact shared failure object serialized to CEF.
+    #[cfg(test)]
+    pub(crate) fn failure(&self) -> &ControlFailureDto {
+        &self.failure
     }
 }
 
 impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        self.failure.fmt(f)
     }
 }
 
 impl std::error::Error for ControlError {}
 
 /// The one socket round-trip helper the whole bridge is built on. Surfaces the engine's `ok:false`
-/// reply as a typed `Err` (message + envelope `code`).
+/// reply as the exact shared typed failure object.
 #[allow(dead_code)] // wired to the CEF message-router query handler next
 pub fn control_request_with_params(
     socket_path: &str,
@@ -68,43 +87,63 @@ pub fn control_request_with_params(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut stream = UnixStream::connect(socket_path)
-        .map_err(|err| format!("control socket unavailable: {err}"))?;
+        .map_err(|err| ControlError::transport(format!("control socket unavailable: {err}")))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(5000)))
-        .map_err(|err| format!("set read timeout: {err}"))?;
+        .map_err(|err| ControlError::transport(format!("set read timeout: {err}")))?;
     let mut request = json!({ "id": 1, "cmd": command, "params": params }).to_string();
     request.push('\n');
     stream
         .write_all(request.as_bytes())
-        .map_err(|err| format!("send control request: {err}"))?;
+        .map_err(|err| ControlError::transport(format!("send control request: {err}")))?;
 
     let mut reply = String::new();
     let mut buffer = [0_u8; 4096];
     while !reply.contains('\n') {
         let read = stream
             .read(&mut buffer)
-            .map_err(|err| format!("read control reply: {err}"))?;
+            .map_err(|err| ControlError::transport(format!("read control reply: {err}")))?;
         if read == 0 {
             break;
         }
         reply.push_str(&String::from_utf8_lossy(&buffer[..read]));
     }
-    let value: Value =
-        serde_json::from_str(reply.trim()).map_err(|err| format!("decode control reply: {err}"))?;
-    if value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return Ok(value.get("result").cloned().unwrap_or_default());
+    let value: Value = serde_json::from_str(reply.trim())
+        .map_err(|err| ControlError::malformed_reply(format!("decode control reply: {err}")))?;
+    let Some(object) = value.as_object() else {
+        return Err(ControlError::malformed_reply(
+            "control reply is not an object",
+        ));
+    };
+    if !object.contains_key("id") {
+        return Err(ControlError::malformed_reply(
+            "control reply is missing its id",
+        ));
     }
-    Err(ControlError {
-        message: value
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("control command failed")
-            .to_string(),
-        code: value
-            .get("code")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
-    })
+    match object.get("ok").and_then(Value::as_bool) {
+        Some(true)
+            if object.len() == 3
+                && object.contains_key("result")
+                && !object.contains_key("error") =>
+        {
+            Ok(object["result"].clone())
+        }
+        Some(false)
+            if object.len() == 3
+                && object.contains_key("error")
+                && !object.contains_key("result") =>
+        {
+            let failure = serde_json::from_value(object["error"].clone()).map_err(|err| {
+                ControlError::malformed_reply(format!("decode control failure: {err}"))
+            })?;
+            Err(ControlError {
+                failure: Box::new(failure),
+            })
+        }
+        _ => Err(ControlError::malformed_reply(
+            "control reply does not match the generated envelope",
+        )),
+    }
 }
 
 #[allow(dead_code)] // wired to the lifecycle/teardown path (Phase 6)
@@ -144,7 +183,7 @@ mod tests {
 
     #[test]
     fn ok_reply_returns_result_and_sends_envelope() {
-        let (sock, handle) = mock_server("ok", r#"{"ok":true,"result":{"v":42}}"#);
+        let (sock, handle) = mock_server("ok", r#"{"id":1,"ok":true,"result":{"v":42}}"#);
         let out = control_request_with_params(&sock, "get-thing", json!({"a":1})).unwrap();
         assert_eq!(out, json!({"v":42}));
         let request: Value = serde_json::from_str(handle.join().unwrap().trim()).unwrap();
@@ -155,14 +194,37 @@ mod tests {
     }
 
     #[test]
-    fn error_reply_carries_message_and_code() {
+    fn error_reply_preserves_the_shared_failure() {
         let (sock, handle) = mock_server(
             "err",
-            r#"{"ok":false,"error":"nope","code":"busy-loading"}"#,
+            r#"{"id":1,"ok":false,"error":{"code":"diagnostic","message":"graph candidates limit exceeded","diagnostic":{"domain":"vegetation-graph","detail":{"category":"limit","resource":"candidates","requested":"16","limit":"4"}}}}"#,
         );
         let err = control_request(&sock, "do-thing").unwrap_err();
-        assert_eq!(err.message, "nope");
-        assert_eq!(err.code.as_deref(), Some("busy-loading"));
+        let ControlFailureDto::Diagnostic { diagnostic, .. } = err.failure() else {
+            panic!("expected diagnostic failure")
+        };
+        assert_eq!(
+            diagnostic,
+            &saffron_protocol::ControlDiagnosticDto::VegetationGraph(
+                saffron_protocol::VegetationGraphDiagnosticDto::Limit {
+                    resource: "candidates".to_owned(),
+                    requested: "16".to_owned(),
+                    limit: "4".to_owned(),
+                }
+            )
+        );
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn string_error_reply_is_malformed() {
+        let (sock, handle) = mock_server(
+            "old-error-shape",
+            r#"{"id":1,"ok":false,"error":"nope","code":"command"}"#,
+        );
+        let err = control_request(&sock, "do-thing").unwrap_err();
+        assert_eq!(err.failure().code(), "malformed-reply");
         handle.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
@@ -206,7 +268,9 @@ mod tests {
                     reader.read_line(&mut line).unwrap();
                     thread::sleep(Duration::from_millis(25)); // widen the overlap window
                     let mut writer = stream;
-                    writer.write_all(br#"{"ok":true,"result":{}}"#).unwrap();
+                    writer
+                        .write_all(br#"{"id":1,"ok":true,"result":{}}"#)
+                        .unwrap();
                     writer.write_all(b"\n").unwrap();
                     sif.fetch_sub(1, Ordering::SeqCst);
                     sserved.fetch_add(1, Ordering::SeqCst);

@@ -206,10 +206,7 @@ pub fn dispatch(
         other if other.starts_with("store_") || other.starts_with("connector_") => {
             crate::store_commands::dispatch(state, command, args)
         }
-        other => Err(ControlError::coded(
-            format!("unknown command '{other}'"),
-            "unknown-command",
-        )),
+        other => Err(ControlError::bridge(format!("unknown command '{other}'"))),
     }
 }
 
@@ -246,9 +243,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_command_is_coded() {
+    fn unknown_command_is_a_typed_bridge_failure() {
         let err = dispatch(&state(), "no_such_command", json!({})).unwrap_err();
-        assert_eq!(err.code.as_deref(), Some("unknown-command"));
+        assert_eq!(err.failure().code(), "bridge");
     }
 
     #[test]
@@ -263,6 +260,6 @@ mod tests {
     fn missing_required_arg_errors() {
         // `open_external` needs a `url`; absent, it fails before spawning anything.
         let err = dispatch(&state(), "open_external", json!({})).unwrap_err();
-        assert!(err.message.contains("url"));
+        assert!(err.failure().message().contains("url"));
     }
 }
