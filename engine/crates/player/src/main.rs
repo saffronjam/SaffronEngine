@@ -15,14 +15,18 @@ use std::rc::Rc;
 
 use saffron_app::{App, AppConfig, Layer, attach_layer, run};
 use saffron_assets::{
-    AssetServer, ProjectHost, ProjectInfo, RenderSceneOptions, RendererScene, advance_time_of_day,
-    render_scene,
+    AssetServer, ProjectHost, ProjectInfo, RenderSceneOptions, RendererScene, RendererUploader,
+    advance_time_of_day, render_scene, scene_surface_field_snapshots,
 };
 use saffron_core::TimeSpan;
 use saffron_protocol::AppManifest;
 use saffron_rendering::{Renderer, Uploader};
 use saffron_runtime::RuntimeSession;
 use saffron_scene::{ComponentRegistry, Scene, ScriptInputState, register_builtin_components};
+use saffron_spatial::{
+    ResidencyFacet, ResidencyManager, ResidencyMask, SourceLevel, SpatialSource, SpatialSourceId,
+    WorldPosition,
+};
 use saffron_window::keyboard::{KeyCode, PhysicalKey};
 use saffron_window::{
     ElementState, MouseButton, MouseScrollDelta, Window, WindowConfig, WindowEvent,
@@ -171,6 +175,7 @@ struct PlayerLayer {
     scene: Scene,
     assets: AssetServer,
     runtime: RuntimeSession,
+    spatial: ResidencyManager,
     registry: ComponentRegistry,
     project: ProjectInfo,
     uploader: Option<Uploader>,
@@ -189,6 +194,7 @@ impl PlayerLayer {
             scene: Scene::new(),
             assets,
             runtime: RuntimeSession::new(),
+            spatial: ResidencyManager::new(),
             registry: register_builtin_components(),
             project: ProjectInfo::default(),
             uploader: None,
@@ -217,6 +223,57 @@ impl PlayerLayer {
         }
         for err in self.runtime.take_errors() {
             tracing::error!("[script error] {}: {}", err.script, err.message);
+        }
+    }
+
+    fn update_vegetation_source(&mut self) {
+        const PLAYER_VIEW_SOURCE: SpatialSourceId = SpatialSourceId(1);
+        let Some(camera) = self.scene.primary_camera() else {
+            self.spatial.remove_source(PLAYER_VIEW_SOURCE);
+            return;
+        };
+        let render_position = camera.view.inverse().w_axis.truncate();
+        let Ok(position) =
+            WorldPosition::from_render_relative(render_position, WorldPosition::origin())
+        else {
+            self.spatial.remove_source(PLAYER_VIEW_SOURCE);
+            return;
+        };
+        let revision =
+            position
+                .global_ticks()
+                .into_iter()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+                    value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
+                        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    })
+                });
+        let facets = ResidencyMask::one(ResidencyFacet::Render)
+            .with(ResidencyFacet::Physics)
+            .with(ResidencyFacet::Simulation)
+            .with(ResidencyFacet::Navigation);
+        if let Err(error) = self.spatial.update_source(SpatialSource {
+            id: PLAYER_VIEW_SOURCE,
+            revision,
+            position,
+            velocity_mps: saffron_geometry::glam::DVec3::ZERO,
+            prediction_seconds: 0.25,
+            levels: vec![
+                SourceLevel {
+                    level: 0,
+                    load_radius_cells: 4,
+                    cleanup_radius_cells: 6,
+                },
+                SourceLevel {
+                    level: 4,
+                    load_radius_cells: 2,
+                    cleanup_radius_cells: 3,
+                },
+            ],
+            facets,
+            priority: 100,
+        }) {
+            tracing::warn!("player vegetation spatial source rejected: {error}");
         }
     }
 
@@ -298,6 +355,13 @@ impl Layer for PlayerLayer {
         if !self.started {
             return;
         }
+        self.update_vegetation_source();
+        if let Err(error) =
+            self.runtime
+                .synchronize_vegetation(&mut self.scene, &self.assets, &self.spatial)
+        {
+            tracing::error!("saffron-player: vegetation runtime advance failed: {error}");
+        }
         {
             let mut input = self.input.borrow_mut();
             self.runtime
@@ -323,6 +387,28 @@ impl Layer for PlayerLayer {
         let Some(uploader) = self.uploader.as_ref() else {
             return;
         };
+        if self.runtime.vegetation_needs_regeneration() {
+            let gpu = RendererUploader::new(
+                uploader,
+                renderer.descriptors(),
+                renderer.skinning_enabled(),
+            );
+            match scene_surface_field_snapshots(&gpu, &mut self.scene, &mut self.assets) {
+                Ok(providers) => {
+                    if let Err(error) = self
+                        .runtime
+                        .regenerate_missing_vegetation(&mut self.assets, &providers)
+                    {
+                        tracing::error!(
+                            "saffron-player: vegetation runtime regeneration failed: {error}"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(
+                    "saffron-player: vegetation runtime surface capture failed: {error}"
+                ),
+            }
+        }
         if renderer.viewport_width() == 0 || renderer.viewport_height() == 0 {
             return;
         }

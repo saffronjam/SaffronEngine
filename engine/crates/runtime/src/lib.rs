@@ -14,8 +14,12 @@
 
 mod bridge;
 mod session;
+mod vegetation;
 
 pub use bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
 };
 pub use session::RuntimeSession;
+pub use vegetation::{
+    VegetationRuntimeBindingStatus, VegetationRuntimeError, VegetationRuntimeUnavailableReason,
+};

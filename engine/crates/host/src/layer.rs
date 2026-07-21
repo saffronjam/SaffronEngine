@@ -21,9 +21,12 @@ use saffron_animation::{AnimMode, AnimationRuntime};
 use saffron_app::{App, Layer};
 use saffron_assets::{
     AssetServer, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind, RenderSceneOptions,
-    RendererScene, RendererUploader, advance_time_of_day, render_scene, write_thumbnail_cache,
+    RendererScene, RendererUploader, advance_time_of_day, render_scene,
+    scene_surface_field_snapshots, write_thumbnail_cache,
 };
-use saffron_control::{ControlContext, PreviewSubject, build_preview_scene_for_thumbnail};
+use saffron_control::{
+    ControlContext, ControlRenderer, PreviewSubject, build_preview_scene_for_thumbnail,
+};
 use saffron_runtime::RuntimeSession;
 
 use crate::control_renderer::HostControlRenderer;
@@ -453,6 +456,18 @@ impl HostLayer {
     /// Returns `true` when a mutating command ran this drain (the reactive-redraw signal); a drain
     /// skipped for a missing uploader reports `false`.
     fn poll_control(&mut self, window: &mut Window, renderer: &mut Renderer) -> bool {
+        let vegetation_result = if self.editor.project_ready() {
+            self.runtime.synchronize_vegetation(
+                self.editor.active_scene(),
+                &self.assets,
+                &self.spatial,
+            )
+        } else {
+            self.runtime.clear_vegetation()
+        };
+        if let Err(error) = vegetation_result {
+            tracing::error!("vegetation runtime advance failed: {error}");
+        }
         // The control plane's GPU-upload seam needs the host-owned one-off uploader; build
         // it before assembling the borrow (the asset commands resolve/upload through it).
         self.ensure_uploader(renderer);
@@ -460,18 +475,50 @@ impl HostLayer {
             return false; // No uploader (device create failed): the control drain is skipped.
         };
         let mut control_renderer = HostControlRenderer::new(renderer, uploader);
+        if self.runtime.vegetation_needs_regeneration() {
+            let mut providers = None;
+            control_renderer.with_gpu_uploader(&mut |gpu| {
+                providers = Some(scene_surface_field_snapshots(
+                    gpu,
+                    self.editor.active_scene(),
+                    &mut self.assets,
+                ));
+            });
+            match providers {
+                Some(Ok(providers)) => {
+                    if let Err(error) = self
+                        .runtime
+                        .regenerate_missing_vegetation(&mut self.assets, &providers)
+                    {
+                        tracing::error!("vegetation runtime regeneration failed: {error}");
+                    }
+                }
+                Some(Err(error)) => {
+                    tracing::error!("vegetation runtime surface capture failed: {error}");
+                }
+                None => {
+                    tracing::error!("vegetation runtime surface capture was unavailable");
+                }
+            }
+        }
         // Lend the live play world into the `EngineContext::physics` borrow: a `RefMut` on the
         // runtime's shared world cell, held for the drain's duration. The cell is an owned `Rc`
         // clone, so borrowing it does not alias `self.editor`/`self.assets`; no simulation step
         // runs during the drain, so the world is free to borrow here.
         let physics_cell = self.runtime.physics_cell();
         let mut physics = physics_cell.borrow_mut();
+        let vegetation_status = self.runtime.vegetation_status().clone();
+        let vegetation_regeneration_cells = self.runtime.missing_vegetation_cells();
+        let vegetation = self.runtime.vegetation_world_mut();
         self.control.poll(
             window,
             &mut control_renderer,
             &mut self.editor,
             &mut self.assets,
             &mut self.spatial,
+            vegetation,
+            vegetation_status,
+            vegetation_regeneration_cells,
             physics.as_mut(),
         )
     }

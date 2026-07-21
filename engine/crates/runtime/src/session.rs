@@ -24,9 +24,15 @@ use saffron_scene::{
     derive_script_input_edges, register_builtin_components,
 };
 use saffron_script::{ContactInfo, ScriptHost, ScriptHostBridge, ScriptRunError};
+use saffron_spatial::ResidencyManager;
+use saffron_vegetation::VegetationWorld;
 
 use crate::bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
+};
+use crate::vegetation::VegetationRuntimeScheduler;
+use crate::{
+    VegetationRuntimeBindingStatus, VegetationRuntimeError, VegetationRuntimeUnavailableReason,
 };
 
 /// The shared play-mode simulation spine.
@@ -63,6 +69,10 @@ pub struct RuntimeSession {
     /// Whether the Jolt process globals are installed — set true the first time a world is built.
     /// They outlive every world, so teardown shuts them down once, after the last world drops.
     physics_init: bool,
+    /// The sole authoritative vegetation runtime, bound to one exact cooked manifest.
+    vegetation: Option<VegetationWorld>,
+    vegetation_scheduler: VegetationRuntimeScheduler,
+    vegetation_status: VegetationRuntimeBindingStatus,
 }
 
 impl Default for RuntimeSession {
@@ -100,6 +110,9 @@ impl RuntimeSession {
             contact_cursor: 0,
             script_vm_active: false,
             physics_init: false,
+            vegetation: None,
+            vegetation_scheduler: VegetationRuntimeScheduler::default(),
+            vegetation_status: VegetationRuntimeBindingStatus::default(),
         }
     }
 
@@ -340,6 +353,83 @@ impl RuntimeSession {
     #[must_use]
     pub fn physics_cell(&self) -> SharedPhysics {
         Rc::clone(&self.physics)
+    }
+
+    /// The sole runtime vegetation authority, lent to host systems for residency and control.
+    #[must_use]
+    pub fn vegetation_world(&self) -> Option<&VegetationWorld> {
+        self.vegetation.as_ref()
+    }
+
+    /// The sole mutable runtime vegetation authority.
+    #[must_use]
+    pub fn vegetation_world_mut(&mut self) -> &mut Option<VegetationWorld> {
+        &mut self.vegetation
+    }
+
+    /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load workers.
+    pub fn synchronize_vegetation(
+        &mut self,
+        scene: &mut Scene,
+        assets: &AssetServer,
+        spatial: &ResidencyManager,
+    ) -> Result<(), VegetationRuntimeError> {
+        match self
+            .vegetation_scheduler
+            .advance(&mut self.vegetation, scene, assets, spatial)
+        {
+            Ok(status) => {
+                self.vegetation_status = status;
+                Ok(())
+            }
+            Err(error) => {
+                self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
+                    reason: VegetationRuntimeUnavailableReason::Fault,
+                    detail: Some(error.to_string()),
+                };
+                Err(error)
+            }
+        }
+    }
+
+    /// Clears vegetation authority and joins every pending cell-load worker.
+    pub fn clear_vegetation(&mut self) -> Result<(), VegetationRuntimeError> {
+        self.vegetation_scheduler.clear(&mut self.vegetation)?;
+        self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
+            reason: VegetationRuntimeUnavailableReason::NoProject,
+            detail: None,
+        };
+        Ok(())
+    }
+
+    /// Current closed binding state for control/UI inspection.
+    #[must_use]
+    pub fn vegetation_status(&self) -> &VegetationRuntimeBindingStatus {
+        &self.vegetation_status
+    }
+
+    /// Drains cells whose disposable CAS artifact must be regenerated through the shared cooker.
+    pub fn missing_vegetation_cells(&self) -> Vec<saffron_spatial::WorldCellKey> {
+        self.vegetation_scheduler.missing_cells()
+    }
+
+    /// Whether a deleted disposable cell artifact is being rebuilt through the shared cooker.
+    #[must_use]
+    pub fn vegetation_needs_regeneration(&self) -> bool {
+        self.vegetation_scheduler.needs_regeneration()
+    }
+
+    /// Advances missing-cell regeneration through the one staged cooker and atomic commit path.
+    pub fn regenerate_missing_vegetation(
+        &mut self,
+        assets: &mut AssetServer,
+        surface_providers: &[Arc<dyn saffron_spatial::SurfaceField>],
+    ) -> Result<(), VegetationRuntimeError> {
+        self.vegetation_scheduler.regenerate_missing(
+            &mut self.vegetation,
+            assets,
+            surface_providers,
+        )
     }
 
     /// Whether a live world is present.

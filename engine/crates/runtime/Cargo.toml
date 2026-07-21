@@ -21,4 +21,7 @@ saffron-assets = { path = "../assets" }
 saffron-animation = { path = "../animation" }
 saffron-script = { path = "../script" }
 saffron-physics = { path = "../physics" }
+saffron-vegetation = { path = "../vegetation" }
+saffron-spatial = { path = "../spatial" }
 glam.workspace = true
+thiserror.workspace = true
