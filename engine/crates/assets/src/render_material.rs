@@ -6,8 +6,7 @@
 //! - [`build_submesh_material`] maps one resolved [`MaterialAsset`] to a
 //!   [`SubmeshMaterial`], resolving each texture slot through a borrowed loader closure.
 //!   The main draw path passes [`AssetServer::load_texture_asset`]; the thumbnail worker
-//!   passes its own uploader — one mapping, one call site, the loader a
-//!   `&dyn Fn(Uuid) -> Option<Arc<…>>`.
+//!   passes its own uploader — one mapping, one call site, with the upload role explicit.
 //! - [`AssetServer::resolve_material_asset`] instantiates a [`MaterialAsset`] on the main
 //!   thread, wiring [`build_submesh_material`]'s loader to [`AssetServer::load_texture_asset`].
 //! - [`AssetServer::resolve_entity_materials`] resolves a single renderable's whole
@@ -19,7 +18,8 @@
 //! A material's single ORM texture (`orm_texture`) drives **both** the
 //! metallic-roughness slot (roughness in G, metalness in B) and the occlusion slot (AO
 //! in R), so one map covers all three. [`SubmeshMaterial::blend_mode`] is parsed from the
-//! `.smat` `blend` string via [`BlendMode::from_wire`].
+//! `.smat` `blend` string via [`BlendMode::from_wire`] for standard surfaces. Thin-sheet
+//! foliage derives it from the canonical coverage classification.
 //!
 //! # Component precedence
 //!
@@ -38,8 +38,14 @@ use saffron_core::Uuid;
 use saffron_geometry::Submesh;
 use saffron_geometry::glam::Vec3;
 use saffron_json::Value;
-use saffron_rendering::{GpuTexture, SubmeshMaterial};
+use saffron_rendering::{
+    AggregateMaterialMoments, CoverageSourceKind, GpuTexture, SubmeshMaterial, ThinSheetMaterial,
+    ThinSheetNormalMode,
+};
 use saffron_scene::{Entity, MaterialSet, Scene};
+use saffron_vegetation::{
+    AlphaClassification, CoverageSource, MaterialSurface, ThinSheetNormalBehavior,
+};
 
 use crate::gpu::GpuUploader;
 use crate::graph::lower_graph_to_params;
@@ -89,16 +95,14 @@ impl Default for ResolvedMaterials {
 /// thumbnail worker passes its own uploader. A zero texture id leaves that handle unset —
 /// the draw path's default-white substitution is a renderer concern, not done here. The
 /// packed `orm_texture` feeds **both** the metallic-roughness and the occlusion slot, and
-/// `blend_mode` parses the `.smat` `blend` string.
+/// `blend_mode` parses the `.smat` `blend` string for standard surfaces and follows the
+/// canonical coverage classification for thin sheets.
 ///
-/// The loader is `FnMut(id, as_height)`: the main path's closure fills the texture cache as it
-/// resolves, so a borrowed mutable closure is the allocation-free shape — no trait object for a single
-/// call site. The `as_height` flag (set only for a [`HeightMode::Displacement`] material's height slot)
-/// routes that texture through the pyramid-building height loader; one closure keeps a single `&mut
-/// self` borrow (two self-capturing closures would conflict).
+/// The loader receives a [`TextureLoadRole`] so height and coverage pyramids use their canonical
+/// builders while one closure retains the single mutable server borrow.
 pub fn build_submesh_material(
     material: &MaterialAsset,
-    load_tex: &mut dyn FnMut(saffron_core::Uuid, bool) -> Option<Arc<GpuTexture>>,
+    load_tex: &mut dyn FnMut(saffron_core::Uuid, TextureLoadRole) -> Option<Arc<GpuTexture>>,
 ) -> SubmeshMaterial {
     let mut sm = SubmeshMaterial {
         base_color: material.base_color,
@@ -117,28 +121,110 @@ pub fn build_submesh_material(
         ..SubmeshMaterial::defaults()
     };
     if material.albedo_texture.value() != 0 {
-        sm.albedo_texture = load_tex(material.albedo_texture, false);
+        sm.albedo_texture = load_tex(material.albedo_texture, TextureLoadRole::Plain);
     }
     if material.orm_texture.value() != 0 {
-        sm.metallic_roughness_texture = load_tex(material.orm_texture, false);
-        sm.occlusion_texture = load_tex(material.orm_texture, false);
+        sm.metallic_roughness_texture = load_tex(material.orm_texture, TextureLoadRole::Plain);
+        sm.occlusion_texture = load_tex(material.orm_texture, TextureLoadRole::Plain);
     }
     if material.normal_texture.value() != 0 {
-        sm.normal_texture = load_tex(material.normal_texture, false);
+        sm.normal_texture = load_tex(material.normal_texture, TextureLoadRole::Plain);
     }
     if material.emissive_texture.value() != 0 {
-        sm.emissive_texture = load_tex(material.emissive_texture, false);
+        sm.emissive_texture = load_tex(material.emissive_texture, TextureLoadRole::Plain);
     }
     if material.height_texture.value() != 0 {
         // A displacement material's height map carries the min/max pyramid (built by the height loader)
         // that the tessellation factor kernel samples for per-region LOD; bump/parallax need no pyramid.
-        let as_height = material.height_mode == HeightMode::Displacement;
-        sm.height_texture = load_tex(material.height_texture, as_height);
+        let role = if material.height_mode == HeightMode::Displacement {
+            TextureLoadRole::Height
+        } else {
+            TextureLoadRole::Plain
+        };
+        sm.height_texture = load_tex(material.height_texture, role);
     }
     if material.vector_displacement_texture.value() != 0 {
-        sm.vector_displacement_texture = load_tex(material.vector_displacement_texture, false);
+        sm.vector_displacement_texture =
+            load_tex(material.vector_displacement_texture, TextureLoadRole::Plain);
+    }
+    if let MaterialSurface::ThinSheetFoliage(parameters) = &material.surface {
+        let coverage_id = match parameters.coverage_source {
+            CoverageSource::AlbedoAlpha => material.albedo_texture,
+            CoverageSource::Texture(texture) => texture,
+            CoverageSource::ModeledGeometry => Uuid(0),
+        };
+        if coverage_id.value() != 0 {
+            sm.coverage_texture = load_tex(
+                coverage_id,
+                TextureLoadRole::Coverage {
+                    cutoff_bits: parameters.coverage.reference_cutoff.bits(),
+                },
+            );
+        }
+        sm.blend_mode = match parameters.coverage.classification {
+            AlphaClassification::Opaque => BlendMode::Opaque,
+            AlphaClassification::Masked => BlendMode::Masked,
+            AlphaClassification::Transmissive => BlendMode::Blend,
+        };
+        sm.thin_sheet = Some(thin_sheet_material(parameters));
+        sm.double_sided = true;
     }
     sm
+}
+
+/// Texture upload role selected while resolving a material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureLoadRole {
+    /// Ordinary color/data texture with the standard filtered mip chain.
+    Plain,
+    /// Displacement texture with a min/max height pyramid.
+    Height,
+    /// Linear coverage texture with cutoff-preserving alpha mips.
+    Coverage {
+        /// Canonical normalized cutoff bits.
+        cutoff_bits: u16,
+    },
+}
+
+fn thin_sheet_material(
+    parameters: &saffron_vegetation::ThinSheetFoliageParameters,
+) -> ThinSheetMaterial {
+    let scalar = |value: saffron_spatial::DecisionScalar| value.to_f64() as f32;
+    let unit = |value: saffron_spatial::UnitInterval| value.to_f64() as f32;
+    let vec3 = |values: [saffron_spatial::DecisionScalar; 3]| {
+        Vec3::new(scalar(values[0]), scalar(values[1]), scalar(values[2]))
+    };
+    let moments = parameters.voxel_moments;
+    ThinSheetMaterial {
+        front_albedo_response: unit(parameters.front_albedo_response),
+        back_albedo_response: unit(parameters.back_albedo_response),
+        thickness: scalar(parameters.thickness),
+        absorption: vec3(parameters.absorption_color),
+        transmission: vec3(parameters.transmission_color),
+        roughness: unit(parameters.roughness),
+        normal_mode: match parameters.normal_behavior {
+            ThinSheetNormalBehavior::Preserve => ThinSheetNormalMode::Preserve,
+            ThinSheetNormalBehavior::FaceForwardBack => ThinSheetNormalMode::FaceForwardBack,
+            ThinSheetNormalBehavior::Symmetric => ThinSheetNormalMode::Symmetric,
+        },
+        coverage_source: match parameters.coverage_source {
+            CoverageSource::AlbedoAlpha => CoverageSourceKind::AlbedoAlpha,
+            CoverageSource::Texture(_) => CoverageSourceKind::Texture,
+            CoverageSource::ModeledGeometry => CoverageSourceKind::ModeledGeometry,
+        },
+        coverage_classification: parameters.coverage.classification,
+        coverage_hash_salt: parameters.coverage.spatial_hash_salt,
+        coverage_source_extent: parameters.coverage.source_extent,
+        energy_limit: unit(parameters.energy_limit),
+        aggregate: AggregateMaterialMoments {
+            occupancy: unit(moments.occupancy),
+            albedo_mean: vec3(moments.albedo_mean),
+            roughness_mean: unit(moments.roughness_mean),
+            transmission_mean: vec3(moments.transmission_mean),
+            thickness_mean: scalar(moments.thickness_mean),
+            normal_second_moments: moments.normal_second_moments.map(scalar),
+        },
+    }
 }
 
 impl AssetServer {
@@ -153,11 +239,11 @@ impl AssetServer {
         gpu: &dyn GpuUploader,
         material: &MaterialAsset,
     ) -> SubmeshMaterial {
-        build_submesh_material(material, &mut |id, as_height| {
-            if as_height {
-                self.load_height_texture_asset(gpu, id)
-            } else {
-                self.load_texture_asset(gpu, id)
+        build_submesh_material(material, &mut |id, role| match role {
+            TextureLoadRole::Plain => self.load_texture_asset(gpu, id),
+            TextureLoadRole::Height => self.load_height_texture_asset(gpu, id),
+            TextureLoadRole::Coverage { cutoff_bits } => {
+                self.load_coverage_texture_asset(gpu, id, cutoff_bits)
             }
         })
     }
@@ -357,10 +443,11 @@ mod tests {
         // A loader that records which ids it was asked for, returning `None` (no GPU);
         // the test asserts on the *requests*, not the handles.
         let mut requests = Vec::<u64>::new();
-        let mut load = |id: saffron_core::Uuid, _as_height: bool| -> Option<Arc<GpuTexture>> {
-            requests.push(id.value());
-            None
-        };
+        let mut load =
+            |id: saffron_core::Uuid, _role: TextureLoadRole| -> Option<Arc<GpuTexture>> {
+                requests.push(id.value());
+                None
+            };
         let sm = build_submesh_material(&material, &mut load);
 
         // The factors copy across verbatim.
@@ -410,11 +497,72 @@ mod tests {
     }
 
     #[test]
+    fn thin_sheet_surface_is_the_authority_for_coverage_and_optics() {
+        use saffron_spatial::{DecisionScalar, UnitInterval};
+
+        let thin = saffron_vegetation::ThinSheetFoliageParameters {
+            front_albedo_response: UnitInterval::from_bits(20_000),
+            back_albedo_response: UnitInterval::from_bits(10_000),
+            thickness: DecisionScalar::from_bits(131),
+            absorption_color: [
+                DecisionScalar::from_bits(1_000),
+                DecisionScalar::from_bits(2_000),
+                DecisionScalar::from_bits(3_000),
+            ],
+            transmission_color: [
+                DecisionScalar::from_bits(4_000),
+                DecisionScalar::from_bits(5_000),
+                DecisionScalar::from_bits(6_000),
+            ],
+            coverage_source: CoverageSource::Texture(Uuid(707)),
+            coverage: saffron_vegetation::CoverageMipMetadata {
+                classification: AlphaClassification::Masked,
+                reference_cutoff: UnitInterval::from_bits(22_000),
+                source_extent: [512, 256],
+                spatial_hash_salt: 0x1122_3344_5566_7788,
+                mip_hashes: Vec::new(),
+            },
+            ..saffron_vegetation::ThinSheetFoliageParameters::default()
+        };
+        let material = MaterialAsset {
+            blend: "opaque".to_owned(),
+            double_sided: false,
+            surface: MaterialSurface::ThinSheetFoliage(thin.clone()),
+            ..MaterialAsset::default()
+        };
+        let mut requests = Vec::new();
+        let resolved = build_submesh_material(&material, &mut |id, role| {
+            requests.push((id, role));
+            None
+        });
+
+        assert_eq!(resolved.blend_mode, BlendMode::Masked);
+        assert!(resolved.double_sided);
+        assert_eq!(
+            requests,
+            [(
+                Uuid(707),
+                TextureLoadRole::Coverage {
+                    cutoff_bits: 22_000
+                }
+            )]
+        );
+        let gpu = resolved.thin_sheet.expect("thin-sheet GPU contract");
+        assert_eq!(gpu.coverage_source, CoverageSourceKind::Texture);
+        assert_eq!(gpu.coverage_classification, AlphaClassification::Masked);
+        assert_eq!(gpu.coverage_source_extent, [512, 256]);
+        assert_eq!(gpu.coverage_hash_salt, 0x1122_3344_5566_7788);
+        assert_eq!(gpu.front_albedo_response, 20_000.0 / 65_535.0);
+        assert_eq!(gpu.back_albedo_response, 10_000.0 / 65_535.0);
+        assert_eq!(gpu.thickness, 131.0 / 65_536.0);
+    }
+
+    #[test]
     fn displacement_material_requests_its_height_slot_as_a_height_map() {
         use saffron_geometry::glam::Vec4;
         // Two materials sharing a height texture id: one Displacement (pyramid), one Bump (plain). The
         // loader records the `as_height` flag it was asked for per id.
-        let mut asks: Vec<(u64, bool)> = Vec::new();
+        let mut asks: Vec<(u64, TextureLoadRole)> = Vec::new();
         for mode in [HeightMode::Displacement, HeightMode::Bump] {
             let material = MaterialAsset {
                 base_color: Vec4::ONE,
@@ -422,18 +570,21 @@ mod tests {
                 height_mode: mode,
                 ..MaterialAsset::default()
             };
-            let _ = build_submesh_material(&material, &mut |id, as_height| {
-                asks.push((id.value(), as_height));
+            let _ = build_submesh_material(&material, &mut |id, role| {
+                asks.push((id.value(), role));
                 None
             });
         }
         // The height slot is requested `as_height = true` only for the Displacement material; every
         // non-height slot is always plain.
         assert!(
-            asks.contains(&(777, true)),
+            asks.contains(&(777, TextureLoadRole::Height)),
             "displacement height → pyramid load"
         );
-        assert!(asks.contains(&(777, false)), "bump height → plain load");
+        assert!(
+            asks.contains(&(777, TextureLoadRole::Plain)),
+            "bump height → plain load"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::{AssetServer, Error, Result};
 /// change retires the whole cache — every kind, not just materials — by bumping this one number:
 /// the new prefix simply never matches the old files (which age out via the size-cap eviction).
 /// Bump it whenever the rendered look of a tile changes.
-pub const THUMBNAIL_CACHE_VERSION: u32 = 11;
+pub const THUMBNAIL_CACHE_VERSION: u32 = 12;
 
 /// The FNV-1a 64-bit offset basis.
 const FNV_OFFSET: u64 = 1469598103934665603;
@@ -258,6 +258,9 @@ fn thumbnail_material_hash(m: &MaterialAsset) -> u64 {
     }
     for c in m.blend.bytes() {
         h.mix(u64::from(c));
+    }
+    for byte in crate::material::material_asset_to_text(m, 0).bytes() {
+        h.mix(u64::from(byte));
     }
     h.0
 }
@@ -625,7 +628,8 @@ fn build_embedded_job(
     // chunks at the identity (correct for the single-node case).
     let nodes = crate::spawn::imported_nodes_from_json(&container.meta.nodes);
     let node_mesh_ids = crate::spawn::node_mesh_ids_from_json(&container.meta.nodes);
-    let world = node_world_transforms(&nodes);
+    let world = crate::model::imported_node_world_transforms(&nodes)
+        .map_err(|error| Error::Thumbnail(error.to_string()))?;
     let mut transform_by_mesh: std::collections::HashMap<u64, Mat4> =
         std::collections::HashMap::new();
     for (i, mesh_id) in node_mesh_ids.iter().enumerate() {
@@ -695,26 +699,6 @@ fn build_embedded_job(
         materials,
         textures,
     })
-}
-
-/// World transforms for an imported node forest: each node's local `T·R·S` composed up its
-/// parent chain. Parallel to `nodes`.
-fn node_world_transforms(nodes: &[saffron_geometry::ImportedNode]) -> Vec<Mat4> {
-    let locals: Vec<Mat4> = nodes
-        .iter()
-        .map(|n| Mat4::from_scale_rotation_translation(n.scale, n.rotation, n.translation))
-        .collect();
-    (0..nodes.len())
-        .map(|i| {
-            let mut m = locals[i];
-            let mut parent = nodes[i].parent;
-            while parent >= 0 && (parent as usize) < nodes.len() {
-                m = locals[parent as usize] * m;
-                parent = nodes[parent as usize].parent;
-            }
-            m
-        })
-        .collect()
 }
 
 /// The five texture slot ids of a material, in slot order.

@@ -318,8 +318,7 @@ pub fn extract_sub_asset(
     // `.smat`, so drop its memoized resolution too.
     assets.model_by_uuid.remove(&model_id.value());
     assets.mesh_by_uuid.remove(&sub_id.value());
-    assets.texture_by_uuid.remove(&sub_id.value());
-    assets.height_texture_by_uuid.remove(&sub_id.value());
+    assets.invalidate_texture_caches(sub_id);
     assets.invalidate_material_caches();
     Ok(sub_id)
 }
@@ -381,8 +380,7 @@ pub fn clear_extraction(assets: &mut AssetServer, model_id: Uuid, sub_id: Uuid) 
     }
     assets.model_by_uuid.remove(&model_id.value());
     assets.mesh_by_uuid.remove(&sub_id.value());
-    assets.texture_by_uuid.remove(&sub_id.value());
-    assets.height_texture_by_uuid.remove(&sub_id.value());
+    assets.invalidate_texture_caches(sub_id);
     // The sub-asset resolves from the embedded chunk again; drop its memoized material resolution.
     assets.invalidate_material_caches();
     Ok(())
@@ -498,8 +496,7 @@ pub fn reimport_model(assets: &mut AssetServer, model_id: Uuid) -> Result<Reimpo
     assets.model_by_uuid.remove(&model_id.value());
     for sid in new_subs.union(&old_subs) {
         assets.mesh_by_uuid.remove(sid);
-        assets.texture_by_uuid.remove(sid);
-        assets.height_texture_by_uuid.remove(sid);
+        assets.invalidate_texture_caches(Uuid(*sid));
     }
     // Embedded material chunks were re-baked under stable ids, so their cached resolutions are stale.
     assets.invalidate_material_caches();
@@ -733,7 +730,9 @@ pub fn build_dependency_graph(scene: &mut Scene, assets: &mut AssetServer) -> De
                     }
                     if let saffron_vegetation::PlantFamilySource::Imported(recipe) = plant.source {
                         for source in recipe.sources {
-                            if let Some(dependency) = source.asset {
+                            if let saffron_vegetation::PlantSourceLocator::Asset(dependency) =
+                                source.locator
+                            {
                                 graph.edges.push(RefEdge {
                                     from: entry.id,
                                     to: dependency,

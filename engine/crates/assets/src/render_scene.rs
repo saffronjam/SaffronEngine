@@ -230,6 +230,15 @@ impl GpuUploader for RendererScene<'_> {
             .upload_texture_float(self.renderer.descriptors(), rgba, width, height)
     }
 
+    fn upload_texture_mips(
+        &self,
+        mips: &[saffron_rendering::TextureMipLevel<'_>],
+        srgb: bool,
+    ) -> saffron_rendering::Result<Arc<saffron_rendering::GpuTexture>> {
+        self.uploader
+            .upload_texture_mips(self.renderer.descriptors(), mips, srgb)
+    }
+
     fn upload_height_texture(
         &self,
         rgba: &[u8],
@@ -565,14 +574,17 @@ fn render_aabb_of(
 }
 
 /// A camera-independent hash of the inputs the point-shadow cube depends on: the light position +
-/// far plane and every mesh entity's world matrix + mesh asset id.
+/// far plane, render-content revision, and every mesh entity's world matrix + mesh asset id.
 ///
 /// The renderer re-renders the 6-face cube only when this changes, so panning the camera over a
 /// static light + static casters reuses the cached cube; any caster (or the light) moving, or a
-/// mesh added/removed/reassigned, invalidates it. (A glTF reimport that swaps a mesh's geometry
-/// under the same asset id is the one case this misses — the cube refreshes on the next transform
-/// change; reimport is rare and already idles the GPU + rebuilds caches.)
-fn point_shadow_content_key(scene: &mut Scene, light_pos: Vec3, far_plane: f32) -> u64 {
+/// mesh added/removed/reassigned, or an asset-content replacement invalidates it.
+fn point_shadow_content_key(
+    scene: &mut Scene,
+    light_pos: Vec3,
+    far_plane: f32,
+    render_content_revision: u64,
+) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -586,6 +598,7 @@ fn point_shadow_content_key(scene: &mut Scene, light_pos: Vec3, far_plane: f32) 
         fold(&component.to_le_bytes());
     }
     fold(&far_plane.to_le_bytes());
+    fold(&render_content_revision.to_le_bytes());
     let mut casters: Vec<(Entity, u64)> = Vec::new();
     scene.for_each::<&MeshComponent, _>(|entity, mesh| casters.push((entity, mesh.mesh.0)));
     for (entity, mesh_id) in casters {
@@ -826,7 +839,12 @@ pub fn render_scene<R: SceneRenderer>(
         point_shadow_far,
         point_shadow.map_or(0, |p| p.light_index),
         point_shadow.is_some(),
-        point_shadow_content_key(scene, point_shadow_pos, point_shadow_far),
+        point_shadow_content_key(
+            scene,
+            point_shadow_pos,
+            point_shadow_far,
+            assets.render_content_revision(),
+        ),
     );
 
     // The camera world position is the inverse-view translation; the BRDF needs it as the
@@ -1825,6 +1843,7 @@ pub fn scene_surface_providers(
                 ),
                 bounds: WorldBounds::from_world_meters(minimum.as_dvec3(), maximum.as_dvec3())?,
                 primitive_count: mesh.cpu_indices.len() as u64 / 3,
+                max_tags_per_hit: u32::from(!tags.is_empty()),
                 capabilities: SurfaceCapabilities {
                     ray: true,
                     project: true,
@@ -2760,20 +2779,20 @@ mod tests {
         scene.update_world_transforms();
 
         let light = Vec3::new(0.0, 5.0, 0.0);
-        let k1 = point_shadow_content_key(&mut scene, light, 50.0);
+        let k1 = point_shadow_content_key(&mut scene, light, 50.0, 1);
         assert_eq!(
             k1,
-            point_shadow_content_key(&mut scene, light, 50.0),
+            point_shadow_content_key(&mut scene, light, 50.0, 1),
             "key is stable for a static scene (camera-independent)"
         );
         assert_ne!(
             k1,
-            point_shadow_content_key(&mut scene, Vec3::new(0.1, 5.0, 0.0), 50.0),
+            point_shadow_content_key(&mut scene, Vec3::new(0.1, 5.0, 0.0), 50.0, 1),
             "a light move invalidates the cube"
         );
         assert_ne!(
             k1,
-            point_shadow_content_key(&mut scene, light, 60.0),
+            point_shadow_content_key(&mut scene, light, 60.0, 1),
             "a far-plane change invalidates the cube"
         );
         scene
@@ -2782,8 +2801,13 @@ mod tests {
         scene.update_world_transforms();
         assert_ne!(
             k1,
-            point_shadow_content_key(&mut scene, light, 50.0),
+            point_shadow_content_key(&mut scene, light, 50.0, 1),
             "a caster move invalidates the cube"
+        );
+        assert_ne!(
+            k1,
+            point_shadow_content_key(&mut scene, light, 50.0, 2),
+            "an asset-content replacement invalidates the cube"
         );
     }
 
