@@ -110,7 +110,7 @@ fn bind_batch_vertices(
     // A tessellated batch binds the frame's amplified transient VB (binding 0) + generated index
     // stream (both 48 B `Vertex` / u32, matching the static attribute + index state).
     if let Some(t) = &batch.tessellated {
-        // SAFETY: the ash seam. The transient VB/IB are pinned by the frame's `TransientResources`
+        // SAFETY: the ash seam. The transient VB/IB are pinned by the frame's `RenderGraphResources`
         // until this slot's fence; `cmd` is recording inside the pass.
         unsafe {
             raw.cmd_bind_vertex_buffers(cmd, 0, &[t.vertex_buffer], &[0]);
@@ -377,10 +377,7 @@ fn record_batches(
     }
 }
 
-/// Records the vertex-only shadow depth pass: bind the shadow PSO (depth-biased) + the
-/// instance set (2), push the LIGHT's viewProj, and draw every batch's submeshes into the
-/// shadow map. Shared by the directional and spot passes (only the push transform + the
-/// target map differ).
+/// Records the shadow depth pass with canonical material coverage.
 #[allow(clippy::too_many_arguments)]
 pub fn record_shadow_depth(
     raw: &ash::Device,
@@ -388,6 +385,7 @@ pub fn record_shadow_depth(
     list: &SceneDrawList,
     shadow_pipeline: vk::Pipeline,
     shadow_layout: vk::PipelineLayout,
+    bindless_set: vk::DescriptorSet,
     instance_set: vk::DescriptorSet,
     light_view_proj: Mat4,
     deformed: Option<vk::Buffer>,
@@ -405,6 +403,14 @@ pub fn record_shadow_depth(
             SHADOW_DEPTH_BIAS_CONSTANT,
             0.0,
             SHADOW_DEPTH_BIAS_SLOPE,
+        );
+        raw.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            shadow_layout,
+            0,
+            &[bindless_set],
+            &[],
         );
         raw.cmd_bind_descriptor_sets(
             cmd,
@@ -432,9 +438,10 @@ struct PointShadowPush {
     light_pos: Vec4,
 }
 
-/// Records the vertex-only depth pre-pass: bind the instance set (2) + the viewProj
-/// push, then draw every batch's submeshes with the single depth PSO. Lays down scene
-/// depth so the scene pass loads it and shades only the front-most fragments.
+/// Records the depth pre-pass after its caller binds the bindless coverage set (0).
+///
+/// Binds the instance/material set (2), pushes the view projection, and draws every opaque or
+/// masked batch. The fragment uses the canonical coverage classifier before writing depth.
 pub fn record_depth_prepass(
     raw: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -516,9 +523,7 @@ pub fn record_reactive_coverage(
     }
 }
 
-/// Records the thin G-buffer prepass: bind the instance set (2) + the `viewProj + view`
-/// push, then draw every batch's static submeshes with the G-buffer PSO. Writes the
-/// view-space normal (rgb) + view-Z (.a) the screen-space chain reads.
+/// Records the thin G-buffer prepass with canonical material coverage.
 #[allow(clippy::too_many_arguments)]
 pub fn record_gbuffer(
     raw: &ash::Device,
@@ -526,6 +531,7 @@ pub fn record_gbuffer(
     list: &SceneDrawList,
     gbuffer_pipeline: vk::Pipeline,
     gbuffer_layout: vk::PipelineLayout,
+    bindless_set: vk::DescriptorSet,
     instance_set: vk::DescriptorSet,
     push: &crate::ssao::GbufferPush,
     deformed: Option<vk::Buffer>,
@@ -538,6 +544,14 @@ pub fn record_gbuffer(
     // the declared two-mat4 vertex range.
     unsafe {
         raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, gbuffer_pipeline);
+        raw.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            gbuffer_layout,
+            0,
+            &[bindless_set],
+            &[],
+        );
         raw.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::GRAPHICS,
@@ -566,26 +580,19 @@ pub fn record_gbuffer(
 /// point shadow cube before building the pass.
 #[derive(Clone, Copy)]
 pub struct PointShadowTarget {
-    /// The cube color image (all 6 layers barriered together).
-    pub cube_image: vk::Image,
     /// The 6 per-face 2D render views (cube layer order +X,−X,+Y,−Y,+Z,−Z).
     pub face_views: [vk::ImageView; 6],
-    /// The shared single-layer depth scratch image (reused across faces).
-    pub depth_image: vk::Image,
-    /// The depth scratch view.
-    pub depth_view: vk::ImageView,
+    /// The 6 per-face depth render views.
+    pub depth_views: [vk::ImageView; 6],
     /// The per-face square extent.
     pub extent: vk::Extent2D,
 }
 
 /// Renders world distance-to-light into the 6 faces of the point-shadow distance cube.
 ///
-/// Runs as the body of a Compute-kind graph pass (the graph opens no rendering scope),
-/// so this opens its own per-face dynamic-rendering scopes and manages the cube layout
-/// directly: the cube's 6 layers exceed the graph's single-layer barrier. It transitions
-/// all 6 layers `ShaderReadOnly → ColorAttachment`, renders each face (clearing the depth
-/// scratch + the color to a beyond-far distance), then transitions back to
-/// `ShaderReadOnly` for the scene sample.
+/// Runs as the body of a graphics-command graph pass, opening one dynamic-rendering scope
+/// per face. The pass declaration owns whole-image synchronization for the layered color
+/// and depth targets.
 ///
 /// `deformed_only` selects which casters this cube holds: `false` renders the non-deformed (static)
 /// batches into the cached static cube, `true` renders the deformed (skinned / morph) batches into
@@ -597,6 +604,7 @@ pub fn record_point_shadow(
     list: &SceneDrawList,
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
+    bindless_set: vk::DescriptorSet,
     instance_set: vk::DescriptorSet,
     target: &PointShadowTarget,
     faces: &[Mat4; 6],
@@ -609,34 +617,6 @@ pub fn record_point_shadow(
         return;
     }
     let extent = target.extent;
-
-    // All 6 cube layers: ShaderReadOnly (entry) → ColorAttachment for rendering. The cube
-    // is seeded UNDEFINED on its first frame; the renderer's first-frame path passes
-    // UNDEFINED as the old layout so contents are discarded (every face clears anyway).
-    cube_barrier(
-        raw,
-        cmd,
-        target.cube_image,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_SAMPLED_READ,
-        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-    );
-    // The shared depth scratch: Undefined → DepthAttachment (cleared each face).
-    depth_barrier(
-        raw,
-        cmd,
-        target.depth_image,
-        vk::ImageLayout::UNDEFINED,
-        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-        vk::PipelineStageFlags2::TOP_OF_PIPE,
-        vk::AccessFlags2::empty(),
-        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-    );
 
     let viewport = vk::Viewport {
         x: 0.0,
@@ -658,30 +638,26 @@ pub fn record_point_shadow(
             cmd,
             vk::PipelineBindPoint::GRAPHICS,
             layout,
+            0,
+            &[bindless_set],
+            &[],
+        );
+        raw.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            layout,
             2,
             &[instance_set],
             &[],
         );
     }
 
-    for (face, (face_view, &face_view_proj)) in
-        target.face_views.iter().zip(faces.iter()).enumerate()
+    for ((face_view, depth_view), &face_view_proj) in target
+        .face_views
+        .iter()
+        .zip(target.depth_views.iter())
+        .zip(faces.iter())
     {
-        // The depth scratch is reused across faces; barrier write→write between faces.
-        if face > 0 {
-            depth_barrier(
-                raw,
-                cmd,
-                target.depth_image,
-                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            );
-        }
-
         let color_attach = [vk::RenderingAttachmentInfo::default()
             .image_view(*face_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -694,7 +670,7 @@ pub fn record_point_shadow(
                 },
             })];
         let depth_attach = vk::RenderingAttachmentInfo::default()
-            .image_view(target.depth_view)
+            .image_view(*depth_view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -740,113 +716,6 @@ pub fn record_point_shadow(
         // SAFETY: the ash seam. Closes the per-face rendering scope opened above.
         unsafe { raw.cmd_end_rendering(cmd) };
     }
-
-    // All 6 layers back to ShaderReadOnly for the scene pass to sample.
-    cube_barrier(
-        raw,
-        cmd,
-        target.cube_image,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_SAMPLED_READ,
-    );
-}
-
-/// One sync2 barrier over all 6 layers of the point-shadow cube color image.
-#[allow(clippy::too_many_arguments)]
-fn cube_barrier(
-    raw: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
-) {
-    layer_barrier(
-        raw,
-        cmd,
-        image,
-        vk::ImageAspectFlags::COLOR,
-        6,
-        old_layout,
-        new_layout,
-        src_stage,
-        src_access,
-        dst_stage,
-        dst_access,
-    );
-}
-
-/// One sync2 barrier over the single-layer depth scratch.
-#[allow(clippy::too_many_arguments)]
-fn depth_barrier(
-    raw: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
-) {
-    layer_barrier(
-        raw,
-        cmd,
-        image,
-        vk::ImageAspectFlags::DEPTH,
-        1,
-        old_layout,
-        new_layout,
-        src_stage,
-        src_access,
-        dst_stage,
-        dst_access,
-    );
-}
-
-/// One sync2 image-memory barrier over `layer_count` layers of `aspect`.
-#[allow(clippy::too_many_arguments)]
-fn layer_barrier(
-    raw: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    aspect: vk::ImageAspectFlags,
-    layer_count: u32,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
-) {
-    let barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(src_stage)
-        .src_access_mask(src_access)
-        .dst_stage_mask(dst_stage)
-        .dst_access_mask(dst_access)
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count,
-        });
-    let barriers = [barrier];
-    let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-    // SAFETY: the ash seam. The image outlives the recorded command; `cmd` is recording.
-    unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
 }
 
 #[cfg(test)]
@@ -937,6 +806,7 @@ mod tests {
                     view_proj: Mat4::IDENTITY,
                     wireframe: false,
                     default_texture_index: crate::DEFAULT_WHITE_SLOT,
+                    coverage_temporal_phase: 0,
                     rt_skinned: false,
                     displace_enabled: true,
                     tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
@@ -950,8 +820,16 @@ mod tests {
         let shadow = pipelines.request_shadow_depth().expect("shadow PSO");
         let point = pipelines.request_point_shadow().expect("point-shadow PSO");
 
-        record_shadow_and_point(&device, &targets, &list, &shadow, &point, instance_set)
-            .expect("record shadow + point-shadow");
+        record_shadow_and_point(
+            &device,
+            &targets,
+            &list,
+            &shadow,
+            &point,
+            descriptors.bindless_set(),
+            instance_set,
+        )
+        .expect("record shadow + point-shadow");
 
         drop(list);
         drop(shadow);
@@ -985,6 +863,7 @@ mod tests {
         list: &SceneDrawList,
         shadow: &Arc<crate::Pipeline>,
         point: &Arc<crate::Pipeline>,
+        bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
     ) -> Result<()> {
         let raw = device.raw();
@@ -1009,14 +888,11 @@ mod tests {
             height: crate::lighting::SHADOW_MAP_SIZE,
         };
         let target = PointShadowTarget {
-            cube_image: targets.point_shadow.image(),
             face_views: std::array::from_fn(|f| targets.point_shadow.face_view(f)),
-            depth_image: targets.point_shadow.depth_image(),
-            depth_view: targets.point_shadow.depth_view(),
+            depth_views: std::array::from_fn(|f| targets.point_shadow.depth_face_view(f)),
             extent: targets.point_shadow.extent,
         };
         let faces = point_shadow_face_matrices(G3::new(0.0, 0.0, 5.0), 50.0);
-
         let record = || -> Result<()> {
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1025,7 +901,8 @@ mod tests {
 
             // Directional shadow through the graph (DepthWrite → an external slot).
             let mut graph = RenderGraph::new();
-            let slot = graph.alloc_external_layout(vk::ImageLayout::UNDEFINED);
+            let slot =
+                graph.alloc_external_state(crate::RgExternalState::new(vk::ImageLayout::UNDEFINED));
             let res = graph.import_image(
                 targets.directional_shadow.handle(),
                 targets.directional_shadow.view(),
@@ -1058,29 +935,60 @@ mod tests {
                             &shadow_list,
                             shadow_pipeline,
                             shadow_layout,
+                            bindless_set,
                             instance_set,
                             Mat4::IDENTITY,
                             None,
                         );
                     }),
             );
-            graph.execute(device, cmd);
-
-            // The point-shadow cube body (6 face scopes + its own barriers).
-            record_point_shadow(
-                raw,
-                cmd,
-                list,
-                point.handle(),
-                point.layout(),
-                instance_set,
-                &target,
-                &faces,
-                G3::new(0.0, 0.0, 5.0),
-                50.0,
-                None,
-                false,
+            let cube_slot = graph.alloc_external_state(targets.point_shadow.graph_state());
+            let cube = graph.import_image(
+                targets.point_shadow.image(),
+                targets.point_shadow.cube_view(),
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                Some(cube_slot),
             );
+            let depth_slot = graph.alloc_external_state(targets.point_shadow.depth_graph_state());
+            let point_depth = graph.import_image(
+                targets.point_shadow.depth_image(),
+                targets.point_shadow.depth_face_view(0),
+                vk::ImageAspectFlags::DEPTH,
+                vk::ImageLayout::UNDEFINED,
+                Some(depth_slot),
+            );
+            let point_list = list.shallow_clone();
+            let raw_point = raw.clone();
+            let point_pipeline = point.handle();
+            let point_layout = point.layout();
+            graph.add_pass(
+                RgPass::graphics_commands("point-shadow")
+                    .access(cube, crate::RgUsage::ColorWrite)
+                    .access(point_depth, crate::RgUsage::DepthWrite)
+                    .body(move |cmd, _| {
+                        record_point_shadow(
+                            &raw_point,
+                            cmd,
+                            &point_list,
+                            point_pipeline,
+                            point_layout,
+                            bindless_set,
+                            instance_set,
+                            &target,
+                            &faces,
+                            G3::new(0.0, 0.0, 5.0),
+                            50.0,
+                            None,
+                            false,
+                        );
+                    }),
+            );
+            graph.add_pass(
+                RgPass::graphics_commands("point-shadow-sample")
+                    .access(cube, crate::RgUsage::SampledRead),
+            );
+            graph.execute(device, cmd);
 
             // SAFETY: the ash seam.
             unsafe { checked(raw.end_command_buffer(cmd), "end")? };

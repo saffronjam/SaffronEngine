@@ -2176,6 +2176,7 @@ mod tests {
                     view_proj: Mat4::IDENTITY,
                     wireframe: false,
                     default_texture_index: crate::DEFAULT_WHITE_SLOT,
+                    coverage_temporal_phase: 0,
                     rt_skinned: false,
                     displace_enabled: true,
                     tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
@@ -2205,6 +2206,7 @@ mod tests {
 
         let extent = view.scaled_render_extent();
         let instance_set = instancing.instance_set(0);
+        let bindless_set = descriptors.bindless_set();
         let groups = |n: u32| n.div_ceil(8);
 
         let raw = device.raw();
@@ -2273,7 +2275,7 @@ mod tests {
             vk::ImageLayout::UNDEFINED,
             None,
         );
-        let ao_slot = graph.alloc_external_layout(view.ao_map.as_ref().unwrap().layout);
+        let ao_slot = graph.alloc_external_state(view.ao_map.as_ref().unwrap().graph_state());
         let ao_map = graph.import_image(
             view.ao_map.as_ref().unwrap().handle(),
             view.ao_map.as_ref().unwrap().view(),
@@ -2313,6 +2315,7 @@ mod tests {
                             &list,
                             handle,
                             layout,
+                            bindless_set,
                             instance_set,
                             &ssao_push,
                             None,
@@ -2352,7 +2355,8 @@ mod tests {
             groups(extent.height),
         );
         // contact.
-        let contact_slot = graph.alloc_external_layout(view.contact_map.as_ref().unwrap().layout);
+        let contact_slot =
+            graph.alloc_external_state(view.contact_map.as_ref().unwrap().graph_state());
         let contact_map = graph.import_image(
             view.contact_map.as_ref().unwrap().handle(),
             view.contact_map.as_ref().unwrap().view(),
@@ -2382,7 +2386,7 @@ mod tests {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             None,
         );
-        let ssgi_slot = graph.alloc_external_layout(view.ssgi_map.as_ref().unwrap().layout);
+        let ssgi_slot = graph.alloc_external_state(view.ssgi_map.as_ref().unwrap().graph_state());
         let ssgi_map = graph.import_image(
             view.ssgi_map.as_ref().unwrap().handle(),
             view.ssgi_map.as_ref().unwrap().view(),
@@ -2391,7 +2395,7 @@ mod tests {
             Some(ssgi_slot),
         );
         let denoised_slot =
-            graph.alloc_external_layout(view.ssgi_denoised.as_ref().unwrap().layout);
+            graph.alloc_external_state(view.ssgi_denoised.as_ref().unwrap().graph_state());
         let ssgi_denoised = graph.import_image(
             view.ssgi_denoised.as_ref().unwrap().handle(),
             view.ssgi_denoised.as_ref().unwrap().view(),

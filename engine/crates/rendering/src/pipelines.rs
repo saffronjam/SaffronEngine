@@ -2012,6 +2012,15 @@ impl Pipelines {
     ) -> Result<Pipeline> {
         // Vertex writes depth; the fragment does only the alpha-clip discard (masked materials must
         // not write depth at cutout texels). Opaque materials fall straight through — depth-only.
+        let a2c_value: vk::Bool32 = u32::from(self.sample_count != vk::SampleCountFlags::TYPE_1);
+        let a2c_entry = [vk::SpecializationMapEntry::default()
+            .constant_id(1)
+            .offset(0)
+            .size(size_of::<vk::Bool32>())];
+        let a2c_data = a2c_value.to_ne_bytes();
+        let a2c_info = vk::SpecializationInfo::default()
+            .map_entries(&a2c_entry)
+            .data(&a2c_data);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -2020,7 +2029,8 @@ impl Pipelines {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
-                .name(c"depthPrepassFragment"),
+                .name(c"depthPrepassFragment")
+                .specialization_info(&a2c_info),
         ];
 
         let bindings = [vk::VertexInputBindingDescription::default()
@@ -2043,7 +2053,8 @@ impl Pipelines {
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(self.sample_count);
+            .rasterization_samples(self.sample_count)
+            .alpha_to_coverage_enable(self.sample_count != vk::SampleCountFlags::TYPE_1);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
             .depth_write_enable(true)
@@ -2611,9 +2622,10 @@ impl Pipelines {
         Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
     }
 
-    /// Builds the vertex-only, depth-biased shadow depth PSO from the übershader's
-    /// `vertexMain`: binding 0 = the base [`Vertex`] stream, no color, depth `LESS` +
-    /// write, dynamic depth-bias, single-sampled, sets 0/1/2, the light-viewProj push.
+    /// Builds the canonical-coverage, depth-biased shadow PSO from the übershader's
+    /// `vertexMain` + `depthPrepassFragment`: binding 0 = the base [`Vertex`] stream,
+    /// no color, depth `LESS` + write, dynamic depth-bias, single-sampled, sets 0/1/2,
+    /// the light-viewProj push.
     fn build_shadow_depth(&self) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/mesh.spv")?;
@@ -2629,10 +2641,16 @@ impl Pipelines {
         raw: &ash::Device,
         module: vk::ShaderModule,
     ) -> Result<Pipeline> {
-        let stages = [vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(module)
-            .name(c"vertexMain")];
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vertexMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"depthPrepassFragment"),
+        ];
 
         let bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)

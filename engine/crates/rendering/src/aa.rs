@@ -316,7 +316,7 @@ pub struct TaaPush {
 
 const _: () = assert!(size_of::<TaaPush>() == 80);
 
-/// Records the motion-vector prepass: bind the instance set (2) + the cur/prev camera
+/// Records the coverage-aware motion-vector prepass: bind the material sets + cur/prev camera
 /// viewProj push, then draw every batch's submeshes with both vertex bindings pointing at
 /// the same static stream (so `prevPosition == position` and object motion comes from
 /// `inst.prevModel`). The skinned deform-motion path uses distinct cur/prev deformed
@@ -328,6 +328,7 @@ pub fn record_motion(
     list: &SceneDrawList,
     motion_pipeline: vk::Pipeline,
     motion_layout: vk::PipelineLayout,
+    bindless_set: vk::DescriptorSet,
     instance_set: vk::DescriptorSet,
     push: &MotionPush,
     deformed: Option<vk::Buffer>,
@@ -341,6 +342,14 @@ pub fn record_motion(
     // declared two-mat4 vertex range.
     unsafe {
         raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, motion_pipeline);
+        raw.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            motion_layout,
+            0,
+            &[bindless_set],
+            &[],
+        );
         raw.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::GRAPHICS,
@@ -374,7 +383,7 @@ pub fn record_motion(
             (cur, prev, batch.mesh.index_buffer())
         };
         // SAFETY: the ash seam. The bound streams outlive the recorded command (pinned by
-        // the batch `Arc` / the frame's `Skinning` / `TransientResources`); the index buffer + draw
+        // the batch `Arc` / the frame's `Skinning` / `RenderGraphResources`); the index buffer + draw
         // cover the batch.
         unsafe {
             raw.cmd_bind_vertex_buffers(cmd, 0, &[cur, prev], &[0, 0]);
