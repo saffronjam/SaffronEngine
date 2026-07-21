@@ -2400,13 +2400,31 @@
       }
     },
     {
-      "name": "vegetation-evaluate-region",
-      "summary": "start one bounded asynchronous biome evaluation through the canonical evaluator",
+      "name": "vegetation-preflight-region",
+      "summary": "assemble, comprehensively bound, and retain one biome evaluation without starting a worker",
       "params": [
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/VegetationEvaluateRegionParams"
+            "$ref": "#/components/schemas/VegetationPreflightRegionParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationEvaluationJobDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-start-evaluation",
+      "summary": "start the exact evaluator and inputs retained by a prepared vegetation job",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationEvaluationJobParams"
           }
         }
       ],
@@ -2468,6 +2486,240 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/ProvenanceExplanationDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-cook",
+      "summary": "start one deterministic content-addressed vegetation cook",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationCookParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationCookJobDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-cook-status",
+      "summary": "poll an asynchronous vegetation cook and its terminal manifest",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationCookJobParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationCookStatusDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-cancel-cook",
+      "summary": "cancel a vegetation cook without publishing partial or superseded output",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationCookJobParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationCookStatusDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-cell-inspect",
+      "summary": "inspect one validated immutable vegetation cell header and section table",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationCellInspectParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationCellInspectResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-manifest",
+      "summary": "inspect the current or one exact immutable vegetation base manifest",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationManifestParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationManifestResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-runtime-status",
+      "summary": "report the exact runtime vegetation generation, state, queues, residency, and budgets",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationRuntimeStatusDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-runtime-cell",
+      "summary": "inspect one immutable CPU-resident vegetation cell generation",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationRuntimeCellParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationRuntimeCellResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-runtime-query",
+      "summary": "query CPU-resident macro vegetation by bounds, radius, ray, or nearest",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationRuntimeQueryParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationRuntimeQueryResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-runtime-inspect",
+      "summary": "inspect one stable plant's effective row, persistent state, and resident provenance",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationRuntimePlantInspectParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationRuntimePlantInspectResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-state-export",
+      "summary": "export the canonical strict runtime vegetation state snapshot",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationStateSnapshotDto"
+        }
+      }
+    },
+    {
+      "name": "vegetation-state-import",
+      "summary": "verify and atomically import one exact runtime vegetation state snapshot",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationStateImportParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationStateSnapshotDto"
+        }
+      }
+    },
+    {
+      "name": "plant-validate",
+      "summary": "validate one authored plant family and inspect its exact sources",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/PlantValidateParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PlantValidationResult"
+        }
+      }
+    },
+    {
+      "name": "plant-recook",
+      "summary": "normalize and atomically publish one plant family through its retained recipe",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/PlantRecookParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PlantRecookResult"
         }
       }
     },
@@ -4771,6 +5023,24 @@
           "parameterCount": {
             "type": "integer",
             "minimum": 0
+          },
+          "validation": {
+            "$ref": "#/components/schemas/VegetationValidationSummaryDto"
+          },
+          "provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationSourceProvenanceDto"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestDependencyDto"
+            }
+          },
+          "latestCook": {
+            "$ref": "#/components/schemas/VegetationCookStatisticsDto"
           }
         },
         "required": [
@@ -4780,7 +5050,10 @@
           "role",
           "plantPalette",
           "modules",
-          "parameterCount"
+          "parameterCount",
+          "validation",
+          "provenance",
+          "dependencies"
         ]
       },
       "BiomeRoleDto": {
@@ -5609,6 +5882,205 @@
           "point",
           "normal",
           "tick"
+        ]
+      },
+      "ControlDiagnosticDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "domain": {
+                "type": "string",
+                "const": "vegetation-graph"
+              },
+              "detail": {
+                "$ref": "#/components/schemas/VegetationGraphDiagnosticDto"
+              }
+            },
+            "required": [
+              "domain",
+              "detail"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "domain": {
+                "type": "string",
+                "const": "vegetation-artifact"
+              },
+              "detail": {
+                "$ref": "#/components/schemas/VegetationArtifactDiagnosticDto"
+              }
+            },
+            "required": [
+              "domain",
+              "detail"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "domain": {
+                "type": "string",
+                "const": "reimport-conflict"
+              },
+              "detail": {
+                "$ref": "#/components/schemas/ReimportConflictDiagnosticDto"
+              }
+            },
+            "required": [
+              "domain",
+              "detail"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ControlFailureDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "command"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "params"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "busy-loading"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "invalid-request"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "transport"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "malformed-reply"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "const": "bridge"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "diagnostic": {
+                "$ref": "#/components/schemas/ControlDiagnosticDto"
+              },
+              "code": {
+                "type": "string",
+                "const": "diagnostic"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message",
+              "diagnostic"
+            ]
+          }
         ]
       },
       "CoverageMipMetadataDto": {
@@ -8660,6 +9132,24 @@
             "items": {
               "type": "string"
             }
+          },
+          "validation": {
+            "$ref": "#/components/schemas/VegetationValidationSummaryDto"
+          },
+          "provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationSourceProvenanceDto"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestDependencyDto"
+            }
+          },
+          "latestCook": {
+            "$ref": "#/components/schemas/VegetationCookStatisticsDto"
           }
         },
         "required": [
@@ -8669,7 +9159,115 @@
           "source",
           "partCount",
           "phenotypeCount",
-          "materialSlots"
+          "materialSlots",
+          "validation",
+          "provenance",
+          "dependencies"
+        ]
+      },
+      "PlantCompileDiagnosticCodeDto": {
+        "type": "string",
+        "enum": [
+          "missing-source",
+          "duplicate-source",
+          "empty-selection",
+          "invalid-geometry",
+          "missing-material",
+          "invalid-material",
+          "invalid-skeleton",
+          "missing-coverage-uv",
+          "invalid-leaf-orientation",
+          "bounds-mismatch",
+          "limit-exceeded",
+          "source-changed"
+        ]
+      },
+      "PlantCompileDiagnosticDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "error"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "missing-source",
+              "duplicate-source",
+              "empty-selection",
+              "invalid-geometry",
+              "missing-material",
+              "invalid-material",
+              "invalid-skeleton",
+              "missing-coverage-uv",
+              "invalid-leaf-orientation",
+              "bounds-mismatch",
+              "limit-exceeded",
+              "source-changed"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "sourceSelector": {
+            "$ref": "#/components/schemas/PlantSourceSelectorDto"
+          },
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "code",
+          "path",
+          "message"
+        ]
+      },
+      "PlantCompileStatisticsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sources": {
+            "type": "string"
+          },
+          "meshes": {
+            "type": "string"
+          },
+          "vertices": {
+            "type": "string"
+          },
+          "indices": {
+            "type": "string"
+          },
+          "joints": {
+            "type": "string"
+          },
+          "materials": {
+            "type": "string"
+          },
+          "rejected": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sources",
+          "meshes",
+          "vertices",
+          "indices",
+          "joints",
+          "materials",
+          "rejected"
         ]
       },
       "PlantId": {
@@ -8860,11 +9458,381 @@
           "surfaceProjectionBits"
         ]
       },
+      "PlantRecookParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "$ref": "#/components/schemas/AssetSelector"
+          },
+          "platformProfile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "plant"
+        ]
+      },
+      "PlantRecookResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string"
+          },
+          "familyHash": {
+            "type": "string"
+          },
+          "artifactHash": {
+            "type": "string"
+          },
+          "cacheHit": {
+            "type": "boolean"
+          },
+          "validation": {
+            "$ref": "#/components/schemas/VegetationValidationSummaryDto"
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantCompileDiagnosticDto"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantSourceReferenceDto"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestDependencyDto"
+            }
+          },
+          "sourceUpdates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantSourceHashUpdateDto"
+            }
+          },
+          "statistics": {
+            "$ref": "#/components/schemas/PlantCompileStatisticsDto"
+          }
+        },
+        "required": [
+          "plant",
+          "familyHash",
+          "artifactHash",
+          "cacheHit",
+          "validation",
+          "diagnostics",
+          "sources",
+          "dependencies",
+          "sourceUpdates",
+          "statistics"
+        ]
+      },
+      "PlantReimportConflictReasonDto": {
+        "type": "string",
+        "enum": [
+          "missing-source",
+          "missing-element"
+        ]
+      },
+      "PlantSemanticDestinationDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "part"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "spine"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "slot": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "const": "material-slot"
+              }
+            },
+            "required": [
+              "kind",
+              "slot"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "collision-proxy"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "navigation-proxy"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "const": "phenotype"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ]
+          }
+        ]
+      },
+      "PlantSourceHashUpdateDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "previous": {
+            "type": "string"
+          },
+          "current": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "previous",
+          "current"
+        ]
+      },
       "PlantSourceKindDto": {
         "type": "string",
         "enum": [
           "imported",
           "native"
+        ]
+      },
+      "PlantSourceLocatorDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "asset": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "asset"
+              }
+            },
+            "required": [
+              "kind",
+              "asset"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "uri": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "file"
+              }
+            },
+            "required": [
+              "kind",
+              "uri"
+            ]
+          }
+        ]
+      },
+      "PlantSourceReferenceDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "locator": {
+            "$ref": "#/components/schemas/PlantSourceLocatorDto"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "geometry",
+              "material",
+              "skeleton",
+              "collision",
+              "navigation"
+            ]
+          },
+          "selector": {
+            "$ref": "#/components/schemas/PlantSourceSelectorDto"
+          },
+          "contentHash": {
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/VegetationSourceProvenanceDto"
+          }
+        },
+        "required": [
+          "id",
+          "locator",
+          "role",
+          "selector",
+          "contentHash",
+          "provenance"
+        ]
+      },
+      "PlantSourceRoleDto": {
+        "type": "string",
+        "enum": [
+          "geometry",
+          "material",
+          "skeleton",
+          "collision",
+          "navigation"
+        ]
+      },
+      "PlantSourceSelectorDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "whole"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "path": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "element"
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "path"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "element": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "const": "submesh"
+              }
+            },
+            "required": [
+              "kind",
+              "element",
+              "index"
+            ]
+          }
         ]
       },
       "PlantStateOverrideDto": {
@@ -8974,6 +9942,76 @@
           "plant",
           "globalTicks",
           "scaleBits"
+        ]
+      },
+      "PlantValidateParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "$ref": "#/components/schemas/AssetSelector"
+          }
+        },
+        "required": [
+          "plant"
+        ]
+      },
+      "PlantValidationResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string"
+          },
+          "validation": {
+            "$ref": "#/components/schemas/VegetationValidationSummaryDto"
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantCompileDiagnosticDto"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantSourceReferenceDto"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestDependencyDto"
+            }
+          },
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReimportConflictEntryDto"
+            }
+          },
+          "sourceUpdates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlantSourceHashUpdateDto"
+            }
+          },
+          "familyHash": {
+            "type": "string"
+          },
+          "statistics": {
+            "$ref": "#/components/schemas/PlantCompileStatisticsDto"
+          }
+        },
+        "required": [
+          "plant",
+          "validation",
+          "diagnostics",
+          "sources",
+          "dependencies",
+          "conflicts",
+          "sourceUpdates",
+          "statistics"
         ]
       },
       "PlayAnimationParams": {
@@ -9711,6 +10749,63 @@
           "intensity",
           "boxProjection",
           "boxExtent"
+        ]
+      },
+      "ReimportConflictDiagnosticDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string"
+          },
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReimportConflictEntryDto"
+            }
+          }
+        },
+        "required": [
+          "plant",
+          "conflicts"
+        ]
+      },
+      "ReimportConflictEntryDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "source": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "selector": {
+            "$ref": "#/components/schemas/PlantSourceSelectorDto"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/PlantSemanticDestinationDto"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "missing-source",
+              "missing-element"
+            ]
+          }
+        },
+        "required": [
+          "target",
+          "source",
+          "selector",
+          "destination",
+          "reason"
         ]
       },
       "ReimportModelParams": {
@@ -12883,6 +13978,10 @@
           "primitiveCount": {
             "type": "string"
           },
+          "maxTagsPerHit": {
+            "type": "integer",
+            "minimum": 0
+          },
           "capabilities": {
             "$ref": "#/components/schemas/SurfaceCapabilitiesDto"
           }
@@ -12894,6 +13993,7 @@
           "revision",
           "bounds",
           "primitiveCount",
+          "maxTagsPerHit",
           "capabilities"
         ]
       },
@@ -13442,6 +14542,268 @@
           "w"
         ]
       },
+      "VegetationArtifactDiagnosticDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "truncated"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "found": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "expected": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "category": {
+                "type": "string",
+                "const": "version"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "found",
+              "expected"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "schema"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "section": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "category": {
+                "type": "string",
+                "const": "unknown-section"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "section"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "codec": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "category": {
+                "type": "string",
+                "const": "unknown-codec"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "codec"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "section": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "category": {
+                "type": "string",
+                "const": "duplicate-section"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "section"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "section": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "category": {
+                "type": "string",
+                "const": "misaligned-section"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "section"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "section": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "category": {
+                "type": "string",
+                "const": "overlapping-section"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "section"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "subject": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "hash-mismatch"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "subject"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "format"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "format",
+              "field"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "contentHash": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "not-found"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "kind",
+              "contentHash"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "content-address-collision"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "path"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "category"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "superseded"
+              }
+            },
+            "required": [
+              "category"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "VegetationArtifactSectionCodecDto": {
+        "type": "string",
+        "enum": [
+          "raw"
+        ]
+      },
       "VegetationAssetSummaryDto": {
         "oneOf": [
           {
@@ -13550,10 +14912,22 @@
             "type": "integer",
             "minimum": 0
           },
+          "world": {
+            "type": "string"
+          },
           "map": {
             "type": "string"
           },
           "mapHash": {
+            "type": "string"
+          },
+          "versions": {
+            "$ref": "#/components/schemas/VegetationCookVersionSetDto"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/VegetationCookPlatformProfileDto"
+          },
+          "cookGraphHash": {
             "type": "string"
           },
           "dependencies": {
@@ -13562,16 +14936,32 @@
               "$ref": "#/components/schemas/VegetationManifestDependencyDto"
             }
           },
+          "seedNamespaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationSeedNamespaceDto"
+            }
+          },
           "pointSchemaHash": {
             "type": "string"
           },
-          "evaluatorVersion": {
-            "type": "integer",
-            "minimum": 0
+          "pointColumns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestPointColumnDto"
+            }
           },
-          "cookerVersion": {
-            "type": "integer",
-            "minimum": 0
+          "plants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestPlantDto"
+            }
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestCellDto"
+            }
           },
           "identity": {
             "type": "string"
@@ -13579,12 +14969,18 @@
         },
         "required": [
           "version",
+          "world",
           "map",
           "mapHash",
+          "versions",
+          "platform",
+          "cookGraphHash",
           "dependencies",
+          "seedNamespaces",
           "pointSchemaHash",
-          "evaluatorVersion",
-          "cookerVersion",
+          "pointColumns",
+          "plants",
+          "cells",
           "identity"
         ]
       },
@@ -13633,6 +15029,168 @@
           "competition",
           "foreign-owner",
           "no-species"
+        ]
+      },
+      "VegetationCellInspectParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "map": {
+            "$ref": "#/components/schemas/AssetSelector"
+          },
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "manifest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "map",
+          "cell"
+        ]
+      },
+      "VegetationCellInspectResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/VegetationCellSummaryDto"
+          }
+        },
+        "required": [
+          "cell"
+        ]
+      },
+      "VegetationCellSectionDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "macro-points",
+              "micro-fields",
+              "provenance",
+              "rejection-diagnostics",
+              "surface-attachments",
+              "surface-dependencies",
+              "render-references",
+              "render-bounds",
+              "collision-inputs",
+              "navigation-contributions",
+              "ecology-boundary",
+              "ecology-checkpoint"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "codec": {
+            "type": "string",
+            "enum": [
+              "raw"
+            ]
+          },
+          "alignment": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "string"
+          },
+          "storedSize": {
+            "type": "string"
+          },
+          "decodedSize": {
+            "type": "string"
+          },
+          "contentHash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "version",
+          "codec",
+          "alignment",
+          "offset",
+          "storedSize",
+          "decodedSize",
+          "contentHash"
+        ]
+      },
+      "VegetationCellSectionKindDto": {
+        "type": "string",
+        "enum": [
+          "macro-points",
+          "micro-fields",
+          "provenance",
+          "rejection-diagnostics",
+          "surface-attachments",
+          "surface-dependencies",
+          "render-references",
+          "render-bounds",
+          "collision-inputs",
+          "navigation-contributions",
+          "ecology-boundary",
+          "ecology-checkpoint"
+        ]
+      },
+      "VegetationCellSummaryDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "map": {
+            "type": "string"
+          },
+          "manifest": {
+            "type": "string"
+          },
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "contentHash": {
+            "type": "string"
+          },
+          "cookKey": {
+            "type": "string"
+          },
+          "platformProfile": {
+            "type": "string"
+          },
+          "payloadHash": {
+            "type": "string"
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/WorldBoundsDto"
+          },
+          "macroPoints": {
+            "type": "string"
+          },
+          "microSamples": {
+            "type": "string"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationCellSectionDto"
+            }
+          }
+        },
+        "required": [
+          "map",
+          "manifest",
+          "cell",
+          "contentHash",
+          "cookKey",
+          "platformProfile",
+          "payloadHash",
+          "bounds",
+          "macroPoints",
+          "microSamples",
+          "sections"
         ]
       },
       "VegetationCompileBiomeParams": {
@@ -13729,6 +15287,469 @@
               "biomeInstance"
             ]
           }
+        ]
+      },
+      "VegetationCookJobDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "job": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "completed",
+              "cancelled",
+              "superseded",
+              "failed"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/VegetationCookScopeDto"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/VegetationCookProgressDto"
+          }
+        },
+        "required": [
+          "job",
+          "state",
+          "scope",
+          "progress"
+        ]
+      },
+      "VegetationCookJobParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "job": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job"
+        ]
+      },
+      "VegetationCookJobStateDto": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "completed",
+          "cancelled",
+          "superseded",
+          "failed"
+        ]
+      },
+      "VegetationCookNodeAddressDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "family": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "plant"
+              }
+            },
+            "required": [
+              "kind",
+              "family"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "map": {
+                "type": "string"
+              },
+              "biomeInstance": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "stage": {
+                "type": "string"
+              },
+              "owner": {
+                "$ref": "#/components/schemas/WorldCellDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "global-stage"
+              }
+            },
+            "required": [
+              "kind",
+              "map",
+              "biomeInstance",
+              "stage",
+              "owner"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "map": {
+                "type": "string"
+              },
+              "cell": {
+                "$ref": "#/components/schemas/WorldCellDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "cell"
+              }
+            },
+            "required": [
+              "kind",
+              "map",
+              "cell"
+            ]
+          }
+        ]
+      },
+      "VegetationCookParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "map": {
+            "$ref": "#/components/schemas/AssetSelector"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/VegetationCookScopeDto"
+          },
+          "platformProfile": {
+            "type": "string"
+          },
+          "workers": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
+        },
+        "required": [
+          "map",
+          "scope"
+        ]
+      },
+      "VegetationCookPlatformProfileDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string"
+          },
+          "contentProfile": {
+            "type": "string"
+          },
+          "toolchain": {
+            "type": "string"
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "identity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "contentProfile",
+          "toolchain",
+          "features",
+          "identity"
+        ]
+      },
+      "VegetationCookProgressDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "completedNodes": {
+            "type": "string"
+          },
+          "totalNodes": {
+            "type": "string"
+          },
+          "cacheHits": {
+            "type": "string"
+          },
+          "publishedCells": {
+            "type": "string"
+          },
+          "current": {
+            "$ref": "#/components/schemas/VegetationCookNodeAddressDto"
+          }
+        },
+        "required": [
+          "completedNodes",
+          "totalNodes",
+          "cacheHits",
+          "publishedCells"
+        ]
+      },
+      "VegetationCookRejectionTotalDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "surface-miss",
+              "threshold",
+              "weighted-elimination",
+              "priority-exclusion",
+              "competition",
+              "foreign-owner",
+              "no-species"
+            ]
+          },
+          "count": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "count"
+        ]
+      },
+      "VegetationCookScopeDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "all"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "bounds": {
+                "$ref": "#/components/schemas/WorldBoundsDto"
+              },
+              "level": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "kind": {
+                "type": "string",
+                "const": "bounds"
+              }
+            },
+            "required": [
+              "kind",
+              "bounds",
+              "level"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "cells": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WorldCellDto"
+                }
+              },
+              "kind": {
+                "type": "string",
+                "const": "cells"
+              }
+            },
+            "required": [
+              "kind",
+              "cells"
+            ]
+          }
+        ]
+      },
+      "VegetationCookStatisticsDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "nodes": {
+            "type": "string"
+          },
+          "elapsedMicros": {
+            "type": "string"
+          },
+          "peakMemoryBytes": {
+            "type": "string"
+          },
+          "inputBytes": {
+            "type": "string"
+          },
+          "outputBytes": {
+            "type": "string"
+          },
+          "cacheHits": {
+            "type": "string"
+          },
+          "cacheMisses": {
+            "type": "string"
+          },
+          "publishedCells": {
+            "type": "string"
+          },
+          "rejections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationCookRejectionTotalDto"
+            }
+          }
+        },
+        "required": [
+          "nodes",
+          "elapsedMicros",
+          "peakMemoryBytes",
+          "inputBytes",
+          "outputBytes",
+          "cacheHits",
+          "cacheMisses",
+          "publishedCells",
+          "rejections"
+        ]
+      },
+      "VegetationCookStatusDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "job": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "completed",
+              "cancelled",
+              "superseded",
+              "failed"
+            ]
+          },
+          "progress": {
+            "$ref": "#/components/schemas/VegetationCookProgressDto"
+          },
+          "statistics": {
+            "$ref": "#/components/schemas/VegetationCookStatisticsDto"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/VegetationBaseManifestDto"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ControlFailureDto"
+          }
+        },
+        "required": [
+          "job",
+          "state",
+          "progress"
+        ]
+      },
+      "VegetationCookVersionSetDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compiler": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "evaluator": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "numeric": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "simulation": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "schema",
+          "compiler",
+          "evaluator",
+          "numeric",
+          "simulation"
+        ]
+      },
+      "VegetationCookWorkActualDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "elapsedMicros": {
+            "type": "string"
+          },
+          "peakMemoryBytes": {
+            "type": "string"
+          },
+          "inputBytes": {
+            "type": "string"
+          },
+          "outputBytes": {
+            "type": "string"
+          },
+          "rejectionCount": {
+            "type": "string"
+          },
+          "cacheHit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "elapsedMicros",
+          "peakMemoryBytes",
+          "inputBytes",
+          "outputBytes",
+          "rejectionCount",
+          "cacheHit"
+        ]
+      },
+      "VegetationCookWorkEstimateDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "workUnits": {
+            "type": "string"
+          },
+          "peakMemoryBytes": {
+            "type": "string"
+          },
+          "inputBytes": {
+            "type": "string"
+          },
+          "outputBytes": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workUnits",
+          "peakMemoryBytes",
+          "inputBytes",
+          "outputBytes"
         ]
       },
       "VegetationDiagnosticCandidateSampleDto": {
@@ -13917,43 +15938,6 @@
           }
         ]
       },
-      "VegetationEvaluateRegionParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "map": {
-            "type": "string"
-          },
-          "biomeInstance": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{32}$",
-            "minLength": 32,
-            "maxLength": 32
-          },
-          "bounds": {
-            "$ref": "#/components/schemas/WorldBoundsDto"
-          },
-          "level": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 255
-          },
-          "ecologyTick": {
-            "type": "string"
-          },
-          "workers": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 65535
-          }
-        },
-        "required": [
-          "map",
-          "biomeInstance",
-          "bounds",
-          "level"
-        ]
-      },
       "VegetationEvaluationJobDto": {
         "type": "object",
         "additionalProperties": false,
@@ -13964,20 +15948,21 @@
           "state": {
             "type": "string",
             "enum": [
+              "prepared",
               "running",
               "completed",
               "cancelled",
               "failed"
             ]
           },
-          "cells": {
-            "type": "string"
+          "preflight": {
+            "$ref": "#/components/schemas/VegetationEvaluationPreflightDto"
           }
         },
         "required": [
           "job",
           "state",
-          "cells"
+          "preflight"
         ]
       },
       "VegetationEvaluationJobParams": {
@@ -13995,10 +15980,81 @@
       "VegetationEvaluationJobStateDto": {
         "type": "string",
         "enum": [
+          "prepared",
           "running",
           "completed",
           "cancelled",
           "failed"
+        ]
+      },
+      "VegetationEvaluationPreflightDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "outputCells": {
+            "type": "string"
+          },
+          "globalStageTiles": {
+            "type": "string"
+          },
+          "inputTiles": {
+            "type": "string"
+          },
+          "retainedInputBytes": {
+            "type": "string"
+          },
+          "generatedInputBytes": {
+            "type": "string"
+          },
+          "candidateCount": {
+            "type": "string"
+          },
+          "acceptedCount": {
+            "type": "string"
+          },
+          "microSamples": {
+            "type": "string"
+          },
+          "preflightPeakBytes": {
+            "type": "string"
+          },
+          "executionPeakBytes": {
+            "type": "string"
+          },
+          "memoryBytes": {
+            "type": "string"
+          },
+          "transferBytes": {
+            "type": "string"
+          },
+          "workerCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "timeLimitMs": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/VegetationGraphLimitsDto"
+          }
+        },
+        "required": [
+          "outputCells",
+          "globalStageTiles",
+          "inputTiles",
+          "retainedInputBytes",
+          "generatedInputBytes",
+          "candidateCount",
+          "acceptedCount",
+          "microSamples",
+          "preflightPeakBytes",
+          "executionPeakBytes",
+          "memoryBytes",
+          "transferBytes",
+          "workerCount",
+          "timeLimitMs",
+          "limits"
         ]
       },
       "VegetationEvaluationStatusDto": {
@@ -14011,22 +16067,27 @@
           "state": {
             "type": "string",
             "enum": [
+              "prepared",
               "running",
               "completed",
               "cancelled",
               "failed"
             ]
           },
+          "preflight": {
+            "$ref": "#/components/schemas/VegetationEvaluationPreflightDto"
+          },
           "summary": {
             "$ref": "#/components/schemas/VegetationEvaluationSummaryDto"
           },
           "error": {
-            "type": "string"
+            "$ref": "#/components/schemas/ControlFailureDto"
           }
         },
         "required": [
           "job",
-          "state"
+          "state",
+          "preflight"
         ]
       },
       "VegetationEvaluationSummaryDto": {
@@ -14242,6 +16303,309 @@
           "kind",
           "identity",
           "contentHash"
+        ]
+      },
+      "VegetationGraphDiagnosticDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "numeric-overflow"
+              }
+            },
+            "required": [
+              "category"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "resource": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "memory-reservation"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "resource",
+              "reason"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "worker-spawn"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "reason"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "worker-panicked"
+              }
+            },
+            "required": [
+              "category"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "document"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "path",
+              "reason"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "category": {
+                "type": "string",
+                "const": "cycle"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "node"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "fromNode": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "fromPin": {
+                "type": "string"
+              },
+              "fromDomain": {
+                "type": "string"
+              },
+              "toNode": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "toPin": {
+                "type": "string"
+              },
+              "toDomain": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "type-mismatch"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "fromNode",
+              "fromPin",
+              "fromDomain",
+              "toNode",
+              "toPin",
+              "toDomain"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "reason": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "authority"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "node",
+              "reason"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "category": {
+                "type": "string",
+                "const": "unbounded-influence"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "node"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "resource": {
+                "type": "string"
+              },
+              "requested": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "limit"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "resource",
+              "requested",
+              "limit"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "category": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "category"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "input": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "authoritative-input"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "node",
+              "input"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "node": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "profile": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "gpu-qualification"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "node",
+              "profile"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "profile": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string",
+                "const": "gpu-execution"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "profile",
+              "reason"
+            ]
+          }
         ]
       },
       "VegetationGraphEstimateDto": {
@@ -14851,11 +17215,153 @@
           }
         ]
       },
-      "VegetationManifestDependencyDto": {
+      "VegetationManifestCellDependencyDto": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "id": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "contentHash": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "neighbour",
+              "halo",
+              "ancestor",
+              "global-stage"
+            ]
+          },
+          "haloBits": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cell",
+          "contentHash",
+          "role",
+          "haloBits"
+        ]
+      },
+      "VegetationManifestCellDependencyRoleDto": {
+        "type": "string",
+        "enum": [
+          "neighbour",
+          "halo",
+          "ancestor",
+          "global-stage"
+        ]
+      },
+      "VegetationManifestCellDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/WorldBoundsDto"
+          },
+          "artifactHash": {
+            "type": "string"
+          },
+          "payloadHash": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestCellDependencyDto"
+            }
+          },
+          "speciesCounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationSpeciesCountDto"
+            }
+          },
+          "macroCount": {
+            "type": "string"
+          },
+          "microCount": {
+            "type": "string"
+          },
+          "residentMemoryBytes": {
+            "type": "string"
+          },
+          "storedBytes": {
+            "type": "string"
+          },
+          "estimate": {
+            "$ref": "#/components/schemas/VegetationCookWorkEstimateDto"
+          },
+          "actual": {
+            "$ref": "#/components/schemas/VegetationCookWorkActualDto"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestCellSectionDto"
+            }
+          }
+        },
+        "required": [
+          "cell",
+          "bounds",
+          "artifactHash",
+          "payloadHash",
+          "dependencies",
+          "speciesCounts",
+          "macroCount",
+          "microCount",
+          "residentMemoryBytes",
+          "storedBytes",
+          "estimate",
+          "actual",
+          "sections"
+        ]
+      },
+      "VegetationManifestCellSectionDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "macro-points",
+              "micro-fields",
+              "provenance",
+              "rejection-diagnostics",
+              "surface-attachments",
+              "surface-dependencies",
+              "render-references",
+              "render-bounds",
+              "collision-inputs",
+              "navigation-contributions",
+              "ecology-boundary",
+              "ecology-checkpoint"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "codec": {
+            "type": "string",
+            "enum": [
+              "raw"
+            ]
+          },
+          "alignment": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "storedSize": {
+            "type": "string"
+          },
+          "decodedSize": {
             "type": "string"
           },
           "contentHash": {
@@ -14863,8 +17369,392 @@
           }
         },
         "required": [
-          "id",
+          "kind",
+          "version",
+          "codec",
+          "alignment",
+          "storedSize",
+          "decodedSize",
           "contentHash"
+        ]
+      },
+      "VegetationManifestDependencyAddressDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "asset": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "source-asset"
+              }
+            },
+            "required": [
+              "kind",
+              "asset"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "uri": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "source-file"
+              }
+            },
+            "required": [
+              "kind",
+              "uri"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "material": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "material-coverage"
+              }
+            },
+            "required": [
+              "kind",
+              "material"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "map": {
+                "type": "string"
+              },
+              "instance": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$",
+                "minLength": 32,
+                "maxLength": 32
+              },
+              "kind": {
+                "type": "string",
+                "const": "biome-ir"
+              }
+            },
+            "required": [
+              "kind",
+              "map",
+              "instance"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "map": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "map-manifest"
+              }
+            },
+            "required": [
+              "kind",
+              "map"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "map": {
+                "type": "string"
+              },
+              "key": {
+                "$ref": "#/components/schemas/VegetationMapChunkKeyDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "map-object"
+              }
+            },
+            "required": [
+              "kind",
+              "map",
+              "key"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "surface-provider"
+              }
+            },
+            "required": [
+              "kind",
+              "provider",
+              "revision"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/FieldChannelDto"
+              },
+              "bounds": {
+                "$ref": "#/components/schemas/WorldBoundsDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "surface-tile"
+              }
+            },
+            "required": [
+              "kind",
+              "provider",
+              "revision",
+              "bounds"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "namespace": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "const": "contract"
+              }
+            },
+            "required": [
+              "kind",
+              "namespace"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "node": {
+                "$ref": "#/components/schemas/VegetationCookNodeAddressDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "node"
+              }
+            },
+            "required": [
+              "kind",
+              "node"
+            ]
+          }
+        ]
+      },
+      "VegetationManifestDependencyDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "$ref": "#/components/schemas/VegetationManifestDependencyAddressDto"
+          },
+          "contentHash": {
+            "type": "string"
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/WorldBoundsDto"
+          },
+          "haloBits": {
+            "type": "integer"
+          },
+          "ancestorLevel": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          }
+        },
+        "required": [
+          "address",
+          "contentHash",
+          "haloBits"
+        ]
+      },
+      "VegetationManifestParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "map": {
+            "$ref": "#/components/schemas/AssetSelector"
+          },
+          "identity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "map"
+        ]
+      },
+      "VegetationManifestPlantDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sourceHash": {
+            "type": "string"
+          },
+          "artifactHash": {
+            "type": "string"
+          },
+          "localBoundsMinBits": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "localBoundsMaxBits": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "variationCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "phenotypeCount": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "family",
+          "tags",
+          "sourceHash",
+          "artifactHash",
+          "localBoundsMinBits",
+          "localBoundsMaxBits",
+          "variationCount",
+          "phenotypeCount"
+        ]
+      },
+      "VegetationManifestPointColumnDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "elementType": {
+            "type": "string",
+            "enum": [
+              "id128",
+              "world-cell",
+              "orientation",
+              "fixed-vec3",
+              "world-bounds",
+              "asset-uuid",
+              "u32",
+              "u64",
+              "optional-id128",
+              "unit",
+              "surface-projection",
+              "optional-surface-attachment",
+              "world-position"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "elementType"
+        ]
+      },
+      "VegetationManifestResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/VegetationBaseManifestDto"
+          },
+          "latestCook": {
+            "$ref": "#/components/schemas/VegetationCookStatisticsDto"
+          }
+        },
+        "required": [
+          "manifest"
+        ]
+      },
+      "VegetationMapChunkKeyDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "layer": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "tile": {
+            "$ref": "#/components/schemas/VegetationMapTileKeyDto"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "field",
+              "anchor-override",
+              "graph-instance",
+              "layer-metadata",
+              "editor-metadata"
+            ]
+          }
+        },
+        "required": [
+          "layer",
+          "tile",
+          "kind"
+        ]
+      },
+      "VegetationMapChunkKindDto": {
+        "type": "string",
+        "enum": [
+          "field",
+          "anchor-override",
+          "graph-instance",
+          "layer-metadata",
+          "editor-metadata"
         ]
       },
       "VegetationMapSummaryDto": {
@@ -14898,6 +17788,24 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 255
+          },
+          "validation": {
+            "$ref": "#/components/schemas/VegetationValidationSummaryDto"
+          },
+          "provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationSourceProvenanceDto"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationManifestDependencyDto"
+            }
+          },
+          "latestCook": {
+            "$ref": "#/components/schemas/VegetationCookStatisticsDto"
           }
         },
         "required": [
@@ -14907,7 +17815,42 @@
           "bounds",
           "layerCount",
           "biomeInstances",
-          "chunkLevel"
+          "chunkLevel",
+          "validation",
+          "provenance",
+          "dependencies"
+        ]
+      },
+      "VegetationMapTileKeyDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "global"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "cell": {
+                "$ref": "#/components/schemas/WorldCellDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "cell"
+              }
+            },
+            "required": [
+              "kind",
+              "cell"
+            ]
+          }
         ]
       },
       "VegetationMutationDto": {
@@ -15714,6 +18657,978 @@
         },
         "required": [
           "nodes"
+        ]
+      },
+      "VegetationPointColumnTypeDto": {
+        "type": "string",
+        "enum": [
+          "id128",
+          "world-cell",
+          "orientation",
+          "fixed-vec3",
+          "world-bounds",
+          "asset-uuid",
+          "u32",
+          "u64",
+          "optional-id128",
+          "unit",
+          "surface-projection",
+          "optional-surface-attachment",
+          "world-position"
+        ]
+      },
+      "VegetationPreflightRegionParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "map": {
+            "type": "string"
+          },
+          "biomeInstance": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/WorldBoundsDto"
+          },
+          "level": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "ecologyTick": {
+            "type": "string"
+          },
+          "workers": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
+        },
+        "required": [
+          "map",
+          "biomeInstance",
+          "bounds",
+          "level"
+        ]
+      },
+      "VegetationRuntimeAvailableStatusDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "world": {
+            "type": "string"
+          },
+          "map": {
+            "type": "string"
+          },
+          "manifestIdentity": {
+            "type": "string"
+          },
+          "persistentStateIdentity": {
+            "type": "string"
+          },
+          "persistentCells": {
+            "type": "string"
+          },
+          "persistentPlants": {
+            "type": "string"
+          },
+          "predictionCount": {
+            "type": "string"
+          },
+          "sourceCount": {
+            "type": "string"
+          },
+          "requestedCells": {
+            "type": "string"
+          },
+          "residentCells": {
+            "type": "string"
+          },
+          "requestedBytes": {
+            "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+          },
+          "residentBytes": {
+            "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+          },
+          "budgets": {
+            "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationRuntimePendingCellDto"
+            }
+          },
+          "regenerationCells": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorldCellDto"
+            }
+          }
+        },
+        "required": [
+          "world",
+          "map",
+          "manifestIdentity",
+          "persistentStateIdentity",
+          "persistentCells",
+          "persistentPlants",
+          "predictionCount",
+          "sourceCount",
+          "requestedCells",
+          "residentCells",
+          "requestedBytes",
+          "residentBytes",
+          "budgets",
+          "pending",
+          "regenerationCells"
+        ]
+      },
+      "VegetationRuntimeCellParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          }
+        },
+        "required": [
+          "cell"
+        ]
+      },
+      "VegetationRuntimeCellResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "manifestIdentity": {
+            "type": "string"
+          },
+          "residentFacets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "render",
+                "physics",
+                "simulation",
+                "editing",
+                "navigation",
+                "network"
+              ]
+            }
+          },
+          "macroPlants": {
+            "type": "string"
+          },
+          "microTiles": {
+            "type": "string"
+          },
+          "disturbanceMasks": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cell",
+          "generation",
+          "manifestIdentity",
+          "residentFacets",
+          "macroPlants",
+          "microTiles",
+          "disturbanceMasks"
+        ]
+      },
+      "VegetationRuntimeFacetBytesDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "render": {
+            "type": "string"
+          },
+          "physics": {
+            "type": "string"
+          },
+          "simulation": {
+            "type": "string"
+          },
+          "editing": {
+            "type": "string"
+          },
+          "navigation": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "render",
+          "physics",
+          "simulation",
+          "editing",
+          "navigation",
+          "network"
+        ]
+      },
+      "VegetationRuntimePendingCellDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "facets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "render",
+                "physics",
+                "simulation",
+                "editing",
+                "navigation",
+                "network"
+              ]
+            }
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "sourceRevision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cell",
+          "facets",
+          "priority",
+          "sourceRevision"
+        ]
+      },
+      "VegetationRuntimePlantDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "positionTicks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/WorldBoundsDto"
+          },
+          "family": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "seed",
+              "sprout",
+              "juvenile",
+              "mature",
+              "senescent",
+              "dead",
+              "stump",
+              "removed"
+            ]
+          },
+          "phenotype": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "interactionPolicy": {
+            "type": "string",
+            "enum": [
+              "decorative",
+              "interactive",
+              "harvestable",
+              "structural"
+            ]
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "moisture": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "fuel": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/ProvenanceDto"
+          }
+        },
+        "required": [
+          "plant",
+          "cell",
+          "generation",
+          "positionTicks",
+          "bounds",
+          "family",
+          "tags",
+          "lifecycle",
+          "phenotype",
+          "interactionPolicy",
+          "health",
+          "moisture",
+          "fuel"
+        ]
+      },
+      "VegetationRuntimePlantInspectParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "plant"
+        ]
+      },
+      "VegetationRuntimePlantInspectResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "resident": {
+            "$ref": "#/components/schemas/VegetationRuntimePlantDto"
+          },
+          "persistent": {
+            "$ref": "#/components/schemas/VegetationRuntimePlantStateDto"
+          }
+        },
+        "required": [
+          "plant"
+        ]
+      },
+      "VegetationRuntimePlantStateDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/WorldCellDto"
+          },
+          "cellRevision": {
+            "type": "string"
+          },
+          "added": {
+            "type": "boolean"
+          },
+          "tombstoned": {
+            "type": "boolean"
+          },
+          "positionTicks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "seed",
+              "sprout",
+              "juvenile",
+              "mature",
+              "senescent",
+              "dead",
+              "stump",
+              "removed"
+            ]
+          },
+          "phenotype": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ecologyTick": {
+            "type": "string"
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "moisture": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "fuel": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "interactionPolicy": {
+            "type": "string",
+            "enum": [
+              "decorative",
+              "interactive",
+              "harvestable",
+              "structural"
+            ]
+          },
+          "promoted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cell",
+          "cellRevision",
+          "added",
+          "tombstoned",
+          "promoted"
+        ]
+      },
+      "VegetationRuntimeQueryDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "bounds": {
+                "$ref": "#/components/schemas/WorldBoundsDto"
+              },
+              "kind": {
+                "type": "string",
+                "const": "bounds"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "bounds"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "centerTicks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "radiusM": {
+                "type": "number"
+              },
+              "kind": {
+                "type": "string",
+                "const": "radius"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "centerTicks",
+              "radiusM"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "originTicks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "direction": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "maxDistanceM": {
+                "type": "number"
+              },
+              "kind": {
+                "type": "string",
+                "const": "ray"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "originTicks",
+              "direction",
+              "maxDistanceM"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "positionTicks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "maxDistanceM": {
+                "type": "number"
+              },
+              "kind": {
+                "type": "string",
+                "const": "nearest"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "positionTicks"
+            ]
+          }
+        ]
+      },
+      "VegetationRuntimeQueryFilterDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "families": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requiredTags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "lifecycles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "seed",
+                "sprout",
+                "juvenile",
+                "mature",
+                "senescent",
+                "dead",
+                "stump",
+                "removed"
+              ]
+            }
+          },
+          "interactionPolicies": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "decorative",
+                "interactive",
+                "harvestable",
+                "structural"
+              ]
+            }
+          }
+        },
+        "required": [
+          "families",
+          "requiredTags",
+          "lifecycles",
+          "interactionPolicies"
+        ]
+      },
+      "VegetationRuntimeQueryHitDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plant": {
+            "$ref": "#/components/schemas/VegetationRuntimePlantDto"
+          },
+          "distanceM": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "plant"
+        ]
+      },
+      "VegetationRuntimeQueryParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "$ref": "#/components/schemas/VegetationRuntimeQueryDto"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/VegetationRuntimeQueryFilterDto"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "VegetationRuntimeQueryResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "matches": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "hits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationRuntimeQueryHitDto"
+            }
+          }
+        },
+        "required": [
+          "matches",
+          "truncated",
+          "hits"
+        ]
+      },
+      "VegetationRuntimeStatusDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "no-project",
+                  "no-enabled-field",
+                  "no-cooked-manifest",
+                  "fault"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "const": "unavailable"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "state",
+              "reason"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "world": {
+                "type": "string"
+              },
+              "map": {
+                "type": "string"
+              },
+              "manifestIdentity": {
+                "type": "string"
+              },
+              "persistentStateIdentity": {
+                "type": "string"
+              },
+              "persistentCells": {
+                "type": "string"
+              },
+              "persistentPlants": {
+                "type": "string"
+              },
+              "predictionCount": {
+                "type": "string"
+              },
+              "sourceCount": {
+                "type": "string"
+              },
+              "requestedCells": {
+                "type": "string"
+              },
+              "residentCells": {
+                "type": "string"
+              },
+              "requestedBytes": {
+                "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+              },
+              "residentBytes": {
+                "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+              },
+              "budgets": {
+                "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+              },
+              "pending": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/VegetationRuntimePendingCellDto"
+                }
+              },
+              "regenerationCells": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WorldCellDto"
+                }
+              },
+              "state": {
+                "type": "string",
+                "const": "available"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "state",
+              "world",
+              "map",
+              "manifestIdentity",
+              "persistentStateIdentity",
+              "persistentCells",
+              "persistentPlants",
+              "predictionCount",
+              "sourceCount",
+              "requestedCells",
+              "residentCells",
+              "requestedBytes",
+              "residentBytes",
+              "budgets",
+              "pending",
+              "regenerationCells"
+            ]
+          }
+        ]
+      },
+      "VegetationRuntimeUnavailableReasonDto": {
+        "type": "string",
+        "enum": [
+          "no-project",
+          "no-enabled-field",
+          "no-cooked-manifest",
+          "fault"
+        ]
+      },
+      "VegetationSeedNamespaceDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "name",
+          "namespace"
+        ]
+      },
+      "VegetationSourceProvenanceDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "sourceUri": {
+            "type": "string"
+          },
+          "licenseId": {
+            "type": "string"
+          },
+          "licenseUri": {
+            "type": "string"
+          },
+          "author": {
+            "type": "string"
+          },
+          "attribution": {
+            "type": "string"
+          },
+          "requiresAttribution": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "source",
+          "sourceUri",
+          "licenseId",
+          "licenseUri",
+          "author",
+          "attribution",
+          "requiresAttribution"
+        ]
+      },
+      "VegetationSpeciesCountDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "macroCount": {
+            "type": "string"
+          },
+          "microCount": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "family",
+          "macroCount",
+          "microCount"
+        ]
+      },
+      "VegetationStateImportParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "dataHex": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataHex"
+        ]
+      },
+      "VegetationStateSnapshotDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "manifestIdentity": {
+            "type": "string"
+          },
+          "contentHash": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "string"
+          },
+          "dataHex": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "manifestIdentity",
+          "contentHash",
+          "bytes",
+          "dataHex"
+        ]
+      },
+      "VegetationValidationIssueDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "error"
+            ]
+          },
+          "code": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "sourceSelector": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "code",
+          "path",
+          "message"
+        ]
+      },
+      "VegetationValidationSeverityDto": {
+        "type": "string",
+        "enum": [
+          "info",
+          "warning",
+          "error"
+        ]
+      },
+      "VegetationValidationSummaryDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationValidationIssueDto"
+            }
+          }
+        },
+        "required": [
+          "valid",
+          "issues"
         ]
       },
       "ViewModeDto": {

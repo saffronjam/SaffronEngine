@@ -933,11 +933,18 @@
       "fixture": "empty"
     },
     {
-      "name": "vegetation-evaluate-region",
-      "params": "VegetationEvaluateRegionParams",
+      "name": "vegetation-preflight-region",
+      "params": "VegetationPreflightRegionParams",
       "result": "VegetationEvaluationJobDto",
       "status": "typed",
       "skip": "requires an imported vegetation map and bound biome instance"
+    },
+    {
+      "name": "vegetation-start-evaluation",
+      "params": "VegetationEvaluationJobParams",
+      "result": "VegetationEvaluationJobDto",
+      "status": "typed",
+      "skip": "requires a prepared vegetation evaluation job"
     },
     {
       "name": "vegetation-evaluation-status",
@@ -959,6 +966,97 @@
       "result": "ProvenanceExplanationDto",
       "status": "typed",
       "skip": "requires a completed vegetation evaluation and point identity"
+    },
+    {
+      "name": "vegetation-cook",
+      "params": "VegetationCookParams",
+      "result": "VegetationCookJobDto",
+      "status": "typed",
+      "skip": "requires an imported vegetation map and its exact source dependencies"
+    },
+    {
+      "name": "vegetation-cook-status",
+      "params": "VegetationCookJobParams",
+      "result": "VegetationCookStatusDto",
+      "status": "typed",
+      "skip": "requires a prior vegetation cook job"
+    },
+    {
+      "name": "vegetation-cancel-cook",
+      "params": "VegetationCookJobParams",
+      "result": "VegetationCookStatusDto",
+      "status": "typed",
+      "skip": "requires a running vegetation cook job"
+    },
+    {
+      "name": "vegetation-cell-inspect",
+      "params": "VegetationCellInspectParams",
+      "result": "VegetationCellInspectResult",
+      "status": "typed",
+      "skip": "requires a completed manifest and content-addressed cell artifact"
+    },
+    {
+      "name": "vegetation-manifest",
+      "params": "VegetationManifestParams",
+      "result": "VegetationManifestResult",
+      "status": "typed",
+      "skip": "requires a completed vegetation cook"
+    },
+    {
+      "name": "vegetation-runtime-status",
+      "params": "EmptyParams",
+      "result": "VegetationRuntimeStatusDto",
+      "status": "typed",
+      "skip": "requires an enabled VegetationField and completed vegetation cook"
+    },
+    {
+      "name": "vegetation-runtime-cell",
+      "params": "VegetationRuntimeCellParams",
+      "result": "VegetationRuntimeCellResult",
+      "status": "typed",
+      "skip": "requires a CPU-resident cooked vegetation cell"
+    },
+    {
+      "name": "vegetation-runtime-query",
+      "params": "VegetationRuntimeQueryParams",
+      "result": "VegetationRuntimeQueryResult",
+      "status": "typed",
+      "skip": "requires CPU-resident cooked macro vegetation"
+    },
+    {
+      "name": "vegetation-runtime-inspect",
+      "params": "VegetationRuntimePlantInspectParams",
+      "result": "VegetationRuntimePlantInspectResult",
+      "status": "typed",
+      "skip": "requires a resident plant or persistent plant delta"
+    },
+    {
+      "name": "vegetation-state-export",
+      "params": "EmptyParams",
+      "result": "VegetationStateSnapshotDto",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
+      "name": "vegetation-state-import",
+      "params": "VegetationStateImportParams",
+      "result": "VegetationStateSnapshotDto",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation and snapshot"
+    },
+    {
+      "name": "plant-validate",
+      "params": "PlantValidateParams",
+      "result": "PlantValidationResult",
+      "status": "typed",
+      "skip": "requires an imported plant-family asset"
+    },
+    {
+      "name": "plant-recook",
+      "params": "PlantRecookParams",
+      "result": "PlantRecookResult",
+      "status": "typed",
+      "skip": "requires an imported plant family and its retained source recipe"
     },
     {
       "name": "get-project",
