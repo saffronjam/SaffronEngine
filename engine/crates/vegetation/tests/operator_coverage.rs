@@ -23,7 +23,7 @@ use saffron_vegetation::{
     GraphParameterType, GraphParameterValue, GraphSink, GraphSpatialRequirement, NodeSpatialPolicy,
     PlantPrototype, QuantizedFieldTileValues, QuantizedSurfaceFieldValue, Result, SuccessionRule,
     SuitabilityBinding, canonical_surface_provider_set_hash, compile_biome_graph,
-    vegetation_content_hash,
+    precompute_surface_field_tile, vegetation_content_hash,
 };
 
 const FAMILY_A: Uuid = Uuid(7_001);
@@ -1720,6 +1720,7 @@ impl CanonicalSurfaceProvider {
                 revision: SurfaceRevision(3),
                 bounds: WorldBounds::new([-1_000_000_000_000; 3], [1_000_000_000_000; 3]).unwrap(),
                 primitive_count: 1,
+                max_tags_per_hit: 2,
                 capabilities: SurfaceCapabilities {
                     ray: true,
                     project: true,
@@ -1939,7 +1940,7 @@ impl SurfaceField for CanonicalSurfaceProvider {
 }
 
 #[test]
-fn canonical_provider_drives_projection_and_all_field_derivatives_through_replay() {
+fn canonical_provider_precomputes_all_derivatives_and_replays_live_queries() {
     let region = node(601, O::RegionInput);
     let mut coverage = node(602, O::StratifiedCoverage);
     coverage
@@ -2035,7 +2036,7 @@ fn canonical_provider_drives_projection_and_all_field_derivatives_through_replay
     let provider = Arc::new(CanonicalSurfaceProvider::new());
     let provider_dyn: Arc<dyn SurfaceField> = provider.clone();
     let provider_hash =
-        canonical_surface_provider_set_hash(std::slice::from_ref(&provider_dyn)).unwrap();
+        canonical_surface_provider_set_hash(std::slice::from_ref(&provider_dyn), 1).unwrap();
     let mut root = asset(document);
     root.policy.maximum_influence_radius = DecisionScalar::from_bits(64 * 65_536);
     let resolver = FixtureResolver {
@@ -2073,7 +2074,107 @@ fn canonical_provider_drives_projection_and_all_field_derivatives_through_replay
             value_quantum_bits: 1,
         }]
     );
-    let result = evaluate_partitioned(&root, &resolver, input);
+    let descriptor = provider
+        .authoritative_tiles(FieldChannel::Altitude, input.read_bounds)
+        .pop()
+        .unwrap();
+    let cancellation = GraphCancellationToken::default();
+    for (derivative, expected) in [
+        (
+            FieldDerivative::Value,
+            QuantizedFieldTileValues::Scalar(vec![12_345; 8]),
+        ),
+        (
+            FieldDerivative::Gradient,
+            QuantizedFieldTileValues::Gradient(vec![[100, 200, 300]; 8]),
+        ),
+        (
+            FieldDerivative::Hessian,
+            QuantizedFieldTileValues::Hessian(vec![[400, 500, 600, 700, 800, 900]; 8]),
+        ),
+    ] {
+        let tile = precompute_surface_field_tile(
+            provider.as_ref(),
+            descriptor,
+            FieldChannel::Altitude,
+            derivative,
+            provider_hash,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(tile.values, expected);
+    }
+    let evaluator = BiomeGraphEvaluator::new(Arc::new(graph), 1).unwrap();
+    let live_job = GraphEvaluationJobInputs {
+        cells: vec![input],
+        global_stages: Vec::new(),
+    };
+    let live_bound = evaluator.preflight(&live_job, &cancellation).unwrap();
+    let mut result = evaluator
+        .evaluate(live_job, &cancellation)
+        .unwrap()
+        .cells
+        .pop()
+        .unwrap();
+    assert!(live_bound.input_tiles >= 3);
+    let mut replay_input = evaluation_input(evaluator.graph());
+    let replay_bounds = replay_input.output_bounds;
+    replay_input
+        .set_hierarchical_region(611, replay_bounds)
+        .unwrap();
+    replay_input.surface_provider_set_hash = provider_hash;
+    replay_input.surface_projection_tiles = result.surface_projection_tiles.clone();
+    replay_input.surface_field_query_tiles = result.surface_field_query_tiles.clone();
+    let mut mismatched_projection = replay_input.clone();
+    mismatched_projection.surface_projection_tiles[0].provider_set_hash = [0xA5; 32];
+    let error = evaluator
+        .preflight(
+            &GraphEvaluationJobInputs {
+                cells: vec![mismatched_projection],
+                global_stages: Vec::new(),
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        saffron_vegetation::Error::GraphDocument { path, .. }
+            if path == "evaluation.surfaceProjectionTiles"
+    ));
+    let mut mismatched_field_query = replay_input.clone();
+    mismatched_field_query.surface_field_query_tiles[0].provider_set_hash = [0x5A; 32];
+    let error = evaluator
+        .preflight(
+            &GraphEvaluationJobInputs {
+                cells: vec![mismatched_field_query],
+                global_stages: Vec::new(),
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        saffron_vegetation::Error::GraphDocument { path, .. }
+            if path == "evaluation.surfaceFieldQueryTiles"
+    ));
+    let replay_job = GraphEvaluationJobInputs {
+        cells: vec![replay_input],
+        global_stages: Vec::new(),
+    };
+    let replay_bound = evaluator.preflight(&replay_job, &cancellation).unwrap();
+    assert_eq!(replay_bound.input_tiles, 3);
+    let replay = evaluator
+        .evaluate(replay_job, &cancellation)
+        .unwrap()
+        .cells
+        .pop()
+        .unwrap();
+    assert_eq!(
+        replay.canonical_byte_len().unwrap(),
+        replay.canonical_bytes().unwrap().len()
+    );
+    assert!(replay_bound.memory_bytes >= replay.canonical_bytes().unwrap().len() as u64);
+    result = replay;
     assert_eq!(result.surface_projection_tiles.len(), 1);
     let projection_tile = &result.surface_projection_tiles[0];
     assert_eq!(projection_tile.node, 603);
@@ -2104,7 +2205,7 @@ fn canonical_provider_drives_projection_and_all_field_derivatives_through_replay
             ]
         );
     }
-    assert_eq!(result.surface_field_query_tiles.len(), 3);
+    assert_eq!(result.surface_field_query_tiles.len(), 1);
     for tile in &result.surface_field_query_tiles {
         assert_eq!(tile.channel, FieldChannel::Altitude);
         assert_eq!(tile.provider_set_hash, provider_hash);

@@ -12,6 +12,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ControlFailureDto } from "@saffron/protocol";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO = join(HERE, "..", "..");
@@ -21,6 +22,17 @@ export const ENGINE_BIN =
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const IS_MACOS = process.platform === "darwin";
+
+/// A rejected engine command carrying the exact shared control failure.
+export class EngineCallError extends Error {
+  constructor(
+    readonly command: string,
+    readonly failure: ControlFailureDto,
+  ) {
+    super(`${command}: ${failure.message}`);
+    this.name = "EngineCallError";
+  }
+}
 
 /// macOS has no Wayland compositor; the offscreen host needs none. It needs MoltenVK's ICD plus
 /// Homebrew's validation-layer manifest and dynamic-library directory. Applied only when Vulkan
@@ -211,7 +223,9 @@ export class Engine {
         }
         clearTimeout(timer);
         socket.end();
-        let envelope: { ok?: boolean; result?: T; error?: string };
+        let envelope:
+          | { id: unknown; ok: true; result: T }
+          | { id: unknown; ok: false; error: ControlFailureDto };
         try {
           envelope = JSON.parse(data.slice(0, nl));
         } catch (err) {
@@ -219,9 +233,9 @@ export class Engine {
           return;
         }
         if (envelope.ok === false) {
-          reject(new Error(`${cmd}: ${envelope.error}`));
+          reject(new EngineCallError(cmd, envelope.error));
         } else {
-          resolve(envelope.result as T);
+          resolve(envelope.result);
         }
       });
       socket.on("error", (err) => {
