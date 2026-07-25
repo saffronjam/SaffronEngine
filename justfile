@@ -275,7 +275,7 @@ compute-conformance:
     cd "{{engine}}"
     cargo run -p xtask -- shaders
     {{gpu_driver}}
-    cargo run -p saffron-rendering --example compute_conformance
+    cargo run -p saffron-vegetation-gpu --example compute_conformance
 
 # start the editor: build the engine host + the CEF shell, verify CEF's staged runtime, start Vite,
 # then launch the shell pointed at it (the shell spawns the host as a child).
