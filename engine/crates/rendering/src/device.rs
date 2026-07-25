@@ -71,11 +71,7 @@ pub enum SurfaceSource<'a> {
 pub trait WindowSurface: HasDisplayHandle + HasWindowHandle {}
 impl<T: HasDisplayHandle + HasWindowHandle> WindowSurface for T {}
 
-/// Resolved optional-feature flags, probed once at device creation.
-///
-/// Optional features never gate device selection — a software (llvmpipe) device
-/// reports `rt_supported == false` and is created and used regardless, the
-/// degradation the unit test asserts.
+/// Resolved required and optional capabilities, probed once at device creation.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Capabilities {
     /// KHR acceleration-structure + ray-query present and enabled.
@@ -136,6 +132,14 @@ pub struct Capabilities {
     pub max_per_stage_descriptor_update_after_bind_sampled_images: u32,
     /// Per-set sampled-image limit for update-after-bind descriptors.
     pub max_descriptor_set_update_after_bind_sampled_images: u32,
+    /// Per-stage sampler limit for update-after-bind descriptors.
+    pub max_per_stage_descriptor_update_after_bind_samplers: u32,
+    /// Per-set sampler limit for update-after-bind descriptors.
+    pub max_descriptor_set_update_after_bind_samplers: u32,
+    /// Total update-after-bind resources visible to one shader stage.
+    pub max_per_stage_update_after_bind_resources: u32,
+    /// Maximum equal capacity of each bindless array after accounting for the full set layout.
+    pub max_bindless_array_elements: u32,
     /// Native subgroup width.
     pub subgroup_size: u32,
     /// Shader stages supporting subgroup operations.
@@ -144,6 +148,18 @@ pub struct Capabilities {
     pub subgroup_supported_operations: vk::SubgroupFeatureFlags,
     /// Quad operations are supported in every advertised subgroup stage.
     pub subgroup_quad_operations_in_all_stages: bool,
+    /// Required subgroup sizes may be selected per pipeline stage.
+    pub subgroup_size_control: bool,
+    /// Compute workgroups can require complete subgroups.
+    pub compute_full_subgroups: bool,
+    /// Smallest selectable subgroup size.
+    pub min_subgroup_size: u32,
+    /// Largest selectable subgroup size.
+    pub max_subgroup_size: u32,
+    /// Maximum subgroups in one compute workgroup.
+    pub max_compute_workgroup_subgroups: u32,
+    /// Stages that accept a required subgroup size.
+    pub required_subgroup_size_stages: vk::ShaderStageFlags,
     /// `PhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructureIndirectBuild`: a BLAS
     /// can be built with a GPU-provided primitive count. Only meaningful when
     /// [`Capabilities::rt_supported`].
@@ -271,8 +287,7 @@ pub struct Device {
     // Drop go through it; on a software device it stays `None` and every RT path is a no-op.
     accel: Option<accel::Device>,
     // The `VK_EXT_mesh_shader` device dispatch (`cmd_draw_mesh_tasks`), present only when
-    // mesh shaders are enabled.
-    // where the meshlet raster path never runs and the index-draw path serves every mesh.
+    // mesh shaders are enabled; `None` on hardware/llvmpipe without the extension.
     mesh_shader: Option<ash::ext::mesh_shader::Device>,
     // The `VK_EXT_calibrated_timestamps` device dispatch,
     // present only when the extension is enabled and both the device and the
@@ -304,6 +319,31 @@ fn timestamp_valid_mask(valid_bits: u32) -> u64 {
     } else {
         (1u64 << valid_bits) - 1
     }
+}
+
+fn normalized_timestamp_masks(
+    graphics_valid_bits: u32,
+    compute_valid_bits: Option<u32>,
+) -> (u64, u64, Option<u64>) {
+    let compute_valid_bits = compute_valid_bits.filter(|bits| *bits != 0);
+    let common_valid_bits = compute_valid_bits
+        .map(|bits| bits.min(graphics_valid_bits))
+        .unwrap_or(graphics_valid_bits);
+    (
+        timestamp_valid_mask(common_valid_bits),
+        timestamp_valid_mask(graphics_valid_bits),
+        compute_valid_bits.map(timestamp_valid_mask),
+    )
+}
+
+fn resolve_rt_capabilities(
+    extensions_available: bool,
+    acceleration_structure: bool,
+    ray_query: bool,
+    indirect_build: bool,
+) -> (bool, bool) {
+    let rt_supported = extensions_available && acceleration_structure && ray_query;
+    (rt_supported, rt_supported && indirect_build)
 }
 
 impl Device {
@@ -392,6 +432,7 @@ impl Device {
             physical_device,
             graphics_queue_family,
             selection.compute_queue,
+            &selection.capabilities,
             require_present,
         )?;
         // SAFETY: the family/index pair was just used to create the device with one
@@ -544,8 +585,7 @@ impl Device {
     }
 
     /// The `VK_EXT_mesh_shader` device dispatch (`cmd_draw_mesh_tasks`), present only when
-    /// [`Capabilities::mesh_shader`]. The meshlet raster path records its draws through
-    /// it; `None` on hardware/llvmpipe without the extension, where the index-draw path serves.
+    /// [`Capabilities::mesh_shader`]; `None` on hardware/llvmpipe without the extension.
     pub fn mesh_shader_dispatch(&self) -> Option<&ash::ext::mesh_shader::Device> {
         self.mesh_shader.as_ref()
     }
@@ -607,11 +647,8 @@ impl Device {
         let graphics_valid_bits = families
             .get(self.graphics_queue_family as usize)
             .map_or(0, |f| f.timestamp_valid_bits);
-        let compute_valid_bits = self.compute_timestamp_valid_bits.filter(|bits| *bits != 0);
-        let common_valid_bits = compute_valid_bits
-            .map(|bits| bits.min(graphics_valid_bits))
-            .unwrap_or(graphics_valid_bits);
-        let timestamp_mask = timestamp_valid_mask(common_valid_bits);
+        let (timestamp_mask, graphics_timestamp_mask, compute_timestamp_mask) =
+            normalized_timestamp_masks(graphics_valid_bits, self.compute_timestamp_valid_bits);
         let device_name = props
             .device_name_as_c_str()
             .ok()
@@ -621,8 +658,8 @@ impl Device {
         ProfilerFacts {
             timestamp_period: props.limits.timestamp_period,
             timestamp_mask,
-            graphics_timestamp_mask: timestamp_valid_mask(graphics_valid_bits),
-            compute_timestamp_mask: compute_valid_bits.map(timestamp_valid_mask),
+            graphics_timestamp_mask,
+            compute_timestamp_mask,
             timestamps_supported: graphics_valid_bits != 0,
             pipeline_stats_supported: self.capabilities.pipeline_stats,
             calibration_available: self.calibrated_ts.is_some(),
@@ -1132,7 +1169,7 @@ impl DevicePreference {
 /// optional features.
 ///
 /// The required features (`runtimeDescriptorArray`, `descriptorBindingPartiallyBound`,
-/// `bufferDeviceAddress`, `dynamicRendering`, `synchronization2`) gate selection;
+/// `bufferDeviceAddress`, `timelineSemaphore`, `dynamicRendering`, `synchronization2`) gate selection;
 /// RT / fill-mode-non-solid / memory-budget / pipeline-stats are probed and never
 /// gate (the degradation the unit test asserts on llvmpipe).
 ///
@@ -1250,9 +1287,7 @@ fn evaluate_device(
         ));
     }
     if features11.shader_draw_parameters == 0 {
-        return Err(format!(
-            "{name}: missing required shaderDrawParameters"
-        ));
+        return Err(format!("{name}: missing required shaderDrawParameters"));
     }
 
     if features12.runtime_descriptor_array == 0
@@ -1264,6 +1299,9 @@ fn evaluate_device(
         return Err(format!(
             "{name}: missing required descriptor-indexing features"
         ));
+    }
+    if features12.timeline_semaphore == 0 {
+        return Err(format!("{name}: missing required timelineSemaphore"));
     }
     if features13.dynamic_rendering == 0 || features13.synchronization2 == 0 {
         return Err(format!(
@@ -1395,7 +1433,9 @@ fn probe_optional_features(
 
     let has_as = has_ext(ash::khr::acceleration_structure::NAME);
     let has_rq = has_ext(ash::khr::ray_query::NAME);
-    let (rt_supported, acceleration_structure_indirect_build) = if has_as && has_rq {
+    let has_deferred = has_ext(ash::khr::deferred_host_operations::NAME);
+    let (rt_supported, acceleration_structure_indirect_build) = if has_as && has_rq && has_deferred
+    {
         let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
         let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
@@ -1403,9 +1443,12 @@ fn probe_optional_features(
             .push_next(&mut rq_feat);
         // SAFETY: the ash seam. Fills the chained RT feature structs.
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
-        let rt = as_feat.acceleration_structure != 0 && rq_feat.ray_query != 0;
-        // Indirect builds are meaningful only when acceleration structures are enabled.
-        (rt, rt && as_feat.acceleration_structure_indirect_build != 0)
+        resolve_rt_capabilities(
+            true,
+            as_feat.acceleration_structure != 0,
+            rq_feat.ray_query != 0,
+            as_feat.acceleration_structure_indirect_build != 0,
+        )
     } else {
         (false, false)
     };
@@ -1413,10 +1456,12 @@ fn probe_optional_features(
     let mesh_extension = has_ext(ash::ext::mesh_shader::NAME);
     let mut features11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut features11)
-        .push_next(&mut features12);
+        .push_next(&mut features12)
+        .push_next(&mut features13);
     if mesh_extension {
         features2 = features2.push_next(&mut mesh_features);
     }
@@ -1425,10 +1470,12 @@ fn probe_optional_features(
 
     let mut descriptor_properties = vk::PhysicalDeviceDescriptorIndexingProperties::default();
     let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut subgroup_size_properties = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
     let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
     let mut properties2 = vk::PhysicalDeviceProperties2::default()
         .push_next(&mut descriptor_properties)
-        .push_next(&mut subgroup_properties);
+        .push_next(&mut subgroup_properties)
+        .push_next(&mut subgroup_size_properties);
     if mesh_extension {
         properties2 = properties2.push_next(&mut mesh_properties);
     }
@@ -1447,8 +1494,10 @@ fn probe_optional_features(
         &core_features,
         &features11,
         &features12,
+        &features13,
         &descriptor_properties,
         &subgroup_properties,
+        &subgroup_size_properties,
         mesh_extension.then_some((&mesh_features, &mesh_properties)),
         rt_supported,
         acceleration_structure_indirect_build,
@@ -1463,8 +1512,10 @@ fn resolve_capabilities(
     core_features: &vk::PhysicalDeviceFeatures,
     features11: &vk::PhysicalDeviceVulkan11Features<'_>,
     features12: &vk::PhysicalDeviceVulkan12Features<'_>,
+    features13: &vk::PhysicalDeviceVulkan13Features<'_>,
     descriptor_properties: &vk::PhysicalDeviceDescriptorIndexingProperties<'_>,
     subgroup_properties: &vk::PhysicalDeviceSubgroupProperties<'_>,
+    subgroup_size_properties: &vk::PhysicalDeviceSubgroupSizeControlProperties<'_>,
     mesh: Option<(
         &vk::PhysicalDeviceMeshShaderFeaturesEXT<'_>,
         &vk::PhysicalDeviceMeshShaderPropertiesEXT<'_>,
@@ -1475,6 +1526,17 @@ fn resolve_capabilities(
     software_gpu: bool,
 ) -> Capabilities {
     let (mesh_features, mesh_properties) = mesh.unzip();
+    let max_bindless_array_elements = [
+        descriptor_properties.max_update_after_bind_descriptors_in_all_pools / 5,
+        descriptor_properties.max_per_stage_descriptor_update_after_bind_samplers / 4,
+        descriptor_properties.max_per_stage_descriptor_update_after_bind_sampled_images / 5,
+        descriptor_properties.max_per_stage_update_after_bind_resources / 5,
+        descriptor_properties.max_descriptor_set_update_after_bind_samplers / 4,
+        descriptor_properties.max_descriptor_set_update_after_bind_sampled_images / 5,
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
     Capabilities {
         rt_supported,
         mesh_shader: mesh_features.is_some_and(|features| features.mesh_shader != 0),
@@ -1504,7 +1566,19 @@ fn resolve_capabilities(
             1.0
         },
         multi_draw_indirect: core_features.multi_draw_indirect != 0,
-        draw_indirect_count: features12.draw_indirect_count != 0,
+        draw_indirect_count: {
+            let supported = features12.draw_indirect_count != 0;
+            tracing::info!(
+                "gpu-driven draws: drawIndirectCount {} (maxDrawIndirectCount {})",
+                if supported {
+                    "supported"
+                } else {
+                    "UNSUPPORTED — fixed-slice draws"
+                },
+                props.limits.max_draw_indirect_count
+            );
+            supported
+        },
         max_draw_indirect_count: props.limits.max_draw_indirect_count,
         buffer_device_address: features12.buffer_device_address != 0,
         shader_draw_parameters: features11.shader_draw_parameters != 0,
@@ -1522,12 +1596,24 @@ fn resolve_capabilities(
             .max_per_stage_descriptor_update_after_bind_sampled_images,
         max_descriptor_set_update_after_bind_sampled_images: descriptor_properties
             .max_descriptor_set_update_after_bind_sampled_images,
+        max_per_stage_descriptor_update_after_bind_samplers: descriptor_properties
+            .max_per_stage_descriptor_update_after_bind_samplers,
+        max_descriptor_set_update_after_bind_samplers: descriptor_properties
+            .max_descriptor_set_update_after_bind_samplers,
+        max_per_stage_update_after_bind_resources: descriptor_properties
+            .max_per_stage_update_after_bind_resources,
+        max_bindless_array_elements,
         subgroup_size: subgroup_properties.subgroup_size,
         subgroup_supported_stages: subgroup_properties.supported_stages,
         subgroup_supported_operations: subgroup_properties.supported_operations,
-        subgroup_quad_operations_in_all_stages: subgroup_properties
-            .quad_operations_in_all_stages
+        subgroup_quad_operations_in_all_stages: subgroup_properties.quad_operations_in_all_stages
             != 0,
+        subgroup_size_control: features13.subgroup_size_control != 0,
+        compute_full_subgroups: features13.compute_full_subgroups != 0,
+        min_subgroup_size: subgroup_size_properties.min_subgroup_size,
+        max_subgroup_size: subgroup_size_properties.max_subgroup_size,
+        max_compute_workgroup_subgroups: subgroup_size_properties.max_compute_workgroup_subgroups,
+        required_subgroup_size_stages: subgroup_size_properties.required_subgroup_size_stages,
         acceleration_structure_indirect_build,
         min_uniform_buffer_offset_alignment: props.limits.min_uniform_buffer_offset_alignment,
     }
@@ -1548,6 +1634,7 @@ fn create_logical_device(
     physical_device: vk::PhysicalDevice,
     graphics_queue_family: u32,
     compute_queue: Option<AsyncComputeQueue>,
+    capabilities: &Capabilities,
     enable_swapchain: bool,
 ) -> Result<(ash::Device, bool)> {
     let single_queue_priority = [1.0_f32];
@@ -1577,10 +1664,8 @@ fn create_logical_device(
         );
     }
 
-    // Re-probe RT extension presence to decide what to enable on the device. The
-    // selection step proved the *required* set; this enables the *optional* RT set
-    // only when the device advertises both extensions.
-    // SAFETY: the ash seam. Extension query on the chosen device.
+    // Extension enumeration is retained only for extensions whose activation is not a
+    // renderer feature policy (portability and optional clock calibration).
     let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
         .map_err(|result| Error::Vk {
             context: "enumerate_device_extension_properties",
@@ -1593,19 +1678,8 @@ fn create_logical_device(
                 .unwrap_or(false)
         })
     };
-    let enable_rt =
-        has_ext(ash::khr::acceleration_structure::NAME) && has_ext(ash::khr::ray_query::NAME);
-    let mesh_extension = has_ext(ash::ext::mesh_shader::NAME);
-    let (enable_mesh_shader, enable_task_shader) = if mesh_extension {
-        let mut features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
-        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features);
-        // SAFETY: the ash seam. The feature struct belongs to an advertised extension.
-        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
-        (features.mesh_shader != 0, features.task_shader != 0)
-    } else {
-        (false, false)
-    };
-    let enable_mesh_extension = enable_mesh_shader || enable_task_shader;
+    let enable_rt = capabilities.rt_supported;
+    let enable_mesh_extension = capabilities.mesh_shader || capabilities.task_shader;
 
     let mut device_extensions: Vec<*const c_char> = Vec::new();
     // The swapchain device extension requires the instance-level `VK_KHR_surface`,
@@ -1621,7 +1695,7 @@ fn create_logical_device(
     if enable_mesh_extension {
         device_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
     }
-    if has_ext(ash::ext::memory_budget::NAME) {
+    if capabilities.memory_budget {
         device_extensions.push(ash::ext::memory_budget::NAME.as_ptr());
     }
     // A portability physical device (MoltenVK) that advertises `VK_KHR_portability_subset` MUST
@@ -1638,72 +1712,49 @@ fn create_logical_device(
         device_extensions.push(calibrated_timestamps::NAME.as_ptr());
     }
 
-    // Enable the optional core features the renderer uses when the device advertises them:
-    // `pipelineStatisticsQuery` (the deepest profiler level's input — creating a stats query
-    // pool without it is `VUID-VkQueryPoolCreateInfo-queryType-00791`) and `fillModeNonSolid`
-    // (the wireframe view mode's `PolygonMode::LINE`). Both are optional, never gating selection.
-    // SAFETY: the ash seam. Core feature query on the chosen device.
-    let core_features = unsafe { instance.get_physical_device_features(physical_device) };
-    let mut enabled_core = vk::PhysicalDeviceFeatures::default();
-    enabled_core = enabled_core.shader_int64(true);
-    if core_features.pipeline_statistics_query != 0 {
+    let mut enabled_core = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+    if capabilities.pipeline_stats {
         enabled_core = enabled_core.pipeline_statistics_query(true);
     }
-    if core_features.fill_mode_non_solid != 0 {
+    if capabilities.fill_mode_non_solid {
         enabled_core = enabled_core.fill_mode_non_solid(true);
     }
     // Anisotropic filtering for the material sampler: the correct minification filter for
     // high-frequency albedo/AO textures at grazing angles, so they stay band-limited
     // rather than aliasing into the in-motion shimmer TAA would otherwise have to hide.
-    if core_features.sampler_anisotropy != 0 {
+    if capabilities.max_anisotropy > 1.0 {
         enabled_core = enabled_core.sampler_anisotropy(true);
     }
     // `multiDrawIndirect` lets one indirect command issue more than one draw.
-    if core_features.multi_draw_indirect != 0 {
+    if capabilities.multi_draw_indirect {
         enabled_core = enabled_core.multi_draw_indirect(true);
     }
-    // Advertised support for GPU-written draw counts and indirect acceleration-structure builds.
-    let (adv_draw_indirect_count, adv_as_indirect_build) = {
-        let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut as_probe = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
-        let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
-        if enable_rt {
-            feat2 = feat2.push_next(&mut as_probe);
-        }
-        // SAFETY: the ash seam. Fills the chained indirect-capability feature structs.
-        unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
-        (
-            v12.draw_indirect_count != 0,
-            enable_rt && as_probe.acceleration_structure_indirect_build != 0,
-        )
-    };
-
-    // Slang's `SV_VertexID` fullscreen-triangle shaders (the sky / post passes) emit the
-    // SPIR-V `DrawParameters` capability, so the device must enable `shaderDrawParameters`.
-    let mut features11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+    let mut features11 = vk::PhysicalDeviceVulkan11Features::default()
+        .shader_draw_parameters(capabilities.shader_draw_parameters);
     let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-        .runtime_descriptor_array(true)
-        .descriptor_binding_partially_bound(true)
-        .descriptor_binding_sampled_image_update_after_bind(true)
-        .shader_sampled_image_array_non_uniform_indexing(true)
-        .buffer_device_address(true);
-    // GPU-written draw counts are enabled only when advertised.
-    if adv_draw_indirect_count {
-        features12 = features12.draw_indirect_count(true);
-    }
+        .runtime_descriptor_array(capabilities.runtime_descriptor_array)
+        .descriptor_binding_partially_bound(capabilities.descriptor_binding_partially_bound)
+        .descriptor_binding_sampled_image_update_after_bind(
+            capabilities.descriptor_binding_sampled_image_update_after_bind,
+        )
+        .shader_sampled_image_array_non_uniform_indexing(
+            capabilities.shader_sampled_image_array_non_uniform_indexing,
+        )
+        .timeline_semaphore(true)
+        .buffer_device_address(capabilities.buffer_device_address)
+        .draw_indirect_count(capabilities.draw_indirect_count);
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
-        .synchronization2(true);
-    let mut as_feat =
-        vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
-    // Indirect acceleration-structure builds are enabled only when advertised.
-    if adv_as_indirect_build {
-        as_feat = as_feat.acceleration_structure_indirect_build(true);
-    }
-    let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+        .synchronization2(true)
+        .subgroup_size_control(capabilities.subgroup_size_control)
+        .compute_full_subgroups(capabilities.compute_full_subgroups);
+    let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+        .acceleration_structure(enable_rt)
+        .acceleration_structure_indirect_build(capabilities.acceleration_structure_indirect_build);
+    let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(enable_rt);
     let mut ms_feat = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
-        .mesh_shader(enable_mesh_shader)
-        .task_shader(enable_task_shader);
+        .mesh_shader(capabilities.mesh_shader)
+        .task_shader(capabilities.task_shader);
 
     let mut create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
@@ -1904,8 +1955,7 @@ mod tests {
             device.surface().is_none(),
             "the offscreen device creates no surface"
         );
-        // The indirect-build capability is only ever set when RT itself is enabled — the invariant
-        // The flag is meaningless without an acceleration structure.
+        // The indirect-build capability is meaningful only with acceleration structures.
         assert!(
             !device.capabilities.acceleration_structure_indirect_build
                 || device.capabilities.rt_supported,
@@ -1930,8 +1980,7 @@ mod tests {
         props.limits.max_draw_indirect_count = 73;
         props.limits.min_uniform_buffer_offset_alignment = 256;
         let core = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(true);
-        let features11 =
-            vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+        let features11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
         let features12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .draw_indirect_count(true)
@@ -1939,9 +1988,15 @@ mod tests {
             .descriptor_binding_partially_bound(true)
             .descriptor_binding_sampled_image_update_after_bind(true)
             .shader_sampled_image_array_non_uniform_indexing(true);
+        let features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .subgroup_size_control(true)
+            .compute_full_subgroups(true);
         let descriptor = vk::PhysicalDeviceDescriptorIndexingProperties::default()
             .max_update_after_bind_descriptors_in_all_pools(50_000)
+            .max_per_stage_descriptor_update_after_bind_samplers(4_096)
             .max_per_stage_descriptor_update_after_bind_sampled_images(8_192)
+            .max_per_stage_update_after_bind_resources(2_048)
+            .max_descriptor_set_update_after_bind_samplers(12_000)
             .max_descriptor_set_update_after_bind_sampled_images(16_384);
         let subgroup = vk::PhysicalDeviceSubgroupProperties::default()
             .subgroup_size(32)
@@ -1950,6 +2005,11 @@ mod tests {
                 vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::BALLOT,
             )
             .quad_operations_in_all_stages(true);
+        let subgroup_size = vk::PhysicalDeviceSubgroupSizeControlProperties::default()
+            .min_subgroup_size(16)
+            .max_subgroup_size(64)
+            .max_compute_workgroup_subgroups(8)
+            .required_subgroup_size_stages(vk::ShaderStageFlags::COMPUTE);
         let mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
             .mesh_shader(true)
             .task_shader(false);
@@ -1967,8 +2027,10 @@ mod tests {
             &core,
             &features11,
             &features12,
+            &features13,
             &descriptor,
             &subgroup,
+            &subgroup_size,
             Some((&mesh_features, &mesh_properties)),
             true,
             true,
@@ -1985,9 +2047,59 @@ mod tests {
         assert!(capabilities.runtime_descriptor_array);
         assert_eq!(capabilities.max_draw_indirect_count, 73);
         assert_eq!(capabilities.subgroup_size, 32);
+        assert!(capabilities.subgroup_size_control);
+        assert!(capabilities.compute_full_subgroups);
+        assert_eq!(capabilities.min_subgroup_size, 16);
+        assert_eq!(capabilities.max_subgroup_size, 64);
+        assert_eq!(capabilities.max_bindless_array_elements, 409);
+        assert_eq!(
+            capabilities.max_per_stage_descriptor_update_after_bind_samplers,
+            4_096
+        );
+        assert_eq!(
+            capabilities.max_descriptor_set_update_after_bind_samplers,
+            12_000
+        );
+        assert_eq!(
+            capabilities.max_per_stage_update_after_bind_resources,
+            2_048
+        );
         assert_eq!(
             capabilities.max_descriptor_set_update_after_bind_sampled_images,
             16_384
+        );
+    }
+
+    #[test]
+    fn profiler_normalizes_queue_timestamp_widths_and_disables_zero_bit_compute() {
+        let (common, graphics, compute) = normalized_timestamp_masks(64, Some(32));
+        assert_eq!(common, u64::from(u32::MAX));
+        assert_eq!(graphics, u64::MAX);
+        assert_eq!(compute, Some(u64::from(u32::MAX)));
+
+        let (common, graphics, compute) = normalized_timestamp_masks(48, Some(0));
+        assert_eq!(common, (1_u64 << 48) - 1);
+        assert_eq!(graphics, common);
+        assert_eq!(compute, None);
+    }
+
+    #[test]
+    fn rt_resolution_requires_extensions_and_both_feature_bits() {
+        assert_eq!(
+            resolve_rt_capabilities(true, true, false, true),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_rt_capabilities(true, false, true, true),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_rt_capabilities(false, true, true, true),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_rt_capabilities(true, true, true, true),
+            (true, true)
         );
     }
 
