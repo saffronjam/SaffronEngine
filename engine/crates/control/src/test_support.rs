@@ -29,6 +29,7 @@ impl GpuUploader for StubGpu {
     fn upload_mesh(
         &self,
         _mesh: &Mesh,
+        _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
         _skin: &[VertexSkin],
         _morph: Option<&saffron_geometry::MorphData>,
         _sdf_bake: Option<&saffron_rendering::SdfBake>,
@@ -229,6 +230,28 @@ impl ControlRenderer for StubRenderer {
             ..RenderStatsFull::default()
         }
     }
+
+    fn page_residency_stats(&self) -> saffron_rendering::PageResidencyStats {
+        saffron_rendering::PageResidencyStats::default()
+    }
+
+    fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown {
+        saffron_assets::VegetationRenderBreakdown::default()
+    }
+
+    fn page_faults(&self) -> u64 {
+        0
+    }
+
+    fn visibility_counters(&self) -> [u32; 16] {
+        [0; 16]
+    }
+
+    fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats {
+        saffron_assets::GpuSceneMirrorStats::default()
+    }
+
+    fn submit_interaction_impulse(&mut self, _impulse: saffron_rendering::InteractionImpulse) {}
 
     fn clustered_enabled(&self) -> bool {
         self.clustered
@@ -759,6 +782,9 @@ pub fn with_stub<T>(
         vegetation: &mut vegetation,
         vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus::default(),
         vegetation_regeneration_cells: Vec::new(),
+        vegetation_collision: None,
+        vegetation_promotion: None,
+        vegetation_navigation: None,
         physics: None,
         vegetation_jobs: &mut vegetation_jobs,
         vegetation_cook_jobs: &mut vegetation_cook_jobs,

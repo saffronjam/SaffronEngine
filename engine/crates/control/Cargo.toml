@@ -17,6 +17,7 @@ saffron-json = { path = "../json" }
 saffron-window = { path = "../window" }
 saffron-rendering = { path = "../rendering" }
 saffron-scene = { path = "../scene" }
+saffron-wind = { path = "../wind" }
 saffron-sceneedit = { path = "../sceneedit" }
 saffron-assets = { path = "../assets" }
 saffron-physics = { path = "../physics" }

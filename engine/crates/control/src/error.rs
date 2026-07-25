@@ -83,6 +83,14 @@ impl From<saffron_assets::Error> for Error {
     }
 }
 
+impl From<saffron_spatial::Error> for Error {
+    fn from(error: saffron_spatial::Error) -> Self {
+        // The one spatial failure a command surfaces is a malformed plant identity;
+        // map it through the same invalid-argument wire shape the vegetation error takes.
+        Error::Params(error.to_string())
+    }
+}
+
 impl From<saffron_vegetation::Error> for Error {
     fn from(error: saffron_vegetation::Error) -> Self {
         use saffron_vegetation::Error as VegetationError;
@@ -181,12 +189,16 @@ impl From<saffron_vegetation::Error> for Error {
             | VegetationError::ArtifactSchema { .. }
             | VegetationError::ArtifactUnknownSection { .. }
             | VegetationError::ArtifactUnknownCodec { .. }
+            | VegetationError::ArtifactCodec { .. }
+            | VegetationError::ArtifactSectionLimit { .. }
+            | VegetationError::ArtifactTotalLimit { .. }
             | VegetationError::ArtifactDuplicateSection { .. }
             | VegetationError::ArtifactMisalignedSection { .. }
             | VegetationError::ArtifactOverlappingSection { .. }
             | VegetationError::ArtifactHashMismatch { .. }
             | VegetationError::ArtifactFormat { .. }
             | VegetationError::Spatial(_)
+            | VegetationError::Material(_)
             | VegetationError::Json(_) => return Self::Command(error.to_string()),
         };
         Self::Diagnostic {

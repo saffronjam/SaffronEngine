@@ -171,7 +171,7 @@ impl ProjectLoader {
                 assets.warm_asset(gpu, id);
                 res.done += 1;
                 current = assets
-                    .catalog
+                    .catalog()
                     .find(id)
                     .map_or_else(String::new, |entry| entry.name.clone());
                 if start.elapsed() >= RESIDENCY_FRAME_BUDGET {
@@ -272,7 +272,7 @@ fn install_doc(
     // may still read one) — the load-order UAF guard.
     renderer.wait_gpu_idle();
     assets.clear_asset_caches();
-    assets.catalog = doc.catalog;
+    assets.replace_catalog(doc.catalog);
     assets.set_asset_root(&doc.asset_root);
 
     set_stage(

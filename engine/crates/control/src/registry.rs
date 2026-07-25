@@ -57,10 +57,21 @@ pub trait ControlRenderer {
     /// The full per-frame draw + timing + telemetry snapshot.
     fn render_stats(&self) -> RenderStatsFull;
 
+    /// Population and rebuild counters of the persistent GPU-scene mirror.
+    fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats;
+    fn page_residency_stats(&self) -> saffron_rendering::PageResidencyStats;
+    fn visibility_counters(&self) -> [u32; 16];
+    /// Per-family and per-cell vegetation render population.
+    fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown;
+    /// GPU missing-page requests drained since startup.
+    fn page_faults(&self) -> u64;
+
     /// Whether clustered-forward light culling is on.
     fn clustered_enabled(&self) -> bool;
     /// Toggles clustered-forward culling.
     fn set_clustered(&mut self, enabled: bool);
+    /// Stages a world interaction impulse for the next frame's field step.
+    fn submit_interaction_impulse(&mut self, impulse: saffron_rendering::InteractionImpulse);
     /// Whether the depth pre-pass is on.
     fn depth_prepass_enabled(&self) -> bool;
     /// Toggles the depth pre-pass.
@@ -446,6 +457,13 @@ pub struct EngineContext<'a> {
     pub vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus,
     /// Cells whose deleted disposable artifact is queued through the shared cooker.
     pub vegetation_regeneration_cells: Vec<saffron_spatial::WorldCellKey>,
+    /// Collision-facet residency counters, present only with a live play world.
+    pub vegetation_collision: Option<saffron_runtime::VegetationCollisionReport>,
+    /// The promotion authority owning transient macro-plant entity views, present only with a
+    /// live play world.
+    pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
+    /// The navigation contribution seam: published contributions and dirty regions.
+    pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
     /// The live play physics world, or `None` in Edit.
     pub physics: Option<&'a mut World>,
     /// Owned asynchronous vegetation evaluation jobs and retained results.
@@ -708,6 +726,7 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) {
     crate::commands_physics::register_physics_commands(reg);
     crate::commands_vegetation::register_vegetation_commands(reg);
     crate::commands_asset::register_plant_commands(reg);
+    crate::commands_asset::register_interchange_commands(reg);
     crate::commands_asset::register_asset_commands(reg);
 }
 
@@ -757,8 +776,9 @@ pub fn is_read_only_command(name: &str) -> bool {
         | "vegetation-cell-inspect" | "vegetation-manifest"
         | "vegetation-runtime-status" | "vegetation-runtime-cell"
         | "vegetation-runtime-query" | "vegetation-runtime-inspect"
+        | "vegetation-combustion" | "vegetation-ecology-status"
         | "vegetation-state-export"
-        | "plant-validate"
+        | "plant-validate" | "plant-growth" | "plant-graph" | "plant-elements"
         // project-load phase + progress the editor's loading screen polls each tick
         | "project-status"
     )

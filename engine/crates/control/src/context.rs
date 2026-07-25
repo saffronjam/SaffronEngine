@@ -23,6 +23,34 @@ use crate::server::{ControlServer, control_socket_path, start_control_server};
 use crate::vegetation_cook_jobs::VegetationCookJobs;
 use crate::vegetation_jobs::VegetationEvaluationJobs;
 
+/// Live subsystem borrows and vegetation state consumed by one control-plane drain.
+pub struct ControlPollContext<'a> {
+    /// Window command target.
+    pub window: &'a mut Window,
+    /// Renderer command target and GPU upload seam.
+    pub renderer: &'a mut dyn ControlRenderer,
+    /// Editor scene and selection state.
+    pub scene_edit: &'a mut SceneEditContext,
+    /// Project asset server.
+    pub assets: &'a mut AssetServer,
+    /// Shared spatial residency manager.
+    pub spatial: &'a mut ResidencyManager,
+    /// Published vegetation world, when one is bound.
+    pub vegetation: &'a mut Option<VegetationWorld>,
+    /// Runtime vegetation binding state.
+    pub vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus,
+    /// Cells whose derived vegetation needs regeneration.
+    pub vegetation_regeneration_cells: Vec<saffron_spatial::WorldCellKey>,
+    /// Collision-facet residency counters, present only with a live play world.
+    pub vegetation_collision: Option<saffron_runtime::VegetationCollisionReport>,
+    /// The promotion authority, present only with a live play world.
+    pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
+    /// The navigation contribution seam.
+    pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
+    /// Live play-mode physics world, absent in edit mode.
+    pub physics: Option<&'a mut World>,
+}
+
 /// Owns the command registry and the listening socket. The registry is built
 /// once at startup (it has no per-frame mutation); the `EngineContext` is rebuilt
 /// each frame in [`ControlContext::poll`].
@@ -145,18 +173,21 @@ impl ControlContext {
     /// Returns `true` when at least one **mutating** command ran this drain (anything not
     /// [`is_read_only_command`] that completed `ok`), so the host can request a viewport redraw
     /// while a static scene's read-only pollers leave the GPU idle.
-    pub fn poll(
-        &mut self,
-        window: &mut Window,
-        renderer: &mut dyn ControlRenderer,
-        scene_edit: &mut SceneEditContext,
-        assets: &mut AssetServer,
-        spatial: &mut ResidencyManager,
-        vegetation: &mut Option<VegetationWorld>,
-        vegetation_status: saffron_runtime::VegetationRuntimeBindingStatus,
-        vegetation_regeneration_cells: Vec<saffron_spatial::WorldCellKey>,
-        physics: Option<&mut World>,
-    ) -> bool {
+    pub fn poll(&mut self, context: ControlPollContext<'_>) -> bool {
+        let ControlPollContext {
+            window,
+            renderer,
+            scene_edit,
+            assets,
+            spatial,
+            vegetation,
+            vegetation_status,
+            vegetation_regeneration_cells,
+            vegetation_collision,
+            vegetation_promotion,
+            vegetation_navigation,
+            physics,
+        } = context;
         let mut mutated = false;
         let ready = match self.vegetation_cook_jobs.poll_ready() {
             Ok(ready) => ready,
@@ -206,6 +237,9 @@ impl ControlContext {
             vegetation,
             vegetation_status,
             vegetation_regeneration_cells,
+            vegetation_collision,
+            vegetation_promotion,
+            vegetation_navigation,
             physics,
             vegetation_jobs: &mut self.vegetation_jobs,
             vegetation_cook_jobs: &mut self.vegetation_cook_jobs,

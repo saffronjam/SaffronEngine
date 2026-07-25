@@ -11,6 +11,7 @@
 
 #![deny(unsafe_code)]
 
+mod botanical_dto;
 mod commands_animation;
 mod commands_asset;
 mod commands_physics;
@@ -30,9 +31,11 @@ mod test_support;
 mod vegetation_cook_dto;
 mod vegetation_cook_jobs;
 mod vegetation_jobs;
+mod vegetation_layer_dto;
+mod vegetation_mutation_dto;
 
 pub use commands_asset::{PreviewSubject, build_preview_scene_for_thumbnail};
-pub use context::ControlContext;
+pub use context::{ControlContext, ControlPollContext};
 pub use error::{Error, Result};
 pub use registry::{
     Command, CommandRegistry, ControlRenderer, EngineContext, VegetationComputeExecutor,
