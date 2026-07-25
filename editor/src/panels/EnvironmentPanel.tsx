@@ -1632,6 +1632,61 @@ export function EnvironmentPanel() {
                   onDragEnd={onDragEnd}
                 />
               </Row>
+              <Row label="Turb. Octaves">
+                <NumberDrag
+                  value={wind.turbulenceOctaves}
+                  min={0}
+                  max={8}
+                  step={1}
+                  onChange={(value) => patchWind("turbulenceOctaves", Math.round(value))}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Turb. Roughness">
+                <NumberDrag
+                  value={wind.turbulenceRoughness}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={(value) => patchWind("turbulenceRoughness", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Gust Freq. (Hz)">
+                <NumberDrag
+                  value={wind.gustFrequency}
+                  min={0}
+                  max={2}
+                  step={0.01}
+                  onChange={(value) => patchWind("gustFrequency", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Ref. Height (m)">
+                <NumberDrag
+                  value={wind.referenceHeight}
+                  min={0.1}
+                  max={200}
+                  step={0.1}
+                  onChange={(value) => patchWind("referenceHeight", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
+              <Row label="Height Exp.">
+                <NumberDrag
+                  value={wind.heightExponent}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={(value) => patchWind("heightExponent", value)}
+                  onDragStart={onDragStart}
+                  onDragEnd={onDragEnd}
+                />
+              </Row>
             </PropertySection>
           ) : null}
 
