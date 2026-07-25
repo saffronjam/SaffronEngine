@@ -13,6 +13,9 @@ pub enum Error {
     /// A component read found no component of the requested type on the entity.
     #[error("entity has no component of the requested type")]
     MissingComponent,
+    /// A mutation attempted to replace the stable identity owned by the entity.
+    #[error("the IdComponent identity is immutable; create or destroy the entity instead")]
+    ImmutableIdentity,
     /// A second instance of a scene-singleton component was rejected.
     #[error("scene already has a {0} component")]
     SingletonComponent(&'static str),

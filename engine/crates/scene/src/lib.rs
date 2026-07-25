@@ -18,6 +18,7 @@ mod document;
 mod environment;
 mod error;
 mod hierarchy;
+mod journal;
 mod registry;
 mod scene;
 mod script_input;
@@ -28,9 +29,10 @@ pub use component::{
     AnimationPlayer, AtmosphereRole, Bone, BonePhysics, BonePhysicsComponent, Camera,
     CharacterController, Collider, ComponentOrder, DirectionalLight, FogShape, FogVolume,
     FootChain, FootIk, IdComponent, Joint, KinematicBones, MaterialSet, MaterialSlot, Mesh,
-    ModelInstance, MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PointLight,
-    PoseOverride, PreviewGhost, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot,
-    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, WorldTransform, Wrap,
+    ModelInstance, MorphComponent, MorphWeightOverride, Motion, Name, PhysicsMaterial, PlantOrigin,
+    PlantVariant, PlantVitals, PointLight, PoseOverride, PreviewGhost, ReflectionProbe,
+    Relationship, Rigidbody, Script, ScriptSlot, Shape, SkinnedMesh, SpotLight, Transform,
+    Transition, VegetationField, WindSource, WorldTransform, Wrap,
 };
 pub use document::SCENE_VERSION;
 pub use environment::{
@@ -41,6 +43,10 @@ pub use environment::{
 pub use error::{Error, Result};
 pub use hierarchy::{
     CameraView, camera_projection, quat_from_euler_xyz, quat_to_euler_zyx, transform_matrix,
+};
+pub use journal::{
+    SceneEntityRevisions, SceneJournalCursor, SceneJournalRead, SceneMutation, SceneMutationKind,
+    SceneRevision, SceneWorldTransformState,
 };
 pub use registry::{
     BUILTIN_COMPONENT_NAMES, ComponentRegistry, ComponentTraits, SceneSerialize,

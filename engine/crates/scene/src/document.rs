@@ -553,10 +553,9 @@ mod tests {
                     .get_mut("components")
                     .and_then(|c| c.get_mut("Relationship"))
                     .and_then(Value::as_object_mut)
+                    && rel.get("parent").and_then(Value::as_str) != Some("0")
                 {
-                    if rel.get("parent").and_then(Value::as_str) != Some("0") {
-                        rel.insert("parent".to_string(), Value::String("424242".to_string()));
-                    }
+                    rel.insert("parent".to_string(), Value::String("424242".to_string()));
                 }
             }
         }
@@ -701,7 +700,7 @@ mod tests {
             r#""fog":{"aerialIntensity":1.0,"aerialPerspective":false,"albedo":{"x":0.5,"y":0.6000000238418579,"z":0.699999988079071},"baseDensity":0.019999999552965164,"density":0.019999999552965164,"directionalColor":{"x":1.0,"y":0.8999999761581421,"z":0.699999988079071},"directionalExponent":8.0,"emissive":{"x":0.0,"y":0.0,"z":0.0},"enabled":false,"height":0.0,"heightFalloff":0.20000000298023224,"historyBlend":0.05000000074505806,"layer2Density":0.0,"layer2Falloff":0.5,"layer2Height":0.0,"lightClamp":0.0,"maxOpacity":1.0,"mode":"analytic","neighborhoodClamp":false,"phaseG":0.6000000238418579,"quality":"medium","scatterAlbedo":0.8999999761581421,"startDistance":0.0},"#,
             r#""skyIntensity":1.0,"skyMode":"procedural","skyRotation":0.0,"skyTexture":"0","#,
             r#""timeOfDay":{"cloudTypeCurve":[],"coverageCurve":[],"day":21,"dayLengthSeconds":600.0,"enabled":false,"exposureCurve":[],"latitude":0.0,"longitude":0.0,"manualOverride":false,"month":6,"timeOfDay":0.5,"tintCurve":{"blue":[],"green":[],"master":[],"red":[]},"year":2025},"#,
-            r#""useSkyForAmbient":true,"visible":true,"wind":{"gust":0.25,"orientation":0.0,"speed":10.0}},"#,
+            r#""useSkyForAmbient":true,"visible":true,"wind":{"gust":0.25,"gustFrequency":0.15000000596046448,"heightExponent":0.20000000298023224,"orientation":0.0,"referenceHeight":10.0,"seed":0,"speed":10.0,"turbulenceOctaves":3,"turbulenceRoughness":0.550000011920929}},"#,
             r#""version":4}"#
         );
 

@@ -13,6 +13,8 @@ workspace = true
 tracing.workspace = true
 saffron-core = { path = "../core" }
 saffron-json = { path = "../json" }
+saffron-spatial = { path = "../spatial" }
+saffron-wind = { path = "../wind" }
 hecs.workspace = true
 thiserror.workspace = true
 glam.workspace = true

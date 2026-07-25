@@ -39,7 +39,7 @@ use crate::component::{
     CharacterController, Collider, DirectionalLight, FogShape, FogVolume, FootChain, FootIk, Joint,
     KinematicBones, MaterialSet, MaterialSlot, Mesh, ModelInstance, MorphComponent, Motion, Name,
     PhysicsMaterial, PointLight, ReflectionProbe, Relationship, Rigidbody, Script, ScriptSlot,
-    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, Wrap,
+    Shape, SkinnedMesh, SpotLight, Transform, Transition, VegetationField, WindSource, Wrap,
 };
 use crate::environment::{
     AtmosphereSettings, CloudSettings, FogMode, FogQuality, FogSettings, SceneEnvironment, SkyMode,
@@ -573,6 +573,40 @@ impl SceneSerialize for FogVolume {
         self.noise_detail = json_f32_or(value, "noiseDetail", 0.5);
         self.wind = vec3_from_json(&object_field(value, "wind"));
         self.speed = json_f32_or(value, "speed", 0.1);
+        Ok(())
+    }
+}
+
+impl SceneSerialize for WindSource {
+    fn to_json(&self) -> Value {
+        let kind = match self.kind {
+            saffron_wind::WindSourceKind::Directional => "directional",
+            saffron_wind::WindSourceKind::Point => "point",
+            saffron_wind::WindSourceKind::Vortex => "vortex",
+            saffron_wind::WindSourceKind::Wake => "wake",
+            saffron_wind::WindSourceKind::Volume => "volume",
+        };
+        object([
+            ("kind", Value::String(kind.to_string())),
+            ("strength", f32_value(self.strength)),
+            ("radius", f32_value(self.radius)),
+            ("falloff", f32_value(self.falloff)),
+            ("enabled", Value::Bool(self.enabled)),
+        ])
+    }
+
+    fn load_json(&mut self, value: &Value) -> Result<()> {
+        self.kind = match json_string_or(value, "kind", "directional".to_string()).as_str() {
+            "point" => saffron_wind::WindSourceKind::Point,
+            "vortex" => saffron_wind::WindSourceKind::Vortex,
+            "wake" => saffron_wind::WindSourceKind::Wake,
+            "volume" => saffron_wind::WindSourceKind::Volume,
+            _ => saffron_wind::WindSourceKind::Directional,
+        };
+        self.strength = json_f32_or(value, "strength", 5.0);
+        self.radius = json_f32_or(value, "radius", 20.0);
+        self.falloff = json_f32_or(value, "falloff", 0.5);
+        self.enabled = json_bool_or(value, "enabled", true);
         Ok(())
     }
 }
@@ -1149,6 +1183,12 @@ fn wind_to_json(wind: &WindSettings) -> Value {
         ("orientation", f32_value(wind.orientation)),
         ("speed", f32_value(wind.speed)),
         ("gust", f32_value(wind.gust)),
+        ("turbulenceOctaves", Value::from(wind.turbulence_octaves)),
+        ("turbulenceRoughness", f32_value(wind.turbulence_roughness)),
+        ("gustFrequency", f32_value(wind.gust_frequency)),
+        ("referenceHeight", f32_value(wind.reference_height)),
+        ("heightExponent", f32_value(wind.height_exponent)),
+        ("seed", Value::from(wind.seed)),
     ])
 }
 
@@ -1160,6 +1200,18 @@ fn wind_from_json(value: &Value) -> WindSettings {
     wind.orientation = json_f32_or(value, "orientation", wind.orientation);
     wind.speed = json_f32_or(value, "speed", wind.speed);
     wind.gust = json_f32_or(value, "gust", wind.gust);
+    wind.turbulence_octaves = u32::try_from(json_u64_or(
+        value,
+        "turbulenceOctaves",
+        wind.turbulence_octaves.into(),
+    ))
+    .unwrap_or(wind.turbulence_octaves);
+    wind.turbulence_roughness =
+        json_f32_or(value, "turbulenceRoughness", wind.turbulence_roughness);
+    wind.gust_frequency = json_f32_or(value, "gustFrequency", wind.gust_frequency);
+    wind.reference_height = json_f32_or(value, "referenceHeight", wind.reference_height);
+    wind.height_exponent = json_f32_or(value, "heightExponent", wind.height_exponent);
+    wind.seed = u32::try_from(json_u64_or(value, "seed", wind.seed.into())).unwrap_or(wind.seed);
     wind
 }
 

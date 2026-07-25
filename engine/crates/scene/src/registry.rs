@@ -24,7 +24,7 @@ use crate::component::{
     AnimationPlayer, Bone, BonePhysicsComponent, Camera, CharacterController, Collider,
     ComponentOrder, DirectionalLight, FogVolume, FootIk, KinematicBones, MaterialSet, Mesh,
     ModelInstance, MorphComponent, Name, PointLight, ReflectionProbe, Relationship, Rigidbody,
-    Script, SkinnedMesh, SpotLight, Transform, VegetationField,
+    Script, SkinnedMesh, SpotLight, Transform, VegetationField, WindSource,
 };
 use crate::error::Result;
 use crate::scene::{Component, Entity, Scene};
@@ -398,6 +398,7 @@ pub fn register_builtin_components() -> ComponentRegistry {
     register_component!(reg, SpotLight, "SpotLight");
     register_component!(reg, ReflectionProbe, "ReflectionProbe");
     register_component!(reg, FogVolume, "FogVolume");
+    register_component!(reg, WindSource, "WindSource");
     register_component!(reg, Relationship, "Relationship", false);
     register_component!(reg, SkinnedMesh, "SkinnedMesh");
     register_component!(reg, MorphComponent, "Morph");
@@ -432,6 +433,7 @@ pub const BUILTIN_COMPONENT_NAMES: &[&str] = &[
     "SpotLight",
     "ReflectionProbe",
     "FogVolume",
+    "WindSource",
     "Relationship",
     "SkinnedMesh",
     "Morph",

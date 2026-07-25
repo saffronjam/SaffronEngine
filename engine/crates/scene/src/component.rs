@@ -132,6 +132,82 @@ pub struct PreviewGhost {
     pub tag: u8,
 }
 
+/// Binds a promoted entity to the authoritative macro plant it is a transient view of.
+///
+/// Runtime-only and immutable: the promotion authority adds it when it spawns the entity,
+/// and the scene rejects replacing, mutably borrowing, or removing it — an entity can never
+/// be re-pointed at another plant. The macro SoA stays the authority; this entity is a view,
+/// not a second plant record, so the component is never serialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlantOrigin {
+    /// The plant this entity represents.
+    pub plant: saffron_spatial::PlantId,
+    /// The cell generation the view was promoted from. A demotion whose source generation has been
+    /// superseded knows its state describes a plant row that has since been rebuilt.
+    pub source_generation: u64,
+}
+
+/// A promoted plant's live biological state, carried on its entity view so gameplay reads and
+/// writes it like any other component.
+///
+/// Runtime-only and never serialized: the macro SoA remains the authority, and a demotion returns
+/// whatever the view settled at through the reducer. Unlike [`PlantOrigin`] this is mutable — that
+/// is the point, since damage and growth happen to the view.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlantVitals {
+    /// Biological lifecycle stage, as the vegetation lifecycle discriminant.
+    pub lifecycle: u32,
+    /// Persistent health in 0..1.
+    pub health: f32,
+    /// Persistent moisture in 0..1.
+    pub moisture: f32,
+    /// Persistent combustible fuel in 0..1.
+    pub fuel: f32,
+    /// Monotonic biological age tick.
+    pub ecology_tick: u64,
+}
+
+/// Selects which authored `(variation, phenotype)` combination of a multi-prototype
+/// assembly mesh (a compiled plant family) this entity renders. Left unregistered —
+/// preview tooling sets it; an entity without it renders the first authored
+/// combination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlantVariant {
+    /// Authored variation index.
+    pub variation: u32,
+    /// Species-declared phenotype id.
+    pub phenotype: u32,
+}
+
+/// A placeable local wind influence composited over the global environment wind:
+/// the entity's world position anchors it and its forward axis aims directional
+/// flow. The influence shape comes from [`saffron_wind::WindSourceKind`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindSource {
+    /// Influence shape.
+    pub kind: saffron_wind::WindSourceKind,
+    /// Peak speed in metres per second (`Volume`: the global scale factor).
+    pub strength: f32,
+    /// Influence radius in metres.
+    pub radius: f32,
+    /// Edge-falloff fraction of the radius in 0..1.
+    pub falloff: f32,
+    /// A muted source contributes nothing.
+    pub enabled: bool,
+}
+
+impl Default for WindSource {
+    fn default() -> Self {
+        Self {
+            kind: saffron_wind::WindSourceKind::Directional,
+            strength: 5.0,
+            radius: 20.0,
+            falloff: 0.5,
+            enabled: true,
+        }
+    }
+}
+
 /// A skinned renderable: the mesh asset plus the ordered joint list by uuid.
 ///
 /// `bones[i]` drives `joint_matrices()[i]` through `inverse_bind[i]` — glTF joint order,
