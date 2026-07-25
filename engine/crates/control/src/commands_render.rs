@@ -1,4 +1,4 @@
-//! The 35 render-domain control commands: render-stats, the profiler/capture group,
+//! The 36 render-domain control commands: render-stats, gpu-scene-stats, the profiler/capture group,
 //! perf config, frame history, alarms, the AA / view-mode / clustering / IBL / sky-occlusion /
 //! SSAO / shadow / GI / skinning / displacement / depth-prepass toggles, native viewport info +
 //! size, exposure, and reflection-probe management.
@@ -17,20 +17,20 @@ use saffron_protocol::{
     AnamorphicParams, CaptureModeDto, CaptureStartParams, CaptureStartResult, CaptureStateDto,
     CaptureStatusResult, CaptureStopResult, DrainAlarmsParams, DrainAlarmsResult, EmptyParams,
     FrameHistoryDto, FrameHistoryParams, FrameSampleDto, GetTaaParamsResult, GetUpscaleResult,
-    GiModeDto, ListProbesResult, PerfConfigDto, PipelineStatsDto, ProbeRef, ProfileCaptureDto,
-    ProfileCaptureMetadataDto, ProfileLaneDto, ProfileSpanDto, ProfilerModeDto, ProfilerModeResult,
-    ProfilerSetModeParams, RecaptureProbesResult, RenderPassTimingDto, RenderPassTimingsDto,
-    RenderQualityResult, RenderStatsDto, SetAaParams, SetAaResult, SetBloomParams, SetBloomResult,
-    SetClusteredResult, SetColorGradingParams, SetColorGradingResult, SetDepthPrepassResult,
-    SetDisplacementResult, SetExposureParams, SetExposureResult, SetGdfResult, SetGiParams,
-    SetGiResult, SetIblResult, SetPerfConfigParams, SetProbesParams, SetProbesResult,
-    SetRenderQualityParams, SetRestirResult, SetRtReflectionsResult, SetRtShadowsResult,
-    SetShadowsResult, SetSkinningResult, SetSkyOcclusionResult, SetSsrResult, SetTaaParamsParams,
-    SetTaaParamsResult, SetTessellationQualityParams, SetTessellationQualityResult,
-    SetTonemapParams, SetUpscaleParams, SetUpscaleResult, SetViewModeParams, SetViewModeResult,
-    SetViewportPowerStateParams, SetViewportSizeParams, SetViewportSizeResult, ToggleParams,
-    TonemapResult, UpscaleDto, Uuid, Vec3, ViewModeDto, ViewportNativeInfoResult,
-    ViewportPowerStateResult,
+    GiModeDto, GpuSceneMirrorStatsDto, ListProbesResult, PerfConfigDto, PipelineStatsDto, ProbeRef,
+    ProfileCaptureDto, ProfileCaptureMetadataDto, ProfileLaneDto, ProfileSpanDto, ProfilerModeDto,
+    ProfilerModeResult, ProfilerSetModeParams, RecaptureProbesResult, RenderPassTimingDto,
+    RenderPassTimingsDto, RenderQualityResult, RenderStatsDto, SetAaParams, SetAaResult,
+    SetBloomParams, SetBloomResult, SetClusteredResult, SetColorGradingParams,
+    SetColorGradingResult, SetDepthPrepassResult, SetDisplacementResult, SetExposureParams,
+    SetExposureResult, SetGdfResult, SetGiParams, SetGiResult, SetIblResult, SetPerfConfigParams,
+    SetProbesParams, SetProbesResult, SetRenderQualityParams, SetRestirResult,
+    SetRtReflectionsResult, SetRtShadowsResult, SetShadowsResult, SetSkinningResult,
+    SetSkyOcclusionResult, SetSsrResult, SetTaaParamsParams, SetTaaParamsResult,
+    SetTessellationQualityParams, SetTessellationQualityResult, SetTonemapParams, SetUpscaleParams,
+    SetUpscaleResult, SetViewModeParams, SetViewModeResult, SetViewportPowerStateParams,
+    SetViewportSizeParams, SetViewportSizeResult, ToggleParams, TonemapResult, UpscaleDto, Uuid,
+    Vec3, ViewModeDto, ViewportNativeInfoResult, ViewportPowerStateResult, VsmStatsDto,
 };
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, AlarmEvent, AlarmEventKind, AlarmSeverity, CaptureMode, CaptureState,
@@ -108,6 +108,7 @@ fn view_mode_to_dto(mode: ViewMode) -> ViewModeDto {
         ViewMode::MotionVectors => ViewModeDto::MotionVectors,
         ViewMode::Fog => ViewModeDto::Fog,
         ViewMode::CloudDensity => ViewModeDto::CloudDensity,
+        ViewMode::ShadowPages => ViewModeDto::ShadowPages,
     }
 }
 
@@ -132,6 +133,7 @@ fn view_mode_from_dto(mode: ViewModeDto) -> ViewMode {
         ViewModeDto::MotionVectors => ViewMode::MotionVectors,
         ViewModeDto::Fog => ViewMode::Fog,
         ViewModeDto::CloudDensity => ViewMode::CloudDensity,
+        ViewModeDto::ShadowPages => ViewMode::ShadowPages,
     }
 }
 
@@ -227,6 +229,15 @@ fn render_stats_dto(renderer: &dyn ControlRenderer) -> RenderStatsDto {
         instance_upload_bytes: stats.draw.instance_upload_bytes,
         retained_mesh_cpu_bytes: stats.draw.retained_mesh_cpu_bytes,
         shadow_draw_calls: stats.draw.shadow_draw_calls as i32,
+        vsm: VsmStatsDto {
+            requested: stats.vsm.requested as i32,
+            hits: stats.vsm.hits as i32,
+            allocated: stats.vsm.allocated as i32,
+            rendered: stats.vsm.rendered as i32,
+            dirtied: stats.vsm.dirtied as i32,
+            evicted: stats.vsm.evicted as i32,
+            overflow: stats.vsm.overflow as i32,
+        },
         rt_instances: stats.rt_instances as i32,
         frame_ms: stats.frame_ms,
         fps: stats.fps,
@@ -540,12 +551,138 @@ fn to_chrome_trace(capture: &ProfileCapture) -> String {
     doc.to_string()
 }
 
-/// Registers the 34 render-domain commands, in registration order, onto `reg`.
+/// Registers the 35 render-domain commands, in registration order, onto `reg`.
 pub fn register_render_commands(reg: &mut CommandRegistry) {
     reg.register::<EmptyParams, RenderStatsDto>(
         "render-stats",
         "last frame's scene draw counters",
         |ctx, _params| Ok(render_stats_dto(ctx.renderer)),
+    );
+
+    reg.register::<
+        saffron_protocol::EmitInteractionImpulseParams,
+        saffron_protocol::EmitInteractionImpulseResult,
+    >(
+        "emit-interaction-impulse",
+        "emit-interaction-impulse {positionM, radiusM, strength, direction?, depress?} — push the world interaction field",
+        |ctx, params| {
+            let finite = params.position_m.iter().all(|v| v.is_finite())
+                && params.radius_m.is_finite()
+                && params.strength.is_finite()
+                && params.direction.is_none_or(|d| d.iter().all(|v| v.is_finite()))
+                && params.depress.is_none_or(f64::is_finite);
+            if !finite {
+                return Err(crate::Error::Command(
+                    "impulse fields must be finite".into(),
+                ));
+            }
+            if !(0.01..=64.0).contains(&params.radius_m) {
+                return Err(crate::Error::Command(
+                    "radiusM must be within 0.01..=64".into(),
+                ));
+            }
+            if !(0.0..=50.0).contains(&params.strength) {
+                return Err(crate::Error::Command(
+                    "strength must be within 0..=50".into(),
+                ));
+            }
+            let depress = params.depress.unwrap_or(0.0);
+            if !(0.0..=10.0).contains(&depress) {
+                return Err(crate::Error::Command(
+                    "depress must be within 0..=10".into(),
+                ));
+            }
+            let direction = params.direction.unwrap_or([0.0, 0.0]);
+            ctx.renderer
+                .submit_interaction_impulse(saffron_rendering::InteractionImpulse {
+                    position: [params.position_m[0] as f32, params.position_m[1] as f32],
+                    radius: params.radius_m as f32,
+                    strength: params.strength as f32,
+                    direction: [direction[0] as f32, direction[1] as f32],
+                    depress: depress as f32,
+                    reserved: 0.0,
+                });
+            Ok(saffron_protocol::EmitInteractionImpulseResult { accepted: true })
+        },
+    );
+
+    reg.register::<EmptyParams, saffron_protocol::VegetationRenderStatsDto>(
+        "vegetation-render-stats",
+        "per-family and per-cell vegetation render population plus page faults",
+        |ctx, _params| {
+            let breakdown = ctx.renderer.vegetation_breakdown();
+            Ok(saffron_protocol::VegetationRenderStatsDto {
+                families: breakdown
+                    .families
+                    .into_iter()
+                    .map(|row| saffron_protocol::VegetationFamilyRenderDto {
+                        family: saffron_protocol::Uuid(row.family),
+                        instances: row.instances,
+                        field_tiles: row.field_tiles,
+                        micro_predicted: row.micro_predicted,
+                    })
+                    .collect(),
+                cells: breakdown
+                    .cells
+                    .into_iter()
+                    .map(|row| saffron_protocol::VegetationCellRenderDto {
+                        cell: crate::vegetation_cook_dto::world_cell_dto(row.cell),
+                        plants: row.plants,
+                        field_tiles: row.field_tiles,
+                    })
+                    .collect(),
+                page_faults: ctx.renderer.page_faults().to_string(),
+            })
+        },
+    );
+
+    reg.register::<EmptyParams, GpuSceneMirrorStatsDto>(
+        "gpu-scene-stats",
+        "persistent GPU-scene mirror population and rebuild counters",
+        |ctx, _params| {
+            let stats = ctx.renderer.gpu_scene_mirror_stats();
+            let residency = ctx.renderer.page_residency_stats();
+            Ok(GpuSceneMirrorStatsDto {
+                meshes: stats.meshes as u32,
+                materials: stats.materials as u32,
+                textures: stats.textures as u32,
+                instances: stats.instances as u32,
+                lights: stats.lights as u32,
+                unresolved_instances: stats.unresolved_instances as u32,
+                retained_mesh_bytes: stats.retained_mesh_bytes,
+                shared_rebuilds: stats.shared_rebuilds,
+                world_rebuilds: stats.world_rebuilds,
+                micro_predicted: stats.micro_predicted,
+                page_residency: saffron_protocol::PageResidencyStatsDto {
+                    registered: residency.registered,
+                    resident: residency.resident,
+                    resident_bytes: residency.resident_bytes,
+                    budget_bytes: residency.budget_bytes,
+                    requested: residency.requested,
+                    loading: residency.loading,
+                    ready: residency.ready,
+                    evictions: residency.evictions,
+                },
+                visibility: {
+                    let words = ctx.renderer.visibility_counters();
+                    saffron_protocol::SceneVisibilityStatsDto {
+                        visible: words[0],
+                        retested: words[1],
+                        records: words[3],
+                        transparent: words[5],
+                        micro_candidates: words[9],
+                        transitioning: words[10],
+                        voxel_records: words[11],
+                        max_cut_depth: words[12],
+                        culled_frustum: words[13],
+                        culled_occlusion: words[14],
+                        sub_quad_triangles: words[15],
+                        overflow_flags: words[2],
+                        pressure_flags: words[4],
+                    }
+                },
+            })
+        },
     );
 
     reg.register::<ProfilerSetModeParams, ProfilerModeResult>(
