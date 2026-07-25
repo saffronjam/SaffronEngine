@@ -27,14 +27,45 @@ use saffron_core::Uuid;
 pub struct ScriptRayHit {
     /// Whether the ray/sweep hit anything.
     pub hit: bool,
-    /// The owner-entity uuid of the struck body (`Uuid(0)` = none).
-    pub entity: Uuid,
+    /// The struck body's tagged owner (`None` on a miss or an unowned body).
+    pub target: Option<ScriptHitTarget>,
     /// World-space contact point.
     pub point: Vec3,
     /// World-space surface normal at the hit.
     pub normal: Vec3,
     /// Distance along the ray from the origin.
     pub distance: f32,
+}
+
+/// One macro plant a script-side vegetation query matched.
+///
+/// The identity is the canonical 32-digit hexadecimal string, the same text the control plane and
+/// the `sa` CLI use, so a script can hand it straight back to an interaction call. Position and
+/// bounds are render-relative metres, matching every other script-visible world value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScriptPlantHit {
+    /// Canonical plant identity.
+    pub plant: String,
+    /// Render-relative plant position.
+    pub position: Vec3,
+    /// Metric distance from the query origin.
+    pub distance: f32,
+    /// Biological lifecycle name (`seed`, `sprout`, `mature`, `stump`, …).
+    pub lifecycle: String,
+    /// Persistent health in 0..1.
+    pub health: f32,
+    /// Gameplay interaction policy name (`decorative`, `interactive`, `harvestable`, `structural`).
+    pub interaction_policy: String,
+}
+
+/// The tagged owner of a struck body, mirrored from the physics world-hit target so
+/// `saffron-script` stays free of a physics dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptHitTarget {
+    /// A hecs scene entity, by stable uuid.
+    SceneEntity(Uuid),
+    /// An authoritative macro plant, by its full 128-bit identity.
+    Vegetation(saffron_spatial::PlantId),
 }
 
 /// A rig's live ragdoll state surfaced to Lua, Jolt-free POD.
@@ -102,6 +133,27 @@ pub trait ScriptHostBridge {
     /// The rig's live ragdoll state.
     fn ragdoll_state(&self, rig: Uuid) -> ScriptRagdollState;
 
+    /// The closest macro plant along `origin + dir * max_dist` whose conservative bounds the ray
+    /// enters. Bounds-level, never a physics cast: it reports plants with no collision body too.
+    fn vegetation_raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<ScriptPlantHit>;
+
+    /// The macro plant nearest `position` within `radius`.
+    fn vegetation_nearest(&self, position: Vec3, radius: f32) -> Option<ScriptPlantHit>;
+
+    /// Every macro plant within `radius` of `position`, nearest first, capped at `limit`.
+    fn vegetation_in_radius(
+        &self,
+        position: Vec3,
+        radius: f32,
+        limit: usize,
+    ) -> Vec<ScriptPlantHit>;
+
+    /// Apply `amount` of damage (0..1) to the plant, returning whether the mutation committed.
+    fn vegetation_damage(&self, plant: &str, amount: f32) -> bool;
+
+    /// Harvest the plant into `phenotype`, returning whether the mutation committed.
+    fn vegetation_harvest(&self, plant: &str, phenotype: u32) -> bool;
+
     /// Route a `sa.log(...)` line to the editor's script-log ring, tagged with the uuid
     /// of the instance whose handler is running. Called *after* the engine log, so a
     /// no-op sink still writes the console.
@@ -143,6 +195,36 @@ impl ScriptHostBridge for NoopBridge {
 
     fn ragdoll_state(&self, _rig: Uuid) -> ScriptRagdollState {
         ScriptRagdollState::default()
+    }
+
+    fn vegetation_raycast(
+        &self,
+        _origin: Vec3,
+        _dir: Vec3,
+        _max_dist: f32,
+    ) -> Option<ScriptPlantHit> {
+        None
+    }
+
+    fn vegetation_nearest(&self, _position: Vec3, _radius: f32) -> Option<ScriptPlantHit> {
+        None
+    }
+
+    fn vegetation_in_radius(
+        &self,
+        _position: Vec3,
+        _radius: f32,
+        _limit: usize,
+    ) -> Vec<ScriptPlantHit> {
+        Vec::new()
+    }
+
+    fn vegetation_damage(&self, _plant: &str, _amount: f32) -> bool {
+        false
+    }
+
+    fn vegetation_harvest(&self, _plant: &str, _phenotype: u32) -> bool {
+        false
     }
 
     fn log_sink(&self, _sender: Uuid, _message: &str) {}

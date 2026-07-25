@@ -44,7 +44,9 @@ pub use bindings::{
     Arg, BINDINGS, Binding, BindingKind, register_no_scene_globals, register_scene_globals,
     register_value_types,
 };
-pub use bridge::{NoopBridge, ScriptHostBridge, ScriptRagdollState, ScriptRayHit};
+pub use bridge::{
+    NoopBridge, ScriptHitTarget, ScriptHostBridge, ScriptPlantHit, ScriptRagdollState, ScriptRayHit,
+};
 pub use entity::EntityHandle;
 pub use error::{Error, Result};
 pub use runtime::{ContactInfo, ScriptHost, ScriptRunError};

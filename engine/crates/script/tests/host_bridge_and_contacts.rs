@@ -20,14 +20,16 @@ use saffron_scene::{
     Transform, register_builtin_components,
 };
 use saffron_script::{
-    ContactInfo, ScriptHost, ScriptHostBridge, ScriptRagdollState, ScriptRayHit, ScriptRunError,
+    ContactInfo, ScriptHitTarget, ScriptHost, ScriptHostBridge, ScriptRagdollState, ScriptRayHit,
+    ScriptRunError,
 };
 
 /// Builds a [`ContactInfo`] for the tests' a/b uuids.
 fn contact(a: Uuid, b: Uuid, begin: bool, sensor: bool, point: Vec3, normal: Vec3) -> ContactInfo {
+    let tag = |uuid: Uuid| (uuid != Uuid(0)).then_some(ScriptHitTarget::SceneEntity(uuid));
     ContactInfo {
-        entity_a: a,
-        entity_b: b,
+        target_a: tag(a),
+        target_b: tag(b),
         begin,
         sensor,
         point,
@@ -95,7 +97,7 @@ impl ScriptHostBridge for RecordingBridge {
         });
         ScriptRayHit {
             hit: true,
-            entity: self.hit_entity,
+            target: Some(ScriptHitTarget::SceneEntity(self.hit_entity)),
             point: Vec3::new(11.0, 12.0, 13.0),
             normal: Vec3::new(0.0, 1.0, 0.0),
             distance: 42.0,
@@ -109,7 +111,7 @@ impl ScriptHostBridge for RecordingBridge {
         });
         ScriptRayHit {
             hit: true,
-            entity: Uuid(0),
+            target: None,
             point: Vec3::new(1.0, 2.0, 3.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
             distance: 7.0,
@@ -147,6 +149,40 @@ impl ScriptHostBridge for RecordingBridge {
             bones: 9,
         }
     }
+    fn vegetation_raycast(
+        &self,
+        _origin: Vec3,
+        _dir: Vec3,
+        _max_dist: f32,
+    ) -> Option<saffron_script::ScriptPlantHit> {
+        None
+    }
+
+    fn vegetation_nearest(
+        &self,
+        _position: Vec3,
+        _radius: f32,
+    ) -> Option<saffron_script::ScriptPlantHit> {
+        None
+    }
+
+    fn vegetation_in_radius(
+        &self,
+        _position: Vec3,
+        _radius: f32,
+        _limit: usize,
+    ) -> Vec<saffron_script::ScriptPlantHit> {
+        Vec::new()
+    }
+
+    fn vegetation_damage(&self, _plant: &str, _amount: f32) -> bool {
+        false
+    }
+
+    fn vegetation_harvest(&self, _plant: &str, _phenotype: u32) -> bool {
+        false
+    }
+
     fn log_sink(&self, sender: Uuid, message: &str) {
         self.record(Call::LogSink(sender, message.to_owned()));
     }

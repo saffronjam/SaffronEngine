@@ -482,6 +482,41 @@ pub const BINDINGS: &[Binding] = &[
         "Sweep a sphere against the live physics world (a thicker probe than raycast)."
     ),
     binding!(
+        "vegetation_raycast", None, BindingKind::Free,
+        [
+            ("ox": "number"), ("oy": "number"), ("oz": "number"),
+            ("dx": "number"), ("dy": "number"), ("dz": "number"),
+            ("max_dist": "number"),
+        ],
+        Some("PlantHit"),
+        "Closest macro plant whose bounds the ray enters (bounds-level, not a physics cast)."
+    ),
+    binding!(
+        "vegetation_nearest", None, BindingKind::Free,
+        [("x": "number"), ("y": "number"), ("z": "number"), ("radius": "number")],
+        Some("PlantHit"),
+        "The macro plant nearest a point within `radius`."
+    ),
+    binding!(
+        "vegetation_in_radius", None, BindingKind::Free,
+        [
+            ("x": "number"), ("y": "number"), ("z": "number"),
+            ("radius": "number"), ("limit": "number"),
+        ],
+        Some("any"),
+        "Macro plants within `radius`, nearest first, capped at `limit` (default 64)."
+    ),
+    binding!(
+        "vegetation_damage", None, BindingKind::Free,
+        [("plant": "string"), ("amount": "number")], Some("boolean"),
+        "Apply 0..1 damage to a plant through the reducer; returns whether it committed."
+    ),
+    binding!(
+        "vegetation_harvest", None, BindingKind::Free,
+        [("plant": "string"), ("phenotype": "number")], Some("boolean"),
+        "Harvest a plant into a phenotype through the reducer; returns whether it committed."
+    ),
+    binding!(
         "spawn_task", None, BindingKind::Free, [("fn": "any")], Some("any"),
         "Start a coroutine task; returns the coroutine (resumes immediately)."
     ),
@@ -714,6 +749,77 @@ pub fn register_scene_globals(lua: &Lua) -> Result<()> {
         .map_err(runtime)?;
     sa.set("spherecast", spherecast).map_err(runtime)?;
 
+    // Vegetation: bounds-level macro queries and the two interaction mutations a script drives.
+    // A query answers from the bound authority synchronously; a mutation reduces through the one
+    // reducer and reports whether it committed.
+    let vegetation_raycast = lua
+        .create_function(
+            |lua, (ox, oy, oz, dx, dy, dz, max_dist): (f32, f32, f32, f32, f32, f32, f32)| {
+                let origin = glam::Vec3::new(ox, oy, oz);
+                let dir = glam::Vec3::new(dx, dy, dz);
+                let hit =
+                    session::with_bridge(|bridge| bridge.vegetation_raycast(origin, dir, max_dist))
+                        .flatten();
+                plant_hit_table(lua, hit)
+            },
+        )
+        .map_err(runtime)?;
+    sa.set("vegetation_raycast", vegetation_raycast)
+        .map_err(runtime)?;
+
+    let vegetation_nearest = lua
+        .create_function(|lua, (x, y, z, radius): (f32, f32, f32, f32)| {
+            let position = glam::Vec3::new(x, y, z);
+            let hit = session::with_bridge(|bridge| bridge.vegetation_nearest(position, radius))
+                .flatten();
+            plant_hit_table(lua, hit)
+        })
+        .map_err(runtime)?;
+    sa.set("vegetation_nearest", vegetation_nearest)
+        .map_err(runtime)?;
+
+    let vegetation_in_radius = lua
+        .create_function(
+            |lua, (x, y, z, radius, limit): (f32, f32, f32, f32, Option<u32>)| {
+                let position = glam::Vec3::new(x, y, z);
+                let limit = limit.unwrap_or(64) as usize;
+                let hits = session::with_bridge(|bridge| {
+                    bridge.vegetation_in_radius(position, radius, limit)
+                })
+                .unwrap_or_default();
+                let list = lua.create_table()?;
+                for (index, hit) in hits.into_iter().enumerate() {
+                    list.set(index + 1, plant_hit_table(lua, Some(hit))?)?;
+                }
+                Ok(list)
+            },
+        )
+        .map_err(runtime)?;
+    sa.set("vegetation_in_radius", vegetation_in_radius)
+        .map_err(runtime)?;
+
+    let vegetation_damage = lua
+        .create_function(|_, (plant, amount): (String, f32)| {
+            Ok(
+                session::with_bridge(|bridge| bridge.vegetation_damage(&plant, amount))
+                    .unwrap_or(false),
+            )
+        })
+        .map_err(runtime)?;
+    sa.set("vegetation_damage", vegetation_damage)
+        .map_err(runtime)?;
+
+    let vegetation_harvest = lua
+        .create_function(|_, (plant, phenotype): (String, u32)| {
+            Ok(
+                session::with_bridge(|bridge| bridge.vegetation_harvest(&plant, phenotype))
+                    .unwrap_or(false),
+            )
+        })
+        .map_err(runtime)?;
+    sa.set("vegetation_harvest", vegetation_harvest)
+        .map_err(runtime)?;
+
     // Override the no-scene `sa.log` with the play VM's log-sink variant: the line still
     // hits the engine log, then routes to the host's script-log ring tagged with the
     // running instance's uuid.
@@ -730,10 +836,28 @@ pub fn register_scene_globals(lua: &Lua) -> Result<()> {
     Ok(())
 }
 
-/// Shapes a [`ScriptRayHit`] POD into the `{hit, distance, point, normal, entity}` Lua
+/// Shapes a [`ScriptRayHit`] POD into the `{hit, distance, point, normal, entity | plant}` Lua
 /// table. `point`/`normal` are `sa.Vec3`; `entity` is the resolved [`EntityHandle`] only
 /// on a hit with an owner entity (a miss / unmapped body has no `entity` key — `nil`). A
 /// `None` hit (no bridge lent) is the miss table `{hit = false}`.
+/// Shapes one vegetation hit into its result table. A miss is `{ hit = false }`, mirroring the
+/// physics-cast tables so a script reads both the same way.
+fn plant_hit_table(lua: &Lua, hit: Option<crate::bridge::ScriptPlantHit>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    let Some(hit) = hit else {
+        table.set("hit", false)?;
+        return Ok(table);
+    };
+    table.set("hit", true)?;
+    table.set("plant", hit.plant)?;
+    table.set("position", SaVec3::new(hit.position))?;
+    table.set("distance", hit.distance)?;
+    table.set("lifecycle", hit.lifecycle)?;
+    table.set("health", hit.health)?;
+    table.set("interaction_policy", hit.interaction_policy)?;
+    Ok(table)
+}
+
 fn ray_hit_table(lua: &Lua, hit: Option<ScriptRayHit>) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let Some(hit) = hit else {
@@ -744,11 +868,17 @@ fn ray_hit_table(lua: &Lua, hit: Option<ScriptRayHit>) -> mlua::Result<Table> {
     table.set("distance", hit.distance)?;
     table.set("point", SaVec3::new(hit.point))?;
     table.set("normal", SaVec3::new(hit.normal))?;
-    if hit.hit && hit.entity != Uuid(0) {
-        let resolved = session::with_scene(|scene| scene.find_entity_by_uuid(hit.entity)).flatten();
-        if let Some(entity) = resolved {
-            table.set("entity", EntityHandle::new(entity))?;
+    match hit.target {
+        Some(crate::bridge::ScriptHitTarget::SceneEntity(uuid)) if hit.hit => {
+            let resolved = session::with_scene(|scene| scene.find_entity_by_uuid(uuid)).flatten();
+            if let Some(entity) = resolved {
+                table.set("entity", EntityHandle::new(entity))?;
+            }
         }
+        Some(crate::bridge::ScriptHitTarget::Vegetation(plant)) if hit.hit => {
+            table.set("plant", plant.canonical_hex())?;
+        }
+        _ => {}
     }
     Ok(table)
 }
@@ -982,7 +1112,7 @@ mod tests {
     /// row count and the first/last rows are pinned.
     #[test]
     fn table_order_is_stable() {
-        assert_eq!(BINDINGS.len(), 70);
+        assert_eq!(BINDINGS.len(), 75);
         assert_eq!((BINDINGS[0].class, BINDINGS[0].name), (Some("Vec3"), "x"));
         let last = BINDINGS[BINDINGS.len() - 1];
         assert_eq!((last.class, last.name), (None, "delay"));

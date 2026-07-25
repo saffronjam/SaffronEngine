@@ -59,12 +59,21 @@ struct ScriptInstance {
 /// world-space contact manifold. The host fills it from a drained `saffron-physics`
 /// `ContactEvent` — `saffron-script` carries no physics edge, so this is the plain shape
 /// the binding sees.
+/// The `other` argument a contact handler receives: the touching entity's handle, or
+/// a macro plant's canonical hex identity.
+enum ContactOther {
+    /// The other body's scene entity (the null handle when unowned).
+    Entity(Entity),
+    /// The other body's plant identity as canonical hex.
+    Plant(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContactInfo {
-    /// One body's owner-entity uuid (`Uuid(0)` when the body had no owning entity).
-    pub entity_a: Uuid,
-    /// The other body's owner-entity uuid (`Uuid(0)` when none).
-    pub entity_b: Uuid,
+    /// One body's tagged owner (`None` when the body has no owner).
+    pub target_a: Option<crate::bridge::ScriptHitTarget>,
+    /// The other body's tagged owner (`None` when none).
+    pub target_b: Option<crate::bridge::ScriptHitTarget>,
     /// Whether the contact began (`true`) or ended (`false`).
     pub begin: bool,
     /// Whether either body is a sensor — a trigger overlap, not a solid touch.
@@ -304,8 +313,8 @@ impl ScriptHost {
         let mut failure = self.dispatch_contact_one(
             handler,
             with_manifold,
-            contact.entity_a,
-            contact.entity_b,
+            contact.target_a,
+            contact.target_b,
             contact.point,
             contact.normal,
         );
@@ -313,8 +322,8 @@ impl ScriptHost {
             failure = self.dispatch_contact_one(
                 handler,
                 with_manifold,
-                contact.entity_b,
-                contact.entity_a,
+                contact.target_b,
+                contact.target_a,
                 contact.point,
                 contact.normal,
             );
@@ -335,17 +344,27 @@ impl ScriptHost {
         &self,
         handler: &str,
         with_manifold: bool,
-        self_uuid: Uuid,
-        other_uuid: Uuid,
+        self_target: Option<crate::bridge::ScriptHitTarget>,
+        other_target: Option<crate::bridge::ScriptHitTarget>,
         point: glam::Vec3,
         normal: glam::Vec3,
     ) -> Option<ScriptRunError> {
-        if self_uuid == Uuid(0) {
+        // Handlers run on scene entities; a plant (or an unowned body) has no script
+        // instance until promotion turns it into one.
+        let Some(crate::bridge::ScriptHitTarget::SceneEntity(self_uuid)) = self_target else {
             return None;
-        }
-        let other = session::with_scene(|scene| scene.find_entity_by_uuid(other_uuid))
-            .flatten()
-            .unwrap_or(Entity::NULL);
+        };
+        let other = match other_target {
+            Some(crate::bridge::ScriptHitTarget::SceneEntity(uuid)) => ContactOther::Entity(
+                session::with_scene(|scene| scene.find_entity_by_uuid(uuid))
+                    .flatten()
+                    .unwrap_or(Entity::NULL),
+            ),
+            Some(crate::bridge::ScriptHitTarget::Vegetation(plant)) => {
+                ContactOther::Plant(plant.canonical_hex())
+            }
+            None => ContactOther::Entity(Entity::NULL),
+        };
         for instance in &self.instances {
             if instance.entity_uuid != self_uuid {
                 continue;
@@ -354,7 +373,7 @@ impl ScriptHost {
             if let Err(err) = self.call_contact_handler(
                 &instance.self_ref,
                 handler,
-                other,
+                &other,
                 with_manifold,
                 point,
                 normal,
@@ -380,7 +399,7 @@ impl ScriptHost {
         &self,
         self_ref: &RegistryKey,
         name: &str,
-        other: Entity,
+        other: &ContactOther,
         with_manifold: bool,
         point: glam::Vec3,
         normal: glam::Vec3,
@@ -402,11 +421,20 @@ impl ScriptHost {
         };
 
         vm.reset_budget();
-        let other_handle = EntityHandle::new(other);
+        let other_value = match other {
+            ContactOther::Entity(entity) => LuaValue::UserData(
+                lua.create_userdata(EntityHandle::new(*entity))
+                    .map_err(|e| Error::Runtime(e.to_string()))?,
+            ),
+            ContactOther::Plant(hex) => LuaValue::String(
+                lua.create_string(hex)
+                    .map_err(|e| Error::Runtime(e.to_string()))?,
+            ),
+        };
         let result: mlua::Result<()> = if with_manifold {
-            method.call((self_table, other_handle, SaVec3(point), SaVec3(normal)))
+            method.call((self_table, other_value, SaVec3(point), SaVec3(normal)))
         } else {
-            method.call((self_table, other_handle))
+            method.call((self_table, other_value))
         };
         result.map_err(|e| vm.classify_run_error(&e))
     }
