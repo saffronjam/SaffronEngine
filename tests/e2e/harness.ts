@@ -210,7 +210,8 @@ export class Engine {
       const timer = setTimeout(
         () => {
           socket.destroy();
-          reject(new Error(`timeout calling ${cmd}`));
+          const tail = this.buf.split("\n").slice(-40).join("\n");
+          reject(new Error(`timeout calling ${cmd}\n--- engine log tail ---\n${tail}`));
         },
         Number(process.env.SAFFRON_E2E_CALL_TIMEOUT_MS) || 15_000,
       );
@@ -280,9 +281,23 @@ export class Engine {
   async awaitProjectReady(timeoutMs = 30_000): Promise<void> {
     const start = Date.now();
     for (;;) {
-      let status: { phase: string; error: string } = { phase: "loading", error: "" };
+      let status: {
+        phase: string;
+        error: string;
+        stage?: string;
+        currentItem?: string;
+        done?: number;
+        total?: number;
+      } = { phase: "loading", error: "" };
       try {
-        status = await this.call<{ phase: string; error: string }>("project-status");
+        status = await this.call<{
+          phase: string;
+          error: string;
+          stage?: string;
+          currentItem?: string;
+          done?: number;
+          total?: number;
+        }>("project-status");
       } catch {
         // Socket briefly busy mid-load; retry.
       }
@@ -293,7 +308,10 @@ export class Engine {
         throw new Error(`project load failed: ${status.error}`);
       }
       if (Date.now() - start > timeoutMs) {
-        throw new Error(`timeout waiting for project ready (phase=${status.phase})`);
+        throw new Error(
+          `timeout waiting for project ready (phase=${status.phase} stage=${status.stage} ` +
+            `${status.done}/${status.total} item=${status.currentItem})`,
+        );
       }
       await delay(50);
     }
