@@ -25,15 +25,21 @@ pub fn native_plant_source_id(family: Uuid) -> u128 {
     (1_u128 << 127) | u128::from(family.value())
 }
 
+/// Stable source identity of one variation's grown geometry.
+///
+/// Each declared variation is its own individual with its own meshes, so it needs its own source
+/// identity for the family's variation table to select it. Source identities are family-local, so
+/// this derives from the index alone — a value that depends on the family id would go stale the
+/// moment the catalog assigns a different one.
+#[must_use]
+pub fn native_variation_source_id(variation: usize) -> u128 {
+    (1_u128 << 126) | u128::from(variation as u64)
+}
+
 /// Hashes the complete canonical embedded botanical graph source.
 #[must_use]
-pub fn native_botanical_graph_content_hash(graph: &crate::NativeBotanicalGraph) -> [u8; 32] {
-    let mut bytes = b"saffron-anima/native-botanical-graph/v1\0".to_vec();
-    bytes.extend_from_slice(&graph.schema_hash);
-    let document = saffron_json::dump_json_sorted(&graph.graph, -1);
-    bytes.extend_from_slice(&(document.len() as u64).to_be_bytes());
-    bytes.extend_from_slice(document.as_bytes());
-    crate::vegetation_content_hash(&bytes)
+pub fn native_botanical_graph_content_hash(graph: &crate::BotanicalGraphDocument) -> [u8; 32] {
+    graph.identity().bytes()
 }
 
 /// Hard bounds applied before plant-source normalization allocates output.
@@ -190,6 +196,8 @@ pub enum PlantCompileDiagnosticCode {
     LimitExceeded,
     /// A resolved source hash differs from the last accepted source identity.
     SourceChanged,
+    /// An authored manual edit has no surviving element to change.
+    OrphanedEdit,
 }
 
 /// One typed source-compile diagnostic.
@@ -405,6 +413,8 @@ pub struct PlantCompileStatistics {
     pub materials: u64,
     /// Rejected source elements.
     pub rejected: u64,
+    /// Hero meshes grafted over generated elements.
+    pub grafts: u64,
 }
 
 /// Shared result used by validation and recook; only the asset layer decides whether to publish.
@@ -448,8 +458,8 @@ pub fn compile_plant_family(
         PlantFamilySource::Imported(recipe) => {
             compile_imported_plant_family(asset, recipe, snapshots, limits)
         }
-        PlantFamilySource::Native(graph) => {
-            compile_native_plant_family(asset, graph, snapshots, limits)
+        PlantFamilySource::Native { graph, grafts } => {
+            compile_native_plant_family(asset, graph, grafts, snapshots, limits)
         }
     }
 }
@@ -859,7 +869,8 @@ fn compile_imported_plant_family(
 
 fn compile_native_plant_family(
     asset: &PlantFamilyAsset,
-    graph: &crate::NativeBotanicalGraph,
+    graph: &crate::BotanicalGraphDocument,
+    grafts: &[crate::PlantSourceReference],
     snapshots: &[PlantSourceSnapshot],
     limits: PlantCompileLimits,
 ) -> Result<PlantCompileOutput> {
@@ -867,39 +878,79 @@ fn compile_native_plant_family(
     let content_hash = native_botanical_graph_content_hash(graph);
     let mut diagnostics = Vec::new();
     let mut statistics = PlantCompileStatistics::default();
-    if snapshots.len() > limits.sources as usize {
-        push_limit(
-            &mut diagnostics,
-            limits,
-            "source.native",
-            "native source count exceeds the compile limit",
-        )?;
+    let mut source_updates = Vec::new();
+    // A native family grows its own geometry, so the snapshots it may carry are its own canonical
+    // one plus one per declared graft. Anything else means an imported payload leaked in.
+    let snapshot = snapshots.iter().find(|snapshot| snapshot.source == source);
+    let graft_by_id: BTreeMap<u128, &crate::PlantSourceReference> =
+        grafts.iter().map(|graft| (graft.id, graft)).collect();
+    let mut graft_snapshots: BTreeMap<u128, &PlantSourceSnapshot> = BTreeMap::new();
+    let mut unexpected = false;
+    for candidate in snapshots {
+        if candidate.source == source {
+            continue;
+        }
+        if graft_by_id.contains_key(&candidate.source) {
+            if graft_snapshots
+                .insert(candidate.source, candidate)
+                .is_some()
+            {
+                push_diagnostic(
+                    &mut diagnostics,
+                    limits,
+                    diagnostic(
+                        PlantCompileDiagnosticSeverity::Error,
+                        PlantCompileDiagnosticCode::DuplicateSource,
+                        Some(candidate.source),
+                        None,
+                        "source.native.graft",
+                        "more than one snapshot carries this graft source identity",
+                    ),
+                )?;
+            }
+        } else {
+            unexpected = true;
+        }
     }
-    let matching = snapshots
-        .iter()
-        .filter(|snapshot| snapshot.source == source)
-        .collect::<Vec<_>>();
-    let snapshot = if matching.len() == 1 && snapshots.len() == 1 {
-        Some(matching[0])
-    } else {
+    if unexpected {
         push_diagnostic(
             &mut diagnostics,
             limits,
             diagnostic(
                 PlantCompileDiagnosticSeverity::Error,
-                if matching.len() > 1 {
-                    PlantCompileDiagnosticCode::DuplicateSource
-                } else {
-                    PlantCompileDiagnosticCode::MissingSource
-                },
+                PlantCompileDiagnosticCode::DuplicateSource,
                 Some(source),
                 None,
                 "source.native",
-                "native botanical graph requires exactly one canonical source snapshot",
+                "a native botanical family accepts only its own snapshot and its declared grafts",
             ),
         )?;
-        None
-    };
+    }
+    for graft in grafts {
+        let Some(resolved) = graft_snapshots.get(&graft.id) else {
+            push_diagnostic(
+                &mut diagnostics,
+                limits,
+                diagnostic(
+                    PlantCompileDiagnosticSeverity::Error,
+                    PlantCompileDiagnosticCode::MissingSource,
+                    Some(graft.id),
+                    Some(graft.selector.clone()),
+                    "source.native.graft",
+                    "graft source has no resolved snapshot",
+                ),
+            )?;
+            continue;
+        };
+        statistics.sources += 1;
+        if resolved.content_hash != graft.content_hash {
+            source_updates.push(PlantSourceHashUpdate {
+                source: graft.id,
+                previous: graft.content_hash,
+                current: resolved.content_hash,
+            });
+        }
+    }
     if let Some(snapshot) = snapshot {
         statistics.sources = 1;
         if snapshot.content_hash != content_hash {
@@ -926,11 +977,176 @@ fn compile_native_plant_family(
                     Some(source),
                     None,
                     "source.native.generatedPayload",
-                    "native generated payload requires the typed botanical generation contract",
+                    "a native family grows its geometry; an imported payload cannot stand in for it",
                 ),
             )?;
         }
     }
+
+    // Grow every declared variation. Each is its own individual with its own geometry under its own
+    // source identity, which is how the family's variation table selects one. A graph that cannot
+    // grow is a compile error naming the field that failed, not a silently empty family.
+    let mut generated = None;
+    let mut meshes = Vec::new();
+    let mut joints = Vec::new();
+    let mut assemblies = Vec::new();
+    let mut failed = false;
+    for index in 0..graph.variations.len() {
+        let growth = match crate::grow(graph, index) {
+            Ok(growth) => growth,
+            Err(error) => {
+                push_diagnostic(
+                    &mut diagnostics,
+                    limits,
+                    diagnostic(
+                        PlantCompileDiagnosticSeverity::Error,
+                        PlantCompileDiagnosticCode::InvalidGeometry,
+                        Some(source),
+                        None,
+                        "source.native.graph",
+                        &error.to_string(),
+                    ),
+                )?;
+                failed = true;
+                break;
+            }
+        };
+        // An orphaned edit is reported once, on the representative individual: the layer is shared,
+        // so every variation orphans the same edits and repeating them says nothing new.
+        if index == 0 {
+            for orphan in &growth.diagnostics.orphans {
+                push_diagnostic(
+                    &mut diagnostics,
+                    limits,
+                    diagnostic(
+                        PlantCompileDiagnosticSeverity::Warning,
+                        PlantCompileDiagnosticCode::OrphanedEdit,
+                        Some(source),
+                        None,
+                        "source.native.edits",
+                        &format!(
+                            "manual {} edit on element {:032x} has no target: {}",
+                            orphan.action.name(),
+                            orphan.target.value(),
+                            orphan.reason.name()
+                        ),
+                    ),
+                )?;
+            }
+        }
+        // Each graft's hero mesh normalizes through the imported-source path — the same transform,
+        // winding, tangent, and material contract an imported family gets — before the generator
+        // stands it up on its frame. There is no native-only mesh path.
+        let mut grafted: BTreeMap<crate::BotanicalElementId, Vec<NormalizedPlantMesh>> =
+            BTreeMap::new();
+        for graft in &growth.assembly.grafts {
+            let (Some(reference), Some(resolved)) = (
+                graft_by_id.get(&graft.source),
+                graft_snapshots.get(&graft.source),
+            ) else {
+                continue;
+            };
+            let selected = selected_meshes(resolved, &graft.selector);
+            if selected.is_empty() {
+                push_diagnostic(
+                    &mut diagnostics,
+                    limits,
+                    diagnostic(
+                        PlantCompileDiagnosticSeverity::Error,
+                        PlantCompileDiagnosticCode::EmptySelection,
+                        Some(graft.source),
+                        Some(graft.selector.clone()),
+                        "source.native.graft.selection",
+                        "graft selection contains no source geometry",
+                    ),
+                )?;
+                continue;
+            }
+            for mesh in selected {
+                match normalize_mesh(
+                    asset,
+                    graft.source,
+                    PlantSourceRole::Geometry,
+                    &reference.settings,
+                    mesh,
+                    Vec3::ZERO,
+                ) {
+                    Ok(normalized) => grafted.entry(graft.id).or_default().push(normalized),
+                    Err(message) => push_diagnostic(
+                        &mut diagnostics,
+                        limits,
+                        diagnostic(
+                            PlantCompileDiagnosticSeverity::Error,
+                            PlantCompileDiagnosticCode::InvalidGeometry,
+                            Some(graft.source),
+                            Some(graft.selector.clone()),
+                            "source.native.graft.geometry",
+                            &message,
+                        ),
+                    )?,
+                }
+            }
+        }
+        statistics.grafts += growth.assembly.grafts.len() as u64;
+        let variation_source = native_variation_source_id(index);
+        match crate::normalize_botanical_geometry(variation_source, &growth.assembly, &grafted) {
+            Ok(geometry) => {
+                // Skin joint indices are family-global, so each variation's joints are appended and
+                // its own indices shift by what came before.
+                let base = u16::try_from(joints.len()).unwrap_or(u16::MAX);
+                for mut mesh in geometry.meshes {
+                    for skin in &mut mesh.skin {
+                        for joint in &mut skin.joints {
+                            *joint = joint.saturating_add(base);
+                        }
+                    }
+                    meshes.push(mesh);
+                }
+                joints.extend(geometry.joints);
+                assemblies.push(growth.assembly);
+            }
+            Err(error) => {
+                push_diagnostic(
+                    &mut diagnostics,
+                    limits,
+                    diagnostic(
+                        PlantCompileDiagnosticSeverity::Error,
+                        PlantCompileDiagnosticCode::InvalidGeometry,
+                        Some(variation_source),
+                        None,
+                        "source.native.generation",
+                        &error.to_string(),
+                    ),
+                )?;
+                failed = true;
+                break;
+            }
+        }
+    }
+    if !failed {
+        match crate::widest_family_structure(&assemblies) {
+            Ok(structure) => {
+                statistics.meshes = meshes.len() as u64;
+                statistics.joints = joints.len() as u64;
+                statistics.vertices = meshes.iter().map(|mesh| mesh.vertices.len() as u64).sum();
+                statistics.indices = meshes.iter().map(|mesh| mesh.indices.len() as u64).sum();
+                generated = Some((meshes, joints, structure));
+            }
+            Err(error) => push_diagnostic(
+                &mut diagnostics,
+                limits,
+                diagnostic(
+                    PlantCompileDiagnosticSeverity::Error,
+                    PlantCompileDiagnosticCode::InvalidGeometry,
+                    Some(source),
+                    None,
+                    "source.native.generation",
+                    &error.to_string(),
+                ),
+            )?,
+        }
+    }
+
     let (material_snapshots, conflicting_materials) = collect_material_snapshots(snapshot);
     let materials = resolve_materials(
         asset,
@@ -961,14 +1177,24 @@ fn compile_native_plant_family(
     let blocked = diagnostics
         .iter()
         .any(|diagnostic| diagnostic.severity == PlantCompileDiagnosticSeverity::Error);
-    let family = (!blocked).then_some(NormalizedPlantFamily {
-        family: asset.id,
-        tags: asset.tags.clone(),
-        sources: vec![(source, content_hash)],
-        meshes: Vec::new(),
-        joints: Vec::new(),
-        materials,
-        dimensions: asset.dimensions,
+    let family = if blocked { None } else { generated }.map(|(meshes, joints, structure)| {
+        NormalizedPlantFamily {
+            family: asset.id,
+            tags: asset.tags.clone(),
+            sources: std::iter::once((source, content_hash))
+                .chain(
+                    graft_snapshots
+                        .values()
+                        .map(|snapshot| (snapshot.source, snapshot.content_hash)),
+                )
+                .collect(),
+            meshes,
+            joints,
+            materials,
+            // The grown plant's own bounds, not the authored declaration: a native family's
+            // dimensions are a result, and a stale authored value would be a second truth.
+            dimensions: structure.dimensions,
+        }
     });
     let family_hash = family
         .as_ref()
@@ -979,7 +1205,7 @@ fn compile_native_plant_family(
         family_hash,
         diagnostics,
         conflicts: PlantReimportConflictReport::default(),
-        source_updates: Vec::new(),
+        source_updates,
         statistics,
     })
 }
@@ -2098,10 +2324,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ImportedPlantFamilyRecipe, InteractionPolicy, MechanicalResponse, NativeBotanicalGraph,
-        PLANT_ASSET_VERSION, PhenotypeRole, PlantFamilySource, PlantImportSettings,
-        PlantManualSemanticTarget, PlantPart, PlantPhenotype, PlantSourceLocator,
-        PlantSourceReference, PlantVariation, SourceProvenance,
+        ImportedPlantFamilyRecipe, InteractionPolicy, MechanicalResponse, PLANT_ASSET_VERSION,
+        PhenotypeRole, PlantFamilySource, PlantImportSettings, PlantManualSemanticTarget,
+        PlantPart, PlantPhenotype, PlantSourceLocator, PlantSourceReference, PlantVariation,
+        SourceProvenance,
     };
 
     fn fixed(value: i32) -> DecisionScalar {
@@ -2189,6 +2415,7 @@ mod tests {
             phenotypes: vec![PlantPhenotype {
                 id: 0,
                 role: PhenotypeRole::Healthy,
+                season_window: None,
                 variation: 0,
                 material_remap: Vec::new(),
                 active_parts: Vec::new(),
@@ -2197,6 +2424,7 @@ mod tests {
             navigation_proxies: Vec::new(),
             interaction_policy: InteractionPolicy::Decorative,
             habitat: None,
+            ecology: crate::PlantEcologyDeclaration::default(),
         }
     }
 
@@ -2366,16 +2594,107 @@ mod tests {
         }));
     }
 
+    /// A graft's hero mesh reaches the family through the imported normalizer and stands on the
+    /// frame of the element it replaced — no native-only mesh path, and no lost geometry.
+    #[test]
+    fn a_graft_normalizes_through_the_imported_source_path() {
+        let mut asset = asset();
+        let mut graph = crate::BotanicalGraphDocument::sapling(0x5a11);
+        let grown = crate::grow(&graph, 0).unwrap().assembly;
+        let leaf = grown.elements[0].clone();
+        let hero = PlantSourceReference {
+            id: 77,
+            locator: PlantSourceLocator::Asset(Uuid(1_100)),
+            role: PlantSourceRole::Geometry,
+            selector: selector(20, "oak/leaves"),
+            content_hash: [1; 32],
+            settings: PlantImportSettings {
+                pivot: PlantPivot::SourceOrigin,
+                ..PlantImportSettings::default()
+            },
+            provenance: provenance(),
+        };
+        graph.edits = vec![crate::BotanicalManualEdit {
+            target: leaf.id,
+            action: crate::BotanicalEditAction::Graft {
+                source: hero.id,
+                selector: selector(20, "oak/leaves"),
+            },
+        }];
+        asset.source = PlantFamilySource::Native {
+            graph: graph.clone(),
+            grafts: vec![hero.clone()],
+        };
+        asset.parts[0].sources.clear();
+        asset.variations[0].sources = vec![native_variation_source_id(0)];
+
+        let mut native = snapshot();
+        native.source = native_plant_source_id(asset.id);
+        native.content_hash = native_botanical_graph_content_hash(&graph);
+        native.meshes.clear();
+        native.joints.clear();
+        let mut grafted = snapshot();
+        grafted.source = hero.id;
+        grafted.content_hash = hero.content_hash;
+
+        let output =
+            compile_plant_family(&asset, &[native, grafted], PlantCompileLimits::default())
+                .unwrap();
+        assert!(output.publishable(), "{:?}", output.diagnostics);
+        assert_eq!(output.statistics.grafts, 1);
+        let family = output.family.unwrap();
+        // Generated geometry plus the graft, and the graft's vertices sit around the frame the
+        // replaced leaf stood on rather than at the family origin.
+        assert_eq!(family.meshes.len(), 2);
+        let graft_mesh = family
+            .meshes
+            .iter()
+            .find(|mesh| mesh.source == hero.id)
+            .expect("the graft reached the family");
+        assert!(!graft_mesh.vertices.is_empty());
+        assert!(
+            graft_mesh
+                .skin
+                .iter()
+                .all(|skin| skin.weights[0] == UnitInterval::ONE.bits()),
+            "a graft is rigid on the limb it stands on"
+        );
+        let near = graft_mesh.vertices.iter().any(|vertex| {
+            (0..3).all(|lane| {
+                (vertex.position_bits[lane] - leaf.position[lane].bits()).abs() < (4 << 16)
+            })
+        });
+        assert!(near, "the graft stands on its frame");
+        // Both sources are recorded, so a recook knows exactly what it read.
+        assert_eq!(family.sources.len(), 2);
+
+        // A graft whose source has no snapshot blocks publication rather than losing the mesh.
+        let mut lonely = snapshot();
+        lonely.source = native_plant_source_id(asset.id);
+        lonely.content_hash = native_botanical_graph_content_hash(&graph);
+        lonely.meshes.clear();
+        lonely.joints.clear();
+        let missing =
+            compile_plant_family(&asset, &[lonely], PlantCompileLimits::default()).unwrap();
+        assert!(!missing.publishable());
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|entry| entry.code == PlantCompileDiagnosticCode::MissingSource)
+        );
+    }
+
     #[test]
     fn native_source_uses_the_shared_normalized_family_contract() {
         let mut asset = asset();
-        let graph = NativeBotanicalGraph {
-            schema_hash: [1; 32],
-            graph: saffron_json::Value::Object(Default::default()),
+        let graph = crate::BotanicalGraphDocument::sapling(0x5a11);
+        asset.source = PlantFamilySource::Native {
+            graph: graph.clone(),
+            grafts: Vec::new(),
         };
-        asset.source = PlantFamilySource::Native(graph.clone());
         asset.parts[0].sources.clear();
-        asset.variations[0].sources.clear();
+        asset.variations[0].sources = vec![native_variation_source_id(0)];
         let mut source = snapshot();
         source.source = native_plant_source_id(asset.id);
         source.content_hash = native_botanical_graph_content_hash(&graph);
@@ -2385,9 +2704,15 @@ mod tests {
             compile_plant_family(&asset, &[source], PlantCompileLimits::default()).unwrap();
         assert!(output.publishable(), "{:?}", output.diagnostics);
         let family = output.family.unwrap();
-        assert!(family.meshes.is_empty());
-        assert!(family.joints.is_empty());
+        // A native family grows real geometry: one mesh with a submesh per material slot, a
+        // structural joint per axis, and the grown plant's own bounds.
+        assert_eq!(family.meshes.len(), 1);
+        assert!(!family.meshes[0].vertices.is_empty());
+        assert_eq!(family.meshes[0].skin.len(), family.meshes[0].vertices.len());
+        assert!(!family.joints.is_empty());
+        assert!(family.dimensions.height.bits() > 0);
         assert_eq!(family.materials.len(), 1);
         assert_eq!(family.sources[0].0, native_plant_source_id(asset.id));
+        assert!(output.statistics.vertices > 0 && output.statistics.joints > 0);
     }
 }
