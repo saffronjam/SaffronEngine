@@ -59,9 +59,10 @@ per-fragment variation.
 
 ## Visibility
 
-The directional shadow pass renders a 2048×2048 depth map from an orthographic light view fitted to
-the scene bounds. `pcfShadow` projects the surface into that map and averages a 3×3 comparison kernel.
-Samples outside the map or beyond its far plane are lit.
+The sun shadows through [virtual shadow pages](../../shadows-and-culling/virtual-shadow-maps/):
+`vsmSampleDirectional` resolves the surface through eight camera-snapped clip levels and takes a 3×3
+comparison filter inside the resident page. Samples outside every level or beyond the depth span are
+lit.
 
 When inline ray-query shadows run, `evalLighting` traces toward the sun with a maximum distance of
 `1e4` instead of sampling the map. Opaque surfaces can also multiply the selected visibility by the
@@ -72,7 +73,7 @@ query handles larger occluders.
 
 Volumetric fog calls `fogDirectionalInScatter` with the same color, intensity, and direction. The
 light's `volumetric_scattering` scales this contribution. When `cast_volumetric_shadow` is true and a
-directional shadow map is available, the fog sample uses that map to form shadowed shafts.
+the sun casts, the fog sample reads the same shadow pages to form shadowed shafts.
 
 The `ambient` field does not change the direct term. When IBL is disabled and the environment does
 not supply sky ambient, the renderer expands the scalar into a grayscale flat-ambient value. If the
@@ -86,7 +87,7 @@ component scalar. [IBL](../ibl-ambient-term/) ignores both flat fallbacks while 
 | Authored component | `scene/src/component.rs` | `DirectionalLight`, `DirectionalLight::DEFAULT_DIRECTION` |
 | Scene resolution | `assets/src/render_scene.rs` | `gather_directional_light`, `DirectionalResolved` |
 | Frame upload | `rendering/src/lighting.rs` | `SceneLighting`, `Lighting::set_scene_lighting`, `LightUbo` |
-| Surface and fog shading | `assets/shaders/lighting.slang` | `evalLighting`, `fogDirectionalInScatter`, `pcfShadow` |
+| Surface and fog shading | `assets/shaders/lighting.slang` | `evalLighting`, `fogDirectionalInScatter`, `vsmSampleDirectional` |
 | Starter sun | `scene/src/starter.rs` | `seed_starter_scene` |
 
 ## Related

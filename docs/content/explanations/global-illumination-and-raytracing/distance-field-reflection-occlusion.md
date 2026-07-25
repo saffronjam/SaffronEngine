@@ -35,7 +35,7 @@ The march takes up to 12 sphere-trace steps over at most 12 m, stepping by the f
 
 The cone reads the Global Distance Field clipmap: three camera-centered `R16_SNORM` volumes of
 128³ voxels, the finest spanning 32 m (a 0.25 m voxel) and each coarser cascade doubling the
-extent. `gdfDistance` selects the finest cascade containing the sample, converts world position to
+extent. `gdfDistanceOccupancy` selects the finest cascade containing the sample, converts world position to
 that cascade's toroidal UVW, and takes one trilinear tap; near a cascade's outer face it blends
 into the next coarser one so the handoff shows no shell. One tap costs the same regardless of
 scene size, because the cone never iterates an instance list.
@@ -113,7 +113,7 @@ the cones march never composites.
 
 | What | File | Symbols |
 |---|---|---|
-| Reflection cone march | `assets/shaders/sdf.slang` | `sdfReflectionOcclusion`, `gdfDistance`, `gdfEnabled` |
+| Reflection cone march | `assets/shaders/sdf.slang` | `sdfReflectionOcclusion`, `gdfDistanceOccupancy`, `gdfEnabled` |
 | Diffuse sky-visibility cones | `assets/shaders/sdf.slang` | `sdfSkyVisibility` |
 | Specular prepass | `assets/shaders/specocc.slang` | `computeMain` |
 | Diffuse (DFAO) prepass | `assets/shaders/dfao.slang` | `computeMain` |
@@ -123,6 +123,14 @@ the cones march never composites.
 | Lighting UBO bit | `crates/rendering/src/lighting.rs` | `set_frame_sdf_occlusion` |
 | GDF cascade constants | `crates/rendering/src/global_sdf.rs` | `GDF_CASCADES`, `GDF_RES`, `GDF_CASCADE0_EXTENT` |
 | Control command | `crates/control/src/commands_render.rs` | `set-sky-occlusion` |
+
+## Porous matter
+
+Porous aggregate matter (foliage-classed materials) contributes no distance to the field; the cones
+instead accumulate Beer–Lambert extinction through its per-cascade occupancy volumes using the
+shared `sdfExtinctionStep`. A canopy therefore dims a reflection or the sky by its density rather
+than sealing the cone the way a wall does. The [software ray trace](../software-ray-trace/) applies
+the same step along its probe rays.
 
 ## Related
 

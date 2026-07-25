@@ -26,7 +26,7 @@ ray queries. ReSTIR uses that visibility path for many-light direct lighting.
 | Page | Covers | Code |
 |---|---|---|
 | `ddgi-overview` | what DDGI is, the four-pass probe pipeline, sky-on-miss, the camera-centered clipmap, replacing the IBL diffuse by coverage | `lighting.slang` · `ddgiSampleIrradiance`; `rendering/src/renderer.rs` · `add_ddgi_passes` |
-| `distance-field-reflection-occlusion` | a roughness-widened cone marching the Global Distance Field along the reflection vector to occlude the reflected skybox | `sdf.slang` · `sdfReflectionOcclusion`, `gdfDistance` |
+| `distance-field-reflection-occlusion` | a roughness-widened cone marching the Global Distance Field along the reflection vector to occlude the reflected skybox | `sdf.slang` · `sdfReflectionOcclusion`, `gdfDistanceOccupancy` |
 | `probe-volume-and-sampling` | the 16×8×16 camera-centered cage, the toroidal tile fold, octahedral encoding, trilinear + backface + Chebyshev weights | `lighting.slang` · `ddgiSampleIrradiance`, `ddgiOctEncode`; `rendering/src/ddgi.rs` · `Ddgi` |
 | `software-ray-trace` | Fibonacci-sphere rays, sphere-marching the MDF→GDF field, sky-on-miss + albedo-cache hit color, free multi-bounce via probe reuse | `ddgi_trace.slang` · `computeMain`, `sphericalFibonacci`, `sampleAlbedo` |
 | `irradiance-and-moment-atlases` | temporal irradiance blend, Chebyshev moment atlas, octahedral border wrap | `ddgi_blend_irradiance.slang`, `ddgi_blend_distance.slang`, `ddgi_border.slang` |

@@ -63,13 +63,15 @@ and front depth; it does not composite into the scene target.
 
 ## Wind and night lighting
 
-`WindSettings` defines one scene-wide horizontal field with orientation, speed, and gust. Cloud
-weather and noise coordinates advect from the time-of-day clock, while the elevation-indexed coverage
-and cloud-type curves drive the weather cycle. A divergence-free 2D curl warp bends
-the detail flow without compressing the field, following
+The [wind field](../../scene-and-ecs/wind-field/) drives all sky-side advection. Cloud weather and
+noise coordinates translate with the field's mean term at the cloud layer's mid altitude (the shear
+power law applied to the authored speed), on the monotonic simulation clock; the elevation-indexed
+coverage and cloud-type curves drive the weather cycle.
+
+A divergence-free 2D curl warp bends the detail flow without compressing the field, following
 [Curl-Noise for Procedural Fluid Flow](https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph2007-curlnoise.pdf).
-Fog volumes with no local wind use the same velocity; an authored `FogVolume.wind` remains a local
-override.
+A fog volume with no local wind samples the shared field at its own position on the same clock; an
+authored `FogVolume.wind` remains a local override.
 
 The cloud march and shadow fill choose the atmosphere-coupled sun while it is above the horizon and
 the moon otherwise. Night clouds therefore use the same lunar direction, colour, intensity, and
