@@ -24,6 +24,7 @@ use crate::binary::BinaryReader;
 use crate::canonical::{ByteSink, CanonicalSink, CountSink};
 use crate::graph::{CompiledDemandSlice, CompiledDemandUnitSlice};
 use crate::hash::{VegetationContentHasher, sha256};
+use crate::identity::derive_procedural_plant_id;
 use crate::memory::{
     ALLOCATION_OVERHEAD_BYTES, checked_memory_sum as sum_memory_bytes,
     requested_btree_bytes as memory_requested_btree_bytes,
@@ -270,6 +271,9 @@ pub struct PlantPrototype {
     pub local_bounds_max: [DecisionScalar; 3],
     /// Closed shade amount tolerated without reducing community weight.
     pub shade_tolerance: UnitInterval,
+    /// The family's declared gameplay interaction policy, which a procedurally scattered point
+    /// inherits (an authored point carries its own).
+    pub interaction_policy: InteractionPolicy,
 }
 
 impl PlantPrototype {
@@ -286,6 +290,7 @@ impl PlantPrototype {
                 .habitat
                 .as_ref()
                 .map_or(UnitInterval::ZERO, |habitat| habitat.shade_tolerance),
+            interaction_policy: asset.interaction_policy,
         };
         prototype.validate()?;
         Ok(prototype)
@@ -923,6 +928,8 @@ pub enum CandidateRejectionReason {
 pub struct RejectedCandidate {
     /// Stable pre-acceptance identity.
     pub candidate: CandidateIdentity,
+    /// Exact quantized world position at rejection.
+    pub position: WorldPosition,
     /// Rejection reason.
     pub reason: CandidateRejectionReason,
     /// Complete lineage in the result's shared provenance table.
@@ -1045,7 +1052,7 @@ pub struct GraphEvaluationDiagnostics {
 /// Validates a complete rejection-diagnostics facet and returns nonzero reason totals.
 pub fn vegetation_rejection_totals(bytes: &[u8]) -> Result<Vec<(CandidateRejectionReason, u64)>> {
     let mut reader = BinaryReader::new(bytes, "vegetation rejection diagnostics");
-    reader.expect(b"SVEGREJ1", "magic")?;
+    reader.expect(b"SVEGREJ2", "magic")?;
     let candidate_count = reader.u64()?;
     let accepted_count = reader.u64()?;
     if accepted_count > candidate_count {
@@ -1054,10 +1061,13 @@ pub fn vegetation_rejection_totals(bytes: &[u8]) -> Result<Vec<(CandidateRejecti
             field: "acceptedCount".to_owned(),
         });
     }
-    let rejected_count = reader.count(57)?;
+    let rejected_count = reader.count(105)?;
     let mut totals = [0_u64; 7];
     for _ in 0..rejected_count {
         skip_candidate_identity(&mut reader)?;
+        for _ in 0..3 {
+            reader.u128()?;
+        }
         let reason = rejection_reason_from_byte(reader.u8()?)?;
         reader.u32()?;
         totals[usize::from(rejection_reason_byte(reason))] = totals
@@ -1239,7 +1249,7 @@ impl GraphEvaluationResult {
         self.encode_provenance(&mut provenance)?;
 
         let mut diagnostics = ByteSink::new();
-        diagnostics.write(b"SVEGREJ1")?;
+        diagnostics.write(b"SVEGREJ2")?;
         self.encode_rejection_diagnostics(&mut diagnostics)?;
 
         let mut attachments = ByteSink::new();
@@ -1275,45 +1285,45 @@ impl GraphEvaluationResult {
         self.encode_ecology_checkpoint(&mut ecology_checkpoint)?;
 
         Ok(vec![
-            VegetationCellSection::raw(VegetationCellSectionKind::MacroPoints, macro_points),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(VegetationCellSectionKind::MacroPoints, macro_points),
+            VegetationCellSection::new(
                 VegetationCellSectionKind::MicroFields,
                 micro_fields.finish(),
             ),
-            VegetationCellSection::raw(VegetationCellSectionKind::Provenance, provenance.finish()),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(VegetationCellSectionKind::Provenance, provenance.finish()),
+            VegetationCellSection::new(
                 VegetationCellSectionKind::RejectionDiagnostics,
                 diagnostics.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::SurfaceAttachments,
                 attachments.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::SurfaceDependencies,
                 surface_dependencies.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::RenderReferences,
                 render_references.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::RenderBounds,
                 render_bounds.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::CollisionInputs,
                 collision_inputs.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::NavigationContributions,
                 navigation.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::EcologyBoundary,
                 ecology_boundary.finish(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::EcologyCheckpoint,
                 ecology_checkpoint.finish(),
             ),
@@ -1336,8 +1346,7 @@ impl GraphEvaluationResult {
     }
 
     fn encode_micro_fields<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
-        push_len(sink, self.micro_fields.len())?;
-        encode_ordered(sink, &self.micro_fields, encode_micro_tile)
+        encode_micro_fields_body(sink, &self.micro_fields)
     }
 
     fn encode_surface_attachments<S: CanonicalSink>(&self, sink: &mut S) -> Result<()> {
@@ -1595,6 +1604,16 @@ where
     Ok(())
 }
 
+/// Encodes the micro-field rows (count + tiles) shared by the section facet and the
+/// canonical result hash.
+pub(crate) fn encode_micro_fields_body<S: CanonicalSink>(
+    sink: &mut S,
+    tiles: &[MicroFieldTile],
+) -> Result<()> {
+    push_len(sink, tiles.len())?;
+    encode_ordered(sink, tiles, encode_micro_tile)
+}
+
 fn encode_micro_tile<S: CanonicalSink>(sink: &mut S, tile: &MicroFieldTile) -> Result<()> {
     sink.write(&tile.cell.canonical_bytes())?;
     sink.write(&tile.family.value().to_be_bytes())?;
@@ -1747,6 +1766,9 @@ fn encode_rejected_candidate<S: CanonicalSink>(
     candidate: &RejectedCandidate,
 ) -> Result<()> {
     push_candidate_identity(sink, candidate.candidate)?;
+    for ticks in candidate.position.global_ticks() {
+        sink.write(&ticks.to_be_bytes())?;
+    }
     sink.write_byte(rejection_reason_byte(candidate.reason))?;
     sink.write(&candidate.provenance.0.to_be_bytes())
 }
@@ -1878,9 +1900,12 @@ fn skip_diagnostic_stream(reader: &mut BinaryReader<'_>) -> Result<()> {
             reader.i32()?;
         }
     }
-    let rejected_count = reader.count(57)?;
+    let rejected_count = reader.count(105)?;
     for _ in 0..rejected_count {
         skip_candidate_identity(reader)?;
+        for _ in 0..3 {
+            reader.u128()?;
+        }
         rejection_reason_from_byte(reader.u8()?)?;
         reader.u32()?;
     }
@@ -12324,7 +12349,7 @@ fn macro_output(
         let seed_namespace = species_seed_namespace(node, family, species)?;
         let id = candidate.authored_point.as_ref().map_or_else(
             || {
-                PlantId::procedural(ProceduralPlantIdentity {
+                derive_procedural_plant_id(ProceduralPlantIdentity {
                     map: state.inputs.map,
                     layer_guid: candidate.source_layer,
                     node_address: candidate.identity.node_address,
@@ -12428,9 +12453,12 @@ fn macro_output(
             flags: authored.map_or(PlantFlags::default(), |point| {
                 point.flags.union(PlantFlags::AUTHORED)
             }),
-            interaction_policy: authored.map_or(InteractionPolicy::Decorative, |point| {
-                point.interaction_policy
-            }),
+            interaction_policy: match authored {
+                Some(point) => point.interaction_policy,
+                // A scattered point inherits its family's declared policy: the species decides
+                // whether it collides, is harvestable, or is decorative scenery.
+                None => prototype_for_family(state, family)?.interaction_policy,
+            },
             provenance: provenance.0,
             attachment: candidate.attachment,
             surface_projection: candidate.surface_projection,
@@ -13479,6 +13507,7 @@ fn reject_candidate(
     });
     let rejected = RejectedCandidate {
         candidate: candidate.identity,
+        position: candidate.position,
         reason,
         provenance,
     };
@@ -13572,7 +13601,7 @@ fn resolve_candidate_reference(
         return Ok(None);
     };
     let seed_namespace = species_seed_namespace(node, family, species)?;
-    Ok(Some(PlantId::procedural(ProceduralPlantIdentity {
+    Ok(Some(derive_procedural_plant_id(ProceduralPlantIdentity {
         map: state.inputs.map,
         layer_guid: reference.source_layer,
         node_address: reference.identity.node_address,
@@ -14362,7 +14391,7 @@ fn orientation_from_normal_and_yaw(
     };
     let yaw = yaw_quaternion_q15(yaw)?;
     let product = multiply_quaternion_q15(align, yaw)?;
-    QuantizedOrientation::new(
+    Ok(QuantizedOrientation::new(
         product
             .map(i16::try_from)
             .into_iter()
@@ -14370,12 +14399,12 @@ fn orientation_from_normal_and_yaw(
             .map_err(|_| Error::NumericOverflow)?
             .try_into()
             .map_err(|_| Error::NumericOverflow)?,
-    )
+    )?)
 }
 
 fn yaw_orientation(yaw: UnitInterval) -> Result<QuantizedOrientation> {
     let quaternion = yaw_quaternion_q15(yaw)?;
-    QuantizedOrientation::new(
+    Ok(QuantizedOrientation::new(
         quaternion
             .map(i16::try_from)
             .into_iter()
@@ -14383,7 +14412,7 @@ fn yaw_orientation(yaw: UnitInterval) -> Result<QuantizedOrientation> {
             .map_err(|_| Error::NumericOverflow)?
             .try_into()
             .map_err(|_| Error::NumericOverflow)?,
-    )
+    )?)
 }
 
 fn yaw_quaternion_q15(yaw: UnitInterval) -> Result<[i64; 4]> {
@@ -17239,6 +17268,7 @@ mod tests {
                 DecisionScalar::from_bits(65_536),
             ],
             shade_tolerance: UnitInterval::from_bits(32_768),
+            interaction_policy: InteractionPolicy::Structural,
         });
         input
     }
@@ -19141,11 +19171,13 @@ mod tests {
                 rejected: vec![
                     RejectedCandidate {
                         candidate: candidate(1),
+                        position: WorldPosition::origin(),
                         reason: CandidateRejectionReason::Threshold,
                         provenance: ProvenanceHandle(0),
                     },
                     RejectedCandidate {
                         candidate: candidate(2),
+                        position: WorldPosition::origin(),
                         reason: CandidateRejectionReason::NoSpecies,
                         provenance: ProvenanceHandle(0),
                     },

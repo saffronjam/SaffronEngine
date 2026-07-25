@@ -129,7 +129,7 @@ impl CookVersionSet {
         Self {
             schema: 2,
             compiler: 2,
-            evaluator: 4,
+            evaluator: 5,
             numeric: 1,
             simulation: 1,
         }

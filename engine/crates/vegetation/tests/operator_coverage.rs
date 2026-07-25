@@ -1002,6 +1002,7 @@ fn prototype(family: Uuid) -> PlantPrototype {
         local_bounds_min: [DecisionScalar::from_bits(-8_192); 3],
         local_bounds_max: [DecisionScalar::from_bits(8_192); 3],
         shade_tolerance: UnitInterval::ONE,
+        interaction_policy: saffron_vegetation::InteractionPolicy::Structural,
     }
 }
 
