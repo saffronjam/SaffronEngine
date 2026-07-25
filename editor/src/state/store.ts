@@ -55,7 +55,9 @@ import type {
   DebugOverlaysResult,
   EntityListEntry,
   Environment,
+  FieldChannelDto,
   FrameHistoryDto,
+  WorldBoundsDto,
   GizmoState,
   InspectResult,
   PerfConfigDto,
@@ -127,6 +129,46 @@ export interface ProjectLoadState {
 /// capture is armed by a button, never polled on the metrics lane.
 export type CaptureState = "idle" | "arming" | "recording" | "ready";
 export type VegetationAssetType = "plant" | "biome" | "vegetation-map";
+
+/// The Vegetation mode's viewport tools (the phase's authoring vocabulary).
+export type VegetationTool =
+  | "select"
+  | "lasso"
+  | "paint"
+  | "erase"
+  | "density"
+  | "reapply"
+  | "single"
+  | "fill"
+  | "spline"
+  | "volume"
+  | "exclude"
+  | "pin"
+  | "promote";
+
+/// The Vegetation brush parameters (metres for radius/spacing; falloff 0..1).
+/// `projection` picks how a stroke sample lands on the world: the camera ray's hit,
+/// or a straight-down cast above it (painting hillsides from grazing views).
+/// `maxSlopeDeg` drops samples whose surface tilts past the limit (90 = no filter).
+export interface VegetationBrush {
+  radius: number;
+  falloff: number;
+  spacing: number;
+  projection: "view" | "down";
+  maxSlopeDeg: number;
+}
+
+/// The active authored layer a vegetation brush stroke targets, derived by the
+/// Vegetation panel from the bound map's summary. `channel` is the layer operator's
+/// field channel for paintable (density/scalar-field) layers; null means the layer
+/// is selectable but takes no strokes.
+export interface VegetationPaintTarget {
+  map: string;
+  layer: string;
+  channel: FieldChannelDto | null;
+  chunkLevel: number;
+  locked: boolean;
+}
 export type ViewTab =
   | { id: "scene"; kind: "scene"; title: "Scene"; closable: false }
   | { id: "flamegraph"; kind: "flamegraph"; title: "Flame graph"; closable: true }
@@ -136,14 +178,6 @@ export type ViewTab =
   // model, its mesh, and any of its clips open or focus the SAME tab — and the engine's one-previewScene
   // constraint can never be violated by two tabs of one model.
   | { id: string; kind: "assetEditor"; assetId: string; title: string; closable: true }
-  | {
-      id: string;
-      kind: "vegetationAsset";
-      assetId: string;
-      title: string;
-      assetType: VegetationAssetType;
-      closable: true;
-    }
   // The image viewer: a passive texture/image preview (distinct from the asset editor's 3D preview).
   | {
       id: string;
@@ -352,6 +386,25 @@ export interface EditorState {
   /// the Scene hierarchy and the asset→scene switch shows no one-frame stale list. App.tsx drives it.
   sceneEntitiesLive: boolean;
   gizmo: GizmoState;
+  /// The Vegetation mode's active viewport tool (UI-only; the vegetation dock panel
+  /// drives it and the viewport routes brush input by it).
+  vegetationTool: VegetationTool;
+  /// The Vegetation brush parameters (metres for radius/spacing; falloff 0..1).
+  vegetationBrush: VegetationBrush;
+  /// Species selected in the Vegetation palette (plant asset ids; multi-select).
+  vegetationSpecies: Set<string>;
+  /// Per-species paint weight (0..1; absent means 1).
+  vegetationWeights: Record<string, number>;
+  /// The viewport-picked macro plant (stable PlantId hex; nonpersistent selection).
+  vegetationSelectedPlant: string | null;
+  /// The active authored layer for brush strokes (null until a layer row is chosen).
+  vegetationActiveLayer: VegetationPaintTarget | null;
+  /// The most recent vegetation cook job id (stroke-fired or panel-fired); the
+  /// Vegetation panel polls its status and offers cancellation.
+  vegetationCookJob: string | null;
+  /// World bounds (ticks) of the last committed brush stroke — the region the
+  /// panel's Estimate preflights.
+  vegetationLastStroke: WorldBoundsDto | null;
   /// Editor play mode, mirrored from the engine via the reconcile poll
   /// (get-selection carries playState/playVersion; the poll dedups on the version).
   /// The gizmo is hidden and save/load are locked while not "edit"; panels stay live
@@ -501,7 +554,6 @@ export interface EditorState {
   /// Open (or focus) the node-graph editor for a material as a main tab.
   openMaterialGraphTab(materialId: string): void;
   /// Open (or focus) the read-only domain summary for an authored vegetation asset.
-  openVegetationAssetTab(assetId: string, title: string, assetType: VegetationAssetType): void;
   /// Open (or focus) the asset editor for a model, keyed by its resolved container uuid. The caller
   /// resolves an asset (model, mesh, or clip) to its model id before opening.
   openAssetEditorTab(assetId: string, title: string): void;
@@ -590,6 +642,14 @@ export interface EditorState {
   setCatalogDrag(catalogDrag: CatalogDragPayload | null): void;
   setSceneEntitiesLive(live: boolean): void;
   setGizmo(patch: Partial<GizmoState>): void;
+  setVegetationTool(tool: VegetationTool): void;
+  setVegetationBrush(patch: Partial<VegetationBrush>): void;
+  toggleVegetationSpecies(id: string, additive: boolean): void;
+  setVegetationWeight(id: string, weight: number): void;
+  setVegetationSelectedPlant(plant: string | null): void;
+  setVegetationActiveLayer(target: VegetationPaintTarget | null): void;
+  setVegetationCookJob(job: string | null): void;
+  setVegetationLastStroke(bounds: WorldBoundsDto | null): void;
   /// Optimistic play-state write (the reconcile poll repairs it from the engine).
   setPlayState(playState: PlayState): void;
   setViewportHidden(viewportHidden: boolean): void;
@@ -717,6 +777,14 @@ export const useEditorStore = create<EditorState>((set) => ({
   // immediately. App.tsx holds it false while an asset tab is active / during a view switch.
   sceneEntitiesLive: true,
   gizmo: { op: "translate", space: "world", preserveChildren: false },
+  vegetationTool: "select",
+  vegetationBrush: { radius: 4, falloff: 0.5, spacing: 1, projection: "view", maxSlopeDeg: 90 },
+  vegetationSpecies: new Set<string>(),
+  vegetationWeights: {},
+  vegetationSelectedPlant: null,
+  vegetationActiveLayer: null,
+  vegetationCookJob: null,
+  vegetationLastStroke: null,
   playState: "edit",
   animationState: null,
   animationClips: [],
@@ -844,10 +912,6 @@ export const useEditorStore = create<EditorState>((set) => ({
         if (tab.kind === "assetEditor") {
           const model = assets.find((entry) => entry.id === tab.assetId);
           return model ? { ...tab, title: model.name } : tab;
-        }
-        if (tab.kind === "vegetationAsset") {
-          const asset = assets.find((entry) => entry.id === tab.assetId);
-          return asset ? { ...tab, title: asset.name } : tab;
         }
         if (tab.kind !== "imageViewer") {
           return tab;
@@ -1047,20 +1111,6 @@ export const useEditorStore = create<EditorState>((set) => ({
       const existing = s.viewTabs.some((t) => t.id === id);
       return recordActivation(s, { viewTabs: existing ? s.viewTabs : [...s.viewTabs, tab] }, id);
     }),
-  openVegetationAssetTab: (assetId, title, assetType) =>
-    set((s) => {
-      const id = `vegetationAsset:${assetId}`;
-      const tab: ViewTab = {
-        id,
-        kind: "vegetationAsset",
-        assetId,
-        title,
-        assetType,
-        closable: true,
-      };
-      const existing = s.viewTabs.some((candidate) => candidate.id === id);
-      return recordActivation(s, { viewTabs: existing ? s.viewTabs : [...s.viewTabs, tab] }, id);
-    }),
   openAssetEditorTab: (assetId, title) =>
     set((s) => {
       const id = `assetEditor:${assetId}`;
@@ -1069,6 +1119,12 @@ export const useEditorStore = create<EditorState>((set) => ({
       return recordActivation(s, { viewTabs: existing ? s.viewTabs : [...s.viewTabs, tab] }, id);
     }),
   openAssetEditorForAsset: (assetId, fallbackName) => {
+    const asset = useEditorStore.getState().assets.find((entry) => entry.id === assetId);
+    if (asset?.type === "plant" || asset?.type === "biome" || asset?.type === "vegetation-map") {
+      // Vegetation subjects have no model container; the workspace skips the preview.
+      useEditorStore.getState().openAssetEditorTab(assetId, asset.name);
+      return;
+    }
     void (async () => {
       try {
         const model = await client.getAssetModel(assetId);
@@ -1438,6 +1494,52 @@ export const useEditorStore = create<EditorState>((set) => ({
   setCatalogDrag: (catalogDrag) => set({ catalogDrag }),
   setSceneEntitiesLive: (sceneEntitiesLive) => set({ sceneEntitiesLive }),
   // Keeps the object identity when the patch changes nothing, so the reconcile
+  setVegetationTool: (tool) =>
+    set((s) => (s.vegetationTool === tool ? {} : { vegetationTool: tool })),
+  toggleVegetationSpecies: (id, additive) =>
+    set((s) => {
+      const next = new Set(additive ? s.vegetationSpecies : []);
+      if (s.vegetationSpecies.has(id) && (additive || s.vegetationSpecies.size === 1)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next.size === s.vegetationSpecies.size &&
+        [...next].every((entry) => s.vegetationSpecies.has(entry))
+        ? {}
+        : { vegetationSpecies: next };
+    }),
+  setVegetationSelectedPlant: (plant) =>
+    set((s) => (s.vegetationSelectedPlant === plant ? {} : { vegetationSelectedPlant: plant })),
+  setVegetationActiveLayer: (target) =>
+    set((s) =>
+      s.vegetationActiveLayer === target ||
+      (s.vegetationActiveLayer !== null &&
+        target !== null &&
+        JSON.stringify(s.vegetationActiveLayer) === JSON.stringify(target))
+        ? {}
+        : { vegetationActiveLayer: target },
+    ),
+  setVegetationCookJob: (job) =>
+    set((s) => (s.vegetationCookJob === job ? {} : { vegetationCookJob: job })),
+  setVegetationLastStroke: (bounds) => set({ vegetationLastStroke: bounds }),
+  setVegetationWeight: (id, weight) =>
+    set((s) =>
+      s.vegetationWeights[id] === weight
+        ? {}
+        : { vegetationWeights: { ...s.vegetationWeights, [id]: weight } },
+    ),
+  setVegetationBrush: (patch) =>
+    set((s) => {
+      const vegetationBrush = { ...s.vegetationBrush, ...patch };
+      return vegetationBrush.radius === s.vegetationBrush.radius &&
+        vegetationBrush.falloff === s.vegetationBrush.falloff &&
+        vegetationBrush.spacing === s.vegetationBrush.spacing &&
+        vegetationBrush.projection === s.vegetationBrush.projection &&
+        vegetationBrush.maxSlopeDeg === s.vegetationBrush.maxSlopeDeg
+        ? {}
+        : { vegetationBrush };
+    }),
   // poll confirming an unchanged gizmo doesn't re-render every subscriber.
   setGizmo: (patch) =>
     set((s) => {

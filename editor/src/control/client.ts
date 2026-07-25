@@ -98,9 +98,12 @@ export interface ViewportBounds {
 /// reports what (if anything) the ray hit. `id`/`name` are present only on a hit.
 export interface PickResult {
   hit: boolean;
-  kind?: "mesh" | "billboard";
+  kind?: "mesh" | "billboard" | "vegetation" | "micro-vegetation";
   id?: string;
   name?: string;
+  plant?: string;
+  position?: [number, number, number];
+  normal?: [number, number, number];
 }
 
 export interface RecentProject {
@@ -424,6 +427,11 @@ export const client = {
     lightVolumes?: boolean;
     grid?: boolean;
     colliders?: boolean;
+    vegetationCells?: boolean;
+    vegetationBounds?: boolean;
+    vegetationRejections?: boolean;
+    vegetationHeatmap?: boolean;
+    vegetationNavigation?: boolean;
   }): Promise<DebugOverlaysResult> {
     return call("set-debug-overlays", opts);
   },
@@ -437,7 +445,11 @@ export const client = {
     return call("pick-skeleton-joint", { u, v, radiusPx });
   },
   /// Preview-scene settings (v1: show floor).
-  setAssetPreviewOptions(opts: { floor?: boolean }): Promise<AssetPreviewOptionsResult> {
+  setAssetPreviewOptions(opts: {
+    floor?: boolean;
+    variation?: number;
+    phenotype?: number;
+  }): Promise<AssetPreviewOptionsResult> {
     return call("set-asset-preview-options", opts);
   },
 
@@ -507,6 +519,60 @@ export const client = {
   },
   importVegetationAsset(path: string, folder?: string) {
     return call("import-vegetation-asset", folder ? { path, folder } : { path });
+  },
+  vegetationRenderStats() {
+    return call("vegetation-render-stats");
+  },
+  vegetationRuntimeStatus() {
+    return call("vegetation-runtime-status");
+  },
+  vegetationMutate(records: CommandParamsMap["vegetation-mutate"]["records"]) {
+    return call("vegetation-mutate", { records });
+  },
+  vegetationRuntimeInspect(plant: string) {
+    return call("vegetation-runtime-inspect", { plant });
+  },
+  vegetationMapLayerCommit(params: CommandParamsMap["vegetation-map-layer-commit"]) {
+    return call("vegetation-map-layer-commit", params);
+  },
+  vegetationMapChunkCommit(params: CommandParamsMap["vegetation-map-chunk-commit"]) {
+    return call("vegetation-map-chunk-commit", params);
+  },
+  vegetationMapChunkRead(params: CommandParamsMap["vegetation-map-chunk-read"]) {
+    return call("vegetation-map-chunk-read", params);
+  },
+  vegetationCook(params: CommandParamsMap["vegetation-cook"]) {
+    return call("vegetation-cook", params);
+  },
+  vegetationCookStatus(job: string) {
+    return call("vegetation-cook-status", { job });
+  },
+  vegetationCancelCook(job: string) {
+    return call("vegetation-cancel-cook", { job });
+  },
+  vegetationPreflightRegion(params: CommandParamsMap["vegetation-preflight-region"]) {
+    return call("vegetation-preflight-region", params);
+  },
+  querySurfaceRay(params: CommandParamsMap["query-surface-ray"]) {
+    return call("query-surface-ray", params);
+  },
+  vegetationTopologyDiff(params: CommandParamsMap["vegetation-topology-diff"]) {
+    return call("vegetation-topology-diff", params);
+  },
+  vegetationNodeSchema() {
+    return call("vegetation-node-schema", {});
+  },
+  vegetationCompileBiome(params: CommandParamsMap["vegetation-compile-biome"]) {
+    return call("vegetation-compile-biome", params);
+  },
+  vegetationCancelEvaluation(job: string) {
+    return call("vegetation-cancel-evaluation", { job });
+  },
+  vegetationStartEvaluation(job: string) {
+    return call("vegetation-start-evaluation", { job });
+  },
+  vegetationEvaluationStatus(job: string) {
+    return call("vegetation-evaluation-status", { job });
   },
   vegetationAssetSummary(asset: string) {
     return call("vegetation-asset-summary", { asset });
