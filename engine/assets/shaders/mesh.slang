@@ -1,4 +1,5 @@
 import lighting;
+import global_gpu_data;
 
 // The unlit permutation stays a consumer spec constant so the PSO can specialize it (constant_id 0);
 // keeping it out of the module avoids relying on spec-constant export across the link.
@@ -42,6 +43,7 @@ SurfaceData evalSurface(MaterialInput m)
     s.absorption = thinSheet ? mat.thinAbsorption.rgb : float3(0.0);
     s.transmission = thinSheet ? mat.thinTransmission.rgb : float3(0.0);
     s.energyLimit = thinSheet ? mat.thinAbsorption.w : 1.0;
+    s.sheetNormal = normalize(m.sheetNormal);
     // Node-graph codegen replaces the block between the markers (see compileMaterialMeshShader); the
     // default below is the fixed glTF metallic-roughness path. `mat`/`uv`/`m`/`albedoTextures` are in scope.
     // @graph-begin
@@ -103,20 +105,150 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
     return transformVertex(input, instanceIndex);
 }
 
+// The frame's semantic record stream (the active view's traversal output); the executor
+// vertex path below indexes it by firstInstance.
+[[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
+
+float2 executorOctToVector(uint packed)
+{
+    float2 oct = float2(
+        float(int(packed << 16u) >> 16u) / 32767.0,
+        float(int(packed) >> 16u) / 32767.0);
+    return oct;
+}
+
+float3 executorDecodeNormal(uint packed)
+{
+    float2 oct = executorOctToVector(packed);
+    float3 n = float3(oct.x, oct.y, 1.0 - abs(oct.x) - abs(oct.y));
+    if (n.z < 0.0)
+    {
+        float2 folded = (1.0 - abs(float2(n.y, n.x))) * sign(float2(n.x, n.y));
+        n.x = folded.x;
+        n.y = folded.y;
+    }
+    return normalize(n);
+}
+
+// Indexed-MDI executor vertex path: SV_VertexID is the pulled index value (the pages
+// arena is the index buffer), SV_VulkanInstanceID is the record index the bin scatter
+// stored in firstInstance. Geometry pulls through buffer device addresses; the emitted
+// interface is `VertexOutput`, so every fragment entry shades identically.
+[shader("vertex")]
+VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+{
+    let addresses = gpuSceneAddresses;
+    let record = executorRecords[recordIndex];
+    let instance = gpuSceneLoadInstance(addresses, record.instance.index);
+    let geometry = gpuSceneResidentGeometry(addresses, record.geometry);
+
+    // An assembly record (a plant use) rebases its vertex fetch to the placed
+    // prototype's slice and premultiplies the use's family-local transform.
+    bool assembly =
+        geometry.parts.count != 0u && record.clusterState != GPU_ASSEMBLY_NO_USE;
+    GpuAssemblyUseRecord use = {};
+    uint vertexBase = 0u;
+    if (assembly)
+    {
+        use = gpuSceneAssemblyUse(addresses, geometry, geometry.reserved, record.clusterState);
+        vertexBase =
+            gpuSceneAssemblyPrototype(addresses, geometry, use.prototype).vertexBase;
+    }
+
+    float3 local;
+    float3 localNormal;
+    float2 uv;
+    if (record.representation == GPU_REPRESENTATION_MICRO_BLADE)
+    {
+        let blade = gpuSceneMicroBladeVertex(
+            gpuSceneMicroCandidate(addresses, record.contentIndex), vertexIndex, false);
+        local = blade.position;
+        localNormal = blade.normal;
+        uv = blade.uv;
+    }
+    else if (record.representation == GPU_REPRESENTATION_AGGREGATE_VOXEL)
+    {
+        GpuHandle pageHandle = GpuHandle(record.contentIndex, 0u);
+        let page = gpuSceneResidentPage(addresses, pageHandle);
+        let node = gpuScenePageNode(addresses, page);
+        let vertex = gpuScenePageVoxelVertex(addresses, page, node, vertexIndex);
+        local = vertex.position;
+        localNormal = executorDecodeNormal(vertex.normalOct);
+        uv = float2(0.0);
+    }
+    else if (record.deformation.index != 0xFFFFFFFFu
+        && (instance.deformation.index == record.deformation.index))
+    {
+        // A deformed instance pulls the skinning compute's stable output; UVs stay in
+        // the static stream (deformation never rewrites them).
+        let scene = gpuSceneLoadDeformation(addresses, record.deformation.index);
+        let provider = gpuSceneDeformationProvider(addresses, scene.target.index);
+        uint firstVertex = gpuSceneDeformationParameter(addresses, provider.firstParameter);
+        uint64_t base = addresses.deformedVertices
+            + uint64_t(firstVertex + vertexBase + vertexIndex) * geometry.vertexStride;
+        local = *(float3*)(base);
+        localNormal = *(float3*)(base + 12u);
+        uint64_t staticBase = addresses.vertices + geometry.vertices.first
+            + uint64_t(vertexBase + vertexIndex) * geometry.vertexStride;
+        uv = *(float2*)(staticBase + 24u);
+    }
+    else
+    {
+        uint64_t base = addresses.vertices + geometry.vertices.first
+            + uint64_t(vertexBase + vertexIndex) * geometry.vertexStride;
+        local = *(float3*)(base);
+        localNormal = *(float3*)(base + 12u);
+        uv = *(float2*)(base + 24u);
+    }
+    if (assembly)
+    {
+        local = gpuSceneAssemblyTransformPoint(use, local);
+        localNormal = normalize(gpuSceneAssemblyTransformVector(use, localNormal));
+    }
+
+    // The record's material resolves to the resident parameter block the fragment's
+    // set-2 params buffer indexes.
+    let materialReference = gpuSceneLoadMaterialReference(addresses, record.material.index);
+    let material = gpuSceneResidentMaterial(addresses, materialReference.target);
+    float3 windOffset = gpuSceneWindDeform(
+        addresses,
+        instance,
+        record.instance.index,
+        local,
+        false,
+        assembly,
+        use,
+        record.clusterState);
+    return transformExecutorVertex(
+        local,
+        localNormal,
+        uv,
+        instance,
+        windOffset,
+        material.parameterIndex,
+        record.transition);
+}
+
 [shader("vertex")]
 VertexOutput vertexMainSkinned(SkinnedVertexInput input, uint instanceIndex : SV_VulkanInstanceID)
 {
     return transformVertexSkinned(input, instanceIndex);
 }
 
-// Depth-prepass fragment: depth-only (no color output), doing solely the alpha-clip test so masked
-// materials (foliage/curtains) do NOT write depth at their cutout texels — otherwise the scene pass,
-// which loads this depth and discards at the same texels, would leave holes bleeding the background.
-// Reads only material params (set 2) + albedo (set 0), never `globals` (set 1), so the prepass PSO
-// binds no light set. The test mirrors `fragmentMain` exactly so the depth matches at edges.
+// Depth-prepass fragment: depth-only (the pass binds no color attachment), doing solely the
+// alpha-clip test so masked materials (foliage/curtains) do NOT write depth at their cutout
+// texels — otherwise the scene pass, which loads this depth and discards at the same texels,
+// would leave holes bleeding the background. The float4 return carries the coverage alpha in the
+// alpha component for alpha-to-coverage under MSAA; the rgb lanes are never consumed. Reads only
+// material params (set 2) + albedo (set 0), never `globals` (set 1), so the prepass PSO binds no
+// light set. The test mirrors `fragmentMain` exactly so the depth matches at edges.
 [shader("fragment")]
-float depthPrepassFragment(VertexOutput input) : SV_Target
+float4 depthPrepassFragment(VertexOutput input) : SV_Target
 {
+    if (!gpuTransitionCovered(input.transition, uint2(input.position.xy)))
+    {
+        discard;
+    }
     MaterialParams mat = materialParams[input.materialIndex];
     bool thinSheet = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u;
     if (thinSheet || (mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
@@ -137,9 +269,9 @@ float depthPrepassFragment(VertexOutput input) : SV_Target
             thinSheet,
             kAlphaToCoverage);
         if (!coverage.covered) { discard; }
-        return coverage.alpha;
+        return float4(0.0, 0.0, 0.0, coverage.alpha);
     }
-    return 1.0;
+    return float4(0.0, 0.0, 0.0, 1.0);
 }
 
 // Reactive-coverage fragment: the TAA reactive mask's producer. The reactive-coverage pass draws
@@ -153,9 +285,33 @@ float reactiveCoverageFragment(VertexOutput input) : SV_Target
     return 1.0;
 }
 
+// Transition-reactive vertex path: re-walks the opaque record stream and keeps only
+// content whose reprojected history is unreliable — micro blades (regenerated per
+// frame) and records mid representation-transition. Every other record collapses to a
+// degenerate off-screen point, so it rasterizes nothing.
+[shader("vertex")]
+VertexOutput vertexMainReactiveTransition(
+    uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+{
+    let record = executorRecords[recordIndex];
+    if (record.representation != GPU_REPRESENTATION_MICRO_BLADE && record.transition == 0u)
+    {
+        VertexOutput collapsed = {};
+        collapsed.position = float4(2.0e9, 2.0e9, 2.0e9, 1.0);
+        return collapsed;
+    }
+    return vertexMainExecutor(vertexIndex, recordIndex);
+}
+
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace) : SV_Target
 {
+    // A record mid representation-crossfade owns only its stochastic share of the
+    // pixels; the complementary side draws the rest (mirrors depthPrepassFragment).
+    if (!gpuTransitionCovered(input.transition, uint2(input.position.xy)))
+    {
+        discard;
+    }
     // Double-sided materials rasterize both faces (cull NONE); glTF requires the back-face normal be
     // inverted before lighting, else a back-facing fragment reads N·L < 0 (no direct light) and samples
     // IBL along the wrong hemisphere. Single-sided materials cull back faces, so `isFront` is always
@@ -164,6 +320,7 @@ float4 fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace) : SV_Targ
     MaterialParams coverageMaterial = materialParams[input.materialIndex];
     bool thinSheet = (coverageMaterial.tex1.w & FEATURE_THIN_SHEET) != 0u;
     uint normalMode = coverageMaterial.coverage.w;
+    float3 sheetNormal = input.worldNormal;
     float3 viewDirection = makeMaterialInput(input).viewDir;
     if ((!isFront && (!thinSheet || normalMode == THIN_NORMAL_FACE_FORWARD_BACK))
         || (thinSheet
@@ -203,6 +360,7 @@ float4 fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace) : SV_Targ
         if (!canonicalCoverage.covered) { discard; }
     }
     MaterialInput mi = makeMaterialInput(input);
+    mi.sheetNormal = sheetNormal;
     SurfaceData surf = evalSurface(mi);
     surf.frontFace = isFront ? 1.0 : 0.0;
     if (thinSheet)

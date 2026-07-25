@@ -13,6 +13,7 @@
 // previous clip = prevViewProj * prevModel * prevPosition
 
 import coverage;
+import global_gpu_data;
 import material_params;
 
 [[vk::binding(0, 0)]] Sampler2D albedoTextures[1024];
@@ -54,6 +55,8 @@ struct VertexOutput
     float2 uv0 : TEXCOORD2;
     nointerpolation uint materialIndex : TEXCOORD3;
     float3 coverageAnchor : TEXCOORD4;
+    // The record's representation-crossfade word (zero outside a transition).
+    nointerpolation uint transition : TEXCOORD5;
 };
 
 [shader("vertex")]
@@ -70,12 +73,130 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
     output.uv0 = input.uv0;
     output.materialIndex = inst.texture.w;
     output.coverageAnchor = input.position;
+    output.transition = 0u;
+    return output;
+}
+
+// The frame's semantic record stream (layout parity with the mesh module's binding).
+[[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
+
+// Indexed-MDI executor vertex path: current position from the static or deformed
+// stream, previous position from the prev-deformed stream (static falls back to the
+// same static position), current/previous world transforms from the scene instance
+// record's two column sets.
+[shader("vertex")]
+VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+{
+    let addresses = gpuSceneAddresses;
+    let record = executorRecords[recordIndex];
+    let instance = gpuSceneLoadInstance(addresses, record.instance.index);
+    let geometry = gpuSceneResidentGeometry(addresses, record.geometry);
+
+    // An assembly record (a plant use) rebases its vertex fetch to the placed
+    // prototype's slice and premultiplies the use's family-local transform.
+    bool assembly =
+        geometry.parts.count != 0u && record.clusterState != GPU_ASSEMBLY_NO_USE;
+    GpuAssemblyUseRecord use = {};
+    uint vertexBase = 0u;
+    if (assembly)
+    {
+        use = gpuSceneAssemblyUse(addresses, geometry, geometry.reserved, record.clusterState);
+        vertexBase =
+            gpuSceneAssemblyPrototype(addresses, geometry, use.prototype).vertexBase;
+    }
+
+    float3 local;
+    float3 prevLocal;
+    float2 uv;
+    if (record.representation == GPU_REPRESENTATION_MICRO_BLADE)
+    {
+        let candidate = gpuSceneMicroCandidate(addresses, record.contentIndex);
+        let blade = gpuSceneMicroBladeVertex(candidate, vertexIndex, false);
+        local = blade.position;
+        // The previous frame's blade rebuilds with the stored previous wind bend,
+        // so blade motion vectors carry the exact wind term.
+        prevLocal = gpuSceneMicroBladeVertex(candidate, vertexIndex, true).position;
+        uv = blade.uv;
+    }
+    else if (record.representation == GPU_REPRESENTATION_AGGREGATE_VOXEL)
+    {
+        GpuHandle pageHandle = GpuHandle(record.contentIndex, 0u);
+        let page = gpuSceneResidentPage(addresses, pageHandle);
+        let node = gpuScenePageNode(addresses, page);
+        let vertex = gpuScenePageVoxelVertex(addresses, page, node, vertexIndex);
+        local = vertex.position;
+        prevLocal = local;
+        uv = float2(0.0);
+    }
+    else if (record.deformation.index != 0xFFFFFFFFu
+        && instance.deformation.index == record.deformation.index)
+    {
+        let scene = gpuSceneLoadDeformation(addresses, record.deformation.index);
+        let provider = gpuSceneDeformationProvider(addresses, scene.target.index);
+        uint firstVertex = gpuSceneDeformationParameter(addresses, provider.firstParameter);
+        uint prevFirst = gpuSceneDeformationParameter(addresses, provider.firstParameter + 1u);
+        local = *(float3*)(addresses.deformedVertices
+            + uint64_t(firstVertex + vertexBase + vertexIndex) * geometry.vertexStride);
+        prevLocal = *(float3*)(addresses.prevDeformedVertices
+            + uint64_t(prevFirst + vertexBase + vertexIndex) * geometry.vertexStride);
+        uint64_t staticBase = addresses.vertices + geometry.vertices.first
+            + uint64_t(vertexBase + vertexIndex) * geometry.vertexStride;
+        uv = *(float2*)(staticBase + 24u);
+    }
+    else
+    {
+        uint64_t base = addresses.vertices + geometry.vertices.first
+            + uint64_t(vertexBase + vertexIndex) * geometry.vertexStride;
+        local = *(float3*)(base);
+        prevLocal = local;
+        uv = *(float2*)(base + 24u);
+    }
+    if (assembly)
+    {
+        local = gpuSceneAssemblyTransformPoint(use, local);
+        prevLocal = gpuSceneAssemblyTransformPoint(use, prevLocal);
+    }
+
+    float4 c0, c1, c2, c3;
+    gpuSceneInstanceColumns(instance, false, c0, c1, c2, c3);
+    float3 curWorld = c0.xyz * local.x + c1.xyz * local.y + c2.xyz * local.z + c3.xyz
+        + gpuSceneWindDeform(
+            addresses, instance, record.instance.index, local, false, assembly, use,
+            record.clusterState);
+    // A dynamic instance's previous columns carry its object motion; a static
+    // instance decodes to its one exact placement (zero object motion). The stored
+    // previous wind sway restores the wind term of that motion.
+    float4 p0, p1, p2, p3;
+    gpuSceneInstanceColumns(instance, true, p0, p1, p2, p3);
+    float3 prevWorld =
+        p0.xyz * prevLocal.x + p1.xyz * prevLocal.y + p2.xyz * prevLocal.z + p3.xyz
+        + gpuSceneWindDeform(
+            addresses, instance, record.instance.index, prevLocal, true, assembly, use,
+            record.clusterState);
+
+    let materialReference = gpuSceneLoadMaterialReference(addresses, record.material.index);
+    let material = gpuSceneResidentMaterial(addresses, materialReference.target);
+
+    VertexOutput output;
+    output.position = mul(pc.curViewProj, float4(curWorld, 1.0));
+    output.curClip = output.position;
+    output.prevClip = mul(pc.prevViewProj, float4(prevWorld, 1.0));
+    output.worldPos = curWorld;
+    output.uv0 = uv;
+    output.materialIndex = material.parameterIndex;
+    output.coverageAnchor = local;
+    output.transition = record.transition;
     return output;
 }
 
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target
 {
+    // Mirrors the depth and shading passes' stochastic crossfade share exactly.
+    if (!gpuTransitionCovered(input.transition, uint2(input.position.xy)))
+    {
+        discard;
+    }
     MaterialParams mat = materialParams[input.materialIndex];
     bool thinSheet = (mat.tex1.w & FEATURE_THIN_SHEET) != 0u;
     if (thinSheet || (mat.tex1.w & FEATURE_ALPHACLIP) != 0u)
