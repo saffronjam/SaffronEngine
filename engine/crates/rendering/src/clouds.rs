@@ -4,7 +4,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use ash::vk;
-use saffron_geometry::glam::{Mat4, Vec3, Vec4};
+use saffron_geometry::glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::froxel_fog::create_compute_layout;
 use crate::{Buffer, Device, GpuTexture, Image, Image3D, ImageDesc, Pipeline, Pipelines, checked};
@@ -72,18 +72,18 @@ pub struct CloudRenderSettings {
     pub cloud_shadow_strength: f32,
     /// Cloud-shadow strength on opaque surfaces.
     pub cloud_shadow_on_surface_strength: f32,
-    /// Horizontal wind direction in degrees, clockwise from world +Z.
-    pub wind_orientation: f32,
-    /// Mean wind speed in metres per second.
-    pub wind_speed: f32,
-    /// Curl-warp turbulence amplitude.
-    pub wind_gust: f32,
-    /// Phase-3 normalized time-of-day scalar.
-    pub time_of_day: f32,
 }
 
 /// Per-view, per-frame camera and physically-coupled lighting state for the cloud passes.
 pub(crate) struct CloudFrameState {
+    /// Horizontal advection direction of the shared wind field (sin, cos of orientation).
+    pub wind_direction: Vec2,
+    /// Mean advection speed at the cloud layer's mid altitude (shear-scaled).
+    pub wind_speed: f32,
+    /// Turbulent fraction of the mean speed.
+    pub wind_gust: f32,
+    /// Monotonic simulation seconds.
+    pub wind_time_s: f32,
     pub inv_view_proj: Mat4,
     pub prev_view_proj: Mat4,
     pub camera: Vec3,
@@ -147,10 +147,6 @@ impl Default for CloudRenderSettings {
             cast_cloud_shadows: true,
             cloud_shadow_strength: 1.0,
             cloud_shadow_on_surface_strength: 1.0,
-            wind_orientation: 0.0,
-            wind_speed: 10.0,
-            wind_gust: 0.25,
-            time_of_day: 0.5,
         }
     }
 }
@@ -293,13 +289,13 @@ impl CloudParams {
                 },
             ],
             wind_time: [
-                settings.wind_orientation.to_radians().sin(),
-                settings.wind_orientation.to_radians().cos(),
-                settings.wind_speed,
-                settings.time_of_day.rem_euclid(1.0) * 86_400.0,
+                state.wind_direction.x,
+                state.wind_direction.y,
+                state.wind_speed,
+                state.wind_time_s,
             ],
             shadow: [
-                settings.wind_gust,
+                state.wind_gust,
                 settings.cloud_shadow_strength,
                 settings.cloud_shadow_on_surface_strength,
                 0.0,

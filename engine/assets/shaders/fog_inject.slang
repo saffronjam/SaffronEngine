@@ -2,28 +2,26 @@
 // frustum-aligned `FROXEL_GRID_{X,Y,Z}` grid: reconstruct the froxel-center world position from the
 // exponential-Z view distance + the inverse view-proj, evaluate the participating-medium extinction
 // (the Phase-1 analytic height density as the base medium + a constant `baseDensity`), and accumulate
-// in-scatter over the containing cull cluster's light list — the directional sun (cascade PCF), the
-// clustered point/spot lights (map shadows), and an isotropic ambient term — each weighted by the
+// in-scatter over the containing cull cluster's light list — the directional sun, the clustered
+// point/spot lights (virtual shadow pages), and an isotropic ambient term — each weighted by the
 // Henyey-Greenstein phase. Writes `(L_scat.rgb, sigma_t)` into the persistent scatter volume.
 //
-// Set 0 is the mesh light set (reused verbatim: globals/lights/clusters/clusterParams + shadow maps,
-// with COMPUTE added to its stage flags). Set 1 is the fog volume: the scatter storage image + the
+// Set 0 is the mesh light set (reused verbatim: globals/lights/clusters/clusterParams + the virtual
+// shadow atlas, with COMPUTE added to its stage flags). Set 1 is the fog volume: the scatter storage image + the
 // froxel-grid UBO. The binding-free light/shadow math is shared with the forward mesh path, with the
 // HG phase substituting for the surface BRDF.
 
 import lighting_common;
+import wind;
 
 [[vk::binding(0, 0)]] ConstantBuffer<LightGlobals> globals;
 [[vk::binding(1, 0)]] StructuredBuffer<GpuLight> lights;
 [[vk::binding(2, 0)]] StructuredBuffer<Cluster> clusters;
 [[vk::binding(3, 0)]] ConstantBuffer<ClusterParams> clusterParams;
-[[vk::binding(4, 0)]] Sampler2DShadow shadowMap;
-[[vk::binding(5, 0)]] Sampler2DShadow spotShadowMap;
-[[vk::binding(6, 0)]] SamplerCube pointShadowMap;
-[[vk::binding(7, 0)]] SamplerCube pointShadowMapDynamic;
+[[vk::binding(13, 0)]] Sampler2DShadow vsmAtlas;
 [[vk::binding(12, 0)]] Sampler2DArray<float> cloudShadowMap;
 
-// The froxel-grid params UBO (mirrors `froxel_fog::FogGridParams`, 288 B std140).
+// The froxel-grid params UBO (mirrors `froxel_fog::FogGridParams`, 272 B std140).
 struct FogGrid
 {
     float4x4 invProjection; // clip -> view (froxel-center reconstruction)
@@ -34,7 +32,6 @@ struct FogGrid
     float4 zPlanes;         // x near, y far (shared with the cull), z froxel-far coverage
     float4 temporal;        // x historyBlend, y historyValid, z neighborhoodClamp, w lightClamp
     float4 jitter;          // xy sub-froxel NDC jitter, z jitter phase index, w scene time (s)
-    float4 globalWind;      // xyz shared wind velocity, w time-of-day clock (s)
 };
 
 // One local FogVolume (mirrors `froxel_fog::FogVolumeGpu`, std430, 160 B). `localFromWorld` frames the
@@ -162,8 +159,20 @@ float fogVolumeNoise(float3 worldPos, FogVolumeGpu v)
     float scale = v.noiseParams.x;
     float detail = v.noiseParams.z;
     bool hasLocalWind = dot(v.wind.xyz, v.wind.xyz) > 1e-8;
-    float3 velocity = hasLocalWind ? v.wind.xyz * v.emissiveSpeed.w : grid.globalWind.xyz;
-    float time = hasLocalWind ? grid.jitter.w : grid.globalWind.w;
+    // A volume without an authored wind override drifts on the shared field, sampled
+    // at its own position on the monotonic simulation clock.
+    float3 velocity = hasLocalWind
+        ? v.wind.xyz * v.emissiveSpeed.w
+        : sampleComposedWindVelocity(
+              worldPos,
+              globals.windTime.x,
+              globals.windDirSpeedGust,
+              globals.windParams,
+              globals.windMeta.x,
+              globals.windMeta.y,
+              globals.windSources,
+              globals.windMeta.z);
+    float time = hasLocalWind ? grid.jitter.w : globals.windTime.x;
     float3 drift = velocity * time;
     float3 p = (worldPos - drift) * scale;
     float base = noiseTex.SampleLevel(p, 0.0);
@@ -236,7 +245,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     uint cluster = clusterIndexFor(clusterParams, pixel, viewZ);
 
     float lightClamp = grid.temporal.w;
-    float3 inScatter = fogDirectionalInScatter(worldPos, viewDir, phaseG, globals, shadowMap);
+    float3 inScatter = fogDirectionalInScatter(worldPos, viewDir, phaseG, globals, vsmAtlas);
     inScatter *= cloudShadowVisibility(
         worldPos, cloudShadowMap, globals, globals.cloudShadowMeta.y);
     if (lightClamp > 0.0)
@@ -250,7 +259,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     {
         uint li = clusters[cluster].indices[i];
         float3 c = fogPunctualInScatter(lights[li], li, worldPos, viewDir, phaseG,
-                                        globals, spotShadowMap, pointShadowMap, pointShadowMapDynamic);
+                                        globals, vsmAtlas);
         // Per-light firefly clamp (off when lightClamp == 0): cap a single light's in-scatter before
         // accumulation so a bright light grazing a shadow edge cannot inject a single-froxel spike.
         inScatter += (lightClamp > 0.0) ? min(c, lightClamp) : c;

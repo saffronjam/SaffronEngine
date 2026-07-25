@@ -213,12 +213,10 @@ pub struct FogGridParams {
     /// Sub-froxel jitter: `xy` = this frame's NDC jitter (the same offset TAA advances), `z` = the
     /// Halton jitter phase index (drives the per-frame Z-slice supersample), `w` = scene time.
     pub jitter: Vec4,
-    /// Shared wind velocity in `xyz`; `w` is the time-of-day clock in seconds.
-    pub global_wind: Vec4,
 }
 
 const _: () = assert!(
-    size_of::<FogGridParams>() == 288,
+    size_of::<FogGridParams>() == 272,
     "FogGridParams must match the std140 shader layout (3 mat4 + 6 vectors == 288 bytes)"
 );
 
@@ -233,7 +231,6 @@ impl Default for FogGridParams {
             z_planes: Vec4::new(0.1, 0.0, FROXEL_FAR, 0.0),
             temporal: Vec4::new(0.05, 0.0, 0.0, 0.0),
             jitter: Vec4::ZERO,
-            global_wind: Vec4::ZERO,
         }
     }
 }
@@ -1519,7 +1516,6 @@ mod tests {
             z_planes: Vec4::new(0.1, 100.0, FROXEL_FAR, 0.0),
             temporal: Vec4::new(0.05, 0.0, 0.0, 0.0),
             jitter: Vec4::ZERO,
-            global_wind: Vec4::ZERO,
         }
     }
 
