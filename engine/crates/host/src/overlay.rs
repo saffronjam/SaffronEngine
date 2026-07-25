@@ -1029,6 +1029,204 @@ fn build_scene_edit_camera_frustums(
     }
 }
 
+/// The heatmap overlay: one thin surface-hugging tile per occupied micro-density
+/// texel, ramped green → red by density. Depth-tested, Edit-only.
+/// The wind overlay: one speed-colored arrow per sampled ground-grid point — the
+/// shaft along the sampled velocity plus a short vertical tip tick. Depth-tested,
+/// Edit-only.
+fn build_wind_overlay(
+    wind: &[(Vec3, Vec3)],
+    cam: &CameraView,
+    width: u32,
+    height: u32,
+    vertices: &mut Vec<OverlayVertex>,
+) {
+    if wind.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let aspect = width as f32 / height as f32;
+    let view_projection = camera_projection(cam, aspect) * cam.view;
+    const CALM: Vec4 = Vec4::new(0.35, 0.6, 0.95, 0.85);
+    const STORM: Vec4 = Vec4::new(0.95, 0.3, 0.2, 0.9);
+    for (base, velocity) in wind {
+        let speed = velocity.length();
+        if speed < 0.05 {
+            continue;
+        }
+        let color = CALM.lerp(STORM, (speed / 15.0).clamp(0.0, 1.0));
+        let shaft = *velocity * (0.15_f32).min(3.0 / speed);
+        let start = *base + Vec3::new(0.0, 0.15, 0.0);
+        let tip = start + shaft;
+        add_clipped_overlay_line(
+            vertices,
+            &view_projection,
+            start,
+            tip,
+            2.0,
+            color,
+            width,
+            height,
+        );
+        add_clipped_overlay_line(
+            vertices,
+            &view_projection,
+            tip,
+            tip + Vec3::new(0.0, 0.12, 0.0),
+            2.0,
+            color,
+            width,
+            height,
+        );
+    }
+}
+
+fn build_heatmap_overlay(
+    heatmap: &[(Vec3, f32)],
+    cam: &CameraView,
+    width: u32,
+    height: u32,
+    vertices: &mut Vec<OverlayVertex>,
+) {
+    if heatmap.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let aspect = width as f32 / height as f32;
+    let view_projection = camera_projection(cam, aspect) * cam.view;
+    const LOW: Vec4 = Vec4::new(0.2, 0.8, 0.35, 0.75);
+    const HIGH: Vec4 = Vec4::new(0.95, 0.25, 0.2, 0.85);
+    const HALF: f32 = 0.6;
+    for (position, density) in heatmap {
+        let color = LOW.lerp(HIGH, density.clamp(0.0, 1.0));
+        add_world_aabb(
+            vertices,
+            &view_projection,
+            *position - Vec3::new(HALF, 0.02, HALF),
+            *position + Vec3::new(HALF, 0.06, HALF),
+            color,
+            width,
+            height,
+        );
+    }
+}
+
+/// The rejection overlay: one small reason-colored marker cube per rejected
+/// candidate (the host caches the rows from the resident cells' rejection facets).
+/// Depth-tested, Edit-only.
+fn build_rejection_overlay(
+    rejections: &[(Vec3, u8)],
+    cam: &CameraView,
+    width: u32,
+    height: u32,
+    vertices: &mut Vec<OverlayVertex>,
+) {
+    if rejections.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let aspect = width as f32 / height as f32;
+    let view_projection = camera_projection(cam, aspect) * cam.view;
+    const REASON_COLORS: [Vec4; 7] = [
+        Vec4::new(0.55, 0.55, 0.6, 0.85),  // surface-miss: grey
+        Vec4::new(0.95, 0.85, 0.3, 0.85),  // threshold: yellow
+        Vec4::new(0.95, 0.6, 0.25, 0.85),  // weighted-elimination: orange
+        Vec4::new(0.9, 0.35, 0.75, 0.85),  // priority-exclusion: magenta
+        Vec4::new(0.95, 0.3, 0.3, 0.85),   // competition: red
+        Vec4::new(0.4, 0.65, 0.95, 0.85),  // foreign-owner: blue
+        Vec4::new(0.65, 0.45, 0.95, 0.85), // no-species: violet
+    ];
+    const HALF: f32 = 0.12;
+    for (position, reason) in rejections {
+        let color = REASON_COLORS[usize::from(*reason) % REASON_COLORS.len()];
+        add_world_aabb(
+            vertices,
+            &view_projection,
+            *position - Vec3::splat(HALF),
+            *position + Vec3::splat(HALF),
+            color,
+            width,
+            height,
+        );
+    }
+}
+
+/// The vegetation debug overlays (`set-debug-overlays`): resident runtime cells as
+/// wireframe boxes, and per-plant conservative world bounds colored by lifecycle.
+/// Depth-tested, Edit-only; the plant boxes cap so a dense world stays interactive.
+fn build_vegetation_overlays(
+    editor: &mut SceneEditContext,
+    vegetation: Option<&saffron_runtime::VegetationWorld>,
+    cam: &CameraView,
+    width: u32,
+    height: u32,
+    vertices: &mut Vec<OverlayVertex>,
+) {
+    let opts = editor.debug_overlays;
+    if width == 0 || height == 0 || (!opts.vegetation_cells && !opts.vegetation_bounds) {
+        return;
+    }
+    let Some(world) = vegetation else {
+        return;
+    };
+    let aspect = width as f32 / height as f32;
+    let view_projection = camera_projection(cam, aspect) * cam.view;
+    const CELL_COLOR: Vec4 = Vec4::new(0.35, 0.75, 0.95, 0.8);
+    const MATURE_COLOR: Vec4 = Vec4::new(0.4, 0.9, 0.45, 0.85);
+    const YOUNG_COLOR: Vec4 = Vec4::new(0.85, 0.95, 0.4, 0.85);
+    const DECLINING_COLOR: Vec4 = Vec4::new(0.95, 0.6, 0.3, 0.85);
+    const DORMANT_COLOR: Vec4 = Vec4::new(0.6, 0.6, 0.65, 0.7);
+    const PLANT_BOX_CAP: usize = 4096;
+    let to_meters = |ticks: [i128; 3]| {
+        Vec3::new(
+            ticks[0] as f32 / 4096.0,
+            ticks[1] as f32 / 4096.0,
+            ticks[2] as f32 / 4096.0,
+        )
+    };
+    let mut plant_boxes = 0_usize;
+    for (cell, generation) in world.resident_cells() {
+        if opts.vegetation_cells {
+            let bounds = cell.bounds();
+            add_world_aabb(
+                vertices,
+                &view_projection,
+                to_meters(bounds.min_ticks()),
+                to_meters(bounds.max_ticks_exclusive()),
+                CELL_COLOR,
+                width,
+                height,
+            );
+        }
+        if opts.vegetation_bounds && plant_boxes < PLANT_BOX_CAP {
+            let points = generation.macro_points();
+            for index in 0..points.ids.len() {
+                if plant_boxes >= PLANT_BOX_CAP {
+                    break;
+                }
+                let color = match points.lifecycles[index] {
+                    saffron_runtime::PlantLifecycle::Seed
+                    | saffron_runtime::PlantLifecycle::Removed => continue,
+                    saffron_runtime::PlantLifecycle::Mature => MATURE_COLOR,
+                    saffron_runtime::PlantLifecycle::Sprout
+                    | saffron_runtime::PlantLifecycle::Juvenile => YOUNG_COLOR,
+                    saffron_runtime::PlantLifecycle::Senescent
+                    | saffron_runtime::PlantLifecycle::Dead => DECLINING_COLOR,
+                    saffron_runtime::PlantLifecycle::Stump => DORMANT_COLOR,
+                };
+                let bounds = points.bounds[index];
+                add_world_aabb(
+                    vertices,
+                    &view_projection,
+                    to_meters(bounds.min_ticks()),
+                    to_meters(bounds.max_ticks_exclusive()),
+                    color,
+                    width,
+                    height,
+                );
+                plant_boxes += 1;
+            }
+        }
+    }
+}
+
 /// The viewport debug overlays (`set-debug-overlays`): per-entity bounds (the exact box
 /// `pick_entity` tests, static + skinned joint-union), the whole-scene AABB the shadow fit
 /// uses, and point/spot light volumes. Depth-tested, Edit-only.
@@ -1522,20 +1720,145 @@ fn build_collider_overlays(
 /// Returns `(depth_tested, on_top)` so the host's `render_ui` owns the renderer borrow when it
 /// submits, and unit tests assert the ranges without a GPU.
 #[must_use]
+/// The per-frame inputs of one overlay build: the camera framing, the viewport
+/// extent, whether the edit chrome draws, and the live vegetation world (when a
+/// map is bound).
+pub struct OverlayFrame<'a> {
+    pub cam: &'a CameraView,
+    pub width: u32,
+    pub height: u32,
+    pub edit_chrome: bool,
+    pub vegetation: Option<&'a saffron_runtime::VegetationWorld>,
+    /// Reason-coded rejected-candidate markers (world metres; empty when the
+    /// rejection overlay is off).
+    pub rejections: &'a [(Vec3, u8)],
+    /// Surface-cast micro-density texels (world metres + density 0..1; empty when
+    /// the heatmap overlay is off).
+    pub heatmap: &'a [(Vec3, f32)],
+    /// Sampled wind vectors (world-metre base + velocity m/s; empty when the wind
+    /// overlay is off).
+    pub wind: &'a [(Vec3, Vec3)],
+    /// Published navigation contributions and the regions awaiting a rebuild (empty when the
+    /// navigation overlay is off).
+    pub navigation: Option<&'a saffron_runtime::VegetationNavigationSeam>,
+}
+
+/// Draws vegetation's published navigation contributions: each footprint as a closed loop at its
+/// obstacle height, colored by declaration, plus the regions awaiting a rebuild as boxes. Obstacles
+/// read red, dynamic obstacles (a plant currently moving) amber, cost fields blue, and a dirty
+/// region white — so a glance answers whether the seam matches what is on screen.
+fn build_navigation_overlay(
+    editor: &SceneEditContext,
+    navigation: Option<&saffron_runtime::VegetationNavigationSeam>,
+    cam: &CameraView,
+    width: u32,
+    height: u32,
+    vertices: &mut Vec<OverlayVertex>,
+) {
+    if width == 0 || height == 0 || !editor.debug_overlays.vegetation_navigation {
+        return;
+    }
+    let Some(seam) = navigation else {
+        return;
+    };
+    const OBSTACLE_COLOR: Vec4 = Vec4::new(0.95, 0.35, 0.3, 0.85);
+    const DYNAMIC_COLOR: Vec4 = Vec4::new(0.98, 0.72, 0.25, 0.9);
+    const COST_COLOR: Vec4 = Vec4::new(0.4, 0.65, 0.95, 0.75);
+    const DIRTY_COLOR: Vec4 = Vec4::new(0.95, 0.95, 0.95, 0.6);
+    const FOOTPRINT_CAP: usize = 2048;
+    let aspect = width as f32 / height as f32;
+    let view_projection = camera_projection(cam, aspect) * cam.view;
+    let to_meters = |ticks: [i128; 3]| {
+        Vec3::new(
+            ticks[0] as f32 / 4096.0,
+            ticks[1] as f32 / 4096.0,
+            ticks[2] as f32 / 4096.0,
+        )
+    };
+
+    let mut drawn = 0_usize;
+    for (_, contributions) in seam.cells() {
+        for contribution in contributions {
+            if drawn >= FOOTPRINT_CAP {
+                break;
+            }
+            let color = match contribution.kind {
+                saffron_runtime::NavigationContributionKind::Cost => COST_COLOR,
+                saffron_runtime::NavigationContributionKind::StaticObstacle => OBSTACLE_COLOR,
+                saffron_runtime::NavigationContributionKind::DynamicObstacle => DYNAMIC_COLOR,
+            };
+            let base_y = to_meters(contribution.bounds.min_ticks()).y;
+            let top_y = base_y + contribution.height_m as f32;
+            for (index, point) in contribution.footprint.iter().enumerate() {
+                let next =
+                    contribution.footprint[(index + 1) % contribution.footprint.len().max(1)];
+                let from = Vec3::new(point[0] as f32, base_y, point[1] as f32);
+                let to = Vec3::new(next[0] as f32, base_y, next[1] as f32);
+                add_clipped_overlay_line(
+                    vertices,
+                    &view_projection,
+                    from,
+                    to,
+                    1.5,
+                    color,
+                    width,
+                    height,
+                );
+                // One upright per vertex carries the obstacle height without drawing a full prism.
+                add_clipped_overlay_line(
+                    vertices,
+                    &view_projection,
+                    from,
+                    Vec3::new(from.x, top_y, from.z),
+                    1.5,
+                    color,
+                    width,
+                    height,
+                );
+            }
+            drawn += 1;
+        }
+    }
+    for region in seam.dirty_regions() {
+        add_world_aabb(
+            vertices,
+            &view_projection,
+            to_meters(region.min_ticks()),
+            to_meters(region.max_ticks_exclusive()),
+            DIRTY_COLOR,
+            width,
+            height,
+        );
+    }
+}
+
 pub fn build_scene_edit_overlay(
     editor: &mut SceneEditContext,
     assets: &mut AssetServer,
     gpu: &dyn GpuUploader,
-    cam: &CameraView,
-    width: u32,
-    height: u32,
-    edit_chrome: bool,
+    frame: &OverlayFrame<'_>,
 ) -> (Vec<OverlayVertex>, Vec<OverlayVertex>) {
+    let OverlayFrame {
+        cam,
+        width,
+        height,
+        edit_chrome,
+        vegetation,
+        rejections,
+        heatmap,
+        wind,
+        navigation,
+    } = *frame;
     let mut depth_tested: Vec<OverlayVertex> = Vec::new();
     let mut on_top: Vec<OverlayVertex> = Vec::new();
     if edit_chrome {
         build_scene_edit_camera_frustums(editor, cam, width, height, &mut depth_tested);
         build_debug_overlays(editor, assets, gpu, cam, width, height, &mut depth_tested);
+        build_vegetation_overlays(editor, vegetation, cam, width, height, &mut depth_tested);
+        build_rejection_overlay(rejections, cam, width, height, &mut depth_tested);
+        build_heatmap_overlay(heatmap, cam, width, height, &mut depth_tested);
+        build_wind_overlay(wind, cam, width, height, &mut depth_tested);
+        build_navigation_overlay(editor, navigation, cam, width, height, &mut depth_tested);
         build_scene_edit_billboards(editor, cam, width, height, &mut on_top);
         build_native_gizmo(editor, cam, width, height, &mut on_top);
     }
@@ -1729,6 +2052,7 @@ mod tests {
         fn upload_mesh(
             &self,
             _mesh: &saffron_geometry::Mesh,
+            _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             _skin: &[saffron_geometry::VertexSkin],
             _morph: Option<&saffron_geometry::MorphData>,
             _sdf_bake: Option<&saffron_rendering::SdfBake>,
@@ -1785,8 +2109,22 @@ mod tests {
 
         // Edit chrome on: the on-top range carries the billboards + the gizmo; the depth-tested
         // range carries the seeded camera's frustum.
-        let (depth, on_top) =
-            build_scene_edit_overlay(&mut ctx, &mut assets, &gpu, &cam, w, h, true);
+        let (depth, on_top) = build_scene_edit_overlay(
+            &mut ctx,
+            &mut assets,
+            &gpu,
+            &OverlayFrame {
+                cam: &cam,
+                width: w,
+                height: h,
+                edit_chrome: true,
+                vegetation: None,
+                rejections: &[],
+                heatmap: &[],
+                wind: &[],
+                navigation: None,
+            },
+        );
         assert!(
             !on_top.is_empty(),
             "edit chrome populates the on-top range (gizmo + billboards)"
@@ -1798,8 +2136,22 @@ mod tests {
 
         // Edit chrome off (Play): the gizmo / billboards / frustums vanish; with the skeleton
         // off and no colliders, both ranges are empty.
-        let (depth_play, on_top_play) =
-            build_scene_edit_overlay(&mut ctx, &mut assets, &gpu, &cam, w, h, false);
+        let (depth_play, on_top_play) = build_scene_edit_overlay(
+            &mut ctx,
+            &mut assets,
+            &gpu,
+            &OverlayFrame {
+                cam: &cam,
+                width: w,
+                height: h,
+                edit_chrome: false,
+                vegetation: None,
+                rejections: &[],
+                heatmap: &[],
+                wind: &[],
+                navigation: None,
+            },
+        );
         assert!(
             depth_play.is_empty() && on_top_play.is_empty(),
             "no edit chrome and no colliders/skeleton → both ranges empty"
@@ -1830,8 +2182,22 @@ mod tests {
         let (w, h) = (1280u32, 720u32);
 
         // Even with edit_chrome=false (Play), the collider draws into the depth-tested range.
-        let (depth, _on_top) =
-            build_scene_edit_overlay(&mut ctx, &mut assets, &gpu, &cam, w, h, false);
+        let (depth, _on_top) = build_scene_edit_overlay(
+            &mut ctx,
+            &mut assets,
+            &gpu,
+            &OverlayFrame {
+                cam: &cam,
+                width: w,
+                height: h,
+                edit_chrome: false,
+                vegetation: None,
+                rejections: &[],
+                heatmap: &[],
+                wind: &[],
+                navigation: None,
+            },
+        );
         assert!(
             !depth.is_empty(),
             "colliders draw in Play (outside edit_chrome)"
@@ -1840,8 +2206,22 @@ mod tests {
         // The preview guard suppresses colliders while previewing.
         ctx.preview_scene = Some(Scene::new());
         ctx.preview_active_view = true;
-        let (depth_preview, _) =
-            build_scene_edit_overlay(&mut ctx, &mut assets, &gpu, &cam, w, h, false);
+        let (depth_preview, _) = build_scene_edit_overlay(
+            &mut ctx,
+            &mut assets,
+            &gpu,
+            &OverlayFrame {
+                cam: &cam,
+                width: w,
+                height: h,
+                edit_chrome: false,
+                vegetation: None,
+                rejections: &[],
+                heatmap: &[],
+                wind: &[],
+                navigation: None,
+            },
+        );
         assert!(
             depth_preview.is_empty(),
             "the collider preview guard suppresses them while previewing"

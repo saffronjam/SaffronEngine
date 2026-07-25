@@ -146,6 +146,9 @@ pub struct SceneEditContext {
     pub script_input: ScriptInputState,
 
     /// The isolated preview scene; `None` when not previewing.
+    /// Monotonic simulation seconds the host accumulates every frame (both modes).
+    /// Wind and other evolution sample it; the calendar never touches it.
+    pub simulation_time_s: f64,
     pub preview_scene: Option<Scene>,
     /// The model container being previewed (`0` = none).
     pub preview_asset: Uuid,
@@ -215,6 +218,7 @@ impl Default for SceneEditContext {
             script_logs: Vec::new(),
             script_log_seq: 0,
             script_input: ScriptInputState::default(),
+            simulation_time_s: 0.0,
             preview_scene: None,
             preview_asset: Uuid(0),
             preview_root_entity: Entity::NULL,

@@ -48,6 +48,18 @@ pub struct DebugOverlayOptions {
     pub grid: bool,
     /// Physics collision shapes (box/sphere/capsule wireframes); Edit + Play.
     pub colliders: bool,
+    /// Resident vegetation runtime cells as wireframe boxes.
+    pub vegetation_cells: bool,
+    /// Per-plant conservative world bounds, colored by lifecycle.
+    pub vegetation_bounds: bool,
+    /// Rejected-candidate markers colored by rejection reason.
+    pub vegetation_rejections: bool,
+    /// Micro-density heatmap texels over the resident cells.
+    pub vegetation_heatmap: bool,
+    /// Published navigation contributions (obstacle/cost footprints) and dirty rebuild regions.
+    pub vegetation_navigation: bool,
+    /// Sampled wind-field vectors on a camera-centred ground grid.
+    pub wind_vectors: bool,
 }
 
 /// Serializes the debug overlays to their `project.json` object. The keys are the frozen
@@ -60,6 +72,12 @@ pub fn debug_overlays_to_json(opts: &DebugOverlayOptions) -> Value {
         "lightVolumes": opts.light_volumes,
         "grid": opts.grid,
         "colliders": opts.colliders,
+        "vegetationCells": opts.vegetation_cells,
+        "vegetationBounds": opts.vegetation_bounds,
+        "vegetationRejections": opts.vegetation_rejections,
+        "vegetationHeatmap": opts.vegetation_heatmap,
+        "vegetationNavigation": opts.vegetation_navigation,
+        "windVectors": opts.wind_vectors,
     })
 }
 
@@ -76,6 +94,14 @@ pub fn debug_overlays_from_json(opts: &mut DebugOverlayOptions, value: &Value) {
     opts.light_volumes = json_bool_or(value, "lightVolumes", opts.light_volumes);
     opts.grid = json_bool_or(value, "grid", opts.grid);
     opts.colliders = json_bool_or(value, "colliders", opts.colliders);
+    opts.vegetation_cells = json_bool_or(value, "vegetationCells", opts.vegetation_cells);
+    opts.vegetation_bounds = json_bool_or(value, "vegetationBounds", opts.vegetation_bounds);
+    opts.vegetation_rejections =
+        json_bool_or(value, "vegetationRejections", opts.vegetation_rejections);
+    opts.vegetation_heatmap = json_bool_or(value, "vegetationHeatmap", opts.vegetation_heatmap);
+    opts.vegetation_navigation =
+        json_bool_or(value, "vegetationNavigation", opts.vegetation_navigation);
+    opts.wind_vectors = json_bool_or(value, "windVectors", opts.wind_vectors);
 }
 
 #[cfg(test)]
@@ -90,6 +116,12 @@ mod tests {
             light_volumes: true,
             grid: true,
             colliders: false,
+            vegetation_cells: true,
+            vegetation_bounds: false,
+            vegetation_rejections: true,
+            vegetation_heatmap: false,
+            vegetation_navigation: true,
+            wind_vectors: false,
         };
 
         let value = debug_overlays_to_json(&opts);
@@ -99,6 +131,11 @@ mod tests {
         assert_eq!(value["lightVolumes"], json!(true));
         assert_eq!(value["grid"], json!(true));
         assert_eq!(value["colliders"], json!(false));
+        assert_eq!(value["vegetationCells"], json!(true));
+        assert_eq!(value["vegetationBounds"], json!(false));
+        assert_eq!(value["vegetationRejections"], json!(true));
+        assert_eq!(value["vegetationHeatmap"], json!(false));
+        assert_eq!(value["windVectors"], json!(false));
 
         let mut read = DebugOverlayOptions::default();
         debug_overlays_from_json(&mut read, &value);
