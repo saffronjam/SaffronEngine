@@ -12,10 +12,10 @@ workspace = true
 [dependencies]
 saffron-core = { path = "../core" }
 saffron-json = { path = "../json" }
+saffron-material = { path = "../material" }
 saffron-geometry = { path = "../geometry" }
 saffron-spatial = { path = "../spatial" }
 glam.workspace = true
-optimesh.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zstd.workspace = true

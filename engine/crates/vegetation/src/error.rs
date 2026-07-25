@@ -118,9 +118,7 @@ pub enum Error {
         source: std::io::Error,
     },
     /// A declared artifact section size exceeds the bounded container contract.
-    #[error(
-        "{format} section {section} {size_kind} size {requested} exceeds limit {limit}"
-    )]
+    #[error("{format} section {section} {size_kind} size {requested} exceeds limit {limit}")]
     ArtifactSectionLimit {
         /// Logical artifact format.
         format: &'static str,
@@ -133,12 +131,14 @@ pub enum Error {
         /// Maximum accepted byte count.
         limit: u64,
     },
-    /// The sum of decoded artifact sections exceeds the bounded container contract.
-    #[error("{format} decoded size {requested} exceeds limit {limit}")]
-    ArtifactDecodedLimit {
+    /// The sum of stored or decoded artifact sections exceeds the caller's budget.
+    #[error("{format} total {size_kind} size {requested} exceeds limit {limit}")]
+    ArtifactTotalLimit {
         /// Logical artifact format.
         format: &'static str,
-        /// Declared decoded byte count across every section.
+        /// Whether stored or decoded bytes exceeded the aggregate bound.
+        size_kind: &'static str,
+        /// Declared byte count across every section.
         requested: u64,
         /// Maximum accepted byte count.
         limit: u64,
@@ -291,6 +291,9 @@ pub enum Error {
     /// A nested shared spatial operation failed.
     #[error("spatial error: {0}")]
     Spatial(#[from] saffron_spatial::Error),
+    /// A material surface or coverage contract failed validation.
+    #[error("material error: {0}")]
+    Material(#[from] saffron_material::Error),
     /// A nested canonical JSON operation failed.
     #[error("json error: {0}")]
     Json(#[from] saffron_json::Error),
