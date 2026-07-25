@@ -13,7 +13,8 @@ synchronization from that.
 ```rust
 pub struct RgPass {
     pub name: String,
-    pub kind: RgPassKind,          // Graphics or Compute
+    pub kind: RgPassKind,          // Graphics, GraphicsCommands, or Compute
+    pub queue: RgQueuePreference,
     pub accesses: Vec<RgAccess>,   // non-attachment reads/writes
     pub colors: Vec<RgAttachment>, // MRT: index 0 is location 0
     pub depth: Option<RgAttachment>,
@@ -22,17 +23,18 @@ pub struct RgPass {
 }
 ```
 
-A pass is built with chained constructors: `RgPass::graphics(name, render_area)` or
-`RgPass::compute(name)`, then `.access(resource, usage)`, `.color(att)`, `.depth_attachment(att)`,
-and `.body(closure)`. The body is `FnOnce` — it runs exactly once on the render thread while the
-command buffer records. Besides the command buffer it receives a `NestedScopeRecorder`, which lets
-it open [profiler sub-scopes](../renderer-profiling/) around its own phases.
+A pass is built with chained constructors: `RgPass::graphics(name, render_area)`,
+`RgPass::graphics_commands(name)`, or `RgPass::compute(name)`, then `.access(resource, usage)`,
+`.color(att)`, `.depth_attachment(att)`, and `.body(closure)`. `access_buffer` declares a precise
+byte range. The `FnOnce` body runs exactly once while its queue command buffer records. It also
+receives a `NestedScopeRecorder` for [profiler sub-scopes](../renderer-profiling/).
 
 ## How a pass runs
 
 The `kind` decides what the graph wraps around the body. A `Graphics` pass gets a
 [dynamic-rendering](../../vulkan-foundation/dynamic-rendering/) scope plus a viewport and scissor
-covering `render_area`; a `Compute` pass gets only its barriers. Both run the same way: emit the
+covering `render_area`; a `GraphicsCommands` body manages multiple rendering scopes; a `Compute`
+pass gets only its barriers and prefers the independent compute queue. All run the same way: emit the
 barriers the declarations imply, then call the body. The closure does ordinary recording — bind a
 pipeline and descriptor sets, push constants, draw or dispatch — and never writes a barrier or
 transitions a layout.
@@ -45,6 +47,7 @@ flowchart TD
     D --> E[beginRendering + viewport + scissor]
     E --> F[body records draws]
     F --> G[endRendering]
+    C -- GraphicsCommands --> I[body records rendering scopes]
     C -- Compute --> H[body records dispatches]
 ```
 
@@ -56,7 +59,7 @@ Vulkan handles.
 ## Accesses versus attachments
 
 A pass declares its resource use in two places. `accesses` lists the non-attachment reads and
-writes: the shadow maps the scene fragment shader samples (`SampledRead`), the deformed buffer a
+writes: the shadow atlas the scene fragment shader samples (`SampledRead`), the deformed buffer a
 skinned batch reads as its vertex stream (`VertexInputRead`), an image a post pass reads and writes
 in place. Each entry is an `RgAccess`, a resource handle plus one `RgUsage` that says what the pass
 does with it.
@@ -132,11 +135,11 @@ attachments, points the color's `resolve` at the offscreen output, and points th
 
 | What | File | Symbols |
 |---|---|---|
-| Pass shape | `render_graph.rs` | `RgPass`, `RgPassKind`, `PassBody`, `RgPass::graphics`, `RgPass::compute` |
+| Pass shape | `render_graph.rs` | `RgPass`, `RgPassKind`, `PassBody`, pass constructors |
 | Attachment shape | `render_graph.rs` | `RgAttachment`, `RgAttachment::clear_store` |
-| Non-attachment access | `render_graph.rs` | `RgAccess`, `RgUsage`, `RgPass::access` |
+| Non-attachment access | `render_graph.rs` | `RgAccess`, `RgUsage`, `RgPass::access`, `access_buffer` |
 | Implied attachment usage | `render_graph.rs` | `RenderGraph::derive_pass_barriers` |
-| Recording a pass | `render_graph.rs` | `RenderGraph::execute_profiled`, `record_graphics` |
+| Recording a pass | `render_graph.rs` | `RenderGraph::record_submission_plan_profiled`, `record_graphics` |
 | MRT in practice | `renderer.rs` | `Renderer::add_screen_space_passes` (the `gbuffer` `RgPass`) |
 | MSAA resolve in practice | `renderer.rs` | `Renderer::record_scene_graph` (the scene `RgPass`, its `resolve`) |
 
