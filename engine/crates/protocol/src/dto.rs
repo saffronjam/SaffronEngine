@@ -225,6 +225,8 @@ pub enum AddEntityPreset {
 pub enum PickKind {
     Billboard,
     Mesh,
+    Vegetation,
+    MicroVegetation,
 }
 
 /// The active gizmo operation.
@@ -324,6 +326,7 @@ pub enum ViewModeDto {
     MotionVectors,
     Fog,
     CloudDensity,
+    ShadowPages,
 }
 
 /// The asset slot an `assign-asset` targets.
@@ -452,6 +455,27 @@ pub struct PingResult {
     pub pid: i32,
 }
 
+/// One frame's virtual-shadow residency activity (page counts).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VsmStatsDto {
+    /// Pages demanded (receiver requests + bootstrap).
+    pub requested: i32,
+    /// Demands answered by an already-resident page.
+    pub hits: i32,
+    /// Fresh page-to-tile allocations.
+    pub allocated: i32,
+    /// Pages the frame rasterized.
+    pub rendered: i32,
+    /// Resident pages re-marked dirty.
+    pub dirtied: i32,
+    /// LRU evictions.
+    pub evicted: i32,
+    /// Demands the full atlas could not satisfy.
+    pub overflow: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -465,8 +489,10 @@ pub struct RenderStatsDto {
     pub instance_upload_bytes: u64,
     /// Host bytes retained by unique drawn meshes for exact surface queries.
     pub retained_mesh_cpu_bytes: u64,
-    /// Actual indexed draw invocations across directional, spot, and point shadows.
+    /// Indirect draw invocations recorded across the frame's virtual-shadow pages.
     pub shadow_draw_calls: i32,
+    /// Virtual-shadow residency activity (requests, allocations, evictions, …).
+    pub vsm: VsmStatsDto,
     /// Instances published into the active frame TLAS.
     pub rt_instances: i32,
     pub frame_ms: f32,
@@ -554,6 +580,95 @@ pub struct RenderStatsDto {
     pub bloom_per_mip_tint: Vec<[f32; 3]>,
     pub aa: AaModeDto,
     pub view_mode: ViewModeDto,
+}
+
+/// Population and rebuild counters for the journal-driven persistent GPU-scene mirror.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GpuSceneMirrorStatsDto {
+    /// Mirrored mesh assets (prototypes).
+    pub meshes: u32,
+    /// Interned resolved material variants.
+    pub materials: u32,
+    /// Interned texture-table records.
+    pub textures: u32,
+    /// Instances across every synced world.
+    pub instances: u32,
+    /// Punctual lights across every synced world.
+    pub lights: u32,
+    /// Entities whose referenced mesh is currently unresolvable.
+    pub unresolved_instances: u32,
+    /// Host bytes the mirrored meshes retain for surface queries.
+    pub retained_mesh_bytes: u64,
+    /// Complete shared-record rebuilds (asset journal overflow or catalog replacement).
+    pub shared_rebuilds: u64,
+    /// Complete world rebuilds (scene journal overflow or a rebound scene instance).
+    pub world_rebuilds: u64,
+    /// Cooked density upper bound of micro blade candidates across the resident-tile
+    /// directory; the per-frame generated count never exceeds it.
+    pub micro_predicted: u64,
+    /// Hierarchy page-payload residency counters.
+    pub page_residency: PageResidencyStatsDto,
+    /// GPU visibility counters from the latest completed frame.
+    pub visibility: SceneVisibilityStatsDto,
+}
+
+/// GPU instance-visibility counters for one completed frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SceneVisibilityStatsDto {
+    /// Instances on the visible list.
+    pub visible: u32,
+    /// Occlusion-retested instances.
+    pub retested: u32,
+    /// Semantic draw records emitted by the traversal.
+    pub records: u32,
+    /// Back-to-front transparent draws.
+    pub transparent: u32,
+    /// Generated micro-blade candidates.
+    pub micro_candidates: u32,
+    /// Records mid representation-crossfade.
+    pub transitioning: u32,
+    /// Aggregate-voxel records on the cut.
+    pub voxel_records: u32,
+    /// The deepest hierarchy level on the emitted cut.
+    pub max_cut_depth: u32,
+    /// Instances the frustum culled.
+    pub culled_frustum: u32,
+    /// Instances the occlusion retest kept hidden.
+    pub culled_occlusion: u32,
+    /// Emitted triangles whose whole record projects under one 2×2 quad — the
+    /// quad-utilization pressure the rasterizer pays for sub-quad geometry.
+    pub sub_quad_triangles: u32,
+    /// List overflow flags (visible/retest).
+    pub overflow_flags: u32,
+    /// Record-stream and draw-bucket pressure flags.
+    pub pressure_flags: u32,
+}
+
+/// Hierarchy page-payload residency counters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PageResidencyStatsDto {
+    /// Registered pages.
+    pub registered: u64,
+    /// Pages whose payload is resident.
+    pub resident: u64,
+    /// Resident payload bytes.
+    pub resident_bytes: u64,
+    /// Resident byte budget.
+    pub budget_bytes: u64,
+    /// Pages awaiting the load worker.
+    pub requested: u64,
+    /// Pages at the load worker.
+    pub loading: u64,
+    /// Loaded pages awaiting publication.
+    pub ready: u64,
+    /// Cumulative evictions.
+    pub evictions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -893,8 +1008,12 @@ pub struct FitColliderResult {
 pub struct ContactEventDto {
     pub seq: i64,
     pub kind: String,
-    pub entity_a: Uuid,
-    pub entity_b: Uuid,
+    /// One body's owner; absent when the body has no owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_a: Option<WorldHitTargetDto>,
+    /// The other body's owner; absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_b: Option<WorldHitTargetDto>,
     pub sensor: bool,
     pub point: Vec3,
     pub normal: Vec3,
@@ -923,7 +1042,9 @@ pub struct DrainContactsResult {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct PhysicsBodyDto {
-    pub entity: Uuid,
+    /// The body's owner; absent when the body carried no owner identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<WorldHitTargetDto>,
     pub motion: String,
     pub active: bool,
     pub position: Vec3,
@@ -1016,12 +1137,34 @@ pub struct ShapecastParams {
     pub max_dist: Option<f32>,
 }
 
+/// The tagged owner a physics interaction resolves to on the wire: a scene entity by
+/// stable uuid, or an authoritative macro plant by canonical identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+#[ts(export)]
+pub enum WorldHitTargetDto {
+    /// A hecs scene entity.
+    #[serde(rename = "scene-entity")]
+    SceneEntity {
+        /// The entity's stable uuid.
+        id: Uuid,
+    },
+    /// An authoritative macro plant.
+    #[serde(rename = "vegetation")]
+    Vegetation {
+        /// The plant's canonical 32-hex identity.
+        plant: crate::PlantId,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct RaycastResult {
     pub hit: bool,
-    pub entity: Uuid,
+    /// The struck body's owner; absent on a miss or an unowned body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<WorldHitTargetDto>,
     pub point: Vec3,
     pub normal: Vec3,
     pub distance: f32,
@@ -2540,6 +2683,40 @@ pub struct PickResult {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<PickKind>,
+    /// The stable plant identity when a macro plant is the nearest hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plant: Option<crate::PlantId>,
+    /// The world-space hit position in metres (a mesh surface or micro-vegetation
+    /// ground hit; absent for billboards and misses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<[f64; 3]>,
+    /// The geometric surface normal at a mesh hit (absent for billboards, plants,
+    /// micro hits, and misses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal: Option<[f32; 3]>,
+}
+
+/// Parameters for one explicit surface-ray query (metres; the direction normalizes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct QuerySurfaceRayParams {
+    pub origin_m: [f64; 3],
+    pub direction: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_distance_m: Option<f64>,
+}
+
+/// Result of one explicit surface-ray query: the nearest scene-surface hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SurfaceRayResult {
+    pub hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal: Option<[f32; 3]>,
 }
 
 /// One exact signed world-tick coordinate encoded as decimal strings.
@@ -3079,6 +3256,59 @@ pub struct SetCloudsParams {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
+pub struct SampleWindParams {
+    /// World position in metres.
+    pub position_m: [f64; 3],
+    /// Simulation seconds; the engine's monotonic clock when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_s: Option<f64>,
+}
+
+/// Params of `emit-interaction-impulse`: one world-space impulse into the
+/// interaction field (a horizontal push disc with a smooth falloff).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EmitInteractionImpulseParams {
+    /// World-space XZ centre in metres.
+    pub position_m: [f64; 2],
+    /// Falloff radius in metres.
+    #[schemars(range(min = 0.01, max = 64.0))]
+    pub radius_m: f64,
+    /// Velocity change at the centre in metres per second.
+    #[schemars(range(min = 0.0, max = 50.0))]
+    pub strength: f64,
+    /// Horizontal push direction; radial from the centre when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<[f64; 2]>,
+    /// Ground-depression velocity change at the centre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0, max = 10.0))]
+    pub depress: Option<f64>,
+}
+
+/// Reply of `emit-interaction-impulse`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct EmitInteractionImpulseResult {
+    /// Whether the impulse was staged for the next frame.
+    pub accepted: bool,
+}
+
+/// One composed wind sample: the global profile plus every enabled `WindSource`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SampleWindResult {
+    pub velocity_mps: [f32; 3],
+    pub gust_front: f32,
+    pub time_s: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SetWindParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<Value>,
@@ -3272,6 +3502,20 @@ pub struct AssetPreviewResult {
     pub bones: Vec<BoneEntityDto>,
     pub target: Vec3,
     pub distance: f32,
+    /// The authored (variation, phenotype) combinations of a plant subject —
+    /// the scrub domain for `set-asset-preview-options`; empty for every other
+    /// subject kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plant_combinations: Vec<PlantCombinationDto>,
+}
+
+/// One authored assembly combination of a compiled plant family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantCombinationDto {
+    pub variation: u32,
+    pub phenotype: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -3425,6 +3669,34 @@ pub struct DebugOverlaysParams {
         deserialize_with = "coerce::opt_boolean"
     )]
     pub colliders: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub vegetation_cells: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub vegetation_bounds: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub vegetation_rejections: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "coerce::opt_boolean"
+    )]
+    pub vegetation_heatmap: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vegetation_navigation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wind_vectors: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -3436,6 +3708,12 @@ pub struct DebugOverlaysResult {
     pub light_volumes: bool,
     pub grid: bool,
     pub colliders: bool,
+    pub vegetation_cells: bool,
+    pub vegetation_bounds: bool,
+    pub vegetation_rejections: bool,
+    pub vegetation_heatmap: bool,
+    pub vegetation_navigation: bool,
+    pub wind_vectors: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -3473,6 +3751,12 @@ pub struct SetAssetPreviewOptionsParams {
         deserialize_with = "coerce::opt_boolean"
     )]
     pub floor: Option<bool>,
+    /// Selects a plant subject's authored variation (with `phenotype`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variation: Option<u32>,
+    /// Selects a plant subject's phenotype (with `variation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phenotype: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
