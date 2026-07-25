@@ -19,9 +19,9 @@ interface Vec3 {
 }
 interface RayHit {
   hit: boolean;
-  entity: string;
-  point: Vec3;
-  normal: Vec3;
+  target?: { kind: "scene-entity"; id: string } | { kind: "vegetation"; plant: string };
+  point: { x: number; y: number; z: number };
+  normal: { x: number; y: number; z: number };
   distance: number;
 }
 
@@ -79,7 +79,7 @@ test("a down-ray hits the floor; an up-ray misses", async () => {
     maxDist: 20,
   });
   expect(down.hit).toBe(true);
-  expect(down.entity).toBe(floor);
+  expect(down.target).toEqual({ kind: "scene-entity", id: floor });
   expect(down.point.y).toBeCloseTo(0.1, 1);
   expect(down.normal.y).toBeGreaterThan(0.8);
   expect(down.distance).toBeCloseTo(4.9, 1);
@@ -91,7 +91,7 @@ test("a down-ray hits the floor; an up-ray misses", async () => {
     maxDist: 20,
   });
   expect(onBox.hit).toBe(true);
-  expect(onBox.entity).toBe(box);
+  expect(onBox.target).toEqual({ kind: "scene-entity", id: box });
   expect(onBox.point.y).toBeCloseTo(1.5, 1);
 
   // Straight up into empty space -> no hit.
@@ -101,7 +101,7 @@ test("a down-ray hits the floor; an up-ray misses", async () => {
     maxDist: 20,
   });
   expect(up.hit).toBe(false);
-  expect(up.entity).toBe("0");
+  expect(up.target).toBeUndefined();
 });
 
 test("a sphere-cast grazes the box edge where a thin ray misses it", async () => {
@@ -112,7 +112,7 @@ test("a sphere-cast grazes the box edge where a thin ray misses it", async () =>
     maxDist: 20,
   });
   expect(thin.hit).toBe(true);
-  expect(thin.entity).toBe(floor); // missed the box, hit the floor
+  expect(thin.target).toEqual({ kind: "scene-entity", id: floor }); // missed the box, hit the floor
 
   // ...but a radius-0.5 sphere sweep reaches the box edge and hits it first.
   const sphere = await engine.call<RayHit>("shapecast", {
@@ -122,7 +122,7 @@ test("a sphere-cast grazes the box edge where a thin ray misses it", async () =>
     maxDist: 20,
   });
   expect(sphere.hit).toBe(true);
-  expect(sphere.entity).toBe(box);
+  expect(sphere.target).toEqual({ kind: "scene-entity", id: box });
 
   await engine.call("stop");
   await engine.settle();

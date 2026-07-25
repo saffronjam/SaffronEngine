@@ -7,11 +7,13 @@ import { Engine } from "./harness.ts";
 
 let engine: Engine;
 
+type HitTarget = { kind: "scene-entity"; id: string } | { kind: "vegetation"; plant: string };
+
 interface ContactEvent {
   seq: number;
   kind: string;
-  entityA: string;
-  entityB: string;
+  targetA?: HitTarget;
+  targetB?: HitTarget;
   sensor: boolean;
   tick: number;
 }
@@ -22,8 +24,11 @@ interface ContactDrain {
   overflowed: boolean;
 }
 
+const entityOf = (target: HitTarget | undefined): string =>
+  target?.kind === "scene-entity" ? target.id : "";
 const involves = (e: ContactEvent, a: string, b: string): boolean =>
-  (e.entityA === a && e.entityB === b) || (e.entityA === b && e.entityB === a);
+  (entityOf(e.targetA) === a && entityOf(e.targetB) === b) ||
+  (entityOf(e.targetA) === b && entityOf(e.targetB) === a);
 
 async function createCollider(
   name: string,

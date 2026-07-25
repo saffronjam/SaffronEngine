@@ -23,8 +23,10 @@ interface PhysicsState {
   bodyCount: number;
   dynamicCount: number;
 }
+type HitTarget = { kind: "scene-entity"; id: string } | { kind: "vegetation"; plant: string };
+
 interface ContactDrain {
-  events: { kind: string; entityA: string; entityB: string; sensor: boolean }[];
+  events: { kind: string; targetA?: HitTarget; targetB?: HitTarget; sensor: boolean }[];
   highWaterSeq: number;
   oldestSeq: number;
   overflowed: boolean;
