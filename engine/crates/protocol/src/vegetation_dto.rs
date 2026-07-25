@@ -928,7 +928,7 @@ pub enum PlantSourceRoleDto {
 }
 
 /// Stable selection within one imported source snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -936,9 +936,16 @@ pub enum PlantSourceRoleDto {
 )]
 #[ts(export)]
 pub enum PlantSourceSelectorDto {
+    #[default]
     Whole,
-    Element { id: VegetationGuid, path: String },
-    Submesh { element: VegetationGuid, index: u32 },
+    Element {
+        id: VegetationGuid,
+        path: String,
+    },
+    Submesh {
+        element: VegetationGuid,
+        index: u32,
+    },
 }
 
 /// Authored semantic destination of one stable imported-source selector.
@@ -975,6 +982,7 @@ pub enum PlantCompileDiagnosticCodeDto {
     BoundsMismatch,
     LimitExceeded,
     SourceChanged,
+    OrphanedEdit,
 }
 
 /// One exact source-normalization diagnostic from the plant compiler.
@@ -1023,6 +1031,154 @@ pub struct PlantCompileStatisticsDto {
     pub joints: String,
     pub materials: String,
     pub rejected: String,
+}
+
+/// Source coordinate units.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SourceUnitsDto {
+    #[default]
+    Meters,
+    Centimeters,
+    Millimeters,
+    Feet,
+}
+
+/// A signed coordinate axis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SourceAxisDto {
+    PositiveX,
+    NegativeX,
+    #[default]
+    PositiveY,
+    NegativeY,
+    PositiveZ,
+    NegativeZ,
+}
+
+/// Source coordinate-system handedness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SourceHandednessDto {
+    #[default]
+    Right,
+    Left,
+}
+
+/// Source front-face winding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SourceWindingDto {
+    #[default]
+    CounterClockwise,
+    Clockwise,
+}
+
+/// Source UV vertical origin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum SourceUvOriginDto {
+    #[default]
+    TopLeft,
+    BottomLeft,
+}
+
+/// Tangent-frame normalization policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum PlantTangentPolicyDto {
+    Require,
+    #[default]
+    GenerateMissing,
+    Regenerate,
+}
+
+/// Family origin policy after coordinate normalization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum PlantPivotDto {
+    #[default]
+    SourceOrigin,
+    BoundsBaseCenter,
+    Explicit {
+        /// Position in source metres, as Q15.16 bits.
+        position_bits: [i32; 3],
+    },
+    SemanticPart {
+        /// The part identity the origin follows.
+        part: VegetationGuid,
+    },
+}
+
+/// How one external source is read into a plant family.
+///
+/// Every field defaults, so a caller states only what differs from metres, Y-up, right-handed,
+/// counter-clockwise geometry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+#[ts(export)]
+pub struct PlantImportSettingsDto {
+    pub units: SourceUnitsDto,
+    pub up_axis: SourceAxisDto,
+    pub forward_axis: SourceAxisDto,
+    pub handedness: SourceHandednessDto,
+    /// Uniform post-unit scale, as Q15.16 bits, where 65536 is unchanged.
+    pub scale_bits: i32,
+    pub pivot: PlantPivotDto,
+    pub winding: SourceWindingDto,
+    pub uv_origin: SourceUvOriginDto,
+    /// UV scale, as Q15.16 bits.
+    pub uv_scale_bits: [i32; 2],
+    /// UV offset applied after scaling, as Q15.16 bits.
+    pub uv_offset_bits: [i32; 2],
+    pub tangent_policy: PlantTangentPolicyDto,
+}
+
+impl Default for PlantImportSettingsDto {
+    fn default() -> Self {
+        Self {
+            units: SourceUnitsDto::default(),
+            up_axis: SourceAxisDto::PositiveY,
+            forward_axis: SourceAxisDto::PositiveZ,
+            handedness: SourceHandednessDto::default(),
+            scale_bits: 1 << 16,
+            pivot: PlantPivotDto::default(),
+            winding: SourceWindingDto::default(),
+            uv_origin: SourceUvOriginDto::default(),
+            uv_scale_bits: [1 << 16, 1 << 16],
+            uv_offset_bits: [0, 0],
+            tangent_policy: PlantTangentPolicyDto::default(),
+        }
+    }
+}
+
+/// One external hero mesh a native family may graft over a generated element.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantGraftSourceDto {
+    /// Source identity a graft edit names, as 32 hex digits.
+    pub id: VegetationGuid,
+    pub locator: PlantSourceLocatorDto,
+    /// Which of the source's elements the graft takes.
+    #[serde(default)]
+    pub selector: PlantSourceSelectorDto,
+    #[serde(default)]
+    pub settings: PlantImportSettingsDto,
+    pub provenance: VegetationSourceProvenanceDto,
 }
 
 /// One exact source snapshot read by plant validation and recooking.
@@ -1078,11 +1234,26 @@ pub struct BiomeAssetSummaryDto {
     pub plant_palette: Vec<Uuid>,
     pub modules: Vec<Uuid>,
     pub parameter_count: u32,
+    /// The authored biome graph document (the versioned graph JSON the compiler reads).
+    #[schemars(with = "std::collections::BTreeMap<String, Value>")]
+    #[ts(type = "Record<string, unknown>")]
+    pub graph: Value,
     pub validation: VegetationValidationSummaryDto,
     pub provenance: Vec<VegetationSourceProvenanceDto>,
     pub dependencies: Vec<VegetationManifestDependencyDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_cook: Option<VegetationCookStatisticsDto>,
+}
+
+/// One local biome-graph instance bound into an authored map: the stable instance
+/// identity (the address preflight/evaluation commands take) plus the referenced
+/// root biome asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationBiomeInstanceRefDto {
+    pub instance: VegetationGuid,
+    pub biome: Uuid,
 }
 
 /// Catalog/editor summary for one `.svegmap`.
@@ -1093,10 +1264,15 @@ pub struct VegetationMapSummaryDto {
     pub id: Uuid,
     pub name: String,
     pub version: u32,
+    /// The root generation optimistic layer commits are based on.
+    pub generation: String,
     pub bounds: WorldBoundsDto,
     pub layer_count: u32,
-    pub biome_instances: Vec<Uuid>,
+    pub biome_instances: Vec<VegetationBiomeInstanceRefDto>,
     pub chunk_level: u8,
+    /// Layers whose authored chunks differ from what the current manifest consumed
+    /// (every layer when no manifest exists) — a recook would change the output.
+    pub dirty_layers: Vec<VegetationGuid>,
     pub validation: VegetationValidationSummaryDto,
     pub provenance: Vec<VegetationSourceProvenanceDto>,
     pub dependencies: Vec<VegetationManifestDependencyDto>,
@@ -1735,6 +1911,7 @@ pub enum VegetationCellSectionKindDto {
 #[ts(export)]
 pub enum VegetationArtifactSectionCodecDto {
     Raw,
+    Zstd,
 }
 
 /// One validated random-access section descriptor from a `.svegcell` TOC.
@@ -1840,13 +2017,19 @@ pub struct VegetationRuntimePlantDto {
     pub plant: PlantId,
     pub cell: WorldCellDto,
     pub generation: String,
+    /// Monotonic biological tick.
+    pub ecology_tick: String,
     pub position_ticks: [String; 3],
+    pub orientation: [i16; 4],
+    pub scale_bits: [i32; 3],
     pub bounds: WorldBoundsDto,
     pub family: Uuid,
     /// Decimal stable plant-tag identities.
     pub tags: Vec<String>,
     pub lifecycle: PlantLifecycleDto,
     pub phenotype: u32,
+    /// The phenotype the renderer resolves from typed lifecycle + season.
+    pub rendered_phenotype: u32,
     pub interaction_policy: InteractionPolicyDto,
     pub health: u16,
     pub moisture: u16,
@@ -1873,6 +2056,45 @@ pub struct VegetationRuntimeQueryResult {
     pub matches: String,
     pub truncated: bool,
     pub hits: Vec<VegetationRuntimeQueryHitDto>,
+}
+
+/// Per-family and per-cell vegetation render population plus streaming faults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationRenderStatsDto {
+    /// One row per family with resident plants or field tiles.
+    pub families: Vec<VegetationFamilyRenderDto>,
+    /// One row per cell with resident plants or field tiles.
+    pub cells: Vec<VegetationCellRenderDto>,
+    /// GPU missing-page requests drained since startup.
+    pub page_faults: String,
+}
+
+/// One family's resident render population.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationFamilyRenderDto {
+    pub family: Uuid,
+    /// Mirrored plant instances of the family.
+    pub instances: u32,
+    /// Resident micro field tiles of the family.
+    pub field_tiles: u32,
+    /// Cooked density upper bound of the family's blade candidates.
+    pub micro_predicted: u64,
+}
+
+/// One cell's resident render population.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationCellRenderDto {
+    pub cell: WorldCellDto,
+    /// Mirrored plant instances in the cell.
+    pub plants: u32,
+    /// Resident micro field tiles in the cell.
+    pub field_tiles: u32,
 }
 
 /// One coalesced runtime cell-facet load request.
@@ -1930,6 +2152,25 @@ pub struct VegetationRuntimeAvailableStatusDto {
     pub budgets: VegetationRuntimeFacetBytesDto,
     pub pending: Vec<VegetationRuntimePendingCellDto>,
     pub regeneration_cells: Vec<WorldCellDto>,
+    /// Collision-facet body residency; absent without a live play world.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collision: Option<VegetationCollisionResidencyDto>,
+    /// Promotion counters; absent without a live play world.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<VegetationPromotionReportDto>,
+}
+
+/// Batched collision-facet residency counters for the live play world.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationCollisionResidencyDto {
+    pub resident_cells: String,
+    pub resident_bodies: String,
+    pub created_total: String,
+    pub removed_total: String,
+    pub hull_skipped_total: String,
+    pub failed_families: String,
 }
 
 /// Runtime residency and persistent-state status for one exact cooked generation.
@@ -1972,12 +2213,292 @@ pub struct VegetationRuntimeCellResult {
     pub disturbance_masks: String,
 }
 
-/// Parameters for inspecting one stable runtime plant identity.
+/// Selects one stable runtime plant identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
-pub struct VegetationRuntimePlantInspectParams {
+pub struct VegetationRuntimePlantParams {
     pub plant: PlantId,
+}
+
+/// Where one plant sits in the promotion lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum PlantPromotionStateDto {
+    /// The macro row is the only representation.
+    Bulk,
+    /// Promotion commits at the next synchronization point.
+    Promoting,
+    /// A live entity view owns render, collision, and simulation.
+    Promoted { entity: Uuid },
+    /// Demotion commits at the next synchronization point.
+    Demoting { entity: Uuid },
+}
+
+/// One plant's promotion state after a requested transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationPromotionResult {
+    pub plant: PlantId,
+    pub state: PlantPromotionStateDto,
+}
+
+/// What one plant contributes to navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[ts(export)]
+pub enum NavigationContributionKindDto {
+    /// Passable, at a traversal-cost multiplier.
+    Cost,
+    /// An immovable simplified obstacle.
+    StaticObstacle,
+    /// An obstacle that is moving, so a consumer treats it as dynamic until it settles.
+    DynamicObstacle,
+}
+
+/// One published navigation contribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationNavigationContributionDto {
+    pub plant: PlantId,
+    pub kind: NavigationContributionKindDto,
+    pub bounds: WorldBoundsDto,
+    /// World-space footprint polygon, X/Z metre pairs in authored order.
+    pub footprint: Vec<[f64; 2]>,
+    pub height_m: f64,
+    pub cost: f64,
+}
+
+/// One cell's published contributions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationNavigationCellDto {
+    pub cell: WorldCellDto,
+    pub contributions: Vec<VegetationNavigationContributionDto>,
+}
+
+/// Reads the navigation seam: published contributions plus the dirty regions awaiting a rebuild.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationNavigationParams {
+    /// Take ownership of the dirty regions, clearing them from the seam. Omit to peek.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_dirty: Option<bool>,
+}
+
+/// The navigation seam's current publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationNavigationResult {
+    pub cells: Vec<VegetationNavigationCellDto>,
+    pub dirty_regions: Vec<WorldBoundsDto>,
+    pub contributions: String,
+    pub obstacles: String,
+    pub dynamic_obstacles: String,
+    pub drained: bool,
+}
+
+/// What one committed vegetation transition did, in gameplay terms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum VegetationTransitionKindDto {
+    Damaged {
+        amount: u16,
+        health: u16,
+    },
+    Harvested {
+        phenotype: u32,
+    },
+    Burned {
+        phenotype: u32,
+        remaining_fuel: u16,
+    },
+    Removed,
+    Planted,
+    Regrew {
+        lifecycle: PlantLifecycleDto,
+        phenotype: u32,
+    },
+    LifecycleChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<PlantLifecycleDto>,
+        to: PlantLifecycleDto,
+    },
+    Ignited,
+    Extinguished,
+    Wetted {
+        moisture: u16,
+        fuel: u16,
+    },
+    StateReplaced,
+    Moved,
+    Disturbed {
+        categories: u32,
+    },
+}
+
+/// Advances biological time and catches dependency regions up to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationAdvanceEcologyParams {
+    /// World biological tick to reach; never behind the clock.
+    pub target_tick: String,
+    /// Ticks this call may execute before reporting what it still owes.
+    pub max_ticks: u32,
+    /// Sampled water reaching the ground, as `UnitInterval` bits.
+    pub water: u16,
+    /// Sampled warmth available for growth, as `UnitInterval` bits.
+    pub warmth: u16,
+}
+
+/// What one catch-up call did, and what it still owes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationEcologyReportDto {
+    pub world_tick: String,
+    pub regions: u32,
+    pub regions_caught_up: u32,
+    pub regions_awaiting_residency: u32,
+    pub ticks_run: String,
+    pub ticks_owed: String,
+    /// Hex checkpoint identity over the rule set, the clock, and every boundary summary.
+    pub checkpoint: String,
+}
+
+/// One dependency region's catch-up standing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationEcologyRegionDto {
+    pub cells: Vec<WorldCellDto>,
+    /// The tick every cell of the region stands at.
+    pub tick: String,
+    /// Whether the region has reached world time.
+    pub caught_up: bool,
+    /// Whether every cell it spans carries resident macro rows, which a tick requires.
+    pub resident: bool,
+}
+
+/// One cell's published boundary summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationEcologyCellDto {
+    pub cell: WorldCellDto,
+    pub tick: String,
+    pub plants: u32,
+    pub canopy: u16,
+    pub health: u16,
+    pub moisture: u16,
+    pub fuel: u16,
+}
+
+/// Where biological time stands, region by region.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationEcologyStatusDto {
+    pub world_tick: String,
+    /// Rule set the committed state was simulated under.
+    pub simulation_version: u32,
+    /// Hex checkpoint identity over the rule set, the clock, and every boundary summary.
+    pub checkpoint: String,
+    /// Region radius in cells, the widest declared influence.
+    pub region_radius_cells: u32,
+    pub regions: Vec<VegetationEcologyRegionDto>,
+    pub cells: Vec<VegetationEcologyCellDto>,
+}
+
+/// Samples the combustible state of a volume.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationCombustionParams {
+    pub bounds: WorldBoundsDto,
+    #[serde(default)]
+    pub filter: VegetationRuntimeQueryFilterDto,
+}
+
+/// What a volume holds, for a system that needs to know whether it will burn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationCombustionDto {
+    pub plants: u32,
+    pub ignited: u32,
+    pub fuel: u16,
+    pub moisture: u16,
+    pub health: u16,
+    pub occupancy: u16,
+}
+
+/// One sequence-stamped committed transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationEventDto {
+    pub seq: String,
+    pub transaction: String,
+    pub cell: WorldCellDto,
+    /// The plant it names; absent for a cell-wide change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plant: Option<PlantId>,
+    pub transition: VegetationTransitionKindDto,
+}
+
+/// Reads committed transitions newer than a cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationDrainEventsParams {
+    /// The caller's last-seen sequence number; omit to read the whole retained ring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
+/// Events after the cursor plus the metadata a stale cursor needs to notice a gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationDrainEventsResult {
+    pub events: Vec<VegetationEventDto>,
+    pub high_water_seq: String,
+    pub oldest_seq: String,
+    pub overflowed: bool,
+}
+
+/// Promotion counters for the live play world.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationPromotionReportDto {
+    pub promoted: String,
+    pub promoting: String,
+    pub demoting: String,
+    pub promoted_total: String,
+    pub demoted_total: String,
+    pub felled_total: String,
+    pub failed_total: String,
+    pub flushed_total: String,
 }
 
 /// Persistent overlay for one plant, independent of current facet residency.
@@ -2007,7 +2528,12 @@ pub struct VegetationRuntimePlantStateDto {
 pub struct VegetationRuntimePlantInspectResult {
     pub plant: PlantId,
     pub resident: Option<VegetationRuntimePlantDto>,
-    pub persistent: Option<VegetationRuntimePlantStateDto>,
+    /// Every persistent delta the plant carries, in canonical cell order. A plant that moved has
+    /// one entry per cell that recorded state for it: its base cell plus the cell it now occupies.
+    pub persistent: Vec<VegetationRuntimePlantStateDto>,
+    /// Promotion lifecycle state; absent without a live play world.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<PlantPromotionStateDto>,
 }
 
 /// Canonical strict runtime-state snapshot and its exact generation identity.
@@ -2027,6 +2553,485 @@ pub struct VegetationStateSnapshotDto {
 #[ts(export)]
 pub struct VegetationStateImportParams {
     pub data_hex: String,
+}
+
+/// A botanical element class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum BotanicalElementDto {
+    Trunk,
+    Branch,
+    Root,
+    Vine,
+    Frond,
+    Leaf,
+    Needle,
+    Blade,
+    Flower,
+    Fruit,
+    Bud,
+    Scar,
+    DeadPart,
+}
+
+/// How child attachments are arranged around a parent axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum PhyllotaxisPatternDto {
+    Alternate,
+    Opposite,
+    Whorled,
+    Spiral,
+}
+
+/// Which way a tropism bends an axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum TropismKindDto {
+    Phototropism,
+    Gravitropism,
+    Thigmotropism,
+}
+
+/// Which axes a prune rule removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum PruneRuleDto {
+    BelowHeight,
+    ShorterThan,
+    KeepStrongest,
+}
+
+/// One point of a taper curve: where along the axis, and the radius factor there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalCurvePointDto {
+    /// Position along the axis, as `UnitInterval` bits.
+    pub at: u16,
+    /// Radius factor, as Q15.16 bits.
+    pub factor_bits: i32,
+}
+
+/// One point of a hand-drawn spine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalDrawnPointDto {
+    /// Position in family-local metres, as Q15.16 bits.
+    pub position_bits: [i32; 3],
+    /// Radius there, as Q15.16 bits.
+    pub radius_bits: i32,
+}
+
+/// One typed botanical operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum BotanicalOperatorDto {
+    Drawn {
+        element: BotanicalElementDto,
+        points: Vec<BotanicalDrawnPointDto>,
+    },
+    Trunk {
+        element: BotanicalElementDto,
+        length_bits: i32,
+        base_radius_bits: i32,
+        taper: Vec<BotanicalCurvePointDto>,
+        segments: u32,
+    },
+    Branch {
+        element: BotanicalElementDto,
+        length_ratio: u16,
+        radius_ratio: u16,
+        declination: u16,
+        jitter: u16,
+        segments: u32,
+    },
+    Phyllotaxis {
+        pattern: PhyllotaxisPatternDto,
+        count: u32,
+        nodes: u32,
+        start: u16,
+        end: u16,
+        divergence: u16,
+    },
+    Tropism {
+        kind_of: TropismKindDto,
+        strength: u16,
+    },
+    Prune {
+        rule: PruneRuleDto,
+        threshold_bits: i32,
+        count: u32,
+    },
+    Roots {
+        depth_ratio: u16,
+        spread_ratio: u16,
+        count: u32,
+    },
+    Shell {
+        material_slot: u32,
+        sides: u32,
+    },
+    Instance {
+        element: BotanicalElementDto,
+        material_slot: u32,
+        size_bits: i32,
+        jitter: u16,
+    },
+    Family,
+}
+
+/// One node of a botanical graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalNodeDto {
+    /// Stable node GUID as a decimal `u128`.
+    pub guid: String,
+    pub version: u32,
+    pub semantic_revision: u32,
+    pub operator: BotanicalOperatorDto,
+}
+
+/// One directed typed edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalEdgeDto {
+    pub from_node: String,
+    pub from_pin: String,
+    pub to_node: String,
+    pub to_pin: String,
+}
+
+/// What one manual edit does to its target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum BotanicalEditActionDto {
+    Transform {
+        /// Translation in family-local metres, as Q15.16 bits.
+        offset_bits: [i32; 3],
+        /// Turn about the target's base, as `UnitInterval` bits.
+        roll: u16,
+        /// Uniform scale as Q15.16 bits, where 65536 is unchanged.
+        scale_bits: i32,
+    },
+    Trim {
+        /// Where along the axis the cut falls, as `UnitInterval` bits.
+        at: u16,
+    },
+    Remove,
+    Graft {
+        /// The family graft source supplying the geometry.
+        source: VegetationGuid,
+        /// Which of that source's elements to take.
+        selector: PlantSourceSelectorDto,
+    },
+}
+
+/// One manual edit laid over what the graph grows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalManualEditDto {
+    /// Element identity the edit addresses, as a decimal `u128`.
+    pub target: String,
+    pub action: BotanicalEditActionDto,
+}
+
+/// Why an authored edit found nothing to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum BotanicalEditOrphanReasonDto {
+    TargetMissing,
+    TargetKind,
+    TargetRemoved,
+}
+
+/// One edit that did not apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalEditOrphanDto {
+    /// Element identity the edit addressed, as a decimal `u128`.
+    pub target: String,
+    pub action: BotanicalEditActionDto,
+    pub reason: BotanicalEditOrphanReasonDto,
+}
+
+/// Imports instanced points from a digital-content-creation tool into an authored map layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationImportPointsParams {
+    /// The authored vegetation map to commit into.
+    pub map: crate::AssetSelector,
+    /// The authored layer that owns the anchors.
+    pub layer: VegetationGuid,
+    /// Path to the point file. A Houdini JSON `.geo` point cloud.
+    pub path: String,
+    /// Prototype name to plant-family catalog identity. An unnamed source uses the single entry.
+    pub prototypes: Vec<VegetationPointPrototypeDto>,
+    /// The map generation the caller last observed.
+    pub expected_generation: String,
+}
+
+/// One prototype binding: the source's name for it, and the family it means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationPointPrototypeDto {
+    /// Source-facing prototype name.
+    pub name: String,
+    /// The plant family it resolves to.
+    pub family: Uuid,
+}
+
+/// What one point import committed, and what it could not express.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationImportPointsResult {
+    /// Anchors committed.
+    pub anchors: u32,
+    /// Tiles the anchors landed in.
+    pub tiles: u32,
+    /// Prototypes the source placed.
+    pub prototypes: u32,
+    /// Source attributes the canonical point vocabulary cannot express.
+    pub unsupported: Vec<String>,
+    /// The map generation after the commit.
+    pub generation: String,
+}
+
+/// Exports one authored layer's anchors for a round trip through a content-creation tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationExportPointsParams {
+    /// The authored vegetation map to read.
+    pub map: crate::AssetSelector,
+    /// The authored layer whose anchors to export.
+    pub layer: VegetationGuid,
+    /// Destination path for the Houdini JSON `.geo` point cloud.
+    pub path: String,
+}
+
+/// What one point export wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationExportPointsResult {
+    /// Instances written.
+    pub instances: u32,
+    /// Prototypes written.
+    pub prototypes: u32,
+    /// The file that was written.
+    pub path: String,
+}
+
+/// One individual a graph grows: a seed, an intrinsic age, and a name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalVariationDto {
+    /// Seed selecting the individual, as a decimal `u128`.
+    pub seed: String,
+    /// Intrinsic age as `UnitInterval` bits, where 65535 is fully grown.
+    pub age: u16,
+    /// Artist-facing name.
+    pub name: String,
+}
+
+/// One native plant family's botanical graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalGraphDto {
+    /// The individuals the graph grows, in authored order; the first is the representative one and
+    /// each becomes a family variation.
+    pub variations: Vec<BotanicalVariationDto>,
+    pub nodes: Vec<BotanicalNodeDto>,
+    pub edges: Vec<BotanicalEdgeDto>,
+    /// Manual edits laid over what the nodes grow, in canonical target order.
+    #[serde(default)]
+    pub edits: Vec<BotanicalManualEditDto>,
+}
+
+/// Replaces one native plant family's botanical graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantGraphSetParams {
+    pub plant: crate::AssetSelector,
+    pub graph: BotanicalGraphDto,
+    /// External hero meshes the graph's grafts name, in canonical identity order.
+    #[serde(default)]
+    pub grafts: Vec<PlantGraftSourceDto>,
+}
+
+/// The graph a plant family carries, and what it grows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantGraphResult {
+    pub plant: Uuid,
+    pub graph: BotanicalGraphDto,
+    /// External hero meshes the graph's grafts name.
+    pub grafts: Vec<PlantGraftSourceDto>,
+    pub growth: BotanicalGrowthDto,
+}
+
+/// Creates a native plant family from the starter botanical graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantCreateParams {
+    /// Catalog name for the new family.
+    pub name: String,
+    /// Catalog folder.
+    #[serde(default)]
+    pub folder: String,
+    /// Seed selecting which individual the starter graph grows; zero derives one from the name.
+    #[serde(default)]
+    pub seed: String,
+    /// Material assets bound to the graph's slots, bark first.
+    pub materials: Vec<Uuid>,
+}
+
+/// What one grown botanical graph produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalGrowthDto {
+    /// Exact graph identity.
+    pub graph: String,
+    /// Which declared variation the report describes.
+    pub variation: u32,
+    /// Seed the individual grew from.
+    pub seed: String,
+    /// Intrinsic age it grew at, as `UnitInterval` bits.
+    pub age: u16,
+    /// Variations the graph declares.
+    pub variations: u32,
+    /// Grown axes.
+    pub axes: u32,
+    /// Attachment frames carrying a placed element.
+    pub frames: u32,
+    /// Swept shells.
+    pub shells: u32,
+    /// Instanced elements.
+    pub elements: u32,
+    /// Generated vertices.
+    pub vertices: u32,
+    /// Generated triangles.
+    pub triangles: u32,
+    /// Semantic parts the family declares.
+    pub parts: u32,
+    /// Structural spines.
+    pub spines: u32,
+    /// Family height in Q15.16 metres.
+    pub height_bits: i32,
+    /// Hero meshes grafted over generated elements. Their geometry is resolved by the cooker, so
+    /// the vertex and triangle counts above are the generated surface alone.
+    pub grafts: u32,
+    /// Manual edits that found their target.
+    pub applied_edits: u32,
+    /// Manual edits that did not, and why.
+    pub orphans: Vec<BotanicalEditOrphanDto>,
+}
+
+/// One created native plant family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantCreateResult {
+    /// Catalog identity of the new family.
+    pub plant: Uuid,
+    /// What its starter graph grew.
+    pub growth: BotanicalGrowthDto,
+}
+
+/// Reads what one plant family's botanical graph grows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantGrowthParams {
+    pub plant: crate::AssetSelector,
+    /// Which declared variation to grow; zero is the representative individual.
+    #[serde(default)]
+    pub variation: u32,
+}
+
+/// One grown axis, as the authoring surface addresses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalAxisDto {
+    /// Stable element identity as a decimal `u128`, which an edit targets.
+    pub id: String,
+    /// Parent axis identity, absent for a trunk or a drawn spine.
+    pub parent: Option<String>,
+    /// Attachment frame it grew from, absent when it grew from a base rather than a frame.
+    pub frame: Option<String>,
+    pub element: BotanicalElementDto,
+    /// Base position in family-local metres, as Q15.16 bits.
+    pub base_bits: [i32; 3],
+    /// Tip position in family-local metres, as Q15.16 bits.
+    pub tip_bits: [i32; 3],
+    /// Radius at the base, as Q15.16 bits.
+    pub base_radius_bits: i32,
+    /// Rest points along the axis.
+    pub points: u32,
+}
+
+/// One placed instanced element, as the authoring surface addresses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct BotanicalPlacementDto {
+    /// Stable element identity as a decimal `u128`, which an edit targets.
+    pub id: String,
+    /// Frame it sits on, as a decimal `u128`.
+    pub frame: String,
+    pub element: BotanicalElementDto,
+    pub material_slot: u32,
+    /// Position in family-local metres, as Q15.16 bits.
+    pub position_bits: [i32; 3],
+    /// Size in metres, as Q15.16 bits.
+    pub size_bits: i32,
+    /// Roll about the frame, as `UnitInterval` bits.
+    pub roll: u16,
+}
+
+/// Every element of one plant family an edit can address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct PlantElementsResult {
+    pub plant: Uuid,
+    /// Grown axes in canonical identity order.
+    pub axes: Vec<BotanicalAxisDto>,
+    /// Placed elements in canonical identity order.
+    pub elements: Vec<BotanicalPlacementDto>,
 }
 
 /// Selects one authored plant family for pure validation.
@@ -2168,6 +3173,12 @@ pub enum VegetationMutationDto {
         phenotype: u32,
         remaining_fuel: u16,
     },
+    Ignite {
+        plant: PlantId,
+    },
+    Extinguish {
+        plant: PlantId,
+    },
     Regrow {
         plant: PlantId,
         lifecycle: PlantLifecycleDto,
@@ -2185,6 +3196,233 @@ pub enum VegetationMutationDto {
         tile: VegetationGuid,
         values: Vec<i16>,
     },
+}
+
+/// One quantized authored field/blocker tile on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct AuthoredFieldTileDto {
+    pub channel: FieldChannelDto,
+    pub layer: VegetationGuid,
+    pub dimensions: [u32; 3],
+    pub quantum_bits: i32,
+    pub values: Vec<i32>,
+}
+
+/// One explicit authored anchor row on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct ExplicitPlantAnchorDto {
+    pub id: PlantId,
+    pub layer: VegetationGuid,
+    pub family: Uuid,
+    pub point: PlantPointDto,
+}
+
+/// One typed authored map-chunk payload a brush transaction writes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum VegetationMapChunkPayloadDto {
+    Field {
+        fields: Vec<AuthoredFieldTileDto>,
+        blockers: Vec<AuthoredFieldTileDto>,
+    },
+    AnchorOverride {
+        explicit_plants: Vec<ExplicitPlantAnchorDto>,
+        pins: Vec<PlantId>,
+        transform_overrides: Vec<PlantTransformOverrideDto>,
+        state_overrides: Vec<PlantStateOverrideDto>,
+    },
+}
+
+/// One complete authored chunk replacement in a brush transaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapChunkDto {
+    pub key: VegetationMapChunkKeyDto,
+    pub revision: String,
+    pub payload: VegetationMapChunkPayloadDto,
+}
+
+/// Parameters for one optimistic authored-map chunk transaction (a brush gesture:
+/// its touched tiles and anchors across cells commit atomically).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapChunkCommitParams {
+    pub map: crate::AssetSelector,
+    /// Root generation captured before the gesture began.
+    pub expected_generation: String,
+    pub upserts: Vec<VegetationMapChunkDto>,
+    pub removals: Vec<VegetationMapChunkKeyDto>,
+}
+
+/// Result of committing an authored-map chunk transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapChunkCommitResult {
+    /// The map root generation after the commit.
+    pub generation: String,
+}
+
+/// Parameters for reading one cooked cell's rejected candidates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationRejectionsParams {
+    pub map: crate::AssetSelector,
+    pub cell: WorldCellDto,
+    /// Exact manifest identity; the current manifest when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// Row cap (default 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One rejected candidate: its world position, reason, and sampler ordinal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationRejectionDto {
+    pub reason: VegetationCandidateRejectionReasonDto,
+    pub position_ticks: [String; 3],
+    pub ordinal: String,
+}
+
+/// Result of reading one cell's rejected candidates (rows capped by `limit`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationRejectionsResult {
+    pub candidates: String,
+    pub accepted: String,
+    pub total_rejected: String,
+    pub rows: Vec<VegetationRejectionDto>,
+}
+
+/// Parameters for one per-cell topology diff between two cooked manifests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationTopologyDiffParams {
+    pub map: crate::AssetSelector,
+    /// The older manifest identity (the editor captures it before the edit's recook).
+    pub from: String,
+    /// The newer manifest identity; the current manifest when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Restricts the diff to these cells; every cell of either manifest when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<WorldCellDto>>,
+}
+
+/// One authored override whose referenced plant is absent from the newer manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationOverrideConflictDto {
+    /// The authored row kind: `anchor`, `pin`, `transform-override`, or `state-override`.
+    pub kind: String,
+    pub plant: PlantId,
+    pub layer: VegetationGuid,
+}
+
+/// One cell's topology diff: identity churn plus unresolved authored overrides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationTopologyCellDiffDto {
+    pub cell: WorldCellDto,
+    pub added: String,
+    pub removed: String,
+    pub moved: String,
+    /// Capped id samples of each churn class (`64` per list).
+    pub added_ids: Vec<PlantId>,
+    pub removed_ids: Vec<PlantId>,
+    pub moved_ids: Vec<PlantId>,
+    pub conflicts: Vec<VegetationOverrideConflictDto>,
+}
+
+/// Result of one topology diff: the compared identities and every changed cell.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationTopologyDiffResult {
+    pub from: String,
+    pub to: String,
+    pub cells: Vec<VegetationTopologyCellDiffDto>,
+}
+
+/// Parameters for reading authored map chunks by logical key (a brush gesture's
+/// read-modify-write starts here).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapChunkReadParams {
+    pub map: crate::AssetSelector,
+    pub keys: Vec<VegetationMapChunkKeyDto>,
+}
+
+/// Result of reading authored map chunks: the map root generation (the optimistic
+/// baseline for the commit that follows) and every requested chunk present in the
+/// inventory — a key with no chunk contributes no row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapChunkReadResult {
+    pub generation: String,
+    pub chunks: Vec<VegetationMapChunkDto>,
+}
+
+/// Parameters for one optimistic authored-map layer transaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapLayerCommitParams {
+    pub map: crate::AssetSelector,
+    /// Root generation captured before editing began (optimistic concurrency).
+    pub expected_generation: String,
+    /// Complete replacement rows for the listed layer ids.
+    pub upserts: Vec<VegetationLayerDto>,
+    /// Layer ids removed from the map.
+    pub removals: Vec<VegetationGuid>,
+}
+
+/// Result of committing an authored-map layer transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMapLayerCommitResult {
+    /// The map root generation after the commit.
+    pub generation: String,
+}
+
+/// Parameters for applying a batch of typed vegetation mutations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMutateParams {
+    /// The ordered mutation records; the batch applies atomically per record order.
+    pub records: Vec<VegetationMutationRecordDto>,
+}
+
+/// Result of applying a vegetation mutation batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct VegetationMutateResult {
+    /// Records applied.
+    pub applied: u32,
 }
 
 /// A vegetation mutation with common deterministic metadata.
