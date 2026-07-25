@@ -21,6 +21,13 @@ import { useSubsurfaceBounds } from "../lib/useSubsurfaceBounds";
 import { useOrbitCamera, type OrbitState } from "../lib/useOrbitCamera";
 import { errorText, notifyError } from "../lib/flash";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import {
   DropdownMenu,
@@ -57,6 +64,10 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // Overlay toggles default on (the engine forces show=on while previewing); local mirror for the chips.
   const [showBones, setShowBones] = useState(true);
   const [showAxes, setShowAxes] = useState(false);
+  // A plant subject's authored (variation, phenotype) combinations — the scrub domain
+  // reported by enter-asset-preview; empty for every other subject.
+  const [combinations, setCombinations] = useState<{ variation: number; phenotype: number }[]>([]);
+  const [combinationIndex, setCombinationIndex] = useState(0);
   // The bone the tree has highlighted (a get-asset-model node index); local view state, not selection.
   const [highlightJoint, setHighlightJoint] = useState(-1);
 
@@ -71,6 +82,14 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
   // A material subject gets the Material editor pinned to it in the right dock (no selector). For a
   // self-container material the catalog id IS the material id, so `assetId` is what the panel edits.
   const isMaterial = asset?.type === "material";
+  // Vegetation subjects: a plant previews its compiled renderable form like any model;
+  // biome/map have no 3D subject — no enter-asset-preview, no subsurface, the summary
+  // panel carries the workspace.
+  const vegetationType =
+    asset?.type === "plant" || asset?.type === "biome" || asset?.type === "vegetation-map"
+      ? asset.type
+      : null;
+  const summaryOnly = vegetationType === "biome" || vegetationType === "vegetation-map";
   const isHdr = asset?.role === "hdri" || asset?.colorspace === "hdr";
   const panOnly = isTexture && !isHdr;
   // The HDRI preview's exposure sweep (EV, exp2). Restored engine-side on exit-asset-preview, so it
@@ -90,7 +109,9 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
 
   // Drive this pane's OWN "assetPreview" viewport surface (permanently sized to the pane). Gated on
   // `active && ready` so a parked/loading pane emits nothing; App.tsx parks the surface when inactive.
-  useSubsurfaceBounds(hostRef, "assetPreview", { enabled: active && ready });
+  useSubsurfaceBounds(hostRef, "assetPreview", {
+    enabled: active && ready && !summaryOnly,
+  });
 
   // Highlight a bone in the live overlay (a get-asset-model node index) — view state, not selection.
   const onBoneSelect = useCallback((joint: number) => {
@@ -126,11 +147,19 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     let cancelled = false;
     void (async () => {
       try {
+        if (summaryOnly) {
+          // No 3D subject: the summary panel is the workspace.
+          setModel(null);
+          setStatus("ready");
+          return;
+        }
         const entered = await client.enterAssetPreview(assetId);
         if (cancelled) {
           return;
         }
         setRootEntity(entered.rootEntity);
+        setCombinations(entered.plantCombinations ?? []);
+        setCombinationIndex(0);
         const cam = await client.getCamera();
         if (cancelled) {
           return;
@@ -167,7 +196,7 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       cancelled = true;
       void client.exitAssetPreview().catch(() => {});
     };
-  }, [assetId, orbit]);
+  }, [assetId, orbit, summaryOnly]);
 
   // This pane owns its OWN viewport surface (the "assetPreview" view), permanently sized to the pane.
   // App.tsx drives set-active-view + per-view park on a tab switch — switching is instant (the surface
@@ -210,7 +239,17 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     } else {
       closePanel("materialEdit");
     }
-  }, [ready, hasRig, hasClips, isMaterial]);
+    if (vegetationType !== null) {
+      openPanel("vegSummary");
+    } else {
+      closePanel("vegSummary");
+    }
+    if (vegetationType === "biome") {
+      openPanel("biomeGraph");
+    } else {
+      closePanel("biomeGraph");
+    }
+  }, [ready, hasRig, hasClips, isMaterial, vegetationType]);
 
   // Space = play/pause while THIS tab is active (the workspace stays mounted-but-hidden when parked, so
   // the window listener must no-op unless active) and no text field is focused.
@@ -242,6 +281,24 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [active, rootEntity]);
+
+  // Scrubs the plant subject to another authored combination (variation + phenotype).
+  const onCombination = useCallback(
+    (index: number) => {
+      setCombinationIndex(index);
+      const combination = combinations[index];
+      if (!combination) {
+        return;
+      }
+      void client
+        .setAssetPreviewOptions({
+          variation: combination.variation,
+          phenotype: combination.phenotype,
+        })
+        .catch((err: unknown) => notifyError(errorText(err)));
+    },
+    [combinations],
+  );
 
   const toggleFloor = useCallback(() => {
     setFloor((prev) => {
@@ -291,8 +348,21 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
       active,
       ready,
       materialSubject: isMaterial ? assetId : null,
+      assetId,
+      vegetationType,
     }),
-    [model, rootEntity, highlightJoint, onBoneSelect, orbit, active, ready, isMaterial, assetId],
+    [
+      model,
+      rootEntity,
+      highlightJoint,
+      onBoneSelect,
+      orbit,
+      active,
+      ready,
+      isMaterial,
+      assetId,
+      vegetationType,
+    ],
   );
 
   if (status === "error") {
@@ -363,6 +433,31 @@ export function AssetEditorWorkspace({ assetId, active }: { assetId: string; act
                   <Axis3d className="size-4" />
                 </Button>
               </>
+            ) : null}
+            {combinations.length > 1 ? (
+              <Select
+                value={String(combinationIndex)}
+                onValueChange={(value) => onCombination(Number(value))}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="h-7 w-40 text-[11px]"
+                  aria-label="Plant combination"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {combinations.map((combination, index) => (
+                    <SelectItem
+                      key={`${combination.variation}-${combination.phenotype}`}
+                      value={String(index)}
+                      className="text-[11px]"
+                    >
+                      Variation {combination.variation} · Phenotype {combination.phenotype}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             ) : null}
             <Button
               variant={floor ? "secondary" : "ghost"}

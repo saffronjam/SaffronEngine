@@ -20,6 +20,7 @@ import { WindowResizeFrame } from "./WindowResizeFrame";
 import { WindowTitlebar } from "./WindowTitlebar";
 import { useGizmoShortcuts } from "./useGizmoShortcuts";
 import { useUndoRedoShortcuts } from "./useUndoRedoShortcuts";
+import { useVegetationShortcuts } from "./useVegetationShortcuts";
 import { useMouseBindings } from "./useMouseBindings";
 import { useFocusPolicy } from "./useFocusPolicy";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -32,7 +33,6 @@ import { AssetPreview } from "../components/AssetViewer";
 import { CaptureFlame } from "../components/CaptureFlame";
 import { MaterialGraphEditor } from "../panels/MaterialGraphEditor";
 import { AssetEditorWorkspace } from "../panels/AssetEditorWorkspace";
-import { VegetationAssetWorkspace } from "../panels/VegetationAssetWorkspace";
 import { StoreWorkspace } from "../storefront/StoreWorkspace";
 import { DockPanelsHost } from "../components/dock/DockPanelsHost";
 import { DockDropOverlay } from "../components/dock/DockDropOverlay";
@@ -81,12 +81,6 @@ export function App() {
   const activeAssetEditorId = useEditorStore((s) => {
     const tab = s.viewTabs.find((candidate) => candidate.id === s.activeViewTabId);
     return tab?.kind === "assetEditor" ? tab.assetId : null;
-  });
-  const activeVegetationAsset = useEditorStore((s) => {
-    const tab = s.viewTabs.find((candidate) => candidate.id === s.activeViewTabId);
-    return tab?.kind === "vegetationAsset"
-      ? { assetId: tab.assetId, assetType: tab.assetType }
-      : null;
   });
   // The Store tab stays mounted (hidden when inactive) while its tab exists, so the search
   // query and results survive switching to another tab and back.
@@ -145,6 +139,7 @@ export function App() {
   useGizmoShortcuts();
   // Ctrl+Z / Ctrl+Shift+Z (+ Ctrl+Y) → undo/redo on the active tab's history.
   useUndoRedoShortcuts();
+  useVegetationShortcuts();
   // Mouse-button commands (tab back/forward, close hovered tab) via the keybinding registry.
   useMouseBindings();
   // Trap the Tab key so browser focus never walks the chrome (Tab still navigates modals).
@@ -412,12 +407,6 @@ export function App() {
         <DockDropOverlay />
         <CatalogDragGhost />
         {activeKind === "imageViewer" && <ImageViewerWorkspace asset={activeImage} />}
-        {activeKind === "vegetationAsset" && activeVegetationAsset !== null && (
-          <VegetationAssetWorkspace
-            assetId={activeVegetationAsset.assetId}
-            assetType={activeVegetationAsset.assetType}
-          />
-        )}
         {activeKind === "flamegraph" && <FlameGraphWorkspace />}
         {/* Kept mounted (hidden when inactive) so the search query + results persist across
             tab switches, like the scene dock and asset editor. */}

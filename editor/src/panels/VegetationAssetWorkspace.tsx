@@ -157,7 +157,7 @@ export function VegetationAssetWorkspace({ assetId, assetType }: VegetationAsset
             <>
               <ReferenceList
                 title="Biome instances"
-                ids={summary.summary.asset.biomeInstances}
+                ids={summary.summary.asset.biomeInstances.map((row) => row.biome)}
                 assetNames={assetNames}
               />
               <section className="overflow-hidden rounded-md border border-border bg-card">
