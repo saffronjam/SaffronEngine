@@ -22,8 +22,9 @@ use saffron_control::{ControlRenderer, VegetationComputeExecutor};
 use saffron_rendering::{
     ActiveAlarm, AlarmDrain, CaptureMode, CaptureState, FrameHistoryStats, FrameSample, PassTiming,
     PerfConfig, ProfileCapture, ProfilerMode, ReflectionProbe, RenderStatsFull, Renderer, Uploader,
-    ViewId, ViewMode, VulkanGraphComputeExecutor,
+    ViewId, ViewMode,
 };
+use saffron_vegetation_gpu::VulkanGraphComputeExecutor;
 use serde_json::Value;
 
 /// Maps a wire grade range onto the renderer's [`saffron_rendering::GradeRange`].
@@ -56,16 +57,23 @@ fn grade_to_range(r: &saffron_rendering::GradeRange) -> saffron_protocol::GradeR
 pub struct HostControlRenderer<'a> {
     renderer: &'a mut Renderer,
     uploader: &'a Uploader,
+    mirror: &'a mut saffron_assets::GpuSceneMirror,
     skinning_enabled: bool,
 }
 
 impl<'a> HostControlRenderer<'a> {
-    /// Bundles the renderer + the host-owned uploader for a control drain.
-    pub fn new(renderer: &'a mut Renderer, uploader: &'a Uploader) -> Self {
+    /// Bundles the renderer, the host-owned uploader, and the GPU-scene mirror for a
+    /// control drain.
+    pub fn new(
+        renderer: &'a mut Renderer,
+        uploader: &'a Uploader,
+        mirror: &'a mut saffron_assets::GpuSceneMirror,
+    ) -> Self {
         let skinning_enabled = renderer.skinning_enabled();
         Self {
             renderer,
             uploader,
+            mirror,
             skinning_enabled,
         }
     }
@@ -76,11 +84,34 @@ impl ControlRenderer for HostControlRenderer<'_> {
         self.renderer.render_stats()
     }
 
+    fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats {
+        self.mirror.stats()
+    }
+
+    fn page_residency_stats(&self) -> saffron_rendering::PageResidencyStats {
+        self.renderer.page_residency_stats()
+    }
+
+    fn visibility_counters(&self) -> [u32; 16] {
+        self.renderer.visibility_counters()
+    }
+
+    fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown {
+        self.mirror.vegetation_breakdown()
+    }
+
+    fn page_faults(&self) -> u64 {
+        self.renderer.page_faults()
+    }
+
     fn clustered_enabled(&self) -> bool {
         self.renderer.clustered_enabled()
     }
     fn set_clustered(&mut self, enabled: bool) {
         self.renderer.set_clustered(enabled);
+    }
+    fn submit_interaction_impulse(&mut self, impulse: saffron_rendering::InteractionImpulse) {
+        self.renderer.submit_interaction_impulses(&[impulse]);
     }
     fn depth_prepass_enabled(&self) -> bool {
         self.renderer.depth_prepass_enabled()
@@ -611,7 +642,7 @@ impl ControlRenderer for HostControlRenderer<'_> {
         crate::layer::render_preview_scene_to_png(
             self.renderer,
             self.uploader,
-            self.skinning_enabled,
+            self.mirror,
             &mut scene,
             assets,
             &view,
