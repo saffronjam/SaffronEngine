@@ -578,6 +578,10 @@ fn vegetation_cell_toc_and_cook_scope_are_closed_unions() {
         serde_json::to_value(VegetationArtifactSectionCodecDto::Raw).unwrap(),
         "raw"
     );
+    assert_eq!(
+        serde_json::to_value(VegetationArtifactSectionCodecDto::Zstd).unwrap(),
+        "zstd"
+    );
 
     let scope = VegetationCookScopeDto::Bounds {
         bounds: WorldBoundsDto {

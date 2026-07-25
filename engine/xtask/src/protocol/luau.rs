@@ -217,7 +217,8 @@ pub fn emit_component_defs() -> String {
 /// [`map_type`], so the mapping has one owner.
 ///
 /// - `number`/`boolean`/`string` pass through (via [`map_type`]).
-/// - `Vec3`/`Entity`/`RayHit`/`RagdollState`/`ScriptSelf` -> `sa.<Name>` (the API classes).
+/// - `Vec3`/`Entity`/`RayHit`/`PlantHit`/`RagdollState`/`ScriptSelf` -> `sa.<Name>` (the API
+///   classes).
 /// - `ComponentName` -> `sa.ComponentName` (the registered-name alias).
 /// - `table`/`any` pass through (an opaque wire snapshot / payload).
 /// - `T[]` -> `<mapped T>[]` (nested).
@@ -379,6 +380,8 @@ pub fn emit_api_defs() -> String {
     let ray_hit = "---@class sa.RayHit\n---@field hit boolean\n---@field distance number\n---@field \
                    point sa.Vec3\n---@field normal sa.Vec3\n---@field entity sa.Entity?";
 
+    let plant_hit = "---@class sa.PlantHit\n---@field hit boolean\n---@field plant                      string\n---@field position sa.Vec3\n---@field distance number\n---@field                      lifecycle string\n---@field health number\n---@field interaction_policy                      string";
+
     let ragdoll_state = "---@class sa.RagdollState\n---@field present boolean\n---@field active \
                          boolean\n---@field body_weight number\n---@field bones integer";
 
@@ -394,6 +397,7 @@ pub fn emit_api_defs() -> String {
         header.to_owned(),
         emit_vec3_class(),
         ray_hit.to_owned(),
+        plant_hit.to_owned(),
         ragdoll_state.to_owned(),
         emit_component_name_alias(),
         emit_entity_class(),
