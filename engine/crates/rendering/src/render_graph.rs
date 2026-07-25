@@ -754,8 +754,13 @@ fn validate_declared_access(resource: &RgResourceState, usage: RgUsage) {
                 !resource.is_image,
                 "buffer usage declared for a graph image"
             );
+            // An imported buffer's creation flags are the owner's contract — the
+            // tracked usage only accumulates *declared* graph usages, so it cannot
+            // prove a flag absent. Only graph-owned allocations are checkable.
             assert!(
-                resource.buffer_usage.is_empty() || resource.buffer_usage.contains(required),
+                resource.buffer_lifetime == RgBufferLifetime::Imported
+                    || resource.buffer_usage.is_empty()
+                    || resource.buffer_usage.contains(required),
                 "graph buffer was not allocated with the Vulkan usage required by {usage:?}"
             );
         }
@@ -1270,7 +1275,8 @@ impl RenderGraph {
         if self.resources[index].external_buffer_state.is_none() {
             let slot = self.alloc_external_buffer_state(resources.buffer_state(handle));
             self.resources[index].external_buffer_state = Some(slot);
-            self.resources[index].buffer_accesses = self.external_buffer_states[slot].accesses.clone();
+            self.resources[index].buffer_accesses =
+                self.external_buffer_states[slot].accesses.clone();
         }
         Ok(graph_resource)
     }
@@ -1308,21 +1314,16 @@ impl RenderGraph {
         })
     }
 
-    pub(crate) fn resolved_graph_buffer_states(
-        &self,
-    ) -> Vec<(vk::Buffer, RgExternalBufferState)> {
+    pub(crate) fn resolved_graph_buffer_states(&self) -> Vec<(vk::Buffer, RgExternalBufferState)> {
         self.resources
             .iter()
             .filter(|resource| {
                 !resource.is_image && resource.buffer_lifetime != RgBufferLifetime::Imported
             })
             .filter_map(|resource| {
-                resource.external_buffer_state.map(|slot| {
-                    (
-                        resource.buffer,
-                        self.external_buffer_states[slot].clone(),
-                    )
-                })
+                resource
+                    .external_buffer_state
+                    .map(|slot| (resource.buffer, self.external_buffer_states[slot].clone()))
             })
             .collect()
     }
@@ -1331,28 +1332,85 @@ impl RenderGraph {
     pub fn queue_assignments(&self, families: RgQueueFamilies) -> Vec<RgQueueAssignment> {
         self.passes
             .iter()
-            .map(|pass| self.resolve_queue(pass, families).0)
+            .enumerate()
+            .map(|(index, pass)| self.resolve_queue(pass, index, families).0)
             .collect()
     }
 
-    fn resolve_queue(&self, pass: &RgPass, families: RgQueueFamilies) -> (RgQueueAssignment, u32) {
+    fn resolve_queue(
+        &self,
+        pass: &RgPass,
+        pass_index: usize,
+        families: RgQueueFamilies,
+    ) -> (RgQueueAssignment, u32) {
         let resolved = families.resolve(pass);
         if resolved.0 == RgQueueAssignment::AsyncCompute
             && (pass.accesses.is_empty()
                 || !pass.accesses.iter().all(|access| {
                     let resource = &self.resources[access.resource.index as usize];
                     if resource.is_image {
-                        resource.external_state.is_some() && resource.queue.is_some()
+                        (resource.external_state.is_some() && resource.queue.is_some())
+                            || !resource.touched
+                            || self.prior_pass_touches(access.resource, pass_index)
                     } else {
                         resource.buffer_lifetime != RgBufferLifetime::Imported
                             || (resource.external_buffer_state.is_some()
                                 && buffer_state_covers(resource, access.buffer_range))
+                            || self.prior_pass_covers_buffer(
+                                access.resource,
+                                access.buffer_range,
+                                pass_index,
+                            )
                     }
                 }))
         {
             return (RgQueueAssignment::Graphics, families.graphics);
         }
         resolved
+    }
+
+    fn prior_pass_touches(&self, resource: RgResource, pass_index: usize) -> bool {
+        self.passes[..pass_index].iter().any(|pass| {
+            pass.accesses
+                .iter()
+                .any(|access| access.resource == resource)
+                || pass.colors.iter().any(|attachment| {
+                    attachment.resource == resource || attachment.resolve == Some(resource)
+                })
+                || pass.depth.as_ref().is_some_and(|attachment| {
+                    attachment.resource == resource || attachment.resolve == Some(resource)
+                })
+        })
+    }
+
+    fn prior_pass_covers_buffer(
+        &self,
+        resource: RgResource,
+        range: Option<RgBufferRange>,
+        pass_index: usize,
+    ) -> bool {
+        let state = &self.resources[resource.index as usize];
+        let (start, end) = buffer_range_bounds(state.buffer_size, range);
+        let mut spans = self.passes[..pass_index]
+            .iter()
+            .flat_map(|pass| pass.accesses.iter())
+            .filter(|access| access.resource == resource)
+            .map(|access| buffer_range_bounds(state.buffer_size, access.buffer_range))
+            .filter(|(span_start, span_end)| *span_end > start && *span_start < end)
+            .map(|(span_start, span_end)| (span_start.max(start), span_end.min(end)))
+            .collect::<Vec<_>>();
+        spans.sort_unstable_by_key(|span| span.0);
+        let mut cursor = start;
+        for (span_start, span_end) in spans {
+            if span_start > cursor {
+                return false;
+            }
+            cursor = cursor.max(span_end);
+            if cursor >= end {
+                return true;
+            }
+        }
+        false
     }
 
     /// Compiles pass-local synchronization and queue ownership for a queue topology.
@@ -1462,7 +1520,8 @@ impl RenderGraph {
         let assignments = self
             .passes
             .iter()
-            .map(|pass| self.resolve_queue(pass, families))
+            .enumerate()
+            .map(|(index, pass)| self.resolve_queue(pass, index, families))
             .collect::<Vec<_>>();
         let mut schedule = assignments
             .iter()
@@ -1705,9 +1764,8 @@ impl RenderGraph {
                     &barriers.before_images,
                     &barriers.before_buffers,
                 );
-                if batch.queue == RgQueueAssignment::Graphics
-                    && let (Some(index), Some(timestamps)) =
-                        (gpu_index, recorders.gpu.as_mut())
+                if records_pipeline_statistics(batch.queue)
+                    && let (Some(index), Some(timestamps)) = (gpu_index, recorders.gpu.as_mut())
                 {
                     let pixels =
                         u64::from(pass.render_area.width) * u64::from(pass.render_area.height);
@@ -1932,8 +1990,14 @@ fn emit_barriers(
     unsafe { raw.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
+fn records_pipeline_statistics(queue: RgQueueAssignment) -> bool {
+    queue == RgQueueAssignment::Graphics
+}
+
 #[cfg(test)]
 mod tests {
+    use std::mem::{offset_of, size_of};
+
     use super::*;
     use ash::vk::Handle;
 
@@ -1970,6 +2034,14 @@ mod tests {
             buffer: vk::Buffer::null(),
             ..RgResourceState::default()
         }
+    }
+
+    #[test]
+    fn pipeline_statistics_are_reserved_only_for_graphics_batches() {
+        assert!(records_pipeline_statistics(RgQueueAssignment::Graphics));
+        assert!(!records_pipeline_statistics(
+            RgQueueAssignment::AsyncCompute
+        ));
     }
 
     fn compute_on_graphics(name: &str) -> RgPass {
@@ -2342,6 +2414,87 @@ mod tests {
     }
 
     #[test]
+    fn indexed_indirect_abi_and_argument_barrier_ranges_are_byte_locked() {
+        assert_eq!(size_of::<vk::DrawIndexedIndirectCommand>(), 20);
+        assert_eq!(offset_of!(vk::DrawIndexedIndirectCommand, index_count), 0);
+        assert_eq!(
+            offset_of!(vk::DrawIndexedIndirectCommand, instance_count),
+            4
+        );
+        assert_eq!(offset_of!(vk::DrawIndexedIndirectCommand, first_index), 8);
+        assert_eq!(
+            offset_of!(vk::DrawIndexedIndirectCommand, vertex_offset),
+            12
+        );
+        assert_eq!(
+            offset_of!(vk::DrawIndexedIndirectCommand, first_instance),
+            16
+        );
+
+        let mut resource = RgResourceState {
+            is_image: false,
+            buffer: vk::Buffer::null(),
+            buffer_size: 128,
+            ..RgResourceState::default()
+        };
+        let mut write = DerivedBarriers::default();
+        apply_access_queued(
+            &mut resource,
+            usage_info(RgUsage::StorageWriteCompute),
+            Some(RgBufferRange::new(64, 24).unwrap()),
+            0,
+            RgQueueAssignment::Graphics,
+            0,
+            &mut write,
+        );
+        assert!(write.is_empty());
+
+        let mut arguments = DerivedBarriers::default();
+        apply_access_queued(
+            &mut resource,
+            usage_info(RgUsage::IndirectCommandRead),
+            Some(RgBufferRange::new(64, 20).unwrap()),
+            1,
+            RgQueueAssignment::Graphics,
+            0,
+            &mut arguments,
+        );
+        assert_eq!(arguments.buffer.len(), 1);
+        assert_eq!(arguments.buffer[0].offset, 64);
+        assert_eq!(arguments.buffer[0].size, 20);
+        assert_eq!(
+            arguments.buffer[0].dst_stage_mask,
+            vk::PipelineStageFlags2::DRAW_INDIRECT
+        );
+        assert_eq!(
+            arguments.buffer[0].dst_access_mask,
+            vk::AccessFlags2::INDIRECT_COMMAND_READ
+        );
+
+        let mut count = DerivedBarriers::default();
+        apply_access_queued(
+            &mut resource,
+            usage_info(RgUsage::IndirectCountRead),
+            Some(RgBufferRange::new(84, 4).unwrap()),
+            1,
+            RgQueueAssignment::Graphics,
+            0,
+            &mut count,
+        );
+        assert_eq!(count.buffer.len(), 1);
+        assert_eq!(count.buffer[0].offset, 84);
+        assert_eq!(count.buffer[0].size, 4);
+        assert_eq!(
+            count.buffer[0].dst_stage_mask,
+            vk::PipelineStageFlags2::DRAW_INDIRECT
+        );
+        assert_eq!(
+            count.buffer[0].dst_access_mask,
+            vk::AccessFlags2::INDIRECT_COMMAND_READ
+        );
+    }
+
+    #[test]
     fn compute_write_transitions_cover_every_buffer_consumer() {
         let consumers = [
             (
@@ -2593,6 +2746,35 @@ mod tests {
         assert_eq!(
             graph.queue_assignments(RgQueueFamilies::graphics_only(0)),
             [RgQueueAssignment::Graphics]
+        );
+    }
+
+    #[test]
+    fn graphics_output_feeds_async_post_compute_in_a_production_graph_shape() {
+        let mut graph = RenderGraph::new();
+        let color = graph.import_image(
+            vk::Image::from_raw(7),
+            vk::ImageView::from_raw(8),
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+            None,
+        );
+        graph.add_pass(
+            RgPass::graphics("scene", vk::Extent2D::default())
+                .color(RgAttachment::clear_store(color)),
+        );
+        graph.add_pass(RgPass::compute("tonemap").access(color, RgUsage::StorageImageRwCompute));
+
+        assert_eq!(
+            graph.queue_assignments(RgQueueFamilies {
+                graphics: 0,
+                async_compute: Some(1),
+            }),
+            [RgQueueAssignment::Graphics, RgQueueAssignment::AsyncCompute]
+        );
+        assert_eq!(
+            graph.queue_assignments(RgQueueFamilies::graphics_only(0)),
+            [RgQueueAssignment::Graphics, RgQueueAssignment::Graphics]
         );
     }
 
