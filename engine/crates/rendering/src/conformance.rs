@@ -1,6 +1,5 @@
-//! Typed, machine-readable capture of physical-GPU numeric conformance evidence.
+//! Generic Vulkan profile, shader-artifact, and spatial-numeric conformance evidence.
 
-use std::io::Write;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -8,45 +7,22 @@ use saffron_spatial::{
     DecisionCurve, DecisionScalar, PHILOX4X32_ZERO_VECTOR, RandomDomain, RandomStream,
     UnitInterval, WorldCellKey, div_round_ties_even,
 };
-use saffron_vegetation::{
-    BIOME_NODE_VERSION, GRAPH_GPU_ABI_VERSION, GpuExecutionProfile, GpuShaderArtifactIdentity,
-    GraphComputeExecutor, GraphOperator, graph_gpu_abi_hash, qualification_corpus,
-    qualification_corpus_hash, qualification_reference_hash,
-};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::compute_dispatch::{ComputeBuffer, ComputeDispatch, ComputeDispatchOutcome};
 use crate::{
-    Device, Error, Result, ShaderArtifactIdentity, VulkanGraphComputeExecutor,
-    validation_issue_count,
+    ComputeBuffer, ComputeDispatch, ComputeDispatchOutcome, Device, Error, Result,
+    ShaderArtifactContract, ShaderArtifactIdentity, VulkanDeviceIdentity,
 };
 
-const CONFORMANCE_SCHEMA_VERSION: u32 = 1;
 const SPATIAL_GOLDEN_WORDS: usize = 32;
-
-/// Complete Phase-1 and Phase-3 conformance evidence from one physical Vulkan profile.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComputeConformanceEvidence {
-    /// Evidence document schema.
-    pub schema_version: u32,
-    /// Exact physical device and driver identity.
-    pub profile: VulkanProfileEvidence,
-    /// Shared RNG and fixed-numeric Rust/Slang golden evidence.
-    pub spatial_numeric: SpatialNumericEvidence,
-    /// Resident graph-program Rust/Slang qualification evidence.
-    pub graph_program: GraphProgramEvidence,
-    /// Validation-layer count bracketing both captures.
-    pub validation: ValidationEvidence,
-}
-
-impl ComputeConformanceEvidence {
-    /// Writes this evidence as one pretty-printed JSON value.
-    pub fn write_json(&self, writer: impl Write) -> serde_json::Result<()> {
-        serde_json::to_writer_pretty(writer, self)
-    }
-}
+const SPATIAL_NUMERIC_ARTIFACT: ShaderArtifactContract = ShaderArtifactContract::new(
+    "spatial_numeric_test",
+    "spatial_numeric_test.slang",
+    "spatial_numeric_test.spv",
+    &["spatial_numeric.slang", "spatial_numeric_test.slang"],
+    &[],
+);
 
 /// Physical Vulkan identity recorded with semantic evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -94,7 +70,7 @@ pub struct ShaderArtifactEvidence {
     pub spirv_flags: Vec<String>,
     /// Ordered preprocessor definitions.
     pub defines: Vec<String>,
-    /// SHA-256 of flags, defines, source names, and source bytes.
+    /// SHA-256 of flags, definitions, source names, and source bytes.
     pub compile_input_sha256: String,
     /// SHA-256 of the exact loaded SPIR-V bytes.
     pub spirv_sha256: String,
@@ -102,7 +78,7 @@ pub struct ShaderArtifactEvidence {
     pub record_sha256: String,
 }
 
-/// Phase-1 shared RNG and fixed-numeric golden evidence.
+/// Shared RNG and fixed-numeric Rust/Slang golden evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpatialNumericEvidence {
@@ -114,40 +90,6 @@ pub struct SpatialNumericEvidence {
     pub rust_reference_sha256: String,
     /// SHA-256 of canonical big-endian Slang result words.
     pub slang_sha256: String,
-}
-
-/// One graph operator/version qualified by the complete resident corpus.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QualifiedOperatorEvidence {
-    /// Stable operator wire spelling.
-    pub operator: String,
-    /// Exact semantic version.
-    pub semantic_version: u32,
-}
-
-/// Phase-3 resident graph-program qualification evidence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GraphProgramEvidence {
-    /// Resident graph ABI version.
-    pub abi_version: u32,
-    /// SHA-256 of the canonical ABI descriptor.
-    pub abi_sha256: String,
-    /// Number of distinct resident programs in the corpus.
-    pub corpus_program_count: usize,
-    /// Total ordered invocations across the corpus.
-    pub corpus_invocation_count: usize,
-    /// SHA-256 of every program and invocation in canonical order.
-    pub corpus_sha256: String,
-    /// SHA-256 of canonical Rust reference outputs.
-    pub rust_reference_sha256: String,
-    /// SHA-256 of canonical Slang outputs.
-    pub slang_sha256: String,
-    /// Exact shader artifact executed by qualification.
-    pub shader_artifact: ShaderArtifactEvidence,
-    /// Every operator admitted for this exact profile and artifact.
-    pub qualified_operators: Vec<QualifiedOperatorEvidence>,
 }
 
 /// Validation issue counts around conformance execution.
@@ -162,55 +104,10 @@ pub struct ValidationEvidence {
     pub new_issues: u64,
 }
 
-/// Executes both conformance phases and returns evidence bound to the exact physical profile.
-pub fn capture_compute_conformance(device: Arc<Device>) -> Result<ComputeConformanceEvidence> {
-    let before = validation_issue_count();
-    let physical_identity = device.device_identity();
-    if !physical_identity.is_physical_gpu() {
-        return Err(Error::ShaderLoad(format!(
-            "platform conformance evidence requires a physical integrated or discrete GPU, found {}",
-            physical_identity.device_type_name()
-        )));
-    }
-    let device_type = physical_identity.device_type_name();
-    let molten_vk = physical_identity.is_molten_vk();
-    let profile = GpuExecutionProfile {
-        name: physical_identity.name,
-        vendor_id: physical_identity.vendor_id,
-        device_id: physical_identity.device_id,
-        driver_version: physical_identity.driver_version,
-        api_version: physical_identity.api_version,
-        driver_id: physical_identity.driver_id,
-        device_uuid: physical_identity.device_uuid,
-        driver_uuid: physical_identity.driver_uuid,
-        molten_vk,
-    };
-    let spatial_numeric = capture_spatial_numeric(Arc::clone(&device))?;
-    let graph_program = capture_graph_program(Arc::clone(&device), &profile)?;
-    device.wait_idle()?;
-    let after = validation_issue_count();
-    if after != before {
-        return Err(Error::ShaderLoad(format!(
-            "compute conformance raised {} Vulkan validation issues",
-            after.saturating_sub(before)
-        )));
-    }
-    Ok(ComputeConformanceEvidence {
-        schema_version: CONFORMANCE_SCHEMA_VERSION,
-        profile: profile_evidence(&profile, device_type),
-        spatial_numeric,
-        graph_program,
-        validation: ValidationEvidence {
-            before,
-            after,
-            new_issues: after.saturating_sub(before),
-        },
-    })
-}
-
-fn capture_spatial_numeric(device: Arc<Device>) -> Result<SpatialNumericEvidence> {
-    let mut dispatcher = ComputeDispatch::new(device, "spatial_numeric_test", 1)?;
-    let artifact = artifact_evidence(dispatcher.shader_artifact_identity());
+/// Captures the generic spatial-numeric Rust/Slang evidence.
+pub fn capture_spatial_numeric(device: Arc<Device>) -> Result<SpatialNumericEvidence> {
+    let mut dispatcher = ComputeDispatch::new_verified(device, SPATIAL_NUMERIC_ARTIFACT, 1)?;
+    let artifact = shader_artifact_evidence(dispatcher.shader_artifact_identity());
     let outcome = dispatcher.run_interruptible(
         vec![ComputeBuffer::zeroed(
             SPATIAL_GOLDEN_WORDS * size_of::<u32>(),
@@ -254,96 +151,9 @@ fn capture_spatial_numeric(device: Arc<Device>) -> Result<SpatialNumericEvidence
     })
 }
 
-fn capture_graph_program(
-    device: Arc<Device>,
-    expected_profile: &GpuExecutionProfile,
-) -> Result<GraphProgramEvidence> {
-    let executor = VulkanGraphComputeExecutor::new(device)?;
-    if executor.profile() != expected_profile {
-        return Err(Error::ShaderLoad(
-            "graph qualification profile differs from the captured Vulkan profile".to_owned(),
-        ));
-    }
-    let identity = executor.shader_artifact_identity();
-    let expected_artifact = GpuShaderArtifactIdentity {
-        record_hash: identity.record_sha256().bytes(),
-        compile_input_hash: identity.compile_input_sha256().bytes(),
-        spirv_hash: identity.spirv_sha256().bytes(),
-        compiler_identity_hash: identity.compiler_identity_sha256().bytes(),
-    };
-    let evidence = executor.qualifications().evidence();
-    let first = evidence.first().ok_or_else(|| {
-        Error::ShaderLoad("graph qualification produced no operator evidence".to_owned())
-    })?;
-    let hashes = first.result_hashes();
-    let corpus_hash = qualification_corpus_hash();
-    let reference_hash = qualification_reference_hash();
-    let expected_operators = GraphOperator::ALL
-        .iter()
-        .copied()
-        .filter(|operator| operator.has_slang_executor())
-        .collect::<Vec<_>>();
-    if first.artifact() != expected_artifact
-        || hashes != (corpus_hash, reference_hash, reference_hash)
-        || evidence.len() != expected_operators.len()
-        || evidence.iter().any(|item| {
-            item.profile() != expected_profile
-                || item.artifact() != expected_artifact
-                || item.result_hashes() != hashes
-                || item.operator_version().1 != BIOME_NODE_VERSION
-        })
-        || evidence
-            .iter()
-            .zip(expected_operators)
-            .any(|(item, expected)| item.operator_version().0 != expected)
-    {
-        return Err(Error::ShaderLoad(
-            "graph qualification evidence is not canonical for one profile and artifact".to_owned(),
-        ));
-    }
-    let corpus = qualification_corpus();
-    let corpus_invocation_count = corpus
-        .iter()
-        .map(|batch| batch.invocation_batch.invocation_count())
-        .sum();
-    Ok(GraphProgramEvidence {
-        abi_version: GRAPH_GPU_ABI_VERSION,
-        abi_sha256: hex_bytes(&graph_gpu_abi_hash()),
-        corpus_program_count: corpus.len(),
-        corpus_invocation_count,
-        corpus_sha256: hex_bytes(&corpus_hash),
-        rust_reference_sha256: hex_bytes(&reference_hash),
-        slang_sha256: hex_bytes(&hashes.2),
-        shader_artifact: artifact_evidence(identity),
-        qualified_operators: evidence
-            .iter()
-            .map(|item| {
-                let (operator, semantic_version) = item.operator_version();
-                QualifiedOperatorEvidence {
-                    operator: operator.as_wire().to_owned(),
-                    semantic_version,
-                }
-            })
-            .collect(),
-    })
-}
-
-fn profile_evidence(profile: &GpuExecutionProfile, device_type: &str) -> VulkanProfileEvidence {
-    VulkanProfileEvidence {
-        name: profile.name.clone(),
-        device_type: device_type.to_owned(),
-        vendor_id: profile.vendor_id,
-        device_id: profile.device_id,
-        driver_version: profile.driver_version,
-        api_version: profile.api_version,
-        driver_id: profile.driver_id,
-        device_uuid: hex_bytes(&profile.device_uuid),
-        driver_uuid: hex_bytes(&profile.driver_uuid),
-        molten_vk: profile.molten_vk,
-    }
-}
-
-fn artifact_evidence(identity: &ShaderArtifactIdentity) -> ShaderArtifactEvidence {
+/// Converts a verified shader identity into serializable evidence.
+#[must_use]
+pub fn shader_artifact_evidence(identity: &ShaderArtifactIdentity) -> ShaderArtifactEvidence {
     ShaderArtifactEvidence {
         shader: identity.shader().to_owned(),
         source: identity.source().to_owned(),
@@ -356,6 +166,23 @@ fn artifact_evidence(identity: &ShaderArtifactIdentity) -> ShaderArtifactEvidenc
         compile_input_sha256: identity.compile_input_sha256().to_string(),
         spirv_sha256: identity.spirv_sha256().to_string(),
         record_sha256: identity.record_sha256().to_string(),
+    }
+}
+
+/// Converts the renderer's Vulkan identity into serializable profile evidence.
+#[must_use]
+pub fn vulkan_profile_evidence(identity: &VulkanDeviceIdentity) -> VulkanProfileEvidence {
+    VulkanProfileEvidence {
+        name: identity.name.clone(),
+        device_type: identity.device_type_name().to_owned(),
+        vendor_id: identity.vendor_id,
+        device_id: identity.device_id,
+        driver_version: identity.driver_version,
+        api_version: identity.api_version,
+        driver_id: identity.driver_id,
+        device_uuid: hex_bytes(&identity.device_uuid),
+        driver_uuid: hex_bytes(&identity.driver_uuid),
+        molten_vk: identity.is_molten_vk(),
     }
 }
 
@@ -454,7 +281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evidence_json_uses_hexadecimal_hashes_and_uuid_strings() {
+    fn evidence_hashes_are_lowercase_hexadecimal() {
         assert_eq!(hex_bytes(&[0x00, 0x7f, 0xff]), "007fff");
         assert_eq!(hash_words(&[0x0102_0304]).len(), 64);
     }

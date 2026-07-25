@@ -26,11 +26,6 @@ const EXPECTED_SPIRV_FLAGS: &[&str] = &[
     "-capability",
     SPIRV_CAPABILITIES,
 ];
-const VEGETATION_SHADER: &str = "vegetation_graph";
-const VEGETATION_SOURCE: &str = "vegetation_graph.slang";
-const VEGETATION_ARTIFACT: &str = "vegetation_graph.spv";
-const VEGETATION_SOURCE_FILES: &[&str] = &["spatial_numeric.slang", "vegetation_graph.slang"];
-
 /// One exact SHA-256 identity used by the generated shader pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShaderSha256([u8; 32]);
@@ -98,6 +93,67 @@ pub struct ShaderArtifactIdentity {
     spirv_flags: Vec<String>,
     defines: Vec<String>,
     record_sha256: ShaderSha256,
+}
+
+/// Exact generated shader name, entry source, closure, and definition contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShaderArtifactContract {
+    shader: &'static str,
+    source: &'static str,
+    artifact: &'static str,
+    source_files: &'static [&'static str],
+    defines: &'static [&'static str],
+}
+
+impl ShaderArtifactContract {
+    /// Creates one compile-time artifact contract.
+    #[must_use]
+    pub const fn new(
+        shader: &'static str,
+        source: &'static str,
+        artifact: &'static str,
+        source_files: &'static [&'static str],
+        defines: &'static [&'static str],
+    ) -> Self {
+        Self {
+            shader,
+            source,
+            artifact,
+            source_files,
+            defines,
+        }
+    }
+
+    /// Logical shader variant selected from the generated manifest.
+    #[must_use]
+    pub const fn shader(self) -> &'static str {
+        self.shader
+    }
+
+    /// Verifies one loaded identity against every exact contract field.
+    pub fn verify(self, identity: &ShaderArtifactIdentity) -> Result<(), ShaderArtifactError> {
+        let source_files_match = identity
+            .source_files
+            .iter()
+            .map(String::as_str)
+            .eq(self.source_files.iter().copied());
+        let defines_match = identity
+            .defines
+            .iter()
+            .map(String::as_str)
+            .eq(self.defines.iter().copied());
+        if identity.shader != self.shader
+            || identity.source != self.source
+            || identity.artifact != self.artifact
+            || !source_files_match
+            || !defines_match
+        {
+            return Err(ShaderArtifactError::ContractMismatch {
+                shader: self.shader.to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ShaderArtifactIdentity {
@@ -242,6 +298,12 @@ pub enum ShaderArtifactError {
         /// Requested logical shader name.
         shader: String,
     },
+    /// A loaded record differs from the complete contract supplied by its consumer.
+    #[error("shader artifact record '{shader}' does not match its consumer contract")]
+    ContractMismatch {
+        /// Logical shader name required by the consumer.
+        shader: String,
+    },
     /// Runtime source bytes no longer match the compile-input identity.
     #[error("shader '{shader}' compile-input hash mismatch: manifest {expected}, runtime {actual}")]
     CompileInputMismatch {
@@ -314,9 +376,6 @@ pub(crate) fn load_shader_artifact(
             shader: shader.to_owned(),
         })?;
     let entry = &manifest.artifacts[index];
-    if shader == VEGETATION_SHADER {
-        validate_vegetation_record(entry)?;
-    }
     let compile_input_expected =
         ShaderSha256::parse("compileInputSha256", shader, &entry.compile_input_sha256)?;
     let spirv_expected = ShaderSha256::parse("spirvSha256", shader, &entry.spirv_sha256)?;
@@ -442,24 +501,6 @@ fn validate_record(entry: &ManifestEntry) -> Result<(), ShaderArtifactError> {
         &entry.compile_input_sha256,
     )?;
     ShaderSha256::parse("spirvSha256", &entry.shader, &entry.spirv_sha256)?;
-    Ok(())
-}
-
-fn validate_vegetation_record(entry: &ManifestEntry) -> Result<(), ShaderArtifactError> {
-    if entry.source != VEGETATION_SOURCE
-        || entry.artifact != VEGETATION_ARTIFACT
-        || !entry.defines.is_empty()
-        || entry
-            .source_files
-            .iter()
-            .map(String::as_str)
-            .ne(VEGETATION_SOURCE_FILES.iter().copied())
-    {
-        return noncanonical(
-            entry,
-            "vegetation graph compile closure does not match the contract",
-        );
-    }
     Ok(())
 }
 
@@ -627,6 +668,11 @@ mod tests {
 
     use super::*;
 
+    const FIXTURE_SHADER: &str = "compute_fixture";
+    const FIXTURE_SOURCE: &str = "compute_fixture.slang";
+    const FIXTURE_ARTIFACT: &str = "compute_fixture.spv";
+    const FIXTURE_SOURCE_FILES: &[&str] = &["compute_fixture.slang", "spatial_numeric.slang"];
+
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
     struct Fixture {
@@ -651,7 +697,7 @@ mod tests {
             )
             .unwrap();
             std::fs::write(
-                source_dir.join("vegetation_graph.slang"),
+                source_dir.join(FIXTURE_SOURCE),
                 b"import spatial_numeric;\n",
             )
             .unwrap();
@@ -659,7 +705,7 @@ mod tests {
                 .iter()
                 .map(|flag| (*flag).to_owned())
                 .collect::<Vec<_>>();
-            let source_files = VEGETATION_SOURCE_FILES
+            let source_files = FIXTURE_SOURCE_FILES
                 .iter()
                 .map(|source| (*source).to_owned())
                 .collect::<Vec<_>>();
@@ -673,15 +719,15 @@ mod tests {
                 0_u32.to_le_bytes(),
             ]
             .concat();
-            std::fs::write(shader_dir.join(VEGETATION_ARTIFACT), &spirv).unwrap();
+            std::fs::write(shader_dir.join(FIXTURE_ARTIFACT), &spirv).unwrap();
             let manifest = json!({
                 "schemaVersion": MANIFEST_SCHEMA_VERSION,
                 "slangcVersion": "2026.12.2",
                 "spirvFlags": flags,
                 "artifacts": [{
-                    "shader": VEGETATION_SHADER,
-                    "source": VEGETATION_SOURCE,
-                    "artifact": VEGETATION_ARTIFACT,
+                    "shader": FIXTURE_SHADER,
+                    "source": FIXTURE_SOURCE,
+                    "artifact": FIXTURE_ARTIFACT,
                     "defines": [],
                     "sourceFiles": source_files,
                     "compileInputSha256": compile_input.to_string(),
@@ -713,18 +759,18 @@ mod tests {
     #[test]
     fn strict_reader_binds_compiler_sources_flags_and_artifact() {
         let mut fixture = Fixture::new();
-        let (first, bytes) = load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER).unwrap();
+        let (first, bytes) = load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER).unwrap();
         assert_eq!(bytes, fixture.spirv);
-        assert_eq!(first.shader(), VEGETATION_SHADER);
-        assert_eq!(first.source(), VEGETATION_SOURCE);
-        assert_eq!(first.artifact(), VEGETATION_ARTIFACT);
+        assert_eq!(first.shader(), FIXTURE_SHADER);
+        assert_eq!(first.source(), FIXTURE_SOURCE);
+        assert_eq!(first.artifact(), FIXTURE_ARTIFACT);
         assert_eq!(
             first
                 .source_files()
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            VEGETATION_SOURCE_FILES
+            FIXTURE_SOURCE_FILES
         );
         assert_eq!(first.compiler_identity(), "2026.12.2");
         assert_eq!(
@@ -738,10 +784,30 @@ mod tests {
         assert!(first.defines().is_empty());
         assert_eq!(first.spirv_sha256(), ShaderSha256::digest(&bytes));
         assert_ne!(first.record_sha256().bytes(), [0; 32]);
+        ShaderArtifactContract::new(
+            FIXTURE_SHADER,
+            FIXTURE_SOURCE,
+            FIXTURE_ARTIFACT,
+            FIXTURE_SOURCE_FILES,
+            &[],
+        )
+        .verify(&first)
+        .unwrap();
+        assert!(matches!(
+            ShaderArtifactContract::new(
+                FIXTURE_SHADER,
+                FIXTURE_SOURCE,
+                FIXTURE_ARTIFACT,
+                &[FIXTURE_SOURCE],
+                &[],
+            )
+            .verify(&first),
+            Err(ShaderArtifactError::ContractMismatch { .. })
+        ));
 
         fixture.manifest["slangcVersion"] = json!("2026.12.3");
         fixture.write_manifest();
-        let (second, _) = load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER).unwrap();
+        let (second, _) = load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER).unwrap();
         assert_eq!(first.compile_input_sha256(), second.compile_input_sha256());
         assert_eq!(first.spirv_sha256(), second.spirv_sha256());
         assert_ne!(
@@ -757,7 +823,7 @@ mod tests {
         fixture.manifest["unexpected"] = json!(true);
         fixture.write_manifest();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::MalformedManifest { .. })
         ));
 
@@ -772,7 +838,7 @@ mod tests {
             .push(json!("-O3"));
         fixture.write_manifest();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::UnexpectedSpirvFlags)
         ));
     }
@@ -783,7 +849,7 @@ mod tests {
         fixture.manifest["schemaVersion"] = json!(MANIFEST_SCHEMA_VERSION + 1);
         fixture.write_manifest();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::UnsupportedSchema { .. })
         ));
 
@@ -791,7 +857,7 @@ mod tests {
         fixture.manifest["slangcVersion"] = json!("2026.12.2\n");
         fixture.write_manifest();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::InvalidCompilerIdentity)
         ));
 
@@ -799,7 +865,7 @@ mod tests {
         fixture.manifest["artifacts"][0]["artifact"] = json!("other.spv");
         fixture.write_manifest();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::NoncanonicalRecord { .. })
         ));
     }
@@ -808,23 +874,23 @@ mod tests {
     fn strict_reader_rejects_source_and_artifact_drift() {
         let fixture = Fixture::new();
         std::fs::write(
-            fixture.shader_dir.join(VEGETATION_ARTIFACT),
+            fixture.shader_dir.join(FIXTURE_ARTIFACT),
             [fixture.spirv.as_slice(), &[0, 0, 0, 0]].concat(),
         )
         .unwrap();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::SpirvMismatch { .. })
         ));
 
-        std::fs::write(fixture.shader_dir.join(VEGETATION_ARTIFACT), &fixture.spirv).unwrap();
+        std::fs::write(fixture.shader_dir.join(FIXTURE_ARTIFACT), &fixture.spirv).unwrap();
         std::fs::write(
             fixture.shader_dir.join("source/spatial_numeric.slang"),
             b"const uint VALUE = 8;\n",
         )
         .unwrap();
         assert!(matches!(
-            load_shader_artifact(&fixture.shader_dir, VEGETATION_SHADER),
+            load_shader_artifact(&fixture.shader_dir, FIXTURE_SHADER),
             Err(ShaderArtifactError::CompileInputMismatch { .. })
         ));
     }
@@ -832,7 +898,7 @@ mod tests {
     #[test]
     fn compile_input_hash_matches_xtask_golden() {
         let fixture = Fixture::new();
-        let source_files = VEGETATION_SOURCE_FILES
+        let source_files = FIXTURE_SOURCE_FILES
             .iter()
             .map(|source| (*source).to_owned())
             .collect::<Vec<_>>();
@@ -849,7 +915,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             hash.to_string(),
-            "482d933053c6da24098a3342551ae03d02c9419e1a22705b7b3c92e090c468c8"
+            "122b26fd9511b87f07623958835354f11e37d34f89eed7f6496ec3e8804570d0"
         );
     }
 }
