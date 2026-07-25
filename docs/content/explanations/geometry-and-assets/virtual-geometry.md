@@ -6,19 +6,22 @@ weight = 15
 # Virtual geometry
 
 Virtual geometry stores renderable detail as a device-independent hierarchy of triangle clusters,
-aggregate voxel nodes, assembly parts, and content-addressed pages. A view chooses a hierarchy cut
-from projected appearance error and residency. It never chooses a separately authored foliage LOD,
-billboard, or platform-specific species representation.
+aggregate voxel nodes, assembly parts, and content-addressed pages. Ordinary `.smesh` assets and
+plant families use the same hierarchy format and cooker. A view chooses a cut from projected
+appearance error and residency.
 
 ## Portable hierarchy
 
-The plant cooker clusters normalized source triangles with portable limits of 64 vertices and 124
-triangles. Each cluster stores compact local indices, cluster-relative quantized positions,
-octahedral normals and tangents, material class, conservative static and deformed bounds, a normal
-cone, deformation influence, page ownership, and child/parent error. Vertex-cache optimization,
-meshlet construction, and border-aware simplification follow the algorithms documented by
+The geometry cooker clusters normalized source triangles with portable limits of 64 vertices and 124
+triangles. Each cluster stores compact local and source vertex indices, cluster-relative quantized
+positions, octahedral normals and tangents, material class, conservative static and deformed bounds,
+a normal cone, deformation influence, page ownership, and child/parent error.
+
+Vertex-cache optimization, meshlet construction, and border-aware simplification follow the algorithms documented by
 [meshoptimizer](https://meshoptimizer.org/); Anima uses the safe Rust `optimesh` implementation for
-the cooker.
+the cooker. Format adapters turn an ordinary `Mesh` or a normalized plant family into
+`PortableHierarchyInput`; clustering, simplification, paging, codecs, and validation remain in
+`saffron-geometry`.
 
 Contiguous solid geometry simplifies through border-locked hierarchy groups. Repeated plant parts
 remain one prototype plus assembly transforms instead of expanding every leaf or branch into the
@@ -34,7 +37,17 @@ Appearance error is a tuple rather than geometric distance alone:
 Parent error bounds its descendants. A cut can therefore mix triangle and aggregate nodes while
 retaining a drawable coarse root. Page dependencies are parent-first, and a parent remains usable
 until all selected children and their dependencies are resident. The portable aggregate output is
-indexed geometry, so it does not require mesh shaders or Vulkan sparse residency.
+indexed geometry, so it does not require Vulkan sparse residency.
+
+An ordinary `.smesh` stores the five-section hierarchy in a required envelope after its conditioning
+data. Mesh upload validates this envelope and carries its pages on `GpuMesh`; the GPU-scene mirror
+publishes them into the global page arena the visibility traversal draws from, so rendering consumes
+one import-time cook.
+
+The device-free reference evaluator orthographically renders finest triangle descendants and their
+aggregate voxel parent over six deterministic view/light fixtures. It measures silhouette distance,
+coverage, transmission, material response, and normal moments against the node's declared
+`AppearanceError`.
 
 ## Compiled plant artifact
 
@@ -68,9 +81,9 @@ root, a malformed range, or a mismatched hash before the artifact can enter the 
 
 Device-global vertex, index, cluster, assembly-part, aggregate-voxel, and page arenas let unrelated
 geometry share indexed indirect draws without CPU buffer rebinding. Immutable prototype, geometry,
-material, texture, coverage, skeleton, and page tables point into those arenas. Portable indexed
-drawing uses global offsets or buffer device addresses; a mesh-shader executor reads the same
-semantic records when its individual feature bits and limits qualify.
+material, texture, coverage, skeleton, and page tables point into those arenas. Passes bind the
+global page arena as the index buffer and pull vertices through buffer device addresses — the
+übershader's `vertexMainExecutor` entry.
 
 Every table handle is an index and generation. A table slot begins with its live generation, so a
 consumer can reject a stale handle. Removing a record or arena range retires it across every
@@ -86,9 +99,9 @@ mutated underneath submitted work.
 ## Draw records and bins
 
 A semantic draw record names geometry, material, instance, deformation, cluster, representation,
-source generation, hierarchy state, and temporal transition. Visibility produces this record once.
-Indexed indirect and mesh-task executors derive their command formats from it rather than defining
-different content paths.
+source generation, hierarchy state, and temporal transition. Visibility produces this record once;
+binning kernels scatter each record into its bucket's `VkDrawIndexedIndirectCommand` slice, and
+passes replay the slices with counted indirect draws.
 
 The fixed PSO bin packs typed dimensions for representation, coverage classification, sidedness,
 surface model, transparency, deformation, and pass. Texture identity and geometry addresses stay in
@@ -99,7 +112,10 @@ translucent, and thin-sheet materials.
 
 | What | File | Symbols |
 |---|---|---|
-| Hierarchy cooking and strict codecs | `vegetation/src/virtual_hierarchy.rs` | `cook_portable_virtual_hierarchy`, `validate_portable_virtual_hierarchy`, `decode_portable_virtual_hierarchy_sections` |
+| Hierarchy cooking and strict codecs | `geometry/src/virtual_hierarchy.rs` | `PortableHierarchyInput`, `cook_portable_virtual_hierarchy`, `decode_portable_virtual_hierarchy_sections` |
+| Ordinary mesh artifact | `geometry/src/smesh.rs` | `save_mesh_to_buffer`, `load_mesh_hierarchy_from_bytes` |
+| Plant-family adapter | `vegetation/src/virtual_hierarchy.rs` | `plant_hierarchy_input`, `plant_hierarchy_material` |
+| Device-free comparison | `geometry/src/hierarchy_reference.rs` | `compare_triangle_voxel_transitions`, `TriangleVoxelReferenceComparison` |
 | Plant artifact assembly | `assets/src/plant_cook.rs` | `build_plant_sections`, `validate_complete_plant_artifact` |
 | Artifact store validation | `assets/src/vegetation_store.rs` | `validate_plant_artifact` |
 | Global arenas and handles | `rendering/src/global_gpu_data.rs` | `GlobalGpuData`, `GlobalGpuArena`, `GpuHandle`, `ResidentGpuTable` |
