@@ -828,7 +828,13 @@ impl AssetServer {
         let graph = translate_model(path)?;
         let bake = self.bake_model(&graph, options, path, Uuid(0))?;
         for row in &bake.rows {
-            self.catalog.put(row.clone());
+            // Sub-asset ids are stable over the source path, so importing a source whose
+            // rows are already catalogued re-registers them as reimported content.
+            if self.catalog.find(row.id).is_some() {
+                self.register_reimported_asset(row.clone());
+            } else {
+                self.register_imported_asset(row.clone());
+            }
         }
         Ok(bake)
     }

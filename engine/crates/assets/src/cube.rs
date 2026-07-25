@@ -210,7 +210,7 @@ impl AssetServer {
             .map_err(|e| Error::Io(format!("cannot write '{rel}': {e}")))?;
         let gpu_lut = gpu.upload_lut_3d(&lut.rgb, lut.size)?;
         let name = self.catalog.unique_name(&stem);
-        self.catalog.put(AssetEntry {
+        self.register_imported_asset(AssetEntry {
             id,
             name,
             asset_type: AssetType::Lut,
@@ -248,7 +248,7 @@ impl AssetServer {
         std::fs::write(self.root.join(&rel), &bytes)
             .map_err(|e| Error::Io(format!("cannot write '{rel}': {e}")))?;
         let unique = self.catalog.unique_name(name);
-        self.catalog.put(AssetEntry {
+        self.register_imported_asset(AssetEntry {
             id,
             name: unique,
             asset_type: AssetType::Lut,

@@ -15,6 +15,7 @@ glam.workspace = true
 saffron-core = { path = "../core" }
 saffron-json = { path = "../json" }
 saffron-geometry = { path = "../geometry" }
+saffron-material = { path = "../material" }
 saffron-rendering = { path = "../rendering" }
 saffron-scene = { path = "../scene" }
 saffron-spatial = { path = "../spatial" }
@@ -22,6 +23,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
 atomic-write-file.workspace = true
+bytemuck.workspace = true
 solar-positioning.workspace = true
 saffron-vegetation = { path = "../vegetation" }
 resvg.workspace = true
@@ -30,6 +32,5 @@ tiny-skia.workspace = true
 
 [dev-dependencies]
 ash.workspace = true
-bytemuck.workspace = true
 image.workspace = true
 saffron-test-support = { path = "../test-support" }

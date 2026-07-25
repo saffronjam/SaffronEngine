@@ -32,8 +32,10 @@ mod cube;
 mod environment_profile;
 mod error;
 mod gpu;
+mod gpu_scene_mirror;
 mod graph;
 mod import;
+mod journal;
 mod load;
 mod manage;
 mod material;
@@ -41,7 +43,9 @@ mod material_schema;
 mod mesh_surface;
 mod model;
 mod names;
+mod page_stream;
 mod plant_cook;
+mod plant_render;
 mod project;
 mod project_load;
 mod render_material;
@@ -72,10 +76,18 @@ pub use environment_profile::{
 };
 pub use error::{Error, Result};
 pub use gpu::{GpuUploader, RendererUploader};
+pub use gpu_scene_mirror::{
+    GpuSceneMirror, GpuSceneMirrorStats, GpuSceneMirrorTarget, VegetationCellRenderRow,
+    VegetationFamilyRenderRow, VegetationRenderBreakdown,
+};
 pub use graph::{emit_graph_surface, lower_graph_to_params};
 pub use import::{
     Axis, BakeResult, IMPORTER_VERSION, ImportOptions, ScanDelta, catalog_rows_for_container,
     hash_file_fnv,
+};
+pub use journal::{
+    AssetCatalogSnapshot, AssetInvalidations, AssetJournalCursor, AssetJournalRead, AssetMutation,
+    AssetMutationKind, AssetMutationTarget, AssetRevision,
 };
 pub use load::engine_asset_path;
 pub use manage::{
@@ -93,7 +105,7 @@ pub use material::{
 pub use material_schema::{
     ExposedParam, ExposedParamKind, exposed_parameter, pbr_exposed_parameters,
 };
-pub use mesh_surface::{StaticMeshSurfaceInput, StaticMeshSurfaceProvider};
+pub use mesh_surface::{CanonicalCpuCoverage, StaticMeshSurfaceInput, StaticMeshSurfaceProvider};
 pub use model::{
     ByteSource, ContainerMetadata, Import, METADATA_SCHEMA_VERSION, ModelAsset, SubAsset,
     encode_container_metadata, read_container_metadata,
@@ -102,11 +114,13 @@ pub use names::{
     asset_type_from_name, asset_type_name, colorspace_from_name, colorspace_name,
     texture_role_from_name, texture_role_name,
 };
+pub use page_stream::{PageLoadRequest, PageLoadResult, PagePayloadSource, PageStreamWorker};
 pub use plant_cook::{
     PlantRecookOptions, PlantRecookOutcome, PlantValidationOutcome, PreparedPlantFamily,
     PublishedPlantRecook, prepare_plant_family_sources, recook_plant_family,
     validate_plant_family_sources,
 };
+pub use plant_render::{PlantFamilyRender, PlantPhenotypeRender};
 pub use project::{
     LUARC_JSON, NewProject, PROJECT_VERSION, ProjectHost, ProjectInfo, ProjectSidecar,
     STARTER_SCRIPT, app_data_root, create_project_script, default_display_name,
@@ -119,7 +133,7 @@ pub use render_scene::{
     RendererScene, SceneRenderer, SceneSurfaceHit, SceneSurfaceProvider, model_render_aabb,
     pick_entity, pick_scene_surface, query_scene_surface_ray, render_scene,
     sample_scene_surface_field, scene_render_aabb, scene_surface_field_snapshots,
-    scene_surface_providers, viewport_ray,
+    scene_surface_providers, viewport_pick_ray, viewport_ray,
 };
 pub use scan::{
     colorspace_for_role_explicit, detect_height_mode, detect_material_role, infer_texture_role,
@@ -139,10 +153,11 @@ pub use vegetation::{
     CatalogBiomeGraphResolver, ResolvedBiomeGraph, VegetationImport, VegetationMapTransaction,
     assemble_biome_graph_evaluation_job, commit_vegetation_map_transaction,
     compile_catalog_biome_graph, compile_catalog_biome_instance_graph, import_vegetation_asset,
-    load_biome_asset, load_plant_family_asset, load_vegetation_map_root,
-    load_vegetation_map_snapshot, load_vegetation_map_tile_snapshot, remove_vegetation_map_package,
-    save_biome_asset, save_plant_family_asset, save_vegetation_map_asset, update_biome_asset,
-    update_plant_family_asset, update_vegetation_map_asset, vegetation_graph_dependency_hashes,
+    load_biome_asset, load_plant_family_asset, load_vegetation_map_chunks,
+    load_vegetation_map_root, load_vegetation_map_snapshot, load_vegetation_map_tile_snapshot,
+    remove_vegetation_map_package, save_biome_asset, save_plant_family_asset,
+    save_vegetation_map_asset, update_biome_asset, update_plant_family_asset,
+    update_vegetation_map_asset, vegetation_graph_dependency_hashes,
 };
 pub use vegetation_cooker::{
     PlantSourceAcceptance, StagedVegetationCook, VegetationCookEvent, VegetationCookOutput,
@@ -154,12 +169,17 @@ pub use vegetation_store::{
     VegetationAuthoredLock, VegetationGenerationLock,
 };
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use saffron_core::Uuid;
-use saffron_rendering::{GpuMesh, GpuTexture, SubmeshMaterial};
+use saffron_rendering::{GpuMesh, GpuTexture};
 use saffron_scene::AssetCatalog;
+
+use crate::journal::invalidations_for;
+
+const DEFAULT_ASSET_JOURNAL_CAPACITY: usize = 4096;
 
 /// The built-in default material: white albedo, fully rough, non-metallic. Returned
 /// by the resolve path when a referenced material is missing. Its id is in the
@@ -188,6 +208,15 @@ pub const PREVIEW_MATERIAL_ID: Uuid = Uuid(6);
 /// rendered on the offscreen Thumbnail view can never overwrite the slot an interactive texture
 /// preview is using. Never a catalog row.
 pub const PREVIEW_THUMBNAIL_MATERIAL_ID: Uuid = Uuid(8);
+
+/// The editor-camera gizmo model's mesh, in the reserved (`< 1024`) range. Seeded into the
+/// GPU mesh cache from the engine's `models/editor-camera.glb` on demand (never a catalog
+/// row), so a camera's runtime gizmo ghost references it like any mesh asset.
+pub const EDITOR_CAMERA_MESH_ID: Uuid = Uuid(9);
+
+/// The editor-camera gizmo model's material, in the reserved (`< 1024`) range. Seeded
+/// beside the mesh; never a catalog row.
+pub const EDITOR_CAMERA_MATERIAL_ID: Uuid = Uuid(10);
 
 /// A native built-in primitive mesh — geometry the engine generates itself, referenced by
 /// a reserved id and seeded into the GPU cache on demand. Never a catalog asset: a
@@ -245,23 +274,10 @@ impl BuiltinMesh {
     }
 }
 
-/// A renderer-internal mesh visual (the editor-camera gizmo): an attempted-once
-/// shared mesh plus its resolved submesh material table. Held by [`AssetServer`],
-/// not the catalog.
-#[derive(Default)]
-pub struct SystemMeshVisual {
-    /// Whether a load has been attempted (so a failed load is not retried).
-    pub attempted: bool,
-    /// The shared GPU mesh, `None` until loaded (or after a failed attempt).
-    pub mesh: Option<Arc<GpuMesh>>,
-    /// The resolved per-submesh materials for the visual.
-    pub submesh_materials: Vec<SubmeshMaterial>,
-}
-
 /// Per-frame options the scene driver reads (phase 12).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderSceneOptions {
-    /// Append the editor-camera gizmo models to the draw list.
+    /// Keep a runtime gizmo-model ghost under each `show_model` camera.
     pub show_editor_camera_models: bool,
     /// Draw the infinite analytic ground grid (debug overlay).
     pub show_grid: bool,
@@ -290,45 +306,60 @@ pub struct AssetServer {
     /// The asset root directory (the project's `assets/` dir).
     pub root: PathBuf,
     /// The live catalog: id → `{name, type, path}`. The source of truth.
-    pub catalog: AssetCatalog,
+    catalog: AssetCatalog,
     /// GPU mesh cache, keyed by mesh / sub-id. `None` = negative marker.
-    pub mesh_by_uuid: AssetCache<GpuMesh>,
+    mesh_by_uuid: AssetCache<GpuMesh>,
+    /// Per-mesh page-payload source (artifact slice or retained cooked hierarchy),
+    /// recorded at mesh load for the page-stream worker.
+    page_source_by_uuid: std::collections::HashMap<u64, crate::page_stream::PagePayloadSource>,
+    /// Loaded plant-family renders keyed by exact `.splantc` identity. `None` = negative
+    /// marker (a failed load, not retried until a cache clear).
+    plant_render_by_hash: std::collections::HashMap<
+        saffron_vegetation::ContentHash,
+        Option<crate::plant_render::PlantFamilyRender>,
+    >,
     /// Per-mesh ray-pick BVH cache, keyed by mesh sub-id, built lazily from a mesh's CPU
     /// geometry on first pick. `None` = a mesh with no pickable triangles.
-    pub mesh_bvh_by_uuid: AssetCache<saffron_geometry::MeshBvh>,
+    mesh_bvh_by_uuid: AssetCache<saffron_geometry::MeshBvh>,
     /// GPU texture cache, keyed by texture / sub-id. `None` = negative marker.
-    pub texture_by_uuid: AssetCache<GpuTexture>,
+    texture_by_uuid: AssetCache<GpuTexture>,
+    /// Decoded RGBA8 source pixels used by canonical CPU coverage queries.
+    texture_pixels_by_uuid:
+        std::collections::HashMap<u64, Option<Arc<saffron_geometry::DecodedImage>>>,
     /// GPU cache of textures resolved as **displacement height maps**, keyed by texture / sub-id. A
     /// separate map so a height map carries its per-height min/max pyramid (built at upload for the
     /// tessellation factor kernel), independent of the same image used as a plain albedo/data texture.
     /// `None` = negative marker.
-    pub height_texture_by_uuid: AssetCache<GpuTexture>,
+    height_texture_by_uuid: AssetCache<GpuTexture>,
     /// Coverage-preserving texture variants keyed by `(texture id, reference cutoff bits)`.
     /// Each variant owns an exact CPU-derived mip chain used by every foliage coverage pass.
-    pub coverage_texture_by_uuid: std::collections::HashMap<(u64, u16), Option<Arc<GpuTexture>>>,
+    coverage_texture_by_uuid: std::collections::HashMap<(u64, u16), Option<Arc<GpuTexture>>>,
     /// GPU creative-LUT cache, keyed by LUT asset id. `None` = negative marker. Holds the `GpuLut`
     /// (a 3D image, no bindless slot) a `.cube` import or baked `.slut` resolves to.
-    pub lut_by_uuid: AssetCache<saffron_rendering::GpuLut>,
+    lut_by_uuid: AssetCache<saffron_rendering::GpuLut>,
     /// Opened `.smodel` containers, keyed by model id. `None` = negative marker.
-    pub model_by_uuid: AssetCache<ModelAsset>,
+    model_by_uuid: AssetCache<ModelAsset>,
     /// Parent-resolved material assets (parent chain walked, instance overrides baked, *before*
     /// per-slot overrides), keyed by material id. The draw path resolves each entity's materials
     /// every frame; without this it re-read + re-parsed each `.smat` (and, for a container-embedded
     /// material, re-read the whole `.smodel`) from disk per entity per frame. `None` = negative
-    /// marker. Coarsely cleared on any material mutation (see [`Self::invalidate_material_caches`]).
-    pub material_by_uuid: AssetCache<MaterialAsset>,
+    /// marker. Coarsely cleared on any material mutation.
+    material_by_uuid: AssetCache<MaterialAsset>,
     /// The codegen `_mesh.spv` shader path per material id (a non-foldable node-graph material's
     /// compiled übershader variant), or `None` (the common case: no graph shader). Memoizes
     /// [`render_material`](crate::render_material)'s `codegen_shader_for` so the per-frame resolve
     /// stops probing the disk. Invalidated with [`Self::material_by_uuid`].
-    pub material_shader_by_uuid: AssetCache<String>,
+    material_shader_by_uuid: AssetCache<String>,
     /// Monotonic invalidation epoch for render-derived asset content.
     ///
     /// Static shadow caches fold this into their content key so a material, texture, or mesh
     /// replacement invalidates cached silhouettes even when catalog ids and transforms are stable.
     render_content_revision: u64,
+    asset_revision: AssetRevision,
+    asset_journal_base: AssetRevision,
+    asset_journal_capacity: usize,
+    asset_journal: VecDeque<AssetMutation>,
     /// The editor-camera gizmo's mesh visual.
-    pub editor_camera_model: SystemMeshVisual,
     /// The app-level, content-addressed thumbnail cache dir, defaulted from
     /// [`app_data_root`] so it is shared across every project and survives a project switch
     /// (it is *not* repointed by [`Self::set_asset_root`]). Overridable so a test can isolate
@@ -358,8 +389,11 @@ impl AssetServer {
             root,
             catalog: AssetCatalog::default(),
             mesh_by_uuid: AssetCache::new(),
+            page_source_by_uuid: std::collections::HashMap::new(),
+            plant_render_by_hash: std::collections::HashMap::new(),
             mesh_bvh_by_uuid: AssetCache::new(),
             texture_by_uuid: AssetCache::new(),
+            texture_pixels_by_uuid: std::collections::HashMap::new(),
             height_texture_by_uuid: AssetCache::new(),
             coverage_texture_by_uuid: std::collections::HashMap::new(),
             lut_by_uuid: AssetCache::new(),
@@ -367,7 +401,10 @@ impl AssetServer {
             material_by_uuid: AssetCache::new(),
             material_shader_by_uuid: AssetCache::new(),
             render_content_revision: 1,
-            editor_camera_model: SystemMeshVisual::default(),
+            asset_revision: AssetRevision::ZERO,
+            asset_journal_base: AssetRevision::ZERO,
+            asset_journal_capacity: DEFAULT_ASSET_JOURNAL_CAPACITY,
+            asset_journal: VecDeque::new(),
             thumbnail_cache_root: Path::new(&app_data_root()).join("thumbnail-cache"),
             vegetation_cache_root,
             preview_render_queue: std::collections::VecDeque::new(),
@@ -375,6 +412,323 @@ impl AssetServer {
         };
         assets.ensure_asset_directories();
         assets
+    }
+
+    /// Immutable live asset catalog.
+    #[must_use]
+    pub fn catalog(&self) -> &AssetCatalog {
+        &self.catalog
+    }
+
+    /// Current mutation cursor for an atomically read catalog snapshot.
+    #[must_use]
+    pub fn asset_journal_cursor(&self) -> AssetJournalCursor {
+        AssetJournalCursor::at(self.asset_revision)
+    }
+
+    /// Captures the complete catalog and the exact cursor representing it.
+    #[must_use]
+    pub fn asset_catalog_snapshot(&self) -> AssetCatalogSnapshot {
+        AssetCatalogSnapshot {
+            catalog: self.catalog.clone(),
+            cursor: self.asset_journal_cursor(),
+        }
+    }
+
+    /// Reads every retained mutation after `cursor`, or requests a complete snapshot rebuild.
+    #[must_use]
+    pub fn read_asset_journal(&self, cursor: AssetJournalCursor) -> AssetJournalRead {
+        let revision = cursor.revision();
+        let next = self.asset_journal_cursor();
+        if revision < self.asset_journal_base || revision > self.asset_revision {
+            return AssetJournalRead::SnapshotRequired { next };
+        }
+        AssetJournalRead::Delta {
+            mutations: self
+                .asset_journal
+                .iter()
+                .copied()
+                .filter(|mutation| mutation.revision > revision)
+                .collect(),
+            next,
+        }
+    }
+
+    /// Registers one newly imported catalog entry.
+    pub fn register_imported_asset(&mut self, entry: saffron_scene::AssetEntry) {
+        assert!(
+            self.catalog.find(entry.id).is_none(),
+            "imported asset id {} already exists",
+            entry.id.value()
+        );
+        let id = entry.id;
+        let asset_type = entry.asset_type;
+        self.catalog.put(entry);
+        // A failed load of this id may have negative-cached before the import existed;
+        // the import makes that cached absence stale.
+        self.invalidate_loaded_asset(id, asset_type);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset { id, asset_type },
+            AssetMutationKind::Imported,
+            invalidations_for(asset_type),
+        );
+    }
+
+    /// Inserts or replaces a stable catalog entry produced by reimport.
+    pub fn register_reimported_asset(&mut self, entry: saffron_scene::AssetEntry) {
+        let id = entry.id;
+        let asset_type = entry.asset_type;
+        self.catalog.put(entry);
+        self.invalidate_loaded_asset(id, asset_type);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset { id, asset_type },
+            AssetMutationKind::Reimported,
+            invalidations_for(asset_type),
+        );
+    }
+
+    /// Replaces an existing catalog entry after an authored edit.
+    pub fn replace_edited_asset_entry(&mut self, entry: saffron_scene::AssetEntry) -> bool {
+        if self.catalog.find(entry.id).is_none() {
+            return false;
+        }
+        let id = entry.id;
+        let asset_type = entry.asset_type;
+        self.catalog.put(entry);
+        self.invalidate_loaded_asset(id, asset_type);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset { id, asset_type },
+            AssetMutationKind::Edited,
+            invalidations_for(asset_type),
+        );
+        true
+    }
+
+    /// Marks authored bytes for an existing catalog asset as edited.
+    pub fn asset_edited(&mut self, id: Uuid) -> bool {
+        let Some(asset_type) = self.catalog.find(id).map(|entry| entry.asset_type) else {
+            return false;
+        };
+        self.invalidate_loaded_asset(id, asset_type);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset { id, asset_type },
+            AssetMutationKind::Edited,
+            invalidations_for(asset_type),
+        );
+        true
+    }
+
+    fn edit_asset_metadata(
+        &mut self,
+        id: Uuid,
+        edit: impl FnOnce(&mut saffron_scene::AssetEntry),
+    ) -> bool {
+        let Some(index) = self.catalog.by_id.get(&id.value()).copied() else {
+            return false;
+        };
+        let asset_type = self.catalog.entries[index].asset_type;
+        edit(&mut self.catalog.entries[index]);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset { id, asset_type },
+            AssetMutationKind::Edited,
+            AssetInvalidations::NONE,
+        );
+        true
+    }
+
+    /// Renames one catalog asset without invalidating its render content.
+    pub fn rename_asset(&mut self, id: Uuid, name: String) -> bool {
+        self.edit_asset_metadata(id, |entry| entry.name = name)
+    }
+
+    /// Moves one catalog asset to a folder without invalidating its render content.
+    pub fn move_asset_to_folder(&mut self, id: Uuid, folder: String) -> bool {
+        self.edit_asset_metadata(id, |entry| entry.folder = folder)
+    }
+
+    /// Publishes a content hash written as part of an authored content edit.
+    pub fn update_asset_content_hash(&mut self, id: Uuid, content_hash: u64) -> bool {
+        let Some(index) = self.catalog.by_id.get(&id.value()).copied() else {
+            return false;
+        };
+        self.catalog.entries[index].content_hash = content_hash;
+        self.asset_edited(id)
+    }
+
+    /// Backfills derived catalog metadata without invalidating unchanged render content.
+    pub fn backfill_asset_content_hash(&mut self, id: Uuid, content_hash: u64) -> bool {
+        self.edit_asset_metadata(id, |entry| entry.content_hash = content_hash)
+    }
+
+    /// Records source attribution without invalidating render-derived content.
+    pub fn set_asset_attribution(
+        &mut self,
+        id: Uuid,
+        attribution: saffron_scene::Attribution,
+    ) -> bool {
+        self.edit_asset_metadata(id, |entry| entry.attribution = Some(attribution))
+    }
+
+    /// Removes one catalog asset, invalidates its loaded representations, and publishes deletion.
+    pub fn delete_asset_entry(&mut self, id: Uuid) -> Option<saffron_scene::AssetEntry> {
+        let removed = self.catalog.remove(id)?;
+        self.invalidate_loaded_asset(id, removed.asset_type);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset {
+                id,
+                asset_type: removed.asset_type,
+            },
+            AssetMutationKind::Deleted,
+            invalidations_for(removed.asset_type),
+        );
+        Some(removed)
+    }
+
+    /// Drops the loaded representations for one asset while retaining its catalog identity.
+    pub fn unload_asset(&mut self, id: Uuid) -> bool {
+        let Some(asset_type) = self.catalog.find(id).map(|entry| entry.asset_type) else {
+            return false;
+        };
+        self.invalidate_loaded_asset(id, asset_type);
+        self.record_asset_mutation(
+            AssetMutationTarget::Asset { id, asset_type },
+            AssetMutationKind::Unloaded,
+            invalidations_for(asset_type),
+        );
+        true
+    }
+
+    /// Replaces the complete live catalog and publishes one rebuild boundary.
+    ///
+    /// The caller must idle the GPU before replacement because loaded GPU representations are
+    /// discarded with the old catalog.
+    pub fn replace_catalog(&mut self, catalog: AssetCatalog) {
+        self.clear_loaded_asset_state();
+        self.catalog = catalog;
+        self.record_asset_mutation(
+            AssetMutationTarget::All,
+            AssetMutationKind::CatalogReplaced,
+            AssetInvalidations::ALL,
+        );
+    }
+
+    pub(crate) fn replace_scanned_catalog(&mut self, catalog: AssetCatalog) {
+        let previous = std::mem::replace(&mut self.catalog, catalog);
+        let unloaded = !self.asset_caches_are_empty();
+        self.clear_loaded_asset_state();
+        if unloaded {
+            self.record_asset_mutation(
+                AssetMutationTarget::All,
+                AssetMutationKind::Unloaded,
+                AssetInvalidations::ALL,
+            );
+        }
+
+        let removed = previous
+            .entries
+            .iter()
+            .filter(|entry| self.catalog.find(entry.id).is_none())
+            .map(|entry| (entry.id, entry.asset_type))
+            .collect::<Vec<_>>();
+        for (id, asset_type) in removed {
+            self.record_asset_mutation(
+                AssetMutationTarget::Asset { id, asset_type },
+                AssetMutationKind::Deleted,
+                invalidations_for(asset_type),
+            );
+        }
+        let changed = self
+            .catalog
+            .entries
+            .iter()
+            .filter_map(|entry| match previous.find(entry.id) {
+                None => Some((entry.id, entry.asset_type, AssetMutationKind::Imported)),
+                Some(previous) if previous != entry => {
+                    Some((entry.id, entry.asset_type, AssetMutationKind::Reimported))
+                }
+                Some(_) => None,
+            })
+            .collect::<Vec<_>>();
+        for (id, asset_type, kind) in changed {
+            self.record_asset_mutation(
+                AssetMutationTarget::Asset { id, asset_type },
+                kind,
+                invalidations_for(asset_type),
+            );
+        }
+    }
+
+    /// Catalog folder names in display order.
+    #[must_use]
+    pub fn catalog_folders(&self) -> &[String] {
+        &self.catalog.folders
+    }
+
+    /// Adds a catalog folder.
+    pub fn add_catalog_folder(&mut self, folder: String) {
+        self.catalog.folders.push(folder);
+    }
+
+    /// Replaces the catalog folder list after a validated hierarchy edit.
+    pub fn replace_catalog_folders(&mut self, folders: Vec<String>) {
+        self.catalog.folders = folders;
+    }
+
+    /// Renames a catalog folder and every direct asset assignment.
+    pub fn rename_catalog_folder(&mut self, from: &str, to: &str) {
+        for folder in &mut self.catalog.folders {
+            if folder == from {
+                *folder = to.to_owned();
+            }
+        }
+        let edited = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.folder == from)
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        for id in edited {
+            let _ = self.move_asset_to_folder(id, to.to_owned());
+        }
+    }
+
+    /// Removes a catalog folder and reparents its contents to the folder's parent.
+    pub fn remove_catalog_folder(&mut self, folder: &str, parent: &str) {
+        self.catalog.folders.retain(|candidate| candidate != folder);
+        let edited = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.folder == folder)
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        for id in edited {
+            let _ = self.move_asset_to_folder(id, parent.to_owned());
+        }
+    }
+
+    /// Whether the GPU and decoded asset caches contain no entries.
+    #[must_use]
+    pub fn asset_caches_are_empty(&self) -> bool {
+        self.mesh_by_uuid.is_empty()
+            && self.mesh_bvh_by_uuid.is_empty()
+            && self.texture_by_uuid.is_empty()
+            && self.height_texture_by_uuid.is_empty()
+            && self.coverage_texture_by_uuid.is_empty()
+            && self.lut_by_uuid.is_empty()
+            && self.model_by_uuid.is_empty()
+            && self.material_by_uuid.is_empty()
+            && self.material_shader_by_uuid.is_empty()
+            && self.preview_render_queue.is_empty()
+            && self.preview_render_in_flight.is_empty()
+    }
+
+    /// Seeds a reserved editor-preview material that is not a catalog asset.
+    pub fn seed_preview_material(&mut self, id: Uuid, material: MaterialAsset) {
+        assert!(id.value() < 1024, "preview material id must be reserved");
+        self.material_by_uuid
+            .insert(id.value(), Some(Arc::new(material)));
     }
 
     /// Repoints the asset root and (re)creates its standard subdirectories.
@@ -432,33 +786,35 @@ impl AssetServer {
     /// that `Drop` ordering cannot catch. Clearing under an idle GPU is the entire
     /// discipline.
     pub fn clear_asset_caches(&mut self) {
+        self.clear_loaded_asset_state();
+        self.record_asset_mutation(
+            AssetMutationTarget::All,
+            AssetMutationKind::Unloaded,
+            AssetInvalidations::ALL,
+        );
+    }
+
+    fn clear_loaded_asset_state(&mut self) {
         self.clear_thumbnail_queue();
         self.mesh_by_uuid.clear();
+        self.plant_render_by_hash.clear();
         self.mesh_bvh_by_uuid.clear();
         self.texture_by_uuid.clear();
+        self.texture_pixels_by_uuid.clear();
         self.height_texture_by_uuid.clear();
         self.coverage_texture_by_uuid.clear();
         self.lut_by_uuid.clear();
         self.model_by_uuid.clear();
-        self.invalidate_material_caches();
+        self.clear_material_caches();
         // The editor-camera gizmo visual is a cached GPU `Ref` too (its `Arc<GpuMesh>` +
         // resolved submesh materials), so it must drop here with the other caches — before
         // the renderer frees the device/allocator. Leaving it would `vmaDestroyBuffer` on a
         // dead allocator when `AssetServer` finally drops (a teardown use-after-free).
-        self.editor_camera_model = SystemMeshVisual::default();
     }
 
-    /// Drops the memoized material resolutions so the next frame re-reads them from disk.
-    ///
-    /// Coarse by design: a material's resolved value depends on its parent chain, and several
-    /// mutation paths rebuild the whole catalog, so a precise per-id drop would need a
-    /// parent→child index to stay correct. Material edits are never per-frame, so clearing the
-    /// (small, CPU-only) caches wholesale is cheap and always correct. Called at every material
-    /// write/rebake/delete seam so every control command inherits invalidation.
-    pub fn invalidate_material_caches(&mut self) {
+    fn clear_material_caches(&mut self) {
         self.material_by_uuid.clear();
         self.material_shader_by_uuid.clear();
-        self.render_content_revision = self.render_content_revision.wrapping_add(1).max(1);
     }
 
     /// Asset-content epoch used by camera-independent render caches.
@@ -470,6 +826,7 @@ impl AssetServer {
     /// Drops every GPU texture representation derived from one catalog texture.
     pub(crate) fn invalidate_texture_caches(&mut self, id: Uuid) {
         self.texture_by_uuid.remove(&id.value());
+        self.texture_pixels_by_uuid.remove(&id.value());
         self.height_texture_by_uuid.remove(&id.value());
         self.coverage_texture_by_uuid
             .retain(|(texture, _), _| *texture != id.value());
@@ -483,11 +840,203 @@ impl AssetServer {
         self.preview_render_queue.clear();
         self.preview_render_in_flight.clear();
     }
+
+    fn invalidate_loaded_asset(&mut self, id: Uuid, asset_type: saffron_scene::AssetType) {
+        use saffron_scene::AssetType;
+
+        match asset_type {
+            AssetType::Mesh => {
+                self.mesh_by_uuid.remove(&id.value());
+                self.mesh_bvh_by_uuid.remove(&id.value());
+            }
+            AssetType::Texture => {
+                self.invalidate_texture_caches(id);
+                self.clear_material_caches();
+            }
+            AssetType::Material => self.clear_material_caches(),
+            AssetType::Model => {
+                self.model_by_uuid.remove(&id.value());
+                self.clear_material_caches();
+            }
+            AssetType::Lut => {
+                self.lut_by_uuid.remove(&id.value());
+            }
+            AssetType::Other
+            | AssetType::Animation
+            | AssetType::Environment
+            | AssetType::Plant
+            | AssetType::Biome
+            | AssetType::VegetationMap => {}
+        }
+    }
+
+    fn record_asset_mutation(
+        &mut self,
+        target: AssetMutationTarget,
+        kind: AssetMutationKind,
+        invalidations: AssetInvalidations,
+    ) {
+        self.asset_revision = self.asset_revision.next();
+        if invalidations != AssetInvalidations::NONE {
+            self.render_content_revision = self.render_content_revision.wrapping_add(1).max(1);
+        }
+        if self.asset_journal_capacity == 0 {
+            self.asset_journal_base = self.asset_revision;
+            return;
+        }
+        self.asset_journal.push_back(AssetMutation {
+            revision: self.asset_revision,
+            target,
+            kind,
+            invalidations,
+        });
+        while self.asset_journal.len() > self.asset_journal_capacity {
+            if let Some(dropped) = self.asset_journal.pop_front() {
+                self.asset_journal_base = dropped.revision;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn journal_entry(id: u64, asset_type: saffron_scene::AssetType) -> saffron_scene::AssetEntry {
+        saffron_scene::AssetEntry {
+            id: Uuid(id),
+            name: format!("asset-{id}"),
+            asset_type,
+            path: format!("assets/{id}"),
+            ..saffron_scene::AssetEntry::default()
+        }
+    }
+
+    #[test]
+    fn asset_journal_orders_import_edit_reimport_unload_and_delete() {
+        use saffron_scene::AssetType;
+
+        let root =
+            std::env::temp_dir().join(format!("saffron-asset-journal-{}", Uuid::new().value()));
+        let mut assets = AssetServer::new(&root);
+        let start = assets.asset_journal_cursor();
+        let id = Uuid(4096);
+
+        assets.register_imported_asset(journal_entry(id.value(), AssetType::Mesh));
+        assert!(assets.rename_asset(id, "renamed".to_owned()));
+        assets.register_reimported_asset(saffron_scene::AssetEntry {
+            name: "reimported".to_owned(),
+            ..journal_entry(id.value(), AssetType::Mesh)
+        });
+        assert!(assets.unload_asset(id));
+        assert!(assets.delete_asset_entry(id).is_some());
+
+        let AssetJournalRead::Delta { mutations, next } = assets.read_asset_journal(start) else {
+            panic!("fresh cursor retains the complete mutation delta");
+        };
+        assert_eq!(next.revision().get(), 5);
+        assert_eq!(
+            mutations
+                .iter()
+                .map(|mutation| mutation.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                AssetMutationKind::Imported,
+                AssetMutationKind::Edited,
+                AssetMutationKind::Reimported,
+                AssetMutationKind::Unloaded,
+                AssetMutationKind::Deleted,
+            ]
+        );
+        assert_eq!(
+            mutations
+                .iter()
+                .map(|mutation| mutation.revision.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            mutations[0].target,
+            AssetMutationTarget::Asset {
+                id,
+                asset_type: AssetType::Mesh
+            }
+        );
+        assert!(
+            mutations[0]
+                .invalidations
+                .contains(AssetInvalidations::PROTOTYPE)
+        );
+        assert!(
+            mutations[0]
+                .invalidations
+                .contains(AssetInvalidations::PAGE)
+        );
+        assert_eq!(mutations[1].invalidations, AssetInvalidations::NONE);
+        assert!(assets.catalog().find(id).is_none());
+
+        let snapshot = assets.asset_catalog_snapshot();
+        assert_eq!(snapshot.cursor, next);
+        assert!(snapshot.catalog.entries.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asset_journal_overflow_requires_snapshot_rebuild() {
+        use saffron_scene::AssetType;
+
+        let root =
+            std::env::temp_dir().join(format!("saffron-asset-overflow-{}", Uuid::new().value()));
+        let mut assets = AssetServer::new(&root);
+        assets.asset_journal_capacity = 2;
+        assets.register_imported_asset(journal_entry(4096, AssetType::Material));
+        let retained = assets.asset_journal_cursor();
+        assets.register_imported_asset(journal_entry(4097, AssetType::Texture));
+        assets.register_imported_asset(journal_entry(4098, AssetType::Plant));
+
+        assert_eq!(
+            assets.read_asset_journal(AssetJournalCursor::START),
+            AssetJournalRead::SnapshotRequired {
+                next: assets.asset_journal_cursor()
+            }
+        );
+        let AssetJournalRead::Delta { mutations, next } = assets.read_asset_journal(retained)
+        else {
+            panic!("cursor at the retained boundary remains readable");
+        };
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(next.revision().get(), 3);
+        assert!(
+            mutations[0]
+                .invalidations
+                .contains(AssetInvalidations::TEXTURE)
+        );
+        assert!(
+            mutations[1]
+                .invalidations
+                .contains(AssetInvalidations::PAGE)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reimport_evicts_negative_caches_before_publication() {
+        use saffron_scene::AssetType;
+
+        let root =
+            std::env::temp_dir().join(format!("saffron-asset-cache-{}", Uuid::new().value()));
+        let mut assets = AssetServer::new(&root);
+        let id = Uuid(4096);
+        assets.register_imported_asset(journal_entry(id.value(), AssetType::Mesh));
+        assets.mesh_by_uuid.insert(id.value(), None);
+        assets.mesh_bvh_by_uuid.insert(id.value(), None);
+
+        assets.register_reimported_asset(journal_entry(id.value(), AssetType::Mesh));
+
+        assert!(!assets.mesh_by_uuid.contains_key(&id.value()));
+        assert!(!assets.mesh_bvh_by_uuid.contains_key(&id.value()));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn reserved_sentinels_are_in_the_reserved_range() {

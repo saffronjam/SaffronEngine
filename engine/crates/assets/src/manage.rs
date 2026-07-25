@@ -191,7 +191,7 @@ pub(crate) fn rewrite_material_chunk(
     // The rewritten container's TOC offsets shifted, so the memoized reader + material resolutions
     // are stale; drop them so the next resolve reopens the container and slices the fresh chunk.
     assets.model_by_uuid.remove(&container.value());
-    assets.invalidate_material_caches();
+    let _ = assets.asset_edited(id);
     Ok(())
 }
 
@@ -294,7 +294,7 @@ pub fn extract_sub_asset(
     let container_full = format!("{}/{container}", assets.root.display());
     rewrite_container_meta(&container_full, &model.reader, &updated)?;
 
-    assets.catalog.put(AssetEntry {
+    let replaced = assets.replace_edited_asset_entry(AssetEntry {
         id: sub_id,
         name: sub.name.clone(),
         asset_type: sub.asset_type,
@@ -304,6 +304,7 @@ pub fn extract_sub_asset(
         tracks: sub.tracks,
         ..AssetEntry::default()
     });
+    debug_assert!(replaced, "extracted sub-asset remains catalogued");
     // Pin the name/colorspace to the now-standalone leaf so a cold scan can't fall back to the
     // uuid stem (and doesn't depend on the walk order vs the container's remap row).
     if let Err(err) = assets.write_asset_sidecar(sub_id) {
@@ -317,9 +318,6 @@ pub fn extract_sub_asset(
     // next resolve reads the external file. A material sub-asset now resolves from the external
     // `.smat`, so drop its memoized resolution too.
     assets.model_by_uuid.remove(&model_id.value());
-    assets.mesh_by_uuid.remove(&sub_id.value());
-    assets.invalidate_texture_caches(sub_id);
-    assets.invalidate_material_caches();
     Ok(sub_id)
 }
 
@@ -365,7 +363,7 @@ pub fn clear_extraction(assets: &mut AssetServer, model_id: Uuid, sub_id: Uuid) 
         .iter()
         .find(|s| s.sub_id.value() == sub_id.value())
     {
-        assets.catalog.put(AssetEntry {
+        let replaced = assets.replace_edited_asset_entry(AssetEntry {
             id: sub_id,
             name: sub.name.clone(),
             asset_type: sub.asset_type,
@@ -377,12 +375,9 @@ pub fn clear_extraction(assets: &mut AssetServer, model_id: Uuid, sub_id: Uuid) 
             tracks: sub.tracks,
             ..AssetEntry::default()
         });
+        debug_assert!(replaced, "embedded sub-asset remains catalogued");
     }
     assets.model_by_uuid.remove(&model_id.value());
-    assets.mesh_by_uuid.remove(&sub_id.value());
-    assets.invalidate_texture_caches(sub_id);
-    // The sub-asset resolves from the embedded chunk again; drop its memoized material resolution.
-    assets.invalidate_material_caches();
     Ok(())
 }
 
@@ -490,16 +485,12 @@ pub fn reimport_model(assets: &mut AssetServer, model_id: Uuid) -> Result<Reimpo
     // sub-id's GPU ref so live instances re-resolve the new bytes.
     if let Ok(final_meta) = read_container_metadata(&container_full) {
         for row in catalog_rows_for_container(&final_meta, &bake.path, AssetType::Model) {
-            assets.catalog.put(row);
+            assets.register_reimported_asset(row);
         }
     }
-    assets.model_by_uuid.remove(&model_id.value());
-    for sid in new_subs.union(&old_subs) {
-        assets.mesh_by_uuid.remove(sid);
-        assets.invalidate_texture_caches(Uuid(*sid));
+    for sid in old_subs.difference(&new_subs) {
+        let _ = assets.asset_edited(Uuid(*sid));
     }
-    // Embedded material chunks were re-baked under stable ids, so their cached resolutions are stale.
-    assets.invalidate_material_caches();
     Ok(delta)
 }
 
@@ -1036,11 +1027,16 @@ pub fn delete_unused(
             continue;
         };
         crate::vegetation::remove_vegetation_map_package(assets, &entry)?;
-        let path = entry.path;
+        let path = entry.path.clone();
         let full = format!("{}/{path}", assets.root.display());
         let bytes = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&full);
         let _ = std::fs::remove_file(format!("{full}.smeta")); // foreign-file sidecar, if any
+        let removed = assets.delete_asset_entry(*id);
+        debug_assert!(
+            removed.is_some(),
+            "validated unused asset remains catalogued"
+        );
         result.deleted += 1;
         result.reclaimed_bytes += bytes;
         tracing::info!("delete-unused: removed '{path}' ({bytes} bytes)");
@@ -1141,9 +1137,8 @@ pub fn import_material_folder(
         if row.id == material_id {
             row.name = unique.clone();
         }
-        assets.catalog.put(row);
+        assets.register_imported_asset(row);
     }
-    assets.invalidate_material_caches();
     Ok(MaterialImportResult {
         material: material_id,
         roles: baked.roles,

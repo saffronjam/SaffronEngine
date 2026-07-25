@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use saffron_json::{Value, dump_json, json_string_or, json_u64_or, parse_json};
-use saffron_scene::{ComponentRegistry, Scene, seed_starter_scene};
+use saffron_scene::{AssetCatalog, ComponentRegistry, Scene, seed_starter_scene};
 
 use crate::AssetServer;
 use crate::catalog::{
@@ -487,11 +487,16 @@ impl AssetServer {
         ensure_script_library(Path::new(&project.root), sa_lua_defs);
 
         let empty_array = Value::Array(Vec::new());
-        catalog_from_json(&mut self.catalog, doc.get("assets").unwrap_or(&empty_array));
+        let mut loaded_catalog = AssetCatalog::default();
+        catalog_from_json(
+            &mut loaded_catalog,
+            doc.get("assets").unwrap_or(&empty_array),
+        );
         catalog_folders_from_json(
-            &mut self.catalog,
+            &mut loaded_catalog,
             doc.get("assetFolders").unwrap_or(&empty_array),
         );
+        self.replace_catalog(loaded_catalog);
         // The filesystem is the source of truth: reconcile the doc's catalog against disk
         // via the regenerable cache (a cold scan on a cache miss), so a never-saved import
         // is rediscovered and a deleted file's row is dropped. The doc names just loaded
@@ -569,10 +574,8 @@ impl AssetServer {
         host.wait_gpu_idle();
         *scene = Scene::default();
         seed_starter_scene(scene);
-        self.catalog.entries.clear();
-        self.catalog.folders.clear();
-        self.catalog.by_id.clear();
         self.clear_asset_caches();
+        self.replace_catalog(AssetCatalog::default());
         self.set_asset_root(root.join("assets"));
         ensure_script_src(&root);
         ensure_script_library(&root, sa_lua_defs);

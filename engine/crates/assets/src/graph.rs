@@ -189,6 +189,7 @@ pub fn emit_graph_surface(graph: &Value, mesh: bool) -> String {
     } else {
         body += concat!(
             "    s.normal = float3(0.0, 0.0, 1.0);\n",
+            "    s.sheetNormal = float3(0.0, 0.0, 1.0);\n",
             "    s.occlusion = 1.0;\n",
             "    s.opacity = mat.baseColor.a;\n",
             "    s.surfaceModel = 0u;\n",
@@ -374,6 +375,7 @@ mod tests {
         "    s.roughness = 1.0;\n",
         "    s.emissive = float3(0.0);\n",
         "    s.normal = float3(0.0, 0.0, 1.0);\n",
+        "    s.sheetNormal = float3(0.0, 0.0, 1.0);\n",
         "    s.occlusion = 1.0;\n",
         "    s.opacity = mat.baseColor.a;\n",
         "    s.surfaceModel = 0u;\n",
@@ -440,6 +442,7 @@ mod tests {
             "    s.roughness = 1.0;\n",
             "    s.emissive = float3(0.0);\n",
             "    s.normal = float3(0.0, 0.0, 1.0);\n",
+            "    s.sheetNormal = float3(0.0, 0.0, 1.0);\n",
             "    s.occlusion = 1.0;\n",
             "    s.opacity = mat.baseColor.a;\n",
             "    s.surfaceModel = 0u;\n",

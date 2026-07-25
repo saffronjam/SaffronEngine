@@ -204,10 +204,7 @@ impl AssetServer {
     pub fn scan_assets(&mut self) -> Result<ScanDelta> {
         let (rebuilt, delta) =
             reconcile_catalog_from_disk(&self.root, &self.catalog, &mut |_, _, _| {});
-        self.catalog = rebuilt;
-        // The catalog was rebuilt from disk (ids/paths may have changed), so any memoized material
-        // resolution keyed by id could be stale.
-        self.invalidate_material_caches();
+        self.replace_scanned_catalog(rebuilt);
         Ok(delta)
     }
 }
@@ -466,7 +463,7 @@ impl AssetServer {
     pub fn load_catalog(&mut self) -> Result<ScanDelta> {
         let (catalog, delta) =
             resolve_catalog_from_disk(&self.root, &self.catalog, &mut |_, _, _| {});
-        self.catalog = catalog;
+        self.replace_scanned_catalog(catalog);
         Ok(delta)
     }
 
@@ -666,7 +663,7 @@ impl AssetServer {
             spec.role
         };
         let unique = self.catalog.unique_name(spec.name);
-        self.catalog.put(AssetEntry {
+        self.register_imported_asset(AssetEntry {
             id,
             name: unique,
             asset_type: AssetType::Texture,

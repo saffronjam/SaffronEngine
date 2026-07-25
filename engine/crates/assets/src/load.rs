@@ -23,8 +23,10 @@ use std::sync::Arc;
 
 use saffron_core::Uuid;
 use saffron_geometry::{
-    AnimClip, ChunkKind, Mesh, MeshBvh, VertexSkin, decode_image_from_memory,
-    decode_image_from_memory_hdr, load_animation, load_animation_from_bytes, load_mesh_from_bytes,
+    AnimClip, ChunkKind, DecodedImage, Mesh, MeshBvh, PortableHierarchyInput,
+    PortableVirtualHierarchy, VertexSkin, cook_portable_virtual_hierarchy,
+    decode_image_from_memory, decode_image_from_memory_hdr, load_animation,
+    load_animation_from_bytes, load_mesh_from_bytes, load_mesh_hierarchy_from_bytes,
     load_mesh_morph_from_bytes, load_mesh_skin_from_bytes, translate_model,
 };
 use saffron_rendering::{GpuMesh, GpuTexture, SdfBake};
@@ -39,6 +41,14 @@ use crate::{AssetServer, PREVIEW_FLOOR_MESH_ID};
 pub(crate) struct CpuMeshSource {
     pub(crate) mesh: Mesh,
     pub(crate) skin: Vec<VertexSkin>,
+}
+
+fn hierarchy_for_generated_mesh(
+    mesh: &Mesh,
+    skin: &[VertexSkin],
+) -> saffron_geometry::Result<PortableVirtualHierarchy> {
+    let input = PortableHierarchyInput::from_mesh(mesh, skin)?;
+    cook_portable_virtual_hierarchy(&input)
 }
 
 /// The `Colorspace` a `.smodel` texture chunk's `flags` word encodes.
@@ -106,8 +116,22 @@ impl AssetServer {
             return cached.clone();
         }
         let result = self.upload_mesh_from_source(gpu, sub_id, source, sdf_bake);
+        if result.is_some() {
+            self.page_source_by_uuid.insert(
+                sub_id.value(),
+                crate::page_stream::PagePayloadSource::Artifact(source.clone()),
+            );
+        }
         self.mesh_by_uuid.insert(sub_id.value(), result.clone());
         result
+    }
+
+    /// The recorded page-payload source for a loaded mesh, if any.
+    pub fn page_payload_source(
+        &self,
+        sub_id: Uuid,
+    ) -> Option<crate::page_stream::PagePayloadSource> {
+        self.page_source_by_uuid.get(&sub_id.value()).cloned()
     }
 
     /// Reads + decodes + uploads the mesh, GPU-baking (or cache-loading) its signed distance
@@ -134,12 +158,19 @@ impl AssetServer {
                 return None;
             }
         };
+        let hierarchy = match load_mesh_hierarchy_from_bytes(&bytes) {
+            Ok(hierarchy) => hierarchy,
+            Err(err) => {
+                tracing::warn!("mesh {}: {err}", sub_id.value());
+                return None;
+            }
+        };
         // A skinned `.smesh` carries a parallel skin stream; an unskinned one returns an
         // empty stream (the uploader treats an empty skin as a static mesh). A morph
         // `.smesh` carries its sparse deltas; the deform pass reads them on the GPU.
         let skin = load_mesh_skin_from_bytes(&bytes).unwrap_or_default();
         let morph = load_mesh_morph_from_bytes(&bytes).ok().flatten();
-        match gpu.upload_mesh(&mesh, &skin, morph.as_ref(), sdf_bake.as_ref()) {
+        match gpu.upload_mesh(&mesh, &hierarchy, &skin, morph.as_ref(), sdf_bake.as_ref()) {
             Ok(mesh_ref) => Some(mesh_ref),
             Err(err) => {
                 tracing::warn!("mesh {}: {err}", sub_id.value());
@@ -317,6 +348,9 @@ impl AssetServer {
         if let Some(builtin) = crate::BuiltinMesh::from_reserved_id(id) {
             return self.seed_builtin_mesh(gpu, builtin);
         }
+        if id == crate::EDITOR_CAMERA_MESH_ID {
+            return self.seed_editor_camera_mesh(gpu);
+        }
         // Extract the owned row fields, dropping the catalog borrow before the `&mut self`
         // resolve/upload calls below.
         let (container, rel_path) = match self.catalog.find(id) {
@@ -349,6 +383,42 @@ impl AssetServer {
         id: Uuid,
     ) -> Option<Arc<GpuTexture>> {
         self.load_texture_asset_role(gpu, id, false)
+    }
+
+    /// Resolves and caches the exact decoded RGBA8 source pixels for CPU coverage queries.
+    pub(crate) fn load_texture_pixels(&mut self, id: Uuid) -> Option<Arc<DecodedImage>> {
+        if let Some(cached) = self.texture_pixels_by_uuid.get(&id.value()) {
+            return cached.clone();
+        }
+        let (container, path) = match self.catalog.find(id) {
+            Some(entry) if entry.asset_type == AssetType::Texture => {
+                (entry.container, entry.path.clone())
+            }
+            _ => {
+                self.texture_pixels_by_uuid.insert(id.value(), None);
+                return None;
+            }
+        };
+        let source = if container.value() == 0 {
+            ByteSource {
+                path: format!("{}/{}", self.root.display(), path),
+                ..ByteSource::default()
+            }
+        } else {
+            let Some(model) = self.load_model_asset(container) else {
+                self.texture_pixels_by_uuid.insert(id.value(), None);
+                return None;
+            };
+            self.chunk_source_for(&model, ChunkKind::Texture, id)
+        };
+        let decoded = source
+            .read()
+            .ok()
+            .and_then(|bytes| decode_image_from_memory(&bytes).ok())
+            .map(Arc::new);
+        self.texture_pixels_by_uuid
+            .insert(id.value(), decoded.clone());
+        decoded
     }
 
     /// Resolves a texture id as a **displacement height map**: identical resolution to
@@ -604,8 +674,21 @@ impl AssetServer {
                 .insert(PREVIEW_FLOOR_MESH_ID.value(), None);
             return false;
         };
-        match gpu.upload_mesh(mesh, &[], None, None) {
+        let hierarchy = match hierarchy_for_generated_mesh(mesh, &[]) {
+            Ok(hierarchy) => hierarchy,
+            Err(err) => {
+                tracing::warn!("preview floor mesh: {err}");
+                self.mesh_by_uuid
+                    .insert(PREVIEW_FLOOR_MESH_ID.value(), None);
+                return false;
+            }
+        };
+        match gpu.upload_mesh(mesh, &hierarchy, &[], None, None) {
             Ok(mesh_ref) => {
+                self.page_source_by_uuid.insert(
+                    PREVIEW_FLOOR_MESH_ID.value(),
+                    crate::page_stream::PagePayloadSource::Cooked(std::sync::Arc::new(hierarchy)),
+                );
                 self.mesh_by_uuid
                     .insert(PREVIEW_FLOOR_MESH_ID.value(), Some(mesh_ref));
                 true
@@ -629,8 +712,21 @@ impl AssetServer {
         builtin: crate::BuiltinMesh,
     ) -> Option<Arc<GpuMesh>> {
         let key = builtin.reserved_id().value();
-        match gpu.upload_mesh(&builtin.geometry(), &[], None, None) {
+        let mesh = builtin.geometry();
+        let hierarchy = match hierarchy_for_generated_mesh(&mesh, &[]) {
+            Ok(hierarchy) => hierarchy,
+            Err(err) => {
+                tracing::warn!("built-in {builtin:?} mesh: {err}");
+                self.mesh_by_uuid.insert(key, None);
+                return None;
+            }
+        };
+        match gpu.upload_mesh(&mesh, &hierarchy, &[], None, None) {
             Ok(mesh_ref) => {
+                self.page_source_by_uuid.insert(
+                    key,
+                    crate::page_stream::PagePayloadSource::Cooked(std::sync::Arc::new(hierarchy)),
+                );
                 self.mesh_by_uuid.insert(key, Some(mesh_ref.clone()));
                 Some(mesh_ref)
             }
@@ -642,46 +738,43 @@ impl AssetServer {
         }
     }
 
-    /// Loads (attempted exactly once) the editor-camera gizmo mesh + its dark resolved
-    /// material into [`AssetServer::editor_camera_model`], returning whether a live mesh
-    /// is now present.
-    ///
-    /// A failed attempt sets `attempted` and does not re-translate; a later call returns
-    /// `false` directly without re-translating. The skinned editor-camera variant uploads
-    /// with its skin stream. The caller reads the visual back through
-    /// [`AssetServer::editor_camera_model`].
-    pub fn load_editor_camera_model(&mut self, gpu: &dyn GpuUploader) -> bool {
-        if self.editor_camera_model.attempted {
-            return self.editor_camera_model.mesh.is_some();
-        }
-        self.editor_camera_model.attempted = true;
+    /// Seeds the editor-camera gizmo mesh (the reserved [`crate::EDITOR_CAMERA_MESH_ID`])
+    /// into the GPU mesh cache from the engine's `models/editor-camera.glb`, plus its dark
+    /// material under [`crate::EDITOR_CAMERA_MATERIAL_ID`]. A failed translate/upload
+    /// caches `None`, so the load is attempted exactly once (until a project-switch cache
+    /// clear re-seeds on demand).
+    fn seed_editor_camera_mesh(&mut self, gpu: &dyn GpuUploader) -> Option<Arc<GpuMesh>> {
+        let key = crate::EDITOR_CAMERA_MESH_ID.value();
+        let fail = |assets: &mut Self, err: String| {
+            tracing::warn!("editor camera model: {err}");
+            assets.mesh_by_uuid.insert(key, None);
+            None
+        };
         let model = match translate_model(engine_asset_path("models/editor-camera.glb")) {
             Ok(model) => model,
-            Err(err) => {
-                tracing::warn!("editor camera model: {err}");
-                return false;
-            }
+            Err(err) => return fail(self, err.to_string()),
         };
         let skin = model
             .skin
             .as_ref()
             .map_or(&[][..], |skin| skin.stream.as_slice());
         let Some(mesh) = model.primary_mesh() else {
-            tracing::warn!("editor camera model: no geometry");
-            return false;
+            return fail(self, "no geometry".to_owned());
         };
-        let submesh_count = mesh.submeshes.len().max(1);
-        let mesh_ref = match gpu.upload_mesh(mesh, skin, None, None) {
+        let hierarchy = match hierarchy_for_generated_mesh(mesh, skin) {
+            Ok(hierarchy) => hierarchy,
+            Err(err) => return fail(self, err.to_string()),
+        };
+        let mesh_ref = match gpu.upload_mesh(mesh, &hierarchy, skin, None, None) {
             Ok(mesh_ref) => mesh_ref,
-            Err(err) => {
-                tracing::warn!("editor camera model: {err}");
-                return false;
-            }
+            Err(err) => return fail(self, err.to_string()),
         };
-        self.editor_camera_model.mesh = Some(mesh_ref);
-        let material = editor_camera_material();
-        self.editor_camera_model.submesh_materials = vec![material; submesh_count];
-        true
+        self.page_source_by_uuid.insert(
+            key,
+            crate::page_stream::PagePayloadSource::Cooked(std::sync::Arc::new(hierarchy)),
+        );
+        self.mesh_by_uuid.insert(key, Some(mesh_ref.clone()));
+        Some(mesh_ref)
     }
 
     /// The standalone-mesh path with the `meshes/` → `models/` fixup: a row whose file is
@@ -698,14 +791,18 @@ impl AssetServer {
     }
 }
 
-/// The dark, slightly-emissive resolved material the editor-camera gizmo renders with.
-fn editor_camera_material() -> saffron_rendering::SubmeshMaterial {
+/// The dark, slightly-emissive resolved material the editor-camera gizmo renders with
+/// (the reserved [`crate::EDITOR_CAMERA_MATERIAL_ID`], answered analytically by the
+/// material loader like the default material).
+pub(crate) fn editor_camera_material_asset() -> crate::MaterialAsset {
     use saffron_geometry::glam::{Vec3, Vec4};
-    let mut material = saffron_rendering::SubmeshMaterial::defaults();
-    material.base_color = Vec4::new(0.02, 0.018, 0.016, 1.0);
-    material.roughness = 0.78;
-    material.emissive = Vec3::splat(0.012);
-    material
+    crate::MaterialAsset {
+        base_color: Vec4::new(0.02, 0.018, 0.016, 1.0),
+        roughness: 0.78,
+        emissive: Vec3::splat(0.012),
+        emissive_strength: 1.0,
+        ..crate::material::default_material_asset()
+    }
 }
 
 /// Reads + decodes + uploads the texture (the colorspace selects the uploader), or
@@ -878,6 +975,7 @@ mod tests {
         inner: RendererUploader<'a>,
         mesh_uploads: AtomicUsize,
         texture_uploads: AtomicUsize,
+        fail_mesh_uploads: bool,
     }
 
     impl<'a> CountingUploader<'a> {
@@ -886,7 +984,14 @@ mod tests {
                 inner: RendererUploader::new(uploader, descriptors, true),
                 mesh_uploads: AtomicUsize::new(0),
                 texture_uploads: AtomicUsize::new(0),
+                fail_mesh_uploads: false,
             }
+        }
+
+        /// Every mesh upload counts an attempt and then fails, for the negative-cache path.
+        fn fail_mesh_uploads(mut self) -> Self {
+            self.fail_mesh_uploads = true;
+            self
         }
     }
 
@@ -894,12 +999,19 @@ mod tests {
         fn upload_mesh(
             &self,
             mesh: &Mesh,
+            hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
             sdf_bake: Option<&saffron_rendering::SdfBake>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
             self.mesh_uploads.fetch_add(1, Ordering::SeqCst);
-            self.inner.upload_mesh(mesh, skin, morph, sdf_bake)
+            if self.fail_mesh_uploads {
+                return Err(saffron_rendering::Error::InvalidUploadData(
+                    "injected upload failure".to_owned(),
+                ));
+            }
+            self.inner
+                .upload_mesh(mesh, hierarchy, skin, morph, sdf_bake)
         }
 
         fn upload_texture(
@@ -974,8 +1086,6 @@ mod tests {
             // VMA allocations + returns the bindless slots), then the borrowing sub-state,
             // then the device last.
             device.wait_idle().expect("idle before teardown");
-            assets.editor_camera_model.mesh = None;
-            assets.editor_camera_model.submesh_materials.clear();
             assets.clear_asset_caches();
             drop(assets);
             drop(uploader);
@@ -1121,31 +1231,12 @@ mod tests {
         let dir = scratch("uploadfail");
         let root = dir.join("project").join("assets");
         let mut assets = AssetServer::new(&root);
-        // A `.smesh` of an empty mesh: it reads + decodes fine, but `upload_mesh` rejects
-        // it (`EmptyMesh`) — the upload-failure path.
+        // A valid `.smesh` whose upload the uploader fails by injection — the
+        // upload-failure path.
         let id = Uuid(5200);
-        let rel = "meshes/empty.smesh";
-        std::fs::create_dir_all(format!("{}/meshes", root.display())).unwrap();
-        let empty = Mesh {
-            vertices: Vec::new(),
-            indices: Vec::new(),
-            submeshes: Vec::new(),
-        };
-        std::fs::write(
-            format!("{}/{rel}", root.display()),
-            save_mesh_to_buffer(&empty, &[], None).unwrap(),
-        )
-        .unwrap();
-        assets.catalog.put(AssetEntry {
-            id,
-            name: "empty".to_owned(),
-            asset_type: AssetType::Mesh,
-            path: rel.to_owned(),
-            chunk: -1,
-            ..AssetEntry::default()
-        });
+        write_standalone_mesh(&mut assets, id, "uploadfail");
 
-        let gpu = fx.counting();
+        let gpu = fx.counting().fail_mesh_uploads();
         assert!(assets.load_mesh_asset(&gpu, id).is_none());
         assert!(matches!(assets.mesh_by_uuid.get(&id.value()), Some(None)));
         assert_eq!(
@@ -1394,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn load_editor_camera_model_is_attempted_exactly_once() {
+    fn editor_camera_mesh_seeds_once_and_caches() {
         let Some(fx) = gpu_or_skip() else {
             return;
         };
@@ -1408,27 +1499,26 @@ mod tests {
         let mut assets = AssetServer::new(&root);
 
         let gpu = RendererUploader::new(&fx.uploader, &fx.descriptors, true);
+        let first = assets
+            .load_mesh_asset(&gpu, crate::EDITOR_CAMERA_MESH_ID)
+            .expect("the editor-camera model seeds on first resolve");
         assert!(
-            assets.load_editor_camera_model(&gpu),
-            "the editor-camera model uploads"
-        );
-        assert!(assets.editor_camera_model.attempted);
-        assert!(assets.editor_camera_model.mesh.is_some());
-        assert!(
-            !assets.editor_camera_model.submesh_materials.is_empty(),
-            "the dark resolved material is assigned"
+            assets
+                .material_by_uuid
+                .get(&crate::EDITOR_CAMERA_MATERIAL_ID.value())
+                .is_some_and(|entry| entry.is_some()),
+            "the dark material seeds beside the mesh"
         );
 
-        // The attempted-once contract: clear the mesh handle (as if the attempt had
-        // failed) but keep `attempted` set — a second call must take the early-return path
-        // and NOT re-translate/re-upload, so it reports no mesh.
-        assets.editor_camera_model.mesh = None;
-        assert!(
-            !assets.load_editor_camera_model(&gpu),
-            "a recorded attempt is never retried"
-        );
-        assert!(assets.editor_camera_model.mesh.is_none());
+        // The cache contract: a second resolve returns the same live `Arc` without
+        // re-translating.
+        let second = assets
+            .load_mesh_asset(&gpu, crate::EDITOR_CAMERA_MESH_ID)
+            .expect("cached resolve");
+        assert!(Arc::ptr_eq(&first, &second), "the seeded mesh is cached");
 
+        drop(first);
+        drop(second);
         fx.teardown(assets);
         let _ = std::fs::remove_dir_all(&dir);
     }

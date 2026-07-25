@@ -129,7 +129,7 @@ pub fn save_environment_profile(
     std::fs::write(assets.root.join(&relative_path), &text)
         .map_err(|error| Error::Io(error.to_string()))?;
     let unique_name = assets.catalog.unique_name(name);
-    assets.catalog.put(AssetEntry {
+    assets.register_imported_asset(AssetEntry {
         id,
         name: unique_name,
         asset_type: AssetType::Environment,
@@ -168,9 +168,9 @@ pub fn update_environment_profile(
     let text = saffron_json::dump_json_sorted(&environment_to_json(environment), 2);
     std::fs::write(assets.root.join(relative_path), &text)
         .map_err(|error| Error::Io(error.to_string()))?;
-    assets
-        .catalog
-        .set_content_hash(id, hash_bytes_fnv(text.as_bytes()));
+    let hash = hash_bytes_fnv(text.as_bytes());
+    let updated = assets.update_asset_content_hash(id, hash);
+    debug_assert!(updated, "validated environment remains catalogued");
     Ok(())
 }
 

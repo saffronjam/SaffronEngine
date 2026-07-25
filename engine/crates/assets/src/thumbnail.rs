@@ -173,6 +173,8 @@ pub enum PreviewRenderKind {
     Model(Uuid),
     /// An HDRI, shown as a chrome ball reflecting the equirect (which also backs the tile).
     Hdri(Uuid),
+    /// A plant family, shown as its compiled renderable form on the studio floor.
+    Plant(Uuid),
 }
 
 /// One queued main-graph preview render: the subject, the square size, and the content-addressed
@@ -806,7 +808,7 @@ pub fn request_thumbnail(assets: &mut AssetServer, id: Uuid, size: u32) -> Resul
     // keys on its live resolved state, so it falls through to the job build below.
     if matches!(
         entry.asset_type,
-        AssetType::Texture | AssetType::Mesh | AssetType::Model
+        AssetType::Texture | AssetType::Mesh | AssetType::Model | AssetType::Plant
     ) && entry.content_hash != 0
     {
         let cache_path = assets.thumbnail_content_cache_path(entry.content_hash, size);
@@ -827,7 +829,8 @@ pub fn request_thumbnail(assets: &mut AssetServer, id: Uuid, size: u32) -> Resul
     // Self-heal a legacy row: persist the derived hash so later boots take the cheap path
     // above instead of re-loading the container every time.
     if job.self_healed && job.content_hash != 0 {
-        assets.catalog.set_content_hash(id, job.content_hash);
+        let updated = assets.backfill_asset_content_hash(id, job.content_hash);
+        debug_assert!(updated, "thumbnail subject remains catalogued");
         assets.write_catalog_cache();
     }
 
@@ -852,7 +855,6 @@ pub fn request_thumbnail(assets: &mut AssetServer, id: Uuid, size: u32) -> Resul
 
 fn vegetation_icon_svg(asset_type: AssetType) -> Option<&'static str> {
     match asset_type {
-        AssetType::Plant => Some(include_str!("../../../assets/icons/sprout.svg")),
         AssetType::Biome => Some(include_str!("../../../assets/icons/tree-pine.svg")),
         AssetType::VegetationMap => Some(include_str!("../../../assets/icons/map.svg")),
         _ => None,
@@ -897,12 +899,13 @@ fn entry_preview_kind(entry: &saffron_scene::AssetEntry, id: Uuid) -> PreviewRen
     match entry.asset_type {
         AssetType::Mesh => PreviewRenderKind::Mesh(id),
         AssetType::Model => PreviewRenderKind::Model(id),
+        AssetType::Plant => PreviewRenderKind::Plant(id),
         AssetType::Texture if entry.role == TextureRole::Hdri => PreviewRenderKind::Hdri(id),
         AssetType::Texture => PreviewRenderKind::TextureRole {
             tid: id,
             role: entry.role,
         },
-        _ => unreachable!("only texture/mesh/model reach the stored-hash cheap path"),
+        _ => unreachable!("only texture/mesh/model/plant reach the stored-hash cheap path"),
     }
 }
 

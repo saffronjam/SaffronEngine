@@ -39,6 +39,14 @@ pub enum Error {
     #[error("vegetation error: {0}")]
     Vegetation(#[from] saffron_vegetation::Error),
 
+    /// A material surface or coverage contract failed validation.
+    #[error("material error: {0}")]
+    Material(#[from] saffron_material::Error),
+
+    /// The GPU-scene mirror could not represent canonical state as device records.
+    #[error("gpu scene mirror error: {0}")]
+    GpuSceneMirror(String),
+
     /// Two different byte streams resolved to the same vegetation CAS path.
     #[error("vegetation artifact content-address collision at {path}")]
     VegetationArtifactCollision {
