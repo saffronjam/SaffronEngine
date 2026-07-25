@@ -266,6 +266,57 @@ impl SignedUnit {
     }
 }
 
+/// A quantized unit quaternion in canonical XYZW order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QuantizedOrientation([SignedUnit; 4]);
+
+impl QuantizedOrientation {
+    /// Identity orientation.
+    #[must_use]
+    pub fn identity() -> Self {
+        Self([
+            SignedUnit::from_bits(0).expect("zero is a signed unit"),
+            SignedUnit::from_bits(0).expect("zero is a signed unit"),
+            SignedUnit::from_bits(0).expect("zero is a signed unit"),
+            SignedUnit::from_bits(i16::MAX).expect("positive one is a signed unit"),
+        ])
+    }
+
+    /// Constructs a non-zero normalized quaternion within quantization tolerance.
+    pub fn new(bits: [i16; 4]) -> Result<Self> {
+        let lanes = bits
+            .map(SignedUnit::from_bits)
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let length_squared: i64 = bits
+            .into_iter()
+            .map(|value| i64::from(value) * i64::from(value))
+            .sum();
+        let unit = i64::from(i16::MAX) * i64::from(i16::MAX);
+        let tolerance = unit / 512;
+        if length_squared.abs_diff(unit) > tolerance as u64 {
+            return Err(Error::InvalidOrientation);
+        }
+        Ok(Self(
+            lanes
+                .try_into()
+                .expect("four orientation lanes were collected"),
+        ))
+    }
+
+    /// Canonical signed normalized lane bits.
+    #[must_use]
+    pub fn bits(self) -> [i16; 4] {
+        self.0.map(SignedUnit::bits)
+    }
+}
+
+impl Default for QuantizedOrientation {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
 /// A finite float with canonical zero and total ordering, for non-authoritative sort keys.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CanonicalF32(f32);
@@ -401,6 +452,24 @@ mod tests {
             DecisionScalar::from_bits(i32::MAX)
                 .checked_add(DecisionScalar::from_bits(1))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn quantized_orientation_requires_a_unit_quaternion() {
+        let identity = QuantizedOrientation::identity();
+        assert_eq!(identity.bits(), [0, 0, 0, i16::MAX]);
+        assert_eq!(
+            QuantizedOrientation::new([0, 0, 0, i16::MAX]).unwrap(),
+            identity
+        );
+        assert_eq!(
+            QuantizedOrientation::new([0, 0, 0, 0]).unwrap_err(),
+            Error::InvalidOrientation
+        );
+        assert_eq!(
+            QuantizedOrientation::new([i16::MIN, 0, 0, 0]).unwrap_err(),
+            Error::NormalizedRange
         );
     }
 

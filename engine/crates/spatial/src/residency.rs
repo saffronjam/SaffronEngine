@@ -77,6 +77,12 @@ impl ResidencyMask {
         self.0 & (1 << facet as u8) != 0
     }
 
+    /// The packed facet bits, for hashing a source's demand into its revision.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
     /// Facets in canonical order.
     pub fn iter(self) -> impl Iterator<Item = ResidencyFacet> {
         ResidencyFacet::ALL

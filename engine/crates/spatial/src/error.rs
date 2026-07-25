@@ -15,6 +15,9 @@ pub enum Error {
     /// A byte sequence is not a canonical cell encoding.
     #[error("invalid canonical cell encoding")]
     InvalidCellEncoding,
+    /// A plant identity's bytes carry an unassigned namespace tag or a zero payload.
+    #[error("invalid plant identity")]
+    InvalidPlantId,
     /// Exact cell enumeration exceeds its caller-supplied hard bound.
     #[error("cell enumeration limit exceeded: requested {requested}, limit {limit}")]
     CellEnumerationLimit {
@@ -41,6 +44,9 @@ pub enum Error {
     /// A normalized input lies outside its closed range.
     #[error("normalized input lies outside its range")]
     NormalizedRange,
+    /// Quantized quaternion lanes do not form a unit orientation within tolerance.
+    #[error("orientation is not a quantized unit quaternion")]
+    InvalidOrientation,
     /// A curve has duplicate or descending abscissae.
     #[error("curve points must have unique ascending abscissae")]
     CurveOrder,

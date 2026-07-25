@@ -10,6 +10,7 @@ mod coordinate;
 mod error;
 mod fixture;
 mod numeric;
+mod plant_identity;
 mod random;
 mod residency;
 mod surface;
@@ -23,8 +24,9 @@ pub use error::{Error, Result};
 pub use fixture::{FOREST_BASELINE_SPEC, ForestBaselineSpec, SpatialFixture};
 pub use numeric::{
     CanonicalF32, DecisionCurve, DecisionHessian3, DecisionScalar, DecisionVec3, FixedI32,
-    SignedUnit, UnitInterval, div_round_ties_even,
+    QuantizedOrientation, SignedUnit, UnitInterval, div_round_ties_even,
 };
+pub use plant_identity::{PlantId, PlantIdNamespace};
 pub use random::{PHILOX4X32_ZERO_VECTOR, RandomDomain, RandomStream, philox4x32_10};
 pub use residency::{
     DEFAULT_SOURCE_CLAIM_BUDGET, FACET_COUNT, GenerationSlot, GenerationToken, JobPriorityKey,
