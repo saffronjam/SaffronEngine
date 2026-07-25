@@ -148,10 +148,10 @@ where
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
                 let ext = span.extensions();
-                if let Some(fields) = ext.get::<FormattedFields<N>>() {
-                    if !fields.fields.is_empty() {
-                        write!(writer, "[{}] ", fields.fields)?;
-                    }
+                if let Some(fields) = ext.get::<FormattedFields<N>>()
+                    && !fields.fields.is_empty()
+                {
+                    write!(writer, "[{}] ", fields.fields)?;
                 }
             }
         }

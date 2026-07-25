@@ -15,8 +15,8 @@ use std::rc::Rc;
 
 use saffron_app::{App, AppConfig, Layer, attach_layer, run};
 use saffron_assets::{
-    AssetServer, ProjectHost, ProjectInfo, RenderSceneOptions, RendererScene, RendererUploader,
-    advance_time_of_day, render_scene, scene_surface_field_snapshots,
+    AssetServer, GpuSceneMirror, ProjectHost, ProjectInfo, RenderSceneOptions, RendererScene,
+    RendererUploader, advance_time_of_day, render_scene, scene_surface_field_snapshots,
 };
 use saffron_core::TimeSpan;
 use saffron_protocol::AppManifest;
@@ -179,6 +179,8 @@ struct PlayerLayer {
     registry: ComponentRegistry,
     project: ProjectInfo,
     uploader: Option<Uploader>,
+    /// The journal-driven bridge feeding the renderer's persistent GPU scene.
+    gpu_scene_mirror: GpuSceneMirror,
     /// The gameplay input, shared with the window-signal closures that mutate it.
     input: Rc<RefCell<ScriptInputState>>,
     started: bool,
@@ -198,6 +200,7 @@ impl PlayerLayer {
             registry: register_builtin_components(),
             project: ProjectInfo::default(),
             uploader: None,
+            gpu_scene_mirror: GpuSceneMirror::new(),
             input: Rc::new(RefCell::new(ScriptInputState::default())),
             started: false,
             warned_no_camera: false,
@@ -413,6 +416,21 @@ impl Layer for PlayerLayer {
             return;
         }
 
+        let world = renderer.active_view_id().gpu_scene_world();
+        let vegetation_cell = self.runtime.vegetation_cell();
+        let vegetation = vegetation_cell.borrow();
+        if let Err(error) = self.gpu_scene_mirror.sync_renderer_world(
+            world,
+            &mut self.scene,
+            vegetation.as_ref(),
+            &mut self.assets,
+            renderer,
+            uploader,
+        ) {
+            tracing::error!("saffron-player: gpu scene mirror sync: {error}");
+        }
+        drop(vegetation);
+
         if let Some(cam) = self.scene.primary_camera() {
             let skinning = renderer.skinning_enabled();
             let mut driver = RendererScene::new(renderer, uploader, skinning);
@@ -424,6 +442,7 @@ impl Layer for PlayerLayer {
                 &mut driver,
                 &mut self.scene,
                 &mut self.assets,
+                &self.gpu_scene_mirror,
                 &cam,
                 options,
             );

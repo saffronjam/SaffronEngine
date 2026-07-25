@@ -338,11 +338,10 @@ impl TestEngine {
         };
         if env.iter().any(|(key, value)| {
             matches!(*key, "SAFFRON_PROJECT" | "SAFFRON_SCRATCH_PROJECT") && !value.is_empty()
-        }) {
-            if let Err(error) = engine.wait_for_project_ready() {
-                engine.shutdown();
-                return Err(error);
-            }
+        }) && let Err(error) = engine.wait_for_project_ready()
+        {
+            engine.shutdown();
+            return Err(error);
         }
         Ok(engine)
     }
@@ -509,10 +508,10 @@ fn engine_binary() -> PathBuf {
     }
     // The test binary lives in `target/<profile>/deps/`; the host is two levels up, in
     // `target/<profile>/saffron-host`.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(profile_dir) = exe.parent().and_then(|deps| deps.parent()) {
-            return profile_dir.join("saffron-host");
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(profile_dir) = exe.parent().and_then(|deps| deps.parent())
+    {
+        return profile_dir.join("saffron-host");
     }
     PathBuf::from("saffron-host")
 }
