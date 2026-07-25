@@ -29,7 +29,6 @@ use crate::descriptors::Descriptors;
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::gpu_types::GpuLight;
 use crate::resources::{Buffer, DeviceResources};
-use crate::targets::Targets;
 use crate::{Device, Result};
 
 /// Froxel cluster grid: X×Y screen tiles, Z exponential view-space slices. Must match
@@ -54,19 +53,11 @@ const CLUSTER_STRIDE: vk::DeviceSize =
 /// thereafter.
 const LIGHT_LIST_INITIAL: u32 = 16;
 
-/// Directional / spot shadow-map resolution.
-pub const SHADOW_MAP_SIZE: u32 = 2048;
 /// Constant depth bias for the shadow depth pass (units of D32 depth) — kills acne
 /// without obvious peter-panning on llvmpipe.
 pub const SHADOW_DEPTH_BIAS_CONSTANT: f32 = 1.25;
 /// Slope-scaled depth bias for the shadow depth pass.
 pub const SHADOW_DEPTH_BIAS_SLOPE: f32 = 2.0;
-
-/// Per-face resolution of the omnidirectional point-shadow distance cube.
-pub const POINT_SHADOW_SIZE: u32 = 512;
-/// The point-shadow cube's color format — `R32_SFLOAT` world distance to the nearest
-/// occluder.
-pub const POINT_SHADOW_COLOR_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 
 /// The per-frame directional + ambient + eye + shadow-transform UBO (set 1, binding 0).
 /// std140-compatible: every member is a 16-byte-aligned `vec4`/`uvec4`/`mat4` block, so
@@ -89,8 +80,6 @@ pub struct LightUbo {
     pub counts: UVec4,
     /// `xyz` world-space camera position.
     pub eye_position: Vec4,
-    /// Directional light-space transform (world → shadow clip).
-    pub shadow_view_proj: Mat4,
     /// Shadowed spot light-space transform (perspective).
     pub spot_shadow_view_proj: Mat4,
     /// `x` shadowed spot's light index, `y` enabled (0/1).
@@ -136,10 +125,34 @@ pub struct LightUbo {
     pub cloud_shadow_centers: [Vec4; CLOUD_SHADOW_CASCADES as usize],
     /// `x` ESM exponent, `y` cloud/fog strength, `z` surface strength, `w` enabled.
     pub cloud_shadow_meta: Vec4,
+    /// `xy` mean wind direction (x, z), `z` speed m/s, `w` gust fraction.
+    pub wind_dir_speed_gust: Vec4,
+    /// `x` turbulence roughness, `y` gust frequency Hz, `z` reference height m,
+    /// `w` height shear exponent.
+    pub wind_params: Vec4,
+    /// `x` turbulence octaves, `y` phase seed.
+    pub wind_meta: UVec4,
+    /// `x` simulation seconds this frame, `y` previous frame's seconds.
+    pub wind_time: Vec4,
+    /// The frame's local wind-source list (device address; the count rides
+    /// `wind_meta.z`).
+    pub wind_sources: u64,
+    /// Reserved ABI tail word.
+    pub wind_sources_reserved: u64,
+    /// World → light rotation of the directional virtual shadow space.
+    pub vsm_basis: Mat4,
+    /// Per clip level: window origin (light-plane metres) in `xy`, extent in `z`.
+    pub vsm_levels: [Vec4; crate::VSM_DIRECTIONAL_LEVELS as usize],
+    /// `x` = light-space depth centre, `y` = depth half-span, `z` = enabled flag.
+    pub vsm_params: Vec4,
+    /// The frame's page-table device address (8 levels × 1024 packed entries).
+    pub vsm_page_table: u64,
+    /// Reserved ABI tail word.
+    pub vsm_reserved: u64,
 }
 
 const _: () = assert!(
-    size_of::<LightUbo>() == 592,
+    size_of::<LightUbo>() == 832,
     "LightUbo must match the std140 shader layout"
 );
 
@@ -152,7 +165,6 @@ impl Default for LightUbo {
             moon_color: Vec4::ZERO,
             counts: UVec4::ZERO,
             eye_position: Vec4::ZERO,
-            shadow_view_proj: Mat4::IDENTITY,
             spot_shadow_view_proj: Mat4::IDENTITY,
             spot_shadow: UVec4::ZERO,
             point_shadow: Vec4::new(0.0, 0.0, 0.0, 1.0),
@@ -172,6 +184,17 @@ impl Default for LightUbo {
             cloud_shadow_up: Vec4::Z,
             cloud_shadow_centers: [Vec4::ZERO; CLOUD_SHADOW_CASCADES as usize],
             cloud_shadow_meta: Vec4::ZERO,
+            wind_dir_speed_gust: Vec4::new(0.0, 1.0, 0.0, 0.0),
+            wind_params: Vec4::new(0.55, 0.15, 10.0, 0.2),
+            wind_meta: UVec4::ZERO,
+            wind_time: Vec4::ZERO,
+            wind_sources: 0,
+            wind_sources_reserved: 0,
+            vsm_basis: Mat4::IDENTITY,
+            vsm_levels: [Vec4::ZERO; crate::VSM_DIRECTIONAL_LEVELS as usize],
+            vsm_params: Vec4::ZERO,
+            vsm_page_table: 0,
+            vsm_reserved: 0,
         }
     }
 }
@@ -230,6 +253,66 @@ pub struct ClusterCamera {
 
 /// The scene-lighting state the per-frame light UBO is derived from. The directional
 /// light + ambient + eye + the punctual list; the rest of the UBO's flags are folded in
+/// The shared wind field's per-frame parameters, mirrored into the light UBO for
+/// the shader-side sampler.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneWind {
+    /// Horizontal direction in degrees, clockwise from world +Z.
+    pub orientation: f32,
+    /// Mean advection speed in metres per second at the reference height.
+    pub speed: f32,
+    /// Turbulent fraction of the mean speed.
+    pub gust: f32,
+    /// Turbulence octave count.
+    pub turbulence_octaves: u32,
+    /// Per-octave amplitude falloff.
+    pub turbulence_roughness: f32,
+    /// Gust-front passage frequency in hertz.
+    pub gust_frequency: f32,
+    /// Height in metres at which `speed` is authored.
+    pub reference_height: f32,
+    /// Power-law shear exponent.
+    pub height_exponent: f32,
+    /// Deterministic phase seed.
+    pub seed: u32,
+    /// Monotonic simulation seconds.
+    pub time_s: f64,
+}
+
+impl Default for SceneWind {
+    fn default() -> Self {
+        Self {
+            orientation: 0.0,
+            speed: 0.0,
+            gust: 0.0,
+            turbulence_octaves: 0,
+            turbulence_roughness: 0.55,
+            gust_frequency: 0.15,
+            reference_height: 10.0,
+            height_exponent: 0.2,
+            seed: 0,
+            time_s: 0.0,
+        }
+    }
+}
+
+impl SceneWind {
+    /// The frame's parameters as the shared field's sampling profile.
+    pub fn profile(&self) -> saffron_wind::WindProfile {
+        saffron_wind::WindProfile {
+            orientation: self.orientation,
+            speed: self.speed,
+            gust: self.gust,
+            turbulence_octaves: self.turbulence_octaves,
+            turbulence_roughness: self.turbulence_roughness,
+            gust_frequency: self.gust_frequency,
+            reference_height: self.reference_height,
+            height_exponent: self.height_exponent,
+            seed: self.seed,
+        }
+    }
+}
+
 /// by the renderer (IBL/SSAO/etc.).
 #[derive(Debug, Clone)]
 pub struct SceneLighting {
@@ -322,6 +405,15 @@ pub struct Lighting {
     frame_cloud_shadow_up: Vec4,
     frame_cloud_shadow_centers: [Vec4; CLOUD_SHADOW_CASCADES as usize],
     frame_cloud_shadow_meta: Vec4,
+    frame_wind_dir_speed_gust: Vec4,
+    frame_wind_params: Vec4,
+    frame_wind_meta: UVec4,
+    frame_wind_time: Vec4,
+    frame_wind_sources: u64,
+    frame_vsm_basis: Mat4,
+    frame_vsm_levels: [Vec4; crate::VSM_DIRECTIONAL_LEVELS as usize],
+    frame_vsm_params: Vec4,
+    frame_vsm_page_table: u64,
     frame_ddgi_volume_min: Vec4,
     frame_ddgi_volume_extent: Vec4,
     frame_ddgi_probe_count: UVec4,
@@ -330,7 +422,6 @@ pub struct Lighting {
     cluster_dispatch_pending: bool,
 
     shadow_pending: bool,
-    shadow_view_proj: Mat4,
     spot_shadow_pending: bool,
     spot_shadow_view_proj: Mat4,
     spot_shadow_light_index: u32,
@@ -340,8 +431,6 @@ pub struct Lighting {
     point_shadow_light_index: u32,
     /// Camera-independent hash of the cube's inputs (light + caster transforms), set each frame by
     /// `set_point_shadow`. The renderer compares it against the last rendered key (and the cube
-    /// image handle) to skip re-rendering a static light's cube while only the camera moves.
-    point_shadow_key: u64,
 
     /// The debug view-mode channel the mesh fragment outputs instead of full shading
     /// (`0` lit/wireframe, `1` albedo, … `5` emissive), folded into the light UBO's
@@ -351,17 +440,19 @@ pub struct Lighting {
 
 impl Lighting {
     /// Builds the per-frame light + cluster buffers and sets, binding the shadow maps
-    /// (directional / spot at the compare sampler, the point distance cube at the linear
-    /// sampler) into every light set.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Vk`] for any failing buffer/set allocation.
-    pub fn new(device: &Device, descriptors: &Descriptors, targets: &Targets) -> Result<Self> {
+    pub fn new(
+        device: &Device,
+        descriptors: &Descriptors,
+        vsm_atlas: vk::ImageView,
+    ) -> Result<Self> {
         let resources = Arc::clone(device.resources());
         let mut frames = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            frames.push(build_frame(&resources, descriptors, targets)?);
+            frames.push(build_frame(&resources, descriptors, vsm_atlas)?);
         }
         Ok(Self {
             resources,
@@ -380,6 +471,15 @@ impl Lighting {
             frame_cloud_shadow_up: Vec4::Z,
             frame_cloud_shadow_centers: [Vec4::ZERO; CLOUD_SHADOW_CASCADES as usize],
             frame_cloud_shadow_meta: Vec4::ZERO,
+            frame_wind_dir_speed_gust: Vec4::new(0.0, 1.0, 0.0, 0.0),
+            frame_wind_params: Vec4::new(0.55, 0.15, 10.0, 0.2),
+            frame_wind_meta: UVec4::ZERO,
+            frame_wind_time: Vec4::ZERO,
+            frame_wind_sources: 0,
+            frame_vsm_basis: Mat4::IDENTITY,
+            frame_vsm_levels: [Vec4::ZERO; crate::VSM_DIRECTIONAL_LEVELS as usize],
+            frame_vsm_params: Vec4::ZERO,
+            frame_vsm_page_table: 0,
             frame_ddgi_volume_min: Vec4::ZERO,
             frame_ddgi_volume_extent: Vec4::ZERO,
             frame_ddgi_probe_count: UVec4::ZERO,
@@ -387,7 +487,6 @@ impl Lighting {
             frame_sdf_occlusion: UVec4::ZERO,
             cluster_dispatch_pending: false,
             shadow_pending: false,
-            shadow_view_proj: Mat4::IDENTITY,
             spot_shadow_pending: false,
             spot_shadow_view_proj: Mat4::IDENTITY,
             spot_shadow_light_index: 0,
@@ -395,7 +494,6 @@ impl Lighting {
             point_shadow_pos: Vec3::ZERO,
             point_shadow_far: 1.0,
             point_shadow_light_index: 0,
-            point_shadow_key: 0,
             debug_channel: 0,
         })
     }
@@ -504,11 +602,6 @@ impl Lighting {
         self.shadow_pending
     }
 
-    /// The directional light-space transform (the shadow pass push constant).
-    pub fn shadow_view_proj(&self) -> Mat4 {
-        self.shadow_view_proj
-    }
-
     /// Whether a shadow-casting spot light is present this frame (arms `spot-shadow`).
     pub fn spot_shadow_pending(&self) -> bool {
         self.spot_shadow_pending
@@ -522,12 +615,6 @@ impl Lighting {
     /// Whether a shadow-casting point light is present this frame (arms `point-shadow`).
     pub fn point_shadow_pending(&self) -> bool {
         self.point_shadow_pending
-    }
-
-    /// The camera-independent hash of the point-shadow cube's inputs (light + caster transforms);
-    /// the renderer caches the cube against it.
-    pub fn point_shadow_key(&self) -> u64 {
-        self.point_shadow_key
     }
 
     /// The shadowed point light's world position.
@@ -590,7 +677,6 @@ impl Lighting {
                 0,
             ),
             eye_position: scene.eye_position.extend(0.0),
-            shadow_view_proj: self.shadow_view_proj,
             spot_shadow_view_proj: self.spot_shadow_view_proj,
             spot_shadow: UVec4::new(
                 self.spot_shadow_light_index,
@@ -629,6 +715,17 @@ impl Lighting {
             cloud_shadow_up: self.frame_cloud_shadow_up,
             cloud_shadow_centers: self.frame_cloud_shadow_centers,
             cloud_shadow_meta: self.frame_cloud_shadow_meta,
+            wind_dir_speed_gust: self.frame_wind_dir_speed_gust,
+            wind_params: self.frame_wind_params,
+            wind_meta: self.frame_wind_meta,
+            wind_time: self.frame_wind_time,
+            wind_sources: self.frame_wind_sources,
+            wind_sources_reserved: 0,
+            vsm_basis: self.frame_vsm_basis,
+            vsm_levels: self.frame_vsm_levels,
+            vsm_params: self.frame_vsm_params,
+            vsm_page_table: self.frame_vsm_page_table,
+            vsm_reserved: 0,
         };
         let dst = self.frames[frame]
             .light_ubo
@@ -643,6 +740,62 @@ impl Lighting {
     /// (`ambient_color.w`) into the next [`Lighting::set_scene_lighting`] write. The
     /// renderer reads its sibling `Ibl`/`ReflectionProbes` sub-state and pushes them here
     /// before the UBO write.
+    /// Folds the shared wind field's frame words into the next
+    /// [`Lighting::set_scene_lighting`] write (the previous time comes from the last
+    /// fold, so motion evaluates last frame's wind exactly).
+    pub(crate) fn set_frame_wind(
+        &mut self,
+        dir_speed_gust: Vec4,
+        params: Vec4,
+        meta: UVec4,
+        time_s: f32,
+        sources: u64,
+    ) {
+        let previous = self.frame_wind_time.x;
+        self.frame_wind_dir_speed_gust = dir_speed_gust;
+        self.frame_wind_params = params;
+        self.frame_wind_meta = meta;
+        self.frame_wind_time = Vec4::new(time_s, previous, 0.0, 0.0);
+        self.frame_wind_sources = sources;
+    }
+
+    /// The frame slot's light UBO buffer + size (the VSM demand pass binds it).
+    pub(crate) fn frame_ubo(&self, frame: usize) -> (vk::Buffer, u64) {
+        let ubo = &self.frames[frame].light_ubo;
+        (ubo.handle(), ubo.size())
+    }
+
+    /// Folds the frame's directional virtual-shadow space into the next
+    /// [`Lighting::set_scene_lighting`] write: the light basis, per-level snapped
+    /// windows, depth span, and the frame's page-table address.
+    pub(crate) fn set_frame_vsm(
+        &mut self,
+        basis: Mat4,
+        levels: [Vec4; crate::VSM_DIRECTIONAL_LEVELS as usize],
+        params: Vec4,
+        page_table: u64,
+    ) {
+        self.frame_vsm_basis = basis;
+        self.frame_vsm_levels = levels;
+        self.frame_vsm_params = params;
+        self.frame_vsm_page_table = page_table;
+    }
+
+    /// The frame's wind words as the wind deformation prepass push consumes them.
+    pub(crate) fn wind_deform_push(&self) -> crate::WindDeformPush {
+        crate::WindDeformPush {
+            dir_speed_gust: self.frame_wind_dir_speed_gust.to_array(),
+            params: self.frame_wind_params.to_array(),
+            octaves: self.frame_wind_meta.x,
+            seed: self.frame_wind_meta.y,
+            time_current: self.frame_wind_time.x,
+            time_previous: self.frame_wind_time.y,
+            sources: self.frame_wind_sources,
+            source_count: self.frame_wind_meta.z,
+            reserved: 0,
+        }
+    }
+
     pub fn set_frame_ibl(&mut self, ibl_enabled: bool, probe_count: u32) {
         self.frame_ibl_flag = ibl_enabled;
         self.frame_probe_count = probe_count;
@@ -760,15 +913,13 @@ impl Lighting {
         self.cluster_dispatch_pending = self.use_clustered && self.frame_light_count > 0;
     }
 
-    /// Sets the directional shadow caster's light-space transform; `casting` arms the
-    /// `shadow` pass (gated by the master `use_shadows`).
-    pub fn set_directional_shadow(&mut self, light_view_proj: Mat4, casting: bool) {
-        self.shadow_view_proj = light_view_proj;
+    /// Arms directional shadowing (gated by the master `use_shadows`).
+    pub fn set_directional_shadow(&mut self, casting: bool) {
         self.shadow_pending = casting && self.use_shadows;
     }
 
     /// Sets the shadowed spot light's perspective transform + its index in the per-frame
-    /// light list; `casting` arms the `spot-shadow` pass.
+    /// light list; `casting` arms its virtual-shadow space.
     pub fn set_spot_shadow(&mut self, light_view_proj: Mat4, light_index: u32, casting: bool) {
         self.spot_shadow_view_proj = light_view_proj;
         self.spot_shadow_light_index = light_index;
@@ -776,20 +927,18 @@ impl Lighting {
     }
 
     /// Sets the shadowed point light's world position + far plane + its index; `casting`
-    /// arms the `point-shadow` pass.
+    /// arms its virtual face spaces.
     pub fn set_point_shadow(
         &mut self,
         light_pos: Vec3,
         far_plane: f32,
         light_index: u32,
         casting: bool,
-        content_key: u64,
     ) {
         self.point_shadow_pos = light_pos;
         self.point_shadow_far = far_plane;
         self.point_shadow_light_index = light_index;
         self.point_shadow_pending = casting && self.use_shadows;
-        self.point_shadow_key = content_key;
     }
 
     /// Ensures the frame's punctual-light SSBO holds at least `count` [`GpuLight`]
@@ -831,12 +980,12 @@ impl Lighting {
     }
 }
 
-/// Builds one frame slot's lighting buffers + sets, binding the shadow maps into the
-/// light set and wiring the cluster set's params/light/cluster bindings.
+/// Builds one frame slot's lighting buffers + sets, binding the virtual-shadow atlas
+/// into the light set and wiring the cluster set's params/light/cluster bindings.
 fn build_frame(
     resources: &Arc<DeviceResources>,
     descriptors: &Descriptors,
-    targets: &Targets,
+    vsm_atlas: vk::ImageView,
 ) -> Result<FrameLighting> {
     let raw = resources.device();
 
@@ -844,9 +993,9 @@ fn build_frame(
     let light_set = descriptors.allocate_set(descriptors.light_set_layout())?;
     descriptors.write_uniform_buffer(light_set, 0, light_ubo.handle(), light_ubo.size());
 
-    // Bindings 4/5 (directional/spot shadow maps, compare sampler) + 6 (point distance
-    // cube, linear sampler). The graph guarantees ShaderReadOnly when the scene samples.
-    write_shadow_samplers(raw, descriptors, light_set, targets);
+    // Binding 13: the virtual-shadow atlas behind its immutable compare sampler. The
+    // graph guarantees ShaderReadOnly when the scene samples.
+    write_shadow_samplers(raw, light_set, vsm_atlas);
 
     let light_list = make_mapped_storage_buffer(
         resources,
@@ -890,59 +1039,24 @@ fn build_frame(
     })
 }
 
-/// Binds the directional (4) + spot (5) shadow maps with the compare sampler and the
-/// point distance cube (6) with the linear sampler into `light_set`.
+/// Binds the virtual-shadow atlas (13, behind the layout's immutable compare
+/// sampler) into `light_set`.
 fn write_shadow_samplers(
     raw: &ash::Device,
-    descriptors: &Descriptors,
     light_set: vk::DescriptorSet,
-    targets: &Targets,
+    vsm_atlas: vk::ImageView,
 ) {
-    let linear = descriptors.linear_sampler();
-    let directional = [vk::DescriptorImageInfo {
+    let atlas = [vk::DescriptorImageInfo {
         sampler: vk::Sampler::null(),
-        image_view: targets.directional_shadow_view(),
+        image_view: vsm_atlas,
         image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     }];
-    let spot = [vk::DescriptorImageInfo {
-        sampler: vk::Sampler::null(),
-        image_view: targets.spot_shadow_view(),
-        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    }];
-    let point = [vk::DescriptorImageInfo {
-        sampler: linear,
-        image_view: targets.point_shadow_view(),
-        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    }];
-    let point_dynamic = [vk::DescriptorImageInfo {
-        sampler: linear,
-        image_view: targets.point_shadow_dynamic_view(),
-        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    }];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(light_set)
-            .dst_binding(4)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&directional),
-        vk::WriteDescriptorSet::default()
-            .dst_set(light_set)
-            .dst_binding(5)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&spot),
-        vk::WriteDescriptorSet::default()
-            .dst_set(light_set)
-            .dst_binding(6)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&point),
-        vk::WriteDescriptorSet::default()
-            .dst_set(light_set)
-            .dst_binding(7)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&point_dynamic),
-    ];
-    // SAFETY: the ash seam. The set + views outlive the call; the writes target bindings
-    // the light set's layout declares.
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(light_set)
+        .dst_binding(13)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(&atlas)];
+    // SAFETY: the ash seam; the set and view outlive the call.
     unsafe { raw.update_descriptor_sets(&writes, &[]) };
 }
 
@@ -1146,11 +1260,15 @@ mod tests {
     use std::mem::offset_of;
     use std::sync::Mutex;
 
-    /// `LightUbo` is exactly 592 bytes with each field at the std140 offset the mesh
+    /// `LightUbo` is exactly 656 bytes with each field at the std140 offset the mesh
     /// fragment reads — the contract the shaded path reads by raw bytes.
     #[test]
     fn light_ubo_byte_layout_matches_std140() {
-        assert_eq!(size_of::<LightUbo>(), 592);
+        assert_eq!(size_of::<LightUbo>(), 832);
+        assert_eq!(offset_of!(LightUbo, vsm_basis), 608);
+        assert_eq!(offset_of!(LightUbo, vsm_levels), 672);
+        assert_eq!(offset_of!(LightUbo, vsm_params), 800);
+        assert_eq!(offset_of!(LightUbo, vsm_page_table), 816);
         assert_eq!(align_of::<LightUbo>(), 16);
         assert_eq!(offset_of!(LightUbo, direction_ambient), 0);
         assert_eq!(offset_of!(LightUbo, color_intensity), 16);
@@ -1158,26 +1276,30 @@ mod tests {
         assert_eq!(offset_of!(LightUbo, moon_color), 48);
         assert_eq!(offset_of!(LightUbo, counts), 64);
         assert_eq!(offset_of!(LightUbo, eye_position), 80);
-        assert_eq!(offset_of!(LightUbo, shadow_view_proj), 96);
-        assert_eq!(offset_of!(LightUbo, spot_shadow_view_proj), 160);
-        assert_eq!(offset_of!(LightUbo, spot_shadow), 224);
-        assert_eq!(offset_of!(LightUbo, point_shadow), 240);
-        assert_eq!(offset_of!(LightUbo, point_shadow_meta), 256);
-        assert_eq!(offset_of!(LightUbo, screen_flags), 272);
-        assert_eq!(offset_of!(LightUbo, ddgi_volume_min), 288);
-        assert_eq!(offset_of!(LightUbo, ddgi_volume_extent), 304);
-        assert_eq!(offset_of!(LightUbo, ddgi_probe_count), 320);
-        assert_eq!(offset_of!(LightUbo, ddgi_scroll_base), 336);
-        assert_eq!(offset_of!(LightUbo, sdf_occlusion), 352);
-        assert_eq!(offset_of!(LightUbo, ambient_color), 368);
-        assert_eq!(offset_of!(LightUbo, ibl_tint), 384);
-        assert_eq!(offset_of!(LightUbo, extra_flags), 400);
-        assert_eq!(offset_of!(LightUbo, prev_view_proj), 416);
-        assert_eq!(offset_of!(LightUbo, froxel_fog), 480);
-        assert_eq!(offset_of!(LightUbo, cloud_shadow_right), 496);
-        assert_eq!(offset_of!(LightUbo, cloud_shadow_up), 512);
-        assert_eq!(offset_of!(LightUbo, cloud_shadow_centers), 528);
-        assert_eq!(offset_of!(LightUbo, cloud_shadow_meta), 576);
+        assert_eq!(offset_of!(LightUbo, spot_shadow_view_proj), 96);
+        assert_eq!(offset_of!(LightUbo, spot_shadow), 160);
+        assert_eq!(offset_of!(LightUbo, point_shadow), 176);
+        assert_eq!(offset_of!(LightUbo, point_shadow_meta), 192);
+        assert_eq!(offset_of!(LightUbo, screen_flags), 208);
+        assert_eq!(offset_of!(LightUbo, ddgi_volume_min), 224);
+        assert_eq!(offset_of!(LightUbo, ddgi_volume_extent), 240);
+        assert_eq!(offset_of!(LightUbo, ddgi_probe_count), 256);
+        assert_eq!(offset_of!(LightUbo, ddgi_scroll_base), 272);
+        assert_eq!(offset_of!(LightUbo, sdf_occlusion), 288);
+        assert_eq!(offset_of!(LightUbo, ambient_color), 304);
+        assert_eq!(offset_of!(LightUbo, ibl_tint), 320);
+        assert_eq!(offset_of!(LightUbo, extra_flags), 336);
+        assert_eq!(offset_of!(LightUbo, prev_view_proj), 352);
+        assert_eq!(offset_of!(LightUbo, froxel_fog), 416);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_right), 432);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_up), 448);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_centers), 464);
+        assert_eq!(offset_of!(LightUbo, cloud_shadow_meta), 512);
+        assert_eq!(offset_of!(LightUbo, wind_dir_speed_gust), 528);
+        assert_eq!(offset_of!(LightUbo, wind_params), 544);
+        assert_eq!(offset_of!(LightUbo, wind_meta), 560);
+        assert_eq!(offset_of!(LightUbo, wind_time), 576);
+        assert_eq!(offset_of!(LightUbo, wind_sources), 592);
     }
 
     /// `ClusterParams` is exactly 192 bytes with each field at the std140 offset both
@@ -1419,8 +1541,9 @@ mod tests {
 
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let targets = Targets::new(&device).expect("Targets::new");
-        let mut lighting = Lighting::new(&device, &descriptors, &targets).expect("Lighting::new");
+        let vsm = crate::vsm::VsmGpu::new(&device).expect("VsmGpu::new");
+        let mut lighting =
+            Lighting::new(&device, &descriptors, vsm.atlas.view()).expect("Lighting::new");
 
         // Defaults: clustered + shadows on, no lights uploaded yet.
         assert!(lighting.use_clustered);
@@ -1474,7 +1597,7 @@ mod tests {
         );
 
         drop(lighting);
-        drop(targets);
+        drop(vsm);
         drop(descriptors);
         device.wait_idle().expect("idle before teardown");
         drop(device);
