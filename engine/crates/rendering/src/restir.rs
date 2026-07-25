@@ -169,7 +169,8 @@ pub struct Restir {
     initial_layout: vk::DescriptorSetLayout,
     /// Reuse set layout: gbuffer + motion + initial + previous + lights + combined (6).
     reuse_layout: vk::DescriptorSetLayout,
-    /// Resolve set layout: gbuffer + combined + previousOut + lights + TLAS + radiance (6).
+    /// Resolve set layout: gbuffer + combined + previousOut + lights + TLAS + radiance +
+    /// the GPU-scene address block (7).
     resolve_layout: vk::DescriptorSetLayout,
     /// Set-7 mesh layout (the radiance sampler) — borrowed from [`Descriptors`], freed with
     /// its pool; `null` on a software device.
@@ -620,8 +621,9 @@ impl RestirView {
 
     /// Writes the PER-FRAME bindings before the three passes: the G-buffer + motion samplers
     /// (they recreate with the offscreen and motion may be absent → fall back to the
-    /// G-buffer), the punctual-light + cluster SSBOs (they regrow per frame), and the TLAS
-    /// into the resolve set (it is a per-frame ring slot). A no-op when not ready.
+    /// G-buffer), the punctual-light + cluster SSBOs (they regrow per frame), the TLAS
+    /// into the resolve set (it is a per-frame ring slot), and the frame's GPU-scene
+    /// address-block slice `(buffer, offset, range)`. A no-op when not ready.
     #[allow(clippy::too_many_arguments)]
     pub fn write_frame_bindings(
         &self,
@@ -632,6 +634,7 @@ impl RestirView {
         light_buffer: (vk::Buffer, vk::DeviceSize),
         cluster_buffer: (vk::Buffer, vk::DeviceSize),
         tlas: vk::AccelerationStructureKHR,
+        address_block: (vk::Buffer, vk::DeviceSize, vk::DeviceSize),
     ) {
         if !self.ready {
             return;
@@ -651,10 +654,18 @@ impl RestirView {
         write_combined_sampler(raw, self.reuse_set, 0, g_normal_view, ro, sampler);
         write_combined_sampler(raw, self.reuse_set, 1, motion, ro, sampler);
         write_storage_buffer(raw, self.reuse_set, 4, light_buffer.0, light_buffer.1);
-        // resolve: b0 gbuffer, b3 lights, b4 TLAS.
+        // resolve: b0 gbuffer, b3 lights, b4 TLAS, b6 the frame's address-block slice.
         write_combined_sampler(raw, self.resolve_set, 0, g_normal_view, ro, sampler);
         write_storage_buffer(raw, self.resolve_set, 3, light_buffer.0, light_buffer.1);
         write_tlas(raw, self.resolve_set, 4, tlas);
+        write_uniform_buffer(
+            raw,
+            self.resolve_set,
+            6,
+            address_block.0,
+            address_block.1,
+            address_block.2,
+        );
     }
 }
 
@@ -683,8 +694,10 @@ fn build_layouts(raw: &ash::Device) -> Result<RestirLayouts> {
             return Err(err);
         }
     };
-    // resolve: gbuffer + combined + previousOut + lights + TLAS + radianceImage.
-    let resolve = match make_compute_layout(raw, &[cs, sb, sb, sb, as_, si]) {
+    // resolve: gbuffer + combined + previousOut + lights + TLAS + radianceImage + the
+    // GPU-scene address block (the candidate coverage confirmation resolves through it).
+    let ub = vk::DescriptorType::UNIFORM_BUFFER;
+    let resolve = match make_compute_layout(raw, &[cs, sb, sb, sb, as_, si, ub]) {
         Ok(layout) => layout,
         Err(err) => {
             // SAFETY: the ash seam. Free the prior layouts.
@@ -778,6 +791,30 @@ fn write_storage_buffer(
         .dst_set(set)
         .dst_binding(binding)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&info);
+    // SAFETY: the ash seam. The set + buffer outlive the call; written single-threaded at
+    // the (fence-waited) frame build point.
+    unsafe { raw.update_descriptor_sets(&[write], &[]) };
+}
+
+/// Writes a uniform-buffer slice `[offset, offset+range)` into `(set, binding)`.
+fn write_uniform_buffer(
+    raw: &ash::Device,
+    set: vk::DescriptorSet,
+    binding: u32,
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    range: vk::DeviceSize,
+) {
+    let info = [vk::DescriptorBufferInfo {
+        buffer,
+        offset,
+        range,
+    }];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
         .buffer_info(&info);
     // SAFETY: the ash seam. The set + buffer outlive the call; written single-threaded at
     // the (fence-waited) frame build point.
@@ -1075,10 +1112,21 @@ mod tests {
 
         // Write the per-frame bindings: a valid G-buffer view stand-in (the radiance view),
         // no motion (falls back to the G-buffer view), the (empty) light + cluster SSBOs are
-        // not yet sized here — use the radiance view as the sampler source and a 256-byte
-        // dummy buffer for the SSBO bindings, and the seeded empty TLAS into the resolve set.
+        // not yet sized here — use the radiance view as the sampler source, a 256-byte
+        // dummy buffer for the SSBO bindings, the seeded empty TLAS into the resolve set,
+        // and a small uniform buffer standing in for the GPU-scene address block.
         let g_view = view.radiance().expect("radiance").1;
         let dummy = make_device_storage_buffer(device.resources(), 256).expect("dummy ssbo");
+        let addresses = Buffer::new(
+            device.resources(),
+            size_of::<crate::GpuSceneAddressBlock>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                ..Default::default()
+            },
+        )
+        .expect("address-block ubo");
         view.write_frame_bindings(
             &device,
             &restir,
@@ -1087,12 +1135,14 @@ mod tests {
             (dummy.handle(), dummy.size()),
             (dummy.handle(), dummy.size()),
             rt.frame_tlas(0),
+            (addresses.handle(), 0, addresses.size()),
         );
 
         // Enabling on an RT device + a ready view arms the history reset.
         assert!(restir.set_enabled(true));
         assert!(restir.use_restir());
 
+        drop(addresses);
         drop(dummy);
         drop(view);
         drop(rt);

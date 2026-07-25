@@ -78,11 +78,26 @@ struct FrameRt {
 /// [`crate::SceneDrawList`] (their deformed offsets are authoritative there), not here.
 #[derive(Default)]
 pub struct RtScene {
-    /// Static mesh-instance world transforms (column-major; transposed to a row-major 3×4
-    /// when packed into the TLAS instance).
-    pub models: Vec<Mat4>,
-    /// The mesh each transform draws — supplies the BLAS reference for the TLAS instance.
-    pub meshes: Vec<Arc<GpuMesh>>,
+    /// This frame's static TLAS instance inputs.
+    pub instances: Vec<RtInstanceInput>,
+}
+
+/// The GPU-scene instance slot value of a TLAS instance with no mirrored identity; ray
+/// candidates on such an instance commit without record resolution.
+pub const RT_UNMIRRORED_INSTANCE: u32 = 0x00FF_FFFF;
+
+/// One static TLAS instance: its world transform, the mesh supplying the BLAS, the stable
+/// GPU-scene instance slot packed as `instanceCustomIndex`, and its opacity class.
+pub struct RtInstanceInput {
+    /// Column-major world transform (transposed to a row-major 3×4 at packing).
+    pub model: Mat4,
+    /// The mesh whose BLAS the instance references.
+    pub mesh: Arc<GpuMesh>,
+    /// The GPU-scene instance slot, or [`RT_UNMIRRORED_INSTANCE`].
+    pub custom_index: u32,
+    /// Whether every submesh classifies opaque; a non-opaque instance surfaces ray
+    /// candidates for canonical-coverage confirmation.
+    pub force_opaque: bool,
 }
 
 /// Hardware-ray-tracing sub-state: the per-frame TLAS ring + the set-6 TLAS descriptor the
@@ -263,17 +278,16 @@ impl Rt {
             .map_or(vk::AccelerationStructureKHR::null(), |tlas| tlas.handle())
     }
 
-    /// Captures this frame's static instance transforms + meshes for the `tlas-build` pass,
+    /// Captures this frame's static TLAS instance inputs for the `tlas-build` pass,
     /// arming the build when RT shadows are on.
-    pub fn set_rt_scene(&mut self, models: Vec<Mat4>, meshes: Vec<Arc<GpuMesh>>) {
-        self.scene.models = models;
-        self.scene.meshes = meshes;
+    pub fn set_rt_scene(&mut self, instances: Vec<RtInstanceInput>) {
+        self.scene.instances = instances;
         self.build_pending = self.supported && (self.use_rt_shadows || self.use_rt_reflections);
     }
 
     /// Whether this frame has any RT instances (static or deforming) to build a TLAS over.
     pub fn has_instances(&self, deformed: &[DeformedRtInstance]) -> bool {
-        !self.scene.models.is_empty() || !deformed.is_empty()
+        !self.scene.instances.is_empty() || !deformed.is_empty()
     }
 
     /// Clears the per-frame static-scene capture + the ready/pending flags at the top of a
@@ -282,8 +296,7 @@ impl Rt {
     /// per-slot skinned-BLAS maps are intentionally *not* cleared — they are grow-only across
     /// frames (an entity keeps its AS and refits in place).
     pub fn begin_frame(&mut self) {
-        self.scene.models.clear();
-        self.scene.meshes.clear();
+        self.scene.instances.clear();
         self.tlas_ready = false;
         self.build_pending = false;
     }
@@ -326,7 +339,7 @@ impl Rt {
         self.tlas_ready = false;
         self.skinned_blas_count = 0;
         self.tessellated_blas_count = 0;
-        if !self.supported || (self.scene.models.is_empty() && deformed.is_empty()) {
+        if !self.supported || (self.scene.instances.is_empty() && deformed.is_empty()) {
             return None;
         }
         let dispatch = self.dispatch.clone()?;
@@ -342,14 +355,23 @@ impl Rt {
 
         // Pack one instance per static mesh that has a BLAS, then one per deforming instance.
         let mut instances: Vec<vk::AccelerationStructureInstanceKHR> =
-            Vec::with_capacity(self.scene.models.len() + deformed.len());
+            Vec::with_capacity(self.scene.instances.len() + deformed.len());
         let mut retained: Vec<Arc<AccelerationStructure>> = Vec::new();
-        for (model, mesh) in self.scene.models.iter().zip(self.scene.meshes.iter()) {
-            let Some(blas) = mesh.blas.as_ref() else {
+        for input in &self.scene.instances {
+            let Some(blas) = input.mesh.blas.as_ref() else {
                 continue;
             };
-            let index = instances.len() as u32;
-            instances.push(make_instance(transform_rows(model), index, blas.address));
+            let opacity = if input.force_opaque {
+                vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE
+            } else {
+                vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE
+            };
+            instances.push(make_instance(
+                transform_rows(&input.model),
+                input.custom_index.min(RT_UNMIRRORED_INSTANCE),
+                opacity,
+                blas.address,
+            ));
             retained.push(Arc::clone(blas));
         }
         // A deforming instance references its BLAS at its `world_transform`: identity for a skinned
@@ -372,10 +394,10 @@ impl Rt {
             let Some(accel) = accel else {
                 continue;
             };
-            let index = instances.len() as u32;
             instances.push(make_instance(
                 transform_rows(&inst.world_transform),
-                index,
+                RT_UNMIRRORED_INSTANCE,
+                vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE,
                 accel.address,
             ));
             retained.push(accel);
@@ -1209,6 +1231,7 @@ fn transform_rows(model: &Mat4) -> [f32; 12] {
 fn make_instance(
     rows: [f32; 12],
     custom_index: u32,
+    opacity: vk::GeometryInstanceFlagsKHR,
     accel_reference: vk::DeviceAddress,
 ) -> vk::AccelerationStructureInstanceKHR {
     vk::AccelerationStructureInstanceKHR {
@@ -1216,7 +1239,7 @@ fn make_instance(
         instance_custom_index_and_mask: vk::Packed24_8::new(custom_index, 0xFF),
         instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
             0,
-            vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+            (vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | opacity).as_raw() as u8,
         ),
         acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
             device_handle: accel_reference,
@@ -1452,17 +1475,67 @@ mod tests {
         );
     }
 
-    /// `make_instance` packs the custom index + 0xFF mask, the triangle-cull-disable flag,
-    /// and the referenced AS device address into a `VkAccelerationStructureInstanceKHR`.
+    /// A two-buffer [`GpuMesh`] with no BLAS, enough for scene-capture bookkeeping tests.
+    fn test_mesh(device: &Device) -> Arc<crate::GpuMesh> {
+        use vk_mem::Alloc;
+        let make_buffer = |size: vk::DeviceSize, usage: vk::BufferUsageFlags| {
+            let alloc_info = vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                ..Default::default()
+            };
+            let info = vk::BufferCreateInfo::default().size(size).usage(usage);
+            // SAFETY: the VMA seam. Ownership passes into the GpuMesh below.
+            unsafe {
+                device
+                    .resources()
+                    .allocator()
+                    .create_buffer(&info, &alloc_info)
+            }
+            .expect("create_buffer")
+        };
+        Arc::new(crate::GpuMesh::from_parts(
+            device.resources(),
+            crate::GpuMeshParts {
+                vertex: make_buffer(96, vk::BufferUsageFlags::VERTEX_BUFFER),
+                index: make_buffer(48, vk::BufferUsageFlags::INDEX_BUFFER),
+                skin: None,
+                morph: None,
+                conditioning: None,
+                index_count: 3,
+                vertex_count: 3,
+                submeshes: Vec::new(),
+                bounds_min: saffron_geometry::glam::Vec3::ZERO,
+                bounds_max: saffron_geometry::glam::Vec3::ONE,
+                cpu_vertices: Vec::new(),
+                cpu_indices: Vec::new(),
+                cpu_skin: Vec::new(),
+                blas: None,
+                sdfs: Vec::new(),
+                hierarchy_pages: Vec::new(),
+                assembly: None,
+            },
+        ))
+    }
+
+    /// `make_instance` packs the custom index + 0xFF mask, the triangle-cull-disable flag
+    /// plus the per-instance opacity flag, and the referenced AS device address into a
+    /// `VkAccelerationStructureInstanceKHR`.
     #[test]
     fn make_instance_packs_index_mask_flags_and_reference() {
-        let inst = make_instance(IDENTITY_ROWS, 7, 0xDEAD_BEEF);
+        let inst = make_instance(
+            IDENTITY_ROWS,
+            7,
+            vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE,
+            0xDEAD_BEEF,
+        );
         assert_eq!(inst.instance_custom_index_and_mask.low_24(), 7);
         assert_eq!(inst.instance_custom_index_and_mask.high_8(), 0xFF);
         assert_eq!(
             inst.instance_shader_binding_table_record_offset_and_flags
                 .high_8(),
-            vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8
+            (vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE
+                | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE)
+                .as_raw() as u8
         );
         // SAFETY: the reference is the `device_handle` union arm, set by `make_instance`.
         assert_eq!(
@@ -1503,7 +1576,7 @@ mod tests {
         assert!(!rt.shadows_enabled());
 
         // set_rt_scene with static instances does not arm a build on a non-RT device.
-        rt.set_rt_scene(vec![Mat4::IDENTITY], Vec::new());
+        rt.set_rt_scene(Vec::new());
         assert!(!rt.build_pending());
 
         // The build path is a no-op: it produces no plan and leaves tlas_ready false.
@@ -1531,11 +1604,11 @@ mod tests {
         };
         // Shadows off → never pending, regardless of support.
         rt.set_rt_shadows(false);
-        rt.set_rt_scene(vec![Mat4::IDENTITY], Vec::new());
+        rt.set_rt_scene(Vec::new());
         assert!(!rt.build_pending());
 
         rt.set_rt_shadows(true);
-        rt.set_rt_scene(vec![Mat4::IDENTITY], Vec::new());
+        rt.set_rt_scene(Vec::new());
         // Pending iff the device actually supports RT (the toggle was clamped otherwise).
         assert_eq!(rt.build_pending(), rt.supported());
 
@@ -1551,7 +1624,22 @@ mod tests {
             return;
         };
         rt.set_rt_shadows(true);
-        rt.set_rt_scene(vec![Mat4::IDENTITY, Mat4::IDENTITY], Vec::new());
+        let mesh = test_mesh(&device);
+        rt.set_rt_scene(vec![
+            RtInstanceInput {
+                model: Mat4::IDENTITY,
+                mesh: Arc::clone(&mesh),
+                custom_index: RT_UNMIRRORED_INSTANCE,
+                force_opaque: true,
+            },
+            RtInstanceInput {
+                model: Mat4::IDENTITY,
+                mesh,
+                custom_index: 5,
+                force_opaque: false,
+            },
+        ]);
+        assert!(rt.has_instances(&[]));
         rt.begin_frame();
         assert!(!rt.build_pending());
         assert!(!rt.tlas_ready());
@@ -1606,8 +1694,9 @@ mod tests {
                 material_slot: 0,
             }],
         };
+        let hierarchy = crate::upload::hierarchy_for_upload(&mesh, &[]).expect("cook hierarchy");
         let gpu_mesh = uploader
-            .upload_mesh(&descriptors, &mesh, &[], None, None)
+            .upload_mesh(&descriptors, &mesh, &hierarchy, &[], None, None)
             .expect("upload_mesh");
         assert!(
             gpu_mesh.blas.is_some(),
@@ -1616,7 +1705,12 @@ mod tests {
 
         // Arm RT shadows + capture one static instance, then prepare the per-frame TLAS build.
         rt.set_rt_shadows(true);
-        rt.set_rt_scene(vec![Mat4::IDENTITY], vec![Arc::clone(&gpu_mesh)]);
+        rt.set_rt_scene(vec![RtInstanceInput {
+            model: Mat4::IDENTITY,
+            mesh: Arc::clone(&gpu_mesh),
+            custom_index: RT_UNMIRRORED_INSTANCE,
+            force_opaque: true,
+        }]);
         assert!(rt.build_pending());
         let plan = rt
             .prepare_tlas_build(&device, 0, &[], None)
