@@ -21,17 +21,16 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use saffron_geometry::glam::Vec3;
 use saffron_geometry::{
-    GridDesc, Mesh, MeshConditioning, Meshlet, MorphData, MorphDelta, Sdf, Submesh, VertexSkin,
-    bake_grid, build_meshlets, build_min_max_pyramid, sdf_chunk_cores, sdf_set_from_bytes,
-    sdf_set_to_bytes,
+    GridDesc, Mesh, MeshConditioning, MorphData, MorphDelta, PortableVirtualHierarchy, Sdf,
+    Submesh, VertexSkin, bake_grid, build_min_max_pyramid, sdf_chunk_cores, sdf_set_from_bytes,
+    sdf_set_to_bytes, validate_portable_virtual_hierarchy,
 };
 use vk_mem::Alloc;
 
 use crate::descriptors::Descriptors;
 use crate::resources::{
     ConditioningBuffers, DeviceResources, GpuLut, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts,
-    GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, MeshletBuffers, MinMaxPyramid,
-    MorphBuffers,
+    GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, MinMaxPyramid, MorphBuffers,
 };
 use crate::{Device, Error, GradeUniform, Pipeline, Result, checked};
 
@@ -46,6 +45,166 @@ pub struct SdfBake {
     /// The `assets/cache` directory the baked field is read from / written to (a content
     /// hash of the mesh keys it). `None` bakes every time (no sidecar).
     pub cache_dir: Option<PathBuf>,
+}
+
+fn validate_upload_hierarchy(mesh: &Mesh, hierarchy: &PortableVirtualHierarchy) -> Result<()> {
+    validate_portable_virtual_hierarchy(hierarchy)
+        .map_err(|error| Error::InvalidUploadData(error.to_string()))?;
+    if hierarchy.prototypes.is_empty() {
+        return Err(Error::InvalidUploadData(
+            "portable hierarchy has no geometry prototype".to_owned(),
+        ));
+    }
+    // The uploaded vertex stream is the prototypes' streams concatenated in prototype-id
+    // order; the submesh table concatenates the per-prototype ranges the same way (a
+    // single-prototype mesh with no authored submeshes uploads one implicit full range).
+    let vertex_total: usize = hierarchy
+        .prototypes
+        .iter()
+        .map(|prototype| prototype.vertex_count as usize)
+        .sum();
+    let submesh_total: usize = hierarchy
+        .prototypes
+        .iter()
+        .map(|prototype| prototype.submesh_count as usize)
+        .sum();
+    if vertex_total != mesh.vertices.len() || submesh_total != mesh.submeshes.len().max(1) {
+        return Err(Error::InvalidUploadData(
+            "portable hierarchy does not describe the uploaded mesh".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the assembly-part table for a hierarchy that places prototypes through uses —
+/// `None` for the trivial single-prototype, single-identity-use shape every plain mesh
+/// cooks to (its executor path stays base-free).
+fn assembly_from_hierarchy(
+    hierarchy: &PortableVirtualHierarchy,
+) -> Result<Option<crate::MeshAssembly>> {
+    const IDENTITY_BITS: [i32; 16] = [
+        65_536, 0, 0, 0, 0, 65_536, 0, 0, 0, 0, 65_536, 0, 0, 0, 0, 65_536,
+    ];
+    let trivial = hierarchy.prototypes.len() == 1
+        && hierarchy.micro_instances.len() == 1
+        && hierarchy.micro_instances[0].prototype == 0
+        && hierarchy.micro_instances[0].transform_bits == IDENTITY_BITS;
+    if trivial {
+        return Ok(None);
+    }
+    if hierarchy.micro_instances.is_empty() {
+        return Err(Error::InvalidUploadData(
+            "assembly hierarchy places no prototype uses".to_owned(),
+        ));
+    }
+    // The parts table is indexed by prototype id, so the hierarchy's table must be
+    // id-ordered (the cooker emits it that way).
+    for (index, prototype) in hierarchy.prototypes.iter().enumerate() {
+        if prototype.id as usize != index {
+            return Err(Error::InvalidUploadData(
+                "assembly hierarchy prototype table is not id-ordered".to_owned(),
+            ));
+        }
+    }
+    let mut prototypes = Vec::with_capacity(hierarchy.prototypes.len());
+    let mut uses = Vec::with_capacity(hierarchy.micro_instances.len());
+    // Each use carries its part's structural semantic tag so the wind branch modes
+    // pick the response per part (trunk 0 … blade 7; absent parts read trunk).
+    let semantic_by_part: std::collections::HashMap<u128, u32> = hierarchy
+        .deformation
+        .iter()
+        .map(|region| (region.part, u32::from(region.semantic.0)))
+        .collect();
+    let mut vertex_base = 0_u64;
+    for prototype in &hierarchy.prototypes {
+        let first_use = u32::try_from(uses.len())
+            .map_err(|_| Error::InvalidUploadData("assembly use table overflow".to_owned()))?;
+        for instance in hierarchy
+            .micro_instances
+            .iter()
+            .filter(|instance| instance.prototype == prototype.id)
+        {
+            let mut transform = [0.0_f32; 12];
+            for (slot, bits) in transform
+                .iter_mut()
+                .zip(instance.transform_bits.iter().take(12))
+            {
+                *slot = *bits as f32 / 65_536.0;
+            }
+            uses.push(crate::GpuAssemblyUseRecord {
+                transform,
+                prototype: prototype.id,
+                reserved: [
+                    semantic_by_part.get(&instance.part).copied().unwrap_or(0),
+                    0,
+                    0,
+                ],
+            });
+        }
+        let use_count = u32::try_from(uses.len())
+            .map_err(|_| Error::InvalidUploadData("assembly use table overflow".to_owned()))?
+            - first_use;
+        if use_count == 0 {
+            return Err(Error::InvalidUploadData(
+                "assembly hierarchy leaves a prototype unused".to_owned(),
+            ));
+        }
+        // The executor's vertex base counts vertices (its fetch multiplies by the stride).
+        let base = u32::try_from(vertex_base).map_err(|_| {
+            Error::InvalidUploadData("assembly vertex stream exceeds u32 bases".to_owned())
+        })?;
+        prototypes.push(crate::GpuAssemblyPrototypeRecord {
+            first_use,
+            use_count,
+            vertex_base: base,
+            reserved: 0,
+        });
+        vertex_base = vertex_base
+            .checked_add(u64::from(prototype.vertex_count))
+            .ok_or_else(|| {
+                Error::InvalidUploadData("assembly vertex stream overflow".to_owned())
+            })?;
+    }
+    // The mask table: authored combinations, or one implicit all-active combination
+    // for an assembly cooked without variation data.
+    let mask_words = uses.len().div_ceil(32);
+    let (combinations, masks) = if hierarchy.combinations.is_empty() {
+        let mut words = vec![0_u32; mask_words];
+        for use_index in 0..uses.len() {
+            words[use_index / 32] |= 1 << (use_index % 32);
+        }
+        (vec![(0, 0)], words)
+    } else {
+        let mut identities = Vec::with_capacity(hierarchy.combinations.len());
+        let mut words = Vec::with_capacity(hierarchy.combinations.len() * mask_words);
+        for combination in &hierarchy.combinations {
+            if combination.active_words.len() != mask_words {
+                return Err(Error::InvalidUploadData(
+                    "assembly combination mask does not span the use table".to_owned(),
+                ));
+            }
+            identities.push((combination.variation, combination.phenotype));
+            words.extend_from_slice(&combination.active_words);
+        }
+        (identities, words)
+    };
+    Ok(Some(crate::MeshAssembly {
+        prototypes,
+        uses,
+        combinations,
+        masks,
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn hierarchy_for_upload(
+    mesh: &Mesh,
+    skin: &[VertexSkin],
+) -> Result<PortableVirtualHierarchy> {
+    let input = saffron_geometry::PortableHierarchyInput::from_mesh(mesh, skin)
+        .map_err(|error| Error::InvalidUploadData(error.to_string()))?;
+    saffron_geometry::cook_portable_virtual_hierarchy(&input)
+        .map_err(|error| Error::InvalidUploadData(error.to_string()))
 }
 
 /// One prefiltered RGBA8 mip supplied to [`Uploader::upload_texture_mips`].
@@ -114,10 +273,13 @@ impl GpuQueue {
         fence: vk::Fence,
         context: &'static str,
     ) -> Result<()> {
-        let queue = *self.inner.lock().expect("gpu queue mutex");
-        // SAFETY: the ash seam. The queue is externally synchronized by the mutex held
-        // here; the submit-infos + fence are valid for the call.
-        checked(unsafe { raw.queue_submit2(queue, submits, fence) }, context)
+        let queue = self.inner.lock().expect("gpu queue mutex");
+        // SAFETY: the ash seam. The queue is externally synchronized by the mutex guard
+        // held across the call; the submit-infos + fence are valid for the call.
+        checked(
+            unsafe { raw.queue_submit2(*queue, submits, fence) },
+            context,
+        )
     }
 
     /// Presents one swapchain image under the same external-synchronization lock as submits.
@@ -126,8 +288,10 @@ impl GpuQueue {
         loader: &ash::khr::swapchain::Device,
         info: &vk::PresentInfoKHR<'_>,
     ) -> std::result::Result<bool, vk::Result> {
-        let queue = *self.inner.lock().expect("gpu queue mutex");
-        unsafe { loader.queue_present(queue, info) }
+        let queue = self.inner.lock().expect("gpu queue mutex");
+        // SAFETY: the ash seam. The queue is externally synchronized by the mutex guard
+        // held across the call.
+        unsafe { loader.queue_present(*queue, info) }
     }
 
     /// Waits for the logical device while excluding concurrent queue submissions.
@@ -157,10 +321,6 @@ pub struct Uploader {
     /// RT is supported. `None` on a software device —
     /// the mesh's `blas` then stays `None` and the engine renders via the shadow-map path.
     accel: Option<ash::khr::acceleration_structure::Device>,
-    /// Whether `VK_EXT_mesh_shader` is enabled, so each mesh also builds + uploads its meshlet
-    /// buffers (the mesh-shader raster front end). `false` on llvmpipe / unsupported hardware —
-    /// meshes then carry no meshlets and render via the index-draw path.
-    mesh_shader: bool,
     /// The two GPU jump-flood bake compute pipelines (voxelize → JFA) the SDF bake dispatches
     /// on the one-off command buffer; the sign pass is on the host. Owned here (not the
     /// renderer's frame PSO cache) because the bake runs on the upload path — including the
@@ -204,7 +364,6 @@ impl Uploader {
             queue: queue.clone(),
             command_pool,
             accel: device.accel_dispatch().cloned(),
-            mesh_shader: device.mesh_shader_enabled(),
             bake,
         })
     }
@@ -221,11 +380,15 @@ impl Uploader {
 
     /// Allocates a primary one-off command buffer, records `record` into it, submits
     /// it on the shared queue, and blocks on a fresh fence (never `device.waitIdle`,
-    /// which would drain the in-flight scene frame). Frees the buffer + fence.
-    fn with_one_off_commands<R>(&self, record: R) -> Result<()>
+    /// which would drain the in-flight scene frame). Frees the buffer + fence. `label`
+    /// names the submission in the slow-buffer warning: a one-off whose GPU execution
+    /// nears the platform watchdog risks a device loss, so anything past half a second
+    /// logs.
+    fn with_one_off_commands<R>(&self, label: &'static str, record: R) -> Result<()>
     where
         R: FnOnce(vk::CommandBuffer),
     {
+        let started = std::time::Instant::now();
         let raw = self.raw();
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
@@ -251,12 +414,22 @@ impl Uploader {
                 unsafe { raw.end_command_buffer(cmd) },
                 "end_command_buffer (one-off)",
             )?;
+            // Registered across the wait, so a submission that never completes is still named.
+            let _watch = crate::watchdog::watch(label, 0);
             self.submit_and_wait(cmd)
         })();
 
         // SAFETY: the ash seam. The submit fence was waited (or never submitted), so
         // the buffer is idle and freed exactly once.
         unsafe { raw.free_command_buffers(self.command_pool, &[cmd]) };
+        let elapsed = started.elapsed();
+        if elapsed.as_millis() > 500 {
+            tracing::warn!(
+                label,
+                ms = elapsed.as_secs_f32() * 1000.0,
+                "one-off GPU submission ran long"
+            );
+        }
         recorded
     }
 
@@ -378,6 +551,7 @@ impl Uploader {
         &self,
         descriptors: &Descriptors,
         mesh: &Mesh,
+        hierarchy: &PortableVirtualHierarchy,
         skin: &[VertexSkin],
         morph: Option<&MorphData>,
         sdf_bake: Option<&SdfBake>,
@@ -391,6 +565,7 @@ impl Uploader {
                 vertices: mesh.vertices.len(),
             });
         }
+        validate_upload_hierarchy(mesh, hierarchy)?;
 
         let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as vk::DeviceSize;
         let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as vk::DeviceSize;
@@ -475,7 +650,7 @@ impl Uploader {
         };
 
         // Record + submit the staging copies.
-        let copy = self.with_one_off_commands(|cmd| {
+        let copy = self.with_one_off_commands("upload_mesh", |cmd| {
             // SAFETY: the ash seam. The buffers outlive the submit-wait; the staging
             // buffer is the upload source.
             unsafe {
@@ -523,16 +698,23 @@ impl Uploader {
 
         // Build this mesh's BLAS once (the RT geometry occlusion oracle) when RT is
         // available. A failure is logged, not fatal — the mesh renders without RT shadows.
-        let blas = match self.build_mesh_blas(
-            vertex.0,
-            mesh.vertices.len() as u32,
-            index.0,
-            mesh.indices.len() as u32,
-        ) {
-            Ok(blas) => blas,
-            Err(err) => {
-                tracing::warn!("BLAS build failed: {err}");
-                None
+        // An assembly's shape is its placed uses, not the concatenated prototype streams,
+        // so it carries no merged BLAS (its RT representation is per-use instancing).
+        let assembly = assembly_from_hierarchy(hierarchy)?;
+        let blas = if assembly.is_some() {
+            None
+        } else {
+            match self.build_mesh_blas(
+                vertex.0,
+                mesh.vertices.len() as u32,
+                index.0,
+                mesh.indices.len() as u32,
+            ) {
+                Ok(blas) => blas,
+                Err(err) => {
+                    tracing::warn!("BLAS build failed: {err}");
+                    None
+                }
             }
         };
 
@@ -582,21 +764,6 @@ impl Uploader {
             None => Vec::new(),
         };
 
-        // Cluster + upload the meshlet buffers for the mesh-shader raster front end when the device
-        // supports `VK_EXT_mesh_shader`. A failure is logged, not fatal — the mesh then carries no
-        // meshlets and renders via the index-draw path.
-        let meshlet_buffers = if self.mesh_shader {
-            match self.upload_meshlet_buffers(mesh) {
-                Ok(buffers) => buffers,
-                Err(err) => {
-                    tracing::warn!("meshlet upload failed: {err}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Build + upload the watertight-conditioning buffers (edges/weld/basis). A failure is logged,
         // not fatal — nothing consumes them until Phase 3, so the mesh simply carries none.
         let conditioning_buffers = match self.upload_conditioning_buffers(mesh) {
@@ -612,7 +779,6 @@ impl Uploader {
             index,
             skin: skin_buf,
             morph: morph_buffers,
-            meshlets: meshlet_buffers,
             conditioning: conditioning_buffers,
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertices.len() as u32,
@@ -624,6 +790,8 @@ impl Uploader {
             cpu_skin: skin.to_vec(),
             blas,
             sdfs: gpu_sdfs,
+            hierarchy_pages: hierarchy.pages.clone(),
+            assembly,
         };
         Ok(Arc::new(GpuMesh::from_parts(&self.resources, parts)))
     }
@@ -723,7 +891,7 @@ impl Uploader {
         let Some(index) = descriptors.claim_sdf_slot() else {
             tracing::warn!(
                 "SDF bindless array full ({}), field skipped",
-                crate::descriptors::MAX_BINDLESS_SDF
+                descriptors.sdf_capacity()
             );
             // SAFETY: the ash/VMA seam. All three images+views were created above and not
             // yet owned by a `GpuSdf`; free them once on this array-full path.
@@ -818,7 +986,7 @@ impl Uploader {
             "vmaCreateImage (sdf)",
         )?;
 
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("create_and_upload_sdf_image", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 let raw = self.raw();
@@ -1044,7 +1212,7 @@ impl Uploader {
         let handle = pipeline.handle();
         let layout = pipeline.layout();
 
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("bake_look_lut", |cmd| {
             // SAFETY: the ash seam. Every resource outlives the submit-wait.
             unsafe {
                 let raw = self.raw();
@@ -1193,7 +1361,7 @@ impl Uploader {
             "vmaCreateImage (lut)",
         )?;
 
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("create_lut_3d_image", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 let raw = self.raw();
@@ -1599,7 +1767,7 @@ impl Uploader {
         }
         // After init (writes A), each prop step alternates the result buffer B,A,B,A…; an
         // even step count leaves the result in A (final parity 0), odd in B (final parity 1).
-        let final_parity = if steps.len() % 2 == 0 { 0 } else { 1 };
+        let final_parity = if steps.len().is_multiple_of(2) { 0 } else { 1 };
 
         let base_push = BakePush {
             dims: [nx, ny, nz, tri_count],
@@ -1613,7 +1781,7 @@ impl Uploader {
             misc: [0; 4],
         };
 
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("run_bake_passes", |cmd| {
             // SAFETY: the ash seam. Every resource outlives the submit-wait below.
             unsafe {
                 let raw = self.raw();
@@ -1878,7 +2046,7 @@ impl Uploader {
             }
         };
 
-        let copy = self.with_one_off_commands(|cmd| {
+        let copy = self.with_one_off_commands("upload_morph_buffers", |cmd| {
             // SAFETY: the ash seam. Both device buffers outlive the submit-wait; the staging
             // buffer is the source.
             unsafe {
@@ -1916,118 +2084,11 @@ impl Uploader {
         })
     }
 
-    /// Clusters a mesh into meshlets ([`build_meshlets`]) and uploads the three device buffers the
-    /// mesh shader binds: the [`Meshlet`] descriptor array, the flat global vertex indices, and the
-    /// packed local triangle indices (the `u8` array padded to a 4-byte multiple so the shader reads
-    /// it as a raw byte-address buffer). Returns `None` when the mesh produced no meshlets.
-    fn upload_meshlet_buffers(&self, mesh: &Mesh) -> Result<Option<MeshletBuffers>> {
-        let set = build_meshlets(mesh);
-        if set.is_empty() {
-            return Ok(None);
-        }
-
-        // The triangle bytes are read via `ByteAddressBuffer.Load<uint>`, which fetches 4 bytes at
-        // a 4-aligned offset — pad the tail so the last triangle's group is fully backed.
-        let mut triangles = set.triangles.clone();
-        while triangles.len() % 4 != 0 {
-            triangles.push(0);
-        }
-
-        let desc_bytes = std::mem::size_of_val(set.meshlets.as_slice());
-        let vert_bytes = std::mem::size_of_val(set.vertices.as_slice());
-        let tri_bytes = triangles.len();
-        let desc_size = desc_bytes.max(std::mem::size_of::<Meshlet>()) as vk::DeviceSize;
-        let vert_size = vert_bytes.max(std::mem::size_of::<u32>()) as vk::DeviceSize;
-        let tri_size = tri_bytes.max(4) as vk::DeviceSize;
-
-        let mut staging = StagingBuffer::new(self.allocator(), desc_size + vert_size + tri_size)?;
-        {
-            let bytes = staging.mapped_slice();
-            let d = desc_size as usize;
-            let v = vert_size as usize;
-            bytes[..desc_bytes].copy_from_slice(bytemuck::cast_slice(&set.meshlets));
-            if vert_bytes > 0 {
-                bytes[d..d + vert_bytes].copy_from_slice(bytemuck::cast_slice(&set.vertices));
-            }
-            if tri_bytes > 0 {
-                bytes[d + v..d + v + tri_bytes].copy_from_slice(&triangles);
-            }
-        }
-        staging.flush();
-
-        let allocator = self.allocator();
-        let desc_buf =
-            make_device_buffer(allocator, desc_size, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-        let vert_buf =
-            match make_device_buffer(allocator, vert_size, vk::BufferUsageFlags::STORAGE_BUFFER) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    free_one(allocator, desc_buf);
-                    return Err(err);
-                }
-            };
-        let tri_buf =
-            match make_device_buffer(allocator, tri_size, vk::BufferUsageFlags::STORAGE_BUFFER) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    free_one(allocator, desc_buf);
-                    free_one(allocator, vert_buf);
-                    return Err(err);
-                }
-            };
-
-        let copy = self.with_one_off_commands(|cmd| {
-            // SAFETY: the ash seam. All three device buffers outlive the submit-wait; the staging
-            // buffer is the source for each contiguous slice.
-            unsafe {
-                let raw = self.raw();
-                raw.cmd_copy_buffer(
-                    cmd,
-                    staging.handle(),
-                    desc_buf.0,
-                    &[vk::BufferCopy::default().size(desc_size)],
-                );
-                raw.cmd_copy_buffer(
-                    cmd,
-                    staging.handle(),
-                    vert_buf.0,
-                    &[vk::BufferCopy::default()
-                        .src_offset(desc_size)
-                        .size(vert_size)],
-                );
-                raw.cmd_copy_buffer(
-                    cmd,
-                    staging.handle(),
-                    tri_buf.0,
-                    &[vk::BufferCopy::default()
-                        .src_offset(desc_size + vert_size)
-                        .size(tri_size)],
-                );
-            }
-        });
-        drop(staging);
-        if let Err(err) = copy {
-            free_one(allocator, desc_buf);
-            free_one(allocator, vert_buf);
-            free_one(allocator, tri_buf);
-            return Err(err);
-        }
-
-        let meshlet_count = set.len() as u32;
-        Ok(Some(MeshletBuffers {
-            descriptors: desc_buf,
-            vertices: vert_buf,
-            triangles: tri_buf,
-            submesh_ranges: set.submesh_ranges,
-            meshlet_count,
-        }))
-    }
-
     /// Builds the watertight-conditioning data ([`MeshConditioning`], a pure function of the mesh, as
-    /// the meshlet clusterer is) and uploads its four arrays as device-local `STORAGE_BUFFER`s: the
+    /// the cook's clusterer is) and uploads its four arrays as device-local `STORAGE_BUFFER`s: the
     /// unique edges, the per-triangle edge indices, the per-welded-vertex basis, and the base→welded
     /// map. One staging buffer with four contiguous slices, one `cmd_copy_buffer` per slice.
-    /// Non-fatal on failure (the mesh then carries no conditioning), mirroring the meshlet path.
+    /// Non-fatal on failure (the mesh then carries no conditioning).
     fn upload_conditioning_buffers(&self, mesh: &Mesh) -> Result<Option<ConditioningBuffers>> {
         if mesh.vertices.is_empty() {
             return Ok(None);
@@ -2097,7 +2158,7 @@ impl Uploader {
             }
         };
 
-        let copy = self.with_one_off_commands(|cmd| {
+        let copy = self.with_one_off_commands("upload_conditioning_buffers", |cmd| {
             // SAFETY: the ash seam. All four device buffers outlive the submit-wait; the staging
             // buffer is the source for each contiguous slice.
             unsafe {
@@ -2190,7 +2251,7 @@ impl Uploader {
         let image = uploaded.image;
 
         // Record the upload + mip generation; on failure free the image.
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("upload_texture", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 record_texture_upload(
@@ -2253,7 +2314,7 @@ impl Uploader {
         let uploaded =
             self.create_sampled_image(base.width, base.height, mips.len() as u32, format)?;
         let image = uploaded.image;
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("upload_texture_mips", |cmd| {
             // SAFETY: the image/staging buffer and mip slices outlive the submit-wait.
             unsafe {
                 transition_image(
@@ -2388,7 +2449,7 @@ impl Uploader {
         let uploaded = self.create_sampled_image(width, height, 1, format)?;
         let image = uploaded.image;
 
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("upload_texture_float", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 let raw = self.raw();
@@ -2465,7 +2526,7 @@ impl Uploader {
         };
         let mut image = Image::new(&self.resources, &desc)?;
         let handle = image.handle();
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("upload_cube_float", |cmd| {
             // SAFETY: the cube and staging buffer outlive the waited one-off submit.
             unsafe {
                 transition_image_layers(
@@ -2568,7 +2629,7 @@ impl Uploader {
             }
         };
         let image = uploaded.image;
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("upload_height_texture", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 record_texture_upload(
@@ -2636,7 +2697,7 @@ impl Uploader {
         } else {
             levels.iter().map(|l| (l.width, l.height)).collect()
         };
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("build_and_upload_pyramid", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 let raw = self.raw();
@@ -2742,7 +2803,7 @@ impl Uploader {
 
         let uploaded = self.create_sampled_image(1, 1, 1, vk::Format::R32G32_SFLOAT)?;
         let image = uploaded.image;
-        let recorded = self.with_one_off_commands(|cmd| {
+        let recorded = self.with_one_off_commands("upload_default_height_minmax", |cmd| {
             // SAFETY: the ash seam. The image/staging buffer outlive the submit-wait.
             unsafe {
                 let raw = self.raw();
@@ -2904,7 +2965,7 @@ impl Uploader {
         let Some(index) = descriptors.claim_slot() else {
             tracing::warn!(
                 "albedo bindless array full ({}), texture skipped",
-                crate::descriptors::MAX_BINDLESS_TEXTURES
+                descriptors.texture_capacity()
             );
             // SAFETY: the ash seam. The view was created above and not yet owned by a
             // `GpuTexture`; free it once on this array-full path before the image.
@@ -2929,6 +2990,7 @@ impl Uploader {
                 bindless_index: index,
                 extent: vk::Extent2D { width, height },
                 format,
+                mip_count: mip_levels,
                 min_max,
             },
             descriptors.free_list(),
@@ -4041,6 +4103,99 @@ mod tests {
         }
     }
 
+    /// A plain mesh's cooked hierarchy (one prototype, one identity use) builds no
+    /// assembly table; a multi-prototype hierarchy builds the id-ordered prototype
+    /// records with prefix-summed vertex bases and prototype-grouped f32 use
+    /// transforms.
+    #[test]
+    fn assembly_table_builds_for_multi_prototype_hierarchies_only() {
+        let mesh = triangle();
+        let hierarchy = hierarchy_for_upload(&mesh, &[]).expect("cook hierarchy");
+        assert!(
+            assembly_from_hierarchy(&hierarchy)
+                .expect("trivial shape")
+                .is_none(),
+            "a plain mesh keeps its parts range empty"
+        );
+
+        const IDENTITY: [i32; 16] = [
+            65_536, 0, 0, 0, 0, 65_536, 0, 0, 0, 0, 65_536, 0, 0, 0, 0, 65_536,
+        ];
+        let mut translated = IDENTITY;
+        translated[7] = 2 * 65_536; // row 1, column 3: +2 m along Y.
+        let mut family = hierarchy.clone();
+        let base = family.prototypes[0].clone();
+        family.prototypes = vec![
+            saffron_geometry::GeometryPrototype {
+                id: 0,
+                vertex_count: 3,
+                ..base.clone()
+            },
+            saffron_geometry::GeometryPrototype {
+                id: 1,
+                vertex_count: 5,
+                ..base
+            },
+        ];
+        family.micro_instances = vec![
+            saffron_geometry::MicroInstance {
+                part: 1,
+                prototype: 0,
+                transform_bits: IDENTITY,
+            },
+            saffron_geometry::MicroInstance {
+                part: 2,
+                prototype: 1,
+                transform_bits: translated,
+            },
+            saffron_geometry::MicroInstance {
+                part: 3,
+                prototype: 1,
+                transform_bits: IDENTITY,
+            },
+        ];
+        let assembly = assembly_from_hierarchy(&family)
+            .expect("family shape")
+            .expect("assembly table");
+        assert_eq!(assembly.prototypes.len(), 2);
+        assert_eq!(
+            assembly.prototypes[0],
+            crate::GpuAssemblyPrototypeRecord {
+                first_use: 0,
+                use_count: 1,
+                vertex_base: 0,
+                reserved: 0,
+            }
+        );
+        assert_eq!(
+            assembly.prototypes[1],
+            crate::GpuAssemblyPrototypeRecord {
+                first_use: 1,
+                use_count: 2,
+                vertex_base: 3,
+                reserved: 0,
+            }
+        );
+        assert_eq!(assembly.uses.len(), 3);
+        assert_eq!(assembly.uses[1].prototype, 1);
+        assert_eq!(
+            assembly.uses[1].transform[7], 2.0,
+            "row 1 translation in metres"
+        );
+        assert_eq!(assembly.uses[2].transform[0], 1.0, "identity scale");
+        // No authored combinations → one implicit all-active mask word.
+        assert_eq!(assembly.combinations, vec![(0, 0)]);
+        assert_eq!(assembly.masks, vec![0b111]);
+        assert_eq!(
+            assembly.byte_len(),
+            size_of::<crate::GpuAssemblyHeaderRecord>()
+                + 2 * size_of::<crate::GpuAssemblyPrototypeRecord>()
+                + 3 * size_of::<crate::GpuAssemblyUseRecord>()
+                + size_of::<u32>()
+        );
+        assert_eq!(assembly.packed_bytes().len(), assembly.byte_len());
+    }
+
     /// Uploading a mesh with a skin stream produces a `GpuMesh` with a non-null skin
     /// buffer; uploading without one leaves it null — the phase's named skin gate. The
     /// upload runs the real staging→device-local copy on the queue, validation-clean.
@@ -4056,9 +4211,10 @@ mod tests {
         let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
         let mesh = triangle();
+        let plain_hierarchy = hierarchy_for_upload(&mesh, &[]).expect("cook hierarchy");
 
         let plain = uploader
-            .upload_mesh(&descriptors, &mesh, &[], None, None)
+            .upload_mesh(&descriptors, &mesh, &plain_hierarchy, &[], None, None)
             .expect("unskinned upload");
         assert_eq!(plain.index_count, 3);
         assert_eq!(plain.vertex_count, 3);
@@ -4070,8 +4226,9 @@ mod tests {
         assert_eq!(plain.cpu_vertices.len(), 3);
 
         let skin = vec![VertexSkin::default(); mesh.vertices.len()];
+        let skinned_hierarchy = hierarchy_for_upload(&mesh, &skin).expect("cook hierarchy");
         let skinned = uploader
-            .upload_mesh(&descriptors, &mesh, &skin, None, None)
+            .upload_mesh(&descriptors, &mesh, &skinned_hierarchy, &skin, None, None)
             .expect("skinned upload");
         assert!(
             skinned.skin_buffer().is_some(),
@@ -4080,7 +4237,14 @@ mod tests {
         assert_eq!(skinned.cpu_skin.len(), 3);
 
         // A mismatched skin stream is rejected before any allocation.
-        let bad = uploader.upload_mesh(&descriptors, &mesh, &[VertexSkin::default()], None, None);
+        let bad = uploader.upload_mesh(
+            &descriptors,
+            &mesh,
+            &plain_hierarchy,
+            &[VertexSkin::default()],
+            None,
+            None,
+        );
         assert!(matches!(bad, Err(Error::SkinMismatch { .. })));
 
         drop(plain);

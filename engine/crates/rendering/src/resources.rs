@@ -672,6 +672,8 @@ pub struct GpuTexture {
     pub extent: vk::Extent2D,
     /// The texture format.
     pub format: vk::Format,
+    /// The uploaded mip-level count.
+    pub mip_count: u32,
 }
 
 // SAFETY: the free-list is `Arc<Mutex<_>>` (Send+Sync); the image/view/allocation
@@ -701,6 +703,8 @@ pub struct GpuTextureParts {
     pub extent: vk::Extent2D,
     /// The image format.
     pub format: vk::Format,
+    /// The uploaded mip-level count.
+    pub mip_count: u32,
     /// The per-height min/max pyramid, for a displacement height map only (else `None`).
     pub min_max: Option<MinMaxPyramid>,
 }
@@ -727,6 +731,7 @@ impl GpuTexture {
             min_max: parts.min_max,
             extent: parts.extent,
             format: parts.format,
+            mip_count: parts.mip_count,
         }
     }
 
@@ -1032,8 +1037,6 @@ pub struct GpuMesh {
     skin: Option<(vk::Buffer, vk_mem::Allocation)>,
     /// The morph (blend-shape) buffers (`None` for a mesh without morph targets).
     morph: Option<MorphBuffers>,
-    /// The meshlet buffers (`None` unless built with mesh-shader support).
-    meshlets: Option<MeshletBuffers>,
     /// The watertight-conditioning buffers (`None` for an empty mesh).
     conditioning: Option<ConditioningBuffers>,
     /// Number of indices across every submesh.
@@ -1060,6 +1063,64 @@ pub struct GpuMesh {
     /// a build without SDF support). Held here so the fields live exactly as long as the mesh
     /// that owns them; the lighting cone-trace indexes each by [`GpuSdf::bindless_index`].
     pub sdfs: Vec<Arc<GpuSdf>>,
+    /// The cooked hierarchy page directory (dependencies, guaranteed roots, bounds,
+    /// transition errors). The GPU-scene mirror builds the prototype's page graph from this;
+    /// page payloads stream from the source artifact, never from mesh memory.
+    pub hierarchy_pages: Vec<saffron_geometry::PortableHierarchyPage>,
+    /// The assembly-part table for a multi-prototype geometry (a plant family): the
+    /// per-prototype vertex bases + use spans and the per-use family-local transforms the
+    /// mirror uploads into the parts arena. `None` for a plain single-prototype mesh.
+    pub assembly: Option<MeshAssembly>,
+}
+
+/// The assembly-part table a multi-prototype [`GpuMesh`] carries: the records the mirror
+/// packs into the geometry's parts-arena range (prototype records first, then use records).
+#[derive(Clone, Debug, Default)]
+pub struct MeshAssembly {
+    /// Per-prototype `{first_use, use_count, vertex_base}` records, indexed by prototype id.
+    pub prototypes: Vec<crate::GpuAssemblyPrototypeRecord>,
+    /// Use records grouped by prototype in prototype-id order.
+    pub uses: Vec<crate::GpuAssemblyUseRecord>,
+    /// The `(variation, phenotype)` identity of each mask-table combination, in table
+    /// order — the CPU adapter resolves an instance's combination index against this.
+    pub combinations: Vec<(u32, u32)>,
+    /// The packed active-use mask words, `mask_words` per combination.
+    pub masks: Vec<u32>,
+}
+
+impl MeshAssembly {
+    /// Mask words per combination.
+    #[must_use]
+    pub fn mask_words(&self) -> usize {
+        self.uses.len().div_ceil(32)
+    }
+
+    /// The packed parts-range bytes: the header, the prototype table, the use table,
+    /// then the combination mask words.
+    #[must_use]
+    pub fn packed_bytes(&self) -> Vec<u8> {
+        let header = crate::GpuAssemblyHeaderRecord {
+            prototype_count: self.prototypes.len() as u32,
+            use_count: self.uses.len() as u32,
+            mask_words: self.mask_words() as u32,
+            combination_count: self.combinations.len() as u32,
+        };
+        let mut bytes = Vec::with_capacity(self.byte_len());
+        bytes.extend_from_slice(bytemuck::bytes_of(&header));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.prototypes));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.uses));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.masks));
+        bytes
+    }
+
+    /// Total packed byte length of the parts range.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        size_of::<crate::GpuAssemblyHeaderRecord>()
+            + self.prototypes.len() * size_of::<crate::GpuAssemblyPrototypeRecord>()
+            + self.uses.len() * size_of::<crate::GpuAssemblyUseRecord>()
+            + self.masks.len() * size_of::<u32>()
+    }
 }
 
 impl GpuMesh {
@@ -1076,23 +1137,6 @@ impl GpuMesh {
             .saturating_add(bytes_for::<VertexSkin>(self.cpu_skin.len()))
             .saturating_add(bytes_for::<Submesh>(self.submeshes.len()))
     }
-}
-
-/// The device-local meshlet buffers a [`GpuMesh`] carries when built with mesh-shader support: the
-/// [`saffron_geometry::Meshlet`] descriptor array, the flat meshlet-vertex indices, and the packed
-/// meshlet-triangle local indices (padded to `u32` for storage-buffer reads). The mesh shader binds
-/// all three; the draw records one `cmd_draw_mesh_tasks` per submesh over [`MeshletBuffers::submesh_ranges`].
-pub struct MeshletBuffers {
-    /// The `Meshlet` descriptor array buffer + allocation (32 B stride).
-    pub descriptors: (vk::Buffer, vk_mem::Allocation),
-    /// The flat global vertex-index buffer + allocation (`u32` per entry).
-    pub vertices: (vk::Buffer, vk_mem::Allocation),
-    /// The packed local triangle-index buffer + allocation (`u32` per byte-triple group; see upload).
-    pub triangles: (vk::Buffer, vk_mem::Allocation),
-    /// `(first_meshlet, meshlet_count)` per submesh, parallel to [`GpuMesh::submeshes`].
-    pub submesh_ranges: Vec<(u32, u32)>,
-    /// Total meshlet count across all submeshes.
-    pub meshlet_count: u32,
 }
 
 /// The device-local morph buffers a [`GpuMesh`] carries when it has blend shapes: the flat
@@ -1154,8 +1198,6 @@ pub struct GpuMeshParts {
     pub skin: Option<(vk::Buffer, vk_mem::Allocation)>,
     /// The optional device-local morph buffers.
     pub morph: Option<MorphBuffers>,
-    /// The optional device-local meshlet buffers (mesh-shader raster path).
-    pub meshlets: Option<MeshletBuffers>,
     /// The optional device-local watertight-conditioning buffers.
     pub conditioning: Option<ConditioningBuffers>,
     /// Number of indices across every submesh.
@@ -1179,6 +1221,10 @@ pub struct GpuMeshParts {
     /// The uploaded per-mesh signed distance fields (one per primitive / chunk; empty when
     /// none was baked).
     pub sdfs: Vec<Arc<GpuSdf>>,
+    /// The cooked hierarchy page directory retained on the mesh.
+    pub hierarchy_pages: Vec<saffron_geometry::PortableHierarchyPage>,
+    /// The assembly-part table for a multi-prototype geometry (`None` for a plain mesh).
+    pub assembly: Option<MeshAssembly>,
 }
 
 impl GpuMesh {
@@ -1192,7 +1238,6 @@ impl GpuMesh {
             index_alloc: parts.index.1,
             skin: parts.skin,
             morph: parts.morph,
-            meshlets: parts.meshlets,
             conditioning: parts.conditioning,
             index_count: parts.index_count,
             vertex_count: parts.vertex_count,
@@ -1204,6 +1249,8 @@ impl GpuMesh {
             cpu_skin: parts.cpu_skin,
             blas: parts.blas,
             sdfs: parts.sdfs,
+            hierarchy_pages: parts.hierarchy_pages,
+            assembly: parts.assembly,
         }
     }
 
@@ -1233,11 +1280,6 @@ impl GpuMesh {
         self.morph.as_ref()
     }
 
-    /// The meshlet buffers, or `None` when the mesh was built without mesh-shader support.
-    pub fn meshlets(&self) -> Option<&MeshletBuffers> {
-        self.meshlets.as_ref()
-    }
-
     /// The watertight-conditioning buffers, or `None` for an empty mesh.
     pub fn conditioning(&self) -> Option<&ConditioningBuffers> {
         self.conditioning.as_ref()
@@ -1258,11 +1300,6 @@ impl Drop for GpuMesh {
             if let Some(morph) = self.morph.as_mut() {
                 allocator.destroy_buffer(morph.deltas.0, &mut morph.deltas.1);
                 allocator.destroy_buffer(morph.ranges.0, &mut morph.ranges.1);
-            }
-            if let Some(meshlets) = self.meshlets.as_mut() {
-                allocator.destroy_buffer(meshlets.descriptors.0, &mut meshlets.descriptors.1);
-                allocator.destroy_buffer(meshlets.vertices.0, &mut meshlets.vertices.1);
-                allocator.destroy_buffer(meshlets.triangles.0, &mut meshlets.triangles.1);
             }
             if let Some(c) = self.conditioning.as_mut() {
                 allocator.destroy_buffer(c.edges.0, &mut c.edges.1);
@@ -1532,6 +1569,7 @@ mod tests {
                     height: 1,
                 },
                 format: vk::Format::R8G8B8A8_UNORM,
+                mip_count: 1,
                 min_max: None,
             },
             free_list,
@@ -1629,7 +1667,6 @@ mod tests {
                 index: make_buffer(48, vk::BufferUsageFlags::INDEX_BUFFER),
                 skin: None,
                 morph: None,
-                meshlets: None,
                 conditioning: None,
                 index_count: 12,
                 vertex_count: 3,
@@ -1641,6 +1678,8 @@ mod tests {
                 cpu_skin: Vec::new(),
                 blas: None,
                 sdfs: Vec::new(),
+                hierarchy_pages: Vec::new(),
+                assembly: None,
             };
             let mesh = GpuMesh::from_parts(resources, parts);
             assert_eq!(mesh.index_count, 12);
