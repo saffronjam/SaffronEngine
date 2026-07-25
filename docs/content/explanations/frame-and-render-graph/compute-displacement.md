@@ -5,7 +5,7 @@ weight = 11
 
 # Compute displacement
 
-Compute displacement turns a material height field into generated micro-geometry. The renderer dices conditioned base triangles, displaces the resulting vertices, and writes per-frame vertex and index buffers. Depth, shadow, G-buffer, motion, and scene passes then draw those buffers through the normal mesh pipelines.
+Compute displacement turns a material height field into generated micro-geometry. The renderer dices conditioned base triangles, displaces the resulting vertices, and writes per-frame vertex and index buffers. Depth, shadow, G-buffer, motion, and scene passes then draw those buffers through the tessellation seam's indirect draws — the renderer's only vertex-input pipelines.
 
 This path changes the silhouette and supplies real triangles to ray queries. Bump mapping changes only the shading normal, while parallax mapping offsets texture coordinates on an unchanged surface.
 
@@ -25,7 +25,7 @@ flowchart LR
   coarse --> blas[per-frame tessellated BLAS]
 ```
 
-`Instancing::submit_draw_list` creates one `TessBucket` for each displacement-enabled instance whose `GpuMesh` carries conditioning data. The renderer accepts at most `TESS_MAX_INSTANCES = 64` buckets per frame. A bucket contains the base mesh, object transform, texture slots, UV transform, height scale, and tessellation quality controls.
+`gather_instance_deformation` creates one `TessBucket` for each displaced instance the scene driver submits through `Renderer::submit_gpu_scene_deformations`, provided its `GpuMesh` carries conditioning data. The renderer accepts at most `TESS_MAX_INSTANCES = 64` buckets per frame. A bucket contains the base mesh, object transform, texture slots, UV transform, height scale, and tessellation quality controls.
 
 The primary chain contains five compute passes:
 
@@ -71,9 +71,9 @@ The fractional factor also drives a geomorph. Boundary points blend between floo
 
 ## Raster and motion consumers
 
-`tess-finalize` seeds an indirect indexed draw whose `firstInstance` points at the instance's material rows. `record_batch_submeshes` takes the tessellated branch and issues one `cmd_draw_indexed_indirect`. `bind_batch_vertices` binds the amplified vertex and index buffers for every raster consumer.
+A displaced instance's material carries `GPU_MATERIAL_TABLE_FLAG_TESSELLATED`, so the visibility traversal skips its records and the raster passes replay the frame's `TessSceneDraw` list instead. `tess-finalize` seeds an indirect indexed draw whose `firstInstance` selects the instance's row in the frame instance SSBO. `record_tess_scene_draws` binds each instance's mesh PSO plus its transient vertex and index buffers and issues one `cmd_draw_indexed_indirect`; `record_tess_depth_draws` does the same in the depth-family passes with each pass's single vertex-input PSO.
 
-The emit kernel also writes `tess.vb.prev`. It evaluates the current grid with the previous frame's per-edge factors, stored in a persistent two-slot ping-pong. A changed edge-count layout falls back to current factors so previous and current positions match. `record_motion` binds current and previous tessellated streams separately, which captures camera-driven geomorph motion as well as object motion.
+The emit kernel also writes `tess.vb.prev`. It evaluates the current grid with the previous frame's per-edge factors, stored in a persistent two-slot ping-pong. A changed edge-count layout falls back to current factors so previous and current positions match. The motion pass's `record_tess_depth_draws` binds the previous tessellated stream alongside the current one, which captures camera-driven geomorph motion as well as object motion.
 
 ## Ray-tracing geometry
 
@@ -107,9 +107,9 @@ This selects a 128 factor cap, a minimum factor of 1, and a six-pixel micro-edge
 | Draw command | `engine/assets/shaders/tess_finalize.slang` | `computeMain` |
 | Amplifying kernel | `engine/assets/shaders/tessellate.slang` | `emitLeafVertex`, `emitLeafTriangle`, `computeMain` |
 | Pass recording | `engine/crates/rendering/src/renderer.rs` | `Renderer::record_tess_prep` |
-| Raster and motion draws | `engine/crates/rendering/src/scene_pass.rs`, `engine/crates/rendering/src/aa.rs` | `record_batch_submeshes`, `bind_batch_vertices`, `record_motion` |
+| Raster and motion draws | `engine/crates/rendering/src/scene_pass.rs`, `engine/crates/rendering/src/draw_list.rs` | `record_tess_scene_draws`, `record_tess_depth_draws`, `TessSceneDraw` |
 | Ray-tracing build | `engine/crates/rendering/src/rt.rs` | `TessellatedBlas`, `Rt::plan_tessellated_blas_builds` |
-| Material feature | `engine/crates/rendering/src/instancing.rs` | `FEATURE_DISPLACE`, `resolve_material` |
+| Material feature | `engine/crates/rendering/src/instancing.rs`, `engine/assets/shaders/scene_traversal.slang` | `FEATURE_DISPLACE`, `resolve_material_params`, `GPU_MATERIAL_TABLE_FLAG_TESSELLATED` |
 | Control commands | `engine/crates/control/src/commands_render.rs` | `set-displacement`, `set-tessellation-quality` |
 
 ## Related
