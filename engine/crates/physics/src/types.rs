@@ -10,10 +10,45 @@ use glam::Vec3;
 use saffron_animation::JointPose;
 use saffron_core::Uuid;
 
+/// The tagged world target a physics interaction resolves to. Every query, contact,
+/// and body snapshot names its subject through this one type: a scene entity by stable
+/// uuid, or an authoritative macro plant by [`PlantId`] — never a forged uuid, never a
+/// truncated id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorldHitTarget {
+    /// A hecs scene entity, by its stable uuid.
+    SceneEntity(Uuid),
+    /// An authoritative macro plant, by its full 128-bit identity.
+    Vegetation(saffron_spatial::PlantId),
+}
+
 /// The deterministic fixed substep the world advances by, matching SceneEdit's `PlayFixedStep`
 /// (`1/60`). The accumulator advances the sim in fixed increments so it is frame-rate independent
 /// and stays bit-exact under the cross-platform-deterministic build.
 pub const FIXED_STEP: f32 = 1.0 / 60.0;
+
+/// One batched static/sensor body row created directly against a tagged world target (a
+/// vegetation collision proxy) rather than derived from a scene entity's components. Analytic
+/// shapes only: Box half-extents in `half_extents`, Sphere radius in `.x`, Capsule radius `.x` +
+/// cylinder half-height `.y`; a cooked-geometry shape row yields the invalid-id sentinel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StaticTargetBodyCreate {
+    /// The tagged owner every query and contact on the body reports.
+    pub target: WorldHitTarget,
+    /// Analytic shape family.
+    pub shape: saffron_scene::Shape,
+    /// Per-shape size, in the `Collider` convention.
+    pub half_extents: Vec3,
+    /// World-space position.
+    pub position: Vec3,
+    /// World-space rotation.
+    pub rotation: glam::Quat,
+    /// Overlap-only trigger body: queries and contact events report it, the solver never
+    /// pushes against it.
+    pub sensor: bool,
+    /// Surface friction.
+    pub friction: f32,
+}
 
 /// How a body participates in the simulation. Mirrors Jolt `EMotionType` 1:1 and is the raw
 /// discriminant the bridge carries.
@@ -108,8 +143,8 @@ pub struct WorldStats {
 /// One live body's read-only snapshot for the editor's physics panel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyInfo {
-    /// Owner entity uuid (`0` when the entity carried no id).
-    pub entity: Uuid,
+    /// The body's owner (`None` when the body carried no owner identity).
+    pub target: Option<WorldHitTarget>,
     /// The body's motion type.
     pub motion: MotionType,
     /// Whether the body is awake.
@@ -134,8 +169,8 @@ pub struct BodyInfo {
 pub struct RayHit {
     /// Whether the ray hit anything.
     pub hit: bool,
-    /// Owner entity uuid of the hit body (`0` = none).
-    pub entity: Uuid,
+    /// The struck body's owner (`None` on a miss or an unowned body).
+    pub target: Option<WorldHitTarget>,
     /// World-space contact point.
     pub point: Vec3,
     /// World-space surface normal at the hit.
@@ -148,7 +183,7 @@ impl Default for RayHit {
     fn default() -> Self {
         Self {
             hit: false,
-            entity: Uuid(0),
+            target: None,
             point: Vec3::ZERO,
             normal: Vec3::ZERO,
             distance: 0.0,
@@ -179,10 +214,10 @@ pub struct ContactEvent {
     pub seq: u64,
     /// Whether the contact began or ended.
     pub kind: ContactKind,
-    /// One body's owner-entity uuid (`Uuid(0)` when the body had no owning entity).
-    pub entity_a: Uuid,
-    /// The other body's owner-entity uuid (`Uuid(0)` when none).
-    pub entity_b: Uuid,
+    /// One body's owner (`None` when the body has no owner).
+    pub target_a: Option<WorldHitTarget>,
+    /// The other body's owner (`None` when none).
+    pub target_b: Option<WorldHitTarget>,
     /// Either body is a sensor — a trigger overlap, not a solid touch.
     pub sensor: bool,
     /// A representative world-space contact point; zero for an `End` event.
