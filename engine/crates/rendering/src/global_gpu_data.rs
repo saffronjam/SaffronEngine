@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use saffron_vegetation::{
+use saffron_material::{
     AlphaClassification, CoverageMipMetadata, CoverageSource, OpacityMicromapDerivation,
     SurfaceModel,
 };
@@ -38,9 +38,9 @@ pub const GPU_PSO_SURFACE_MODEL_SHIFT: u32 = 5;
 /// PSO-bin shift for transparency compositing.
 pub const GPU_PSO_TRANSPARENCY_SHIFT: u32 = 6;
 /// PSO-bin shift for deformation provider.
-pub const GPU_PSO_DEFORMATION_SHIFT: u32 = 7;
+pub const GPU_PSO_DEFORMATION_SHIFT: u32 = 8;
 /// PSO-bin shift for pass class.
-pub const GPU_PSO_PASS_SHIFT: u32 = 8;
+pub const GPU_PSO_PASS_SHIFT: u32 = 9;
 /// Material-class shift for canonical coverage.
 pub const GPU_MATERIAL_COVERAGE_SHIFT: u32 = 0;
 /// Material-class shift for sidedness.
@@ -49,6 +49,8 @@ pub const GPU_MATERIAL_SIDEDNESS_SHIFT: u32 = 2;
 pub const GPU_MATERIAL_SURFACE_MODEL_SHIFT: u32 = 3;
 /// Material-class shift for transparency.
 pub const GPU_MATERIAL_TRANSPARENCY_SHIFT: u32 = 4;
+/// Unlit shading bit within [`GpuMaterialClass`].
+pub const GPU_MATERIAL_UNLIT_SHIFT: u32 = 5;
 
 fn live_frame_mask() -> u64 {
     (1_u64 << MAX_FRAMES_IN_FLIGHT) - 1
@@ -121,6 +123,12 @@ fn next_capacity(current: u64, needed: u64, floor: u64) -> Result<u64> {
         })?;
     }
     Ok(capacity)
+}
+
+fn arena_byte_offset(first: u32, element_stride: u64) -> Result<u64> {
+    u64::from(first)
+        .checked_mul(element_stride)
+        .ok_or_else(|| Error::InvalidUploadData("global GPU byte offset overflow".to_owned()))
 }
 
 /// Stable index plus generation used by every global GPU table.
@@ -213,6 +221,14 @@ impl<T> ImmutableGpuTable<T> {
         let slot = self.slots.get(handle.index as usize)?;
         (slot.generation == handle.generation)
             .then_some(slot.value.as_ref())
+            .flatten()
+    }
+
+    /// Mutably looks up a record only when both slot and generation match.
+    pub fn get_mut(&mut self, handle: GpuHandle) -> Option<&mut T> {
+        let slot = self.slots.get_mut(handle.index as usize)?;
+        (slot.generation == handle.generation)
+            .then_some(slot.value.as_mut())
             .flatten()
     }
 
@@ -358,13 +374,15 @@ impl GpuRangeAllocator {
                 let aligned = u32::try_from(aligned).ok()?;
                 let padding = aligned.checked_sub(first)?;
                 let consumed = padding.checked_add(reserved_count)?;
-                (available >= consumed).then_some((
-                    available - padding - reserved_count,
-                    first,
-                    available,
-                    aligned,
-                    padding,
-                ))
+                (available >= consumed).then(|| {
+                    (
+                        available - padding - reserved_count,
+                        first,
+                        available,
+                        aligned,
+                        padding,
+                    )
+                })
             })
             .min_by_key(|candidate| (candidate.0, candidate.2));
         if let Some((_, first, available, aligned, padding)) = candidate {
@@ -714,9 +732,7 @@ impl<K> GlobalGpuArena<K> {
 
     /// Byte offset of a logical range.
     pub fn byte_offset(&self, range: GpuArenaRange) -> Result<u64> {
-        u64::from(range.first)
-            .checked_mul(self.element_stride)
-            .ok_or_else(|| Error::InvalidUploadData("global GPU byte offset overflow".to_owned()))
+        arena_byte_offset(range.first, self.element_stride)
     }
 
     /// Current physical element capacity.
@@ -1081,6 +1097,22 @@ impl<T: Pod, K> ResidentGpuTable<T, K> {
         self.records.get(handle)
     }
 
+    /// Overwrites a live record in place, keeping its handle and generation.
+    ///
+    /// The caller restages the slot so the device copy follows; the page table uses this
+    /// for residency publication and eviction (byte span + resident generation).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidUploadData`] when the handle is stale or unoccupied.
+    pub fn update(&mut self, handle: GpuHandle, record: T) -> Result<()> {
+        let value = self.records.get_mut(handle).ok_or_else(|| {
+            Error::InvalidUploadData("global GPU table update requires a live handle".to_owned())
+        })?;
+        *value = record;
+        Ok(())
+    }
+
     /// Stages a GPU tombstone, then retires the CPU record with fence-deferred reuse.
     pub fn retire(
         &mut self,
@@ -1201,6 +1233,17 @@ impl<T: Pod, K> ResidentGpuTable<T, K> {
         self.slot_stride
     }
 
+    /// Descriptor-ready buffer identity for this immutable table.
+    pub fn descriptor(&self, device: &Device) -> GpuTableDescriptor {
+        GpuTableDescriptor {
+            buffer: self.buffer(),
+            offset: 0,
+            range: self.storage.buffer.size(),
+            address: self.address(device),
+            slot_stride: self.slot_stride,
+        }
+    }
+
     /// Reclaims handles and superseded physical buffers after a frame fence signals.
     pub fn begin_frame(&mut self, completed_frame_slot: usize) -> Result<()> {
         self.records.begin_frame(completed_frame_slot)?;
@@ -1242,12 +1285,247 @@ pub struct GpuGeometryRecord {
     pub parts: GpuArenaRange,
     /// Aggregate-voxel arena range.
     pub voxels: GpuArenaRange,
+    /// Submesh-record range in [`GlobalGpuData::submesh_table`].
+    pub submeshes: GpuArenaRange,
     /// Geometry format and topology flags.
     pub flags: u32,
     /// Vertex stride in bytes.
     pub vertex_stride: u32,
     /// Index stride in bytes.
     pub index_stride: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+}
+
+/// The parts range's fixed header: the table split the shaders derive offsets from.
+/// The range lays this header first, then the prototype table, the use records, and
+/// the per-combination active-use mask words; the prototype count also rides
+/// [`GpuGeometryRecord::reserved`].
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct GpuAssemblyHeaderRecord {
+    /// Prototype records following the header.
+    pub prototype_count: u32,
+    /// Use records following the prototypes.
+    pub use_count: u32,
+    /// Mask words per combination (`ceil(use_count / 32)`).
+    pub mask_words: u32,
+    /// Combinations in the mask table.
+    pub combination_count: u32,
+}
+
+const _: () = assert!(size_of::<GpuAssemblyHeaderRecord>() == 16);
+
+/// One assembly prototype's entry in a geometry's parts range: its slice of the use
+/// records and its base vertex within the geometry's flattened vertex range. The parts
+/// range lays the header first, then the prototype table, then every use record; the
+/// prototype count rides [`GpuGeometryRecord::reserved`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C, align(4))]
+pub struct GpuAssemblyPrototypeRecord {
+    /// First use record (global across the geometry's prototypes).
+    pub first_use: u32,
+    /// Number of uses placing this prototype.
+    pub use_count: u32,
+    /// The prototype's base vertex within the geometry's vertex range.
+    pub vertex_base: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+}
+
+const _: () = assert!(size_of::<GpuAssemblyPrototypeRecord>() == 16);
+
+/// One assembly use: the prototype it places and its family-local transform (rows 0-2
+/// of the row-major matrix; the implicit last row is `[0, 0, 0, 1]`). The visibility
+/// traversal emits one draw record per use of a cut node's prototype, and the executor
+/// vertex path premultiplies the use transform before the instance transform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C, align(4))]
+pub struct GpuAssemblyUseRecord {
+    /// Rows 0-2 of the row-major family-local transform.
+    pub transform: [f32; 12],
+    /// The placed prototype.
+    pub prototype: u32,
+    /// Reserved ABI words.
+    pub reserved: [u32; 3],
+}
+
+const _: () = assert!(size_of::<GpuAssemblyUseRecord>() == 64);
+
+/// `GpuDrawRecord::clusterState`: the record draws outside any assembly (an ordinary
+/// mesh, or a family node spanning prototypes).
+pub const GPU_ASSEMBLY_NO_USE: u32 = u32::MAX;
+
+/// Frames one representation crossfade sweeps: the traversal advances a flip node's
+/// phase once per frame until it reaches this total and the transition settles.
+pub const GPU_TRANSITION_FRAMES: u32 = 16;
+
+/// Instance-flag shift of the two-bit vegetation interaction policy.
+pub const GPU_SCENE_INSTANCE_POLICY_SHIFT: u32 = 1;
+/// Instance flag: the static payload carries explicit conservative bounds spheres
+/// (words 16..24) the cull uses instead of the prototype sphere.
+pub const GPU_SCENE_INSTANCE_FLAG_EXPLICIT_BOUNDS: u32 = 8;
+/// Instance flag: the static payload carries a surface attachment (words 24..30).
+pub const GPU_SCENE_INSTANCE_FLAG_ATTACHED: u32 = 16;
+/// Instance flag: the wind deformation prepass writes this instance's sway record,
+/// every raster pass applies it, and the visibility cull adds its bounds slack.
+pub const GPU_SCENE_INSTANCE_FLAG_WIND: u32 = 32;
+
+/// One wind-deformed instance's prepass output: the full sway displacement at the
+/// instance's bounds top for the current and previous frame times, the reciprocal
+/// of the local bounds-top height, and the world-space cull slack covering both
+/// sways. The device buffer holds one record per instance slot.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuWindInstanceRecord {
+    /// World-space sway at the bounds top, current frame time.
+    pub sway_current: [f32; 3],
+    /// Reciprocal of the instance-local bounds-top height.
+    pub height_scale: f32,
+    /// World-space sway at the bounds top, previous frame time.
+    pub sway_previous: [f32; 3],
+    /// Cull slack in metres: the larger sway magnitude plus the larger interaction
+    /// magnitude.
+    pub bounds_inflation: f32,
+    /// World interaction-field displacement at the root, current frame.
+    pub interaction_current: [f32; 3],
+    /// Reserved ABI word.
+    pub reserved0: f32,
+    /// The previous frame's interaction displacement (the field is stateful, so the
+    /// prepass carries it forward from the record rather than recomputing).
+    pub interaction_previous: [f32; 3],
+    /// Reserved ABI word.
+    pub reserved1: f32,
+    /// Branch-mode quadrature (sin, cos of the mode angle) at the current and the
+    /// previous frame's time — a per-use phase offset applies as
+    /// `sin(ωt+φ) = s·cosφ + c·sinφ`, so time never reaches the vertex path.
+    pub branch_quadrature: [f32; 4],
+    /// Branch-mode amplitude in metres at the bounds top.
+    pub branch_amplitude: f32,
+    /// Leaf-flutter amplitude in metres.
+    pub flutter_amplitude: f32,
+    /// Reserved ABI words.
+    pub reserved2: [f32; 2],
+}
+
+const _: () = assert!(size_of::<GpuWindInstanceRecord>() == 96);
+
+/// Cascades of the world interaction field.
+pub const GPU_INTERACTION_CASCADES: u32 = 2;
+/// Texels per interaction-cascade side.
+pub const GPU_INTERACTION_TEXELS: u32 = 256;
+/// Byte size of one interaction texel.
+pub const GPU_INTERACTION_TEXEL_SIZE: u32 = 32;
+/// Byte size of the interaction field's header.
+pub const GPU_INTERACTION_HEADER_SIZE: u32 = 32;
+
+/// Total byte size of one world's interaction field buffer (header + cascades).
+pub const GPU_INTERACTION_FIELD_BYTES: u64 = GPU_INTERACTION_HEADER_SIZE as u64
+    + GPU_INTERACTION_CASCADES as u64
+        * GPU_INTERACTION_TEXELS as u64
+        * GPU_INTERACTION_TEXELS as u64
+        * GPU_INTERACTION_TEXEL_SIZE as u64;
+
+/// One resident micro field tile's header in the fields arena. The header is followed
+/// by `sample_count` `u16` density samples (padded to a four-byte boundary), then
+/// `attribute_count` typed channels, each a 16-byte channel id plus `sample_count`
+/// `i32` values. The tile grid spans its owner cell's bounds.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct GpuFieldTileRecord {
+    /// Signed level-zero owner-cell coordinates.
+    pub cell: [i64; 3],
+    /// Density-grid dimensions.
+    pub dims: [u32; 3],
+    /// Density samples in the grid.
+    pub sample_count: u32,
+    /// The 128-bit cosmetic reconstruction seed as four little-endian words.
+    pub seed: [u32; 4],
+    /// Typed attribute channels following the density samples.
+    pub attribute_count: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+}
+
+const _: () = assert!(size_of::<GpuFieldTileRecord>() == 64);
+
+/// `GpuSceneInstanceRecord::flags` bit: the instance anchors a micro vegetation field.
+/// The visibility cull skips it (field tiles cull per texel in the micro pass); only
+/// micro-blade records reference it.
+pub const GPU_SCENE_INSTANCE_FLAG_MICRO_FIELD: u32 = 1;
+
+/// Vertices in the shared micro-blade template: a four-segment tapered strip the
+/// executor derives procedurally per candidate (no vertex data exists — the template
+/// only enumerates triangle corners).
+pub const MICRO_BLADE_VERTEX_COUNT: u32 = 10;
+
+/// Indices in the shared micro-blade template (eight triangles over the strip).
+pub const MICRO_BLADE_INDEX_COUNT: u32 = 24;
+
+/// The template's triangle corners: per strip segment, two counter-clockwise
+/// triangles over vertex pairs `(2i, 2i+1)` → `(2i+2, 2i+3)`.
+#[must_use]
+pub fn micro_blade_template_indices() -> Vec<u32> {
+    let mut indices = Vec::with_capacity(MICRO_BLADE_INDEX_COUNT as usize);
+    for segment in 0..4_u32 {
+        let base = segment * 2;
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+        indices.extend_from_slice(&[base + 1, base + 3, base + 2]);
+    }
+    indices
+}
+
+/// One generated micro-blade candidate: the frame-transient placement the executor
+/// vertex paths reconstruct the blade from (`GpuDrawRecord::content_index` slots).
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuMicroCandidate {
+    /// World-space root position.
+    pub position: [f32; 3],
+    /// Blade height in metres.
+    pub height: f32,
+    /// Facing yaw in radians.
+    pub yaw: f32,
+    /// Blade width in metres.
+    pub width: f32,
+    /// Phenotype selector.
+    pub phenotype: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+    /// Horizontal analytic wind bend (x, z) at the current frame time.
+    pub wind_bend: [f32; 2],
+    /// Horizontal analytic wind bend (x, z) at the previous frame time.
+    pub wind_bend_previous: [f32; 2],
+}
+
+const _: () = assert!(size_of::<GpuMicroCandidate>() == 48);
+
+/// One resident micro field tile's directory entry: the tile's byte offset in the
+/// fields arena and the per-family field instance its blade records reference.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct GpuFieldDirectoryEntry {
+    /// The per-family field instance (index, generation).
+    pub instance: GpuHandle,
+    /// The tile header's byte offset within the fields arena.
+    pub tile_offset: u32,
+    /// Cooked density upper bound of the tile's blade candidates (no view term).
+    pub predicted: u32,
+}
+
+const _: () = assert!(size_of::<GpuFieldDirectoryEntry>() == 16);
+
+/// One submesh of a geometry: its index-range slice and the prototype material slot it
+/// draws with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C, align(8))]
+pub struct GpuSubmeshRecord {
+    /// First index within the geometry's index range.
+    pub first_index: u32,
+    /// Number of indices.
+    pub index_count: u32,
+    /// Prototype material slot.
+    pub material_slot: u32,
     /// Reserved ABI word.
     pub reserved: u32,
 }
@@ -1266,8 +1544,46 @@ pub struct GpuMaterialTableRecord {
     pub parameter_index: u32,
     /// Pass-independent immutable material pipeline dimensions.
     pub material_class: GpuMaterialClass,
-    /// Reserved ABI words.
-    pub reserved: [u32; 2],
+    /// Executor shader identity: 0 is the engine übershader, nonzero indexes the
+    /// renderer's registered codegen shader table.
+    pub shader_index: u32,
+    /// [`GPU_MATERIAL_TABLE_FLAG_TESSELLATED`] and future material flags.
+    pub flags: u32,
+}
+
+/// The executor shader registry: gives [`GpuMaterialTableRecord::shader_index`] its
+/// meaning. Index 0 is the engine übershader; nonzero indices are codegen material
+/// shaders registered when the mirror interns them.
+#[derive(Debug)]
+pub struct ExecutorShaderRegistry {
+    shaders: Vec<String>,
+}
+
+impl Default for ExecutorShaderRegistry {
+    fn default() -> Self {
+        Self {
+            shaders: vec!["shaders/mesh.spv".to_owned()],
+        }
+    }
+}
+
+impl ExecutorShaderRegistry {
+    /// Registers `shader`, returning its stable index (existing entries dedup).
+    pub fn register(&mut self, shader: &str) -> u32 {
+        if let Some(index) = self.shaders.iter().position(|entry| entry == shader) {
+            return index as u32;
+        }
+        self.shaders.push(shader.to_owned());
+        (self.shaders.len() - 1) as u32
+    }
+
+    /// The shader path behind `index` (the übershader for an unknown index).
+    #[must_use]
+    pub fn get(&self, index: u32) -> &str {
+        self.shaders
+            .get(index as usize)
+            .map_or("shaders/mesh.spv", String::as_str)
+    }
 }
 
 /// Immutable texture-table record.
@@ -1382,7 +1698,28 @@ pub struct GpuInverseBindRecord {
     pub matrix: [f32; 16],
 }
 
+/// [`GpuDeformationProviderRecord::provider_mask`]: compute skinning (joint palettes
+/// over the skin stream).
+pub const GPU_DEFORMATION_PROVIDER_SKINNING: u32 = 1 << 0;
+/// [`GpuDeformationProviderRecord::provider_mask`]: morph-target blending (before skin).
+pub const GPU_DEFORMATION_PROVIDER_MORPH: u32 = 1 << 1;
+/// [`GpuDeformationProviderRecord::provider_mask`]: material height displacement through
+/// the tessellation seam.
+pub const GPU_DEFORMATION_PROVIDER_DISPLACEMENT: u32 = 1 << 2;
+/// [`GpuDeformationProviderRecord::provider_mask`]: wind sway sampled from the shared
+/// deterministic wind field.
+pub const GPU_DEFORMATION_PROVIDER_WIND: u32 = 1 << 3;
+/// [`GpuDeformationProviderRecord::provider_mask`]: the world interaction field
+/// (impulse displacement with damped recovery).
+pub const GPU_DEFORMATION_PROVIDER_INTERACTION: u32 = 1 << 4;
+
 /// One composed deformation-provider chain in the global deformation arena.
+///
+/// The contract every provider composes through: current AND previous outputs
+/// (vertices or transforms) so motion vectors read the same deformation the passes
+/// draw, cluster-tight swept bounds for visibility, and optional BLAS inputs for the
+/// ray-traced mirror. `provider_mask` names the composed providers; the parameter
+/// words at `first_parameter` belong to them in mask-bit order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C, align(16))]
 pub struct GpuDeformationProviderRecord {
@@ -1395,6 +1732,16 @@ pub struct GpuDeformationProviderRecord {
     /// Deformation-output flags.
     pub flags: u32,
 }
+
+/// Page-record flag: the page is a guaranteed root that stays drawable under every
+/// residency pressure condition.
+pub const GPU_PAGE_FLAG_GUARANTEED_ROOT: u32 = 1 << 0;
+
+/// [`GpuMaterialTableRecord::flags`]: the material displaces real geometry
+/// (`HeightMode::Displacement` with a bound height map). The visibility traversal
+/// skips records carrying it while the tessellation seam is active — the amplified
+/// transient geometry draws through the tess indirect draws instead.
+pub const GPU_MATERIAL_TABLE_FLAG_TESSELLATED: u32 = 1 << 0;
 
 /// Immutable page-table record with parent-before-child residency.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -1446,6 +1793,131 @@ pub struct GpuDrawRecord {
     pub reserved: u32,
 }
 
+/// Device form of one GPU-scene prototype slot.
+///
+/// Handle fields typed [`GpuHandle`] address the resident asset tables; `root_page` is a
+/// packed GPU-scene page handle resolved through the scene page table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C, align(16))]
+pub struct GpuScenePrototypeGpuRecord {
+    /// Geometry-table handle.
+    pub geometry: GpuHandle,
+    /// Range of packed scene-material handles in [`GlobalGpuData::prototype_materials`].
+    pub material_range: GpuArenaRange,
+    /// Packed scene deformation handle or [`GpuHandle::INVALID`].
+    pub deformation: GpuHandle,
+    /// Packed scene SDF handle or [`GpuHandle::INVALID`].
+    pub sdf: GpuHandle,
+    /// Packed scene page handle of the guaranteed-resident root.
+    pub root_page: GpuHandle,
+    /// Source generation of the mirrored asset.
+    pub source_generation: u32,
+    /// Prototype flags.
+    pub flags: u32,
+    /// Conservative object-space bounding sphere (16-byte aligned for storage-pointer loads).
+    pub bounds: [f32; 4],
+    /// Reserved ABI words.
+    pub reserved: [u32; 4],
+}
+
+/// Device form of one GPU-scene reference slot (material, deformation, or SDF): a
+/// resident-table handle plus the revision of its source data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C, align(8))]
+pub struct GpuSceneReferenceGpuRecord {
+    /// Resident-table handle the reference resolves to.
+    pub target: GpuHandle,
+    /// Monotonic source-data revision.
+    pub source_revision: u64,
+}
+
+/// Device form of one GPU-scene page slot: the resident page-table record it wraps and
+/// its packed parent scene-page handle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C, align(8))]
+pub struct GpuScenePageGpuRecord {
+    /// Resident [`GlobalGpuData::page_table`] handle.
+    pub table: GpuHandle,
+    /// Packed parent scene-page handle or [`GpuHandle::INVALID`] for a root.
+    pub parent: GpuHandle,
+    /// Source generation of the mirrored page.
+    pub source_generation: u32,
+    /// Page flags.
+    pub flags: u32,
+}
+
+/// The `transform_kind` value of a compact static placement transform.
+pub const GPU_SCENE_TRANSFORM_STATIC: u32 = 0;
+/// The `transform_kind` value of a current/previous dynamic matrix pair.
+pub const GPU_SCENE_TRANSFORM_DYNAMIC: u32 = 1;
+
+/// Device form of one per-world GPU-scene instance slot.
+///
+/// `transform` stores either the 64-byte compact static placement (remaining words zero)
+/// or the current and previous column-major world matrices, selected by `transform_kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[repr(C, align(16))]
+pub struct GpuSceneInstanceGpuRecord {
+    /// Packed scene prototype handle.
+    pub prototype: GpuHandle,
+    /// Packed scene deformation handle or [`GpuHandle::INVALID`].
+    pub deformation: GpuHandle,
+    /// Packed scene SDF handle or [`GpuHandle::INVALID`].
+    pub sdf: GpuHandle,
+    /// Range of [`GpuSceneOverrideGpuRecord`] elements in the override arena.
+    pub material_overrides: GpuArenaRange,
+    /// [`GPU_SCENE_TRANSFORM_STATIC`] or [`GPU_SCENE_TRANSFORM_DYNAMIC`].
+    pub transform_kind: u32,
+    /// Source generation of the mirrored instance.
+    pub source_generation: u32,
+    /// Instance flags.
+    pub flags: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+    /// The transform payload words.
+    pub transform: [f32; 32],
+}
+
+impl Default for GpuSceneInstanceGpuRecord {
+    fn default() -> Self {
+        Zeroable::zeroed()
+    }
+}
+
+/// Device form of one per-world GPU-scene light slot.
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[repr(C, align(16))]
+pub struct GpuSceneLightGpuRecord {
+    /// The packed punctual light.
+    pub light: crate::GpuLight,
+    /// Monotonic source-data revision.
+    pub source_revision: u64,
+    /// Reserved ABI words.
+    pub reserved: u64,
+}
+
+/// One sparse per-instance material override element.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C, align(8))]
+pub struct GpuSceneOverrideGpuRecord {
+    /// Prototype material slot the override replaces.
+    pub slot: u32,
+    /// Reserved ABI word.
+    pub reserved: u32,
+    /// Packed scene material handle.
+    pub material: GpuHandle,
+}
+
+const _: () = assert!(
+    size_of::<GpuScenePrototypeGpuRecord>() == 80
+        && size_of::<GpuSceneReferenceGpuRecord>() == 16
+        && size_of::<GpuScenePageGpuRecord>() == 24
+        && size_of::<GpuSceneInstanceGpuRecord>() == 176
+        && size_of::<GpuSceneLightGpuRecord>() == 80
+        && size_of::<GpuSceneOverrideGpuRecord>() == 16,
+    "GPU-scene device records must match the locked std430 slot layouts"
+);
+
 /// Fixed semantic PSO-bin vocabulary independent of the draw executor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable)]
 #[repr(transparent)]
@@ -1465,6 +1937,8 @@ pub enum GpuRepresentation {
     TriangleCluster = 0,
     /// Aggregate voxel surface.
     AggregateVoxel = 1,
+    /// Procedural micro vegetation blade reconstructed from a resident field tile.
+    MicroBlade = 2,
 }
 
 /// Raster sidedness.
@@ -1534,6 +2008,7 @@ impl GpuMaterialClass {
         sidedness: GpuSidedness,
         surface_model: SurfaceModel,
         transparency: GpuTransparency,
+        unlit: bool,
     ) -> Self {
         let surface_model = match surface_model {
             SurfaceModel::Standard => 0,
@@ -1543,17 +2018,24 @@ impl GpuMaterialClass {
             ((coverage as u32) << GPU_MATERIAL_COVERAGE_SHIFT)
                 | ((sidedness as u32) << GPU_MATERIAL_SIDEDNESS_SHIFT)
                 | (surface_model << GPU_MATERIAL_SURFACE_MODEL_SHIFT)
-                | ((transparency as u32) << GPU_MATERIAL_TRANSPARENCY_SHIFT),
+                | ((transparency as u32) << GPU_MATERIAL_TRANSPARENCY_SHIFT)
+                | ((unlit as u32) << GPU_MATERIAL_UNLIT_SHIFT),
         )
     }
 
     /// Strictly restores a bounded material class from GPU bits.
     #[must_use]
     pub const fn from_bits(bits: u32) -> Option<Self> {
-        if bits & !0x1f != 0 || bits & 0x3 > 2 {
+        if bits & !0x3f != 0 || bits & 0x3 > 2 {
             return None;
         }
         Some(Self(bits))
+    }
+
+    /// The unlit shading permutation.
+    #[must_use]
+    pub const fn unlit(self) -> bool {
+        self.0 & (1 << GPU_MATERIAL_UNLIT_SHIFT) != 0
     }
 
     /// Canonical scalar embedded in material and full PSO records.
@@ -1623,7 +2105,7 @@ impl GpuPsoBin {
     /// Validates and restores the complete bounded PSO vocabulary from GPU bits.
     #[must_use]
     pub const fn from_bits(bits: u32) -> Option<Self> {
-        if bits & !0x0fff != 0
+        if bits & !0x1fff != 0
             || bits & 0x3 > 1
             || (bits >> 2) & 0x3 > 2
             || (bits >> GPU_PSO_PASS_SHIFT) & 0xf > 9
@@ -1716,10 +2198,18 @@ pub enum IndexArena {}
 pub enum ClusterArena {}
 /// Marker for the global assembly-part arena.
 pub enum PartArena {}
+
+/// Marker for the micro vegetation field-tile arena.
+#[derive(Debug)]
+pub enum FieldArena {}
 /// Marker for the global aggregate-voxel arena.
 pub enum VoxelArena {}
 /// Marker for the global page-byte arena.
 pub enum PageArena {}
+/// Stable deformed-vertex output arena marker.
+pub enum DeformedVertexArena {}
+/// Previous-frame deformed-vertex arena marker.
+pub enum PrevDeformedVertexArena {}
 /// Marker for the page dependency-handle arena.
 pub enum PageDependencyArena {}
 /// Marker for the skeleton joint-hierarchy arena.
@@ -1748,6 +2238,77 @@ pub enum CoverageTable {}
 pub enum SkeletonTable {}
 /// Marker for the page table.
 pub enum PageTable {}
+/// Marker for the geometry submesh-record arena.
+pub enum SubmeshArena {}
+/// Marker for the GPU-scene prototype table.
+pub enum ScenePrototypeTable {}
+/// Marker for the GPU-scene material-reference table.
+pub enum SceneMaterialTable {}
+/// Marker for the GPU-scene deformation-reference table.
+pub enum SceneDeformationTable {}
+/// Marker for the GPU-scene SDF-reference table.
+pub enum SceneSdfTable {}
+/// Marker for the GPU-scene page table.
+pub enum ScenePageTable {}
+/// Marker for a per-world GPU-scene instance table.
+pub enum SceneInstanceTable {}
+/// Marker for a per-world GPU-scene light table.
+pub enum SceneLightTable {}
+/// Marker for the per-instance material-override arena.
+pub enum SceneOverrideArena {}
+
+/// One resident device table addressed by the pending-upload queues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GlobalGpuTableKind {
+    /// [`GlobalGpuData::prototypes`].
+    Prototype,
+    /// [`GlobalGpuData::geometries`].
+    Geometry,
+    /// [`GlobalGpuData::materials`].
+    Material,
+    /// [`GlobalGpuData::textures`].
+    Texture,
+    /// [`GlobalGpuData::coverage`].
+    Coverage,
+    /// [`GlobalGpuData::skeletons`].
+    Skeleton,
+    /// [`GlobalGpuData::page_table`].
+    Page,
+}
+
+/// Descriptor-ready identity of one global immutable table buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuTableDescriptor {
+    /// Vulkan storage buffer.
+    pub buffer: vk::Buffer,
+    /// First bound byte.
+    pub offset: vk::DeviceSize,
+    /// Bound byte range.
+    pub range: vk::DeviceSize,
+    /// Element-zero device address, or zero without BDA support.
+    pub address: vk::DeviceAddress,
+    /// Generation-header plus record stride.
+    pub slot_stride: u64,
+}
+
+/// Complete immutable-table descriptor set shared by every GPU-scene world and view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlobalGpuTableDescriptors {
+    /// Prototype records.
+    pub prototypes: GpuTableDescriptor,
+    /// Geometry records.
+    pub geometries: GpuTableDescriptor,
+    /// Material records.
+    pub materials: GpuTableDescriptor,
+    /// Texture records.
+    pub textures: GpuTableDescriptor,
+    /// Coverage records.
+    pub coverage: GpuTableDescriptor,
+    /// Skeleton records.
+    pub skeletons: GpuTableDescriptor,
+    /// Resident-page records.
+    pub pages: GpuTableDescriptor,
+}
 
 /// Complete device-global geometry arenas and immutable metadata tables.
 pub struct GlobalGpuData {
@@ -1759,10 +2320,25 @@ pub struct GlobalGpuData {
     pub clusters: GlobalGpuArena<ClusterArena>,
     /// Plant assembly-part records.
     pub parts: GlobalGpuArena<PartArena>,
+    /// Micro vegetation field tiles (quantized density + reconstruction headers).
+    pub fields: GlobalGpuArena<FieldArena>,
+    /// The shared micro-blade template's index block within the pages arena, seeded
+    /// once at renderer startup.
+    pub micro_blade_template: GpuArenaRange,
+    /// The frame-transient micro-blade candidates: one
+    /// [`crate::SCENE_MICRO_CANDIDATE_CAPACITY`]-slot region per frame in flight,
+    /// written by the micro pass and read by the executor vertex paths through the
+    /// address block.
+    pub micro_candidates: crate::Buffer,
     /// Aggregate-voxel records and portable surface output.
     pub voxels: GlobalGpuArena<VoxelArena>,
     /// Content-addressed resident page bytes.
     pub pages: GlobalGpuArena<PageArena>,
+    /// Stable per-instance deformed-vertex output (the skinning compute writes it; the
+    /// executor pulls it).
+    pub deformed_vertices: GlobalGpuArena<DeformedVertexArena>,
+    /// Last frame's deformed vertices (deformation motion vectors).
+    pub prev_deformed_vertices: GlobalGpuArena<PrevDeformedVertexArena>,
     /// Page dependency handles addressed by [`GpuPageRecord::dependencies`].
     pub page_dependencies: GlobalGpuArena<PageDependencyArena>,
     /// Skeleton joints addressed by [`GpuSkeletonRecord::joints`].
@@ -1777,6 +2353,10 @@ pub struct GlobalGpuData {
     pub prototype_materials: GlobalGpuArena<PrototypeMaterialArena>,
     /// Immutable parameters addressed by [`GpuMaterialTableRecord::parameter_index`].
     pub material_parameters: GlobalGpuArena<MaterialParameterArena>,
+    /// Geometry submesh records referenced by [`GpuGeometryRecord::submeshes`].
+    pub submesh_table: GlobalGpuArena<SubmeshArena>,
+    /// The executor shader registry [`GpuMaterialTableRecord::shader_index`] indexes.
+    pub executor_shaders: ExecutorShaderRegistry,
     /// Prototype records.
     pub prototypes: ResidentGpuTable<GpuPrototypeRecord, PrototypeTable>,
     /// Geometry records.
@@ -1798,13 +2378,34 @@ pub struct GlobalGpuData {
 impl GlobalGpuData {
     /// Creates the global substrate with byte-addressable arenas.
     pub fn new(device: &Device) -> Result<Self> {
+        let mut pages = GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?;
+        let micro_candidates = crate::Buffer::new(
+            device.resources(),
+            u64::from(crate::MAX_FRAMES_IN_FLIGHT as u32)
+                * u64::from(crate::SCENE_MICRO_CANDIDATE_CAPACITY)
+                * size_of::<GpuMicroCandidate>() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                ..Default::default()
+            },
+        )?;
+        // The shared micro-blade template's index block lives at a fixed pages-arena
+        // range; the renderer seeds its bytes once at startup.
+        let (micro_blade_template, _) =
+            pages.allocate(MICRO_BLADE_INDEX_COUNT * size_of::<u32>() as u32, 16)?;
         Ok(Self {
             vertices: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
+            deformed_vertices: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
+            prev_deformed_vertices: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
             indices: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
             clusters: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
             parts: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
+            fields: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
             voxels: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
-            pages: GlobalGpuArena::new(device, 1, INITIAL_ARENA_BYTES)?,
+            pages,
+            micro_blade_template,
+            micro_candidates,
             page_dependencies: GlobalGpuArena::new(
                 device,
                 std::mem::size_of::<GpuHandle>() as u64,
@@ -1840,6 +2441,12 @@ impl GlobalGpuData {
                 std::mem::size_of::<MaterialParamsData>() as u64,
                 4_096,
             )?,
+            submesh_table: GlobalGpuArena::new(
+                device,
+                std::mem::size_of::<GpuSubmeshRecord>() as u64,
+                4_096,
+            )?,
+            executor_shaders: ExecutorShaderRegistry::default(),
             prototypes: ResidentGpuTable::new(device, 1_024)?,
             geometries: ResidentGpuTable::new(device, 1_024)?,
             materials: ResidentGpuTable::new(device, 4_096)?,
@@ -1858,6 +2465,7 @@ impl GlobalGpuData {
         self.indices.begin_frame(completed_frame_slot)?;
         self.clusters.begin_frame(completed_frame_slot)?;
         self.parts.begin_frame(completed_frame_slot)?;
+        self.fields.begin_frame(completed_frame_slot)?;
         self.voxels.begin_frame(completed_frame_slot)?;
         self.pages.begin_frame(completed_frame_slot)?;
         self.page_dependencies.begin_frame(completed_frame_slot)?;
@@ -1869,6 +2477,7 @@ impl GlobalGpuData {
             .begin_frame(completed_frame_slot)?;
         self.prototype_materials.begin_frame(completed_frame_slot)?;
         self.material_parameters.begin_frame(completed_frame_slot)?;
+        self.submesh_table.begin_frame(completed_frame_slot)?;
         self.prototypes.begin_frame(completed_frame_slot)?;
         self.geometries.begin_frame(completed_frame_slot)?;
         self.materials.begin_frame(completed_frame_slot)?;
@@ -1877,6 +2486,20 @@ impl GlobalGpuData {
         self.skeletons.begin_frame(completed_frame_slot)?;
         self.page_table.begin_frame(completed_frame_slot)?;
         self.uploads.begin_frame(completed_frame_slot)
+    }
+
+    /// Captures descriptor-ready identities for every immutable global table.
+    #[must_use]
+    pub fn table_descriptors(&self, device: &Device) -> GlobalGpuTableDescriptors {
+        GlobalGpuTableDescriptors {
+            prototypes: self.prototypes.descriptor(device),
+            geometries: self.geometries.descriptor(device),
+            materials: self.materials.descriptor(device),
+            textures: self.textures.descriptor(device),
+            coverage: self.coverage.descriptor(device),
+            skeletons: self.skeletons.descriptor(device),
+            pages: self.page_table.descriptor(device),
+        }
     }
 }
 
@@ -2053,6 +2676,7 @@ mod tests {
                                 sidedness,
                                 surface_model,
                                 transparency,
+                                false,
                             );
                             material_bits.insert(material.bits());
                             assert_eq!(
@@ -2089,10 +2713,24 @@ mod tests {
     #[test]
     fn gpu_abi_layouts_are_byte_locked() {
         assert_eq!((size_of::<GpuHandle>(), align_of::<GpuHandle>()), (8, 8));
+        assert_eq!(offset_of!(GpuHandle, index), 0);
+        assert_eq!(offset_of!(GpuHandle, generation), 4);
         assert_eq!(
             (size_of::<GpuArenaRange>(), align_of::<GpuArenaRange>()),
             (8, 8)
         );
+        assert_eq!(offset_of!(GpuArenaRange, first), 0);
+        assert_eq!(offset_of!(GpuArenaRange, count), 4);
+        assert_eq!(
+            (
+                size_of::<GpuTableSlotHeader>(),
+                align_of::<GpuTableSlotHeader>()
+            ),
+            (16, 4)
+        );
+        assert_eq!(offset_of!(GpuTableSlotHeader, generation), 0);
+        assert_eq!(offset_of!(GpuTableSlotHeader, occupied), 4);
+        assert_eq!(offset_of!(GpuTableSlotHeader, reserved), 8);
         assert_eq!(
             (
                 size_of::<GpuPrototypeRecord>(),
@@ -2100,12 +2738,32 @@ mod tests {
             ),
             (64, 16)
         );
+        assert_eq!(offset_of!(GpuPrototypeRecord, geometry), 0);
+        assert_eq!(offset_of!(GpuPrototypeRecord, material_range), 8);
+        assert_eq!(offset_of!(GpuPrototypeRecord, skeleton), 16);
+        assert_eq!(offset_of!(GpuPrototypeRecord, root_page), 24);
+        assert_eq!(offset_of!(GpuPrototypeRecord, bounds), 32);
+        assert_eq!(offset_of!(GpuPrototypeRecord, flags), 48);
+        assert_eq!(offset_of!(GpuPrototypeRecord, reserved), 52);
         assert_eq!(
             (
                 size_of::<GpuGeometryRecord>(),
                 align_of::<GpuGeometryRecord>()
             ),
-            (56, 8)
+            (64, 8)
+        );
+        assert_eq!(offset_of!(GpuGeometryRecord, vertices), 0);
+        assert_eq!(offset_of!(GpuGeometryRecord, indices), 8);
+        assert_eq!(offset_of!(GpuGeometryRecord, clusters), 16);
+        assert_eq!(offset_of!(GpuGeometryRecord, parts), 24);
+        assert_eq!(offset_of!(GpuGeometryRecord, voxels), 32);
+        assert_eq!(offset_of!(GpuGeometryRecord, submeshes), 40);
+        assert_eq!(
+            (
+                size_of::<GpuSubmeshRecord>(),
+                align_of::<GpuSubmeshRecord>()
+            ),
+            (16, 8)
         );
         assert_eq!(
             (
@@ -2114,6 +2772,13 @@ mod tests {
             ),
             (40, 8)
         );
+        assert_eq!(offset_of!(GpuMaterialTableRecord, base_color_texture), 0);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, normal_texture), 8);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, coverage), 16);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, parameter_index), 24);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, material_class), 28);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, shader_index), 32);
+        assert_eq!(offset_of!(GpuMaterialTableRecord, flags), 36);
         assert_eq!(
             (
                 size_of::<GpuTextureTableRecord>(),
@@ -2121,6 +2786,12 @@ mod tests {
             ),
             (32, 4)
         );
+        assert_eq!(offset_of!(GpuTextureTableRecord, descriptor_index), 0);
+        assert_eq!(offset_of!(GpuTextureTableRecord, width), 4);
+        assert_eq!(offset_of!(GpuTextureTableRecord, height), 8);
+        assert_eq!(offset_of!(GpuTextureTableRecord, mip_count), 12);
+        assert_eq!(offset_of!(GpuTextureTableRecord, flags), 16);
+        assert_eq!(offset_of!(GpuTextureTableRecord, reserved), 20);
         assert_eq!(
             (
                 size_of::<GpuCoverageRecord>(),
@@ -2128,6 +2799,11 @@ mod tests {
             ),
             (48, 8)
         );
+        assert_eq!(offset_of!(GpuCoverageRecord, texture), 0);
+        assert_eq!(offset_of!(GpuCoverageRecord, classification), 12);
+        assert_eq!(offset_of!(GpuCoverageRecord, omm_policy), 20);
+        assert_eq!(offset_of!(GpuCoverageRecord, source_extent), 32);
+        assert_eq!(offset_of!(GpuCoverageRecord, reserved), 44);
         assert_eq!(
             (
                 size_of::<GpuSkeletonRecord>(),
@@ -2135,10 +2811,22 @@ mod tests {
             ),
             (32, 8)
         );
+        assert_eq!(offset_of!(GpuSkeletonRecord, joints), 0);
+        assert_eq!(offset_of!(GpuSkeletonRecord, inverse_binds), 8);
+        assert_eq!(offset_of!(GpuSkeletonRecord, deformation), 16);
+        assert_eq!(offset_of!(GpuSkeletonRecord, flags), 24);
+        assert_eq!(offset_of!(GpuSkeletonRecord, reserved), 28);
         assert_eq!(
             (size_of::<GpuPageRecord>(), align_of::<GpuPageRecord>()),
             (40, 8)
         );
+        assert_eq!(offset_of!(GpuPageRecord, parent), 0);
+        assert_eq!(offset_of!(GpuPageRecord, dependencies), 8);
+        assert_eq!(offset_of!(GpuPageRecord, byte_offset), 16);
+        assert_eq!(offset_of!(GpuPageRecord, byte_length), 24);
+        assert_eq!(offset_of!(GpuPageRecord, resident_generation), 28);
+        assert_eq!(offset_of!(GpuPageRecord, flags), 32);
+        assert_eq!(offset_of!(GpuPageRecord, reserved), 36);
         assert_eq!(
             (size_of::<GpuDrawRecord>(), align_of::<GpuDrawRecord>()),
             (64, 8)
@@ -2151,8 +2839,11 @@ mod tests {
             ),
             (4, 4)
         );
-        assert_eq!(offset_of!(GpuGeometryRecord, flags), 40);
-        assert_eq!(offset_of!(GpuGeometryRecord, reserved), 52);
+        assert_eq!(offset_of!(GpuMaterialClass, 0), 0);
+        assert_eq!(offset_of!(GpuGeometryRecord, flags), 48);
+        assert_eq!(offset_of!(GpuGeometryRecord, vertex_stride), 52);
+        assert_eq!(offset_of!(GpuGeometryRecord, index_stride), 56);
+        assert_eq!(offset_of!(GpuGeometryRecord, reserved), 60);
         assert_eq!(offset_of!(GpuCoverageRecord, cutoff), 8);
         assert_eq!(offset_of!(GpuCoverageRecord, source_kind), 16);
         assert_eq!(offset_of!(GpuCoverageRecord, hash_salt), 24);
@@ -2164,6 +2855,8 @@ mod tests {
             ),
             (8, 8)
         );
+        assert_eq!(offset_of!(GpuSkeletonJointRecord, parent), 0);
+        assert_eq!(offset_of!(GpuSkeletonJointRecord, flags), 4);
         assert_eq!(
             (
                 size_of::<GpuInverseBindRecord>(),
@@ -2171,6 +2864,7 @@ mod tests {
             ),
             (64, 16)
         );
+        assert_eq!(offset_of!(GpuInverseBindRecord, matrix), 0);
         assert_eq!(
             (
                 size_of::<GpuDeformationProviderRecord>(),
@@ -2178,9 +2872,21 @@ mod tests {
             ),
             (16, 16)
         );
+        assert_eq!(offset_of!(GpuDeformationProviderRecord, provider_mask), 0);
+        assert_eq!(offset_of!(GpuDeformationProviderRecord, first_parameter), 4);
+        assert_eq!(offset_of!(GpuDeformationProviderRecord, parameter_count), 8);
+        assert_eq!(offset_of!(GpuDeformationProviderRecord, flags), 12);
+        assert_eq!(offset_of!(GpuDrawRecord, geometry), 0);
+        assert_eq!(offset_of!(GpuDrawRecord, material), 8);
+        assert_eq!(offset_of!(GpuDrawRecord, instance), 16);
+        assert_eq!(offset_of!(GpuDrawRecord, deformation), 24);
         assert_eq!(offset_of!(GpuDrawRecord, pso_bin), 48);
         assert_eq!(offset_of!(GpuDrawRecord, content_index), 32);
         assert_eq!(offset_of!(GpuDrawRecord, part), 36);
+        assert_eq!(offset_of!(GpuDrawRecord, representation), 40);
+        assert_eq!(offset_of!(GpuDrawRecord, source_generation), 44);
+        assert_eq!(offset_of!(GpuDrawRecord, transition), 52);
+        assert_eq!(offset_of!(GpuDrawRecord, cluster_state), 56);
         assert_eq!(offset_of!(GpuDrawRecord, reserved), 60);
     }
 
@@ -2204,23 +2910,71 @@ mod tests {
         ] {
             assert!(source.contains(&declaration), "missing `{declaration}`");
         }
-        for record in [
-            "GpuHandle",
-            "GpuArenaRange",
-            "GpuTableSlotHeader",
-            "GpuPrototypeRecord",
-            "GpuGeometryRecord",
-            "GpuMaterialTableRecord",
-            "GpuTextureTableRecord",
-            "GpuCoverageRecord",
-            "GpuSkeletonRecord",
-            "GpuSkeletonJointRecord",
-            "GpuInverseBindRecord",
-            "GpuDeformationProviderRecord",
-            "GpuPageRecord",
-            "GpuDrawRecord",
+        for (record, expected_body) in [
+            ("GpuHandle", "public uint index; public uint generation;"),
+            ("GpuArenaRange", "public uint first; public uint count;"),
+            (
+                "GpuTableSlotHeader",
+                "public uint generation; public uint occupied; public uint2 reserved;",
+            ),
+            (
+                "GpuPrototypeRecord",
+                "public GpuHandle geometry; public GpuArenaRange materialRange; public GpuHandle skeleton; public GpuHandle rootPage; public float4 bounds; public uint flags; public uint3 reserved;",
+            ),
+            (
+                "GpuGeometryRecord",
+                "public GpuArenaRange vertices; public GpuArenaRange indices; public GpuArenaRange clusters; public GpuArenaRange parts; public GpuArenaRange voxels; public GpuArenaRange submeshes; public uint flags; public uint vertexStride; public uint indexStride; public uint reserved;",
+            ),
+            (
+                "GpuMaterialTableRecord",
+                "public GpuHandle baseColorTexture; public GpuHandle normalTexture; public GpuHandle coverage; public uint parameterIndex; public uint materialClass; public uint shaderIndex; public uint flags;",
+            ),
+            (
+                "GpuTextureTableRecord",
+                "public uint descriptorIndex; public uint width; public uint height; public uint mipCount; public uint flags; public uint3 reserved;",
+            ),
+            (
+                "GpuCoverageRecord",
+                "public GpuHandle texture; public float cutoff; public uint classification; public uint sourceKind; public uint ommPolicy; public uint2 hashSalt; public uint2 sourceExtent; public uint ommThresholds; public uint reserved;",
+            ),
+            (
+                "GpuSkeletonRecord",
+                "public GpuArenaRange joints; public GpuArenaRange inverseBinds; public GpuArenaRange deformation; public uint flags; public uint reserved;",
+            ),
+            (
+                "GpuSkeletonJointRecord",
+                "public uint parent; public uint flags;",
+            ),
+            ("GpuInverseBindRecord", "public float4x4 matrix;"),
+            (
+                "GpuDeformationProviderRecord",
+                "public uint providerMask; public uint firstParameter; public uint parameterCount; public uint flags;",
+            ),
+            (
+                "GpuPageRecord",
+                "public GpuHandle parent; public GpuArenaRange dependencies; public uint64_t byteOffset; public uint byteLength; public uint residentGeneration; public uint flags; public uint reserved;",
+            ),
+            (
+                "GpuDrawRecord",
+                "public GpuHandle geometry; public GpuHandle material; public GpuHandle instance; public GpuHandle deformation; public uint contentIndex; public uint part; public uint representation; public uint sourceGeneration; public uint psoBin; public uint transition; public uint clusterState; public uint reserved;",
+            ),
         ] {
-            assert!(source.contains(&format!("public struct {record}")));
+            let marker = format!("public struct {record}");
+            let declaration = source
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("missing `{marker}`"))
+                .1;
+            let body = declaration
+                .split_once('{')
+                .expect("Slang record opening brace")
+                .1
+                .split_once('}')
+                .expect("Slang record closing brace")
+                .0
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(body, expected_body, "Slang fields for {record}");
         }
         assert!(source.contains("gpuHandleMatches(GpuHandle handle"));
         assert!(source.contains("header.occupied != 0u && header.generation == handle.generation"));
@@ -2265,5 +3019,90 @@ mod tests {
             generation: 0x0123_4567,
         };
         assert_eq!(GpuHandle::from_packed(handle.packed()), handle);
+    }
+
+    #[test]
+    fn arena_bda_byte_offsets_are_exact_and_checked() {
+        assert_eq!(arena_byte_offset(0, 48).unwrap(), 0);
+        assert_eq!(arena_byte_offset(1, 48).unwrap(), 48);
+        assert_eq!(arena_byte_offset(0x0123_4567, 64).unwrap(), 0x48d1_59c0);
+        assert!(arena_byte_offset(u32::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn arena_growth_and_reclamation_preserve_live_addresses_and_generations() {
+        let device = match Device::new(&crate::SurfaceSource::Offscreen) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping: no Vulkan device obtainable ({error})");
+                return;
+            }
+        };
+        let before = crate::validation_issue_count();
+        let mut arena = GlobalGpuArena::<VertexArena>::new(&device, 16, 1).unwrap();
+        let first = arena.allocate(8, 1).unwrap().0;
+        let second = arena.allocate(8, 1).unwrap().0;
+        assert_eq!((first.first, second.first), (0, 8));
+
+        let original_buffer = arena.buffer();
+        let original_address = arena.address(&device);
+        let growth_count = u32::try_from(arena.capacity()).unwrap() + 1;
+        let (_, needs_growth) = arena.allocate(growth_count, 1).unwrap();
+        assert!(needs_growth);
+        let growth = arena
+            .prepare_growth(&device)
+            .unwrap()
+            .expect("the range exceeds the original arena");
+        assert_eq!(growth.source, original_buffer);
+        assert_eq!(growth.destination, arena.buffer());
+        assert_eq!(growth.size, growth.source_size);
+        assert!(growth.destination_size > growth.source_size);
+        assert_eq!(arena.retired_allocation_count(), 1);
+        if device.capabilities.buffer_device_address {
+            assert_ne!(original_address, 0);
+            assert_eq!(
+                device.buffer_device_address(growth.source),
+                original_address
+            );
+            assert_ne!(arena.address(&device), original_address);
+        }
+
+        arena.retire(first).unwrap();
+        arena.retire(second).unwrap();
+        let before_fences = arena.allocate(16, 1).unwrap().0;
+        assert_ne!(before_fences.first, first.first);
+
+        let mut handles = ImmutableGpuTable::default();
+        let retired_handle = handles.insert(7_u32).unwrap();
+        assert_eq!(handles.retire(retired_handle), Some(7));
+        assert_ne!(handles.insert(8).unwrap().index, retired_handle.index);
+
+        for frame_slot in 0..MAX_FRAMES_IN_FLIGHT {
+            if frame_slot + 1 < MAX_FRAMES_IN_FLIGHT && device.capabilities.buffer_device_address {
+                assert_eq!(
+                    device.buffer_device_address(growth.source),
+                    original_address
+                );
+            }
+            arena.begin_frame(frame_slot).unwrap();
+            handles.begin_frame(frame_slot).unwrap();
+            let expected_retired = usize::from(frame_slot + 1 < MAX_FRAMES_IN_FLIGHT);
+            assert_eq!(arena.retired_allocation_count(), expected_retired);
+            if frame_slot + 1 < MAX_FRAMES_IN_FLIGHT {
+                assert_ne!(handles.insert(9_u32).unwrap().index, retired_handle.index);
+            }
+        }
+
+        let compacted = arena.allocate(16, 1).unwrap().0;
+        assert_eq!(compacted.first, first.first);
+        let reused_handle = handles.insert(10_u32).unwrap();
+        assert_eq!(reused_handle.index, retired_handle.index);
+        assert_ne!(reused_handle.generation, retired_handle.generation);
+        assert!(handles.get(retired_handle).is_none());
+
+        drop(arena);
+        device.wait_idle().expect("idle before teardown");
+        drop(device);
+        assert_eq!(crate::validation_issue_count(), before);
     }
 }

@@ -121,7 +121,9 @@ pub struct SdfInstance {
     /// The SDF grid's padded lower corner in local (rest) space (`xyz`; `w` = base-color **blue**) —
     /// the local sample maps to a fine-voxel coordinate via `local_min.xyz` + the voxel dims.
     pub local_min: Vec4,
-    /// The SDF grid's padded upper corner in local space (`xyz`; `w` reserved).
+    /// The SDF grid's padded upper corner in local space (`xyz`; `w` = the entity's
+    /// aggregate occupancy — `1` solid, fractional for porous thin-sheet matter the
+    /// distance-field consumers treat as extinction rather than a hard surface).
     pub local_max: Vec4,
     /// `.x` the shared bindless SDF slot (atlas binding 1 + indirection binding 2 + coverage
     /// binding 3) as a float, `.y` the `R16_SNORM` encode clamp (`max_dist`, local units),
