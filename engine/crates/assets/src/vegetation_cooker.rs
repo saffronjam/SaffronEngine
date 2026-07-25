@@ -253,7 +253,10 @@ fn reusable_plant(
     let Some(bytes) = store.read_plant_if_present(previous_node.output_hash)? else {
         return Ok(None);
     };
-    let index = PlantCompiledArtifactIndex::open(&bytes)?;
+    let index = PlantCompiledArtifactIndex::open(
+        &bytes,
+        saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+    )?;
     if index.family != family
         || index.cook_key != cook_key
         || index.platform_profile != options.platform.identity()?
@@ -291,6 +294,7 @@ fn reusable_plant(
             .map_err(|_| Error::Vegetation(saffron_vegetation::Error::NumericOverflow))?,
         phenotype_count: u32::try_from(prepared.accepted_asset.phenotypes.len())
             .map_err(|_| Error::Vegetation(saffron_vegetation::Error::NumericOverflow))?,
+        ecology: prepared.accepted_asset.ecology.clone(),
     };
     Ok(Some((node, plant)))
 }
@@ -464,6 +468,7 @@ pub fn stage_vegetation_cook(
                 .map_err(|_| Error::Vegetation(saffron_vegetation::Error::NumericOverflow))?,
             phenotype_count: u32::try_from(publication.accepted_asset.phenotypes.len())
                 .map_err(|_| Error::Vegetation(saffron_vegetation::Error::NumericOverflow))?,
+            ecology: publication.accepted_asset.ecology.clone(),
         });
         plant_outputs.insert(family.value(), publication.publication.content_hash);
         if source != publication.accepted_asset {
@@ -663,7 +668,10 @@ pub fn stage_vegetation_cook(
         )?;
         cancellation_checkpoint(cancellation)?;
         let publication = store.publish_cell(&bytes)?;
-        let index = VegetationCellArtifactIndex::open(&bytes)?;
+        let index = VegetationCellArtifactIndex::open(
+            &bytes,
+            saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+        )?;
         node.output_hash = publication.content_hash;
         node.actual = result_actual(&result, publication.bytes, publication.cache_hit);
         let species_counts = species_counts(&result)?;

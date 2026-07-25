@@ -7,9 +7,8 @@ use std::str::FromStr;
 use crate::{Error, Result};
 use atomic_write_file::AtomicWriteFile;
 use saffron_core::Uuid;
-use saffron_vegetation::{
-    ContentHash, PlantCompiledSectionKind, decode_portable_virtual_hierarchy_sections,
-};
+use saffron_geometry::decode_portable_virtual_hierarchy_sections;
+use saffron_vegetation::{ContentHash, PlantCompiledSectionKind};
 
 /// One derived vegetation artifact namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +106,10 @@ impl VegetationArtifactStore {
     /// Publishes one strictly validated `.svegcell` artifact.
     pub fn publish_cell(&self, bytes: &[u8]) -> Result<VegetationArtifactPublication> {
         self.publish_typed(VegetationArtifactKind::Cell, bytes, |bytes| {
-            saffron_vegetation::VegetationCellArtifactIndex::open(bytes)?;
+            saffron_vegetation::VegetationCellArtifactIndex::open(
+                bytes,
+                saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+            )?;
             Ok(())
         })
     }
@@ -141,7 +143,10 @@ impl VegetationArtifactStore {
     /// Reads and validates one `.svegcell` artifact by exact content identity.
     pub fn read_cell(&self, hash: ContentHash) -> Result<Vec<u8>> {
         self.read_typed(VegetationArtifactKind::Cell, hash, |bytes| {
-            saffron_vegetation::VegetationCellArtifactIndex::open(bytes)?;
+            saffron_vegetation::VegetationCellArtifactIndex::open(
+                bytes,
+                saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+            )?;
             Ok(())
         })
     }
@@ -149,7 +154,10 @@ impl VegetationArtifactStore {
     /// Reads and validates one `.svegcell` when it is present in the disposable cache.
     pub fn read_cell_if_present(&self, hash: ContentHash) -> Result<Option<Vec<u8>>> {
         self.read_typed_if_present(VegetationArtifactKind::Cell, hash, |bytes| {
-            saffron_vegetation::VegetationCellArtifactIndex::open(bytes)?;
+            saffron_vegetation::VegetationCellArtifactIndex::open(
+                bytes,
+                saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+            )?;
             Ok(())
         })
     }
@@ -161,7 +169,10 @@ impl VegetationArtifactStore {
     ) -> Result<saffron_vegetation::VegetationCellArtifactReader<std::fs::File>> {
         let path = self.path(VegetationArtifactKind::Cell, hash);
         let file = std::fs::File::open(&path).map_err(|error| Error::Io(error.to_string()))?;
-        let reader = saffron_vegetation::VegetationCellArtifactReader::open(file)?;
+        let reader = saffron_vegetation::VegetationCellArtifactReader::open(
+            file,
+            saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+        )?;
         if reader.artifact_hash() != hash {
             return Err(Error::VegetationArtifactHash {
                 path: path.display().to_string(),
@@ -329,7 +340,10 @@ impl VegetationArtifactStore {
                 ));
             }
             let bytes = self.read_plant(plant.artifact_hash)?;
-            let index = saffron_vegetation::PlantCompiledArtifactIndex::open(&bytes)?;
+            let index = saffron_vegetation::PlantCompiledArtifactIndex::open(
+                &bytes,
+                saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+            )?;
             let artifact_tags = index.family_tags(&bytes)?;
             if artifact_tags != plant.tags {
                 return Err(Error::VegetationPlantTagMismatch {
@@ -371,7 +385,10 @@ impl VegetationArtifactStore {
                 ));
             }
             let bytes = self.read_cell(cell.artifact_hash)?;
-            let index = saffron_vegetation::VegetationCellArtifactIndex::open(&bytes)?;
+            let index = saffron_vegetation::VegetationCellArtifactIndex::open(
+                &bytes,
+                saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+            )?;
             if index.cell != cell.cell
                 || index.cook_key != *cook_key
                 || index.platform_profile != platform_profile
@@ -513,21 +530,33 @@ impl VegetationArtifactStore {
 }
 
 fn validate_plant_artifact(bytes: &[u8]) -> Result<()> {
-    let index = saffron_vegetation::PlantCompiledArtifactIndex::open(bytes)?;
+    let index = saffron_vegetation::PlantCompiledArtifactIndex::open(
+        bytes,
+        saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+    )?;
     index.family_tags(bytes)?;
     for kind in PlantCompiledSectionKind::ALL {
-        if index.section(bytes, kind)?.is_none_or(<[u8]>::is_empty) {
+        if index
+            .section(bytes, kind)?
+            .is_none_or(|section| section.is_empty())
+        {
             return Err(Error::Io(format!(
                 "compiled plant artifact is missing {kind:?}"
             )));
         }
     }
+    let triangle =
+        required_plant_section(&index, bytes, PlantCompiledSectionKind::TriangleHierarchy)?;
+    let voxel = required_plant_section(&index, bytes, PlantCompiledSectionKind::VoxelHierarchy)?;
+    let deformation = required_plant_section(&index, bytes, PlantCompiledSectionKind::Deformation)?;
+    let pages = required_plant_section(&index, bytes, PlantCompiledSectionKind::PageDirectory)?;
+    let ray_tracing = required_plant_section(&index, bytes, PlantCompiledSectionKind::RayTracing)?;
     decode_portable_virtual_hierarchy_sections(
-        required_plant_section(&index, bytes, PlantCompiledSectionKind::TriangleHierarchy)?,
-        required_plant_section(&index, bytes, PlantCompiledSectionKind::VoxelHierarchy)?,
-        required_plant_section(&index, bytes, PlantCompiledSectionKind::Deformation)?,
-        required_plant_section(&index, bytes, PlantCompiledSectionKind::PageDirectory)?,
-        required_plant_section(&index, bytes, PlantCompiledSectionKind::RayTracing)?,
+        triangle.as_ref(),
+        voxel.as_ref(),
+        deformation.as_ref(),
+        pages.as_ref(),
+        ray_tracing.as_ref(),
     )?;
     Ok(())
 }
@@ -536,7 +565,7 @@ fn required_plant_section<'a>(
     index: &saffron_vegetation::PlantCompiledArtifactIndex,
     bytes: &'a [u8],
     kind: PlantCompiledSectionKind,
-) -> Result<&'a [u8]> {
+) -> Result<std::borrow::Cow<'a, [u8]>> {
     index
         .section(bytes, kind)?
         .ok_or_else(|| Error::Io(format!("compiled plant artifact is missing {kind:?}")))
@@ -583,15 +612,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use saffron_geometry::{
+        AppearanceError, HierarchyRepresentation, PortableBounds, PortableHierarchyNode,
+        PortableHierarchyPage, PortableMaterialMoments, PortableRayTracingRecord,
+        PortableVirtualHierarchy, PortableVoxelBrick, PortableVoxelVertex, VirtualMaterialClass,
+    };
     use saffron_spatial::{DecisionScalar, WorldCellKey};
     use saffron_vegetation::{
-        AppearanceError, CookDependency, CookDependencyAddress, CookGraph, CookNodeAddress,
-        CookNodeRecord, CookPlatformProfile, CookVersionSet, CookWorkActual, CookWorkEstimate,
-        HierarchyRepresentation, PlantCompiledArtifactHeader, PlantCompiledSection,
-        PlantCompiledSectionKind, PlantTagId, PortableBounds, PortableHierarchyNode,
-        PortableHierarchyPage, PortableRayTracingRecord, PortableVirtualHierarchy,
-        PortableVoxelBrick, PortableVoxelVertex, VegetationManifestPlant, VirtualMaterialClass,
-        VoxelMaterialMoments, write_plant_compiled_artifact,
+        CookDependency, CookDependencyAddress, CookGraph, CookNodeAddress, CookNodeRecord,
+        CookPlatformProfile, CookVersionSet, CookWorkActual, CookWorkEstimate,
+        PlantCompiledArtifactHeader, PlantCompiledSection, PlantCompiledSectionKind, PlantTagId,
+        VegetationManifestPlant, write_plant_compiled_artifact,
     };
 
     use super::*;
@@ -666,7 +697,7 @@ mod tests {
             bounds,
             deformed_bounds: bounds,
             occupancy: vec![u8::MAX; 64],
-            moments: VoxelMaterialMoments::default(),
+            moments: PortableMaterialMoments::default(),
             material_class: VirtualMaterialClass::Opaque,
             opacity_micromap: false,
             vertices: vec![
@@ -731,7 +762,7 @@ mod tests {
                     PlantCompiledSectionKind::RayTracing => hierarchy.ray_tracing_bytes().unwrap(),
                     _ => vec![u8::try_from(kind as u16).unwrap()],
                 };
-                PlantCompiledSection::raw(kind, bytes)
+                PlantCompiledSection::new(kind, bytes)
             })
             .collect()
     }
@@ -912,6 +943,7 @@ mod tests {
             local_bounds_max: [DecisionScalar::from_integer(1).unwrap(); 3],
             variation_count: 1,
             phenotype_count: 1,
+            ecology: saffron_vegetation::PlantEcologyDeclaration::default(),
         });
 
         assert!(matches!(

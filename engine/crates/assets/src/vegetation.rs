@@ -20,12 +20,12 @@ use saffron_vegetation::{
     GraphCompileOptions, GraphDependencyFingerprint, GraphDependencySource, GraphEvaluationInputs,
     GraphEvaluationJobInputs, PlantFamilyAsset, PlantPointColumns, PlantPrototype,
     QuantizedFieldTileValues, VegetationLayerOperator, VegetationMapAsset, VegetationMapChunk,
-    VegetationMapChunkKind, VegetationMapChunkPayload, VegetationMapChunkReference,
-    VegetationMapSnapshot, VegetationMapTileKey, VegetationMapTileSnapshot,
-    canonical_surface_provider_set_hash, compile_biome_graph, read_biome_asset, read_plant_asset,
-    read_vegetation_map_asset as decode_map, read_vegetation_map_chunk, vegetation_content_hash,
-    write_biome_asset, write_plant_asset, write_vegetation_map_asset as encode_map,
-    write_vegetation_map_chunk,
+    VegetationMapChunkKey, VegetationMapChunkKind, VegetationMapChunkPayload,
+    VegetationMapChunkReference, VegetationMapSnapshot, VegetationMapTileKey,
+    VegetationMapTileSnapshot, canonical_surface_provider_set_hash, compile_biome_graph,
+    read_biome_asset, read_plant_asset, read_vegetation_map_asset as decode_map,
+    read_vegetation_map_chunk, vegetation_content_hash, write_biome_asset, write_plant_asset,
+    write_vegetation_map_asset as encode_map, write_vegetation_map_chunk,
 };
 
 use crate::cook_reader::CookAssetAccess;
@@ -1446,6 +1446,30 @@ pub fn load_vegetation_map_snapshot(
     load_vegetation_map_snapshot_from(assets, id)
 }
 
+/// Reads the authored chunks for the requested logical keys; a key with no
+/// inventory entry contributes no row.
+pub fn load_vegetation_map_chunks(
+    assets: &AssetServer,
+    id: Uuid,
+    keys: &[VegetationMapChunkKey],
+) -> Result<Vec<VegetationMapChunk>> {
+    let entry = typed_entry_from(assets, id, AssetType::VegetationMap, "vegetation map")?;
+    let root = load_vegetation_map_root_from(assets, id)?;
+    let package = assets.root().join(map_package_directory(&entry.path));
+    let references = root
+        .inventory
+        .iter()
+        .map(|reference| (reference.key, *reference))
+        .collect::<BTreeMap<_, _>>();
+    let mut chunks = Vec::new();
+    for key in keys {
+        if let Some(reference) = references.get(key) {
+            chunks.push(read_map_object_from(assets, &package, id, reference)?);
+        }
+    }
+    Ok(chunks)
+}
+
 pub(crate) fn load_vegetation_map_snapshot_from(
     assets: &dyn CookAssetAccess,
     id: Uuid,
@@ -1564,7 +1588,9 @@ pub fn update_vegetation_map_asset(
     ))?;
     let bytes = encode_map(&next)?;
     atomic_write(&assets.root.join(&entry.path), &bytes)?;
-    assets.catalog.set_content_hash(id, hash_bytes_fnv(&bytes));
+    let content_hash = hash_bytes_fnv(&bytes);
+    let updated = assets.update_asset_content_hash(id, content_hash);
+    debug_assert!(updated, "validated vegetation map remains catalogued");
     Ok(())
 }
 
@@ -1926,8 +1952,8 @@ fn save_typed_asset(
 ) -> Result<Uuid> {
     assets.ensure_asset_directories();
     atomic_write(&assets.root.join(&relative_path), bytes)?;
-    let unique_name = assets.catalog.unique_name(name);
-    assets.catalog.put(AssetEntry {
+    let unique_name = assets.catalog().unique_name(name);
+    assets.register_imported_asset(AssetEntry {
         id,
         name: unique_name,
         asset_type,
@@ -1937,7 +1963,7 @@ fn save_typed_asset(
         ..AssetEntry::default()
     });
     if let Err(error) = assets.write_asset_sidecar(id) {
-        assets.catalog.remove(id);
+        let _ = assets.delete_asset_entry(id);
         let _ = std::fs::remove_file(assets.root.join(&relative_path));
         return Err(error);
     }
@@ -1958,7 +1984,7 @@ fn import_typed_asset(
             "authored vegetation asset identity is in the reserved range".to_owned(),
         ));
     }
-    if assets.catalog.find(id).is_some() || assets.root.join(&relative_path).exists() {
+    if assets.catalog().find(id).is_some() || assets.root.join(&relative_path).exists() {
         return Err(Error::Io(format!(
             "vegetation asset identity {} already exists in the project",
             id.value()
@@ -1976,7 +2002,9 @@ fn update_typed_asset(
 ) -> Result<()> {
     let path = typed_entry(assets, id, asset_type, wanted)?.path.clone();
     atomic_write(&assets.root.join(path), bytes)?;
-    assets.catalog.set_content_hash(id, hash_bytes_fnv(bytes));
+    let content_hash = hash_bytes_fnv(bytes);
+    let updated = assets.update_asset_content_hash(id, content_hash);
+    debug_assert!(updated, "validated vegetation asset remains catalogued");
     Ok(())
 }
 
@@ -2144,7 +2172,7 @@ fn map_object_path(package: &Path, hash: &[u8; 32]) -> PathBuf {
 }
 
 fn rollback_new_asset(assets: &mut AssetServer, id: Uuid) {
-    let Some(entry) = assets.catalog.find(id).cloned() else {
+    let Some(entry) = assets.catalog().find(id).cloned() else {
         return;
     };
     assets.remove_asset_sidecar(id);
@@ -2152,7 +2180,7 @@ fn rollback_new_asset(assets: &mut AssetServer, id: Uuid) {
     if !entry.path.is_empty() {
         let _ = std::fs::remove_file(assets.root.join(&entry.path));
     }
-    assets.catalog.remove(id);
+    let _ = assets.delete_asset_entry(id);
 }
 
 pub(crate) fn vegetation_map_content_hash_path(path: &Path) -> Result<u64> {
@@ -2227,10 +2255,10 @@ mod tests {
     use saffron_vegetation::{
         AuthoredFieldTile, BIOME_ASSET_VERSION, BIOME_GRAPH_VERSION, BIOME_INTERFACE_VERSION,
         BIOME_NODE_VERSION, BiomeAsset, BiomeGraphDocument, BiomeGraphEvaluator, BiomeGraphPolicy,
-        BiomeModuleReference, BiomePaletteEntry, BiomeRole, FieldBlendOperator, FieldTileLayer,
-        GraphAuthority, GraphCancellationToken, GraphDomain, GraphEdge, GraphInterfaceOutput,
-        GraphNodeDefinition, GraphOperator, GraphParameterValue, GraphSink, HabitatPreferences,
-        InteractionPolicy, LocalBiomeInstance, MechanicalResponse, NativeBotanicalGraph,
+        BiomeModuleReference, BiomePaletteEntry, BiomeRole, BotanicalGraphDocument,
+        FieldBlendOperator, FieldTileLayer, GraphAuthority, GraphCancellationToken, GraphDomain,
+        GraphEdge, GraphInterfaceOutput, GraphNodeDefinition, GraphOperator, GraphParameterValue,
+        GraphSink, HabitatPreferences, InteractionPolicy, LocalBiomeInstance, MechanicalResponse,
         NodeSpatialPolicy, PLANT_ASSET_VERSION, PlantDimensions, PlantFamilyAsset,
         PlantFamilySource, PlantPart, PlantPartSemantic, VEGETATION_MAP_CHUNK_VERSION,
         VEGETATION_MAP_VERSION, VegetationLayer, VegetationLayerOperator, VegetationMapAsset,
@@ -2282,10 +2310,10 @@ mod tests {
             id,
             name: name.to_owned(),
             tags: Vec::new(),
-            source: PlantFamilySource::Native(NativeBotanicalGraph {
-                schema_hash: [1; 32],
-                graph: Value::Object(Default::default()),
-            }),
+            source: PlantFamilySource::Native {
+                graph: BotanicalGraphDocument::sapling(0x5a11),
+                grafts: Vec::new(),
+            },
             parts: vec![PlantPart {
                 id: 12,
                 parent: None,
@@ -2315,12 +2343,13 @@ mod tests {
             variations: vec![saffron_vegetation::PlantVariation {
                 id: 0,
                 name: "Default".to_owned(),
-                sources: Vec::new(),
+                sources: vec![saffron_vegetation::native_variation_source_id(0)],
                 active_parts: Vec::new(),
             }],
             phenotypes: vec![saffron_vegetation::PlantPhenotype {
                 id: 0,
                 role: saffron_vegetation::PhenotypeRole::Healthy,
+                season_window: None,
                 variation: 0,
                 material_remap: Vec::new(),
                 active_parts: Vec::new(),
@@ -2333,6 +2362,7 @@ mod tests {
                 surface_tags: vec![14],
                 shade_tolerance: UnitInterval::from_bits(32_768),
             }),
+            ecology: saffron_vegetation::PlantEcologyDeclaration::default(),
         }
     }
 
@@ -2618,15 +2648,21 @@ mod tests {
             .map(|path| std::fs::read(path).unwrap())
             .collect();
         assets.thumbnail_cache_root = root.join(".cache/thumbnails");
-        for id in [plant_id, biome_id, map_id] {
+        for id in [biome_id, map_id] {
             assert!(
                 !crate::request_thumbnail(&mut assets, id, 128)
                     .unwrap()
                     .pending
             );
         }
+        // The plant renders through the main graph: a cold cache replies pending.
+        assert!(
+            crate::request_thumbnail(&mut assets, plant_id, 128)
+                .unwrap()
+                .pending
+        );
         let removed = assets.clear_thumbnail_cache_dir();
-        assert_eq!(removed.entries, 3);
+        assert_eq!(removed.entries, 2);
         assets.clear_asset_caches();
         for (path, expected) in authored_paths.iter().zip(authored_bytes) {
             assert_eq!(std::fs::read(path).unwrap(), expected);
@@ -2859,7 +2895,7 @@ mod tests {
             save_vegetation_map_asset(&mut assets, map_fixture(Uuid(3), "World"), "World", "")
                 .unwrap();
 
-        for id in [plant, biome, map] {
+        for id in [biome, map] {
             let first = crate::request_thumbnail(&mut assets, id, 128).unwrap();
             assert!(!first.pending);
             assert_eq!((first.width, first.height), (128, 128));
@@ -2867,7 +2903,12 @@ mod tests {
             let cached = crate::request_thumbnail(&mut assets, id, 128).unwrap();
             assert_eq!(cached, first);
         }
-        assert_eq!(assets.thumbnail_cache_stats().entries, 3);
+        // A plant family renders through the main graph like a mesh/model tile: a cold
+        // cache replies pending and enqueues one preview render for the host to drain.
+        let pending = crate::request_thumbnail(&mut assets, plant, 128).unwrap();
+        assert!(pending.pending);
+        assert_eq!(assets.take_preview_render_jobs(4).len(), 1);
+        assert_eq!(assets.thumbnail_cache_stats().entries, 2);
     }
 
     #[test]
