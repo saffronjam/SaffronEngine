@@ -65,11 +65,9 @@ The feature word travels with the resolved material-table row. Two surfaces can 
 
 ## Other PSO axes
 
-The mesh module also exports `vertexMain` and `vertexMainSkinned`. Selecting an entry point changes the vertex-input layout and the PSO key; it is not a fragment specialization constant. The standard draw-list path compute-deforms animated vertices and uses the base entry point for the resulting stream.
+The vertex entry point is another PSO axis — the `executor` field of `PsoKey`, not a fragment specialization constant. Scene passes select `vertexMainExecutor`, which binds no vertex input: each draw record resolves its geometry through buffer device addresses, including the per-frame deformed buffers that hold compute-skinned and morphed vertices. The `vertexMain` entry binds a vertex-input stream and serves the tessellation seam's displaced draws.
 
 Wireframe is another PSO axis rather than shader specialization. It chooses `VK_POLYGON_MODE_LINE` when the device supports non-solid fill. Sample count and fixed-function blend state also belong to the pipeline key.
-
-The meshlet raster path combines the task and mesh stages from `meshlet.spv` with `fragmentMain` from the mesh übershader. This keeps surface evaluation identical between indexed and mesh-shader geometry paths.
 
 ## Generated material shaders
 
