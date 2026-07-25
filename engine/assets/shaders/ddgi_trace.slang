@@ -145,6 +145,10 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     float3 radiance = float3(0.0);
     float hitDist = kMaxDist;
     bool hit = false;
+    // Beer-Lambert transmittance through porous aggregate matter (canopies): the ray dims
+    // instead of stopping, and saturated extinction inside dense matter is itself a hit.
+    float transmittance = 1.0;
+    const float kAggregateHit = 0.05;
     float t = kStart;
     for (int s = 0; s < kSteps; s = s + 1)
     {
@@ -176,15 +180,19 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
             {
                 float st = kStart;
                 bool occluded = false;
+                float sunTrans = 1.0;
                 for (int ss = 0; ss < kShadowSteps; ss = ss + 1)
                 {
                     float3 sp = wp + nrm * kShadowBias + toSun * st;
-                    float sd = sampleField(sp, count, max(kMinStep, st * 0.03), st).distance;
-                    if (sd < kSurfEps) { occluded = true; break; }
-                    st += clamp(sd, kMinStep, kMaxLeap);
-                    if (st >= kShadowMaxDist) { break; }
+                    SdfSample shadowSmp = sampleField(sp, count, max(kMinStep, st * 0.03), st);
+                    if (shadowSmp.distance < kSurfEps) { occluded = true; break; }
+                    float sstep = clamp(shadowSmp.distance, kMinStep, kMaxLeap);
+                    // A canopy between the surface and the sun dims rather than blocks.
+                    sunTrans *= sdfExtinctionStep(shadowSmp.occupancy, sstep);
+                    st += sstep;
+                    if (sunTrans < 0.02 || st >= kShadowMaxDist) { break; }
                 }
-                sunVis = occluded ? 0.0 : ndotl;
+                sunVis = occluded ? 0.0 : ndotl * sunTrans;
             }
 
             float3 directLit = albedo * (pc.sunColor.rgb * pc.sunDir.w * sunVis);
@@ -193,18 +201,56 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
             // through an opening (a missed ray → sky) is stored in probe irradiance and re-gathered
             // here, propagating one bounce deeper per frame.
             float3 bounce = sampleProbeIrradiance(phys, dir, interior) * albedo * 0.5;
+            radiance = (directLit + bounce) * transmittance;
+            hitDist = t;
+            hit = true;
+            break;
+        }
+        float step = clamp(smp.distance, kMinStep, kMaxLeap);
+        transmittance *= sdfExtinctionStep(smp.occupancy, step);
+        if (transmittance < kAggregateHit)
+        {
+            // The ray saturated inside a dense aggregate: shade the interior as a hit —
+            // the cell's cached colour, an occupancy-gradient normal, and the sun dimmed
+            // by the canopy above it.
+            float3 albedo = sampleAlbedo(wp);
+            float o0 = gdfOccupancyAt(wp);
+            float3 grad = float3(
+                gdfOccupancyAt(wp + float3(kGradEps, 0.0, 0.0)),
+                gdfOccupancyAt(wp + float3(0.0, kGradEps, 0.0)),
+                gdfOccupancyAt(wp + float3(0.0, 0.0, kGradEps))) - o0;
+            // Density rises toward the interior; the outward normal opposes the gradient.
+            float3 nrm = (dot(grad, grad) > 1e-10) ? normalize(-grad) : -dir;
+            float3 toSun = -normalize(pc.sunDir.xyz);
+            float ndotl = max(0.0, dot(nrm, toSun));
+            float sunThrough = 1.0;
+            {
+                float st = kStart;
+                for (int ss = 0; ss < 8; ss = ss + 1)
+                {
+                    float3 sp = wp + toSun * st;
+                    float so = gdfOccupancyAt(sp);
+                    float sstep = 1.0;
+                    sunThrough *= sdfExtinctionStep(so, sstep);
+                    st += sstep;
+                    if (sunThrough < 0.02 || st > 8.0) { break; }
+                }
+            }
+            float3 directLit = albedo * (pc.sunColor.rgb * pc.sunDir.w * ndotl * sunThrough);
+            float3 bounce = sampleProbeIrradiance(phys, dir, interior) * albedo * 0.5;
             radiance = directLit + bounce;
             hitDist = t;
             hit = true;
             break;
         }
-        t += clamp(smp.distance, kMinStep, kMaxLeap);
+        t += step;
         if (t >= kMaxDist) { break; }
     }
     if (!hit)
     {
-        // The ray escaped to open space: it sees the sky (the only place sky enters radiance).
-        radiance = skyShRadiance(dir, skyShCoefficients);
+        // The ray escaped to open space: it sees the sky through whatever porous matter it
+        // crossed (the only place sky enters radiance).
+        radiance = skyShRadiance(dir, skyShCoefficients) * transmittance;
     }
     rayOut[uint2(ray, physIndex)] = float4(radiance, hitDist);
 }

@@ -340,42 +340,46 @@ impl Ddgi {
         self.mesh_set
     }
 
-    /// The per-frame ray image handle + view + tracked layout.
-    pub fn rays(&self) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
-        (self.rays.handle(), self.rays.view(), self.rays.layout)
+    /// The per-frame ray image handle, view, and cross-frame graph state.
+    pub fn rays(&self) -> (vk::Image, vk::ImageView, crate::RgExternalState) {
+        (
+            self.rays.handle(),
+            self.rays.view(),
+            self.rays.graph_state(),
+        )
     }
 
-    /// Writes back the ray image's resolved layout after the graph executes.
-    pub fn set_rays_layout(&mut self, layout: vk::ImageLayout) {
-        self.rays.layout = layout;
+    /// Stores the ray image's resolved graph state.
+    pub fn set_rays_state(&mut self, state: crate::RgExternalState) {
+        self.rays.set_graph_state(state);
     }
 
-    /// The irradiance atlas handle + view + tracked layout.
-    pub fn irradiance(&self) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
+    /// The irradiance atlas handle, view, and cross-frame graph state.
+    pub fn irradiance(&self) -> (vk::Image, vk::ImageView, crate::RgExternalState) {
         (
             self.irradiance.handle(),
             self.irradiance.view(),
-            self.irradiance.layout,
+            self.irradiance.graph_state(),
         )
     }
 
-    /// Writes back the irradiance atlas's resolved layout after the graph executes.
-    pub fn set_irradiance_layout(&mut self, layout: vk::ImageLayout) {
-        self.irradiance.layout = layout;
+    /// Stores the irradiance atlas's resolved graph state.
+    pub fn set_irradiance_state(&mut self, state: crate::RgExternalState) {
+        self.irradiance.set_graph_state(state);
     }
 
-    /// The distance (moment) atlas handle + view + tracked layout.
-    pub fn distance(&self) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
+    /// The distance atlas handle, view, and cross-frame graph state.
+    pub fn distance(&self) -> (vk::Image, vk::ImageView, crate::RgExternalState) {
         (
             self.distance.handle(),
             self.distance.view(),
-            self.distance.layout,
+            self.distance.graph_state(),
         )
     }
 
-    /// Writes back the distance atlas's resolved layout after the graph executes.
-    pub fn set_distance_layout(&mut self, layout: vk::ImageLayout) {
-        self.distance.layout = layout;
+    /// Stores the distance atlas's resolved graph state.
+    pub fn set_distance_state(&mut self, state: crate::RgExternalState) {
+        self.distance.set_graph_state(state);
     }
 
     /// The trace pass's PSO set (set 2: albedo cache + prev-irradiance + ray storage).
@@ -818,9 +822,14 @@ impl Ddgi {
             raw.destroy_command_pool(pool, None);
         }
         if result.is_ok() {
-            self.irradiance.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-            self.distance.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-            self.rays.layout = vk::ImageLayout::GENERAL;
+            self.irradiance.set_graph_state(crate::RgExternalState::new(
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ));
+            self.distance.set_graph_state(crate::RgExternalState::new(
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ));
+            self.rays
+                .set_graph_state(crate::RgExternalState::new(vk::ImageLayout::GENERAL));
         }
         result
     }
@@ -1116,10 +1125,13 @@ mod tests {
         assert!(ddgi.ready);
         assert!(ddgi.use_ddgi);
         assert_eq!(
-            ddgi.irradiance().2,
+            ddgi.irradiance().2.layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         );
-        assert_eq!(ddgi.distance().2, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(
+            ddgi.distance().2.layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
         assert_ne!(ddgi.mesh_set(), vk::DescriptorSet::null());
 
         // A camera-centered scene set snaps the volume to the probe grid; the probe-grid UBO + the

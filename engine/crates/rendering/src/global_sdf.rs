@@ -45,6 +45,10 @@ use crate::{Device, Result, SdfInstance, checked};
 pub const GDF_CASCADES: u32 = 3;
 /// Each cascade volume is `GDF_RES`³ voxels.
 pub const GDF_RES: u32 = 128;
+/// A full cascade refresh composites in this many per-frame z-slabs, bounding any one
+/// frame's composite volume (a whole `GDF_RES`³ recomposite in one command buffer is the
+/// kind of multi-second submission a platform GPU watchdog kills).
+pub const GDF_FULL_SLABS: u32 = 8;
 /// Each cascade covers `GDF_EXPONENT×` the world extent of the previous.
 pub const GDF_EXPONENT: f32 = 2.0;
 /// The finest cascade's full world extent (metres). Its voxel is `GDF_CASCADE0_EXTENT / GDF_RES`
@@ -54,6 +58,10 @@ pub const GDF_CASCADE0_EXTENT: f32 = 32.0;
 /// The cascade volume format — `R16_SNORM`, matching the per-mesh brick atlas encode so the
 /// composite `min()` is in the same normalized space.
 pub const GDF_FORMAT: vk::Format = vk::Format::R16_SNORM;
+/// The porous-occupancy cascade format — `R8_UNORM` density in [0, 1]; `0` = open or solid
+/// (solid matter lives in the distance field), fractional = porous aggregate matter the
+/// consumers march THROUGH, accumulating Beer–Lambert extinction instead of hitting.
+pub const GDF_OCCUPANCY_FORMAT: vk::Format = vk::Format::R8_UNORM;
 /// The lite albedo-cache format — `rgba16f` (rgb base color, a = the written flag). Aligned to the
 /// finest cascade (`GDF_RES`³, toroidal); read by the DDGI trace at hit points.
 pub const GDF_ALBEDO_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -291,6 +299,10 @@ pub struct GlobalSdf {
     pub ready: bool,
 
     cascades: Vec<Image3D>,
+    /// One porous-occupancy volume per cascade (toroidal `R8_UNORM`, the same addressing as
+    /// its distance cascade): the aggregate density porous matter splats where solid matter
+    /// would have written distance.
+    occupancy: Vec<Image3D>,
     /// The lite per-cell albedo cache, aligned to the finest cascade (`GDF_RES`³, toroidal). The
     /// DDGI trace reads it for hit radiance; the composite splats it for cascade 0.
     albedo: Image3D,
@@ -309,6 +321,10 @@ pub struct GlobalSdf {
     /// Per-cascade history flag — false until the cascade has had a full composite (forces a full
     /// refresh on the first frame after enable / bring-up).
     has_history: [bool; GDF_CASCADES as usize],
+    /// Per-cascade in-progress full-refresh cursor: the next z-slab (of
+    /// [`GDF_FULL_SLABS`]) to composite, or `GDF_FULL_SLABS` when no full refresh is in
+    /// flight. Advanced in [`GlobalSdf::advance_frame`].
+    full_slab: [u32; GDF_CASCADES as usize],
     /// Round-robins the staggered far-cascade full refresh (one cascade fully refreshed per frame).
     frame: u32,
     /// This frame's per-instance world AABBs (`[min, max]`, `.xyz` world space), mirroring the
@@ -339,8 +355,11 @@ impl GlobalSdf {
         let raw = resources.device();
 
         // One toroidal distance volume per cascade: STORAGE (composite write, GENERAL) + SAMPLED
-        // (consumer read, ShaderReadOnly).
-        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        // (consumer read, ShaderReadOnly) + TRANSFER_DST (the one-shot open-space clear below,
+        // which makes a partially-refreshed cascade read as open rather than garbage).
+        let usage = vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST;
         let mut cascades = Vec::with_capacity(GDF_CASCADES as usize);
         for _ in 0..GDF_CASCADES {
             cascades.push(Image3D::new(
@@ -351,6 +370,23 @@ impl GlobalSdf {
                     depth: GDF_RES,
                 },
                 GDF_FORMAT,
+                1,
+                usage,
+            )?);
+        }
+
+        // One porous-occupancy volume per cascade, addressed exactly like its distance
+        // cascade.
+        let mut occupancy = Vec::with_capacity(GDF_CASCADES as usize);
+        for _ in 0..GDF_CASCADES {
+            occupancy.push(Image3D::new(
+                &resources,
+                vk::Extent3D {
+                    width: GDF_RES,
+                    height: GDF_RES,
+                    depth: GDF_RES,
+                },
+                GDF_OCCUPANCY_FORMAT,
                 1,
                 usage,
             )?);
@@ -369,6 +405,18 @@ impl GlobalSdf {
             1,
             usage,
         )?;
+
+        // One-shot: every volume clears to open space (distance +max, occupancy 0, albedo
+        // 0) and parks in GENERAL, so a cascade mid-way through its slabbed full refresh
+        // samples open air instead of uninitialized memory.
+        initialize_volumes(device, &cascades, &occupancy, &albedo)?;
+        let mut cascades = cascades;
+        let mut occupancy = occupancy;
+        let mut albedo = albedo;
+        for img in cascades.iter_mut().chain(occupancy.iter_mut()) {
+            img.layout = vk::ImageLayout::GENERAL;
+        }
+        albedo.layout = vk::ImageLayout::GENERAL;
 
         let sampler = create_linear_repeat_sampler(raw)?;
 
@@ -406,6 +454,7 @@ impl GlobalSdf {
             use_gdf: true,
             ready: false,
             cascades,
+            occupancy,
             albedo,
             frames,
             sampler,
@@ -415,6 +464,7 @@ impl GlobalSdf {
             cur_center: [IVec3::ZERO; GDF_CASCADES as usize],
             prev_center: [IVec3::ZERO; GDF_CASCADES as usize],
             has_history: [false; GDF_CASCADES as usize],
+            full_slab: [0; GDF_CASCADES as usize],
             frame: 0,
             cur_aabbs: Vec::new(),
             prev_aabbs: Vec::new(),
@@ -506,33 +556,27 @@ impl GlobalSdf {
     /// The far cascades are staggered — one fully refreshes per frame, round-robined across them
     /// (mirroring the DDGI probe-budget round-robin), reconverging within `GDF_CASCADES - 1` frames.
     pub fn dirty_regions(&self, c: u32) -> Vec<GdfRegion> {
+        // An in-flight full refresh emits one z-slab per frame — never the whole
+        // `GDF_RES`³ volume in one command buffer (a submission that large is the kind
+        // the platform GPU watchdog kills). `prepare_frame_regions` arms the cursor;
+        // `advance_frame` moves it.
+        if self.full_slab[c as usize] < GDF_FULL_SLABS {
+            return vec![self.full_slab_region(c)];
+        }
         if c > 0 {
-            let round_robin = (c - 1) == self.frame % (GDF_CASCADES - 1);
+            // Far cascades between full-refresh cycles composite only their scroll
+            // slabs.
             return cascade_dirty_regions(
                 self.prev_center[c as usize],
                 self.cur_center[c as usize],
-                self.has_history[c as usize],
-                round_robin,
+                true,
+                false,
                 GDF_RES as i32,
             );
         }
 
-        let half = GDF_RES as i32 / 2;
-        let full = || {
-            vec![GdfRegion {
-                base: self.cur_center[0] - IVec3::splat(half),
-                size: UVec3::splat(GDF_RES),
-            }]
-        };
-        let scrolled_out = (self.cur_center[0] - self.prev_center[0])
-            .abs()
-            .max_element()
-            >= GDF_RES as i32;
-        if !self.has_history[0] || scrolled_out || self.cur_aabbs.len() != self.prev_aabbs.len() {
-            return full();
-        }
-
-        // Toroidal scroll slabs (no forced full refresh for the near cascade any more).
+        // Near cascade: toroidal scroll slabs plus the vacated + new footprint of every
+        // occluder that moved this frame.
         let mut regions = cascade_dirty_regions(
             self.prev_center[0],
             self.cur_center[0],
@@ -540,20 +584,64 @@ impl GlobalSdf {
             false,
             GDF_RES as i32,
         );
-        // The vacated + new footprint of every occluder that moved this frame.
-        let mut moved = 0usize;
         for (prev, cur) in self.prev_aabbs.iter().zip(self.cur_aabbs.iter()) {
             if !aabb_changed(prev, cur) {
                 continue;
-            }
-            moved += 1;
-            if moved > GDF_MAX_DIRTY_INSTANCES {
-                return full();
             }
             regions.extend(self.instance_region(prev[0], prev[1]));
             regions.extend(self.instance_region(cur[0], cur[1]));
         }
         merge_regions(regions)
+    }
+
+    /// Arms each cascade's full-refresh slab cursor for this frame: first fill, a
+    /// scroll past a whole window, the far-cascade round-robin, or (near cascade) an
+    /// instance-count change or too many moved occluders. Called once per frame after
+    /// the centers + instance AABBs update, before the graph builds.
+    pub fn prepare_frame_regions(&mut self) {
+        for c in 0..GDF_CASCADES as usize {
+            if self.full_slab[c] < GDF_FULL_SLABS {
+                continue; // a refresh is already in flight
+            }
+            let scrolled_out = (self.cur_center[c] - self.prev_center[c])
+                .abs()
+                .max_element()
+                >= GDF_RES as i32;
+            let mut arm = !self.has_history[c] || scrolled_out;
+            if c == 0 {
+                arm = arm || self.cur_aabbs.len() != self.prev_aabbs.len() || {
+                    let mut moved = 0usize;
+                    self.prev_aabbs
+                        .iter()
+                        .zip(self.cur_aabbs.iter())
+                        .filter(|(prev, cur)| aabb_changed(prev, cur))
+                        .any(|_| {
+                            moved += 1;
+                            moved > GDF_MAX_DIRTY_INSTANCES
+                        })
+                };
+            } else {
+                let round_robin = (c as u32 - 1) == self.frame % (GDF_CASCADES - 1);
+                arm = arm || round_robin;
+            }
+            if arm {
+                self.full_slab[c] = 0;
+            }
+        }
+    }
+
+    /// The z-slab of cascade `c`'s window the in-flight full refresh composites this
+    /// frame.
+    fn full_slab_region(&self, c: u32) -> GdfRegion {
+        let half = GDF_RES as i32 / 2;
+        let slab = self.full_slab[c as usize].min(GDF_FULL_SLABS - 1);
+        let depth = GDF_RES / GDF_FULL_SLABS;
+        let mut base = self.cur_center[c as usize] - IVec3::splat(half);
+        base.z += (slab * depth) as i32;
+        GdfRegion {
+            base,
+            size: UVec3::new(GDF_RES, GDF_RES, depth),
+        }
     }
 
     /// The cascade-0 voxel region a world AABB overlaps, clipped to the near cascade's window.
@@ -589,6 +677,18 @@ impl GlobalSdf {
     /// Writes back cascade `c`'s resolved layout after the graph executes.
     pub fn set_cascade_layout(&mut self, c: u32, layout: vk::ImageLayout) {
         self.cascades[c as usize].layout = layout;
+    }
+
+    /// Cascade `c`'s porous-occupancy volume handle + view + tracked layout, for the graph
+    /// import.
+    pub fn occupancy_cascade(&self, c: u32) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
+        let img = &self.occupancy[c as usize];
+        (img.handle(), img.view(), img.layout)
+    }
+
+    /// Writes back cascade `c`'s occupancy-volume layout after the graph executes.
+    pub fn set_occupancy_layout(&mut self, c: u32, layout: vk::ImageLayout) {
+        self.occupancy[c as usize].layout = layout;
     }
 
     /// The lite albedo cache's handle + view + tracked layout, for the graph import + the DDGI
@@ -646,7 +746,14 @@ impl GlobalSdf {
     pub fn advance_frame(&mut self) {
         self.prev_center = self.cur_center;
         self.prev_aabbs.clone_from(&self.cur_aabbs);
-        self.has_history = [true; GDF_CASCADES as usize];
+        for c in 0..GDF_CASCADES as usize {
+            if self.full_slab[c] < GDF_FULL_SLABS {
+                self.full_slab[c] += 1;
+                if self.full_slab[c] == GDF_FULL_SLABS {
+                    self.has_history[c] = true;
+                }
+            }
+        }
         self.frame = self.frame.wrapping_add(1);
     }
 
@@ -687,6 +794,24 @@ impl GlobalSdf {
         // SAFETY: the ash seam. The set + views + sampler outlive the call; the array write fills
         // binding 9's `GDF_CASCADES` elements the light layout declares.
         unsafe { raw.update_descriptor_sets(&[write], &[]) };
+        let occupancy_infos: Vec<vk::DescriptorImageInfo> = self
+            .occupancy
+            .iter()
+            .map(|img| {
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.sampler)
+                    .image_view(img.view())
+                    .image_layout(ro)
+            })
+            .collect();
+        let occupancy_write = vk::WriteDescriptorSet::default()
+            .dst_set(light_set)
+            .dst_binding(14)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&occupancy_infos);
+        // SAFETY: the ash seam. The set + views + sampler outlive the call.
+        unsafe { raw.update_descriptor_sets(&[occupancy_write], &[]) };
         let params_ubo = &self.frames[frame].params_ubo;
         write_uniform_buffer(raw, light_set, 10, params_ubo.handle(), params_ubo.size());
     }
@@ -739,6 +864,24 @@ impl GlobalSdf {
                 .image_info(&albedo_info);
             // SAFETY: the ash seam. The set + view outlive the call.
             unsafe { raw.update_descriptor_sets(&[albedo_write], &[]) };
+            // The porous-occupancy volumes (binding 4, storage-image array).
+            let occupancy_infos: Vec<vk::DescriptorImageInfo> = self
+                .occupancy
+                .iter()
+                .map(|img| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(img.view())
+                        .image_layout(vk::ImageLayout::GENERAL)
+                })
+                .collect();
+            let occupancy_write = vk::WriteDescriptorSet::default()
+                .dst_set(frame.composite_set)
+                .dst_binding(4)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&occupancy_infos);
+            // SAFETY: the ash seam. The set + views outlive the call.
+            unsafe { raw.update_descriptor_sets(&[occupancy_write], &[]) };
         }
     }
 
@@ -900,15 +1043,162 @@ fn build_frame(
 
 /// Builds the cull + composite compute set layouts, freeing the cull layout on a composite
 /// failure. Returns `(cull, composite)`.
+/// Clears every cascade volume to the open-space value (`1.0` = +max-encode distance),
+/// the occupancy volumes to `0`, and the albedo cache to `0`, leaving all of them in
+/// `GENERAL` for the composite. One submission at construction, fence-waited.
+fn initialize_volumes(
+    device: &Device,
+    cascades: &[Image3D],
+    occupancy: &[Image3D],
+    albedo: &Image3D,
+) -> Result<()> {
+    let raw = device.resources().device();
+    let pool_info =
+        vk::CommandPoolCreateInfo::default().queue_family_index(device.graphics_queue_family);
+    // SAFETY: the ash seam. Freed at the end of the function.
+    let pool = checked(
+        unsafe { raw.create_command_pool(&pool_info, None) },
+        "gdf init pool",
+    )?;
+    let alloc = vk::CommandBufferAllocateInfo::default()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: the ash seam. One buffer from the pool above.
+    let cmd = match checked(
+        unsafe { raw.allocate_command_buffers(&alloc) },
+        "gdf init cmd",
+    ) {
+        Ok(buffers) => buffers[0],
+        Err(err) => {
+            // SAFETY: the ash seam. Free the pool on this failure path.
+            unsafe { raw.destroy_command_pool(pool, None) };
+            return Err(err);
+        }
+    };
+    let fence = match checked(
+        unsafe { raw.create_fence(&vk::FenceCreateInfo::default(), None) },
+        "gdf init fence",
+    ) {
+        Ok(fence) => fence,
+        Err(err) => {
+            // SAFETY: the ash seam.
+            unsafe { raw.destroy_command_pool(pool, None) };
+            return Err(err);
+        }
+    };
+    let result = (|| -> Result<()> {
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let volumes: Vec<(vk::Image, vk::ClearColorValue)> = cascades
+            .iter()
+            .map(|img| {
+                (
+                    img.handle(),
+                    vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 0.0],
+                    },
+                )
+            })
+            .chain(
+                occupancy
+                    .iter()
+                    .chain(std::iter::once(albedo))
+                    .map(|img| (img.handle(), vk::ClearColorValue { float32: [0.0; 4] })),
+            )
+            .collect();
+        // SAFETY: the ash seam. The barriers/clears reference this device's images.
+        unsafe {
+            checked(raw.begin_command_buffer(cmd, &begin), "gdf init begin")?;
+            let to_transfer: Vec<vk::ImageMemoryBarrier2> = volumes
+                .iter()
+                .map(|(image, _)| {
+                    vk::ImageMemoryBarrier2::default()
+                        .image(*image)
+                        .subresource_range(range)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                })
+                .collect();
+            raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
+            );
+            for (image, clear) in &volumes {
+                raw.cmd_clear_color_image(
+                    cmd,
+                    *image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    clear,
+                    &[range],
+                );
+            }
+            let to_general: Vec<vk::ImageMemoryBarrier2> = volumes
+                .iter()
+                .map(|(image, _)| {
+                    vk::ImageMemoryBarrier2::default()
+                        .image(*image)
+                        .subresource_range(range)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(
+                            vk::AccessFlags2::SHADER_STORAGE_READ
+                                | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                        )
+                })
+                .collect();
+            raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+            );
+            checked(raw.end_command_buffer(cmd), "gdf init end")?;
+            let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            let submit = [vk::SubmitInfo2::default().command_buffer_infos(&buffers)];
+            device
+                .graphics_queue
+                .submit2(raw, &submit, fence, "gdf init submit")?;
+            checked(
+                raw.wait_for_fences(&[fence], true, u64::MAX),
+                "gdf init wait",
+            )?;
+        }
+        Ok(())
+    })();
+    // SAFETY: the ash seam. The fence was waited (or the submit never happened).
+    unsafe {
+        raw.destroy_fence(fence, None);
+        raw.destroy_command_pool(pool, None);
+    }
+    result
+}
+
 fn build_layouts(raw: &ash::Device) -> Result<(vk::DescriptorSetLayout, vk::DescriptorSetLayout)> {
     let sb = vk::DescriptorType::STORAGE_BUFFER;
     let si = vk::DescriptorType::STORAGE_IMAGE;
     // Cull set: instances (b0, read) + cull list (b1, rw).
     let cull = make_compute_layout(raw, &[(sb, 1), (sb, 1)])?;
     // Composite set: instances (b0) + cull list (b1) + cascade volumes (b2, array of GDF_CASCADES)
-    // + the lite albedo cache (b3, single storage image, written for the finest cascade).
-    let composite = match make_compute_layout(raw, &[(sb, 1), (sb, 1), (si, GDF_CASCADES), (si, 1)])
-    {
+    // + the lite albedo cache (b3, single storage image, written for the finest cascade) + the
+    // porous-occupancy volumes (b4, array of GDF_CASCADES).
+    let composite = match make_compute_layout(
+        raw,
+        &[
+            (sb, 1),
+            (sb, 1),
+            (si, GDF_CASCADES),
+            (si, 1),
+            (si, GDF_CASCADES),
+        ],
+    ) {
         Ok(layout) => layout,
         Err(err) => {
             // SAFETY: the ash seam. Free the cull layout on this partial-failure path.

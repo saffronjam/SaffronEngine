@@ -20,6 +20,11 @@ import mdf_brick;
 [[vk::binding(2, 1)]] RWTexture3D<float> cascades[3];
 [[vk::image_format("rgba16f")]]
 [[vk::binding(3, 1)]] RWTexture3D<float4> albedoCache;
+// Binding 4: the per-cascade porous-occupancy volumes (toroidal `r8` density). Porous matter
+// (instance occupancy < 1) never hardens the distance field; it splats density here instead,
+// and the consumers march through it accumulating extinction.
+[[vk::image_format("r8")]]
+[[vk::binding(4, 1)]] RWTexture3D<float> occupancyCascades[3];
 
 // Header words before the per-cascade index segments (matches `gdf_cull.slang` / `global_sdf.rs`).
 static const uint kCullHeader = 4u;
@@ -62,11 +67,25 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     uint count = min(cullList[c], maxCulled);
     float best = 1e30;
     float3 bestAlbedo = float3(0.0);
+    float porous = 0.0;
+    float3 porousAlbedo = float3(0.0);
     for (uint k = 0; k < count; k = k + 1)
     {
         uint idx = cullList[kCullHeader + c * maxCulled + k];
         SdfInstance inst = instances[idx];
         SdfSample smp = sampleMdfBrick(inst, worldCenter, footprint);
+        float instanceOccupancy = inst.localMax.w;
+        if (instanceOccupancy < 1.0)
+        {
+            // Porous matter: density where the brick surface passes through the voxel,
+            // never a hard distance. The densest overlapping instance wins.
+            if (smp.distance < voxel * 0.5 && instanceOccupancy > porous)
+            {
+                porous = instanceOccupancy;
+                porousAlbedo = float3(inst.worldMin.w, inst.worldMax.w, inst.localMin.w);
+            }
+            continue;
+        }
         if (smp.distance < best)
         {
             best = smp.distance;
@@ -82,13 +101,27 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 
     int3 phys = int3(wrapMod(global.x, res), wrapMod(global.y, res), wrapMod(global.z, res));
     cascades[c][uint3(phys)] = stored;
+    occupancyCascades[c][uint3(phys)] = porous;
 
-    // The finest cascade also splats the per-cell base color into the albedo cache (alpha = the
-    // written flag: 1 where a brick covers the cell, 0 for open space). The DDGI trace reads it
-    // only at hit points (near a surface), where `bestAlbedo` is the nearest occluder's color.
+    // The finest cascade also splats the per-cell base color into the albedo cache. Alpha
+    // carries the cell's matter: 1 where a solid brick covers it, the porous density where
+    // only porous matter does, 0 for open space. The DDGI trace reads it at hit points and
+    // inside dense aggregates.
     if (c == 0u)
     {
-        float4 albedo = (best >= 1e29) ? float4(0.0, 0.0, 0.0, 0.0) : float4(bestAlbedo, 1.0);
+        float4 albedo;
+        if (best < 1e29)
+        {
+            albedo = float4(bestAlbedo, 1.0);
+        }
+        else if (porous > 0.0)
+        {
+            albedo = float4(porousAlbedo, porous);
+        }
+        else
+        {
+            albedo = float4(0.0, 0.0, 0.0, 0.0);
+        }
         albedoCache[uint3(phys)] = albedo;
     }
 }
