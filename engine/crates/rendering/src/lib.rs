@@ -31,13 +31,17 @@ mod frame_history;
 mod froxel_fog;
 mod global_gpu_data;
 mod global_sdf;
+mod gpu_scene_upload;
 mod gpu_types;
+mod hzb;
 mod ibl;
 mod instancing;
 mod lighting;
-mod meshlet_raster;
 mod nested_scopes;
 mod overlay;
+mod page_payload;
+mod page_residency;
+mod persistent_gpu_scene;
 mod pipelines;
 mod present;
 mod profiler;
@@ -58,26 +62,29 @@ mod spatial_numeric;
 mod ssao;
 mod stars;
 mod swapchain;
-mod targets;
 mod tessellation;
+mod thin_sheet;
 mod thumbnail;
 mod transient;
 mod upload;
-mod vegetation_compute;
-#[cfg(test)]
-mod vegetation_graph;
 mod view_target;
+mod visibility;
+mod vsm;
+mod watchdog;
 
 pub use aa::{
     Aa, MOTION_FORMAT, MotionPush, REACTIVE_FORMAT, TAA_JITTER_PHASES, TaaParams, TaaPush,
-    clamp_sample_count, jitter_offset, jitter_phase_count, record_motion,
+    clamp_sample_count, jitter_offset, jitter_phase_count,
 };
 pub use canonical_coverage::*;
 pub use clouds::{CloudRenderSettings, Clouds};
+pub use compute_dispatch::{
+    ComputeBuffer, ComputeDispatch, ComputeDispatchAbort, ComputeDispatchLimits,
+    ComputeDispatchOutcome, compute_dispatch_limits,
+};
 pub use conformance::{
-    ComputeConformanceEvidence, GraphProgramEvidence, QualifiedOperatorEvidence,
     ShaderArtifactEvidence, SpatialNumericEvidence, ValidationEvidence, VulkanProfileEvidence,
-    capture_compute_conformance,
+    capture_spatial_numeric, shader_artifact_evidence, vulkan_profile_evidence,
 };
 pub use count_scan_scatter::{
     CountScanScatterError, CountScanScatterOutcome, CountScanScatterOverflow, CountScanScatterPlan,
@@ -96,9 +103,9 @@ pub use device::{
     validation_issue_count,
 };
 pub use draw_list::{
-    AggregateMaterialMoments, CoverageSourceKind, DeformedRtInstance, DrawBatch, DrawItem,
-    MorphDispatch, RenderStats, SceneDrawList, SkinDispatch, SubmeshMaterial, TessDraw,
-    TessRtSlice, ThinSheetMaterial, ThinSheetNormalMode, normal_matrix,
+    AggregateMaterialMoments, CoverageSourceKind, DeformedRtInstance, MorphDispatch, RenderStats,
+    SceneDrawList, SkinDispatch, SkinnedDeformation, SubmeshMaterial, TessDraw, TessRtSlice,
+    TessSceneDraw, ThinSheetMaterial, ThinSheetNormalMode, normal_matrix,
 };
 pub use frame::MAX_FRAMES_IN_FLIGHT;
 pub use frame_history::{
@@ -112,29 +119,52 @@ pub use froxel_fog::{
     FogVolumeGpu, FogVolumeUpload, FroxelFog, FroxelQuality, MAX_FOG_VOLUMES, ap_slice_view_z,
     froxel_slice_view_z, froxel_to_cluster,
 };
+pub use global_gpu_data::ExecutorShaderRegistry;
 pub use global_gpu_data::{
-    ClusterArena, CoverageTable, DeformationParameterArena, DeformationProviderArena,
-    FrameUploadRing, GLOBAL_GPU_DATA_ABI_VERSION, GPU_MATERIAL_COVERAGE_SHIFT,
-    GPU_MATERIAL_SIDEDNESS_SHIFT, GPU_MATERIAL_SURFACE_MODEL_SHIFT,
-    GPU_MATERIAL_TRANSPARENCY_SHIFT, GPU_PSO_COVERAGE_SHIFT, GPU_PSO_DEFORMATION_SHIFT,
+    ClusterArena, CoverageTable, DeformationParameterArena, DeformationProviderArena, FieldArena,
+    FrameUploadRing, GLOBAL_GPU_DATA_ABI_VERSION, GPU_ASSEMBLY_NO_USE,
+    GPU_DEFORMATION_PROVIDER_DISPLACEMENT, GPU_DEFORMATION_PROVIDER_INTERACTION,
+    GPU_DEFORMATION_PROVIDER_MORPH, GPU_DEFORMATION_PROVIDER_SKINNING,
+    GPU_DEFORMATION_PROVIDER_WIND, GPU_INTERACTION_CASCADES, GPU_INTERACTION_FIELD_BYTES,
+    GPU_INTERACTION_HEADER_SIZE, GPU_INTERACTION_TEXEL_SIZE, GPU_INTERACTION_TEXELS,
+    GPU_MATERIAL_COVERAGE_SHIFT, GPU_MATERIAL_SIDEDNESS_SHIFT, GPU_MATERIAL_SURFACE_MODEL_SHIFT,
+    GPU_MATERIAL_TABLE_FLAG_TESSELLATED, GPU_MATERIAL_TRANSPARENCY_SHIFT,
+    GPU_PAGE_FLAG_GUARANTEED_ROOT, GPU_PSO_COVERAGE_SHIFT, GPU_PSO_DEFORMATION_SHIFT,
     GPU_PSO_MATERIAL_SHIFT, GPU_PSO_PASS_SHIFT, GPU_PSO_REPRESENTATION_SHIFT,
     GPU_PSO_SIDEDNESS_SHIFT, GPU_PSO_SURFACE_MODEL_SHIFT, GPU_PSO_TRANSPARENCY_SHIFT,
-    GeometryTable, GlobalGpuArena, GlobalGpuData, GpuArenaGrowth, GpuArenaRange, GpuBufferUpload,
-    GpuCoverageRecord, GpuDeformation, GpuDeformationProviderRecord, GpuDrawRecord,
-    GpuGeometryRecord, GpuHandle, GpuInverseBindRecord, GpuMaterialClass, GpuMaterialTableRecord,
-    GpuPageRecord, GpuPassClass, GpuPrototypeRecord, GpuPsoBin, GpuRangeAllocator,
-    GpuRecordRetirement, GpuRepresentation, GpuSidedness, GpuSkeletonJointRecord,
-    GpuSkeletonRecord, GpuTableSlotHeader, GpuTextureTableRecord, GpuTransparency,
-    ImmutableGpuTable, IndexArena, InverseBindArena, MaterialParameterArena, MaterialTable,
-    PageArena, PageDependencyArena, PageTable, PartArena, PrototypeMaterialArena, PrototypeTable,
-    ResidentGpuTable, SkeletonJointArena, SkeletonTable, TextureTable, UploadSlice, VertexArena,
-    VoxelArena,
+    GPU_SCENE_INSTANCE_FLAG_ATTACHED, GPU_SCENE_INSTANCE_FLAG_EXPLICIT_BOUNDS,
+    GPU_SCENE_INSTANCE_FLAG_MICRO_FIELD, GPU_SCENE_INSTANCE_FLAG_WIND,
+    GPU_SCENE_INSTANCE_POLICY_SHIFT, GPU_SCENE_TRANSFORM_DYNAMIC, GPU_SCENE_TRANSFORM_STATIC,
+    GPU_TRANSITION_FRAMES, GeometryTable, GlobalGpuArena, GlobalGpuData, GlobalGpuTableDescriptors,
+    GlobalGpuTableKind, GpuArenaGrowth, GpuArenaRange, GpuAssemblyHeaderRecord,
+    GpuAssemblyPrototypeRecord, GpuAssemblyUseRecord, GpuBufferUpload, GpuCoverageRecord,
+    GpuDeformation, GpuDeformationProviderRecord, GpuDrawRecord, GpuFieldDirectoryEntry,
+    GpuFieldTileRecord, GpuGeometryRecord, GpuHandle, GpuInverseBindRecord, GpuMaterialClass,
+    GpuMaterialTableRecord, GpuMicroCandidate, GpuPageRecord, GpuPassClass, GpuPrototypeRecord,
+    GpuPsoBin, GpuRangeAllocator, GpuRecordRetirement, GpuRepresentation,
+    GpuSceneInstanceGpuRecord, GpuSceneLightGpuRecord, GpuSceneOverrideGpuRecord,
+    GpuScenePageGpuRecord, GpuScenePrototypeGpuRecord, GpuSceneReferenceGpuRecord, GpuSidedness,
+    GpuSkeletonJointRecord, GpuSkeletonRecord, GpuSubmeshRecord, GpuTableDescriptor,
+    GpuTableSlotHeader, GpuTextureTableRecord, GpuTransparency, GpuWindInstanceRecord,
+    ImmutableGpuTable, IndexArena, InverseBindArena, MICRO_BLADE_INDEX_COUNT,
+    MICRO_BLADE_VERTEX_COUNT, MaterialParameterArena, MaterialTable, PageArena,
+    PageDependencyArena, PageTable, PartArena, PrototypeMaterialArena, PrototypeTable,
+    ResidentGpuTable, SceneDeformationTable, SceneInstanceTable, SceneLightTable,
+    SceneMaterialTable, SceneOverrideArena, ScenePageTable, ScenePrototypeTable, SceneSdfTable,
+    SkeletonJointArena, SkeletonTable, SubmeshArena, TextureTable, UploadSlice, VertexArena,
+    VoxelArena, micro_blade_template_indices,
 };
 pub use global_sdf::{
     GDF_BAND_FRACTION, GDF_CASCADE0_EXTENT, GDF_CASCADES, GDF_EXPONENT, GDF_FORMAT, GDF_MAX_CULLED,
     GDF_NEAR_HANDOFF, GDF_RES, GdfCompositePush, GdfCullPush, GdfParamsUbo, GdfRegion, GlobalSdf,
 };
+pub use gpu_scene_upload::{
+    GpuArenaUploadRequest, GpuSceneAddressBlock, GpuScenePendingUploads, GpuSceneTableDescriptors,
+    GpuSceneTableStorage, GpuSceneUploadRunStats, GpuSceneUploader, GpuSceneWorldDescriptors,
+    GpuSceneWorldTables, record_pending_global_uploads,
+};
 pub use gpu_types::{GpuLight, InstanceData, Material, MaterialParamsData, SdfInstance};
+pub use hzb::{HZB_MAX_MIPS, HZB_PUSH_SIZE, Hzb, HzbPyramid};
 pub use ibl::{
     ATMOS_MULTI_SCATTER_SIZE, ATMOS_SKY_VIEW_H, ATMOS_SKY_VIEW_W, ATMOS_TRANSMITTANCE_H,
     ATMOS_TRANSMITTANCE_W, AtmosphereParams, EnvSource, IBL_COLOR_FORMAT, IBL_ENV_SIZE,
@@ -142,17 +172,26 @@ pub use ibl::{
     ReflectionProbe, ReflectionProbeUpload, ReflectionProbes, SKY_SH_COEFFICIENTS, Sky, SkyDraw,
     SkyRenderSettings, SkygenParams, record_sky,
 };
-pub use instancing::{DrawListInputs, Instancing};
+pub use instancing::{
+    DeformationGather, DeformationWork, Instancing, TessGatherParams, displace_info_from,
+    gather_instance_deformation, resolve_material_params,
+};
 pub use lighting::{
     CLUSTER_COUNT, CLUSTER_GRID_X, CLUSTER_GRID_Y, CLUSTER_GRID_Z, ClusterCamera, ClusterParams,
-    LightUbo, Lighting, MAX_LIGHTS_PER_CLUSTER, POINT_SHADOW_SIZE, SHADOW_MAP_SIZE, SceneLighting,
-    cull_clusters_cpu, point_shadow_face_matrices,
+    LightUbo, Lighting, MAX_LIGHTS_PER_CLUSTER, SceneLighting, SceneWind, cull_clusters_cpu,
+    point_shadow_face_matrices,
 };
 pub use overlay::{
     BloomPush, ColorGrade, GradeRange, GradeUniform, GridPush, LUT_BAKE_SIZE, LUT_SHAPER_EV_MAX,
     LUT_SHAPER_EV_MIN, OverlayDraw, OverlayState, OverlayVertex, TonemapMode, TonemapPush,
     record_grid, record_overlay,
 };
+pub use page_payload::{
+    GPU_PAGE_NODE_NO_PROTOTYPE, GPU_PAGE_PAYLOAD_FLAG_GUARANTEED_ROOT, GpuPageClusterRecord,
+    GpuPageNodeRecord, GpuPageVoxelVertex, PagePayload, build_page_payload,
+};
+pub use page_residency::{PageDemandView, PageResidency, PageResidencyBudgets, PageResidencyStats};
+pub use persistent_gpu_scene::*;
 pub use pipelines::{DEPTH_FORMAT, OFFSCREEN_COLOR_FORMAT, Pipelines, PsoKey};
 pub use profiler::{
     CaptureMode, CaptureRecorder, CaptureState, CpuMarkerRegistry, CpuProfiler, CpuSpan,
@@ -165,15 +204,15 @@ pub use quality::{QualityTier, RenderQuality};
 pub use reactive::{PowerState, ReactiveState};
 pub use render_graph::{
     ProfileRecorders, RenderGraph, RgAccess, RgAttachment, RgBatchCommandBuffers, RgBufferDesc,
-    RgBufferLifetime, RgBufferRange, RgBufferRangeError, RgBufferResource, RgExternalState, RgPass,
-    RgPassBarriers, RgPassBatch, RgPassKind, RgQueueAssignment, RgQueueFamilies, RgQueuePreference,
-    RgRecordedBatch, RgResource, RgSubmissionPlan, RgUsage,
+    RgBufferLifetime, RgBufferRange, RgBufferRangeError, RgBufferResource, RgExternalBufferState,
+    RgExternalState, RgPass, RgPassBarriers, RgPassBatch, RgPassKind, RgQueueAssignment,
+    RgQueueFamilies, RgQueuePreference, RgRecordedBatch, RgResource, RgSubmissionPlan, RgUsage,
 };
 pub use renderer::{FogRenderSettings, RenderStatsFull, Renderer, VIEW_COUNT, ViewId, ViewMode};
 pub use resources::{
     AccelerationStructure, BindlessFreeList, Buffer, DefaultHeightMinMax, DeviceResources, GpuLut,
     GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D,
-    ImageDesc, MinMaxPyramid, Pipeline,
+    ImageDesc, MeshAssembly, MinMaxPyramid, Pipeline,
 };
 pub use restir::{
     InitialPush as RestirInitialPush, RESTIR_CANDIDATE_COUNT, RESTIR_INITIAL_PUSH_SIZE,
@@ -182,15 +221,16 @@ pub use restir::{
     ReusePush as RestirReusePush, reservoir_bytes as restir_reservoir_bytes, wants_restir,
 };
 pub use rt::{
-    BlasRefitOp, MeshBlasBuild, Rt, RtScene, TlasBuildOp, TlasBuildPlan, record_mesh_blas_build,
-    record_tlas_build_plan,
+    BlasRefitOp, MeshBlasBuild, RT_UNMIRRORED_INSTANCE, Rt, RtInstanceInput, RtScene, TlasBuildOp,
+    TlasBuildPlan, record_mesh_blas_build, record_tlas_build_plan,
 };
 pub use scene_pass::{
-    PointShadowTarget, record_depth_prepass, record_gbuffer, record_point_shadow,
-    record_reactive_coverage, record_scene_draw_list, record_shadow_depth,
-    record_transparent_draw_list,
+    MeshPassSets, record_executor_buckets, record_executor_depth_family,
+    record_executor_transparent_stream, record_tess_depth_draws, record_tess_scene_draws,
 };
-pub use shader_artifact::{ShaderArtifactError, ShaderArtifactIdentity, ShaderSha256};
+pub use shader_artifact::{
+    ShaderArtifactContract, ShaderArtifactError, ShaderArtifactIdentity, ShaderSha256,
+};
 pub use shm_publish::{
     MIN_SHM_SLOT_CAPACITY, SHM_HEADER_BYTES, SHM_MAGIC, SHM_RING_SLOTS, ShmPublish,
 };
@@ -204,7 +244,6 @@ pub use ssao::{
 };
 pub use stars::{StarCatalog, StarDraw, record_stars};
 pub use swapchain::Swapchain;
-pub use targets::{PointShadowCube, Targets};
 pub use tessellation::{
     TESS_CLAS_MAX_TRIS, TESS_CLAS_MAX_VERTS, TESS_DEFAULT_EDGE_LENGTH_TARGET,
     TESS_DEFAULT_FACTOR_CAP, TESS_DEFAULT_MIN_FACTOR, TESS_MAX_DICE_FACTOR, TESS_MAX_INSTANCES,
@@ -213,13 +252,40 @@ pub use tessellation::{
     coarse_parent_bary, displacement_aware_factor, factor_push, geomorph_weight,
     project_world_to_pixels, smoothstep01, split_recursion, tess_worst_case, wire_storage_set,
 };
+pub use thin_sheet::{ThinSheetEnergyPartition, thin_sheet_energy_partition};
 pub use thumbnail::{
     PngTransfer, ThumbnailPng, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
 pub use transient::{FROXEL_VOLUME_KEYS, RenderGraphResources};
 pub use upload::{GpuQueue, SdfBake, TextureMipLevel, Uploader};
-pub use vegetation_compute::VulkanGraphComputeExecutor;
 pub use view_target::ViewTarget;
+pub use visibility::{
+    ExecutorBucket, ExecutorDrawInputs, GpuWindSourceRecord, InteractionImpulse,
+    SCENE_BUCKET_PRESSURE, SCENE_EXECUTOR_BUCKET_CAPACITY, SCENE_MICRO_CANDIDATE_CAPACITY,
+    SCENE_MICRO_FIELD_PUSH_SIZE, SCENE_MICRO_TEXEL_BUDGET, SCENE_RADIX_WORKGROUP,
+    SCENE_TRANSITION_PRESSURE, SCENE_TRANSITION_STATE_CAPACITY, SCENE_TRANSPARENT_OVERFLOW,
+    SCENE_TRAVERSAL_OVERFLOW_RECORDS, SCENE_TRAVERSAL_PUSH_SIZE,
+    SCENE_VISIBILITY_COUNTER_CULLED_FRUSTUM, SCENE_VISIBILITY_COUNTER_CULLED_OCCLUSION,
+    SCENE_VISIBILITY_COUNTER_MAX_CUT_DEPTH, SCENE_VISIBILITY_COUNTER_MICRO_CANDIDATES,
+    SCENE_VISIBILITY_COUNTER_OVERFLOW, SCENE_VISIBILITY_COUNTER_RECORD_OVERFLOW,
+    SCENE_VISIBILITY_COUNTER_RECORDS, SCENE_VISIBILITY_COUNTER_RETEST,
+    SCENE_VISIBILITY_COUNTER_SUB_QUAD_TRIANGLES, SCENE_VISIBILITY_COUNTER_TRANSITIONING,
+    SCENE_VISIBILITY_COUNTER_TRANSPARENT, SCENE_VISIBILITY_COUNTER_TRIANGLES,
+    SCENE_VISIBILITY_COUNTER_VISIBLE, SCENE_VISIBILITY_COUNTER_VOXEL_RECORDS,
+    SCENE_VISIBILITY_COUNTER_WORDS, SCENE_VISIBILITY_OVERFLOW_RETEST,
+    SCENE_VISIBILITY_OVERFLOW_VISIBLE, SCENE_VISIBILITY_PASS_CULL, SCENE_VISIBILITY_PASS_RETEST,
+    SCENE_VISIBILITY_PUSH_SIZE, SCENE_VISIBILITY_RECORD_CAPACITY, SceneMicroFieldPush,
+    SceneTraversalPush, SceneVisibility, SceneVisibilityPush, SceneVisibilityView,
+    TransparentSortPipelines, WIND_DEFORM_PUSH_SIZE, WIND_INTERACT_PUSH_SIZE, WindDeformPush,
+    WindInteractPush, bucket_material, build_executor_buckets, record_executor_bucket_draw,
+    record_executor_pass_prefix,
+};
+pub use vsm::{
+    VSM_ATLAS_SIZE, VSM_ATLAS_TILES, VSM_COMPACT_PUSH_SIZE, VSM_DEMAND_CAPACITY,
+    VSM_DEMAND_PUSH_SIZE, VSM_DIRECTIONAL_LEVELS, VSM_LEVEL_PAGES, VSM_LEVEL0_EXTENT_M,
+    VSM_PAGE_SIZE, VSM_TABLE_RESIDENT, VsmCompactPush, VsmCounters, VsmDemand, VsmDemandPush,
+    VsmDirectionalSpace, VsmPageKey, VsmRenderPage, VsmResidency, vsm_table_entry,
+};
 
 use ash::vk;
 
@@ -289,6 +355,10 @@ pub enum Error {
     /// A generated shader artifact or its compiler/source manifest is missing or stale.
     #[error(transparent)]
     ShaderArtifact(#[from] ShaderArtifactError),
+
+    /// A persistent GPU-scene delta or upload contract was invalid.
+    #[error(transparent)]
+    GpuScene(#[from] GpuSceneError),
 
     /// The GPU signed-distance-field bake could not run or its sidecar was malformed
     /// (no bake pipelines, or a decode/IO failure on the cache).

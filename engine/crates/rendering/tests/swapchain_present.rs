@@ -394,8 +394,11 @@ impl BlitSmoke {
         }
         let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 320.0 / 240.0, 0.1, 100.0);
         let view = Mat4::look_at_rh(Vec3::new(0.0, 1.0, 4.0), Vec3::ZERO, Vec3::Y);
-        if let Err(err) = renderer.submit_draw_list(proj * view, &[]) {
-            self.failure = Some(format!("submit_draw_list {}: {err}", self.frames_done));
+        if let Err(err) = renderer.submit_gpu_scene_deformations(proj * view, &[], &[]) {
+            self.failure = Some(format!(
+                "submit_gpu_scene_deformations {}: {err}",
+                self.frames_done
+            ));
             event_loop.exit();
             return;
         }
