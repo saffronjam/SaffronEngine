@@ -408,6 +408,15 @@ fn format_text(cmd: &str, result: &Value) -> Vec<String> {
         "profiler.capture-stop" => format_capture_stop(result),
         "frame-history" => vec![format_frame_history(result)],
         "get-perf-config" | "set-perf-config" => vec![format_perf_config(result)],
+        "vegetation-promote" | "vegetation-demote" | "vegetation-fell" => {
+            vec![format_promotion(result)]
+        }
+        "plant-elements" => format_plant_elements(result),
+        "plant-create" | "plant-graph" | "plant-graph-set" | "plant-growth" => {
+            format_plant_growth(result)
+        }
+        "vegetation-drain-events" => format_vegetation_events(result),
+        "vegetation-nav-contributions" => format_vegetation_nav(result),
         "drain-alarms" => format_drain_alarms(result),
         "list-active-alarms" => format_active_alarms(result),
         "play" | "pause" | "stop" | "step" | "get-play-state" => vec![format!(
@@ -830,6 +839,170 @@ fn format_fit_collider(result: &Value) -> String {
     )
 }
 
+/// A tagged world-hit target's display form: `entity=<uuid>`, `plant=<hex>`, or `unowned`.
+/// A Q15.16 bit pattern as metres.
+fn q16(bits: i64) -> f64 {
+    bits as f64 / 65_536.0
+}
+
+/// The `plant-elements` lines: one per addressable axis, then one per placed element. The
+/// identities printed here are what a manual edit targets.
+fn format_plant_elements(result: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for axis in field_array(result, "axes") {
+        let base = field_array(&axis, "baseBits");
+        lines.push(format!(
+            "  axis {:>34}  {:<8} base=({:.2}, {:.2}, {:.2})  r={:.3}  points={}",
+            field_str(&axis, "id"),
+            field_str(&axis, "element"),
+            q16(base.first().and_then(Value::as_i64).unwrap_or(0)),
+            q16(base.get(1).and_then(Value::as_i64).unwrap_or(0)),
+            q16(base.get(2).and_then(Value::as_i64).unwrap_or(0)),
+            q16(field_i64(&axis, "baseRadiusBits")),
+            field_u64(&axis, "points"),
+        ));
+    }
+    for element in field_array(result, "elements") {
+        let position = field_array(&element, "positionBits");
+        lines.push(format!(
+            "  elem {:>34}  {:<8} at=({:.2}, {:.2}, {:.2})  size={:.3}  slot={}",
+            field_str(&element, "id"),
+            field_str(&element, "element"),
+            q16(position.first().and_then(Value::as_i64).unwrap_or(0)),
+            q16(position.get(1).and_then(Value::as_i64).unwrap_or(0)),
+            q16(position.get(2).and_then(Value::as_i64).unwrap_or(0)),
+            q16(field_i64(&element, "sizeBits")),
+            field_u64(&element, "materialSlot"),
+        ));
+    }
+    lines
+}
+
+/// The growth summary line, plus one line per manual edit that found nothing to change.
+fn format_plant_growth(result: &Value) -> Vec<String> {
+    let growth = result.get("growth").unwrap_or(result);
+    let mut lines = vec![format!(
+        "axes={}  frames={}  shells={}  elements={}  verts={}  tris={}  parts={}  height={:.2}m  edits={}",
+        field_u64(growth, "axes"),
+        field_u64(growth, "frames"),
+        field_u64(growth, "shells"),
+        field_u64(growth, "elements"),
+        field_u64(growth, "vertices"),
+        field_u64(growth, "triangles"),
+        field_u64(growth, "parts"),
+        q16(field_i64(growth, "heightBits")),
+        field_u64(growth, "appliedEdits"),
+    )];
+    for orphan in field_array(growth, "orphans") {
+        lines.push(format!(
+            "  orphan {:>34}  {}  {}",
+            field_str(&orphan, "target"),
+            field_str(orphan.get("action").unwrap_or(&Value::Null), "kind"),
+            field_str(&orphan, "reason"),
+        ));
+    }
+    lines
+}
+
+/// The `vegetation-nav-contributions` lines: one per contributing cell, the dirty regions, then
+/// the totals.
+fn format_vegetation_nav(result: &Value) -> Vec<String> {
+    let cells = field_array(result, "cells");
+    let mut lines: Vec<String> = cells
+        .iter()
+        .map(|cell| {
+            let contributions = field_array(cell, "contributions");
+            let obstacles = contributions
+                .iter()
+                .filter(|row| field_str(row, "kind") != "cost")
+                .count();
+            format!(
+                "  cell {:>6},{:>6},{:>6} L{}  {} contribution(s), {obstacles} obstacle(s)",
+                field_str(cell.get("cell").unwrap_or(&Value::Null), "x"),
+                field_str(cell.get("cell").unwrap_or(&Value::Null), "y"),
+                field_str(cell.get("cell").unwrap_or(&Value::Null), "z"),
+                cell.get("cell")
+                    .and_then(|cell| cell.get("level"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                contributions.len(),
+            )
+        })
+        .collect();
+    let dirty = field_array(result, "dirtyRegions");
+    lines.push(format!(
+        "  dirty={}  contributions={}  obstacles={} (dynamic {})  drained={}",
+        dirty.len(),
+        field_str(result, "contributions"),
+        field_str(result, "obstacles"),
+        field_str(result, "dynamicObstacles"),
+        yes_no(field_bool(result, "drained")),
+    ));
+    lines
+}
+
+/// The `vegetation-drain-events` lines: one per committed transition, then the cursor summary.
+fn format_vegetation_events(result: &Value) -> Vec<String> {
+    let events = field_array(result, "events");
+    let mut lines: Vec<String> = events
+        .iter()
+        .map(|event| {
+            let plant = event
+                .get("plant")
+                .and_then(Value::as_str)
+                .map_or_else(|| "cell-wide".to_owned(), |plant| format!("plant={plant}"));
+            format!(
+                "  #{:<5}  {:<18}  {}",
+                field_str(event, "seq"),
+                event
+                    .get("transition")
+                    .and_then(|transition| transition.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                plant,
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "  high={}  oldest={}  overflowed={}  ({} events)",
+        field_str(result, "highWaterSeq"),
+        field_str(result, "oldestSeq"),
+        yes_no(field_bool(result, "overflowed")),
+        events.len(),
+    ));
+    lines
+}
+
+/// The `vegetation-promote`/`vegetation-demote` line: the plant and the state its transition
+/// leaves it in until the next synchronization point commits.
+fn format_promotion(result: &Value) -> String {
+    let state = result.get("state");
+    let label = state
+        .and_then(|state| state.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let entity = state
+        .and_then(|state| state.get("entity"))
+        .and_then(Value::as_str)
+        .map(|entity| format!("  entity={entity}"))
+        .unwrap_or_default();
+    format!(
+        "plant={}  state={label}{entity}",
+        field_str(result, "plant")
+    )
+}
+
+fn format_hit_target(value: Option<&Value>) -> String {
+    let Some(target) = value else {
+        return "unowned".to_owned();
+    };
+    match target.get("kind").and_then(Value::as_str) {
+        Some("scene-entity") => format!("entity={}", field_str(target, "id")),
+        Some("vegetation") => format!("plant={}", field_str(target, "plant")),
+        _ => "unowned".to_owned(),
+    }
+}
+
 /// The `raycast`/`shapecast` line: the hit detail or `no hit`.
 fn format_raycast(result: &Value) -> String {
     if !field_bool(result, "hit") {
@@ -838,8 +1011,8 @@ fn format_raycast(result: &Value) -> String {
     let p = result.get("point");
     let n = result.get("normal");
     format!(
-        "hit entity={}  point=({:.3}, {:.3}, {:.3})  normal=({:.2}, {:.2}, {:.2})  dist={:.3}",
-        field_str(result, "entity"),
+        "hit {}  point=({:.3}, {:.3}, {:.3})  normal=({:.2}, {:.2}, {:.2})  dist={:.3}",
+        format_hit_target(result.get("target")),
         vec_component(p, "x"),
         vec_component(p, "y"),
         vec_component(p, "z"),
@@ -865,8 +1038,8 @@ fn format_drain_contacts(result: &Value) -> Vec<String> {
                 } else {
                     "solid"
                 },
-                field_str(e, "entityA"),
-                field_str(e, "entityB"),
+                format_hit_target(e.get("targetA")),
+                format_hit_target(e.get("targetB")),
             )
         })
         .collect();
@@ -1763,7 +1936,7 @@ mod tests {
     #[test]
     fn format_raycast_hit_branch() {
         let result = json!({
-            "hit": true, "entity": "42",
+            "hit": true, "target": {"kind": "scene-entity", "id": "42"},
             "point": {"x": 1.0, "y": 2.0, "z": 3.0},
             "normal": {"x": 0.0, "y": 1.0, "z": 0.0},
             "distance": 5.5,
@@ -1772,6 +1945,18 @@ mod tests {
             format_text("raycast", &result),
             vec![
                 "hit entity=42  point=(1.000, 2.000, 3.000)  normal=(0.00, 1.00, 0.00)  dist=5.500"
+            ]
+        );
+        let plant = json!({
+            "hit": true, "target": {"kind": "vegetation", "plant": "00ab"},
+            "point": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "normal": {"x": 0.0, "y": 1.0, "z": 0.0},
+            "distance": 1.0,
+        });
+        assert_eq!(
+            format_text("raycast", &plant),
+            vec![
+                "hit plant=00ab  point=(0.000, 0.000, 0.000)  normal=(0.00, 1.00, 0.00)  dist=1.000"
             ]
         );
     }
@@ -1954,6 +2139,83 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&written).unwrap(),
             "INLINE-TRACE-BYTES"
+        );
+    }
+
+    #[test]
+    fn format_vegetation_nav_counts_obstacles_per_cell() {
+        let result = json!({
+            "cells": [{
+                "cell": {"x": "1", "y": "0", "z": "-2", "level": 0},
+                "contributions": [
+                    {"plant": "40aa", "kind": "static-obstacle", "heightM": 4.0, "cost": 1.0,
+                     "footprint": [], "bounds": {"minTicks": ["0","0","0"], "maxTicksExclusive": ["1","1","1"]}},
+                    {"plant": "40bb", "kind": "cost", "heightM": 0.5, "cost": 0.4,
+                     "footprint": [], "bounds": {"minTicks": ["0","0","0"], "maxTicksExclusive": ["1","1","1"]}},
+                ],
+            }],
+            "dirtyRegions": [{"minTicks": ["0","0","0"], "maxTicksExclusive": ["1","1","1"]}],
+            "contributions": "2", "obstacles": "1", "dynamicObstacles": "0", "drained": true,
+        });
+        let lines = format_text("vegetation-nav-contributions", &result);
+        assert_eq!(
+            lines[0],
+            "  cell      1,     0,    -2 L0  2 contribution(s), 1 obstacle(s)"
+        );
+        assert_eq!(
+            lines[1],
+            "  dirty=1  contributions=2  obstacles=1 (dynamic 0)  drained=yes"
+        );
+    }
+
+    #[test]
+    fn format_vegetation_events_lists_transitions_then_the_cursor() {
+        let result = json!({
+            "events": [
+                {
+                    "seq": "7", "transaction": "12",
+                    "cell": {"x": "0", "y": "0", "z": "0", "level": 0},
+                    "plant": "40aabbccddeeff00112233445566778899",
+                    "transition": {"kind": "damaged", "amount": 16000, "health": 40000},
+                },
+                {
+                    "seq": "8", "transaction": "12",
+                    "cell": {"x": "0", "y": "0", "z": "0", "level": 0},
+                    "transition": {"kind": "disturbed", "categories": 3},
+                },
+            ],
+            "highWaterSeq": "8", "oldestSeq": "1", "overflowed": false,
+        });
+        let lines = format_text("vegetation-drain-events", &result);
+        assert_eq!(
+            lines[0],
+            "  #7      damaged             plant=40aabbccddeeff00112233445566778899"
+        );
+        // A cell-wide change (a disturbance tile) names no plant.
+        assert_eq!(lines[1], "  #8      disturbed           cell-wide");
+        assert_eq!(lines[2], "  high=8  oldest=1  overflowed=no  (2 events)");
+    }
+
+    #[test]
+    fn format_promotion_reports_the_committed_and_pending_states() {
+        // A promotion request that has not committed yet carries no entity.
+        let pending = json!({
+            "plant": "40aabbccddeeff00112233445566778899",
+            "state": {"state": "promoting"},
+        });
+        assert_eq!(
+            format_text("vegetation-promote", &pending)[0],
+            "plant=40aabbccddeeff00112233445566778899  state=promoting"
+        );
+
+        // A live view names the entity that owns the plant.
+        let live = json!({
+            "plant": "40aabbccddeeff00112233445566778899",
+            "state": {"state": "demoting", "entity": "7"},
+        });
+        assert_eq!(
+            format_text("vegetation-demote", &live)[0],
+            "plant=40aabbccddeeff00112233445566778899  state=demoting  entity=7"
         );
     }
 
