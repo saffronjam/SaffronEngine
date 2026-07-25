@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec2, Vec3};
 use saffron_geometry::{MeshBvh, MeshNearestHit, MeshRayHit, Ray, Submesh, Vertex};
+use saffron_rendering::{CoverageSourceKind, classify_canonical_coverage};
 use saffron_spatial::{
     DecisionScalar, FieldAvailability, FieldChannel, FieldDerivative, FieldSample,
     HessianFieldSample, SurfaceAttachment, SurfaceCapabilities, SurfaceCoordinates,
@@ -12,6 +13,75 @@ use saffron_spatial::{
     SurfaceRay, SurfaceRevision, SurfaceTagId, SurfaceTileDescriptor, UnitInterval,
     VectorFieldSample, WeightedSurfaceTag, WorldBounds, WorldPosition,
 };
+use saffron_vegetation::AlphaClassification;
+
+/// CPU-resident projection of one material's canonical coverage contract.
+#[derive(Clone)]
+pub struct CanonicalCpuCoverage {
+    /// Canonical source interpretation.
+    pub source_kind: CoverageSourceKind,
+    /// Alpha classification applied after filtering.
+    pub classification: AlphaClassification,
+    /// Material alpha multiplied into albedo-alpha sources.
+    pub base_color_alpha: f32,
+    /// Decoded level-zero dimensions used for filtering.
+    pub texture_extent: [u32; 2],
+    /// Authored source dimensions used by object-anchored stochastic coverage.
+    pub hash_extent: [u32; 2],
+    /// Stable object-space stochastic-coverage salt.
+    pub salt: u64,
+    /// Temporal coverage phase shared with this frame's raster draws.
+    pub temporal_phase: u32,
+    /// Authored alpha cutoff.
+    pub reference_cutoff: f32,
+    /// Whether the decoded alpha already stores coverage probability.
+    pub canonical_probability: bool,
+    /// Material UV scale.
+    pub uv_tiling: Vec2,
+    /// Material UV translation.
+    pub uv_offset: Vec2,
+    /// Optional decoded level-zero alpha plane.
+    pub alpha: Option<Arc<[u8]>>,
+}
+
+impl CanonicalCpuCoverage {
+    pub(crate) fn covered(&self, uv: Vec2, anchor: Vec3) -> bool {
+        let uv = uv * self.uv_tiling + self.uv_offset;
+        let sampled = self.alpha.as_ref().map_or(1.0, |alpha| {
+            sample_bilinear_alpha(alpha, self.texture_extent, uv)
+        });
+        classify_canonical_coverage(
+            sampled,
+            uv.to_array(),
+            anchor.to_array(),
+            self.source_kind,
+            self.classification,
+            self.base_color_alpha,
+            self.hash_extent,
+            self.salt,
+            self.temporal_phase,
+            self.reference_cutoff,
+            0.0,
+            self.canonical_probability,
+            false,
+        )
+        .covered
+    }
+}
+
+pub(crate) fn coverage_for_triangle<'a>(
+    submeshes: &[Submesh],
+    coverage: &'a [CanonicalCpuCoverage],
+    triangle_index: u32,
+) -> Option<&'a CanonicalCpuCoverage> {
+    let index_offset = triangle_index.saturating_mul(3);
+    submeshes.iter().enumerate().find_map(|(index, submesh)| {
+        let end = submesh.first_index.saturating_add(submesh.index_count);
+        (index_offset >= submesh.first_index && index_offset < end)
+            .then(|| coverage.get(index))
+            .flatten()
+    })
+}
 
 /// Complete immutable inputs for one static-mesh surface-provider snapshot.
 pub struct StaticMeshSurfaceInput {
@@ -37,6 +107,8 @@ pub struct StaticMeshSurfaceInput {
     pub render_origin: WorldPosition,
     /// Stable material tags indexed by material slot.
     pub material_tags: Vec<SurfaceTagId>,
+    /// Canonical coverage records parallel to `submeshes`.
+    pub coverage: Vec<CanonicalCpuCoverage>,
 }
 
 /// A provider over one static mesh instance and its cached mesh-local BVH.
@@ -50,6 +122,7 @@ pub struct StaticMeshSurfaceProvider {
     inverse: Mat4,
     render_origin: WorldPosition,
     material_tags: Vec<SurfaceTagId>,
+    coverage: Vec<CanonicalCpuCoverage>,
 }
 
 impl StaticMeshSurfaceProvider {
@@ -67,6 +140,7 @@ impl StaticMeshSurfaceProvider {
             model,
             render_origin,
             material_tags,
+            coverage,
         } = input;
         let determinant = model.determinant();
         let inverse = model.inverse();
@@ -115,6 +189,7 @@ impl StaticMeshSurfaceProvider {
             model,
             render_origin,
             material_tags,
+            coverage,
         })
     }
 
@@ -128,7 +203,10 @@ impl StaticMeshSurfaceProvider {
             origin: self.inverse.transform_point3(world_ray.origin),
             dir: self.inverse.transform_vector3(world_ray.dir),
         };
-        let Some(hit) = self.bvh.raycast_hit(&local_ray) else {
+        let Some(hit) = self
+            .bvh
+            .raycast_hit_filtered(&local_ray, |hit| self.hit_is_covered(hit))
+        else {
             return Ok(None);
         };
         let local_point = local_ray.origin + local_ray.dir * hit.distance;
@@ -139,6 +217,30 @@ impl StaticMeshSurfaceProvider {
         }
         self.surface_hit(hit, local_point, world_point, distance)
             .map(Some)
+    }
+
+    fn hit_is_covered(&self, hit: MeshRayHit) -> bool {
+        let Ok(vertices) = self.triangle_vertices(hit.triangle_index) else {
+            return false;
+        };
+        let uv = barycentric_interpolate_vec2(
+            vertices[0].uv0,
+            vertices[1].uv0,
+            vertices[2].uv0,
+            hit.barycentric,
+        );
+        let anchor = barycentric_interpolate(
+            vertices[0].position,
+            vertices[1].position,
+            vertices[2].position,
+            hit.barycentric,
+        );
+        self.coverage_for_triangle(hit.triangle_index)
+            .is_none_or(|coverage| coverage.covered(uv, anchor))
+    }
+
+    fn coverage_for_triangle(&self, triangle_index: u32) -> Option<&CanonicalCpuCoverage> {
+        coverage_for_triangle(&self.submeshes, &self.coverage, triangle_index)
     }
 
     fn surface_hit(
@@ -457,6 +559,30 @@ fn barycentric_interpolate_vec2(a: Vec2, b: Vec2, c: Vec2, weights: [f32; 3]) ->
     a * weights[0] + b * weights[1] + c * weights[2]
 }
 
+fn sample_bilinear_alpha(alpha: &[u8], extent: [u32; 2], uv: Vec2) -> f32 {
+    let [width, height] = extent;
+    if width == 0
+        || height == 0
+        || alpha.len() != width as usize * height as usize
+        || !uv.is_finite()
+    {
+        return 1.0;
+    }
+    let texel = uv * Vec2::new(width as f32, height as f32) - Vec2::splat(0.5);
+    let base = texel.floor();
+    let fraction = texel - base;
+    let sample = |x: i32, y: i32| {
+        let x = x.rem_euclid(width as i32) as usize;
+        let y = y.rem_euclid(height as i32) as usize;
+        f32::from(alpha[y * width as usize + x]) * (1.0 / 255.0)
+    };
+    let x = base.x as i32;
+    let y = base.y as i32;
+    let top = sample(x, y) + (sample(x + 1, y) - sample(x, y)) * fraction.x;
+    let bottom = sample(x, y + 1) + (sample(x + 1, y + 1) - sample(x, y + 1)) * fraction.x;
+    top + (bottom - top) * fraction.y
+}
+
 #[cfg(test)]
 mod tests {
     use glam::{DVec3, Mat4, Vec2, Vec3};
@@ -465,7 +591,13 @@ mod tests {
         SurfaceField, SurfaceProviderId, SurfaceRay, SurfaceRevision, SurfaceTagId, WorldPosition,
     };
 
-    use super::{StaticMeshSurfaceInput, StaticMeshSurfaceProvider};
+    use saffron_rendering::CoverageSourceKind;
+    use saffron_vegetation::AlphaClassification;
+
+    use super::{
+        CanonicalCpuCoverage, StaticMeshSurfaceInput, StaticMeshSurfaceProvider,
+        sample_bilinear_alpha,
+    };
 
     fn triangle_provider(
         render_origin: WorldPosition,
@@ -512,6 +644,7 @@ mod tests {
             model: Mat4::from_translation(Vec3::new(render_translation_x, 0.0, 0.0)),
             render_origin,
             material_tags: vec![SurfaceTagId(23)],
+            coverage: Vec::new(),
         })
         .unwrap()
     }
@@ -557,10 +690,135 @@ mod tests {
             model: Mat4::from_scale(Vec3::new(1.0, 0.0, 1.0)),
             render_origin: WorldPosition::origin(),
             material_tags: Vec::new(),
+            coverage: Vec::new(),
         });
         assert!(matches!(
             result,
             Err(saffron_spatial::Error::InvalidSurfaceTransform)
         ));
+    }
+
+    #[test]
+    fn raycast_rejects_a_transparent_near_triangle_and_returns_the_solid_triangle() {
+        let vertices: std::sync::Arc<[Vertex]> = vec![
+            Vertex {
+                position: Vec3::new(-1.0, 0.0, -1.0),
+                uv0: Vec2::ZERO,
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(0.0, 0.0, 1.0),
+                uv0: Vec2::ZERO,
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(1.0, 0.0, -1.0),
+                uv0: Vec2::ZERO,
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(-1.0, -1.0, -1.0),
+                uv0: Vec2::ZERO,
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(0.0, -1.0, 1.0),
+                uv0: Vec2::ZERO,
+                ..Vertex::default()
+            },
+            Vertex {
+                position: Vec3::new(1.0, -1.0, -1.0),
+                uv0: Vec2::ZERO,
+                ..Vertex::default()
+            },
+        ]
+        .into();
+        let indices: std::sync::Arc<[u32]> = vec![0, 1, 2, 3, 4, 5].into();
+        let positions = vertices
+            .iter()
+            .map(|vertex| vertex.position)
+            .collect::<Vec<_>>();
+        let provider = StaticMeshSurfaceProvider::new(StaticMeshSurfaceInput {
+            id: SurfaceProviderId(31),
+            revision: SurfaceRevision(1),
+            vertices,
+            indices: std::sync::Arc::clone(&indices),
+            submeshes: vec![
+                Submesh {
+                    first_index: 0,
+                    index_count: 3,
+                    vertex_offset: 0,
+                    material_slot: 0,
+                },
+                Submesh {
+                    first_index: 3,
+                    index_count: 3,
+                    vertex_offset: 0,
+                    material_slot: 1,
+                },
+            ],
+            bounds_min: Vec3::new(-1.0, -1.0, -1.0),
+            bounds_max: Vec3::new(1.0, 0.0, 1.0),
+            bvh: std::sync::Arc::new(MeshBvh::build(&positions, &indices).unwrap()),
+            model: Mat4::IDENTITY,
+            render_origin: WorldPosition::origin(),
+            material_tags: Vec::new(),
+            coverage: vec![
+                CanonicalCpuCoverage {
+                    source_kind: CoverageSourceKind::Texture,
+                    classification: AlphaClassification::Masked,
+                    base_color_alpha: 1.0,
+                    texture_extent: [1, 1],
+                    hash_extent: [1, 1],
+                    salt: 0,
+                    temporal_phase: 0,
+                    reference_cutoff: 0.5,
+                    canonical_probability: true,
+                    uv_tiling: Vec2::ONE,
+                    uv_offset: Vec2::ZERO,
+                    alpha: Some(vec![0].into()),
+                },
+                CanonicalCpuCoverage {
+                    source_kind: CoverageSourceKind::ModeledGeometry,
+                    classification: AlphaClassification::Opaque,
+                    base_color_alpha: 1.0,
+                    texture_extent: [1, 1],
+                    hash_extent: [1, 1],
+                    salt: 0,
+                    temporal_phase: 0,
+                    reference_cutoff: 0.5,
+                    canonical_probability: true,
+                    uv_tiling: Vec2::ONE,
+                    uv_offset: Vec2::ZERO,
+                    alpha: None,
+                },
+            ],
+        })
+        .unwrap();
+        let ray = SurfaceRay::new(
+            WorldPosition::from_world_meters(DVec3::new(0.0, 2.0, 0.0)).unwrap(),
+            DVec3::NEG_Y,
+            10.0,
+        )
+        .unwrap();
+        let hit = provider.raycast(&ray).unwrap().unwrap();
+        assert_eq!(hit.position.world_meters().y, -1.0);
+    }
+
+    #[test]
+    fn bilinear_alpha_matches_repeat_sampler_texel_centres() {
+        let alpha = [0, 255];
+        assert_eq!(
+            sample_bilinear_alpha(&alpha, [2, 1], Vec2::new(0.25, 0.5)),
+            0.0
+        );
+        assert_eq!(
+            sample_bilinear_alpha(&alpha, [2, 1], Vec2::new(0.75, 0.5)),
+            1.0
+        );
+        assert_eq!(
+            sample_bilinear_alpha(&alpha, [2, 1], Vec2::new(0.0, 0.5)),
+            0.5
+        );
     }
 }

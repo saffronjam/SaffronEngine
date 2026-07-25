@@ -31,15 +31,16 @@ use saffron_geometry::{
     Ray, Vertex, ray_aabb_slab, ray_triangle_coordinates, world_aabb_from_corners,
 };
 use saffron_rendering::{
-    CloudRenderSettings, ClusterCamera, DrawItem, EnvSource, FOG_SHAPE_BOX, FOG_SHAPE_SPHERE,
-    FogRenderSettings, FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES, MAX_REFLECTION_PROBES,
-    Material, ReflectionProbeUpload, SceneLighting, SdfInstance, SkyRenderSettings, SkygenParams,
+    CloudRenderSettings, ClusterCamera, CoverageSourceKind, EnvSource, FOG_SHAPE_BOX,
+    FOG_SHAPE_SPHERE, FogRenderSettings, FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES,
+    MAX_REFLECTION_PROBES, Material, ReflectionProbeUpload, SceneLighting, SdfInstance,
+    SkyRenderSettings, SkygenParams,
 };
 use saffron_scene::{
     AtmosphereRole, Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, IdComponent,
-    MaterialSet, Mesh as MeshComponent, MorphComponent, MorphWeightOverride, PointLight,
-    PreviewGhost, ReflectionProbe, Scene, SkinnedMesh, SkyMode, SpotLight, Transform,
-    camera_projection,
+    MaterialSet, MaterialSlot, Mesh as MeshComponent, MorphComponent, MorphWeightOverride,
+    PointLight, PreviewGhost, ReflectionProbe, Relationship, Scene, SkinnedMesh, SkyMode,
+    SpotLight, Transform, camera_projection,
 };
 use saffron_spatial::{
     FieldChannel, FieldDerivative, FieldSample, SurfaceCapabilities, SurfaceCoordinates,
@@ -47,6 +48,7 @@ use saffron_spatial::{
     SurfaceRay, SurfaceRevision, SurfaceTagId, UnitInterval, WeightedSurfaceTag, WorldBounds,
     WorldPosition,
 };
+use saffron_vegetation::{AlphaClassification, CoverageSource, MaterialSurface};
 
 use crate::gpu::GpuUploader;
 use crate::time_of_day::{
@@ -54,8 +56,8 @@ use crate::time_of_day::{
     solar_position, world_from_equatorial,
 };
 use crate::{
-    AssetServer, RenderSceneOptions, StaticMeshSurfaceInput, StaticMeshSurfaceProvider,
-    SystemMeshVisual,
+    AssetServer, CanonicalCpuCoverage, MaterialAsset, RenderSceneOptions, StaticMeshSurfaceInput,
+    StaticMeshSurfaceProvider,
 };
 
 const STAR_RADIANCE_SCALE: f32 = 4.0e-5;
@@ -80,21 +82,19 @@ pub trait SceneRenderer: GpuUploader {
 
     /// Arms the spot shadow pass.
     fn set_spot_shadow(&mut self, light_view_proj: Mat4, light_index: u32, casting: bool);
-    /// Arms the point shadow pass. `content_key` hashes the light + every caster's world
-    /// transform (camera-independent), so the renderer re-renders the 6-face cube only when it
-    /// changes — a moving camera over a static light + casters reuses the cached cube.
+    /// Arms the point shadow pass (the six-face cube re-renders every active frame
+    /// from the executor stream).
     fn set_point_shadow(
         &mut self,
         light_pos: Vec3,
         far_plane: f32,
         light_index: u32,
         casting: bool,
-        content_key: u64,
     );
     /// Arms the directional shadow pass.
-    fn set_directional_shadow(&mut self, light_view_proj: Mat4, casting: bool);
+    fn set_directional_shadow(&mut self, casting: bool);
     /// Captures the frame's static RT instances.
-    fn set_rt_scene(&mut self, models: Vec<Mat4>, meshes: Vec<Arc<GpuMesh>>);
+    fn set_rt_scene(&mut self, instances: Vec<saffron_rendering::RtInstanceInput>);
     /// Snaps the camera-centered DDGI probe clipmap to the camera + passes the sun for the trace.
     fn set_ddgi_scene(&mut self, cam_pos: Vec3, sun_dir: Vec3, sun_color: Vec3, sun_intensity: f32);
     /// Uploads this frame's per-static-instance SDF list (the lighting cone-trace iterates
@@ -123,19 +123,30 @@ pub trait SceneRenderer: GpuUploader {
     fn set_ssao_camera(&mut self, view: Mat4, proj: Mat4, sun_direction_world: Vec3);
     /// Toggles the ground-grid debug overlay this frame.
     fn set_show_grid(&mut self, enabled: bool);
-    /// Records the static + skinned draw-list gather duration.
+    /// Records the frame scene gather duration.
     fn record_scene_gather(&mut self, elapsed: Duration);
-    /// Builds the frame's draw list + concatenated joint palette.
+    /// Whether displacement tessellation is built and on; the gather derives displace
+    /// facts only when it is.
+    fn displacement_enabled(&self) -> bool {
+        true
+    }
+    /// Submits the frame's record-driven deformation work + concatenated joint palette
+    /// (the executor draws come from the GPU scene's visibility traversal, not a list).
     ///
     /// # Errors
     ///
-    /// Returns a [`saffron_rendering::Error`] if an SSBO / deformed-buffer grow or upload fails.
-    fn submit_draw_list(
+    /// Returns a [`saffron_rendering::Error`] if a palette / deformed-buffer grow or
+    /// dispatch wiring fails.
+    fn submit_deformations(
         &mut self,
         view_proj: Mat4,
-        items: &[DrawItem],
+        work: &[saffron_rendering::DeformationWork],
         joints: &[Mat4],
     ) -> saffron_rendering::Result<()>;
+    /// Pushes the submitted frame's skinned palette/deformed offsets into the mirror's
+    /// stable deformation-provider params (a no-op for a renderer without the GPU
+    /// scene).
+    fn patch_frame_deformations(&mut self, _scene: &Scene, _mirror: &crate::GpuSceneMirror) {}
     /// Folds the visible-sky settings in.
     fn submit_sky(&mut self, settings: &SkyRenderSettings);
     /// Folds the cloud shape and resolved painted-weather source in.
@@ -201,12 +212,19 @@ impl GpuUploader for RendererScene<'_> {
     fn upload_mesh(
         &self,
         mesh: &saffron_geometry::Mesh,
+        hierarchy: &saffron_geometry::PortableVirtualHierarchy,
         skin: &[saffron_geometry::VertexSkin],
         morph: Option<&saffron_geometry::MorphData>,
         sdf_bake: Option<&saffron_rendering::SdfBake>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
-        self.uploader
-            .upload_mesh(self.renderer.descriptors(), mesh, skin, morph, sdf_bake)
+        self.uploader.upload_mesh(
+            self.renderer.descriptors(),
+            mesh,
+            hierarchy,
+            skin,
+            morph,
+            sdf_bake,
+        )
     }
 
     fn upload_texture(
@@ -260,6 +278,10 @@ impl GpuUploader for RendererScene<'_> {
     fn skinning_enabled(&self) -> bool {
         self.skinning_enabled
     }
+
+    fn coverage_temporal_phase(&self) -> u32 {
+        self.renderer.active_view().jitter_index
+    }
 }
 
 impl SceneRenderer for RendererScene<'_> {
@@ -287,19 +309,17 @@ impl SceneRenderer for RendererScene<'_> {
         far_plane: f32,
         light_index: u32,
         casting: bool,
-        content_key: u64,
     ) {
         self.renderer
-            .set_point_shadow(light_pos, far_plane, light_index, casting, content_key);
+            .set_point_shadow(light_pos, far_plane, light_index, casting);
     }
 
-    fn set_directional_shadow(&mut self, light_view_proj: Mat4, casting: bool) {
-        self.renderer
-            .set_directional_shadow(light_view_proj, casting);
+    fn set_directional_shadow(&mut self, casting: bool) {
+        self.renderer.set_directional_shadow(casting);
     }
 
-    fn set_rt_scene(&mut self, models: Vec<Mat4>, meshes: Vec<Arc<GpuMesh>>) {
-        self.renderer.set_rt_scene(models, meshes);
+    fn set_rt_scene(&mut self, instances: Vec<saffron_rendering::RtInstanceInput>) {
+        self.renderer.set_rt_scene(instances);
     }
 
     fn set_ddgi_scene(
@@ -355,14 +375,28 @@ impl SceneRenderer for RendererScene<'_> {
         self.renderer.record_scene_gather(elapsed);
     }
 
-    fn submit_draw_list(
+    fn patch_frame_deformations(&mut self, scene: &Scene, mirror: &crate::GpuSceneMirror) {
+        let world = self.renderer.active_gpu_scene_world();
+        let deformations = self.renderer.skinned_deformations().to_vec();
+        let (_, gpu_scene, pending, _) = self.renderer.gpu_scene_parts_mut();
+        let deformed = mirror.patch_frame_deformations(world, scene, &deformations, pending);
+        gpu_scene.note_instances_moved(world, &deformed);
+        self.renderer
+            .record_retained_mesh_bytes(mirror.retained_mesh_cpu_bytes());
+    }
+
+    fn displacement_enabled(&self) -> bool {
+        self.renderer.displacement_enabled()
+    }
+
+    fn submit_deformations(
         &mut self,
         view_proj: Mat4,
-        items: &[DrawItem],
+        work: &[saffron_rendering::DeformationWork],
         joints: &[Mat4],
     ) -> saffron_rendering::Result<()> {
         self.renderer
-            .submit_draw_list_skinned(view_proj, items, joints)
+            .submit_gpu_scene_deformations(view_proj, work, joints)
     }
 
     fn submit_sky(&mut self, settings: &SkyRenderSettings) {
@@ -415,11 +449,6 @@ fn morph_weights_for(scene: &Scene, entity: Entity) -> Vec<f32> {
         .unwrap_or_default()
 }
 
-/// `transpose(inverse(mat3(model)))` as a [`Mat4`] (the normal matrix).
-fn normal_matrix(model: Mat4) -> Mat4 {
-    Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose())
-}
-
 /// A `glm::lookAt`-equivalent view matrix (right-handed, the engine's GLM convention).
 fn look_at(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
     Mat4::look_at_rh(eye, center, up)
@@ -430,62 +459,85 @@ fn perspective(fov: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     Mat4::perspective_rh(fov, aspect, near, far)
 }
 
-/// A `glm::ortho` with Vulkan `[0, 1]` clip depth (`GLM_FORCE_DEPTH_ZERO_TO_ONE`).
-fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
-    Mat4::orthographic_rh(left, right, bottom, top, near, far)
-}
+/// Reconciles the runtime-only editor-camera gizmo entities: every [`Camera`] with
+/// `show_model` owns one [`PreviewGhost`]-tagged child rendering the reserved
+/// editor-camera model mesh ([`crate::EDITOR_CAMERA_MESH_ID`], seeded on first
+/// resolve); clearing the flag — or disabling the option — removes the child. A ghost
+/// never serializes, lists, or picks, so the gizmo is pure runtime state that renders
+/// through the ordinary GPU-scene mirror like any entity.
+fn sync_editor_camera_models(scene: &mut Scene, enabled: bool) {
+    const MODEL_SCALE: f32 = 7.5;
+    const LENS_LOCAL_X: f32 = 0.080_121_7;
 
-/// Appends the editor-camera gizmo models to `items`: one per [`Camera`] entity with
-/// `show_model`, placed by its world matrix and the fixed local lens offset.
-///
-/// A no-op until the editor-camera mesh loads (attempted once). The visual's mesh + resolved
-/// material are read out of [`AssetServer::editor_camera_model`] after the load.
-fn append_editor_camera_models<R: SceneRenderer>(
-    scene: &mut Scene,
-    assets: &mut AssetServer,
-    renderer: &R,
-    items: &mut Vec<DrawItem>,
-) {
-    if !assets.load_editor_camera_model(renderer) {
-        return;
+    // The cameras that should carry a gizmo child.
+    let mut wanted: Vec<Entity> = Vec::new();
+    if enabled {
+        scene.for_each::<(&Transform, &Camera), _>(|entity, (_, camera)| {
+            if camera.show_model {
+                wanted.push(entity);
+            }
+        });
     }
-    let SystemMeshVisual {
-        mesh: Some(mesh),
-        submesh_materials,
-        ..
-    } = &assets.editor_camera_model
-    else {
-        return;
-    };
-    let mesh = Arc::clone(mesh);
-    let submesh_materials = submesh_materials.clone();
-
-    let mut cameras: Vec<Entity> = Vec::new();
-    scene.for_each::<(&Transform, &Camera), _>(|entity, (_, camera)| {
-        if camera.show_model {
-            cameras.push(entity);
+    // The existing gizmo ghosts (identified by tag + the reserved mesh id).
+    let mut existing: Vec<Entity> = Vec::new();
+    scene.for_each::<(&PreviewGhost, &MeshComponent), _>(|entity, (_, mesh)| {
+        if mesh.mesh == crate::EDITOR_CAMERA_MESH_ID {
+            existing.push(entity);
         }
     });
-    for entity in cameras {
-        const MODEL_SCALE: f32 = 7.5;
-        const LENS_LOCAL_X: f32 = 0.080_121_7;
-        let model = scene.world_matrix(entity)
-            * Mat4::from_translation(Vec3::new(0.0, -0.1, 0.0))
-            * Mat4::from_rotation_y(90.0_f32.to_radians())
-            * Mat4::from_scale(Vec3::splat(MODEL_SCALE))
-            * Mat4::from_translation(Vec3::new(-LENS_LOCAL_X, 0.0, 0.0));
-        items.push(DrawItem {
-            mesh: Arc::clone(&mesh),
-            model,
-            normal_matrix: normal_matrix(model),
-            submesh_materials: submesh_materials.clone(),
-            material: Material::default(),
-            skinned: false,
-            joint_offset: 0,
-            joint_count: 0,
-            morph_weights: Vec::new(),
-            entity: 0,
-        });
+    let mut covered: Vec<Entity> = Vec::new();
+    for ghost in existing {
+        let parent = scene
+            .with_component::<Relationship, _>(ghost, |rel| rel.parent_handle)
+            .unwrap_or(None);
+        match parent {
+            // One ghost per camera: extras and orphans reconcile away.
+            Some(camera) if wanted.contains(&camera) && !covered.contains(&camera) => {
+                covered.push(camera);
+            }
+            _ => scene.destroy_entity(ghost),
+        }
+    }
+    if wanted.iter().all(|camera| covered.contains(camera)) {
+        return;
+    }
+    // The gizmo's local offset under its camera parent, as one TRS (the rotation is a
+    // pure +90° yaw, so the Euler triple is exact).
+    let lens = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2).transform_vector3(Vec3::new(
+        -LENS_LOCAL_X * MODEL_SCALE,
+        0.0,
+        0.0,
+    ));
+    let local = Transform {
+        translation: Vec3::new(0.0, -0.1, 0.0) + lens,
+        scale: Vec3::splat(MODEL_SCALE),
+        rotation: Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0),
+    };
+    for camera in wanted {
+        if covered.contains(&camera) {
+            continue;
+        }
+        let ghost = scene.create_entity("Camera Model");
+        let _ = scene.add_component(ghost, PreviewGhost::default());
+        let _ = scene.add_component(
+            ghost,
+            MeshComponent {
+                mesh: crate::EDITOR_CAMERA_MESH_ID,
+            },
+        );
+        let _ = scene.add_component(
+            ghost,
+            MaterialSet {
+                slots: vec![MaterialSlot {
+                    material: crate::EDITOR_CAMERA_MATERIAL_ID,
+                    ..MaterialSlot::default()
+                }],
+            },
+        );
+        let _ = scene.with_component_mut::<Transform, _>(ghost, |transform| *transform = local);
+        if let Err(err) = scene.set_parent(ghost, Some(camera), false) {
+            tracing::warn!("camera gizmo parent: {err}");
+        }
     }
 }
 
@@ -571,50 +623,6 @@ fn render_aabb_of(
         }
     }
     found.then_some((min, max))
-}
-
-/// A camera-independent hash of the inputs the point-shadow cube depends on: the light position +
-/// far plane, render-content revision, and every mesh entity's world matrix + mesh asset id.
-///
-/// The renderer re-renders the 6-face cube only when this changes, so panning the camera over a
-/// static light + static casters reuses the cached cube; any caster (or the light) moving, or a
-/// mesh added/removed/reassigned, or an asset-content replacement invalidates it.
-fn point_shadow_content_key(
-    scene: &mut Scene,
-    light_pos: Vec3,
-    far_plane: f32,
-    render_content_revision: u64,
-) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    let mut fold = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    };
-    for component in light_pos.to_array() {
-        fold(&component.to_le_bytes());
-    }
-    fold(&far_plane.to_le_bytes());
-    fold(&render_content_revision.to_le_bytes());
-    let mut casters: Vec<(Entity, u64)> = Vec::new();
-    scene.for_each::<&MeshComponent, _>(|entity, mesh| casters.push((entity, mesh.mesh.0)));
-    for (entity, mesh_id) in casters {
-        // Skinned (deformed) casters are *dynamic* — they render into the per-frame dynamic cube,
-        // so they must not key the static cube (an animating skeleton would otherwise invalidate
-        // it every frame and defeat the cache). Their motion is captured by re-rendering the
-        // dynamic cube each frame, not by this key.
-        if scene.has_component::<SkinnedMesh>(entity) {
-            continue;
-        }
-        for component in scene.world_matrix(entity).to_cols_array() {
-            fold(&component.to_le_bytes());
-        }
-        fold(&mesh_id.to_le_bytes());
-    }
-    hash
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -784,6 +792,7 @@ pub fn render_scene<R: SceneRenderer>(
     renderer: &mut R,
     scene: &mut Scene,
     assets: &mut AssetServer,
+    mirror: &crate::GpuSceneMirror,
     camera: &CameraView,
     options: RenderSceneOptions,
 ) {
@@ -803,6 +812,10 @@ pub fn render_scene<R: SceneRenderer>(
     let jitter = renderer.jitter_offset();
     let view_projection =
         Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.0)) * (proj * view);
+
+    // Reconcile the runtime camera-gizmo ghosts before the flatten, so a fresh ghost's
+    // world transform composes this frame.
+    sync_editor_camera_models(scene, options.show_editor_camera_models);
 
     // Flatten the hierarchy once per frame before any consumer reads: every loop below
     // (lights, meshes, probes) and the between-frame pick/gizmo paths read the world-
@@ -839,12 +852,6 @@ pub fn render_scene<R: SceneRenderer>(
         point_shadow_far,
         point_shadow.map_or(0, |p| p.light_index),
         point_shadow.is_some(),
-        point_shadow_content_key(
-            scene,
-            point_shadow_pos,
-            point_shadow_far,
-            assets.render_content_revision(),
-        ),
     );
 
     // The camera world position is the inverse-view translation; the BRDF needs it as the
@@ -853,54 +860,33 @@ pub fn render_scene<R: SceneRenderer>(
     let eye_position = view.inverse().w_axis.truncate();
 
     let gather_started = Instant::now();
-    let mut build = DrawListBuild::default();
-    gather_static_draw_list(renderer, scene, assets, &mut build);
-    let frame_joints = if renderer.skinning_enabled() {
-        gather_skinned_draw_list(renderer, scene, assets, &mut build)
-    } else {
-        Vec::new()
-    };
-    let DrawListBuild {
-        mut items,
+    let mut build = FrameSceneBuild::default();
+    gather_static_frame_facts(renderer, scene, assets, mirror, &mut build);
+    if renderer.skinning_enabled() {
+        gather_skinned_frame_facts(renderer, scene, assets, mirror, &mut build);
+    }
+    let FrameSceneBuild {
+        work,
+        frame_joints,
+        renderable_count,
         scene_min,
         scene_max,
         sdf_instances,
+        rt_instances,
     } = build;
     let scene_gather_elapsed = gather_started.elapsed();
 
-    // Fit an orthographic shadow frustum to the scene's world AABB, looking down the
-    // directional light. A bounding sphere keeps the fit rotation-stable. With no sun in
-    // the scene there is nothing to cast, so the directional shadow pass is skipped.
-    let cast_shadow = has_sun && !items.is_empty() && scene_max.x >= scene_min.x;
-    let shadow_view_proj = if cast_shadow {
-        let center = (scene_min + scene_max) * 0.5;
-        let radius = (scene_max - scene_min).length() * 0.5 + 0.5;
-        let dir = light_dir.normalize();
-        let up = look_at_up_for_dir(dir);
-        let eye = center - dir * (radius + 1.0);
-        let light_view = look_at(eye, center, up);
-        let light_proj = orthographic(-radius, radius, -radius, radius, 0.0, 2.0 * radius + 2.0);
-        light_proj * light_view
-    } else {
-        Mat4::IDENTITY
-    };
-    renderer.set_directional_shadow(shadow_view_proj, cast_shadow);
+    // The sun shadows through the directional virtual pages (the renderer builds
+    // the camera-snapped clip-level spaces itself); with no sun in the scene there
+    // is nothing to cast.
+    let cast_shadow = has_sun && renderable_count > 0 && scene_max.x >= scene_min.x;
+    renderer.set_directional_shadow(cast_shadow);
 
-    // RT: hand the frame's STATIC instance transforms + meshes to the renderer for the
-    // per-frame TLAS build. Skinned instances ride the draw list (their deformed verts are
-    // already world-space, referenced by an identity transform), so they are excluded here.
-    {
-        let mut rt_models = Vec::with_capacity(items.len());
-        let mut rt_meshes = Vec::with_capacity(items.len());
-        for item in &items {
-            if item.skinned {
-                continue;
-            }
-            rt_models.push(item.model);
-            rt_meshes.push(Arc::clone(&item.mesh));
-        }
-        renderer.set_rt_scene(rt_models, rt_meshes);
-    }
+    // RT: hand the frame's STATIC instances (gathered above with their stable GPU-scene
+    // instance slots) to the renderer for the per-frame TLAS build. Skinned instances
+    // ride the deformation gather's refit entries (their deformed verts are already
+    // world-space, referenced by an identity transform), so they are excluded here.
+    renderer.set_rt_scene(rt_instances);
 
     // Upload the frame's per-static-instance SDF occluder list (empty when no static
     // mesh carries a baked field — that resets the count). Independent of DDGI: the
@@ -956,10 +942,6 @@ pub fn render_scene<R: SceneRenderer>(
         cast_cloud_shadows: c.cast_cloud_shadows,
         cloud_shadow_strength: c.cloud_shadow_strength,
         cloud_shadow_on_surface_strength: c.cloud_shadow_on_surface_strength,
-        wind_orientation: scene.environment.wind.orientation,
-        wind_speed: scene.environment.wind.speed,
-        wind_gust: scene.environment.wind.gust,
-        time_of_day: scene.environment.time_of_day.time_of_day,
     });
     if let Err(err) = renderer.set_scene_lighting(&SceneLighting {
         direction: light_dir,
@@ -1002,13 +984,11 @@ pub fn render_scene<R: SceneRenderer>(
     renderer.set_ssao_camera(view, proj, light_dir);
     renderer.set_show_grid(options.show_grid);
 
-    if options.show_editor_camera_models {
-        append_editor_camera_models(scene, assets, renderer, &mut items);
-    }
     renderer.record_scene_gather(scene_gather_elapsed);
-    if let Err(err) = renderer.submit_draw_list(view_projection, &items, &frame_joints) {
-        tracing::error!("submit_draw_list: {err}");
+    if let Err(err) = renderer.submit_deformations(view_projection, &work, &frame_joints) {
+        tracing::error!("submit_deformations: {err}");
     }
+    renderer.patch_frame_deformations(scene, mirror);
 
     // Resolve the scene environment into the visible-sky settings.
     let env = &scene.environment;
@@ -1167,6 +1147,44 @@ struct SpotShadow {
 
 /// Gathers the punctual (point + spot) lights into the per-frame [`GpuLight`] list, tracking
 /// the first point's position/range and the first spot's perspective light-space transform.
+/// Packs one point light into the shared punctual-light GPU layout.
+pub(crate) fn gpu_point_light(light: &PointLight, position: Vec3) -> GpuLight {
+    GpuLight {
+        position_range: position.extend(light.range),
+        color_intensity: light.color.extend(light.intensity),
+        direction_type: Vec4::ZERO,
+        spot_cos: Vec4::new(
+            0.0,
+            0.0,
+            light.volumetric_scattering,
+            if light.cast_volumetric_shadow {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+    }
+}
+
+/// Packs one spot light into the shared punctual-light GPU layout.
+pub(crate) fn gpu_spot_light(light: &SpotLight, position: Vec3, direction: Vec3) -> GpuLight {
+    GpuLight {
+        position_range: position.extend(light.range),
+        color_intensity: light.color.extend(light.intensity),
+        direction_type: direction.extend(1.0),
+        spot_cos: Vec4::new(
+            light.inner_angle.to_radians().cos(),
+            light.outer_angle.to_radians().cos(),
+            light.volumetric_scattering,
+            if light.cast_volumetric_shadow {
+                1.0
+            } else {
+                0.0
+            },
+        ),
+    }
+}
+
 fn gather_punctual_lights(
     scene: &mut Scene,
 ) -> (Vec<GpuLight>, Option<PointShadow>, Option<SpotShadow>) {
@@ -1183,22 +1201,7 @@ fn gather_punctual_lights(
     let mut point_shadow: Option<PointShadow> = None;
     for (entity, light) in points {
         let pos = scene.world_translation(entity);
-        lights.push(GpuLight {
-            position_range: pos.extend(light.range),
-            color_intensity: light.color.extend(light.intensity),
-            direction_type: Vec4::ZERO, // type 0 = point
-            // point: inner/outer cos = 0; z = volumetric-scatter mult, w = cast-volumetric-shadow gate.
-            spot_cos: Vec4::new(
-                0.0,
-                0.0,
-                light.volumetric_scattering,
-                if light.cast_volumetric_shadow {
-                    1.0
-                } else {
-                    0.0
-                },
-            ),
-        });
+        lights.push(gpu_point_light(&light, pos));
         if point_shadow.is_none() {
             point_shadow = Some(PointShadow {
                 pos,
@@ -1213,22 +1216,7 @@ fn gather_punctual_lights(
         let pos = scene.world_translation(entity);
         let dir = (scene.world_rotation(entity) * light.direction).normalize();
         let index = lights.len() as u32;
-        lights.push(GpuLight {
-            position_range: pos.extend(light.range),
-            color_intensity: light.color.extend(light.intensity),
-            direction_type: dir.extend(1.0), // type 1 = spot
-            // z = volumetric-scatter mult, w = cast-volumetric-shadow gate.
-            spot_cos: Vec4::new(
-                light.inner_angle.to_radians().cos(),
-                light.outer_angle.to_radians().cos(),
-                light.volumetric_scattering,
-                if light.cast_volumetric_shadow {
-                    1.0
-                } else {
-                    0.0
-                },
-            ),
-        });
+        lights.push(gpu_spot_light(&light, pos, dir));
         if spot_shadow.is_none() {
             // A perspective frustum down the spot cone: fov = 2 x outer angle (a small pad so
             // the penumbra sits inside the map), aspect 1, near/far from range.
@@ -1247,35 +1235,51 @@ fn gather_punctual_lights(
 
 /// The accumulating draw-list + scene-AABB + SDF-occluder state built across the static and
 /// skinned passes.
-struct DrawListBuild {
-    items: Vec<DrawItem>,
+struct FrameSceneBuild {
+    /// The record-driven deformation work (skinned / morph / displaced instances).
+    work: Vec<saffron_rendering::DeformationWork>,
+    /// The concatenated frame joint palette the skinned work indexes.
+    frame_joints: Vec<Mat4>,
+    /// Renderable instances gathered (drives the shadow-frustum "anything to cast" gate).
+    renderable_count: usize,
     scene_min: Vec3,
     scene_max: Vec3,
     /// One [`SdfInstance`] per static draw whose mesh carries a baked signed distance field — the
     /// lighting cone-trace's + the GDF composite's per-instance occluder list. Its base color rides
     /// the reserved `.w` of the world/local AABB corners (the GDF albedo cache's per-cell color).
     sdf_instances: Vec<SdfInstance>,
+    /// The frame's static RT instances (skinned casters ride the deformation gather's
+    /// refit entries instead).
+    rt_instances: Vec<saffron_rendering::RtInstanceInput>,
 }
 
-impl Default for DrawListBuild {
+impl Default for FrameSceneBuild {
     fn default() -> Self {
         Self {
-            items: Vec::new(),
+            work: Vec::new(),
+            frame_joints: Vec::new(),
+            renderable_count: 0,
             scene_min: Vec3::splat(f32::MAX),
             scene_max: Vec3::splat(f32::MIN),
             sdf_instances: Vec::new(),
+            rt_instances: Vec::new(),
         }
     }
 }
 
-/// Gathers the static `Transform + Mesh` renderables: resolves each mesh + its materials on
-/// demand, accumulates the world AABB + per-draw box proxies, and pushes a [`DrawItem`].
-fn gather_static_draw_list<R: SceneRenderer>(
+/// Gathers the static `Transform + Mesh` renderables' frame facts: the world AABB, the
+/// SDF occluder list, the static RT instances, and one [`DeformationWork`] item per
+/// morphing or displaced instance. Draw commands come from the GPU scene's visibility
+/// traversal; nothing here builds a draw list.
+fn gather_static_frame_facts<R: SceneRenderer>(
     renderer: &R,
     scene: &mut Scene,
     assets: &mut AssetServer,
-    build: &mut DrawListBuild,
+    mirror: &crate::GpuSceneMirror,
+    build: &mut FrameSceneBuild,
 ) {
+    let scene_instance = scene.instance_id();
+    let displacement = renderer.displacement_enabled();
     let mut meshes: Vec<(Entity, MeshComponent)> = Vec::new();
     scene.for_each::<(&Transform, &MeshComponent), _>(|entity, (_, mesh)| {
         meshes.push((entity, *mesh));
@@ -1298,6 +1302,7 @@ fn gather_static_draw_list<R: SceneRenderer>(
         );
         build.scene_min = build.scene_min.min(box_min);
         build.scene_max = build.scene_max.max(box_max);
+        build.renderable_count += 1;
         // A static instance contributes one SDF occluder per baked field — one tight field
         // per primitive (and per spatial chunk of an oversized primitive). Each carries the
         // shared world→local transform, the field's OWN world AABB (for the cone-march's
@@ -1333,7 +1338,7 @@ fn gather_static_draw_list<R: SceneRenderer>(
                     world_min: field_min.extend(albedo.x),
                     world_max: field_max.extend(albedo.y),
                     local_min: field.bounds_min.extend(albedo.z),
-                    local_max: field.bounds_max.extend(0.0),
+                    local_max: field.bounds_max.extend(materials.occupancy),
                     params: Vec4::new(
                         field.bindless_index() as f32,
                         field.max_dist,
@@ -1346,44 +1351,71 @@ fn gather_static_draw_list<R: SceneRenderer>(
                 });
             }
         }
-        build.items.push(DrawItem {
-            mesh: mesh_ref,
-            model,
-            normal_matrix: normal_matrix(model),
-            submesh_materials: materials.submeshes,
-            material: Material {
-                shader: materials.shader,
-                unlit: materials.unlit,
-                // blend/masked are per-submesh now — each SubmeshMaterial carries its own blend
-                // mode, and the draw-list batcher resolves the PSO + pass per submesh. The item's
-                // Material is only the shared PSO base (shader + unlit).
-                blend: false,
-                masked: false,
-            },
-            skinned: false,
-            joint_offset: 0,
-            joint_count: 0,
-            morph_weights: morph_weights_for(scene, entity),
-            entity: entity_id_or_zero(scene, entity),
+        // RT: each static instance carries its stable GPU-scene instance slot as its
+        // `instanceCustomIndex` (the sentinel for unmirrored system visuals) and its
+        // opacity class, so ray candidates on non-opaque instances resolve canonical
+        // coverage through the scene tables.
+        let force_opaque = materials.submeshes.iter().all(|material| {
+            material.blend_mode == saffron_core::BlendMode::Opaque && material.thin_sheet.is_none()
         });
+        let custom_index = mirror
+            .instance_slot(scene_instance, entity, false)
+            .unwrap_or(saffron_rendering::RT_UNMIRRORED_INSTANCE);
+        build.rt_instances.push(saffron_rendering::RtInstanceInput {
+            model,
+            mesh: Arc::clone(&mesh_ref),
+            custom_index,
+            force_opaque,
+        });
+        let morph_weights = morph_weights_for(scene, entity);
+        let displace = if displacement {
+            saffron_rendering::displace_info_from(&materials.submeshes)
+        } else {
+            None
+        };
+        if !morph_weights.is_empty() || displace.is_some() {
+            build.work.push(saffron_rendering::DeformationWork {
+                mesh: mesh_ref,
+                entity: entity_id_or_zero(scene, entity),
+                skinned: false,
+                joint_offset: 0,
+                joint_count: 0,
+                morph_weights,
+                model,
+                displace,
+                material: Material {
+                    shader: materials.shader,
+                    unlit: materials.unlit,
+                    blend: false,
+                    masked: false,
+                },
+                submesh_materials: materials.submeshes,
+                parameter_index: mirror
+                    .material_parameter_index(scene_instance, entity)
+                    .unwrap_or(0),
+            });
+        }
     }
 }
 
-/// Gathers the skinned `Transform + SkinnedMesh` renderables (identity model, joint palette
-/// via [`Scene::joint_matrices`]), unioning the conservative bind-AABB bounds through every
-/// joint, and returns the concatenated frame joint palette. Called only when skinning is on.
-fn gather_skinned_draw_list<R: SceneRenderer>(
+/// Gathers the skinned `Transform + SkinnedMesh` renderables' frame facts (identity model,
+/// joint palette via [`Scene::joint_matrices`]): one [`DeformationWork`] item per skinned
+/// instance, unioning the conservative bind-AABB bounds through every joint into the frame
+/// palette. Called only when skinning is on.
+fn gather_skinned_frame_facts<R: SceneRenderer>(
     renderer: &R,
     scene: &mut Scene,
     assets: &mut AssetServer,
-    build: &mut DrawListBuild,
-) -> Vec<Mat4> {
+    mirror: &crate::GpuSceneMirror,
+    build: &mut FrameSceneBuild,
+) {
+    let scene_instance = scene.instance_id();
+    let displacement = renderer.displacement_enabled();
     let mut skins: Vec<(Entity, SkinnedMesh)> = Vec::new();
     scene.for_each::<(&Transform, &SkinnedMesh), _>(|entity, (_, skin)| {
         skins.push((entity, skin.clone()));
     });
 
-    let mut frame_joints: Vec<Mat4> = Vec::new();
     for (entity, skin) in skins {
         let Some(mesh_ref) = assets.load_mesh_asset(renderer, skin.mesh) else {
             continue;
@@ -1407,29 +1439,34 @@ fn gather_skinned_draw_list<R: SceneRenderer>(
                 &mut build.scene_max,
             );
         }
-        build.items.push(DrawItem {
+        build.renderable_count += 1;
+        let displace = if displacement {
+            saffron_rendering::displace_info_from(&materials.submeshes)
+        } else {
+            None
+        };
+        build.work.push(saffron_rendering::DeformationWork {
             mesh: mesh_ref,
+            entity: entity_id_or_zero(scene, entity),
+            skinned: true,
+            joint_offset: build.frame_joints.len() as u32,
+            joint_count: palette.len() as u32,
+            morph_weights: morph_weights_for(scene, entity),
             model: Mat4::IDENTITY,
-            normal_matrix: Mat4::IDENTITY,
-            submesh_materials: materials.submeshes,
+            displace,
             material: Material {
                 shader: materials.shader,
                 unlit: materials.unlit,
-                // blend/masked are per-submesh now — each SubmeshMaterial carries its own blend
-                // mode, and the draw-list batcher resolves the PSO + pass per submesh. The item's
-                // Material is only the shared PSO base (shader + unlit).
                 blend: false,
                 masked: false,
             },
-            skinned: true,
-            joint_offset: frame_joints.len() as u32,
-            joint_count: palette.len() as u32,
-            morph_weights: morph_weights_for(scene, entity),
-            entity: entity_id_or_zero(scene, entity),
+            submesh_materials: materials.submeshes,
+            parameter_index: mirror
+                .material_parameter_index(scene_instance, entity)
+                .unwrap_or(0),
         });
-        frame_joints.extend_from_slice(&palette);
+        build.frame_joints.extend_from_slice(&palette);
     }
-    frame_joints
 }
 
 /// Snapshots each [`ReflectionProbe`] (positioned by its [`Transform`]) into a per-frame
@@ -1696,9 +1733,37 @@ pub fn query_scene_surface_ray(
                 acc
             })
             .collect();
-        if let Some((triangle_index, triangle_hit)) =
-            nearest_triangle(&world_ray, &deformed, &mesh_ref.cpu_indices)
-        {
+        let material_assets =
+            assets.resolve_entity_material_assets(scene, entity, &mesh_ref.submeshes);
+        let coverage =
+            canonical_cpu_coverage(assets, &material_assets, gpu.coverage_temporal_phase());
+        if let Some((triangle_index, triangle_hit)) = nearest_triangle_filtered(
+            &world_ray,
+            &deformed,
+            &mesh_ref.cpu_indices,
+            |triangle_index, hit| {
+                let base = triangle_index as usize * 3;
+                let indices = &mesh_ref.cpu_indices[base..base + 3];
+                let vertices = [
+                    mesh_ref.cpu_vertices[indices[0] as usize],
+                    mesh_ref.cpu_vertices[indices[1] as usize],
+                    mesh_ref.cpu_vertices[indices[2] as usize],
+                ];
+                let weights = hit.barycentric;
+                let uv = vertices[0].uv0 * weights[0]
+                    + vertices[1].uv0 * weights[1]
+                    + vertices[2].uv0 * weights[2];
+                let anchor = vertices[0].position * weights[0]
+                    + vertices[1].position * weights[1]
+                    + vertices[2].position * weights[2];
+                crate::mesh_surface::coverage_for_triangle(
+                    &mesh_ref.submeshes,
+                    &coverage,
+                    triangle_index,
+                )
+                .is_none_or(|coverage| coverage.covered(uv, anchor))
+            },
+        ) {
             let distance_m = f64::from(triangle_hit.distance);
             if distance_m > query.max_distance_m {
                 continue;
@@ -1943,6 +2008,8 @@ fn static_mesh_surface_provider(
     };
     let model = scene.world_matrix(entity);
     let material_tags = surface_material_tags(scene, entity);
+    let material_assets = assets.resolve_entity_material_assets(scene, entity, &mesh_ref.submeshes);
+    let coverage = canonical_cpu_coverage(assets, &material_assets, gpu.coverage_temporal_phase());
     let revision = mesh_surface_revision(
         mesh.mesh.value(),
         &mesh_ref.cpu_vertices,
@@ -1962,9 +2029,109 @@ fn static_mesh_surface_provider(
         model,
         render_origin: WorldPosition::origin(),
         material_tags,
+        coverage,
     })
     .map(Some)
     .map_err(Into::into)
+}
+
+fn canonical_cpu_coverage(
+    assets: &mut AssetServer,
+    materials: &[MaterialAsset],
+    temporal_phase: u32,
+) -> Vec<CanonicalCpuCoverage> {
+    materials
+        .iter()
+        .map(|material| {
+            let standard_masked = material.blend == "masked";
+            let (
+                source_kind,
+                classification,
+                source_id,
+                hash_extent,
+                salt,
+                reference_cutoff,
+                canonical_probability,
+            ) = match &material.surface {
+                MaterialSurface::Standard => (
+                    CoverageSourceKind::AlbedoAlpha,
+                    if standard_masked {
+                        AlphaClassification::Masked
+                    } else {
+                        AlphaClassification::Opaque
+                    },
+                    material.albedo_texture,
+                    [1, 1],
+                    0,
+                    material.alpha_cutoff,
+                    false,
+                ),
+                MaterialSurface::ThinSheetFoliage(parameters) => {
+                    let (kind, id) = match parameters.coverage_source {
+                        CoverageSource::AlbedoAlpha => {
+                            (CoverageSourceKind::AlbedoAlpha, material.albedo_texture)
+                        }
+                        CoverageSource::Texture(id) => (CoverageSourceKind::Texture, id),
+                        CoverageSource::ModeledGeometry => {
+                            (CoverageSourceKind::ModeledGeometry, saffron_core::Uuid(0))
+                        }
+                    };
+                    (
+                        kind,
+                        parameters.coverage.classification,
+                        id,
+                        parameters.coverage.source_extent,
+                        parameters.coverage.spatial_hash_salt,
+                        parameters.coverage.reference_cutoff.to_f64() as f32,
+                        true,
+                    )
+                }
+            };
+            let decoded = (source_id.value() != 0)
+                .then(|| assets.load_texture_pixels(source_id))
+                .flatten();
+            let (texture_extent, alpha) = decoded.map_or(([1, 1], None), |decoded| {
+                let rgba = if canonical_probability {
+                    crate::coverage_preserving_mips(
+                        &decoded.rgba,
+                        decoded.width,
+                        decoded.height,
+                        match &material.surface {
+                            MaterialSurface::ThinSheetFoliage(parameters) => {
+                                parameters.coverage.reference_cutoff.bits()
+                            }
+                            MaterialSurface::Standard => 0,
+                        },
+                    )
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| decoded.rgba.clone(), |mip| mip.rgba)
+                } else {
+                    decoded.rgba.clone()
+                };
+                let alpha = rgba
+                    .chunks_exact(4)
+                    .map(|pixel| pixel[3])
+                    .collect::<Vec<_>>()
+                    .into();
+                ([decoded.width, decoded.height], Some(alpha))
+            });
+            CanonicalCpuCoverage {
+                source_kind,
+                classification,
+                base_color_alpha: material.base_color.w,
+                texture_extent,
+                hash_extent,
+                salt,
+                temporal_phase,
+                reference_cutoff,
+                canonical_probability,
+                uv_tiling: material.uv_tiling,
+                uv_offset: material.uv_offset,
+                alpha,
+            }
+        })
+        .collect()
 }
 
 fn surface_material_tags(scene: &Scene, entity: Entity) -> Vec<SurfaceTagId> {
@@ -2073,6 +2240,22 @@ fn scene_surface_is_nearer(candidate: &SceneSurfaceHit, current: Option<&SceneSu
 }
 
 /// Builds the world-space viewport ray used by picking and placement.
+/// The viewport pick ray in the vegetation query vocabulary — the same origin and
+/// direction the scene-surface pick casts, with a finite far bound.
+#[must_use]
+pub fn viewport_pick_ray(
+    viewport: (u32, u32),
+    camera: &CameraView,
+    ndc: Vec2,
+) -> Option<saffron_vegetation::VegetationQueryRay> {
+    if viewport.0 == 0 || viewport.1 == 0 {
+        return None;
+    }
+    let ray = viewport_ray(viewport, camera, ndc);
+    let origin = WorldPosition::from_render_relative(ray.origin, WorldPosition::origin()).ok()?;
+    saffron_vegetation::VegetationQueryRay::new(origin, ray.dir.as_dvec3(), 10_000.0).ok()
+}
+
 pub fn viewport_ray(viewport: (u32, u32), camera: &CameraView, ndc: Vec2) -> Ray {
     let (width, height) = viewport;
     let aspect = width as f32 / height as f32;
@@ -2089,10 +2272,11 @@ pub fn viewport_ray(viewport: (u32, u32), camera: &CameraView, ndc: Vec2) -> Ray
 }
 
 /// Walks a deformed triangle soup and reports the nearest source triangle with barycentrics.
-fn nearest_triangle(
+fn nearest_triangle_filtered(
     ray: &Ray,
     positions: &[Vec3],
     indices: &[u32],
+    mut filter: impl FnMut(u32, &saffron_geometry::TriangleRayHit) -> bool,
 ) -> Option<(u32, saffron_geometry::TriangleRayHit)> {
     let mut best: Option<(u32, saffron_geometry::TriangleRayHit)> = None;
     for (triangle_index, tri) in indices.chunks_exact(3).enumerate() {
@@ -2103,6 +2287,9 @@ fn nearest_triangle(
         );
         if let Some(hit) = ray_triangle_coordinates(ray, a, b, c) {
             let triangle_index = triangle_index as u32;
+            if !filter(triangle_index, &hit) {
+                continue;
+            }
             let replace = best.is_none_or(|(current_index, current)| {
                 hit.distance < current.distance
                     || (hit.distance == current.distance && triangle_index < current_index)
@@ -2156,8 +2343,8 @@ mod tests {
         ClusterCamera,
         SsaoCamera,
         ShowGrid(bool),
-        DrawList {
-            item_count: usize,
+        Deformations {
+            work_count: usize,
             joint_count: usize,
         },
         Sky {
@@ -2181,9 +2368,10 @@ mod tests {
         skinning: bool,
         gpu: Option<(&'a Uploader, &'a Descriptors)>,
         calls: RefCell<Vec<Call>>,
-        // The static RT models captured by the last `set_rt_scene`, for the split assert.
-        rt_models: RefCell<Vec<Mat4>>,
-        draw_items: RefCell<Vec<DrawItem>>,
+        // The static RT inputs captured by the last `set_rt_scene`, for the split assert.
+        rt_inputs: RefCell<Vec<saffron_rendering::RtInstanceInput>>,
+        // Per submitted work item: (entity, skinned, model, joint_offset, joint_count).
+        work_facts: RefCell<Vec<(u64, bool, Mat4, u32, u32)>>,
     }
 
     impl<'a> RecordingRenderer<'a> {
@@ -2194,8 +2382,8 @@ mod tests {
                 skinning,
                 gpu: None,
                 calls: RefCell::new(Vec::new()),
-                rt_models: RefCell::new(Vec::new()),
-                draw_items: RefCell::new(Vec::new()),
+                rt_inputs: RefCell::new(Vec::new()),
+                work_facts: RefCell::new(Vec::new()),
             }
         }
 
@@ -2213,12 +2401,13 @@ mod tests {
         fn upload_mesh(
             &self,
             mesh: &saffron_geometry::Mesh,
+            hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
             sdf_bake: Option<&saffron_rendering::SdfBake>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
             let (uploader, descriptors) = self.gpu.expect("upload_mesh needs a GPU fixture");
-            uploader.upload_mesh(descriptors, mesh, skin, morph, sdf_bake)
+            uploader.upload_mesh(descriptors, mesh, hierarchy, skin, morph, sdf_bake)
         }
 
         fn upload_texture(
@@ -2264,30 +2453,23 @@ mod tests {
                 casting,
             });
         }
-        fn set_point_shadow(
-            &mut self,
-            _pos: Vec3,
-            far: f32,
-            light_index: u32,
-            casting: bool,
-            _content_key: u64,
-        ) {
+        fn set_point_shadow(&mut self, _pos: Vec3, far: f32, light_index: u32, casting: bool) {
             self.calls.borrow_mut().push(Call::PointShadow {
                 index: light_index,
                 casting,
                 far,
             });
         }
-        fn set_directional_shadow(&mut self, _view_proj: Mat4, casting: bool) {
+        fn set_directional_shadow(&mut self, casting: bool) {
             self.calls
                 .borrow_mut()
                 .push(Call::DirectionalShadow { casting });
         }
-        fn set_rt_scene(&mut self, models: Vec<Mat4>, _meshes: Vec<Arc<GpuMesh>>) {
+        fn set_rt_scene(&mut self, instances: Vec<saffron_rendering::RtInstanceInput>) {
             self.calls.borrow_mut().push(Call::RtScene {
-                static_count: models.len(),
+                static_count: instances.len(),
             });
-            *self.rt_models.borrow_mut() = models;
+            *self.rt_inputs.borrow_mut() = instances;
         }
         fn set_ddgi_scene(
             &mut self,
@@ -2333,17 +2515,28 @@ mod tests {
             self.calls.borrow_mut().push(Call::ShowGrid(enabled));
         }
         fn record_scene_gather(&mut self, _elapsed: Duration) {}
-        fn submit_draw_list(
+        fn submit_deformations(
             &mut self,
             _view_proj: Mat4,
-            items: &[DrawItem],
+            work: &[saffron_rendering::DeformationWork],
             joints: &[Mat4],
         ) -> saffron_rendering::Result<()> {
-            self.calls.borrow_mut().push(Call::DrawList {
-                item_count: items.len(),
+            self.calls.borrow_mut().push(Call::Deformations {
+                work_count: work.len(),
                 joint_count: joints.len(),
             });
-            *self.draw_items.borrow_mut() = items.to_vec();
+            *self.work_facts.borrow_mut() = work
+                .iter()
+                .map(|item| {
+                    (
+                        item.entity,
+                        item.skinned,
+                        item.model,
+                        item.joint_offset,
+                        item.joint_count,
+                    )
+                })
+                .collect();
             Ok(())
         }
         fn submit_sky(&mut self, settings: &SkyRenderSettings) {
@@ -2392,6 +2585,7 @@ mod tests {
             &mut renderer,
             &mut scene,
             &mut assets,
+            &crate::GpuSceneMirror::new(),
             &test_camera(),
             RenderSceneOptions::default(),
         );
@@ -2411,6 +2605,7 @@ mod tests {
             &mut renderer,
             &mut scene,
             &mut assets,
+            &crate::GpuSceneMirror::new(),
             &test_camera(),
             RenderSceneOptions::default(),
         );
@@ -2441,8 +2636,8 @@ mod tests {
                 Call::ClusterCamera,
                 Call::SsaoCamera,
                 Call::ShowGrid(false),
-                Call::DrawList {
-                    item_count: 0,
+                Call::Deformations {
+                    work_count: 0,
                     joint_count: 0
                 },
                 Call::Sky { mode: 2 },
@@ -2603,6 +2798,7 @@ mod tests {
             &mut renderer,
             &mut scene,
             &mut assets,
+            &crate::GpuSceneMirror::new(),
             &test_camera(),
             RenderSceneOptions::default(),
         );
@@ -2657,12 +2853,14 @@ mod tests {
             &mut renderer,
             &mut scene,
             &mut assets,
+            &crate::GpuSceneMirror::new(),
             &test_camera(),
             RenderSceneOptions::default(),
         );
-        // The DrawList carries zero items + zero joints (the skinned loop never ran).
-        assert!(renderer.calls().contains(&Call::DrawList {
-            item_count: 0,
+        // The deformation submit carries zero work + zero joints (the skinned loop
+        // never ran).
+        assert!(renderer.calls().contains(&Call::Deformations {
+            work_count: 0,
             joint_count: 0
         }));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2760,59 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn point_shadow_key_is_camera_independent_and_caster_sensitive() {
-        // The cache key drives the point-shadow cube reuse: it must be stable for a static scene
-        // (no camera term exists to perturb it) yet change when the light or a caster moves.
-        let mut scene = Scene::new();
-        let e = scene.create_entity("Mesh");
-        scene
-            .with_component_mut::<Transform, _>(e, |t| t.translation = Vec3::new(1.0, 0.0, 0.0))
-            .unwrap();
-        scene
-            .add_component(
-                e,
-                MeshComponent {
-                    mesh: saffron_core::Uuid(7000),
-                },
-            )
-            .unwrap();
-        scene.update_world_transforms();
-
-        let light = Vec3::new(0.0, 5.0, 0.0);
-        let k1 = point_shadow_content_key(&mut scene, light, 50.0, 1);
-        assert_eq!(
-            k1,
-            point_shadow_content_key(&mut scene, light, 50.0, 1),
-            "key is stable for a static scene (camera-independent)"
-        );
-        assert_ne!(
-            k1,
-            point_shadow_content_key(&mut scene, Vec3::new(0.1, 5.0, 0.0), 50.0, 1),
-            "a light move invalidates the cube"
-        );
-        assert_ne!(
-            k1,
-            point_shadow_content_key(&mut scene, light, 60.0, 1),
-            "a far-plane change invalidates the cube"
-        );
-        scene
-            .with_component_mut::<Transform, _>(e, |t| t.translation = Vec3::new(2.0, 0.0, 0.0))
-            .unwrap();
-        scene.update_world_transforms();
-        assert_ne!(
-            k1,
-            point_shadow_content_key(&mut scene, light, 50.0, 1),
-            "a caster move invalidates the cube"
-        );
-        assert_ne!(
-            k1,
-            point_shadow_content_key(&mut scene, light, 50.0, 2),
-            "an asset-content replacement invalidates the cube"
-        );
-    }
-
-    #[test]
-    fn two_mesh_scene_records_two_draw_items_with_world_matrices() {
+    fn two_mesh_scene_records_two_rt_instances_with_world_matrices() {
         let Some(fx) = gpu_or_skip() else {
             return;
         };
@@ -2854,12 +3000,15 @@ mod tests {
                 &mut renderer,
                 &mut scene,
                 &mut assets,
+                &crate::GpuSceneMirror::new(),
                 &test_camera(),
                 RenderSceneOptions::default(),
             );
-            // Two DrawItems, both static; the RT static split carries both models.
-            assert!(renderer.calls().contains(&Call::DrawList {
-                item_count: 2,
+            // Two static renderables, nothing deforming; the RT scene carries both
+            // with distinct world matrices. The directional shadow stays off because
+            // the fixture has no Sun-role light.
+            assert!(renderer.calls().contains(&Call::Deformations {
+                work_count: 0,
                 joint_count: 0
             }));
             assert!(
@@ -2867,19 +3016,10 @@ mod tests {
                     .calls()
                     .contains(&Call::RtScene { static_count: 2 })
             );
-            // The two DrawItems carry distinct world matrices and the resolved base color. The
-            // directional shadow stays off because the fixture has no Sun-role light.
-            let items = renderer.draw_items.borrow();
-            assert_eq!(items.len(), 2);
-            let xs: Vec<f32> = items.iter().map(|it| it.model.w_axis.x).collect();
+            let inputs = renderer.rt_inputs.borrow();
+            assert_eq!(inputs.len(), 2);
+            let xs: Vec<f32> = inputs.iter().map(|input| input.model.w_axis.x).collect();
             assert!(xs.contains(&-3.0) && xs.contains(&3.0));
-            for it in items.iter() {
-                assert!(!it.skinned);
-                assert_eq!(
-                    it.submesh_materials[0].base_color,
-                    Vec4::new(0.2, 0.4, 0.6, 1.0)
-                );
-            }
             assert!(
                 renderer
                     .calls()
@@ -2967,11 +3107,11 @@ mod tests {
     }
 
     #[test]
-    fn render_scene_flattens_the_hierarchy_before_the_draw_gather() {
+    fn render_scene_flattens_the_hierarchy_before_the_frame_gather() {
         // A parented child whose world matrix is only correct after `update_world_transforms`.
         // `render_scene` must run it once at the top, so reading the child's world matrix after
-        // the call (and inside the draw gather, which produced its DrawItem) reflects the
-        // parent. Without a GPU the mesh never resolves; the world-matrix read is the proof.
+        // the call (and inside the frame gather) reflects the parent. Without a GPU the mesh
+        // never resolves; the world-matrix read is the proof.
         let mut renderer = RecordingRenderer::new(800, 600, false);
         let mut scene = Scene::new();
         let (mut assets, tmp) = scratch_server("flatten");
@@ -2992,6 +3132,7 @@ mod tests {
             &mut renderer,
             &mut scene,
             &mut assets,
+            &crate::GpuSceneMirror::new(),
             &test_camera(),
             RenderSceneOptions::default(),
         );
@@ -3088,7 +3229,7 @@ mod tests {
     }
 
     #[test]
-    fn skinning_gate_on_produces_an_identity_model_skinned_item_split_from_rt() {
+    fn skinning_gate_on_produces_an_identity_model_skinned_work_item_split_from_rt() {
         let Some(fx) = gpu_or_skip() else {
             return;
         };
@@ -3116,12 +3257,14 @@ mod tests {
                 &mut renderer,
                 &mut scene,
                 &mut assets,
+                &crate::GpuSceneMirror::new(),
                 &test_camera(),
                 RenderSceneOptions::default(),
             );
-            // Two items (one static, one skinned), three joints? no — one joint (one bone).
-            assert!(renderer.calls().contains(&Call::DrawList {
-                item_count: 2,
+            // One skinned work item with a one-joint palette; the static mesh emits
+            // no work (it neither skins nor morphs nor displaces).
+            assert!(renderer.calls().contains(&Call::Deformations {
+                work_count: 1,
                 joint_count: 1
             }));
             // The RT static split carries only the one static item (the skinned one is excluded).
@@ -3130,16 +3273,14 @@ mod tests {
                     .calls()
                     .contains(&Call::RtScene { static_count: 1 })
             );
-            let items = renderer.draw_items.borrow();
-            let skinned_item = items.iter().find(|it| it.skinned).expect("a skinned item");
-            assert_eq!(
-                skinned_item.model,
-                Mat4::IDENTITY,
-                "skinned model is identity"
-            );
-            assert_eq!(skinned_item.joint_count, 1);
-            assert_eq!(skinned_item.joint_offset, 0);
-            assert_eq!(skinned_item.entity, entity_id_or_zero(&scene, skinned));
+            let facts = renderer.work_facts.borrow();
+            let (entity, skinned_flag, model, joint_offset, joint_count) =
+                *facts.iter().find(|fact| fact.1).expect("a skinned item");
+            assert!(skinned_flag);
+            assert_eq!(model, Mat4::IDENTITY, "skinned model is identity");
+            assert_eq!(joint_count, 1);
+            assert_eq!(joint_offset, 0);
+            assert_eq!(entity, entity_id_or_zero(&scene, skinned));
         }
 
         fx.teardown(assets);
@@ -3193,6 +3334,7 @@ mod tests {
             &mut renderer,
             &mut scene,
             &mut assets,
+            &crate::GpuSceneMirror::new(),
             &test_camera(),
             RenderSceneOptions::default(),
         );
