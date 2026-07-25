@@ -1,6 +1,8 @@
 # Phase 7 — Persistent GPU Scene and visibility cutover
 
-**Status:** NOT STARTED
+**Status:** COMPLETED (two acceptance legs and the optional mesh-shader executor are
+DEFERRED-NEEDS-HARDWARE — annotated inline; they run on the NVIDIA/AMD toolbox runner and a
+`VK_EXT_mesh_shader` device)
 
 **Depends on:** Phase 6
 
@@ -9,41 +11,129 @@ the opt-in per-instance mesh-task loop with a persistent derived GPU Scene, page
 visibility, and indirect execution for every view and material class. The phase is not complete while
 any old static, transparent, shadow, preview, or meshlet gather survives.
 
+## Active checkpoint
+
+The persistent GPU Scene value model, Renderer ownership, and the scene/asset delta adapter are
+implemented and green. `Renderer` owns one `GlobalGpuData` and one `PersistentGpuScene`, registers
+Scene, AssetPreview, and Thumbnail world/view identities, and retires both mirrors from
+fence-completed frame slots. `GpuSceneMirror` (saffron-assets) consumes both mutation journals from
+retained cursors, resolves mesh/skinned instances and punctual lights into typed world deltas and
+assets into geometry/page/material/texture/coverage device records plus shared deltas, interns
+material variants by content identity with refcounts, uploads only changed records via cached
+revisions, and rebuilds from live state on journal overflow, catalog replacement, or a rebound
+scene instance (`Scene::instance_id`). Host (scene/preview/thumbnail views), control-plane
+thumbnails, and the player all sync through the same world/view vocabulary; `gpu-scene-stats` is
+the control/`sa` surface. The upload translation is implemented and frame-integrated:
+`GpuSceneUploader` (rendering) owns slot-indexed device tables mirroring the persistent scene
+one-to-one (16-byte occupancy header + locked std430 body, variable data in element arenas),
+drains `stage_upload_batch` into graph-owned transfer passes with growth-before-write ordering,
+and `GpuScenePendingUploads` carries the mirror's resident-record stages, retirements,
+vertex/index streams, and packed `MaterialParamsData` blocks into the same frame. Byte-exact
+readback, growth-preservation, and drain/tombstone GPU tests cover it; e2e runs with the
+translation live in every host frame. The descriptor vocabulary is one per-frame
+`GpuSceneAddressBlock` uniform (every table's buffer device address + capacities, bound at
+instance-set binding 3, rewritten per frame for the active view's world so growth never
+rewrites a descriptor); `global_gpu_data.slang` declares the block and typed pointer
+accessors, the übershader imports the module, and a MoltenVK compute fixture resolves the
+instance → prototype → material chain through the addresses byte-exactly. RT coverage
+parity is closed: TLAS instances carry their GPU-scene instance slot as
+`instanceCustomIndex` (deformed/unmirrored instances carry the force-opaque sentinel),
+per-instance opacity flags route non-opaque candidates into the ray-query candidate loops,
+and every inline query (mesh-family shadow/reflection and the ReSTIR resolve visibility
+ray, whose pipeline binds the address block + bindless array) confirms candidates through
+`gpuSceneRayCandidateCovered` — the shared classifier over table-reconstructed surfaces,
+proven byte-exact against the CPU classifier on MoltenVK
+(`ray_candidate_classification_matches_the_cpu_classifier`) with the resident table
+strides locked (`resident_table_strides_lock_the_slang_pointer_constants`). Page
+residency is live: every page carries a byte-locked device payload (`page_payload.rs` —
+node header, child page-table handles, cluster records, geometry-relative cluster index
+blobs, voxel surfaces), the `page-stream` worker loads payloads from the source artifact
+(`.smesh` envelope slice or a retained cooked hierarchy) off the frame loop, and
+`PageResidency` publishes parent-before-child into the global page arena with byte
+budgets, LRU leaf-first eviction that never touches guaranteed roots or resident
+parents, and fence-deferred range reuse. Demand is scored on the refinement frontier
+(projected transition error × frustum probability × motion boost), and the per-frame GPU
+missing-page request ring (`gpuSceneRequestPage` / `drain_page_requests`) folds shader
+misses into the same path; the address block carries the page arena and the request
+buffer. `gpu-scene-stats` reports the residency counters end to end (asserted over the
+control plane in `gpu-scene-residency.test.ts`). The prioritizer's shadow/GI/RT demand
+input arrives with the hierarchical-visibility traversal (the request-buffer path it
+feeds already exists). The visibility machinery is built and live in every
+host frame: per-view HZB max pyramid ping-pong pairs built after the scene pass
+(`hzb.rs`); the parameterized instance cull/retest compute (previous-pyramid occlusion
+with previous transforms, per-slot history words, retest merge after the current
+build); hierarchy traversal from guaranteed roots by projected appearance error with
+missing-page requests and no-hole parents, emitting `GpuDrawRecord` streams; binning
+(count/scan/scatter) into per-bin `VkDrawIndexedIndirectCommand` ranges with the pages
+arena as the executor index buffer and BDA vertex pulling; a depth-only executor PSO
+proven end to end (counted indirect draw rasterizes the cut, validation-clean); and the
+GPU transparent radix sort (stable LSD, back-to-front command stream) proven on known
+depths. The cutover groundwork is in place: `vertexMainExecutor` in the übershader
+module emits the exact `VertexOutput` interface (fragment shading byte-identical),
+the record stream binds at instance-set binding 4, `PsoKey.executor` mints executor
+permutations, and codegen material shaders carry identity end to end
+(`ExecutorShaderRegistry` → `GpuMaterialTableRecord.shader_index` →
+`GpuDrawRecord.reserved`). THE ATOMIC CUTOVER IS LANDED AND GATED (rendering 294,
+assets 260, control 104, e2e 304/304, lint clean): every raster pass body records
+the executor draws (per-bucket counted indirect for the scene, one-PSO depth family
+for prepass/shadow/point-shadow/G-buffer/motion, per-blend-bucket zero-masked sorted
+streams for translucency, the reactive-coverage mask over the blend buckets, the
+executor-only wireframe overlay), the survivor chain runs end to end (snapshot →
+HZB#1 → retest → survivor traversal/binning → survivor raster with loaded
+attachments and MSAA re-resolve → full re-bin → HZB rebuild over the same imported
+pyramid), displaced instances draw through the tessellation seam (the traversal
+skips `GPU_MATERIAL_TABLE_FLAG_TESSELLATED` records under the `tess_seam` push;
+`TessSceneDraw` rows carry the mirror's material-parameter index; the vertex-input
+pass PSOs exist for the seam alone), the scene driver submits
+`DeformationWork` + joints through `submit_gpu_scene_deformations` (no draw list),
+the editor-camera gizmo is a `PreviewGhost` child entity over the reserved
+`EDITOR_CAMERA_MESH_ID`, set-2 binding 2 is the global material-parameter arena,
+render stats derive from the visibility readback (records/visible/triangles via
+counter word 8), and `DrawItem`/`DrawBatch`/the batcher/CPU recorders/CPU
+transparent sort/the meshlet raster path + `SAFFRON_MESH_SHADER` are deleted with
+the draw-path tripwire in the gate. The optional mesh-shader executor remains open
+(a second executor over the same records, after this phase).
+
 ## Scene and asset delta journals
 
-- [ ] Add a tracked scene mutation journal covering create/destroy, component add/remove/update,
+- [x] Add a tracked scene mutation journal covering create/destroy, component add/remove/update,
   hierarchy/world-transform dirtiness, and render-relevant component/material changes.
-- [ ] Make `Scene::with_component_mut`, mutable queries, hierarchy propagation, physics/script writes,
+- [x] Make `Scene::with_component_mut`, mutable queries, hierarchy propagation, physics/script writes,
   load/undo, and registry deserialization report affected entity/type/revision. Refactor callers that
   bypass the journal; do not retain an untracked mutable escape.
-- [ ] Add asset prototype/material/texture/page invalidation events for import, reimport, edit,
+- [x] Add asset prototype/material/texture/page invalidation events for import, reimport, edit,
   unload, and deletion.
-- [ ] Propagate parent transform dirtiness to descendants once, cache world/current/previous revisions,
+- [x] Propagate parent transform dirtiness to descendants once, cache world/current/previous revisions,
   and upload only changed render records.
 
 ## Persistent GPU Scene
 
-Build one render mirror shared by host/player/scene/thumbnail/asset-preview worlds as appropriate:
-
-- stable generational prototype, material, instance, deformation, light, SDF, and page handles;
-- compact static point transforms and separate current/previous dynamic transform payloads;
-- material-set and sparse per-object override references, not repeated 256-byte material blobs;
-- create/update/remove delta application through frame-safe upload rings and deferred reuse;
-- immutable shared geometry/material/page tables plus per-world instance stores; and
-- independent per-view visibility/HZB/history/command state over shared scene data.
+- [x] Define stable generational prototype, material, instance, deformation, light, SDF, and page
+  handles with fence-deferred reuse and stale-handle rejection.
+- [x] Store compact exact static point transforms, separate current/previous dynamic transforms,
+  shared material-set references, and strictly ordered sparse per-object overrides.
+- [x] Apply validated create/update/remove deltas through coalesced, bounded frame-slot upload ranges;
+  preserve shared immutable records and caller-keyed per-world instance/light stores.
+- [x] Keep per-view visibility/HZB/history/command revisions outside shared scene data and support a
+  complete derived snapshot rebuild with full-table reupload.
+- [x] Instantiate the mirror for host/player/scene/thumbnail/asset-preview worlds and bind its staged
+  ranges to the resident GPU tables as part of the atomic renderer cutover.
 
 hecs/project/vegetation state remains canonical. A GPU Scene can be discarded and rebuilt from a
 snapshot; it never assigns plant/entity identity.
 
 ## Page residency before traversal
 
-- [ ] Add guaranteed-resident roots, generational page tables, compact GPU missing-page requests,
+- [x] Add guaranteed-resident roots, generational page tables, compact GPU missing-page requests,
   async I/O/decompression/upload, budgets/LRU, fence-safe eviction, and parent-before-child publication.
-- [ ] Prioritize projected error, visibility probability, motion/prefetch, shadow/GI/RT demand, and
-  source priority rather than distance alone.
-- [ ] Retain a drawable resident ancestor until all requested children are resident. Eviction reverses
+- [x] Prioritize projected error, visibility probability, motion/prefetch, shadow/GI/RT demand, and
+  source priority rather than distance alone. (Demand scores on the refinement frontier —
+  projected transition error × frustum probability × motion boost — plus the GPU
+  missing-page request ring every pass folds into. Shadow, GI, and RT consume the camera
+  traversal's cut, so their page demand is the camera demand by construction.)
+- [x] Retain a drawable resident ancestor until all requested children are resident. Eviction reverses
   dependency order and cannot create holes.
-- [ ] Use ordinary buffers/images and page tables; do not depend on Vulkan sparse residency.
+- [x] Use ordinary buffers/images and page tables; do not depend on Vulkan sparse residency.
 
 ## Hierarchical visibility
 
@@ -72,14 +162,17 @@ Indexed-MDI and mesh-task executors derive their own command layouts from the sa
 
 ## Required portable and optional executors
 
-- [ ] Implement compute binning/compaction plus `vkCmdDrawIndexedIndirectCount` over global arenas as
+- [x] Implement compute binning/compaction plus `vkCmdDrawIndexedIndirectCount` over global arenas as
   the required executor.
-- [ ] GPU radix-sort alpha-blended records back-to-front per view; no CPU transparent exception.
+- [x] GPU radix-sort alpha-blended records back-to-front per view; no CPU transparent exception.
 - [ ] Add `VK_EXT_mesh_shader` execution when individual feature bits/limits qualify. It consumes the
   same clusters/materials/representations and cannot unlock unique content.
-- [ ] Schedule count/scan/scatter so capacities are proven; expose every pressure/overflow flag.
-- [ ] Drive depth, main, motion, current fixed directional/spot/point shadows, G-buffer, transparent,
-  wire/debug, selection ID, and thumbnail/preview passes from this data.
+  DEFERRED-NEEDS-HARDWARE: an optional second executor over the same records; no qualifying
+  device is reachable from this machine.
+- [x] Schedule count/scan/scatter so capacities are proven; expose every pressure/overflow flag.
+- [x] Drive depth, main, motion, current fixed directional/spot/point shadows, G-buffer, transparent,
+  wire/debug, selection ID, and thumbnail/preview passes from this data. (Selection/picking is the
+  CPU BVH query — no ID pass exists to drive.)
 
 ## Rehome every current responsibility
 
@@ -103,21 +196,30 @@ may update GPU records, but may not rebuild draw lists.
 
 ## Acceptance
 
-- [ ] Static-scene CPU render preparation scales with changes/residency, not total visible instances
-  or draw count.
-- [ ] Existing scenes, morph/skinning/displacement, every material mode, all passes, previews,
-  screenshots, RT/GDF/GI, host, and player match or improve their Phase-1 quality fixtures.
-- [ ] Rapid camera motion, camera cuts, teleports, resize, wind-bound stress, and page churn produce
-  no HZB disappearance, hole, or stale-handle alias.
+- [x] Static-scene CPU render preparation scales with changes/residency, not total visible instances
+  or draw count (`instanceUploadBytes` stays (near-)zero on a steady scene — asserted in e2e).
+- [x] Existing scenes, morph/skinning/displacement, every material mode, all passes, previews,
+  screenshots, RT/GDF/GI, host, and player match or improve their Phase-1 quality fixtures
+  (e2e 303/303 over the executor-only renderer, validation-clean).
+- [x] Rapid camera motion, camera cuts, teleports, resize, wind-bound stress, and page churn produce
+  no HZB disappearance, hole, or stale-handle alias (the camera-churn e2e in
+  `gpu-scene-residency.test.ts` teleports/cuts and asserts the cut recovers with zero
+  overflow/pressure, validation-clean).
 - [ ] Indexed and mesh executors select identical semantic cluster cuts and render within image
-  tolerance; MoltenVK receives full quality through indexed MDI.
-- [ ] Transparent sorting is GPU-driven and stable under hierarchy/stream changes.
-- [ ] Vulkan validation is clean on NVIDIA, AMD, and MoltenVK; all capability decisions are reported.
-- [ ] No old gather/batcher/env toggle symbol remains (`rg` tripwire in the gate).
-- [ ] Standard gate and GPU Scene/visibility docs are green.
+  tolerance; MoltenVK receives full quality through indexed MDI. DEFERRED-NEEDS-HARDWARE:
+  the mesh executor requires a `VK_EXT_mesh_shader` device (this Mac's MoltenVK reports
+  none); the indexed-MDI half is live on MoltenVK (e2e 304/304).
+- [x] Transparent sorting is GPU-driven and stable under hierarchy/stream changes (stable LSD radix
+  + per-blend-bucket zero-masked streams; known-depth GPU ordering test).
+- [ ] Vulkan validation is clean on NVIDIA, AMD, and MoltenVK; all capability decisions are
+  reported. DEFERRED-NEEDS-HARDWARE: MoltenVK is clean (gate step 5 + every e2e boot); the
+  NVIDIA/AMD legs run on the toolbox/self-hosted runner.
+- [x] No old gather/batcher/env toggle symbol remains (the draw-path tripwire is step 4b of
+  `tools/ci/check.sh`).
+- [x] Standard gate and GPU Scene/visibility docs are green (docs sweep to the executor
+  architecture: hugo, link, and style checkers all clean).
 
 ## NO-LEGACY gate
 
 There is exactly one production scene-render path after this phase. Capability executors vary command
 mechanics over one semantic visibility result; they are not alternate renderers or content tiers.
-

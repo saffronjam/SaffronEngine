@@ -29,9 +29,11 @@ just compute-conformance
 
 The command regenerates the exact shader artifacts first, executes the Phase 1 spatial-numeric
 goldens and the Phase 3 resident graph-program corpus, and writes machine-readable JSON to standard
-output. The record binds every result to the physical device and driver UUIDs, resident-program ABI,
-corpus and reference hashes, complete shader-manifest identity, and validation-layer counts. Software
-Vulkan devices are rejected because they do not qualify a supported hardware profile.
+output through `saffron-vegetation-gpu`, the sole adapter between vegetation programs and generic
+renderer compute. The record binds every result to the physical device and driver UUIDs,
+resident-program ABI, corpus and reference hashes, complete shader-manifest identity, and
+validation-layer counts. Software Vulkan devices are rejected because they do not qualify a
+supported hardware profile.
 
 `compute-conformance-apple-m4-moltenvk.json` is the physical Apple M4 record. Its 32 spatial words
 include the full-width probability primitive, and its four resident programs qualify all seven

@@ -197,21 +197,26 @@ saffron-core
 saffron-log
 saffron-signal      → saffron-core
 saffron-json        → saffron-core
+saffron-spatial     → (no Saffron dependencies)                            deterministic world vocabulary
+saffron-wind        → (no Saffron dependencies)                            shared deterministic wind field
+saffron-material    → {saffron-core, saffron-spatial}                      surface/coverage vocabulary
 saffron-window      → {saffron-core, saffron-signal}
-saffron-geometry    → saffron-core
-saffron-scene       → {saffron-core, saffron-json}                       hecs-backed ECS
+saffron-geometry    → {saffron-core, saffron-material}
+saffron-scene       → {saffron-core, saffron-json, saffron-spatial, saffron-wind}   hecs-backed ECS
 saffron-animation   → {saffron-core, saffron-geometry, saffron-scene}
 saffron-physics-sys → (cxx-built vendored Jolt 5.3.0)
-saffron-physics     → {saffron-core, saffron-geometry, saffron-scene, saffron-animation, saffron-physics-sys}
-saffron-script      → {saffron-core, saffron-scene}                      Luau via mlua (vendored)
-saffron-rendering   → {saffron-core, saffron-window, saffron-geometry}   ash + vk-mem
-saffron-assets      → {saffron-core, saffron-json, saffron-geometry, saffron-rendering, saffron-scene}
+saffron-physics     → {saffron-core, saffron-spatial, saffron-geometry, saffron-scene, saffron-animation, saffron-physics-sys}
+saffron-script      → {saffron-core, saffron-spatial, saffron-scene}      Luau via mlua (vendored)
+saffron-vegetation  → {saffron-core, saffron-json, saffron-material, saffron-geometry, saffron-spatial}
+saffron-rendering   → {saffron-core, saffron-window, saffron-geometry, saffron-material, saffron-spatial, saffron-wind}   ash + vk-mem
+saffron-vegetation-gpu → {saffron-rendering, saffron-vegetation}          Vulkan graph adapter
+saffron-assets      → {saffron-core, saffron-json, saffron-geometry, saffron-material, saffron-rendering, saffron-scene, saffron-spatial, saffron-vegetation}
 saffron-sceneedit   → {saffron-core, saffron-signal, saffron-scene, saffron-json}
-saffron-runtime     → {saffron-core, saffron-scene, saffron-assets, saffron-animation, saffron-script, saffron-physics}   shared play-mode sim spine
+saffron-runtime     → {saffron-core, saffron-spatial, saffron-scene, saffron-assets, saffron-animation, saffron-script, saffron-physics, saffron-vegetation}   shared play-mode sim spine
 saffron-protocol    → saffron-core                                       wire DTOs (serde + schemars + ts-rs)
-saffron-control     → {saffron-core, saffron-geometry, saffron-json, saffron-window, saffron-rendering, saffron-scene, saffron-sceneedit, saffron-assets, saffron-physics, saffron-protocol}
+saffron-control     → {saffron-core, saffron-geometry, saffron-json, saffron-window, saffron-rendering, saffron-scene, saffron-wind, saffron-sceneedit, saffron-assets, saffron-physics, saffron-protocol, saffron-spatial, saffron-vegetation, saffron-runtime}
 saffron-app         → {saffron-core, saffron-window, saffron-rendering}
-saffron-host        → {saffron-core, saffron-log, saffron-app, saffron-window, saffron-rendering, saffron-sceneedit, saffron-runtime, saffron-control, saffron-scene, saffron-geometry, saffron-animation, saffron-physics, saffron-script, saffron-assets, saffron-signal, saffron-protocol}   (the present-only host exe)
+saffron-host        → {saffron-core, saffron-log, saffron-app, saffron-window, saffron-rendering, saffron-vegetation-gpu, saffron-sceneedit, saffron-runtime, saffron-control, saffron-scene, saffron-geometry, saffron-animation, saffron-physics, saffron-script, saffron-assets, saffron-signal, saffron-protocol, saffron-spatial, saffron-wind}   (the present-only host exe)
 saffron-player      → {saffron-core, saffron-log, saffron-app, saffron-runtime, saffron-rendering, saffron-window, saffron-scene, saffron-assets, saffron-protocol}   (the exported-game exe)
 saffron-control-client → saffron-protocol                               unix-socket client (no engine dep)
 sa                  → {saffron-protocol, saffron-control-client}         the control CLI (clap)
@@ -326,6 +331,10 @@ a feature — follow and update a matching plan rather than starting cold.
   rigidbody/collider split components with five shapes + materials + auto-fit; object-layer matrix +
   sensors/triggers + a contact-event ring to scripts; kinematic bone-following; a `CharacterVirtual`
   controller; raycast/shapecast queries + a Luau `sa.raycast`; and a motor-driven ragdoll routed through
-  the pose-buffer override/weight blend layer — passive, active, and partial, with import auto-fit).
+  the pose-buffer override/weight blend layer — passive, active, and partial, with import auto-fit);
+  and the persistent GPU scene with GPU-driven rendering (a journal-driven mirror + device tables,
+  byte-locked page residency with a streaming worker, per-view HZB occlusion + hierarchy traversal +
+  GPU binning, counted-indirect executor draws with BDA vertex pulling for every raster pass, a GPU
+  radix-sorted transparent pass, and a tessellation-seam path for displaced instances).
 - **Not yet:** transient render-graph resources (graph-created images + aliasing) + async compute;
-  GPU-driven culling (MDI / mesh shaders); hardware GPU in the toolbox.
+  the optional `VK_EXT_mesh_shader` executor; hardware GPU in the toolbox.

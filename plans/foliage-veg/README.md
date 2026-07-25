@@ -169,7 +169,7 @@ mesh-task loop are deleted in the same phase that every responsibility moves to 
 | Opt-in meshlet path | `engine/crates/rendering/src/meshlet_raster.rs`; `engine/assets/shaders/meshlet.slang` | It emits one mesh-task draw per instance/submesh and only frustum-culls spheres; Phase 7 retires it. |
 | Existing Vulkan capabilities | `engine/crates/rendering/src/device.rs` — `Capabilities`, `draw_indirect_count`, `mesh_shader_supported` | Query individual feature bits/limits; portable indexed MDI is required on MoltenVK. |
 | Render graph | `engine/crates/rendering/src/render_graph.rs`, `transient.rs` | Phase 6 adds persistent/transient buffers and indirect access/barrier declarations before culling. |
-| Meshlet cook | `engine/crates/geometry/src/meshlet.rs`; `engine/crates/rendering/src/upload.rs` | Sequential sphere-only meshlets are replaced by the appearance-error hierarchy; no runtime recook fork. |
+| Virtual hierarchy | `engine/crates/geometry/src/virtual_hierarchy.rs`; `engine/crates/rendering/src/upload.rs` | One portable appearance-error hierarchy feeds artifact codecs and execution packing. |
 | Material schema | `engine/crates/assets/src/material.rs` — `MaterialAsset`; `render_material.rs`; `lighting.slang` — `SurfaceData` | Thin-sheet and coverage contracts land before plant hierarchy baking. |
 | Asset catalog | `engine/crates/scene/src/environment.rs` — `AssetType`; `engine/crates/assets/src/scan.rs`, `names.rs`, `manage.rs` | Add Plant/Biome/VegetationMap through every frozen map and scan/rename/delete route. |
 | Scene component registry | `engine/crates/scene/src/registry.rs` — `register_builtin_components`, `BUILTIN_COMPONENT_NAMES`; `engine/crates/protocol/src/scene_dto.rs` — `COMPONENT_NAMES` | `VegetationField` is one fully registered serialized component with generated DTOs. |
@@ -204,10 +204,13 @@ mesh-task loop are deleted in the same phase that every responsibility moves to 
 ## External ownership boundaries
 
 - `saffron-spatial` owns coordinates, hierarchical keys, spatial sources, cancellation, and facet
-  residency. It depends on core/geometry only and remains independent of scene, assets, vegetation,
+  residency. It has no Saffron dependencies and remains independent of scene, assets, vegetation,
   rendering, Jolt, and networking.
+- `saffron-material` owns generic surface, coverage, thin-sheet, and aggregate-material vocabulary.
 - `saffron-vegetation` owns plant/biome/map formats, IDs, graph IR, cell payloads, state reduction,
   lifecycle rules, and snapshot/delta codecs without depending on rendering or Jolt.
+- `saffron-vegetation-gpu` is the sole Vulkan adapter for vegetation graph execution and depends on
+  both `saffron-rendering` and `saffron-vegetation`.
 - `saffron-assets`, `saffron-runtime`, rendering, physics, control, host, player, and editor integrate
   those lower-level contracts without creating cycles.
 - The future terrain system implements `SurfaceField`; it does not add terrain grass.

@@ -1,6 +1,6 @@
 # Phase 6 — Virtual geometry and render substrate
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 **Depends on:** Phases 2 and 4
 
@@ -8,6 +8,20 @@ This phase builds the final data and Vulkan substrate that the Phase-7 atomic re
 It does not introduce an alternate runtime renderer or route any production view through partial
 infrastructure. Offline cooks, focused GPU tests, and benchmark fixtures validate the new contracts
 until the cutover is complete.
+
+## Active checkpoint
+
+Complete. The alpha-card contour cook, thin-sheet optical partition, shared Slang lighting path,
+canonical static/skinned CPU picking, and material/vegetation-GPU ownership cutover are implemented
+and green. RT candidate coverage is integrated: every inline ray query (the mesh-family shadow and
+reflection queries and the ReSTIR resolve visibility ray) confirms non-opaque candidates through
+`gpuSceneRayCandidateCovered` — the candidate surface reconstructed from the persistent-scene tables
+(`gpuSceneResolveCandidate`), classified by the one canonical classifier with zero alpha width and
+the address block's temporal phase. Coverage classification is single-sourced (`coverage.slang` /
+`classify_canonical_coverage`) across depth, main, shadow, picking, and RT, and its CPU/GPU parity
+is locked by `rust_and_slang_coverage_matrix_match_on_gpu` (the classifier matrix, including A2C
+and transmissive fixtures) plus `ray_candidate_classification_matches_the_cpu_classifier` (the full
+table → interpolation → classifier chain, byte-exact on MoltenVK).
 
 ## Render-graph buffer and indirect primitives
 
@@ -18,7 +32,7 @@ until the cutover is complete.
   ownership, and AS-build barriers. Validation tests cover every transition.
 - [x] Add count→scan→scatter building blocks and overflow reporting. No visible list, bin, page request,
   or work queue silently truncates; a coarser resident parent remains drawable under pressure.
-- [ ] Add async-compute scheduling as a render-graph queue assignment for the same declared pass.
+- [x] Add async-compute scheduling as a render-graph queue assignment for the same declared pass.
   Devices without useful overlap execute the identical pass on graphics.
 
 ## Global GPU data model
@@ -34,7 +48,7 @@ Indexed MDI cannot draw unrelated existing per-mesh buffers without CPU rebindin
   transparency, and pass;
 - [x] frame-safe upload rings, deferred handle/page reuse, stable in-flight addresses, and arena growth
   that retains old allocations until all referencing frames complete; and
-- [ ] capability resolution that queries BDA, shader draw parameters, multi-draw, indirect count,
+- [x] capability resolution that queries BDA, shader draw parameters, multi-draw, indirect count,
   descriptor-indexing subfeatures/limits, update-after-bind limits, `maxDrawIndirectCount`, subgroup
   properties, and mesh/task limits separately.
 
@@ -45,14 +59,14 @@ Missing optional limits affect scheduling/bin sizes, never content or quality.
 Implement the Phase-2 `.smat` contract in `MaterialAsset`, `MaterialParamsData`, codegen,
 `SurfaceData`, material graph output, preview, thumbnails, all light paths, and RT hit shading:
 
-- [ ] energy-conserving two-sided reflection plus thickness/absorption-based transmission with
+- [x] energy-conserving two-sided reflection plus thickness/absorption-based transmission with
   distinct front/back normal behavior;
 - [x] coverage-preserving alpha mip generation and one canonical coverage sample function;
-- [ ] modeled geometry as the primary leaf/blade silhouette, alpha only for irreducible serrations/
+- [x] modeled geometry as the primary leaf/blade silhouette, alpha only for irreducible serrations/
   holes;
 - [x] A2C when MSAA is enabled and spatially anchored hashed coverage with deterministic temporal
   sequencing under TAA;
-- [ ] coverage evaluation before expensive shading and identical depth/main/shadow/picking/RT
+- [x] coverage evaluation before expensive shading and identical depth/main/shadow/picking/RT
   classification; and
 - [x] aggregate material moments: occupancy/coverage density, albedo/roughness/transmission/thickness
   statistics, and a normal distribution sufficient for the same thin-sheet response.
@@ -92,17 +106,21 @@ texture mip/KTX2-derived payloads where applicable, collision/RT derivation meta
 source hashes, checksums, and compression. `.splant` remains the only authored owner and recook source;
 there is no independently renderable generated `.smesh` plant copy.
 
+Section storage uses one deterministic checksummed Zstandard profile without dictionaries or worker
+threads. The writer retains raw bytes only when compression is not smaller; TOC limits are accepted
+before decoding, section hashes cover decoded bytes, and payload/artifact hashes cover stored bytes.
+
 ## Focused verification
 
 - [x] CPU hierarchy-cut reference proves child/parent coverage and no-hole residency behavior.
-- [ ] Triangle↔voxel reference renders compare silhouette, coverage, transmission, material, and
+- [x] Triangle↔voxel reference renders compare silhouette, coverage, transmission, material, and
   normal-distribution error over view/light directions.
-- [ ] Coverage mip/A2C/hash classification agrees across all pass fixtures.
-- [ ] Rust/Slang layouts, BDA offsets, handle generations, and indirect barriers are byte-locked.
-- [ ] Arena growth/compaction under in-flight frames never invalidates an address or reuses a live
+- [x] Coverage mip/A2C/hash classification agrees across all pass fixtures.
+- [x] Rust/Slang layouts, BDA offsets, handle generations, and indirect barriers are byte-locked.
+- [x] Arena growth/compaction under in-flight frames never invalidates an address or reuses a live
   generation.
-- [ ] The portable executor can render every cooked representation in an isolated test on MoltenVK.
-- [ ] Standard gate and virtual-geometry/material docs are green.
+- [x] The portable executor can render every cooked representation in an isolated test on MoltenVK.
+- [x] Standard gate and virtual-geometry/material docs are green.
 
 ## NO-LEGACY gate
 
