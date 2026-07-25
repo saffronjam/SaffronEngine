@@ -7,7 +7,7 @@ use saffron_spatial::{
 };
 
 use crate::{
-    BrushGestureMetadata, InteractionPolicy, PlantId, PlantPoint, PlantStateOverride,
+    BrushGestureMetadata, Error, InteractionPolicy, PlantId, PlantPoint, PlantStateOverride,
     PlantTransformOverride, ProvenanceTable, Result, VegetationLayer,
 };
 
@@ -276,22 +276,22 @@ pub struct ImportedPlantFamilyRecipe {
     pub semantic_targets: Vec<PlantManualSemanticTarget>,
 }
 
-/// Embedded native botanical graph source.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NativeBotanicalGraph {
-    /// Graph schema identity.
-    pub schema_hash: [u8; 32],
-    /// Canonical graph document. Nodes carry stable GUIDs and typed ports.
-    pub graph: Value,
-}
-
 /// Exactly one source for a plant family.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlantFamilySource {
     /// Imported-family recipe normalized during cooking.
     Imported(ImportedPlantFamilyRecipe),
     /// Embedded native botanical graph.
-    Native(NativeBotanicalGraph),
+    Native {
+        /// The authored graph, including its manual edit layer.
+        graph: crate::BotanicalGraphDocument,
+        /// External geometry the graph's grafts substitute in, in canonical source order.
+        ///
+        /// A graft names one of these by identity rather than carrying it, because a recook writes
+        /// the resolved content hash back into the reference — and a hash living inside the graph
+        /// document would change the graph's identity every time the hero mesh was re-read.
+        grafts: Vec<PlantSourceReference>,
+    },
 }
 
 /// Semantic role of a plant part.
@@ -394,6 +394,14 @@ pub enum PhenotypeRole {
     Burned,
     /// Dead appearance.
     Dead,
+    /// Flowering seasonal appearance.
+    Flowering,
+    /// Fruiting seasonal appearance.
+    Fruiting,
+    /// Senescent (autumn) seasonal appearance.
+    Senescent,
+    /// Wet appearance.
+    Wet,
 }
 
 /// One plant phenotype/life-state variant.
@@ -403,6 +411,9 @@ pub struct PlantPhenotype {
     pub id: u32,
     /// Semantic role.
     pub role: PhenotypeRole,
+    /// Seasonal window `(start, end)` in per-mille of the year in which a seasonal
+    /// role shows, wrapping through 1000; `None` derives the role's default window.
+    pub season_window: Option<(u16, u16)>,
     /// Family variation available to the phenotype.
     pub variation: u32,
     /// Material slot remap `(from, to)`.
@@ -478,6 +489,60 @@ pub struct HabitatPreferences {
     pub shade_tolerance: UnitInterval,
 }
 
+/// How one species relates to another growing nearby.
+///
+/// Relations are declared by the species, not by a biome: an oak shades out what it shades out
+/// wherever it grows. The simulation reads them from the compiled family, so a rule never needs the
+/// asset catalog at tick time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlantRelationKind {
+    /// Grows better near the other family — nurse plants, nitrogen fixers, shared mycorrhizae.
+    Companion,
+    /// Suppressed by the other family — allelopathy, root crowding, canopy exclusion.
+    Antagonist,
+    /// Establishes under the other family's canopy and takes its place as that canopy fails.
+    Successor,
+    /// Lives permanently beneath the other family and needs its shade.
+    Understory,
+}
+
+impl TryFrom<u32> for PlantRelationKind {
+    type Error = Error;
+
+    fn try_from(value: u32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Companion),
+            1 => Ok(Self::Antagonist),
+            2 => Ok(Self::Successor),
+            3 => Ok(Self::Understory),
+            _ => Err(Error::ArtifactFormat {
+                format: "splant",
+                field: "ecology.relations.kind".to_owned(),
+            }),
+        }
+    }
+}
+
+/// One declared relation to another plant family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlantSpeciesRelation {
+    /// The other family.
+    pub family: Uuid,
+    /// What the relation does.
+    pub kind: PlantRelationKind,
+    /// How strongly it applies.
+    pub strength: UnitInterval,
+}
+
+/// What a species does over biological time, and how it responds to its neighbours.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlantEcologyDeclaration {
+    /// The fixed-tick rules the ecology simulation runs for this family.
+    pub rules: crate::EcologySpeciesRules,
+    /// Relations to other families, in canonical family order.
+    pub relations: Vec<PlantSpeciesRelation>,
+}
+
 /// One normalized `.splant` plant-family asset.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlantFamilyAsset {
@@ -513,6 +578,8 @@ pub struct PlantFamilyAsset {
     pub interaction_policy: InteractionPolicy,
     /// Optional species habitat defaults.
     pub habitat: Option<HabitatPreferences>,
+    /// Species ecology rules and relations.
+    pub ecology: PlantEcologyDeclaration,
 }
 
 /// Root biome or reusable typed module role.
@@ -1138,15 +1205,49 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
                 });
             }
         }
-        PlantFamilySource::Native(graph) => {
-            if graph.schema_hash == [0; 32]
-                || !graph.graph.is_object()
-                || asset.parts.iter().any(|part| !part.sources.is_empty())
-            {
+        PlantFamilySource::Native { graph, grafts } => {
+            // A native family's geometry is grown, so no part may reference an external source.
+            if asset.parts.iter().any(|part| !part.sources.is_empty()) {
                 return Err(crate::Error::InvalidFormat {
                     format: ".splant",
-                    field: "source.native.graph".to_owned(),
+                    field: "source.native.parts".to_owned(),
                 });
+            }
+            graph.validate().map_err(|_| crate::Error::InvalidFormat {
+                format: ".splant",
+                field: "source.native.graph".to_owned(),
+            })?;
+            let field = |name: &str| crate::Error::InvalidFormat {
+                format: ".splant",
+                field: name.to_owned(),
+            };
+            let mut declared = std::collections::BTreeSet::new();
+            for pair in grafts.windows(2) {
+                if pair[0].id >= pair[1].id {
+                    return Err(field("source.native.grafts.order"));
+                }
+            }
+            for graft in grafts {
+                if graft.id == 0 || !declared.insert(graft.id) {
+                    return Err(field("source.native.grafts.id"));
+                }
+                if graft.role != PlantSourceRole::Geometry {
+                    return Err(field("source.native.grafts.role"));
+                }
+                // The two top bits are reserved for the identities a native family derives: its own
+                // graph source and one per variation.
+                if graft.id >> 126 != 0 {
+                    return Err(field("source.native.grafts.reserved"));
+                }
+            }
+            // A graft naming a source the family does not declare has no geometry to substitute,
+            // and there is nothing sensible to fall back to.
+            for edit in &graph.edits {
+                if let crate::BotanicalEditAction::Graft { source, .. } = &edit.action
+                    && !declared.contains(source)
+                {
+                    return Err(field("source.native.grafts.reference"));
+                }
             }
         }
     }
@@ -1235,7 +1336,17 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
                 .map(|source| source.id)
                 .collect::<std::collections::BTreeSet<_>>(),
         ),
-        PlantFamilySource::Native(_) => None,
+        PlantFamilySource::Native { .. } => None,
+    };
+    // A native family's variation sources are the per-individual geometry the graph grows, one
+    // source per declared variation, so they are derived rather than authored.
+    let native_source_ids = match &asset.source {
+        PlantFamilySource::Native { graph, .. } => Some(
+            (0..graph.variations.len())
+                .map(crate::native_variation_source_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+        ),
+        PlantFamilySource::Imported(_) => None,
     };
     if asset.variations.is_empty()
         || variation_ids.len() != asset.variations.len()
@@ -1271,7 +1382,13 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
                                     .any(|source| variation_sources.contains(source))
                         })
                 })
-                || imported_source_ids.is_none() && !variation.sources.is_empty()
+                || native_source_ids.as_ref().is_some_and(|sources| {
+                    variation.sources.len() != 1
+                        || variation
+                            .sources
+                            .iter()
+                            .any(|source| !sources.contains(source))
+                })
         })
         || imported_source_ids.as_ref().is_some_and(|sources| {
             sources.iter().any(|source| {
@@ -1304,15 +1421,15 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
     if asset.phenotypes.is_empty()
         || phenotype_ids.len() != asset.phenotypes.len()
         || duplicate_phenotype_role
+        || !asset
+            .phenotypes
+            .iter()
+            .any(|phenotype| phenotype.role == PhenotypeRole::Healthy)
         || asset.variations.iter().any(|variation| {
-            asset
+            !asset
                 .phenotypes
                 .iter()
-                .filter(|phenotype| {
-                    phenotype.variation == variation.id && phenotype.role == PhenotypeRole::Healthy
-                })
-                .count()
-                != 1
+                .any(|phenotype| phenotype.variation == variation.id)
         })
         || asset.phenotypes.iter().any(|phenotype| {
             let material_sources = phenotype
@@ -1402,6 +1519,34 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
         return Err(crate::Error::InvalidFormat {
             format: ".splant",
             field: "habitat.fields".to_owned(),
+        });
+    }
+    // Stages only ever advance, and a species cannot relate to itself or name a family twice: both
+    // would make the tick's answer depend on which duplicate it read.
+    let stages = asset.ecology.rules.stage_ticks;
+    if stages.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "ecology.rules.stageTicks".to_owned(),
+        });
+    }
+    let related = asset
+        .ecology
+        .relations
+        .iter()
+        .map(|relation| relation.family.value())
+        .collect::<std::collections::BTreeSet<_>>();
+    if related.len() != asset.ecology.relations.len()
+        || related.contains(&asset.id.value())
+        || asset
+            .ecology
+            .relations
+            .windows(2)
+            .any(|pair| pair[0].family.value() >= pair[1].family.value())
+    {
+        return Err(crate::Error::InvalidFormat {
+            format: ".splant",
+            field: "ecology.relations".to_owned(),
         });
     }
     Ok(())
@@ -1728,12 +1873,13 @@ pub fn validate_vegetation_map(asset: &VegetationMapAsset) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PlantId, ProceduralPlantIdentity};
+    use crate::ProceduralPlantIdentity;
+    use crate::identity::derive_procedural_plant_id;
 
     #[test]
     fn topology_changes_report_affected_pins_and_overrides() {
         let id = |candidate| {
-            PlantId::procedural(ProceduralPlantIdentity {
+            derive_procedural_plant_id(ProceduralPlantIdentity {
                 map: Uuid(1),
                 layer_guid: 2,
                 node_address: 3,

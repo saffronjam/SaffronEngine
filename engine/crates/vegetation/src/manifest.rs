@@ -1,7 +1,7 @@
 //! Canonical vegetation-world manifest and immutable cell directory.
 
 use saffron_core::Uuid;
-use saffron_spatial::{DecisionScalar, WorldBounds, WorldCellKey};
+use saffron_spatial::{DecisionScalar, UnitInterval, WorldBounds, WorldCellKey};
 
 use crate::binary::{BinaryReader, BinaryWriter};
 use crate::{
@@ -62,6 +62,9 @@ pub struct VegetationManifestPlant {
     pub variation_count: u32,
     /// Compiled phenotype count.
     pub phenotype_count: u32,
+    /// Species ecology rules and relations, baked by the cook so a tick never needs the asset
+    /// catalog.
+    pub ecology: crate::PlantEcologyDeclaration,
 }
 
 /// Spatial reason that one immutable cell reads another cell artifact.
@@ -347,7 +350,7 @@ impl VegetationBaseManifest {
             });
         }
 
-        let plant_count = reader.count(100)?;
+        let plant_count = reader.count(146)?;
         let mut plants = Vec::with_capacity(plant_count);
         for _ in 0..plant_count {
             plants.push(decode_plant(&mut reader)?);
@@ -525,6 +528,26 @@ fn encode_plant(writer: &mut BinaryWriter, plant: &VegetationManifestPlant) -> R
     }
     writer.u32(plant.variation_count);
     writer.u32(plant.phenotype_count);
+    for tick in plant.ecology.rules.stage_ticks {
+        writer.u64(tick);
+    }
+    for value in [
+        plant.ecology.rules.shade_tolerance,
+        plant.ecology.rules.drought_tolerance,
+        plant.ecology.rules.propagation_chance,
+        plant.ecology.rules.regrowth_chance,
+        plant.ecology.rules.deadfall_chance,
+        plant.ecology.rules.root_demand,
+    ] {
+        writer.u16(value.bits());
+    }
+    writer.u32(plant.ecology.rules.spread_radius_m);
+    writer.length(plant.ecology.relations.len())?;
+    for relation in &plant.ecology.relations {
+        writer.uuid(relation.family);
+        writer.u32(relation.kind as u32);
+        writer.u16(relation.strength.bits());
+    }
     Ok(())
 }
 
@@ -553,6 +576,30 @@ fn decode_plant(reader: &mut BinaryReader<'_>) -> Result<VegetationManifestPlant
         ],
         variation_count: reader.u32()?,
         phenotype_count: reader.u32()?,
+        ecology: crate::PlantEcologyDeclaration {
+            rules: crate::EcologySpeciesRules {
+                stage_ticks: [reader.u64()?, reader.u64()?, reader.u64()?, reader.u64()?],
+                shade_tolerance: UnitInterval::from_bits(reader.u16()?),
+                drought_tolerance: UnitInterval::from_bits(reader.u16()?),
+                propagation_chance: UnitInterval::from_bits(reader.u16()?),
+                regrowth_chance: UnitInterval::from_bits(reader.u16()?),
+                deadfall_chance: UnitInterval::from_bits(reader.u16()?),
+                root_demand: UnitInterval::from_bits(reader.u16()?),
+                spread_radius_m: reader.u32()?,
+            },
+            relations: {
+                let count = reader.count(22)?;
+                let mut relations = Vec::with_capacity(count);
+                for _ in 0..count {
+                    relations.push(crate::PlantSpeciesRelation {
+                        family: reader.uuid()?,
+                        kind: crate::PlantRelationKind::try_from(reader.u32()?)?,
+                        strength: UnitInterval::from_bits(reader.u16()?),
+                    });
+                }
+                relations
+            },
+        },
     })
 }
 
@@ -807,6 +854,7 @@ mod tests {
             ],
             variation_count: 2,
             phenotype_count: 3,
+            ecology: crate::PlantEcologyDeclaration::default(),
         });
         let cell = WorldCellKey::base(-3, 2, -1);
         manifest.cells.push(VegetationManifestCell {

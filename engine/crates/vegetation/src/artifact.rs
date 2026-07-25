@@ -27,11 +27,43 @@ const PLANT_MAGIC: &[u8; 8] = b"SPLANTC2";
 const COMMON_HEADER_BYTES: usize = 8 + 4 + 32 + 2 + 32 + 32 + 4 + 32;
 const TOC_ENTRY_BYTES: usize = 2 + 4 + 1 + 4 + 8 + 8 + 8 + 32;
 const MAX_SECTION_ALIGNMENT: u32 = 4096;
-const MAX_SECTION_STORED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_SECTION_DECODED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_ARTIFACT_DECODED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const ZSTD_COMPRESSION_LEVEL: i32 = 10;
 const ZSTD_WINDOW_LOG: u32 = 27;
+
+/// Explicit stored and decoded byte budgets accepted while validating an artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactDecodeLimits {
+    max_stored_section_bytes: u64,
+    max_total_stored_bytes: u64,
+    max_decoded_section_bytes: u64,
+    max_total_decoded_bytes: u64,
+}
+
+impl ArtifactDecodeLimits {
+    /// Creates one caller-owned validation and section-extraction budget.
+    #[must_use]
+    pub const fn new(
+        max_stored_section_bytes: u64,
+        max_total_stored_bytes: u64,
+        max_decoded_section_bytes: u64,
+        max_total_decoded_bytes: u64,
+    ) -> Self {
+        Self {
+            max_stored_section_bytes,
+            max_total_stored_bytes,
+            max_decoded_section_bytes,
+            max_total_decoded_bytes,
+        }
+    }
+}
+
+/// Project-wide artifact validation policy used by runtime and editor asset stores.
+pub const VEGETATION_ARTIFACT_DECODE_LIMITS: ArtifactDecodeLimits = ArtifactDecodeLimits::new(
+    16 * 1024 * 1024 * 1024,
+    64 * 1024 * 1024 * 1024,
+    16 * 1024 * 1024 * 1024,
+    64 * 1024 * 1024 * 1024,
+);
 
 /// Stable schema identity of the `.svegcell` header and TOC vocabulary.
 #[must_use]
@@ -357,6 +389,7 @@ pub struct VegetationCellArtifactIndex {
     pub payload_hash: ContentHash,
     /// Sections in canonical kind order.
     pub sections: Vec<VegetationCellSectionDescriptor>,
+    decode_limits: ArtifactDecodeLimits,
 }
 
 /// Bounded-memory validated reader over independently resident `.svegcell` facets.
@@ -368,7 +401,7 @@ pub struct VegetationCellArtifactReader<R> {
 
 impl<R: Read + Seek> VegetationCellArtifactReader<R> {
     /// Streams and validates the complete container without retaining unrelated section bytes.
-    pub fn open(mut source: R) -> Result<Self> {
+    pub fn open(mut source: R, limits: ArtifactDecodeLimits) -> Result<Self> {
         let format = ArtifactFlavor::Cell.format();
         let length = source
             .seek(SeekFrom::End(0))
@@ -388,7 +421,7 @@ impl<R: Read + Seek> VegetationCellArtifactReader<R> {
             .ok_or(Error::NumericOverflow)?;
         let mut toc_bytes = vec![0_u8; toc_size];
         read_exact_artifact(&mut source, &mut toc_bytes, format)?;
-        let sections = read_container_toc(&toc_bytes, ArtifactFlavor::Cell)?;
+        let sections = read_container_toc(&toc_bytes, ArtifactFlavor::Cell, limits)?;
         let payload_start = header_size
             .checked_add(toc_size)
             .ok_or(Error::NumericOverflow)?;
@@ -411,20 +444,12 @@ impl<R: Read + Seek> VegetationCellArtifactReader<R> {
                 &mut artifact_hasher,
                 format,
             )?;
-            let stored_size =
-                usize::try_from(descriptor.stored_size).map_err(|_| Error::NumericOverflow)?;
-            let mut stored = Vec::new();
-            stored
-                .try_reserve_exact(stored_size)
-                .map_err(|source| Error::MemoryReservation {
-                    resource: "vegetation artifact stored section",
-                    source,
-                })?;
-            stored.resize(stored_size, 0);
-            read_exact_artifact(&mut source, &mut stored, format)?;
-            payload_hasher.update(&stored)?;
-            artifact_hasher.update(&stored)?;
-            decode_stored_section(&stored, *descriptor, format)?;
+            let hashing_source = ArtifactHashingReader {
+                source: source.by_ref().take(descriptor.stored_size),
+                payload_hasher: &mut payload_hasher,
+                artifact_hasher: &mut artifact_hasher,
+            };
+            validate_decoded_section(hashing_source, *descriptor, format)?;
             cursor = descriptor
                 .offset
                 .checked_add(descriptor.stored_size)
@@ -443,13 +468,16 @@ impl<R: Read + Seek> VegetationCellArtifactReader<R> {
             });
         }
         let artifact_hash = ContentHash::new(artifact_hasher.finalize()?);
-        let index = cell_index_from_raw(RawIndex {
-            identity: header.identity,
-            cook_key: header.cook_key,
-            platform_profile: header.platform_profile,
-            payload_hash: header.payload_hash,
-            sections,
-        })?;
+        let index = cell_index_from_raw(
+            RawIndex {
+                identity: header.identity,
+                cook_key: header.cook_key,
+                platform_profile: header.platform_profile,
+                payload_hash: header.payload_hash,
+                sections,
+            },
+            limits,
+        )?;
         Ok(Self {
             source,
             index,
@@ -496,7 +524,12 @@ impl<R: Read + Seek> VegetationCellArtifactReader<R> {
             })?;
         bytes.resize(size, 0);
         read_exact_artifact(&mut self.source, &mut bytes, ".svegcell")?;
-        let decoded = decode_stored_section(&bytes, descriptor.into(), ".svegcell")?;
+        let decoded = decode_stored_section(
+            &bytes,
+            descriptor.into(),
+            ".svegcell",
+            self.index.decode_limits,
+        )?;
         Ok(Some(match decoded {
             Cow::Borrowed(_) => bytes,
             Cow::Owned(decoded) => decoded,
@@ -511,8 +544,8 @@ impl<R: Read + Seek> VegetationCellArtifactReader<R> {
 
 impl VegetationCellArtifactIndex {
     /// Strictly validates a complete artifact and indexes its independent sections.
-    pub fn open(bytes: &[u8]) -> Result<Self> {
-        cell_index_from_raw(read_container(bytes, ArtifactFlavor::Cell)?)
+    pub fn open(bytes: &[u8], limits: ArtifactDecodeLimits) -> Result<Self> {
+        cell_index_from_raw(read_container(bytes, ArtifactFlavor::Cell, limits)?, limits)
     }
 
     /// Returns one validated decoded section without decoding unrelated facets.
@@ -529,11 +562,15 @@ impl VegetationCellArtifactIndex {
                 .copied()
                 .map(Into::into),
             ".svegcell",
+            self.decode_limits,
         )
     }
 }
 
-fn cell_index_from_raw(raw: RawIndex) -> Result<VegetationCellArtifactIndex> {
+fn cell_index_from_raw(
+    raw: RawIndex,
+    decode_limits: ArtifactDecodeLimits,
+) -> Result<VegetationCellArtifactIndex> {
     let cell = WorldCellKey::from_canonical_bytes(raw.identity.try_into().map_err(|_| {
         Error::ArtifactFormat {
             format: ".svegcell",
@@ -571,6 +608,7 @@ fn cell_index_from_raw(raw: RawIndex) -> Result<VegetationCellArtifactIndex> {
         platform_profile: raw.platform_profile,
         payload_hash: raw.payload_hash,
         sections,
+        decode_limits,
     })
 }
 
@@ -587,12 +625,13 @@ pub struct PlantCompiledArtifactIndex {
     pub payload_hash: ContentHash,
     /// Sections in canonical kind order.
     pub sections: Vec<PlantCompiledSectionDescriptor>,
+    decode_limits: ArtifactDecodeLimits,
 }
 
 impl PlantCompiledArtifactIndex {
     /// Strictly validates a complete artifact and indexes its independent sections.
-    pub fn open(bytes: &[u8]) -> Result<Self> {
-        let raw = read_container(bytes, ArtifactFlavor::Plant)?;
+    pub fn open(bytes: &[u8], limits: ArtifactDecodeLimits) -> Result<Self> {
+        let raw = read_container(bytes, ArtifactFlavor::Plant, limits)?;
         let mut reader = BinaryReader::new(&raw.identity, ".splantc");
         let family = reader.uuid()?;
         reader.complete()?;
@@ -626,6 +665,7 @@ impl PlantCompiledArtifactIndex {
             platform_profile: raw.platform_profile,
             payload_hash: raw.payload_hash,
             sections,
+            decode_limits: limits,
         })
     }
 
@@ -643,6 +683,7 @@ impl PlantCompiledArtifactIndex {
                 .copied()
                 .map(Into::into),
             ".splantc",
+            self.decode_limits,
         )
     }
 
@@ -698,7 +739,7 @@ pub fn write_vegetation_cell_artifact(
         header.platform_profile,
         &raw,
     )?;
-    VegetationCellArtifactIndex::open(&bytes)?;
+    VegetationCellArtifactIndex::open(&bytes, exact_decode_limits(&bytes, &raw)?)?;
     Ok(bytes)
 }
 
@@ -725,7 +766,7 @@ pub fn write_plant_compiled_artifact(
         header.platform_profile,
         &raw,
     )?;
-    PlantCompiledArtifactIndex::open(&bytes)?;
+    PlantCompiledArtifactIndex::open(&bytes, exact_decode_limits(&bytes, &raw)?)?;
     Ok(bytes)
 }
 
@@ -839,6 +880,25 @@ struct RawHeader {
     section_count: usize,
 }
 
+fn exact_decode_limits(bytes: &[u8], sections: &[RawSection]) -> Result<ArtifactDecodeLimits> {
+    let stored_bytes = u64::try_from(bytes.len()).map_err(|_| Error::NumericOverflow)?;
+    let mut max_decoded = 0_u64;
+    let mut total_decoded = 0_u64;
+    for section in sections {
+        let decoded = u64::try_from(section.bytes.len()).map_err(|_| Error::NumericOverflow)?;
+        max_decoded = max_decoded.max(decoded);
+        total_decoded = total_decoded
+            .checked_add(decoded)
+            .ok_or(Error::NumericOverflow)?;
+    }
+    Ok(ArtifactDecodeLimits::new(
+        stored_bytes,
+        stored_bytes,
+        max_decoded,
+        total_decoded,
+    ))
+}
+
 fn write_container(
     flavor: ArtifactFlavor,
     identity: &[u8],
@@ -886,7 +946,8 @@ fn write_container(
         cursor = align_up(cursor, section.alignment)?;
         let (codec, stored) = encode_section(format, section.kind, &section.bytes)?;
         let stored_size = u64::try_from(stored.len()).map_err(|_| Error::NumericOverflow)?;
-        let decoded_size = u64::try_from(section.bytes.len()).map_err(|_| Error::NumericOverflow)?;
+        let decoded_size =
+            u64::try_from(section.bytes.len()).map_err(|_| Error::NumericOverflow)?;
         let descriptor = RawDescriptor {
             kind: section.kind,
             version: section.version,
@@ -898,18 +959,13 @@ fn write_container(
             content_hash: ContentHash::of(&section.bytes),
         };
         validate_descriptor(format, descriptor)?;
+        let stored_length = stored.len();
         stored_sections.push(StoredSection {
             descriptor,
             bytes: stored,
         });
         cursor = cursor
-            .checked_add(
-                stored_sections
-                    .last()
-                    .ok_or(Error::NumericOverflow)?
-                    .bytes
-                    .len(),
-            )
+            .checked_add(stored_length)
             .ok_or(Error::NumericOverflow)?;
     }
     let mut payload = BinaryWriter::with_capacity(cursor.saturating_sub(payload_start));
@@ -941,7 +997,11 @@ fn write_container(
     Ok(writer.finish())
 }
 
-fn read_container(bytes: &[u8], flavor: ArtifactFlavor) -> Result<RawIndex> {
+fn read_container(
+    bytes: &[u8],
+    flavor: ArtifactFlavor,
+    limits: ArtifactDecodeLimits,
+) -> Result<RawIndex> {
     let format = flavor.format();
     let header_size = COMMON_HEADER_BYTES
         .checked_add(flavor.identity_size())
@@ -964,6 +1024,7 @@ fn read_container(bytes: &[u8], flavor: ArtifactFlavor) -> Result<RawIndex> {
             .get(header_size..payload_start)
             .ok_or(Error::ArtifactTruncated { format })?,
         flavor,
+        limits,
     )?;
     validate_spans(bytes, format, payload_start, &sections)?;
     let payload = bytes
@@ -976,7 +1037,11 @@ fn read_container(bytes: &[u8], flavor: ArtifactFlavor) -> Result<RawIndex> {
         });
     }
     for descriptor in &sections {
-        decode_section(bytes, *descriptor, format)?;
+        validate_decoded_section(
+            std::io::Cursor::new(descriptor_slice(bytes, *descriptor, format)?),
+            *descriptor,
+            format,
+        )?;
     }
     Ok(RawIndex {
         identity: header.identity,
@@ -1036,7 +1101,11 @@ fn read_container_header(bytes: &[u8], flavor: ArtifactFlavor) -> Result<RawHead
     })
 }
 
-fn read_container_toc(bytes: &[u8], flavor: ArtifactFlavor) -> Result<Vec<RawDescriptor>> {
+fn read_container_toc(
+    bytes: &[u8],
+    flavor: ArtifactFlavor,
+    limits: ArtifactDecodeLimits,
+) -> Result<Vec<RawDescriptor>> {
     let format = flavor.format();
     if !bytes.len().is_multiple_of(TOC_ENTRY_BYTES) {
         return Err(Error::ArtifactFormat {
@@ -1076,7 +1145,7 @@ fn read_container_toc(bytes: &[u8], flavor: ArtifactFlavor) -> Result<Vec<RawDes
             });
         }
     }
-    validate_decode_limits(format, &sections)?;
+    validate_decode_limits(format, &sections, limits)?;
     Ok(sections)
 }
 
@@ -1091,7 +1160,6 @@ fn validate_section_header(flavor: ArtifactFlavor, section: &RawSection) -> Resu
         });
     }
     validate_alignment(format, section.kind, section.alignment)?;
-    validate_section_size(format, section.kind, "decoded", section.bytes.len() as u64)?;
     Ok(())
 }
 
@@ -1100,24 +1168,13 @@ fn validate_descriptor(format: &'static str, descriptor: RawDescriptor) -> Resul
     if descriptor.content_hash.is_zero()
         || descriptor.codec == ArtifactSectionCodec::Raw
             && descriptor.stored_size != descriptor.decoded_size
+        || descriptor.codec == ArtifactSectionCodec::Zstd && descriptor.stored_size == 0
     {
         return Err(Error::ArtifactFormat {
             format,
             field: format!("section{}.sizeOrHash", descriptor.kind),
         });
     }
-    validate_section_size(
-        format,
-        descriptor.kind,
-        "stored",
-        descriptor.stored_size,
-    )?;
-    validate_section_size(
-        format,
-        descriptor.kind,
-        "decoded",
-        descriptor.decoded_size,
-    )?;
     Ok(())
 }
 
@@ -1126,12 +1183,8 @@ fn validate_section_size(
     section: u16,
     size_kind: &'static str,
     requested: u64,
+    limit: u64,
 ) -> Result<()> {
-    let limit = match size_kind {
-        "stored" => MAX_SECTION_STORED_BYTES,
-        "decoded" => MAX_SECTION_DECODED_BYTES,
-        _ => return Err(Error::NumericOverflow),
-    };
     if requested > limit {
         return Err(Error::ArtifactSectionLimit {
             format,
@@ -1144,18 +1197,49 @@ fn validate_section_size(
     Ok(())
 }
 
-fn validate_decode_limits(format: &'static str, sections: &[RawDescriptor]) -> Result<()> {
-    let mut total = 0_u64;
+fn validate_decode_limits(
+    format: &'static str,
+    sections: &[RawDescriptor],
+    limits: ArtifactDecodeLimits,
+) -> Result<()> {
+    let mut total_stored = 0_u64;
+    let mut total_decoded = 0_u64;
     for descriptor in sections {
-        total = total
+        validate_section_size(
+            format,
+            descriptor.kind,
+            "stored",
+            descriptor.stored_size,
+            limits.max_stored_section_bytes,
+        )?;
+        validate_section_size(
+            format,
+            descriptor.kind,
+            "decoded",
+            descriptor.decoded_size,
+            limits.max_decoded_section_bytes,
+        )?;
+        total_stored = total_stored
+            .checked_add(descriptor.stored_size)
+            .ok_or(Error::NumericOverflow)?;
+        total_decoded = total_decoded
             .checked_add(descriptor.decoded_size)
             .ok_or(Error::NumericOverflow)?;
     }
-    if total > MAX_ARTIFACT_DECODED_BYTES {
-        return Err(Error::ArtifactDecodedLimit {
+    if total_stored > limits.max_total_stored_bytes {
+        return Err(Error::ArtifactTotalLimit {
             format,
-            requested: total,
-            limit: MAX_ARTIFACT_DECODED_BYTES,
+            size_kind: "stored",
+            requested: total_stored,
+            limit: limits.max_total_stored_bytes,
+        });
+    }
+    if total_decoded > limits.max_total_decoded_bytes {
+        return Err(Error::ArtifactTotalLimit {
+            format,
+            size_kind: "decoded",
+            requested: total_decoded,
+            limit: limits.max_total_decoded_bytes,
         });
     }
     Ok(())
@@ -1279,6 +1363,177 @@ fn stream_region(
     Ok(())
 }
 
+struct ArtifactHashingReader<'a, R> {
+    source: R,
+    payload_hasher: &'a mut VegetationContentHasher,
+    artifact_hasher: &'a mut VegetationContentHasher,
+}
+
+impl<R: Read> Read for ArtifactHashingReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let length = self.source.read(buffer)?;
+        self.payload_hasher
+            .update(&buffer[..length])
+            .and_then(|()| self.artifact_hasher.update(&buffer[..length]))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(length)
+    }
+}
+
+struct PrefixReplayReader<R> {
+    prefix: [u8; 18],
+    prefix_length: usize,
+    prefix_position: usize,
+    source: R,
+}
+
+impl<R: Read> Read for PrefixReplayReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.prefix_position < self.prefix_length {
+            let length = buffer.len().min(self.prefix_length - self.prefix_position);
+            buffer[..length]
+                .copy_from_slice(&self.prefix[self.prefix_position..self.prefix_position + length]);
+            self.prefix_position += length;
+            return Ok(length);
+        }
+        self.source.read(buffer)
+    }
+}
+
+fn hash_decoded_reader(
+    reader: &mut impl Read,
+    expected_size: u64,
+) -> std::io::Result<(u64, ContentHash)> {
+    let mut hasher = VegetationContentHasher::new();
+    let mut decoded_size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = reader.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        decoded_size = decoded_size
+            .checked_add(
+                u64::try_from(length).map_err(|error| std::io::Error::other(error.to_string()))?,
+            )
+            .filter(|size| *size <= expected_size)
+            .ok_or_else(|| std::io::Error::other("decoded section exceeds declared size"))?;
+        hasher
+            .update(&buffer[..length])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    let hash = hasher
+        .finalize()
+        .map(ContentHash::new)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok((decoded_size, hash))
+}
+
+fn validate_decoded_section<R: Read>(
+    mut source: R,
+    descriptor: RawDescriptor,
+    format: &'static str,
+) -> Result<()> {
+    let (decoded_size, content_hash) = match descriptor.codec {
+        ArtifactSectionCodec::Raw => hash_decoded_reader(&mut source, descriptor.decoded_size)
+            .map_err(|source| Error::ArtifactIo { format, source })?,
+        ArtifactSectionCodec::Zstd => {
+            let prefix_length = usize::try_from(descriptor.stored_size.min(18))
+                .map_err(|_| Error::NumericOverflow)?;
+            let mut prefix = [0_u8; 18];
+            source
+                .read_exact(&mut prefix[..prefix_length])
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                })?;
+            let frame_content_size =
+                zstd::zstd_safe::get_frame_content_size(&prefix[..prefix_length])
+                    .map_err(|source| Error::ArtifactCodec {
+                        format,
+                        section: descriptor.kind,
+                        source: std::io::Error::other(source.to_string()),
+                    })?
+                    .ok_or_else(|| Error::ArtifactFormat {
+                        format,
+                        field: format!("section{}.zstdContentSize", descriptor.kind),
+                    })?;
+            if frame_content_size != descriptor.decoded_size {
+                return Err(Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.decodedSize", descriptor.kind),
+                });
+            }
+            let replay = PrefixReplayReader {
+                prefix,
+                prefix_length,
+                prefix_position: 0,
+                source,
+            };
+            let mut decoder = zstd::stream::read::Decoder::new(replay)
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                })?
+                .single_frame();
+            decoder
+                .window_log_max(ZSTD_WINDOW_LOG)
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                })?;
+            let decoded =
+                hash_decoded_reader(&mut decoder, descriptor.decoded_size).map_err(|source| {
+                    Error::ArtifactCodec {
+                        format,
+                        section: descriptor.kind,
+                        source,
+                    }
+                })?;
+            let buffered = decoder.finish();
+            if !buffered.buffer().is_empty() {
+                return Err(Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.zstdFrameSize", descriptor.kind),
+                });
+            }
+            let mut replay = buffered.into_inner();
+            let mut trailing = [0_u8; 1];
+            if replay
+                .read(&mut trailing)
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                })?
+                != 0
+            {
+                return Err(Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.zstdFrameSize", descriptor.kind),
+                });
+            }
+            decoded
+        }
+    };
+    if decoded_size != descriptor.decoded_size {
+        return Err(Error::ArtifactFormat {
+            format,
+            field: format!("section{}.decodedSize", descriptor.kind),
+        });
+    }
+    if content_hash != descriptor.content_hash {
+        return Err(Error::ArtifactHashMismatch {
+            format,
+            subject: format!("section {}", descriptor.kind),
+        });
+    }
+    Ok(())
+}
+
 fn read_exact_artifact(
     source: &mut impl Read,
     bytes: &mut [u8],
@@ -1293,13 +1548,187 @@ fn read_exact_artifact(
     })
 }
 
+fn encode_section(
+    format: &'static str,
+    section: u16,
+    decoded: &[u8],
+) -> Result<(ArtifactSectionCodec, Vec<u8>)> {
+    let decoded_size = u64::try_from(decoded.len()).map_err(|_| Error::NumericOverflow)?;
+
+    let mut encoder =
+        zstd::stream::Encoder::new(Vec::new(), ZSTD_COMPRESSION_LEVEL).map_err(|source| {
+            Error::ArtifactCodec {
+                format,
+                section,
+                source,
+            }
+        })?;
+    encoder
+        .include_checksum(true)
+        .and_then(|()| encoder.include_dictid(false))
+        .and_then(|()| encoder.include_contentsize(true))
+        .and_then(|()| encoder.long_distance_matching(false))
+        .and_then(|()| encoder.window_log(ZSTD_WINDOW_LOG))
+        .and_then(|()| encoder.set_pledged_src_size(Some(decoded_size)))
+        .and_then(|()| encoder.write_all(decoded))
+        .map_err(|source| Error::ArtifactCodec {
+            format,
+            section,
+            source,
+        })?;
+    let compressed = encoder.finish().map_err(|source| Error::ArtifactCodec {
+        format,
+        section,
+        source,
+    })?;
+    if compressed.len() < decoded.len() {
+        return Ok((ArtifactSectionCodec::Zstd, compressed));
+    }
+
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(decoded.len())
+        .map_err(|source| Error::MemoryReservation {
+            resource: "vegetation artifact raw section",
+            source,
+        })?;
+    raw.extend_from_slice(decoded);
+    Ok((ArtifactSectionCodec::Raw, raw))
+}
+
+fn decode_stored_section<'a>(
+    stored: &'a [u8],
+    descriptor: RawDescriptor,
+    format: &'static str,
+    limits: ArtifactDecodeLimits,
+) -> Result<Cow<'a, [u8]>> {
+    validate_section_size(
+        format,
+        descriptor.kind,
+        "stored",
+        descriptor.stored_size,
+        limits.max_stored_section_bytes,
+    )?;
+    validate_section_size(
+        format,
+        descriptor.kind,
+        "decoded",
+        descriptor.decoded_size,
+        limits.max_decoded_section_bytes,
+    )?;
+    let decoded = match descriptor.codec {
+        ArtifactSectionCodec::Raw => Cow::Borrowed(stored),
+        ArtifactSectionCodec::Zstd => {
+            let frame_size =
+                zstd::zstd_safe::find_frame_compressed_size(stored).map_err(|code| {
+                    Error::ArtifactCodec {
+                        format,
+                        section: descriptor.kind,
+                        source: std::io::Error::other(zstd::zstd_safe::get_error_name(code)),
+                    }
+                })?;
+            if frame_size != stored.len() {
+                return Err(Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.zstdFrameSize", descriptor.kind),
+                });
+            }
+            let frame_content_size = zstd::zstd_safe::get_frame_content_size(stored)
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source: std::io::Error::other(source.to_string()),
+                })?
+                .ok_or_else(|| Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.zstdContentSize", descriptor.kind),
+                })?;
+            if frame_content_size != descriptor.decoded_size {
+                return Err(Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.decodedSize", descriptor.kind),
+                });
+            }
+            let decoded_size =
+                usize::try_from(descriptor.decoded_size).map_err(|_| Error::NumericOverflow)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(decoded_size)
+                .map_err(|source| Error::MemoryReservation {
+                    resource: "vegetation artifact decoded section",
+                    source,
+                })?;
+            bytes.resize(decoded_size, 0);
+            let mut decoder = zstd::stream::read::Decoder::new(stored).map_err(|source| {
+                Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                }
+            })?;
+            decoder
+                .window_log_max(ZSTD_WINDOW_LOG)
+                .and_then(|()| decoder.read_exact(&mut bytes))
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                })?;
+            let mut extra = [0_u8; 1];
+            if decoder
+                .read(&mut extra)
+                .map_err(|source| Error::ArtifactCodec {
+                    format,
+                    section: descriptor.kind,
+                    source,
+                })?
+                != 0
+            {
+                return Err(Error::ArtifactFormat {
+                    format,
+                    field: format!("section{}.decodedSize", descriptor.kind),
+                });
+            }
+            Cow::Owned(bytes)
+        }
+    };
+    if u64::try_from(decoded.len()).map_err(|_| Error::NumericOverflow)? != descriptor.decoded_size
+    {
+        return Err(Error::ArtifactFormat {
+            format,
+            field: format!("section{}.decodedSize", descriptor.kind),
+        });
+    }
+    if ContentHash::of(decoded.as_ref()) != descriptor.content_hash {
+        return Err(Error::ArtifactHashMismatch {
+            format,
+            subject: format!("section {}", descriptor.kind),
+        });
+    }
+    Ok(decoded)
+}
+
+fn decode_section<'a>(
+    bytes: &'a [u8],
+    descriptor: RawDescriptor,
+    format: &'static str,
+    limits: ArtifactDecodeLimits,
+) -> Result<Cow<'a, [u8]>> {
+    decode_stored_section(
+        descriptor_slice(bytes, descriptor, format)?,
+        descriptor,
+        format,
+        limits,
+    )
+}
+
 fn section_bytes<'a>(
     bytes: &'a [u8],
     descriptor: Option<RawDescriptor>,
     format: &'static str,
-) -> Result<Option<&'a [u8]>> {
+    limits: ArtifactDecodeLimits,
+) -> Result<Option<Cow<'a, [u8]>>> {
     descriptor
-        .map(|descriptor| descriptor_slice(bytes, descriptor, format))
+        .map(|descriptor| decode_section(bytes, descriptor, format, limits))
         .transpose()
 }
 
@@ -1363,6 +1792,7 @@ mod tests {
     const DESCRIPTOR_CODEC: usize = 6;
     const DESCRIPTOR_ALIGNMENT: usize = 7;
     const DESCRIPTOR_OFFSET: usize = 11;
+    const DESCRIPTOR_DECODED_SIZE: usize = 27;
     const DESCRIPTOR_HASH: usize = 35;
 
     fn cell_header() -> VegetationCellArtifactHeader {
@@ -1375,23 +1805,22 @@ mod tests {
 
     fn cell_sections() -> Vec<VegetationCellSection> {
         vec![
-            VegetationCellSection::raw(VegetationCellSectionKind::MacroPoints, vec![1, 2, 3]),
-            VegetationCellSection::raw(VegetationCellSectionKind::MicroFields, vec![4, 5]),
-            VegetationCellSection::raw(VegetationCellSectionKind::RenderBounds, vec![6; 33]),
+            VegetationCellSection::new(VegetationCellSectionKind::MacroPoints, vec![1, 2, 3]),
+            VegetationCellSection::new(VegetationCellSectionKind::MicroFields, vec![4, 5]),
+            VegetationCellSection::new(VegetationCellSectionKind::RenderBounds, vec![6; 33]),
         ]
     }
 
     #[test]
     fn negative_cell_and_sections_round_trip() {
         let bytes = write_vegetation_cell_artifact(cell_header(), &cell_sections()).unwrap();
-        let index = VegetationCellArtifactIndex::open(&bytes).unwrap();
+        let index =
+            VegetationCellArtifactIndex::open(&bytes, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
         assert_eq!(index.cell, WorldCellKey::base(-7, 3, -2));
-        assert_eq!(
-            index
-                .section(&bytes, VegetationCellSectionKind::MicroFields)
-                .unwrap(),
-            Some([4_u8, 5].as_slice())
-        );
+        let micro_fields = index
+            .section(&bytes, VegetationCellSectionKind::MicroFields)
+            .unwrap();
+        assert_eq!(micro_fields.as_deref(), Some([4_u8, 5].as_slice()));
         assert_eq!(
             index
                 .section(&bytes, VegetationCellSectionKind::Provenance)
@@ -1404,8 +1833,22 @@ mod tests {
     fn streaming_reader_validates_once_and_reads_only_the_requested_facet() {
         let bytes = write_vegetation_cell_artifact(cell_header(), &cell_sections()).unwrap();
         let expected_hash = ContentHash::of(&bytes);
-        let expected_index = VegetationCellArtifactIndex::open(&bytes).unwrap();
-        let mut reader = VegetationCellArtifactReader::open(std::io::Cursor::new(bytes)).unwrap();
+        let expected_index =
+            VegetationCellArtifactIndex::open(&bytes, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
+        assert_eq!(
+            expected_index
+                .sections
+                .iter()
+                .find(|section| section.kind == VegetationCellSectionKind::RenderBounds)
+                .unwrap()
+                .codec,
+            ArtifactSectionCodec::Zstd
+        );
+        let mut reader = VegetationCellArtifactReader::open(
+            std::io::Cursor::new(bytes),
+            VEGETATION_ARTIFACT_DECODE_LIMITS,
+        )
+        .unwrap();
         assert_eq!(reader.artifact_hash(), expected_hash);
         assert_eq!(reader.index(), &expected_index);
         assert_eq!(
@@ -1428,13 +1871,17 @@ mod tests {
         let mut corrupt = bytes.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(matches!(
-            VegetationCellArtifactReader::open(std::io::Cursor::new(corrupt)),
-            Err(Error::ArtifactHashMismatch { .. })
+            VegetationCellArtifactReader::open(
+                std::io::Cursor::new(corrupt),
+                VEGETATION_ARTIFACT_DECODE_LIMITS
+            ),
+            Err(Error::ArtifactCodec { .. })
         ));
         assert!(matches!(
-            VegetationCellArtifactReader::open(std::io::Cursor::new(
-                bytes[..bytes.len() - 1].to_vec()
-            )),
+            VegetationCellArtifactReader::open(
+                std::io::Cursor::new(bytes[..bytes.len() - 1].to_vec()),
+                VEGETATION_ARTIFACT_DECODE_LIMITS
+            ),
             Err(Error::ArtifactTruncated { .. })
         ));
     }
@@ -1451,13 +1898,138 @@ mod tests {
     }
 
     #[test]
+    fn canonical_codec_uses_zstd_only_when_it_is_smaller() {
+        let sections = vec![
+            VegetationCellSection::new(VegetationCellSectionKind::MacroPoints, vec![1, 2, 3]),
+            VegetationCellSection::new(
+                VegetationCellSectionKind::MicroFields,
+                vec![0x5a; 64 * 1024],
+            ),
+        ];
+        let first = write_vegetation_cell_artifact(cell_header(), &sections).unwrap();
+        let second = write_vegetation_cell_artifact(cell_header(), &sections).unwrap();
+        assert_eq!(first, second);
+
+        let index =
+            VegetationCellArtifactIndex::open(&first, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
+        let raw = index
+            .sections
+            .iter()
+            .find(|section| section.kind == VegetationCellSectionKind::MacroPoints)
+            .unwrap();
+        assert_eq!(raw.codec, ArtifactSectionCodec::Raw);
+        assert_eq!(raw.stored_size, raw.decoded_size);
+        let compressed = index
+            .sections
+            .iter()
+            .find(|section| section.kind == VegetationCellSectionKind::MicroFields)
+            .unwrap();
+        assert_eq!(compressed.codec, ArtifactSectionCodec::Zstd);
+        assert!(compressed.stored_size < compressed.decoded_size);
+        assert_eq!(compressed.content_hash, ContentHash::of(&sections[1].bytes));
+        let stored_begin = usize::try_from(compressed.offset).unwrap();
+        let stored_end = stored_begin + usize::try_from(compressed.stored_size).unwrap();
+        let stored = &first[stored_begin..stored_end];
+        assert_eq!(&stored[..4], [0x28, 0xb5, 0x2f, 0xfd]);
+        assert_ne!(stored[4] & 0x04, 0);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(stored).unwrap(),
+            Some(compressed.decoded_size)
+        );
+        let decoded = index
+            .section(&first, VegetationCellSectionKind::MicroFields)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.as_ref(), sections[1].bytes);
+    }
+
+    #[test]
+    fn zstd_checksum_corruption_and_truncation_are_typed_failures() {
+        let sections = vec![VegetationCellSection::new(
+            VegetationCellSectionKind::MacroPoints,
+            vec![0xa5; 64 * 1024],
+        )];
+        let mut bytes = write_vegetation_cell_artifact(cell_header(), &sections).unwrap();
+        let index =
+            VegetationCellArtifactIndex::open(&bytes, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
+        let descriptor = index.sections[0];
+        assert_eq!(descriptor.codec, ArtifactSectionCodec::Zstd);
+
+        let stored_begin = usize::try_from(descriptor.offset).unwrap();
+        let stored_size = usize::try_from(descriptor.stored_size).unwrap();
+        let stored_end = stored_begin + stored_size;
+        let mut truncated = bytes[stored_begin..stored_end].to_vec();
+        truncated.pop();
+        let truncated_descriptor = RawDescriptor {
+            stored_size: descriptor.stored_size - 1,
+            ..descriptor.into()
+        };
+        assert!(matches!(
+            decode_stored_section(
+                &truncated,
+                truncated_descriptor,
+                ".svegcell",
+                VEGETATION_ARTIFACT_DECODE_LIMITS
+            ),
+            Err(Error::ArtifactCodec { .. })
+        ));
+
+        bytes[stored_end - 1] ^= 1;
+        let payload_start = CELL_TOC_START + index.sections.len() * TOC_ENTRY_BYTES;
+        let payload_hash = ContentHash::of(&bytes[payload_start..]);
+        bytes[CELL_TOC_START - 32..CELL_TOC_START].copy_from_slice(&payload_hash.bytes());
+        assert!(matches!(
+            VegetationCellArtifactIndex::open(&bytes, VEGETATION_ARTIFACT_DECODE_LIMITS),
+            Err(Error::ArtifactCodec { .. })
+        ));
+    }
+
+    #[test]
+    fn decoded_size_limits_are_validated_from_the_toc() {
+        let bytes = write_vegetation_cell_artifact(cell_header(), &cell_sections()).unwrap();
+        let mut oversized = bytes;
+        let section_limits = ArtifactDecodeLimits::new(u64::MAX, u64::MAX, 2, u64::MAX);
+        oversized[CELL_TOC_START + DESCRIPTOR_DECODED_SIZE
+            ..CELL_TOC_START + DESCRIPTOR_DECODED_SIZE + 8]
+            .copy_from_slice(&3_u64.to_be_bytes());
+        assert!(matches!(
+            VegetationCellArtifactIndex::open(&oversized, section_limits),
+            Err(Error::ArtifactSectionLimit {
+                size_kind: "decoded",
+                ..
+            })
+        ));
+
+        let descriptor = RawDescriptor {
+            kind: 1,
+            version: 1,
+            codec: ArtifactSectionCodec::Zstd,
+            alignment: 16,
+            offset: 0,
+            stored_size: 1,
+            decoded_size: 10,
+            content_hash: ContentHash::new([1; 32]),
+        };
+        let total_limits = ArtifactDecodeLimits::new(u64::MAX, u64::MAX, 10, 40);
+        assert!(matches!(
+            validate_decode_limits("test artifact", &[descriptor; 5], total_limits),
+            Err(Error::ArtifactTotalLimit {
+                size_kind: "decoded",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn one_section_change_preserves_unrelated_section_identity() {
         let first = write_vegetation_cell_artifact(cell_header(), &cell_sections()).unwrap();
         let mut changed = cell_sections();
         changed[1].bytes.push(9);
         let second = write_vegetation_cell_artifact(cell_header(), &changed).unwrap();
-        let first = VegetationCellArtifactIndex::open(&first).unwrap();
-        let second = VegetationCellArtifactIndex::open(&second).unwrap();
+        let first =
+            VegetationCellArtifactIndex::open(&first, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
+        let second =
+            VegetationCellArtifactIndex::open(&second, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
         let hash = |index: &VegetationCellArtifactIndex, kind| {
             index
                 .sections
@@ -1483,11 +2055,14 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&corrupt),
+            VegetationCellArtifactIndex::open(&corrupt, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactHashMismatch { .. })
         ));
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&bytes[..bytes.len() - 1]),
+            VegetationCellArtifactIndex::open(
+                &bytes[..bytes.len() - 1],
+                VEGETATION_ARTIFACT_DECODE_LIMITS
+            ),
             Err(Error::ArtifactTruncated { .. })
         ));
     }
@@ -1498,13 +2073,13 @@ mod tests {
         let mut version = bytes.clone();
         version[8..12].copy_from_slice(&2_u32.to_be_bytes());
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&version),
+            VegetationCellArtifactIndex::open(&version, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::FormatVersion { found: 2, .. })
         ));
         let mut schema = bytes;
         schema[12] ^= 1;
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&schema),
+            VegetationCellArtifactIndex::open(&schema, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactSchema { .. })
         ));
     }
@@ -1516,14 +2091,14 @@ mod tests {
         unknown_section[CELL_TOC_START..CELL_TOC_START + 2]
             .copy_from_slice(&u16::MAX.to_be_bytes());
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&unknown_section),
+            VegetationCellArtifactIndex::open(&unknown_section, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactUnknownSection { .. })
         ));
 
         let mut unknown_codec = bytes.clone();
         unknown_codec[CELL_TOC_START + DESCRIPTOR_CODEC] = u8::MAX;
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&unknown_codec),
+            VegetationCellArtifactIndex::open(&unknown_codec, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactUnknownCodec { .. })
         ));
 
@@ -1532,7 +2107,10 @@ mod tests {
             [CELL_TOC_START + DESCRIPTOR_VERSION..CELL_TOC_START + DESCRIPTOR_VERSION + 4]
             .copy_from_slice(&2_u32.to_be_bytes());
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&unsupported_version),
+            VegetationCellArtifactIndex::open(
+                &unsupported_version,
+                VEGETATION_ARTIFACT_DECODE_LIMITS
+            ),
             Err(Error::FormatVersion { found: 2, .. })
         ));
 
@@ -1541,7 +2119,7 @@ mod tests {
         let first_kind = duplicate[CELL_TOC_START..CELL_TOC_START + 2].to_vec();
         duplicate[second..second + 2].copy_from_slice(&first_kind);
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&duplicate),
+            VegetationCellArtifactIndex::open(&duplicate, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactDuplicateSection { .. })
         ));
     }
@@ -1555,7 +2133,10 @@ mod tests {
         invalid_alignment[second + DESCRIPTOR_ALIGNMENT..second + DESCRIPTOR_ALIGNMENT + 4]
             .copy_from_slice(&3_u32.to_be_bytes());
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&invalid_alignment),
+            VegetationCellArtifactIndex::open(
+                &invalid_alignment,
+                VEGETATION_ARTIFACT_DECODE_LIMITS
+            ),
             Err(Error::ArtifactMisalignedSection { .. })
         ));
 
@@ -1566,14 +2147,14 @@ mod tests {
         overlapping[second + DESCRIPTOR_OFFSET..second + DESCRIPTOR_OFFSET + 8]
             .copy_from_slice(&first_offset);
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&overlapping),
+            VegetationCellArtifactIndex::open(&overlapping, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactOverlappingSection { .. })
         ));
 
         let mut section_hash = bytes;
         section_hash[CELL_TOC_START + DESCRIPTOR_HASH] ^= 1;
         assert!(matches!(
-            VegetationCellArtifactIndex::open(&section_hash),
+            VegetationCellArtifactIndex::open(&section_hash, VEGETATION_ARTIFACT_DECODE_LIMITS),
             Err(Error::ArtifactHashMismatch { subject, .. }) if subject == "section 1"
         ));
     }
@@ -1582,7 +2163,14 @@ mod tests {
     fn plant_container_uses_the_same_strict_toc_contract() {
         let sections = PlantCompiledSectionKind::ALL
             .into_iter()
-            .map(|kind| PlantCompiledSection::raw(kind, vec![kind as u8]))
+            .map(|kind| {
+                let bytes = if kind == PlantCompiledSectionKind::Validation {
+                    vec![kind as u8; 64 * 1024]
+                } else {
+                    vec![kind as u8]
+                };
+                PlantCompiledSection::new(kind, bytes)
+            })
             .collect::<Vec<_>>();
         let bytes = write_plant_compiled_artifact(
             PlantCompiledArtifactHeader {
@@ -1593,13 +2181,26 @@ mod tests {
             &sections,
         )
         .unwrap();
-        let index = PlantCompiledArtifactIndex::open(&bytes).unwrap();
+        let index =
+            PlantCompiledArtifactIndex::open(&bytes, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
         assert_eq!(index.family, Uuid(77));
+        let part_table = index
+            .section(&bytes, PlantCompiledSectionKind::PartTable)
+            .unwrap();
         assert_eq!(
-            index
-                .section(&bytes, PlantCompiledSectionKind::PartTable)
-                .unwrap(),
+            part_table.as_deref(),
             Some([PlantCompiledSectionKind::PartTable as u8].as_slice())
         );
+        let validation = index
+            .sections
+            .iter()
+            .find(|section| section.kind == PlantCompiledSectionKind::Validation)
+            .unwrap();
+        assert_eq!(validation.codec, ArtifactSectionCodec::Zstd);
+        let decoded = index
+            .section(&bytes, PlantCompiledSectionKind::Validation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.as_ref(), sections.last().unwrap().bytes);
     }
 }

@@ -18,7 +18,7 @@ const MAP_CHUNK_MAGIC: &[u8; 8] = b"SVEGCH01";
 /// SHA-256 identity of the `.splant` binary field vocabulary.
 #[must_use]
 pub fn plant_asset_schema_hash() -> [u8; 32] {
-    sha256(b"saffron-anima/splant/schema/v4/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotypes+collision+navigation+interaction+habitat")
+    sha256(b"saffron-anima/splant/schema/v4/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotypes+collision+navigation+interaction+habitat+ecology+botanical")
 }
 
 /// SHA-256 identity of the `.sbiome` binary field vocabulary.
@@ -85,6 +85,14 @@ pub fn write_plant_asset(asset: &PlantFamilyAsset) -> Result<Vec<u8>> {
     writer.vec(&asset.phenotypes, |writer, phenotype| {
         writer.u32(phenotype.id);
         writer.u8(phenotype_role_tag(phenotype.role));
+        match phenotype.season_window {
+            Some((start, end)) => {
+                writer.u8(1);
+                writer.u16(start);
+                writer.u16(end);
+            }
+            None => writer.u8(0),
+        }
         writer.u32(phenotype.variation);
         writer.vec(&phenotype.material_remap, |writer, (from, to)| {
             writer.u32(*from);
@@ -130,6 +138,7 @@ pub fn write_plant_asset(asset: &PlantFamilyAsset) -> Result<Vec<u8>> {
         writer.unit(habitat.shade_tolerance);
         Ok(())
     })?;
+    write_plant_ecology(&mut writer, &asset.ecology)?;
     Ok(writer.finish())
 }
 
@@ -173,6 +182,11 @@ pub fn read_plant_asset(bytes: &[u8]) -> Result<PlantFamilyAsset> {
             Ok(PlantPhenotype {
                 id: reader.u32()?,
                 role: phenotype_role(reader.u8()?)?,
+                season_window: match reader.u8()? {
+                    0 => None,
+                    1 => Some((reader.u16()?, reader.u16()?)),
+                    _ => return Err(invalid_enum(".splant", "phenotypes.seasonWindow")),
+                },
                 variation: reader.u32()?,
                 material_remap: reader.vec(|reader| Ok((reader.u32()?, reader.u32()?)))?,
                 active_parts: reader.vec(Reader::u128)?,
@@ -206,10 +220,55 @@ pub fn read_plant_asset(bytes: &[u8]) -> Result<PlantFamilyAsset> {
                 shade_tolerance: reader.unit()?,
             })
         })?,
+        ecology: read_plant_ecology(&mut reader)?,
     };
     reader.complete()?;
     validate_plant_family(&asset)?;
     Ok(asset)
+}
+
+fn write_plant_ecology(
+    writer: &mut Writer,
+    ecology: &crate::PlantEcologyDeclaration,
+) -> Result<()> {
+    for tick in ecology.rules.stage_ticks {
+        writer.u64(tick);
+    }
+    writer.unit(ecology.rules.shade_tolerance);
+    writer.unit(ecology.rules.drought_tolerance);
+    writer.unit(ecology.rules.propagation_chance);
+    writer.u32(ecology.rules.spread_radius_m);
+    writer.unit(ecology.rules.regrowth_chance);
+    writer.unit(ecology.rules.deadfall_chance);
+    writer.unit(ecology.rules.root_demand);
+    writer.vec(&ecology.relations, |writer, relation| {
+        writer.uuid(relation.family);
+        writer.u32(relation.kind as u32);
+        writer.unit(relation.strength);
+        Ok(())
+    })
+}
+
+fn read_plant_ecology(reader: &mut Reader<'_>) -> Result<crate::PlantEcologyDeclaration> {
+    Ok(crate::PlantEcologyDeclaration {
+        rules: crate::EcologySpeciesRules {
+            stage_ticks: [reader.u64()?, reader.u64()?, reader.u64()?, reader.u64()?],
+            shade_tolerance: reader.unit()?,
+            drought_tolerance: reader.unit()?,
+            propagation_chance: reader.unit()?,
+            spread_radius_m: reader.u32()?,
+            regrowth_chance: reader.unit()?,
+            deadfall_chance: reader.unit()?,
+            root_demand: reader.unit()?,
+        },
+        relations: reader.vec(|reader| {
+            Ok(crate::PlantSpeciesRelation {
+                family: reader.uuid()?,
+                kind: crate::PlantRelationKind::try_from(reader.u32()?)?,
+                strength: reader.unit()?,
+            })
+        })?,
+    })
 }
 
 fn write_plant_source(writer: &mut Writer, source: &PlantFamilySource) -> Result<()> {
@@ -234,10 +293,19 @@ fn write_plant_source(writer: &mut Writer, source: &PlantFamilySource) -> Result
                 Ok(())
             })
         }
-        PlantFamilySource::Native(graph) => {
+        PlantFamilySource::Native { graph, grafts } => {
             writer.u8(1);
-            writer.bytes(&graph.schema_hash);
-            writer.value(&graph.graph)
+            write_botanical_graph(writer, graph)?;
+            writer.vec(grafts, |writer, source| {
+                writer.u128(source.id);
+                write_source_locator(writer, &source.locator)?;
+                writer.u8(source_role_tag(source.role));
+                write_source_selector(writer, &source.selector)?;
+                writer.bytes(&source.content_hash);
+                write_import_settings(writer, &source.settings)?;
+                write_source_provenance(writer, &source.provenance)?;
+                Ok(())
+            })
         }
     }
 }
@@ -265,12 +333,304 @@ fn read_plant_source(reader: &mut Reader<'_>) -> Result<PlantFamilySource> {
                 })
             })?,
         })),
-        1 => Ok(PlantFamilySource::Native(NativeBotanicalGraph {
-            schema_hash: reader.array()?,
-            graph: reader.value()?,
-        })),
+        1 => Ok(PlantFamilySource::Native {
+            graph: read_botanical_graph(reader)?,
+            grafts: reader.vec(|reader| {
+                Ok(PlantSourceReference {
+                    id: reader.u128()?,
+                    locator: read_source_locator(reader)?,
+                    role: source_role(reader.u8()?)?,
+                    selector: read_source_selector(reader)?,
+                    content_hash: reader.array()?,
+                    settings: read_import_settings(reader)?,
+                    provenance: read_source_provenance(reader)?,
+                })
+            })?,
+        }),
         _ => Err(reader.invalid("source")),
     }
+}
+
+fn write_botanical_graph(writer: &mut Writer, graph: &crate::BotanicalGraphDocument) -> Result<()> {
+    writer.vec(&graph.variations, |writer, variation| {
+        writer.u128(variation.seed);
+        writer.unit(variation.age);
+        writer.string(&variation.name)
+    })?;
+    writer.vec(&graph.nodes, |writer, node| {
+        writer.u128(node.guid);
+        writer.u32(node.version);
+        writer.u32(node.semantic_revision);
+        write_botanical_operator(writer, &node.operator)
+    })?;
+    writer.vec(&graph.edges, |writer, edge| {
+        writer.u128(edge.from_node);
+        writer.string(&edge.from_pin)?;
+        writer.u128(edge.to_node);
+        writer.string(&edge.to_pin)
+    })?;
+    writer.vec(&graph.edits, |writer, edit| {
+        writer.u128(edit.target.value());
+        match edit.action {
+            crate::BotanicalEditAction::Transform {
+                offset,
+                roll,
+                scale,
+            } => {
+                writer.u8(0);
+                for component in offset {
+                    writer.fixed(component);
+                }
+                writer.unit(roll);
+                writer.fixed(scale);
+            }
+            crate::BotanicalEditAction::Trim { at } => {
+                writer.u8(1);
+                writer.unit(at);
+            }
+            crate::BotanicalEditAction::Remove => writer.u8(2),
+            crate::BotanicalEditAction::Graft {
+                ref source,
+                ref selector,
+            } => {
+                writer.u8(3);
+                writer.u128(*source);
+                write_source_selector(writer, selector)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn write_botanical_operator(
+    writer: &mut Writer,
+    operator: &crate::BotanicalOperator,
+) -> Result<()> {
+    use crate::BotanicalOperator as Op;
+    match operator {
+        Op::Trunk {
+            element,
+            length,
+            base_radius,
+            taper,
+            segments,
+        } => {
+            writer.u8(0);
+            writer.u32(element.tag());
+            writer.fixed(*length);
+            writer.fixed(*base_radius);
+            writer.vec(taper.points(), |writer, (at, value)| {
+                writer.unit(*at);
+                writer.fixed(*value);
+                Ok(())
+            })?;
+            writer.u32(*segments);
+        }
+        Op::Branch {
+            element,
+            length_ratio,
+            radius_ratio,
+            declination,
+            jitter,
+            segments,
+        } => {
+            writer.u8(1);
+            writer.u32(element.tag());
+            for value in [length_ratio, radius_ratio, declination, jitter] {
+                writer.unit(*value);
+            }
+            writer.u32(*segments);
+        }
+        Op::Phyllotaxis {
+            pattern,
+            count,
+            nodes,
+            start,
+            end,
+            divergence,
+        } => {
+            writer.u8(2);
+            writer.u32(pattern.tag());
+            writer.u32(*count);
+            writer.u32(*nodes);
+            for value in [start, end, divergence] {
+                writer.unit(*value);
+            }
+        }
+        Op::Tropism { kind, strength } => {
+            writer.u8(3);
+            writer.u32(kind.tag());
+            writer.unit(*strength);
+        }
+        Op::Prune {
+            rule,
+            threshold,
+            count,
+        } => {
+            writer.u8(4);
+            writer.u32(rule.tag());
+            writer.fixed(*threshold);
+            writer.u32(*count);
+        }
+        Op::Roots {
+            depth_ratio,
+            spread_ratio,
+            count,
+        } => {
+            writer.u8(5);
+            writer.unit(*depth_ratio);
+            writer.unit(*spread_ratio);
+            writer.u32(*count);
+        }
+        Op::Shell {
+            material_slot,
+            sides,
+        } => {
+            writer.u8(6);
+            writer.u32(*material_slot);
+            writer.u32(*sides);
+        }
+        Op::Instance {
+            element,
+            material_slot,
+            size,
+            jitter,
+        } => {
+            writer.u8(7);
+            writer.u32(element.tag());
+            writer.u32(*material_slot);
+            writer.fixed(*size);
+            writer.unit(*jitter);
+        }
+        Op::Family => writer.u8(8),
+        Op::Drawn { element, points } => {
+            writer.u8(9);
+            writer.u32(element.tag());
+            writer.vec(points, |writer, point| {
+                for component in point.position {
+                    writer.fixed(component);
+                }
+                writer.fixed(point.radius);
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn read_botanical_graph(reader: &mut Reader<'_>) -> Result<crate::BotanicalGraphDocument> {
+    let graph = crate::BotanicalGraphDocument {
+        variations: reader.vec(|reader| {
+            Ok(crate::BotanicalVariation {
+                seed: reader.u128()?,
+                age: reader.unit()?,
+                name: reader.string()?,
+            })
+        })?,
+        nodes: reader.vec(|reader| {
+            Ok(crate::BotanicalNode {
+                guid: reader.u128()?,
+                version: reader.u32()?,
+                semantic_revision: reader.u32()?,
+                operator: read_botanical_operator(reader)?,
+            })
+        })?,
+        edges: reader.vec(|reader| {
+            Ok(crate::BotanicalEdge {
+                from_node: reader.u128()?,
+                from_pin: reader.string()?,
+                to_node: reader.u128()?,
+                to_pin: reader.string()?,
+            })
+        })?,
+        edits: reader.vec(|reader| {
+            Ok(crate::BotanicalManualEdit {
+                target: crate::BotanicalElementId::from_value(reader.u128()?),
+                action: match reader.u8()? {
+                    0 => crate::BotanicalEditAction::Transform {
+                        offset: [reader.fixed()?, reader.fixed()?, reader.fixed()?],
+                        roll: reader.unit()?,
+                        scale: reader.fixed()?,
+                    },
+                    1 => crate::BotanicalEditAction::Trim { at: reader.unit()? },
+                    2 => crate::BotanicalEditAction::Remove,
+                    3 => crate::BotanicalEditAction::Graft {
+                        source: reader.u128()?,
+                        selector: read_source_selector(reader)?,
+                    },
+                    _ => return Err(reader.invalid("edits.action")),
+                },
+            })
+        })?,
+    };
+    graph.validate()?;
+    Ok(graph)
+}
+
+fn read_botanical_operator(reader: &mut Reader<'_>) -> Result<crate::BotanicalOperator> {
+    use crate::BotanicalOperator as Op;
+    Ok(match reader.u8()? {
+        0 => Op::Trunk {
+            element: crate::BotanicalElement::try_from(reader.u32()?)?,
+            length: reader.fixed()?,
+            base_radius: reader.fixed()?,
+            taper: saffron_spatial::DecisionCurve::new(
+                reader.vec(|reader| Ok((reader.unit()?, reader.fixed()?)))?,
+            )?,
+            segments: reader.u32()?,
+        },
+        1 => Op::Branch {
+            element: crate::BotanicalElement::try_from(reader.u32()?)?,
+            length_ratio: reader.unit()?,
+            radius_ratio: reader.unit()?,
+            declination: reader.unit()?,
+            jitter: reader.unit()?,
+            segments: reader.u32()?,
+        },
+        2 => Op::Phyllotaxis {
+            pattern: crate::PhyllotaxisPattern::try_from(reader.u32()?)?,
+            count: reader.u32()?,
+            nodes: reader.u32()?,
+            start: reader.unit()?,
+            end: reader.unit()?,
+            divergence: reader.unit()?,
+        },
+        3 => Op::Tropism {
+            kind: crate::TropismKind::try_from(reader.u32()?)?,
+            strength: reader.unit()?,
+        },
+        4 => Op::Prune {
+            rule: crate::PruneRule::try_from(reader.u32()?)?,
+            threshold: reader.fixed()?,
+            count: reader.u32()?,
+        },
+        5 => Op::Roots {
+            depth_ratio: reader.unit()?,
+            spread_ratio: reader.unit()?,
+            count: reader.u32()?,
+        },
+        6 => Op::Shell {
+            material_slot: reader.u32()?,
+            sides: reader.u32()?,
+        },
+        7 => Op::Instance {
+            element: crate::BotanicalElement::try_from(reader.u32()?)?,
+            material_slot: reader.u32()?,
+            size: reader.fixed()?,
+            jitter: reader.unit()?,
+        },
+        8 => Op::Family,
+        9 => Op::Drawn {
+            element: crate::BotanicalElement::try_from(reader.u32()?)?,
+            points: reader.vec(|reader| {
+                Ok(crate::BotanicalDrawnPoint {
+                    position: [reader.fixed()?, reader.fixed()?, reader.fixed()?],
+                    radius: reader.fixed()?,
+                })
+            })?,
+        },
+        _ => return Err(reader.invalid("source.native.operator")),
+    })
 }
 
 fn write_source_provenance(writer: &mut Writer, value: &SourceProvenance) -> Result<()> {
@@ -1825,6 +2185,10 @@ fn phenotype_role_tag(value: PhenotypeRole) -> u8 {
         PhenotypeRole::Damaged => 2,
         PhenotypeRole::Burned => 3,
         PhenotypeRole::Dead => 4,
+        PhenotypeRole::Flowering => 5,
+        PhenotypeRole::Fruiting => 6,
+        PhenotypeRole::Senescent => 7,
+        PhenotypeRole::Wet => 8,
     }
 }
 
@@ -1835,6 +2199,10 @@ fn phenotype_role(value: u8) -> Result<PhenotypeRole> {
         2 => Ok(PhenotypeRole::Damaged),
         3 => Ok(PhenotypeRole::Burned),
         4 => Ok(PhenotypeRole::Dead),
+        5 => Ok(PhenotypeRole::Flowering),
+        6 => Ok(PhenotypeRole::Fruiting),
+        7 => Ok(PhenotypeRole::Senescent),
+        8 => Ok(PhenotypeRole::Wet),
         _ => Err(invalid_enum(".splant", "phenotypes.role")),
     }
 }
@@ -2144,7 +2512,7 @@ impl<'a> Reader<'a> {
     }
 
     fn plant_id(&mut self) -> Result<PlantId> {
-        PlantId::from_canonical_bytes(self.array()?)
+        PlantId::from_canonical_bytes(self.array()?).map_err(|_| Error::InvalidPlantId)
     }
 
     fn cell(&mut self) -> Result<WorldCellKey> {
@@ -2246,10 +2614,10 @@ mod tests {
             id: Uuid(11),
             name: "Oak".to_owned(),
             tags: vec![PlantTagId::new(7).unwrap(), PlantTagId::new(19).unwrap()],
-            source: PlantFamilySource::Native(NativeBotanicalGraph {
-                schema_hash: [1; 32],
-                graph: Value::Object(Default::default()),
-            }),
+            source: PlantFamilySource::Native {
+                graph: BotanicalGraphDocument::sapling(0x5a11),
+                grafts: Vec::new(),
+            },
             parts: vec![PlantPart {
                 id: 12,
                 parent: None,
@@ -2279,12 +2647,13 @@ mod tests {
             variations: vec![PlantVariation {
                 id: 0,
                 name: "Default".to_owned(),
-                sources: Vec::new(),
+                sources: vec![crate::native_variation_source_id(0)],
                 active_parts: Vec::new(),
             }],
             phenotypes: vec![PlantPhenotype {
                 id: 0,
                 role: PhenotypeRole::Healthy,
+                season_window: None,
                 variation: 0,
                 material_remap: Vec::new(),
                 active_parts: Vec::new(),
@@ -2297,6 +2666,7 @@ mod tests {
                 surface_tags: vec![14],
                 shade_tolerance: UnitInterval::from_bits(32_768),
             }),
+            ecology: crate::PlantEcologyDeclaration::default(),
         }
     }
 
