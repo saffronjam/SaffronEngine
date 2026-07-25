@@ -26,7 +26,6 @@ use saffron_geometry::{Vertex, VertexSkin};
 
 use crate::descriptors::Descriptors;
 use crate::gpu_types::Material;
-use crate::meshlet_raster::MeshletPush;
 use crate::resources::{DeviceResources, Pipeline};
 use crate::{Device, Error, Result, checked};
 
@@ -54,7 +53,6 @@ enum ScreenCompute {
     DdgiBorder,
     RestirInitial,
     RestirReuse,
-    RestirResolve,
     GiResolve,
 }
 
@@ -79,6 +77,9 @@ pub struct PsoKey {
     pub alpha_to_coverage: bool,
     /// The MSAA sample count the PSO's multisample state matches.
     pub sample_count: vk::SampleCountFlags,
+    /// The indexed-MDI executor vertex path: no vertex input bindings, the
+    /// `vertexMainExecutor` entry pulling geometry through buffer device addresses.
+    pub executor: bool,
 }
 
 /// The übershader PSO cache + the lazy thumbnail/preview pipelines.
@@ -106,13 +107,6 @@ pub struct Pipelines {
     /// lazily on the first request and reused.
     depth_prepass: Option<Arc<Pipeline>>,
 
-    /// The vertex-only, depth-biased shadow depth PSO (the directional + spot shadow
-    /// maps), built lazily.
-    shadow_depth: Option<Arc<Pipeline>>,
-
-    /// The color (distance) + depth point-shadow cube-face PSO, built lazily.
-    point_shadow: Option<Arc<Pipeline>>,
-
     /// The clustered light-cull compute PSO, built lazily.
     light_cull: Option<Arc<Pipeline>>,
 
@@ -133,10 +127,6 @@ pub struct Pipelines {
     /// The Phase-4 amplifying emit PSO (`tessellate.slang`, bindless set 0 + the emit set 1, a 64-byte
     /// push), built lazily.
     tessellate: Option<Arc<Pipeline>>,
-
-    /// The `VK_EXT_mesh_shader` meshlet raster PSO (task+mesh+`fragmentMain`), built lazily when the
-    /// mesh-shader path is enabled. Bakes the MSAA sample count, so `set_sample_count` clears it.
-    meshlet: Option<Arc<Pipeline>>,
 
     /// The cluster compute set layout the cull PSO binds (set 0).
     cluster_set_layout: vk::DescriptorSetLayout,
@@ -196,6 +186,30 @@ pub struct Pipelines {
     restir_initial: Option<Arc<Pipeline>>,
     restir_reuse: Option<Arc<Pipeline>>,
     restir_resolve: Option<Arc<Pipeline>>,
+    hzb_copy: Option<Arc<Pipeline>>,
+    scene_visibility: Option<Arc<Pipeline>>,
+    wind_deform: Option<Arc<Pipeline>>,
+    wind_interact: Option<Arc<Pipeline>>,
+    vsm_demand: Option<Arc<Pipeline>>,
+    vsm_demand_compact: Option<Arc<Pipeline>>,
+    scene_traversal: Option<Arc<Pipeline>>,
+    scene_bin_count: Option<Arc<Pipeline>>,
+    scene_bin_seed: Option<Arc<Pipeline>>,
+    scene_bin_scatter: Option<Arc<Pipeline>>,
+    scene_executor_depth: Option<Arc<Pipeline>>,
+    scene_micro_count: Option<Arc<Pipeline>>,
+    scene_micro_scan: Option<Arc<Pipeline>>,
+    scene_micro_scatter: Option<Arc<Pipeline>>,
+    depth_prepass_executor: Option<Arc<Pipeline>>,
+    shadow_depth_executor: Option<Arc<Pipeline>>,
+    gbuffer_executor: Option<Arc<Pipeline>>,
+    motion_executor: Option<Arc<Pipeline>>,
+    transparent_keys: Option<Arc<Pipeline>>,
+    radix_histogram: Option<Arc<Pipeline>>,
+    radix_scan: Option<Arc<Pipeline>>,
+    radix_scatter: Option<Arc<Pipeline>>,
+    transparent_reorder: Option<Arc<Pipeline>>,
+    hzb_reduce: Option<Arc<Pipeline>>,
     /// The screen-space indirect-diffuse resolve PSO (`gi_resolve.spv`, the bespoke single set).
     gi_resolve: Option<Arc<Pipeline>>,
 
@@ -253,6 +267,7 @@ pub struct Pipelines {
     /// target, depth-tested read-only against the scene depth, set 2 + a viewProj push): re-draws
     /// the translucent batches to mark the reactive mask. Built lazily when TAA first resolves.
     reactive_coverage: Option<Arc<Pipeline>>,
+    reactive_transition: Option<Arc<Pipeline>>,
     /// The analytic ground-grid graphics PSO (fullscreen, depth-tested, alpha-blended,
     /// a 2×mat4 push), built lazily.
     grid: Option<Arc<Pipeline>>,
@@ -319,8 +334,6 @@ impl Pipelines {
             cache: HashMap::new(),
             pipelines_created: 0,
             depth_prepass: None,
-            shadow_depth: None,
-            point_shadow: None,
             light_cull: None,
             skin: None,
             morph: None,
@@ -329,7 +342,6 @@ impl Pipelines {
             tess_finalize: None,
             tess_args: None,
             tessellate: None,
-            meshlet: None,
             cluster_set_layout: descriptors.cluster_set_layout(),
             gbuffer: None,
             gtao: None,
@@ -352,6 +364,30 @@ impl Pipelines {
             restir_initial: None,
             restir_reuse: None,
             restir_resolve: None,
+            hzb_copy: None,
+            scene_visibility: None,
+            wind_deform: None,
+            wind_interact: None,
+            vsm_demand: None,
+            vsm_demand_compact: None,
+            scene_traversal: None,
+            scene_bin_count: None,
+            scene_bin_seed: None,
+            scene_bin_scatter: None,
+            scene_executor_depth: None,
+            scene_micro_count: None,
+            scene_micro_scan: None,
+            scene_micro_scatter: None,
+            depth_prepass_executor: None,
+            shadow_depth_executor: None,
+            gbuffer_executor: None,
+            motion_executor: None,
+            transparent_keys: None,
+            radix_histogram: None,
+            radix_scan: None,
+            radix_scatter: None,
+            transparent_reorder: None,
+            hzb_reduce: None,
             gi_resolve: None,
             motion: None,
             taa: None,
@@ -373,6 +409,7 @@ impl Pipelines {
             fog_set_layout: descriptors.fog_set_layout(),
             depth_upscale: None,
             reactive_coverage: None,
+            reactive_transition: None,
             grid: None,
             overlay: None,
             overlay_depth: None,
@@ -393,12 +430,11 @@ impl Pipelines {
         // The mesh cache keys by sample count, so stale entries would never be hit again;
         // clear them so the dropped `Arc`s free once the GPU is idle (the caller's job).
         self.cache.clear();
-        // The depth-prepass PSO bakes the count too — drop it to rebuild lazily. The
+        // The depth-prepass PSOs bake the count too — drop them to rebuild lazily. The
         // G-buffer / shadow / motion PSOs are always 1× (they feed post-resolve targets),
         // so they are untouched.
         self.depth_prepass = None;
-        // The meshlet raster PSO bakes the count in its multisample state — drop it to rebuild.
-        self.meshlet = None;
+        self.depth_prepass_executor = None;
     }
 
     /// The MSAA sample count the sample-count-baked PSOs currently target.
@@ -413,6 +449,44 @@ impl Pipelines {
     /// Wireframe is gated on `fill_mode_non_solid`: an unsupported device falls back
     /// to the fill PSO (so the key never names a permutation the device cannot make).
     /// A build failure is logged and returns `None`.
+    /// The indexed-MDI executor permutation of a material's mesh PSO: the same
+    /// fragment permutations over the `vertexMainExecutor` record-driven vertex path
+    /// (no vertex input bindings).
+    pub fn request_executor_mesh_pipeline(
+        &mut self,
+        material: &Material,
+        wireframe: bool,
+    ) -> Option<Arc<Pipeline>> {
+        let wireframe = wireframe && self.fill_mode_non_solid;
+        let alpha_to_coverage =
+            material.masked && self.sample_count != vk::SampleCountFlags::TYPE_1;
+        let key = PsoKey {
+            shader: material.shader.clone(),
+            unlit: material.unlit,
+            skinned: false,
+            wireframe,
+            blend: material.blend,
+            alpha_to_coverage,
+            sample_count: self.sample_count,
+            executor: true,
+        };
+        if let Some(pipeline) = self.cache.get(&key) {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_mesh_pipeline(&key) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.cache.insert(key, Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_executor_mesh_pipeline: {err}");
+                None
+            }
+        }
+    }
+
     pub fn request_mesh_pipeline(
         &mut self,
         material: &Material,
@@ -432,6 +506,7 @@ impl Pipelines {
             blend: material.blend,
             alpha_to_coverage,
             sample_count: self.sample_count,
+            executor: false,
         };
         if let Some(pipeline) = self.cache.get(&key) {
             return Some(Arc::clone(pipeline));
@@ -459,7 +534,7 @@ impl Pipelines {
         if let Some(pipeline) = &self.depth_prepass {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_depth_prepass() {
+        match self.build_depth_prepass(false) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
                 self.depth_prepass = Some(Arc::clone(&pipeline));
@@ -473,45 +548,42 @@ impl Pipelines {
         }
     }
 
-    /// The vertex-only, depth-biased shadow depth PSO, built and cached on first request.
-    /// Like the depth pre-pass but always single-sampled (the shadow map is 1×) and
-    /// depth-biased (dynamic, set per shadow pass) to kill acne. Binds sets 0/1/2 + the
-    /// light-space viewProj push. Returns `None` on a build failure (logged).
-    pub fn request_shadow_depth(&mut self) -> Option<Arc<Pipeline>> {
-        if let Some(pipeline) = &self.shadow_depth {
+    /// The executor permutation of the depth pre-pass: the record-driven
+    /// `vertexMainExecutor` (no vertex input) over the same alpha-clip fragment.
+    pub fn request_depth_prepass_executor(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.depth_prepass_executor {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_shadow_depth() {
+        match self.build_depth_prepass(true) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
-                self.shadow_depth = Some(Arc::clone(&pipeline));
+                self.depth_prepass_executor = Some(Arc::clone(&pipeline));
                 self.pipelines_created += 1;
                 Some(pipeline)
             }
             Err(err) => {
-                tracing::error!("request_shadow_depth: {err}");
+                tracing::error!("request_depth_prepass_executor: {err}");
                 None
             }
         }
     }
 
-    /// The point-shadow cube-face PSO (color distance + depth), built and cached on first
-    /// request. Renders world distance-to-light into one cube face; the push carries the
-    /// face viewProj (mat4) + the light world position (vec4), in the VERTEX|FRAGMENT
-    /// stages. Returns `None` on a build failure (logged).
-    pub fn request_point_shadow(&mut self) -> Option<Arc<Pipeline>> {
-        if let Some(pipeline) = &self.point_shadow {
+    /// The executor permutation of the shadow depth PSO: the record-driven
+    /// `vertexMainExecutor` (no vertex input) over the same canonical-coverage
+    /// fragment and dynamic depth bias.
+    pub fn request_shadow_depth_executor(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.shadow_depth_executor {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_point_shadow() {
+        match self.build_shadow_depth(true) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
-                self.point_shadow = Some(Arc::clone(&pipeline));
+                self.shadow_depth_executor = Some(Arc::clone(&pipeline));
                 self.pipelines_created += 1;
                 Some(pipeline)
             }
             Err(err) => {
-                tracing::error!("request_point_shadow: {err}");
+                tracing::error!("request_shadow_depth_executor: {err}");
                 None
             }
         }
@@ -703,7 +775,7 @@ impl Pipelines {
         if let Some(pipeline) = &self.gbuffer {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_gbuffer() {
+        match self.build_gbuffer(false) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
                 self.gbuffer = Some(Arc::clone(&pipeline));
@@ -712,6 +784,26 @@ impl Pipelines {
             }
             Err(err) => {
                 tracing::error!("request_gbuffer: {err}");
+                None
+            }
+        }
+    }
+
+    /// The executor permutation of the G-buffer prepass (record-driven vertex path,
+    /// no vertex input).
+    pub fn request_gbuffer_executor(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.gbuffer_executor {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_gbuffer(true) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.gbuffer_executor = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_gbuffer_executor: {err}");
                 None
             }
         }
@@ -980,18 +1072,604 @@ impl Pipelines {
         )
     }
 
-    /// The ReSTIR resolve compute PSO (its set layout incl. the TLAS binding, a 160-byte
-    /// push). RT-only — the resolve traces one visibility ray via the TLAS.
+    /// The ReSTIR resolve compute PSO: set 0 = the resolve layout (incl. the TLAS + the
+    /// GPU-scene address block), set 1 = the bindless texture array (the candidate coverage
+    /// confirmation samples it), a 160-byte push. RT-only — the resolve traces one
+    /// visibility ray via the TLAS.
     pub fn request_restir_resolve(
         &mut self,
         layout: vk::DescriptorSetLayout,
     ) -> Option<Arc<Pipeline>> {
-        self.request_screen_compute(
-            ScreenCompute::RestirResolve,
+        if let Some(pipeline) = &self.restir_resolve {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [layout, self.set_layouts[0]];
+        match self.build_compute_multi(
             "shaders/restir_resolve.spv",
-            layout,
+            &set_layouts,
             crate::RESTIR_RESOLVE_PUSH_SIZE,
-        )
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.restir_resolve = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_restir_resolve: {err}");
+                None
+            }
+        }
+    }
+
+    /// The instance-visibility compute PSO (lists + history + HZB + address block, a
+    /// 160-byte push). One pipeline serves the cull and retest pass kinds.
+    pub fn request_scene_visibility(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_visibility {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/scene_visibility.spv",
+            layout,
+            crate::SCENE_VISIBILITY_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_visibility = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_visibility: {err}");
+                None
+            }
+        }
+    }
+
+    /// The wind deformation prepass PSO (the visibility set layout for its address
+    /// block, a [`crate::WIND_DEFORM_PUSH_SIZE`]-byte push of the frame's wind words).
+    pub fn request_wind_deform(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.wind_deform {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/wind_deform.spv",
+            layout,
+            crate::WIND_DEFORM_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.wind_deform = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_wind_deform: {err}");
+                None
+            }
+        }
+    }
+
+    /// The interaction-field step PSO (BDA-only, a
+    /// [`crate::WIND_INTERACT_PUSH_SIZE`]-byte push of addresses, centres, and dt).
+    pub fn request_wind_interact(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.wind_interact {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/wind_interact.spv",
+            layout,
+            crate::WIND_INTERACT_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.wind_interact = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_wind_interact: {err}");
+                None
+            }
+        }
+    }
+
+    /// The VSM receiver-demand mark PSO (a [`crate::VSM_DEMAND_PUSH_SIZE`]-byte push).
+    pub fn request_vsm_demand(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.vsm_demand {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/vsm_demand.spv",
+            layout,
+            crate::VSM_DEMAND_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.vsm_demand = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_vsm_demand: {err}");
+                None
+            }
+        }
+    }
+
+    /// The VSM demand-compact PSO (a [`crate::VSM_COMPACT_PUSH_SIZE`]-byte push).
+    pub fn request_vsm_demand_compact(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.vsm_demand_compact {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/vsm_demand_compact.spv",
+            layout,
+            crate::VSM_COMPACT_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.vsm_demand_compact = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_vsm_demand_compact: {err}");
+                None
+            }
+        }
+    }
+
+    /// The hierarchy-traversal compute PSO (counters + visible list + record stream +
+    /// address block, a 32-byte push).
+    pub fn request_scene_traversal(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_traversal {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/scene_traversal.spv",
+            layout,
+            crate::SCENE_TRAVERSAL_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_traversal = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_traversal: {err}");
+                None
+            }
+        }
+    }
+
+    /// The micro-field survivor-count compute PSO
+    /// ([`crate::SCENE_MICRO_FIELD_PUSH_SIZE`]-byte push).
+    pub fn request_scene_micro_count(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_micro_count {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/scene_micro_count.spv",
+            layout,
+            crate::SCENE_MICRO_FIELD_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_micro_count = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_micro_count: {err}");
+                None
+            }
+        }
+    }
+
+    /// The micro-field exclusive-base scan compute PSO
+    /// ([`crate::SCENE_MICRO_FIELD_PUSH_SIZE`]-byte push).
+    pub fn request_scene_micro_scan(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_micro_scan {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/scene_micro_scan.spv",
+            layout,
+            crate::SCENE_MICRO_FIELD_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_micro_scan = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_micro_scan: {err}");
+                None
+            }
+        }
+    }
+
+    /// The micro-field exact-slot scatter compute PSO
+    /// ([`crate::SCENE_MICRO_FIELD_PUSH_SIZE`]-byte push).
+    pub fn request_scene_micro_scatter(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_micro_scatter {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute(
+            "shaders/scene_micro_scatter.spv",
+            layout,
+            crate::SCENE_MICRO_FIELD_PUSH_SIZE,
+        ) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_micro_scatter = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_micro_scatter: {err}");
+                None
+            }
+        }
+    }
+
+    /// The transparent key-collection compute PSO (a 32-byte push).
+    pub fn request_transparent_keys(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.transparent_keys {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/scene_transparent_keys.spv", layout, 32) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.transparent_keys = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_transparent_keys: {err}");
+                None
+            }
+        }
+    }
+
+    /// The radix per-workgroup histogram compute PSO (a 16-byte push).
+    pub fn request_radix_histogram(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.radix_histogram {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/radix_histogram.spv", layout, 16) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.radix_histogram = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_radix_histogram: {err}");
+                None
+            }
+        }
+    }
+
+    /// The radix global-scan compute PSO (a 16-byte push).
+    pub fn request_radix_scan(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.radix_scan {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/radix_scan.spv", layout, 16) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.radix_scan = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_radix_scan: {err}");
+                None
+            }
+        }
+    }
+
+    /// The radix stable-scatter compute PSO (a 16-byte push).
+    pub fn request_radix_scatter(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.radix_scatter {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/radix_scatter.spv", layout, 16) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.radix_scatter = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_radix_scatter: {err}");
+                None
+            }
+        }
+    }
+
+    /// The transparent command-reorder compute PSO (a 16-byte push).
+    pub fn request_transparent_reorder(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.transparent_reorder {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/scene_transparent_reorder.spv", layout, 16) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.transparent_reorder = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_transparent_reorder: {err}");
+                None
+            }
+        }
+    }
+
+    /// The executor bin-count compute PSO (a 16-byte push).
+    pub fn request_scene_bin_count(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_bin_count {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/scene_bin_count.spv", layout, 16) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_bin_count = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_bin_count: {err}");
+                None
+            }
+        }
+    }
+
+    /// The executor bucket-seed compute PSO (no push).
+    pub fn request_scene_bin_seed(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_bin_seed {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/scene_bin_seed.spv", layout, 0) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_bin_seed = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_bin_seed: {err}");
+                None
+            }
+        }
+    }
+
+    /// The executor bin-scatter compute PSO (a 16-byte push).
+    pub fn request_scene_bin_scatter(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_bin_scatter {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/scene_bin_scatter.spv", layout, 16) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_bin_scatter = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_bin_scatter: {err}");
+                None
+            }
+        }
+    }
+
+    /// The indexed-MDI executor's depth-only graphics PSO: no vertex input (BDA vertex
+    /// pulling), the pages arena as the index buffer, depth LESS + write, dynamic
+    /// viewport/scissor, a mat4 push in the vertex stage.
+    pub fn request_scene_executor_depth(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_executor_depth {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_scene_executor_depth(layout) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_executor_depth = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_executor_depth: {err}");
+                None
+            }
+        }
+    }
+
+    fn build_scene_executor_depth(&self, layout: vk::DescriptorSetLayout) -> Result<Pipeline> {
+        let raw = self.resources.device();
+        let module = self.load_shader_module("shaders/scene_executor_depth.spv")?;
+        let result = self.build_scene_executor_depth_with_module(raw, module, layout);
+        // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
+        // after creation is valid and required.
+        unsafe { raw.destroy_shader_module(module, None) };
+        result
+    }
+
+    fn build_scene_executor_depth_with_module(
+        &self,
+        raw: &ash::Device,
+        module: vk::ShaderModule,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<Pipeline> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vertexMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"fragmentMain"),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
+        let push_constant = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)];
+        let set_layouts = [layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant);
+        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by
+        // the returned `Pipeline`.
+        let pipeline_layout = checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "create_pipeline_layout (scene executor depth)",
+        )?;
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(pipeline_layout);
+        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the
+        // layout is freed exactly once.
+        let created = unsafe {
+            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        let pipeline = match created {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => {
+                // SAFETY: the ash seam. The layout was created above; freed once here.
+                unsafe { raw.destroy_pipeline_layout(pipeline_layout, None) };
+                return Err(Error::Vk {
+                    context: "create_graphics_pipelines (scene executor depth)",
+                    result,
+                });
+            }
+        };
+        Ok(Pipeline::from_parts(
+            &self.resources,
+            pipeline,
+            pipeline_layout,
+        ))
+    }
+
+    /// The HZB seed compute PSO (depth sampler + mip-0 storage, a 16-byte push).
+    pub fn request_hzb_copy(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.hzb_copy {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/hzb_copy.spv", layout, crate::HZB_PUSH_SIZE) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.hzb_copy = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_hzb_copy: {err}");
+                None
+            }
+        }
+    }
+
+    /// The HZB reduce compute PSO (two storage mips, a 16-byte push).
+    pub fn request_hzb_reduce(&mut self, layout: vk::DescriptorSetLayout) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.hzb_reduce {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_compute("shaders/hzb_reduce.spv", layout, crate::HZB_PUSH_SIZE) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.hzb_reduce = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_hzb_reduce: {err}");
+                None
+            }
+        }
     }
 
     /// The motion-vector prepass PSO (instanced scene, depth-tested, rg16f motion from
@@ -1003,7 +1681,7 @@ impl Pipelines {
         if let Some(pipeline) = &self.motion {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_motion() {
+        match self.build_motion(false) {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
                 self.motion = Some(Arc::clone(&pipeline));
@@ -1012,6 +1690,26 @@ impl Pipelines {
             }
             Err(err) => {
                 tracing::error!("request_motion: {err}");
+                None
+            }
+        }
+    }
+
+    /// The executor permutation of the motion prepass (record-driven vertex path,
+    /// no vertex input; previous positions from the prev-deformed BDA).
+    pub fn request_motion_executor(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.motion_executor {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_motion(true) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.motion_executor = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_motion_executor: {err}");
                 None
             }
         }
@@ -1380,11 +2078,32 @@ impl Pipelines {
 
     /// The TAA reactive-coverage graphics PSO (marks the translucent batches into the r8 reactive
     /// mask), built and cached on first request. Returns `None` on a build failure (logged).
+    /// The transition-reactive graphics PSO: re-draws the opaque buckets through the
+    /// degenerate-collapse vertex path, marking only blades and records mid
+    /// representation-transition into the reactive mask.
+    pub fn request_reactive_transition(&mut self) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.reactive_transition {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_reactive_coverage_entry(c"vertexMainReactiveTransition") {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.reactive_transition = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_reactive_transition: {err}");
+                None
+            }
+        }
+    }
+
     pub fn request_reactive_coverage(&mut self) -> Option<Arc<Pipeline>> {
         if let Some(pipeline) = &self.reactive_coverage {
             return Some(Arc::clone(pipeline));
         }
-        match self.build_reactive_coverage() {
+        match self.build_reactive_coverage_entry(c"vertexMainExecutor") {
             Ok(pipeline) => {
                 let pipeline = Arc::new(pipeline);
                 self.reactive_coverage = Some(Arc::clone(&pipeline));
@@ -1550,7 +2269,6 @@ impl Pipelines {
             ScreenCompute::DdgiBorder => self.ddgi_border.as_ref(),
             ScreenCompute::RestirInitial => self.restir_initial.as_ref(),
             ScreenCompute::RestirReuse => self.restir_reuse.as_ref(),
-            ScreenCompute::RestirResolve => self.restir_resolve.as_ref(),
             ScreenCompute::GiResolve => self.gi_resolve.as_ref(),
         }
     }
@@ -1571,7 +2289,6 @@ impl Pipelines {
             ScreenCompute::DdgiBorder => &mut self.ddgi_border,
             ScreenCompute::RestirInitial => &mut self.restir_initial,
             ScreenCompute::RestirReuse => &mut self.restir_reuse,
-            ScreenCompute::RestirResolve => &mut self.restir_resolve,
             ScreenCompute::GiResolve => &mut self.gi_resolve,
         }
     }
@@ -1637,7 +2354,9 @@ impl Pipelines {
             .map_entries(&spec_entries)
             .data(&spec_data);
 
-        let vertex_entry: &CStr = if key.skinned {
+        let vertex_entry: &CStr = if key.executor {
+            c"vertexMainExecutor"
+        } else if key.skinned {
             c"vertexMainSkinned"
         } else {
             c"vertexMain"
@@ -1655,7 +2374,8 @@ impl Pipelines {
         ];
 
         // Binding 0: the base Vertex stream. Binding 1: the VertexSkin stream, added
-        // only for the skinned variant (the unskinned layout is untouched).
+        // only for the skinned variant. The executor variant binds no vertex input at
+        // all (geometry pulls through buffer device addresses).
         let bindings = [
             vk::VertexInputBindingDescription::default()
                 .binding(0)
@@ -1698,7 +2418,13 @@ impl Pipelines {
                 .format(vk::Format::R32G32B32A32_SFLOAT)
                 .offset(offset_of_skin_weights()),
         ];
-        let (binding_count, attribute_count) = if key.skinned { (2, 6) } else { (1, 4) };
+        let (binding_count, attribute_count) = if key.executor {
+            (0, 0)
+        } else if key.skinned {
+            (2, 6)
+        } else {
+            (1, 4)
+        };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings[..binding_count])
             .vertex_attribute_descriptions(&attributes[..attribute_count]);
@@ -1816,189 +2542,13 @@ impl Pipelines {
         Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
     }
 
-    /// The `VK_EXT_mesh_shader` meshlet raster PSO (task+mesh from `meshlet.spv`, the übershader
-    /// `fragmentMain` from `mesh.spv`), built lazily and cached. `meshlet_set_layout` is set 8 (the
-    /// meshlet decomposition + base vertex stream). Built only when the mesh-shader path is enabled;
-    /// `None` on a build failure (logged).
-    pub fn request_meshlet(
-        &mut self,
-        meshlet_set_layout: vk::DescriptorSetLayout,
-    ) -> Option<Arc<Pipeline>> {
-        if let Some(pipeline) = &self.meshlet {
-            return Some(Arc::clone(pipeline));
-        }
-        match self.build_meshlet_pipeline(meshlet_set_layout) {
-            Ok(pipeline) => {
-                let pipeline = Arc::new(pipeline);
-                self.meshlet = Some(Arc::clone(&pipeline));
-                self.pipelines_created += 1;
-                Some(pipeline)
-            }
-            Err(err) => {
-                tracing::error!("request_meshlet: {err}");
-                None
-            }
-        }
-    }
-
-    fn build_meshlet_pipeline(
-        &self,
-        meshlet_set_layout: vk::DescriptorSetLayout,
-    ) -> Result<Pipeline> {
-        let raw = self.resources.device();
-        // Two modules: the task/mesh stages from meshlet.spv, the fragment from the übershader.
-        let meshlet_module = self.load_shader_module("shaders/meshlet.spv")?;
-        let mesh_module = match self.load_shader_module("shaders/mesh.spv") {
-            Ok(m) => m,
-            Err(err) => {
-                // SAFETY: the ash seam. The meshlet module was created above; freed once here.
-                unsafe { raw.destroy_shader_module(meshlet_module, None) };
-                return Err(err);
-            }
-        };
-        let result = self.build_meshlet_pipeline_with_modules(
-            raw,
-            meshlet_module,
-            mesh_module,
-            meshlet_set_layout,
-        );
-        // SAFETY: the ash seam. Both modules are consumed by pipeline creation; freed after.
-        unsafe {
-            raw.destroy_shader_module(meshlet_module, None);
-            raw.destroy_shader_module(mesh_module, None);
-        }
-        result
-    }
-
-    fn build_meshlet_pipeline_with_modules(
-        &self,
-        raw: &ash::Device,
-        meshlet_module: vk::ShaderModule,
-        mesh_module: vk::ShaderModule,
-        meshlet_set_layout: vk::DescriptorSetLayout,
-    ) -> Result<Pipeline> {
-        // The meshlet path is the opaque-lit permutation: unlit / a2c / translucent all off.
-        let spec_data = [0u8; 12];
-        let spec_entries = [
-            vk::SpecializationMapEntry::default()
-                .constant_id(0)
-                .offset(0)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(1)
-                .offset(4)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(2)
-                .offset(8)
-                .size(4),
-        ];
-        let spec_info = vk::SpecializationInfo::default()
-            .map_entries(&spec_entries)
-            .data(&spec_data);
-
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::TASK_EXT)
-                .module(meshlet_module)
-                .name(c"taskMain"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MESH_EXT)
-                .module(meshlet_module)
-                .name(c"meshMain"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(mesh_module)
-                .name(c"fragmentMain")
-                .specialization_info(&spec_info),
-        ];
-
-        // No vertex-input / input-assembly state: a mesh shader fetches its own geometry.
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-            .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(self.sample_count);
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
-        let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(false)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
-        let color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-
-        let color_formats = [OFFSCREEN_COLOR_FORMAT];
-        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_formats)
-            .depth_attachment_format(DEPTH_FORMAT);
-
-        // Layout: the übershader sets 0–7 (identical, so the frame's sets rebind here) + set 8
-        // (meshlet geometry) + the mesh/task push (viewProj + instance/meshlet/vertex indices).
-        // `meshlet.slang` fixes the geometry set at index 8; when the device lacks RT (so the
-        // übershader list stops at set 5) sets 6/7 are padded with an unused layout so the geometry
-        // set still lands at 8. The übershader `fragmentMain` never references the padded sets.
-        let mut set_layouts = self.set_layouts.clone();
-        while set_layouts.len() < 8 {
-            set_layouts.push(self.set_layouts[0]);
-        }
-        set_layouts.push(meshlet_set_layout);
-        let push_constant = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT)
-            .offset(0)
-            .size(size_of::<MeshletPush>() as u32)];
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_constant);
-        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by the Pipeline.
-        let layout = checked(
-            unsafe { raw.create_pipeline_layout(&layout_info, None) },
-            "create_pipeline_layout (meshlet)",
-        )?;
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .push_next(&mut rendering_info)
-            .stages(&stages)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&raster)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&color_blend)
-            .dynamic_state(&dynamic)
-            .layout(layout);
-        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the layout frees.
-        let created = unsafe {
-            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        };
-        let pipeline = match created {
-            Ok(pipelines) => pipelines[0],
-            Err((_, result)) => {
-                // SAFETY: the ash seam. The layout was created above; freed once on the error path.
-                unsafe { raw.destroy_pipeline_layout(layout, None) };
-                return Err(Error::Vk {
-                    context: "create_graphics_pipelines (meshlet)",
-                    result,
-                });
-            }
-        };
-        Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
-    }
-
     /// Builds the vertex-only depth pre-pass PSO from the übershader's `vertexMain`:
     /// binding 0 = the base [`Vertex`] stream (position/normal/uv0), no color, depth
     /// `LESS` + write, sets 0/1/2, the viewProj push.
-    fn build_depth_prepass(&self) -> Result<Pipeline> {
+    fn build_depth_prepass(&self, executor: bool) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/mesh.spv")?;
-        let result = self.build_depth_prepass_with_module(raw, module);
+        let result = self.build_depth_prepass_with_module(raw, module, executor);
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
         // after creation is valid and required.
         unsafe { raw.destroy_shader_module(module, None) };
@@ -2009,6 +2559,7 @@ impl Pipelines {
         &self,
         raw: &ash::Device,
         module: vk::ShaderModule,
+        executor: bool,
     ) -> Result<Pipeline> {
         // Vertex writes depth; the fragment does only the alpha-clip discard (masked materials must
         // not write depth at cutout texels). Opaque materials fall straight through — depth-only.
@@ -2021,11 +2572,16 @@ impl Pipelines {
         let a2c_info = vk::SpecializationInfo::default()
             .map_entries(&a2c_entry)
             .data(&a2c_data);
+        let vertex_entry: &CStr = if executor {
+            c"vertexMainExecutor"
+        } else {
+            c"vertexMain"
+        };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(module)
-                .name(c"vertexMain"),
+                .name(vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
@@ -2038,9 +2594,10 @@ impl Pipelines {
             .stride(size_of::<Vertex>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
         let attributes = base_vertex_attributes();
+        let (binding_count, attribute_count) = if executor { (0, 0) } else { (1, 4) };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_binding_descriptions(&bindings[..binding_count])
+            .vertex_attribute_descriptions(&attributes[..attribute_count]);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -2121,10 +2678,10 @@ impl Pipelines {
     /// fragment writes, depth `LESS_OR_EQUAL` **read-only** (test against the resolved scene depth
     /// so occluded translucents don't mark), single-sampled (the reactive target + TAA scratch are
     /// 1×), cull off (translucents are often double-sided), sets 0/1/2 + the viewProj push.
-    fn build_reactive_coverage(&self) -> Result<Pipeline> {
+    fn build_reactive_coverage_entry(&self, vertex_entry: &'static CStr) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/mesh.spv")?;
-        let result = self.build_reactive_coverage_with_module(raw, module);
+        let result = self.build_reactive_coverage_with_module(raw, module, vertex_entry);
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it after
         // creation is valid and required.
         unsafe { raw.destroy_shader_module(module, None) };
@@ -2135,26 +2692,21 @@ impl Pipelines {
         &self,
         raw: &ash::Device,
         module: vk::ShaderModule,
+        vertex_entry: &'static CStr,
     ) -> Result<Pipeline> {
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(module)
-                .name(c"vertexMain"),
+                .name(vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
                 .name(c"reactiveCoverageFragment"),
         ];
 
-        let bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(size_of::<Vertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
-        let attributes = base_vertex_attributes();
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+        // Record-driven vertex pulling: no vertex input bindings exist.
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -2241,10 +2793,10 @@ impl Pipelines {
     /// [`Vertex`] stream, two colors (`R16G16B16A16_SFLOAT` view normal rgb + view-Z, then
     /// `R8_UNORM` roughness), depth `LESS` + write, single-sampled (the G-buffer is post-resolve),
     /// sets 0/1/2, the `viewProj + view` push.
-    fn build_gbuffer(&self) -> Result<Pipeline> {
+    fn build_gbuffer(&self, executor: bool) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/gbuffer.spv")?;
-        let result = self.build_gbuffer_with_module(raw, module);
+        let result = self.build_gbuffer_with_module(raw, module, executor);
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
         // after creation is valid and required.
         unsafe { raw.destroy_shader_module(module, None) };
@@ -2255,12 +2807,18 @@ impl Pipelines {
         &self,
         raw: &ash::Device,
         module: vk::ShaderModule,
+        executor: bool,
     ) -> Result<Pipeline> {
+        let vertex_entry: &CStr = if executor {
+            c"vertexMainExecutor"
+        } else {
+            c"vertexMain"
+        };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(module)
-                .name(c"vertexMain"),
+                .name(vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
@@ -2272,9 +2830,10 @@ impl Pipelines {
             .stride(size_of::<Vertex>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
         let attributes = base_vertex_attributes();
+        let (binding_count, attribute_count) = if executor { (0, 0) } else { (1, 4) };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_binding_descriptions(&bindings[..binding_count])
+            .vertex_attribute_descriptions(&attributes[..attribute_count]);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -2389,14 +2948,8 @@ impl Pipelines {
                 .name(c"fragmentMain"),
         ];
 
-        let bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(size_of::<Vertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
-        let attributes = base_vertex_attributes();
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+        // Record-driven vertex pulling: no vertex input bindings exist.
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -2480,10 +3033,10 @@ impl Pipelines {
     /// position on binding 0, prev position on binding 1), instanced (sets 0/1/2),
     /// single-sampled (the motion target is 1×), depth `LESS` + write, rg16f color, the
     /// cur/prev viewProj push.
-    fn build_motion(&self) -> Result<Pipeline> {
+    fn build_motion(&self, executor: bool) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/motion.spv")?;
-        let result = self.build_motion_with_module(raw, module);
+        let result = self.build_motion_with_module(raw, module, executor);
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
         // after creation is valid and required.
         unsafe { raw.destroy_shader_module(module, None) };
@@ -2494,12 +3047,18 @@ impl Pipelines {
         &self,
         raw: &ash::Device,
         module: vk::ShaderModule,
+        executor: bool,
     ) -> Result<Pipeline> {
+        let vertex_entry: &CStr = if executor {
+            c"vertexMainExecutor"
+        } else {
+            c"vertexMain"
+        };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(module)
-                .name(c"vertexMain"),
+                .name(vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
@@ -2542,9 +3101,10 @@ impl Pipelines {
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(offset_of_vertex_position()),
         ];
+        let (binding_count, attribute_count) = if executor { (0, 0) } else { (2, 4) };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_binding_descriptions(&bindings[..binding_count])
+            .vertex_attribute_descriptions(&attributes[..attribute_count]);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -2626,10 +3186,10 @@ impl Pipelines {
     /// `vertexMain` + `depthPrepassFragment`: binding 0 = the base [`Vertex`] stream,
     /// no color, depth `LESS` + write, dynamic depth-bias, single-sampled, sets 0/1/2,
     /// the light-viewProj push.
-    fn build_shadow_depth(&self) -> Result<Pipeline> {
+    fn build_shadow_depth(&self, executor: bool) -> Result<Pipeline> {
         let raw = self.resources.device();
         let module = self.load_shader_module("shaders/mesh.spv")?;
-        let result = self.build_shadow_depth_with_module(raw, module);
+        let result = self.build_shadow_depth_with_module(raw, module, executor);
         // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
         // after creation is valid and required.
         unsafe { raw.destroy_shader_module(module, None) };
@@ -2640,12 +3200,18 @@ impl Pipelines {
         &self,
         raw: &ash::Device,
         module: vk::ShaderModule,
+        executor: bool,
     ) -> Result<Pipeline> {
+        let vertex_entry: &CStr = if executor {
+            c"vertexMainExecutor"
+        } else {
+            c"vertexMain"
+        };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(module)
-                .name(c"vertexMain"),
+                .name(vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
@@ -2657,9 +3223,10 @@ impl Pipelines {
             .stride(size_of::<Vertex>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
         let attributes = base_vertex_attributes();
+        let (binding_count, attribute_count) = if executor { (0, 0) } else { (1, 4) };
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_binding_descriptions(&bindings[..binding_count])
+            .vertex_attribute_descriptions(&attributes[..attribute_count]);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -2730,123 +3297,6 @@ impl Pipelines {
                 unsafe { raw.destroy_pipeline_layout(layout, None) };
                 return Err(Error::Vk {
                     context: "create_graphics_pipelines (shadow)",
-                    result,
-                });
-            }
-        };
-        Ok(Pipeline::from_parts(&self.resources, pipeline, layout))
-    }
-
-    /// Builds the point-shadow cube-face PSO from `point_shadow.slang`: binding 0 = the
-    /// base [`Vertex`] stream, one `R32_SFLOAT` color (distance) + depth, depth `LESS` +
-    /// write, single-sampled, sets 0/1/2, the (mat4 viewProj + vec4 lightPos) push in the
-    /// VERTEX|FRAGMENT stages.
-    fn build_point_shadow(&self) -> Result<Pipeline> {
-        let raw = self.resources.device();
-        let module = self.load_shader_module("shaders/point_shadow.spv")?;
-        let result = self.build_point_shadow_with_module(raw, module);
-        // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
-        // after creation is valid and required.
-        unsafe { raw.destroy_shader_module(module, None) };
-        result
-    }
-
-    fn build_point_shadow_with_module(
-        &self,
-        raw: &ash::Device,
-        module: vk::ShaderModule,
-    ) -> Result<Pipeline> {
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
-                .name(c"vertexMain"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
-                .name(c"fragmentMain"),
-        ];
-
-        let vertex_bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(size_of::<Vertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
-        let attributes = base_vertex_attributes();
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&vertex_bindings)
-            .vertex_attribute_descriptions(&attributes);
-
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-            .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
-        let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(false)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
-        let color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-
-        let color_formats = [crate::lighting::POINT_SHADOW_COLOR_FORMAT];
-        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_formats)
-            .depth_attachment_format(DEPTH_FORMAT);
-
-        // The push is mat4 viewProj + vec4 lightPos, read in the vertex AND fragment stages.
-        let push_size = (size_of::<saffron_geometry::glam::Mat4>()
-            + size_of::<saffron_geometry::glam::Vec4>()) as u32;
-        let push_constant = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(push_size)];
-        let set_layouts = &self.set_layouts[..3];
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(set_layouts)
-            .push_constant_ranges(&push_constant);
-        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by
-        // the returned `Pipeline`.
-        let layout = checked(
-            unsafe { raw.create_pipeline_layout(&layout_info, None) },
-            "create_pipeline_layout (point-shadow)",
-        )?;
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .push_next(&mut rendering_info)
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&raster)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&color_blend)
-            .dynamic_state(&dynamic)
-            .layout(layout);
-        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the
-        // layout is freed exactly once.
-        let created = unsafe {
-            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        };
-        let pipeline = match created {
-            Ok(pipelines) => pipelines[0],
-            Err((_, result)) => {
-                // SAFETY: the ash seam. The layout was created above; freed once here.
-                unsafe { raw.destroy_pipeline_layout(layout, None) };
-                return Err(Error::Vk {
-                    context: "create_graphics_pipelines (point-shadow)",
                     result,
                 });
             }
@@ -3452,6 +3902,7 @@ mod tests {
             blend: false,
             alpha_to_coverage: false,
             sample_count: vk::SampleCountFlags::TYPE_1,
+            executor: false,
         };
         let mut set = HashSet::new();
         set.insert(base.clone());
@@ -3484,10 +3935,14 @@ mod tests {
                 sample_count: vk::SampleCountFlags::TYPE_4,
                 ..base.clone()
             },
+            PsoKey {
+                executor: true,
+                ..base.clone()
+            },
         ] {
             assert!(set.insert(variant));
         }
-        assert_eq!(set.len(), 7);
+        assert_eq!(set.len(), 8);
     }
 
     /// The same variant requested twice returns the *same* `Arc` (one PSO, a cache
