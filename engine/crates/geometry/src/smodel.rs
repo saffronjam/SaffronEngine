@@ -343,10 +343,7 @@ mod tests {
     #[test]
     fn fourcc_packs_little_endian() {
         // tag[0] in the low byte: "META" == 'M' | 'E'<<8 | 'T'<<16 | 'A'<<24.
-        assert_eq!(
-            fourcc(b"META"),
-            u32::from_le_bytes([b'M', b'E', b'T', b'A'])
-        );
+        assert_eq!(fourcc(b"META"), u32::from_le_bytes(*b"META"));
         assert_eq!(ChunkKind::Meta as u32, u32::from_le_bytes(*b"META"));
         assert_eq!(ChunkKind::Mesh as u32, u32::from_le_bytes(*b"MESH"));
         assert_eq!(ChunkKind::Texture as u32, u32::from_le_bytes(*b"STEX"));
