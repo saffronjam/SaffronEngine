@@ -13,7 +13,7 @@ use crate::budget::{BudgetController, BudgetStep};
 use crate::ddgi::DDGI_RAYS_PER_PROBE;
 use crate::descriptors::Descriptors;
 use crate::device::SurfaceSource;
-use crate::draw_list::{DrawItem, RenderStats, SceneDrawList};
+use crate::draw_list::{RenderStats, SceneDrawList};
 use crate::frame::{FrameRing, FrameTimelinePoint};
 use crate::frame_history::{
     ActiveAlarm, AlarmDrain, AlarmInputs, AlarmState, FrameHistory, FrameHistoryStats, FrameSample,
@@ -24,8 +24,7 @@ use crate::ibl::{
     SOLAR_ILLUMINANCE_TOA, Sky, SkyRenderSettings, SkygenParams, sun_transmittance,
 };
 use crate::instancing::Instancing;
-use crate::lighting::{ClusterCamera, Lighting, SceneLighting, point_shadow_face_matrices};
-use crate::meshlet_raster::MeshletRaster;
+use crate::lighting::{ClusterCamera, Lighting, SceneLighting, SceneWind};
 use crate::nested_scopes::NestedScopeRecorder;
 use crate::overlay::{
     ColorGrade, GradeUniform, GridPush, OverlayDraw, OverlayState, OverlayVertex, TonemapMode,
@@ -44,13 +43,9 @@ use crate::render_graph::{
     RgResource, RgUsage,
 };
 use crate::resources::BindlessFreeList;
-use crate::scene_pass::{
-    PointShadowTarget, record_depth_prepass, record_gbuffer, record_point_shadow,
-    record_scene_draw_list, record_shadow_depth, record_transparent_draw_list,
-};
+use crate::scene_pass::record_executor_depth_family;
 use crate::skinning::Skinning;
 use crate::ssao::Ssao;
-use crate::targets::Targets;
 use crate::tessellation::Tessellation;
 use crate::transient::RenderGraphResources;
 use crate::view_target::ViewTarget;
@@ -111,6 +106,9 @@ pub enum ViewMode {
     Fog,
     /// Raw volumetric cloud density integrated by the dedicated cloud debug pass.
     CloudDensity,
+    /// Virtual-shadow page visualization: the directional sampler's resolved
+    /// (level, page) as a stable colour, dimmed where no page is resident.
+    ShadowPages,
 }
 
 impl ViewMode {
@@ -140,6 +138,7 @@ impl ViewMode {
             ViewMode::AmbientOcclusion => 11,
             ViewMode::Gi => 12,
             ViewMode::LightComplexity => 13,
+            ViewMode::ShadowPages => 14,
         }
     }
 }
@@ -192,6 +191,16 @@ impl ViewId {
         }
     }
 
+    /// Stable world identity reserved for this renderer-owned view.
+    pub fn gpu_scene_world(self) -> crate::GpuSceneWorldId {
+        crate::GpuSceneWorldId(self.index() as u64)
+    }
+
+    /// Stable temporal-view identity reserved for this renderer-owned view.
+    pub fn gpu_scene_view(self) -> crate::GpuSceneViewId {
+        crate::GpuSceneViewId(self.index() as u64)
+    }
+
     /// The [`ViewId`] for a dense slot index, the inverse of [`ViewId::index`].
     pub fn from_index(index: usize) -> Self {
         match index {
@@ -231,6 +240,8 @@ impl ViewId {
 pub struct RenderStatsFull {
     /// The draw-path counters from the last submitted draw list.
     pub draw: RenderStats,
+    /// Last completed frame's virtual-shadow residency activity.
+    pub vsm: crate::VsmCounters,
     /// Wall-clock render-thread frame time (ms); `0` until the run loop records it.
     pub frame_ms: f32,
     /// Frames per second derived from `frame_ms` (`0` when `frame_ms` is `0`).
@@ -291,16 +302,18 @@ pub struct RenderStatsFull {
 /// immutably. A `None` arms nothing — that pass is skipped this frame.
 struct FramePipelines {
     depth_prepass: Option<Arc<crate::Pipeline>>,
+    /// The tessellation seam's vertex-input pass PSOs, resolved only when the frame
+    /// carries tess draws.
+    depth_prepass_tess: Option<Arc<crate::Pipeline>>,
+    gbuffer_tess: Option<Arc<crate::Pipeline>>,
+    motion_tess: Option<Arc<crate::Pipeline>>,
     cull: Option<Arc<crate::Pipeline>>,
     /// The compute skinning PSO, resolved when the frame has skinned dispatches.
     skin: Option<Arc<crate::Pipeline>>,
     /// The compute morph PSO, resolved when the frame has morph dispatches.
     morph: Option<Arc<crate::Pipeline>>,
+    /// The executor depth PSO the virtual-shadow page passes rasterize with.
     shadow: Option<Arc<crate::Pipeline>>,
-    point_shadow: Option<Arc<crate::Pipeline>>,
-    /// Whether the **static** point-shadow cube needs re-rendering this frame (its content key or
-    /// image changed). The dynamic cube always re-renders when `point_shadow` is `Some`.
-    static_point_shadow_dirty: bool,
     /// The thin G-buffer prepass + the screen-space compute PSOs, resolved when the
     /// screen-space chain runs this frame (any of GTAO / contact / SSGI on).
     gbuffer: Option<Arc<crate::Pipeline>>,
@@ -394,6 +407,10 @@ struct FramePipelines {
     /// The TAA reactive-coverage graphics PSO: re-draws the translucent batches into the r8
     /// reactive mask. Resolved only when TAA is active (the mask feeds the TAA resolve).
     reactive_coverage: Option<Arc<crate::Pipeline>>,
+    /// The transition-reactive graphics PSO: re-draws the opaque buckets through the
+    /// degenerate-collapse vertex path so blades and representation transitions mark the
+    /// reactive mask too.
+    reactive_transition: Option<Arc<crate::Pipeline>>,
     /// The ground-grid graphics PSO, resolved when the grid is shown this frame.
     grid: Option<Arc<crate::Pipeline>>,
     /// The on-top + depth-tested overlay graphics PSOs, resolved when overlay geometry
@@ -449,6 +466,10 @@ struct GdfPipelines {
 struct GdfResult {
     cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
     cascade_slots: [Option<usize>; crate::GDF_CASCADES as usize],
+    /// The porous-occupancy volume resources + their external slots, mirroring the
+    /// distance cascades.
+    occupancy: Option<[RgResource; crate::GDF_CASCADES as usize]>,
+    occupancy_slots: [Option<usize>; crate::GDF_CASCADES as usize],
     /// The lite albedo cache resource (the DDGI trace's `SampledRead`) + its external slot. `Some`
     /// only when the composite ran this frame (it writes the cache GENERAL).
     albedo: Option<RgResource>,
@@ -702,6 +723,14 @@ pub(crate) struct FogParams {
     ap: crate::AerialParamsUbo,
 }
 
+/// One world's wind sway record buffer: one [`crate::GpuWindInstanceRecord`] per
+/// instance slot, recreated (behind an idle wait) when the world's instance
+/// capacity outgrows it.
+struct WindDeformRecords {
+    buffer: crate::Buffer,
+    capacity: u32,
+}
+
 /// The renderer: device, swapchain, frame ring, and the clear color.
 ///
 /// Drop order is load-bearing — the frame ring and swapchain are destroyed (their
@@ -869,14 +898,6 @@ pub struct Renderer {
     scene_draw_list: SceneDrawList,
     stats: RenderStats,
 
-    /// The point-shadow cube cache: the content key + cube image handle of the last cube actually
-    /// rendered. The cube persists in `SHADER_READ_ONLY` between frames, so when the key and the
-    /// image both match, the `point-shadow` pass is skipped and the cached cube is sampled — a
-    /// static light + casters cost nothing while the camera moves. A target recreation mints a new
-    /// image handle, which forces a re-render (the new cube is `UNDEFINED`).
-    last_point_shadow_key: Option<u64>,
-    last_point_shadow_cube: vk::Image,
-
     /// The active render-quality tier + resolved screen-space GI parameters (applied to
     /// [`Ssao`]). Reported in `render-stats` and saved with the project.
     render_quality: RenderQuality,
@@ -914,14 +935,6 @@ pub struct Renderer {
     /// surface in `render-stats`, and the host reads the power state back to suppress a hidden view.
     reactive: ReactiveState,
 
-    /// The directional shadow map's layout carried across frames: the graph seeds the
-    /// entry layout from it and writes back the
-    /// resolved exit layout each frame, so the cross-frame `DepthWrite → ShaderReadOnly`
-    /// transition is derived, never hand-written.
-    directional_shadow_layout: vk::ImageLayout,
-    /// The spot shadow map's cross-frame layout.
-    spot_shadow_layout: vk::ImageLayout,
-
     /// The anti-aliasing selection (MSAA / FXAA / TAA, mutually exclusive). The frame
     /// graph branches the scene output on this; the temporal targets live per-view.
     aa: crate::Aa,
@@ -939,6 +952,69 @@ pub struct Renderer {
     /// The per-editor-pane render targets, indexed by [`ViewId::index`] (`Scene` = 0,
     /// `AssetPreview` = 1). Always [`VIEW_COUNT`] entries.
     views: Vec<ViewTarget>,
+    /// Device-global immutable arenas and tables shared by every registered GPU-scene world.
+    global_gpu_data: crate::GlobalGpuData,
+    /// Device tables of the persistent GPU scene plus its frame upload translation.
+    gpu_scene_uploader: crate::GpuSceneUploader,
+    /// Per-world wind sway record buffers (one record per instance slot), written by
+    /// the wind deformation prepass and read through the address block.
+    wind_deform_records: std::collections::HashMap<u64, WindDeformRecords>,
+    /// The frame's shared wind field parameters (clouds and fog advect on the same
+    /// state the light UBO and the deformation prepass carry).
+    scene_wind: SceneWind,
+    /// The virtual shadow map: the physical atlas + page-table ring.
+    vsm_gpu: crate::vsm::VsmGpu,
+    /// The VSM CPU residency authority (allocation, LRU, cooldown, dirty pages).
+    vsm_residency: crate::VsmResidency,
+    /// Per-directional-level page-render visibility views, built lazily by the
+    /// page-render block.
+    vsm_views: Vec<Option<crate::SceneVisibilityView>>,
+    /// The dirty pages this frame rasterizes.
+    vsm_render_pages: Vec<crate::VsmRenderPage>,
+    /// The frame's directional virtual-shadow space.
+    vsm_space: crate::VsmDirectionalSpace,
+    /// The GPU receiver-demand apparatus (bitmap + request rings + layouts).
+    vsm_demand: crate::VsmDemand,
+    /// The freshest drained receiver demand as `(level, page)` pairs.
+    vsm_demanded: Vec<u32>,
+    /// The spot matrix the resident spot pages were rendered under.
+    vsm_spot_matrix: [f32; 16],
+    /// The point light's position + far of the pages on the atlas; a change
+    /// invalidates every point-face page.
+    vsm_point_key: [f32; 4],
+    /// Per-world interaction field buffers (header + damped-oscillator texel cascades).
+    interaction_fields: std::collections::HashMap<u64, crate::Buffer>,
+    /// Impulses staged for this frame's interaction-field step.
+    interaction_impulses: Vec<crate::InteractionImpulse>,
+    /// Per-frame-in-flight mapped impulse upload ring.
+    interaction_impulse_ring: Vec<crate::Buffer>,
+    /// Per-frame-in-flight mapped local wind-source ring (cap 64 records).
+    wind_source_ring: Vec<crate::Buffer>,
+    /// The hierarchy page-payload residency authority (state machine, budgets, LRU).
+    page_residency: crate::PageResidency,
+    /// Device-shared HZB scaffolding (sampler + build set layouts).
+    hzb: crate::Hzb,
+    /// Device-shared instance-visibility scaffolding (set layouts + HZB sampler).
+    scene_visibility: crate::SceneVisibility,
+    /// The populated executor bins (shader index, material class bits) the mirror
+    /// pushed after its last sync; draw sites iterate only these.
+    live_executor_bins: Vec<(u32, u32)>,
+    /// The mirror's upper bound on emitted draw records (see
+    /// [`set_live_draw_record_bound`](Self::set_live_draw_record_bound)).
+    live_draw_record_bound: u32,
+    /// The latest fence-completed visibility counters (visible/retest/records +
+    /// overflow/pressure flags) for the active view.
+    visibility_counters: [u32; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
+    page_faults: u64,
+    /// Resident-record stages, retirements, and arena uploads queued by the asset mirror,
+    /// drained into each frame's transfer passes.
+    pending_gpu_scene_uploads: crate::GpuScenePendingUploads,
+    /// The resident micro-field tile directory (fields-arena byte offset + entries).
+    micro_field_directory: Option<(u32, u32)>,
+    /// The most recent frame's upload-translation counters.
+    last_gpu_scene_upload: crate::GpuSceneUploadRunStats,
+    /// Sole renderer-derived mirror for scene, preview, thumbnail, and player worlds.
+    persistent_gpu_scene: crate::PersistentGpuScene,
     /// Which view the renderer renders + presents this frame.
     active_view: ViewId,
 
@@ -954,18 +1030,12 @@ pub struct Renderer {
     pending_shm_publish: Option<(usize, usize)>,
 
     lighting: Lighting,
-    targets: Targets,
     instancing: Instancing,
     skinning: Skinning,
     /// The adaptive-tessellation prep subsystem (factor/scan/finalize/args descriptor infra); records
     /// the Phase-3 prep passes in the deform scope and emits the amplified transient geometry every
     /// raster + RT consumer reads for a displaced mesh.
     tessellation: Tessellation,
-    /// The `VK_EXT_mesh_shader` meshlet raster path — `Some` only on a mesh-shader device, engaged
-    /// only when `SAFFRON_MESH_SHADER` opts in (else the index-draw path serves every mesh).
-    meshlet_raster: Option<MeshletRaster>,
-    /// Whether the meshlet raster path is enabled this run (`SAFFRON_MESH_SHADER` + device support).
-    meshlet_enabled: bool,
     transient: RenderGraphResources,
     pipelines: Pipelines,
     ibl: Ibl,
@@ -1110,15 +1180,18 @@ impl Renderer {
         // before the `Device` field would (it is not yet moved into `Self`).
         type BuildParts = (
             Arc<Descriptors>,
-            Targets,
             Lighting,
             Pipelines,
             Instancing,
             Skinning,
             Tessellation,
-            Option<MeshletRaster>,
-            bool,
             RenderGraphResources,
+            crate::GlobalGpuData,
+            crate::GpuSceneUploader,
+            crate::PageResidency,
+            crate::Hzb,
+            crate::SceneVisibility,
+            crate::PersistentGpuScene,
             Ibl,
             Ibl,
             Sky,
@@ -1139,6 +1212,8 @@ impl Renderer {
             Arc<crate::GpuSdf>,
             crate::resources::DefaultHeightMinMax,
             Arc<crate::GpuLut>,
+            crate::vsm::VsmGpu,
+            crate::VsmDemand,
         );
         let build = || -> Result<BuildParts> {
             let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
@@ -1165,23 +1240,34 @@ impl Renderer {
             // never branches on look presence (intensity 0 is the neutral).
             let default_lut = uploader.upload_identity_lut()?;
 
-            let targets = Targets::new(&device)?;
-            let lighting = Lighting::new(&device, &descriptors, &targets)?;
+            let vsm_gpu = crate::vsm::VsmGpu::new(&device)?;
+            let vsm_demand = crate::VsmDemand::new(&device, &descriptors)?;
+            let lighting = Lighting::new(&device, &descriptors, vsm_gpu.atlas.view())?;
             let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
             let instancing = Instancing::new(&device, &descriptors)?;
             let skinning = Skinning::new(&device)?;
             let tessellation = Tessellation::new(&device)?;
-            // The meshlet raster path exists only on a mesh-shader device; it engages only when
-            // `SAFFRON_MESH_SHADER` opts in, so the validated index-draw path stays the default.
-            let meshlet_raster = MeshletRaster::new(&device)?;
-            let meshlet_enabled =
-                meshlet_raster.is_some() && std::env::var_os("SAFFRON_MESH_SHADER").is_some();
-            if meshlet_enabled {
-                tracing::info!(
-                    "meshlet raster path enabled (VK_EXT_mesh_shader + SAFFRON_MESH_SHADER)"
+            let transient = RenderGraphResources::new(device.resources().clone());
+            let global_gpu_data = crate::GlobalGpuData::new(&device)?;
+            let gpu_scene_uploader = crate::GpuSceneUploader::new(&device)?;
+            let page_residency = crate::PageResidency::new(crate::PageResidencyBudgets::default());
+            let hzb = crate::Hzb::new(&device)?;
+            let scene_visibility = crate::SceneVisibility::new(&device)?;
+            for frame in 0..crate::MAX_FRAMES_IN_FLIGHT {
+                descriptors.write_uniform_buffer_at(
+                    instancing.instance_set(frame),
+                    3,
+                    gpu_scene_uploader.address_buffer(),
+                    frame as u64 * gpu_scene_uploader.address_block_stride(),
+                    size_of::<crate::GpuSceneAddressBlock>() as u64,
                 );
             }
-            let transient = RenderGraphResources::new(device.resources().clone());
+            let mut persistent_gpu_scene =
+                crate::PersistentGpuScene::new(crate::GpuSceneUploadLimits::default())?;
+            for view in [ViewId::Scene, ViewId::AssetPreview, ViewId::Thumbnail] {
+                persistent_gpu_scene.create_world(view.gpu_scene_world())?;
+                persistent_gpu_scene.create_view(view.gpu_scene_view(), view.gpu_scene_world())?;
+            }
 
             // IBL: the cubes + LUT sampler + set 3, then the first (procedural) bake so set
             // 3 is valid before the first frame. The sky reuses the env cube; the reflection
@@ -1340,15 +1426,18 @@ impl Renderer {
             ssao.ready = true;
             Ok((
                 descriptors,
-                targets,
                 lighting,
                 pipelines,
                 instancing,
                 skinning,
                 tessellation,
-                meshlet_raster,
-                meshlet_enabled,
                 transient,
+                global_gpu_data,
+                gpu_scene_uploader,
+                page_residency,
+                hzb,
+                scene_visibility,
+                persistent_gpu_scene,
                 ibl,
                 preview_ibl,
                 sky,
@@ -1369,19 +1458,24 @@ impl Renderer {
                 default_sdf,
                 default_height_minmax,
                 default_lut,
+                vsm_gpu,
+                vsm_demand,
             ))
         };
         let (
             descriptors,
-            targets,
             lighting,
             pipelines,
             instancing,
             skinning,
             tessellation,
-            meshlet_raster,
-            meshlet_enabled,
             transient,
+            global_gpu_data,
+            gpu_scene_uploader,
+            page_residency,
+            hzb,
+            scene_visibility,
+            persistent_gpu_scene,
             ibl,
             preview_ibl,
             sky,
@@ -1402,6 +1496,8 @@ impl Renderer {
             default_sdf,
             default_height_minmax,
             default_lut,
+            vsm_gpu,
+            vsm_demand,
         ) = match build() {
             Ok(parts) => parts,
             Err(err) => {
@@ -1472,7 +1568,7 @@ impl Renderer {
         // binding 0); the trace reads it as the hit radiance's per-cell base color. Persistent.
         ddgi.bind_gdf_albedo(&global_sdf);
 
-        Ok(Self {
+        let mut renderer = Self {
             clear_color: [0.05, 0.06, 0.08, 1.0],
             wireframe: false,
             use_depth_prepass: true,
@@ -1534,8 +1630,6 @@ impl Renderer {
             overlay,
             submissions: Vec::new(),
             scene_draw_list: SceneDrawList::default(),
-            last_point_shadow_key: None,
-            last_point_shadow_cube: vk::Image::null(),
             render_quality: RenderQuality::default(),
             budget_controller: BudgetController::new(),
             pending_render_scale: None,
@@ -1548,11 +1642,6 @@ impl Renderer {
             creative_lut_size: 2,
             reactive: ReactiveState::default(),
             stats: RenderStats::default(),
-            // The shadow maps are init-transitioned to ShaderReadOnly by `Targets::new`,
-            // so the first frame's graph import seeds that layout (the depth-write pass
-            // then transitions ShaderReadOnly → DepthWrite → ShaderReadOnly).
-            directional_shadow_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            spot_shadow_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             aa,
             taa_params: crate::TaaParams::default(),
             camera_near_far: (0.1, 100.0),
@@ -1565,16 +1654,46 @@ impl Renderer {
                 far: 100.0,
             },
             views,
+            global_gpu_data,
+            gpu_scene_uploader,
+            wind_deform_records: std::collections::HashMap::new(),
+            scene_wind: SceneWind::default(),
+            vsm_gpu,
+            vsm_residency: crate::VsmResidency::default(),
+            vsm_views: (0..crate::VSM_DIRECTIONAL_LEVELS + 1 + crate::vsm::VSM_POINT_FACES)
+                .map(|_| None)
+                .collect(),
+            vsm_render_pages: Vec::new(),
+            vsm_space: crate::VsmDirectionalSpace::build(
+                saffron_geometry::glam::Vec3::NEG_Y,
+                saffron_geometry::glam::Vec3::ZERO,
+            ),
+            vsm_demand,
+            vsm_demanded: Vec::new(),
+            vsm_spot_matrix: [0.0; 16],
+            vsm_point_key: [0.0; 4],
+            interaction_fields: std::collections::HashMap::new(),
+            interaction_impulses: Vec::new(),
+            interaction_impulse_ring: Vec::new(),
+            wind_source_ring: Vec::new(),
+            page_residency,
+            hzb,
+            scene_visibility,
+            live_executor_bins: Vec::new(),
+            live_draw_record_bound: 0,
+            visibility_counters: [0; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
+            page_faults: 0,
+            pending_gpu_scene_uploads: crate::GpuScenePendingUploads::default(),
+            micro_field_directory: None,
+            last_gpu_scene_upload: crate::GpuSceneUploadRunStats::default(),
+            persistent_gpu_scene,
             active_view: ViewId::Scene,
             shm_publish_enabled: [false; VIEW_COUNT],
             pending_shm_publish: None,
             lighting,
-            targets,
             instancing,
             skinning,
             tessellation,
-            meshlet_raster,
-            meshlet_enabled,
             transient,
             pipelines,
             ibl,
@@ -1601,7 +1720,19 @@ impl Renderer {
             swapchain,
             present_sync,
             device,
-        })
+        };
+        // Seed the shared micro-blade template's index block; it drains with the
+        // first frame's pending uploads.
+        renderer
+            .pending_gpu_scene_uploads
+            .upload_arena(crate::GpuArenaUploadRequest::PageBytes {
+                range: renderer.global_gpu_data.micro_blade_template,
+                data: crate::micro_blade_template_indices()
+                    .iter()
+                    .flat_map(|index| index.to_le_bytes())
+                    .collect(),
+            });
+        Ok(renderer)
     }
 
     /// The immutable device, shared by the sibling sub-state.
@@ -1642,6 +1773,115 @@ impl Renderer {
         Arc::clone(&self.descriptors)
     }
 
+    /// Device-global geometry arenas and immutable metadata tables.
+    pub fn global_gpu_data(&self) -> &crate::GlobalGpuData {
+        &self.global_gpu_data
+    }
+
+    /// Mutable device-global tables used by the asset delta adapter.
+    pub fn global_gpu_data_mut(&mut self) -> &mut crate::GlobalGpuData {
+        &mut self.global_gpu_data
+    }
+
+    /// Descriptor-ready immutable-table bindings for visibility and draw executors.
+    pub fn global_gpu_table_descriptors(&self) -> crate::GlobalGpuTableDescriptors {
+        self.global_gpu_data.table_descriptors(&self.device)
+    }
+
+    /// Sole persistent renderer-derived scene mirror.
+    pub fn persistent_gpu_scene(&self) -> &crate::PersistentGpuScene {
+        &self.persistent_gpu_scene
+    }
+
+    /// Mutable scene mirror used by typed world and asset delta adapters.
+    pub fn persistent_gpu_scene_mut(&mut self) -> &mut crate::PersistentGpuScene {
+        &mut self.persistent_gpu_scene
+    }
+
+    /// The latest fence-completed visibility counters for the active view:
+    /// `[visible, retest, list overflow flags, records, record/bucket pressure,
+    /// transparent, _, _]`.
+    pub fn visibility_counters(&self) -> [u32; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        self.visibility_counters
+    }
+
+    /// GPU missing-page requests drained since startup (the page-fault total).
+    pub fn page_faults(&self) -> u64 {
+        self.page_faults
+    }
+
+    /// Replaces the populated executor bin set (the mirror pushes it per sync).
+    pub fn set_live_executor_bins(&mut self, bins: Vec<(u32, u32)>) {
+        self.live_executor_bins = bins;
+    }
+
+    /// Publishes the mirror's upper bound on emitted draw records, which bounds the fixed-slice
+    /// indirect draws on a device without `drawIndirectCount`.
+    pub fn set_live_draw_record_bound(&mut self, bound: u32) {
+        self.live_draw_record_bound = bound;
+    }
+
+    /// The page-payload residency counters (registered/resident/bytes/evictions).
+    pub fn page_residency_stats(&self) -> crate::PageResidencyStats {
+        self.page_residency.stats()
+    }
+
+    /// The active view's page-demand context: the eye for projected error, the
+    /// projection scale (pixels per metre at unit distance), and the view-projection
+    /// for frustum visibility probability.
+    pub fn page_demand_view(&self) -> crate::PageDemandView {
+        let view = self.ssao.view();
+        let inv_projection = self.ssao.inv_projection();
+        let extent = self.views[self.active_view.index()].scaled_render_extent();
+        let inv_scale = inv_projection.col(1).y;
+        let proj_scale = if inv_scale.abs() > f32::EPSILON {
+            (1.0 / inv_scale).abs() * extent.height as f32 * 0.5
+        } else {
+            0.0
+        };
+        crate::PageDemandView {
+            eye: view.inverse().col(3).truncate(),
+            proj_scale,
+            view_proj: inv_projection.inverse() * view,
+        }
+    }
+
+    /// The GPU-scene halves the delta adapter writes in one borrow: device tables for
+    /// record inserts, the persistent mirror for typed deltas, the pending-upload queue
+    /// for staged bytes, retirements, and arena data, and the page-residency authority.
+    pub fn gpu_scene_parts_mut(
+        &mut self,
+    ) -> (
+        &mut crate::GlobalGpuData,
+        &mut crate::PersistentGpuScene,
+        &mut crate::GpuScenePendingUploads,
+        &mut crate::PageResidency,
+    ) {
+        (
+            &mut self.global_gpu_data,
+            &mut self.persistent_gpu_scene,
+            &mut self.pending_gpu_scene_uploads,
+            &mut self.page_residency,
+        )
+    }
+
+    /// The persistent GPU scene's device tables and upload translation.
+    pub fn gpu_scene_uploader(&self) -> &crate::GpuSceneUploader {
+        &self.gpu_scene_uploader
+    }
+
+    /// Publishes the resident micro-field tile directory (byte offset within the
+    /// fields arena + entry count) the micro reconstruction pass dispatches over,
+    /// or `None` while no field tiles are resident.
+    pub fn set_micro_field_directory(&mut self, directory: Option<(u32, u32)>) {
+        self.micro_field_directory = directory;
+    }
+
+    /// The most recent frame's GPU-scene upload-translation counters.
+    pub fn gpu_scene_upload_stats(&self) -> crate::GpuSceneUploadRunStats {
+        self.last_gpu_scene_upload
+    }
+
     /// The 1×1 white texture occupying [`crate::DEFAULT_WHITE_SLOT`]: a material with no
     /// albedo/ORM texture indexes its bindless slot.
     pub fn default_white(&self) -> &Arc<crate::GpuTexture> {
@@ -1675,6 +1915,135 @@ impl Renderer {
     /// The active view's offscreen scene-color image handle + view + extent.
     pub fn active_view(&self) -> &ViewTarget {
         &self.views[self.active_view.index()]
+    }
+
+    /// The active view's GPU-scene world identity.
+    pub fn active_gpu_scene_world(&self) -> crate::GpuSceneWorldId {
+        self.active_view.gpu_scene_world()
+    }
+
+    /// The record-driven deformation frame: uploads the palettes and wires the
+    /// skin/morph/tessellation work for `work` (the scene driver's per-entity
+    /// deformation facts) without any draw list. The gathered outputs land on the
+    /// frame's [`SceneDrawList`] deformation fields (dispatches, RT entries, tess
+    /// buckets, provider-patch facts); the draw batches stay untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error`] on buffer growth or dispatch wiring failure.
+    pub fn submit_gpu_scene_deformations(
+        &mut self,
+        view_proj: Mat4,
+        work: &[crate::DeformationWork],
+        joints: &[Mat4],
+    ) -> Result<()> {
+        let frame = self.frames.index();
+        let mut gather = crate::DeformationGather::default();
+        let mut prev_joints: Vec<Mat4> = joints.to_vec();
+        let params = crate::TessGatherParams {
+            rt_skinned: self.rt.use_rt_shadows() || self.rt.use_rt_reflections(),
+            factor_cap: self.tess_factor_cap,
+            min_factor: self.tess_min_factor,
+            edge_length_target: self.tess_edge_length_target,
+        };
+        // A displaced item's tess bucket links to its instance row via `base_instance`
+        // (row `i` = the i-th displaced item, matching `upload_tess_instance_rows`).
+        let mut displaced_row = 0u32;
+        for item in work {
+            let base_instance = if item.displace.is_some() {
+                let row = displaced_row;
+                displaced_row += 1;
+                row
+            } else {
+                0
+            };
+            crate::gather_instance_deformation(
+                &mut gather,
+                &mut self.skinning,
+                item,
+                joints,
+                &mut prev_joints,
+                params,
+                base_instance,
+            );
+        }
+        let mut list = SceneDrawList {
+            view_proj,
+            ..SceneDrawList::default()
+        };
+        self.instancing.wire_gathered_deformations(
+            &self.descriptors,
+            &mut self.skinning,
+            frame,
+            gather,
+            joints,
+            prev_joints,
+            &mut list,
+        )?;
+        // The tessellation seam: one instance row + mesh PSO per displaced item; the
+        // tess prep resolves each draw's amplified VB/IB/args once the frame's
+        // transients exist.
+        let displaced: Vec<&crate::DeformationWork> =
+            work.iter().filter(|item| item.displace.is_some()).collect();
+        if !displaced.is_empty() {
+            let rows: Vec<(u64, Mat4, &[crate::SubmeshMaterial], u32)> = displaced
+                .iter()
+                .map(|item| {
+                    (
+                        item.entity,
+                        item.model,
+                        item.submesh_materials.as_slice(),
+                        item.parameter_index,
+                    )
+                })
+                .collect();
+            let phase = self.views[self.active_view.index()].jitter_index;
+            self.instancing.upload_tess_instance_rows(
+                &self.descriptors,
+                &mut self.skinning,
+                frame,
+                &rows,
+                crate::DEFAULT_WHITE_SLOT,
+                phase,
+                &mut list,
+            )?;
+            for (row, item) in displaced.iter().enumerate() {
+                let Some(pso) =
+                    self.pipelines
+                        .request_mesh_pipeline(&item.material, false, self.wireframe)
+                else {
+                    continue;
+                };
+                let slot0 = item.submesh_materials.first();
+                list.tess_draws.push(crate::TessSceneDraw {
+                    pso,
+                    base_instance: row as u32,
+                    cull: if slot0.is_some_and(|material| material.double_sided) {
+                        vk::CullModeFlags::NONE
+                    } else {
+                        vk::CullModeFlags::BACK
+                    },
+                    blend: slot0.is_some_and(|material| {
+                        material.blend_mode == saffron_core::BlendMode::Blend
+                    }),
+                    draw: None,
+                });
+            }
+        }
+        list.valid = true;
+        self.scene_draw_list = list;
+        Ok(())
+    }
+
+    /// Records the retained-mesh host-byte figure the mirror reports (render stats).
+    pub fn record_retained_mesh_bytes(&mut self, bytes: u64) {
+        self.stats.retained_mesh_cpu_bytes = bytes;
+    }
+
+    /// The submitted frame's skinned palette/deformed offsets (the provider-params
+    /// patch input).
+    pub fn skinned_deformations(&self) -> &[crate::SkinnedDeformation] {
+        &self.scene_draw_list.skinned_deformations
     }
 
     /// This frame's active-view sub-pixel jitter offset (NDC) — the offset applied to the scene
@@ -1722,7 +2091,7 @@ impl Renderer {
         self.reset_view_temporal(view);
     }
 
-    /// The most recent frame's draw counters (refreshed by [`Renderer::submit_draw_list`]).
+    /// The most recent frame's draw counters (derived from the visibility readback).
     pub fn stats(&self) -> RenderStats {
         self.stats
     }
@@ -2151,6 +2520,7 @@ impl Renderer {
         let eye = view.inverse().col(3).truncate();
         // The recording frame's slot — the params UBO this frame's light set (same slot) reads.
         self.global_sdf.set_camera(eye, self.frames.index());
+        self.global_sdf.prepare_frame_regions();
     }
 
     /// Toggles the Global Distance Field: the camera-centered cascade clipmap the far-field cone
@@ -2174,6 +2544,7 @@ impl Renderer {
     /// Returns [`Error`] if growing the punctual SSBO fails.
     pub fn set_scene_lighting(&mut self, scene: &SceneLighting) -> Result<()> {
         let frame = self.frames.index();
+        self.prepare_vsm_frame(frame, scene.direction);
         let mut scene = scene.clone();
         if self.scene_ibl().atmosphere_live() {
             let atmosphere = self.scene_ibl().baked_atmosphere();
@@ -2252,6 +2623,99 @@ impl Renderer {
         );
         self.lighting
             .set_scene_lighting(&self.descriptors, frame, &scene)
+    }
+
+    /// Folds the shared wind field's frame parameters into the light UBO: the mean
+    /// direction/speed/gust, the deterministic sampling parameters, and the monotonic
+    /// simulation time (previous frame's time is retained for motion). Call once per
+    /// frame before [`Renderer::set_scene_lighting`].
+    /// The monotonically increasing frame serial (the traversal's `frameStamp`).
+    pub fn frame_serial(&self) -> u64 {
+        self.frame_serial
+    }
+
+    /// Stages world-space interaction impulses for this frame's field step; the
+    /// staged list drains when the frame records.
+    pub fn submit_interaction_impulses(&mut self, impulses: &[crate::InteractionImpulse]) {
+        self.interaction_impulses.extend_from_slice(impulses);
+    }
+
+    /// Folds the frame's wind parameters and local sources into the light UBO
+    /// words, the deformation pushes, and the source ring every GPU sampler reads.
+    pub fn set_wind(
+        &mut self,
+        wind: &SceneWind,
+        sources: &[saffron_wind::LocalWindSource],
+    ) -> Result<()> {
+        self.scene_wind = *wind;
+        while self.wind_source_ring.len() < crate::MAX_FRAMES_IN_FLIGHT {
+            self.wind_source_ring.push(crate::Buffer::new(
+                self.device.resources(),
+                64 * size_of::<crate::GpuWindSourceRecord>() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::Auto,
+                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                        | vk_mem::AllocationCreateFlags::MAPPED,
+                    ..Default::default()
+                },
+            )?);
+        }
+        let frame = self.frames.index();
+        let records: Vec<crate::GpuWindSourceRecord> = sources
+            .iter()
+            .take(64)
+            .map(|source| crate::GpuWindSourceRecord {
+                position: [
+                    source.position.x as f32,
+                    source.position.y as f32,
+                    source.position.z as f32,
+                ],
+                kind: match source.kind {
+                    saffron_wind::WindSourceKind::Directional => 0,
+                    saffron_wind::WindSourceKind::Point => 1,
+                    saffron_wind::WindSourceKind::Vortex => 2,
+                    saffron_wind::WindSourceKind::Wake => 3,
+                    saffron_wind::WindSourceKind::Volume => 4,
+                },
+                direction: source.direction.to_array(),
+                strength: source.strength,
+                radius: source.radius,
+                falloff: source.falloff,
+                reserved: [0.0; 2],
+            })
+            .collect();
+        let ring = &self.wind_source_ring[frame];
+        if !records.is_empty() {
+            // SAFETY: HOST_VISIBLE + MAPPED; the frame slot's fence passed before reuse.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    records.as_ptr().cast::<u8>(),
+                    ring.mapped_ptr(),
+                    records.len() * size_of::<crate::GpuWindSourceRecord>(),
+                );
+            }
+        }
+        let sources_address = self.device.buffer_device_address(ring.handle());
+        let radians = wind.orientation.to_radians();
+        self.lighting.set_frame_wind(
+            Vec4::new(radians.sin(), radians.cos(), wind.speed, wind.gust),
+            Vec4::new(
+                wind.turbulence_roughness,
+                wind.gust_frequency,
+                wind.reference_height,
+                wind.height_exponent,
+            ),
+            saffron_geometry::glam::UVec4::new(
+                wind.turbulence_octaves,
+                wind.seed,
+                records.len() as u32,
+                0,
+            ),
+            wind.time_s as f32,
+            sources_address,
+        );
+        Ok(())
     }
 
     /// Whether screen-space reflections are enabled.
@@ -2454,8 +2918,13 @@ impl Renderer {
         // clear of the index stream.
         let storage_cleared = storage | vk::BufferUsageFlags::TRANSFER_DST;
         // The AS-build-input flag the RT BLAS requires on the geometry buffers it references by device
-        // address (Phase 7 builds the tessellated BLAS from the transient VB/IB).
-        let accel_input = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        // address (Phase 7 builds the tessellated BLAS from the transient VB/IB). The flag is valid
+        // only with `VK_KHR_acceleration_structure`; without RT the buffers are raster-only.
+        let accel_input = if self.rt.supported() {
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+        } else {
+            vk::BufferUsageFlags::empty()
+        };
         let acquire = |graph: &mut RenderGraph,
                        t: &mut RenderGraphResources,
                        key: &'static str,
@@ -2566,14 +3035,14 @@ impl Renderer {
             return None;
         };
 
-        // Resolve each displaced batch's `tessellated` handles now that the per-frame transients exist,
-        // matched to its tess instance by `base_instance` (unique per single-instance displaced bucket).
-        // The finalize seed for row `r` lives at byte `r * 20` in the `seeds` args buffer. Done before
-        // the raster passes shallow-clone the draw list, so they pick up the indirect-draw handles.
+        // Resolve each tess-seam draw's handles now that the per-frame transients exist,
+        // matched to its tess instance by `base_instance`. The finalize seed for row `r`
+        // lives at byte `r * 20` in the `seeds` args buffer. Done before the raster
+        // passes shallow-clone the draw list, so they pick up the indirect-draw handles.
         for (row, inst) in insts.iter().enumerate() {
-            for batch in self.scene_draw_list.batches.iter_mut() {
-                if batch.base_instance == inst.base_instance {
-                    batch.tessellated = Some(crate::TessDraw {
+            for tess_draw in self.scene_draw_list.tess_draws.iter_mut() {
+                if tess_draw.base_instance == inst.base_instance {
+                    tess_draw.draw = Some(crate::TessDraw {
                         vertex_buffer: out_vb,
                         prev_vertex_buffer: out_prev_vb,
                         index_buffer: out_ib,
@@ -3421,33 +3890,30 @@ impl Renderer {
         tess_rt_res
     }
 
-    /// Arms the directional shadow pass with the light-space transform; `casting` (gated
-    /// by the master shadow toggle) drives whether the `shadow` pass runs this frame.
-    pub fn set_directional_shadow(&mut self, light_view_proj: Mat4, casting: bool) {
-        self.lighting
-            .set_directional_shadow(light_view_proj, casting);
+    /// Arms the directional virtual-shadow sampling; `casting` (gated by the master
+    /// shadow toggle) drives whether the sun shadows this frame.
+    pub fn set_directional_shadow(&mut self, casting: bool) {
+        self.lighting.set_directional_shadow(casting);
     }
 
-    /// Arms the spot shadow pass with the spot's perspective transform + its index in the
-    /// per-frame light list.
+    /// Arms the spot's virtual-shadow space with its perspective transform + its index
+    /// in the per-frame light list.
     pub fn set_spot_shadow(&mut self, light_view_proj: Mat4, light_index: u32, casting: bool) {
         self.lighting
             .set_spot_shadow(light_view_proj, light_index, casting);
     }
 
-    /// Arms the point shadow pass with the light's world position + far plane + its index, plus a
-    /// camera-independent `content_key` (light + caster transforms) the renderer uses to reuse the
-    /// cached cube when only the camera moved.
+    /// Arms the point light's six virtual face spaces with its world position + far
+    /// plane + its index.
     pub fn set_point_shadow(
         &mut self,
         light_pos: saffron_geometry::glam::Vec3,
         far_plane: f32,
         light_index: u32,
         casting: bool,
-        content_key: u64,
     ) {
         self.lighting
-            .set_point_shadow(light_pos, far_plane, light_index, casting, content_key);
+            .set_point_shadow(light_pos, far_plane, light_index, casting);
     }
 
     /// Whether the device supports hardware ray tracing (acceleration-structure +
@@ -3496,8 +3962,8 @@ impl Renderer {
     /// Captures this frame's static mesh instances (parallel world transforms + meshes) for
     /// the `tlas-build` pass, arming the build when RT shadows are on. Skinned instances
     /// ride the draw list.
-    pub fn set_rt_scene(&mut self, models: Vec<Mat4>, meshes: Vec<Arc<crate::GpuMesh>>) {
-        self.rt.set_rt_scene(models, meshes);
+    pub fn set_rt_scene(&mut self, instances: Vec<crate::RtInstanceInput>) {
+        self.rt.set_rt_scene(instances);
     }
 
     /// Drops every per-slot skinned refit BLAS (e.g. on a scene reset).
@@ -3640,6 +4106,19 @@ impl Renderer {
         let scale_only = input_changed && !display_changed;
         self.device.wait_idle()?;
         self.views[i].resize(&self.device, input, display)?;
+        // Rebuild the view's HZB pyramids at the new input extent under the idle wait,
+        // returning the old build sets to the pool.
+        if let Some(mut old_pyramid) = self.views[i].hzb_pyramid.take() {
+            old_pyramid.free_sets(&self.descriptors);
+        }
+        self.views[i].hzb_pyramid =
+            match crate::HzbPyramid::new(&self.device, &self.descriptors, &self.hzb, input) {
+                Ok(pyramid) => Some(pyramid),
+                Err(err) => {
+                    tracing::error!("hzb pyramid rebuild: {err}");
+                    None
+                }
+            };
         // `build_screen_space` sizes the input-extent chain from `scaled_render_extent`;
         // `build_aa_targets` sizes the display history + input motion/scratch/reactive/MSAA + the
         // overlay depth. On a scale-only change the preserving variant keeps the display history.
@@ -4722,6 +5201,7 @@ impl Renderer {
         };
         RenderStatsFull {
             draw: self.stats,
+            vsm: self.vsm_residency.counters(),
             frame_ms: self.frame_ms,
             fps,
             gpu_ms: self.gpu_frame_ms,
@@ -5040,65 +5520,10 @@ impl Renderer {
         self.overlay.submit(depth_tested, on_top);
     }
 
-    /// Builds the frame's [`SceneDrawList`] from `items`, uploading the instance +
-    /// material SSBOs for the current frame slot and refreshing [`Renderer::stats`].
-    /// Equivalent to [`Renderer::submit_draw_list_skinned`] with an empty palette — the
-    /// static-scene front door.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if an SSBO grow/upload fails.
-    pub fn submit_draw_list(&mut self, view_proj: Mat4, items: &[DrawItem]) -> Result<()> {
-        self.submit_draw_list_skinned(view_proj, items, &[])
-    }
-
-    /// Builds the frame's [`SceneDrawList`] from `items` + the concatenated `joints`
-    /// palette (`worldBone * inverseBind` per joint, indexed by each skinned item's
-    /// `joint_offset`). Uploads the instance / material / palette SSBOs, sizes the
-    /// deformed buffers, and wires the skin dispatches for the current frame slot. Call
-    /// once per frame before [`Renderer::render_scene_offscreen`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if an SSBO / deformed-buffer grow or upload fails.
-    pub fn submit_draw_list_skinned(
-        &mut self,
-        view_proj: Mat4,
-        items: &[DrawItem],
-        joints: &[Mat4],
-    ) -> Result<()> {
-        let inputs = crate::instancing::DrawListInputs {
-            frame: self.frames.index(),
-            view_proj,
-            wireframe: self.wireframe,
-            default_texture_index: crate::DEFAULT_WHITE_SLOT,
-            coverage_temporal_phase: self.views[self.active_view.index()].jitter_index,
-            // Track skinned RT instances when an RT consumer is armed (ray-query shadows or
-            // reflections on, on an RT device) — they feed the per-frame refit BLAS the
-            // `tlas-build` reads.
-            rt_skinned: self.rt.use_rt_shadows() || self.rt.use_rt_reflections(),
-            displace_enabled: self.displacement_enabled,
-            tess_factor_cap: self.tess_factor_cap,
-            tess_min_factor: self.tess_min_factor,
-            tess_edge_length_target: self.tess_edge_length_target,
-        };
-        let (list, stats) = self.instancing.submit_draw_list(
-            &self.descriptors,
-            &mut self.pipelines,
-            &mut self.skinning,
-            items,
-            joints,
-            inputs,
-        )?;
-        self.scene_draw_list = list;
-        self.stats = stats;
-        Ok(())
-    }
-
     /// Records and submits the scene + optional depth-prepass into the active view's
-    /// offscreen target through the render graph — the first real end-to-end frame
-    /// (geometry → instanced draw → a flat-ambient image). Call after
-    /// [`Renderer::submit_draw_list`]; submit-seam closures replay after the batch list.
+    /// offscreen target through the render graph. Call after
+    /// [`Renderer::submit_gpu_scene_deformations`]; submit-seam closures replay after
+    /// the executor draws.
     ///
     /// The graph derives the UNDEFINED → COLOR/DEPTH attachment barriers and the depth WAW
     /// barrier from the declared usages. The offscreen image is left in
@@ -5121,6 +5546,9 @@ impl Renderer {
     pub fn begin_offscreen_frame(&mut self) -> Result<()> {
         let raw = self.device.raw();
         let in_flight = self.frames.in_flight();
+        // The wait is unbounded, so a frame whose GPU work never completes blocks here forever.
+        // Registering it names that frame from the watchdog thread instead of hanging silently.
+        let _watch = crate::watchdog::watch("frame", self.frame_serial());
         // SAFETY: the ash seam. The fence belongs to this device; the wait blocks until this
         // slot's prior GPU work completes, so its per-frame buffers/sets are free to reuse.
         checked(
@@ -5138,6 +5566,9 @@ impl Renderer {
         // into `gpu_frame_ms` + `last_timings` at the begin-frame fence wait. A no-op when the
         // profiler is `Off`.
         let slot = self.frames.index();
+        self.global_gpu_data.begin_frame(slot)?;
+        self.gpu_scene_uploader.begin_frame(slot)?;
+        self.persistent_gpu_scene.begin_frame(slot)?;
         // Re-sample the GPU↔CPU clock offset (cheap, no queue work) before the read-back, so
         // this frame's spans decode onto the CPU axis (ordering: calibrate → readback). The
         // profiler self-gates to ~once a second; only runs while
@@ -5250,7 +5681,26 @@ impl Renderer {
         // so the graph build below borrows the rest of `self` immutably. A `None` arms
         // nothing — a build failure (logged once) degrades to the unlit/unshadowed path.
         let depth_prepass = if self.use_depth_prepass {
+            self.pipelines.request_depth_prepass_executor()
+        } else {
+            None
+        };
+        // The tessellation seam's vertex-input pass PSOs, resolved only when the frame
+        // carries tess draws (displaced instances draw their amplified transient
+        // geometry after each pass's executor buckets).
+        let has_tess_draws = !self.scene_draw_list.tess_draws.is_empty();
+        let depth_prepass_tess = if has_tess_draws && self.use_depth_prepass {
             self.pipelines.request_depth_prepass()
+        } else {
+            None
+        };
+        let gbuffer_tess = if has_tess_draws {
+            self.pipelines.request_gbuffer()
+        } else {
+            None
+        };
+        let motion_tess = if has_tess_draws {
+            self.pipelines.request_motion()
         } else {
             None
         };
@@ -5274,39 +5724,10 @@ impl Renderer {
         } else {
             None
         };
-        let shadow_pipeline =
-            if self.lighting.shadow_pending() || self.lighting.spot_shadow_pending() {
-                self.pipelines.request_shadow_depth()
-            } else {
-                None
-            };
-        // Point-shadow cubes. The PSO is needed whenever a point light casts; the dynamic cube
-        // (skinned/morph casters) re-renders every active frame, while the **static** cube
-        // (everything else) re-renders only when its content key (light + static casters) or the
-        // cube image changed — a static light + static casters reuse the cached static cube while a
-        // character animates, so only the (few) dynamic casters re-render. Both persist in
-        // `SHADER_READ_ONLY` between frames, so a skipped pass samples its cached cube.
-        let point_shadow_pipeline = if self.lighting.point_shadow_pending() {
-            self.pipelines.request_point_shadow()
-        } else {
+        let shadow_pipeline = if self.vsm_render_pages.is_empty() {
             None
-        };
-        let static_point_shadow_dirty = if point_shadow_pipeline.is_some() {
-            let key = self
-                .lighting
-                .point_shadow_key()
-                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                ^ u64::from(self.views[self.active_view.index()].jitter_index);
-            let cube = self.targets.point_shadow.image();
-            if self.last_point_shadow_key == Some(key) && self.last_point_shadow_cube == cube {
-                false
-            } else {
-                self.last_point_shadow_key = Some(key);
-                self.last_point_shadow_cube = cube;
-                true
-            }
         } else {
-            false
+            self.pipelines.request_shadow_depth_executor()
         };
 
         // Screen-space effects ride a thin G-buffer prepass that runs when ANY of GTAO /
@@ -5347,7 +5768,7 @@ impl Renderer {
         let compute3 = self.ssao.compute3_layout();
         let gi_resolve_layout = self.ssao.gi_resolve_layout();
         let (gbuffer, gtao, ao_blur, contact, ssgi, ssgi_blur, ssr, copy_color) = if want_screen {
-            let gbuffer = self.pipelines.request_gbuffer();
+            let gbuffer = self.pipelines.request_gbuffer_executor();
             let (gtao, ao_blur) = if want_ssao {
                 (
                     self.pipelines.request_gtao(compute2),
@@ -5516,7 +5937,7 @@ impl Renderer {
         let want_motion =
             (self.aa.taa() || want_ssgi || want_dfao || want_cloud_motion) && have_motion_targets;
         let motion = if want_motion {
-            self.pipelines.request_motion()
+            self.pipelines.request_motion_executor()
         } else {
             None
         };
@@ -5570,10 +5991,13 @@ impl Renderer {
             .request_depth_upscale(self.descriptors.depth_upscale_layout());
         // The reactive-coverage pass (marks translucent geometry into the r8 reactive mask) arms
         // only under TAA — the mask is a TAA-resolve input. Memoized, so the request is cheap.
-        let reactive_coverage = if self.aa.taa() {
-            self.pipelines.request_reactive_coverage()
+        let (reactive_coverage, reactive_transition) = if self.aa.taa() {
+            (
+                self.pipelines.request_reactive_coverage(),
+                self.pipelines.request_reactive_transition(),
+            )
         } else {
-            None
+            (None, None)
         };
 
         // The final post chain: the tonemap is mandatory (resolved every frame); the grid
@@ -5679,47 +6103,15 @@ impl Renderer {
             None
         };
 
-        let batch_shadow_draws = |deformed: Option<bool>| {
-            self.scene_draw_list
-                .batches
-                .iter()
-                .filter(|batch| deformed.is_none_or(|value| batch.deformed == value))
-                .fold(0_u32, |total, batch| {
-                    total.saturating_add(if batch.submeshes.is_empty() {
-                        1
-                    } else {
-                        u32::try_from(batch.submeshes.len()).unwrap_or(u32::MAX)
-                    })
-                })
-        };
-        let all_shadow_draws = batch_shadow_draws(None);
-        let mut shadow_draw_calls = 0_u32;
-        if shadow_pipeline.is_some() {
-            if self.lighting.shadow_pending() {
-                shadow_draw_calls = shadow_draw_calls.saturating_add(all_shadow_draws);
-            }
-            if self.lighting.spot_shadow_pending() {
-                shadow_draw_calls = shadow_draw_calls.saturating_add(all_shadow_draws);
-            }
-        }
-        if point_shadow_pipeline.is_some() {
-            if static_point_shadow_dirty {
-                shadow_draw_calls = shadow_draw_calls
-                    .saturating_add(batch_shadow_draws(Some(false)).saturating_mul(6));
-            }
-            shadow_draw_calls =
-                shadow_draw_calls.saturating_add(batch_shadow_draws(Some(true)).saturating_mul(6));
-        }
-        self.stats.shadow_draw_calls = shadow_draw_calls;
-
         let frame_pipelines = FramePipelines {
             depth_prepass,
+            depth_prepass_tess,
+            gbuffer_tess,
+            motion_tess,
             cull: cull_pipeline,
             skin: skin_pipeline,
             morph: morph_pipeline,
             shadow: shadow_pipeline,
-            point_shadow: point_shadow_pipeline,
-            static_point_shadow_dirty,
             gbuffer,
             gtao,
             ao_blur,
@@ -5760,6 +6152,7 @@ impl Renderer {
             scene_resolve,
             depth_upscale,
             reactive_coverage,
+            reactive_transition,
             grid,
             overlay,
             overlay_depth,
@@ -5846,13 +6239,15 @@ impl Renderer {
         let prefix_point = self.frames.reserve_timeline(RgQueueAssignment::Graphics)?;
         submit_graph_command(
             &self.device,
-            RgQueueAssignment::Graphics,
-            prefix,
-            &[],
-            &[prefix_point],
-            None,
-            vk::Fence::null(),
-            "queue_submit2 (scene prefix)",
+            GraphCommandSubmission {
+                queue: RgQueueAssignment::Graphics,
+                command_buffer: prefix,
+                waits: &[],
+                signals: &[prefix_point],
+                binary_signal: None,
+                fence: vk::Fence::null(),
+                context: "queue_submit2 (scene prefix)",
+            },
         )?;
 
         let mut batch_points = Vec::with_capacity(recorded.batches.len());
@@ -5872,13 +6267,15 @@ impl Renderer {
             }
             submit_graph_command(
                 &self.device,
-                batch.queue,
-                batch.command_buffer,
-                &waits,
-                &[point],
-                None,
-                vk::Fence::null(),
-                "queue_submit2 (render-graph batch)",
+                GraphCommandSubmission {
+                    queue: batch.queue,
+                    command_buffer: batch.command_buffer,
+                    waits: &waits,
+                    signals: &[point],
+                    binary_signal: None,
+                    fence: vk::Fence::null(),
+                    context: "queue_submit2 (render-graph batch)",
+                },
             )?;
             batch_points.push(point);
         }
@@ -5902,13 +6299,15 @@ impl Renderer {
         };
         submit_graph_command(
             &self.device,
-            RgQueueAssignment::Graphics,
-            recorded.tail,
-            &tail_waits,
-            &[],
-            present_signal,
-            self.frames.in_flight(),
-            "queue_submit2 (scene tail)",
+            GraphCommandSubmission {
+                queue: RgQueueAssignment::Graphics,
+                command_buffer: recorded.tail,
+                waits: &tail_waits,
+                signals: &[],
+                binary_signal: present_signal,
+                fence: self.frames.in_flight(),
+                context: "queue_submit2 (scene tail)",
+            },
         )?;
         if present_signal.is_some()
             && let Some(present_sync) = self.present_sync.as_mut()
@@ -5925,11 +6324,242 @@ impl Renderer {
     /// active view's offscreen target. The pass bodies capture resolved handles + the
     /// moved draw list / submissions, never `&mut self`.
     ///
+    /// The frame's directional virtual-shadow step, before the light UBO write:
+    /// rebuild the snapped space, invalidate levels whose windows moved, seed the
+    /// conservative camera-centred demand, stage this frame's dirty pages, and
+    /// publish the page table the sampler reads.
+    /// Marks every resident virtual-shadow page a swept world AABB overlaps as
+    /// dirty, across the directional levels and the armed spot/point spaces. The
+    /// projection is conservative (bounds sphere through each space); marking an
+    /// absent page is a no-op.
+    fn dirty_vsm_swept_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
+        use saffron_geometry::glam::{Vec3, Vec4};
+        let center = Vec3::new(
+            (min[0] + max[0]) * 0.5,
+            (min[1] + max[1]) * 0.5,
+            (min[2] + max[2]) * 0.5,
+        );
+        let half_diag = Vec3::new(max[0] - min[0], max[1] - min[1], max[2] - min[2]).length() * 0.5;
+        let light_center = self.vsm_space.basis.transform_point3(center);
+        for level in 0..crate::VSM_DIRECTIONAL_LEVELS {
+            let window = &self.vsm_space.levels[level as usize];
+            if window.extent_m <= 0.0 {
+                continue;
+            }
+            let page_m = window.extent_m / crate::VSM_LEVEL_PAGES as f32;
+            let lo = [
+                (light_center.x - half_diag - window.origin_light[0]) / page_m,
+                (light_center.y - half_diag - window.origin_light[1]) / page_m,
+            ];
+            let hi = [
+                (light_center.x + half_diag - window.origin_light[0]) / page_m,
+                (light_center.y + half_diag - window.origin_light[1]) / page_m,
+            ];
+            if hi[0] < 0.0
+                || hi[1] < 0.0
+                || lo[0] >= crate::VSM_LEVEL_PAGES as f32
+                || lo[1] >= crate::VSM_LEVEL_PAGES as f32
+            {
+                continue;
+            }
+            let x0 = lo[0].max(0.0) as u32;
+            let y0 = lo[1].max(0.0) as u32;
+            let x1 = (hi[0].min(crate::VSM_LEVEL_PAGES as f32 - 1.0)) as u32;
+            let y1 = (hi[1].min(crate::VSM_LEVEL_PAGES as f32 - 1.0)) as u32;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    self.vsm_residency
+                        .mark_dirty(crate::VsmPageKey::Directional { level, x, y });
+                }
+            }
+        }
+        let projective = |matrix: saffron_geometry::glam::Mat4,
+                          pages: u32,
+                          residency: &mut crate::VsmResidency,
+                          key: &dyn Fn(u32, u32) -> crate::VsmPageKey| {
+            let clip = matrix * center.extend(1.0);
+            if clip.w <= 0.0 {
+                return;
+            }
+            // Row norms of the upper 3x3 bound how fast NDC moves per world metre.
+            let rx = Vec3::new(matrix.x_axis.x, matrix.y_axis.x, matrix.z_axis.x).length();
+            let ry = Vec3::new(matrix.x_axis.y, matrix.y_axis.y, matrix.z_axis.y).length();
+            let ndc = clip.truncate() / clip.w;
+            let radius = Vec4::new(rx, ry, 0.0, 0.0) * half_diag / clip.w;
+            let lo = [
+                ((ndc.x - radius.x) * 0.5 + 0.5) * pages as f32,
+                ((ndc.y - radius.y) * 0.5 + 0.5) * pages as f32,
+            ];
+            let hi = [
+                ((ndc.x + radius.x) * 0.5 + 0.5) * pages as f32,
+                ((ndc.y + radius.y) * 0.5 + 0.5) * pages as f32,
+            ];
+            if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= pages as f32 || lo[1] >= pages as f32 {
+                return;
+            }
+            let x0 = lo[0].max(0.0) as u32;
+            let y0 = lo[1].max(0.0) as u32;
+            let x1 = (hi[0].min(pages as f32 - 1.0)) as u32;
+            let y1 = (hi[1].min(pages as f32 - 1.0)) as u32;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    residency.mark_dirty(key(x, y));
+                }
+            }
+        };
+        if self.lighting.spot_shadow_pending() {
+            projective(
+                self.lighting.spot_shadow_view_proj(),
+                crate::vsm::VSM_SPOT_PAGES,
+                &mut self.vsm_residency,
+                &|x, y| crate::VsmPageKey::Spot { x, y },
+            );
+        }
+        if self.lighting.point_shadow_pending() {
+            let faces = crate::point_shadow_face_matrices(
+                self.lighting.point_shadow_pos(),
+                self.lighting.point_shadow_far(),
+            );
+            for (face, matrix) in faces.iter().enumerate() {
+                let face = face as u32;
+                projective(
+                    *matrix,
+                    crate::vsm::VSM_POINT_FACE_PAGES,
+                    &mut self.vsm_residency,
+                    &|x, y| crate::VsmPageKey::PointFace { face, x, y },
+                );
+            }
+        }
+    }
+
+    fn prepare_vsm_frame(&mut self, frame: usize, sun_direction: saffron_geometry::glam::Vec3) {
+        // One global atlas serves the scene view; preview/thumbnail lighting keeps
+        // its own fixed behaviour without thrashing the residency.
+        if self.active_view.index() != 0 {
+            return;
+        }
+        // The master shadow toggle: off publishes a disabled table (every sampler
+        // reads unshadowed via the `vsmParams.z` gate, so the demand marker writes
+        // nothing) and stages no pages.
+        if !self.lighting.use_shadows {
+            self.vsm_render_pages.clear();
+            self.lighting.set_frame_vsm(
+                saffron_geometry::glam::Mat4::IDENTITY,
+                [saffron_geometry::glam::Vec4::ZERO; crate::VSM_DIRECTIONAL_LEVELS as usize],
+                saffron_geometry::glam::Vec4::ZERO,
+                0,
+            );
+            return;
+        }
+        // Pages staged last frame that the graph never rasterized stay dirty.
+        for page in std::mem::take(&mut self.vsm_render_pages) {
+            self.vsm_residency.mark_dirty(page.key);
+        }
+        let space = crate::VsmDirectionalSpace::build(sun_direction, self.page_demand_view().eye);
+        let serial = self.frame_serial;
+        self.vsm_residency.begin_frame(serial);
+        for level in 0..crate::VSM_DIRECTIONAL_LEVELS {
+            if space.levels[level as usize].snap != self.vsm_space.levels[level as usize].snap {
+                self.vsm_residency
+                    .invalidate_directional_level(level, serial);
+            }
+        }
+        self.vsm_space = space;
+        // Receiver-driven demand from the drained GPU requests, plus a coarse
+        // bootstrap ring so the first frames (and un-marked regions) fall back to
+        // the outermost level instead of nothing.
+        {
+            let bootstrap = crate::VSM_LEVEL_PAGES / 2;
+            for y in (bootstrap - 4)..(bootstrap + 4) {
+                for x in (bootstrap - 4)..(bootstrap + 4) {
+                    let _ = self.vsm_residency.demand(
+                        crate::VsmPageKey::Directional {
+                            level: crate::VSM_DIRECTIONAL_LEVELS - 1,
+                            x,
+                            y,
+                        },
+                        serial,
+                    );
+                }
+            }
+        }
+        // A moved/re-aimed spot invalidates its whole space (the projective pages
+        // are meaningless under the new transform).
+        let spot_matrix = self.lighting.spot_shadow_view_proj().to_cols_array();
+        if self.vsm_spot_matrix != spot_matrix {
+            self.vsm_spot_matrix = spot_matrix;
+            self.vsm_residency.invalidate_spot(serial);
+        }
+        // A moved or re-ranged point light stales all six face spaces.
+        let point_key = self
+            .lighting
+            .point_shadow_pos()
+            .extend(self.lighting.point_shadow_far())
+            .to_array();
+        if self.vsm_point_key != point_key {
+            self.vsm_point_key = point_key;
+            self.vsm_residency.invalidate_point(serial);
+        }
+        // Dynamic content re-dirties the pages it overlaps; static pages stay
+        // cached. Discrete movers arrive as swept bounds from the persistent
+        // scene's instance deltas; continuous wind sway re-dirties the levels
+        // fine enough to resolve it (the render budget paces the churn).
+        let (moved, moved_overflow) = self.persistent_gpu_scene.take_moved_bounds();
+        let wind_dynamic = self.scene_wind.speed > 0.0
+            && self
+                .wind_deform_records
+                .contains_key(&self.active_view.gpu_scene_world().0);
+        if wind_dynamic || moved_overflow {
+            self.vsm_residency
+                .mark_dynamic_dirty(crate::vsm::VSM_DYNAMIC_MAX_LEVEL);
+        }
+        for (min, max) in moved {
+            self.dirty_vsm_swept_bounds(min, max);
+        }
+        for &index in &self.vsm_demanded {
+            if let Some(key) = crate::vsm::vsm_demand_key(index) {
+                let _ = self.vsm_residency.demand(key, serial);
+            }
+        }
+        self.vsm_render_pages = self.vsm_residency.take_render_pages(64);
+        let table = self
+            .vsm_gpu
+            .publish_table(&self.device, frame, &self.vsm_residency);
+        let mut levels =
+            [saffron_geometry::glam::Vec4::ZERO; crate::VSM_DIRECTIONAL_LEVELS as usize];
+        for (slot, level) in levels.iter_mut().zip(self.vsm_space.levels.iter()) {
+            *slot = saffron_geometry::glam::Vec4::new(
+                level.origin_light[0],
+                level.origin_light[1],
+                level.extent_m,
+                0.0,
+            );
+        }
+        self.lighting.set_frame_vsm(
+            self.vsm_space.basis,
+            levels,
+            saffron_geometry::glam::Vec4::new(
+                self.vsm_space.center_forward,
+                crate::vsm::VSM_DIRECTIONAL_HALF_DEPTH_M,
+                1.0,
+                0.0,
+            ),
+            table,
+        );
+    }
+
+    /// The active view's world wind sway record buffer, once a frame has created it.
+    /// Executor raster passes declare their device-address read on it through this.
+    fn wind_records_handle(&self) -> Option<vk::Buffer> {
+        self.wind_deform_records
+            .get(&self.active_view.gpu_scene_world().0)
+            .map(|records| records.buffer.handle())
+    }
+
     /// Pass order (the `beginFrameGraph` slice this phase fills): `light-cull` (compute)
-    /// → `shadow` / `spot-shadow` (depth-only graphics, `DepthWrite → ShaderReadOnly`) →
-    /// `point-shadow` (graphics commands driving 6 declared face draws) → optional
-    /// `depth-prepass` → `scene`. The graph derives every barrier from the declared
-    /// usage; the shadow maps' cross-frame layout rides external slots.
+    /// → the virtual-shadow page passes (per-space cull/bin chains + atlas raster) →
+    /// optional `depth-prepass` → `scene`. The graph derives every barrier from the
+    /// declared usage; the atlas's cross-frame layout rides its external slot.
     fn record_scene_graph(
         &mut self,
         frame: usize,
@@ -5960,8 +6590,593 @@ impl Renderer {
         let instance_set = self.instancing.instance_set(frame);
         let ibl_set = self.scene_ibl().set(frame);
         let raw = self.device.raw().clone();
+        // The tessellation seam owns displaced instances this frame: the traversal
+        // skips their records and the tess indirect draws render the amplified
+        // geometry.
+        let tess_seam = u32::from(!self.scene_draw_list.tess_buckets.is_empty());
+        // The mesh fragments read the packed material-parameter blocks (set 2,
+        // binding 2) from the global arena the mirror uploads into; the arena's
+        // buffer changes on growth, so the binding rewrites every frame.
+        self.descriptors.write_storage_buffer(
+            self.instancing.instance_set(frame),
+            2,
+            self.global_gpu_data.material_parameters.buffer(),
+            vk::WHOLE_SIZE,
+        );
 
         let mut graph = RenderGraph::new();
+        // Page residency runs before the transfer drain: the slot's fence has completed,
+        // so its GPU missing-page requests are readable, and any ready payload publishes
+        // into this frame's pending queue (parent-before-child inside publish_ready).
+        self.page_residency.begin_frame();
+        {
+            let demanded = self.vsm_demand.drain(frame);
+            if !demanded.is_empty() {
+                self.vsm_demanded = demanded;
+            }
+        }
+        for slot in self.gpu_scene_uploader.drain_page_requests(frame) {
+            self.page_faults += 1;
+            self.page_residency.demand_slot(slot, u64::MAX / 2);
+        }
+        self.page_residency.publish_ready(
+            &mut self.global_gpu_data,
+            &mut self.pending_gpu_scene_uploads,
+        )?;
+        // The GPU-scene transfer passes lead the frame: pending resident-record stages,
+        // retirements, and arena bytes from the asset mirror, then the persistent scene's
+        // coalesced slot writes, all before any pass that could consume the tables.
+        crate::gpu_scene_upload::record_pending_global_uploads(
+            &mut self.pending_gpu_scene_uploads,
+            &self.device,
+            &mut graph,
+            &mut self.global_gpu_data,
+            frame,
+        )?;
+        self.last_gpu_scene_upload = self.gpu_scene_uploader.record_frame(
+            &self.device,
+            &mut graph,
+            &mut self.global_gpu_data,
+            &mut self.persistent_gpu_scene,
+            frame,
+        )?;
+        // The frame's instance-upload traffic is the GPU-scene table bytes staged this
+        // frame — (near-)zero on a steady scene, the O(changes) guarantee.
+        self.stats.instance_upload_bytes = self.last_gpu_scene_upload.table_bytes;
+        // The wind deformation prepass output buffer: one sway record per instance
+        // slot, (re)created behind an idle wait before the address block captures its
+        // address. A fresh buffer is zero-filled in this frame's graph before any read.
+        let wind_world = self.active_view.gpu_scene_world();
+        let wind_capacity = self
+            .gpu_scene_uploader
+            .world_instance_capacity(wind_world)
+            .max(1);
+        let wind_records_created = self
+            .wind_deform_records
+            .get(&wind_world.0)
+            .is_none_or(|records| records.capacity < wind_capacity);
+        if wind_records_created {
+            self.device.wait_idle()?;
+            let buffer = crate::Buffer::new(
+                self.device.resources(),
+                u64::from(wind_capacity) * size_of::<crate::GpuWindInstanceRecord>() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                    ..Default::default()
+                },
+            )?;
+            self.wind_deform_records.insert(
+                wind_world.0,
+                WindDeformRecords {
+                    buffer,
+                    capacity: wind_capacity,
+                },
+            );
+        }
+        let wind_records_handle = self.wind_deform_records[&wind_world.0].buffer.handle();
+        let wind_records_address = self.device.buffer_device_address(wind_records_handle);
+        // The world interaction field: fixed size, created once per world; the
+        // impulse ring holds this frame's staged impulses for the step pass.
+        let interaction_created = !self.interaction_fields.contains_key(&wind_world.0);
+        if interaction_created {
+            let buffer = crate::Buffer::new(
+                self.device.resources(),
+                crate::GPU_INTERACTION_FIELD_BYTES,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                    ..Default::default()
+                },
+            )?;
+            self.interaction_fields.insert(wind_world.0, buffer);
+        }
+        let interaction_handle = self.interaction_fields[&wind_world.0].handle();
+        let interaction_address = self.device.buffer_device_address(interaction_handle);
+        while self.interaction_impulse_ring.len() < crate::MAX_FRAMES_IN_FLIGHT {
+            self.interaction_impulse_ring.push(crate::Buffer::new(
+                self.device.resources(),
+                256 * size_of::<crate::InteractionImpulse>() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::Auto,
+                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                        | vk_mem::AllocationCreateFlags::MAPPED,
+                    ..Default::default()
+                },
+            )?);
+        }
+        self.interaction_impulses.truncate(256);
+        let interaction_impulse_count = self.interaction_impulses.len() as u32;
+        if interaction_impulse_count > 0 {
+            let ring = &self.interaction_impulse_ring[frame];
+            // SAFETY: HOST_VISIBLE + MAPPED; the frame slot's fence passed before reuse.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.interaction_impulses.as_ptr().cast::<u8>(),
+                    ring.mapped_ptr(),
+                    interaction_impulse_count as usize * size_of::<crate::InteractionImpulse>(),
+                );
+            }
+        }
+        let interaction_impulse_address = self
+            .device
+            .buffer_device_address(self.interaction_impulse_ring[frame].handle());
+        self.interaction_impulses.clear();
+        let address_block = self.gpu_scene_uploader.build_address_block(
+            &self.device,
+            &self.global_gpu_data,
+            self.active_view.gpu_scene_world(),
+            frame,
+            self.skinning.frame_deformed_addresses(frame, &self.device),
+            wind_records_address,
+            interaction_address,
+            self.views[self.active_view.index()].jitter_index,
+        );
+        self.gpu_scene_uploader
+            .write_address_block(frame, address_block);
+        let wind_records_res = graph.import_buffer(wind_records_handle, None);
+        let interaction_field_res = graph.import_buffer(interaction_handle, None);
+        if wind_records_created || interaction_created {
+            let raw = self.device.raw().clone();
+            let clear_records = wind_records_created.then_some(wind_records_handle);
+            let clear_field = interaction_created.then_some(interaction_handle);
+            let mut clear = crate::RgPass::compute("wind-clear");
+            if clear_records.is_some() {
+                clear = clear.access(wind_records_res, crate::RgUsage::TransferWrite);
+            }
+            if clear_field.is_some() {
+                clear = clear.access(interaction_field_res, crate::RgUsage::TransferWrite);
+            }
+            graph.add_pass(clear.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam. Both buffers are TRANSFER_DST.
+                unsafe {
+                    if let Some(handle) = clear_records {
+                        raw.cmd_fill_buffer(cmd, handle, 0, vk::WHOLE_SIZE, 0);
+                    }
+                    if let Some(handle) = clear_field {
+                        raw.cmd_fill_buffer(cmd, handle, 0, vk::WHOLE_SIZE, 0);
+                    }
+                }
+            }));
+        }
+
+        // Instance visibility, first half: swap the HZB ping-pong for this frame, size
+        // the per-view lists to the world's instance capacity (an idle wait on growth),
+        // write the frame bindings, and record the clear + cull passes — established
+        // instances test the previous pyramid with previous transforms.
+        // The shared blade-template words every binning scatter needs: index count +
+        // first index within the pages arena (u32 units).
+        let micro_template = (
+            crate::MICRO_BLADE_INDEX_COUNT,
+            self.global_gpu_data.micro_blade_template.first / 4,
+        );
+        let micro_field_psos = (
+            self.pipelines
+                .request_scene_micro_count(self.scene_visibility.micro_layout()),
+            self.pipelines
+                .request_scene_micro_scan(self.scene_visibility.micro_layout()),
+            self.pipelines
+                .request_scene_micro_scatter(self.scene_visibility.micro_layout()),
+        );
+        let wind_deform_pso = self
+            .pipelines
+            .request_wind_deform(self.scene_visibility.layout());
+        let wind_interact_pso = self
+            .pipelines
+            .request_wind_interact(self.scene_visibility.layout());
+        let vsm_demand_pso = self
+            .pipelines
+            .request_vsm_demand(self.vsm_demand.mark_layout());
+        let vsm_compact_pso = self
+            .pipelines
+            .request_vsm_demand_compact(self.vsm_demand.compact_layout());
+        let visibility_psos = (
+            self.pipelines
+                .request_scene_visibility(self.scene_visibility.layout()),
+            self.pipelines
+                .request_scene_traversal(self.scene_visibility.traversal_layout()),
+            self.pipelines
+                .request_scene_bin_count(self.scene_visibility.bin_count_layout()),
+            self.pipelines
+                .request_scene_bin_seed(self.scene_visibility.bin_seed_layout()),
+            self.pipelines
+                .request_scene_bin_scatter(self.scene_visibility.bin_scatter_layout()),
+        );
+        let transparent_sort_psos = (
+            self.pipelines
+                .request_transparent_keys(self.scene_visibility.transparent_keys_layout()),
+            self.pipelines
+                .request_radix_histogram(self.scene_visibility.radix_histogram_layout()),
+            self.pipelines
+                .request_radix_scan(self.scene_visibility.radix_scan_layout()),
+            self.pipelines
+                .request_radix_scatter(self.scene_visibility.radix_scatter_layout()),
+            self.pipelines
+                .request_transparent_reorder(self.scene_visibility.transparent_reorder_layout()),
+        );
+        let mut visibility_active = false;
+        let mut visibility_history_valid = false;
+        let mut executor_buckets: Vec<crate::ExecutorBucket> = Vec::new();
+        let mut executor_inputs: Option<crate::ExecutorDrawInputs> = None;
+        if self.views[self.active_view.index()].hzb_pyramid.is_none() {
+            // Views that never pass through the resize hook (a fixed-size offscreen
+            // boot) build their pyramids on first use.
+            let extent = self.views[self.active_view.index()].scaled_render_extent();
+            self.views[self.active_view.index()].hzb_pyramid =
+                match crate::HzbPyramid::new(&self.device, &self.descriptors, &self.hzb, extent) {
+                    Ok(pyramid) => Some(pyramid),
+                    Err(err) => {
+                        tracing::error!("hzb pyramid bring-up: {err}");
+                        None
+                    }
+                };
+        }
+        if let (Some(cull_pso), Some(_), Some(_), Some(_), Some(_)) = (
+            &visibility_psos.0,
+            &visibility_psos.1,
+            &visibility_psos.2,
+            &visibility_psos.3,
+            &visibility_psos.4,
+        ) && self.views[self.active_view.index()].hzb_pyramid.is_some()
+        {
+            let instance_capacity = address_block.instance_capacity.max(1);
+            // The frame's draw buckets derive from the mirror's live (shader, class)
+            // pairs alone; the blend subset sizes the sorted transparent stream (one
+            // full-length slice per blend bucket), so a new blend bucket going live
+            // rebuilds the view's lists exactly like instance-capacity growth.
+            let (frame_buckets, bucket_table) = crate::build_executor_buckets(
+                &self.live_executor_bins,
+                crate::SCENE_VISIBILITY_RECORD_CAPACITY,
+            );
+            let blend_keys: Vec<u32> = frame_buckets
+                .iter()
+                .filter(|bucket| {
+                    crate::bucket_material(&self.global_gpu_data.executor_shaders, **bucket).blend
+                })
+                .map(|bucket| (bucket.shader_index << 16) | (bucket.pso_bin & 0xFFFF))
+                .collect();
+            let blend_group_count = (blend_keys.len() as u32).max(1);
+            let needs_lists = self.views[self.active_view.index()]
+                .visibility_view
+                .as_ref()
+                .is_none_or(|lists| {
+                    lists.capacity() < instance_capacity
+                        || lists.transparent_group_capacity() < blend_group_count
+                });
+            if needs_lists {
+                self.device.wait_idle()?;
+                if let Some(mut old_lists) =
+                    self.views[self.active_view.index()].visibility_view.take()
+                {
+                    old_lists.free_sets(&self.descriptors);
+                }
+                self.views[self.active_view.index()].visibility_view =
+                    match crate::SceneVisibilityView::new(
+                        &self.device,
+                        &self.descriptors,
+                        &self.scene_visibility,
+                        instance_capacity,
+                        crate::SCENE_VISIBILITY_RECORD_CAPACITY,
+                        blend_group_count,
+                    ) {
+                        Ok(lists) => Some(lists),
+                        Err(err) => {
+                            tracing::error!("visibility lists rebuild: {err}");
+                            None
+                        }
+                    };
+            }
+            if let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_mut() {
+                pyramid.begin_frame();
+            }
+            if let Some(lists) = self.views[self.active_view.index()]
+                .visibility_view
+                .as_ref()
+            {
+                // The slot's fence completed before this frame reused it, so its
+                // readback words are last use's final counters.
+                self.visibility_counters = lists.read_counters(frame);
+                // The GPU decides the frame's draws; the stats mirror the slot's
+                // last-use readback: emitted records = indirect draw commands,
+                // visible instances, and the traversal's rasterized-triangle count.
+                self.stats.draw_calls =
+                    self.visibility_counters[crate::SCENE_VISIBILITY_COUNTER_RECORDS];
+                self.stats.instances =
+                    self.visibility_counters[crate::SCENE_VISIBILITY_COUNTER_VISIBLE];
+                self.stats.triangles =
+                    self.visibility_counters[crate::SCENE_VISIBILITY_COUNTER_TRIANGLES];
+            }
+            let view_index = self.active_view.index();
+            let (previous_view, previous_image, previous_layout, previous_valid) = {
+                let pyramid = self.views[view_index]
+                    .hzb_pyramid
+                    .as_ref()
+                    .expect("pyramid checked above");
+                let (image, view) = pyramid.previous();
+                (
+                    view,
+                    image,
+                    pyramid.previous_layout(),
+                    pyramid.previous_valid(),
+                )
+            };
+            visibility_history_valid =
+                previous_valid && self.views[view_index].prev_view_proj_valid;
+            if let Some(lists) = self.views[view_index].visibility_view.as_ref() {
+                let hzb_pyramid = self.views[view_index]
+                    .hzb_pyramid
+                    .as_ref()
+                    .expect("pyramid checked above");
+                let address_slice = (
+                    self.gpu_scene_uploader.address_buffer(),
+                    frame as u64 * self.gpu_scene_uploader.address_block_stride(),
+                    size_of::<crate::GpuSceneAddressBlock>() as u64,
+                );
+                lists.write_frame_bindings(
+                    &self.device,
+                    &self.scene_visibility,
+                    frame,
+                    previous_view,
+                    hzb_pyramid.current().1,
+                    address_slice,
+                );
+                // The executor vertex path indexes the record stream through the
+                // instance set (binding 4).
+                self.descriptors.write_storage_buffer(
+                    self.instancing.instance_set(frame),
+                    4,
+                    lists.records(frame),
+                    u64::from(lists.record_capacity()) * size_of::<crate::GpuDrawRecord>() as u64,
+                );
+                // The kernels look records up in the bucket table, so it publishes
+                // before the binning passes execute.
+                lists.write_bucket_table(frame, &bucket_table);
+                executor_buckets = frame_buckets;
+                executor_inputs =
+                    Some(lists.executor_draw_inputs(frame, self.live_draw_record_bound));
+                let camera_view = self.ssao.view();
+                let camera_proj = self.ssao.inv_projection().inverse();
+                let view_proj = (camera_proj * camera_view).to_cols_array();
+                let prev_view_proj = if visibility_history_valid {
+                    self.views[view_index].prev_view_proj.to_cols_array()
+                } else {
+                    view_proj
+                };
+                let previous_res = graph.import_image(
+                    previous_image,
+                    previous_view,
+                    vk::ImageAspectFlags::COLOR,
+                    previous_layout,
+                    None,
+                );
+                // The interaction-field step runs first (scroll reset + impulse
+                // splat + damped integration), then the wind deformation prepass
+                // samples it into the sway records the cull and every raster pass
+                // read.
+                if let Some(interact_pso) = &wind_interact_pso {
+                    let wind = self.lighting.wind_deform_push();
+                    let eye = self.page_demand_view().eye;
+                    let center_for = |cascade: u32| {
+                        let texel = 0.25_f32 * (1u32 << (2 * cascade)) as f32;
+                        [
+                            (eye.x / texel).floor() as i32,
+                            (eye.z / texel).floor() as i32,
+                        ]
+                    };
+                    lists.add_wind_interact_pass(
+                        &self.device,
+                        &mut graph,
+                        interact_pso,
+                        frame,
+                        interaction_field_res,
+                        crate::WindInteractPush {
+                            field: interaction_address,
+                            impulses: interaction_impulse_address,
+                            center0: center_for(0),
+                            center1: center_for(1),
+                            impulse_count: interaction_impulse_count,
+                            dt: (wind.time_current - wind.time_previous).max(0.0),
+                            reserved: [0; 2],
+                        },
+                    );
+                }
+                if let Some(wind_pso) = &wind_deform_pso {
+                    lists.add_wind_deform_pass(
+                        &self.device,
+                        &mut graph,
+                        wind_pso,
+                        frame,
+                        wind_records_res,
+                        interaction_field_res,
+                        instance_capacity,
+                        self.lighting.wind_deform_push(),
+                    );
+                }
+                lists.add_cull_pass(
+                    &self.device,
+                    &mut graph,
+                    cull_pso,
+                    frame,
+                    previous_res,
+                    wind_records_res,
+                    instance_capacity,
+                    crate::SceneVisibilityPush {
+                        view_proj,
+                        prev_view_proj,
+                        hzb_extent: [hzb_pyramid.extent().width, hzb_pyramid.extent().height],
+                        hzb_mip_count: hzb_pyramid.mip_count(),
+                        pass_kind: crate::SCENE_VISIBILITY_PASS_CULL,
+                        history_valid: u32::from(visibility_history_valid),
+                        list_capacity: lists.capacity(),
+                        reserved: [0; 2],
+                    },
+                );
+                visibility_active = true;
+                // Stages 2-3: traverse the culled instances (classified against the
+                // previous pyramid) into the record stream, then bin into indirect
+                // commands — the provisional cut the raster passes consume.
+                if let Some(traversal_pso) = &visibility_psos.1 {
+                    let demand = self.page_demand_view();
+                    lists.add_traversal_pass(
+                        &self.device,
+                        &mut graph,
+                        traversal_pso,
+                        frame,
+                        crate::SceneTraversalPush {
+                            eye: demand.eye.to_array(),
+                            proj_scale: demand.proj_scale,
+                            error_threshold_px: 1.0,
+                            record_capacity: lists.record_capacity(),
+                            list_capacity: lists.capacity(),
+                            survivor: 0,
+                            tess_seam,
+                            transition_frames: crate::GPU_TRANSITION_FRAMES,
+                            frame_stamp: self.frame_serial as u32,
+                            reserved0: 0,
+                        },
+                    );
+                    // Micro-field reconstruction appends blade records to the same
+                    // stream before binning; the binning re-reads the total.
+                    if let (
+                        Some((directory_offset, directory_count)),
+                        (Some(micro_count), Some(micro_scan), Some(micro_scatter)),
+                    ) = (
+                        self.micro_field_directory,
+                        (
+                            micro_field_psos.0.as_ref(),
+                            micro_field_psos.1.as_ref(),
+                            micro_field_psos.2.as_ref(),
+                        ),
+                    ) {
+                        lists.add_micro_field_passes(
+                            &self.device,
+                            &mut graph,
+                            (micro_count, micro_scan, micro_scatter),
+                            frame,
+                            self.global_gpu_data.micro_candidates.handle(),
+                            interaction_field_res,
+                            {
+                                let wind = self.lighting.wind_deform_push();
+                                crate::SceneMicroFieldPush {
+                                    view_proj,
+                                    eye: demand.eye.to_array(),
+                                    max_distance: 96.0,
+                                    directory_offset,
+                                    directory_count,
+                                    record_capacity: lists.record_capacity(),
+                                    candidate_capacity: crate::SCENE_MICRO_CANDIDATE_CAPACITY,
+                                    frame_base: frame as u32
+                                        * crate::SCENE_MICRO_CANDIDATE_CAPACITY,
+                                    reserved: [0; 3],
+                                    wind_dir_speed_gust: wind.dir_speed_gust,
+                                    wind_params: wind.params,
+                                    wind_octaves: wind.octaves,
+                                    wind_seed: wind.seed,
+                                    wind_time_current: wind.time_current,
+                                    wind_time_previous: wind.time_previous,
+                                    wind_sources: wind.sources,
+                                    wind_source_count: wind.source_count,
+                                    wind_reserved: 0,
+                                }
+                            },
+                        );
+                    }
+                }
+                if let (Some(bin_count), Some(bin_scan), Some(bin_scatter)) =
+                    (&visibility_psos.2, &visibility_psos.3, &visibility_psos.4)
+                {
+                    lists.add_binning_passes(
+                        &self.device,
+                        &mut graph,
+                        (bin_count, bin_scan, bin_scatter),
+                        frame,
+                        false,
+                        micro_template,
+                    );
+                }
+                // The transparent back-to-front sort follows the binning: per blend
+                // bucket, the sorted command slice the scene pass's translucent scope
+                // draws. Nothing blend-routed this frame skips the sort outright.
+                if let (Some(keys), Some(histogram), Some(scan), Some(scatter), Some(reorder)) = (
+                    &transparent_sort_psos.0,
+                    &transparent_sort_psos.1,
+                    &transparent_sort_psos.2,
+                    &transparent_sort_psos.3,
+                    &transparent_sort_psos.4,
+                ) && !blend_keys.is_empty()
+                {
+                    let camera_view = self.ssao.view();
+                    let row2 = camera_view.row(2);
+                    lists.add_transparent_sort_passes(
+                        &self.device,
+                        &mut graph,
+                        crate::TransparentSortPipelines {
+                            keys,
+                            histogram,
+                            scan,
+                            scatter,
+                            reorder,
+                        },
+                        frame,
+                        [row2.x, row2.y, row2.z, row2.w],
+                        &blend_keys,
+                    );
+                }
+            }
+        }
+        // F1: resolve each frame bucket's executor mesh PSO for the pass bodies (the
+        // borrow of `self.pipelines` must not overlap the visibility block's `lists`).
+        let executor_draws: Vec<(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)> =
+            executor_buckets
+                .iter()
+                .filter_map(|bucket| {
+                    let material =
+                        crate::bucket_material(&self.global_gpu_data.executor_shaders, *bucket);
+                    self.pipelines
+                        .request_executor_mesh_pipeline(&material, self.wireframe)
+                        .map(|pso| (*bucket, material.blend, pso))
+                })
+                .collect();
+        // The frame's live draw buckets, plus the tess seam's amplified draws on the
+        // draw-call stat (each is one real recorded indirect draw in the scene pass).
+        self.stats.batches = executor_draws.len() as u32;
+        self.stats.draw_calls = self
+            .stats
+            .draw_calls
+            .saturating_add(self.scene_draw_list.tess_draws.len() as u32);
+        // Fold the executor buckets into the shadow draw-call stat: one recorded
+        // counted-indirect draw per non-blend bucket per shadow pass this frame.
+        let non_blend_buckets = executor_draws
+            .iter()
+            .filter(|(_, blend, _)| !*blend)
+            .count() as u32;
+        let shadow_passes = u32::try_from(self.vsm_render_pages.len()).unwrap_or(u32::MAX);
+        self.stats.shadow_draw_calls = shadow_passes.saturating_mul(non_blend_buckets);
         let ibl_live = self.scene_ibl_mut().add_live_capture_passes(&mut graph);
         let ddgi_sh = if self.active_view == ViewId::Thumbnail {
             graph.import_buffer(self.ibl.sh_coefficients().handle(), None)
@@ -6034,6 +7249,11 @@ impl Renderer {
         } else {
             None
         };
+        // The executor vertex paths read the micro-blade candidates through their
+        // device address; every raster pass declares the read so the graph orders it
+        // after the micro pass's compute write.
+        let micro_candidates_res =
+            graph.import_buffer(self.global_gpu_data.micro_candidates.handle(), None);
         let (deformed_res, prev_deformed_res) = if do_deform {
             let deformed = graph.import_buffer(deformed_handle.expect("deformed buffer"), None);
             let prev_deformed =
@@ -6117,234 +7337,70 @@ impl Renderer {
         self.rt.reset_frame_ready();
         let deformed_rt = self.scene_draw_list.deformed_rt_instances.clone();
         let has_skinned_rt = !deformed_rt.is_empty();
-        if self.rt.build_pending() && self.rt.has_instances(&deformed_rt) {
-            if let Some(plan) =
+        if self.rt.build_pending()
+            && self.rt.has_instances(&deformed_rt)
+            && let Some(plan) =
                 self.rt
                     .prepare_tlas_build(&self.device, frame, &deformed_rt, deformed_handle)
-            {
-                let raw_body = raw.clone();
-                let mut tlas_pass = RgPass::compute("tlas-build").body(
-                    move |cmd, _scopes: &mut NestedScopeRecorder| {
-                        crate::record_tlas_build_plan(&raw_body, cmd, &plan);
-                    },
-                );
-                // Declare the deformed-buffer read so the graph orders this after the skin
-                // pass (the skinned BLAS refit reads the freshly deformed vertices).
-                if has_skinned_rt {
-                    if let Some(deformed) = deformed_res {
-                        tlas_pass = tlas_pass.access(deformed, RgUsage::AccelStructBuildRead);
-                    }
-                }
-                // The tessellated BLAS builds over the coarse (secondary-ray) VB/IB the tess-emit-rt pass
-                // wrote; declaring the read here lets the graph derive the compute-write → AS-build-read
-                // barrier and orders this pass after the coarse emit.
-                if let Some((vb_rt, ib_rt)) = tess_rt_res {
-                    tlas_pass = tlas_pass
-                        .access(vb_rt, RgUsage::AccelStructBuildRead)
-                        .access(ib_rt, RgUsage::AccelStructBuildRead);
-                }
-                graph.add_pass(tlas_pass);
-            }
-        }
-
-        // Directional + spot shadow depth passes: depth-only graphics, the graph
-        // transitions each map DepthWrite → (next frame's sample) ShaderReadOnly via its
-        // external layout slot. The slot index is read back after execute.
-        let mut directional_slot: Option<usize> = None;
-        let mut spot_slot: Option<usize> = None;
-        // The shadow maps the mesh fragment samples via the light set (set 1) this frame,
-        // declared `SampledRead` on the scene pass below so the graph derives the
-        // DepthWrite → ShaderReadOnly transition between the depth-write pass and the scene
-        // draw (otherwise the mesh samples a DEPTH_ATTACHMENT image, `00344`).
-        let mut directional_res: Option<RgResource> = None;
-        let mut spot_res: Option<RgResource> = None;
-        if let Some(shadow) = &pipelines.shadow {
-            if self.lighting.shadow_pending() {
-                let slot = graph.alloc_external_state(crate::RgExternalState::new(
-                    self.directional_shadow_layout,
-                ));
-                directional_slot = Some(slot);
-                let res = graph.import_image(
-                    self.targets.directional_shadow.handle(),
-                    self.targets.directional_shadow.view(),
-                    vk::ImageAspectFlags::DEPTH,
-                    self.directional_shadow_layout,
-                    Some(slot),
-                );
-                directional_res = Some(res);
-                self.add_shadow_pass(
-                    &mut graph,
-                    "shadow",
-                    res,
-                    shadow,
-                    bindless_set,
-                    instance_set,
-                    self.lighting.shadow_view_proj(),
-                    deformed_res,
-                    deformed_handle,
-                );
-            }
-            if self.lighting.spot_shadow_pending() {
-                let slot = graph
-                    .alloc_external_state(crate::RgExternalState::new(self.spot_shadow_layout));
-                spot_slot = Some(slot);
-                let res = graph.import_image(
-                    self.targets.spot_shadow.handle(),
-                    self.targets.spot_shadow.view(),
-                    vk::ImageAspectFlags::DEPTH,
-                    self.spot_shadow_layout,
-                    Some(slot),
-                );
-                spot_res = Some(res);
-                self.add_shadow_pass(
-                    &mut graph,
-                    "spot-shadow",
-                    res,
-                    shadow,
-                    bindless_set,
-                    instance_set,
-                    self.lighting.spot_shadow_view_proj(),
-                    deformed_res,
-                    deformed_handle,
-                );
-            }
-        }
-
-        let mut point_static_slots: Option<(usize, Option<usize>)> = None;
-        let mut point_dynamic_slots: Option<(usize, usize)> = None;
-        let mut point_shadow_sampled = Vec::with_capacity(2);
-
-        // Point shadow: each graphics-command pass opens six face rendering scopes while
-        // the graph synchronizes the complete layered color and depth images.
-        if let Some(point) = &pipelines.point_shadow {
-            let faces = point_shadow_face_matrices(
-                self.lighting.point_shadow_pos(),
-                self.lighting.point_shadow_far(),
-            );
-            let light_pos = self.lighting.point_shadow_pos();
-            let far_plane = self.lighting.point_shadow_far();
-            let point_pipeline = point.handle();
-            let point_layout = point.layout();
-
-            let static_slot = graph.alloc_external_state(self.targets.point_shadow.graph_state());
-            let static_cube = graph.import_image(
-                self.targets.point_shadow.image(),
-                self.targets.point_shadow.cube_view(),
-                vk::ImageAspectFlags::COLOR,
-                self.targets.point_shadow.graph_state().layout,
-                Some(static_slot),
-            );
-            point_shadow_sampled.push(static_cube);
-
-            // Static cube: non-deformed casters, rendered only when its content key / image
-            // changed. Skipped frames sample the cached cube (it persists ShaderReadOnly).
-            if pipelines.static_point_shadow_dirty {
-                let target = PointShadowTarget {
-                    face_views: std::array::from_fn(|f| self.targets.point_shadow.face_view(f)),
-                    depth_views: std::array::from_fn(|f| {
-                        self.targets.point_shadow.depth_face_view(f)
-                    }),
-                    extent: self.targets.point_shadow.extent,
-                };
-                let depth_slot =
-                    graph.alloc_external_state(self.targets.point_shadow.depth_graph_state());
-                let depth = graph.import_image(
-                    self.targets.point_shadow.depth_image(),
-                    self.targets.point_shadow.depth_face_view(0),
-                    vk::ImageAspectFlags::DEPTH,
-                    self.targets.point_shadow.depth_graph_state().layout,
-                    Some(depth_slot),
-                );
-                let list = self.scene_draw_list.shallow_clone();
-                let point_static = Arc::clone(point);
-                let raw_body = raw.clone();
-                graph.add_pass(
-                    RgPass::graphics_commands("point-shadow-static")
-                        .access(static_cube, RgUsage::ColorWrite)
-                        .access(depth, RgUsage::DepthWrite)
-                        .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                            record_point_shadow(
-                                &raw_body,
-                                cmd,
-                                &list,
-                                point_pipeline,
-                                point_layout,
-                                bindless_set,
-                                instance_set,
-                                &target,
-                                &faces,
-                                light_pos,
-                                far_plane,
-                                None,
-                                false,
-                            );
-                            drop(point_static);
-                        }),
-                );
-                point_static_slots = Some((static_slot, Some(depth_slot)));
-            } else {
-                point_static_slots = Some((static_slot, None));
-            }
-
-            // Dynamic cube: deformed (skinned / morph) casters, re-rendered every active frame so a
-            // moving character's shadow tracks it against the cached static environment cube.
-            let dynamic_slot =
-                graph.alloc_external_state(self.targets.point_shadow_dynamic.graph_state());
-            let dynamic_cube = graph.import_image(
-                self.targets.point_shadow_dynamic.image(),
-                self.targets.point_shadow_dynamic.cube_view(),
-                vk::ImageAspectFlags::COLOR,
-                self.targets.point_shadow_dynamic.graph_state().layout,
-                Some(dynamic_slot),
-            );
-            point_shadow_sampled.push(dynamic_cube);
-            let dynamic_depth_slot =
-                graph.alloc_external_state(self.targets.point_shadow_dynamic.depth_graph_state());
-            let dynamic_depth = graph.import_image(
-                self.targets.point_shadow_dynamic.depth_image(),
-                self.targets.point_shadow_dynamic.depth_face_view(0),
-                vk::ImageAspectFlags::DEPTH,
-                self.targets.point_shadow_dynamic.depth_graph_state().layout,
-                Some(dynamic_depth_slot),
-            );
-            let dyn_target = PointShadowTarget {
-                face_views: std::array::from_fn(|f| self.targets.point_shadow_dynamic.face_view(f)),
-                depth_views: std::array::from_fn(|f| {
-                    self.targets.point_shadow_dynamic.depth_face_view(f)
-                }),
-                extent: self.targets.point_shadow_dynamic.extent,
-            };
-            let list = self.scene_draw_list.shallow_clone();
-            let point_dynamic = Arc::clone(point);
+        {
             let raw_body = raw.clone();
-            let mut pass = RgPass::graphics_commands("point-shadow-dynamic")
-                .access(dynamic_cube, RgUsage::ColorWrite)
-                .access(dynamic_depth, RgUsage::DepthWrite)
-                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    record_point_shadow(
-                        &raw_body,
-                        cmd,
-                        &list,
-                        point_pipeline,
-                        point_layout,
-                        bindless_set,
-                        instance_set,
-                        &dyn_target,
-                        &faces,
-                        light_pos,
-                        far_plane,
-                        deformed_handle,
-                        true,
-                    );
-                    drop(point_dynamic);
-                });
-            // A skinned batch draws the deformed buffer into the cube faces; declare the
-            // read so the graph orders it after the skin compute write.
-            if let Some(deformed) = deformed_res {
-                pass = pass.access(deformed, RgUsage::VertexInputRead);
+            let mut tlas_pass = RgPass::compute("tlas-build").body(
+                move |cmd, _scopes: &mut NestedScopeRecorder| {
+                    crate::record_tlas_build_plan(&raw_body, cmd, &plan);
+                },
+            );
+            // Declare the deformed-buffer read so the graph orders this after the skin
+            // pass (the skinned BLAS refit reads the freshly deformed vertices).
+            if has_skinned_rt && let Some(deformed) = deformed_res {
+                tlas_pass = tlas_pass.access(deformed, RgUsage::AccelStructBuildRead);
             }
-            graph.add_pass(pass);
-            point_dynamic_slots = Some((dynamic_slot, dynamic_depth_slot));
+            // The tessellated BLAS builds over the coarse (secondary-ray) VB/IB the tess-emit-rt pass
+            // wrote; declaring the read here lets the graph derive the compute-write → AS-build-read
+            // barrier and orders this pass after the coarse emit.
+            if let Some((vb_rt, ib_rt)) = tess_rt_res {
+                tlas_pass = tlas_pass
+                    .access(vb_rt, RgUsage::AccelStructBuildRead)
+                    .access(ib_rt, RgUsage::AccelStructBuildRead);
+            }
+            graph.add_pass(tlas_pass);
+        }
+
+        // Virtual-shadow pages: each dirty page rasterizes into its atlas tile
+        // behind its space's own cull/traversal/bin chain. The scene pass declares
+        // the returned atlas resource `SampledRead` so the graph derives the
+        // DepthWrite -> ShaderReadOnly transition before the mesh samples it.
+        let mut vsm_atlas_res: Option<RgResource> = None;
+        if let (
+            Some(shadow),
+            Some(cull_pso),
+            Some(traversal_pso),
+            Some(bin_count),
+            Some(bin_seed),
+            Some(bin_scatter),
+        ) = (
+            &pipelines.shadow,
+            &visibility_psos.0,
+            &visibility_psos.1,
+            &visibility_psos.2,
+            &visibility_psos.3,
+            &visibility_psos.4,
+        ) {
+            let vsm_capacity = address_block.instance_capacity.max(1);
+            vsm_atlas_res = self.add_vsm_page_passes(
+                &mut graph,
+                frame,
+                shadow,
+                bindless_set,
+                instance_set,
+                deformed_res,
+                &executor_draws,
+                wind_records_res,
+                cull_pso,
+                traversal_pso,
+                (bin_count, bin_seed, bin_scatter),
+                micro_template,
+                vsm_capacity,
+            )?;
         }
 
         // The offscreen color + 1× depth are always imported (the present blit samples the
@@ -6438,6 +7494,8 @@ impl Renderer {
             instance_set,
             (deformed_res, deformed_handle),
             (prev_deformed_res, prev_deformed_handle),
+            executor_inputs,
+            &executor_draws,
         ) {
             Some((motion, depth)) => (Some(motion), Some(depth)),
             None => (None, None),
@@ -6493,11 +7551,11 @@ impl Renderer {
             let ddgi_dist = self.ddgi.distance().1;
             let ddgi_sampler = self.ddgi.sampler();
             let active = self.active_view.index();
-            if let Some(ubo) = self.views[active].gi_params_ubos.get_mut(frame) {
-                if let Some(dst) = ubo.mapped_bytes() {
-                    let src = bytemuck::bytes_of(&gi_params);
-                    dst[..src.len()].copy_from_slice(src);
-                }
+            if let Some(ubo) = self.views[active].gi_params_ubos.get_mut(frame)
+                && let Some(dst) = ubo.mapped_bytes()
+            {
+                let src = bytemuck::bytes_of(&gi_params);
+                dst[..src.len()].copy_from_slice(src);
             }
             self.views[active].write_gi_resolve_shared(
                 &self.device,
@@ -6519,7 +7577,10 @@ impl Renderer {
             (deformed_res, deformed_handle),
             light_set,
             gdf.cascades,
+            gdf.occupancy,
             ibl_live.sh,
+            executor_inputs,
+            &executor_draws,
         );
 
         // ReSTIR DI: the three-pass reservoir chain (initial candidate sampling → temporal +
@@ -6600,47 +7661,72 @@ impl Renderer {
             }
         }
 
-        let did_depth_prepass = pipelines.depth_prepass.is_some();
-        if let Some(pipeline) = &pipelines.depth_prepass {
-            // Move a shallow copy of the draw list (batches share `Arc`s) into the body.
-            let list = self.scene_draw_list.shallow_clone();
+        let did_depth_prepass = pipelines.depth_prepass.is_some() && executor_inputs.is_some();
+        if did_depth_prepass {
+            let pipeline = pipelines
+                .depth_prepass
+                .as_ref()
+                .expect("prepass PSO gated above");
+            let inputs = executor_inputs.expect("executor inputs gated above");
             let raw_for_body = raw.clone();
             let pipeline = Arc::clone(pipeline);
-            let depth_pipeline = pipeline.handle();
-            let depth_layout = pipeline.layout();
+            let prepass_handle = pipeline.handle();
+            let prepass_layout = pipeline.layout();
             let bindless = bindless_set;
+            let draws = executor_draws.clone();
+            let push = self.scene_draw_list.view_proj;
+            let pages_buffer = self.global_gpu_data.pages.buffer();
+            let draw_count_supported = self.device.capabilities.draw_indirect_count;
+            let tess_pso = pipelines.depth_prepass_tess.clone();
+            let tess_draws = self.scene_draw_list.tess_draws.clone();
+            let pages_res = graph.import_buffer(pages_buffer, None);
+            let commands_res = graph.import_buffer(inputs.commands, None);
+            let counters_res = graph.import_buffer(inputs.counters, None);
+            let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
             // The depth pre-pass writes the (multisampled, when MSAA) scene depth the scene
-            // pass then loads — the same sample count the scene PSO bakes.
+            // pass then loads — the same sample count the scene PSO bakes. Draws come from
+            // the frame's binned executor commands over the pages-arena index stream.
             let mut depth_pass = RgPass::graphics("depth-prepass", extent)
                 .depth_attachment(depth_clear_store(scene_depth))
-                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    // Bind the bindless albedo set (0) so the prepass fragment can alpha-clip masked
-                    // materials; set 0's layout is identical here, so it persists across the PSO bind
-                    // that `record_depth_prepass` issues before the draws.
-                    // SAFETY: the ash seam — the set + layout are valid for this frame.
-                    unsafe {
-                        raw_for_body.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            depth_layout,
-                            0,
-                            &[bindless],
-                            &[],
-                        );
-                    }
-                    record_depth_prepass(
+                .access(pages_res, RgUsage::IndexInputRead)
+                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(counters_res, RgUsage::IndirectCountRead)
+                .access(bucket_counts_res, RgUsage::IndirectCountRead);
+            depth_pass = access_tess_draws(&mut graph, depth_pass, &tess_draws, false);
+            let mut depth_pass = depth_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                record_executor_depth_family(
+                    &raw_for_body,
+                    cmd,
+                    (prepass_handle, prepass_layout),
+                    vk::ShaderStageFlags::VERTEX,
+                    bytemuck::bytes_of(&push),
+                    bindless,
+                    instance_set,
+                    inputs,
+                    pages_buffer,
+                    draw_count_supported,
+                    &draws,
+                    false,
+                );
+                if let Some(tess_pso) = &tess_pso {
+                    crate::scene_pass::record_tess_depth_draws(
                         &raw_for_body,
                         cmd,
-                        &list,
-                        depth_pipeline,
-                        depth_layout,
+                        (tess_pso.handle(), tess_pso.layout()),
+                        vk::ShaderStageFlags::VERTEX,
+                        bytemuck::bytes_of(&push),
+                        bindless,
                         instance_set,
-                        deformed_handle,
+                        &tess_draws,
+                        false,
                     );
-                    drop(pipeline);
-                });
+                }
+                drop(pipeline);
+            });
+            depth_pass = depth_pass.access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead);
+            depth_pass = depth_pass.access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
             if let Some(deformed) = deformed_res {
-                depth_pass = depth_pass.access(deformed, RgUsage::VertexInputRead);
+                depth_pass = depth_pass.access(deformed, RgUsage::ShaderDeviceAddressRead);
             }
             graph.add_pass(depth_pass);
         }
@@ -6654,6 +7740,23 @@ impl Renderer {
         let raw_for_body = raw.clone();
         let clear_color = self.clear_color;
 
+        // The survivor raster (visibility stage 6) redraws the retest survivors over
+        // the provisional scene with both attachments LOADed, then the final HZB
+        // rebuild publishes next frame's previous pyramid. Whether it runs decides the
+        // scene pass's MSAA store ops: the multisampled samples must survive to the
+        // survivor pass, which then owns the final resolve.
+        let hzb_copy_pso = self.pipelines.request_hzb_copy(self.hzb.copy_layout());
+        let hzb_reduce_pso = self.pipelines.request_hzb_reduce(self.hzb.reduce_layout());
+        let survivor_planned = visibility_active
+            && hzb_copy_pso.is_some()
+            && hzb_reduce_pso.is_some()
+            && visibility_psos.0.is_some()
+            && visibility_psos.1.is_some()
+            && visibility_psos.2.is_some()
+            && visibility_psos.3.is_some()
+            && visibility_psos.4.is_some()
+            && executor_inputs.is_some();
+
         let mut color_att = RgAttachment::clear_store(scene_color_attachment);
         color_att.clear_value = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -6666,10 +7769,15 @@ impl Renderer {
             color_att.load_op = vk::AttachmentLoadOp::LOAD;
         }
         // MSAA: render to the multisampled color, resolve into scene_output (the
-        // multisampled samples are discarded). The render graph's `resolve` is the MSAA
-        // resolve (color `AVERAGE`, depth `SAMPLE_ZERO`).
+        // multisampled samples are discarded, unless the survivor raster still draws
+        // over them). The render graph's `resolve` is the MSAA resolve (color
+        // `AVERAGE`, depth `SAMPLE_ZERO`).
         if msaa {
-            color_att.store_op = vk::AttachmentStoreOp::DONT_CARE;
+            color_att.store_op = if survivor_planned {
+                vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
+            };
             color_att.resolve = Some(scene_output);
         }
         let mut depth_att = depth_clear_store(scene_depth);
@@ -6677,10 +7785,14 @@ impl Renderer {
             depth_att.load_op = vk::AttachmentLoadOp::LOAD;
         }
         // Persist the 1× scene depth for the post-tonemap overlay: store it directly (no
-        // MSAA), or resolve the multisampled depth into the 1× target (MSAA samples then
-        // discarded).
+        // MSAA), or resolve the multisampled depth into the 1× target (MSAA samples
+        // kept only for the survivor raster).
         if msaa {
-            depth_att.store_op = vk::AttachmentStoreOp::DONT_CARE;
+            depth_att.store_op = if survivor_planned {
+                vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
+            };
             depth_att.resolve = Some(depth);
         }
         let ssao_mesh_set = screen.mesh_set;
@@ -6708,77 +7820,63 @@ impl Renderer {
         } else {
             self.views[self.active_view.index()].restir.mesh_set()
         };
-        // The meshlet raster path (phase C2, env-gated + mesh-shader-only): when engaged, wire this
-        // frame's opaque meshlet draws + build the meshlet PSO. `wire` returns `None` (falling back to
-        // the index path for the whole opaque list) if any batch lacks a meshlet decomposition or a
-        // set allocation fails. `meshlet_raster` and `pipelines` are disjoint `self` fields, so the
-        // two mutable borrows split. The `(draws, dispatch, pipeline)` triple is captured by the scene
-        // body; the index path runs when it is `None`.
-        let meshlet_prep = if self.meshlet_enabled {
-            match self.meshlet_raster.as_mut() {
-                Some(mr) => {
-                    let set_layout = mr.set_layout();
-                    match self.pipelines.request_meshlet(set_layout) {
-                        Some(pipeline) => mr
-                            .wire(frame, &list, deformed_handle)
-                            .map(|draws| (draws, mr.dispatch(), pipeline)),
-                        None => None,
-                    }
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        // The scene pass binds five descriptor-set operations (sets 0, {1,2}, 3, 4, 5) plus one
-        // each for the RT sets 6/7 when present — constant in the batch count. Record it for
-        // `render-stats` here, where the resolved sets are known, since the pass body runs inside
-        // a graph closure whose return value is discarded.
+        // The scene pass binds the mesh roster once (sets 0, {1,2}, 3, 4, 5 plus one
+        // each for the RT sets 6/7 when present) — constant in the draw count. Record
+        // it for `render-stats` here, where the resolved sets are known, since the
+        // pass body runs inside a graph closure whose return value is discarded.
         self.stats.descriptor_binds = crate::scene_pass::scene_draw_list_bind_count(
-            self.scene_draw_list.valid && !self.scene_draw_list.batches.is_empty(),
+            executor_inputs.is_some() && !executor_draws.is_empty(),
             rt_mesh_set,
             restir_mesh_set,
         );
+        let scene_sets = crate::MeshPassSets {
+            bindless: bindless_set,
+            light: light_set,
+            instance: instance_set,
+            ibl: ibl_set,
+            ssao_mesh: ssao_mesh_set,
+            ddgi_mesh: ddgi_mesh_set,
+            rt_mesh: rt_mesh_set,
+            restir_mesh: restir_mesh_set,
+        };
+        let scene_view_proj = self.scene_draw_list.view_proj;
+        let scene_pages_buffer = self.global_gpu_data.pages.buffer();
+        let scene_draw_count_supported = self.device.capabilities.draw_indirect_count;
+        let scene_draws = executor_draws.clone();
+        let scene_tess_draws = self.scene_draw_list.tess_draws.clone();
+        let scene_transparent_commands = self.views[self.active_view.index()]
+            .visibility_view
+            .as_ref()
+            .map(|lists| lists.transparent_commands(frame));
         let mut scene = RgPass::graphics("scene", extent)
             .color(color_att)
             .depth_attachment(depth_att)
             .body(move |_cmd, scopes: &mut NestedScopeRecorder| {
+                let _ = &list;
                 scopes.scope("scene-opaque", |cmd| {
-                    // The meshlet raster path replaces the whole opaque index draw when it wired
-                    // this frame (env-gated + mesh-shader-only); otherwise the validated index path.
-                    if let Some((draws, dispatch, pipeline)) = &meshlet_prep {
-                        crate::meshlet_raster::record_meshlet_draws(
+                    if let Some(inputs) = executor_inputs {
+                        crate::record_executor_buckets(
                             &raw_for_body,
                             cmd,
-                            dispatch,
-                            pipeline.handle(),
-                            pipeline.layout(),
-                            bindless_set,
-                            light_set,
-                            instance_set,
-                            ibl_set,
-                            ssao_mesh_set,
-                            ddgi_mesh_set,
-                            rt_mesh_set,
-                            restir_mesh_set,
-                            draws,
-                        );
-                    } else {
-                        record_scene_draw_list(
-                            &raw_for_body,
-                            cmd,
-                            &list,
-                            bindless_set,
-                            light_set,
-                            instance_set,
-                            ibl_set,
-                            ssao_mesh_set,
-                            ddgi_mesh_set,
-                            rt_mesh_set,
-                            restir_mesh_set,
-                            deformed_handle,
+                            scene_view_proj,
+                            scene_sets,
+                            inputs,
+                            scene_pages_buffer,
+                            scene_draw_count_supported,
+                            &scene_draws,
+                            false,
                         );
                     }
+                    // The tessellation seam: displaced instances' amplified draws
+                    // composite with the opaque cut.
+                    crate::record_tess_scene_draws(
+                        &raw_for_body,
+                        cmd,
+                        scene_view_proj,
+                        scene_sets,
+                        &scene_tess_draws,
+                        false,
+                    );
                 });
                 scopes.scope("scene-submissions", |cmd| {
                     for body in submissions {
@@ -6786,25 +7884,52 @@ impl Renderer {
                     }
                 });
                 // Translucent geometry composites last, over the resolved opaque scene +
-                // submissions, sorted back-to-front with depth-write off (same color + depth
-                // attachments — no separate pass). Empty (a no-op) when nothing is translucent.
+                // submissions: per blend bucket, the GPU-sorted back-to-front command
+                // slice with that bucket's blend PSO (depth-write off; same color +
+                // depth attachments — no separate pass). A no-op when nothing is
+                // translucent.
                 scopes.scope("scene-translucent", |cmd| {
-                    record_transparent_draw_list(
+                    if let (Some(inputs), Some(transparent_commands)) =
+                        (executor_inputs, scene_transparent_commands)
+                    {
+                        crate::record_executor_transparent_stream(
+                            &raw_for_body,
+                            cmd,
+                            scene_view_proj,
+                            scene_sets,
+                            inputs,
+                            scene_pages_buffer,
+                            transparent_commands,
+                            scene_draw_count_supported,
+                            &scene_draws,
+                        );
+                    }
+                    crate::record_tess_scene_draws(
                         &raw_for_body,
                         cmd,
-                        &list,
-                        bindless_set,
-                        light_set,
-                        instance_set,
-                        ibl_set,
-                        ssao_mesh_set,
-                        ddgi_mesh_set,
-                        rt_mesh_set,
-                        restir_mesh_set,
-                        deformed_handle,
+                        scene_view_proj,
+                        scene_sets,
+                        &scene_tess_draws,
+                        true,
                     );
                 });
             });
+        scene = access_tess_draws(&mut graph, scene, &self.scene_draw_list.tess_draws, false);
+        if let Some(inputs) = executor_inputs {
+            let pages_res = graph.import_buffer(scene_pages_buffer, None);
+            let commands_res = graph.import_buffer(inputs.commands, None);
+            let counters_res = graph.import_buffer(inputs.counters, None);
+            let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+            scene = scene
+                .access(pages_res, RgUsage::IndexInputRead)
+                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(counters_res, RgUsage::IndirectCountRead)
+                .access(bucket_counts_res, RgUsage::IndirectCountRead);
+            if let Some(transparent_commands) = scene_transparent_commands {
+                let transparent_res = graph.import_buffer(transparent_commands, None);
+                scene = scene.access(transparent_res, RgUsage::IndirectCommandRead);
+            }
+        }
         // The scene fragment samples the AO / contact / SSGI maps via set 4; declare the
         // reads so the graph transitions each from GENERAL (compute write) → ShaderReadOnly
         // before the sample. The übershader gates them by flag, but the layout transition
@@ -6834,34 +7959,324 @@ impl Renderer {
                 scene = scene.access(cascade, RgUsage::SampledRead);
             }
         }
+        if let Some(occupancy) = gdf.occupancy {
+            for volume in occupancy {
+                scene = scene.access(volume, RgUsage::SampledRead);
+            }
+        }
         // When ReSTIR ran this frame, the resolve wrote the radiance image as storage
         // (GENERAL); declare the scene's SampledRead so the graph transitions it back to
         // ShaderReadOnly before the mesh sample (set 7).
         if let Some(radiance) = restir.radiance {
             scene = scene.access(radiance, RgUsage::SampledRead);
         }
-        // The mesh fragment samples the directional + spot shadow maps via the light set;
-        // declare the reads so the graph transitions each DepthWrite → ShaderReadOnly between
-        // its depth-write pass and the scene draw (else the sample sees a DEPTH_ATTACHMENT
+        // The mesh fragment samples the virtual-shadow atlas via the light set;
+        // declare the read so the graph transitions DepthWrite → ShaderReadOnly between
+        // the page passes and the scene draw (else the sample sees a DEPTH_ATTACHMENT
         // image, `VUID-vkCmdDrawIndexed-imageLayout-00344`).
-        if let Some(res) = directional_res {
-            scene = scene.access(res, RgUsage::SampledRead);
-        }
-        if let Some(res) = spot_res {
-            scene = scene.access(res, RgUsage::SampledRead);
-        }
-        for res in point_shadow_sampled {
+        if let Some(res) = vsm_atlas_res {
             scene = scene.access(res, RgUsage::SampledRead);
         }
         if let Some(cloud) = cloud_frame {
             scene = scene.access(cloud.shadow, RgUsage::SampledRead);
         }
-        // A skinned batch reads the deformed buffer as its vertex stream; declare the read
-        // so the graph orders the scene pass after the skin compute write.
+        // A skinned draw pulls the deformed buffer through its device address; declare
+        // the read so the graph orders the scene pass after the skin compute write.
+        scene = scene.access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead);
+        scene = scene.access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
         if let Some(deformed) = deformed_res {
-            scene = scene.access(deformed, RgUsage::VertexInputRead);
+            scene = scene.access(deformed, RgUsage::ShaderDeviceAddressRead);
         }
         graph.add_pass(scene);
+
+        // The HZB build follows the scene pass: seed mip 0 from the resolved 1x depth,
+        // then the per-mip max reduction. Next frame's visibility reads this pyramid as
+        // its previous; a missing PSO invalidates instead so tests bypass a stale pyramid.
+        if let (Some(hzb_copy), Some(hzb_reduce)) = (hzb_copy_pso, hzb_reduce_pso) {
+            // Stage-5 prologue: snapshot the provisional visible/record counts into
+            // counter words 6/7 and zero the bucket counts, BEFORE the retest appends
+            // survivors. Every consumer of the provisional cut is declared above, so
+            // the graph orders their reads ahead of the clear.
+            if survivor_planned
+                && let Some(lists) = self.views[self.active_view.index()]
+                    .visibility_view
+                    .as_ref()
+            {
+                lists.add_survivor_snapshot_pass(&self.device, &mut graph, frame);
+            }
+            let hzb_depth_view = self.views[self.active_view.index()].depth.view();
+            let current_hzb_res = self.views[self.active_view.index()]
+                .hzb_pyramid
+                .as_mut()
+                .map(|pyramid| {
+                    pyramid.write_depth_binding(&self.device, &self.hzb, hzb_depth_view);
+                    pyramid.add_build_passes(
+                        &self.device,
+                        &mut graph,
+                        (&hzb_copy, &hzb_reduce),
+                        depth,
+                    )
+                });
+            // Receiver demand for the virtual shadow map: mark needed pages from
+            // the freshly seeded pyramid's full-resolution depth, then compact the
+            // bitmap into the frame's request ring for the fence-time drain.
+            if self.active_view.index() == 0
+                && let (Some(mark_pso), Some(compact_pso), Some(hzb_res)) =
+                    (&vsm_demand_pso, &vsm_compact_pso, current_hzb_res)
+                && let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_ref()
+            {
+                let (_, current_view) = pyramid.current();
+                self.vsm_demand.write_frame(
+                    &self.device.raw().clone(),
+                    frame,
+                    self.lighting.frame_ubo(frame),
+                    current_view,
+                    self.scene_visibility.hzb_sampler(),
+                );
+                let extent = self.views[self.active_view.index()].scaled_render_extent();
+                let inv_view_proj = self.scene_view_proj_unjittered().inverse();
+                let (mark_set, compact_set) = self.vsm_demand.sets(frame);
+                let raw_mark = self.device.raw().clone();
+                let mark = Arc::clone(mark_pso);
+                let mark_push = crate::VsmDemandPush {
+                    inv_view_proj: inv_view_proj.to_cols_array(),
+                    extent: [extent.width, extent.height],
+                    reserved: [0; 2],
+                };
+                let groups = (extent.width.div_ceil(8), extent.height.div_ceil(8));
+                graph.add_pass(
+                    RgPass::compute("vsm-demand")
+                        .access(hzb_res, RgUsage::StorageImageRwCompute)
+                        .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                            // SAFETY: the ash seam; the PSO/set are valid this frame.
+                            unsafe {
+                                raw_mark.cmd_bind_pipeline(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    mark.handle(),
+                                );
+                                raw_mark.cmd_bind_descriptor_sets(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    mark.layout(),
+                                    0,
+                                    &[mark_set],
+                                    &[],
+                                );
+                                raw_mark.cmd_push_constants(
+                                    cmd,
+                                    mark.layout(),
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    bytemuck::bytes_of(&mark_push),
+                                );
+                                raw_mark.cmd_dispatch(cmd, groups.0, groups.1, 1);
+                            }
+                        }),
+                );
+                let raw_compact = self.device.raw().clone();
+                let compact = Arc::clone(compact_pso);
+                let compact_push = crate::VsmCompactPush {
+                    capacity: crate::VSM_DEMAND_CAPACITY,
+                    reserved: [0; 3],
+                };
+                let bitmap_res = graph.import_buffer(self.vsm_demand.bitmap_handle(), None);
+                let ring_res = graph.import_buffer(self.vsm_demand.ring_handle(frame), None);
+                graph.add_pass(
+                    RgPass::compute("vsm-demand-compact")
+                        .access(bitmap_res, RgUsage::StorageReadWriteCompute)
+                        .access(ring_res, RgUsage::StorageReadWriteCompute)
+                        .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                            // SAFETY: the ash seam; the PSO/set are valid this frame.
+                            unsafe {
+                                raw_compact.cmd_bind_pipeline(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    compact.handle(),
+                                );
+                                raw_compact.cmd_bind_descriptor_sets(
+                                    cmd,
+                                    vk::PipelineBindPoint::COMPUTE,
+                                    compact.layout(),
+                                    0,
+                                    &[compact_set],
+                                    &[],
+                                );
+                                raw_compact.cmd_push_constants(
+                                    cmd,
+                                    compact.layout(),
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    bytemuck::bytes_of(&compact_push),
+                                );
+                                raw_compact.cmd_dispatch(cmd, 8, 1, 1);
+                            }
+                        }),
+                );
+            }
+
+            // Instance visibility, stage 5: retest the occluded-established list
+            // against the freshly built pyramid; survivors merge into the visible
+            // list for the survivor traversal.
+            if visibility_active && let Some(current_hzb_res) = current_hzb_res {
+                let view_index = self.active_view.index();
+                let camera_view = self.ssao.view();
+                let camera_proj = self.ssao.inv_projection().inverse();
+                let view_proj = (camera_proj * camera_view).to_cols_array();
+                let lists = self.views[view_index]
+                    .visibility_view
+                    .as_ref()
+                    .expect("visibility lists active");
+                let hzb_pyramid = self.views[view_index]
+                    .hzb_pyramid
+                    .as_ref()
+                    .expect("pyramid active");
+                if let Some(cull_pso) = &visibility_psos.0 {
+                    lists.add_retest_pass(
+                        &self.device,
+                        &mut graph,
+                        cull_pso,
+                        frame,
+                        current_hzb_res,
+                        wind_records_res,
+                        crate::SceneVisibilityPush {
+                            view_proj,
+                            prev_view_proj: view_proj,
+                            hzb_extent: [hzb_pyramid.extent().width, hzb_pyramid.extent().height],
+                            hzb_mip_count: hzb_pyramid.mip_count(),
+                            pass_kind: crate::SCENE_VISIBILITY_PASS_RETEST,
+                            history_valid: u32::from(visibility_history_valid),
+                            list_capacity: lists.capacity(),
+                            reserved: [0; 2],
+                        },
+                    );
+                }
+                // Stage 6: traverse the retest survivors (the visible-list tail past
+                // counter word 6) into records past word 7, re-bin them into the
+                // re-seeded command slices, redraw them over the provisional scene
+                // with both attachments LOADed, then rebuild the HZB so next frame's
+                // previous pyramid holds the complete cut.
+                if survivor_planned {
+                    if let Some(traversal_pso) = &visibility_psos.1 {
+                        let demand = self.page_demand_view();
+                        lists.add_traversal_pass(
+                            &self.device,
+                            &mut graph,
+                            traversal_pso,
+                            frame,
+                            crate::SceneTraversalPush {
+                                eye: demand.eye.to_array(),
+                                proj_scale: demand.proj_scale,
+                                error_threshold_px: 1.0,
+                                record_capacity: lists.record_capacity(),
+                                list_capacity: lists.capacity(),
+                                survivor: 1,
+                                tess_seam,
+                                transition_frames: crate::GPU_TRANSITION_FRAMES,
+                                frame_stamp: self.frame_serial as u32,
+                                reserved0: 0,
+                            },
+                        );
+                    }
+                    if let (Some(bin_count), Some(bin_scan), Some(bin_scatter)) =
+                        (&visibility_psos.2, &visibility_psos.3, &visibility_psos.4)
+                    {
+                        lists.add_binning_passes(
+                            &self.device,
+                            &mut graph,
+                            (bin_count, bin_scan, bin_scatter),
+                            frame,
+                            true,
+                            micro_template,
+                        );
+                    }
+                    if let Some(inputs) = executor_inputs {
+                        let raw_for_body = raw.clone();
+                        let survivor_draws = executor_draws.clone();
+                        let survivor_pages = self.global_gpu_data.pages.buffer();
+                        let survivor_count = self.device.capabilities.draw_indirect_count;
+                        let survivor_view_proj = self.scene_draw_list.view_proj;
+                        let mut survivor_color = color_load_store(scene_color_attachment);
+                        let mut survivor_depth = depth_load_store(scene_depth);
+                        if msaa {
+                            survivor_color.store_op = vk::AttachmentStoreOp::DONT_CARE;
+                            survivor_color.resolve = Some(scene_output);
+                            survivor_depth.store_op = vk::AttachmentStoreOp::DONT_CARE;
+                            survivor_depth.resolve = Some(depth);
+                        }
+                        let mut survivor_pass = RgPass::graphics("scene-survivors", extent)
+                            .color(survivor_color)
+                            .depth_attachment(survivor_depth)
+                            .body(move |_cmd, scopes: &mut NestedScopeRecorder| {
+                                scopes.scope("scene-survivors", |cmd| {
+                                    crate::record_executor_buckets(
+                                        &raw_for_body,
+                                        cmd,
+                                        survivor_view_proj,
+                                        scene_sets,
+                                        inputs,
+                                        survivor_pages,
+                                        survivor_count,
+                                        &survivor_draws,
+                                        false,
+                                    );
+                                });
+                            });
+                        let pages_res = graph.import_buffer(survivor_pages, None);
+                        let commands_res = graph.import_buffer(inputs.commands, None);
+                        let counters_res = graph.import_buffer(inputs.counters, None);
+                        let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+                        survivor_pass = survivor_pass
+                            .access(pages_res, RgUsage::IndexInputRead)
+                            .access(commands_res, RgUsage::IndirectCommandRead)
+                            .access(counters_res, RgUsage::IndirectCountRead)
+                            .access(bucket_counts_res, RgUsage::IndirectCountRead);
+                        if let Some(deformed) = deformed_res {
+                            survivor_pass =
+                                survivor_pass.access(deformed, RgUsage::ShaderDeviceAddressRead);
+                        }
+                        survivor_pass = survivor_pass
+                            .access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead)
+                            .access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
+                        graph.add_pass(survivor_pass);
+                    }
+                    // Restore the complete cut for the passes declared after this
+                    // block (reactive coverage, the wireframe overlay): clear the
+                    // survivor-only bucket counts and re-bin every record.
+                    if let (Some(bin_count), Some(bin_scan), Some(bin_scatter)) =
+                        (&visibility_psos.2, &visibility_psos.3, &visibility_psos.4)
+                    {
+                        lists.add_bucket_count_clear_pass(&self.device, &mut graph, frame);
+                        lists.add_binning_passes(
+                            &self.device,
+                            &mut graph,
+                            (bin_count, bin_scan, bin_scatter),
+                            frame,
+                            false,
+                            micro_template,
+                        );
+                    }
+                }
+                lists.add_counters_readback_pass(&self.device, &mut graph, frame);
+            }
+            // The final HZB rebuild reads the survivor-updated depth over the same
+            // imported pyramid resource, publishing the complete cut as next frame's
+            // previous pyramid.
+            if survivor_planned
+                && let Some(current_hzb_res) = current_hzb_res
+                && let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_mut()
+            {
+                pyramid.add_rebuild_passes(
+                    &self.device,
+                    &mut graph,
+                    (&hzb_copy, &hzb_reduce),
+                    depth,
+                    current_hzb_res,
+                );
+            }
+        } else if let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_mut() {
+            pyramid.invalidate();
+        }
 
         // FXAA: edge-blur the scene scratch into the offscreen (a compute pass), then TAA:
         // reproject history through the motion vector + blend with the current scene
@@ -6875,8 +8290,10 @@ impl Renderer {
             &mut graph,
             &pipelines,
             scene_depth,
+            bindless_set,
             instance_set,
-            deformed_handle,
+            executor_inputs,
+            &executor_draws,
         );
         let taa_slots = self.add_taa_pass(
             &mut graph,
@@ -7012,9 +8429,11 @@ impl Renderer {
             &pipelines,
             color,
             overlay_depth,
+            bindless_set,
             instance_set,
             deformed_res,
-            deformed_handle,
+            executor_inputs,
+            &executor_draws,
         );
         self.add_grid_overlay_passes(&mut graph, &pipelines, color, overlay_depth);
 
@@ -7085,48 +8504,18 @@ impl Renderer {
             .offscreen
             .set_graph_state(graph.external_state(offscreen_slot));
 
-        // Read back the shadow maps' resolved exit layouts for the next frame's seed (the
-        // graph wrote each external slot to the map's final layout — ShaderReadOnly after
-        // a depth-write pass that the next frame's sample waits on).
-        if let Some(slot) = directional_slot {
-            self.directional_shadow_layout = graph.external_state(slot).layout;
-        }
-        if let Some(slot) = spot_slot {
-            self.spot_shadow_layout = graph.external_state(slot).layout;
-        }
-        if let Some((cube_slot, depth_slot)) = point_static_slots {
-            self.targets
-                .point_shadow
-                .set_graph_state(graph.external_state(cube_slot));
-            if let Some(depth_slot) = depth_slot {
-                self.targets
-                    .point_shadow
-                    .set_depth_graph_state(graph.external_state(depth_slot));
-            }
-        }
-        if let Some((cube_slot, depth_slot)) = point_dynamic_slots {
-            self.targets
-                .point_shadow_dynamic
-                .set_graph_state(graph.external_state(cube_slot));
-            self.targets
-                .point_shadow_dynamic
-                .set_depth_graph_state(graph.external_state(depth_slot));
-        }
-
         // Read back the DDGI images' resolved exit layouts (the ray image + the two atlases each
         // rode an external slot), then advance the temporal state (bump the ray-set / round-robin
         // index, commit the scroll base, clear the history-reset flag) — but only when the chain
         // actually ran this frame.
         if let Some(slot) = ddgi.rays_slot {
-            self.ddgi.set_rays_layout(graph.external_state(slot).layout);
+            self.ddgi.set_rays_state(graph.external_state(slot));
         }
         if let Some(slot) = ddgi.irradiance_slot {
-            self.ddgi
-                .set_irradiance_layout(graph.external_state(slot).layout);
+            self.ddgi.set_irradiance_state(graph.external_state(slot));
         }
         if let Some(slot) = ddgi.distance_slot {
-            self.ddgi
-                .set_distance_layout(graph.external_state(slot).layout);
+            self.ddgi.set_distance_state(graph.external_state(slot));
         }
         if ddgi.irradiance.is_some() {
             self.ddgi.advance_frame();
@@ -7141,6 +8530,10 @@ impl Renderer {
                 if let Some(slot) = gdf.cascade_slots[c as usize] {
                     self.global_sdf
                         .set_cascade_layout(c, graph.external_state(slot).layout);
+                }
+                if let Some(slot) = gdf.occupancy_slots[c as usize] {
+                    self.global_sdf
+                        .set_occupancy_layout(c, graph.external_state(slot).layout);
                 }
             }
             if let Some(slot) = gdf.albedo_slot {
@@ -7320,33 +8713,33 @@ impl Renderer {
         };
         let raw = self.device.raw().clone();
 
-        let (ray_image, ray_view, ray_layout) = self.ddgi.rays();
-        let rays_slot = graph.alloc_external_state(crate::RgExternalState::new(ray_layout));
+        let (ray_image, ray_view, ray_state) = self.ddgi.rays();
+        let rays_slot = graph.alloc_external_state(ray_state);
         let ray_res = graph.import_image(
             ray_image,
             ray_view,
             vk::ImageAspectFlags::COLOR,
-            ray_layout,
+            ray_state.layout,
             Some(rays_slot),
         );
 
-        let (irr_image, irr_view, irr_layout) = self.ddgi.irradiance();
-        let irr_slot = graph.alloc_external_state(crate::RgExternalState::new(irr_layout));
+        let (irr_image, irr_view, irr_state) = self.ddgi.irradiance();
+        let irr_slot = graph.alloc_external_state(irr_state);
         let irr_res = graph.import_image(
             irr_image,
             irr_view,
             vk::ImageAspectFlags::COLOR,
-            irr_layout,
+            irr_state.layout,
             Some(irr_slot),
         );
 
-        let (dist_image, dist_view, dist_layout) = self.ddgi.distance();
-        let dist_slot = graph.alloc_external_state(crate::RgExternalState::new(dist_layout));
+        let (dist_image, dist_view, dist_state) = self.ddgi.distance();
+        let dist_slot = graph.alloc_external_state(dist_state);
         let dist_res = graph.import_image(
             dist_image,
             dist_view,
             vk::ImageAspectFlags::COLOR,
-            dist_layout,
+            dist_state.layout,
             Some(dist_slot),
         );
 
@@ -7371,6 +8764,11 @@ impl Renderer {
         if let Some(cascades) = gdf.cascades {
             for cascade in cascades {
                 trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
+            }
+        }
+        if let Some(occupancy) = gdf.occupancy {
+            for volume in occupancy {
+                trace_pass = trace_pass.access(volume, RgUsage::SampledReadCompute);
             }
         }
         if let Some(albedo) = gdf.albedo {
@@ -7519,11 +8917,17 @@ impl Renderer {
         let cull_res = graph.import_buffer(self.global_sdf.cull_buffer(frame), None);
         let mut cascade_res = [RgResource { index: 0 }; crate::GDF_CASCADES as usize];
         let mut cascade_slots = [None; crate::GDF_CASCADES as usize];
+        let mut occupancy_res = [RgResource { index: 0 }; crate::GDF_CASCADES as usize];
+        let mut occupancy_slots = [None; crate::GDF_CASCADES as usize];
         for c in 0..crate::GDF_CASCADES {
             let (image, view, layout) = self.global_sdf.cascade(c);
             let slot = graph.alloc_external_state(crate::RgExternalState::new(layout));
             cascade_res[c as usize] = graph.import_image_3d(image, view, layout, Some(slot));
             cascade_slots[c as usize] = Some(slot);
+            let (image, view, layout) = self.global_sdf.occupancy_cascade(c);
+            let slot = graph.alloc_external_state(crate::RgExternalState::new(layout));
+            occupancy_res[c as usize] = graph.import_image_3d(image, view, layout, Some(slot));
+            occupancy_slots[c as usize] = Some(slot);
         }
         // The lite albedo cache (the composite splats it for the finest cascade; the DDGI trace
         // samples it at hit points).
@@ -7624,6 +9028,9 @@ impl Renderer {
         for cascade in cascade_res {
             composite_pass = composite_pass.access(cascade, RgUsage::StorageImageRwCompute);
         }
+        for occupancy in occupancy_res {
+            composite_pass = composite_pass.access(occupancy, RgUsage::StorageImageRwCompute);
+        }
         composite_pass = composite_pass.access(albedo_res, RgUsage::StorageImageRwCompute);
         let raw_body = raw.clone();
         composite_pass = composite_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
@@ -7657,6 +9064,8 @@ impl Renderer {
         GdfResult {
             cascades: Some(cascade_res),
             cascade_slots,
+            occupancy: Some(occupancy_res),
+            occupancy_slots,
             albedo: Some(albedo_res),
             albedo_slot: Some(albedo_slot),
         }
@@ -7726,6 +9135,11 @@ impl Renderer {
         let light_buffer = self.lighting.light_list_buffer(frame);
         let cluster_buffer = self.lighting.cluster_buffer_with_size(frame);
         let tlas = self.rt.frame_tlas(frame);
+        let address_block = (
+            self.gpu_scene_uploader.address_buffer(),
+            frame as u64 * self.gpu_scene_uploader.address_block_stride(),
+            size_of::<crate::GpuSceneAddressBlock>() as u64,
+        );
         self.views[self.active_view.index()]
             .restir
             .write_frame_bindings(
@@ -7736,6 +9150,7 @@ impl Renderer {
                 light_buffer,
                 cluster_buffer,
                 tlas,
+                address_block,
             );
 
         // The per-frame push inputs (the camera inverses + eye come from the shared SSAO
@@ -7834,24 +9249,43 @@ impl Renderer {
 
         // 3. resolve: one TLAS visibility ray per pixel + shade → the radiance image
         //    (storage RW). Reads the sentinel (the combined reservoir) + writes the radiance.
+        //    Binds set 1 = the bindless texture array for the non-opaque candidate coverage
+        //    confirmation.
         let resolve = Arc::clone(&restir_pipelines.resolve);
         let resolve_handle = resolve.handle();
         let resolve_layout = resolve.layout();
+        let bindless_set = self.descriptors.bindless_set();
         let raw_body = raw.clone();
         graph.add_pass(
             RgPass::compute("restir-resolve")
                 .access(sentinel, RgUsage::StorageReadCompute)
                 .access(radiance_res, RgUsage::StorageImageRwCompute)
                 .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    record_ddgi_compute(
-                        &raw_body,
-                        cmd,
-                        resolve_handle,
-                        resolve_layout,
-                        resolve_set,
-                        bytemuck::bytes_of(&resolve_push),
-                        (groups_x, groups_y, 1),
-                    );
+                    // SAFETY: the ash seam. The PSO/sets/layout are valid this frame; the
+                    // push spans the declared range; the dispatch covers the view grid.
+                    unsafe {
+                        raw_body.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            resolve_handle,
+                        );
+                        raw_body.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            resolve_layout,
+                            0,
+                            &[resolve_set, bindless_set],
+                            &[],
+                        );
+                        raw_body.cmd_push_constants(
+                            cmd,
+                            resolve_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            bytemuck::bytes_of(&resolve_push),
+                        );
+                        raw_body.cmd_dispatch(cmd, groups_x, groups_y, 1);
+                    }
                     drop(resolve);
                 }),
         );
@@ -7887,9 +9321,12 @@ impl Renderer {
         deformed: (Option<RgResource>, Option<vk::Buffer>),
         light_set: vk::DescriptorSet,
         gdf_cascades: Option<[RgResource; crate::GDF_CASCADES as usize]>,
+        gdf_occupancy: Option<[RgResource; crate::GDF_CASCADES as usize]>,
         sky_sh: RgResource,
+        executor_inputs: Option<crate::ExecutorDrawInputs>,
+        executor_draws: &[(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)],
     ) -> ScreenSpaceResult {
-        let (deformed_res, deformed_handle) = deformed;
+        let (deformed_res, _deformed_handle) = deformed;
         let mut result = ScreenSpaceResult::default();
         let Some(gbuffer) = &pipelines.gbuffer else {
             // The screen-space prepass is skipped this frame (no GTAO / contact / SSGI /
@@ -7943,32 +9380,73 @@ impl Renderer {
             None,
         );
         {
-            let list = self.scene_draw_list.shallow_clone();
             let raw_body = raw.clone();
             let push = self.ssao.gbuffer_push();
             let pipeline = Arc::clone(gbuffer);
             let gbuffer_pipeline = pipeline.handle();
             let gbuffer_layout = pipeline.layout();
+            let draws = executor_draws.to_vec();
+            let pages_buffer = self.global_gpu_data.pages.buffer();
+            let draw_count_supported = self.device.capabilities.draw_indirect_count;
+            let tess_pso = pipelines.gbuffer_tess.clone();
+            let tess_draws = self.scene_draw_list.tess_draws.clone();
             let mut pass = RgPass::graphics("gbuffer", extent)
                 .color(RgAttachment::clear_store(g_normal))
                 .color(RgAttachment::clear_store(g_roughness))
-                .depth_attachment(depth_clear_store(g_depth))
-                .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    record_gbuffer(
+                .depth_attachment(depth_clear_store(g_depth));
+            pass = access_tess_draws(graph, pass, &tess_draws, false);
+            let mut pass = pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                if let Some(inputs) = executor_inputs {
+                    record_executor_depth_family(
                         &raw_body,
                         cmd,
-                        &list,
-                        gbuffer_pipeline,
-                        gbuffer_layout,
+                        (gbuffer_pipeline, gbuffer_layout),
+                        vk::ShaderStageFlags::VERTEX,
+                        bytemuck::bytes_of(&push),
                         bindless_set,
                         instance_set,
-                        &push,
-                        deformed_handle,
+                        inputs,
+                        pages_buffer,
+                        draw_count_supported,
+                        &draws,
+                        false,
                     );
-                    drop(pipeline);
-                });
+                    if let Some(tess_pso) = &tess_pso {
+                        crate::scene_pass::record_tess_depth_draws(
+                            &raw_body,
+                            cmd,
+                            (tess_pso.handle(), tess_pso.layout()),
+                            vk::ShaderStageFlags::VERTEX,
+                            bytemuck::bytes_of(&push),
+                            bindless_set,
+                            instance_set,
+                            &tess_draws,
+                            false,
+                        );
+                    }
+                }
+                drop(pipeline);
+            });
+            if let Some(inputs) = executor_inputs {
+                let pages_res = graph.import_buffer(pages_buffer, None);
+                let commands_res = graph.import_buffer(inputs.commands, None);
+                let counters_res = graph.import_buffer(inputs.counters, None);
+                let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+                pass = pass
+                    .access(pages_res, RgUsage::IndexInputRead)
+                    .access(commands_res, RgUsage::IndirectCommandRead)
+                    .access(counters_res, RgUsage::IndirectCountRead)
+                    .access(bucket_counts_res, RgUsage::IndirectCountRead);
+            }
+            let micro_candidates_res =
+                graph.import_buffer(self.global_gpu_data.micro_candidates.handle(), None);
+            pass = pass.access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead);
+            if let Some(wind_records) = self.wind_records_handle() {
+                let wind_records_res = graph.import_buffer(wind_records, None);
+                pass = pass.access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
+            }
             if let Some(deformed) = deformed_res {
-                pass = pass.access(deformed, RgUsage::VertexInputRead);
+                pass = pass.access(deformed, RgUsage::ShaderDeviceAddressRead);
             }
             graph.add_pass(pass);
         }
@@ -8277,6 +9755,11 @@ impl Renderer {
                     trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
                 }
             }
+            if let Some(occupancy) = gdf_occupancy {
+                for volume in occupancy {
+                    trace_pass = trace_pass.access(volume, RgUsage::SampledReadCompute);
+                }
+            }
             let trace_pass = trace_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                 // SAFETY: the ash seam. The PSO + three sets are valid this frame; the dispatch
                 // covers the half-res trace target.
@@ -8498,6 +9981,11 @@ impl Renderer {
                     trace_pass = trace_pass.access(cascade, RgUsage::SampledReadCompute);
                 }
             }
+            if let Some(occupancy) = gdf_occupancy {
+                for volume in occupancy {
+                    trace_pass = trace_pass.access(volume, RgUsage::SampledReadCompute);
+                }
+            }
             let trace_pass = trace_pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                 // SAFETY: the ash seam. The PSO + three sets are valid this frame; the dispatch
                 // covers the half-res trace target.
@@ -8584,10 +10072,8 @@ impl Renderer {
 
         // RT reflections sample prev_color directly in the mesh fragment (set-4 binding 4),
         // so the scene pass must SampledRead it (transition to ShaderReadOnly before the draw).
-        if rt_refl {
-            if let Some(pc) = prev_color {
-                result.scene_sampled.push(pc);
-            }
+        if rt_refl && let Some(pc) = prev_color {
+            result.scene_sampled.push(pc);
         }
 
         // The prev-color history copy runs AFTER the scene (it reads the scene's linear-HDR
@@ -8610,6 +10096,7 @@ impl Renderer {
     /// the rg16f motion target + its depth scratch, draw every batch with the cur/prev
     /// camera viewProj (the per-view `prev_view_proj`). Returns the imported motion resource
     /// (the TAA / SSGI-accum passes sample it), or `None` when motion did not run.
+    #[allow(clippy::too_many_arguments)]
     fn add_motion_pass(
         &self,
         graph: &mut RenderGraph,
@@ -8618,10 +10105,12 @@ impl Renderer {
         instance_set: vk::DescriptorSet,
         deformed: (Option<RgResource>, Option<vk::Buffer>),
         prev_deformed: (Option<RgResource>, Option<vk::Buffer>),
+        executor_inputs: Option<crate::ExecutorDrawInputs>,
+        executor_draws: &[(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)],
     ) -> Option<(RgResource, RgResource)> {
         let motion_pipeline = pipelines.motion.as_ref()?;
-        let (deformed_res, deformed_handle) = deformed;
-        let (prev_deformed_res, prev_deformed_handle) = prev_deformed;
+        let (deformed_res, _) = deformed;
+        let (prev_deformed_res, _) = prev_deformed;
         let view = &self.views[self.active_view.index()];
         let (motion_image, motion_depth) = match (&view.motion, &view.motion_depth) {
             (Some(motion), Some(depth)) => (motion, depth),
@@ -8655,37 +10144,78 @@ impl Renderer {
                 cur_view_proj
             },
         };
-        let list = self.scene_draw_list.shallow_clone();
         let raw_body = self.device.raw().clone();
         let pipeline = Arc::clone(motion_pipeline);
         let motion_handle = pipeline.handle();
         let motion_layout = pipeline.layout();
+        let draws = executor_draws.to_vec();
+        let pages_buffer = self.global_gpu_data.pages.buffer();
+        let draw_count_supported = self.device.capabilities.draw_indirect_count;
+        let tess_pso = pipelines.motion_tess.clone();
+        let tess_draws = self.scene_draw_list.tess_draws.clone();
         let mut pass = RgPass::graphics("motion", extent)
             .color(RgAttachment::clear_store(motion))
-            .depth_attachment(depth_clear_store(motion_depth))
-            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                crate::record_motion(
+            .depth_attachment(depth_clear_store(motion_depth));
+        pass = access_tess_draws(graph, pass, &tess_draws, true);
+        let mut pass = pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+            if let Some(inputs) = executor_inputs {
+                record_executor_depth_family(
                     &raw_body,
                     cmd,
-                    &list,
-                    motion_handle,
-                    motion_layout,
+                    (motion_handle, motion_layout),
+                    vk::ShaderStageFlags::VERTEX,
+                    bytemuck::bytes_of(&push),
                     bindless_set,
                     instance_set,
-                    &push,
-                    deformed_handle,
-                    prev_deformed_handle,
+                    inputs,
+                    pages_buffer,
+                    draw_count_supported,
+                    &draws,
+                    false,
                 );
-                drop(pipeline);
-            });
-        // The motion pass reads BOTH deformed buffers (binding 0 = current position,
-        // binding 1 = previous), so declare both reads for the skin-write → vertex-input
-        // barrier on each.
+                if let Some(tess_pso) = &tess_pso {
+                    crate::scene_pass::record_tess_depth_draws(
+                        &raw_body,
+                        cmd,
+                        (tess_pso.handle(), tess_pso.layout()),
+                        vk::ShaderStageFlags::VERTEX,
+                        bytemuck::bytes_of(&push),
+                        bindless_set,
+                        instance_set,
+                        &tess_draws,
+                        true,
+                    );
+                }
+            }
+            drop(pipeline);
+        });
+        if let Some(inputs) = executor_inputs {
+            let pages_res = graph.import_buffer(pages_buffer, None);
+            let commands_res = graph.import_buffer(inputs.commands, None);
+            let counters_res = graph.import_buffer(inputs.counters, None);
+            let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+            pass = pass
+                .access(pages_res, RgUsage::IndexInputRead)
+                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(counters_res, RgUsage::IndirectCountRead)
+                .access(bucket_counts_res, RgUsage::IndirectCountRead);
+        }
+        // The motion executor pulls BOTH deformed buffers through their device
+        // addresses (current + previous position), so declare both reads for the
+        // skin-write → pull barrier on each. The micro-blade candidates pull the same
+        // way (micro-pass-write → pull).
+        let micro_candidates_res =
+            graph.import_buffer(self.global_gpu_data.micro_candidates.handle(), None);
+        pass = pass.access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead);
+        if let Some(wind_records) = self.wind_records_handle() {
+            let wind_records_res = graph.import_buffer(wind_records, None);
+            pass = pass.access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
+        }
         if let Some(deformed) = deformed_res {
-            pass = pass.access(deformed, RgUsage::VertexInputRead);
+            pass = pass.access(deformed, RgUsage::ShaderDeviceAddressRead);
         }
         if let Some(prev_deformed) = prev_deformed_res {
-            pass = pass.access(prev_deformed, RgUsage::VertexInputRead);
+            pass = pass.access(prev_deformed, RgUsage::ShaderDeviceAddressRead);
         }
         graph.add_pass(pass);
         // Return the motion colour + the motion-prepass depth (the TAA resolve reads the depth
@@ -8834,15 +10364,22 @@ impl Renderer {
     /// read-only against `scene_depth`) so the resolve can bias alpha-blended pixels toward the
     /// current frame. Runs only under TAA. Returns the reactive-mask resource, or `None` when the
     /// PSO / target is unavailable (the resolve then falls back to a fully-cleared mask).
+    #[allow(clippy::too_many_arguments)]
     fn add_reactive_coverage_pass(
         &self,
         graph: &mut RenderGraph,
         pipelines: &FramePipelines,
         scene_depth: RgResource,
+        bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
-        deformed_handle: Option<vk::Buffer>,
+        executor_inputs: Option<crate::ExecutorDrawInputs>,
+        executor_draws: &[(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)],
     ) -> Option<RgResource> {
         let pipeline = pipelines.reactive_coverage.as_ref()?;
+        let transition_keepalive = pipelines.reactive_transition.clone();
+        let transition_pipeline = transition_keepalive
+            .as_ref()
+            .map(|pipeline| (pipeline.handle(), pipeline.layout()));
         let view = &self.views[self.active_view.index()];
         let reactive = view.reactive.as_ref()?;
         let input = view.scaled_render_extent();
@@ -8855,11 +10392,14 @@ impl Renderer {
             vk::ImageLayout::UNDEFINED,
             None,
         );
-        let list = self.scene_draw_list.shallow_clone();
         let raw_body = self.device.raw().clone();
         let pipeline = Arc::clone(pipeline);
         let handle = pipeline.handle();
         let layout = pipeline.layout();
+        let view_proj = self.scene_draw_list.view_proj;
+        let draws = executor_draws.to_vec();
+        let pages_buffer = self.global_gpu_data.pages.buffer();
+        let draw_count_supported = self.device.capabilities.draw_indirect_count;
         let mut color_att = RgAttachment::clear_store(reactive_res);
         color_att.clear_value = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -8867,22 +10407,60 @@ impl Renderer {
             },
         };
         // Read-only depth test against the resolved scene depth (declared by the attachment), so
-        // occluded translucent fragments don't mark coverage.
-        let pass = RgPass::graphics("reactive-coverage", input)
+        // occluded translucent fragments don't mark coverage. The blend buckets' binned
+        // commands are the translucent draws; order is irrelevant for a coverage mask.
+        let mut pass = RgPass::graphics("reactive-coverage", input)
             .color(color_att)
             .depth_attachment(depth_load_readonly(scene_depth))
             .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                crate::scene_pass::record_reactive_coverage(
-                    &raw_body,
-                    cmd,
-                    &list,
-                    handle,
-                    layout,
-                    instance_set,
-                    deformed_handle,
-                );
+                if let Some(inputs) = executor_inputs {
+                    record_executor_depth_family(
+                        &raw_body,
+                        cmd,
+                        (handle, layout),
+                        vk::ShaderStageFlags::VERTEX,
+                        bytemuck::bytes_of(&view_proj),
+                        bindless_set,
+                        instance_set,
+                        inputs,
+                        pages_buffer,
+                        draw_count_supported,
+                        &draws,
+                        true,
+                    );
+                    // The opaque buckets re-walk through the degenerate-collapse entry:
+                    // only blades and records mid representation-transition rasterize.
+                    if let Some((transition_handle, transition_layout)) = transition_pipeline {
+                        record_executor_depth_family(
+                            &raw_body,
+                            cmd,
+                            (transition_handle, transition_layout),
+                            vk::ShaderStageFlags::VERTEX,
+                            bytemuck::bytes_of(&view_proj),
+                            bindless_set,
+                            instance_set,
+                            inputs,
+                            pages_buffer,
+                            draw_count_supported,
+                            &draws,
+                            false,
+                        );
+                    }
+                }
                 drop(pipeline);
+                drop(transition_keepalive);
             });
+        if let Some(inputs) = executor_inputs {
+            let pages_res = graph.import_buffer(pages_buffer, None);
+            let commands_res = graph.import_buffer(inputs.commands, None);
+            let counters_res = graph.import_buffer(inputs.counters, None);
+            let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+            pass = pass
+                .access(pages_res, RgUsage::IndexInputRead)
+                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(counters_res, RgUsage::IndirectCountRead)
+                .access(bucket_counts_res, RgUsage::IndirectCountRead);
+        }
         graph.add_pass(pass);
         Some(reactive_res)
     }
@@ -9364,11 +10942,6 @@ impl Renderer {
         let history_valid = active_view.prev_view_proj_valid && self.froxel.history_ready();
         let jitter = self.active_view_jitter();
         let f = self.fog;
-        let wind = self.clouds.settings();
-        let wind_time = wind.time_of_day.rem_euclid(1.0) * 86_400.0;
-        let wind_angle = wind.wind_orientation.to_radians();
-        let gust =
-            1.0 + wind.wind_gust * (0.5 + 0.5 * (wind_time * std::f32::consts::TAU / 17.0).sin());
         let grid_params = crate::FogGridParams {
             inverse_projection: inv_proj,
             inverse_view: inv_view,
@@ -9397,12 +10970,6 @@ impl Renderer {
                 jitter.y,
                 jitter_index as f32,
                 self.fog_time,
-            ),
-            global_wind: saffron_geometry::glam::Vec4::new(
-                wind_angle.sin() * wind.wind_speed * gust,
-                0.0,
-                wind_angle.cos() * wind.wind_speed * gust,
-                wind_time,
             ),
         };
         self.froxel.update_grid(&grid_params);
@@ -9644,7 +11211,22 @@ impl Renderer {
             .extent;
         let atmosphere = self.scene_ibl().baked_atmosphere();
         let current_view_proj = self.scene_view_proj_unjittered();
+        // The cloud layer advects on the shared wind field's mean term at its own
+        // altitude (the shear power law), on the monotonic simulation clock.
+        let scene_wind = self.scene_wind;
+        let wind_radians = scene_wind.orientation.to_radians();
+        let cloud_settings = self.clouds.settings();
+        let layer_mid = cloud_settings.layer_altitude + cloud_settings.layer_height * 0.5;
+        let wind_speed =
+            scene_wind.speed * saffron_wind::shear_factor(&scene_wind.profile(), layer_mid);
         let state = crate::clouds::CloudFrameState {
+            wind_direction: saffron_geometry::glam::Vec2::new(
+                wind_radians.sin(),
+                wind_radians.cos(),
+            ),
+            wind_speed,
+            wind_gust: scene_wind.gust,
+            wind_time_s: scene_wind.time_s as f32,
             inv_view_proj,
             prev_view_proj: if view.prev_view_proj_valid {
                 view.prev_view_proj
@@ -10352,8 +11934,8 @@ impl Renderer {
     /// geometry in line polygon mode over the post-tonemap `color`, depth-tested read-only
     /// against the persisted 1× `depth` so hidden edges are occluded. A no-op unless the
     /// mode's PSO is resolved (a `fill_mode_non_solid` device; else it falls back to plain
-    /// Lit). Reuses the depth-prepass recorder: bind the PSO + instance set, push the
-    /// viewProj, draw every batch.
+    /// Lit). One executor PSO replays every opaque/masked bucket's counted indirect draw
+    /// with the camera viewProj push.
     #[allow(clippy::too_many_arguments)]
     fn add_lit_wireframe_pass(
         &self,
@@ -10361,37 +11943,67 @@ impl Renderer {
         pipelines: &FramePipelines,
         color: RgResource,
         depth: RgResource,
+        bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
         deformed_res: Option<RgResource>,
-        deformed_handle: Option<vk::Buffer>,
+        executor_inputs: Option<crate::ExecutorDrawInputs>,
+        executor_draws: &[(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)],
     ) {
         let Some(pipeline) = &pipelines.wireframe_overlay else {
             return;
         };
         // Re-drawn at DISPLAY extent, depth-tested against the display-extent overlay depth.
         let extent = self.views[self.active_view.index()].published_extent();
-        let list = self.scene_draw_list.shallow_clone();
         let raw_for_body = self.device.raw().clone();
         let pipeline = Arc::clone(pipeline);
         let handle = pipeline.handle();
         let layout = pipeline.layout();
+        let view_proj = self.scene_draw_list.view_proj;
+        let draws = executor_draws.to_vec();
+        let pages_buffer = self.global_gpu_data.pages.buffer();
+        let draw_count_supported = self.device.capabilities.draw_indirect_count;
         let mut pass = RgPass::graphics("lit-wireframe", extent)
             .color(color_load_store(color))
             .depth_attachment(depth_load_readonly(depth))
             .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                record_depth_prepass(
-                    &raw_for_body,
-                    cmd,
-                    &list,
-                    handle,
-                    layout,
-                    instance_set,
-                    deformed_handle,
-                );
+                if let Some(inputs) = executor_inputs {
+                    record_executor_depth_family(
+                        &raw_for_body,
+                        cmd,
+                        (handle, layout),
+                        vk::ShaderStageFlags::VERTEX,
+                        bytemuck::bytes_of(&view_proj),
+                        bindless_set,
+                        instance_set,
+                        inputs,
+                        pages_buffer,
+                        draw_count_supported,
+                        &draws,
+                        false,
+                    );
+                }
                 drop(pipeline);
             });
+        if let Some(inputs) = executor_inputs {
+            let pages_res = graph.import_buffer(pages_buffer, None);
+            let commands_res = graph.import_buffer(inputs.commands, None);
+            let counters_res = graph.import_buffer(inputs.counters, None);
+            let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+            pass = pass
+                .access(pages_res, RgUsage::IndexInputRead)
+                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(counters_res, RgUsage::IndirectCountRead)
+                .access(bucket_counts_res, RgUsage::IndirectCountRead);
+        }
+        let micro_candidates_res =
+            graph.import_buffer(self.global_gpu_data.micro_candidates.handle(), None);
+        pass = pass.access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead);
+        if let Some(wind_records) = self.wind_records_handle() {
+            let wind_records_res = graph.import_buffer(wind_records, None);
+            pass = pass.access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
+        }
         if let Some(deformed) = deformed_res {
-            pass = pass.access(deformed, RgUsage::VertexInputRead);
+            pass = pass.access(deformed, RgUsage::ShaderDeviceAddressRead);
         }
         graph.add_pass(pass);
     }
@@ -10502,52 +12114,317 @@ impl Renderer {
         graph.add_pass(pass);
     }
 
-    /// Appends a depth-only shadow pass clearing + storing the map and recording the
-    /// vertex-only, depth-biased draw list under `light_view_proj`.
     #[allow(clippy::too_many_arguments)]
-    fn add_shadow_pass(
-        &self,
+    /// Rasterizes this frame's dirty virtual-shadow pages: per directional level,
+    /// the level's own small visibility view culls with the level window (no
+    /// occlusion history), traversal + binning build the level's indirect stream,
+    /// and one atlas pass draws every dirty page into its tile (clear rect +
+    /// dynamic viewport/scissor + the page's ortho sub-window push).
+    #[allow(clippy::too_many_arguments)]
+    fn add_vsm_page_passes(
+        &mut self,
         graph: &mut RenderGraph,
-        name: &'static str,
-        resource: RgResource,
-        pipeline: &Arc<crate::Pipeline>,
+        frame: usize,
+        shadow: &Arc<crate::Pipeline>,
         bindless_set: vk::DescriptorSet,
         instance_set: vk::DescriptorSet,
-        light_view_proj: Mat4,
         deformed_res: Option<RgResource>,
-        deformed_handle: Option<vk::Buffer>,
-    ) {
-        let list = self.scene_draw_list.shallow_clone();
-        let raw_body = self.device.raw().clone();
-        let pipeline = Arc::clone(pipeline);
-        let shadow_pipeline = pipeline.handle();
-        let shadow_layout = pipeline.layout();
-        let extent = vk::Extent2D {
-            width: crate::lighting::SHADOW_MAP_SIZE,
-            height: crate::lighting::SHADOW_MAP_SIZE,
-        };
-        let mut pass = RgPass::graphics(name, extent)
-            .depth_attachment(depth_clear_store(resource))
-            .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
-                record_shadow_depth(
-                    &raw_body,
-                    cmd,
-                    &list,
-                    shadow_pipeline,
-                    shadow_layout,
-                    bindless_set,
-                    instance_set,
-                    light_view_proj,
-                    deformed_handle,
-                );
-                drop(pipeline);
-            });
-        // The skinned batches read the deformed buffer as a vertex stream; declare the
-        // read so the graph emits the skin-compute-write → vertex-input barrier.
-        if let Some(deformed) = deformed_res {
-            pass = pass.access(deformed, RgUsage::VertexInputRead);
+        executor_draws: &[(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)],
+        wind_records_res: RgResource,
+        cull_pso: &Arc<crate::Pipeline>,
+        traversal_pso: &Arc<crate::Pipeline>,
+        bin_psos: (
+            &Arc<crate::Pipeline>,
+            &Arc<crate::Pipeline>,
+            &Arc<crate::Pipeline>,
+        ),
+        micro_template: (u32, u32),
+        instance_capacity: u32,
+    ) -> Result<Option<RgResource>> {
+        if self.vsm_render_pages.is_empty() {
+            return Ok(None);
         }
-        graph.add_pass(pass);
+        let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_ref() else {
+            // No pyramid to bind as the (never-sampled) cull placeholder; the pages
+            // stay staged and re-mark dirty at the next prepare.
+            return Ok(None);
+        };
+        let (previous_image, previous_view) = pyramid.previous();
+        let previous_layout = pyramid.previous_layout();
+        let hzb_extent = [pyramid.extent().width, pyramid.extent().height];
+        let hzb_mips = pyramid.mip_count();
+        let pages = std::mem::take(&mut self.vsm_render_pages);
+        let address_slice = (
+            self.gpu_scene_uploader.address_buffer(),
+            frame as u64 * self.gpu_scene_uploader.address_block_stride(),
+            size_of::<crate::GpuSceneAddressBlock>() as u64,
+        );
+        let atlas_slot = graph.alloc_external_state(self.vsm_gpu.atlas_state);
+        let atlas_res = graph.import_image(
+            self.vsm_gpu.atlas.handle(),
+            self.vsm_gpu.atlas.view(),
+            vk::ImageAspectFlags::DEPTH,
+            self.vsm_gpu.atlas_state.layout,
+            Some(atlas_slot),
+        );
+        let demand = self.page_demand_view();
+        let space = self.vsm_space;
+        let spot_view_proj = self.lighting.spot_shadow_view_proj();
+        let frame_stamp = self.frame_serial as u32;
+        // Page groups: one per directional level, the spot space, and each point
+        // cube face — every group culls with its own frustum and derives per-page
+        // matrices from its own space.
+        let mut groups: Vec<(usize, Mat4, Vec<crate::VsmRenderPage>)> = Vec::new();
+        for level in 0..crate::VSM_DIRECTIONAL_LEVELS {
+            let level_pages: Vec<crate::VsmRenderPage> = pages
+                .iter()
+                .copied()
+                .filter(|page| {
+                    matches!(page.key, crate::VsmPageKey::Directional { level: l, .. } if l == level)
+                })
+                .collect();
+            if !level_pages.is_empty() {
+                groups.push((level as usize, space.level_view_proj(level), level_pages));
+            }
+        }
+        let spot_pages: Vec<crate::VsmRenderPage> = pages
+            .iter()
+            .copied()
+            .filter(|page| matches!(page.key, crate::VsmPageKey::Spot { .. }))
+            .collect();
+        if !spot_pages.is_empty() {
+            groups.push((
+                crate::VSM_DIRECTIONAL_LEVELS as usize,
+                spot_view_proj,
+                spot_pages,
+            ));
+        }
+        let point_faces = crate::point_shadow_face_matrices(
+            self.lighting.point_shadow_pos(),
+            self.lighting.point_shadow_far(),
+        );
+        for face in 0..crate::vsm::VSM_POINT_FACES {
+            let face_pages: Vec<crate::VsmRenderPage> = pages
+                .iter()
+                .copied()
+                .filter(|page| {
+                    matches!(page.key, crate::VsmPageKey::PointFace { face: f, .. } if f == face)
+                })
+                .collect();
+            if !face_pages.is_empty() {
+                groups.push((
+                    (crate::VSM_DIRECTIONAL_LEVELS + 1 + face) as usize,
+                    point_faces[face as usize],
+                    face_pages,
+                ));
+            }
+        }
+        for (view_slot, cull_view_proj, group_pages) in groups {
+            let needs_view = self.vsm_views[view_slot]
+                .as_ref()
+                .is_none_or(|view| view.capacity() < instance_capacity);
+            if needs_view {
+                self.device.wait_idle()?;
+                if let Some(mut old) = self.vsm_views[view_slot].take() {
+                    old.free_sets(&self.descriptors);
+                }
+                self.vsm_views[view_slot] = Some(crate::SceneVisibilityView::new(
+                    &self.device,
+                    &self.descriptors,
+                    &self.scene_visibility,
+                    instance_capacity,
+                    crate::SCENE_VISIBILITY_RECORD_CAPACITY,
+                    1,
+                )?);
+            }
+            let Some(view) = self.vsm_views[view_slot].as_ref() else {
+                continue;
+            };
+            view.write_frame_bindings(
+                &self.device,
+                &self.scene_visibility,
+                frame,
+                previous_view,
+                previous_view,
+                address_slice,
+            );
+            // The frame's bucket vocabulary is shared with the camera view; the
+            // level's bin passes need the same table.
+            let (_, bucket_table) = crate::build_executor_buckets(
+                &self.live_executor_bins,
+                crate::SCENE_VISIBILITY_RECORD_CAPACITY,
+            );
+            view.write_bucket_table(frame, &bucket_table);
+            let previous_res = graph.import_image(
+                previous_image,
+                previous_view,
+                vk::ImageAspectFlags::COLOR,
+                previous_layout,
+                None,
+            );
+            let level_view_proj = cull_view_proj.to_cols_array();
+            view.add_cull_pass(
+                &self.device,
+                graph,
+                cull_pso,
+                frame,
+                previous_res,
+                wind_records_res,
+                instance_capacity,
+                crate::SceneVisibilityPush {
+                    view_proj: level_view_proj,
+                    prev_view_proj: level_view_proj,
+                    hzb_extent,
+                    hzb_mip_count: hzb_mips,
+                    pass_kind: crate::SCENE_VISIBILITY_PASS_CULL,
+                    history_valid: 0,
+                    list_capacity: view.capacity(),
+                    reserved: [0; 2],
+                },
+            );
+            view.add_traversal_pass(
+                &self.device,
+                graph,
+                traversal_pso,
+                frame,
+                crate::SceneTraversalPush {
+                    eye: demand.eye.to_array(),
+                    proj_scale: demand.proj_scale,
+                    error_threshold_px: 1.0,
+                    record_capacity: view.record_capacity(),
+                    list_capacity: view.capacity(),
+                    survivor: 0,
+                    tess_seam: 0,
+                    // Shadow pages draw settled cuts: a nonzero value here would let
+                    // every page view mutate the shared flip-state table with its own
+                    // refine decisions and fabricate camera-view crossfades.
+                    transition_frames: 0,
+                    frame_stamp,
+                    reserved0: 0,
+                },
+            );
+            view.add_binning_passes(&self.device, graph, bin_psos, frame, false, micro_template);
+
+            let inputs = view.executor_draw_inputs(frame, self.live_draw_record_bound);
+            let raw_body = self.device.raw().clone();
+            let shadow_pipeline = shadow.handle();
+            let shadow_layout = shadow.layout();
+            let shadow_keep = Arc::clone(shadow);
+            let draws = executor_draws.to_vec();
+            let pages_buffer = self.global_gpu_data.pages.buffer();
+            let draw_count_supported = self.device.capabilities.draw_indirect_count;
+            let render_pages = group_pages.clone();
+            let extent = vk::Extent2D {
+                width: crate::VSM_ATLAS_SIZE,
+                height: crate::VSM_ATLAS_SIZE,
+            };
+            let pass = RgPass::graphics("vsm-pages", extent).depth_attachment(RgAttachment {
+                resource: atlas_res,
+                load_op: vk::AttachmentLoadOp::LOAD,
+                store_op: vk::AttachmentStoreOp::STORE,
+                clear_value: vk::ClearValue::default(),
+                resolve: None,
+            });
+            let pass_inputs = inputs;
+            let mut pass = pass.body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                // SAFETY: the ash seam; `cmd` is recording inside the pass.
+                unsafe {
+                    raw_body.cmd_set_depth_bias(
+                        cmd,
+                        crate::lighting::SHADOW_DEPTH_BIAS_CONSTANT,
+                        0.0,
+                        crate::lighting::SHADOW_DEPTH_BIAS_SLOPE,
+                    );
+                }
+                for page in &render_pages {
+                    let tile = vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: ((page.tile % crate::VSM_ATLAS_TILES) * crate::VSM_PAGE_SIZE) as i32,
+                            y: ((page.tile / crate::VSM_ATLAS_TILES) * crate::VSM_PAGE_SIZE) as i32,
+                        },
+                        extent: vk::Extent2D {
+                            width: crate::VSM_PAGE_SIZE,
+                            height: crate::VSM_PAGE_SIZE,
+                        },
+                    };
+                    let viewport = vk::Viewport {
+                        x: tile.offset.x as f32,
+                        y: tile.offset.y as f32,
+                        width: crate::VSM_PAGE_SIZE as f32,
+                        height: crate::VSM_PAGE_SIZE as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    };
+                    let clear = vk::ClearAttachment {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        color_attachment: 0,
+                        clear_value: vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        },
+                    };
+                    let clear_rect = vk::ClearRect {
+                        rect: tile,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    // SAFETY: the ash seam; the tile lies inside the atlas attachment.
+                    unsafe {
+                        raw_body.cmd_set_viewport(cmd, 0, &[viewport]);
+                        raw_body.cmd_set_scissor(cmd, 0, &[tile]);
+                        raw_body.cmd_clear_attachments(cmd, &[clear], &[clear_rect]);
+                    }
+                    let page_view_proj = match page.key {
+                        crate::VsmPageKey::Directional { level, x, y } => {
+                            space.page_view_proj(level, x, y)
+                        }
+                        crate::VsmPageKey::Spot { x, y } => {
+                            crate::vsm::vsm_page_crop(crate::vsm::VSM_SPOT_PAGES, x, y)
+                                * spot_view_proj
+                        }
+                        crate::VsmPageKey::PointFace { face, x, y } => {
+                            crate::vsm::vsm_page_crop(crate::vsm::VSM_POINT_FACE_PAGES, x, y)
+                                * point_faces[face as usize]
+                        }
+                    };
+                    record_executor_depth_family(
+                        &raw_body,
+                        cmd,
+                        (shadow_pipeline, shadow_layout),
+                        vk::ShaderStageFlags::VERTEX,
+                        bytemuck::bytes_of(&page_view_proj),
+                        bindless_set,
+                        instance_set,
+                        pass_inputs,
+                        pages_buffer,
+                        draw_count_supported,
+                        &draws,
+                        false,
+                    );
+                }
+                drop(shadow_keep);
+            });
+            let pages_res = graph.import_buffer(pages_buffer, None);
+            let commands_res = graph.import_buffer(inputs.commands, None);
+            let counters_res = graph.import_buffer(inputs.counters, None);
+            let bucket_counts_res = graph.import_buffer(inputs.bucket_counts, None);
+            pass = pass
+                .access(pages_res, RgUsage::IndexInputRead)
+                .access(commands_res, RgUsage::IndirectCommandRead)
+                .access(counters_res, RgUsage::IndirectCountRead)
+                .access(bucket_counts_res, RgUsage::IndirectCountRead)
+                .access(wind_records_res, RgUsage::ShaderDeviceAddressRead);
+            let micro_candidates_res =
+                graph.import_buffer(self.global_gpu_data.micro_candidates.handle(), None);
+            pass = pass.access(micro_candidates_res, RgUsage::ShaderDeviceAddressRead);
+            if let Some(deformed) = deformed_res {
+                pass = pass.access(deformed, RgUsage::ShaderDeviceAddressRead);
+            }
+            graph.add_pass(pass);
+        }
+        Ok(Some(atlas_res))
     }
 
     /// Rebuilds the present swapchain at `(width, height)` after a window resize.
@@ -11144,6 +13021,33 @@ fn record_ddgi_compute(
 
 /// A `CLEAR`-to-1.0-then-`STORE` depth attachment — the scene/depth-prepass clear that
 /// seeds the far plane (depth `LESS` then keeps the nearest fragment).
+/// Declares one pass's reads on the tessellation seam's transient VB/IB/args (shared
+/// across every tess draw), so the graph orders the pass after the emit kernel's
+/// writes. `with_prev` also declares the previous micro-vertex stream (the motion
+/// pass binds it). A no-op when no tess draw resolved this frame.
+fn access_tess_draws(
+    graph: &mut RenderGraph,
+    pass: RgPass,
+    draws: &[crate::TessSceneDraw],
+    with_prev: bool,
+) -> RgPass {
+    let Some(handles) = draws.iter().find_map(|draw| draw.draw) else {
+        return pass;
+    };
+    let vb = graph.import_buffer(handles.vertex_buffer, None);
+    let ib = graph.import_buffer(handles.index_buffer, None);
+    let args = graph.import_buffer(handles.args_buffer, None);
+    let mut pass = pass
+        .access(vb, RgUsage::VertexInputRead)
+        .access(ib, RgUsage::IndexInputRead)
+        .access(args, RgUsage::IndirectCommandRead);
+    if with_prev {
+        let prev = graph.import_buffer(handles.prev_vertex_buffer, None);
+        pass = pass.access(prev, RgUsage::VertexInputRead);
+    }
+    pass
+}
+
 fn depth_clear_store(resource: crate::render_graph::RgResource) -> RgAttachment {
     RgAttachment {
         resource,
@@ -11162,6 +13066,18 @@ fn depth_clear_store(resource: crate::render_graph::RgResource) -> RgAttachment 
 /// A `LOAD`-then-`STORE` color attachment: composite over the existing contents (the
 /// grid + overlay draw over the tonemapped color and keep it).
 fn color_load_store(resource: RgResource) -> RgAttachment {
+    RgAttachment {
+        resource,
+        load_op: vk::AttachmentLoadOp::LOAD,
+        store_op: vk::AttachmentStoreOp::STORE,
+        clear_value: vk::ClearValue::default(),
+        resolve: None,
+    }
+}
+
+/// A `LOAD`-then-`STORE` depth attachment: continue depth-testing and writing over the
+/// scene's laid-down depth (the survivor raster redraws over the provisional cut).
+fn depth_load_store(resource: RgResource) -> RgAttachment {
     RgAttachment {
         resource,
         load_op: vk::AttachmentLoadOp::LOAD,
@@ -11255,17 +13171,19 @@ fn merge_timeline_point(points: &mut Vec<FrameTimelinePoint>, point: FrameTimeli
     }
 }
 
-fn submit_graph_command(
-    device: &Device,
+struct GraphCommandSubmission<'a> {
     queue: RgQueueAssignment,
     command_buffer: vk::CommandBuffer,
-    waits: &[FrameTimelinePoint],
-    signals: &[FrameTimelinePoint],
+    waits: &'a [FrameTimelinePoint],
+    signals: &'a [FrameTimelinePoint],
     binary_signal: Option<vk::Semaphore>,
     fence: vk::Fence,
     context: &'static str,
-) -> Result<()> {
-    let wait_infos = waits
+}
+
+fn submit_graph_command(device: &Device, submission: GraphCommandSubmission<'_>) -> Result<()> {
+    let wait_infos = submission
+        .waits
         .iter()
         .map(|point| {
             vk::SemaphoreSubmitInfo::default()
@@ -11274,7 +13192,8 @@ fn submit_graph_command(
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         })
         .collect::<Vec<_>>();
-    let mut signal_infos = signals
+    let mut signal_infos = submission
+        .signals
         .iter()
         .map(|point| {
             vk::SemaphoreSubmitInfo::default()
@@ -11283,25 +13202,26 @@ fn submit_graph_command(
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         })
         .collect::<Vec<_>>();
-    if let Some(semaphore) = binary_signal {
+    if let Some(semaphore) = submission.binary_signal {
         signal_infos.push(
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(semaphore)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
         );
     }
-    let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+    let commands =
+        [vk::CommandBufferSubmitInfo::default().command_buffer(submission.command_buffer)];
     let submits = [vk::SubmitInfo2::default()
         .wait_semaphore_infos(&wait_infos)
         .command_buffer_infos(&commands)
         .signal_semaphore_infos(&signal_infos)];
-    let queue = match queue {
+    let queue = match submission.queue {
         RgQueueAssignment::Graphics => &device.graphics_queue,
         RgQueueAssignment::AsyncCompute => device.compute_queue.as_ref().ok_or(
             Error::PresentState("async-compute batch has no async-compute queue"),
         )?,
     };
-    queue.submit2(device.raw(), &submits, fence, context)
+    queue.submit2(device.raw(), &submits, submission.fence, submission.context)
 }
 
 /// The validation-clean gate's regression probe seam: when
@@ -11338,6 +13258,7 @@ impl Drop for Renderer {
         // device so nothing is freed under a live GPU read, then destroy the
         // device-borrowing sub-state before the `device` field drops last.
         let _ = self.device.wait_idle();
+        self.gpu_profiler.destroy_pools(&self.device);
         self.frames.destroy(&self.device);
         // Destroy each view's shm-capture fence (the only raw handle ViewTarget owns)
         // before the views Drop their VMA images/buffers.
@@ -11622,332 +13543,6 @@ mod tests {
         unsafe { raw.cmd_pipeline_barrier2(cmd, &dep) };
     }
 
-    /// The first end-to-end frame on llvmpipe: build the renderer sub-state (descriptors,
-    /// the depth-prepass PSO, the per-frame instance SSBO, an offscreen view), submit a
-    /// fullscreen-covering triangle draw list, record the depth pre-pass through the
-    /// render graph into a depth target, read the depth back, and assert geometry
-    /// rasterized (the center reads nearer than the cleared far plane) validation-clean.
-    ///
-    /// This is the GPU-runtime gate the toolbox can actually run: the vertex-only depth
-    /// path (geometry → instanced draw → a depth image), built off the same
-    /// `submit_draw_list` batching + scene-pass recording the shaded path uses. The
-    /// shaded color golden image is DEFERRED — its übershader fragment reads the
-    /// lighting / IBL descriptor sets that land in phases 7-11, so a full-color render
-    /// cannot be validation-clean until then. Skips when no Vulkan device is present.
-    #[test]
-    fn depth_prepass_rasterizes_geometry_validation_clean() {
-        use crate::descriptors::Descriptors;
-        use crate::draw_list::{DrawItem, SubmeshMaterial};
-        use crate::instancing::Instancing;
-        use crate::pipelines::Pipelines;
-        use crate::resources::BindlessFreeList;
-        use crate::upload::Uploader;
-        use crate::view_target::ViewTarget;
-        use saffron_geometry::glam::{Mat4, Vec2, Vec3};
-        use saffron_geometry::{Mesh, Submesh, Vertex};
-        use std::sync::{Arc, Mutex};
-
-        let device = match Device::new(&SurfaceSource::Offscreen) {
-            Ok(device) => device,
-            Err(err) => {
-                eprintln!("skipping: no Vulkan device obtainable ({err})");
-                return;
-            }
-        };
-        let before = validation_issue_count();
-
-        let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
-        let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors");
-        let mut pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
-        let mut instancing = Instancing::new(&device, &descriptors).expect("Instancing");
-        let mut skinning = Skinning::new(&device).expect("Skinning");
-        let view = ViewTarget::new(&device, 16, 16).expect("ViewTarget");
-        let queue = device.graphics_queue.clone();
-        let uploader = Uploader::new(&device, &queue).expect("Uploader");
-
-        // A clip-space triangle covering the whole viewport (NDC corners), so the depth
-        // pre-pass writes the near plane (z=0) across the center under the identity push.
-        let v = |x: f32, y: f32| Vertex {
-            position: Vec3::new(x, y, 0.0),
-            normal: Vec3::new(0.0, 0.0, 1.0),
-            uv0: Vec2::ZERO,
-            ..Vertex::default()
-        };
-        let mesh = Mesh {
-            vertices: vec![v(-3.0, -3.0), v(3.0, -3.0), v(0.0, 3.0)],
-            indices: vec![0, 1, 2],
-            submeshes: vec![Submesh {
-                first_index: 0,
-                index_count: 3,
-                vertex_offset: 0,
-                material_slot: 0,
-            }],
-        };
-        let mesh = uploader
-            .upload_mesh(&descriptors, &mesh, &[], None, None)
-            .expect("upload");
-        let item = DrawItem::new(
-            Arc::clone(&mesh),
-            Mat4::IDENTITY,
-            vec![SubmeshMaterial::defaults()],
-        );
-        let inputs = crate::instancing::DrawListInputs {
-            frame: 0,
-            view_proj: Mat4::IDENTITY,
-            wireframe: false,
-            default_texture_index: crate::DEFAULT_WHITE_SLOT,
-            coverage_temporal_phase: 0,
-            rt_skinned: false,
-            displace_enabled: true,
-            tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
-            tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
-            tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
-        };
-        let (list, stats) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &[item],
-                &[],
-                inputs,
-            )
-            .expect("submit_draw_list");
-        assert_eq!(stats.batches, 1);
-        assert_eq!(stats.instances, 1);
-
-        // A transfer-capable depth image to render + read back (the per-view `ViewTarget`
-        // depth is sampled, not transfer-copied, so it carries no `TRANSFER_SRC`; the
-        // test owns this one to read the result on the CPU).
-        let depth_image = crate::Image::new(
-            device.resources(),
-            &crate::ImageDesc {
-                extent: view.scaled_render_extent(),
-                format: crate::DEPTH_FORMAT,
-                usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-                aspect: vk::ImageAspectFlags::DEPTH,
-                view_type: vk::ImageViewType::TYPE_2D,
-                mip_levels: 1,
-                array_layers: 1,
-                samples: vk::SampleCountFlags::TYPE_1,
-            },
-        )
-        .expect("depth image");
-
-        let depth_pipeline = pipelines.request_depth_prepass().expect("depth PSO");
-        let depth = render_depth_prepass_readback(
-            &device,
-            depth_image.handle(),
-            depth_image.view(),
-            view.scaled_render_extent(),
-            &list,
-            depth_pipeline.handle(),
-            depth_pipeline.layout(),
-            instancing.instance_set(0),
-            descriptors.bindless_set(),
-        )
-        .expect("depth readback");
-
-        // The clear is the far plane (1.0); the rasterized triangle writes the near
-        // plane (0.0) over the center. So the center reads ~0 and a corner stays ~1.
-        let center = depth[16 * 8 + 8];
-        assert!(
-            center < 0.5,
-            "geometry rasterized into depth (center={center})"
-        );
-
-        drop(list);
-        drop(depth_pipeline);
-        drop(depth_image);
-        drop(mesh);
-        drop(view);
-        drop(instancing);
-        device.wait_idle().expect("idle before teardown");
-        drop(skinning);
-        drop(uploader);
-        drop(pipelines);
-        drop(descriptors);
-        drop(device);
-
-        let after = validation_issue_count();
-        assert_eq!(
-            before,
-            after,
-            "the depth pre-pass frame must be validation-clean (saw {} new issue(s))",
-            after.saturating_sub(before)
-        );
-    }
-
-    /// Records the depth pre-pass through the render graph into `view`'s depth target on
-    /// a one-off command buffer, copies the depth into a host buffer, and returns the
-    /// `D32_SFLOAT` texels (row-major). The swapchain-free path the e2e test drives (a
-    /// real `Renderer` cannot be built headless on lavapipe — its swapchain WSI crashes).
-    #[allow(clippy::too_many_arguments)]
-    fn render_depth_prepass_readback(
-        device: &Device,
-        depth_image: vk::Image,
-        depth_view: vk::ImageView,
-        extent: vk::Extent2D,
-        list: &crate::draw_list::SceneDrawList,
-        depth_pipeline: vk::Pipeline,
-        depth_layout: vk::PipelineLayout,
-        instance_set: vk::DescriptorSet,
-        bindless_set: vk::DescriptorSet,
-    ) -> Result<Vec<f32>> {
-        use crate::render_graph::{RenderGraph, RgPass};
-        use crate::scene_pass::record_depth_prepass;
-
-        let raw = device.raw();
-
-        let pool_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(device.graphics_queue_family);
-        // SAFETY: the ash seam. Freed at the end of the function.
-        let pool = checked(unsafe { raw.create_command_pool(&pool_info, None) }, "pool")?;
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: the ash seam. One buffer from the pool above.
-        let cmd = checked(unsafe { raw.allocate_command_buffers(&alloc) }, "cmd")?[0];
-        // SAFETY: the ash seam. Default fence.
-        let fence = checked(
-            unsafe { raw.create_fence(&vk::FenceCreateInfo::default(), None) },
-            "fence",
-        )?;
-
-        let row = extent.width as usize;
-        let pixels = row * extent.height as usize;
-        let buffer = crate::Buffer::new(
-            device.resources(),
-            (pixels * size_of::<f32>()) as vk::DeviceSize,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            &vk_mem::AllocationCreateInfo {
-                usage: vk_mem::MemoryUsage::Auto,
-                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
-                    | vk_mem::AllocationCreateFlags::MAPPED,
-                ..Default::default()
-            },
-        )?;
-
-        let list = list.shallow_clone();
-        let raw_body = raw.clone();
-        let body_set = instance_set;
-        let body = move |cmd: vk::CommandBuffer| {
-            // Bind the bindless albedo set (0) so the prepass fragment can alpha-clip masked
-            // materials — mirrors the real depth-prepass pass body.
-            // SAFETY: the ash seam — the set + layout are valid for this recording.
-            unsafe {
-                raw_body.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    depth_layout,
-                    0,
-                    &[bindless_set],
-                    &[],
-                );
-            }
-            record_depth_prepass(
-                &raw_body,
-                cmd,
-                &list,
-                depth_pipeline,
-                depth_layout,
-                body_set,
-                None,
-            );
-        };
-
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: the ash seam. Record the depth graph + the copy on the one-off buffer.
-        let recorded = (|| -> Result<()> {
-            unsafe { checked(raw.begin_command_buffer(cmd, &begin), "begin")? };
-
-            let mut graph = RenderGraph::new();
-            let depth = graph.import_image(
-                depth_image,
-                depth_view,
-                vk::ImageAspectFlags::DEPTH,
-                vk::ImageLayout::UNDEFINED,
-                None,
-            );
-            graph.add_pass(
-                RgPass::graphics("depth-prepass", extent)
-                    .depth_attachment(super::depth_clear_store(depth))
-                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| body(cmd)),
-            );
-            graph.execute(device, cmd);
-
-            // SAFETY: the ash seam. DEPTH_ATTACHMENT → TRANSFER_SRC then copy out.
-            unsafe {
-                barrier(
-                    raw,
-                    cmd,
-                    depth_image,
-                    range,
-                    vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                );
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::DEPTH,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width: extent.width,
-                        height: extent.height,
-                        depth: 1,
-                    });
-                raw.cmd_copy_image_to_buffer(
-                    cmd,
-                    depth_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    buffer.handle(),
-                    &[region],
-                );
-                checked(raw.end_command_buffer(cmd), "end")?;
-            }
-
-            let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-            let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
-            // SAFETY: the ash seam. Single-threaded queue use in the test.
-            unsafe {
-                device
-                    .graphics_queue
-                    .submit2(raw, &submit, fence, "submit")?;
-                checked(raw.wait_for_fences(&[fence], true, u64::MAX), "wait")?;
-            }
-            Ok(())
-        })();
-
-        let mut out = vec![0.0f32; pixels];
-        if recorded.is_ok() {
-            let ptr = buffer.mapped_ptr().cast::<f32>();
-            // SAFETY: the buffer is HOST_VISIBLE + MAPPED; the copy completed.
-            unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), pixels) };
-        }
-        // SAFETY: the ash seam. The fence was waited, so the pool/fence are idle.
-        unsafe {
-            raw.destroy_fence(fence, None);
-            raw.destroy_command_pool(pool, None);
-        }
-        recorded.map(|()| out)
-    }
-
     /// A GPU-runtime gate: build the descriptor + pipeline sub-state, seed a
     /// known linear-HDR color into an offscreen, then run the full final post chain
     /// (mandatory tonemap → ground grid → editor overlay) through the render graph and
@@ -11986,6 +13581,12 @@ mod tests {
             .expect("alloc sets");
         view.build_screen_space(&device, &descriptors, &ssao)
             .expect("build screen-space (writes the tonemap set)");
+        // Binding 2 of the tonemap set is the always-bound creative LUT; bind the neutral
+        // identity ramp exactly as renderer bring-up does.
+        let queue = device.graphics_queue.clone();
+        let uploader = crate::upload::Uploader::new(&device, &queue).expect("Uploader");
+        let identity_lut = uploader.upload_identity_lut().expect("identity LUT");
+        view.write_tonemap_lut(&device, descriptors.linear_sampler(), identity_lut.view());
 
         // The three post PSOs build on llvmpipe (graphics + compute, no RT).
         let tonemap = pipelines.request_tonemap().expect("tonemap PSO");
@@ -12055,6 +13656,9 @@ mod tests {
         device.wait_idle().expect("idle before teardown");
         drop(view);
         drop(ssao);
+        drop(identity_lut);
+        drop(uploader);
+        drop(queue);
         drop(tonemap);
         drop(grid);
         drop(overlay);
@@ -12488,9 +14092,11 @@ mod tests {
                     .body(|_cmd, _scopes: &mut NestedScopeRecorder| {}),
             );
 
-            // Tonemap (mandatory, in-place compute).
+            // Tonemap (mandatory, in-place compute). Binding 1 is the dynamic-offset grade
+            // UBO; the readback records one frame, so it selects frame slot 0's slice.
             let raw_tm = raw_body.clone();
             let push = exposure;
+            let grade_offset = view.grade_ubo_offset(0);
             let groups = |n: u32| n.div_ceil(8);
             graph.add_pass(
                 RgPass::compute("tonemap")
@@ -12510,7 +14116,7 @@ mod tests {
                                 tonemap_layout,
                                 0,
                                 &[tonemap_set],
-                                &[],
+                                &[grade_offset],
                             );
                             raw_tm.cmd_push_constants(
                                 cmd,
@@ -12658,8 +14264,8 @@ mod tests {
         let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 100.0);
         let view = Mat4::look_at_rh(Vec3::new(0.0, 1.0, 4.0), Vec3::ZERO, Vec3::Y);
         renderer
-            .submit_draw_list(proj * view, &[])
-            .expect("submit_draw_list");
+            .submit_gpu_scene_deformations(proj * view, &[], &[])
+            .expect("submit_gpu_scene_deformations");
         renderer
             .render_scene_offscreen()
             .expect("render_scene_offscreen");
@@ -12829,7 +14435,7 @@ mod tests {
     /// ping-pong runs with real previous factors. Asserts the whole displaced frame is validation-clean.
     #[test]
     fn displaced_instance_tessellation_frame_is_validation_clean() {
-        use crate::draw_list::{DrawItem, SubmeshMaterial};
+        use crate::draw_list::SubmeshMaterial;
         use crate::upload::Uploader;
         use saffron_core::HeightMode;
         use saffron_geometry::glam::{Mat4, Vec2, Vec3};
@@ -12876,8 +14482,9 @@ mod tests {
                 material_slot: 0,
             }],
         };
+        let hierarchy = crate::upload::hierarchy_for_upload(&mesh, &[]).expect("cook hierarchy");
         let mesh = uploader
-            .upload_mesh(renderer.descriptors(), &mesh, &[], None, None)
+            .upload_mesh(renderer.descriptors(), &mesh, &hierarchy, &[], None, None)
             .expect("upload_mesh");
         let mut rgba = vec![0u8; 8 * 8 * 4];
         for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
@@ -12888,12 +14495,26 @@ mod tests {
             .upload_height_texture(renderer.descriptors(), &rgba, 8, 8)
             .expect("upload_height_texture");
 
-        let displaced_item = || {
+        let displaced_work = || {
             let mut material = SubmeshMaterial::defaults();
             material.height_texture = Some(Arc::clone(&height));
             material.height_mode = HeightMode::Displacement;
             material.height_scale = 0.2;
-            DrawItem::new(Arc::clone(&mesh), Mat4::IDENTITY, vec![material])
+            let displace = crate::displace_info_from(std::slice::from_ref(&material))
+                .expect("displaced material");
+            crate::DeformationWork {
+                mesh: Arc::clone(&mesh),
+                entity: 7,
+                skinned: false,
+                joint_offset: 0,
+                joint_count: 0,
+                morph_weights: Vec::new(),
+                model: Mat4::IDENTITY,
+                displace: Some(displace),
+                material: crate::Material::default(),
+                submesh_materials: vec![material],
+                parameter_index: 0,
+            }
         };
 
         // A close camera so the projected factor exceeds 1 and the dice/emit actually amplify (and, at
@@ -12907,8 +14528,8 @@ mod tests {
                 .set_scene_lighting(&SceneLighting::default())
                 .expect("set_scene_lighting");
             renderer
-                .submit_draw_list(view_proj, &[displaced_item()])
-                .expect("submit_draw_list");
+                .submit_gpu_scene_deformations(view_proj, &[displaced_work()], &[])
+                .expect("submit_gpu_scene_deformations");
             renderer
                 .render_scene_offscreen()
                 .unwrap_or_else(|err| panic!("render_scene_offscreen frame {frame}: {err}"));
