@@ -20,7 +20,7 @@ export type CommandKind = "press" | "hold" | "mouse";
 /// share one window listener; fly keys share the viewport fly listener; the
 /// hierarchy/assets deletes are focus-scoped to their own panels, so the same key
 /// in both is fine; tab mouse commands share the mouse dispatcher.
-export type CommandScope = "global" | "hierarchy" | "assets" | "fly" | "tabs";
+export type CommandScope = "global" | "hierarchy" | "assets" | "fly" | "tabs" | "vegetation";
 
 export type CommandId =
   | "gizmo.translate"
@@ -40,7 +40,23 @@ export type CommandId =
   | "camera.flyLeft"
   | "camera.flyRight"
   | "camera.flyUp"
-  | "camera.flyDown";
+  | "camera.flyDown"
+  | "vegetation.tool.select"
+  | "vegetation.tool.lasso"
+  | "vegetation.tool.paint"
+  | "vegetation.tool.erase"
+  | "vegetation.tool.density"
+  | "vegetation.tool.reapply"
+  | "vegetation.tool.single"
+  | "vegetation.tool.fill"
+  | "vegetation.tool.spline"
+  | "vegetation.tool.volume"
+  | "vegetation.tool.exclude"
+  | "vegetation.tool.pin"
+  | "vegetation.tool.promote"
+  | "vegetation.brushGrow"
+  | "vegetation.brushShrink"
+  | "vegetation.delete";
 
 export interface CommandDef {
   id: CommandId;
@@ -197,6 +213,134 @@ export const COMMANDS: readonly CommandDef[] = [
     kind: "hold",
     default: "ShiftLeft",
     scope: "fly",
+  },
+  {
+    id: "vegetation.tool.select",
+    label: "Select tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "1",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.lasso",
+    label: "Lasso tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "2",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.paint",
+    label: "Paint tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "3",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.erase",
+    label: "Erase tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "4",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.density",
+    label: "Density tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "5",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.reapply",
+    label: "Reapply tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "6",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.single",
+    label: "Single tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "7",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.fill",
+    label: "Fill tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "8",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.spline",
+    label: "Spline tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "9",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.volume",
+    label: "Volume tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "0",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.exclude",
+    label: "Exclude tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "shift+1",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.pin",
+    label: "Pin tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "shift+2",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.tool.promote",
+    label: "Promote tool",
+    category: "Vegetation",
+    kind: "press",
+    default: "shift+3",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.brushGrow",
+    label: "Grow brush",
+    category: "Vegetation",
+    kind: "press",
+    default: "]",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.brushShrink",
+    label: "Shrink brush",
+    category: "Vegetation",
+    kind: "press",
+    default: "[",
+    scope: "vegetation",
+  },
+  {
+    id: "vegetation.delete",
+    label: "Delete selected plant",
+    category: "Vegetation",
+    kind: "press",
+    default: "delete",
+    scope: "vegetation",
   },
 ];
 
