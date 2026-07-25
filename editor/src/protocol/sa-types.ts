@@ -370,6 +370,12 @@ export interface WindSettingsDto {
   orientation: number;
   speed: number;
   gust: number;
+  turbulenceOctaves: number;
+  turbulenceRoughness: number;
+  gustFrequency: number;
+  referenceHeight: number;
+  heightExponent: number;
+  seed: number;
 }
 
 export interface TodCurvePointDto {
@@ -402,7 +408,7 @@ export interface TimeOfDaySettingsDto {
 
 export type AddEntityPreset = "empty" | "cube" | "plane" | "sphere" | "point-light" | "spot-light" | "directional-light" | "camera" | "reflection-probe" | "fog-volume";
 
-export type PickKind = "billboard" | "mesh";
+export type PickKind = "billboard" | "mesh" | "vegetation" | "micro-vegetation";
 
 export type GizmoOpDto = "translate" | "rotate" | "scale";
 
@@ -418,7 +424,7 @@ export type AaModeDto = "off" | "fxaa" | "taa" | "msaa2" | "msaa4" | "msaa8";
 
 export type GiModeDto = "off" | "ddgi";
 
-export type ViewModeDto = "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density";
+export type ViewModeDto = "lit" | "unlit" | "wireframe" | "lit-wireframe" | "detail-lighting" | "lighting-only" | "reflections" | "albedo" | "normal" | "roughness" | "metallic" | "emissive" | "depth" | "ambient-occlusion" | "gi" | "light-complexity" | "motion-vectors" | "fog" | "cloud-density" | "shadow-pages";
 
 export type AssetSlotDto = "mesh" | "albedo" | "metallic-roughness" | "normal" | "occlusion" | "emissive" | "height";
 
@@ -823,7 +829,7 @@ export type PlantSourceSelectorDto = { "kind": "whole" } | { "kind": "element", 
 
 export type PlantSemanticDestinationDto = { "kind": "part", id: VegetationGuid, } | { "kind": "spine", id: VegetationGuid, } | { "kind": "material-slot", slot: number, } | { "kind": "collision-proxy", id: VegetationGuid, } | { "kind": "navigation-proxy", id: VegetationGuid, } | { "kind": "phenotype", id: number, };
 
-export type PlantCompileDiagnosticCodeDto = "missing-source" | "duplicate-source" | "empty-selection" | "invalid-geometry" | "missing-material" | "invalid-material" | "invalid-skeleton" | "missing-coverage-uv" | "invalid-leaf-orientation" | "bounds-mismatch" | "limit-exceeded" | "source-changed";
+export type PlantCompileDiagnosticCodeDto = "missing-source" | "duplicate-source" | "empty-selection" | "invalid-geometry" | "missing-material" | "invalid-material" | "invalid-skeleton" | "missing-coverage-uv" | "invalid-leaf-orientation" | "bounds-mismatch" | "limit-exceeded" | "source-changed" | "orphaned-edit";
 
 export interface PlantCompileDiagnosticDto {
   severity: VegetationValidationSeverityDto;
@@ -850,6 +856,50 @@ export interface PlantCompileStatisticsDto {
   joints: string;
   materials: string;
   rejected: string;
+}
+
+export type SourceUnitsDto = "meters" | "centimeters" | "millimeters" | "feet";
+
+export type SourceAxisDto = "positive-x" | "negative-x" | "positive-y" | "negative-y" | "positive-z" | "negative-z";
+
+export type SourceHandednessDto = "right" | "left";
+
+export type SourceWindingDto = "counter-clockwise" | "clockwise";
+
+export type SourceUvOriginDto = "top-left" | "bottom-left";
+
+export type PlantTangentPolicyDto = "require" | "generate-missing" | "regenerate";
+
+export type PlantPivotDto = "SourceOrigin" | "BoundsBaseCenter" | { "Explicit": { 
+/**
+ * Position in source metres, as Q15.16 bits.
+ */
+position_bits: [number, number, number], } } | { "SemanticPart": { 
+/**
+ * The part identity the origin follows.
+ */
+part: VegetationGuid, } };
+
+export interface PlantImportSettingsDto {
+  units: SourceUnitsDto;
+  upAxis: SourceAxisDto;
+  forwardAxis: SourceAxisDto;
+  handedness: SourceHandednessDto;
+  scaleBits: number;
+  pivot: PlantPivotDto;
+  winding: SourceWindingDto;
+  uvOrigin: SourceUvOriginDto;
+  uvScaleBits: [number, number];
+  uvOffsetBits: [number, number];
+  tangentPolicy: PlantTangentPolicyDto;
+}
+
+export interface PlantGraftSourceDto {
+  id: VegetationGuid;
+  locator: PlantSourceLocatorDto;
+  selector: PlantSourceSelectorDto;
+  settings: PlantImportSettingsDto;
+  provenance: VegetationSourceProvenanceDto;
 }
 
 export interface PlantSourceReferenceDto {
@@ -885,6 +935,7 @@ export interface BiomeAssetSummaryDto {
   plantPalette: WireUuid[];
   modules: WireUuid[];
   parameterCount: number;
+  graph: Record<string, unknown>;
   validation: VegetationValidationSummaryDto;
   provenance: VegetationSourceProvenanceDto[];
   dependencies: VegetationManifestDependencyDto[];
@@ -895,10 +946,12 @@ export interface VegetationMapSummaryDto {
   id: WireUuid;
   name: string;
   version: number;
+  generation: string;
   bounds: WorldBoundsDto;
   layerCount: number;
-  biomeInstances: WireUuid[];
+  biomeInstances: VegetationBiomeInstanceRefDto[];
   chunkLevel: number;
+  dirtyLayers: VegetationGuid[];
   validation: VegetationValidationSummaryDto;
   provenance: VegetationSourceProvenanceDto[];
   dependencies: VegetationManifestDependencyDto[];
@@ -1157,7 +1210,7 @@ export interface VegetationCellInspectParams {
 
 export type VegetationCellSectionKindDto = "macro-points" | "micro-fields" | "provenance" | "rejection-diagnostics" | "surface-attachments" | "surface-dependencies" | "render-references" | "render-bounds" | "collision-inputs" | "navigation-contributions" | "ecology-boundary" | "ecology-checkpoint";
 
-export type VegetationArtifactSectionCodecDto = "raw";
+export type VegetationArtifactSectionCodecDto = "raw" | "zstd";
 
 export interface VegetationCellSectionDto {
   kind: VegetationCellSectionKindDto;
@@ -1207,12 +1260,16 @@ export interface VegetationRuntimePlantDto {
   plant: PlantId;
   cell: WorldCellDto;
   generation: string;
+  ecologyTick: string;
   positionTicks: [string, string, string];
+  orientation: [number, number, number, number];
+  scaleBits: [number, number, number];
   bounds: WorldBoundsDto;
   family: WireUuid;
   tags: string[];
   lifecycle: PlantLifecycleDto;
   phenotype: number;
+  renderedPhenotype: number;
   interactionPolicy: InteractionPolicyDto;
   health: number;
   moisture: number;
@@ -1249,6 +1306,15 @@ export interface VegetationRuntimeFacetBytesDto {
 
 export type VegetationRuntimeUnavailableReasonDto = "no-project" | "no-enabled-field" | "no-cooked-manifest" | "fault";
 
+export interface VegetationCollisionResidencyDto {
+  residentCells: string;
+  residentBodies: string;
+  createdTotal: string;
+  removedTotal: string;
+  hullSkippedTotal: string;
+  failedFamilies: string;
+}
+
 export interface VegetationRuntimeAvailableStatusDto {
   world: WireUuid;
   map: WireUuid;
@@ -1265,6 +1331,8 @@ export interface VegetationRuntimeAvailableStatusDto {
   budgets: VegetationRuntimeFacetBytesDto;
   pending: VegetationRuntimePendingCellDto[];
   regenerationCells: WorldCellDto[];
+  collision?: VegetationCollisionResidencyDto;
+  promotion?: VegetationPromotionReportDto;
 }
 
 export type VegetationRuntimeStatusDto = { "Unavailable": { reason: VegetationRuntimeUnavailableReasonDto, detail: string | null, } } | { "Available": VegetationRuntimeAvailableStatusDto };
@@ -1283,8 +1351,76 @@ export interface VegetationRuntimeCellResult {
   disturbanceMasks: string;
 }
 
-export interface VegetationRuntimePlantInspectParams {
+export interface VegetationRuntimePlantParams {
   plant: PlantId;
+}
+
+export type PlantPromotionStateDto = "Bulk" | "Promoting" | { "Promoted": { entity: WireUuid, } } | { "Demoting": { entity: WireUuid, } };
+
+export interface VegetationPromotionResult {
+  plant: PlantId;
+  state: PlantPromotionStateDto;
+}
+
+export interface VegetationPromotionReportDto {
+  promoted: string;
+  promoting: string;
+  demoting: string;
+  promotedTotal: string;
+  demotedTotal: string;
+  felledTotal: string;
+  failedTotal: string;
+  flushedTotal: string;
+}
+
+export type NavigationContributionKindDto = "Cost" | "StaticObstacle" | "DynamicObstacle";
+
+export interface VegetationNavigationContributionDto {
+  plant: PlantId;
+  kind: NavigationContributionKindDto;
+  bounds: WorldBoundsDto;
+  footprint: [number, number][];
+  heightM: number;
+  cost: number;
+}
+
+export interface VegetationNavigationCellDto {
+  cell: WorldCellDto;
+  contributions: VegetationNavigationContributionDto[];
+}
+
+export interface VegetationNavigationParams {
+  drainDirty?: boolean;
+}
+
+export interface VegetationNavigationResult {
+  cells: VegetationNavigationCellDto[];
+  dirtyRegions: WorldBoundsDto[];
+  contributions: string;
+  obstacles: string;
+  dynamicObstacles: string;
+  drained: boolean;
+}
+
+export type VegetationTransitionKindDto = { "Damaged": { amount: number, health: number, } } | { "Harvested": { phenotype: number, } } | { "Burned": { phenotype: number, remaining_fuel: number, } } | "Removed" | "Planted" | { "Regrew": { lifecycle: PlantLifecycleDto, phenotype: number, } } | { "LifecycleChanged": { from: PlantLifecycleDto | null, to: PlantLifecycleDto, } } | "Ignited" | "Extinguished" | { "Wetted": { moisture: number, fuel: number, } } | "StateReplaced" | "Moved" | { "Disturbed": { categories: number, } };
+
+export interface VegetationEventDto {
+  seq: string;
+  transaction: string;
+  cell: WorldCellDto;
+  plant?: PlantId;
+  transition: VegetationTransitionKindDto;
+}
+
+export interface VegetationDrainEventsParams {
+  since?: string;
+}
+
+export interface VegetationDrainEventsResult {
+  events: VegetationEventDto[];
+  highWaterSeq: string;
+  oldestSeq: string;
+  overflowed: boolean;
 }
 
 export interface VegetationRuntimePlantStateDto {
@@ -1306,7 +1442,8 @@ export interface VegetationRuntimePlantStateDto {
 export interface VegetationRuntimePlantInspectResult {
   plant: PlantId;
   resident?: VegetationRuntimePlantDto;
-  persistent?: VegetationRuntimePlantStateDto;
+  persistent: VegetationRuntimePlantStateDto[];
+  promotion?: PlantPromotionStateDto;
 }
 
 export interface VegetationStateSnapshotDto {
@@ -1318,6 +1455,259 @@ export interface VegetationStateSnapshotDto {
 
 export interface VegetationStateImportParams {
   dataHex: string;
+}
+
+export type BotanicalElementDto = "trunk" | "branch" | "root" | "vine" | "frond" | "leaf" | "needle" | "blade" | "flower" | "fruit" | "bud" | "scar" | "dead-part";
+
+export type PhyllotaxisPatternDto = "alternate" | "opposite" | "whorled" | "spiral";
+
+export type TropismKindDto = "phototropism" | "gravitropism" | "thigmotropism";
+
+export type PruneRuleDto = "below-height" | "shorter-than" | "keep-strongest";
+
+export interface BotanicalCurvePointDto {
+  at: number;
+  factorBits: number;
+}
+
+export interface BotanicalDrawnPointDto {
+  positionBits: [number, number, number];
+  radiusBits: number;
+}
+
+export type BotanicalEditActionDto = { "Transform": { 
+/**
+ * Translation in family-local metres, as Q15.16 bits.
+ */
+offset_bits: [number, number, number], 
+/**
+ * Turn about the target's base, as `UnitInterval` bits.
+ */
+roll: number, 
+/**
+ * Uniform scale as Q15.16 bits, where 65536 is unchanged.
+ */
+scale_bits: number, } } | { "Trim": { 
+/**
+ * Where along the axis the cut falls, as `UnitInterval` bits.
+ */
+at: number, } } | "Remove" | { "Graft": { 
+/**
+ * The family graft source supplying the geometry.
+ */
+source: VegetationGuid, 
+/**
+ * Which of that source's elements to take.
+ */
+selector: PlantSourceSelectorDto, } };
+
+export interface BotanicalManualEditDto {
+  target: string;
+  action: BotanicalEditActionDto;
+}
+
+export type BotanicalEditOrphanReasonDto = "target-missing" | "target-kind" | "target-removed";
+
+export interface BotanicalEditOrphanDto {
+  target: string;
+  action: BotanicalEditActionDto;
+  reason: BotanicalEditOrphanReasonDto;
+}
+
+export type BotanicalOperatorDto = { "Drawn": { element: BotanicalElementDto, points: Array<BotanicalDrawnPointDto>, } } | { "Trunk": { element: BotanicalElementDto, length_bits: number, base_radius_bits: number, taper: Array<BotanicalCurvePointDto>, segments: number, } } | { "Branch": { element: BotanicalElementDto, length_ratio: number, radius_ratio: number, declination: number, jitter: number, segments: number, } } | { "Phyllotaxis": { pattern: PhyllotaxisPatternDto, count: number, nodes: number, start: number, end: number, divergence: number, } } | { "Tropism": { kind_of: TropismKindDto, strength: number, } } | { "Prune": { rule: PruneRuleDto, threshold_bits: number, count: number, } } | { "Roots": { depth_ratio: number, spread_ratio: number, count: number, } } | { "Shell": { material_slot: number, sides: number, } } | { "Instance": { element: BotanicalElementDto, material_slot: number, size_bits: number, jitter: number, } } | "Family";
+
+export interface BotanicalNodeDto {
+  guid: string;
+  version: number;
+  semanticRevision: number;
+  operator: BotanicalOperatorDto;
+}
+
+export interface BotanicalEdgeDto {
+  fromNode: string;
+  fromPin: string;
+  toNode: string;
+  toPin: string;
+}
+
+export interface VegetationPointPrototypeDto {
+  name: string;
+  family: WireUuid;
+}
+
+export interface VegetationImportPointsParams {
+  map: AssetSelector;
+  layer: string;
+  path: string;
+  prototypes: VegetationPointPrototypeDto[];
+  expectedGeneration: string;
+}
+
+export interface VegetationImportPointsResult {
+  anchors: number;
+  tiles: number;
+  prototypes: number;
+  unsupported: string[];
+  generation: string;
+}
+
+export interface VegetationExportPointsParams {
+  map: AssetSelector;
+  layer: string;
+  path: string;
+}
+
+export interface VegetationExportPointsResult {
+  instances: number;
+  prototypes: number;
+  path: string;
+}
+
+export interface BotanicalVariationDto {
+  seed: string;
+  age: number;
+  name: string;
+}
+
+export interface BotanicalGraphDto {
+  variations: BotanicalVariationDto[];
+  nodes: BotanicalNodeDto[];
+  edges: BotanicalEdgeDto[];
+  edits: BotanicalManualEditDto[];
+}
+
+export interface PlantGraphSetParams {
+  plant: AssetSelector;
+  graph: BotanicalGraphDto;
+  grafts: PlantGraftSourceDto[];
+}
+
+export interface PlantGraphResult {
+  plant: WireUuid;
+  graph: BotanicalGraphDto;
+  grafts: PlantGraftSourceDto[];
+  growth: BotanicalGrowthDto;
+}
+
+export interface PlantCreateParams {
+  name: string;
+  folder: string;
+  seed: string;
+  materials: WireUuid[];
+}
+
+export interface BotanicalGrowthDto {
+  graph: string;
+  variation: number;
+  seed: string;
+  age: number;
+  variations: number;
+  axes: number;
+  frames: number;
+  shells: number;
+  elements: number;
+  vertices: number;
+  triangles: number;
+  parts: number;
+  spines: number;
+  heightBits: number;
+  grafts: number;
+  appliedEdits: number;
+  orphans: BotanicalEditOrphanDto[];
+}
+
+export interface PlantCreateResult {
+  plant: WireUuid;
+  growth: BotanicalGrowthDto;
+}
+
+export interface PlantGrowthParams {
+  plant: AssetSelector;
+  variation: number;
+}
+
+export interface BotanicalAxisDto {
+  id: string;
+  parent?: string;
+  frame?: string;
+  element: BotanicalElementDto;
+  baseBits: [number, number, number];
+  tipBits: [number, number, number];
+  baseRadiusBits: number;
+  points: number;
+}
+
+export interface BotanicalPlacementDto {
+  id: string;
+  frame: string;
+  element: BotanicalElementDto;
+  materialSlot: number;
+  positionBits: [number, number, number];
+  sizeBits: number;
+  roll: number;
+}
+
+export interface PlantElementsResult {
+  plant: WireUuid;
+  axes: BotanicalAxisDto[];
+  elements: BotanicalPlacementDto[];
+}
+
+export interface VegetationAdvanceEcologyParams {
+  targetTick: string;
+  maxTicks: number;
+  water: number;
+  warmth: number;
+}
+
+export interface VegetationEcologyRegionDto {
+  cells: WorldCellDto[];
+  tick: string;
+  caughtUp: boolean;
+  resident: boolean;
+}
+
+export interface VegetationEcologyCellDto {
+  cell: WorldCellDto;
+  tick: string;
+  plants: number;
+  canopy: number;
+  health: number;
+  moisture: number;
+  fuel: number;
+}
+
+export interface VegetationEcologyStatusDto {
+  worldTick: string;
+  simulationVersion: number;
+  checkpoint: string;
+  regionRadiusCells: number;
+  regions: VegetationEcologyRegionDto[];
+  cells: VegetationEcologyCellDto[];
+}
+
+export interface VegetationEcologyReportDto {
+  worldTick: string;
+  regions: number;
+  regionsCaughtUp: number;
+  regionsAwaitingResidency: number;
+  ticksRun: string;
+  ticksOwed: string;
+  checkpoint: string;
+}
+
+export interface VegetationCombustionParams {
+  bounds: WorldBoundsDto;
+  filter: VegetationRuntimeQueryFilterDto;
+}
+
+export interface VegetationCombustionDto {
+  plants: number;
+  ignited: number;
+  fuel: number;
+  moisture: number;
+  health: number;
+  occupancy: number;
 }
 
 export interface PlantValidateParams {
@@ -1369,7 +1759,7 @@ export interface PlantTransformDto {
   scaleBits: [number, number, number];
 }
 
-export type VegetationMutationDto = { "kind": "field-tile-patch", layer: VegetationGuid, channel: FieldChannelDto, tile: VegetationGuid, dimensions: [number, number, number], quantumBits: number, values: Array<number>, } | { "kind": "anchor-addition", point: PlantPointDto, } | { "kind": "tombstone", plant: PlantId, } | { "kind": "transform-override", plant: PlantId, transform: PlantTransformDto, } | { "kind": "state-override", plant: PlantId, lifecycle: PlantLifecycleDto | null, phenotype: number | null, health: number | null, moisture: number | null, fuel: number | null, interactionPolicy: InteractionPolicyDto | null, } | { "kind": "planting", point: PlantPointDto, } | { "kind": "damage", plant: PlantId, amount: number, phenotype: number | null, } | { "kind": "moisture-fuel", plant: PlantId, moisture: number, fuel: number, } | { "kind": "lifecycle-transition", plant: PlantId, from: PlantLifecycleDto | null, to: PlantLifecycleDto, ecologyTick: string, } | { "kind": "harvest", plant: PlantId, phenotype: number, } | { "kind": "burn", plant: PlantId, phenotype: number, remainingFuel: number, } | { "kind": "regrow", plant: PlantId, lifecycle: PlantLifecycleDto, phenotype: number, ecologyTick: string, } | { "kind": "promotion-origin-state", plant: PlantId, transform: PlantTransformDto, linearVelocityBits: [number, number, number], angularVelocityBits: [number, number, number], } | { "kind": "disturbance-mask", categories: number, tile: VegetationGuid, values: Array<number>, };
+export type VegetationMutationDto = { "kind": "field-tile-patch", layer: VegetationGuid, channel: FieldChannelDto, tile: VegetationGuid, dimensions: [number, number, number], quantumBits: number, values: Array<number>, } | { "kind": "anchor-addition", point: PlantPointDto, } | { "kind": "tombstone", plant: PlantId, } | { "kind": "transform-override", plant: PlantId, transform: PlantTransformDto, } | { "kind": "state-override", plant: PlantId, lifecycle: PlantLifecycleDto | null, phenotype: number | null, health: number | null, moisture: number | null, fuel: number | null, interactionPolicy: InteractionPolicyDto | null, } | { "kind": "planting", point: PlantPointDto, } | { "kind": "damage", plant: PlantId, amount: number, phenotype: number | null, } | { "kind": "moisture-fuel", plant: PlantId, moisture: number, fuel: number, } | { "kind": "lifecycle-transition", plant: PlantId, from: PlantLifecycleDto | null, to: PlantLifecycleDto, ecologyTick: string, } | { "kind": "harvest", plant: PlantId, phenotype: number, } | { "kind": "burn", plant: PlantId, phenotype: number, remainingFuel: number, } | { "kind": "ignite", plant: PlantId, } | { "kind": "extinguish", plant: PlantId, } | { "kind": "regrow", plant: PlantId, lifecycle: PlantLifecycleDto, phenotype: number, ecologyTick: string, } | { "kind": "promotion-origin-state", plant: PlantId, transform: PlantTransformDto, linearVelocityBits: [number, number, number], angularVelocityBits: [number, number, number], } | { "kind": "disturbance-mask", categories: number, tile: VegetationGuid, values: Array<number>, };
 
 export interface VegetationMutationRecordDto {
   header: VegetationMutationHeaderDto;
@@ -1436,6 +1826,16 @@ export interface PingResult {
   pid: number;
 }
 
+export interface VsmStatsDto {
+  requested: number;
+  hits: number;
+  allocated: number;
+  rendered: number;
+  dirtied: number;
+  evicted: number;
+  overflow: number;
+}
+
 export interface RenderStatsDto {
   drawCalls: number;
   batches: number;
@@ -1444,6 +1844,7 @@ export interface RenderStatsDto {
   instanceUploadBytes: number;
   retainedMeshCpuBytes: number;
   shadowDrawCalls: number;
+  vsm: VsmStatsDto;
   rtInstances: number;
   frameMs: number;
   fps: number;
@@ -1502,6 +1903,185 @@ export interface RenderStatsDto {
   bloomPerMipTint: [number, number, number][];
   aa: AaModeDto;
   viewMode: ViewModeDto;
+}
+
+export interface GpuSceneMirrorStatsDto {
+  meshes: number;
+  materials: number;
+  textures: number;
+  instances: number;
+  lights: number;
+  unresolvedInstances: number;
+  retainedMeshBytes: number;
+  sharedRebuilds: number;
+  worldRebuilds: number;
+  microPredicted: number;
+  pageResidency: PageResidencyStatsDto;
+  visibility: SceneVisibilityStatsDto;
+}
+
+export interface VegetationRenderStatsDto {
+  families: VegetationFamilyRenderDto[];
+  cells: VegetationCellRenderDto[];
+  pageFaults: string;
+}
+
+export interface VegetationMapLayerCommitParams {
+  map: AssetSelector;
+  expectedGeneration: string;
+  upserts: VegetationLayerDto[];
+  removals: VegetationGuid[];
+}
+
+export interface VegetationMapChunkCommitParams {
+  map: AssetSelector;
+  expectedGeneration: string;
+  upserts: VegetationMapChunkDto[];
+  removals: VegetationMapChunkKeyDto[];
+}
+
+export interface VegetationMapChunkCommitResult {
+  generation: string;
+}
+
+export interface VegetationMapChunkReadParams {
+  map: AssetSelector;
+  keys: VegetationMapChunkKeyDto[];
+}
+
+export interface VegetationMapChunkReadResult {
+  generation: string;
+  chunks: VegetationMapChunkDto[];
+}
+
+export interface VegetationBiomeInstanceRefDto {
+  instance: VegetationGuid;
+  biome: WireUuid;
+}
+
+export interface VegetationRejectionsParams {
+  map: AssetSelector;
+  cell: WorldCellDto;
+  manifest?: string;
+  limit?: number;
+}
+
+export interface VegetationRejectionDto {
+  reason: VegetationCandidateRejectionReasonDto;
+  positionTicks: [string, string, string];
+  ordinal: string;
+}
+
+export interface VegetationRejectionsResult {
+  candidates: string;
+  accepted: string;
+  totalRejected: string;
+  rows: VegetationRejectionDto[];
+}
+
+export interface VegetationTopologyDiffParams {
+  map: AssetSelector;
+  from: string;
+  to?: string;
+  cells?: WorldCellDto[];
+}
+
+export interface VegetationOverrideConflictDto {
+  kind: string;
+  plant: PlantId;
+  layer: VegetationGuid;
+}
+
+export interface VegetationTopologyCellDiffDto {
+  cell: WorldCellDto;
+  added: string;
+  removed: string;
+  moved: string;
+  addedIds: PlantId[];
+  removedIds: PlantId[];
+  movedIds: PlantId[];
+  conflicts: VegetationOverrideConflictDto[];
+}
+
+export interface VegetationTopologyDiffResult {
+  from: string;
+  to: string;
+  cells: VegetationTopologyCellDiffDto[];
+}
+
+export interface VegetationMapChunkDto {
+  key: VegetationMapChunkKeyDto;
+  revision: string;
+  payload: VegetationMapChunkPayloadDto;
+}
+
+export type VegetationMapChunkPayloadDto = { "kind": "field", fields: Array<AuthoredFieldTileDto>, blockers: Array<AuthoredFieldTileDto>, } | { "kind": "anchor-override", explicitPlants: Array<ExplicitPlantAnchorDto>, pins: Array<PlantId>, transformOverrides: Array<PlantTransformOverrideDto>, stateOverrides: Array<PlantStateOverrideDto>, };
+
+export interface AuthoredFieldTileDto {
+  channel: FieldChannelDto;
+  layer: VegetationGuid;
+  dimensions: [number, number, number];
+  quantumBits: number;
+  values: number[];
+}
+
+export interface ExplicitPlantAnchorDto {
+  id: PlantId;
+  layer: VegetationGuid;
+  family: WireUuid;
+  point: PlantPointDto;
+}
+
+export interface VegetationMapLayerCommitResult {
+  generation: string;
+}
+
+export interface VegetationMutateParams {
+  records: VegetationMutationRecordDto[];
+}
+
+export interface VegetationMutateResult {
+  applied: number;
+}
+
+export interface VegetationFamilyRenderDto {
+  family: WireUuid;
+  instances: number;
+  fieldTiles: number;
+  microPredicted: number;
+}
+
+export interface VegetationCellRenderDto {
+  cell: WorldCellDto;
+  plants: number;
+  fieldTiles: number;
+}
+
+export interface PageResidencyStatsDto {
+  registered: number;
+  resident: number;
+  residentBytes: number;
+  budgetBytes: number;
+  requested: number;
+  loading: number;
+  ready: number;
+  evictions: number;
+}
+
+export interface SceneVisibilityStatsDto {
+  visible: number;
+  retested: number;
+  records: number;
+  transparent: number;
+  microCandidates: number;
+  transitioning: number;
+  voxelRecords: number;
+  maxCutDepth: number;
+  culledFrustum: number;
+  culledOcclusion: number;
+  subQuadTriangles: number;
+  overflowFlags: number;
+  pressureFlags: number;
 }
 
 export interface RenderPassTimingDto {
@@ -1716,8 +2296,8 @@ export interface FitColliderResult {
 export interface ContactEventDto {
   seq: number;
   kind: string;
-  entityA: WireUuid;
-  entityB: WireUuid;
+  targetA?: WorldHitTargetDto;
+  targetB?: WorldHitTargetDto;
   sensor: boolean;
   point: Vec3;
   normal: Vec3;
@@ -1736,7 +2316,7 @@ export interface DrainContactsResult {
 }
 
 export interface PhysicsBodyDto {
-  entity: WireUuid;
+  target?: WorldHitTargetDto;
   motion: string;
   active: boolean;
   position: Vec3;
@@ -1790,9 +2370,19 @@ export interface ShapecastParams {
   maxDist?: number;
 }
 
+export type WorldHitTargetDto = { "kind": "scene-entity", 
+/**
+ * The entity's stable uuid.
+ */
+id: WireUuid, } | { "kind": "vegetation", 
+/**
+ * The plant's canonical 32-hex identity.
+ */
+plant: PlantId, };
+
 export interface RaycastResult {
   hit: boolean;
-  entity: WireUuid;
+  target?: WorldHitTargetDto;
   point: Vec3;
   normal: Vec3;
   distance: number;
@@ -2663,6 +3253,21 @@ export interface PickResult {
   id?: WireUuid;
   name?: string;
   kind?: PickKind;
+  plant?: PlantId;
+  position?: [number, number, number];
+  normal?: [number, number, number];
+}
+
+export interface QuerySurfaceRayParams {
+  originM: [number, number, number];
+  direction: [number, number, number];
+  maxDistanceM?: number;
+}
+
+export interface SurfaceRayResult {
+  hit: boolean;
+  position?: [number, number, number];
+  normal?: [number, number, number];
 }
 
 export interface SpatialTicksDto {
@@ -2936,6 +3541,29 @@ export interface SetWindParams {
   gust?: number;
 }
 
+export interface SampleWindParams {
+  positionM: [number, number, number];
+  timeS?: number;
+}
+
+export interface EmitInteractionImpulseParams {
+  positionM: [number, number];
+  radiusM: number;
+  strength: number;
+  direction?: [number, number];
+  depress?: number;
+}
+
+export interface EmitInteractionImpulseResult {
+  accepted: boolean;
+}
+
+export interface SampleWindResult {
+  velocityMps: [number, number, number];
+  gustFront: number;
+  timeS: number;
+}
+
 export interface TodTintCurveDto {
   master: [number, number][];
   red: [number, number][];
@@ -3036,6 +3664,7 @@ export interface AssetPreviewResult {
   bones: BoneEntityDto[];
   target: Vec3;
   distance: number;
+  plantCombinations: PlantCombinationDto[];
 }
 
 export interface ListClipsParams {
@@ -3106,6 +3735,12 @@ export interface DebugOverlaysParams {
   lightVolumes?: boolean;
   grid?: boolean;
   colliders?: boolean;
+  vegetationCells?: boolean;
+  vegetationBounds?: boolean;
+  vegetationRejections?: boolean;
+  vegetationHeatmap?: boolean;
+  vegetationNavigation?: boolean;
+  windVectors?: boolean;
 }
 
 export interface DebugOverlaysResult {
@@ -3114,6 +3749,12 @@ export interface DebugOverlaysResult {
   lightVolumes: boolean;
   grid: boolean;
   colliders: boolean;
+  vegetationCells: boolean;
+  vegetationBounds: boolean;
+  vegetationRejections: boolean;
+  vegetationHeatmap: boolean;
+  vegetationNavigation: boolean;
+  windVectors: boolean;
 }
 
 export interface SetSkeletonHighlightParams {
@@ -3133,6 +3774,13 @@ export interface PickSkeletonJointResult {
 
 export interface SetAssetPreviewOptionsParams {
   floor?: boolean;
+  variation?: number;
+  phenotype?: number;
+}
+
+export interface PlantCombinationDto {
+  variation: number;
+  phenotype: number;
 }
 
 export interface AssetPreviewOptionsResult {
@@ -3443,6 +4091,9 @@ export interface SetTessellationQualityResult {
 export interface CommandParamsMap {
   "ping": PingParams;
   "render-stats": EmptyParams;
+  "gpu-scene-stats": EmptyParams;
+  "vegetation-mutate": VegetationMutateParams;
+  "vegetation-render-stats": EmptyParams;
   "profiler.set-mode": ProfilerSetModeParams;
   "pass-timings": EmptyParams;
   "profiler.capture-start": CaptureStartParams;
@@ -3491,6 +4142,7 @@ export interface CommandParamsMap {
   "set-light": SetLightParams;
   "select": EntityParams;
   "pick": PickParams;
+  "query-surface-ray": QuerySurfaceRayParams;
   "spatial-cell": SpatialCellParams;
   "spatial-providers": EmptyParams;
   "spatial-sample": SpatialSampleParams;
@@ -3509,6 +4161,8 @@ export interface CommandParamsMap {
   "set-fog": SetFogParams;
   "set-clouds": SetCloudsParams;
   "set-wind": SetWindParams;
+  "sample-wind": SampleWindParams;
+  "emit-interaction-impulse": EmitInteractionImpulseParams;
   "set-time-of-day": SetTimeOfDayParams;
   "get-selection": EmptyParams;
   "deselect": EmptyParams;
@@ -3583,13 +4237,30 @@ export interface CommandParamsMap {
   "vegetation-cook-status": VegetationCookJobParams;
   "vegetation-cancel-cook": VegetationCookJobParams;
   "vegetation-cell-inspect": VegetationCellInspectParams;
+  "vegetation-rejections": VegetationRejectionsParams;
+  "vegetation-topology-diff": VegetationTopologyDiffParams;
   "vegetation-manifest": VegetationManifestParams;
   "vegetation-runtime-status": EmptyParams;
   "vegetation-runtime-cell": VegetationRuntimeCellParams;
   "vegetation-runtime-query": VegetationRuntimeQueryParams;
-  "vegetation-runtime-inspect": VegetationRuntimePlantInspectParams;
+  "vegetation-runtime-inspect": VegetationRuntimePlantParams;
+  "vegetation-nav-contributions": VegetationNavigationParams;
+  "vegetation-drain-events": VegetationDrainEventsParams;
+  "vegetation-promote": VegetationRuntimePlantParams;
+  "vegetation-fell": VegetationRuntimePlantParams;
+  "vegetation-demote": VegetationRuntimePlantParams;
   "vegetation-state-export": EmptyParams;
   "vegetation-state-import": VegetationStateImportParams;
+  "vegetation-advance-ecology": VegetationAdvanceEcologyParams;
+  "vegetation-ecology-status": EmptyParams;
+  "vegetation-combustion": VegetationCombustionParams;
+  "vegetation-import-points": VegetationImportPointsParams;
+  "vegetation-export-points": VegetationExportPointsParams;
+  "plant-create": PlantCreateParams;
+  "plant-graph": PlantGrowthParams;
+  "plant-graph-set": PlantGraphSetParams;
+  "plant-growth": PlantGrowthParams;
+  "plant-elements": PlantGrowthParams;
   "plant-validate": PlantValidateParams;
   "plant-recook": PlantRecookParams;
   "get-project": EmptyParams;
@@ -3605,6 +4276,9 @@ export interface CommandParamsMap {
   "import-lut": ImportLutParams;
   "import-vegetation-asset": ImportVegetationAssetParams;
   "list-assets": EmptyParams;
+  "vegetation-map-layer-commit": VegetationMapLayerCommitParams;
+  "vegetation-map-chunk-commit": VegetationMapChunkCommitParams;
+  "vegetation-map-chunk-read": VegetationMapChunkReadParams;
   "vegetation-asset-summary": VegetationAssetSummaryParams;
   "scan-assets": EmptyParams;
   "extract-subasset": ExtractSubAssetParams;
@@ -3658,6 +4332,9 @@ export interface CommandParamsMap {
 export interface CommandResultMap {
   "ping": PingResult;
   "render-stats": RenderStatsDto;
+  "gpu-scene-stats": GpuSceneMirrorStatsDto;
+  "vegetation-mutate": VegetationMutateResult;
+  "vegetation-render-stats": VegetationRenderStatsDto;
   "profiler.set-mode": ProfilerModeResult;
   "pass-timings": RenderPassTimingsDto;
   "profiler.capture-start": CaptureStartResult;
@@ -3706,6 +4383,7 @@ export interface CommandResultMap {
   "set-light": EntityRef;
   "select": EntityRef;
   "pick": PickResult;
+  "query-surface-ray": SurfaceRayResult;
   "spatial-cell": SpatialCellResult;
   "spatial-providers": SurfaceProvidersResult;
   "spatial-sample": SpatialSampleResult;
@@ -3724,6 +4402,8 @@ export interface CommandResultMap {
   "set-fog": EnvironmentDto;
   "set-clouds": EnvironmentDto;
   "set-wind": EnvironmentDto;
+  "sample-wind": SampleWindResult;
+  "emit-interaction-impulse": EmitInteractionImpulseResult;
   "set-time-of-day": EnvironmentDto;
   "get-selection": SelectionResult;
   "deselect": DeselectResult;
@@ -3798,13 +4478,30 @@ export interface CommandResultMap {
   "vegetation-cook-status": VegetationCookStatusDto;
   "vegetation-cancel-cook": VegetationCookStatusDto;
   "vegetation-cell-inspect": VegetationCellInspectResult;
+  "vegetation-rejections": VegetationRejectionsResult;
+  "vegetation-topology-diff": VegetationTopologyDiffResult;
   "vegetation-manifest": VegetationManifestResult;
   "vegetation-runtime-status": VegetationRuntimeStatusDto;
   "vegetation-runtime-cell": VegetationRuntimeCellResult;
   "vegetation-runtime-query": VegetationRuntimeQueryResult;
   "vegetation-runtime-inspect": VegetationRuntimePlantInspectResult;
+  "vegetation-nav-contributions": VegetationNavigationResult;
+  "vegetation-drain-events": VegetationDrainEventsResult;
+  "vegetation-promote": VegetationPromotionResult;
+  "vegetation-fell": VegetationPromotionResult;
+  "vegetation-demote": VegetationPromotionResult;
   "vegetation-state-export": VegetationStateSnapshotDto;
   "vegetation-state-import": VegetationStateSnapshotDto;
+  "vegetation-advance-ecology": VegetationEcologyReportDto;
+  "vegetation-ecology-status": VegetationEcologyStatusDto;
+  "vegetation-combustion": VegetationCombustionDto;
+  "vegetation-import-points": VegetationImportPointsResult;
+  "vegetation-export-points": VegetationExportPointsResult;
+  "plant-create": PlantCreateResult;
+  "plant-graph": PlantGraphResult;
+  "plant-graph-set": PlantGraphResult;
+  "plant-growth": BotanicalGrowthDto;
+  "plant-elements": PlantElementsResult;
   "plant-validate": PlantValidationResult;
   "plant-recook": PlantRecookResult;
   "get-project": ProjectInfoDto;
@@ -3820,6 +4517,9 @@ export interface CommandResultMap {
   "import-lut": ImportLutResult;
   "import-vegetation-asset": ImportVegetationAssetResult;
   "list-assets": AssetList;
+  "vegetation-map-layer-commit": VegetationMapLayerCommitResult;
+  "vegetation-map-chunk-commit": VegetationMapChunkCommitResult;
+  "vegetation-map-chunk-read": VegetationMapChunkReadResult;
   "vegetation-asset-summary": VegetationAssetSummaryResult;
   "scan-assets": ScanAssetsResult;
   "extract-subasset": AssetRef;

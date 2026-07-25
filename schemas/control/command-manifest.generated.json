@@ -16,6 +16,27 @@
       "fixture": "empty"
     },
     {
+      "name": "gpu-scene-stats",
+      "params": "EmptyParams",
+      "result": "GpuSceneMirrorStatsDto",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
+      "name": "vegetation-mutate",
+      "params": "VegetationMutateParams",
+      "result": "VegetationMutateResult",
+      "status": "typed",
+      "skip": "requires an open vegetation map with authored records"
+    },
+    {
+      "name": "vegetation-render-stats",
+      "params": "EmptyParams",
+      "result": "VegetationRenderStatsDto",
+      "status": "typed",
+      "fixture": "empty"
+    },
+    {
       "name": "profiler.set-mode",
       "params": "ProfilerSetModeParams",
       "result": "ProfilerModeResult",
@@ -352,6 +373,13 @@
       "fixture": "viewport-center"
     },
     {
+      "name": "query-surface-ray",
+      "params": "QuerySurfaceRayParams",
+      "result": "SurfaceRayResult",
+      "status": "typed",
+      "fixture": "surface-ray-down"
+    },
+    {
       "name": "spatial-cell",
       "params": "SpatialCellParams",
       "result": "SpatialCellResult",
@@ -476,6 +504,20 @@
       "result": "EnvironmentDto",
       "status": "typed",
       "fixture": "wind-calm"
+    },
+    {
+      "name": "sample-wind",
+      "params": "SampleWindParams",
+      "result": "SampleWindResult",
+      "status": "typed",
+      "fixture": "wind-sample-origin"
+    },
+    {
+      "name": "emit-interaction-impulse",
+      "params": "EmitInteractionImpulseParams",
+      "result": "EmitInteractionImpulseResult",
+      "status": "typed",
+      "fixture": "interaction-impulse"
     },
     {
       "name": "set-time-of-day",
@@ -996,6 +1038,20 @@
       "skip": "requires a completed manifest and content-addressed cell artifact"
     },
     {
+      "name": "vegetation-rejections",
+      "params": "VegetationRejectionsParams",
+      "result": "VegetationRejectionsResult",
+      "status": "typed",
+      "skip": "requires a completed manifest and content-addressed cell artifact"
+    },
+    {
+      "name": "vegetation-topology-diff",
+      "params": "VegetationTopologyDiffParams",
+      "result": "VegetationTopologyDiffResult",
+      "status": "typed",
+      "skip": "requires two completed manifests to compare"
+    },
+    {
       "name": "vegetation-manifest",
       "params": "VegetationManifestParams",
       "result": "VegetationManifestResult",
@@ -1025,10 +1081,45 @@
     },
     {
       "name": "vegetation-runtime-inspect",
-      "params": "VegetationRuntimePlantInspectParams",
+      "params": "VegetationRuntimePlantParams",
       "result": "VegetationRuntimePlantInspectResult",
       "status": "typed",
       "skip": "requires a resident plant or persistent plant delta"
+    },
+    {
+      "name": "vegetation-nav-contributions",
+      "params": "VegetationNavigationParams",
+      "result": "VegetationNavigationResult",
+      "status": "typed",
+      "skip": "requires a navigation-resident cooked vegetation cell"
+    },
+    {
+      "name": "vegetation-drain-events",
+      "params": "VegetationDrainEventsParams",
+      "result": "VegetationDrainEventsResult",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
+      "name": "vegetation-promote",
+      "params": "VegetationRuntimePlantParams",
+      "result": "VegetationPromotionResult",
+      "status": "typed",
+      "skip": "requires a live play world and a resident macro plant"
+    },
+    {
+      "name": "vegetation-fell",
+      "params": "VegetationRuntimePlantParams",
+      "result": "VegetationPromotionResult",
+      "status": "typed",
+      "skip": "requires a live play world and a resident macro plant"
+    },
+    {
+      "name": "vegetation-demote",
+      "params": "VegetationRuntimePlantParams",
+      "result": "VegetationPromotionResult",
+      "status": "typed",
+      "skip": "requires a live play world and a promoted macro plant"
     },
     {
       "name": "vegetation-state-export",
@@ -1043,6 +1134,76 @@
       "result": "VegetationStateSnapshotDto",
       "status": "typed",
       "skip": "requires an exact bound vegetation runtime generation and snapshot"
+    },
+    {
+      "name": "vegetation-advance-ecology",
+      "params": "VegetationAdvanceEcologyParams",
+      "result": "VegetationEcologyReportDto",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
+      "name": "vegetation-ecology-status",
+      "params": "EmptyParams",
+      "result": "VegetationEcologyStatusDto",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
+      "name": "vegetation-combustion",
+      "params": "VegetationCombustionParams",
+      "result": "VegetationCombustionDto",
+      "status": "typed",
+      "skip": "requires an exact bound vegetation runtime generation"
+    },
+    {
+      "name": "vegetation-import-points",
+      "params": "VegetationImportPointsParams",
+      "result": "VegetationImportPointsResult",
+      "status": "typed",
+      "skip": "requires an authored vegetation map and a readable point file"
+    },
+    {
+      "name": "vegetation-export-points",
+      "params": "VegetationExportPointsParams",
+      "result": "VegetationExportPointsResult",
+      "status": "typed",
+      "skip": "requires an authored vegetation map with anchors"
+    },
+    {
+      "name": "plant-create",
+      "params": "PlantCreateParams",
+      "result": "PlantCreateResult",
+      "status": "typed",
+      "skip": "creates a catalog asset in the loaded project"
+    },
+    {
+      "name": "plant-graph",
+      "params": "PlantGrowthParams",
+      "result": "PlantGraphResult",
+      "status": "typed",
+      "skip": "requires an authored native plant-family asset"
+    },
+    {
+      "name": "plant-graph-set",
+      "params": "PlantGraphSetParams",
+      "result": "PlantGraphResult",
+      "status": "typed",
+      "skip": "requires an authored native plant-family asset and a graph document"
+    },
+    {
+      "name": "plant-growth",
+      "params": "PlantGrowthParams",
+      "result": "BotanicalGrowthDto",
+      "status": "typed",
+      "skip": "requires an authored native plant-family asset"
+    },
+    {
+      "name": "plant-elements",
+      "params": "PlantGrowthParams",
+      "result": "PlantElementsResult",
+      "status": "typed",
+      "skip": "requires an authored native plant-family asset"
     },
     {
       "name": "plant-validate",
@@ -1148,6 +1309,27 @@
       "result": "AssetList",
       "status": "typed",
       "fixture": "empty"
+    },
+    {
+      "name": "vegetation-map-layer-commit",
+      "params": "VegetationMapLayerCommitParams",
+      "result": "VegetationMapLayerCommitResult",
+      "status": "typed",
+      "skip": "requires an imported vegetation map asset"
+    },
+    {
+      "name": "vegetation-map-chunk-commit",
+      "params": "VegetationMapChunkCommitParams",
+      "result": "VegetationMapChunkCommitResult",
+      "status": "typed",
+      "skip": "requires an imported vegetation map asset"
+    },
+    {
+      "name": "vegetation-map-chunk-read",
+      "params": "VegetationMapChunkReadParams",
+      "result": "VegetationMapChunkReadResult",
+      "status": "typed",
+      "skip": "requires an imported vegetation map asset"
     },
     {
       "name": "vegetation-asset-summary",
