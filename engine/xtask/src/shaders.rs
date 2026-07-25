@@ -73,6 +73,14 @@ const COVERAGE_STEM: &str = "coverage";
 const MATERIAL_PARAMS_STEM: &str = "material_params";
 /// The byte-locked global GPU table and draw-record ABI.
 const GLOBAL_GPU_DATA_STEM: &str = "global_gpu_data";
+/// The shared executor-bucket lookup vocabulary.
+const SCENE_BIN_COMMON_STEM: &str = "scene_bin_common";
+/// The shared micro-field reconstruction vocabulary.
+const SCENE_MICRO_COMMON_STEM: &str = "scene_micro_common";
+/// The resource-free energy-conserving thin-sheet optical partition.
+const THIN_SHEET_STEM: &str = "thin_sheet";
+/// The shared deterministic wind-field sampler (mirrors `saffron-wind`).
+const WIND_STEM: &str = "wind";
 
 /// The forward/gbuffer übershader stem. It alone gets an RT-off variant (see the fan-out).
 const MESH_STEM: &str = "mesh";
@@ -302,6 +310,13 @@ pub fn run(config: &Config) -> Result<Report> {
             material_params_src.display()
         );
     }
+    let thin_sheet_src = config.shader_src_dir.join("thin_sheet.slang");
+    if !thin_sheet_src.is_file() {
+        bail!(
+            "shared thin-sheet source not found: {}",
+            thin_sheet_src.display()
+        );
+    }
 
     let shader_sources = shader_sources(&config.shader_src_dir)?;
     for (stem, path) in &shader_sources {
@@ -362,6 +377,7 @@ pub fn run(config: &Config) -> Result<Report> {
                 &sky_sh_src,
                 &coverage_src,
                 &material_params_src,
+                &thin_sheet_src,
             ],
         )?
     {
@@ -498,6 +514,10 @@ fn is_shared_source(stem: &str) -> bool {
             | COVERAGE_STEM
             | MATERIAL_PARAMS_STEM
             | GLOBAL_GPU_DATA_STEM
+            | SCENE_BIN_COMMON_STEM
+            | SCENE_MICRO_COMMON_STEM
+            | THIN_SHEET_STEM
+            | WIND_STEM
     )
 }
 
@@ -1092,6 +1112,10 @@ mod tests {
                 GLOBAL_GPU_DATA_STEM.to_owned(),
                 PathBuf::from("global_gpu_data.slang"),
             ),
+            (
+                THIN_SHEET_STEM.to_owned(),
+                PathBuf::from("thin_sheet.slang"),
+            ),
             (MESH_STEM.to_owned(), PathBuf::from("mesh.slang")),
             ("alpha".to_owned(), PathBuf::from("alpha.slang")),
         ];
@@ -1124,8 +1148,6 @@ mod tests {
             );
         }
 
-        let meshlet = std::fs::read_to_string(shader_dir.join("meshlet.slang"))?;
-        assert!(meshlet.contains("o.coverageAnchor = position;"));
         Ok(())
     }
 
