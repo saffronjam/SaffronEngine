@@ -914,7 +914,7 @@ pub fn save_material_asset(
     let text = material_asset_to_text(material, 2);
     std::fs::write(assets.root.join(&relative_path), text).map_err(|e| Error::Io(e.to_string()))?;
     let unique = assets.catalog.unique_name(name);
-    assets.catalog.put(AssetEntry {
+    assets.register_imported_asset(AssetEntry {
         id,
         name: unique,
         asset_type: AssetType::Material,
@@ -925,9 +925,6 @@ pub fn save_material_asset(
     if let Err(err) = assets.write_asset_sidecar(id) {
         tracing::warn!("material: could not write .smeta for {}: {err}", id.value());
     }
-    // A fresh id has no cached form, but an instance-create rewrites the parent link others resolve
-    // through — clear so the resolve sees the new topology on the next frame.
-    assets.invalidate_material_caches();
     Ok(id)
 }
 
@@ -964,7 +961,7 @@ pub fn update_material_asset(
         let path = assets.root.join(&rel_path);
         std::fs::write(path, text).map_err(|e| Error::Io(e.to_string()))?;
         // The edited material (and every instance that resolves through it) is now stale.
-        assets.invalidate_material_caches();
+        let _ = assets.asset_edited(id);
     } else {
         // Container-embedded (a `.smatx` self-container, or a model container): rewrite only the
         // material chunk, preserving the META + every texture chunk. Invalidates caches internally.

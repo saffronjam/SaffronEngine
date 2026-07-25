@@ -72,9 +72,31 @@ pub struct ResolvedMaterials {
     pub unlit: bool,
     /// The resolved base color's rgb, captured for the DDGI voxel-box proxy albedo.
     pub proxy_albedo: Vec3,
+    /// Aggregate occupancy the SDF/GDF path splats for this entity's matter:
+    /// `1.0` solid; below one, the densest thin-sheet submesh's aggregate
+    /// occupancy (porous matter never hardens the distance field).
+    pub occupancy: f32,
     /// The übershader the scene PSO selects. A codegen material points this at its
     /// compiled `_mesh.spv` variant; everything else keeps the shared übershader.
     pub shader: String,
+}
+
+/// The entity-level aggregate occupancy: an entity whose submeshes are all thin
+/// sheets occupies its bounds only fractionally, and the densest sheet's aggregate
+/// occupancy stands in for the whole; any solid submesh (or no submeshes) keeps the
+/// entity solid at `1.0`.
+fn derive_entity_occupancy(submeshes: &[SubmeshMaterial]) -> f32 {
+    if submeshes.is_empty() {
+        return 1.0;
+    }
+    let mut occupancy = 0.0_f32;
+    for submesh in submeshes {
+        match &submesh.thin_sheet {
+            Some(sheet) => occupancy = occupancy.max(sheet.aggregate.occupancy),
+            None => return 1.0,
+        }
+    }
+    occupancy.clamp(0.0, 1.0)
 }
 
 impl Default for ResolvedMaterials {
@@ -83,6 +105,7 @@ impl Default for ResolvedMaterials {
             submeshes: Vec::new(),
             unlit: false,
             proxy_albedo: Vec3::ONE,
+            occupancy: 1.0,
             shader: DEFAULT_MESH_SHADER.to_owned(),
         }
     }
@@ -269,50 +292,78 @@ impl AssetServer {
     ) -> ResolvedMaterials {
         let mut out = ResolvedMaterials::default();
 
-        let slots = scene
-            .with_component::<MaterialSet, _>(entity, |set| set.slots.clone())
-            .unwrap_or_default();
+        let slots = self.resolve_entity_material_slots(scene, entity);
         if slots.is_empty() {
             return out;
         }
 
-        // Resolve each slot's referenced material (parent chain) with its sparse overrides
-        // once, so a submesh reusing a slot does not re-load it.
-        let resolved: Vec<MaterialAsset> = slots
-            .iter()
-            .map(|slot| self.resolve_slot_material(slot.material, &slot.overrides))
-            .collect();
-
         // The whole-mesh flags + codegen shader follow slot 0.
-        out.unlit = resolved[0].unlit;
-        out.proxy_albedo = resolved[0].base_color.truncate();
-        if let Some(shader) = self.codegen_shader_for(slots[0].material) {
+        out.unlit = slots[0].1.unlit;
+        out.proxy_albedo = slots[0].1.base_color.truncate();
+        if let Some(shader) = self.codegen_shader_for(slots[0].0) {
             out.shader = shader;
         }
 
         out.submeshes.reserve(submeshes.len());
         for submesh in submeshes {
-            let index = (submesh.material_slot as usize).min(resolved.len() - 1);
+            let index = (submesh.material_slot as usize).min(slots.len() - 1);
             out.submeshes
-                .push(self.resolve_material_asset(gpu, &resolved[index]));
+                .push(self.resolve_material_asset(gpu, &slots[index].1));
         }
+        out.occupancy = derive_entity_occupancy(&out.submeshes);
         out
+    }
+
+    /// Resolves the exact material asset used by every submesh for CPU coverage classification.
+    pub(crate) fn resolve_entity_material_assets(
+        &mut self,
+        scene: &Scene,
+        entity: Entity,
+        submeshes: &[Submesh],
+    ) -> Vec<MaterialAsset> {
+        let slots = self.resolve_entity_material_slots(scene, entity);
+        if slots.is_empty() {
+            return vec![default_material_asset(); submeshes.len()];
+        }
+        submeshes
+            .iter()
+            .map(|submesh| {
+                slots[(submesh.material_slot as usize).min(slots.len() - 1)]
+                    .1
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn resolve_entity_material_slots(
+        &mut self,
+        scene: &Scene,
+        entity: Entity,
+    ) -> Vec<(Uuid, MaterialAsset)> {
+        scene
+            .with_component::<MaterialSet, _>(entity, |set| set.slots.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|slot| {
+                let material = self.resolve_slot_material(slot.material, &slot.overrides);
+                (slot.material, material)
+            })
+            .collect()
     }
 
     /// Resolves one slot: loads its referenced `.smat` (parent chain resolved) and layers the
     /// slot's sparse overrides on top. A `0` reference is the built-in default (the common
-    /// case — no warning); a non-zero id that fails to load warns and falls back to default.
-    fn resolve_slot_material(&mut self, material_id: Uuid, overrides: &Value) -> MaterialAsset {
+    /// case); a non-zero id that fails to load falls back to default (the loader warns once
+    /// when it caches the miss).
+    pub(crate) fn resolve_slot_material(
+        &mut self,
+        material_id: Uuid,
+        overrides: &Value,
+    ) -> MaterialAsset {
         let mut material = if material_id.value() == 0 {
             default_material_asset()
         } else {
-            load_material_asset(self, material_id).unwrap_or_else(|| {
-                tracing::warn!(
-                    "slot material asset {} missing; using default",
-                    material_id.value()
-                );
-                default_material_asset()
-            })
+            load_material_asset(self, material_id).unwrap_or_else(default_material_asset)
         };
         apply_overrides(&mut material, overrides);
         material
@@ -327,7 +378,7 @@ impl AssetServer {
     /// frame); the result only changes through the invalidation seams. A container-embedded id
     /// short-circuits to `None` without touching disk — imported materials never carry a graph,
     /// and reading the whole binary `.smodel` as a UTF-8 string was pure per-frame waste.
-    fn codegen_shader_for(&mut self, material_id: Uuid) -> Option<String> {
+    pub(crate) fn codegen_shader_for(&mut self, material_id: Uuid) -> Option<String> {
         if let Some(cached) = self.material_shader_by_uuid.get(&material_id.value()) {
             return cached.as_ref().map(|s| (**s).clone());
         }
@@ -371,6 +422,9 @@ fn load_material_asset(assets: &mut AssetServer, id: saffron_core::Uuid) -> Opti
     if id == DEFAULT_MATERIAL_ID {
         return Some(default_material_asset());
     }
+    if id == crate::EDITOR_CAMERA_MATERIAL_ID {
+        return Some(crate::load::editor_camera_material_asset());
+    }
     // Cached parent-resolved material (before the per-slot overrides the caller layers on the
     // returned clone). A present key — including a negative-cached `None` — skips the disk read;
     // only a true miss reads + parses the `.smat` (and, for a container material, slices the
@@ -379,6 +433,14 @@ fn load_material_asset(assets: &mut AssetServer, id: saffron_core::Uuid) -> Opti
         return cached.as_ref().map(|material| (**material).clone());
     }
     let loaded = crate::material::load_catalog_material_asset(assets, id).ok();
+    if loaded.is_none() {
+        // Once per negative-cache fill, not per resolve: the miss repeats from the
+        // cache silently until a material mutation clears it.
+        tracing::warn!(
+            "material asset {} missing; slots fall back to default",
+            id.value()
+        );
+    }
     assets
         .material_by_uuid
         .insert(id.value(), loaded.clone().map(Arc::new));
@@ -614,6 +676,7 @@ mod tests {
         fn upload_mesh(
             &self,
             _mesh: &saffron_geometry::Mesh,
+            _hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             _skin: &[saffron_geometry::VertexSkin],
             _morph: Option<&saffron_geometry::MorphData>,
             _sdf_bake: Option<&saffron_rendering::SdfBake>,
@@ -774,6 +837,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn occupancy_follows_the_densest_sheet_and_solid_wins() {
+        assert_eq!(derive_entity_occupancy(&[]), 1.0);
+        let sheet = |occupancy_bits: u16| {
+            let mut params = saffron_vegetation::ThinSheetFoliageParameters::default();
+            params.voxel_moments.occupancy =
+                saffron_spatial::UnitInterval::from_bits(occupancy_bits);
+            let mut material = SubmeshMaterial::default();
+            material.thin_sheet = Some(thin_sheet_material(&params));
+            material
+        };
+        // Two sheets: the densest wins (bits scale to [0, 1]).
+        let dense = sheet(u16::MAX);
+        let sparse = sheet(u16::MAX / 4);
+        let both = [sparse.clone(), dense.clone()];
+        assert!((derive_entity_occupancy(&both) - 1.0).abs() < 1e-3);
+        // A solid submesh keeps the entity solid regardless of sheets.
+        let mixed = [sheet(u16::MAX / 4), SubmeshMaterial::default()];
+        assert_eq!(derive_entity_occupancy(&mixed), 1.0);
     }
 
     #[test]
