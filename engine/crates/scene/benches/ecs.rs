@@ -314,12 +314,11 @@ fn relink_hierarchy(scene: &mut Scene) {
     // Resolve each relationship's parent uuid to a live handle.
     let mut parents: Vec<(Entity, Entity)> = Vec::new();
     scene.for_each::<&Relationship, _>(|e, rel| {
-        if rel.parent != 0 {
-            if let Some(&handle) = uuid_to_handle.get(&rel.parent) {
-                if handle != e {
-                    parents.push((e, handle));
-                }
-            }
+        if rel.parent != 0
+            && let Some(&handle) = uuid_to_handle.get(&rel.parent)
+            && handle != e
+        {
+            parents.push((e, handle));
         }
     });
     for &(child, parent) in &parents {
@@ -444,15 +443,11 @@ fn scene_to_snapshots(scene: &mut Scene) -> Vec<EntitySnapshot> {
 }
 
 /// Rebuilds a fresh scene from the snapshot list: spawn an entity per row, re-add each
-/// component, then `relink_hierarchy`. Note `create_entity` mints a *new* id, so each row's
-/// durable id is restored explicitly.
+/// component, then `relink_hierarchy`.
 fn snapshots_to_scene(snaps: &[EntitySnapshot]) -> Scene {
     let mut scene = Scene::new();
     for snap in snaps {
-        let e = scene.create_entity("");
-        scene
-            .add_component(e, IdComponent::new(Uuid(snap.id)))
-            .unwrap();
+        let e = scene.spawn_with_id(Uuid(snap.id));
         scene
             .add_component(
                 e,
