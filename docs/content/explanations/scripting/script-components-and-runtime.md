@@ -103,6 +103,7 @@ The binding table groups the rest of the surface as follows:
 | Entity state | `:get_position`, `:set_position`, `:get_component`, `:set_component`, `:has_component` |
 | Hierarchy and lifetime | `sa.spawn`, `:parent`, `:children`, `:set_parent`, `:destroy` |
 | Physics | `sa.raycast`, `sa.spherecast`, `:apply_impulse`, `:move_character`, `:ragdoll_state` |
+| Vegetation | `sa.vegetation_raycast`, `sa.vegetation_nearest`, `sa.vegetation_in_radius`, `sa.vegetation_damage`, `sa.vegetation_harvest` |
 | Communication | `:send`, `sa.broadcast`, `sa.spawn_task`, `sa.wait`, `sa.delay` |
 | Logging | `sa.log` |
 
@@ -110,6 +111,33 @@ The binding table groups the rest of the surface as follows:
 [Script Logs panel](../../ui-and-editor/script-logs-panel/). `script-input` supplies held keys, mouse
 buttons, pointer position, and scroll; `derive_script_input_edges` calculates press, release, and delta
 values once per simulation tick.
+
+## Vegetation interaction
+
+The vegetation calls reach the same authority the renderer and the control plane read, so a script
+sees the world as it is rather than a copy. Queries are bounds-level over CPU-resident macro
+plants, which is a different question from a physics cast: they report plants that carry no
+collision body at all.
+
+```lua
+local hit = sa.vegetation_raycast(px, py, pz, dx, dy, dz, 8.0)
+if hit.hit and hit.interaction_policy == "harvestable" then
+    sa.vegetation_harvest(hit.plant, 4)
+elseif hit.hit then
+    sa.vegetation_damage(hit.plant, 0.25)
+end
+```
+
+A hit table carries the canonical `plant` identity, its render-relative `position`, the `distance`,
+its `lifecycle` and `interaction_policy` names, and `health`. A miss is `{ hit = false }`, the same
+shape the physics casts return. `sa.vegetation_in_radius` returns an array ordered nearest first,
+capped by its optional limit.
+
+`sa.vegetation_damage` and `sa.vegetation_harvest` reduce a typed mutation through the one
+vegetation reducer and return whether it committed. The header is minted from the plant's owner
+cell and that cell's current revision, so the revision doubles as the optimistic precondition and
+two identical calls both commit rather than one being mistaken for a replay. Each committed
+mutation emits a [typed transition](../../scene-and-ecs/vegetation-state/) any consumer can read.
 
 ## Messages, tasks, and callbacks
 
@@ -123,7 +151,9 @@ scheduler task logs a message and returns without yielding.
 
 Physics dispatches `on_trigger_enter(other)` and `on_trigger_exit(other)` for sensor transitions.
 Solid contact begin invokes `on_contact(other, point, normal)` with world-space `sa.Vec3` values. A
-solid contact end has no script callback.
+solid contact end has no script callback. `other` is the touching entity's handle when a scene
+entity owns the body, the plant's canonical hex identity string when a macro plant does, and the
+null handle for an unowned body.
 
 ## Error containment
 

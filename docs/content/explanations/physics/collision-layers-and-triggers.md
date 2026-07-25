@@ -98,7 +98,8 @@ drains new events and calls `ScriptHost::dispatch_contact` before `on_update`. E
 offered to the scripts on entity A and then entity B, with the opposite entity passed as `other`.
 
 Sensor `Begin` and `End` events call `on_trigger_enter(other)` and `on_trigger_exit(other)`. A solid
-`Begin` calls `on_contact(other, point, normal)` with world-space vectors. Solid `End` remains
+`Begin` calls `on_contact(other, point, normal)` with world-space vectors; `other` is an entity
+handle or, for a macro plant's body, its canonical hex identity string. Solid `End` remains
 visible in the contact ring but has no script handler. Missing handlers are successful no-ops; a
 handler error enters the runtime error sink and stops that tick's dispatch.
 

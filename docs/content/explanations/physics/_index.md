@@ -39,6 +39,7 @@ Colliders provide shapes and surface properties. A rigidbody adds solver-control
 | [Scene queries](scene-queries/) | Ray and sphere casts through control and scripts | `RayHit`, `World::raycast`, `World::sphere_cast` |
 | [Ragdoll](ragdoll/) | Constrained bone bodies and physics-to-pose conversion | `BonePhysicsComponent`, `World::enable_ragdoll`, `World::write_ragdoll_poses` |
 | [Active ragdoll](active-ragdoll/) | Joint motors and per-bone animation/physics blending | `PoseTarget`, `World::drive_ragdolls_to_pose`, `set-ragdoll` |
+| [Vegetation collision residency](vegetation-collision/) | Generation-tagged batched plant proxies | `VegetationCollisionResidency`, `World::add_static_target_bodies` |
 
 ## In the code
 

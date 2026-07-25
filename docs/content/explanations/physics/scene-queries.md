@@ -17,7 +17,7 @@ and return `RayHit`:
 | Field | Meaning on a hit |
 |---|---|
 | `hit` | `true` when the cast found a body |
-| `entity` | UUID mapped from the Jolt body ID |
+| `target` | The struck body's tagged owner: a scene entity (`kind: "scene-entity"`, `id`) or a macro plant (`kind: "vegetation"`, `plant`); absent for an unowned body |
 | `point` | World-space point on the struck body |
 | `normal` | World-space surface normal |
 | `distance` | Hit fraction multiplied by `maxDist` |
@@ -32,8 +32,8 @@ distance from the origin. With a direction of length `L`, the physical displacem
 `distance * L`. Callers that need world-unit distances therefore pass a unit vector.
 
 A miss returns `RayHit::default()`: `hit` is false and every numeric or vector field is zero. The
-safe world maps body IDs through its body index. An untracked Jolt body reports entity UUID zero;
-Lua omits the `entity` field in that case.
+safe world maps body IDs through its body → target registry. An untracked Jolt body carries no
+target; Lua then omits both the `entity` and `plant` fields.
 
 Queries use Jolt's default query filters, so the API has no per-call layer mask. A
 `CharacterVirtual` has no broad-phase body and does not appear in these casts. The
@@ -68,6 +68,12 @@ $ sa raycast --origin '{"x":0,"y":2,"z":0}' --dir '{"x":0,"y":-1,"z":0}' --maxDi
 hit entity=42  point=(0.000, 0.100, 0.000)  normal=(0.00, 1.00, 0.00)  dist=1.900
 ```
 
+A hit on an authoritative macro plant prints its identity instead:
+
+```console
+hit plant=1f3a…  point=(4.100, 0.000, 7.250)  normal=(0.00, 1.00, 0.00)  dist=3.200
+```
+
 The Lua functions take scalar coordinates. `sa.raycast` accepts origin, direction, and maximum
 distance; `sa.spherecast` inserts radius before maximum distance:
 
@@ -75,6 +81,8 @@ distance; `sa.spherecast` inserts radius before maximum distance:
 local hit = sa.raycast(0, 2, 0, 0, -1, 0, 10)
 if hit.hit and hit.entity then
     hit.entity:send("ground_hit", { distance = hit.distance })
+elseif hit.hit and hit.plant then
+    -- A macro plant: `hit.plant` is its canonical hex identity string.
 end
 ```
 
