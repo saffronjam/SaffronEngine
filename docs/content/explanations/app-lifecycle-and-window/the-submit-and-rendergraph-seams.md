@@ -24,7 +24,7 @@ pub fn submit(&mut self, body: impl FnOnce(vk::CommandBuffer) + 'static) {
 
 Nothing executes at the call. The closure is stored as a `RenderFn`, and when the renderer builds
 the frame graph, the scene pass body replays every stored closure in its `scene-submissions`
-scope: after the batched opaque draw list, before the translucent draws.
+scope: after the opaque indirect draws, before the GPU-sorted translucent draws.
 
 The closure receives the frame's `vk::CommandBuffer` (Vulkan via the
 [`ash`](https://github.com/ash-rs/ash) bindings) inside a rendering scope the graph has opened

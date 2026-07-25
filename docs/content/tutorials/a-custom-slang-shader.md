@@ -97,9 +97,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 ```
 
 The `Instance` struct must keep the same field order and layout as `mesh.slang`'s: the
-renderer fills that storage buffer from its `DrawItem` instances regardless of which shader
-draws them. Unused fields can be ignored (here: texture, pbr, emissive), but the order is
-fixed.
+renderer fills that storage buffer with per-instance rows regardless of which shader draws
+them. Unused fields can be ignored (here: texture, pbr, emissive), but the order is fixed.
 
 > [!NOTE]
 > The entry points must be named `vertexMain` and `fragmentMain` — that's what
@@ -129,7 +128,7 @@ distinct `(shader, unlit)` key. Point a material at the new shader:
 ```rust
 let mut flat = Material::default();
 flat.shader = "shaders/flat.spv".to_string();   // the .spv you just compiled
-// attach `flat` to the DrawItems for the meshes you want drawn with it
+// use `flat` as the material for the meshes you want drawn with it
 ```
 
 The PSO cache builds `flat.spv` on first use and reuses it after. Check the pipeline count
@@ -141,9 +140,9 @@ sa render-stats       # "pipelines" increments when flat.spv's PSO is built
 
 > [!NOTE]
 > The renderer's `Material::shader` is selected in engine code, not over the CLI — there's no
-> `sa set-shader`. To see your shader live: set the shader path where the draw list is built,
-> or edit the engine's `mesh.slang` in place so every mesh redraws with your changes on the
-> next pipeline run. See
+> `sa set-shader`. To see your shader live: set the shader path on the renderer `Material` in
+> engine code, or edit the engine's `mesh.slang` in place so every mesh redraws with your
+> changes on the next pipeline run. See
 > [material and PSO selection](../../explanations/materials-and-pipelines/material-and-pso-selection/).
 
 ## Next

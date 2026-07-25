@@ -6,7 +6,7 @@ math = false
 
 # Control commands
 
-The control plane exposes 198 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
+The control plane exposes 223 typed commands over its local Unix socket. This table follows the frozen order in `saffron_protocol::COMMANDS`; the generated OpenRPC methods use the same names, parameter DTOs, and result DTOs.
 
 `register_builtin_commands` installs `ping`, the reflective `help` command, and the render, scene, animation, physics, and asset handlers. The host adds `get-script-schema` because its handler depends on the script crate. A registry test compares the registered names with `COMMANDS` as sets, with that host-owned command accounted for explicitly.
 
@@ -40,7 +40,10 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | Command | Params | Result | Purpose |
 |---|---|---|---|
 | `ping` | `PingParams` | `PingResult` | liveness + engine info |
-| `render-stats` | `EmptyParams` | `RenderStatsDto` | last frame draw counters |
+| `render-stats` | `EmptyParams` | `RenderStatsDto` | last frame draw counters + the `vsm` shadow-page activity block |
+| `gpu-scene-stats` | `EmptyParams` | `GpuSceneMirrorStatsDto` | persistent GPU-scene mirror population and rebuild counters |
+| `vegetation-mutate` | `VegetationMutateParams` | `VegetationMutateResult` | apply typed vegetation mutations (tombstone/override/anchor/…) through the reducer |
+| `vegetation-render-stats` | `EmptyParams` | `VegetationRenderStatsDto` | per-family and per-cell vegetation render population plus page faults |
 | `profiler.set-mode` | `ProfilerSetModeParams` | `ProfilerModeResult` | set the GPU profiler mode |
 | `pass-timings` | `EmptyParams` | `RenderPassTimingsDto` | last frame per-pass GPU timings |
 | `profiler.capture-start` | `CaptureStartParams` | `CaptureStartResult` | arm a bounded profiler capture |
@@ -89,6 +92,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-light` | `SetLightParams` | `EntityRef` | set-light {entity?, direction?, color?, intensity?, ambient?} |
 | `select` | `EntityParams` | `EntityRef` | select {entity} |
 | `pick` | `PickParams` | `PickResult` | pick {u=0.5, v=0.5} |
+| `query-surface-ray` | `QuerySurfaceRayParams` | `SurfaceRayResult` | nearest scene-surface hit |
 | `spatial-cell` | `SpatialCellParams` | `SpatialCellResult` | canonical position ownership and ancestor-cell conversion |
 | `spatial-providers` | `EmptyParams` | `SurfaceProvidersResult` | list live surface providers and capabilities |
 | `spatial-sample` | `SpatialSampleParams` | `SpatialSampleResult` | sample one canonical provider field channel |
@@ -107,6 +111,8 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `set-fog` | `SetFogParams` | `EnvironmentDto` | set analytic height & distance fog settings |
 | `set-clouds` | `SetCloudsParams` | `EnvironmentDto` | set volumetric cloud shape settings |
 | `set-wind` | `SetWindParams` | `EnvironmentDto` | set shared global wind settings |
+| `sample-wind` | `SampleWindParams` | `SampleWindResult` | the composed wind velocity at a world position {positionM, timeS?} |
+| `emit-interaction-impulse` | `EmitInteractionImpulseParams` | `EmitInteractionImpulseResult` | push the world interaction field {positionM, radiusM, strength, direction?, depress?} |
 | `set-time-of-day` | `SetTimeOfDayParams` | `EnvironmentDto` | set calendar-driven time-of-day settings |
 | `get-selection` | `EmptyParams` | `SelectionResult` | get current selection |
 | `deselect` | `EmptyParams` | `DeselectResult` | clear selection |
@@ -125,7 +131,7 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `get-skeleton-overlay` | `EmptyParams` | `SkeletonOverlayResult` | the line-skeleton overlay toggle, axes, and joint size |
 | `set-skeleton-overlay` | `SetSkeletonOverlayParams` | `SkeletonOverlayResult` | the selected rig's line-skeleton viewport overlay (show\|axes\|jointSize) |
 | `get-debug-overlays` | `EmptyParams` | `DebugOverlaysResult` | the viewport debug-overlay toggles (bounds\|sceneAabb\|lightVolumes\|grid\|colliders) |
-| `set-debug-overlays` | `DebugOverlaysParams` | `DebugOverlaysResult` | toggle viewport debug overlays {bounds?, sceneAabb?, lightVolumes?, grid?, colliders?} |
+| `set-debug-overlays` | `DebugOverlaysParams` | `DebugOverlaysResult` | toggle viewport debug overlays {bounds?, sceneAabb?, lightVolumes?, grid?, colliders?, vegetationCells?, vegetationBounds?, vegetationRejections?, vegetationHeatmap?} |
 | `set-skeleton-highlight` | `SetSkeletonHighlightParams` | `SkeletonOverlayResult` | tint a previewed model's joint by its get-asset-model node index (-1 clears) |
 | `pick-skeleton-joint` | `PickSkeletonJointParams` | `PickSkeletonJointResult` | pick the previewed model's nearest joint to a viewport click (u,v) within radiusPx |
 | `set-asset-preview-options` | `SetAssetPreviewOptionsParams` | `AssetPreviewOptionsResult` | set-asset-preview-options {floor?} — preview-scene settings (show floor) |
@@ -181,7 +187,15 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `vegetation-cook-status` | `VegetationCookJobParams` | `VegetationCookStatusDto` | poll cook progress, terminal statistics, manifest, or failure |
 | `vegetation-cancel-cook` | `VegetationCookJobParams` | `VegetationCookStatusDto` | request cooperative cancellation of one vegetation cook |
 | `vegetation-cell-inspect` | `VegetationCellInspectParams` | `VegetationCellInspectResult` | validate and inspect one immutable cell header and section directory |
+| `vegetation-rejections` | `VegetationRejectionsParams` | `VegetationRejectionsResult` | one cooked cell's rejected candidates: position, reason, and ordinal (capped rows) |
+| `vegetation-topology-diff` | `VegetationTopologyDiffParams` | `VegetationTopologyDiffResult` | diff two cooked manifests per cell: added/removed/moved plants + override conflicts |
 | `vegetation-manifest` | `VegetationManifestParams` | `VegetationManifestResult` | inspect the current or an exact immutable generation manifest |
+| `vegetation-runtime-status` | `EmptyParams` | `VegetationRuntimeStatusDto` | report the exact runtime vegetation generation, state, queues, residency, and budgets |
+| `vegetation-runtime-cell` | `VegetationRuntimeCellParams` | `VegetationRuntimeCellResult` | inspect one immutable CPU-resident vegetation cell generation |
+| `vegetation-runtime-query` | `VegetationRuntimeQueryParams` | `VegetationRuntimeQueryResult` | query CPU-resident macro vegetation by bounds, radius, ray, or nearest |
+| `vegetation-runtime-inspect` | `VegetationRuntimePlantInspectParams` | `VegetationRuntimePlantInspectResult` | inspect one stable plant's effective row, persistent state, and resident provenance |
+| `vegetation-state-export` | `EmptyParams` | `VegetationStateSnapshotDto` | export the canonical strict runtime vegetation state snapshot |
+| `vegetation-state-import` | `VegetationStateImportParams` | `VegetationStateSnapshotDto` | verify and atomically import one exact runtime vegetation state snapshot |
 | `plant-validate` | `PlantValidateParams` | `PlantValidationResult` | validate one retained plant source recipe without publication |
 | `plant-recook` | `PlantRecookParams` | `PlantRecookResult` | compile and publish one validated plant-family artifact |
 | `get-project` | `EmptyParams` | `ProjectInfoDto` | active project metadata |
@@ -197,6 +211,9 @@ sa -o json set-transform --entity 42 --translation '{"x":0,"y":1,"z":0}'
 | `import-lut` | `ImportLutParams` | `ImportLutResult` | import-lut {path} — import a creative .cube look as a LUT asset |
 | `import-vegetation-asset` | `ImportVegetationAssetParams` | `ImportVegetationAssetResult` | import an authored plant, biome, or complete vegetation-map package |
 | `list-assets` | `EmptyParams` | `AssetList` | list project asset catalog |
+| `vegetation-map-layer-commit` | `VegetationMapLayerCommitParams` | `VegetationMapLayerCommitResult` | commit one optimistic authored-map layer transaction (upserts + removals) |
+| `vegetation-map-chunk-commit` | `VegetationMapChunkCommitParams` | `VegetationMapChunkCommitResult` | commit one optimistic authored-map chunk transaction (a brush gesture's tiles + anchors) |
+| `vegetation-map-chunk-read` | `VegetationMapChunkReadParams` | `VegetationMapChunkReadResult` | read authored map chunks by logical key (a brush gesture's read-modify-write baseline) |
 | `vegetation-asset-summary` | `VegetationAssetSummaryParams` | `VegetationAssetSummaryResult` | inspect authored vegetation metadata, validation, dependencies, and cook statistics |
 | `scan-assets` | `EmptyParams` | `ScanAssetsResult` | rescan assets/ and reconcile the catalog from disk |
 | `extract-subasset` | `ExtractSubAssetParams` | `AssetRef` | extract-subasset {asset, subAsset} [dest] — slice an embedded sub-asset to a standalone file |
