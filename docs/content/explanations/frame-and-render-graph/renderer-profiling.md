@@ -26,7 +26,7 @@ from the indices, and overlapping siblings remain representable.
   top-level phases (`build-frame-graph`, `execute-render-graph`, `submit-present`), the graph
   opens one span per pass, and a pass body opens children through `NestedScopeRecorder::scope`.
   The scene pass records `scene-opaque`, `scene-submissions`, and `scene-translucent` this way.
-- **GPU spans** come from `RgTimestamps`: `execute_profiled` brackets each pass with a
+- **GPU spans** come from `RgTimestamps`: graph batch recording brackets each timed pass with a
   timestamp-query pair written by `cmd_write_timestamp2` (`TOP_OF_PIPE` at begin,
   `BOTTOM_OF_PIPE` at end) and pushes a `ScopeRecord` with the same parent/depth tagging.
 
@@ -36,9 +36,10 @@ begin-frame fence wait, once that slot's GPU work has provably finished.
 
 ## Why per-pass numbers are relative
 
-A GPU timestamp is a device tick: the raw counter masked by the queue's `timestampValidBits` and
-scaled by `timestamp_period` nanoseconds per tick. A queue reporting zero valid bits cannot time
-at all, and the profiler clamps itself to `Off` on such a device.
+A GPU timestamp is a device tick: the raw counter is masked to the common valid-bit width of the
+timed graphics and compute queues, then scaled by `timestamp_period` nanoseconds per tick. A
+compute queue reporting zero valid bits still executes its work but contributes no scopes. If the
+graphics queue cannot timestamp, the profiler clamps itself to `Off`.
 
 Adjacent GPU passes can execute concurrently, and a parent scope brackets its children, so
 per-pass durations do not sum to a frame total. The frame total is the span from the earliest
@@ -97,7 +98,10 @@ explain a slow pass:
 | fragment invocations ÷ render-area pixels | overdraw |
 | clipping primitives ÷ clipping invocations | culling efficiency |
 | vertex invocations ÷ input-assembly vertices | vertex reuse |
-| compute invocations | dispatch size of compute passes |
+| compute invocations | compute work recorded inside a graphics pass, normally zero |
+
+Async-compute passes do not reserve statistics slots. Their duration still comes from timestamp
+scopes when the compute queue supports them.
 
 The counters are invocation counts, not times, so they mean the same thing on a software
 rasterizer as on hardware.
@@ -133,7 +137,7 @@ numbers.
 |---|---|---|
 | GPU scopes + query pools | `profiler.rs` | `RgTimestamps`, `ScopeRecord`, `GpuProfiler`, `MAX_PROFILED_SCOPES` |
 | CPU spans | `profiler.rs` | `CpuSpanBuffer`, `CpuMarkerRegistry`, `cpu_now_ns` |
-| Per-pass bracketing | `render_graph.rs`, `nested_scopes.rs` | `RenderGraph::execute_profiled`, `ProfileRecorders`, `NestedScopeRecorder::scope` |
+| Per-pass bracketing | `render_graph.rs`, `nested_scopes.rs` | `record_submission_plan_profiled`, `ProfileRecorders`, `NestedScopeRecorder::scope` |
 | Clock correlation + read-back | `profiler.rs` | `GpuProfiler::calibrate`, `GpuCalibration`, `GpuProfiler::readback` |
 | Capture state machine | `profiler.rs` | `CaptureRecorder`, `CaptureMode`, `CaptureState`, `ProfileCapture`, `ProfileCaptureMeta` |
 | Capture drive | `renderer.rs` | `Renderer::start_profile_capture`, `Renderer::stop_profile_capture` |

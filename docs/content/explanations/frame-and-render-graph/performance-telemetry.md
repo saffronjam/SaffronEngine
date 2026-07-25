@@ -40,7 +40,7 @@ the HUD red the moment a project opens.
 ## Per-pass GPU timing
 
 When a mode is armed, the renderer hands the graph an `RgTimestamps` recorder through
-`ProfileRecorders`, and `RenderGraph::execute_profiled` opens a GPU scope around each pass: a begin
+`ProfileRecorders`, and `record_submission_plan_profiled` opens a GPU scope around each timed pass: a begin
 timestamp before the pass's derived barriers, an end timestamp after its body. A pass body can open
 child scopes through `NestedScopeRecorder::scope` when `sub_scopes` is set. Each scope pushes a
 `ScopeRecord` carrying the name plus `parent_index`/`depth`, so the tree stays flat-and-tagged.
@@ -56,8 +56,9 @@ The mechanics follow the Vulkan
 - Read-back targets the pool written `MAX_FRAMES_IN_FLIGHT` frames ago, right after that slot's
   fence wait, with `TYPE_64 | WITH_AVAILABILITY`. It never blocks; a `NOT_READY` result keeps the
   last good read-back.
-- Raw ticks are masked to the graphics queue's `timestamp_valid_bits` and scaled by
-  `timestamp_period` into nanoseconds.
+- Raw ticks are masked to the common valid-bit width of every timed queue and scaled by
+  `timestamp_period` into nanoseconds. A compute batch is left uninstrumented when its queue reports
+  zero timestamp bits.
 
 > [!NOTE]
 > Per-pass numbers are *relative*. Sibling scopes can overlap on the GPU and a parent brackets its
@@ -66,28 +67,31 @@ The mechanics follow the Vulkan
 
 ## Throughput counters
 
-The draw path accumulates a `RenderStats` per frame:
+The frame derives a `RenderStats` from the visibility chain's GPU readback (the counters lag
+by the frames-in-flight depth — a slot reports its last use):
 
 | Counter | Meaning |
 |---|---|
-| `drawCalls` | `drawIndexed` calls (one per submesh per batch) |
-| `batches` | distinct (pipeline, mesh) buckets |
-| `instances` | logical instances drawn |
-| `triangles` | triangles submitted |
-| `sceneGatherMs` | CPU time spent gathering static and skinned draw items |
-| `instanceUploadBytes` | exact bytes written to the frame's `InstanceData` SSBO |
-| `retainedMeshCpuBytes` | unique drawn-mesh bytes retained for exact surface queries |
-| `shadowDrawCalls` | indexed draws recorded across directional, spot, and point shadows |
+| `drawCalls` | draw records the traversal emitted, plus tessellation-seam draws |
+| `batches` | live executor draw buckets (distinct shader + PSO-bin combos) |
+| `instances` | instances the visibility cull kept |
+| `triangles` | triangles the emitted records rasterize |
+| `sceneGatherMs` | CPU time spent gathering the frame facts + deformation work |
+| `instanceUploadBytes` | GPU-scene table bytes staged this frame ((near-)zero when idle) |
+| `retainedMeshCpuBytes` | mirrored-mesh host bytes retained for exact surface queries |
+| `shadowDrawCalls` | counted-indirect draws recorded across the frame's virtual-shadow pages |
+| `vsm` | shadow-page activity: `requested`, `hits`, `allocated`, `rendered`, `dirtied`, `evicted`, `overflow` |
 | `rtInstances` | instances published into the active frame TLAS |
 | `descriptorBinds` | descriptor-set binds recorded in the scene pass |
-| `commandBuffers` | primary command buffers submitted |
-| `queueSubmits` | `vkQueueSubmit2` calls |
+| `commandBuffers` | submitted primaries: prefix, graph batches, and tail |
+| `queueSubmits` | matching `vkQueueSubmit2` calls |
 | `pipelinesCreated` | PSOs compiled this frame |
 
 `pipelinesCreated` is the signature of a PSO-compile hitch: non-zero on a steady-state frame means
-a shader was built mid-frame, and it feeds the `pso-compile` alarm. The bindless, submesh-major
-instancing path binds descriptor sets per pass rather than per draw, so `descriptorBinds` stays
-flat as batches grow.
+a shader was built mid-frame, and it feeds the `pso-compile` alarm. The executor path binds
+descriptor sets per pass rather than per draw, so `descriptorBinds` stays flat as the scene
+grows, and `instanceUploadBytes` stays at (near-)zero on a steady scene — render preparation
+scales with changes, not with instance count.
 
 `render-stats` also carries `vramUsageBytes` / `vramBudgetBytes`, and `PerfConfig` carries warn and
 crit fractions for grading them. The renderer reports both as zero, the value every consumer treats
@@ -139,13 +143,38 @@ update the threshold knobs. The target itself is retargeted through `set-upscale
 sets `target_fps = 1000 / targetMs` and can enable dynamic resolution, so the grading budget and
 the dynamic-resolution driver stay one number.
 
+## Naming a hang while it hangs
+
+Every timing number above is measured after the work completes, which makes them silent for the one
+failure they matter most for: a submission that never completes. A fence wait is unbounded, so the
+thread that would print the number is itself blocked.
+
+A watchdog inverts that. Each submission registers a name — a one-off's label, or the frame serial
+— before it waits, and unregisters when it returns. A background thread wakes twice a second and
+reports anything registered longer than three seconds, once per elapsed second:
+
+```text
+ERROR rendering  GPU submission is still in flight — a hang, not a slow frame  submission="one-off 'bake_material_thumbnail'" seconds=4
+```
+
+The thread only sleeps and reads, so it keeps reporting while every other thread is blocked on a
+fence that will never signal. A slow-but-finite submission is reported by the elapsed-time warns
+instead; the watchdog line means the work did not finish.
+
+It runs in every build, shipped games included: a hang in the field is where nobody can attach a
+debugger, and that log line is the whole diagnosis. Its cost is one uncontended mutex acquisition
+and a scan of sixteen fixed slots per submission — no allocation, nothing growable, and nothing
+formatted until a report is actually due. A seventeenth concurrent submission goes untracked rather
+than allocating.
+
 ## Modes and capability
 
 `profiler.set-mode {off | timestamps | pipeline-stats}` selects the depth. `timestamps` allocates
 the query pools and arms the per-pass recorders. `pipeline-stats` adds a `PIPELINE_STATISTICS` pool
 per frame in flight — six counters per top-level graphics pass (input vertices, vertex, clipping,
-fragment, and compute invocations, clipped primitives) — and requires the `pipelineStatisticsQuery`
-device feature. The bounded CPU+GPU capture built on these recorders is described in
+fragment, compute invocations, and clipped primitives) — and requires the `pipelineStatisticsQuery`
+device feature. Compute-queue passes receive timestamps but no pipeline-statistics query. The
+bounded CPU+GPU capture built on these recorders is described in
 [renderer profiling](../renderer-profiling/).
 
 `GpuProfiler::set_mode` degrades a request the device cannot satisfy: no timestamp support means
@@ -197,8 +226,9 @@ recorded.
 | Run-loop bracketing (busy vs. wait) | `app/src/lib.rs` | `step_frame` |
 | CPU EMAs + the per-frame telemetry tail | `renderer.rs` | `Renderer::observe_cpu_frame`, `observe_frame_delta`, `finalize_frame_telemetry`, `reset_frame_telemetry`, `RenderStatsFull` |
 | Profiler state, pools, modes, read-back | `profiler.rs` | `GpuProfiler`, `ProfilerMode`, `RgTimestamps`, `ScopeRecord`, `PassTiming`, `MAX_PROFILED_SCOPES`, `allocate_pools`, `set_mode`, `frame_recorder`, `readback`, `frame_span_ms` |
-| Per-pass and nested scopes | `render_graph.rs`, `nested_scopes.rs` | `RenderGraph::execute_profiled`, `ProfileRecorders`, `NestedScopeRecorder` |
+| Per-pass and nested scopes | `render_graph.rs`, `nested_scopes.rs` | `record_submission_plan_profiled`, `ProfileRecorders`, `NestedScopeRecorder` |
 | Draw-path counters | `draw_list.rs` | `RenderStats` |
+| Hang watchdog | `watchdog.rs`, `upload.rs`, `renderer.rs` | `watch`, `InFlight`, `with_one_off_commands`, `begin_offscreen_frame` |
 | Frame ring, percentiles, stutter, config | `frame_history.rs` | `FrameHistory`, `FrameSample`, `FrameHistoryStats`, `PerfConfig`, `FRAME_HISTORY_CAPACITY` |
 | HUD grading | `editor/src/lib/perfThresholds.ts` | `frameTimeStatus`, `vramStatus` |
 | Wire surface | `protocol/src/dto.rs`, `control/src/commands_render.rs` | `RenderStatsDto`, `RenderPassTimingsDto`, `FrameHistoryDto`, `PerfConfigDto`, `profiler.set-mode`, `pass-timings`, `frame-history`, `get-perf-config`, `set-perf-config` |

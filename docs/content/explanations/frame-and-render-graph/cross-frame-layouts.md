@@ -5,17 +5,16 @@ weight = 4
 
 # Cross-frame layouts
 
-A cross-frame layout is the Vulkan image layout a long-lived image rests in between frames. The
-[render graph](../render-graph-overview/) is rebuilt from scratch every frame and remembers nothing
-about the previous one, so each such layout is persisted outside the graph and threaded back in
-through an external-layout slot. Without the seed, the first barrier against the image would claim
-a wrong `old_layout` and the transition would corrupt or over-synchronize.
+A cross-frame image state describes the layout, queue owner, and synchronization scope a long-lived
+image carries between graph instances. The [render graph](../render-graph-overview/) is rebuilt from
+scratch every frame, so this state is persisted outside the graph and threaded back through an
+external-state slot. Without it, the first barrier could use a wrong layout or queue owner.
 
-## Imported, not allocated
+## Images are imported
 
-The graph never allocates a resource. Every target is an existing renderer-owned Vulkan handle
-registered with `import_image` (or `import_buffer`; 3D volumes go through `import_image_3d`),
-which returns an `RgResource` index.
+Every target is a renderer-owned Vulkan handle registered with `import_image`; 3D volumes use
+`import_image_3d`. Buffers have a separate import and graph-allocation path described in the
+[API reference](../../../reference/render-graph-api/).
 
 ```rust
 pub fn import_image(
@@ -40,30 +39,28 @@ the image's owner: a renderer field such as `directional_shadow_layout`, the `la
 target's `Image` (the TAA history), or a subsystem setter (`Ddgi::set_irradiance_layout`,
 `GlobalSdf::set_cascade_layout`).
 
-Each frame the renderer threads that value through the graph. `alloc_external_layout(persisted)`
-reserves a slot and returns its `usize` key; passing `Some(slot)` to `import_image` seeds the
-resource's entry layout from the slot, ignoring the `initial_layout` argument. After every pass has
-run, `execute` writes each resolved layout back:
+Each frame the renderer threads that value through the graph.
+`alloc_external_state(RgExternalState::new(persisted_layout))` reserves a slot. Passing
+`Some(slot)` to `import_image` seeds the resource from it. After the graph records, it writes the
+resolved state back:
 
 ```rust
-for r in &self.resources {
-    if let Some(slot) = r.external_layout {
-        self.external_layouts[slot] = r.layout;
-    }
-}
+let slot = graph.alloc_external_state(RgExternalState::new(persisted_layout));
+let image = graph.import_image(handle, view, aspect, persisted_layout, Some(slot));
+// Declare passes that access `image`, then compile and record the graph.
+let resolved = graph.external_state(slot);
 ```
 
-The renderer then reads `external_layout(slot)` back into the persisted field, closing the loop
-for the next frame's seed. The slot is an index, not a raw pointer, so the write-back stays safe
-even though the graph that allocated it is discarded moments later.
+The renderer reads `external_state(slot)` back into the persisted owner, closing the loop for the
+next frame. The slot is an index, not a raw pointer.
 
 ```mermaid
 flowchart LR
-    A["persisted layout<br/>(renderer field / view image / subsystem)"] -->|alloc_external_layout| B["slot"]
+    A["persisted state<br/>(renderer field / view image / subsystem)"] -->|alloc_external_state| B["slot"]
     B -->|seed on import| C[graph resource state]
     C -->|passes advance the layout| D[resolved exit layout]
-    D -->|write-back after execute| B
-    B -->|external_layout read-back| A
+    D -->|write-back after recording| B
+    B -->|external_state read-back| A
 ```
 
 The shadow maps show why the loop matters. The directional map rests in
@@ -73,7 +70,7 @@ never imports the map at all, and the persisted field keeps the resting value wh
 samples the cached map. `Targets::new` init-transitions both maps to ShaderReadOnly, so the
 constructor seeds the fields to match.
 
-## Seeding the source scope
+## Seeding synchronization and ownership
 
 The entry layout alone is not enough. To order the first barrier against an imported image, the
 graph also needs a source stage and access mask (the
@@ -95,7 +92,8 @@ fn seed_image_state(r: &mut RgResourceState) {
 
 An image that enters as `SHADER_READ_ONLY_OPTIMAL` was last sampled by a fragment shader. The first
 write therefore uses `FRAGMENT_SHADER` / `SHADER_SAMPLED_READ` as its write-after-read source scope.
-That seeded state feeds straight into
+The external state also records the last queue and queue family. A first access on another queue can
+therefore compile a release/acquire pair and timeline wait. That seeded state feeds straight into
 [barrier derivation](../usage-and-barrier-derivation/) as if a prior pass had produced it.
 
 > [!NOTE]
@@ -142,19 +140,19 @@ with that fixed `initial_layout` and `external = None`. After the `ssgi-history`
 General, a barrier-only `ssgi-history-restore` pass declares one final `SampledReadCompute` so the
 graph transitions it back to the resting layout before the frame ends.
 
-Two images bypass the mechanism entirely. The point-shadow cubes manage their layouts inside their
-pass bodies, because six cube faces exceed the graph's single-layer barrier; the renderer tracks
-`targets.point_shadow.layout` directly. The swapchain image never enters the graph at all — the
-present blit is a second submit with explicit barriers.
+The virtual-shadow atlas rests the same way: it imports in ShaderReadOnly, the page passes write it
+as a depth attachment, and the scene pass's declared `SampledRead` returns it to the resting layout.
+The swapchain image never enters the scene graph; the present blit is a separate submission with
+explicit barriers.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Reserve + read a slot | `render_graph.rs` | `RenderGraph::alloc_external_layout`, `external_layout` |
-| Import + entry-layout seed | `render_graph.rs` | `RenderGraph::import_image`, `import_image_3d`, `RgResourceState::external_layout` |
+| Reserve + read a slot | `render_graph.rs` | `RenderGraph::alloc_external_state`, `external_state`, `RgExternalState` |
+| Import + entry-state seed | `render_graph.rs` | `RenderGraph::import_image`, `import_image_3d` |
 | Reconstruct the source scope | `render_graph.rs` | `seed_image_state` |
-| Exit write-back loop | `render_graph.rs` | `RenderGraph::execute_profiled` |
+| Exit write-back loop | `render_graph.rs` | `RenderGraph::record_submission_plan_profiled`, `write_external_states` |
 | Per-frame round-trip in practice | `renderer.rs` | `Renderer::record_scene_graph`, `directional_shadow_layout`, `writeback_history_layout` |
 | Exit-layout consumers | `renderer.rs`, `present.rs` | `Renderer::record_shm_copy`, `record_present_blit` |
 
