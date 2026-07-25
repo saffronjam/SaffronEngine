@@ -2,8 +2,9 @@
 
 use saffron_core::Uuid;
 use saffron_spatial::{
-    DecisionScalar, QuantizedLocalPosition, SignedUnit, SurfaceAttachment, SurfacePrimitiveId,
-    SurfaceProviderId, SurfaceRevision, UnitInterval, WorldBounds, WorldCellKey, WorldPosition,
+    DecisionScalar, QuantizedLocalPosition, QuantizedOrientation, SurfaceAttachment,
+    SurfacePrimitiveId, SurfaceProviderId, SurfaceRevision, UnitInterval, WorldBounds,
+    WorldCellKey, WorldPosition,
 };
 
 use crate::binary::BinaryReader;
@@ -127,54 +128,6 @@ pub fn point_schema_hash() -> [u8; 32] {
         .expect("the fixed point schema fits the SHA-256 message bound")
 }
 
-/// A quantized unit quaternion in canonical XYZW order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct QuantizedOrientation([SignedUnit; 4]);
-
-impl QuantizedOrientation {
-    /// Identity orientation.
-    pub fn identity() -> Self {
-        Self([
-            SignedUnit::from_bits(0).unwrap(),
-            SignedUnit::from_bits(0).unwrap(),
-            SignedUnit::from_bits(0).unwrap(),
-            SignedUnit::from_bits(i16::MAX).unwrap(),
-        ])
-    }
-
-    /// Constructs a non-zero normalized quaternion within quantization tolerance.
-    pub fn new(bits: [i16; 4]) -> Result<Self> {
-        let lanes = bits
-            .map(SignedUnit::from_bits)
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let length_squared: i64 = bits
-            .into_iter()
-            .map(|value| i64::from(value) * i64::from(value))
-            .sum();
-        let unit = i64::from(i16::MAX) * i64::from(i16::MAX);
-        let tolerance = unit / 512;
-        if length_squared.abs_diff(unit) > tolerance as u64 {
-            return Err(Error::PointSchema(
-                "orientation is not a quantized unit quaternion".to_owned(),
-            ));
-        }
-        Ok(Self(lanes.try_into().unwrap()))
-    }
-
-    /// Canonical signed normalized lane bits.
-    #[must_use]
-    pub fn bits(self) -> [i16; 4] {
-        self.0.map(SignedUnit::bits)
-    }
-}
-
-impl Default for QuantizedOrientation {
-    fn default() -> Self {
-        Self::identity()
-    }
-}
-
 /// Authored/runtime flags carried by every macro point.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PlantFlags(u32);
@@ -190,6 +143,9 @@ impl PlantFlags {
     pub const TRANSFORM_OVERRIDE: Self = Self(1 << 3);
     /// A persistent lifecycle/state override is active.
     pub const STATE_OVERRIDE: Self = Self(1 << 4);
+    /// The plant is alight. Vegetation owns the bit and the fuel it burns; a fire system owns heat
+    /// propagation and smoke.
+    pub const IGNITED: Self = Self(1 << 5);
 
     /// Constructs the exact packed bitset, rejecting unknown bits.
     pub fn from_bits(bits: u32) -> Result<Self> {
@@ -197,7 +153,8 @@ impl PlantFlags {
             | PlantFlags::RUNTIME.0
             | PlantFlags::PINNED.0
             | PlantFlags::TRANSFORM_OVERRIDE.0
-            | PlantFlags::STATE_OVERRIDE.0;
+            | PlantFlags::STATE_OVERRIDE.0
+            | PlantFlags::IGNITED.0;
         if bits & !KNOWN != 0 {
             return Err(Error::PointSchema("unknown plant flag bit".to_owned()));
         }
@@ -214,6 +171,18 @@ impl PlantFlags {
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// Returns the flag set without `other`.
+    #[must_use]
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Whether every bit of `other` is set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
     }
 }
 
@@ -1027,15 +996,16 @@ fn push_attachment<S: CanonicalSink>(
 
 #[cfg(test)]
 mod tests {
+    use crate::identity::derive_procedural_plant_id;
     use saffron_spatial::{DecisionScalar, WorldBounds};
 
     use super::*;
-    use crate::{PlantId, ProceduralPlantIdentity};
+    use crate::ProceduralPlantIdentity;
 
     fn point(candidate: u64) -> PlantPoint {
         let position = WorldPosition::from_global_ticks([candidate as i128, 0, 0]).unwrap();
         PlantPoint {
-            id: PlantId::procedural(ProceduralPlantIdentity {
+            id: derive_procedural_plant_id(ProceduralPlantIdentity {
                 map: Uuid(1),
                 layer_guid: 2,
                 node_address: 3,

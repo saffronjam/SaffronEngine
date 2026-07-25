@@ -142,6 +142,17 @@ pub enum VegetationMutation {
         /// Fuel remaining after the event.
         remaining_fuel: UnitInterval,
     },
+    /// Set a plant alight. Vegetation persists that it is burning and keeps its fuel; heat
+    /// propagation and smoke belong to a fire system.
+    Ignite {
+        /// Target plant.
+        plant: PlantId,
+    },
+    /// Put a burning plant out, leaving whatever fuel and damage the fire left behind.
+    Extinguish {
+        /// Target plant.
+        plant: PlantId,
+    },
     /// Clear removal and start a new biological lifecycle for the same stable identity.
     Regrow {
         /// Target plant.
@@ -169,6 +180,85 @@ pub enum VegetationMutation {
         /// Packed signed values.
         values: Vec<i16>,
     },
+}
+
+/// What one committed mutation did to the world, in gameplay terms rather than storage terms.
+///
+/// Scripts, VFX, audio, quests, fire, and navigation all consume the same typed transition, so a
+/// reducer commit is the single place a vegetation change becomes observable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VegetationTransitionKind {
+    /// A plant took damage; `health` is the value it settled at.
+    Damaged {
+        /// Damage applied.
+        amount: UnitInterval,
+        /// Resulting persistent health.
+        health: UnitInterval,
+    },
+    /// A plant was harvested into its harvested phenotype.
+    Harvested {
+        /// Harvested phenotype.
+        phenotype: u32,
+    },
+    /// A plant burned; `remaining_fuel` is what is left to burn.
+    Burned {
+        /// Burned phenotype.
+        phenotype: u32,
+        /// Fuel remaining after the event.
+        remaining_fuel: UnitInterval,
+    },
+    /// A plant was removed from every downstream projection.
+    Removed,
+    /// A plant was added by an authority (a runtime planting or an authored anchor).
+    Planted,
+    /// A removed plant started a new biological lifecycle under the same identity.
+    Regrew {
+        /// Regrown lifecycle state.
+        lifecycle: PlantLifecycle,
+        /// Regrown phenotype.
+        phenotype: u32,
+    },
+    /// A plant's biological lifecycle advanced or was replaced.
+    LifecycleChanged {
+        /// Required prior state when the mutation declared one.
+        from: Option<PlantLifecycle>,
+        /// New lifecycle state.
+        to: PlantLifecycle,
+    },
+    /// A plant was set alight.
+    Ignited,
+    /// A burning plant was put out.
+    Extinguished,
+    /// A plant's persistent water and combustible fuel changed.
+    Wetted {
+        /// Persistent moisture.
+        moisture: UnitInterval,
+        /// Persistent fuel.
+        fuel: UnitInterval,
+    },
+    /// A plant's biological or interaction values were replaced wholesale.
+    StateReplaced,
+    /// A plant's exact transform changed (an authored override, or a promoted view's write-back).
+    Moved,
+    /// A signed disturbance-mask tile changed: trample and crush truth, never cosmetic bend.
+    Disturbed {
+        /// Disturbance class bits.
+        categories: u32,
+    },
+}
+
+/// One typed transition a committed mutation produced, addressed by cell and (where the mutation
+/// names one) by plant. Emitted once per committed record; an idempotent replay emits nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationTransition {
+    /// The transaction that committed it.
+    pub transaction: u128,
+    /// The cell whose persistent state changed.
+    pub cell: WorldCellKey,
+    /// The plant it names, absent for a cell-wide change (a field or disturbance tile).
+    pub plant: Option<PlantId>,
+    /// What happened.
+    pub kind: VegetationTransitionKind,
 }
 
 /// One mutation with its required common metadata.
@@ -225,6 +315,8 @@ pub struct PlantPersistentState {
     pub fuel: Option<UnitInterval>,
     /// Gameplay interaction-policy replacement.
     pub interaction_policy: Option<InteractionPolicy>,
+    /// Whether the plant is alight.
+    pub ignited: bool,
     /// State returned by a promoted simulation representation.
     pub promotion_origin: Option<PromotionOriginState>,
 }
@@ -257,6 +349,9 @@ pub struct VegetationState {
     manifest_identity: [u8; 32],
     cells: BTreeMap<WorldCellKey, VegetationCellState>,
     applied_transactions: BTreeMap<u128, [u8; 32]>,
+    /// How far biology has advanced, under which rule set, with the boundary summaries a
+    /// dependency-region catch-up reads.
+    ecology: crate::EcologyState,
 }
 
 impl VegetationState {
@@ -267,6 +362,7 @@ impl VegetationState {
             manifest_identity,
             cells: BTreeMap::new(),
             applied_transactions: BTreeMap::new(),
+            ecology: crate::EcologyState::new(),
         }
     }
 
@@ -290,12 +386,25 @@ impl VegetationState {
         manifest_identity: [u8; 32],
         cells: BTreeMap<WorldCellKey, VegetationCellState>,
         applied_transactions: BTreeMap<u128, [u8; 32]>,
+        ecology: crate::EcologyState,
     ) -> Self {
         Self {
             manifest_identity,
             cells,
             applied_transactions,
+            ecology,
         }
+    }
+
+    /// The persisted ecology state.
+    #[must_use]
+    pub const fn ecology(&self) -> &crate::EcologyState {
+        &self.ecology
+    }
+
+    /// The persisted ecology state, for the simulation that advances it.
+    pub const fn ecology_mut(&mut self) -> &mut crate::EcologyState {
+        &mut self.ecology
     }
 
     /// Writes the canonical, interruption-detecting snapshot container.
@@ -313,6 +422,8 @@ pub struct MutationReduction {
     pub replayed_transactions: Vec<u128>,
     /// Cells published by newly committed transactions, in canonical order.
     pub changed_cells: Vec<WorldCellKey>,
+    /// Typed transitions the committed records produced, in commit order.
+    pub transitions: Vec<VegetationTransition>,
 }
 
 /// Applies one batch through the only persistent vegetation reducer.
@@ -399,6 +510,11 @@ pub fn reduce_mutations(
         }
         for record in &transaction_records {
             apply_mutation(&mut candidate, record)?;
+            // One transition per committed record, in commit order; a replayed transaction
+            // returns above without reaching this loop, so an exact replay emits nothing.
+            if let Some(transition) = transition_for(&candidate, record) {
+                reduction.transitions.push(transition);
+            }
         }
         for cell in &touched {
             let state = candidate.cells.entry(*cell).or_default();
@@ -538,6 +654,112 @@ fn validate_cell_ownership(record: &VegetationMutationRecord) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// The typed transition a just-applied record produced, read from the record plus the state it
+/// settled at. `None` for a change with no gameplay-visible transition (a quantized field tile is
+/// world truth an adapter re-reads, not an event).
+fn transition_for(
+    state: &VegetationState,
+    record: &VegetationMutationRecord,
+) -> Option<VegetationTransition> {
+    let cell = record.header.cell;
+    let settled = |plant: &PlantId| {
+        state
+            .cells
+            .get(&cell)
+            .and_then(|cell| cell.plants.get(plant))
+    };
+    let (plant, kind) = match &record.mutation {
+        VegetationMutation::FieldTilePatch { .. } => return None,
+        VegetationMutation::AnchorAddition(point) | VegetationMutation::Planting(point) => {
+            (Some(point.id), VegetationTransitionKind::Planted)
+        }
+        VegetationMutation::Tombstone { plant } => {
+            (Some(*plant), VegetationTransitionKind::Removed)
+        }
+        VegetationMutation::TransformOverride { plant, .. }
+        | VegetationMutation::PromotionOriginState { plant, .. } => {
+            (Some(*plant), VegetationTransitionKind::Moved)
+        }
+        VegetationMutation::StateOverride { plant, .. } => {
+            (Some(*plant), VegetationTransitionKind::StateReplaced)
+        }
+        VegetationMutation::Damage { plant, amount, .. } => (
+            Some(*plant),
+            VegetationTransitionKind::Damaged {
+                amount: *amount,
+                health: settled(plant)
+                    .and_then(|state| state.health)
+                    .unwrap_or(UnitInterval::ZERO),
+            },
+        ),
+        VegetationMutation::MoistureFuel {
+            plant,
+            moisture,
+            fuel,
+        } => (
+            Some(*plant),
+            VegetationTransitionKind::Wetted {
+                moisture: *moisture,
+                fuel: *fuel,
+            },
+        ),
+        VegetationMutation::LifecycleTransition {
+            plant, from, to, ..
+        } => (
+            Some(*plant),
+            VegetationTransitionKind::LifecycleChanged {
+                from: *from,
+                to: *to,
+            },
+        ),
+        VegetationMutation::Harvest { plant, phenotype } => (
+            Some(*plant),
+            VegetationTransitionKind::Harvested {
+                phenotype: *phenotype,
+            },
+        ),
+        VegetationMutation::Burn {
+            plant,
+            phenotype,
+            remaining_fuel,
+        } => (
+            Some(*plant),
+            VegetationTransitionKind::Burned {
+                phenotype: *phenotype,
+                remaining_fuel: *remaining_fuel,
+            },
+        ),
+        VegetationMutation::Ignite { plant } => (Some(*plant), VegetationTransitionKind::Ignited),
+        VegetationMutation::Extinguish { plant } => {
+            (Some(*plant), VegetationTransitionKind::Extinguished)
+        }
+        VegetationMutation::Regrow {
+            plant,
+            lifecycle,
+            phenotype,
+            ..
+        } => (
+            Some(*plant),
+            VegetationTransitionKind::Regrew {
+                lifecycle: *lifecycle,
+                phenotype: *phenotype,
+            },
+        ),
+        VegetationMutation::DisturbanceMask { categories, .. } => (
+            None,
+            VegetationTransitionKind::Disturbed {
+                categories: *categories,
+            },
+        ),
+    };
+    Some(VegetationTransition {
+        transaction: record.header.transaction,
+        cell,
+        plant,
+        kind,
+    })
 }
 
 fn apply_mutation(state: &mut VegetationState, record: &VegetationMutationRecord) -> Result<()> {
@@ -699,6 +921,12 @@ fn apply_mutation(state: &mut VegetationState, record: &VegetationMutationRecord
             target.fuel = Some(*remaining_fuel);
             target.health = Some(UnitInterval::ZERO);
             target.lifecycle = Some(PlantLifecycle::Dead);
+        }
+        VegetationMutation::Ignite { plant } => {
+            cell.plants.entry(*plant).or_default().ignited = true;
+        }
+        VegetationMutation::Extinguish { plant } => {
+            cell.plants.entry(*plant).or_default().ignited = false;
         }
         VegetationMutation::Regrow {
             plant,
@@ -899,6 +1127,9 @@ fn push_record(bytes: &mut Vec<u8>, record: &VegetationMutationRecord) -> Result
             bytes.extend_from_slice(&phenotype.to_be_bytes());
             bytes.extend_from_slice(&remaining_fuel.canonical_bytes());
         }
+        VegetationMutation::Ignite { plant } | VegetationMutation::Extinguish { plant } => {
+            bytes.extend_from_slice(&plant.bytes());
+        }
         VegetationMutation::Regrow {
             plant,
             lifecycle,
@@ -946,6 +1177,8 @@ pub(crate) fn mutation_tag(mutation: &VegetationMutation) -> u8 {
         VegetationMutation::Regrow { .. } => 11,
         VegetationMutation::PromotionOriginState { .. } => 12,
         VegetationMutation::DisturbanceMask { .. } => 13,
+        VegetationMutation::Ignite { .. } => 14,
+        VegetationMutation::Extinguish { .. } => 15,
     }
 }
 
@@ -962,6 +1195,8 @@ fn mutation_plant_id(mutation: &VegetationMutation) -> Option<PlantId> {
         | VegetationMutation::LifecycleTransition { plant, .. }
         | VegetationMutation::Harvest { plant, .. }
         | VegetationMutation::Burn { plant, .. }
+        | VegetationMutation::Ignite { plant }
+        | VegetationMutation::Extinguish { plant }
         | VegetationMutation::Regrow { plant, .. }
         | VegetationMutation::PromotionOriginState { plant, .. } => Some(*plant),
         VegetationMutation::FieldTilePatch { .. } | VegetationMutation::DisturbanceMask { .. } => {
@@ -1121,6 +1356,79 @@ mod tests {
             },
             mutation,
         }
+    }
+
+    #[test]
+    fn committed_records_emit_one_typed_transition_and_replays_emit_none() {
+        let manifest = [5; 32];
+        let cell = WorldCellKey::base(1, 0, -2);
+        let id = PlantId::runtime([6; 16]).unwrap();
+        let mut state = VegetationState::new(manifest);
+
+        // Plant it, then damage it, then harvest it: three records in one transaction.
+        let planting = record(cell, 1, 21, VegetationMutation::Planting(point(id, cell)));
+        let damage = record(
+            cell,
+            1,
+            22,
+            VegetationMutation::Damage {
+                plant: id,
+                amount: UnitInterval::from_bits(16_000),
+                phenotype: Some(3),
+            },
+        );
+        let harvest = record(
+            cell,
+            1,
+            23,
+            VegetationMutation::Harvest {
+                plant: id,
+                phenotype: 4,
+            },
+        );
+        let records = [planting, damage, harvest];
+        let reduction = reduce_mutations(&mut state, manifest, &records).unwrap();
+
+        assert_eq!(reduction.committed_transactions, vec![1]);
+        assert_eq!(reduction.transitions.len(), 3, "one per committed record");
+        assert!(
+            reduction
+                .transitions
+                .iter()
+                .all(|transition| transition.cell == cell
+                    && transition.plant == Some(id)
+                    && transition.transaction == 1)
+        );
+        assert_eq!(
+            reduction.transitions[0].kind,
+            VegetationTransitionKind::Planted
+        );
+        // The damage transition reports the health the plant settled at, not just the amount.
+        let VegetationTransitionKind::Damaged { amount, health } = reduction.transitions[1].kind
+        else {
+            panic!(
+                "expected a damage transition, got {:?}",
+                reduction.transitions[1].kind
+            );
+        };
+        assert_eq!(amount, UnitInterval::from_bits(16_000));
+        assert_eq!(
+            health,
+            state.cells()[&cell].plants[&id].health.unwrap(),
+            "the emitted health matches the reduced state"
+        );
+        assert_eq!(
+            reduction.transitions[2].kind,
+            VegetationTransitionKind::Harvested { phenotype: 4 }
+        );
+
+        // An exact replay of the same transaction is idempotent, so it emits nothing.
+        let replay = reduce_mutations(&mut state, manifest, &records).unwrap();
+        assert_eq!(replay.replayed_transactions, vec![1]);
+        assert!(
+            replay.transitions.is_empty(),
+            "a replay must not re-fire events"
+        );
     }
 
     #[test]

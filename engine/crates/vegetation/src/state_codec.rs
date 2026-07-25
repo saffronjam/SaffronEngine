@@ -27,7 +27,7 @@ type PersistenceOrderKey = (u64, u128, u128, ([u8; 25], u8, [u8; 16], u128));
 
 fn state_schema_identity() -> ContentHash {
     ContentHash::of(
-        b"saffron-anima/vegetation-state/schema/v1/manifest+cells+field-tiles+plant-deltas+disturbance-masks+applied-transactions",
+        b"saffron-anima/vegetation-state/schema/v1/manifest+cells+field-tiles+plant-deltas+disturbance-masks+applied-transactions+ecology",
     )
 }
 
@@ -144,6 +144,7 @@ pub(crate) fn encode_state(state: &VegetationState) -> Result<Vec<u8>> {
         payload.u128(*transaction);
         payload.bytes(signature);
     }
+    encode_ecology(&mut payload, state.ecology())?;
     encode_frame(
         STATE_FORMAT,
         STATE_MAGIC,
@@ -196,13 +197,93 @@ fn decode_state(bytes: &[u8], expected_manifest: [u8; 32]) -> Result<VegetationS
         }
         previous_transaction = Some(transaction);
     }
+    let ecology = decode_ecology(&mut reader)?;
     reader.complete()?;
-    let state =
-        VegetationState::from_canonical_parts(manifest_identity, cells, applied_transactions);
+    let state = VegetationState::from_canonical_parts(
+        manifest_identity,
+        cells,
+        applied_transactions,
+        ecology,
+    );
     if encode_state(&state)? != bytes {
         return non_canonical(STATE_FORMAT, "canonicalBytes");
     }
     Ok(state)
+}
+
+/// The ecology section: the rule-set version, the completed tick, and every boundary summary in
+/// canonical cell order. Written after the transactions so the frame stays append-structured.
+fn encode_ecology(writer: &mut BinaryWriter, ecology: &crate::EcologyState) -> Result<()> {
+    writer.u32(ecology.version());
+    writer.u64(ecology.clock().tick());
+    writer.length(ecology.summaries().len())?;
+    for (cell, summary) in ecology.summaries() {
+        writer.cell(*cell);
+        writer.u64(summary.tick);
+        writer.u32(summary.plants);
+        for value in [
+            summary.canopy,
+            summary.roots,
+            summary.health,
+            summary.moisture,
+            summary.fuel,
+        ] {
+            writer.bytes(&value.canonical_bytes());
+        }
+        writer.length(summary.families.len())?;
+        for presence in &summary.families {
+            writer.u64(presence.family);
+            writer.bytes(&presence.canopy.canonical_bytes());
+            writer.bytes(&presence.health.canonical_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn decode_ecology(reader: &mut BinaryReader<'_>) -> Result<crate::EcologyState> {
+    let version = reader.u32()?;
+    let clock = crate::EcologyClock::at(reader.u64()?);
+    let count = reader.count(26)?;
+    let mut summaries = BTreeMap::new();
+    let mut previous = None;
+    for _ in 0..count {
+        let cell = reader.cell()?;
+        let summary = crate::EcologyCellSummary {
+            tick: reader.u64()?,
+            plants: reader.u32()?,
+            canopy: UnitInterval::from_bits(reader.u16()?),
+            roots: UnitInterval::from_bits(reader.u16()?),
+            health: UnitInterval::from_bits(reader.u16()?),
+            moisture: UnitInterval::from_bits(reader.u16()?),
+            fuel: UnitInterval::from_bits(reader.u16()?),
+            families: {
+                let count = reader.count(12)?;
+                let mut families: Vec<crate::EcologyFamilyPresence> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let presence = crate::EcologyFamilyPresence {
+                        family: reader.u64()?,
+                        canopy: UnitInterval::from_bits(reader.u16()?),
+                        health: UnitInterval::from_bits(reader.u16()?),
+                    };
+                    if families
+                        .last()
+                        .is_some_and(|last| last.family >= presence.family)
+                    {
+                        return non_canonical(STATE_FORMAT, "ecology.summaries.families.order");
+                    }
+                    families.push(presence);
+                }
+                families
+            },
+        };
+        if previous.is_some_and(|previous| previous >= cell)
+            || summaries.insert(cell, summary).is_some()
+        {
+            return non_canonical(STATE_FORMAT, "ecology.summaries.order");
+        }
+        previous = Some(cell);
+    }
+    crate::EcologyState::from_parts(version, clock, summaries)
 }
 
 fn encode_cell_state(
@@ -401,6 +482,7 @@ fn encode_plant_state(writer: &mut BinaryWriter, state: &PlantPersistentState) -
     encode_option_unit(writer, state.moisture);
     encode_option_unit(writer, state.fuel);
     encode_option_u32(writer, state.interaction_policy.map(|value| value as u32));
+    writer.bool(state.ignited);
     writer.bool(state.promotion_origin.is_some());
     if let Some(promotion) = state.promotion_origin {
         encode_promotion(writer, promotion);
@@ -431,6 +513,7 @@ fn decode_plant_state(reader: &mut BinaryReader<'_>) -> Result<PlantPersistentSt
     let interaction_policy = decode_option_u32(reader)?
         .map(InteractionPolicy::try_from)
         .transpose()?;
+    let ignited = reader.bool()?;
     let promotion_origin = if reader.bool()? {
         Some(decode_promotion(reader)?)
     } else {
@@ -447,6 +530,7 @@ fn decode_plant_state(reader: &mut BinaryReader<'_>) -> Result<PlantPersistentSt
         moisture,
         fuel,
         interaction_policy,
+        ignited,
         promotion_origin,
     })
 }
@@ -648,6 +732,9 @@ fn encode_record(record: &VegetationMutationRecord) -> Result<Vec<u8>> {
             writer.u32(*phenotype);
             writer.u16(remaining_fuel.bits());
         }
+        VegetationMutation::Ignite { plant } | VegetationMutation::Extinguish { plant } => {
+            encode_plant_id(&mut writer, *plant);
+        }
         VegetationMutation::Regrow {
             plant,
             lifecycle,
@@ -748,6 +835,12 @@ fn decode_record(bytes: &[u8]) -> Result<VegetationMutationRecord> {
             plant: decode_plant_id(&mut reader)?,
             phenotype: reader.u32()?,
             remaining_fuel: UnitInterval::from_bits(reader.u16()?),
+        },
+        14 => VegetationMutation::Ignite {
+            plant: decode_plant_id(&mut reader)?,
+        },
+        15 => VegetationMutation::Extinguish {
+            plant: decode_plant_id(&mut reader)?,
         },
         11 => VegetationMutation::Regrow {
             plant: decode_plant_id(&mut reader)?,
@@ -896,7 +989,7 @@ fn encode_plant_id(writer: &mut BinaryWriter, plant: PlantId) {
 }
 
 fn decode_plant_id(reader: &mut BinaryReader<'_>) -> Result<PlantId> {
-    PlantId::from_bytes(reader.array()?)
+    PlantId::from_bytes(reader.array()?).map_err(|_| Error::InvalidPlantId)
 }
 
 fn encode_position(writer: &mut BinaryWriter, position: WorldPosition) {
@@ -917,12 +1010,12 @@ fn encode_orientation(writer: &mut BinaryWriter, orientation: QuantizedOrientati
 }
 
 fn decode_orientation(reader: &mut BinaryReader<'_>) -> Result<QuantizedOrientation> {
-    QuantizedOrientation::new([
+    Ok(QuantizedOrientation::new([
         reader.u16()? as i16,
         reader.u16()? as i16,
         reader.u16()? as i16,
         reader.u16()? as i16,
-    ])
+    ])?)
 }
 
 fn encode_vec3(writer: &mut BinaryWriter, values: [DecisionScalar; 3]) {
@@ -1196,6 +1289,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.canonical_bytes().unwrap(), state_bytes);
+    }
+
+    /// The ecology clock and its boundary summaries survive a snapshot: a reload resumes biology
+    /// where it stopped instead of restarting it, and the checkpoint identity proves the resumed
+    /// state is the same state.
+    #[test]
+    fn the_ecology_section_round_trips_and_preserves_the_checkpoint_identity() {
+        let manifest = [11_u8; 32];
+        let mut state = VegetationState::new(manifest);
+        let cell_a = WorldCellKey::base(0, 0, 0);
+        let cell_b = WorldCellKey::base(1, 0, -2);
+        state.ecology_mut().advance_world_to(3).unwrap();
+        for tick in 1..=3_u64 {
+            let summaries = [cell_a, cell_b]
+                .into_iter()
+                .map(|cell| {
+                    (
+                        cell,
+                        crate::EcologyCellSummary {
+                            tick,
+                            plants: 5 + tick as u32,
+                            canopy: UnitInterval::from_bits(1_000 * tick as u16),
+                            roots: UnitInterval::from_bits(500 * tick as u16),
+                            health: UnitInterval::ONE,
+                            moisture: UnitInterval::from_bits(30_000),
+                            fuel: UnitInterval::from_bits(40_000),
+                            families: vec![crate::EcologyFamilyPresence {
+                                family: 7,
+                                canopy: UnitInterval::from_bits(1_000 * tick as u16),
+                                health: UnitInterval::ONE,
+                            }],
+                        },
+                    )
+                })
+                .collect();
+            state
+                .ecology_mut()
+                .publish_region_tick(tick, &summaries)
+                .unwrap();
+        }
+        let identity = state.ecology().checkpoint_identity();
+
+        let bytes = state.canonical_bytes().unwrap();
+        let decoded = VegetationState::from_canonical_bytes(&bytes, manifest).unwrap();
+        assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+        assert_eq!(decoded.ecology().clock().tick(), 3);
+        assert_eq!(decoded.ecology().summaries().len(), 2);
+        assert_eq!(decoded.ecology().checkpoint_identity(), identity);
     }
 
     #[test]
