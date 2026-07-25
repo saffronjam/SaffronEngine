@@ -17,7 +17,7 @@
 
 use saffron_assets::{
     BuiltinMesh, builtin_environment_profile, builtin_environment_profiles,
-    load_environment_profile, model_render_aabb, pick_entity, sample_scene_surface_field,
+    load_environment_profile, model_render_aabb, sample_scene_surface_field,
     save_environment_profile, scene_surface_providers, update_environment_profile,
 };
 use saffron_geometry::glam::{Mat4, Vec2, Vec3 as GlamVec3};
@@ -370,10 +370,24 @@ fn validate_wind(settings: &WindSettings) -> Result<(), Error> {
     if !settings.orientation.is_finite() {
         return Err(Error::command("orientation must be finite"));
     }
-    for (name, value) in [("speed", settings.speed), ("gust", settings.gust)] {
+    for (name, value) in [
+        ("speed", settings.speed),
+        ("gust", settings.gust),
+        ("gustFrequency", settings.gust_frequency),
+        ("referenceHeight", settings.reference_height),
+        ("heightExponent", settings.height_exponent),
+    ] {
         if !value.is_finite() || value < 0.0 {
             return Err(Error::command(format!("{name} must be finite and >= 0")));
         }
+    }
+    if settings.turbulence_octaves > 8 {
+        return Err(Error::command("turbulenceOctaves must be 8 or fewer"));
+    }
+    if !settings.turbulence_roughness.is_finite()
+        || !(0.0..=1.0).contains(&settings.turbulence_roughness)
+    {
+        return Err(Error::command("turbulenceRoughness must be within 0..=1"));
     }
     Ok(())
 }
@@ -491,6 +505,12 @@ fn scene_environment_dto(environment: &SceneEnvironment) -> EnvironmentDto {
             orientation: wind.orientation,
             speed: wind.speed,
             gust: wind.gust,
+            turbulence_octaves: wind.turbulence_octaves,
+            turbulence_roughness: wind.turbulence_roughness,
+            gust_frequency: wind.gust_frequency,
+            reference_height: wind.reference_height,
+            height_exponent: wind.height_exponent,
+            seed: wind.seed,
         },
         time_of_day: TimeOfDaySettingsDto {
             enabled: time.enabled,
@@ -1096,20 +1116,23 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     id: Some(r.id),
                     name: Some(r.name),
                     kind: Some(PickKind::Billboard),
+                    plant: None,
+                    position: None,
+                    normal: None,
                 });
             }
 
-            // pick_entity flips proj[1][1] to match the renderer's clip space, so it expects
-            // y-down NDC: v=0 (viewport top) maps to ndc.y=-1.
+            // pick_scene_surface flips proj[1][1] to match the renderer's clip space, so it
+            // expects y-down NDC: v=0 (viewport top) maps to ndc.y=-1.
             let ndc = Vec2::new(u * 2.0 - 1.0, v * 2.0 - 1.0);
             let assets = &mut *ctx.assets;
             let viewport = (width, height);
-            let mut hit_result = Ok(Entity::NULL);
-            // The borrow split: pick_entity needs the upload seam + the active scene + the
-            // asset server at once. The scene is borrowed from scene_edit; take it inside the
-            // upload closure so the renderer borrow does not overlap it.
+            let mut hit_result = Ok(None);
+            // The borrow split: the surface pick needs the upload seam + the active scene +
+            // the asset server at once. The scene is borrowed from scene_edit; take it inside
+            // the upload closure so the renderer borrow does not overlap it.
             ctx.renderer.with_gpu_uploader(&mut |gpu| {
-                hit_result = pick_entity(
+                hit_result = saffron_assets::pick_scene_surface(
                     gpu,
                     viewport,
                     ctx.scene_edit.active_scene(),
@@ -1118,16 +1141,76 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                     ndc,
                 );
             });
-            let hit = hit_result.map_err(|error| Error::command(error.to_string()))?;
-            if hit == Entity::NULL {
-                ctx.scene_edit.set_selection(hit);
+            let surface_hit = hit_result.map_err(|error| Error::command(error.to_string()))?;
+            // The same viewport ray tests the resident macro vegetation; the nearest of the
+            // two vocabularies wins. Plants resolve through the CPU cell snapshot to their
+            // stable identity — never a GPU slot.
+            let pick_ray = saffron_assets::viewport_pick_ray(viewport, &cam, ndc);
+            let plant_hit = ctx
+                .vegetation
+                .as_ref()
+                .zip(pick_ray)
+                .and_then(|(world, ray)| {
+                    world
+                        .query_ray(ray, &saffron_vegetation::VegetationQueryFilter::default())
+                        .ok()?
+                        .into_iter()
+                        .next()
+                })
+                .filter(|plant| {
+                    surface_hit
+                        .as_ref()
+                        .is_none_or(|hit| plant.distance_m < hit.surface.distance_m)
+                });
+            if let Some(nearest) = plant_hit {
+                ctx.scene_edit.set_selection(Entity::NULL);
+                return Ok(PickResult {
+                    hit: true,
+                    id: None,
+                    name: None,
+                    kind: Some(PickKind::Vegetation),
+                    plant: Some(saffron_protocol::PlantId(nearest.plant.plant.to_string())),
+                    position: None,
+                    normal: None,
+                });
+            }
+            // A micro-field ground hit is nonpersistent paint feedback: it never beats
+            // an entity surface or a macro plant, and it carries no identity.
+            let micro_hit = ctx
+                .vegetation
+                .as_ref()
+                .zip(pick_ray)
+                .and_then(|(world, ray)| world.query_micro_ray(ray))
+                .filter(|micro| {
+                    surface_hit
+                        .as_ref()
+                        .is_none_or(|hit| micro.distance_m < hit.surface.distance_m)
+                });
+            if let Some(micro) = micro_hit {
+                ctx.scene_edit.set_selection(Entity::NULL);
+                return Ok(PickResult {
+                    hit: true,
+                    id: None,
+                    name: None,
+                    kind: Some(PickKind::MicroVegetation),
+                    plant: None,
+                    position: Some(micro.position.to_array()),
+                    normal: None,
+                });
+            }
+            let Some(surface) = surface_hit else {
+                ctx.scene_edit.set_selection(Entity::NULL);
                 return Ok(PickResult {
                     hit: false,
                     id: None,
                     name: None,
                     kind: None,
+                    plant: None,
+                    position: None,
+                    normal: None,
                 });
-            }
+            };
+            let hit = surface.entity;
             // A model instance is a single subtree; a click anywhere in it selects the whole
             // model (its container root), not the bare mesh/bone node the ray hit.
             let selected = ctx.scene_edit.active_scene().model_root_of(hit);
@@ -1139,6 +1222,56 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 id: Some(r.id),
                 name: Some(r.name),
                 kind: Some(PickKind::Mesh),
+                plant: None,
+                position: Some(surface.surface.position.world_meters().to_array()),
+                normal: Some(surface.surface.frame.normal.to_array()),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::QuerySurfaceRayParams, saffron_protocol::SurfaceRayResult>(
+        "query-surface-ray",
+        "query-surface-ray {originM, direction, maxDistanceM?} — nearest scene-surface hit",
+        |ctx, params| {
+            let origin = saffron_spatial::WorldPosition::from_global_ticks(
+                params
+                    .origin_m
+                    .map(|meters| (meters * 4096.0).round() as i128),
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let direction = saffron_geometry::glam::DVec3::new(
+                f64::from(params.direction[0]),
+                f64::from(params.direction[1]),
+                f64::from(params.direction[2]),
+            );
+            let ray = saffron_spatial::SurfaceRay::new(
+                origin,
+                direction.normalize_or_zero(),
+                params.max_distance_m.unwrap_or(10_000.0),
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let assets = &mut *ctx.assets;
+            let mut hit_result = Ok(None);
+            ctx.renderer.with_gpu_uploader(&mut |gpu| {
+                hit_result = saffron_assets::query_scene_surface_ray(
+                    gpu,
+                    ctx.scene_edit.active_scene(),
+                    assets,
+                    &ray,
+                );
+            });
+            let hit = hit_result.map_err(|error| Error::command(error.to_string()))?;
+            Ok(match hit {
+                Some(surface) => saffron_protocol::SurfaceRayResult {
+                    hit: true,
+                    position: Some(surface.surface.position.world_meters().to_array()),
+                    normal: Some(surface.surface.frame.normal.to_array()),
+                },
+                None => saffron_protocol::SurfaceRayResult {
+                    hit: false,
+                    position: None,
+                    normal: None,
+                },
             })
         },
     );
@@ -1436,7 +1569,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 .collect::<Vec<_>>();
             let mut project_profiles = ctx
                 .assets
-                .catalog
+                .catalog()
                 .entries
                 .iter()
                 .filter(|entry| entry.asset_type == AssetType::Environment)
@@ -1471,7 +1604,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             .map_err(|error| Error::command(error.to_string()))?;
             let entry = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .ok_or_else(|| Error::command("saved environment profile is not in the catalog"))?;
             Ok(EnvironmentProfileSummaryDto {
@@ -1493,7 +1626,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
                 .map_err(|error| Error::command(error.to_string()))?;
             let entry = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .ok_or_else(|| Error::command("updated environment profile is not in the catalog"))?;
             Ok(EnvironmentProfileSummaryDto {
@@ -1840,7 +1973,7 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
 
     reg.register::<SetWindParams, EnvironmentDto>(
         "set-wind",
-        "set-wind {--json {...} | orientation?, speed?, gust?}",
+        "set-wind {--json {turbulenceOctaves?, turbulenceRoughness?, gustFrequency?, referenceHeight?, heightExponent?, seed?, ...} | orientation?, speed?, gust?}",
         |ctx, params| {
             let mut body = environment_to_json(&ctx.scene_edit.active_scene().environment);
             let mut wind = body.get("wind").cloned().unwrap_or_else(|| json!({}));
@@ -1864,6 +1997,39 @@ pub fn register_scene_commands(reg: &mut CommandRegistry) {
             ctx.scene_edit.active_scene().environment = environment;
             ctx.scene_edit.scene_version += 1;
             Ok(environment_dto(ctx))
+        },
+    );
+
+    reg.register::<saffron_protocol::SampleWindParams, saffron_protocol::SampleWindResult>(
+        "sample-wind",
+        "sample-wind {positionM, timeS?} — the composed wind velocity at a world position",
+        |ctx, params| {
+            for value in params.position_m {
+                if !value.is_finite() {
+                    return Err(Error::command("positionM must be finite"));
+                }
+            }
+            let time = match params.time_s {
+                Some(time) if !time.is_finite() || time < 0.0 => {
+                    return Err(Error::command("timeS must be finite and >= 0"));
+                }
+                Some(time) => time,
+                None => ctx.scene_edit.simulation_time_s,
+            };
+            let scene = ctx.scene_edit.active_scene();
+            let profile = scene.environment.wind.profile();
+            let sources = scene.local_wind_sources();
+            let sampled = saffron_wind::sample_composed(
+                &profile,
+                &sources,
+                saffron_geometry::glam::DVec3::from_array(params.position_m),
+                time,
+            );
+            Ok(saffron_protocol::SampleWindResult {
+                velocity_mps: sampled.velocity.to_array(),
+                gust_front: sampled.gust_front,
+                time_s: time,
+            })
         },
     );
 

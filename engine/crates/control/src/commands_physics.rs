@@ -104,7 +104,7 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                 .list_bodies()
                 .into_iter()
                 .map(|body| PhysicsBodyDto {
-                    entity: Uuid(body.entity.0),
+                    target: body.target.map(target_dto),
                     motion: motion_name(body.motion).to_owned(),
                     active: body.active,
                     position: to_vec3(body.position),
@@ -186,8 +186,8 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
                         ContactKind::End => "end",
                     }
                     .to_owned(),
-                    entity_a: Uuid(event.entity_a.0),
-                    entity_b: Uuid(event.entity_b.0),
+                    target_a: event.target_a.map(target_dto),
+                    target_b: event.target_b.map(target_dto),
                     sensor: event.sensor,
                     point: to_vec3(event.point),
                     normal: to_vec3(event.normal),
@@ -389,10 +389,24 @@ pub fn register_physics_commands(reg: &mut CommandRegistry) {
 fn ray_hit_result(hit: saffron_physics::RayHit) -> RaycastResult {
     RaycastResult {
         hit: hit.hit,
-        entity: Uuid(hit.entity.0),
+        target: hit.target.map(target_dto),
         point: to_vec3(hit.point),
         normal: to_vec3(hit.normal),
         distance: hit.distance,
+    }
+}
+
+/// Maps a physics tagged target onto the wire DTO.
+fn target_dto(target: saffron_physics::WorldHitTarget) -> saffron_protocol::WorldHitTargetDto {
+    match target {
+        saffron_physics::WorldHitTarget::SceneEntity(uuid) => {
+            saffron_protocol::WorldHitTargetDto::SceneEntity { id: Uuid(uuid.0) }
+        }
+        saffron_physics::WorldHitTarget::Vegetation(plant) => {
+            saffron_protocol::WorldHitTargetDto::Vegetation {
+                plant: saffron_protocol::PlantId(plant.canonical_hex()),
+            }
+        }
     }
 }
 
