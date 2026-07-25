@@ -8,14 +8,11 @@
 //! formats actually support. There is one AA state, not three independent toggles that can
 //! contradict (the phase's NO-LEGACY note).
 //!
-//! The motion prepass push + recorder ([`MotionPush`], [`record_motion`]) live here
+//! The motion prepass push ([`MotionPush`]) lives here
 //! too, since the motion vectors are the temporal AA's (and SSGI's) shared dependency.
 
 use ash::vk;
 use saffron_geometry::glam::Mat4;
-
-use crate::draw_list::SceneDrawList;
-use crate::scene_pass::record_batch_submeshes;
 
 /// The screen-space motion-vector target format (rg16f): the per-pixel `prevUv - curUv`
 /// offset TAA / SSGI reproject through.
@@ -316,135 +313,9 @@ pub struct TaaPush {
 
 const _: () = assert!(size_of::<TaaPush>() == 80);
 
-/// Records the coverage-aware motion-vector prepass: bind the material sets + cur/prev camera
-/// viewProj push, then draw every batch's submeshes with both vertex bindings pointing at
-/// the same static stream (so `prevPosition == position` and object motion comes from
-/// `inst.prevModel`). The skinned deform-motion path uses distinct cur/prev deformed
-/// buffers.
-#[allow(clippy::too_many_arguments)]
-pub fn record_motion(
-    raw: &ash::Device,
-    cmd: vk::CommandBuffer,
-    list: &SceneDrawList,
-    motion_pipeline: vk::Pipeline,
-    motion_layout: vk::PipelineLayout,
-    bindless_set: vk::DescriptorSet,
-    instance_set: vk::DescriptorSet,
-    push: &MotionPush,
-    deformed: Option<vk::Buffer>,
-    prev_deformed: Option<vk::Buffer>,
-) {
-    if !list.valid || list.batches.is_empty() {
-        return;
-    }
-    let push_bytes = bytemuck::bytes_of(push);
-    // SAFETY: the ash seam. The PSO/layout/set are valid this frame; the push spans the
-    // declared two-mat4 vertex range.
-    unsafe {
-        raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, motion_pipeline);
-        raw.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            motion_layout,
-            0,
-            &[bindless_set],
-            &[],
-        );
-        raw.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            motion_layout,
-            2,
-            &[instance_set],
-            &[],
-        );
-        raw.cmd_push_constants(
-            cmd,
-            motion_layout,
-            vk::ShaderStageFlags::VERTEX,
-            0,
-            push_bytes,
-        );
-    }
-    for batch in &list.batches {
-        // A tessellated batch binds its amplified transient VB as the current position stream and its
-        // double-buffered prev micro-vertex VB as the previous stream (the emit kernel wrote the latter
-        // with last frame's per-edge factors, so the geomorph slide reprojects), plus its generated index
-        // stream; `record_batch_submeshes` then takes the shared indirect branch.
-        let (cur, prev, index_buffer) = if let Some(t) = &batch.tessellated {
-            (t.vertex_buffer, t.prev_vertex_buffer, t.index_buffer)
-        } else {
-            let (cur, prev) = select_motion_streams(
-                batch.deformed,
-                deformed,
-                prev_deformed,
-                batch.mesh.vertex_buffer(),
-            );
-            (cur, prev, batch.mesh.index_buffer())
-        };
-        // SAFETY: the ash seam. The bound streams outlive the recorded command (pinned by
-        // the batch `Arc` / the frame's `Skinning` / `RenderGraphResources`); the index buffer + draw
-        // cover the batch.
-        unsafe {
-            raw.cmd_bind_vertex_buffers(cmd, 0, &[cur, prev], &[0, 0]);
-            raw.cmd_bind_index_buffer(cmd, index_buffer, 0, vk::IndexType::UINT32);
-        }
-        record_batch_submeshes(raw, cmd, batch, None);
-    }
-}
-
-/// Selects the motion pass's (current, previous) position streams for one batch. Binding 0
-/// is this frame's position, binding 1 the previous frame's. A deforming batch (skin or
-/// morph) with both deformed buffers present reads the current + prev deformed buffers; every
-/// other batch binds the same static stream to both (prev == cur, so motion comes purely from
-/// `prev_model`). A morph-only batch (`deformed == true`) takes the first arm exactly like a
-/// skinned batch — only the buffers the host wired differ.
-fn select_motion_streams(
-    deformed_flag: bool,
-    deformed: Option<vk::Buffer>,
-    prev_deformed: Option<vk::Buffer>,
-    static_buffer: vk::Buffer,
-) -> (vk::Buffer, vk::Buffer) {
-    match (deformed_flag, deformed, prev_deformed) {
-        (true, Some(deformed), Some(prev_deformed)) => (deformed, prev_deformed),
-        _ => (static_buffer, static_buffer),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A deforming batch (skin or morph) with both deformed buffers present binds the current
-    /// and previous deformed streams to motion bindings 0/1; a static batch — or a deforming
-    /// batch missing a deformed buffer — binds the static stream to both. A morph-only batch
-    /// with `deformed == true` takes the deforming arm exactly like a skinned batch.
-    #[test]
-    fn select_motion_streams_keys_on_the_deform_flag() {
-        use ash::vk::Handle;
-        let static_buf = vk::Buffer::from_raw(0x5747);
-        let deformed = vk::Buffer::from_raw(0xDEF0);
-        let prev = vk::Buffer::from_raw(0xDEF1);
-
-        // Morph-only / skinned: both deformed buffers present → cur + prev deformed.
-        assert_eq!(
-            select_motion_streams(true, Some(deformed), Some(prev), static_buf),
-            (deformed, prev),
-            "a deforming batch binds the current + prev deformed buffers"
-        );
-        // Static batch: the static stream on both bindings.
-        assert_eq!(
-            select_motion_streams(false, Some(deformed), Some(prev), static_buf),
-            (static_buf, static_buf),
-            "a static batch binds the static stream to both"
-        );
-        // Deforming batch but the deformed buffers were never grown this frame → static.
-        assert_eq!(
-            select_motion_streams(true, None, None, static_buf),
-            (static_buf, static_buf),
-            "a deforming batch with no deformed buffers falls back to the static stream"
-        );
-    }
 
     /// `clamp_sample_count` returns the largest supported count ≤ requested, `TYPE_1` when
     /// none. Pure logic, runs on any host.

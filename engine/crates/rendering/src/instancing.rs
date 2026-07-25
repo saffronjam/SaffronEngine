@@ -1,26 +1,13 @@
-//! The per-frame instance + material storage buffers and the draw-list batcher.
+//! The per-frame instance set (set 2) storage and the deformation gather/wiring.
 //!
-//! [`Instancing`] owns, per frame-in-flight, one instance SSBO (set 2, binding 0) and
-//! one deduplicated material SSBO (set 2, binding 2), each grown on demand to the next
-//! power of two and never shrunk, plus the descriptor set that binds them.
-//! [`Instancing::submit_draw_list`] resolves each [`DrawItem`]'s material to a cached
-//! PSO, buckets by (pipeline, mesh) into instanced draws, deduplicates the material
-//! table by raw bytes, uploads both SSBOs, and returns the [`SceneDrawList`] +
-//! [`RenderStats`].
-//!
-//! The current joint palette is uploaded to set 2,
-//! binding 1; the prev-joint palette feeds the prev skin dispatch directly (it is not
-//! bound). The deformed buffers + dispatch pool live in [`crate::skinning::Skinning`].
-//!
-//! # The submesh-major instance layout (load-bearing)
-//!
-//! A bucket's instance rows are flattened *submesh-major*: every instance's submesh-`s`
-//! row is laid contiguously, so a submesh draws all instances at once by offsetting
-//! `firstInstance` by `base_instance + s * instance_count`. The vertex shader reads
-//! `instances[SV_VulkanInstanceID]`, and Vulkan's instance id includes `firstInstance`,
-//! so this is exactly the row each draw fetches.
-
-use std::collections::{HashMap, HashSet};
+//! [`Instancing`] owns, per frame-in-flight, the instance descriptor set: the
+//! tessellation seam's instance rows (binding 0), the joint palette (binding 1), the
+//! global material-parameter arena (binding 2, rebound by the renderer each frame),
+//! the GPU-scene address block (binding 3), and the frame's semantic record stream
+//! (binding 4). [`gather_instance_deformation`] collects each deforming instance's
+//! skin/morph/tessellation work; [`Instancing::wire_gathered_deformations`] uploads
+//! the palettes and wires the dispatches onto the frame's [`SceneDrawList`]. The
+//! deformed buffers + dispatch pool live in [`crate::skinning::Skinning`].
 
 use ash::vk;
 use saffron_core::{BlendMode, HeightMode};
@@ -28,12 +15,10 @@ use saffron_geometry::glam::{Mat4, UVec4, Vec4};
 
 use crate::descriptors::Descriptors;
 use crate::draw_list::{
-    DeformedRtInstance, DrawBatch, DrawItem, MorphDispatch, RenderStats, SceneDrawList,
-    SkinDispatch, SubmeshMaterial,
+    DeformedRtInstance, MorphDispatch, SceneDrawList, SkinDispatch, SubmeshMaterial,
 };
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
-use crate::gpu_types::{InstanceData, Material, MaterialParamsData};
-use crate::pipelines::Pipelines;
+use crate::gpu_types::{InstanceData, MaterialParamsData};
 use crate::resources::{Buffer, DeviceResources, GpuMesh};
 use crate::skinning::{SkinBucket, SkinBufferSet, Skinning, clamp_to_set_budget};
 use crate::tessellation::{TESS_MAX_INSTANCES, TessBucket};
@@ -41,40 +26,8 @@ use crate::{Device, Result};
 
 use std::sync::Arc;
 
-/// The per-frame policy inputs to [`Instancing::submit_draw_list`]: the camera
-/// transform plus the renderer-state flags that shape the instance rows (the wireframe
-/// PSO permutation, the default bindless slot used for an absent texture).
-#[derive(Debug, Clone, Copy)]
-pub struct DrawListInputs {
-    /// The frame slot keying the per-frame SSBOs.
-    pub frame: usize,
-    /// The camera view-projection (the per-frame vertex push constant).
-    pub view_proj: Mat4,
-    /// Wireframe view mode — selects the wireframe PSO permutation per draw.
-    pub wireframe: bool,
-    /// The default white bindless slot used for any absent material texture.
-    pub default_texture_index: u32,
-    /// Deterministic TAA coverage phase shared by every geometry pass this frame.
-    pub coverage_temporal_phase: u32,
-    /// Whether an RT consumer is armed this frame — gates building the skinned RT-instance
-    /// list (a non-RT scene pays nothing).
-    pub rt_skinned: bool,
-    /// Whether the GPU displacement path runs. Off leaves displacement-enabled meshes at their base
-    /// geometry (no tessellation prep gathered, so no amplified transient geometry to draw).
-    pub displace_enabled: bool,
-    /// The tessellation-quality budget applied to each displaced instance's [`TessBucket`]: the hard
-    /// dice cap, the minimum per-edge factor, and the target screen-space edge length. Runtime-tunable
-    /// via the `set-tessellation-quality` control command; defaults to the `TESS_DEFAULT_*` consts.
-    pub tess_factor_cap: f32,
-    pub tess_min_factor: f32,
-    pub tess_edge_length_target: f32,
-}
-
 /// Initial instance-buffer capacity (in [`InstanceData`] elements).
 const INITIAL_INSTANCE_CAPACITY: u32 = 256;
-
-/// Initial material-buffer capacity (in [`MaterialParamsData`] entries).
-const INITIAL_MATERIAL_CAPACITY: u32 = 64;
 
 /// Initial joint-palette capacity (in [`Mat4`] matrices).
 const INITIAL_JOINT_CAPACITY: u32 = 128;
@@ -91,7 +44,7 @@ const MORPH_WEIGHT_THRESHOLD: f32 = 1.0e-3;
 /// targets (the flat scatter base), and the resolved weight.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct ActiveTarget {
+pub struct ActiveTarget {
     target_index: u32,
     scatter_base: u32,
     weight: f32,
@@ -105,8 +58,6 @@ struct FrameInstancing {
     set: vk::DescriptorSet,
     instances: Option<Buffer>,
     instance_capacity: u32,
-    materials: Option<Buffer>,
-    material_capacity: u32,
     /// The current joint palette (set 2, binding 1): `worldBone * inverseBind` per joint.
     joints: Option<Buffer>,
     joint_capacity: u32,
@@ -124,17 +75,216 @@ struct FrameInstancing {
 /// The per-frame instance + material storage and the draw-list batcher.
 ///
 /// Built once in [`Instancing::new`] (it allocates one instance set per frame slot),
-/// then mutated only through [`Instancing::submit_draw_list`] taking `&mut self` plus
-/// the device / descriptors / pipelines. Each [`Buffer`] is a [`crate::Buffer`] Drop
-/// type holding the allocator `Arc`, so the SSBOs free without a live `&Device`.
+/// then mutated only through the deformation wiring + tess-row uploads taking
+/// `&mut self` plus the device / descriptors. Each [`Buffer`] is a [`crate::Buffer`]
+/// Drop type holding the allocator `Arc`, so the SSBOs free without a live `&Device`.
 pub struct Instancing {
     resources: Arc<DeviceResources>,
     frames: Vec<FrameInstancing>,
 }
 
+/// One deforming instance's frame facts, independent of any draw list: the inputs the
+/// skin/morph/tessellation wiring needs (animation evaluation stays CPU simulation).
+pub struct DeformationWork {
+    /// The mesh supplying static + skin/morph streams.
+    pub mesh: Arc<GpuMesh>,
+    /// Source entity id (0 = none), keying the cross-frame motion caches.
+    pub entity: u64,
+    /// Whether the instance skins (the mesh must carry a skin stream).
+    pub skinned: bool,
+    /// The base of this instance's joints in the frame palette.
+    pub joint_offset: u32,
+    /// This instance's joint count.
+    pub joint_count: u32,
+    /// Morph weights (empty = not a morph instance).
+    pub morph_weights: Vec<f32>,
+    /// The instance's world matrix.
+    pub model: Mat4,
+    /// Displacement-tessellation facts when the instance displaces.
+    pub displace: Option<DisplaceInfo>,
+    /// The shared PSO base (shader + unlit) for the instance's tess-seam draw.
+    /// Meaningful only when [`DeformationWork::displace`] is set.
+    pub material: crate::Material,
+    /// The resolved submesh materials the tess-seam instance row packs. Empty unless
+    /// the instance displaces.
+    pub submesh_materials: Vec<SubmeshMaterial>,
+    /// The global material-parameter arena index of the instance's slot-0 material
+    /// (the mesh fragments index the arena at set 2, binding 2). Meaningful only for
+    /// a displacing instance's tess-seam row.
+    pub parameter_index: u32,
+}
+
+/// The frame's gathered deformation outputs, shared by the draw-list batcher and the
+/// record-driven frame driver.
+#[derive(Default)]
+pub struct DeformationGather {
+    /// Per skinned instance: the palette + deformed-slice wiring.
+    pub skin_buckets: Vec<SkinBucket>,
+    /// Per skinned instance: the provider-params patch facts.
+    pub skinned_deformations: Vec<crate::SkinnedDeformation>,
+    /// Skinned TLAS refit entries.
+    pub skinned_rt: Vec<DeformedRtInstance>,
+    /// Morph deform dispatches (before skin).
+    pub morph_dispatches: Vec<MorphDispatch>,
+    /// Previous-pose morph dispatches (deformation motion).
+    pub prev_morph_dispatches: Vec<MorphDispatch>,
+    /// The morph dispatches' meshes, parallel.
+    pub morph_meshes: Vec<Arc<GpuMesh>>,
+    /// The frame's concatenated active-target list.
+    pub active_targets: Vec<ActiveTarget>,
+    /// Unskinned-morph TLAS entries.
+    pub morph_rt: Vec<DeformedRtInstance>,
+    /// Adaptive-tessellation prep buckets.
+    pub tess_buckets: Vec<TessBucket>,
+    /// Displaced-instance TLAS entries.
+    pub displaced_rt: Vec<DeformedRtInstance>,
+    /// The running deformed-ring cursor (vertices).
+    pub deformed_cursor: u32,
+}
+
+/// Tessellation shape parameters for one frame's gather.
+#[derive(Clone, Copy)]
+pub struct TessGatherParams {
+    /// Whether RT consumers track deformed instances this frame.
+    pub rt_skinned: bool,
+    /// The clamp on per-edge tessellation factors.
+    pub factor_cap: f32,
+    /// The minimum per-edge factor.
+    pub min_factor: f32,
+    /// The screen-space edge-length target (pixels).
+    pub edge_length_target: f32,
+}
+
+/// Gathers one deforming instance's skin/morph/tess work into `gather`, advancing the
+/// deformed cursor exactly as the draw-list batcher does. Returns the instance's
+/// deformed-ring base vertex, or `None` when it claims no slice (not skinned and no
+/// above-threshold morph targets). `base_instance` pairs a tessellation bucket with its
+/// draw batch mid-render.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_instance_deformation(
+    gather: &mut DeformationGather,
+    skinning: &mut Skinning,
+    work: &DeformationWork,
+    joints: &[Mat4],
+    prev_joints: &mut [Mat4],
+    params: TessGatherParams,
+    base_instance: u32,
+) -> Option<u32> {
+    let (morph_active, scatter_count) = match work.mesh.morph() {
+        Some(morph) if !work.morph_weights.is_empty() => {
+            build_active_targets(morph, &work.morph_weights)
+        }
+        _ => (Vec::new(), 0),
+    };
+    let has_morph = !morph_active.is_empty();
+    let deformed = work.skinned || has_morph;
+    let deformed_vertex_offset = deformed.then_some(gather.deformed_cursor);
+    if deformed {
+        let vertex_count = work.mesh.vertex_count;
+        if work.skinned {
+            gather.skin_buckets.push(SkinBucket {
+                mesh: Arc::clone(&work.mesh),
+                joint_offset: work.joint_offset,
+                deformed_offset: gather.deformed_cursor,
+            });
+            gather.skinned_deformations.push(crate::SkinnedDeformation {
+                entity: work.entity,
+                joint_offset: work.joint_offset,
+                joint_count: work.joint_count,
+                deformed_offset: gather.deformed_cursor,
+                vertex_count,
+            });
+            gather.skinned_rt.push(DeformedRtInstance {
+                entity: if params.rt_skinned { work.entity } else { 0 },
+                deformed_offset: gather.deformed_cursor,
+                vertex_count,
+                index_count: work.mesh.index_count,
+                mesh: Arc::clone(&work.mesh),
+                world_transform: Mat4::IDENTITY,
+                tess: None,
+            });
+            let lo = work.joint_offset as usize;
+            let hi = lo + work.joint_count as usize;
+            if work.entity != 0 && work.joint_count > 0 && hi <= joints.len() {
+                let cached = skinning.swap_palette(work.entity, &joints[lo..hi]);
+                prev_joints[lo..hi].copy_from_slice(&cached);
+            }
+        }
+        if has_morph {
+            let active_base = gather.active_targets.len() as u32;
+            let active_count = morph_active.len() as u32;
+            gather.active_targets.extend_from_slice(&morph_active);
+            gather.morph_dispatches.push(MorphDispatch {
+                set: vk::DescriptorSet::null(),
+                vertex_count,
+                scatter_count,
+                active_count,
+                active_base,
+                deformed_offset: gather.deformed_cursor,
+            });
+            let prev_weights = skinning.swap_morph_weights(work.entity, &work.morph_weights);
+            let (prev_active, prev_scatter) = match work.mesh.morph() {
+                Some(morph) => build_active_targets(morph, &prev_weights),
+                None => (Vec::new(), 0),
+            };
+            let prev_active_base = gather.active_targets.len() as u32;
+            let prev_active_count = prev_active.len() as u32;
+            gather.active_targets.extend_from_slice(&prev_active);
+            gather.prev_morph_dispatches.push(MorphDispatch {
+                set: vk::DescriptorSet::null(),
+                vertex_count,
+                scatter_count: prev_scatter,
+                active_count: prev_active_count,
+                active_base: prev_active_base,
+                deformed_offset: gather.deformed_cursor,
+            });
+            gather.morph_meshes.push(Arc::clone(&work.mesh));
+            if !work.skinned {
+                gather.morph_rt.push(DeformedRtInstance {
+                    entity: if params.rt_skinned { work.entity } else { 0 },
+                    deformed_offset: gather.deformed_cursor,
+                    vertex_count,
+                    index_count: work.mesh.index_count,
+                    mesh: Arc::clone(&work.mesh),
+                    world_transform: work.model,
+                    tess: None,
+                });
+            }
+        }
+        gather.deformed_cursor += vertex_count;
+    }
+    if let Some(info) = work.displace {
+        if work.mesh.conditioning().is_some() {
+            gather.tess_buckets.push(TessBucket {
+                mesh: Arc::clone(&work.mesh),
+                base_instance,
+                entity: if params.rt_skinned { work.entity } else { 0 },
+                model: work.model,
+                height_index: info.height_index,
+                height_scale: info.height_scale,
+                uv_transform: info.uv_transform,
+                vector_index: info.vector_index,
+                factor_cap: params.factor_cap,
+                min_factor: params.min_factor,
+                edge_length_target: params.edge_length_target,
+            });
+        }
+        gather.displaced_rt.push(DeformedRtInstance {
+            entity: if params.rt_skinned { work.entity } else { 0 },
+            deformed_offset: 0,
+            vertex_count: work.mesh.vertex_count,
+            index_count: work.mesh.index_count,
+            mesh: Arc::clone(&work.mesh),
+            world_transform: work.model,
+            tess: None,
+        });
+    }
+    deformed_vertex_offset
+}
+
 impl Instancing {
     /// Allocates one instance descriptor set per frame-in-flight from the shared pool.
-    /// The SSBOs are created lazily on the first [`Instancing::submit_draw_list`] that
+    /// The SSBOs are created lazily on the first frame upload that
     /// needs them (the buffers start null and grow on demand).
     ///
     /// # Errors
@@ -148,8 +298,6 @@ impl Instancing {
                 set,
                 instances: None,
                 instance_capacity: 0,
-                materials: None,
-                material_capacity: 0,
                 joints: None,
                 joint_capacity: 0,
                 prev_joints: None,
@@ -170,417 +318,87 @@ impl Instancing {
         self.frames[frame].set
     }
 
-    /// Builds the frame's [`SceneDrawList`] from `items` + the `joints` palette: bucket by
-    /// (pipeline, mesh), flatten submesh-major into the instance SSBO, deduplicate the
-    /// material table, upload the SSBOs + the current/previous joint palettes, and — for
-    /// skinned buckets — size the deformed buffers and wire the per-instance skin
-    /// dispatches through `skinning`. Returns the list + the [`RenderStats`].
-    ///
-    /// `joints` is the concatenated `worldBone * inverseBind` palette every skinned item
-    /// indexes by its `joint_offset`; an unskinned scene passes an empty slice.
-    /// An empty `items` (or one that resolves to no drawable instances) returns an
-    /// invalid (`valid == false`) list and zeroed stats — the scene pass records nothing.
+    /// Uploads the tessellation seam's per-instance rows: row `i` serves the frame's
+    /// displaced instance `i` (its tess bucket's `base_instance`), packing the slot-0
+    /// material (the amplified draw covers the whole mesh as one indirect draw) and
+    /// pinning its textures into `list.live_textures`.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Vk`] if growing/rewriting an SSBO or deformed buffer fails.
+    /// Returns [`crate::Error`] when the instance or material SSBO fails to grow.
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_draw_list(
+    pub fn upload_tess_instance_rows(
         &mut self,
         descriptors: &Descriptors,
-        pipelines: &mut Pipelines,
         skinning: &mut Skinning,
-        items: &[DrawItem],
-        joints: &[Mat4],
-        inputs: DrawListInputs,
-    ) -> Result<(SceneDrawList, RenderStats)> {
-        let DrawListInputs {
-            frame,
-            view_proj,
-            wireframe,
-            default_texture_index,
-            coverage_temporal_phase,
-            rt_skinned,
-            displace_enabled,
-            tess_factor_cap,
-            tess_min_factor,
-            tess_edge_length_target,
-        } = inputs;
-        let pipelines_before = pipelines.pipelines_created();
-        let mut list = SceneDrawList {
-            view_proj,
-            ..SceneDrawList::default()
-        };
-        if items.is_empty() {
-            return Ok((list, RenderStats::default()));
+        frame: usize,
+        rows: &[(u64, Mat4, &[SubmeshMaterial], u32)],
+        default_texture_index: u32,
+        coverage_temporal_phase: u32,
+        list: &mut SceneDrawList,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
         }
-
-        let mut buckets: Vec<Bucket> = Vec::new();
-        let mut live_textures: Vec<Arc<crate::GpuTexture>> = Vec::new();
-        let mut material_table: Vec<MaterialParamsData> = Vec::new();
-        let mut material_dedup: HashMap<MaterialParamsData, u32> = HashMap::new();
-
-        for item in items {
-            // A skinned draw needs the mesh's skin stream; without it the draw is dropped.
-            if item.skinned && item.mesh.skin_buffer().is_none() {
-                continue;
-            }
-
-            // A morph item carries per-target weights and a mesh with morph buffers; it
-            // deforms into its own slice (before skin), so it never merges either.
-            let is_morph = !item.morph_weights.is_empty() && item.mesh.morph().is_some();
-
-            // A displacement-enabled item rides the adaptive-tessellation path (amplified transient
-            // geometry), so — like skin/morph — it never merges. Gated off leaves it as base geometry.
-            let displace = if displace_enabled {
-                displace_info_for(item)
-            } else {
-                None
-            };
-
-            // The per-submesh blend pattern (drives the per-submesh PSO + routing at emit). A
-            // bucket with any translucent submesh is drawn sorted back-to-front, so it never
-            // merges — each keeps its own lone-instance depth key.
-            let blend_modes = submesh_blend_modes(item);
-            let has_blend = blend_modes.contains(&BlendMode::Blend);
-
-            // Find an existing (mesh, base material, blend pattern) bucket; a deforming item
-            // (skinned or morph) or a blend-carrying item never merges (each keeps its own slice /
-            // depth order). PSO is resolved per submesh at emit, so the merge key is the base
-            // material (shader + unlit) plus the whole blend pattern, not a single pipeline.
-            let bucket_index = if item.skinned || is_morph || has_blend || displace.is_some() {
-                None
-            } else {
-                buckets.iter().position(|b| {
-                    !b.skinned
-                        && b.morph_weights.is_empty()
-                        && b.displace.is_none()
-                        && !b.blend_modes.contains(&BlendMode::Blend)
-                        && Arc::ptr_eq(&b.mesh, &item.mesh)
-                        && b.material.shader == item.material.shader
-                        && b.material.unlit == item.material.unlit
-                        && b.blend_modes == blend_modes
-                })
-            };
-            let bucket_index = match bucket_index {
-                Some(index) => index,
-                None => {
-                    buckets.push(Bucket {
-                        mesh: Arc::clone(&item.mesh),
-                        material: item.material.clone(),
-                        blend_modes,
-                        skinned: item.skinned,
-                        joint_offset: item.joint_offset,
-                        joint_count: item.joint_count,
-                        entity: item.entity,
-                        morph_weights: if is_morph {
-                            item.morph_weights.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        model: item.model,
-                        submesh_cull: submesh_cull_for(item),
-                        displace,
-                        instances: Vec::new(),
-                    });
-                    buckets.len() - 1
-                }
-            };
-
-            // This frame's previous model: the entity's cached last-frame world matrix, or
-            // the current one when new/uncached (no object-motion ghost on frame 1).
-            let prev_model = if item.entity != 0 {
-                let prev = skinning.prev_model(item.entity).unwrap_or(item.model);
-                skinning.commit_model(item.entity, item.model);
+        let mut data: Vec<InstanceData> = Vec::with_capacity(rows.len());
+        for (entity, model, materials, parameter_index) in rows {
+            // This frame's previous model: the entity's cached last-frame world
+            // matrix, or the current one when new/uncached (no ghost on frame 1).
+            let prev_model = if *entity != 0 {
+                let prev = skinning.prev_model(*entity).unwrap_or(*model);
+                skinning.commit_model(*entity, *model);
                 prev
             } else {
-                item.model
+                *model
             };
-
-            let rows = build_instance_rows(
-                item,
-                prev_model,
+            let material = materials
+                .first()
+                .cloned()
+                .unwrap_or_else(SubmeshMaterial::defaults);
+            let (_, albedo_index, mr_index) = resolve_material_params(
+                &material,
                 default_texture_index,
                 coverage_temporal_phase,
-                &mut material_table,
-                &mut material_dedup,
-                &mut live_textures,
+                &mut list.live_textures,
             );
-            buckets[bucket_index].instances.push(rows);
+            data.push(InstanceData {
+                model: *model,
+                normal_matrix: crate::normal_matrix(*model),
+                prev_model,
+                base_color: material.base_color,
+                // .w indexes the global material-parameter arena (set 2, binding 2).
+                texture: UVec4::new(albedo_index, 0, mr_index, *parameter_index),
+                pbr: Vec4::new(material.metallic, material.roughness, 0.0, 0.0),
+                emissive: (material.emissive * material.emissive_strength).extend(0.0),
+            });
         }
-
-        // Flatten submesh-major: lay every instance's submesh-`s` row contiguously, so a
-        // submesh draws all instances at once by offsetting `firstInstance`. Skinned
-        // buckets carry instance_count == 1 + a deformed-buffer base vertex; the running
-        // cursor concatenates each skinned instance's full vertex array.
-        let mut instances: Vec<InstanceData> = Vec::new();
-        let mut batches: Vec<DrawBatch> = Vec::new();
-        // Translucent batches paired with their back-to-front depth key (clip-space `w`, larger
-        // = farther); sorted farthest-first after the loop into `list.transparent_batches`.
-        let mut transparent: Vec<(f32, DrawBatch)> = Vec::new();
-        let mut skin_buckets: Vec<SkinBucket> = Vec::new();
-        let mut skinned_rt: Vec<DeformedRtInstance> = Vec::new();
-        // The displaced instances' TLAS entries (mesh-local displaced geometry). Their `tess` slice is
-        // filled mid-render by `record_tess_prep` from the amplified transient buffers.
-        let mut displaced_rt: Vec<DeformedRtInstance> = Vec::new();
-        // The adaptive-tessellation prep work: one bucket per displaced instance, carrying its base
-        // mesh (+ Phase-2 conditioning) and world transform for the factor/scan/finalize passes the
-        // deform scope records. The amplified geometry it emits is what every raster + RT consumer
-        // reads for a displaced mesh.
-        let mut tess_buckets: Vec<TessBucket> = Vec::new();
-        // The morph deform work: one cur + one prev dispatch + mesh per morph-active bucket,
-        // and the frame's concatenated active-target list (each dispatch reads its
-        // `active_base` slice — cur and prev both index the same buffer, differing only in
-        // the output buffer their set binds). The morph pass runs before skin.
-        let mut morph_dispatches: Vec<MorphDispatch> = Vec::new();
-        let mut prev_morph_dispatches: Vec<MorphDispatch> = Vec::new();
-        let mut morph_meshes: Vec<Arc<GpuMesh>> = Vec::new();
-        let mut active_targets: Vec<ActiveTarget> = Vec::new();
-        // RT instances for unskinned-morph buckets (skinned ones ride `skinned_rt`, wired +
-        // budget-clamped in `wire_skin_dispatches`); appended to the draw list after wiring.
-        let mut morph_rt: Vec<DeformedRtInstance> = Vec::new();
-        // The previous palette, laid out exactly like `joints`: a copy of the current
-        // palette (uncached slots → zero deformation motion), each skinned bucket's slice
-        // replaced by the entity's cached last-frame slice.
-        let mut prev_joints: Vec<Mat4> = joints.to_vec();
-        let mut deformed_cursor: u32 = 0;
-        for bucket in &buckets {
-            if bucket.instances.is_empty() {
-                continue;
-            }
-            let submesh_count = bucket.instances[0].len() as u32;
-            // A morph bucket's above-threshold targets (empty if all-rest or not a morph
-            // bucket); a bucket deforms when it is skinned OR has active morph targets.
-            let (morph_active, scatter_count) = match bucket.mesh.morph() {
-                Some(morph) if !bucket.morph_weights.is_empty() => {
-                    build_active_targets(morph, &bucket.morph_weights)
-                }
-                _ => (Vec::new(), 0),
-            };
-            let has_morph = !morph_active.is_empty();
-            // The deformed ring is skin/morph only; a displaced mesh rides the transient
-            // tessellation buffers instead (gathered below, outside this gate).
-            let deformed = bucket.skinned || has_morph;
-
-            let base_instance = instances.len() as u32;
-            let instance_count = bucket.instances.len() as u32;
-            let deformed_vertex_offset = if deformed { deformed_cursor } else { 0 };
-            if deformed {
-                let vertex_count = bucket.mesh.vertex_count;
-                if bucket.skinned {
-                    skin_buckets.push(SkinBucket {
-                        mesh: Arc::clone(&bucket.mesh),
-                        joint_offset: bucket.joint_offset,
-                        deformed_offset: deformed_cursor,
-                    });
-                    // The refit BLAS reads exactly this instance's deformed slice; it needs
-                    // an entity to key the grow-only per-instance BLAS. A placeholder
-                    // (entity 0) keeps parity with the dispatch list and is dropped at the end.
-                    skinned_rt.push(DeformedRtInstance {
-                        entity: if rt_skinned { bucket.entity } else { 0 },
-                        deformed_offset: deformed_cursor,
-                        vertex_count,
-                        index_count: bucket.mesh.index_count,
-                        mesh: Arc::clone(&bucket.mesh),
-                        // Skinned (and skin+morph) deformed vertices are already world-space.
-                        world_transform: Mat4::IDENTITY,
-                        tess: None,
-                    });
-                    // Replace this bucket's slice in the prev palette with the entity's
-                    // cached last-frame slice (or leave the current copy → no frame-1 ghost).
-                    let lo = bucket.joint_offset as usize;
-                    let hi = lo + bucket.joint_count as usize;
-                    if bucket.entity != 0 && bucket.joint_count > 0 && hi <= joints.len() {
-                        let cached = skinning.swap_palette(bucket.entity, &joints[lo..hi]);
-                        prev_joints[lo..hi].copy_from_slice(&cached);
-                    }
-                }
-                if has_morph {
-                    // The morph pass runs before skin and writes this same deformed slice;
-                    // a skinned-morph instance then has skin read+overwrite it in place.
-                    let active_base = active_targets.len() as u32;
-                    let active_count = morph_active.len() as u32;
-                    active_targets.extend_from_slice(&morph_active);
-                    morph_dispatches.push(MorphDispatch {
-                        set: vk::DescriptorSet::null(),
-                        vertex_count,
-                        scatter_count,
-                        active_count,
-                        active_base,
-                        deformed_offset: deformed_cursor,
-                    });
-                    // The prev-pose morph dispatch (previous weights → prev-deformed) for
-                    // deformation motion: build the active list from the entity's cached
-                    // last-frame weights (uncached / length change → prev == cur → zero
-                    // motion). Both lists share the one active-target buffer; only the prev
-                    // set's output buffer differs (prev-deformed).
-                    let prev_weights =
-                        skinning.swap_morph_weights(bucket.entity, &bucket.morph_weights);
-                    let (prev_active, prev_scatter) = match bucket.mesh.morph() {
-                        Some(morph) => build_active_targets(morph, &prev_weights),
-                        None => (Vec::new(), 0),
-                    };
-                    let prev_active_base = active_targets.len() as u32;
-                    let prev_active_count = prev_active.len() as u32;
-                    active_targets.extend_from_slice(&prev_active);
-                    prev_morph_dispatches.push(MorphDispatch {
-                        set: vk::DescriptorSet::null(),
-                        vertex_count,
-                        scatter_count: prev_scatter,
-                        active_count: prev_active_count,
-                        active_base: prev_active_base,
-                        deformed_offset: deformed_cursor,
-                    });
-                    morph_meshes.push(Arc::clone(&bucket.mesh));
-                    // An unskinned-morph instance enters the TLAS at its node world matrix
-                    // (its deformed vertices are mesh-local). Skinned-morph rides skinned_rt.
-                    if !bucket.skinned {
-                        morph_rt.push(DeformedRtInstance {
-                            entity: if rt_skinned { bucket.entity } else { 0 },
-                            deformed_offset: deformed_cursor,
-                            vertex_count,
-                            index_count: bucket.mesh.index_count,
-                            mesh: Arc::clone(&bucket.mesh),
-                            world_transform: bucket.model,
-                            tess: None,
-                        });
-                    }
-                }
-                deformed_cursor += vertex_count;
-            }
-            // A displaced instance rides the adaptive-tessellation path: the prep passes gathered here
-            // amplify its base geometry into the per-frame transient buffers that every raster pass and
-            // its RT BLAS read. It claims no deformed-ring slice (that ring is skin/morph only); its
-            // `tess` RT slice is filled mid-render by `record_tess_prep`.
-            if let Some(info) = bucket.displace {
-                // Only meshes carrying Phase-2 conditioning (watertight base topology) can be tessellated.
-                if bucket.mesh.conditioning().is_some() {
-                    tess_buckets.push(TessBucket {
-                        mesh: Arc::clone(&bucket.mesh),
-                        base_instance,
-                        entity: if rt_skinned { bucket.entity } else { 0 },
-                        model: bucket.model,
-                        height_index: info.height_index,
-                        height_scale: info.height_scale,
-                        uv_transform: info.uv_transform,
-                        vector_index: info.vector_index,
-                        factor_cap: tess_factor_cap,
-                        min_factor: tess_min_factor,
-                        edge_length_target: tess_edge_length_target,
-                    });
-                }
-                // Its TLAS entry (mesh-local displaced geometry at the node world matrix); the tess slice
-                // `record_tess_prep` fills drives the full per-frame BLAS BUILD over the amplified geometry.
-                displaced_rt.push(DeformedRtInstance {
-                    entity: if rt_skinned { bucket.entity } else { 0 },
-                    deformed_offset: 0,
-                    vertex_count: bucket.mesh.vertex_count,
-                    index_count: bucket.mesh.index_count,
-                    mesh: Arc::clone(&bucket.mesh),
-                    world_transform: bucket.model,
-                    tess: None,
-                });
-            }
-            for s in 0..submesh_count as usize {
-                for rows in &bucket.instances {
-                    instances.push(rows[s]);
-                }
-            }
-
-            // Resolve each submesh's PSO from the base material + its blend mode, then group
-            // submeshes sharing a PSO into one batch. Opaque and (at 1×) masked collapse to the
-            // same PSO; under MSAA masked is the distinct alpha-to-coverage PSO; translucent is
-            // the blend PSO. Every group draws from the one shared submesh-major instance block.
-            let no_submesh = bucket.mesh.submeshes.is_empty();
-            let last_mode = bucket.blend_modes.len().saturating_sub(1);
-            let mut groups: Vec<(Arc<crate::Pipeline>, bool, Vec<u32>)> = Vec::new();
-            for s in 0..submesh_count as usize {
-                let mode = bucket
-                    .blend_modes
-                    .get(s.min(last_mode))
-                    .copied()
-                    .unwrap_or_default();
-                let material = Material {
-                    shader: bucket.material.shader.clone(),
-                    unlit: bucket.material.unlit,
-                    blend: mode == BlendMode::Blend,
-                    masked: mode == BlendMode::Masked,
-                };
-                let Some(pipeline) = pipelines.request_mesh_pipeline(&material, false, wireframe)
-                else {
-                    continue;
-                };
-                if let Some(group) = groups
-                    .iter_mut()
-                    .find(|(p, _, _)| Arc::ptr_eq(p, &pipeline))
-                {
-                    group.2.push(s as u32);
-                } else {
-                    groups.push((pipeline, mode == BlendMode::Blend, vec![s as u32]));
-                }
-            }
-            for (pipeline, is_blend, submesh_indices) in groups {
-                let batch = DrawBatch {
-                    pipeline,
-                    mesh: Arc::clone(&bucket.mesh),
-                    base_instance,
-                    instance_count,
-                    deformed,
-                    deformed_vertex_offset,
-                    submesh_cull: bucket.submesh_cull.clone(),
-                    submeshes: if no_submesh {
-                        Vec::new()
-                    } else {
-                        submesh_indices
-                    },
-                    // Resolved mid-render by `record_tess_prep` (the transients don't exist yet),
-                    // matched to this batch by `base_instance`.
-                    tessellated: None,
-                };
-                if is_blend {
-                    // Depth key: the object's world-space origin projected to clip `w`. For a
-                    // perspective view `w = -view_z`, so a larger `w` is farther from the camera.
-                    let clip_w = (view_proj * bucket.model.w_axis).w;
-                    transparent.push((clip_w, batch));
-                } else {
-                    batches.push(batch);
-                }
-            }
-        }
-
-        if instances.is_empty() {
-            return Ok((list, RenderStats::default()));
-        }
-
-        // Back-to-front: farthest (largest clip `w`) first, so nearer translucent surfaces
-        // blend over the ones behind them.
-        transparent.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let transparent_batches: Vec<DrawBatch> =
-            transparent.into_iter().map(|(_, batch)| batch).collect();
-
-        // Upload the instance SSBO, growing/rebinding it on demand.
-        self.ensure_instance_capacity(descriptors, frame, instances.len() as u32)?;
+        self.ensure_instance_capacity(descriptors, frame, data.len() as u32)?;
         upload_into(
             self.frames[frame]
                 .instances
                 .as_mut()
                 .expect("instance buffer"),
-            bytemuck::cast_slice(&instances),
+            bytemuck::cast_slice(&data),
         );
+        Ok(())
+    }
 
-        // Upload the deduplicated material table (set 2, binding 2). Always non-empty
-        // when there are instances — every row interns at least the default material.
-        self.ensure_material_capacity(descriptors, frame, material_table.len() as u32)?;
-        upload_into(
-            self.frames[frame]
-                .materials
-                .as_mut()
-                .expect("material buffer"),
-            bytemuck::cast_slice(&material_table),
-        );
-
-        // Upload the current joint palette (set 2, binding 1) + the previous palette (fed
-        // to the prev skin dispatch). Only when the scene supplied a palette.
+    /// Uploads the frame's palettes and wires the gathered skin/morph/tessellation
+    /// work into `list` — the shared consumer half behind both the draw-list batcher
+    /// and the record-driven frame driver.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wire_gathered_deformations(
+        &mut self,
+        descriptors: &Descriptors,
+        skinning: &mut Skinning,
+        frame: usize,
+        gather: DeformationGather,
+        joints: &[Mat4],
+        prev_joints: Vec<Mat4>,
+        list: &mut SceneDrawList,
+    ) -> Result<()> {
+        // Upload the current joint palette (set 2, binding 1) + the previous palette
+        // (fed to the prev skin dispatch). Only when the scene supplied a palette.
         if !joints.is_empty() {
             self.ensure_joint_capacity(descriptors, frame, joints.len() as u32)?;
             upload_into(
@@ -598,8 +416,22 @@ impl Instancing {
         }
 
         // Size the deformed buffers + wire the per-instance skin dispatches. A skinned
-        // bucket with no palette this frame can't be deformed: drop the skin work so the
-        // skin pass is skipped and the batches read the undeformed bind pose.
+        // instance with no palette this frame can't be deformed: drop the skin work so
+        // the skin pass is skipped and the geometry reads the undeformed bind pose.
+        let DeformationGather {
+            mut skin_buckets,
+            skinned_deformations,
+            mut skinned_rt,
+            mut morph_dispatches,
+            mut prev_morph_dispatches,
+            morph_meshes,
+            active_targets,
+            morph_rt,
+            mut tess_buckets,
+            mut displaced_rt,
+            deformed_cursor,
+        } = gather;
+        list.skinned_deformations = skinned_deformations;
         let skin_ran = !skin_buckets.is_empty() && !joints.is_empty();
         if skin_ran {
             self.wire_skin_dispatches(
@@ -608,7 +440,7 @@ impl Instancing {
                 deformed_cursor,
                 &mut skin_buckets,
                 &mut skinned_rt,
-                &mut list,
+                list,
             )?;
         } else if !skin_buckets.is_empty() {
             tracing::warn!(
@@ -659,11 +491,12 @@ impl Instancing {
                 .extend(morph_rt.into_iter().filter(|s| s.entity != 0));
         }
 
-        // Feed the displaced instances' RT entries into the draw list. They ride the transient
-        // tessellation buffers (their `tess` slice is filled mid-render by `record_tess_prep`), not
-        // the deformed ring — but the deformed buffers must exist for any deform work this frame, so
-        // size them to the deform cursor (idempotent; skin/morph already sized them). Clamp to the
-        // tessellation instance budget, matching how `tess_buckets` is truncated below.
+        // Feed the displaced instances' RT entries into the draw list. They ride the
+        // transient tessellation buffers (their `tess` slice is filled mid-render by
+        // `record_tess_prep`), not the deformed ring — but the deformed buffers must
+        // exist for any deform work this frame, so size them to the deform cursor
+        // (idempotent; skin/morph already sized them). Clamp to the tessellation
+        // instance budget, matching how `tess_buckets` is truncated below.
         if !displaced_rt.is_empty() {
             skinning.ensure_deformed_buffers(frame, deformed_cursor)?;
             displaced_rt.truncate(TESS_MAX_INSTANCES as usize);
@@ -671,23 +504,12 @@ impl Instancing {
                 .extend(displaced_rt.into_iter().filter(|s| s.entity != 0));
         }
 
-        // Hand the deform scope the adaptive-tessellation buckets, clamped to the per-frame descriptor
-        // budget (the subsystem's pool holds `TESS_MAX_INSTANCES` set trios).
+        // Hand the deform scope the adaptive-tessellation buckets, clamped to the
+        // per-frame descriptor budget (the subsystem's pool holds `TESS_MAX_INSTANCES`
+        // set trios).
         tess_buckets.truncate(TESS_MAX_INSTANCES as usize);
         list.tess_buckets = tess_buckets;
-
-        let stats = compute_stats(
-            &batches,
-            &transparent_batches,
-            pipelines.pipelines_created() - pipelines_before,
-            instances.len(),
-        );
-
-        list.batches = batches;
-        list.transparent_batches = transparent_batches;
-        list.live_textures = live_textures;
-        list.valid = true;
-        Ok((list, stats))
+        Ok(())
     }
 
     /// Clamps the skin work to the per-frame set budget, sizes the deformed buffers, and
@@ -769,30 +591,6 @@ impl Instancing {
         descriptors.write_storage_buffer(self.frames[frame].set, 0, buffer.handle(), buffer.size());
         self.frames[frame].instances = Some(buffer);
         self.frames[frame].instance_capacity = capacity;
-        Ok(())
-    }
-
-    /// Ensures the frame's material SSBO holds at least `count` [`MaterialParamsData`]
-    /// entries (same grow-only policy), rewriting its descriptor (set 2, binding 2).
-    fn ensure_material_capacity(
-        &mut self,
-        descriptors: &Descriptors,
-        frame: usize,
-        count: u32,
-    ) -> Result<()> {
-        if self.frames[frame].materials.is_some() && self.frames[frame].material_capacity >= count {
-            return Ok(());
-        }
-        let capacity = grow_capacity(
-            self.frames[frame].material_capacity,
-            INITIAL_MATERIAL_CAPACITY,
-            count,
-        );
-        let size = u64::from(capacity) * size_of::<MaterialParamsData>() as u64;
-        let buffer = make_mapped_storage_buffer(&self.resources, size)?;
-        descriptors.write_storage_buffer(self.frames[frame].set, 2, buffer.handle(), buffer.size());
-        self.frames[frame].materials = Some(buffer);
-        self.frames[frame].material_capacity = capacity;
         Ok(())
     }
 
@@ -889,79 +687,25 @@ fn build_active_targets(
     (active, scatter_base)
 }
 
-/// One (mesh, base material, blend pattern) bucket accumulating instance rows before the
-/// submesh-major flatten. Each instance contributes one [`InstanceData`] row per mesh submesh.
-/// The PSO is resolved per submesh at emit time (from the base material + the submesh's blend
-/// mode), so one mesh's submeshes split into opaque/masked/blend batches. A skinned, morph, or
-/// blend-carrying bucket never merges and carries the palette slice + entity for the dispatch.
-struct Bucket {
-    mesh: Arc<crate::GpuMesh>,
-    /// The item's base PSO identity: shader + unlit. `blend`/`masked` are ignored here — the
-    /// per-submesh blend mode drives them at emit time.
-    material: Material,
-    /// Per-geometry-submesh blend mode (clamped to the submesh count), driving the per-submesh
-    /// PSO + opaque/translucent routing at emit. Part of the merge key: instances merge only when
-    /// their whole blend pattern matches, so the submesh split aligns across the bucket.
-    blend_modes: Vec<BlendMode>,
-    skinned: bool,
-    /// Skinned only: the base of this instance's joints in the palette.
-    joint_offset: u32,
-    /// Skinned only: the matrices this instance contributes (its palette slice length).
-    joint_count: u32,
-    /// Skinned only: the source entity uuid, keying the cross-frame motion caches.
-    entity: u64,
-    /// Per-target morph weights (empty = not a morph bucket); a morph bucket never merges.
-    morph_weights: Vec<f32>,
-    /// The instance's world matrix (used as the RT `world_transform` for an unskinned-morph
-    /// instance, whose deformed vertices are mesh-local; skinned instances place identity). Also
-    /// the translucent depth key origin (a blend-carrying bucket never merges, so it is one item).
-    model: Mat4,
-    /// Per-geometry-submesh backface-cull mode, from the bucket's first item's submesh materials
-    /// (a bucket is one mesh, so its submesh two-sidedness is shared). Copied onto every batch.
-    submesh_cull: Vec<vk::CullModeFlags>,
-    /// Set when the mesh-instance is displacement-enabled: the adaptive-tessellation prep passes
-    /// amplify its base geometry into the per-frame transient buffers every consumer reads (like a
-    /// skinned bucket, it never merges). `None` for a normal bucket.
-    displace: Option<DisplaceInfo>,
-    instances: Vec<Vec<InstanceData>>,
-}
-
-/// Per-geometry-submesh blend mode from the item's submesh materials (clamped to the last material
-/// like the instance-row build), driving the per-submesh PSO + opaque/translucent routing. Length
-/// matches the geometry submesh count (>= 1 for the no-submesh single-draw path).
-fn submesh_blend_modes(item: &DrawItem) -> Vec<BlendMode> {
-    let count = item.mesh.submeshes.len().max(1);
-    let last = item.submesh_materials.len().saturating_sub(1);
-    (0..count)
-        .map(|s| {
-            item.submesh_materials
-                .get(s.min(last))
-                .map(|m| m.blend_mode)
-                .unwrap_or_default()
-        })
-        .collect()
-}
-
-/// Per-geometry-submesh backface-cull mode from the item's submesh materials (clamped to the last
-/// material like the instance-row build): a two-sided submesh disables culling (`NONE`), otherwise
-/// cull `BACK`. Length matches the geometry submesh count (>= 1 for the no-submesh single-draw path).
 /// The height-map index + amplitude + uv transform a displaced mesh-instance's adaptive-tessellation
 /// prep needs, derived from a submesh material. The whole mesh-instance is displaced by one height
 /// field (its first displacement-enabled submesh material).
 #[derive(Clone, Copy)]
-struct DisplaceInfo {
+pub struct DisplaceInfo {
     height_index: u32,
     height_scale: f32,
     uv_transform: [f32; 4],
     vector_index: u32,
 }
 
-/// The displacement info for an item, if any submesh material is displacement-enabled with a height
-/// map. A mesh-instance is displaced as a whole by the first such material (terrain/displaced planes
-/// carry a single material; multi-material displacement picks the first). A bound vector-displacement
-/// map switches the kernel to tangent-space vector offset. `None` → not displaced.
-fn displace_info_for(item: &DrawItem) -> Option<DisplaceInfo> {
-    item.submesh_materials.iter().find_map(|m| {
+/// The displacement info for an instance's resolved submesh materials, if any is
+/// displacement-enabled with a height map. A mesh-instance is displaced as a whole by the first
+/// such material (terrain/displaced planes carry a single material; multi-material displacement
+/// picks the first). A bound vector-displacement map switches the kernel to tangent-space vector
+/// offset. `None` → not displaced.
+#[must_use]
+pub fn displace_info_from(materials: &[crate::draw_list::SubmeshMaterial]) -> Option<DisplaceInfo> {
+    materials.iter().find_map(|m| {
         let texture = m.height_texture.as_ref()?;
         (m.height_mode == HeightMode::Displacement).then(|| DisplaceInfo {
             height_index: texture.bindless_index(),
@@ -975,71 +719,11 @@ fn displace_info_for(item: &DrawItem) -> Option<DisplaceInfo> {
     })
 }
 
-fn submesh_cull_for(item: &DrawItem) -> Vec<vk::CullModeFlags> {
-    let count = item.mesh.submeshes.len().max(1);
-    let last = item.submesh_materials.len().saturating_sub(1);
-    (0..count)
-        .map(|s| {
-            let two_sided = item
-                .submesh_materials
-                .get(s.min(last))
-                .is_some_and(|m| m.double_sided);
-            if two_sided {
-                vk::CullModeFlags::NONE
-            } else {
-                vk::CullModeFlags::BACK
-            }
-        })
-        .collect()
-}
-
-/// Builds one draw item's per-submesh [`InstanceData`] rows, interning each submesh's
-/// [`MaterialParamsData`] into the frame's deduplicated table and pinning every sampled
-/// texture into `live_textures`.
-fn build_instance_rows(
-    item: &DrawItem,
-    prev_model: Mat4,
-    default_texture_index: u32,
-    coverage_temporal_phase: u32,
-    material_table: &mut Vec<MaterialParamsData>,
-    material_dedup: &mut HashMap<MaterialParamsData, u32>,
-    live_textures: &mut Vec<Arc<crate::GpuTexture>>,
-) -> Vec<InstanceData> {
-    let submesh_count = item.mesh.submeshes.len().max(1);
-    let mut rows = Vec::with_capacity(submesh_count);
-    for s in 0..submesh_count {
-        let material = item
-            .submesh_materials
-            .get(s.min(item.submesh_materials.len().saturating_sub(1)))
-            .cloned()
-            .unwrap_or_default();
-        let (params, albedo_index, mr_index) = resolve_material(
-            &material,
-            default_texture_index,
-            coverage_temporal_phase,
-            live_textures,
-        );
-        let material_index = intern_material(params, material_table, material_dedup);
-
-        rows.push(InstanceData {
-            model: item.model,
-            normal_matrix: item.normal_matrix,
-            prev_model,
-            base_color: material.base_color,
-            // .x albedo bindless, .y joint-palette offset, .z metallic-roughness, .w material index.
-            texture: UVec4::new(albedo_index, item.joint_offset, mr_index, material_index),
-            pbr: Vec4::new(material.metallic, material.roughness, 0.0, 0.0),
-            emissive: (material.emissive * material.emissive_strength).extend(0.0),
-        });
-    }
-    rows
-}
-
 /// Packs a [`SubmeshMaterial`] into the std430 [`MaterialParamsData`], resolving each
 /// texture to its bindless index (default white when absent) and setting the feature
 /// bits, while pinning the live texture `Arc`s. Returns the params plus the albedo +
 /// metallic-roughness indices the instance row also carries.
-fn resolve_material(
+pub fn resolve_material_params(
     material: &SubmeshMaterial,
     default_texture_index: u32,
     coverage_temporal_phase: u32,
@@ -1210,23 +894,6 @@ const FEATURE_HEIGHT_BUMP: u32 = 64;
 /// `THIN_SHEET` feature bit: the material uses the complete two-sided foliage response.
 const FEATURE_THIN_SHEET: u32 = 128;
 
-/// Interns a material into the frame's deduplicated table, hashing its raw bytes (the
-/// [`MaterialParamsData`] `Hash`/`Eq` are byte-exact), so identical materials collapse
-/// to one entry. Returns the entry index (`InstanceData.texture.w`).
-fn intern_material(
-    params: MaterialParamsData,
-    table: &mut Vec<MaterialParamsData>,
-    dedup: &mut HashMap<MaterialParamsData, u32>,
-) -> u32 {
-    if let Some(&index) = dedup.get(&params) {
-        return index;
-    }
-    let index = table.len() as u32;
-    table.push(params);
-    dedup.insert(params, index);
-    index
-}
-
 /// Grows `current` (an element capacity) to the next power of two that holds `count`,
 /// seeding from `initial` when empty and never shrinking.
 fn grow_capacity(current: u32, initial: u32, count: u32) -> u32 {
@@ -1266,75 +933,22 @@ fn make_mapped_storage_buffer(
     )
 }
 
-/// Tallies the per-frame draw counters from the batch list — one `drawIndexed` per
-/// submesh per batch, the instance + triangle totals.
-fn compute_stats(
-    batches: &[DrawBatch],
-    transparent: &[DrawBatch],
-    pipelines_created: u32,
-    instance_rows: usize,
-) -> RenderStats {
-    let mut stats = RenderStats {
-        batches: (batches.len() + transparent.len()) as u32,
-        pipelines_created,
-        instance_upload_bytes: u64::try_from(instance_rows)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(size_of::<InstanceData>() as u64),
-        ..RenderStats::default()
-    };
-    let mut retained_meshes = HashSet::new();
-    for batch in batches.iter().chain(transparent) {
-        if retained_meshes.insert(Arc::as_ptr(&batch.mesh)) {
-            stats.retained_mesh_cpu_bytes = stats
-                .retained_mesh_cpu_bytes
-                .saturating_add(batch.mesh.retained_query_cpu_bytes());
-        }
-        // A batch draws only its submesh subset (one mesh's submeshes split across batches by
-        // blend mode), so the draw-call + triangle tallies key off that subset, not the whole mesh.
-        if batch.mesh.submeshes.is_empty() {
-            stats.draw_calls += 1;
-            stats.instances += batch.instance_count;
-            stats.triangles += (batch.mesh.index_count / 3) * batch.instance_count;
-            continue;
-        }
-        stats.draw_calls += batch.submeshes.len() as u32;
-        stats.instances += batch.instance_count;
-        let indices: u32 = batch
-            .submeshes
-            .iter()
-            .filter_map(|&s| batch.mesh.submeshes.get(s as usize))
-            .map(|s| s.index_count)
-            .sum();
-        stats.triangles += (indices / 3) * batch.instance_count;
-    }
-    stats
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::device::SurfaceSource;
-    use crate::draw_list::{DrawItem, SubmeshMaterial};
-    use crate::gpu_types::Material;
+    use crate::draw_list::SubmeshMaterial;
     use crate::resources::BindlessFreeList;
     use crate::skinning::Skinning;
     use crate::upload::Uploader;
-    use crate::validation_issue_count;
-    use saffron_geometry::glam::{Mat4, Vec2, Vec3, Vec4};
+    use saffron_geometry::glam::{Mat4, Vec2, Vec3};
     use saffron_geometry::{Mesh, Submesh, Vertex, VertexSkin};
     use std::sync::Mutex;
 
-    /// A device + descriptors + pipelines + instancing + skinning + uploader fixture, or
-    /// `None` when no Vulkan ICD is available (the test skips cleanly).
+    /// A device + descriptors + instancing + skinning + uploader fixture, or `None`
+    /// when no Vulkan ICD is available (the test skips cleanly).
     #[allow(clippy::type_complexity)]
-    fn fixture_or_skip() -> Option<(
-        Device,
-        Descriptors,
-        Pipelines,
-        Instancing,
-        Skinning,
-        Uploader,
-    )> {
+    fn fixture_or_skip() -> Option<(Device, Descriptors, Instancing, Skinning, Uploader)> {
         let device = match Device::new(&SurfaceSource::Offscreen) {
             Ok(device) => device,
             Err(err) => {
@@ -1344,337 +958,181 @@ mod tests {
         };
         let free_list: BindlessFreeList = Arc::new(Mutex::new(Vec::new()));
         let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
-        let pipelines = Pipelines::new(&device, &descriptors, vk::SampleCountFlags::TYPE_1);
         let instancing = Instancing::new(&device, &descriptors).expect("Instancing::new");
         let skinning = Skinning::new(&device).expect("Skinning::new");
         let queue = device.graphics_queue.clone();
         let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
-        Some((
-            device,
-            descriptors,
-            pipelines,
-            instancing,
-            skinning,
-            uploader,
-        ))
+        Some((device, descriptors, instancing, skinning, uploader))
     }
 
-    /// The default draw-list inputs for frame `frame` — identity view-proj, no
-    /// wireframe, the default white slot, no RT consumer.
-    fn inputs(frame: usize) -> DrawListInputs {
-        DrawListInputs {
-            frame,
-            view_proj: Mat4::IDENTITY,
-            wireframe: false,
-            default_texture_index: crate::DEFAULT_WHITE_SLOT,
-            coverage_temporal_phase: 0,
+    /// A skinned work item with a palette produces a skin dispatch (current + prev)
+    /// through the gather + wiring, and the deformed buffers are allocated; a frame
+    /// with no skinned work arms nothing. The skin pass is armed only when
+    /// `skin_dispatches` is non-empty.
+    #[test]
+    fn skin_dispatch_appears_only_for_skinned_work() {
+        let Some((device, descriptors, mut instancing, mut skinning, uploader)) = fixture_or_skip()
+        else {
+            return;
+        };
+        let mesh = skinned_triangle(&descriptors, &uploader);
+        let palette = [Mat4::IDENTITY];
+        let params = TessGatherParams {
             rt_skinned: false,
-            displace_enabled: true,
-            tess_factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
-            tess_min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
-            tess_edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
-        }
-    }
+            factor_cap: crate::tessellation::TESS_DEFAULT_FACTOR_CAP,
+            min_factor: crate::tessellation::TESS_DEFAULT_MIN_FACTOR,
+            edge_length_target: crate::tessellation::TESS_DEFAULT_EDGE_LENGTH_TARGET,
+        };
 
-    /// A single-submesh triangle.
-    fn triangle() -> Mesh {
-        let v = |x: f32, y: f32| Vertex {
-            position: Vec3::new(x, y, 0.0),
-            normal: Vec3::new(0.0, 0.0, 1.0),
-            uv0: Vec2::ZERO,
-            ..Vertex::default()
-        };
-        Mesh {
-            vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],
-            indices: vec![0, 1, 2],
-            submeshes: vec![Submesh {
-                first_index: 0,
-                index_count: 3,
-                vertex_offset: 0,
-                material_slot: 0,
-            }],
-        }
-    }
-
-    /// A two-submesh quad (two triangles, one submesh each), for the per-submesh blend split.
-    fn two_submesh_quad() -> Mesh {
-        let v = |x: f32, y: f32| Vertex {
-            position: Vec3::new(x, y, 0.0),
-            normal: Vec3::new(0.0, 0.0, 1.0),
-            uv0: Vec2::ZERO,
-            ..Vertex::default()
-        };
-        Mesh {
-            vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0)],
-            indices: vec![0, 1, 2, 0, 2, 3],
-            submeshes: vec![
-                Submesh {
-                    first_index: 0,
-                    index_count: 3,
-                    vertex_offset: 0,
-                    material_slot: 0,
-                },
-                Submesh {
-                    first_index: 3,
-                    index_count: 3,
-                    vertex_offset: 0,
-                    material_slot: 1,
-                },
-            ],
-        }
-    }
-
-    /// One mesh whose two submeshes are opaque + translucent splits into an opaque batch (submesh
-    /// 0) and a sorted-transparent batch (submesh 1), both keyed off the same shared instance
-    /// block — the per-submesh blend routing that makes a mixed-material model's `BLEND` panels
-    /// actually blend instead of taking slot 0's mode for the whole mesh.
-    #[test]
-    fn submit_draw_list_splits_submeshes_by_blend_mode() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
-        else {
-            return;
-        };
-        let mesh = uploader
-            .upload_mesh(&descriptors, &two_submesh_quad(), &[], None, None)
-            .expect("upload quad");
-        let opaque = SubmeshMaterial {
-            blend_mode: BlendMode::Opaque,
-            ..SubmeshMaterial::defaults()
-        };
-        let blend = SubmeshMaterial {
-            blend_mode: BlendMode::Blend,
-            ..SubmeshMaterial::defaults()
-        };
-        let item = DrawItem::new(Arc::clone(&mesh), Mat4::IDENTITY, vec![opaque, blend]);
-
-        let (list, stats) = instancing
-            .submit_draw_list(
+        // No skinned work: wiring an empty gather arms nothing.
+        let mut static_list = SceneDrawList::default();
+        instancing
+            .wire_gathered_deformations(
                 &descriptors,
-                &mut pipelines,
                 &mut skinning,
-                &[item],
-                &[],
-                inputs(0),
+                0,
+                DeformationGather::default(),
+                &palette,
+                palette.to_vec(),
+                &mut static_list,
             )
-            .expect("submit_draw_list");
+            .expect("wire static");
+        assert!(
+            static_list.skin_dispatches.is_empty(),
+            "no skinned work arms no skin dispatch"
+        );
 
-        assert!(list.valid);
-        // Submesh 0 (opaque) draws in the opaque list; submesh 1 (translucent) in the sorted
-        // transparent list — one batch each, from the one mesh.
+        // A skinned work item emits one dispatch (current + prev), and the deformed
+        // buffers are now allocated.
+        let work = DeformationWork {
+            mesh: Arc::clone(&mesh),
+            entity: 1,
+            skinned: true,
+            joint_offset: 0,
+            joint_count: 1,
+            morph_weights: Vec::new(),
+            model: Mat4::IDENTITY,
+            displace: None,
+            material: crate::Material::default(),
+            submesh_materials: Vec::new(),
+            parameter_index: 0,
+        };
+        let mut gather = DeformationGather::default();
+        let mut prev = palette.to_vec();
+        gather_instance_deformation(
+            &mut gather,
+            &mut skinning,
+            &work,
+            &palette,
+            &mut prev,
+            params,
+            0,
+        );
+        let mut list = SceneDrawList::default();
+        instancing
+            .wire_gathered_deformations(
+                &descriptors,
+                &mut skinning,
+                1,
+                gather,
+                &palette,
+                prev,
+                &mut list,
+            )
+            .expect("wire skinned");
         assert_eq!(
-            list.batches.len(),
+            list.skin_dispatches.len(),
             1,
-            "the opaque submesh is one opaque batch"
+            "one dispatch per skinned instance"
         );
-        assert_eq!(list.batches[0].submeshes, vec![0]);
         assert_eq!(
-            list.transparent_batches.len(),
+            list.prev_skin_dispatches.len(),
             1,
-            "the translucent submesh is one transparent batch"
+            "a parallel prev dispatch"
         );
-        assert_eq!(list.transparent_batches[0].submeshes, vec![1]);
-        // Both batches share the one submesh-major instance block.
-        assert_eq!(list.batches[0].base_instance, 0);
-        assert_eq!(list.transparent_batches[0].base_instance, 0);
-        // Two draw calls total (one per submesh), across the two lists.
-        assert_eq!(stats.draw_calls, 2);
-        assert_eq!(stats.batches, 2);
-
-        drop(list);
-        drop(mesh);
-        drop(instancing);
-        device.wait_idle().expect("idle before teardown");
-        drop(skinning);
-        drop(uploader);
-        drop(pipelines);
-        drop(descriptors);
-        drop(device);
-    }
-
-    /// Three items of two meshes (A×2, B×1) batch into two (pipeline, mesh) buckets
-    /// with the submesh-major `base_instance`/`instance_count` the scene pass reads, and
-    /// the stats report 2 batches / 3 instances — the phase's named batching gate.
-    #[test]
-    fn submit_draw_list_batches_by_pipeline_and_mesh() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
-        else {
-            return;
-        };
-
-        let mesh_a = uploader
-            .upload_mesh(&descriptors, &triangle(), &[], None, None)
-            .expect("upload A");
-        let mesh_b = uploader
-            .upload_mesh(&descriptors, &triangle(), &[], None, None)
-            .expect("upload B");
-        let item = |mesh: &Arc<crate::GpuMesh>| {
-            DrawItem::new(
-                Arc::clone(mesh),
-                Mat4::IDENTITY,
-                vec![SubmeshMaterial::defaults()],
-            )
-        };
-        let items = [item(&mesh_a), item(&mesh_b), item(&mesh_a)];
-
-        let (list, stats) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &items,
-                &[],
-                inputs(0),
-            )
-            .expect("submit_draw_list");
-
-        assert!(list.valid);
-        assert_eq!(list.batches.len(), 2, "two (pipeline, mesh) buckets");
-        assert_eq!(stats.batches, 2);
-        assert_eq!(stats.instances, 3, "three logical instances total");
-        assert_eq!(
-            stats.instance_upload_bytes,
-            3 * size_of::<InstanceData>() as u64,
-            "the counter reports the exact uploaded row bytes"
-        );
-        assert_eq!(
-            stats.retained_mesh_cpu_bytes,
-            mesh_a
-                .retained_query_cpu_bytes()
-                .saturating_add(mesh_b.retained_query_cpu_bytes()),
-            "shared mesh instances contribute retained query memory once"
-        );
-        // One drawIndexed per submesh per batch (instanced), not per instance: two
-        // single-submesh batches → two draw calls.
-        assert_eq!(
-            stats.draw_calls, 2,
-            "one instanced drawIndexed per submesh per batch"
-        );
-
-        // Bucket order is first-seen: A (2 instances) then B (1 instance). The
-        // submesh-major flatten lays A's two rows first, then B's single row.
-        let batch_a = &list.batches[0];
-        let batch_b = &list.batches[1];
-        assert!(Arc::ptr_eq(&batch_a.mesh, &mesh_a));
-        assert_eq!(batch_a.base_instance, 0);
-        assert_eq!(batch_a.instance_count, 2);
-        assert!(Arc::ptr_eq(&batch_b.mesh, &mesh_b));
-        assert_eq!(batch_b.base_instance, 2, "B follows A's two rows");
-        assert_eq!(batch_b.instance_count, 1);
-
-        // Every `Arc<GpuMesh>` must release before the device tears down (the device
-        // outlives every resource — README §4). `items` + `list` hold clones, so they
-        // drop here, ahead of the mesh handles and the device.
-        drop(items);
-        drop(list);
-        drop(mesh_a);
-        drop(mesh_b);
-        drop(instancing);
-        device.wait_idle().expect("idle before teardown");
-        drop(skinning);
-        drop(uploader);
-        drop(pipelines);
-        drop(descriptors);
-        drop(device);
-    }
-
-    /// Two items with byte-identical materials dedup to one material SSBO entry; two
-    /// distinct materials produce two. Driven through `submit_draw_list` (the gate's
-    /// dedup case), then asserted by the resulting instance rows' `texture.w` indices.
-    #[test]
-    fn submit_draw_list_dedups_identical_materials() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
-        else {
-            return;
-        };
-        let mesh = uploader
-            .upload_mesh(&descriptors, &triangle(), &[], None, None)
-            .expect("upload");
-
-        // Two items sharing one material (same factors), then a third with a different
-        // base color. Distinct meshes would still share the deduped material table.
-        let red = SubmeshMaterial {
-            base_color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-            ..SubmeshMaterial::defaults()
-        };
-        let blue = SubmeshMaterial {
-            base_color: Vec4::new(0.0, 0.0, 1.0, 1.0),
-            ..SubmeshMaterial::defaults()
-        };
-        let mk = |mat: &SubmeshMaterial, model: Mat4| {
-            let mut item = DrawItem::new(Arc::clone(&mesh), model, vec![mat.clone()]);
-            item.material = Material::default();
-            item
-        };
-
-        // Two identical-red items: one material entry. The materials are deduped per
-        // frame, so the only count we can read back is via fresh frames with controlled
-        // capacity — assert through the public batching invariants + the helper below.
-        let same = [
-            mk(&red, Mat4::IDENTITY),
-            mk(&red, Mat4::from_translation(Vec3::X)),
-        ];
-        let (list_same, _) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &same,
-                &[],
-                inputs(0),
-            )
-            .expect("submit same");
-        assert_eq!(list_same.batches.len(), 1, "one (pipeline, mesh) batch");
-        assert_eq!(list_same.batches[0].instance_count, 2);
-
-        let distinct = [mk(&red, Mat4::IDENTITY), mk(&blue, Mat4::IDENTITY)];
-        let (list_distinct, _) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &distinct,
-                &[],
-                inputs(1),
-            )
-            .expect("submit distinct");
-        assert_eq!(
-            list_distinct.batches[0].instance_count, 2,
-            "still one batch (bindless: material does not split a batch)"
-        );
-
-        // The byte-exact dedup itself is the unit test below; here we confirm the
-        // material table built two entries for the distinct case by re-deriving it.
-        let red_params = material_params(&red);
-        let blue_params = material_params(&blue);
+        assert_eq!(list.skin_dispatches[0].vertex_count, 3);
+        assert_eq!(list.skin_dispatches[0].deformed_offset, 0);
         assert_ne!(
-            red_params, blue_params,
-            "distinct base colors are distinct params"
+            list.skin_dispatches[0].set,
+            vk::DescriptorSet::null(),
+            "the dispatch set is wired"
+        );
+        assert!(
+            skinning.deformed_buffer(1).is_some() && skinning.prev_deformed_buffer(1).is_some(),
+            "both deformed buffers are allocated for the skinned frame"
         );
 
-        // Release every `Arc<GpuMesh>` (the draw-item arrays + lists hold clones)
-        // before the device — the device outlives every resource (README §4).
-        drop(same);
-        drop(distinct);
-        drop(list_same);
-        drop(list_distinct);
+        drop(static_list);
+        drop(list);
+        drop(work);
         drop(mesh);
         drop(instancing);
         device.wait_idle().expect("idle before teardown");
         drop(skinning);
         drop(uploader);
-        drop(pipelines);
         drop(descriptors);
         drop(device);
-        let _ = validation_issue_count();
     }
 
-    /// Re-derives a submesh material's std430 params for the dedup assertion above.
-    fn material_params(material: &SubmeshMaterial) -> MaterialParamsData {
-        let mut live = Vec::new();
-        resolve_material(material, crate::DEFAULT_WHITE_SLOT, 0, &mut live).0
+    /// A new entity's first frame reads back prev == current (zero motion); a moved
+    /// entity's second frame reflects last frame's pose — the tess-seam instance rows
+    /// read and advance the cross-frame motion cache.
+    #[test]
+    fn cross_frame_motion_caches_track_the_entity() {
+        let Some((device, descriptors, mut instancing, mut skinning, uploader)) = fixture_or_skip()
+        else {
+            return;
+        };
+        let materials = vec![SubmeshMaterial::defaults()];
+        let mut list = SceneDrawList::default();
+
+        // Frame one: a new entity at the origin. Uncached → the cache now holds this
+        // pose (prev == current inside the row).
+        let first = Mat4::IDENTITY;
+        instancing
+            .upload_tess_instance_rows(
+                &descriptors,
+                &mut skinning,
+                0,
+                &[(7, first, materials.as_slice(), 0)],
+                crate::DEFAULT_WHITE_SLOT,
+                0,
+                &mut list,
+            )
+            .expect("frame one");
+        assert_eq!(
+            skinning.prev_model(7),
+            Some(first),
+            "the entity's pose is cached after its first frame"
+        );
+
+        // Frame two: the same entity moved. The row reads frame one's pose before the
+        // cache advances.
+        let second = Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0));
+        instancing
+            .upload_tess_instance_rows(
+                &descriptors,
+                &mut skinning,
+                1,
+                &[(7, second, materials.as_slice(), 0)],
+                crate::DEFAULT_WHITE_SLOT,
+                0,
+                &mut list,
+            )
+            .expect("frame two");
+        assert_eq!(
+            skinning.prev_model(7),
+            Some(second),
+            "the cache advanced to frame two's pose"
+        );
+
+        drop(list);
+        drop(instancing);
+        device.wait_idle().expect("idle before teardown");
+        drop(skinning);
+        drop(uploader);
+        drop(descriptors);
+        drop(device);
     }
 
     /// The grow policy seeds from `initial` when empty, doubles to cover `count`, and
@@ -1686,33 +1144,6 @@ mod tests {
         assert_eq!(grow_capacity(0, 64, 200), 256);
         assert_eq!(grow_capacity(512, 256, 100), 512, "never shrinks");
         assert_eq!(grow_capacity(256, 256, 256), 256, "exact fit holds");
-    }
-
-    /// Interning byte-identical materials collapses to one entry; a differing field is
-    /// a distinct entry. This is the per-frame dedup the instance row's `.texture.w`
-    /// indexes.
-    #[test]
-    fn intern_material_dedups_by_bytes() {
-        let mut table = Vec::new();
-        let mut dedup = HashMap::new();
-        let a = MaterialParamsData::default();
-        let b = MaterialParamsData::default();
-        assert_eq!(intern_material(a, &mut table, &mut dedup), 0);
-        assert_eq!(
-            intern_material(b, &mut table, &mut dedup),
-            0,
-            "identical material reuses entry 0"
-        );
-        assert_eq!(table.len(), 1, "no second entry for an identical material");
-
-        let mut c = MaterialParamsData::default();
-        c.tex0.x = 7;
-        assert_eq!(
-            intern_material(c, &mut table, &mut dedup),
-            1,
-            "a differing index is a distinct entry"
-        );
-        assert_eq!(table.len(), 2);
     }
 
     /// A single-submesh triangle with a parallel skin stream (one joint, full weight),
@@ -1741,166 +1172,9 @@ mod tests {
             };
             3
         ];
+        let hierarchy = crate::upload::hierarchy_for_upload(&mesh, &skin).expect("cook hierarchy");
         uploader
-            .upload_mesh(descriptors, &mesh, &skin, None, None)
+            .upload_mesh(descriptors, &mesh, &hierarchy, &skin, None, None)
             .expect("upload skinned")
-    }
-
-    /// A skinned draw item keyed by `entity` with a one-joint palette slice.
-    fn skinned_item(mesh: &Arc<crate::GpuMesh>, model: Mat4, entity: u64) -> DrawItem {
-        let mut item = DrawItem::new(Arc::clone(mesh), model, vec![SubmeshMaterial::defaults()]);
-        item.skinned = true;
-        item.joint_offset = 0;
-        item.joint_count = 1;
-        item.entity = entity;
-        item
-    }
-
-    /// A skinned draw with a palette produces a skin dispatch per skinned instance, and
-    /// the deformed buffers are allocated; an unskinned draw produces none. The skin pass
-    /// is armed only when `skin_dispatches` is non-empty — the phase's named gate.
-    #[test]
-    fn skin_dispatch_appears_only_for_skinned_draws() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
-        else {
-            return;
-        };
-        let mesh = skinned_triangle(&descriptors, &uploader);
-
-        // An unskinned draw, even with a palette supplied, emits no skin dispatch.
-        let static_item = DrawItem::new(
-            Arc::clone(&mesh),
-            Mat4::IDENTITY,
-            vec![SubmeshMaterial::defaults()],
-        );
-        let palette = [Mat4::IDENTITY];
-        let (static_list, _) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &[static_item],
-                &palette,
-                inputs(0),
-            )
-            .expect("submit static");
-        assert!(
-            static_list.skin_dispatches.is_empty(),
-            "an unskinned draw arms no skin dispatch"
-        );
-
-        // A skinned draw with a palette emits one dispatch (current + prev), and the
-        // deformed buffers are now allocated.
-        let item = skinned_item(&mesh, Mat4::IDENTITY, 1);
-        let (list, _) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &[item],
-                &palette,
-                inputs(1),
-            )
-            .expect("submit skinned");
-        assert_eq!(
-            list.skin_dispatches.len(),
-            1,
-            "one dispatch per skinned bucket"
-        );
-        assert_eq!(
-            list.prev_skin_dispatches.len(),
-            1,
-            "a parallel prev dispatch"
-        );
-        assert_eq!(list.skin_dispatches[0].vertex_count, 3);
-        assert_eq!(list.skin_dispatches[0].deformed_offset, 0);
-        assert_ne!(
-            list.skin_dispatches[0].set,
-            vk::DescriptorSet::null(),
-            "the dispatch set is wired"
-        );
-        assert!(
-            skinning.deformed_buffer(1).is_some() && skinning.prev_deformed_buffer(1).is_some(),
-            "both deformed buffers are allocated for the skinned frame"
-        );
-        // The batch draws the deformed buffer as a static stream (its base vertex offset).
-        assert_eq!(list.batches.len(), 1);
-        assert!(list.batches[0].deformed);
-        assert_eq!(list.batches[0].deformed_vertex_offset, 0);
-
-        drop(static_list);
-        drop(list);
-        drop(mesh);
-        drop(instancing);
-        device.wait_idle().expect("idle before teardown");
-        drop(skinning);
-        drop(uploader);
-        drop(pipelines);
-        drop(descriptors);
-        drop(device);
-    }
-
-    /// A new entity's first frame reads back prev == current (zero motion: `prev_model`
-    /// equals `model`, and the prev palette copies the current one); a moved entity's
-    /// second frame reflects last frame's pose — the phase's named cross-frame gate.
-    #[test]
-    fn cross_frame_motion_caches_track_the_entity() {
-        let Some((device, descriptors, mut pipelines, mut instancing, mut skinning, uploader)) =
-            fixture_or_skip()
-        else {
-            return;
-        };
-        let mesh = skinned_triangle(&descriptors, &uploader);
-
-        // Frame one: a new entity at the origin. Uncached → prev_model == model and the
-        // cache now holds this pose.
-        let first = Mat4::IDENTITY;
-        instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &[skinned_item(&mesh, first, 7)],
-                &[Mat4::IDENTITY],
-                inputs(0),
-            )
-            .expect("frame one");
-        assert_eq!(
-            skinning.prev_model(7),
-            Some(first),
-            "the entity's pose is cached after its first frame"
-        );
-
-        // Frame two: the same entity moved. The instance's prev_model must be frame one's
-        // pose; submit_draw_list reads it before overwriting the cache.
-        let second = Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0));
-        let (list, _) = instancing
-            .submit_draw_list(
-                &descriptors,
-                &mut pipelines,
-                &mut skinning,
-                &[skinned_item(&mesh, second, 7)],
-                &[Mat4::IDENTITY],
-                inputs(1),
-            )
-            .expect("frame two");
-        // The single instance row's prev_model is frame one's identity, its model frame two.
-        assert_eq!(list.batches[0].instance_count, 1);
-        assert_eq!(
-            skinning.prev_model(7),
-            Some(second),
-            "the cache advanced to frame two's pose"
-        );
-
-        drop(list);
-        drop(mesh);
-        drop(instancing);
-        device.wait_idle().expect("idle before teardown");
-        drop(skinning);
-        drop(uploader);
-        drop(pipelines);
-        drop(descriptors);
-        drop(device);
     }
 }

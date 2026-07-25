@@ -1,25 +1,20 @@
-//! The per-frame scene draw list: the inputs ([`DrawItem`] + [`SubmeshMaterial`]),
-//! the batched output ([`DrawBatch`] / [`SceneDrawList`]), and the [`RenderStats`]
-//! counters.
+//! The per-frame deformation + tess-seam state ([`SceneDrawList`]), the resolved
+//! material vocabulary ([`SubmeshMaterial`]), and the [`RenderStats`] counters.
 //!
-//! [`crate::Instancing::submit_draw_list`] resolves each item's material to a cached
-//! PSO, buckets by (pipeline, mesh) into instanced draws, deduplicates the per-frame
-//! material table, and produces the [`SceneDrawList`] the scene + depth passes record.
-//!
-//! Skinned items carry a joint palette: [`crate::Instancing::submit_draw_list`] deforms
-//! each into its slice of the frame's deformed-vertex buffer (the [`SkinDispatch`] the
-//! `skin` compute pass replays), then draws it as a static instance reading that slice.
-//! The [`DeformedRtInstance`] list rides for the RT refit BLAS.
+//! A skinned instance deforms into its slice of the frame's deformed-vertex buffer
+//! (the [`SkinDispatch`] the `skin` compute pass replays); the executor vertex path
+//! then pulls the slice through its device address. The [`DeformedRtInstance`] list
+//! rides for the RT refit BLAS; the [`TessSceneDraw`] list is the tessellation seam's
+//! per-pass draws.
 
 use std::sync::Arc;
 
 use ash::vk;
 use saffron_core::{BlendMode, HeightMode};
 use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
-use saffron_vegetation::AlphaClassification;
+use saffron_material::AlphaClassification;
 
-use crate::gpu_types::Material;
-use crate::resources::{GpuMesh, GpuTexture, Pipeline};
+use crate::resources::{GpuMesh, GpuTexture};
 
 /// Canonical coverage source sampled by every foliage raster path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -98,7 +93,7 @@ pub struct ThinSheetMaterial {
 /// One submesh's material: its textures (each `None` → the default white slot) plus
 /// the PBR factors that fold into the per-frame [`crate::MaterialParamsData`].
 ///
-/// A [`DrawItem`] carries one per mesh submesh, indexed by `Submesh::material_slot`
+/// An instance carries one per mesh submesh, indexed by `Submesh::material_slot`
 /// order; a single entry applies to every submesh (clamped).
 #[derive(Clone)]
 pub struct SubmeshMaterial {
@@ -194,63 +189,31 @@ impl Default for SubmeshMaterial {
     }
 }
 
-/// One renderable submitted to the scene draw list: a mesh, its world transform, the
-/// per-submesh materials, and the PSO-selecting [`Material`].
-///
-/// `submit_draw_list` resolves the material to a cached PSO and batches by
-/// (pipeline, mesh) into instanced draws.
-#[derive(Clone)]
-pub struct DrawItem {
-    /// The mesh to draw.
-    pub mesh: Arc<GpuMesh>,
-    /// World matrix.
-    pub model: Mat4,
-    /// `transpose(inverse(mat3(model)))` for correct normals under non-uniform scale.
-    pub normal_matrix: Mat4,
-    /// One entry per mesh submesh; a single entry applies to all submeshes (clamped).
-    pub submesh_materials: Vec<SubmeshMaterial>,
-    /// Selects the PSO (the übershader permutation), shared by all submeshes.
-    pub material: Material,
-    /// GPU skinning: when set the item is deformed once by the `skin` compute pass into
-    /// its slice of the frame's deformed-vertex buffer, then drawn as a lone static
-    /// instance reading that slice. A skinned item with no mesh skin stream is dropped.
-    pub skinned: bool,
-    /// Skinning: the base of this instance's joints in the frame palette.
-    pub joint_offset: u32,
-    /// Skinning: matrices this instance contributes (its palette slice length).
-    pub joint_count: u32,
-    /// Per-target morph weights driving this instance (empty = not a morph draw; canonical
-    /// `0..1`). The instancing pass compacts the above-threshold targets into the frame's
-    /// active-target buffer and dispatches the morph deform before skin; the mesh must
-    /// carry morph buffers (`GpuMesh::morph`).
-    pub morph_weights: Vec<f32>,
-    /// Source entity id (0 = none), keying the cross-frame motion caches (TAA + skin).
-    pub entity: u64,
-}
-
-impl DrawItem {
-    /// A static draw item: a mesh + transform + materials with the default (lit
-    /// übershader) [`Material`] and no skinning.
-    pub fn new(mesh: Arc<GpuMesh>, model: Mat4, submesh_materials: Vec<SubmeshMaterial>) -> Self {
-        Self {
-            mesh,
-            model,
-            normal_matrix: normal_matrix(model),
-            submesh_materials,
-            material: Material::default(),
-            skinned: false,
-            joint_offset: 0,
-            joint_count: 0,
-            morph_weights: Vec::new(),
-            entity: 0,
-        }
-    }
-}
-
 /// `transpose(inverse(mat3(model)))` extended to a `Mat4` — the normal matrix the
 /// instance row carries so non-uniform scale leaves normals orthogonal to the surface.
 pub fn normal_matrix(model: Mat4) -> Mat4 {
     Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose())
+}
+
+/// One tessellation-seam draw: a displaced instance's mesh PSO plus its per-frame
+/// amplified indirect-draw handles. The visibility traversal skips displacing
+/// materials' records; each raster pass replays these draws after its executor
+/// buckets (own VB/IB binds — the tess PSOs keep vertex input).
+#[derive(Clone)]
+pub struct TessSceneDraw {
+    /// The instance's mesh PSO (vertex input over the amplified 48-byte stream).
+    pub pso: Arc<crate::Pipeline>,
+    /// The instance's row in the frame instance SSBO (the `firstInstance` the
+    /// GPU-seeded indirect command carries).
+    pub base_instance: u32,
+    /// Slot-0 cull mode (the amplified draw covers the whole mesh).
+    pub cull: vk::CullModeFlags,
+    /// Whether the slot-0 material alpha-blends (the scene draws it in the
+    /// translucent scope; depth passes skip it).
+    pub blend: bool,
+    /// The amplified VB/IB + GPU-seeded args, `None` until the tess prep resolves
+    /// the frame's transients.
+    pub draw: Option<TessDraw>,
 }
 
 /// The per-frame handles a tessellated (`HeightMode::Displacement`) batch draws through — the
@@ -273,47 +236,25 @@ pub struct TessDraw {
     pub args_offset: u64,
 }
 
-/// A batch of instances sharing a pipeline + mesh, drawn as one instanced draw per
-/// submesh. Bindless means the per-instance texture indices live in the instance SSBO,
-/// not a per-batch descriptor — so texture differences never split a batch.
-/// `base_instance` offsets into the frame's instance buffer.
-#[derive(Clone)]
-pub struct DrawBatch {
-    /// The PSO resolved from the material via the cache.
-    pub pipeline: Arc<Pipeline>,
-    /// The mesh whose vertex/index streams the batch binds and draws.
-    pub mesh: Arc<GpuMesh>,
-    /// The base offset into the frame's instance buffer (submesh 0, instance 0).
-    pub base_instance: u32,
-    /// The number of logical instances in the batch.
-    pub instance_count: u32,
-    /// When set the batch draws the frame's compute-deformed buffer as its binding-0
-    /// vertex stream (the static stream otherwise) — true for a skinned OR a
-    /// morph-active batch; a deformed batch is always one instance.
-    pub deformed: bool,
-    /// The base vertex of this batch's instance in the deformed buffer (0 for the static
-    /// path), added to each submesh's `vertex_offset` in the deformed draw.
-    pub deformed_vertex_offset: u32,
-    /// Per-geometry-submesh backface-cull mode (aligned with `mesh.submeshes`; a single entry backs
-    /// the no-submesh single-draw path): `NONE` for a two-sided submesh material, `BACK` otherwise.
-    /// The scene pass applies it via dynamic state; other passes keep their baked cull mode.
-    pub submesh_cull: Vec<vk::CullModeFlags>,
-    /// The original mesh-submesh indices this batch draws (into `mesh.submeshes`), letting one
-    /// mesh's submeshes split across batches by blend mode: opaque/masked submeshes draw with the
-    /// opaque PSO here, translucent ones with the blend PSO in `transparent_batches` — every batch
-    /// from the same mesh shares one submesh-major instance block (`base_instance`), so a subset
-    /// just picks its `s` slices. Empty for a submesh-less mesh (the whole index buffer draws once).
-    pub submeshes: Vec<u32>,
-    /// When set the batch is a Phase-4 tessellated (`HeightMode::Displacement`) instance: it draws
-    /// the amplified transient VB/IB via one indirect draw sourced from [`TessDraw::args_buffer`]
-    /// instead of the fixed-count `cmd_draw_indexed`. Filled mid-render (the transients don't exist at
-    /// draw-list build time); `None` for a static / skinned / morph batch.
-    pub tessellated: Option<TessDraw>,
+/// One skinned mesh-instance's frame deformation facts: where its palette and deformed
+/// output landed this frame, keyed by entity for the provider-params patch.
+#[derive(Clone, Copy, Debug)]
+pub struct SkinnedDeformation {
+    /// The skinned entity (the mirror's instance key).
+    pub entity: u64,
+    /// The base of this instance's joints in the frame palette.
+    pub joint_offset: u32,
+    /// This instance's joint count.
+    pub joint_count: u32,
+    /// The base vertex of this instance in the frame's deformed buffers.
+    pub deformed_offset: u32,
+    /// The instance's vertex count.
+    pub vertex_count: u32,
 }
 
 /// One skinned mesh-instance's compute work for the frame: the descriptor set wiring its
 /// static + skin streams, the joint palette, and the deformed output, plus the push the
-/// `skin` kernel reads. Built by [`crate::Instancing::submit_draw_list`] and replayed in
+/// `skin` kernel reads. Built by the deformation wiring and replayed in
 /// the `skin` pass.
 #[derive(Clone, Copy)]
 pub struct SkinDispatch {
@@ -330,7 +271,7 @@ pub struct SkinDispatch {
 /// One morph mesh-instance's compute work for the frame: the descriptor set wiring its
 /// base + delta + range + active-target + accumulator + deformed-output buffers, plus the
 /// counts the `morph` kernel's three passes (clear/scatter/resolve) dispatch over. Built
-/// by [`crate::Instancing::submit_draw_list`] and replayed in the `morph` pass before skin.
+/// by the deformation wiring and replayed in the `morph` pass before skin.
 #[derive(Clone, Copy)]
 pub struct MorphDispatch {
     /// The per-dispatch descriptor set (base, deltas, ranges, active list, accum, output).
@@ -399,21 +340,20 @@ pub struct DeformedRtInstance {
     pub tess: Option<TessRtSlice>,
 }
 
-/// The frame's structured draw list, built by `submit_draw_list` and recorded by the
-/// scene pass (shaded) and the optional depth pre-pass (depth only).
+/// The frame's deformation + tess-seam state, built by
+/// [`crate::Renderer::submit_gpu_scene_deformations`] and read by the deform, raster,
+/// and RT passes (the executor draws themselves come from the GPU scene's visibility
+/// traversal).
 #[derive(Default)]
 pub struct SceneDrawList {
     /// The camera view-projection (the per-frame vertex push constant).
     pub view_proj: Mat4,
-    /// The batched instanced opaque + masked draws, in first-seen bucket order.
-    pub batches: Vec<DrawBatch>,
-    /// The translucent draws, each a lone-instance batch, sorted back-to-front (farthest
-    /// first) by clip-space depth. Recorded by the scene pass's trailing translucent scope
-    /// with the blend PSO (depth-test on, depth-write off), never in the depth pre-pass.
-    pub transparent_batches: Vec<DrawBatch>,
     /// Per skinned mesh-instance: the compute work the `skin` pass dispatches before any
     /// geometry pass reads the deformed buffer. Empty when no skinned instances exist.
     pub skin_dispatches: Vec<SkinDispatch>,
+    /// Per skinned mesh-instance: the frame's deformation-provider parameter values
+    /// (the GPU-scene mirror's provider params patch to these offsets each frame).
+    pub skinned_deformations: Vec<SkinnedDeformation>,
     /// The parallel dispatches that deform the previous pose into the prev-deformed
     /// buffer (previous palette + previous-deformed output), read only by the motion pass.
     pub prev_skin_dispatches: Vec<SkinDispatch>,
@@ -430,6 +370,9 @@ pub struct SceneDrawList {
     /// prep passes (factor/scan/finalize) consume in the deform scope. The amplified transient
     /// geometry they emit is what every raster + RT consumer reads for a displaced mesh.
     pub tess_buckets: Vec<crate::tessellation::TessBucket>,
+    /// The tessellation seam's draws: one per displaced instance, replayed by every
+    /// raster pass after its executor buckets.
+    pub tess_draws: Vec<TessSceneDraw>,
     /// Textures pinned live for the frame (their bindless indices are referenced by
     /// the instance SSBO, so the `Arc`s must outlive the GPU read).
     pub live_textures: Vec<Arc<GpuTexture>>,
@@ -438,15 +381,12 @@ pub struct SceneDrawList {
 }
 
 impl SceneDrawList {
-    /// A recording-only copy: the batches (their `Arc`s cloned cheaply) plus the
-    /// view-projection and validity, with no `live_textures`. Both the depth pre-pass
-    /// and scene-pass bodies take one; the texture pins stay on the owning list until
-    /// the frame's fence is waited next, so they outlive the GPU read.
+    /// A recording-only copy (the `Arc`s cloned cheaply) with no `live_textures` — the
+    /// texture pins stay on the owning list until the frame's fence is waited next, so
+    /// they outlive the GPU read.
     pub fn shallow_clone(&self) -> Self {
         Self {
             view_proj: self.view_proj,
-            batches: self.batches.clone(),
-            transparent_batches: self.transparent_batches.clone(),
             skin_dispatches: self.skin_dispatches.clone(),
             prev_skin_dispatches: self.prev_skin_dispatches.clone(),
             morph_dispatches: self.morph_dispatches.clone(),
@@ -454,23 +394,27 @@ impl SceneDrawList {
             deformed_rt_instances: self.deformed_rt_instances.clone(),
             // The prep passes run in the deform scope off the owning list, never a recording copy.
             tess_buckets: Vec::new(),
+            tess_draws: self.tess_draws.clone(),
+            skinned_deformations: Vec::new(),
             live_textures: Vec::new(),
             valid: self.valid,
         }
     }
 }
 
-/// Per-frame scene draw counters, refreshed each `submit_draw_list` and inspectable to
-/// verify the batching is not O(draws).
+/// Per-frame scene draw counters, derived from the visibility chain's GPU readback
+/// (the executor decides the actual draws) and inspectable to verify render
+/// preparation stays O(changes), not O(draws).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderStats {
-    /// `drawIndexed` calls (one per submesh per batch).
+    /// GPU-emitted indirect draw commands (the traversal's record count) plus the
+    /// tessellation seam's draws.
     pub draw_calls: u32,
-    /// Distinct (pipeline, mesh) buckets.
+    /// Live executor draw buckets (distinct shader + PSO-bin combos).
     pub batches: u32,
-    /// Total logical instances drawn.
+    /// Instances the visibility cull kept.
     pub instances: u32,
-    /// Triangles submitted (sum of `index_count / 3` over instances).
+    /// Triangles the emitted records rasterize (sum of `index_count / 3`).
     pub triangles: u32,
     /// Descriptor-set binds recorded in the scene pass.
     pub descriptor_binds: u32,
@@ -480,7 +424,7 @@ pub struct RenderStats {
     pub queue_submits: u32,
     /// PSOs compiled this frame (non-zero on a steady-state frame = a compile hitch).
     pub pipelines_created: u32,
-    /// Bytes uploaded to the frame's `InstanceData` storage buffer.
+    /// GPU-scene table bytes staged this frame ((near-)zero on a steady scene).
     pub instance_upload_bytes: u64,
     /// CPU bytes retained by unique drawn meshes for exact surface queries.
     pub retained_mesh_cpu_bytes: u64,
