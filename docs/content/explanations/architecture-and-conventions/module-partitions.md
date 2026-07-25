@@ -16,7 +16,7 @@ what escapes.
 
 ## Module files and the re-export root
 
-`saffron-rendering` has the most module files of any crate in the workspace: 38 under
+`saffron-rendering` has the most module files of any crate in the workspace: 54 under
 `crates/rendering/src/`, one per feature (`lighting.rs`, `pipelines.rs`, `render_graph.rs`,
 `ssao.rs`, …), each declared privately in `lib.rs`:
 
@@ -27,7 +27,7 @@ mod pipelines;
 mod render_graph;
 mod renderer;
 mod resources;
-// … 38 `mod` lines in all
+// … 54 `mod` lines in all
 
 pub use render_graph::{
     ProfileRecorders, RenderGraph, RgAccess, RgAttachment, RgPass, RgPassKind, RgResource, RgUsage,
@@ -46,8 +46,8 @@ the API. The crate root's `checked` helper is the pattern. `pub(crate) fn checke
 
 ## Internal-only modules
 
-Re-export is per item, so a module can contribute nothing to the API at all. Five rendering
-modules appear in no `pub use` line: `budget`, `meshlet_raster`, `nested_scopes`, `present`, and
+Re-export is per item, so a module can contribute nothing to the API at all. Four rendering
+modules appear in no `pub use` line: `budget`, `nested_scopes`, `present`, and
 `render_settings`. Their types are plain `pub` (`pub struct BudgetController`), which lets sibling
 files reach them through internal paths:
 

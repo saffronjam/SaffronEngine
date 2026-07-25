@@ -52,17 +52,40 @@ container ownership with `clear-extraction`.
 It preserves the asset's stable identity so references between separately imported families, biomes,
 and maps remain valid. `vegetation-asset-summary` returns the native typed summary and ordered map
 layers used by the editor workspace. Each summary includes validation, source attribution, exact
-dependency identities, and attributable cook statistics.
+dependency identities, and attributable cook statistics. A map summary also reports its dirty
+layers: those whose authored chunks differ from what the current manifest consumed (every layer
+when no manifest exists), meaning a recook would change the cooked output.
 
 `plant-validate` resolves the retained source recipe through the plant compiler without publishing.
 Its result contains structured diagnostics, observed source hashes, license provenance, reimport
 conflicts, and the exact dependencies used for the cook key. `plant-recook` runs the same compiler,
 publishes a validated `.splantc`, and accepts changed source hashes only after publication succeeds.
 
+`vegetation-map-layer-commit` edits the authored map's ordered layers as one optimistic
+transaction: complete replacement rows (each with a bumped per-layer revision) plus removals,
+validated against the root generation the editor captured — a concurrent edit rejects instead of
+interleaving. The committed root publishes last, so a reader never sees a partial transaction.
+
+`vegetation-map-chunk-read` and `vegetation-map-chunk-commit` carry a brush gesture's
+read-modify-write over the authored chunks. The read resolves logical keys (layer + tile + kind)
+through the map root's inventory and returns the root generation with every present chunk — an
+absent key contributes no row. The commit replaces the gesture's touched field tiles and anchor
+chunks across cells atomically under that captured generation, through the same optimistic
+transaction as the layer commit.
+
 `vegetation-cook` queues the single staged world-cooking route for an entire map, explicit bounds, or
 an explicit cell set. `vegetation-cook-status` reports monotonic progress and terminal output;
 `vegetation-cancel-cook` requests cooperative cancellation. A newer cook for the same map supersedes
 the older queued or running job.
+
+`vegetation-rejections` reads one cooked cell's rejected candidates: each row carries the sampled
+world position, the rejection reason, and the sampler ordinal — the rejection facet stores every
+candidate's exact position, so diagnostics can place rejections in the world.
+
+`vegetation-topology-diff` compares two cooked manifests per cell: plants added, removed, and
+moved between the identities (unchanged cell artifacts skip by hash), plus unresolved authored
+overrides — anchors, pins, and transform/state overrides whose referenced plant is absent from the
+newer manifest. The editor's Review action drives it across the two most recent cooks.
 
 `vegetation-manifest` reads the current generation or an exact immutable manifest identity.
 `vegetation-cell-inspect` validates one cell through that manifest and returns its header, content
@@ -110,16 +133,19 @@ shader paths behind these commands.
 
 `enter-asset-preview` builds an isolated scene and switches the renderer to the `assetPreview` view.
 Models use their full entity forest; materials and ordinary textures use a furnished sphere; HDRIs
-light a three-sphere environment rig. Built-in primitives use their reserved mesh IDs. The command
-stores the authored camera, selection, overlay, and exposure so `exit-asset-preview` can restore them.
+light a three-sphere environment rig. Built-in primitives use their reserved mesh IDs. A plant
+family compiles through its retained recipe (content-addressed, so an unchanged family reuses its
+artifact) and previews its renderable form with the family's material slots. The command stores the
+authored camera, selection, overlay, and exposure so `exit-asset-preview` can restore them.
 
 `get-thumbnail` and `view-asset` share `request_thumbnail`, with default sizes of 128 and 512 pixels.
 A cache hit returns an inline base64 PNG. A miss returns `pending: true` and enqueues a preview render;
 the host drains up to two jobs per update through the main forward+ graph, writes their PNGs, and the
 client polls again.
 
-Plant, biome, and vegetation-map misses rasterize their canonical vector type icons immediately.
-They use the same content-addressed cache and return a completed PNG in the first reply.
+A plant family renders its compiled form on the studio floor, like a mesh or model tile. Biome and
+vegetation-map misses rasterize their canonical vector type icons immediately; they use the same
+content-addressed cache and return a completed PNG in the first reply.
 
 The cache is app-wide at `<appDataRoot>/thumbnail-cache`. Its key combines cache version, resolved
 content hash, and requested size, so identical content can share a tile across assets and projects.

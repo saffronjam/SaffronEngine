@@ -62,7 +62,9 @@ Raw writes to `Relationship` trigger a hierarchy relink. `set-parent` remains th
 
 `select`, `deselect`, and `get-selection` manage editor selection. The selection result also carries scene, selection, play, and animation versions, making it the editor's lightweight reconciliation poll.
 
-`pick` tests meshless light and camera billboards before mesh surfaces. Static meshes use cached BVHs; skinned meshes use the current deformed pose. A mesh hit inside a `ModelInstance` selects the model root, while a miss clears selection. See [Picking](../../scene-and-ecs/picking/) for the geometric path.
+`pick` tests meshless light and camera billboards before mesh surfaces. Static meshes use cached BVHs; skinned meshes use the current deformed pose. A mesh hit inside a `ModelInstance` selects the model root, while a miss clears selection; a mesh hit also carries the world position and geometric normal. See [Picking](../../scene-and-ecs/picking/) for the geometric path.
+
+`query-surface-ray` casts one explicit world ray (origin in metres, a direction that normalizes, an optional range) against the scene's surface providers and returns the nearest hit's position and normal without touching selection. The vegetation brush's straight-down projection re-lands stroke samples through it.
 
 `focus` frames the selected entity's full renderable subtree. It uses the model bounds center and field of view to choose a distance, falling back to the entity's world translation when no mesh bounds resolve.
 
