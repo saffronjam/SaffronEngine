@@ -52,6 +52,12 @@ Skinned geometry cannot use the rest-pose hierarchy for an exact surface hit. Th
 
 A conservative broad phase transforms the bind-pose bounds through every joint and unions the results. Only a ray that crosses this box pays for CPU skinning and triangle intersection. The deformation matches `skin.slang`, so selection follows the pose shown in the viewport without a GPU readback. Capabilities explicitly mark the result as non-authoritative: it has no stable attachment, nearest query, or quantized field tile.
 
+## Vegetation
+
+The same viewport ray also queries the [vegetation world](../../geometry-and-assets/plant-rendering/). `VegetationWorld::query_ray` walks each resident cell's macro BVH and returns plants by stable `PlantId`, resolved through the CPU cell snapshot — never a GPU slot index. The nearest macro plant competes with the entity surface hit by metric distance.
+
+Micro vegetation has no per-blade identity, so a micro hit is paint feedback rather than selection. `query_micro_ray` intersects the ray with each resident cell's floor plane and accepts the crossing only where the landing texel of a micro field tile carries nonzero density. The result is a world-space position; it loses distance ties to entity surfaces and macro plants.
+
 ## Selection result
 
 `query_scene_surface_ray` returns a `SceneSurfaceHit` containing the mesh entity, complete `SurfaceHit`, and provider capabilities. `pick_scene_surface` builds the viewport ray and consumes that query; `pick_entity` reduces the result to an entity or `Entity::NULL`. Picking does not own a second triangle-intersection path.
@@ -62,6 +68,8 @@ The control command performs one final ownership step: if the surface belongs to
 |---|---|---|
 | Light or camera glyph | `billboard` | Glyph entity |
 | Static or skinned surface | `mesh` | Model root, or hit entity outside a model |
+| Macro plant | `vegetation` | None; the result carries the stable `plant` id |
+| Micro field ground | `micro-vegetation` | None; the result carries the world `position` |
 | Empty viewport | absent | Cleared |
 
 ## Source map

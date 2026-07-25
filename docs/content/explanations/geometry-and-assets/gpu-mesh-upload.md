@@ -6,10 +6,11 @@ weight = 5
 # Mesh upload
 
 Mesh upload moves a CPU-side [`Mesh`](../mesh-and-vertex-layout/) into device-local Vulkan
-buffers and derives, in the same call, everything the renderer will later ask of that
-geometry: draw metadata, a local-space bounding box, CPU copies for picking, and the
-optional skin, morph, meshlet, BLAS, and distance-field sidecars. `Uploader::upload_mesh`
-is the single entry point; the result is a shared `Arc<GpuMesh>`.
+buffers and retains its [portable hierarchy](../virtual-geometry/)'s page directory. It
+derives everything the renderer asks of that geometry: draw metadata, a local-space
+bounding box, CPU copies for picking, and the optional skin, morph, BLAS, and
+distance-field sidecars. `Uploader::upload_mesh` is the single entry point; the result is
+a shared `Arc<GpuMesh>`.
 
 ## Stage, then copy
 
@@ -78,7 +79,7 @@ complete the moment it exists:
 | Morph buffers | the mesh has blend shapes | the morph compute pass | fails the upload |
 | BLAS | RT-capable device, ≥ 1 triangle | the per-frame TLAS build | logged; mesh renders without RT |
 | Per-mesh SDFs | an `SdfBake` request | the distance-field traces | logged; mesh carries no field |
-| Meshlet buffers | a `VK_EXT_mesh_shader` device | the mesh-shader raster front end | logged; mesh uses the index-draw path |
+| Hierarchy page directory | always (validated against the mesh) | the GPU-scene mirror's page graph | fails the upload |
 
 The morph buffers concatenate every target's deltas into one flat `MorphDelta` array plus
 a per-target `[first_delta, delta_count]` range table, both storage buffers for the deform
@@ -93,27 +94,27 @@ arrays, and the [software ray trace](../../global-illumination-and-raytracing/so
 and cone-trace paths index it by that slot. Gizmo and preview meshes pass no request and
 bake nothing.
 
-The meshlet path clusters the mesh with `build_meshlets` and uploads three storage buffers:
-the meshlet descriptors, the flat vertex indices, and the packed triangle bytes (padded to
-a 4-byte multiple for byte-address reads). The draw issues one `cmd_draw_mesh_tasks` range
-per submesh when
-[`VK_EXT_mesh_shader`](https://www.khronos.org/blog/mesh-shading-for-vulkan) is enabled.
+The hierarchy page directory lists each cooked page's dependencies, guaranteed roots,
+bounds, and transition errors. The GPU-scene mirror builds the prototype's page graph from
+it; page payloads stream from the source artifact into the global pages arena — the index
+buffer every visibility-driven draw binds — never from mesh memory.
 
 ## What a GpuMesh holds
 
 ```rust
 pub struct GpuMesh {
-    // device-local vertex + index buffers, optional skin/morph/meshlet buffers
+    // device-local vertex + index buffers, optional skin/morph buffers
     pub index_count: u32,
     pub vertex_count: u32,
     pub submeshes: Vec<Submesh>,
     pub bounds_min: Vec3,                          // local-space AABB
     pub bounds_max: Vec3,
-    pub cpu_positions: Vec<Vec3>,                  // retained for picking
-    pub cpu_indices: Vec<u32>,
+    pub cpu_vertices: Arc<[Vertex]>,               // retained for picking
+    pub cpu_indices: Arc<[u32]>,
     pub cpu_skin: Vec<VertexSkin>,                 // empty when unskinned
     pub blas: Option<Arc<AccelerationStructure>>,  // None without RT
     pub sdfs: Vec<Arc<GpuSdf>>,                    // per-primitive distance fields
+    pub hierarchy_pages: Vec<PortableHierarchyPage>, // the cooked page directory
 }
 ```
 
@@ -146,8 +147,9 @@ re-reading GPU memory:
 | The upload | `rendering/src/upload.rs` | `Uploader::upload_mesh`, `with_one_off_commands` |
 | Staging + device buffers | `rendering/src/upload.rs` | `StagingBuffer`, `make_device_buffer` |
 | Shared queue | `rendering/src/upload.rs` | `GpuQueue` |
-| Sidecar builds | `rendering/src/upload.rs` | `build_mesh_blas`, `upload_morph_buffers`, `upload_meshlet_buffers`, `upload_sdf` |
-| GPU mesh type | `rendering/src/resources.rs` | `GpuMesh`, `GpuMeshParts`, `MorphBuffers`, `MeshletBuffers` |
+| Sidecar builds | `rendering/src/upload.rs` | `build_mesh_blas`, `upload_morph_buffers`, `upload_sdf` |
+| Hierarchy load | `geometry/src/smesh.rs` | `load_mesh_hierarchy_from_bytes` |
+| GPU mesh type | `rendering/src/resources.rs` | `GpuMesh`, `GpuMeshParts`, `MorphBuffers` |
 | Upload seam | `assets/src/gpu.rs` | `GpuUploader`, `RendererUploader` |
 | Bounds consumers | `assets/src/render_scene.rs` | `render_scene`, `pick_scene_surface`, `scene_render_aabb` |
 | Pick BVH cache | `assets/src/load.rs` | `AssetServer::mesh_pick_bvh` |
