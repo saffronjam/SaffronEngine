@@ -25,12 +25,16 @@ use saffron_scene::{
 };
 use saffron_script::{ContactInfo, ScriptHost, ScriptHostBridge, ScriptRunError};
 use saffron_spatial::ResidencyManager;
-use saffron_vegetation::VegetationWorld;
 
 use crate::bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
+    SharedVegetation,
 };
 use crate::vegetation::VegetationRuntimeScheduler;
+use crate::vegetation_collision::{VegetationCollisionReport, VegetationCollisionResidency};
+use crate::vegetation_family::PlantFamilyCache;
+use crate::vegetation_navigation::{VegetationNavigationReport, VegetationNavigationSeam};
+use crate::vegetation_promotion::{VegetationPromotion, VegetationPromotionReport};
 use crate::{
     VegetationRuntimeBindingStatus, VegetationRuntimeError, VegetationRuntimeUnavailableReason,
 };
@@ -69,10 +73,19 @@ pub struct RuntimeSession {
     /// Whether the Jolt process globals are installed — set true the first time a world is built.
     /// They outlive every world, so teardown shuts them down once, after the last world drops.
     physics_init: bool,
-    /// The sole authoritative vegetation runtime, bound to one exact cooked manifest.
-    vegetation: Option<VegetationWorld>,
+    /// The sole authoritative vegetation runtime, bound to one exact cooked manifest. Behind the
+    /// shared cell so a script's `sa.vegetation_*` call reaches the same world the host publishes.
+    vegetation: SharedVegetation,
     vegetation_scheduler: VegetationRuntimeScheduler,
     vegetation_status: VegetationRuntimeBindingStatus,
+    /// Generation-tagged batched Jolt proxies for physics-resident vegetation cells.
+    vegetation_collision: VegetationCollisionResidency,
+    /// The promotion authority owning every transient macro-plant entity view.
+    vegetation_promotion: VegetationPromotion,
+    /// Resolved `.splant` family assets shared by collision residency and promotion.
+    vegetation_families: PlantFamilyCache,
+    /// Published navigation contributions and the dirty world regions they moved.
+    vegetation_navigation: VegetationNavigationSeam,
 }
 
 impl Default for RuntimeSession {
@@ -93,9 +106,11 @@ impl RuntimeSession {
         // off-gate path; control/runtime-driven ragdoll enabling goes straight through the
         // world, so it stays empty here.
         let bridge_scene: SharedScene = Rc::new(RefCell::new(Scene::new()));
+        let vegetation: SharedVegetation = Rc::new(RefCell::new(None));
         let bridge: Rc<dyn ScriptHostBridge> = Rc::new(RuntimeScriptBridge::new(
             Rc::clone(&physics),
             bridge_scene,
+            Rc::clone(&vegetation),
             Rc::clone(&log_sink),
         ));
         Self {
@@ -110,9 +125,13 @@ impl RuntimeSession {
             contact_cursor: 0,
             script_vm_active: false,
             physics_init: false,
-            vegetation: None,
+            vegetation,
             vegetation_scheduler: VegetationRuntimeScheduler::default(),
             vegetation_status: VegetationRuntimeBindingStatus::default(),
+            vegetation_collision: VegetationCollisionResidency::default(),
+            vegetation_promotion: VegetationPromotion::default(),
+            vegetation_families: PlantFamilyCache::default(),
+            vegetation_navigation: VegetationNavigationSeam::default(),
         }
     }
 
@@ -248,8 +267,8 @@ impl RuntimeSession {
         // the same frame the contact fired.
         for event in events {
             let contact = ContactInfo {
-                entity_a: event.entity_a,
-                entity_b: event.entity_b,
+                target_a: event.target_a.map(crate::bridge::script_target),
+                target_b: event.target_b.map(crate::bridge::script_target),
                 begin: event.kind == ContactKind::Begin,
                 sensor: event.sensor,
                 point: event.point,
@@ -302,6 +321,9 @@ impl RuntimeSession {
         self.script.stop_scripts();
         self.script_vm_active = false;
         *self.physics.borrow_mut() = None;
+        self.vegetation_collision.reset();
+        self.vegetation_promotion.reset();
+        self.vegetation_families.clear();
         self.pose_targets.clear();
         self.log_sink.borrow_mut().clear();
         self.error_sink.clear();
@@ -319,6 +341,8 @@ impl RuntimeSession {
     /// shut down).
     pub fn drop_physics_world(&mut self) {
         *self.physics.borrow_mut() = None;
+        self.vegetation_collision.reset();
+        self.vegetation_promotion.reset();
     }
 
     /// Shuts down the Jolt process globals — only after the last world is gone (a live world
@@ -355,31 +379,84 @@ impl RuntimeSession {
         Rc::clone(&self.physics)
     }
 
-    /// The sole runtime vegetation authority, lent to host systems for residency and control.
+    /// An owned clone of the shared vegetation cell. A consumer borrows it for the span it needs
+    /// the authority — the render mirror and the overlays for a read, the control plane for a
+    /// mutable drain. The clone is cheap (`Rc`) and borrowing it does not alias the session's
+    /// other state.
     #[must_use]
-    pub fn vegetation_world(&self) -> Option<&VegetationWorld> {
-        self.vegetation.as_ref()
+    pub fn vegetation_cell(&self) -> SharedVegetation {
+        Rc::clone(&self.vegetation)
     }
 
-    /// The sole mutable runtime vegetation authority.
-    #[must_use]
-    pub fn vegetation_world_mut(&mut self) -> &mut Option<VegetationWorld> {
-        &mut self.vegetation
-    }
-
-    /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load workers.
+    /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load
+    /// workers, then synchronizes the collision facet: every physics-resident cell generation's
+    /// batched Jolt proxies are created/removed against the live play world at this one point.
     pub fn synchronize_vegetation(
         &mut self,
         scene: &mut Scene,
         assets: &AssetServer,
         spatial: &ResidencyManager,
     ) -> Result<(), VegetationRuntimeError> {
+        let vegetation_cell = Rc::clone(&self.vegetation);
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        let bound_identity = vegetation_ref
+            .as_ref()
+            .map(|world| world.manifest_identity());
         match self
             .vegetation_scheduler
-            .advance(&mut self.vegetation, scene, assets, spatial)
+            .advance(&mut vegetation_ref, scene, assets, spatial)
         {
             Ok(status) => {
                 self.vegetation_status = status;
+                let mut world_ref = self.physics.borrow_mut();
+                // A rebind replaced the bound generation, so any entity view describes plants of
+                // a world that no longer exists.
+                if bound_identity.is_some()
+                    && vegetation_ref
+                        .as_ref()
+                        .map(|world| world.manifest_identity())
+                        != bound_identity
+                {
+                    self.vegetation_promotion.abandon(scene, world_ref.as_mut());
+                }
+                match (world_ref.as_mut(), vegetation_ref.as_mut()) {
+                    (mut world, Some(vegetation)) => {
+                        // Promotion commits first: the collision pass below then sees the
+                        // suppression it just applied, so a plant never has two owners.
+                        self.vegetation_promotion.advance(
+                            vegetation,
+                            scene,
+                            assets,
+                            &mut self.vegetation_families,
+                            world.as_deref_mut(),
+                        );
+                        if let Some(world) = world {
+                            self.vegetation_collision.advance(
+                                vegetation,
+                                world,
+                                assets,
+                                &mut self.vegetation_families,
+                            );
+                        }
+                        // Navigation publishes from the same committed state, after promotion has
+                        // decided which plants are moving.
+                        self.vegetation_navigation.advance(
+                            vegetation,
+                            assets,
+                            &mut self.vegetation_families,
+                        );
+                    }
+                    (Some(world), None) => {
+                        self.vegetation_promotion.abandon(scene, Some(world));
+                        self.vegetation_collision.remove_all(world);
+                        self.vegetation_navigation.clear();
+                    }
+                    (None, None) => {
+                        self.vegetation_promotion.reset();
+                        self.vegetation_collision.reset();
+                        self.vegetation_navigation.clear();
+                    }
+                }
                 Ok(())
             }
             Err(error) => {
@@ -392,9 +469,59 @@ impl RuntimeSession {
         }
     }
 
-    /// Clears vegetation authority and joins every pending cell-load worker.
-    pub fn clear_vegetation(&mut self) -> Result<(), VegetationRuntimeError> {
-        self.vegetation_scheduler.clear(&mut self.vegetation)?;
+    /// The promotion authority and the navigation seam, borrowed disjointly for one control-plane
+    /// drain (a command may touch either). The vegetation authority itself comes from
+    /// [`vegetation_cell`](Self::vegetation_cell), so all three borrow independently.
+    pub fn vegetation_control_authorities(
+        &mut self,
+    ) -> (&mut VegetationPromotion, &mut VegetationNavigationSeam) {
+        (
+            &mut self.vegetation_promotion,
+            &mut self.vegetation_navigation,
+        )
+    }
+
+    /// Current navigation-seam counters.
+    #[must_use]
+    pub fn vegetation_navigation_report(&self) -> VegetationNavigationReport {
+        self.vegetation_navigation.report()
+    }
+
+    /// Current promotion counters, present only while a live play world can own entity views.
+    #[must_use]
+    pub fn vegetation_promotion_report(&self) -> Option<VegetationPromotionReport> {
+        self.physics.borrow().as_ref()?;
+        Some(self.vegetation_promotion.report())
+    }
+
+    /// Current collision-facet counters (resident cells/bodies, lifetime create/remove totals),
+    /// present only while a live play world can carry the bodies.
+    #[must_use]
+    pub fn vegetation_collision_report(&self) -> Option<VegetationCollisionReport> {
+        self.physics.borrow().as_ref()?;
+        Some(self.vegetation_collision.report())
+    }
+
+    /// Clears vegetation authority and joins every pending cell-load worker. Every promoted
+    /// plant demotes first — with its state written back through the reducer while the authority
+    /// is still live — and a still-live play world then sheds every vegetation collision body.
+    pub fn clear_vegetation(&mut self, scene: &mut Scene) -> Result<(), VegetationRuntimeError> {
+        let mut world_ref = self.physics.borrow_mut();
+        let vegetation_cell = Rc::clone(&self.vegetation);
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        if let Some(vegetation) = vegetation_ref.as_mut() {
+            self.vegetation_promotion
+                .demote_all(vegetation, scene, world_ref.as_mut());
+        } else {
+            self.vegetation_promotion.abandon(scene, world_ref.as_mut());
+        }
+        if let Some(world) = world_ref.as_mut() {
+            self.vegetation_collision.remove_all(world);
+        }
+        drop(world_ref);
+        self.vegetation_navigation.clear();
+        self.vegetation_families.clear();
+        self.vegetation_scheduler.clear(&mut vegetation_ref)?;
         self.vegetation_status = VegetationRuntimeBindingStatus::Unavailable {
             reason: VegetationRuntimeUnavailableReason::NoProject,
             detail: None,
@@ -425,11 +552,10 @@ impl RuntimeSession {
         assets: &mut AssetServer,
         surface_providers: &[Arc<dyn saffron_spatial::SurfaceField>],
     ) -> Result<(), VegetationRuntimeError> {
-        self.vegetation_scheduler.regenerate_missing(
-            &mut self.vegetation,
-            assets,
-            surface_providers,
-        )
+        let vegetation_cell = Rc::clone(&self.vegetation);
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        self.vegetation_scheduler
+            .regenerate_missing(&mut vegetation_ref, assets, surface_providers)
     }
 
     /// Whether a live world is present.

@@ -62,7 +62,7 @@ pub enum VegetationRuntimeError {
     Binding(&'static str),
     /// An exact asset or CAS operation failed.
     #[error(transparent)]
-    Asset(#[from] saffron_assets::Error),
+    Asset(#[from] Box<saffron_assets::Error>),
     /// Strict vegetation validation or publication failed.
     #[error(transparent)]
     Vegetation(#[from] saffron_vegetation::Error),
@@ -82,9 +82,21 @@ enum CellLoadError {
     #[error("cell artifact is absent from disposable CAS")]
     MissingArtifact,
     #[error(transparent)]
-    Asset(#[from] saffron_assets::Error),
+    Asset(#[from] Box<saffron_assets::Error>),
     #[error(transparent)]
     Vegetation(#[from] saffron_vegetation::Error),
+}
+
+impl From<saffron_assets::Error> for VegetationRuntimeError {
+    fn from(error: saffron_assets::Error) -> Self {
+        Self::Asset(Box::new(error))
+    }
+}
+
+impl From<saffron_assets::Error> for CellLoadError {
+    fn from(error: saffron_assets::Error) -> Self {
+        Self::Asset(Box::new(error))
+    }
 }
 
 type CellLoadOutcome = Result<StagedVegetationCellGeneration, CellLoadError>;
@@ -219,7 +231,7 @@ pub(crate) struct VegetationRuntimeScheduler {
 enum ManifestSelection {
     NoEnabledField,
     NoCookedManifest,
-    Selected(VegetationBaseManifest),
+    Selected(Box<VegetationBaseManifest>),
 }
 
 impl VegetationRuntimeScheduler {
@@ -245,7 +257,7 @@ impl VegetationRuntimeScheduler {
                     detail: None,
                 });
             }
-            ManifestSelection::Selected(manifest) => manifest,
+            ManifestSelection::Selected(manifest) => *manifest,
         };
         let identity = manifest.identity()?;
         if runtime
@@ -456,7 +468,7 @@ fn selected_manifest(
             "selected vegetation manifest belongs to a different map",
         ));
     }
-    Ok(ManifestSelection::Selected(manifest))
+    Ok(ManifestSelection::Selected(Box::new(manifest)))
 }
 
 fn synchronize_sources(

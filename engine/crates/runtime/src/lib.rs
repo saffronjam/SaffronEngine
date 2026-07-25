@@ -15,11 +15,27 @@
 mod bridge;
 mod session;
 mod vegetation;
+mod vegetation_collision;
+mod vegetation_family;
+mod vegetation_navigation;
+mod vegetation_promotion;
 
 pub use bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
 };
+pub use saffron_vegetation::{
+    CandidateRejectionReason, PlantLifecycle, VegetationCellSectionKind, VegetationWorld,
+    decode_vegetation_rejection_diagnostics,
+};
 pub use session::RuntimeSession;
 pub use vegetation::{
     VegetationRuntimeBindingStatus, VegetationRuntimeError, VegetationRuntimeUnavailableReason,
+};
+pub use vegetation_collision::VegetationCollisionReport;
+pub use vegetation_navigation::{
+    NavigationContribution, NavigationContributionKind, VegetationNavigationReport,
+    VegetationNavigationSeam,
+};
+pub use vegetation_promotion::{
+    PlantPromotionState, VegetationPromotion, VegetationPromotionError, VegetationPromotionReport,
 };
