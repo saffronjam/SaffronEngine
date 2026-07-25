@@ -436,6 +436,12 @@ async function paramsForFixture(
       return { enabled: false };
     case "wind-calm":
       return { speed: 0, gust: 0 };
+    case "interaction-impulse":
+      return { positionM: [0, 0], radiusM: 2, strength: 3 };
+    case "wind-sample-origin":
+      return { positionM: [0, 1, 0] };
+    case "surface-ray-down":
+      return { originM: [0, 5, 0], direction: [0, -1, 0] };
     case "time-of-day-noon":
       return { timeOfDay: 0.5 };
     case "cube-preset":

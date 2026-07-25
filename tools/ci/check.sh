@@ -154,6 +154,21 @@ else
   fail_step "4. self-test-removal assertion" "a runtime self-test survives outside #[cfg(test)] (see above)"
 fi
 
+step "4b. draw-path tripwire (no CPU gather/batcher/meshlet symbol survives)"
+# The persistent GPU scene's visibility traversal is the ONE production draw path.
+# Any of these identifiers reappearing in engine source is a resurrected CPU draw
+# list, batcher, or the retired mesh-shader raster toggle.
+tripwire_hits="$(
+  grep -rnE 'DrawItem|DrawBatch|submit_draw_list|gather_static_draw_list|record_scene_draw_list|record_transparent_draw_list|SAFFRON_MESH_SHADER|MeshletRaster|record_meshlet_draws' \
+    "$ENGINE/crates" --include='*.rs' 2>/dev/null || true
+)"
+if [ -z "$tripwire_hits" ]; then
+  pass_step "4b. draw-path tripwire"
+else
+  echo "$tripwire_hits" >&2
+  fail_step "4b. draw-path tripwire" "a retired CPU draw-path symbol survives (see above)"
+fi
+
 step "5. present-only smoke (bounded, headless) + validation-clean log grep"
 if host_ready; then
   smoke_log="/tmp/sa-ci-smoke-$$.log"
