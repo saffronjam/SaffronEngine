@@ -1,6 +1,6 @@
 //! CPU reference for the canonical raster and ray coverage decision.
 
-use saffron_vegetation::AlphaClassification;
+use saffron_material::AlphaClassification;
 
 use crate::CoverageSourceKind;
 
