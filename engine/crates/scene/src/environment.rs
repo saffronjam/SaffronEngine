@@ -288,10 +288,40 @@ impl Default for CloudSettings {
 pub struct WindSettings {
     /// Horizontal direction in degrees, clockwise from world +Z.
     pub orientation: f32,
-    /// Mean advection speed in metres per second.
+    /// Mean advection speed in metres per second at the reference height.
     pub speed: f32,
-    /// Divergence-free turbulent warp amplitude.
+    /// Divergence-free turbulent warp amplitude (fraction of the mean speed).
     pub gust: f32,
+    /// Turbulence octave count (0 = mean advection only).
+    pub turbulence_octaves: u32,
+    /// Per-octave turbulence amplitude falloff in (0, 1].
+    pub turbulence_roughness: f32,
+    /// Gust-front passage frequency in hertz.
+    pub gust_frequency: f32,
+    /// Height in metres at which `speed` is authored.
+    pub reference_height: f32,
+    /// Power-law shear exponent for the height response (0 = uniform).
+    pub height_exponent: f32,
+    /// Deterministic seed for the turbulence phases.
+    pub seed: u32,
+}
+
+impl WindSettings {
+    /// The sampling profile these settings author (field-for-field).
+    #[must_use]
+    pub fn profile(&self) -> saffron_wind::WindProfile {
+        saffron_wind::WindProfile {
+            orientation: self.orientation,
+            speed: self.speed,
+            gust: self.gust,
+            turbulence_octaves: self.turbulence_octaves,
+            turbulence_roughness: self.turbulence_roughness,
+            gust_frequency: self.gust_frequency,
+            reference_height: self.reference_height,
+            height_exponent: self.height_exponent,
+            seed: self.seed,
+        }
+    }
 }
 
 impl Default for WindSettings {
@@ -300,6 +330,12 @@ impl Default for WindSettings {
             orientation: 0.0,
             speed: 10.0,
             gust: 0.25,
+            turbulence_octaves: 3,
+            turbulence_roughness: 0.55,
+            gust_frequency: 0.15,
+            reference_height: 10.0,
+            height_exponent: 0.2,
+            seed: 0,
         }
     }
 }
