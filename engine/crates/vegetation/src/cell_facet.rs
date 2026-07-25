@@ -233,6 +233,17 @@ pub fn decode_vegetation_cell_facet(
     })
 }
 
+/// Encodes the exact current micro-field facet — the encode mirror of
+/// [`decode_vegetation_micro_fields`]. Tiles must be strictly `(cell, family)`-ordered,
+/// the section's canonical order.
+pub fn encode_vegetation_micro_fields(tiles: &[MicroFieldTile]) -> Result<Vec<u8>> {
+    let mut sink = crate::canonical::ByteSink::new();
+    use crate::canonical::CanonicalSink as _;
+    sink.write(b"SVEGMIC2")?;
+    crate::evaluator::encode_micro_fields_body(&mut sink, tiles)?;
+    Ok(sink.finish())
+}
+
 /// Decodes the exact current micro-field facet.
 pub fn decode_vegetation_micro_fields(bytes: &[u8]) -> Result<Vec<MicroFieldTile>> {
     let mut reader = facet_reader(bytes, MICRO_FORMAT, b"SVEGMIC2")?;
@@ -368,13 +379,13 @@ pub fn decode_vegetation_provenance(bytes: &[u8]) -> Result<ProvenanceTable> {
 pub fn decode_vegetation_rejection_diagnostics(
     bytes: &[u8],
 ) -> Result<VegetationRejectionDiagnosticsFacet> {
-    let mut reader = facet_reader(bytes, REJECTION_FORMAT, b"SVEGREJ1")?;
+    let mut reader = facet_reader(bytes, REJECTION_FORMAT, b"SVEGREJ2")?;
     let candidate_count = reader.u64()?;
     let accepted_count = reader.u64()?;
     if accepted_count > candidate_count {
         return invalid(REJECTION_FORMAT, "acceptedCount");
     }
-    let rejected_count = reader.count(57)?;
+    let rejected_count = reader.count(105)?;
     let mut rejected = reserved(rejected_count, "decoded vegetation rejections")?;
     for _ in 0..rejected_count {
         rejected.push(read_rejected_candidate(&mut reader)?);
@@ -727,7 +738,7 @@ fn require_plant_order<T>(
 }
 
 fn read_plant(reader: &mut BinaryReader<'_>) -> Result<PlantId> {
-    PlantId::from_bytes(reader.array()?)
+    PlantId::from_bytes(reader.array()?).map_err(|_| Error::InvalidPlantId)
 }
 
 fn read_optional_plant(
@@ -766,12 +777,12 @@ fn read_packed_world_position(reader: &mut BinaryReader<'_>) -> Result<WorldPosi
 }
 
 fn read_orientation(reader: &mut BinaryReader<'_>) -> Result<QuantizedOrientation> {
-    QuantizedOrientation::new([
+    Ok(QuantizedOrientation::new([
         reader.u16()? as i16,
         reader.u16()? as i16,
         reader.u16()? as i16,
         reader.u16()? as i16,
-    ])
+    ])?)
 }
 
 fn read_scale(reader: &mut BinaryReader<'_>) -> Result<[DecisionScalar; 3]> {
@@ -898,8 +909,18 @@ const fn rejection_code(value: CandidateRejectionReason) -> u8 {
 }
 
 fn read_rejected_candidate(reader: &mut BinaryReader<'_>) -> Result<RejectedCandidate> {
+    let candidate = read_candidate_identity(reader, REJECTION_FORMAT)?;
+    let mut ticks = [0_i128; 3];
+    for slot in &mut ticks {
+        *slot = reader.u128()? as i128;
+    }
+    let position = WorldPosition::from_global_ticks(ticks).map_err(|_| Error::ArtifactFormat {
+        format: REJECTION_FORMAT,
+        field: "rejected.position".to_owned(),
+    })?;
     Ok(RejectedCandidate {
-        candidate: read_candidate_identity(reader, REJECTION_FORMAT)?,
+        candidate,
+        position,
         reason: rejection_reason(reader.u8()?)?,
         provenance: ProvenanceHandle(reader.u32()?),
     })
@@ -981,7 +1002,7 @@ fn read_diagnostic_stream(reader: &mut BinaryReader<'_>) -> Result<NamedDiagnost
         }
         _ => return invalid(REJECTION_FORMAT, "streams.field.presence"),
     };
-    let rejected_count = reader.count(57)?;
+    let rejected_count = reader.count(105)?;
     let mut rejected = reserved(rejected_count, "decoded diagnostic stream rejections")?;
     for _ in 0..rejected_count {
         rejected.push(read_rejected_candidate(reader)?);

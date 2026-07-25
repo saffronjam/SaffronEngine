@@ -895,6 +895,7 @@ mod tests {
     fn rejected_result(cell: WorldCellKey, ordinal: u64) -> GraphEvaluationResult {
         let rejected = RejectedCandidate {
             candidate: candidate(ordinal),
+            position: WorldPosition::origin(),
             reason: CandidateRejectionReason::Threshold,
             provenance: ProvenanceHandle(0),
         };

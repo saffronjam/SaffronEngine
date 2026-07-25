@@ -1,25 +1,31 @@
 //! Immutable runtime cell generations, facet residency, and vegetation queries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use glam::DVec3;
 use saffron_core::Uuid;
 use saffron_spatial::{
-    GenerationSlot, GenerationToken, ResidencyFacet, ResidencyManager, ResidencyMask,
-    ResidencySnapshot, SpatialSource, SpatialSourceId, UnitInterval, WorldBounds, WorldCellKey,
-    WorldPosition,
+    DecisionScalar, GenerationSlot, GenerationToken, ResidencyFacet, ResidencyManager,
+    ResidencyMask, ResidencySnapshot, SpatialSource, SpatialSourceId, UnitInterval, WorldBounds,
+    WorldCellKey, WorldPosition,
 };
 
 use crate::{
-    ContentHash, DisturbanceTileKey, Error, InteractionPolicy, MicroFieldTile, PlantFlags, PlantId,
-    PlantLifecycle, PlantPoint, PlantPointColumns, PlantTagId, ProvenanceHandle, ProvenanceRecord,
-    ProvenanceTable, Result, SaveStateEnvelope, VegetationBaseManifest,
-    VegetationCellArtifactIndex, VegetationCellFacet, VegetationCellSectionKind,
-    VegetationCellState, VegetationManifestCell, VegetationMutationRecord,
-    VegetationRejectionDiagnosticsFacet, VegetationState, VegetationStateBinding,
-    decode_vegetation_cell_facet, reduce_mutations,
+    ContentHash, DisturbanceTileKey, EcologyCatchUp, EcologyCatchUpReport, EcologyInfluence,
+    EcologyPlantState, EcologyRegion, EcologyRegionState, EcologyRelation, EcologyRelations,
+    EcologySpeciesRules, Error, InteractionPolicy, MicroFieldTile, MutationHeader, PlantFlags,
+    PlantId, PlantLifecycle, PlantPoint, PlantPointColumns, PlantTagId, ProvenanceHandle,
+    ProvenanceRecord, ProvenanceTable, QuantizedOrientation, Result, SaveStateEnvelope,
+    VEGETATION_ARTIFACT_DECODE_LIMITS, VegetationBaseManifest, VegetationCellArtifactIndex,
+    VegetationCellFacet, VegetationCellSectionKind, VegetationCellState, VegetationManifestCell,
+    VegetationMutationRecord, VegetationRejectionDiagnosticsFacet, VegetationState,
+    VegetationStateBinding, VegetationTransition, advance_region, decode_vegetation_cell_facet,
+    dependency_regions, reduce_mutations,
 };
+
+/// Authority stamped on every mutation the ecology simulation commits.
+const ECOLOGY_AUTHORITY: u128 = 0x5361_6666_726f_6e5f_4563_6f6c_6f67_7901;
 
 /// Explicit decoded-byte ceilings for each logical residency facet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,10 +102,16 @@ struct PlantSlot {
 pub struct VegetationPlantSnapshot {
     /// Stable plant identity.
     pub plant: PlantId,
+    /// Monotonic biological tick.
+    pub ecology_tick: u64,
     /// Generation-tagged lookup handle.
     pub handle: VegetationPlantHandle,
     /// Exact world position.
     pub position: WorldPosition,
+    /// Quantized orientation.
+    pub orientation: QuantizedOrientation,
+    /// Q15.16 local scale.
+    pub scale: [DecisionScalar; 3],
     /// Conservative world bounds.
     pub bounds: WorldBounds,
     /// Plant-family identity.
@@ -108,6 +120,8 @@ pub struct VegetationPlantSnapshot {
     pub tags: Vec<PlantTagId>,
     /// Biological lifecycle state.
     pub lifecycle: PlantLifecycle,
+    /// Family variation, which selects the individual's geometry.
+    pub variation: u32,
     /// Species phenotype.
     pub phenotype: u32,
     /// Gameplay interaction policy.
@@ -118,8 +132,27 @@ pub struct VegetationPlantSnapshot {
     pub moisture: UnitInterval,
     /// Persistent fuel.
     pub fuel: UnitInterval,
+    /// Whether the plant is alight.
+    pub ignited: bool,
     /// Compact accepted-point provenance when the editing facet is resident.
     pub provenance: Option<ProvenanceRecord>,
+}
+
+/// What a volume holds, for a system that needs to know whether it will burn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VegetationCombustionSample {
+    /// Plants matched by the sample.
+    pub plants: u32,
+    /// How many of them are alight.
+    pub ignited: u32,
+    /// Mean combustible fuel.
+    pub fuel: UnitInterval,
+    /// Mean persistent moisture.
+    pub moisture: UnitInterval,
+    /// Mean health.
+    pub health: UnitInterval,
+    /// Ground covered by the matched plants, as a share of one cell.
+    pub occupancy: UnitInterval,
 }
 
 /// Closed filters shared by every vegetation macro query.
@@ -145,6 +178,19 @@ impl VegetationQueryFilter {
                     .interaction_policies
                     .contains(&point.interaction_policy))
     }
+}
+
+/// One nonpersistent micro-field paint-feedback hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VegetationMicroHit {
+    /// World-space hit position in metres.
+    pub position: saffron_geometry::glam::DVec3,
+    /// Metric distance from the ray origin.
+    pub distance_m: f64,
+    /// The field's plant family.
+    pub family: Uuid,
+    /// The owning cell.
+    pub cell: WorldCellKey,
 }
 
 /// Finite world-space ray used only by the vegetation query surface.
@@ -256,8 +302,8 @@ impl VegetationCellLoad {
 
     /// Validates and decodes the requested facets without touching the published world.
     pub fn stage(self, bytes: &[u8]) -> Result<StagedVegetationCellGeneration> {
-        validate_artifact_against_manifest(self.platform_profile, &self.manifest_cell, bytes)?;
-        let index = VegetationCellArtifactIndex::open(bytes)?;
+        let index =
+            validate_artifact_against_manifest(self.platform_profile, &self.manifest_cell, bytes)?;
         let mut decoded = self.current.facets.clone();
         let resident = union_masks(self.current.resident, self.facets);
         for kind in required_sections(self.facets) {
@@ -267,7 +313,7 @@ impl VegetationCellLoad {
                     format: ".svegcell",
                     field: format!("missing runtime facet {}", kind as u16),
                 })?;
-            decoded.insert(kind, decode_vegetation_cell_facet(kind, section)?);
+            decoded.insert(kind, decode_vegetation_cell_facet(kind, section.as_ref())?);
         }
         decoded.retain(|kind, _| required_sections(resident).contains(kind));
         let base = macro_columns(&decoded)?;
@@ -416,6 +462,25 @@ impl VegetationCellGeneration {
         &self.disturbance_masks
     }
 
+    /// Per-plant navigation contribution rows when the navigation facet is resident.
+    pub fn navigation_contributions(&self) -> Option<&[crate::VegetationNavigationContribution]> {
+        match self
+            .facets
+            .get(&VegetationCellSectionKind::NavigationContributions)
+        {
+            Some(VegetationCellFacet::NavigationContributions(rows)) => Some(rows),
+            _ => None,
+        }
+    }
+
+    /// Per-plant collision derivation rows when the physics facet is resident.
+    pub fn collision_inputs(&self) -> Option<&[crate::VegetationCollisionInput]> {
+        match self.facets.get(&VegetationCellSectionKind::CollisionInputs) {
+            Some(VegetationCellFacet::CollisionInputs(rows)) => Some(rows),
+            _ => None,
+        }
+    }
+
     /// Editor provenance when the editing facet is resident.
     pub fn provenance(&self) -> Option<&ProvenanceTable> {
         match self.facets.get(&VegetationCellSectionKind::Provenance) {
@@ -467,20 +532,25 @@ impl VegetationCellGeneration {
             .cloned();
         Ok(VegetationPlantSnapshot {
             plant: point.id,
+            ecology_tick: point.ecology_tick,
             handle: VegetationPlantHandle {
                 plant: point.id,
                 generation: self.id,
             },
             position: point.position,
+            orientation: point.orientation,
+            scale: point.scale,
             bounds: point.bounds,
             family: point.family,
             tags,
             lifecycle: point.lifecycle,
+            variation: point.variation,
             phenotype: point.phenotype,
             interaction_policy: point.interaction_policy,
             health: point.health,
             moisture: point.moisture,
             fuel: point.fuel,
+            ignited: point.flags.contains(PlantFlags::IGNITED),
             provenance,
         })
     }
@@ -509,6 +579,36 @@ impl VegetationCellGeneration {
 
 struct RuntimeCell {
     slot: Arc<GenerationSlot<VegetationCellGeneration>>,
+    /// Monotonic counter bumped whenever a plant this cell owns enters or leaves bulk
+    /// suppression, so render and collision adapters re-derive the cell.
+    bulk_revision: u64,
+}
+
+/// How many committed transitions the event ring retains before evicting the oldest. A consumer
+/// whose cursor falls behind that tail is told to resync rather than handed a gap.
+pub const VEGETATION_EVENT_RING_CAP: usize = 4096;
+
+/// One committed vegetation transition, sequence-stamped for cursor-based delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationEvent {
+    /// Monotonic sequence number within this world.
+    pub seq: u64,
+    /// The transition itself.
+    pub transition: VegetationTransition,
+}
+
+/// A cursor read of the event ring, plus the metadata a stale cursor needs to notice it missed
+/// evicted events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VegetationEventDrain {
+    /// Events newer than the cursor, oldest first.
+    pub events: Vec<VegetationEvent>,
+    /// The newest sequence number the ring has stamped.
+    pub high_water_seq: u64,
+    /// The oldest sequence number still retained, or zero when the ring is empty.
+    pub oldest_seq: u64,
+    /// The cursor was older than the retained tail, so events were missed: resync.
+    pub overflowed: bool,
 }
 
 /// The sole authoritative owner of runtime vegetation cell generations and persistent deltas.
@@ -524,6 +624,14 @@ pub struct VegetationWorld {
     budgets: VegetationResidencyBudgets,
     residency_revision: u64,
     cells: BTreeMap<WorldCellKey, RuntimeCell>,
+    /// Typed transitions committed since the world came up, newest last.
+    event_ring: VecDeque<VegetationEvent>,
+    /// The newest sequence number the ring has stamped.
+    event_seq: u64,
+    /// Plants whose bulk representation is suppressed because a promoted entity owns them.
+    /// Keyed by identity rather than held in an immutable published generation, so a cell
+    /// unload, republication, or reload never loses or duplicates the suppression.
+    bulk_suppressed: BTreeSet<PlantId>,
 }
 
 impl VegetationWorld {
@@ -560,6 +668,9 @@ impl VegetationWorld {
             budgets,
             residency_revision: 0,
             cells: BTreeMap::new(),
+            event_ring: VecDeque::new(),
+            event_seq: 0,
+            bulk_suppressed: BTreeSet::new(),
         })
     }
 
@@ -643,6 +754,16 @@ impl VegetationWorld {
     /// Returns the current complete generation while keeping it alive for the reader.
     pub fn cell_snapshot(&self, cell: WorldCellKey) -> Option<Arc<VegetationCellGeneration>> {
         self.cells.get(&cell).map(|entry| entry.slot.read())
+    }
+
+    /// Iterates every resident cell's current published generation, keeping each alive
+    /// for the reader — the render adapter's snapshot walk.
+    pub fn resident_cells(
+        &self,
+    ) -> impl Iterator<Item = (WorldCellKey, Arc<VegetationCellGeneration>)> + '_ {
+        self.cells
+            .iter()
+            .map(|(cell, entry)| (*cell, entry.slot.read()))
     }
 
     /// Begins one coalesced load and returns a worker-owned immutable staging packet.
@@ -741,6 +862,9 @@ impl VegetationWorld {
         self.effective = effective;
         self.predictions = predictions;
         self.publish_state_rebuilds(staged)?;
+        // Only a confirmed commit is observable. A prediction is transient and a replay is a
+        // no-op, so neither reaches the ring — every consumer sees each transition exactly once.
+        self.record_transitions(&reduction.transitions);
         Ok(reduction)
     }
 
@@ -813,6 +937,109 @@ impl VegetationWorld {
     #[must_use]
     pub fn prediction_count(&self) -> usize {
         self.predictions.len()
+    }
+
+    /// Reads every committed transition with `seq > since`, oldest first, without consuming the
+    /// ring — one cursor per consumer (scripts, VFX, audio, quests, navigation).
+    #[must_use]
+    pub fn drain_events(&self, since: u64) -> VegetationEventDrain {
+        let events: Vec<VegetationEvent> = self
+            .event_ring
+            .iter()
+            .filter(|event| event.seq > since)
+            .copied()
+            .collect();
+        let oldest_seq = self.event_ring.front().map_or(0, |event| event.seq);
+        VegetationEventDrain {
+            events,
+            high_water_seq: self.event_seq,
+            oldest_seq,
+            overflowed: oldest_seq > 0 && since + 1 < oldest_seq,
+        }
+    }
+
+    fn record_transitions(&mut self, transitions: &[VegetationTransition]) {
+        for transition in transitions {
+            self.event_seq += 1;
+            if self.event_ring.len() >= VEGETATION_EVENT_RING_CAP {
+                self.event_ring.pop_front();
+            }
+            self.event_ring.push_back(VegetationEvent {
+                seq: self.event_seq,
+                transition: *transition,
+            });
+        }
+    }
+
+    /// Suppresses `plant`'s bulk representation: the render and collision adapters skip it from
+    /// this point on, because a promoted entity owns it. Returns the plant's owner cell.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlantNotResident`] when no resident macro facet carries the identity, or
+    /// [`Error::Mutation`] when it is already suppressed (two owners is the one thing this
+    /// authority exists to prevent).
+    pub fn promote_plant(&mut self, plant: PlantId) -> Result<WorldCellKey> {
+        let cell = self.owner_cell(plant)?;
+        if !self.bulk_suppressed.insert(plant) {
+            return Err(Error::Mutation(format!(
+                "plant {plant} is already promoted"
+            )));
+        }
+        self.bump_bulk_revision(cell);
+        Ok(cell)
+    }
+
+    /// Restores `plant`'s bulk representation. Returns the plant's owner cell when it is still
+    /// resident, and `None` when the cell has since unloaded (the suppression is cleared either
+    /// way, so a later reload publishes the plant normally).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mutation`] when the plant was not suppressed.
+    pub fn demote_plant(&mut self, plant: PlantId) -> Result<Option<WorldCellKey>> {
+        if !self.bulk_suppressed.remove(&plant) {
+            return Err(Error::Mutation(format!("plant {plant} is not promoted")));
+        }
+        let cell = self.owner_cell(plant).ok();
+        if let Some(cell) = cell {
+            self.bump_bulk_revision(cell);
+        }
+        Ok(cell)
+    }
+
+    /// Whether a promoted entity owns `plant`, so its bulk representation is suppressed.
+    #[must_use]
+    pub fn is_bulk_suppressed(&self, plant: PlantId) -> bool {
+        self.bulk_suppressed.contains(&plant)
+    }
+
+    /// Every bulk-suppressed plant, in canonical identity order.
+    pub fn bulk_suppressed(&self) -> impl Iterator<Item = PlantId> + '_ {
+        self.bulk_suppressed.iter().copied()
+    }
+
+    /// The cell's bulk-suppression revision. A render or collision adapter caches it beside the
+    /// published generation id and re-derives the cell whenever either changes.
+    #[must_use]
+    pub fn cell_bulk_revision(&self, cell: WorldCellKey) -> u64 {
+        self.cells.get(&cell).map_or(0, |entry| entry.bulk_revision)
+    }
+
+    fn owner_cell(&self, plant: PlantId) -> Result<WorldCellKey> {
+        self.cells
+            .iter()
+            .find(|(_, entry)| entry.slot.read().slots.contains_key(&plant))
+            .map(|(cell, _)| *cell)
+            .ok_or(Error::PlantNotResident {
+                plant: plant.to_string(),
+            })
+    }
+
+    fn bump_bulk_revision(&mut self, cell: WorldCellKey) {
+        if let Some(entry) = self.cells.get_mut(&cell) {
+            entry.bulk_revision = entry.bulk_revision.wrapping_add(1);
+        }
     }
 
     /// Resolves a generation-tagged handle and rejects stale generations deterministically.
@@ -927,6 +1154,61 @@ impl VegetationWorld {
         Ok(results)
     }
 
+    /// Nearest micro-field ground hit along a ray: the first resident cell whose
+    /// floor-plane crossing lands on a texel with nonzero density. The hit is
+    /// nonpersistent paint feedback — micro blades have no identity.
+    pub fn query_micro_ray(&self, ray: VegetationQueryRay) -> Option<VegetationMicroHit> {
+        let origin = ray.origin.world_meters();
+        let mut nearest: Option<VegetationMicroHit> = None;
+        for (cell, generation) in self.resident_cells() {
+            let Some(tiles) = generation.micro_fields() else {
+                continue;
+            };
+            let bounds = cell.bounds();
+            let tick = 1.0 / f64::from(saffron_spatial::LOCAL_TICKS_PER_METER);
+            let min = bounds.min_ticks().map(|value| value as f64 * tick);
+            let max = bounds
+                .max_ticks_exclusive()
+                .map(|value| value as f64 * tick);
+            if ray.direction.y.abs() < 1e-9 {
+                continue;
+            }
+            let t = (min[1] - origin.y) / ray.direction.y;
+            if t < 0.0 || t > ray.max_distance_m {
+                continue;
+            }
+            let point = origin + ray.direction * t;
+            if point.x < min[0] || point.x >= max[0] || point.z < min[2] || point.z >= max[2] {
+                continue;
+            }
+            for tile in tiles {
+                let dims = tile.dimensions;
+                let texel_x =
+                    ((point.x - min[0]) / (max[0] - min[0]) * f64::from(dims[0])).floor() as u32;
+                let texel_z =
+                    ((point.z - min[2]) / (max[2] - min[2]) * f64::from(dims[2])).floor() as u32;
+                let texel_x = texel_x.min(dims[0].saturating_sub(1));
+                let texel_z = texel_z.min(dims[2].saturating_sub(1));
+                let index = (texel_x + dims[0] * dims[1] * texel_z) as usize;
+                if tile.density.get(index).is_none_or(|density| *density == 0) {
+                    continue;
+                }
+                if nearest
+                    .as_ref()
+                    .is_none_or(|current| t < current.distance_m)
+                {
+                    nearest = Some(VegetationMicroHit {
+                        position: point,
+                        distance_m: t,
+                        family: tile.family,
+                        cell,
+                    });
+                }
+            }
+        }
+        nearest
+    }
+
     /// Nearest matching plant within an optional finite maximum distance.
     pub fn query_nearest(
         &self,
@@ -997,6 +1279,315 @@ impl VegetationWorld {
         })
     }
 
+    /// Samples the combustible state of a volume: what is growing there, how much of it is alight,
+    /// and how wet it is.
+    ///
+    /// This is the seam a fire system reads. Vegetation owns fuel, moisture, health, occupancy, and
+    /// the persistent record of what is burning; heat propagation and smoke belong to the system
+    /// that calls this and answers with [`VegetationMutation::Ignite`],
+    /// [`VegetationMutation::Extinguish`], [`VegetationMutation::Burn`], and
+    /// [`VegetationMutation::MoistureFuel`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::query_bounds`].
+    pub fn combustion_sample(
+        &self,
+        bounds: WorldBounds,
+        filter: &VegetationQueryFilter,
+    ) -> Result<VegetationCombustionSample> {
+        let plants = self.query_bounds(bounds, filter)?;
+        if plants.is_empty() {
+            return Ok(VegetationCombustionSample::default());
+        }
+        let mean = |total: u64| {
+            UnitInterval::from_bits(u16::try_from(total / plants.len() as u64).unwrap_or(u16::MAX))
+        };
+        let sum = |select: fn(&VegetationPlantSnapshot) -> UnitInterval| {
+            plants
+                .iter()
+                .map(|plant| u64::from(select(plant).bits()))
+                .sum::<u64>()
+        };
+        let occupancy = plants
+            .iter()
+            .map(|plant| u64::from(canopy_share(plant.bounds, plant.position.cell()).bits()))
+            .sum::<u64>();
+        Ok(VegetationCombustionSample {
+            plants: plants.len() as u32,
+            ignited: plants.iter().filter(|plant| plant.ignited).count() as u32,
+            fuel: mean(sum(|plant| plant.fuel)),
+            moisture: mean(sum(|plant| plant.moisture)),
+            health: mean(sum(|plant| plant.health)),
+            occupancy: UnitInterval::from_bits(
+                u16::try_from(occupancy).unwrap_or(UnitInterval::ONE.bits()),
+            ),
+        })
+    }
+
+    /// Advances biological time to `plan.target_tick` and catches the world's dependency regions
+    /// up to it.
+    ///
+    /// World time moves first and unconditionally: biology has aged whether or not anything is
+    /// loaded. Regions then execute the ticks they owe, one whole region at a time, and a region
+    /// only runs while every cell it spans is resident — a region reading a neighbour that is not
+    /// loaded would read stale ground and diverge from continuous simulation. Whatever the budget
+    /// or residency leaves undone stays owed, in order, for the next call.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the tick rules and the reducer, and fails when a region's cells disagree about
+    /// which tick they have reached — that means state was assembled from mismatched checkpoints.
+    pub fn advance_ecology(&mut self, plan: &EcologyCatchUp<'_>) -> Result<EcologyCatchUpReport> {
+        self.persistent
+            .ecology_mut()
+            .advance_world_to(plan.target_tick)?;
+        self.effective
+            .ecology_mut()
+            .advance_world_to(plan.target_tick)?;
+
+        let regions = self.ecology_regions(plan.influence);
+
+        let mut report = EcologyCatchUpReport {
+            world_tick: plan.target_tick,
+            regions: regions.len(),
+            ..EcologyCatchUpReport::default()
+        };
+        let mut remaining = plan.budget.max_ticks;
+        for region in &regions {
+            if !self.region_is_resident(region) {
+                report.regions_awaiting_residency += 1;
+                continue;
+            }
+            let start = self.region_tick(region)?;
+            let owed = plan.target_tick.saturating_sub(start);
+            if owed == 0 {
+                report.regions_caught_up += 1;
+                continue;
+            }
+            let run = owed.min(u64::from(remaining));
+            for tick in (start + 1)..=(start + run) {
+                self.advance_region_one_tick(region, tick, plan)?;
+                report.ticks_run += 1;
+            }
+            remaining -= u32::try_from(run).map_err(|_| Error::NumericOverflow)?;
+            if run == owed {
+                report.regions_caught_up += 1;
+            } else {
+                // Spent budget, or none left by the time this region came up. What it still owes
+                // is owed, not lost: the next call resumes at the same tick.
+                report.ticks_owed += owed - run;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Ecology rules per family, as the cook baked them into the manifest.
+    ///
+    /// A tick reads its species' rules from here rather than from the asset catalog: the manifest
+    /// is the immutable thing the state is bound to, so the rules cannot drift from the state that
+    /// was simulated under them.
+    #[must_use]
+    pub fn ecology_rules(&self) -> BTreeMap<u64, EcologySpeciesRules> {
+        self.manifest
+            .plants
+            .iter()
+            .map(|plant| (plant.family.value(), plant.ecology.rules))
+            .collect()
+    }
+
+    /// Declared species relations, keyed by (subject family, other family).
+    #[must_use]
+    pub fn ecology_relations(&self) -> EcologyRelations {
+        self.manifest
+            .plants
+            .iter()
+            .flat_map(|plant| {
+                plant.ecology.relations.iter().map(|relation| {
+                    (
+                        (plant.family.value(), relation.family.value()),
+                        EcologyRelation {
+                            kind: relation.kind,
+                            strength: relation.strength,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The world's dependency regions under `influence`, in canonical order.
+    ///
+    /// A region spans every cell the cook planted plus every cell the simulation has planted into
+    /// since: a seed that crossed a border into a cell the cook left empty is still a plant that
+    /// ages.
+    #[must_use]
+    pub fn ecology_regions(&self, influence: EcologyInfluence) -> Vec<EcologyRegion> {
+        let planted: BTreeSet<WorldCellKey> = self
+            .manifest_cells
+            .iter()
+            .filter(|(_, cell)| cell.macro_count > 0)
+            .map(|(key, _)| *key)
+            .chain(self.persistent.cells().keys().copied())
+            .collect();
+        dependency_regions(&planted, influence.region_radius_cells())
+    }
+
+    /// Whether every cell `region` spans carries resident macro rows, which a tick requires.
+    #[must_use]
+    pub fn region_is_resident(&self, region: &EcologyRegion) -> bool {
+        region
+            .cells()
+            .iter()
+            .all(|cell| self.cell_has_resident_macro(*cell))
+    }
+
+    /// The tick a region has been simulated to.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mutation`] when the region's cells disagree, which means state was assembled from
+    /// mismatched checkpoints.
+    pub fn ecology_region_tick(&self, region: &EcologyRegion) -> Result<u64> {
+        self.region_tick(region)
+    }
+
+    /// Whether `cell` has a resident generation carrying macro rows to simulate.
+    fn cell_has_resident_macro(&self, cell: WorldCellKey) -> bool {
+        self.cells
+            .get(&cell)
+            .is_some_and(|entry| !entry.slot.read().macro_points.ids.is_empty())
+    }
+
+    /// The tick a region has been simulated to. Its cells advance together, so a disagreement is a
+    /// corrupt checkpoint rather than something to paper over with a minimum.
+    fn region_tick(&self, region: &EcologyRegion) -> Result<u64> {
+        let ecology = self.persistent.ecology();
+        let mut ticks = region.cells().iter().map(|cell| ecology.cell_tick(*cell));
+        let first = ticks.next().unwrap_or_default();
+        for tick in ticks {
+            if tick != first {
+                return Err(Error::Mutation(format!(
+                    "dependency region spans cells at ticks {first} and {tick}; its cells must \
+                     advance together"
+                )));
+            }
+        }
+        Ok(first)
+    }
+
+    /// Runs and commits one tick for one region: mutations through the one reducer, then the
+    /// region's summaries published atomically.
+    fn advance_region_one_tick(
+        &mut self,
+        region: &EcologyRegion,
+        tick: u64,
+        plan: &EcologyCatchUp<'_>,
+    ) -> Result<()> {
+        // Check the publication precondition before any mutation is committed, so the commit and
+        // the tick generation cannot come apart: a refused tick leaves neither behind.
+        let start = self.region_tick(region)?;
+        if tick != start + 1 || tick > self.persistent.ecology().clock().tick() {
+            return Err(Error::Mutation(format!(
+                "ecology tick {tick} does not follow the region's tick {start} within world time \
+                 {}",
+                self.persistent.ecology().clock().tick()
+            )));
+        }
+        let state = self.region_state(region)?;
+        let result = advance_region(
+            region,
+            &state,
+            tick,
+            &crate::EcologyTickRules {
+                map: leading_u128(self.manifest_identity.bytes()),
+                influence: plan.influence,
+                rules: plan.rules,
+                relations: plan.relations,
+                weather: plan.weather,
+            },
+        )?;
+
+        let mut digest = b"saffron-anima/vegetation-ecology/transaction/v1".to_vec();
+        digest.extend_from_slice(&tick.to_be_bytes());
+        digest.extend_from_slice(&self.manifest_identity.bytes());
+        for (cell, mutations) in &result.mutations {
+            for coordinate in cell.coordinates() {
+                digest.extend_from_slice(&coordinate.to_be_bytes());
+            }
+            digest.extend_from_slice(&(mutations.len() as u64).to_be_bytes());
+        }
+        let transaction = leading_u128(ContentHash::of(&digest).bytes());
+
+        let mut records = Vec::new();
+        let mut salt = 0_u128;
+        for (cell, mutations) in result.mutations {
+            for mutation in mutations {
+                salt += 1;
+                // A spread seed is owned by the cell it landed in, which is not always the cell
+                // whose tick produced it.
+                let cell = match &mutation {
+                    crate::VegetationMutation::Planting(point)
+                    | crate::VegetationMutation::AnchorAddition(point) => point.owner,
+                    _ => cell,
+                };
+                records.push(VegetationMutationRecord {
+                    header: MutationHeader {
+                        cell,
+                        transaction,
+                        authority: ECOLOGY_AUTHORITY,
+                        logical_tick: tick,
+                        idempotency_key: transaction ^ (salt << 8),
+                        base_revision: None,
+                    },
+                    mutation,
+                });
+            }
+        }
+        if !records.is_empty() {
+            self.apply_confirmed_mutations(&records)?;
+        }
+        self.persistent
+            .ecology_mut()
+            .publish_region_tick(tick, &result.summaries)?;
+        self.effective
+            .ecology_mut()
+            .publish_region_tick(tick, &result.summaries)
+    }
+
+    /// Reads a region's plants and boundary summaries out of the resident generations.
+    fn region_state(&self, region: &EcologyRegion) -> Result<EcologyRegionState> {
+        let mut state = EcologyRegionState {
+            summaries: self.persistent.ecology().summaries().clone(),
+            ..EcologyRegionState::default()
+        };
+        for &cell in region.cells() {
+            let Some(entry) = self.cells.get(&cell) else {
+                return Err(Error::UnknownRuntimeCell { cell });
+            };
+            let generation = entry.slot.read();
+            let rows = generation.macro_points.row_count()?;
+            let mut plants = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let point = generation.macro_points.point(row)?;
+                plants.push(EcologyPlantState {
+                    plant: point.id,
+                    family: point.family,
+                    position: point.position,
+                    lifecycle: point.lifecycle,
+                    ecology_tick: point.ecology_tick,
+                    health: point.health,
+                    moisture: point.moisture,
+                    fuel: point.fuel,
+                    canopy: canopy_share(point.bounds, cell),
+                });
+            }
+            plants.sort_unstable_by_key(|plant| plant.plant);
+            state.plants.insert(cell, plants);
+        }
+        Ok(state)
+    }
+
     fn resident_macro_generations(
         &self,
     ) -> impl Iterator<Item = Arc<VegetationCellGeneration>> + '_ {
@@ -1034,6 +1625,7 @@ impl VegetationWorld {
             cell,
             RuntimeCell {
                 slot: Arc::new(GenerationSlot::new(cell, empty)),
+                bulk_revision: 0,
             },
         );
         Ok(())
@@ -1322,14 +1914,14 @@ fn validate_artifact_against_manifest(
     platform_profile: ContentHash,
     cell: &VegetationManifestCell,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<VegetationCellArtifactIndex> {
     if ContentHash::of(bytes) != cell.artifact_hash {
         return Err(Error::ArtifactHashMismatch {
             format: ".svegcell",
             subject: "manifest artifact".to_owned(),
         });
     }
-    let index = VegetationCellArtifactIndex::open(bytes)?;
+    let index = VegetationCellArtifactIndex::open(bytes, VEGETATION_ARTIFACT_DECODE_LIMITS)?;
     if index.cell != cell.cell || index.payload_hash != cell.payload_hash {
         return Err(Error::ArtifactFormat {
             format: ".svegcell",
@@ -1363,7 +1955,7 @@ fn validate_artifact_against_manifest(
             });
         }
     }
-    Ok(())
+    Ok(index)
 }
 
 fn macro_columns(
@@ -1438,6 +2030,11 @@ fn effective_macro_points(
             if let Some(interaction_policy) = delta.interaction_policy {
                 point.interaction_policy = interaction_policy;
             }
+            point.flags = if delta.ignited {
+                point.flags.union(PlantFlags::IGNITED)
+            } else {
+                point.flags.difference(PlantFlags::IGNITED)
+            };
             if delta.lifecycle.is_some()
                 || delta.phenotype.is_some()
                 || delta.ecology_tick.is_some()
@@ -1745,16 +2342,41 @@ fn ticks_to_meters(ticks: [i128; 3]) -> DVec3 {
         / f64::from(saffron_spatial::LOCAL_TICKS_PER_METER)
 }
 
+/// The leading 16 bytes of a content hash, as the transaction and map identities want a `u128`.
+fn leading_u128(bytes: [u8; 32]) -> u128 {
+    let mut leading = [0_u8; 16];
+    leading.copy_from_slice(&bytes[..16]);
+    u128::from_be_bytes(leading)
+}
+
+/// A plant's share of its cell's ground, from the conservative bounds the cook produced.
+///
+/// Shade is an area effect, so the shade a cell casts is the sum of its plants' footprints against
+/// the cell's own footprint. Integer ticks throughout: a canopy figure feeds simulated results, so
+/// it may not vary with floating-point rounding.
+fn canopy_share(plant: WorldBounds, cell: WorldCellKey) -> UnitInterval {
+    let footprint = |bounds: WorldBounds| -> i128 {
+        let minimum = bounds.min_ticks();
+        let maximum = bounds.max_ticks_exclusive();
+        (maximum[0] - minimum[0]).max(0) * (maximum[2] - minimum[2]).max(0)
+    };
+    let ground = footprint(cell.bounds());
+    if ground <= 0 {
+        return UnitInterval::ZERO;
+    }
+    let share = footprint(plant) * i128::from(UnitInterval::ONE.bits()) / ground;
+    UnitInterval::from_bits(u16::try_from(share.clamp(0, i128::from(u16::MAX))).unwrap_or(u16::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use saffron_spatial::{DecisionScalar, QuantizedLocalPosition, SourceLevel, UnitInterval};
 
     use super::*;
     use crate::{
-        ArtifactSectionCodec, CookPlatformProfile, CookVersionSet, CookWorkActual,
-        CookWorkEstimate, ManifestCellSection, ManifestSpeciesCount, PlantPoint,
-        QuantizedOrientation, VegetationCellArtifactHeader, VegetationCellSection,
-        VegetationManifestPlant, write_vegetation_cell_artifact,
+        CookPlatformProfile, CookVersionSet, CookWorkActual, CookWorkEstimate, ManifestCellSection,
+        ManifestSpeciesCount, PlantPoint, QuantizedOrientation, VegetationCellArtifactHeader,
+        VegetationCellSection, VegetationManifestPlant, write_vegetation_cell_artifact,
     };
 
     fn point() -> PlantPoint {
@@ -1771,8 +2393,8 @@ mod tests {
             scale: [DecisionScalar::from_bits(65_536); 3],
             bounds: WorldBounds::new([0, 0, 0], [100, 100, 100]).unwrap(),
             family: Uuid(7),
-            variation: 0,
             lifecycle: PlantLifecycle::Mature,
+            variation: 0,
             phenotype: 2,
             representation_class: 1,
             deterministic_key: 3,
@@ -1793,6 +2415,10 @@ mod tests {
     }
 
     fn fixture() -> (VegetationWorld, Vec<u8>, PlantId) {
+        fixture_with_micro(false)
+    }
+
+    fn fixture_with_micro(micro: bool) -> (VegetationWorld, Vec<u8>, PlantId) {
         let platform = CookPlatformProfile {
             target: "aarch64-apple-darwin".to_owned(),
             content_profile: "portable-vulkan".to_owned(),
@@ -1801,16 +2427,40 @@ mod tests {
         };
         let point = point();
         let columns = PlantPointColumns::from_points(vec![point.clone()]).unwrap();
-        let sections = vec![
-            VegetationCellSection::raw(
+        let mut sections = vec![
+            VegetationCellSection::new(
                 VegetationCellSectionKind::MacroPoints,
                 columns.canonical_bytes().unwrap(),
             ),
-            VegetationCellSection::raw(
+            VegetationCellSection::new(
                 VegetationCellSectionKind::CollisionInputs,
                 [b"SVEGCOL1".as_slice(), &0_u64.to_be_bytes()].concat(),
             ),
         ];
+        if micro {
+            let mut density = vec![32_768_u16; 16];
+            density[0] = 0;
+            let tile = crate::MicroFieldTile {
+                cell: point.owner,
+                family: point.family,
+                dimensions: [4, 1, 4],
+                density,
+                attributes: BTreeMap::new(),
+                reconstruction_seed: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+            };
+            sections.push(VegetationCellSection::new(
+                VegetationCellSectionKind::MicroFields,
+                crate::encode_vegetation_micro_fields(std::slice::from_ref(&tile)).unwrap(),
+            ));
+            sections.push(VegetationCellSection::new(
+                VegetationCellSectionKind::RenderReferences,
+                [b"SVEGRRF1".as_slice(), &0_u64.to_be_bytes()].concat(),
+            ));
+            sections.push(VegetationCellSection::new(
+                VegetationCellSectionKind::RenderBounds,
+                [b"SVEGRBD1".as_slice(), &0_u64.to_be_bytes()].concat(),
+            ));
+        }
         let bytes = write_vegetation_cell_artifact(
             VegetationCellArtifactHeader {
                 cell: point.owner,
@@ -1820,7 +2470,8 @@ mod tests {
             &sections,
         )
         .unwrap();
-        let index = VegetationCellArtifactIndex::open(&bytes).unwrap();
+        let index =
+            VegetationCellArtifactIndex::open(&bytes, VEGETATION_ARTIFACT_DECODE_LIMITS).unwrap();
         let mut manifest = VegetationBaseManifest::current(
             Uuid(1),
             Uuid(2),
@@ -1838,6 +2489,7 @@ mod tests {
             local_bounds_max: [DecisionScalar::from_bits(65_536); 3],
             variation_count: 1,
             phenotype_count: 3,
+            ecology: crate::PlantEcologyDeclaration::default(),
         });
         manifest.cells.push(VegetationManifestCell {
             cell: point.owner,
@@ -1862,7 +2514,7 @@ mod tests {
                 .map(|section| ManifestCellSection {
                     kind: section.kind,
                     version: section.version,
-                    codec: ArtifactSectionCodec::Raw,
+                    codec: section.codec,
                     alignment: section.alignment,
                     stored_size: section.stored_size,
                     decoded_size: section.decoded_size,
@@ -1875,6 +2527,10 @@ mod tests {
     }
 
     fn source() -> SpatialSource {
+        source_with_facet(ResidencyFacet::Physics)
+    }
+
+    fn source_with_facet(facet: ResidencyFacet) -> SpatialSource {
         SpatialSource {
             id: SpatialSourceId(1),
             revision: 1,
@@ -1886,7 +2542,7 @@ mod tests {
                 load_radius_cells: 0,
                 cleanup_radius_cells: 1,
             }],
-            facets: ResidencyMask::one(ResidencyFacet::Physics),
+            facets: ResidencyMask::one(facet),
             priority: 10,
         }
     }
@@ -2072,6 +2728,48 @@ mod tests {
     }
 
     #[test]
+    fn micro_ray_lands_on_the_nearest_dense_floor_texel() {
+        let (mut world, artifact, _) = fixture_with_micro(true);
+        world
+            .update_source(source_with_facet(ResidencyFacet::Render))
+            .unwrap();
+        let staged = world
+            .begin_load(
+                WorldCellKey::base(0, 0, 0),
+                ResidencyMask::one(ResidencyFacet::Render),
+            )
+            .unwrap()
+            .stage(&artifact)
+            .unwrap();
+        world.publish_staged(staged).unwrap();
+
+        let down = |x: f64, z: f64, maximum: f64| {
+            VegetationQueryRay::new(
+                WorldPosition::from_world_meters(DVec3::new(x, 10.0, z)).unwrap(),
+                -DVec3::Y,
+                maximum,
+            )
+            .unwrap()
+        };
+        let hit = world.query_micro_ray(down(40.0, 40.0, 100.0)).unwrap();
+        assert_eq!(hit.position, DVec3::new(40.0, 0.0, 40.0));
+        assert_eq!(hit.distance_m, 10.0);
+        assert_eq!(hit.family, Uuid(7));
+        assert_eq!(hit.cell, WorldCellKey::base(0, 0, 0));
+        // The (0, 0) texel carries zero density; the crossing there reports no hit.
+        assert!(world.query_micro_ray(down(8.0, 8.0, 100.0)).is_none());
+        // The floor crossing past the ray's maximum reports no hit.
+        assert!(world.query_micro_ray(down(40.0, 40.0, 5.0)).is_none());
+        let level = VegetationQueryRay::new(
+            WorldPosition::from_world_meters(DVec3::new(40.0, 10.0, 40.0)).unwrap(),
+            DVec3::X,
+            100.0,
+        )
+        .unwrap();
+        assert!(world.query_micro_ray(level).is_none());
+    }
+
+    #[test]
     fn source_budget_limits_admission_without_losing_demand() {
         let (mut world, _, _) = fixture();
         world.budgets.physics = 1;
@@ -2131,6 +2829,152 @@ mod tests {
                 .unwrap()
                 .resident_facets(),
             ResidencyMask::NONE
+        );
+    }
+
+    fn loaded_world() -> VegetationWorld {
+        let (mut world, artifact, _) = fixture();
+        world.update_source(source()).unwrap();
+        let staged = world
+            .begin_load(
+                WorldCellKey::base(0, 0, 0),
+                ResidencyMask::one(ResidencyFacet::Physics),
+            )
+            .unwrap()
+            .stage(&artifact)
+            .unwrap();
+        assert!(world.publish_staged(staged).unwrap());
+        world
+    }
+
+    fn catch_up_plan(target: u64, max_ticks: u32) -> EcologyCatchUp<'static> {
+        static RULES: std::sync::OnceLock<BTreeMap<u64, crate::EcologySpeciesRules>> =
+            std::sync::OnceLock::new();
+        static RELATIONS: std::sync::OnceLock<EcologyRelations> = std::sync::OnceLock::new();
+        EcologyCatchUp {
+            target_tick: target,
+            budget: crate::EcologyCatchUpBudget { max_ticks },
+            influence: crate::EcologyInfluence::default(),
+            rules: RULES
+                .get_or_init(|| BTreeMap::from([(7, crate::EcologySpeciesRules::default())])),
+            relations: RELATIONS.get_or_init(EcologyRelations::new),
+            weather: crate::EcologyWeather {
+                water: UnitInterval::from_bits(40_000),
+                warmth: UnitInterval::from_bits(45_000),
+            },
+        }
+    }
+
+    /// The phase's central claim: biology reached by running every tick as time passes and biology
+    /// reached by jumping time and catching up land on the same bytes.
+    #[test]
+    fn catch_up_equals_continuous_simulation() {
+        let mut continuous = loaded_world();
+        for tick in 1..=8_u64 {
+            let plan = catch_up_plan(tick, 1);
+            let report = continuous.advance_ecology(&plan).unwrap();
+            assert_eq!(report.ticks_run, 1);
+            assert_eq!(report.regions_caught_up, 1);
+        }
+
+        let mut caught_up = loaded_world();
+        let plan = catch_up_plan(8, 8);
+        let report = caught_up.advance_ecology(&plan).unwrap();
+        assert_eq!(report.ticks_run, 8);
+        assert_eq!(report.ticks_owed, 0);
+        assert_eq!(report.regions, 1);
+
+        assert!(
+            !caught_up.persistent_state().cells().is_empty(),
+            "the run committed real plant changes, so the comparison has something to compare",
+        );
+        assert_eq!(
+            continuous
+                .persistent_state()
+                .ecology()
+                .checkpoint_identity(),
+            caught_up.persistent_state().ecology().checkpoint_identity(),
+        );
+        assert_eq!(
+            continuous.persistent_state().canonical_bytes().unwrap(),
+            caught_up.persistent_state().canonical_bytes().unwrap(),
+            "both routes committed the same persistent state, byte for byte",
+        );
+    }
+
+    /// A budget bounds the work per call. It delays when the region is readable; it never drops a
+    /// tick or changes where the region ends up.
+    #[test]
+    fn a_catch_up_budget_delays_readiness_without_changing_results() {
+        let mut world = loaded_world();
+        let plan = catch_up_plan(8, 3);
+        let first = world.advance_ecology(&plan).unwrap();
+        assert_eq!(first.ticks_run, 3);
+        assert_eq!(first.ticks_owed, 5);
+        assert_eq!(first.regions_caught_up, 0);
+        assert!(
+            !world
+                .persistent_state()
+                .ecology()
+                .is_caught_up(WorldCellKey::base(0, 0, 0)),
+            "a region behind world time is not simulation-ready",
+        );
+
+        let second = world.advance_ecology(&plan).unwrap();
+        assert_eq!(second.ticks_run, 3);
+        let third = world.advance_ecology(&plan).unwrap();
+        assert_eq!(third.ticks_run, 2, "the remainder, not a whole budget");
+        assert_eq!(third.ticks_owed, 0);
+        assert_eq!(third.regions_caught_up, 1);
+
+        let mut unbudgeted = loaded_world();
+        let whole = catch_up_plan(8, 64);
+        unbudgeted.advance_ecology(&whole).unwrap();
+        assert_eq!(
+            world.persistent_state().canonical_bytes().unwrap(),
+            unbudgeted.persistent_state().canonical_bytes().unwrap(),
+            "three budgeted calls and one unbudgeted call agree",
+        );
+    }
+
+    /// World time advances whether or not anything is loaded, but a region whose cells are not
+    /// resident owes its ticks rather than running them against absent neighbours.
+    #[test]
+    fn a_region_awaiting_residency_owes_its_ticks() {
+        let (mut world, artifact, _) = fixture();
+        let plan = catch_up_plan(5, 16);
+        let report = world.advance_ecology(&plan).unwrap();
+        assert_eq!(report.regions_awaiting_residency, 1);
+        assert_eq!(report.ticks_run, 0);
+        assert_eq!(report.world_tick, 5);
+        assert_eq!(world.persistent_state().ecology().clock().tick(), 5);
+
+        // Loading the cell lets the same call finish the owed ticks, reaching the state a world
+        // that never unloaded would hold.
+        world.update_source(source()).unwrap();
+        let staged = world
+            .begin_load(
+                WorldCellKey::base(0, 0, 0),
+                ResidencyMask::one(ResidencyFacet::Physics),
+            )
+            .unwrap()
+            .stage(&artifact)
+            .unwrap();
+        assert!(world.publish_staged(staged).unwrap());
+        let after = world.advance_ecology(&plan).unwrap();
+        assert_eq!(after.ticks_run, 5);
+        assert_eq!(after.regions_caught_up, 1);
+
+        let mut resident_throughout = loaded_world();
+        let same = catch_up_plan(5, 16);
+        resident_throughout.advance_ecology(&same).unwrap();
+        assert_eq!(
+            world.persistent_state().canonical_bytes().unwrap(),
+            resident_throughout
+                .persistent_state()
+                .canonical_bytes()
+                .unwrap(),
+            "the residency path taken to a tick does not change the tick's result",
         );
     }
 }
