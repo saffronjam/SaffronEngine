@@ -7,8 +7,10 @@ use std::time::Instant;
 use saffron_core::Uuid;
 use saffron_geometry::glam::Mat4;
 use saffron_geometry::{
-    AlphaMode, ChunkKind, ImportedMaterial, ImportedModel, ImportedNode, VertexSkin,
-    load_mesh_from_bytes, load_mesh_skin_from_bytes, sub_id_for, translate_model,
+    AlphaMode, ChunkKind, ImportedMaterial, ImportedModel, ImportedNode, Mesh, Submesh, VertexSkin,
+    VirtualHierarchyMaterial, contour_alpha_card, cook_portable_virtual_hierarchy,
+    decode_image_from_memory, decode_portable_virtual_hierarchy_sections, load_mesh_from_bytes,
+    load_mesh_skin_from_bytes, sub_id_for, translate_model,
 };
 use saffron_scene::AssetType;
 use saffron_spatial::DecisionScalar;
@@ -24,11 +26,10 @@ use saffron_vegetation::{
     PlantReimportConflictReason, PlantSemanticDestination, PlantSourceLocator,
     PlantSourceMaterialSnapshot, PlantSourceMeshSnapshot, PlantSourceReference, PlantSourceRole,
     PlantSourceSelector, PlantSourceSnapshot, PlantTangentPolicy, SourceAxis, SourceHandedness,
-    SourceUnits, SourceUvOrigin, SourceWinding, VirtualHierarchyMaterial, compile_plant_family,
-    cook_portable_virtual_hierarchy, decode_portable_virtual_hierarchy_sections,
+    SourceUnits, SourceUvOrigin, SourceWinding, compile_plant_family,
     native_botanical_graph_content_hash, native_plant_source_id, plant_asset_schema_hash,
-    plant_compiled_artifact_schema_hash, vegetation_content_hash, write_plant_asset,
-    write_plant_compiled_artifact,
+    plant_compiled_artifact_schema_hash, plant_hierarchy_input, plant_hierarchy_material,
+    vegetation_content_hash, write_plant_asset, write_plant_compiled_artifact,
 };
 
 use crate::cook_reader::CookAssetAccess;
@@ -281,8 +282,11 @@ fn hierarchy_materials(
         .flat_map(|family| family.materials.iter().enumerate())
         .filter_map(|(slot, material)| {
             resolved.get(&material.material.value()).map(|snapshot| {
-                VirtualHierarchyMaterial::from_surface(slot as u32, &snapshot.surface)
-                    .with_alpha_classification(snapshot.alpha_classification)
+                plant_hierarchy_material(
+                    slot as u32,
+                    &snapshot.surface,
+                    snapshot.alpha_classification,
+                )
             })
         })
         .collect()
@@ -293,15 +297,16 @@ fn asset_with_source_updates(
     updates: &[saffron_vegetation::PlantSourceHashUpdate],
 ) -> Result<PlantFamilyAsset> {
     let mut accepted = asset.clone();
-    if let PlantFamilySource::Imported(recipe) = &mut accepted.source {
-        for update in updates {
-            let source = recipe
-                .sources
-                .iter_mut()
-                .find(|source| source.id == update.source)
-                .ok_or_else(|| Error::Io("compiler returned an unknown plant source".to_owned()))?;
-            source.content_hash = update.current;
-        }
+    let declared = match &mut accepted.source {
+        PlantFamilySource::Imported(recipe) => &mut recipe.sources,
+        PlantFamilySource::Native { grafts, .. } => grafts,
+    };
+    for update in updates {
+        let source = declared
+            .iter_mut()
+            .find(|source| source.id == update.source)
+            .ok_or_else(|| Error::Io("compiler returned an unknown plant source".to_owned()))?;
+        source.content_hash = update.current;
     }
     Ok(accepted)
 }
@@ -335,6 +340,17 @@ fn resolve_plant_inputs(
         match resolved {
             Ok(mut resolved) => {
                 resolved.snapshot.source = source.id;
+                if source.role == PlantSourceRole::Geometry
+                    && geometry_first_semantic(asset, source.id)
+                    && let Err(error) = apply_geometry_first_contours(
+                        &mut resolved.snapshot,
+                        &resolved.coverage_images,
+                    )
+                {
+                    issues.push(resolution_issue(source, error.to_string()));
+                    continue;
+                }
+                resolved.snapshot.content_hash = source_snapshot_hash(&resolved.snapshot);
                 let conflict =
                     resolved
                         .material_documents
@@ -369,7 +385,7 @@ fn resolve_native_plant_input(
     assets: &mut dyn CookAssetAccess,
     asset: &PlantFamilyAsset,
 ) -> ResolvedPlantInputs {
-    let PlantFamilySource::Native(graph) = &asset.source else {
+    let PlantFamilySource::Native { graph, grafts } = &asset.source else {
         unreachable!();
     };
     match resolve_catalog_materials(
@@ -380,18 +396,36 @@ fn resolve_native_plant_input(
             .copied()
             .map(|material| (material, format!("materials/{}", material.value()))),
     ) {
-        Ok((materials, material_documents)) => ResolvedPlantInputs {
-            snapshots: vec![PlantSourceSnapshot {
+        Ok((materials, mut material_documents, _)) => {
+            let mut snapshots = vec![PlantSourceSnapshot {
                 source: native_plant_source_id(asset.id),
                 content_hash: native_botanical_graph_content_hash(graph),
                 meshes: Vec::new(),
                 materials,
                 joints: Vec::new(),
                 semantic_elements: Vec::new(),
-            }],
-            material_documents,
-            issues: Vec::new(),
-        },
+            }];
+            // A graft's hero mesh resolves exactly as an imported family's geometry does — same
+            // locator, same importer, same snapshot — so there is one way external geometry
+            // reaches a plant.
+            let mut issues = Vec::new();
+            for graft in grafts {
+                match resolve_plant_source(assets, asset, graft) {
+                    Ok(mut resolved) => {
+                        resolved.snapshot.source = graft.id;
+                        resolved.snapshot.content_hash = source_snapshot_hash(&resolved.snapshot);
+                        material_documents.extend(resolved.material_documents);
+                        snapshots.push(resolved.snapshot);
+                    }
+                    Err(error) => issues.push(resolution_issue(graft, error.to_string())),
+                }
+            }
+            ResolvedPlantInputs {
+                snapshots,
+                material_documents,
+                issues,
+            }
+        }
         Err(error) => ResolvedPlantInputs {
             snapshots: Vec::new(),
             material_documents: BTreeMap::new(),
@@ -411,10 +445,24 @@ fn resolve_native_plant_input(
 struct ResolvedPlantSource {
     snapshot: PlantSourceSnapshot,
     material_documents: BTreeMap<u64, Vec<u8>>,
+    coverage_images: BTreeMap<u64, ResolvedCoverageImage>,
 }
 
 type ResolvedMaterialDocuments = BTreeMap<u64, Vec<u8>>;
-type ResolvedCatalogMaterials = (Vec<PlantSourceMaterialSnapshot>, ResolvedMaterialDocuments);
+type ResolvedCoverageImages = BTreeMap<u64, ResolvedCoverageImage>;
+type ResolvedCatalogMaterials = (
+    Vec<PlantSourceMaterialSnapshot>,
+    ResolvedMaterialDocuments,
+    ResolvedCoverageImages,
+);
+
+#[derive(Clone)]
+struct ResolvedCoverageImage {
+    alpha: Vec<u8>,
+    width: u32,
+    height: u32,
+    cutoff: u8,
+}
 
 fn resolve_plant_source(
     assets: &mut dyn CookAssetAccess,
@@ -510,7 +558,7 @@ fn resolve_catalog_model(
             material_slots: material_ids.clone(),
         });
     }
-    let (materials, material_documents) = resolve_catalog_materials(
+    let (materials, material_documents, coverage_images) = resolve_catalog_materials(
         assets,
         model
             .meta
@@ -532,6 +580,7 @@ fn resolve_catalog_model(
     Ok(ResolvedPlantSource {
         snapshot,
         material_documents,
+        coverage_images,
     })
 }
 
@@ -546,6 +595,7 @@ fn resolve_catalog_mesh(
     let mut material_ids = asset.material_slots.clone();
     let mut materials = Vec::new();
     let mut material_documents = BTreeMap::new();
+    let mut coverage_images = BTreeMap::new();
     let mut joints = Vec::new();
     if entry.container.value() != 0 {
         let model = assets.load_model(entry.container).ok_or_else(|| {
@@ -566,7 +616,7 @@ fn resolve_catalog_mesh(
             .filter(|sub| sub.asset_type == AssetType::Material)
             .map(|sub| sub.sub_id)
             .collect();
-        (materials, material_documents) = resolve_catalog_materials(
+        (materials, material_documents, coverage_images) = resolve_catalog_materials(
             assets,
             model
                 .meta
@@ -598,6 +648,7 @@ fn resolve_catalog_mesh(
     Ok(ResolvedPlantSource {
         snapshot,
         material_documents,
+        coverage_images,
     })
 }
 
@@ -605,7 +656,7 @@ fn resolve_catalog_material_source(
     assets: &mut dyn CookAssetAccess,
     entry: &saffron_scene::AssetEntry,
 ) -> Result<ResolvedPlantSource> {
-    let (materials, material_documents) = resolve_catalog_materials(
+    let (materials, material_documents, coverage_images) = resolve_catalog_materials(
         assets,
         std::iter::once((entry.id, format!("materials/{}", entry.name))),
     )?;
@@ -621,6 +672,7 @@ fn resolve_catalog_material_source(
     Ok(ResolvedPlantSource {
         snapshot,
         material_documents,
+        coverage_images,
     })
 }
 
@@ -630,9 +682,13 @@ fn resolve_catalog_materials(
 ) -> Result<ResolvedCatalogMaterials> {
     let mut snapshots = Vec::new();
     let mut documents = BTreeMap::new();
+    let mut coverage_images = BTreeMap::new();
     for (id, path) in materials {
         let (material, document) = resolve_catalog_material_strict(assets, id)?;
         let (classification, coverage_source) = material_coverage(&material);
+        if let Some(image) = resolve_material_coverage_image(assets, &material)? {
+            coverage_images.insert(id.value(), image);
+        }
         let content_hash = vegetation_content_hash(&document);
         snapshots.push(PlantSourceMaterialSnapshot {
             selector: PlantSourceSelector::Element {
@@ -647,7 +703,7 @@ fn resolve_catalog_materials(
         });
         documents.insert(id.value(), document);
     }
-    Ok((snapshots, documents))
+    Ok((snapshots, documents, coverage_images))
 }
 
 fn resolve_catalog_material_strict(
@@ -763,6 +819,257 @@ fn read_catalog_asset_bytes(assets: &mut dyn CookAssetAccess, id: Uuid) -> Resul
     assets.read_source(&source)
 }
 
+fn resolve_material_coverage_image(
+    assets: &mut dyn CookAssetAccess,
+    material: &MaterialAsset,
+) -> Result<Option<ResolvedCoverageImage>> {
+    let (texture, cutoff, multiply_base_alpha) = match &material.surface {
+        MaterialSurface::ThinSheetFoliage(parameters) => {
+            let texture = match parameters.coverage_source {
+                CoverageSource::AlbedoAlpha => material.albedo_texture,
+                CoverageSource::Texture(texture) => texture,
+                CoverageSource::ModeledGeometry => return Ok(None),
+            };
+            (
+                texture,
+                unit_interval_to_u8(parameters.coverage.reference_cutoff),
+                matches!(parameters.coverage_source, CoverageSource::AlbedoAlpha),
+            )
+        }
+        MaterialSurface::Standard if material.blend == "masked" => (
+            material.albedo_texture,
+            normalized_f32_to_u8(material.alpha_cutoff),
+            true,
+        ),
+        MaterialSurface::Standard => return Ok(None),
+    };
+    if texture.value() == 0 {
+        return Ok(None);
+    }
+    let decoded = decode_image_from_memory(&read_catalog_asset_bytes(assets, texture)?)?;
+    let base_alpha = if multiply_base_alpha {
+        material.base_color.w
+    } else {
+        1.0
+    };
+    Ok(Some(resolved_coverage_image(
+        decoded.rgba,
+        decoded.width,
+        decoded.height,
+        cutoff,
+        base_alpha,
+    )))
+}
+
+fn imported_material_coverage_image(
+    material: &ImportedMaterial,
+) -> Result<Option<ResolvedCoverageImage>> {
+    if material.alpha_mode != AlphaMode::Mask {
+        return Ok(None);
+    }
+    let Some(texture) = &material.albedo else {
+        return Ok(None);
+    };
+    let decoded = decode_image_from_memory(&texture.bytes)?;
+    Ok(Some(resolved_coverage_image(
+        decoded.rgba,
+        decoded.width,
+        decoded.height,
+        normalized_f32_to_u8(material.alpha_cutoff),
+        material.base_color.w,
+    )))
+}
+
+fn resolved_coverage_image(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    cutoff: u8,
+    base_alpha: f32,
+) -> ResolvedCoverageImage {
+    let alpha = rgba
+        .chunks_exact(4)
+        .map(|pixel| normalized_f32_to_u8(f32::from(pixel[3]) / 255.0 * base_alpha))
+        .collect();
+    ResolvedCoverageImage {
+        alpha,
+        width,
+        height,
+        cutoff,
+    }
+}
+
+fn unit_interval_to_u8(value: saffron_spatial::UnitInterval) -> u8 {
+    u8::try_from((u32::from(value.bits()) * 255 + 32_767) / 65_535)
+        .expect("unit interval maps to u8")
+}
+
+fn normalized_f32_to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn geometry_first_semantic(asset: &PlantFamilyAsset, source: u128) -> bool {
+    asset.parts.iter().any(|part| {
+        part.sources.contains(&source)
+            && matches!(
+                part.semantic,
+                PlantPartSemantic::Frond
+                    | PlantPartSemantic::Leaf
+                    | PlantPartSemantic::Flower
+                    | PlantPartSemantic::Blade
+            )
+    })
+}
+
+fn apply_geometry_first_contours(
+    snapshot: &mut PlantSourceSnapshot,
+    coverage_images: &ResolvedCoverageImages,
+) -> Result<()> {
+    for source in &mut snapshot.meshes {
+        let original = source.mesh.clone();
+        let original_skin = source.skin.clone();
+        if !original_skin.is_empty() && original_skin.len() != original.vertices.len() {
+            return Err(Error::Io(
+                "alpha-card skin stream does not match the vertex stream".to_owned(),
+            ));
+        }
+        let mut mesh = Mesh::default();
+        let mut skin = Vec::new();
+        for submesh_index in 0..original.submeshes.len() {
+            let submesh = original.submeshes[submesh_index];
+            let material = source
+                .material_slots
+                .get(submesh.material_slot as usize)
+                .copied()
+                .ok_or_else(|| Error::Io("alpha-card material slot is unresolved".to_owned()))?;
+            let contoured = if let Some(coverage) = coverage_images.get(&material.value()) {
+                contour_alpha_card(
+                    &original,
+                    submesh_index,
+                    &coverage.alpha,
+                    coverage.width,
+                    coverage.height,
+                    coverage.cutoff,
+                )?
+            } else {
+                None
+            };
+            let first_index = u32::try_from(mesh.indices.len())
+                .map_err(|_| Error::Io("alpha-card index count overflows u32".to_owned()))?;
+            match contoured {
+                Some(contoured) => {
+                    let base = u32::try_from(mesh.vertices.len()).map_err(|_| {
+                        Error::Io("alpha-card vertex count overflows u32".to_owned())
+                    })?;
+                    mesh.vertices
+                        .extend(contoured.vertices.iter().map(|vertex| vertex.vertex));
+                    mesh.indices.extend(
+                        contoured
+                            .indices
+                            .iter()
+                            .map(|index| base.checked_add(*index))
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| {
+                                Error::Io("alpha-card index offset overflows u32".to_owned())
+                            })?,
+                    );
+                    if !original_skin.is_empty() {
+                        skin.extend(contoured.vertices.iter().map(|vertex| {
+                            interpolate_card_skin(
+                                &original_skin,
+                                vertex.source_triangle,
+                                vertex.barycentric,
+                            )
+                        }));
+                    }
+                }
+                None => {
+                    append_source_submesh(&original, &original_skin, submesh, &mut mesh, &mut skin)?
+                }
+            }
+            mesh.submeshes.push(Submesh {
+                first_index,
+                index_count: u32::try_from(mesh.indices.len())
+                    .map_err(|_| Error::Io("alpha-card index count overflows u32".to_owned()))?
+                    - first_index,
+                vertex_offset: 0,
+                material_slot: submesh.material_slot,
+            });
+        }
+        source.mesh = mesh;
+        source.skin = skin;
+    }
+    Ok(())
+}
+
+fn append_source_submesh(
+    source: &Mesh,
+    source_skin: &[VertexSkin],
+    submesh: Submesh,
+    output: &mut Mesh,
+    output_skin: &mut Vec<VertexSkin>,
+) -> Result<()> {
+    let begin = submesh.first_index as usize;
+    let end = begin
+        .checked_add(submesh.index_count as usize)
+        .ok_or_else(|| Error::Io("alpha-card submesh range overflows".to_owned()))?;
+    let indices = source
+        .indices
+        .get(begin..end)
+        .ok_or_else(|| Error::Io("alpha-card submesh range exceeds the index stream".to_owned()))?;
+    let mut remap = BTreeMap::<usize, u32>::new();
+    for index in indices {
+        let addressed = usize::try_from(i64::from(*index) + i64::from(submesh.vertex_offset))
+            .map_err(|_| Error::Io("alpha-card vertex offset is out of range".to_owned()))?;
+        let output_index = if let Some(index) = remap.get(&addressed) {
+            *index
+        } else {
+            let vertex = *source.vertices.get(addressed).ok_or_else(|| {
+                Error::Io("alpha-card index references a missing vertex".to_owned())
+            })?;
+            let output_index = u32::try_from(output.vertices.len())
+                .map_err(|_| Error::Io("alpha-card vertex count overflows u32".to_owned()))?;
+            output.vertices.push(vertex);
+            if !source_skin.is_empty() {
+                output_skin.push(source_skin[addressed]);
+            }
+            remap.insert(addressed, output_index);
+            output_index
+        };
+        output.indices.push(output_index);
+    }
+    Ok(())
+}
+
+fn interpolate_card_skin(
+    skin: &[VertexSkin],
+    triangle: [u32; 3],
+    barycentric: [f32; 3],
+) -> VertexSkin {
+    let mut influences = BTreeMap::<u16, f32>::new();
+    for (index, barycentric_weight) in triangle.into_iter().zip(barycentric) {
+        let source = skin[index as usize];
+        for (joint, weight) in source.joints.into_iter().zip(source.weights) {
+            *influences.entry(joint).or_default() += weight * barycentric_weight;
+        }
+    }
+    let mut influences = influences.into_iter().collect::<Vec<_>>();
+    influences.sort_by(|first, second| {
+        second
+            .1
+            .total_cmp(&first.1)
+            .then_with(|| first.0.cmp(&second.0))
+    });
+    influences.truncate(4);
+    let total = influences.iter().map(|influence| influence.1).sum::<f32>();
+    let mut output = VertexSkin::default();
+    for (slot, (joint, weight)) in influences.into_iter().enumerate() {
+        output.joints[slot] = joint;
+        output.weights[slot] = if total > 0.0 { weight / total } else { 0.0 };
+    }
+    output
+}
+
 fn resolve_file_source(
     assets: &dyn CookAssetAccess,
     asset: &PlantFamilyAsset,
@@ -809,6 +1116,7 @@ fn resolve_imported_model(
         .collect::<Result<Vec<_>>>()?;
     let mut materials = Vec::new();
     let mut material_documents = BTreeMap::new();
+    let mut coverage_images = BTreeMap::new();
     for ((source_material, selector), material) in graph
         .materials
         .iter()
@@ -825,6 +1133,9 @@ fn resolve_imported_model(
             alpha_classification: classification,
             coverage_source,
         });
+        if let Some(image) = imported_material_coverage_image(source_material)? {
+            coverage_images.insert(material.value(), image);
+        }
         material_documents.insert(material.value(), document);
     }
     let mut meshes = Vec::new();
@@ -874,6 +1185,7 @@ fn resolve_imported_model(
     Ok(ResolvedPlantSource {
         snapshot,
         material_documents,
+        coverage_images,
     })
 }
 
@@ -1102,6 +1414,77 @@ fn imported_material_document(material: &ImportedMaterial) -> Vec<u8> {
         }
     }
     bytes
+}
+
+/// Decodes one pinned material document into its resolved [`MaterialAsset`]. The two
+/// document forms dispatch on their domain: a catalog material pins its parent-resolved
+/// `.smat` JSON ([`resolve_catalog_material_strict`]); an imported source pins the
+/// binary parameter record ([`imported_material_document`]). The embedded texture
+/// payloads are cook inputs (coverage/atlas derivation) and are skipped; textures
+/// resolve through the catalog by id.
+pub(crate) fn decode_plant_material_document(bytes: &[u8]) -> Result<MaterialAsset> {
+    let mut probe = SectionReader::new(bytes);
+    if probe.read_bytes()? == b"saffron-anima/plant-material-source/v1" {
+        let document = saffron_json::parse_json(&String::from_utf8_lossy(probe.read_bytes()?))
+            .map_err(|err| Error::Io(format!("pinned plant material document: {err}")))?;
+        return crate::material::material_asset_from_json(&document);
+    }
+    decode_imported_material_document(bytes)
+}
+
+/// Decodes one pinned imported-material document into its resolved parameter-level
+/// [`MaterialAsset`] — the decode mirror of [`imported_material_document`]. The embedded
+/// texture payloads are cook inputs (coverage/atlas derivation) and are skipped; the
+/// runtime material carries the factors, blend axis, and sidedness.
+fn decode_imported_material_document(bytes: &[u8]) -> Result<MaterialAsset> {
+    let mut reader = SectionReader::new(bytes);
+    reader.expect_domain(b"saffron-anima/imported-plant-material/v1")?;
+    let _name = reader.read_string()?;
+    let read_f32 =
+        |reader: &mut SectionReader<'_>| -> Result<f32> { Ok(f32::from_bits(reader.read_u32()?)) };
+    let base_color = [
+        read_f32(&mut reader)?,
+        read_f32(&mut reader)?,
+        read_f32(&mut reader)?,
+        read_f32(&mut reader)?,
+    ];
+    let metallic = read_f32(&mut reader)?;
+    let roughness = read_f32(&mut reader)?;
+    let emissive = [
+        read_f32(&mut reader)?,
+        read_f32(&mut reader)?,
+        read_f32(&mut reader)?,
+    ];
+    let emissive_strength = read_f32(&mut reader)?;
+    let alpha_cutoff = read_f32(&mut reader)?;
+    let blend = match reader.read_u8()? {
+        0 => "opaque",
+        1 => "masked",
+        2 => "translucent",
+        _ => {
+            return Err(Error::Io(
+                "imported plant material alpha mode is unknown".to_owned(),
+            ));
+        }
+    };
+    let double_sided = reader.read_u8()? != 0;
+    for _ in 0..5 {
+        if reader.read_u8()? != 0 {
+            let _ext = reader.read_string()?;
+            let _payload = reader.read_bytes()?;
+        }
+    }
+    Ok(MaterialAsset {
+        blend: blend.to_owned(),
+        double_sided,
+        base_color: saffron_geometry::glam::Vec4::from_array(base_color),
+        metallic,
+        roughness,
+        emissive: saffron_geometry::glam::Vec3::from_array(emissive),
+        emissive_strength,
+        alpha_cutoff,
+        ..MaterialAsset::default()
+    })
 }
 
 fn material_coverage(material: &MaterialAsset) -> (AlphaClassification, CoverageSource) {
@@ -1360,65 +1743,66 @@ fn build_plant_sections(
     accepted_compile
         .diagnostics
         .retain(|diagnostic| diagnostic.code != PlantCompileDiagnosticCode::SourceChanged);
-    let hierarchy = cook_portable_virtual_hierarchy(asset, family, hierarchy_materials)?;
+    let hierarchy_input = plant_hierarchy_input(asset, family, hierarchy_materials)?;
+    let hierarchy = cook_portable_virtual_hierarchy(&hierarchy_input)?;
     Ok(vec![
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::SourceNormalization,
             source_normalization_section(asset, compile, family),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::PartTable,
             part_table_section(asset),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Geometry,
             mesh_section(family, PlantSourceRole::Geometry, true),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::MaterialsCoverage,
             material_section(family, material_documents),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::SkeletonWeights,
             skeleton_section(asset, family),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Phenotypes,
             phenotype_section(asset),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Collision,
             collision_section(asset, family),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Navigation,
             navigation_section(asset, family),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Provenance,
             provenance_section(asset),
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::TriangleHierarchy,
             hierarchy.triangle_hierarchy_bytes()?,
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::VoxelHierarchy,
             hierarchy.voxel_hierarchy_bytes()?,
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Deformation,
             hierarchy.deformation_bytes()?,
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::PageDirectory,
             hierarchy.page_directory_bytes()?,
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::RayTracing,
             hierarchy.ray_tracing_bytes()?,
         ),
-        PlantCompiledSection::raw(
+        PlantCompiledSection::new(
             PlantCompiledSectionKind::Validation,
             validation_section(&accepted_compile),
         ),
@@ -1431,7 +1815,10 @@ fn validate_complete_plant_artifact(
     cook_key: ContentHash,
     platform: ContentHash,
 ) -> Result<()> {
-    let index = PlantCompiledArtifactIndex::open(bytes)?;
+    let index = PlantCompiledArtifactIndex::open(
+        bytes,
+        saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+    )?;
     if index.family != family || index.cook_key != cook_key || index.platform_profile != platform {
         return Err(Error::Io(
             "compiled plant artifact header does not match its cook request".to_owned(),
@@ -1439,28 +1826,36 @@ fn validate_complete_plant_artifact(
     }
     index.family_tags(bytes)?;
     for kind in PlantCompiledSectionKind::ALL {
-        if index.section(bytes, kind)?.is_none_or(<[u8]>::is_empty) {
+        if index
+            .section(bytes, kind)?
+            .is_none_or(|section| section.is_empty())
+        {
             return Err(Error::Io(format!(
                 "compiled plant artifact is missing {kind:?}"
             )));
         }
     }
+    let triangle = index
+        .section(bytes, PlantCompiledSectionKind::TriangleHierarchy)?
+        .ok_or_else(|| Error::Io("compiled plant triangle hierarchy is missing".to_owned()))?;
+    let voxel = index
+        .section(bytes, PlantCompiledSectionKind::VoxelHierarchy)?
+        .ok_or_else(|| Error::Io("compiled plant voxel hierarchy is missing".to_owned()))?;
+    let deformation = index
+        .section(bytes, PlantCompiledSectionKind::Deformation)?
+        .ok_or_else(|| Error::Io("compiled plant deformation is missing".to_owned()))?;
+    let pages = index
+        .section(bytes, PlantCompiledSectionKind::PageDirectory)?
+        .ok_or_else(|| Error::Io("compiled plant page directory is missing".to_owned()))?;
+    let ray_tracing = index
+        .section(bytes, PlantCompiledSectionKind::RayTracing)?
+        .ok_or_else(|| Error::Io("compiled plant RT metadata is missing".to_owned()))?;
     decode_portable_virtual_hierarchy_sections(
-        index
-            .section(bytes, PlantCompiledSectionKind::TriangleHierarchy)?
-            .ok_or_else(|| Error::Io("compiled plant triangle hierarchy is missing".to_owned()))?,
-        index
-            .section(bytes, PlantCompiledSectionKind::VoxelHierarchy)?
-            .ok_or_else(|| Error::Io("compiled plant voxel hierarchy is missing".to_owned()))?,
-        index
-            .section(bytes, PlantCompiledSectionKind::Deformation)?
-            .ok_or_else(|| Error::Io("compiled plant deformation is missing".to_owned()))?,
-        index
-            .section(bytes, PlantCompiledSectionKind::PageDirectory)?
-            .ok_or_else(|| Error::Io("compiled plant page directory is missing".to_owned()))?,
-        index
-            .section(bytes, PlantCompiledSectionKind::RayTracing)?
-            .ok_or_else(|| Error::Io("compiled plant RT metadata is missing".to_owned()))?,
+        triangle.as_ref(),
+        voxel.as_ref(),
+        deformation.as_ref(),
+        pages.as_ref(),
+        ray_tracing.as_ref(),
     )?;
     Ok(())
 }
@@ -1493,11 +1888,11 @@ fn source_normalization_section(
                 append_import_settings(&mut bytes, &source.settings);
             }
         }
-        PlantFamilySource::Native(graph) => {
+        PlantFamilySource::Native { graph, .. } => {
             bytes.push(1);
             let source = native_plant_source_id(asset.id);
             bytes.extend_from_slice(&source.to_be_bytes());
-            bytes.extend_from_slice(&graph.schema_hash);
+            bytes.extend_from_slice(&graph.identity().bytes());
             bytes.extend_from_slice(hashes.get(&source).copied().unwrap_or([0; 32]).as_slice());
         }
     }
@@ -1658,7 +2053,19 @@ fn phenotype_section(asset: &PlantFamilyAsset) -> Vec<u8> {
             saffron_vegetation::PhenotypeRole::Damaged => 2,
             saffron_vegetation::PhenotypeRole::Burned => 3,
             saffron_vegetation::PhenotypeRole::Dead => 4,
+            saffron_vegetation::PhenotypeRole::Flowering => 5,
+            saffron_vegetation::PhenotypeRole::Fruiting => 6,
+            saffron_vegetation::PhenotypeRole::Senescent => 7,
+            saffron_vegetation::PhenotypeRole::Wet => 8,
         });
+        match phenotype.season_window {
+            Some((start, end)) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&start.to_le_bytes());
+                bytes.extend_from_slice(&end.to_le_bytes());
+            }
+            None => bytes.push(0),
+        }
         append_u32(&mut bytes, phenotype.variation);
         append_u64(&mut bytes, phenotype.material_remap.len() as u64);
         for (from, to) in &phenotype.material_remap {
@@ -1740,11 +2147,11 @@ fn provenance_section(asset: &PlantFamilyAsset) -> Vec<u8> {
                 bytes.push(u8::from(source.provenance.requires_attribution));
             }
         }
-        PlantFamilySource::Native(graph) => {
+        PlantFamilySource::Native { graph, .. } => {
             bytes.push(1);
             append_u64(&mut bytes, 1);
             bytes.extend_from_slice(&native_plant_source_id(asset.id).to_be_bytes());
-            bytes.extend_from_slice(&graph.schema_hash);
+            bytes.extend_from_slice(&graph.identity().bytes());
             bytes.extend_from_slice(&native_botanical_graph_content_hash(graph));
         }
     }
@@ -1985,6 +2392,282 @@ fn append_json(bytes: &mut Vec<u8>, value: &saffron_json::Value) {
     append_bytes(bytes, saffron_json::dump_json_sorted(value, -1).as_bytes());
 }
 
+/// One decoded Geometry-section mesh row — the prototype-order source of the family's
+/// flattened render vertex stream. The decode mirrors [`append_normalized_mesh`]
+/// field-for-field so the two stay in lockstep.
+pub(crate) struct PlantGeometryMesh {
+    /// Recipe source identity.
+    pub source: u128,
+    /// Exact selected source element or submesh.
+    pub selector: PlantSourceSelector,
+    /// Quantized family-local vertices.
+    pub vertices: Vec<saffron_vegetation::NormalizedPlantVertex>,
+    /// Prototype-local triangle indices.
+    pub indices: Vec<u32>,
+    /// Material-homogeneous draw ranges.
+    pub submeshes: Vec<saffron_vegetation::NormalizedPlantSubmesh>,
+}
+
+/// One decoded MaterialsCoverage-section row: the material identity plus its resolved
+/// `.smat` document bytes.
+pub(crate) struct PlantMaterialRow {
+    /// The referenced material asset identity.
+    pub material: Uuid,
+    /// The resolved `.smat` JSON document.
+    pub document: Vec<u8>,
+}
+
+/// A big-endian, length-prefixed section reader — the decode mirror of the `append_*`
+/// writers above.
+struct SectionReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SectionReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(count)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| Error::Io("plant section payload is truncated".to_owned()))?;
+        let slice = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        Ok(i16::from_be_bytes(
+            self.take(2)?.try_into().expect("2 bytes"),
+        ))
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("8 bytes"),
+        ))
+    }
+
+    fn read_u128(&mut self) -> Result<u128> {
+        Ok(u128::from_be_bytes(
+            self.take(16)?.try_into().expect("16 bytes"),
+        ))
+    }
+
+    fn read_length(&mut self) -> Result<usize> {
+        let value = self.read_u64()?;
+        usize::try_from(value)
+            .ok()
+            .filter(|count| *count <= self.bytes.len())
+            .ok_or_else(|| Error::Io("plant section length exceeds its payload".to_owned()))
+    }
+
+    fn read_bytes(&mut self) -> Result<&'a [u8]> {
+        let count = self.read_length()?;
+        self.take(count)
+    }
+
+    fn read_string(&mut self) -> Result<String> {
+        String::from_utf8(self.read_bytes()?.to_vec())
+            .map_err(|_| Error::Io("plant section string is not UTF-8".to_owned()))
+    }
+
+    fn read_selector(&mut self) -> Result<PlantSourceSelector> {
+        match self.read_u8()? {
+            0 => Ok(PlantSourceSelector::Whole),
+            1 => Ok(PlantSourceSelector::Element {
+                id: self.read_u128()?,
+                path: self.read_string()?,
+            }),
+            2 => Ok(PlantSourceSelector::Submesh {
+                element: self.read_u128()?,
+                index: self.read_u32()?,
+            }),
+            _ => Err(Error::Io(
+                "plant section selector tag is unknown".to_owned(),
+            )),
+        }
+    }
+
+    fn expect_domain(&mut self, domain: &[u8]) -> Result<()> {
+        if self.read_bytes()? != domain {
+            return Err(Error::Io(
+                "plant section domain does not match its kind".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Decodes one Geometry-section payload into its prototype-ordered mesh rows.
+pub(crate) fn decode_mesh_section(bytes: &[u8]) -> Result<Vec<PlantGeometryMesh>> {
+    let mut reader = SectionReader::new(bytes);
+    reader.expect_domain(b"saffron-anima/splantc/mesh-facet/v1")?;
+    let mesh_count = reader.read_length()?;
+    let mut meshes = Vec::with_capacity(mesh_count);
+    for _ in 0..mesh_count {
+        let source = reader.read_u128()?;
+        let selector = reader.read_selector()?;
+        let vertex_count = reader.read_length()?;
+        let mut vertices = Vec::with_capacity(vertex_count);
+        for _ in 0..vertex_count {
+            let mut vertex = saffron_vegetation::NormalizedPlantVertex::default();
+            for value in &mut vertex.position_bits {
+                *value = reader.read_i32()?;
+            }
+            for value in &mut vertex.normal_snorm {
+                *value = reader.read_i16()?;
+            }
+            for value in &mut vertex.uv_bits {
+                *value = reader.read_i32()?;
+            }
+            for value in &mut vertex.tangent_snorm {
+                *value = reader.read_i16()?;
+            }
+            vertices.push(vertex);
+        }
+        let index_count = reader.read_length()?;
+        let mut indices = Vec::with_capacity(index_count);
+        for _ in 0..index_count {
+            indices.push(reader.read_u32()?);
+        }
+        let submesh_count = reader.read_length()?;
+        let mut submeshes = Vec::with_capacity(submesh_count);
+        for _ in 0..submesh_count {
+            submeshes.push(saffron_vegetation::NormalizedPlantSubmesh {
+                first_index: reader.read_u32()?,
+                index_count: reader.read_u32()?,
+                material_slot: reader.read_u32()?,
+            });
+        }
+        let skin_count = reader.read_length()?;
+        for _ in 0..skin_count {
+            // 4 joint u16s + 4 weight u16s per record; the render loader has no use for
+            // them (structural deformation binds through the skeleton section).
+            reader.take(16)?;
+        }
+        meshes.push(PlantGeometryMesh {
+            source,
+            selector,
+            vertices,
+            indices,
+            submeshes,
+        });
+    }
+    Ok(meshes)
+}
+
+/// One decoded phenotype row: the identity, its variation, and the material remap.
+pub(crate) struct PlantPhenotypeRow {
+    /// Stable family-local phenotype identity.
+    pub id: u32,
+    /// Semantic role.
+    pub role: saffron_vegetation::PhenotypeRole,
+    /// Authored seasonal window in per-mille of the year, wrapping through 1000.
+    pub season_window: Option<(u16, u16)>,
+    /// The variation the phenotype renders.
+    pub variation: u32,
+    /// Material slot remap `(from, to)`.
+    pub material_remap: Vec<(u32, u32)>,
+}
+
+/// Decodes one Phenotypes-section payload — the decode mirror of
+/// [`phenotype_section`]. Active-part sets are cook inputs (baked into the assembly
+/// masks) and are skipped.
+pub(crate) fn decode_phenotype_section(bytes: &[u8]) -> Result<Vec<PlantPhenotypeRow>> {
+    let mut reader = SectionReader::new(bytes);
+    reader.expect_domain(b"saffron-anima/splantc/phenotypes/v1")?;
+    let count = reader.read_length()?;
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = reader.read_u32()?;
+        let role = match reader.read_u8()? {
+            0 => saffron_vegetation::PhenotypeRole::Healthy,
+            1 => saffron_vegetation::PhenotypeRole::Harvested,
+            2 => saffron_vegetation::PhenotypeRole::Damaged,
+            3 => saffron_vegetation::PhenotypeRole::Burned,
+            4 => saffron_vegetation::PhenotypeRole::Dead,
+            5 => saffron_vegetation::PhenotypeRole::Flowering,
+            6 => saffron_vegetation::PhenotypeRole::Fruiting,
+            7 => saffron_vegetation::PhenotypeRole::Senescent,
+            8 => saffron_vegetation::PhenotypeRole::Wet,
+            other => {
+                return Err(Error::Io(format!(
+                    "compiled plant phenotype role {other} is unknown"
+                )));
+            }
+        };
+        let season_window = match reader.read_u8()? {
+            0 => None,
+            1 => {
+                let start = u16::from_le_bytes(reader.take(2)?.try_into().expect("two bytes"));
+                let end = u16::from_le_bytes(reader.take(2)?.try_into().expect("two bytes"));
+                Some((start, end))
+            }
+            other => {
+                return Err(Error::Io(format!(
+                    "compiled plant phenotype window flag {other} is unknown"
+                )));
+            }
+        };
+        let variation = reader.read_u32()?;
+        let remap_count = reader.read_length()?;
+        let mut material_remap = Vec::with_capacity(remap_count);
+        for _ in 0..remap_count {
+            material_remap.push((reader.read_u32()?, reader.read_u32()?));
+        }
+        let active_count = reader.read_length()?;
+        for _ in 0..active_count {
+            reader.take(16)?;
+        }
+        rows.push(PlantPhenotypeRow {
+            id,
+            role,
+            season_window,
+            variation,
+            material_remap,
+        });
+    }
+    Ok(rows)
+}
+
+/// Decodes one MaterialsCoverage-section payload into its material rows.
+pub(crate) fn decode_material_section(bytes: &[u8]) -> Result<Vec<PlantMaterialRow>> {
+    let mut reader = SectionReader::new(bytes);
+    reader.expect_domain(b"saffron-anima/splantc/materials-coverage/v1")?;
+    let material_count = reader.read_length()?;
+    let mut materials = Vec::with_capacity(material_count);
+    for _ in 0..material_count {
+        let material = Uuid(reader.read_u64()?);
+        // The 32-byte content hash pins the resolved document; the loader trusts the
+        // artifact's own validation and keeps only the document.
+        reader.take(32)?;
+        let document = reader.read_bytes()?.to_vec();
+        materials.push(PlantMaterialRow { material, document });
+    }
+    Ok(materials)
+}
+
 fn append_domain(bytes: &mut Vec<u8>, domain: &[u8]) {
     append_bytes(bytes, domain);
 }
@@ -2071,6 +2754,7 @@ fn diagnostic_code_tag(code: PlantCompileDiagnosticCode) -> u8 {
         PlantCompileDiagnosticCode::BoundsMismatch => 9,
         PlantCompileDiagnosticCode::LimitExceeded => 10,
         PlantCompileDiagnosticCode::SourceChanged => 11,
+        PlantCompileDiagnosticCode::OrphanedEdit => 12,
     }
 }
 
@@ -2087,8 +2771,8 @@ mod tests {
     use saffron_scene::{AssetEntry, AssetType};
     use saffron_spatial::UnitInterval;
     use saffron_vegetation::{
-        CookVersionSet, ImportedPlantFamilyRecipe, InteractionPolicy, MechanicalResponse,
-        NativeBotanicalGraph, PhenotypeRole, PlantDimensions, PlantFamilySource,
+        BotanicalGraphDocument, CookVersionSet, ImportedPlantFamilyRecipe, InteractionPolicy,
+        MechanicalResponse, PhenotypeRole, PlantDimensions, PlantFamilySource,
         PlantManualSemanticTarget, PlantPart, PlantPhenotype, PlantReimportConflictReason,
         PlantSourceLocator, PlantSourceReference, PlantVariation, SourceProvenance,
         ThinSheetFoliageParameters, VoxelMaterialMoments,
@@ -2169,6 +2853,46 @@ mod tests {
         mesh
     }
 
+    fn alpha_card() -> Mesh {
+        let mut mesh = Mesh {
+            vertices: vec![
+                Vertex {
+                    position: Vec3::new(-1.0, -1.0, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(0.0, 0.0),
+                    ..Vertex::default()
+                },
+                Vertex {
+                    position: Vec3::new(1.0, -1.0, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(1.0, 0.0),
+                    ..Vertex::default()
+                },
+                Vertex {
+                    position: Vec3::new(1.0, 1.0, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(1.0, 1.0),
+                    ..Vertex::default()
+                },
+                Vertex {
+                    position: Vec3::new(-1.0, 1.0, 0.0),
+                    normal: Vec3::Z,
+                    uv0: Vec2::new(0.0, 1.0),
+                    ..Vertex::default()
+                },
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: 6,
+                vertex_offset: 0,
+                material_slot: 0,
+            }],
+        };
+        compute_tangents(&mut mesh);
+        mesh
+    }
+
     fn provenance() -> SourceProvenance {
         SourceProvenance {
             source: "fixture".to_owned(),
@@ -2218,12 +2942,17 @@ mod tests {
             variations: vec![PlantVariation {
                 id: 0,
                 name: "Default".to_owned(),
-                sources: if imported { vec![10, 11] } else { Vec::new() },
+                sources: if imported {
+                    vec![10, 11]
+                } else {
+                    vec![saffron_vegetation::native_variation_source_id(0)]
+                },
                 active_parts: Vec::new(),
             }],
             phenotypes: vec![PlantPhenotype {
                 id: 0,
                 role: PhenotypeRole::Healthy,
+                season_window: None,
                 variation: 0,
                 material_remap: Vec::new(),
                 active_parts: Vec::new(),
@@ -2232,6 +2961,7 @@ mod tests {
             navigation_proxies: Vec::new(),
             interaction_policy: InteractionPolicy::Decorative,
             habitat: None,
+            ecology: saffron_vegetation::PlantEcologyDeclaration::default(),
         }
     }
 
@@ -2291,13 +3021,10 @@ mod tests {
     fn native_family(material: Uuid) -> PlantFamilyAsset {
         base_family(
             material,
-            PlantFamilySource::Native(NativeBotanicalGraph {
-                schema_hash: [9; 32],
-                graph: serde_json::json!({
-                    "nodes": [],
-                    "version": 1,
-                }),
-            }),
+            PlantFamilySource::Native {
+                graph: BotanicalGraphDocument::sapling(0x5a11),
+                grafts: Vec::new(),
+            },
         )
     }
 
@@ -2372,6 +3099,39 @@ mod tests {
             ),
             17
         );
+    }
+
+    #[test]
+    fn geometry_first_cook_replaces_alpha_card_empty_silhouette() {
+        let material = Uuid(91);
+        let mut snapshot = PlantSourceSnapshot {
+            source: 10,
+            content_hash: [0; 32],
+            meshes: vec![PlantSourceMeshSnapshot {
+                selector: PlantSourceSelector::Whole,
+                transform: Mat4::IDENTITY,
+                mesh: alpha_card(),
+                skin: Vec::new(),
+                material_slots: vec![material],
+            }],
+            materials: Vec::new(),
+            joints: Vec::new(),
+            semantic_elements: Vec::new(),
+        };
+        let coverage = BTreeMap::from([(
+            material.value(),
+            ResolvedCoverageImage {
+                alpha: vec![255, 255, 0, 0, 255, 255, 0, 0],
+                width: 4,
+                height: 2,
+                cutoff: 128,
+            },
+        )]);
+        apply_geometry_first_contours(&mut snapshot, &coverage).unwrap();
+        let mesh = &snapshot.meshes[0].mesh;
+        assert_eq!(mesh.indices.len(), 6);
+        assert!(mesh.vertices.iter().all(|vertex| vertex.uv0.x <= 0.5));
+        assert!(mesh.vertices.iter().all(|vertex| vertex.position.x <= 0.0));
     }
 
     #[test]
@@ -2468,7 +3228,11 @@ mod tests {
                 Some("plants")
             );
             let bytes = std::fs::read(&published.publication.path).expect("artifact");
-            let index = PlantCompiledArtifactIndex::open(&bytes).expect("artifact index");
+            let index = PlantCompiledArtifactIndex::open(
+                &bytes,
+                saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+            )
+            .expect("artifact index");
             let sections = PlantCompiledSectionKind::ALL
                 .into_iter()
                 .map(|kind| index.section(&bytes, kind).expect("section").is_some())
@@ -2488,19 +3252,28 @@ mod tests {
             panic!("valid family was rejected");
         };
         let bytes = std::fs::read(&published.publication.path).expect("artifact");
-        let index = PlantCompiledArtifactIndex::open(&bytes).expect("artifact index");
+        let index = PlantCompiledArtifactIndex::open(
+            &bytes,
+            saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+        )
+        .expect("artifact index");
         let section = |kind| {
             index
                 .section(&bytes, kind)
                 .expect("valid section")
                 .expect("required section")
         };
+        let triangle = section(PlantCompiledSectionKind::TriangleHierarchy);
+        let voxel = section(PlantCompiledSectionKind::VoxelHierarchy);
+        let deformation = section(PlantCompiledSectionKind::Deformation);
+        let pages = section(PlantCompiledSectionKind::PageDirectory);
+        let ray_tracing = section(PlantCompiledSectionKind::RayTracing);
         let hierarchy = decode_portable_virtual_hierarchy_sections(
-            section(PlantCompiledSectionKind::TriangleHierarchy),
-            section(PlantCompiledSectionKind::VoxelHierarchy),
-            section(PlantCompiledSectionKind::Deformation),
-            section(PlantCompiledSectionKind::PageDirectory),
-            section(PlantCompiledSectionKind::RayTracing),
+            triangle.as_ref(),
+            voxel.as_ref(),
+            deformation.as_ref(),
+            pages.as_ref(),
+            ray_tracing.as_ref(),
         )
         .expect("portable hierarchy");
         assert!(!hierarchy.triangle_clusters.is_empty());
@@ -2515,12 +3288,12 @@ mod tests {
             .iter()
             .map(|root| hierarchy.nodes[*root as usize].page)
             .collect::<BTreeSet<_>>();
-        let coarse = saffron_vegetation::select_portable_hierarchy_cut(&hierarchy, &root_pages, 0)
+        let coarse = saffron_geometry::select_portable_hierarchy_cut(&hierarchy, &root_pages, 0)
             .expect("coarse cut");
         assert_eq!(coarse, hierarchy.roots);
 
         let all_pages = hierarchy.pages.iter().map(|page| page.id).collect();
-        let fine = saffron_vegetation::select_portable_hierarchy_cut(&hierarchy, &all_pages, 0)
+        let fine = saffron_geometry::select_portable_hierarchy_cut(&hierarchy, &all_pages, 0)
             .expect("fine cut");
         assert!(!fine.is_empty());
         assert!(fine.iter().all(|node| {
@@ -2529,16 +3302,199 @@ mod tests {
         }));
         assert_eq!(
             hierarchy.triangle_hierarchy_bytes().expect("re-encode"),
-            section(PlantCompiledSectionKind::TriangleHierarchy)
+            triangle.as_ref()
         );
         assert_eq!(
             hierarchy.voxel_hierarchy_bytes().expect("re-encode"),
-            section(PlantCompiledSectionKind::VoxelHierarchy)
+            voxel.as_ref()
         );
 
-        let mut corrupt = section(PlantCompiledSectionKind::PageDirectory).to_vec();
+        let mut corrupt = pages.to_vec();
         corrupt.push(0);
-        assert!(saffron_vegetation::decode_page_directory(&corrupt).is_err());
+        assert!(saffron_geometry::decode_page_directory(&corrupt).is_err());
+    }
+
+    #[test]
+    fn render_decode_flattens_the_published_artifact_against_its_prototypes() {
+        let (_scratch, mut assets, material, mesh) = fixture_server("render-decode");
+        let family = save_family(&mut assets, imported_family(material, mesh));
+        let outcome = recook_plant_family(&mut assets, &family, &options()).expect("recook");
+        let PlantRecookOutcome::Published(published) = outcome else {
+            panic!("valid family was rejected");
+        };
+        let bytes = std::fs::read(&published.publication.path).expect("artifact");
+        let decoded =
+            crate::plant_render::decode_plant_render_sections(&bytes).expect("render decode");
+
+        // The flat vertex stream is the prototypes' streams concatenated in id order.
+        let vertex_total: usize = decoded
+            .hierarchy
+            .prototypes
+            .iter()
+            .map(|prototype| prototype.vertex_count as usize)
+            .sum();
+        assert_eq!(decoded.mesh.vertices.len(), vertex_total);
+        assert!(!decoded.mesh.indices.is_empty());
+        assert!(
+            decoded
+                .mesh
+                .indices
+                .iter()
+                .all(|index| (*index as usize) < decoded.mesh.vertices.len()),
+            "flattened indices are stream-global"
+        );
+        // Every prototype is placed by at least one use, and every use names a live
+        // prototype — the assembly upload's contract.
+        assert!(!decoded.hierarchy.micro_instances.is_empty());
+        assert!(
+            decoded
+                .hierarchy
+                .micro_instances
+                .iter()
+                .all(|instance| (instance.prototype as usize) < decoded.hierarchy.prototypes.len())
+        );
+        // The fixture family resolves one material slot; its pinned document decodes to
+        // the resolved material asset.
+        assert_eq!(decoded.material_slots, vec![material]);
+        assert_eq!(decoded.material_documents.len(), 1);
+        decode_plant_material_document(&decoded.material_documents[0].1)
+            .expect("pinned material resolves");
+    }
+
+    /// Extends the imported fixture with a second geometry source (a second mesh asset
+    /// mapped to its own part), so the compiled family carries two prototypes and the
+    /// runtime load builds a real assembly table.
+    fn two_prototype_family(
+        assets: &mut AssetServer,
+        material: Uuid,
+        first_mesh: Uuid,
+    ) -> PlantFamilyAsset {
+        let second_mesh = Uuid(7_002);
+        let relative = "meshes/birch.smesh";
+        std::fs::write(
+            assets.root.join(relative),
+            save_mesh_to_buffer(&triangle(), &[], None).expect("encode mesh"),
+        )
+        .expect("write mesh");
+        assets.catalog.put(AssetEntry {
+            id: second_mesh,
+            name: "birch".to_owned(),
+            asset_type: AssetType::Mesh,
+            path: relative.to_owned(),
+            ..AssetEntry::default()
+        });
+        let selector = PlantSourceSelector::Element {
+            id: u128::from(second_mesh.value()),
+            path: "birch".to_owned(),
+        };
+        let mut family = imported_family(material, first_mesh);
+        let PlantFamilySource::Imported(recipe) = &mut family.source else {
+            unreachable!();
+        };
+        recipe.sources.push(PlantSourceReference {
+            id: 12,
+            locator: PlantSourceLocator::Asset(second_mesh),
+            role: PlantSourceRole::Geometry,
+            selector: selector.clone(),
+            content_hash: [3; 32],
+            settings: PlantImportSettings {
+                pivot: PlantPivot::SourceOrigin,
+                ..PlantImportSettings::default()
+            },
+            provenance: provenance(),
+        });
+        recipe.semantic_targets.push(PlantManualSemanticTarget {
+            id: 32,
+            source: 12,
+            selector,
+            destination: PlantSemanticDestination::Part(41),
+        });
+        family.parts.push(PlantPart {
+            id: 41,
+            parent: Some(40),
+            semantic: PlantPartSemantic::Leaf,
+            material_slot: 0,
+            sources: vec![12],
+        });
+        family.variations[0].sources.push(12);
+        family
+    }
+
+    /// The full runtime seam: a published two-prototype family loads from the artifact
+    /// store into an assembly-carrying `GpuMesh`, registered under the family id in the
+    /// shared mesh + page-payload caches with its material slot table. Skips when no
+    /// Vulkan device is present.
+    #[test]
+    fn published_family_loads_as_an_assembly_mesh_under_the_family_id() {
+        use saffron_rendering::{
+            BindlessFreeList, Descriptors, Device, SurfaceSource, Uploader, validation_issue_count,
+        };
+        let device = match Device::new(&SurfaceSource::Offscreen) {
+            Ok(device) => device,
+            Err(err) => {
+                eprintln!("skipping: no Vulkan device obtainable ({err})");
+                return;
+            }
+        };
+        let before = validation_issue_count();
+        let free_list: BindlessFreeList = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let descriptors = Descriptors::new(&device, &free_list).expect("Descriptors::new");
+        let queue = device.graphics_queue.clone();
+        let uploader = Uploader::new(&device, &queue).expect("Uploader::new");
+
+        let (_scratch, mut assets, material, first_mesh) = fixture_server("render-load");
+        let two_prototype = two_prototype_family(&mut assets, material, first_mesh);
+        let family = save_family(&mut assets, two_prototype);
+        let outcome = recook_plant_family(&mut assets, &family, &options()).expect("recook");
+        let PlantRecookOutcome::Published(published) = outcome else {
+            panic!("valid family was rejected");
+        };
+
+        let gpu = crate::gpu::RendererUploader::new(&uploader, &descriptors, false);
+        let render = assets
+            .load_plant_family(&gpu, family.id, published.publication.content_hash)
+            .expect("family render");
+        let assembly = render.mesh.assembly.as_ref().expect("assembly table");
+        assert_eq!(
+            assembly.prototypes.len(),
+            2,
+            "one prototype per source mesh"
+        );
+        assert!(assembly.uses.len() >= 2, "every prototype is placed");
+        assert_eq!(assembly.prototypes[0].vertex_base, 0);
+        assert_eq!(
+            assembly.prototypes[1].vertex_base * 2,
+            render.mesh.vertex_count,
+            "two identical source meshes split the flattened stream evenly"
+        );
+        assert!(
+            render.mesh.blas.is_none(),
+            "an assembly carries no merged BLAS"
+        );
+        assert_eq!(render.materials.as_ref(), &[material]);
+
+        // The family registers under its own id, so the mirror's mesh path resolves it.
+        let registered = assets
+            .load_mesh_asset(&gpu, family.id)
+            .expect("family mesh resolves by id");
+        assert!(std::sync::Arc::ptr_eq(&registered, &render.mesh));
+        assert!(
+            matches!(
+                assets.page_payload_source(family.id),
+                Some(crate::page_stream::PagePayloadSource::Cooked(_))
+            ),
+            "family pages stream from the retained cooked hierarchy"
+        );
+
+        device.wait_idle().expect("idle before teardown");
+        assets.clear_asset_caches();
+        drop(render);
+        drop(registered);
+        drop(assets);
+        drop(uploader);
+        drop(descriptors);
+        drop(device);
+        assert_eq!(validation_issue_count(), before);
     }
 
     #[test]
@@ -2568,28 +3524,37 @@ mod tests {
             panic!("valid family was rejected");
         };
         let bytes = std::fs::read(&published.publication.path).expect("artifact");
-        let index = PlantCompiledArtifactIndex::open(&bytes).expect("artifact index");
+        let index = PlantCompiledArtifactIndex::open(
+            &bytes,
+            saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+        )
+        .expect("artifact index");
+        let triangle = index
+            .section(&bytes, PlantCompiledSectionKind::TriangleHierarchy)
+            .unwrap()
+            .unwrap();
+        let voxel = index
+            .section(&bytes, PlantCompiledSectionKind::VoxelHierarchy)
+            .unwrap()
+            .unwrap();
+        let deformation = index
+            .section(&bytes, PlantCompiledSectionKind::Deformation)
+            .unwrap()
+            .unwrap();
+        let pages = index
+            .section(&bytes, PlantCompiledSectionKind::PageDirectory)
+            .unwrap()
+            .unwrap();
+        let ray_tracing = index
+            .section(&bytes, PlantCompiledSectionKind::RayTracing)
+            .unwrap()
+            .unwrap();
         let hierarchy = decode_portable_virtual_hierarchy_sections(
-            index
-                .section(&bytes, PlantCompiledSectionKind::TriangleHierarchy)
-                .unwrap()
-                .unwrap(),
-            index
-                .section(&bytes, PlantCompiledSectionKind::VoxelHierarchy)
-                .unwrap()
-                .unwrap(),
-            index
-                .section(&bytes, PlantCompiledSectionKind::Deformation)
-                .unwrap()
-                .unwrap(),
-            index
-                .section(&bytes, PlantCompiledSectionKind::PageDirectory)
-                .unwrap()
-                .unwrap(),
-            index
-                .section(&bytes, PlantCompiledSectionKind::RayTracing)
-                .unwrap()
-                .unwrap(),
+            triangle.as_ref(),
+            voxel.as_ref(),
+            deformation.as_ref(),
+            pages.as_ref(),
+            ray_tracing.as_ref(),
         )
         .expect("portable hierarchy");
         let root = &hierarchy.nodes[hierarchy.roots[0] as usize];
@@ -2600,7 +3565,7 @@ mod tests {
         assert!(root.appearance_error.normal_distribution > 0);
         assert_eq!(
             hierarchy.ray_tracing[hierarchy.roots[0] as usize].material_class,
-            saffron_vegetation::VirtualMaterialClass::ThinSheet
+            saffron_geometry::VirtualMaterialClass::ThinSheet
         );
     }
 
@@ -2687,5 +3652,78 @@ mod tests {
         );
         assert_eq!(validation.compile.statistics.meshes, 1);
         assert_eq!(validation.compile.statistics.materials, 1);
+    }
+}
+
+/// The checked-in vegetation E2E fixture must stay cookable: its plant family (an
+/// imported OBJ-trunk recipe) resolves, compiles, and publishes against the current
+/// compiler. Regenerate with `cargo run -p xtask -- gen-vegetation-e2e-fixture` when a
+/// format changes.
+#[cfg(test)]
+mod e2e_fixture {
+    use super::*;
+    use crate::AssetServer;
+
+    fn options() -> PlantRecookOptions {
+        PlantRecookOptions {
+            limits: PlantCompileLimits::default(),
+            versions: saffron_vegetation::CookVersionSet::current(),
+            platform: saffron_vegetation::CookPlatformProfile {
+                target: "test-target".to_owned(),
+                content_profile: "portable-vulkan".to_owned(),
+                toolchain: "rust-test".to_owned(),
+                features: vec!["plant-phase-4".to_owned()],
+            },
+        }
+    }
+
+    #[test]
+    fn fixture_family_publishes_against_the_current_compiler() {
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../tests/e2e/fixtures/vegetation-phase3.json"
+        );
+        let raw = std::fs::read_to_string(fixture_path).expect("fixture json");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("fixture parse");
+        let from_hex = |value: &str| -> Vec<u8> {
+            (0..value.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let plant_bytes = from_hex(json["plantHex"].as_str().unwrap());
+        let trunk = from_hex(json["trunkObjHex"].as_str().unwrap());
+        let trunk_path = json["trunkObjPath"].as_str().unwrap();
+
+        let root =
+            std::env::temp_dir().join(format!("saffron-fixture-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let mut assets = AssetServer::new(root.join("assets"));
+        let full = assets.root.join(trunk_path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, &trunk).unwrap();
+        let family = saffron_vegetation::read_plant_asset(&plant_bytes).expect("fixture plant");
+        let id = crate::save_plant_family_asset(&mut assets, family, "E2E birch", "plants")
+            .expect("register fixture plant");
+        let family = crate::load_plant_family_asset(&assets, id).expect("reload fixture plant");
+        let outcome = recook_plant_family(&mut assets, &family, &options()).expect("recook");
+        match outcome {
+            PlantRecookOutcome::Published(published) => {
+                let bytes = std::fs::read(&published.publication.path).expect("artifact");
+                let decoded = crate::plant_render::decode_plant_render_sections(&bytes)
+                    .expect("fixture family render-decodes");
+                assert!(
+                    !decoded.mesh.vertices.is_empty(),
+                    "the fixture family carries renderable geometry"
+                );
+            }
+            PlantRecookOutcome::Rejected(validation) => {
+                panic!(
+                    "rejected: conflicts {:#?} diagnostics {:#?}",
+                    validation.compile.conflicts, validation.compile.diagnostics
+                );
+            }
+        }
     }
 }
