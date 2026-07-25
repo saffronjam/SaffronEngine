@@ -1,10 +1,20 @@
-struct MaterialParamsData size=96 align=16
+struct MaterialParamsData size=256 align=16
 offset baseColor 0
 offset pbr 16
 offset emissive 32
 offset uv 48
 offset tex0 64
 offset tex1 80
+offset thinReflection 96
+offset thinAbsorption 112
+offset thinTransmission 128
+offset coverage 144
+offset coverageHash 160
+offset aggregate0 176
+offset aggregateAlbedo 192
+offset aggregateTransmission 208
+offset aggregateNormal0 224
+offset aggregateNormal1 240
 hexdump:
 cd cc 4c 3f cd cc cc 3e cd cc 4c 3e 00 00 80 3f 
 00 00 80 3e 33 33 33 3f 00 00 80 3f 00 00 00 3f 
@@ -12,3 +22,13 @@ cd cc cc 3d 00 00 00 00 00 00 00 00 cd cc 4c 3d
 00 00 00 40 00 00 00 40 00 00 00 00 00 00 00 00 
 03 00 00 00 00 00 00 00 05 00 00 00 00 00 00 00 
 00 00 00 00 00 00 00 00 00 00 00 00 07 00 00 00 
+cd cc cc 3e 9a 99 99 3e 9a 99 19 3f 6f 12 83 3a 
+cd cc 4c 3e 9a 99 99 3e cd cc cc 3e 66 66 66 3f 
+33 33 33 3f cd cc 4c 3f 00 00 00 3f 00 00 00 00 
+0b 00 00 00 01 00 00 00 01 00 00 00 02 00 00 00 
+0d 00 00 00 11 00 00 00 00 04 00 00 00 02 00 00 
+00 00 00 3f 33 33 33 3f 6f 12 03 3b 00 00 00 00 
+cd cc 4c 3e 00 00 00 3f cd cc cc 3d 00 00 00 00 
+cd cc cc 3e 9a 99 19 3f 9a 99 99 3e 00 00 00 00 
+00 00 00 3f cd cc cc 3e 9a 99 99 3e cd cc cc 3d 
+cd cc 4c 3e cd cc 4c 3d 00 00 00 00 00 00 00 00 

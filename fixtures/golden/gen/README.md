@@ -1,13 +1,13 @@
 # Golden-fixture generator
 
 `gen_golden.cpp` emits the byte-exact reference fixtures in the parent directory. Its writer
-logic is transcribed verbatim from the C++ engine's format owners (see
-`../PROVENANCE.md` for the per-fixture source map and the exact toolchain/commit).
+logic is independently mirrored from each format owner (see `../PROVENANCE.md` for the
+per-fixture source map and the C++ reference toolchain/commit).
 
 It is a **standalone** program: the on-disk formats are pure `#[repr(C)]`/JSON data, so it
 links nothing but the standard library and the engine's vendored `nlohmann/json` (v3.12.0),
-not Vulkan/Jolt/SDL. This makes the genuine C++ bytes reproducible without a full engine
-build.
+not Vulkan/Jolt/SDL. This makes the reference disk bytes and current GPU ABI bytes reproducible
+without a full engine build.
 
 ```sh
 toolbox run -c saffron-build bash -lc '
