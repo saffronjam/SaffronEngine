@@ -29,9 +29,11 @@ mod types;
 mod world;
 
 pub use error::{Error, Result};
+pub use saffron_physics_sys::INVALID_BODY_ID;
 pub use types::{
     BodyInfo, CONTACT_RING_CAP, ContactDrain, ContactEvent, ContactKind, FIXED_STEP, MotionType,
-    ObjectLayer, PoseTarget, RagdollState, RayHit, WorldStats, layers_collide,
+    ObjectLayer, PoseTarget, RagdollState, RayHit, StaticTargetBodyCreate, WorldHitTarget,
+    WorldStats, layers_collide,
 };
 pub use world::{MeshCook, World, fit_bone_capsules, fit_collider_to_mesh, shutdown_physics};
 
@@ -398,9 +400,12 @@ mod tests {
         // `for_each` iteration order is unspecified, so assert on contents/motion by uuid rather
         // than positional order; the creation-order invariant is internal to `bodies` and proven
         // by every entry being present exactly once.
-        let uuids: Vec<Uuid> = bodies.iter().map(|b| b.entity).collect();
+        let uuids: Vec<Option<WorldHitTarget>> = bodies.iter().map(|b| b.target).collect();
         for expected in [d0, d1, floor] {
-            assert!(uuids.contains(&expected), "body {expected:?} is listed");
+            assert!(
+                uuids.contains(&Some(WorldHitTarget::SceneEntity(expected))),
+                "body {expected:?} is listed"
+            );
         }
         let dynamic_listed = bodies
             .iter()
@@ -1052,9 +1057,10 @@ mod tests {
         let begin = begin.expect("a Begin contact fired when the box landed on the floor");
         assert!(!begin.sensor, "a solid floor touch is not a sensor overlap");
         // The two bodies are the floor + the falling box (order is Jolt's, so check the set).
-        let pair = [begin.entity_a, begin.entity_b];
+        let pair = [begin.target_a, begin.target_b];
         assert!(
-            pair.contains(&floor) && pair.contains(&falling),
+            pair.contains(&Some(WorldHitTarget::SceneEntity(floor)))
+                && pair.contains(&Some(WorldHitTarget::SceneEntity(falling))),
             "the Begin event names the floor + the falling box (got {pair:?})"
         );
         // A plausible contact: a finite point near the floor top (y ≈ 0.5) and an up-ish normal.
@@ -1164,9 +1170,10 @@ mod tests {
                     event.sensor,
                     "a sensor overlap carries sensor = true (got {event:?})"
                 );
-                let pair = [event.entity_a, event.entity_b];
+                let pair = [event.target_a, event.target_b];
                 assert!(
-                    pair.contains(&sensor) && pair.contains(&body),
+                    pair.contains(&Some(WorldHitTarget::SceneEntity(sensor)))
+                        && pair.contains(&Some(WorldHitTarget::SceneEntity(body))),
                     "the overlap names the sensor + the probe (got {pair:?})"
                 );
                 match event.kind {
@@ -1791,7 +1798,8 @@ mod tests {
         let hit = world.raycast(Vec3::new(-5.0, 0.0, 0.0), Vec3::X, 10.0);
         assert!(hit.hit, "the ray must strike the static box");
         assert_eq!(
-            hit.entity, target_uuid,
+            hit.target,
+            Some(WorldHitTarget::SceneEntity(target_uuid)),
             "the hit maps back to the box's owner entity"
         );
         assert!(
@@ -1858,7 +1866,8 @@ mod tests {
             "a thicker sphere sweep catches the edge the thin ray missed"
         );
         assert_eq!(
-            swept.entity, edge_uuid,
+            swept.target,
+            Some(WorldHitTarget::SceneEntity(edge_uuid)),
             "the sweep hit maps back to the box's owner entity"
         );
         assert!(
@@ -1933,6 +1942,65 @@ mod tests {
             clean, with_queries,
             "interleaving read-only raycasts/sphere-casts between steps changed the sim trace — a \
              query perturbed the deterministic step (it must not)"
+        );
+    }
+
+    #[test]
+    fn static_target_batch_round_trips_vegetation_hits() {
+        let _guard = jolt_guard();
+        let mut world = World::new().expect("world creation");
+
+        let plant = saffron_spatial::PlantId::explicit([11; 16]).expect("plant id");
+        let sensor_plant = saffron_spatial::PlantId::explicit([13; 16]).expect("plant id");
+        let rows = [
+            StaticTargetBodyCreate {
+                target: WorldHitTarget::Vegetation(plant),
+                shape: Shape::Capsule,
+                half_extents: Vec3::new(0.3, 1.5, 0.3),
+                position: Vec3::new(4.0, 1.5, 0.0),
+                rotation: Quat::IDENTITY,
+                sensor: false,
+                friction: 0.5,
+            },
+            StaticTargetBodyCreate {
+                target: WorldHitTarget::Vegetation(sensor_plant),
+                shape: Shape::Sphere,
+                half_extents: Vec3::new(0.8, 0.0, 0.0),
+                position: Vec3::new(-4.0, 1.0, 0.0),
+                rotation: Quat::IDENTITY,
+                sensor: true,
+                friction: 0.5,
+            },
+        ];
+        let ids = world.add_static_target_bodies(&rows);
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.iter()
+                .all(|&id| id != saffron_physics_sys::INVALID_BODY_ID)
+        );
+
+        // A ray into the solid capsule reports the tagged plant, never a forged entity uuid.
+        let hit = world.raycast(Vec3::new(0.0, 1.5, 0.0), Vec3::X, 10.0);
+        assert!(hit.hit, "the ray reaches the vegetation capsule");
+        assert_eq!(hit.target, Some(WorldHitTarget::Vegetation(plant)));
+
+        // The sensor body is query-visible through the body list with its own tagged owner.
+        let sensor_info = world
+            .list_bodies()
+            .into_iter()
+            .find(|body| body.target == Some(WorldHitTarget::Vegetation(sensor_plant)))
+            .expect("the sensor body is listed");
+        assert_eq!(sensor_info.motion, MotionType::Static);
+
+        // Batch removal drops the bodies and their registry rows: the same ray now misses.
+        world.remove_bodies(&ids);
+        let miss = world.raycast(Vec3::new(0.0, 1.5, 0.0), Vec3::X, 10.0);
+        assert!(!miss.hit, "the removed capsule no longer occludes the ray");
+        assert!(
+            world.list_bodies().into_iter().all(|body| body.target
+                != Some(WorldHitTarget::Vegetation(plant))
+                && body.target != Some(WorldHitTarget::Vegetation(sensor_plant))),
+            "no registry row outlives the batch removal"
         );
     }
 }

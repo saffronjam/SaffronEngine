@@ -11,7 +11,7 @@
 //! is load-bearing for the deterministic sim; the `HashMap<u32, usize>` is only for the hit →
 //! entity lookup the contact drain needs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::{Mat4, Quat, Vec3};
 
@@ -29,7 +29,7 @@ use saffron_scene::{
 use crate::error::{Error, Result};
 use crate::types::{
     BodyInfo, CONTACT_RING_CAP, ContactDrain, ContactEvent, ContactKind, FIXED_STEP, MotionType,
-    ObjectLayer, PoseTarget, RagdollState, RayHit, WorldStats,
+    ObjectLayer, PoseTarget, RagdollState, RayHit, StaticTargetBodyCreate, WorldStats,
 };
 
 /// The weight units/sec the eased per-bone physics weight approaches its target, so the
@@ -60,7 +60,7 @@ struct BodyEntry {
     /// The owning entity handle, for the per-step transform write-back.
     entity: saffron_scene::Entity,
     /// The owner's stable id, surfaced in [`BodyInfo`] and the contact mapping.
-    uuid: Uuid,
+    target: crate::WorldHitTarget,
     /// The raw Jolt `BodyID` (index + sequence) the bridge round-trips.
     id: u32,
     /// The body's motion type.
@@ -79,6 +79,8 @@ struct CharacterEntry {
     entity: Entity,
     /// The character's slot in the shim's `JoltWorld.characters` vector.
     index: u32,
+    /// The velocity the last step commanded, for the interaction-field emitters.
+    last_velocity: Vec3,
 }
 
 /// One live ragdoll's Rust-side bookkeeping. The Jolt `Ragdoll`/`RagdollSettings` live in the
@@ -194,73 +196,102 @@ impl World {
             rows.push((entity, *collider));
         });
 
-        for (entity, collider) in rows {
-            // A CharacterController owns its capsule via a CharacterVirtual, not a world body —
-            // never make a static body for it (it would block the sweep).
-            if scene.has_component::<saffron_scene::CharacterController>(entity) {
-                continue;
-            }
-
-            // A collider with no rigidbody is an implicit Static body; with one, its motion wins.
-            let rigidbody = scene.component::<Rigidbody>(entity).ok();
-            let motion = rigidbody
-                .map(|rb| MotionType::from_scene(rb.motion))
-                .unwrap_or(MotionType::Static);
-
-            // Cook the ConvexHull/Mesh geometry (and reject a Mesh on a Dynamic body) before
-            // touching Jolt. A typed error here is logged + the body skipped, so the caller could
-            // match the cause.
-            let geometry = match cook_shape_geometry(&collider, motion, cook) {
-                Ok(geometry) => geometry,
-                Err(err) => {
-                    tracing::warn!(
-                        "physics: skipping body for {}: {err}",
-                        id_of(scene, entity).0
-                    );
-                    continue;
-                }
-            };
-
-            // World translation/rotation compose on a cache miss (the play scene's caches may be
-            // cold here), scale-free.
-            let position = scene.world_translation(entity);
-            let rotation = scene.world_rotation(entity);
-            let object_layer = resolve_object_layer(rigidbody.as_ref(), motion, collider.is_sensor);
-
-            let create = body_create(
-                &collider,
-                rigidbody.as_ref(),
-                motion,
-                object_layer,
-                position,
-                rotation,
-            );
-            let id = sys::create_body(
-                &mut self.world,
-                &create,
-                &geometry.hull_points,
-                &geometry.mesh_vertices,
-                &geometry.mesh_indices,
-            );
-            if id == INVALID_BODY_ID {
-                // The shim already logged the shape/body create failure; skip this body without
-                // aborting the rest of the world.
-                continue;
-            }
-
-            let uuid = id_of(scene, entity);
-            self.index_by_body_id.insert(id, self.bodies.len());
-            self.bodies.push(BodyEntry {
-                entity,
-                uuid,
-                id,
-                motion,
-                sensor: collider.is_sensor,
-            });
-            if motion == MotionType::Dynamic {
-                self.dynamic_body_count += 1;
+        for (entity, _) in rows {
+            if let Err(err) = self.add_entity_body(scene, entity, cook) {
+                tracing::warn!(
+                    "physics: skipping body for {}: {err}",
+                    id_of(scene, entity).0
+                );
             }
         }
+    }
+
+    /// Create the one body `entity`'s [`Collider`] (plus any [`Rigidbody`]) describes, registered
+    /// under the entity's stable uuid, and return its raw `BodyID`. The per-entity path
+    /// [`World::populate`] walks, and the way an entity that appears mid-play (a promoted macro
+    /// plant) gains collision.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingCollider`] when the entity carries no collider or owns a
+    /// [`CharacterController`](saffron_scene::CharacterController) instead (its capsule is a
+    /// `CharacterVirtual`, never a world body — a static body there would block the sweep), the
+    /// cook error for a `ConvexHull`/`Mesh` shape that could not be built, or
+    /// [`Error::BodyCreate`] when Jolt rejected the shape or hit its body limit.
+    pub fn add_entity_body(
+        &mut self,
+        scene: &Scene,
+        entity: Entity,
+        cook: &mut MeshCook<'_>,
+    ) -> Result<u32> {
+        if scene.has_component::<saffron_scene::CharacterController>(entity) {
+            return Err(Error::MissingCollider);
+        }
+        let collider = scene
+            .component::<Collider>(entity)
+            .map_err(|_| Error::MissingCollider)?;
+
+        // A collider with no rigidbody is an implicit Static body; with one, its motion wins.
+        let rigidbody = scene.component::<Rigidbody>(entity).ok();
+        let motion = rigidbody
+            .map(|rb| MotionType::from_scene(rb.motion))
+            .unwrap_or(MotionType::Static);
+
+        // Cook the ConvexHull/Mesh geometry (and reject a Mesh on a Dynamic body) before touching
+        // Jolt, so a typed cause reaches the caller.
+        let geometry = cook_shape_geometry(&collider, motion, cook)?;
+
+        // World translation/rotation compose on a cache miss (the play scene's caches may be cold
+        // here), scale-free.
+        let position = scene.world_translation(entity);
+        let rotation = scene.world_rotation(entity);
+        let object_layer = resolve_object_layer(rigidbody.as_ref(), motion, collider.is_sensor);
+
+        let create = body_create(
+            &collider,
+            rigidbody.as_ref(),
+            motion,
+            object_layer,
+            position,
+            rotation,
+        );
+        let id = sys::create_body(
+            &mut self.world,
+            &create,
+            &geometry.hull_points,
+            &geometry.mesh_vertices,
+            &geometry.mesh_indices,
+        );
+        if id == INVALID_BODY_ID {
+            // The shim already logged the shape/body create failure.
+            return Err(Error::BodyCreate);
+        }
+
+        let target = crate::WorldHitTarget::SceneEntity(id_of(scene, entity));
+        self.index_by_body_id.insert(id, self.bodies.len());
+        self.bodies.push(BodyEntry {
+            entity,
+            target,
+            id,
+            motion,
+            sensor: collider.is_sensor,
+        });
+        if motion == MotionType::Dynamic {
+            self.dynamic_body_count += 1;
+        }
+        Ok(id)
+    }
+
+    /// Remove and destroy every body registered to `entity`, in one batch. The counterpart of
+    /// [`World::add_entity_body`] for an entity that leaves mid-play (a demoted macro plant).
+    pub fn remove_entity_bodies(&mut self, entity: Entity) {
+        let ids: Vec<u32> = self
+            .bodies
+            .iter()
+            .filter(|body| body.entity == entity)
+            .map(|body| body.id)
+            .collect();
+        self.remove_bodies(&ids);
     }
 
     /// Create one Kinematic capsule body per driven joint of every enabled
@@ -326,15 +357,88 @@ impl World {
                     continue;
                 }
                 let uuid = id_of(scene, joint);
+                let target = crate::WorldHitTarget::SceneEntity(uuid);
                 self.index_by_body_id.insert(id, self.bodies.len());
                 self.bodies.push(BodyEntry {
                     entity: joint,
-                    uuid,
+                    target,
                     id,
                     motion: MotionType::Kinematic,
                     sensor: false,
                 });
             }
+        }
+    }
+
+    /// Create one batch of static tagged-target bodies through Jolt's batched broadphase
+    /// insertion, registering each created body under its row's [`WorldHitTarget`] so queries
+    /// and contacts report the tagged owner. Returns one raw `BodyID` per input row,
+    /// position-aligned; a failed row yields [`INVALID_BODY_ID`] and registers nothing.
+    pub fn add_static_target_bodies(&mut self, rows: &[StaticTargetBodyCreate]) -> Vec<u32> {
+        let creates: Vec<BodyCreate> = rows
+            .iter()
+            .map(|row| BodyCreate {
+                shape: shape_raw(row.shape),
+                half_extents: row.half_extents.to_array(),
+                offset: [0.0; 3],
+                position: row.position.to_array(),
+                rotation: row.rotation.to_array(),
+                motion: MotionType::Static.raw(),
+                object_layer: if row.sensor {
+                    ObjectLayer::Sensor
+                } else {
+                    ObjectLayer::Static
+                }
+                .raw(),
+                is_sensor: row.sensor,
+                friction: row.friction,
+                restitution: 0.0,
+                linear_damping: 0.0,
+                angular_damping: 0.0,
+                gravity_factor: 1.0,
+                mass: 1.0,
+                allowed_dofs: ALLOWED_DOFS_ALL,
+            })
+            .collect();
+        let ids = sys::create_static_batch(&mut self.world, &creates);
+        for (row, &id) in rows.iter().zip(&ids) {
+            if id == INVALID_BODY_ID {
+                continue;
+            }
+            self.index_by_body_id.insert(id, self.bodies.len());
+            self.bodies.push(BodyEntry {
+                entity: saffron_scene::Entity::NULL,
+                target: row.target,
+                id,
+                motion: MotionType::Static,
+                sensor: row.sensor,
+            });
+        }
+        ids
+    }
+
+    /// Remove and destroy the listed bodies in one batch, dropping their registry rows.
+    /// [`INVALID_BODY_ID`] sentinels are skipped. A contact already buffered for a removed body
+    /// drains with a `None` target.
+    pub fn remove_bodies(&mut self, ids: &[u32]) {
+        let removed: HashSet<u32> = ids
+            .iter()
+            .copied()
+            .filter(|&id| id != INVALID_BODY_ID)
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        sys::remove_bodies(&mut self.world, ids);
+        self.dynamic_body_count -= self
+            .bodies
+            .iter()
+            .filter(|entry| removed.contains(&entry.id) && entry.motion == MotionType::Dynamic)
+            .count() as i32;
+        self.bodies.retain(|entry| !removed.contains(&entry.id));
+        self.index_by_body_id.clear();
+        for (index, entry) in self.bodies.iter().enumerate() {
+            self.index_by_body_id.insert(entry.id, index);
         }
     }
 
@@ -418,8 +522,8 @@ impl World {
                 } else {
                     ContactKind::End
                 },
-                entity_a: a.map_or(Uuid(0), |i| self.bodies[i].uuid),
-                entity_b: b.map_or(Uuid(0), |i| self.bodies[i].uuid),
+                target_a: a.map(|i| self.bodies[i].target),
+                target_b: b.map(|i| self.bodies[i].target),
                 sensor: a.is_some_and(|i| self.bodies[i].sensor)
                     || b.is_some_and(|i| self.bodies[i].sensor),
                 point: Vec3::from_array(pending.point),
@@ -486,7 +590,7 @@ impl World {
             return;
         }
         let gravity = Vec3::from_array(sys::world_gravity(&self.world));
-        for entry in &self.characters {
+        for entry in &mut self.characters {
             let Ok(mut controller) = scene.component::<CharacterController>(entry.entity) else {
                 continue;
             };
@@ -510,6 +614,8 @@ impl World {
                 entry.index,
                 [horizontal.x, controller.vertical_velocity, horizontal.z],
             );
+            entry.last_velocity =
+                Vec3::new(horizontal.x, controller.vertical_velocity, horizontal.z);
             let applied_gravity = gravity * controller.gravity_factor;
             sys::character_extended_update(
                 &mut self.world,
@@ -545,12 +651,34 @@ impl World {
         self.bodies
             .iter()
             .map(|entry| BodyInfo {
-                entity: entry.uuid,
+                target: Some(entry.target),
                 motion: entry.motion,
                 active: sys::body_is_active(&self.world, entry.id),
                 position: Vec3::from_array(sys::body_position(&self.world, entry.id)),
             })
             .collect()
+    }
+
+    /// The live world's moving emitters for the cosmetic interaction field: every
+    /// awake dynamic body and every character as (world position, world velocity).
+    pub fn motion_emitters(&self) -> Vec<(Vec3, Vec3)> {
+        let mut emitters = Vec::new();
+        for entry in &self.bodies {
+            if entry.motion != MotionType::Dynamic || !sys::body_is_active(&self.world, entry.id) {
+                continue;
+            }
+            emitters.push((
+                Vec3::from_array(sys::body_position(&self.world, entry.id)),
+                Vec3::from_array(sys::body_linear_velocity(&self.world, entry.id)),
+            ));
+        }
+        for entry in &self.characters {
+            emitters.push((
+                Vec3::from_array(sys::character_position(&self.world, entry.index)),
+                entry.last_velocity,
+            ));
+        }
+        emitters
     }
 
     /// Apply a center-of-mass impulse to the Dynamic body owned by `entity`. A non-Dynamic /
@@ -599,6 +727,16 @@ impl World {
         }
     }
 
+    /// A dynamic body's current angular velocity (radians per second about each world axis), for
+    /// the promotion write-back. Zero for an entity with no dynamic body.
+    #[must_use]
+    pub fn body_angular_velocity(&self, entity: Uuid) -> Vec3 {
+        match self.dynamic_body_id(entity) {
+            Some(id) => Vec3::from_array(sys::body_angular_velocity(&self.world, id)),
+            None => Vec3::ZERO,
+        }
+    }
+
     /// Cast a ray `origin + dir * max_dist` against the live world and return the closest hit,
     /// mapped back to its owner entity. Read-only: it takes `&self` so it cannot perturb the
     /// deterministic step — run it between steps (a command, or `on_update`), never mid-solve.
@@ -635,19 +773,19 @@ impl World {
         }
         RayHit {
             hit: true,
-            entity: self.body_uuid(hit.body),
+            target: self.body_target(hit.body),
             point: Vec3::from_array(hit.point),
             normal: Vec3::from_array(hit.normal),
             distance: hit.distance,
         }
     }
 
-    /// Map a raw `BodyID` back to its owner entity uuid (`Uuid(0)` for an unmapped body). The query
-    /// hits return a raw Jolt `BodyID`; the safe layer owns the body → entity table.
-    fn body_uuid(&self, id: u32) -> Uuid {
+    /// Map a raw `BodyID` back to its tagged owner (`None` for an unmapped body). The query
+    /// hits return a raw Jolt `BodyID`; the safe layer owns the body → target registry.
+    fn body_target(&self, id: u32) -> Option<crate::WorldHitTarget> {
         self.index_by_body_id
             .get(&id)
-            .map_or(Uuid(0), |&i| self.bodies[i].uuid)
+            .map(|&i| self.bodies[i].target)
     }
 
     /// Create a `CharacterVirtual` controller for `entity`: a capsule from its [`Collider`]
@@ -680,7 +818,11 @@ impl World {
         if index == INVALID_BODY_ID {
             return Err(Error::CharacterCapsule);
         }
-        self.characters.push(CharacterEntry { entity, index });
+        self.characters.push(CharacterEntry {
+            entity,
+            index,
+            last_velocity: Vec3::ZERO,
+        });
         Ok(())
     }
 
@@ -1063,7 +1205,10 @@ impl World {
     fn dynamic_body_id(&self, uuid: Uuid) -> Option<u32> {
         self.bodies
             .iter()
-            .find(|e| e.uuid == uuid && e.motion == MotionType::Dynamic)
+            .find(|e| {
+                e.target == crate::WorldHitTarget::SceneEntity(uuid)
+                    && e.motion == MotionType::Dynamic
+            })
             .map(|e| e.id)
     }
 }
