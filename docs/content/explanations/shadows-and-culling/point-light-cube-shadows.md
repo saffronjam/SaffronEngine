@@ -6,115 +6,60 @@ math = true
 
 # Point shadows
 
-A point shadow extends
-[shadow mapping](https://doi.org/10.1145/800248.807402) over all directions around a point light.
-The renderer writes world-space light-to-occluder distance into six cubemap faces. Shading samples
-the cube along the light-to-fragment direction and compares that stored distance with the fragment's
-distance from the light.
-
-A point light has no preferred projection direction, so one 2D map cannot cover it. A cubemap tiles
-the sphere, while linear distance remains comparable across every face. Directional and spot maps
-instead store projection depth for one view.
+A point light shadows in every direction, so no single projection covers it. Anima gives the
+shadowed point light six projective spaces of [virtual shadow pages](../virtual-shadow-maps/) — one
+per cube face, each an 8×8 page grid under a 90° perspective frustum. The faces follow the standard
+cube order `+X, -X, +Y, -Y, +Z, -Z`.
 
 > [!NOTE]
-> Only the first point light receives map-based shadows. It uses a cached static cube plus a dynamic
-> cube for deformed casters. Ray-query shadows override the cube path when enabled.
+> Only the first shadow-casting point light samples its face pages. Ray-query shadows override every
+> map-based punctual path when enabled.
 
-## Distance, not depth
+## Face spaces
 
-The shadow fragment writes `length(input.worldPos - pc.lightPos.xyz)`. Each cube is a single-mip
-`R32_SFLOAT` image with six 512×512 array layers, six 2D color-attachment views, and one cube sampling
-view. A separate `D32_SFLOAT` depth image tests visibility while each face renders; its values are
-not sampled by lighting.
+`point_shadow_face_matrices` builds six world-to-clip matrices with a 90° vertical field of view,
+aspect 1, near plane `0.05`, and far plane at the light's range. The look-at directions and up
+vectors follow the cube sampling convention, with no window Y flip, so a world direction and its
+rasterized face texel agree. A moved or re-ranged light invalidates all six spaces at once.
 
-## Rendering the six faces
+## Face select and depth
 
-`point_shadow_face_matrices` builds six world-to-clip matrices, one per face, with a 90° vertical FOV
-and aspect 1. The views follow `+X, -X, +Y, -Y, +Z, -Z` cube order with face-specific up vectors.
-The projection deliberately has no window Y flip; the matrices and `SamplerCube` therefore address
-the same texel for a world direction. Each face clears its color to `far_plane * 2`, so uncovered
-texels represent no occluder inside the light range.
+Both the demand pass and the sampler pick the face by the dominant axis of the light-to-fragment
+vector — the classic cube major-axis mapping. With $d$ the dominant-axis distance and $(s, t)$ the
+face-local coordinates, the face NDC is $st/d$ and the compared depth follows the projection's
+$[0,1]$ mapping:
 
-The cube cannot be a single graph attachment, because its six array layers exceed the graph's
-single-layer image barrier. Both point-shadow passes therefore use `RgPassKind::Compute`, which keeps
-the graph from opening a rendering scope. `record_point_shadow` opens six per-face dynamic-rendering
-scopes and manages each cube's all-layer transitions directly.
-
-```mermaid
-flowchart TD
-    A[point-shadow pass body] --> B[barrier: all 6 layers<br/>ShaderReadOnly to ColorAttachment]
-    B --> C[for face 0..5:<br/>render one face view, write distance]
-    C --> D[barrier: cube 6 layers<br/>ColorAttachment to ShaderReadOnly]
-    D --> E[scene pass samples the cube]
-```
-
-## Sampling and comparing
-
-In the mesh fragment, `pointShadow` reconstructs the fragment's distance to the light and samples
-both cubes along the light-to-fragment direction:
+$$
+z_{01} = rac{f\,(d - n)}{d\,(f - n)}, \qquad n = 0.05 .
+$$
 
 ```hlsl
-float3 toFrag = worldPos - lightPos;
-float dist = length(toFrag);
-float3 dir = normalize(toFrag);
-float stored = min(
-    staticCube.SampleLevel(dir, 0.0).r,
-    dynamicCube.SampleLevel(dir, 0.0).r);
-return dist - bias <= stored ? 1.0 : 0.0;
+if (a.x >= a.y && a.x >= a.z) {
+    face = toFrag.x > 0.0 ? 0u : 1u;
+    axis = a.x;
+    st = float2(toFrag.x > 0.0 ? -toFrag.z : toFrag.z, -toFrag.y);
+}
 ```
 
-The minimum selects the nearest static or deformed occluder. A fragment at most `stored + bias` from
-the light is lit. The `0.08` bias is measured in world units; [shadow bias](../shadow-bias/) explains
-the comparison. `pointShadowMeta.x` identifies the shadowed point-light index and `.y` enables its
-cube lookup. `.z` selects ray-query shadows instead of all map-based punctual shadow paths.
-
-## Caching the cube
-
-The static cube is camera-independent. `point_shadow_content_key` hashes the light position and
-range, then each `MeshComponent` entity's world matrix and mesh asset ID. Entities carrying
-`SkinnedMesh` are excluded because they render into the dynamic cube. The static cube renders when
-that hash or its Vulkan image handle differs from the last recorded values.
-
-A camera-only change leaves the hash stable and reuses the cube in
-`SHADER_READ_ONLY_OPTIMAL`. Moving the light, transforming a non-skinned mesh, changing its mesh ID,
-or adding or removing one changes the hash. The image-handle comparison also invalidates the cache
-if the cube resource is replaced.
-
-## Static and dynamic cubes
-
-`record_point_shadow` filters draw batches by `batch.deformed`. `point-shadow-static` draws
-non-deformed batches only when the static cache is dirty. `point-shadow-dynamic` draws skinned and
-morph-deformed batches every active frame. A physics-moved rigid body remains non-deformed, so its
-world-transform change invalidates the static hash.
-
-The dynamic pass still opens and clears all six faces when no deformed batches exist. Its
-`far_plane * 2` contents then lose the `min` comparison to real static occluders. Each pass manages
-its cube layout and leaves it in `SHADER_READ_ONLY_OPTIMAL` for surface and volumetric-fog sampling.
-Directional and spot shadow maps use their own per-frame depth passes rather than this content-key
-cache.
-
-## Filtering and limits
-
-The distance comparison is a hard `<=` test with no PCF kernel, so cube resolution appears directly
-in shadow-edge aliasing. The fixed `0.08` world-unit bias has a larger relative effect at small scene
-scales and a smaller relative effect at large scales. Map-based point shadows cover one point light;
-other point lights remain unshadowed unless ray-query shadows are active.
+`vsmSamplePoint` looks the page up in the table's point region (64 entries per face) and takes the
+shared [3×3 tile filter](../pcf-filtering/). A missing page reads unshadowed. Dirty face pages
+rasterize in per-face page groups, each culling with its face matrix and drawing pages through
+`vsm_page_crop(8, x, y)` times the face transform.
 
 ## In the code
 
 | What | File | Symbols |
 |---|---|---|
-| Write distance per face | `engine/assets/shaders/point_shadow.slang` | `fragmentMain` |
-| Six face matrices | `engine/crates/rendering/src/lighting.rs` | `point_shadow_face_matrices` |
-| Cube + face views + clear | `engine/crates/rendering/src/scene_pass.rs` | `PointShadowTarget`, `record_point_shadow` |
-| Cube format + size | `engine/crates/rendering/src/lighting.rs` | `POINT_SHADOW_SIZE`, `POINT_SHADOW_COLOR_FORMAT` |
-| Static and dynamic passes | `engine/crates/rendering/src/renderer.rs` | `"point-shadow-static"`, `"point-shadow-dynamic"` |
-| Static cache key | `engine/crates/assets/src/render_scene.rs` | `point_shadow_content_key` |
-| Cache state and dirty gate | `engine/crates/rendering/src/renderer.rs` | `last_point_shadow_key`, `last_point_shadow_cube`, `static_point_shadow_dirty` |
-| Sample + compare distance | `engine/assets/shaders/lighting.slang` | `pointShadow` |
+| Six face matrices | `crates/rendering/src/lighting.rs` | `point_shadow_face_matrices` |
+| Arm + describe the light | `crates/rendering/src/lighting.rs` | `Lighting::set_point_shadow` |
+| Invalidate on movement | `crates/rendering/src/renderer.rs` | `prepare_vsm_frame`, `VsmResidency::invalidate_point` |
+| Face page space | `crates/rendering/src/vsm.rs` | `VsmPageKey::PointFace`, `VSM_POINT_FACE_PAGES`, `VSM_POINT_TABLE_BASE` |
+| Mark receiver pages | `assets/shaders/vsm_demand.slang` | `computeMain` (point block) |
+| Sample the face pages | `assets/shaders/lighting_common.slang` | `vsmSamplePoint` |
 
 ## Related
 
-- [Shadow bias](../shadow-bias/) — the world-space distance bias used here
-- [Directional shadows](../directional-shadows/) — the 2D depth-map alternative
-- [Render graph](../../frame-and-render-graph/render-graph-overview/) — why this is a compute-kind pass
+- [Virtual shadow maps](../virtual-shadow-maps/) — the atlas and residency behind the faces
+- [Spot-light shadows](../spot-light-shadows/) — the single-frustum analogue
+- [Shadow bias](../shadow-bias/) — the depth bias applied while pages rasterize
+- [Ray-query shadows](../../global-illumination-and-raytracing/ray-query-shadows/) — the per-light alternative on RT hardware
