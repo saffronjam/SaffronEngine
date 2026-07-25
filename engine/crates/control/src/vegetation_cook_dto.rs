@@ -229,6 +229,7 @@ fn cell_section_kind_dto(kind: VegetationCellSectionKind) -> VegetationCellSecti
 fn artifact_section_codec_dto(codec: ArtifactSectionCodec) -> VegetationArtifactSectionCodecDto {
     match codec {
         ArtifactSectionCodec::Raw => VegetationArtifactSectionCodecDto::Raw,
+        ArtifactSectionCodec::Zstd => VegetationArtifactSectionCodecDto::Zstd,
     }
 }
 
@@ -480,6 +481,7 @@ mod tests {
             local_bounds_max: [DecisionScalar::from_bits(1); 3],
             variation_count: 1,
             phenotype_count: 2,
+            ecology: saffron_vegetation::PlantEcologyDeclaration::default(),
         });
 
         let dto = manifest_dto(&manifest).unwrap();

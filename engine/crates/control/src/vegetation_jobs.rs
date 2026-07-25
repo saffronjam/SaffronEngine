@@ -1272,6 +1272,7 @@ mod tests {
                 }]),
                 rejected: vec![RejectedCandidate {
                     candidate: identity,
+                    position: saffron_spatial::WorldPosition::origin(),
                     reason: CandidateRejectionReason::Threshold,
                     provenance: ProvenanceHandle(provenance),
                 }],

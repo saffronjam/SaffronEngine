@@ -293,6 +293,249 @@ pub fn register_vegetation_commands(reg: &mut CommandRegistry) {
             })
         },
     );
+
+    reg.register::<saffron_protocol::VegetationRejectionsParams, saffron_protocol::VegetationRejectionsResult>(
+        "vegetation-rejections",
+        "one cooked cell's rejected candidates: position, reason, and ordinal (capped rows)",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let cell = parse_cell(&params.cell)?;
+            let store = ctx.assets.vegetation_artifact_store();
+            let manifest_identity = match &params.manifest {
+                Some(identity) => parse_content_hash(identity, "manifest")?,
+                None => store
+                    .current_manifest_hash(map)
+                    .map_err(Error::from)?
+                    .ok_or_else(|| Error::command("vegetation map has no cooked generation"))?,
+            };
+            let manifest = read_manifest(&store, manifest_identity, map)?;
+            let row = manifest
+                .cells
+                .iter()
+                .find(|candidate| candidate.cell == cell)
+                .ok_or_else(|| Error::command("cell is absent from the selected manifest"))?;
+            let bytes = store
+                .read_cell_section(
+                    row.artifact_hash,
+                    saffron_vegetation::VegetationCellSectionKind::RejectionDiagnostics,
+                )
+                .map_err(Error::from)?
+                .ok_or_else(|| {
+                    Error::command("vegetation cell has no rejection diagnostics section")
+                })?;
+            let facet =
+                saffron_vegetation::decode_vegetation_rejection_diagnostics(bytes.as_ref())
+                    .map_err(Error::from)?;
+            let limit = usize::try_from(params.limit.unwrap_or(1024))
+                .map_err(|_| Error::command("limit is not representable"))?;
+            Ok(saffron_protocol::VegetationRejectionsResult {
+                candidates: facet.candidate_count.to_string(),
+                accepted: facet.accepted_count.to_string(),
+                total_rejected: facet.rejected.len().to_string(),
+                rows: facet
+                    .rejected
+                    .iter()
+                    .take(limit)
+                    .map(|rejected| saffron_protocol::VegetationRejectionDto {
+                        reason: crate::commands_asset::rejection_reason_dto(rejected.reason),
+                        position_ticks: rejected
+                            .position
+                            .global_ticks()
+                            .map(|ticks| ticks.to_string()),
+                        ordinal: rejected.candidate.ordinal.to_string(),
+                    })
+                    .collect(),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::VegetationTopologyDiffParams, saffron_protocol::VegetationTopologyDiffResult>(
+        "vegetation-topology-diff",
+        "diff two cooked manifests per cell: added/removed/moved plants + override conflicts",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = crate::commands_asset::resolve_asset(ctx, &params.map)?;
+            let cell_filter = params
+                .cells
+                .as_ref()
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(parse_cell)
+                        .collect::<Result<std::collections::BTreeSet<_>>>()
+                })
+                .transpose()?;
+            let store = ctx.assets.vegetation_artifact_store();
+            let from_identity = parse_content_hash(&params.from, "from")?;
+            let to_identity = match &params.to {
+                Some(identity) => parse_content_hash(identity, "to")?,
+                None => store
+                    .current_manifest_hash(map)
+                    .map_err(Error::from)?
+                    .ok_or_else(|| Error::command("vegetation map has no cooked generation"))?,
+            };
+            let from = read_manifest(&store, from_identity, map)?;
+            let to = read_manifest(&store, to_identity, map)?;
+            let from_cells: std::collections::BTreeMap<_, _> = from
+                .cells
+                .iter()
+                .map(|row| (row.cell, row.artifact_hash))
+                .collect();
+            let to_cells: std::collections::BTreeMap<_, _> = to
+                .cells
+                .iter()
+                .map(|row| (row.cell, row.artifact_hash))
+                .collect();
+            let union: std::collections::BTreeSet<_> = from_cells
+                .keys()
+                .chain(to_cells.keys())
+                .copied()
+                .filter(|cell| {
+                    cell_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(cell))
+                })
+                .collect();
+            let macro_map = |hash: Option<&saffron_vegetation::ContentHash>| -> Result<
+                std::collections::BTreeMap<saffron_vegetation::PlantId, [i128; 3]>,
+            > {
+                let Some(hash) = hash else {
+                    return Ok(Default::default());
+                };
+                let Some(bytes) = store
+                    .read_cell_section(
+                        *hash,
+                        saffron_vegetation::VegetationCellSectionKind::MacroPoints,
+                    )
+                    .map_err(Error::from)?
+                else {
+                    return Ok(Default::default());
+                };
+                let columns = saffron_vegetation::PlantPointColumns::from_canonical_bytes(&bytes)
+                    .map_err(Error::from)?;
+                Ok(columns
+                    .ids
+                    .iter()
+                    .zip(&columns.positions)
+                    .map(|(id, position)| (*id, position.global_ticks()))
+                    .collect())
+            };
+            const ID_CAP: usize = 64;
+            let mut cells = Vec::new();
+            let mut changed_cells = Vec::new();
+            for cell in union {
+                let from_hash = from_cells.get(&cell);
+                let to_hash = to_cells.get(&cell);
+                if from_hash == to_hash {
+                    continue;
+                }
+                let from_points = macro_map(from_hash)?;
+                let to_points = macro_map(to_hash)?;
+                let added: Vec<_> = to_points
+                    .keys()
+                    .filter(|id| !from_points.contains_key(id))
+                    .copied()
+                    .collect();
+                let removed: Vec<_> = from_points
+                    .keys()
+                    .filter(|id| !to_points.contains_key(id))
+                    .copied()
+                    .collect();
+                let moved: Vec<_> = to_points
+                    .iter()
+                    .filter(|(id, position)| {
+                        from_points
+                            .get(*id)
+                            .is_some_and(|previous| previous != *position)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                changed_cells.push((cell, to_points));
+                cells.push((cell, added, removed, moved));
+            }
+            drop(store);
+            // Unresolved authored overrides: rows in the changed cells' AnchorOverride
+            // chunks whose plant is absent from the newer manifest's macro set.
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, map)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let mut result_cells = Vec::new();
+            for ((cell, added, removed, moved), (_, to_points)) in
+                cells.into_iter().zip(changed_cells)
+            {
+                let keys: Vec<_> = root
+                    .inventory
+                    .iter()
+                    .filter(|reference| {
+                        reference.key.tile
+                            == saffron_vegetation::VegetationMapTileKey::Cell(cell)
+                            && reference.key.kind
+                                == saffron_vegetation::VegetationMapChunkKind::AnchorOverride
+                    })
+                    .map(|reference| reference.key)
+                    .collect();
+                let chunks = saffron_assets::load_vegetation_map_chunks(ctx.assets, map, &keys)
+                    .map_err(|error| Error::command(error.to_string()))?;
+                let mut conflicts = Vec::new();
+                for chunk in &chunks {
+                    let saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(payload) =
+                        &chunk.payload
+                    else {
+                        continue;
+                    };
+                    let layer = vegetation_guid(chunk.key.layer);
+                    let mut push = |kind: &str, plant: saffron_vegetation::PlantId| {
+                        if !to_points.contains_key(&plant) {
+                            conflicts.push(saffron_protocol::VegetationOverrideConflictDto {
+                                kind: kind.to_owned(),
+                                plant: saffron_protocol::PlantId(plant.to_string()),
+                                layer: layer.clone(),
+                            });
+                        }
+                    };
+                    for anchor in &payload.explicit_plants {
+                        push("anchor", anchor.id);
+                    }
+                    for pin in &payload.pins {
+                        push("pin", *pin);
+                    }
+                    for row in &payload.transform_overrides {
+                        push("transform-override", row.plant);
+                    }
+                    for row in &payload.state_overrides {
+                        push("state-override", row.plant);
+                    }
+                }
+                result_cells.push(saffron_protocol::VegetationTopologyCellDiffDto {
+                    cell: crate::vegetation_cook_dto::world_cell_dto(cell),
+                    added: added.len().to_string(),
+                    removed: removed.len().to_string(),
+                    moved: moved.len().to_string(),
+                    added_ids: added
+                        .iter()
+                        .take(ID_CAP)
+                        .map(|id| saffron_protocol::PlantId(id.to_string()))
+                        .collect(),
+                    removed_ids: removed
+                        .iter()
+                        .take(ID_CAP)
+                        .map(|id| saffron_protocol::PlantId(id.to_string()))
+                        .collect(),
+                    moved_ids: moved
+                        .iter()
+                        .take(ID_CAP)
+                        .map(|id| saffron_protocol::PlantId(id.to_string()))
+                        .collect(),
+                    conflicts,
+                });
+            }
+            Ok(saffron_protocol::VegetationTopologyDiffResult {
+                from: from_identity.to_string(),
+                to: to_identity.to_string(),
+                cells: result_cells,
+            })
+        },
+    );
 }
 
 fn vegetation_world_identity(ctx: &mut EngineContext<'_>, map: Uuid) -> Result<Uuid> {
@@ -666,7 +909,7 @@ fn parse_optional_u64(value: Option<&str>, field: &str) -> Result<Option<u64>> {
     value.map(|value| parse_u64(value, field)).transpose()
 }
 
-fn parse_u64(value: &str, field: &str) -> Result<u64> {
+pub(crate) fn parse_u64(value: &str, field: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| Error::command(format!("{field} must be a canonical u64 decimal string")))
