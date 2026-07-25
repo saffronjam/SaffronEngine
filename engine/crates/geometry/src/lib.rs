@@ -21,13 +21,15 @@
 
 #![deny(unsafe_code)]
 
+mod alpha_card;
 mod conditioning;
 mod error;
 mod gltf_import;
+mod hierarchy_reference;
 mod image_decode;
-mod meshlet;
 mod obj_import;
 mod picking;
+mod portable_binary;
 mod primitives;
 mod sanim;
 mod sdf;
@@ -36,18 +38,20 @@ mod smodel;
 mod sub_id;
 mod translate;
 mod types;
+mod virtual_hierarchy;
 
+pub use alpha_card::{
+    ALPHA_CARD_CONTOUR_MAX_EXTENT, ContouredAlphaCard, ContouredCardVertex, contour_alpha_card,
+};
 pub use conditioning::{
     EDGE_BOUNDARY, EDGE_NON_MANIFOLD, EDGE_SEAM, EDGE_SEAM_OBJECT_SPACE, Edge, MeshConditioning,
     MinMaxLevel, TriEdges, WeldedVertex, build_min_max_pyramid,
 };
 pub use error::{Error, Result};
 pub use gltf_import::import_gltf_model;
+pub use hierarchy_reference::*;
 pub use image_decode::{
     decode_image, decode_image_from_memory, decode_image_from_memory_hdr, decode_image_hdr,
-};
-pub use meshlet::{
-    MESHLET_MAX_TRIANGLES, MESHLET_MAX_VERTICES, Meshlet, MeshletSet, build_meshlets,
 };
 pub use obj_import::import_obj_model;
 pub use picking::{
@@ -67,8 +71,9 @@ pub use sdf::{
 };
 pub use smesh::{
     MESH_FORMAT_VERSION, load_mesh, load_mesh_conditioning_from_bytes, load_mesh_from_bytes,
-    load_mesh_morph_from_bytes, load_mesh_skin, load_mesh_skin_from_bytes, mesh_counts_from_bytes,
-    mesh_file_counts, save_mesh, save_mesh_to_buffer,
+    load_mesh_hierarchy_from_bytes, load_mesh_morph_from_bytes, load_mesh_skin,
+    load_mesh_skin_from_bytes, mesh_counts_from_bytes, mesh_file_counts, save_mesh,
+    save_mesh_to_buffer,
 };
 pub use smodel::{
     CONTAINER_FORMAT_VERSION, ChunkKind, ContainerChunk, ContainerReader, METADATA_SCHEMA_VERSION,
@@ -82,6 +87,7 @@ pub use types::{
     MaterialMapRole, Mesh, MeshCounts, MorphData, MorphDelta, MorphTarget, Ray, SkinPayload,
     Submesh, TextureSource, Vertex, VertexSkin, compute_tangents,
 };
+pub use virtual_hierarchy::*;
 
 // Re-export glam so downstream crates share this crate's pinned math vocabulary
 // rather than depending on glam directly and risking a version split.
