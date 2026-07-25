@@ -1,11 +1,13 @@
 module lighting;
 
 import lighting_common;
+import global_gpu_data;
 import sdf;
 import giprobe;
 __exported import coverage;
 __exported import material_params;
 import sky_sh;
+import thin_sheet;
 
 // Instanced mesh shader. Vertex inputs come from an interleaved buffer
 // (position/normal/uv0); per-instance model + normal matrix + base color come from
@@ -45,6 +47,8 @@ public struct VertexOutput
     public float2 uv0 : TEXCOORD0;
     public float3 coverageAnchor : TEXCOORD1;
     public nointerpolation uint materialIndex : TEXCOORD2;  // index into materialParams (set 2, binding 2)
+    // The record's representation-crossfade word (zero outside a transition).
+    public nointerpolation uint transition : TEXCOORD3;
 };
 
 struct Camera
@@ -71,14 +75,10 @@ struct Camera
 [[vk::binding(3, 1)]] ConstantBuffer<ClusterParams> clusterParams;
 
 // Directional + spot shadow maps: depth textures sampled with a comparison (PCF) sampler.
-[[vk::binding(4, 1)]] Sampler2DShadow shadowMap;
-[[vk::binding(5, 1)]] Sampler2DShadow spotShadowMap;
 // Point shadow: two omnidirectional cubes of world distance-to-light (linear sampler) — a cached
 // STATIC cube (non-deformed casters) and a per-frame DYNAMIC cube (skinned / morph casters). The
 // nearest occluder is the min of the two, so a moving character composites over the cached
 // environment without re-rendering it.
-[[vk::binding(6, 1)]] SamplerCube pointShadowMap;
-[[vk::binding(7, 1)]] SamplerCube pointShadowMapDynamic;
 
 // The froxel volumetric-fog integration volume (binding 11): the integrated `(inScatter,
 // transmittance)` grid the fog composite writes. The forward transparent path samples it at the
@@ -87,6 +87,9 @@ struct Camera
 // SDF-occluder list + GDF clipmap (declared by the `sdf` module).
 [[vk::binding(11, 1)]] Sampler3D<float4> froxelIntegration;
 [[vk::binding(12, 1)]] Sampler2DArray<float> cloudShadowMap;
+// The virtual-shadow physical page atlas (immutable compare sampler); the
+// directional term samples it through the page table in the light UBO.
+[[vk::binding(13, 1)]] Sampler2DShadow vsmAtlas;
 
 // The shared `sdf` module (linked above) also declares the per-mesh SDF-occluder instance list
 // (set 1, binding 8) + the Global-SDF cascade clipmap (bindings 9/10). The fragment reaches only
@@ -214,7 +217,9 @@ float3 boxProject(float3 worldPos, float3 R, float3 origin, float3 extent)
 
 // Trace one TerminateOnFirstHit shadow ray from worldPos toward `toLight` (a unit dir);
 // returns 1 = lit (no occluder within maxDist), 0 = shadowed. Resource-parameterized: the TLAS is
-// passed in so the mesh forward path and the fog inject pass share one copy.
+// passed in so the mesh forward path and the fog inject pass share one copy. Non-opaque
+// candidates confirm through `gpuSceneRayCandidateCovered` with this module's address
+// block + bindless albedo array.
 public float rayQueryShadow(RaytracingAccelerationStructure tlas, float3 worldPos, float3 toLight, float maxDist)
 {
     RayDesc ray;
@@ -224,7 +229,19 @@ public float rayQueryShadow(RaytracingAccelerationStructure tlas, float3 worldPo
     ray.TMax = maxDist;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, ray);
-    q.Proceed();
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE
+            && gpuSceneRayCandidateCovered(
+                gpuSceneAddresses,
+                albedoTextures,
+                q.CandidateInstanceID(),
+                q.CandidatePrimitiveIndex(),
+                q.CandidateTriangleBarycentrics()))
+        {
+            q.CommitNonOpaqueTriangleHit();
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 
@@ -239,7 +256,21 @@ float rayQueryReflection(float3 worldPos, float3 dir, float maxDist)
     ray.TMax = maxDist;
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(rtScene, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, ray);
-    while (q.Proceed()) {}  // opaque triangle candidates auto-commit; loop finds the closest
+    // Opaque triangle candidates auto-commit; a non-opaque candidate commits only when the
+    // canonical classifier confirms its coverage, so cutout texels stay transparent to rays.
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE
+            && gpuSceneRayCandidateCovered(
+                gpuSceneAddresses,
+                albedoTextures,
+                q.CandidateInstanceID(),
+                q.CandidatePrimitiveIndex(),
+                q.CandidateTriangleBarycentrics()))
+        {
+            q.CommitNonOpaqueTriangleHit();
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
 }
 #endif
@@ -278,6 +309,39 @@ public VertexOutput transformVertex(VertexInput input, uint instanceIndex)
     output.uv0 = input.uv0;
     output.coverageAnchor = input.position;
     output.materialIndex = inst.texture.w;
+    output.transition = 0u;
+    return output;
+}
+
+// The executor vertex tail: world transform from the persistent-scene instance record
+// (cofactor normals for non-uniform scale) plus the instance's stored wind sway into
+// the shared `VertexOutput` interface.
+public VertexOutput transformExecutorVertex(
+    float3 local,
+    float3 localNormal,
+    float2 uv,
+    GpuSceneInstanceGpuRecord instance,
+    float3 windOffset,
+    uint parameterIndex,
+    uint transition)
+{
+    float4 c0, c1, c2, c3;
+    gpuSceneInstanceColumns(instance, false, c0, c1, c2, c3);
+    float3 world = c0.xyz * local.x + c1.xyz * local.y + c2.xyz * local.z + c3.xyz
+        + windOffset;
+    float3 n0 = cross(c1.xyz, c2.xyz);
+    float3 n1 = cross(c2.xyz, c0.xyz);
+    float3 n2 = cross(c0.xyz, c1.xyz);
+    float3 worldNormal = n0 * localNormal.x + n1 * localNormal.y + n2 * localNormal.z;
+
+    VertexOutput output;
+    output.worldPos = world;
+    output.position = mul(camera.viewProj, float4(world, 1.0));
+    output.worldNormal = worldNormal;
+    output.uv0 = uv;
+    output.coverageAnchor = local;
+    output.materialIndex = parameterIndex;
+    output.transition = transition;
     return output;
 }
 
@@ -303,6 +367,7 @@ public VertexOutput transformVertexSkinned(SkinnedVertexInput input, uint instan
     output.uv0 = input.uv0;
     output.coverageAnchor = skinnedPos.xyz;
     output.materialIndex = inst.texture.w;
+    output.transition = 0u;
     return output;
 }
 
@@ -362,6 +427,7 @@ public struct SurfaceData
     public float metallic;
     public float roughness;
     public float3 normal;     // world-space, normalized
+    public float3 sheetNormal; // authored front-facing sheet normal
     public float3 emissive;
     public float occlusion;   // 1.0 = none; multiplies the ambient term
     public float opacity;
@@ -375,10 +441,16 @@ public struct SurfaceData
     public float energyLimit;
 };
 
-float3 thinSheetTransmittance(SurfaceData surface, float ndotl)
+ThinSheetEnergyPartition thinSheetPartition(SurfaceData surface, bool incidentFront, float cosine)
 {
-    float opticalDepth = surface.thickness / max(abs(ndotl), 0.08);
-    return saturate(surface.transmission) * exp(-max(surface.absorption, 0.0) * opticalDepth);
+    float response = incidentFront ? surface.frontResponse : surface.backResponse;
+    return thinSheetEnergyPartition(
+        response,
+        surface.thickness,
+        surface.absorption,
+        surface.transmission,
+        surface.energyLimit,
+        cosine);
 }
 
 float3 surfaceDirect(
@@ -392,22 +464,25 @@ float3 surfaceDirect(
     {
         return brdf(n, v, l, surface.albedo, surface.metallic, surface.roughness, radiance);
     }
-    float signedNdotL = dot(n, l);
-    float response = surface.frontFace > 0.5 ? surface.frontResponse : surface.backResponse;
-    float3 transmittance = thinSheetTransmittance(surface, signedNdotL);
-    float energy = response + max(transmittance.r, max(transmittance.g, transmittance.b));
-    float scale = min(1.0, surface.energyLimit / max(energy, 1e-5));
-    float3 reflected = brdf(
-        n,
-        v,
-        l,
-        surface.albedo,
-        0.0,
-        surface.roughness,
-        radiance) * response;
-    float3 transmitted =
-        surface.albedo * transmittance * radiance * max(-signedNdotL, 0.0) / PI;
-    return (reflected + transmitted) * scale;
+    float3 sheetNormal = normalize(surface.sheetNormal);
+    float viewCosine = dot(sheetNormal, v);
+    float lightCosine = dot(sheetNormal, l);
+    bool viewFront = viewCosine >= 0.0;
+    bool lightFront = lightCosine >= 0.0;
+    ThinSheetEnergyPartition partition =
+        thinSheetPartition(surface, lightFront, abs(lightCosine));
+    if (viewFront == lightFront)
+    {
+        return brdf(
+            n,
+            v,
+            l,
+            surface.albedo,
+            0.0,
+            surface.roughness,
+            radiance) * partition.reflection;
+    }
+    return partition.transmission * radiance * abs(lightCosine) / PI;
 }
 
 // One punctual light's Cook-Torrance contribution at a world-space surface point.
@@ -441,12 +516,12 @@ float3 punctual(GpuLight lt, uint lightIndex, float3 worldPos, float3 n, float3 
         cone = smoothstep(lt.spotCos.y, lt.spotCos.x, cosAngle);
         if (globals.pointShadowMeta.z == 0 && globals.spotShadow.y != 0 && lightIndex == globals.spotShadow.x)
         {
-            shadow = pcfShadow(spotShadowMap, globals.spotShadowViewProj, worldPos);
+            shadow = vsmSampleSpot(worldPos, globals, vsmAtlas);
         }
     }
     else if (globals.pointShadowMeta.z == 0 && globals.pointShadowMeta.y != 0 && lightIndex == globals.pointShadowMeta.x)
     {
-        shadow = pointShadow(pointShadowMap, pointShadowMapDynamic, globals.pointShadow.xyz, worldPos);
+        shadow = vsmSamplePoint(worldPos, globals, vsmAtlas);
     }
     float3 radiance = lt.colorIntensity.rgb * lt.colorIntensity.a * attenuation * cone * shadow;
     return surfaceDirect(surface, n, v, l, radiance);
@@ -456,6 +531,7 @@ public struct MaterialInput
 {
     public float3 worldPos;
     public float3 worldNormal;
+    public float3 sheetNormal;
     public float3 viewDir;   // world-space, toward the eye (for parallax)
     public float2 uv0;
     public MaterialParams mat;
@@ -542,6 +618,7 @@ public MaterialInput makeMaterialInput(VertexOutput input)
     MaterialInput mi;
     mi.worldPos = input.worldPos;
     mi.worldNormal = input.worldNormal;
+    mi.sheetNormal = input.worldNormal;
     mi.viewDir = normalize(globals.eyePosition.xyz - input.worldPos);
     mi.uv0 = input.uv0;
     mi.mat = mp;
@@ -597,12 +674,16 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     }
     else if (globals.counts.y != 0)
     {
-        shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
+        // The directional term samples the virtual shadow pages (page-table walk
+        // + tile PCF).
+        shadow = vsmSampleDirectional(input.worldPos, globals, vsmAtlas);
     }
 #else
     if (globals.counts.y != 0)
     {
-        shadow = pcfShadow(shadowMap, globals.shadowViewProj, input.worldPos);
+        // The directional term samples the virtual shadow pages (page-table walk
+        // + tile PCF).
+        shadow = vsmSampleDirectional(input.worldPos, globals, vsmAtlas);
     }
 #endif
     if (globals.screenFlags.x != 0 && !translucent)
@@ -844,10 +925,11 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
     }
     if (surf.surfaceModel == SURFACE_THIN_SHEET)
     {
-        float response = surf.frontFace > 0.5 ? surf.frontResponse : surf.backResponse;
-        float3 transmittance = thinSheetTransmittance(surf, 1.0);
-        float energy = response + max(transmittance.r, max(transmittance.g, transmittance.b));
-        float scale = min(1.0, surf.energyLimit / max(energy, 1e-5));
+        bool viewFront = dot(normalize(surf.sheetNormal), v) >= 0.0;
+        ThinSheetEnergyPartition reflectionPartition =
+            thinSheetPartition(surf, viewFront, 1.0);
+        ThinSheetEnergyPartition transmissionPartition =
+            thinSheetPartition(surf, !viewFront, 1.0);
         float3 oppositeIrradiance;
         if (globals.counts.z != 0)
         {
@@ -867,9 +949,9 @@ public float4 evalLighting(VertexOutput input, SurfaceData surf, bool translucen
         {
             oppositeIrradiance = globals.ambientColor.rgb;
         }
-        ambient = (ambient * response
-            + oppositeIrradiance * surf.albedo * transmittance / PI) * scale;
-        reflectionSpec *= response * scale;
+        ambient = ambient * reflectionPartition.reflection
+            + oppositeIrradiance * transmissionPartition.transmission / PI;
+        reflectionSpec *= reflectionPartition.reflection;
     }
 
     // Two view modes peel a single term off the composed result.
@@ -974,6 +1056,49 @@ public float4 evalViewMode(VertexOutput input, SurfaceData surf, bool kUnlit, bo
             return float4(float3(0.02), 1.0);
         }
         return float4(heatmap(saturate(float(count) / 8.0)), 1.0);
+    }
+
+    // Virtual-shadow pages: the directional sampler's resolved (level, page) as a
+    // stable colour, dimmed where no level holds a resident page. The checker-style
+    // page grid makes residency, level selection, and refresh churn visible.
+    if (channel == 14u)
+    {
+        if (globals.vsmPageTable == 0 || globals.vsmParams.z == 0.0)
+        {
+            return float4(0.05, 0.05, 0.05, 1.0);
+        }
+        float3 lightPos = mul(globals.vsmBasis, float4(input.worldPos, 1.0)).xyz;
+        for (uint level = 0u; level < 8u; ++level)
+        {
+            float4 window = globals.vsmLevels[level];
+            if (window.z <= 0.0)
+            {
+                continue;
+            }
+            float2 local = (lightPos.xy - window.xy) / window.z;
+            if (local.x < 0.0 || local.y < 0.0 || local.x >= 1.0 || local.y >= 1.0)
+            {
+                continue;
+            }
+            uint2 page = uint2(local * 32.0);
+            uint entry = *(uint*)(
+                globals.vsmPageTable
+                + (uint64_t(level) * 1024u + page.y * 32u + page.x) * 4u);
+            if ((entry & VSM_TABLE_RESIDENT) == 0u)
+            {
+                continue;
+            }
+            uint hash = (level * 1024u + page.y * 32u + page.x) * 0x9e3779b9u;
+            float3 colour = float3(
+                float((hash >> 16u) & 0xffu) / 255.0,
+                float((hash >> 8u) & 0xffu) / 255.0,
+                float(hash & 0xffu) / 255.0);
+            // Level tint: fine levels warm, coarse levels cool.
+            float tint = float(level) / 7.0;
+            colour = lerp(colour * float3(1.0, 0.8, 0.6), colour * float3(0.6, 0.8, 1.0), tint);
+            return float4(colour * 0.85 + 0.15, 1.0);
+        }
+        return float4(0.05, 0.05, 0.05, 1.0);
     }
 
     // Material-override modes reuse the full lighting path on a recoloured surface.

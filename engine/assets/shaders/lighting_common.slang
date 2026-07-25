@@ -13,7 +13,6 @@ public struct LightGlobals
     public float4 moonColor;
     public uint4 counts;
     public float4 eyePosition;
-    public float4x4 shadowViewProj;
     public float4x4 spotShadowViewProj;
     public uint4 spotShadow;
     public float4 pointShadow;
@@ -33,6 +32,27 @@ public struct LightGlobals
     public float4 cloudShadowUp;
     public float4 cloudShadowCenters[3];
     public float4 cloudShadowMeta;
+    // Shared wind field: xy = mean direction (x, z), z = speed m/s, w = gust fraction.
+    public float4 windDirSpeedGust;
+    // x = turbulence roughness, y = gust frequency Hz, z = reference height m,
+    // w = height shear exponent.
+    public float4 windParams;
+    // x = turbulence octaves, y = phase seed.
+    public uint4 windMeta;
+    // x = simulation seconds this frame, y = previous frame's seconds.
+    public float4 windTime;
+    // The frame's local wind-source list (device address + reserved pad); the
+    // count rides windMeta.z.
+    public uint64_t windSources;
+    public uint64_t windSourcesReserved;
+    // The directional virtual shadow space: world -> light rotation, per-level
+    // snapped windows (origin.xy, extent), depth centre/half-span/enable, and the
+    // frame's page-table address (8 levels x 1024 packed entries).
+    public float4x4 vsmBasis;
+    public float4 vsmLevels[8];
+    public float4 vsmParams;
+    public uint64_t vsmPageTable;
+    public uint64_t vsmReserved;
 };
 
 public struct GpuLight
@@ -93,37 +113,160 @@ public float cloudShadowVisibility(
     return lerp(1.0, beer, saturate(strength));
 }
 
-public float pointShadow(SamplerCube staticCube, SamplerCube dynCube, float3 lightPos, float3 worldPos)
-{
-    float3 toFrag = worldPos - lightPos;
-    float dist = length(toFrag);
-    float3 dir = normalize(toFrag);
-    float stored = min(
-        staticCube.SampleLevel(dir, 0.0).r,
-        dynCube.SampleLevel(dir, 0.0).r);
-    const float bias = 0.08;
-    return dist - bias <= stored ? 1.0 : 0.0;
-}
+// The packed virtual-shadow page-table entry: bit 31 = resident, low 10 bits =
+// the physical atlas tile.
+public static const uint VSM_TABLE_RESIDENT = 1u << 31u;
+static const float VSM_ATLAS_TEXELS = 4096.0;
+static const float VSM_PAGE_TEXELS = 128.0;
+static const uint VSM_LEVEL_PAGES = 32u;
 
-public float pcfShadow(Sampler2DShadow map, float4x4 viewProj, float3 worldPos)
+// Samples the directional virtual shadow map: rotate into the light plane, walk
+// the clip levels fine to coarse for the first level whose window contains the
+// receiver AND whose page is resident, then 3x3 PCF inside the page's atlas tile
+// (taps clamped one texel inside the tile so filtering never crosses pages). A
+// receiver with no resident page anywhere reads unshadowed — the coarser walk is
+// the defined fallback, never a leak from foreign content.
+public float vsmSampleDirectional(float3 worldPos, LightGlobals lg, Sampler2DShadow atlas)
 {
-    float4 clip = mul(viewProj, float4(worldPos, 1.0));
-    float3 ndc = clip.xyz / clip.w;
-    float2 uv = ndc.xy * 0.5 + 0.5;
-    if (clip.w <= 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0)
+    if (lg.vsmPageTable == 0 || lg.vsmParams.z == 0.0)
     {
         return 1.0;
     }
-    const float texel = 1.0 / 2048.0;
-    float sum = 0.0;
-    for (int x = -1; x <= 1; x = x + 1)
+    float3 lightPos = mul(lg.vsmBasis, float4(worldPos, 1.0)).xyz;
+    float depth = (lightPos.z - (lg.vsmParams.x - lg.vsmParams.y)) / (2.0 * lg.vsmParams.y);
+    if (depth <= 0.0 || depth >= 1.0)
     {
-        for (int y = -1; y <= 1; y = y + 1)
+        return 1.0;
+    }
+    for (uint level = 0u; level < 8u; ++level)
+    {
+        float4 window = lg.vsmLevels[level];
+        if (window.z <= 0.0)
         {
-            sum += map.SampleCmpLevelZero(uv + float2(x, y) * texel, ndc.z);
+            continue;
+        }
+        float2 local = (lightPos.xy - window.xy) / window.z;
+        if (local.x < 0.0 || local.y < 0.0 || local.x >= 1.0 || local.y >= 1.0)
+        {
+            continue;
+        }
+        float2 scaled = local * float(VSM_LEVEL_PAGES);
+        uint2 page = uint2(scaled);
+        uint entry = *(uint*)(
+            lg.vsmPageTable
+            + (uint64_t(level) * (VSM_LEVEL_PAGES * VSM_LEVEL_PAGES)
+               + page.y * VSM_LEVEL_PAGES + page.x) * 4u);
+        if ((entry & VSM_TABLE_RESIDENT) == 0u)
+        {
+            continue;
+        }
+        return vsmTilePcf(atlas, entry, scaled - float2(page), depth);
+    }
+    return 1.0;
+}
+
+// 3x3 PCF inside one resident page's atlas tile; `pageFrac` is the receiver's
+// fractional position within the page and taps clamp one texel inside the tile so
+// filtering never crosses pages.
+float vsmTilePcf(Sampler2DShadow atlas, uint entry, float2 pageFrac, float depth)
+{
+    uint tile = entry & 0x3ffu;
+    float2 texel = clamp(pageFrac * VSM_PAGE_TEXELS, 1.5, VSM_PAGE_TEXELS - 1.5);
+    float2 tileBase = float2(tile % VSM_LEVEL_PAGES, tile / VSM_LEVEL_PAGES) * VSM_PAGE_TEXELS;
+    float2 baseUv = (tileBase + texel) / VSM_ATLAS_TEXELS;
+    float sum = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            sum += atlas.SampleCmpLevelZero(baseUv + float2(dx, dy) / VSM_ATLAS_TEXELS, depth);
         }
     }
     return sum / 9.0;
+}
+
+// Samples the shadowed spot's virtual pages: project by the spot transform, look
+// the page up in the table's spot region (base 8192), and PCF inside its tile. A
+// missing page reads unshadowed — the spot has no coarser level to fall to.
+public float vsmSampleSpot(float3 worldPos, LightGlobals lg, Sampler2DShadow atlas)
+{
+    if (lg.vsmPageTable == 0 || lg.vsmParams.z == 0.0)
+    {
+        return 1.0;
+    }
+    float4 clip = mul(lg.spotShadowViewProj, float4(worldPos, 1.0));
+    if (clip.w <= 0.0)
+    {
+        return 1.0;
+    }
+    float3 ndc = clip.xyz / clip.w;
+    if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0)
+    {
+        return 1.0;
+    }
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    float2 scaled = uv * 16.0;
+    uint2 page = uint2(scaled);
+    uint entry = *(uint*)(lg.vsmPageTable + uint64_t(8192u + page.y * 16u + page.x) * 4u);
+    if ((entry & VSM_TABLE_RESIDENT) == 0u)
+    {
+        return 1.0;
+    }
+    return vsmTilePcf(atlas, entry, scaled - float2(page), ndc.z);
+}
+
+// Samples the shadowed point light's virtual pages: pick the cube face by the
+// dominant axis of the light->fragment direction (the standard cube major-axis
+// mapping, matching the face matrices the page renderer rasterizes with), look
+// the page up in the table's point region (base 8448, 64 entries per face), and
+// PCF inside its tile. A missing page reads unshadowed.
+public float vsmSamplePoint(float3 worldPos, LightGlobals lg, Sampler2DShadow atlas)
+{
+    if (lg.vsmPageTable == 0 || lg.vsmParams.z == 0.0)
+    {
+        return 1.0;
+    }
+    float3 toFrag = worldPos - lg.pointShadow.xyz;
+    float far = lg.pointShadow.w;
+    float3 a = abs(toFrag);
+    uint face;
+    float axis;
+    float2 st;
+    if (a.x >= a.y && a.x >= a.z)
+    {
+        face = toFrag.x > 0.0 ? 0u : 1u;
+        axis = a.x;
+        st = float2(toFrag.x > 0.0 ? -toFrag.z : toFrag.z, -toFrag.y);
+    }
+    else if (a.y >= a.z)
+    {
+        face = toFrag.y > 0.0 ? 2u : 3u;
+        axis = a.y;
+        st = float2(toFrag.x, toFrag.y > 0.0 ? toFrag.z : -toFrag.z);
+    }
+    else
+    {
+        face = toFrag.z > 0.0 ? 4u : 5u;
+        axis = a.z;
+        st = float2(toFrag.z > 0.0 ? toFrag.x : -toFrag.x, -toFrag.y);
+    }
+    // The face frustum's near plane and 0..1 depth mapping mirror the page
+    // renderer's 90-degree projection (near 0.05, far = the light range).
+    const float near = 0.05;
+    if (axis <= near || axis >= far)
+    {
+        return 1.0;
+    }
+    float depth = far * (axis - near) / (axis * (far - near));
+    float2 scaled = clamp(st / axis * 0.5 + 0.5, 0.0, 0.999) * 8.0;
+    uint2 page = uint2(scaled);
+    uint entry = *(uint*)(
+        lg.vsmPageTable + uint64_t(8448u + face * 64u + page.y * 8u + page.x) * 4u);
+    if ((entry & VSM_TABLE_RESIDENT) == 0u)
+    {
+        return 1.0;
+    }
+    return vsmTilePcf(atlas, entry, scaled - float2(page), depth);
 }
 
 public float distanceAttenuation(float dist, float range)
@@ -156,7 +299,7 @@ public uint clusterIndexFor(ClusterParams p, float2 pixel, float viewZ)
 
 public float3 fogPunctualInScatter(
     GpuLight lt, uint lightIndex, float3 worldPos, float3 viewDir, float phaseG,
-    LightGlobals lg, Sampler2DShadow spotMap, SamplerCube ptStatic, SamplerCube ptDyn)
+    LightGlobals lg, Sampler2DShadow atlas)
 {
     float3 toLight = lt.positionRange.xyz - worldPos;
     float dist = length(toLight);
@@ -176,24 +319,24 @@ public float3 fogPunctualInScatter(
         cone = smoothstep(lt.spotCos.y, lt.spotCos.x, dot(spotDir, -l));
         if (castShadow && lg.spotShadow.y != 0 && lightIndex == lg.spotShadow.x)
         {
-            shadow = pcfShadow(spotMap, lg.spotShadowViewProj, worldPos);
+            shadow = vsmSampleSpot(worldPos, lg, atlas);
         }
     }
     else if (castShadow && lg.pointShadowMeta.y != 0 && lightIndex == lg.pointShadowMeta.x)
     {
-        shadow = pointShadow(ptStatic, ptDyn, lg.pointShadow.xyz, worldPos);
+        shadow = vsmSamplePoint(worldPos, lg, atlas);
     }
     float phase = hgPhase(dot(viewDir, l), phaseG);
     return lt.colorIntensity.rgb * lt.colorIntensity.a * atten * cone * shadow * phase * volMult;
 }
 
 public float3 fogDirectionalInScatter(
-    float3 worldPos, float3 viewDir, float phaseG, LightGlobals lg, Sampler2DShadow sunMap)
+    float3 worldPos, float3 viewDir, float phaseG, LightGlobals lg, Sampler2DShadow atlas)
 {
     float volMult = asfloat(lg.extraFlags.z);
     bool castShadow = lg.extraFlags.w != 0;
     float3 lDir = -normalize(lg.directionAmbient.xyz);
-    float shadow = (castShadow && lg.counts.y != 0) ? pcfShadow(sunMap, lg.shadowViewProj, worldPos) : 1.0;
+    float shadow = (castShadow && lg.counts.y != 0) ? vsmSampleDirectional(worldPos, lg, atlas) : 1.0;
     float phase = hgPhase(dot(viewDir, lDir), phaseG);
     return lg.colorIntensity.rgb * lg.colorIntensity.a * shadow * phase * volMult;
 }
