@@ -41,17 +41,19 @@ fn run() -> Result<()> {
     }
 }
 
-/// `xtask gen-vegetation-e2e-fixture` — emit the current canonical authored vegetation package.
+/// `xtask gen-vegetation-e2e-fixture` — emit the canonical authored vegetation package
+/// and the stress-matrix fixtures.
 fn run_gen_vegetation_e2e_fixture(args: Vec<String>) -> Result<()> {
     if !args.is_empty() {
         bail!("usage: cargo run -p xtask -- gen-vegetation-e2e-fixture");
     }
-    let output = workspace_root_repo()?.join("tests/e2e/fixtures/vegetation-phase3.json");
-    vegetation_fixture::write(&output)?;
-    println!(
-        "xtask gen-vegetation-e2e-fixture: wrote {}",
-        output.display()
-    );
+    let dir = workspace_root_repo()?.join("tests/e2e/fixtures");
+    for output in vegetation_fixture::write_all(&dir)? {
+        println!(
+            "xtask gen-vegetation-e2e-fixture: wrote {}",
+            output.display()
+        );
+    }
     Ok(())
 }
 
