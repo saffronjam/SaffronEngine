@@ -113,13 +113,30 @@ const TOGGLES: {
 /// distinct from the feature toggles above, which are project render config.
 const DEBUG_OVERLAYS: {
   label: string;
-  field: "bounds" | "sceneAabb" | "lightVolumes" | "grid" | "colliders";
+  field:
+    | "bounds"
+    | "sceneAabb"
+    | "lightVolumes"
+    | "grid"
+    | "colliders"
+    | "vegetationCells"
+    | "vegetationBounds"
+    | "vegetationRejections"
+    | "vegetationHeatmap"
+    | "vegetationNavigation"
+    | "windVectors";
 }[] = [
   { label: "Bounding Boxes", field: "bounds" },
   { label: "Scene AABB", field: "sceneAabb" },
   { label: "Light Volumes", field: "lightVolumes" },
   { label: "Grid", field: "grid" },
   { label: "Colliders", field: "colliders" },
+  { label: "Vegetation Cells", field: "vegetationCells" },
+  { label: "Vegetation Bounds", field: "vegetationBounds" },
+  { label: "Vegetation Rejections", field: "vegetationRejections" },
+  { label: "Vegetation Heatmap", field: "vegetationHeatmap" },
+  { label: "Vegetation Navigation", field: "vegetationNavigation" },
+  { label: "Wind Vectors", field: "windVectors" },
 ];
 
 function ToggleRow({
