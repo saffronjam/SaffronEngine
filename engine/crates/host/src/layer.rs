@@ -20,12 +20,13 @@ use glam::Vec2;
 use saffron_animation::{AnimMode, AnimationRuntime};
 use saffron_app::{App, Layer};
 use saffron_assets::{
-    AssetServer, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind, RenderSceneOptions,
-    RendererScene, RendererUploader, advance_time_of_day, render_scene,
+    AssetServer, GpuSceneMirror, PREVIEW_THUMBNAIL_MATERIAL_ID, PreviewRenderKind,
+    RenderSceneOptions, RendererScene, RendererUploader, advance_time_of_day, render_scene,
     scene_surface_field_snapshots, write_thumbnail_cache,
 };
 use saffron_control::{
-    ControlContext, ControlRenderer, PreviewSubject, build_preview_scene_for_thumbnail,
+    ControlContext, ControlPollContext, ControlRenderer, PreviewSubject,
+    build_preview_scene_for_thumbnail,
 };
 use saffron_runtime::RuntimeSession;
 
@@ -70,6 +71,9 @@ pub struct HostLayer {
     /// The host-built one-off uploader the scene-render path resolves assets through,
     /// constructed lazily from the renderer's device on the first rendered frame.
     uploader: Option<Uploader>,
+    /// The journal-driven bridge feeding the renderer's persistent GPU scene; one mirror
+    /// serves the scene, asset-preview, and thumbnail worlds.
+    gpu_scene_mirror: GpuSceneMirror,
     /// The per-view viewport shm segments (empty until `run_host` attaches them from the
     /// editor-set environment). The segments exist at startup so the editor's presenter can
     /// block-open both panes.
@@ -90,6 +94,40 @@ pub struct HostLayer {
     script_subscription: SubscriptionId,
     /// The physics-world lifecycle subscription, unsubscribed on detach.
     physics_subscription: SubscriptionId,
+    /// Interaction impulses the play step's moving bodies emitted, staged for the
+    /// renderer's next field step.
+    pending_interaction_impulses: Vec<saffron_rendering::InteractionImpulse>,
+
+    /// Reason-coded rejected-candidate markers for the rejection overlay, rebuilt when
+    /// the manifest or resident-cell fingerprint moves.
+    rejection_overlay: RejectionOverlayCache,
+    wind_overlay: WindOverlayCache,
+    /// Micro-density heatmap texels for the heatmap overlay, surface-cast once per
+    /// manifest/residency fingerprint move.
+    heatmap_overlay: HeatmapOverlayCache,
+}
+
+/// The sampled wind-overlay grid: ground heights cached per snapped origin, rows
+/// (base + velocity) rebuilt every frame the flag is on.
+#[derive(Default)]
+struct WindOverlayCache {
+    origin: Option<(i64, i64)>,
+    heights: Vec<f32>,
+    rows: Vec<(glam::Vec3, glam::Vec3)>,
+}
+
+/// The rejection overlay's cached marker rows (world metres + reason byte).
+#[derive(Default)]
+struct RejectionOverlayCache {
+    fingerprint: u64,
+    rows: Vec<(glam::Vec3, u8)>,
+}
+
+/// The heatmap overlay's cached texels (surface-cast world metres + density 0..1).
+#[derive(Default)]
+struct HeatmapOverlayCache {
+    fingerprint: u64,
+    rows: Vec<(glam::Vec3, f32)>,
 }
 
 /// What the parent-death watch resolved for a frame, split out so the watch is testable
@@ -117,7 +155,8 @@ pub enum TeardownStep {
     JoltGlobalsShutdown,
     /// Unsubscribe the two play-state lifecycle hooks.
     PlayHooksUnsubscribed,
-    /// Drop the host's one-off uploader + clear the GPU `Ref` caches, before the renderer drops.
+    /// Drop the host's one-off uploader + clear the GPU `Ref` caches (the asset caches and
+    /// the GPU-scene mirror's retained mesh/texture `Arc`s), before the renderer drops.
     GpuCachesCleared,
 }
 
@@ -150,6 +189,7 @@ impl HostLayer {
             runtime: RuntimeSession::new(),
             last_play_state: PlayState::Edit,
             uploader: None,
+            gpu_scene_mirror: GpuSceneMirror::new(),
             shm: ViewportShmPublisher::new(),
             shm_publish,
             preview_active: false,
@@ -161,6 +201,10 @@ impl HostLayer {
             },
             script_subscription: SubscriptionId(0),
             physics_subscription: SubscriptionId(0),
+            pending_interaction_impulses: Vec::new(),
+            rejection_overlay: RejectionOverlayCache::default(),
+            wind_overlay: WindOverlayCache::default(),
+            heatmap_overlay: HeatmapOverlayCache::default(),
         };
         layer.install_play_state_hooks();
         layer
@@ -375,6 +419,29 @@ impl HostLayer {
             if self.drain_runtime_sinks() {
                 let _ = self.editor.pause_play();
             }
+            // Moving bodies and characters push the world interaction field: each
+            // emits one impulse whose kick scales with speed and the step, so the
+            // cosmetic bend tracks motion framerate-independently.
+            let physics_cell = self.runtime.physics_cell();
+            if let Some(physics) = physics_cell.borrow().as_ref() {
+                for (position, velocity) in physics.motion_emitters() {
+                    let horizontal = saffron_geometry::glam::Vec2::new(velocity.x, velocity.z);
+                    let speed = horizontal.length();
+                    if speed < 0.5 {
+                        continue;
+                    }
+                    let rate = speed.min(8.0) * 4.0;
+                    self.pending_interaction_impulses
+                        .push(saffron_rendering::InteractionImpulse {
+                            position: [position.x, position.z],
+                            radius: 1.0,
+                            strength: rate * step_dt,
+                            direction: (horizontal / speed).to_array(),
+                            depress: rate * 0.25 * step_dt,
+                            reserved: 0.0,
+                        });
+                }
+            }
         }
 
         // Fly-cam: the editor streams pointer-lock look deltas over the control plane; drain
@@ -463,7 +530,7 @@ impl HostLayer {
                 &self.spatial,
             )
         } else {
-            self.runtime.clear_vegetation()
+            self.runtime.clear_vegetation(self.editor.active_scene())
         };
         if let Err(error) = vegetation_result {
             tracing::error!("vegetation runtime advance failed: {error}");
@@ -474,7 +541,8 @@ impl HostLayer {
         let Some(uploader) = self.uploader.as_ref() else {
             return false; // No uploader (device create failed): the control drain is skipped.
         };
-        let mut control_renderer = HostControlRenderer::new(renderer, uploader);
+        let mut control_renderer =
+            HostControlRenderer::new(renderer, uploader, &mut self.gpu_scene_mirror);
         if self.runtime.vegetation_needs_regeneration() {
             let mut providers = None;
             control_renderer.with_gpu_uploader(&mut |gpu| {
@@ -505,22 +573,34 @@ impl HostLayer {
         // runtime's shared world cell, held for the drain's duration. The cell is an owned `Rc`
         // clone, so borrowing it does not alias `self.editor`/`self.assets`; no simulation step
         // runs during the drain, so the world is free to borrow here.
+        let vegetation_collision = self.runtime.vegetation_collision_report();
         let physics_cell = self.runtime.physics_cell();
         let mut physics = physics_cell.borrow_mut();
         let vegetation_status = self.runtime.vegetation_status().clone();
         let vegetation_regeneration_cells = self.runtime.missing_vegetation_cells();
-        let vegetation = self.runtime.vegetation_world_mut();
-        self.control.poll(
+        // The promotion authority reaches the control plane only in play: a transition or a save
+        // barrier needs the live world its entity views belong to.
+        let play_active = physics.is_some();
+        let vegetation_cell = self.runtime.vegetation_cell();
+        let mut vegetation_ref = vegetation_cell.borrow_mut();
+        let (promotion, navigation) = self.runtime.vegetation_control_authorities();
+        // Promotion is play-only; the navigation seam publishes in Edit as well.
+        let vegetation_promotion = play_active.then_some(promotion);
+        let vegetation_navigation = Some(navigation);
+        self.control.poll(ControlPollContext {
             window,
-            &mut control_renderer,
-            &mut self.editor,
-            &mut self.assets,
-            &mut self.spatial,
-            vegetation,
+            renderer: &mut control_renderer,
+            scene_edit: &mut self.editor,
+            assets: &mut self.assets,
+            spatial: &mut self.spatial,
+            vegetation: &mut vegetation_ref,
             vegetation_status,
             vegetation_regeneration_cells,
-            physics.as_mut(),
-        )
+            vegetation_collision,
+            vegetation_promotion,
+            vegetation_navigation,
+            physics: physics.as_mut(),
+        })
     }
 
     /// Updates the editor viewport's shared predicted residency source.
@@ -539,13 +619,23 @@ impl HostLayer {
             self.spatial.remove_source(EDITOR_VIEW_SOURCE);
             return;
         };
+        // The viewpoint claims render + editing data always. In play it additionally claims the
+        // facets the simulation consumes near the camera: physics collision proxies and the
+        // navigation contributions a consumer rebuilds from. Edit mode simulates nothing, so
+        // claiming them there would decode bytes no one reads.
+        let mut facets = ResidencyMask::one(ResidencyFacet::Render).with(ResidencyFacet::Editing);
+        if self.runtime.has_physics() {
+            facets = facets
+                .with(ResidencyFacet::Physics)
+                .with(ResidencyFacet::Navigation);
+        }
         let ticks = position.global_ticks();
         let revision = ticks
             .into_iter()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
-                value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
-                    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-                })
+            .flat_map(|value| value.to_le_bytes())
+            .chain(std::iter::once(facets.bits()))
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
             });
         let source = SpatialSource {
             id: EDITOR_VIEW_SOURCE,
@@ -565,7 +655,7 @@ impl HostLayer {
                     cleanup_radius_cells: 3,
                 },
             ],
-            facets: ResidencyMask::one(ResidencyFacet::Render).with(ResidencyFacet::Editing),
+            facets,
             priority: 100,
         };
         if let Err(error) = self.spatial.update_source(source) {
@@ -655,7 +745,8 @@ impl HostLayer {
         let Some(uploader) = self.uploader.as_ref() else {
             return false;
         };
-        let mut control_renderer = HostControlRenderer::new(renderer, uploader);
+        let mut control_renderer =
+            HostControlRenderer::new(renderer, uploader, &mut self.gpu_scene_mirror);
         self.control
             .advance_project_load(&mut control_renderer, &mut self.editor, &mut self.assets)
     }
@@ -682,6 +773,7 @@ impl HostLayer {
             .take_preview_render_jobs(MAX_PREVIEW_RENDERS_PER_TICK);
         let uploader = self.uploader.as_ref().expect("uploader present");
         let assets = &mut self.assets;
+        let mirror = &mut self.gpu_scene_mirror;
         for job in &jobs {
             let subject = match job.kind {
                 PreviewRenderKind::Material(id) => PreviewSubject::Material(id),
@@ -691,6 +783,7 @@ impl HostLayer {
                 PreviewRenderKind::Mesh(id) => PreviewSubject::Mesh(id),
                 PreviewRenderKind::Model(id) => PreviewSubject::Model(id),
                 PreviewRenderKind::Hdri(tid) => PreviewSubject::Hdri(tid),
+                PreviewRenderKind::Plant(id) => PreviewSubject::Plant(id),
             };
             // Build the furnished scene (transient uploader over the renderer's descriptors), then
             // render it (the uploader borrow ends with the block, freeing the renderer).
@@ -705,7 +798,7 @@ impl HostLayer {
             };
             let view = camera.view();
             match render_preview_scene_to_png(
-                renderer, uploader, skinning, &mut scene, assets, &view, job.size,
+                renderer, uploader, mirror, &mut scene, assets, &view, job.size,
             ) {
                 Ok(png) => {
                     if let Err(err) =
@@ -723,7 +816,7 @@ impl HostLayer {
     /// Renders the scene through the active camera and submits the native gizmo overlay: track
     /// the viewport size in present mode, sync the gizmo, render the scene, then build + submit
     /// the edit overlay geometry.
-    fn render_ui(&mut self, window: Option<&Window>, renderer: &mut Renderer) {
+    fn render_ui(&mut self, window: Option<&Window>, renderer: &mut Renderer) -> bool {
         // Publish mode: the editor owns the render size (set-viewport-size); the hidden
         // window's size is meaningless. Present mode tracks the window.
         if !self.shm_publish
@@ -737,7 +830,7 @@ impl HostLayer {
         let cam = self.editor.render_camera_view();
         let (view_width, view_height) = (renderer.viewport_width(), renderer.viewport_height());
         if view_width == 0 || view_height == 0 {
-            return;
+            return false;
         }
 
         let options = RenderSceneOptions {
@@ -747,10 +840,60 @@ impl HostLayer {
 
         let skinning = renderer.skinning_enabled();
         self.ensure_uploader(renderer);
+        // Fold the shared wind field's frame words (authored settings + the monotonic
+        // clock) before render_scene writes the light UBO.
+        {
+            let sources = self.editor.active_scene().local_wind_sources();
+            let wind = self.editor.active_scene().environment.wind;
+            if let Err(err) = renderer.set_wind(
+                &saffron_rendering::SceneWind {
+                    orientation: wind.orientation,
+                    speed: wind.speed,
+                    gust: wind.gust,
+                    turbulence_octaves: wind.turbulence_octaves,
+                    turbulence_roughness: wind.turbulence_roughness,
+                    gust_frequency: wind.gust_frequency,
+                    reference_height: wind.reference_height,
+                    height_exponent: wind.height_exponent,
+                    seed: wind.seed,
+                    time_s: self.editor.simulation_time_s,
+                },
+                &sources,
+            ) {
+                tracing::error!("set_wind: {err}");
+            }
+        }
+        if !self.pending_interaction_impulses.is_empty() {
+            renderer.submit_interaction_impulses(&self.pending_interaction_impulses);
+            self.pending_interaction_impulses.clear();
+        }
+        let mut vegetation_mutated = false;
+        let vegetation_cell = self.runtime.vegetation_cell();
         if let Some(uploader) = self.uploader.as_ref() {
+            let world = renderer.active_view_id().gpu_scene_world();
+            let vegetation = vegetation_cell.borrow();
+            match self.gpu_scene_mirror.sync_renderer_world(
+                world,
+                self.editor.active_scene(),
+                vegetation.as_ref(),
+                &mut self.assets,
+                renderer,
+                uploader,
+            ) {
+                Ok(mutated) => vegetation_mutated = mutated,
+                Err(error) => tracing::error!("gpu scene mirror sync: {error}"),
+            }
+            drop(vegetation);
             let mut driver = RendererScene::new(renderer, uploader, skinning);
             let scene: &mut Scene = self.editor.active_scene();
-            render_scene(&mut driver, scene, &mut self.assets, &cam, options);
+            render_scene(
+                &mut driver,
+                scene,
+                &mut self.assets,
+                &self.gpu_scene_mirror,
+                &cam,
+                options,
+            );
         }
 
         self.submit_scene_edit_overlay(renderer, &cam, view_width, view_height);
@@ -768,11 +911,12 @@ impl HostLayer {
         // submits it. A failure is logged, not fatal.
         if let Err(err) = renderer.render_scene_offscreen() {
             tracing::error!("render_scene_offscreen: {err}");
-            return;
+            return vegetation_mutated;
         }
         if self.shm_publish {
             self.publish_pipelined_view(renderer);
         }
+        vegetation_mutated
     }
 
     /// Arms the renderer's per-view shm-publish flags from the host's segment wiring, so
@@ -820,10 +964,16 @@ impl HostLayer {
         width: u32,
         height: u32,
     ) {
+        self.refresh_rejection_overlay();
+        self.refresh_heatmap_overlay(renderer);
+        self.refresh_wind_overlay(renderer, cam);
         let edit_chrome = self.editor.editor_chrome_visible();
         // The overlay's debug/collider builders resolve meshes through the renderer's uploader
         // + descriptors (the bindless texture binds); the gizmo / billboards / skeleton are
         // pure projection. Skinning is off for the resolve (bounds only, no skin stream).
+        let vegetation_cell = self.runtime.vegetation_cell();
+        let vegetation = vegetation_cell.borrow();
+        let (_, navigation) = self.runtime.vegetation_control_authorities();
         let (depth_tested, on_top) = match self.uploader.as_ref() {
             Some(uploader) => {
                 let gpu = RendererUploader::new(uploader, renderer.descriptors(), false);
@@ -831,15 +981,306 @@ impl HostLayer {
                     &mut self.editor,
                     &mut self.assets,
                     &gpu,
-                    cam,
-                    width,
-                    height,
-                    edit_chrome,
+                    &crate::overlay::OverlayFrame {
+                        cam,
+                        width,
+                        height,
+                        edit_chrome,
+                        vegetation: vegetation.as_ref(),
+                        rejections: &self.rejection_overlay.rows,
+                        heatmap: &self.heatmap_overlay.rows,
+                        wind: &self.wind_overlay.rows,
+                        navigation: Some(navigation),
+                    },
                 )
             }
             None => (Vec::new(), Vec::new()),
         };
         renderer.submit_overlay(depth_tested, on_top);
+    }
+
+    /// Rebuilds the heatmap texels when the manifest identity or the resident-cell
+    /// set moves: every resident cell's micro tiles fold to a 16×16 max-density
+    /// grid, and each occupied texel drops one straight-down surface cast for its
+    /// height. The flag gates all work; texels cap at 4096.
+    /// Rebuilds the wind-overlay rows: a 16×16 ground grid (2 m spacing) centred on
+    /// the camera, heights re-cast only when the snapped origin moves, velocities
+    /// resampled from the composed field every frame. The flag gates all work.
+    fn refresh_wind_overlay(&mut self, renderer: &mut Renderer, cam: &CameraView) {
+        self.wind_overlay.rows.clear();
+        if !self.editor.debug_overlays.wind_vectors {
+            self.wind_overlay.origin = None;
+            return;
+        }
+        const GRID: i64 = 16;
+        const SPACING: f64 = 2.0;
+        let eye = cam.view.inverse().col(3);
+        let origin = (
+            (f64::from(eye.x) / SPACING).floor() as i64 - GRID / 2,
+            (f64::from(eye.z) / SPACING).floor() as i64 - GRID / 2,
+        );
+        if self.wind_overlay.origin != Some(origin) {
+            self.wind_overlay.origin = Some(origin);
+            self.wind_overlay.heights.clear();
+            let Some(uploader) = self.uploader.as_ref() else {
+                self.wind_overlay.origin = None;
+                return;
+            };
+            let gpu = RendererUploader::new(uploader, renderer.descriptors(), false);
+            let scene = self.editor.active_scene();
+            let assets = &mut self.assets;
+            let ticks = |meters: f64| (meters * 4096.0).round() as i128;
+            for gz in 0..GRID {
+                for gx in 0..GRID {
+                    let x = (origin.0 + gx) as f64 * SPACING + SPACING * 0.5;
+                    let z = (origin.1 + gz) as f64 * SPACING + SPACING * 0.5;
+                    let mut height = 0.0_f32;
+                    if let Ok(ray_origin) = saffron_spatial::WorldPosition::from_global_ticks([
+                        ticks(x),
+                        ticks(f64::from(eye.y) + 100.0),
+                        ticks(z),
+                    ]) && let Ok(ray) = saffron_spatial::SurfaceRay::new(
+                        ray_origin,
+                        saffron_geometry::glam::DVec3::NEG_Y,
+                        1_000.0,
+                    ) && let Ok(Some(hit)) =
+                        saffron_assets::query_scene_surface_ray(&gpu, scene, assets, &ray)
+                    {
+                        height = hit.surface.position.world_meters().y as f32;
+                    }
+                    self.wind_overlay.heights.push(height);
+                }
+            }
+        }
+        let profile = self.editor.active_scene().environment.wind.profile();
+        let sources = self.editor.active_scene().local_wind_sources();
+        let time = self.editor.simulation_time_s;
+        for gz in 0..GRID {
+            for gx in 0..GRID {
+                let x = (origin.0 + gx) as f64 * SPACING + SPACING * 0.5;
+                let z = (origin.1 + gz) as f64 * SPACING + SPACING * 0.5;
+                let height = self.wind_overlay.heights[(gz * GRID + gx) as usize];
+                let sample = saffron_wind::sample_composed(
+                    &profile,
+                    &sources,
+                    saffron_geometry::glam::DVec3::new(x, f64::from(height), z),
+                    time,
+                );
+                self.wind_overlay
+                    .rows
+                    .push((glam::Vec3::new(x as f32, height, z as f32), sample.velocity));
+            }
+        }
+    }
+
+    fn refresh_heatmap_overlay(&mut self, renderer: &mut Renderer) {
+        if !self.editor.debug_overlays.vegetation_heatmap {
+            self.heatmap_overlay.rows.clear();
+            self.heatmap_overlay.fingerprint = 0;
+            return;
+        }
+        let vegetation_cell = self.runtime.vegetation_cell();
+        let vegetation = vegetation_cell.borrow();
+        let Some(world) = vegetation.as_ref() else {
+            self.heatmap_overlay.rows.clear();
+            self.heatmap_overlay.fingerprint = 0;
+            return;
+        };
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut fingerprint = 0x84222325_cbf29ce4_u64;
+        let mut mix = |value: u64| {
+            fingerprint ^= value;
+            fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+        };
+        for chunk in world.manifest_identity().bytes().chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            mix(u64::from_be_bytes(word));
+        }
+        let resident: Vec<_> = world.resident_cells().collect();
+        for (cell, _) in &resident {
+            let [x, y, z] = cell.coordinates();
+            mix(x as u64);
+            mix(y as u64);
+            mix(z as u64);
+            mix(u64::from(cell.level()));
+        }
+        if fingerprint == self.heatmap_overlay.fingerprint {
+            return;
+        }
+        self.heatmap_overlay.fingerprint = fingerprint;
+        self.heatmap_overlay.rows.clear();
+        const GRID: usize = 16;
+        const TEXEL_CAP: usize = 4096;
+        // Fold the resident micro tiles into flat (x, z, top, density) texels first,
+        // so the world borrow ends before the surface casts borrow the scene.
+        let mut texels: Vec<(f64, f64, f64, f32)> = Vec::new();
+        for (cell, generation) in &resident {
+            let Some(tiles) = generation.micro_fields() else {
+                continue;
+            };
+            let bounds = cell.bounds();
+            let min = bounds.min_ticks();
+            let max = bounds.max_ticks_exclusive();
+            let span_x = (max[0] - min[0]) as f64 / 4096.0;
+            let span_z = (max[2] - min[2]) as f64 / 4096.0;
+            let origin_x = min[0] as f64 / 4096.0;
+            let origin_z = min[2] as f64 / 4096.0;
+            let top_y = max[1] as f64 / 4096.0;
+            let mut grid = [[0_u16; GRID]; GRID];
+            for tile in tiles {
+                let [dim_x, dim_y, dim_z] = tile.dimensions;
+                if dim_x == 0 || dim_z == 0 {
+                    continue;
+                }
+                for (gx, column) in grid.iter_mut().enumerate() {
+                    for (gz, slot) in column.iter_mut().enumerate() {
+                        let tx = gx * dim_x as usize / GRID;
+                        let tz = gz * dim_z as usize / GRID;
+                        let index = (tx * dim_y as usize) * dim_z as usize + tz;
+                        if let Some(density) = tile.density.get(index) {
+                            *slot = (*slot).max(*density);
+                        }
+                    }
+                }
+            }
+            for (gx, column) in grid.iter().enumerate() {
+                for (gz, density) in column.iter().enumerate() {
+                    if *density == 0 || texels.len() >= TEXEL_CAP {
+                        continue;
+                    }
+                    texels.push((
+                        origin_x + (gx as f64 + 0.5) / GRID as f64 * span_x,
+                        origin_z + (gz as f64 + 0.5) / GRID as f64 * span_z,
+                        top_y,
+                        f32::from(*density) / f32::from(u16::MAX),
+                    ));
+                }
+            }
+        }
+        drop(resident);
+        let Some(uploader) = self.uploader.as_ref() else {
+            return;
+        };
+        let gpu = RendererUploader::new(uploader, renderer.descriptors(), false);
+        let scene = self.editor.active_scene();
+        let assets = &mut self.assets;
+        for (x, z, top, density) in texels {
+            let ticks = |meters: f64| (meters * 4096.0).round() as i128;
+            let Ok(origin) =
+                saffron_spatial::WorldPosition::from_global_ticks([ticks(x), ticks(top), ticks(z)])
+            else {
+                continue;
+            };
+            let Ok(ray) = saffron_spatial::SurfaceRay::new(
+                origin,
+                saffron_geometry::glam::DVec3::NEG_Y,
+                1_000.0,
+            ) else {
+                continue;
+            };
+            if let Ok(Some(hit)) =
+                saffron_assets::query_scene_surface_ray(&gpu, scene, assets, &ray)
+            {
+                let meters = hit.surface.position.world_meters();
+                self.heatmap_overlay.rows.push((
+                    glam::Vec3::new(meters.x as f32, meters.y as f32, meters.z as f32),
+                    density,
+                ));
+            }
+        }
+    }
+
+    /// Rebuilds the rejection-overlay marker rows when the manifest identity or the
+    /// resident-cell set moves. The flag gates all work; rows cap at 4096 markers.
+    fn refresh_rejection_overlay(&mut self) {
+        if !self.editor.debug_overlays.vegetation_rejections {
+            self.rejection_overlay.rows.clear();
+            self.rejection_overlay.fingerprint = 0;
+            return;
+        }
+        let vegetation_cell = self.runtime.vegetation_cell();
+        let vegetation = vegetation_cell.borrow();
+        let Some(world) = vegetation.as_ref() else {
+            self.rejection_overlay.rows.clear();
+            self.rejection_overlay.fingerprint = 0;
+            return;
+        };
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        let mut mix = |value: u64| {
+            fingerprint ^= value;
+            fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+        };
+        for chunk in world.manifest_identity().bytes().chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            mix(u64::from_be_bytes(word));
+        }
+        let resident: Vec<_> = world.resident_cells().map(|(cell, _)| cell).collect();
+        for cell in &resident {
+            let [x, y, z] = cell.coordinates();
+            mix(x as u64);
+            mix(y as u64);
+            mix(z as u64);
+            mix(u64::from(cell.level()));
+        }
+        if fingerprint == self.rejection_overlay.fingerprint {
+            return;
+        }
+        self.rejection_overlay.fingerprint = fingerprint;
+        self.rejection_overlay.rows.clear();
+        const MARKER_CAP: usize = 4096;
+        let by_cell: std::collections::BTreeMap<_, _> = world
+            .manifest()
+            .cells
+            .iter()
+            .map(|row| (row.cell, row.artifact_hash))
+            .collect();
+        let store = self.assets.vegetation_artifact_store();
+        let reason_byte = |reason: saffron_runtime::CandidateRejectionReason| -> u8 {
+            use saffron_runtime::CandidateRejectionReason as Reason;
+            match reason {
+                Reason::SurfaceMiss => 0,
+                Reason::Threshold => 1,
+                Reason::WeightedElimination => 2,
+                Reason::PriorityExclusion => 3,
+                Reason::Competition => 4,
+                Reason::ForeignOwner => 5,
+                Reason::NoSpecies => 6,
+            }
+        };
+        for cell in &resident {
+            if self.rejection_overlay.rows.len() >= MARKER_CAP {
+                break;
+            }
+            let Some(artifact) = by_cell.get(cell) else {
+                continue;
+            };
+            let Ok(Some(bytes)) = store.read_cell_section(
+                *artifact,
+                saffron_runtime::VegetationCellSectionKind::RejectionDiagnostics,
+            ) else {
+                continue;
+            };
+            let Ok(facet) = saffron_runtime::decode_vegetation_rejection_diagnostics(&bytes) else {
+                continue;
+            };
+            for rejected in &facet.rejected {
+                if self.rejection_overlay.rows.len() >= MARKER_CAP {
+                    break;
+                }
+                let ticks = rejected.position.global_ticks();
+                self.rejection_overlay.rows.push((
+                    glam::Vec3::new(
+                        ticks[0] as f32 / 4096.0,
+                        ticks[1] as f32 / 4096.0,
+                        ticks[2] as f32 / 4096.0,
+                    ),
+                    reason_byte(rejected.reason),
+                ));
+            }
+        }
     }
 
     /// Lazily builds the host-owned one-off [`Uploader`] from the renderer's device + queue.
@@ -877,7 +1318,8 @@ impl HostLayer {
     ///    `Factory`/registered types outlive every body), then unsubscribe the two play-state
     ///    hooks. The first three steps delegate to the runtime, which owns the VM + world +
     ///    globals.
-    /// 3. Drop the host's one-off uploader + clear every cached GPU `Ref` **before** the renderer
+    /// 3. Drop the host's one-off uploader + clear every cached GPU `Ref` — the asset caches
+    ///    and the GPU-scene mirror's retained mesh/texture `Arc`s — **before** the renderer
     ///    frees the device/allocator — otherwise the last `Arc<GpuMesh>`/`Arc<GpuTexture>` drop
     ///    would free a GPU resource after its allocator is gone (UAF). The loop already idled the
     ///    GPU, so clearing under an idle device is safe.
@@ -905,9 +1347,12 @@ impl HostLayer {
         steps.push(TeardownStep::PlayHooksUnsubscribed);
 
         // The uploader's `Arc<DeviceResources>` must release before the renderer frees the
-        // device, so drop it alongside the cached GPU `Ref`s.
+        // device, so drop it alongside the cached GPU `Ref`s. The GPU-scene mirror retains
+        // `Arc<GpuMesh>`/`Arc<GpuTexture>` clones for its mirrored prototypes and interned
+        // textures, so it resets here for the same reason.
         self.uploader = None;
         self.assets.clear_asset_caches();
+        self.gpu_scene_mirror = GpuSceneMirror::new();
         steps.push(TeardownStep::GpuCachesCleared);
     }
 }
@@ -932,6 +1377,9 @@ impl Layer for HostLayer {
 
     fn on_update(&mut self, app: &mut App, dt: TimeSpan) {
         let current_ppid = self.current_ppid();
+        // The monotonic simulation clock: wind and other evolution sample it; the
+        // calendar never rewinds it.
+        self.editor.simulation_time_s += f64::from(dt.seconds);
 
         // Control first (it reads + mutates the editor through `EngineContext`), so a command
         // this frame takes effect this frame. It needs the renderer + a window; with no
@@ -1008,9 +1456,15 @@ impl Layer for HostLayer {
         // The scene reads its catalog through an `Arc<AssetCatalog>` shared from the asset
         // server (the asset ops keep it in sync). The remaining `on_ui` work is the scene render
         // + overlay submit, which needs the renderer.
+        let mut vegetation_mutated = false;
         if let Some(renderer) = app.frame_host.renderer_mut() {
             let window = app.window.as_ref();
-            self.render_ui(window, renderer);
+            vegetation_mutated = self.render_ui(window, renderer);
+        }
+        // Streamed vegetation changed the visible scene without a control mutation, so
+        // the reactive loop must keep painting until the temporal effects converge.
+        if vegetation_mutated {
+            app.redraw.request_redraw();
         }
     }
 
@@ -1029,7 +1483,7 @@ impl Layer for HostLayer {
 pub(crate) fn render_preview_scene_to_png(
     renderer: &mut Renderer,
     uploader: &Uploader,
-    skinning: bool,
+    mirror: &mut GpuSceneMirror,
     scene: &mut Scene,
     assets: &mut AssetServer,
     camera: &CameraView,
@@ -1040,6 +1494,7 @@ pub(crate) fn render_preview_scene_to_png(
     /// Safety bound for a failed asynchronous environment refresh.
     const MAX_CONVERGE_FRAMES: u32 = 256;
 
+    let skinning = renderer.skinning_enabled();
     let prev_view = renderer.active_view_id();
     renderer.set_active_view(saffron_rendering::ViewId::Thumbnail);
     let result = (|| {
@@ -1050,9 +1505,15 @@ pub(crate) fn render_preview_scene_to_png(
         };
         let mut converged = false;
         for frame in 0..MAX_CONVERGE_FRAMES {
+            let world = saffron_rendering::ViewId::Thumbnail.gpu_scene_world();
+            if let Err(error) =
+                mirror.sync_renderer_world(world, scene, None, assets, renderer, uploader)
+            {
+                tracing::error!("gpu scene mirror sync (thumbnail): {error}");
+            }
             {
                 let mut driver = RendererScene::new(renderer, uploader, skinning);
-                render_scene(&mut driver, scene, assets, camera, options);
+                render_scene(&mut driver, scene, assets, mirror, camera, options);
             }
             renderer.render_scene_offscreen()?;
             if frame + 1 >= MIN_CONVERGE_FRAMES && renderer.active_environment_converged() {
@@ -1459,9 +1920,7 @@ mod tests {
         // Every host-owned GPU cache is emptied (the last `Arc<GpuMesh>`/`Arc<GpuTexture>` drop
         // runs here, under the idle device, not after the allocator is gone).
         assert!(
-            host.assets.mesh_by_uuid.is_empty()
-                && host.assets.texture_by_uuid.is_empty()
-                && host.assets.model_by_uuid.is_empty(),
+            host.assets.asset_caches_are_empty(),
             "the GPU Ref caches are empty after the cache-clear step"
         );
     }
