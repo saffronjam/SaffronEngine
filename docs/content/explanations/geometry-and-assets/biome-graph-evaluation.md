@@ -193,7 +193,8 @@ message.
 | Typed graph compiler and estimates | `engine/crates/vegetation/src/graph.rs` | `compile_biome_graph`, `CompiledBiomeGraph`, `GraphSafetyLimits` |
 | Canonical and parallel evaluator | `engine/crates/vegetation/src/evaluator.rs` | `BiomeGraphEvaluator`, `GraphEvaluationJobInputs`, `GraphEvaluationPreflight`, `GlobalStageEvaluationInputs` |
 | Scheduling and qualification corpus | `engine/crates/vegetation/src/graph_gpu.rs` | `GraphExecutionPlan`, `GraphGpuProgram`, `GraphComputeExecutor`, `qualification_corpus` |
-| Slang compute backend | `engine/crates/rendering/src/vegetation_compute.rs`, `engine/crates/rendering/src/shader_artifact.rs` | `VulkanGraphComputeExecutor`, `ShaderArtifactIdentity` |
+| Slang compute adapter | `engine/crates/vegetation-gpu/src/executor.rs` | `VulkanGraphComputeExecutor` |
+| Generic compute and artifact seam | `engine/crates/rendering/src/compute_dispatch.rs`, `shader_artifact.rs` | `ComputeDispatch`, `ShaderArtifactContract` |
 | Catalog-backed input assembly | `engine/crates/assets/src/vegetation.rs` | `compile_catalog_biome_instance_graph`, `assemble_biome_graph_evaluation_job` |
 | Asynchronous control surface | `engine/crates/control/src/commands_vegetation.rs`, `vegetation_jobs.rs` | `register_vegetation_commands`, `VegetationEvaluationJobs` |
 

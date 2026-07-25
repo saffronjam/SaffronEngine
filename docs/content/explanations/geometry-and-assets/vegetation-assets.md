@@ -18,7 +18,8 @@ disposable products.
 | `.svegmap` | `VegetationMapAsset` | World bounds, ordered layers, local biome instances, and sparse authored chunk policy |
 
 A `.splant` has exactly one source. An imported recipe records source identities, normalization
-settings, semantic-part mapping, and provenance. A native source embeds one typed botanical graph.
+settings, semantic-part mapping, and provenance. A native source embeds one typed
+[botanical graph](../botanical-graph/), which grows the family's geometry instead of referencing it.
 Both fill the same normalized parts, dimensions, spines, mechanics, phenotype, collision, navigation,
 interaction, and habitat fields.
 

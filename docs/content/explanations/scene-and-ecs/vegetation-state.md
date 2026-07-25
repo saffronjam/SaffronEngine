@@ -71,7 +71,7 @@ Logical facets map to these cooked sections:
 | Facet | Cell sections |
 |---|---|
 | Render | Macro points, micro fields, render references, render bounds |
-| Physics | Macro points, collision inputs |
+| Physics | Macro points, collision inputs — consumed by [vegetation collision residency](../../physics/vegetation-collision/) during play |
 | Simulation | Macro points, micro fields, ecology boundary, ecology checkpoint |
 | Editing | Macro points, provenance, rejection diagnostics, surface attachments and dependencies |
 | Navigation | Macro points, navigation contributions |
@@ -135,6 +135,50 @@ The ray query intersects conservative vegetation bounds. It is not a physics ray
 claim that a render-only or simulation-only plant has a collision body. Physics queries remain
 limited to collision-resident objects.
 
+## Biological time
+
+Biological age is its own axis, counted in fixed ecology ticks by a clock that only moves forward.
+The calendar and time of day are presentation inputs: rewinding them previews a different season,
+and it cannot un-grow a tree, revive a dead one, or re-emit an event.
+
+Three independent guards hold that asymmetry, none of them a caller convention. The clock refuses a
+target behind itself, and a cell may only step to its successor tick, so a skipped tick cannot drop
+a generation and a repeat cannot double-apply one. The reducer rejects an `ecology_tick` that
+regresses. Events come from committed transitions, and a replayed transaction commits nothing.
+
+Persisted ecology state carries the rule-set version it was produced under, world time, and one
+boundary summary per cell — the plant count, canopy, health, moisture and fuel a neighbouring cell
+needs without reading its plants. A snapshot decoded under a different rule-set version is a loud
+mismatch rather than a silent re-simulation. [Ecology ticks and catch-up](../ecology-catchup/)
+covers how those summaries let unloaded ground come forward.
+
+## Typed transitions
+
+A committed mutation is where a vegetation change becomes observable. The reducer emits one typed
+transition per committed record — `Damaged`, `Harvested`, `Burned`, `Removed`, `Planted`,
+`Regrew`, `LifecycleChanged`, `Ignited`, `Extinguished`, `Wetted`, `StateReplaced`, `Moved`,
+`Disturbed` — carrying the
+transaction, the cell, and the plant the record named. Scripts, VFX, audio, quests, fire, and
+navigation dirtying all read the same stream, so no consumer needs to diff state to notice a
+change.
+
+Delivery is cursor-based over a ring of the last `VEGETATION_EVENT_RING_CAP` transitions, exactly
+like physics contacts: each consumer keeps its own sequence number, and a cursor older than the
+retained tail is told it overflowed rather than handed a gap. Only confirmed commits reach the
+ring — a transient prediction and an idempotent replay both emit nothing, so a transition is
+observed exactly once.
+
+```sh
+sa vegetation-drain-events
+#   #7      damaged             plant=40aabbccddeeff00112233445566778899
+#   #8      disturbed           cell-wide
+#   high=8  oldest=1  overflowed=no  (2 events)
+```
+
+Cosmetic response stays out of this stream. Bend prediction lives in the GPU interaction field and
+is never persisted; only confirmed crush, clear, and damage state becomes a `DisturbanceMask` or a
+plant delta, and only those emit a transition.
+
 ## Persistent mutations
 
 Persistent state has a fixed precedence:
@@ -150,7 +194,8 @@ confirmed state. Rejecting a prediction republishes the remaining overlay, while
 that transaction through the persistent write boundary. Snapshots contain confirmed state only.
 
 `reduce_mutations` handles field patches, additions, removals, overrides, planting, damage, moisture
-and fuel, lifecycle changes, harvest, burn, regrowth, promoted state, and disturbance masks. Each
+and fuel, lifecycle changes, harvest, burn, ignition and extinguishing, regrowth, promoted state,
+and disturbance masks. Each
 record carries a cell, transaction, authority, logical tick, idempotency key, and optional base
 revision.
 
@@ -158,6 +203,16 @@ The reducer sorts transactions canonically, verifies exact replays, and rejects 
 different contents. It evaluates a multi-cell transaction on a cloned candidate state and publishes
 only after every cell precondition succeeds. Cell revisions and changed-cell output follow canonical
 cell order.
+
+The `vegetation-mutate` control command is the wire form of the same boundary: a batch of typed
+`VegetationMutationRecordDto` records (each header plus one mutation) decodes into the reducer's
+exact vocabulary and applies through `apply_confirmed_mutations`. Editing a generated plant from
+the editor writes an override, pin, or anchor mutation this way — never a transform into cooked
+cell bytes.
+
+```sh
+sa -o json vegetation-mutate '{"records":[{"header":{...},"mutation":{"kind":"tombstone","plant":"…"}}]}'
+```
 
 ## Snapshot and tail persistence
 
@@ -191,6 +246,9 @@ not alter persistent placement unless a mutation writes durable state.
 | Point schema and lifecycle | `vegetation/src/point.rs` | `PlantPointColumns`, `POINT_SCHEMA_COLUMNS`, `PlantLifecycle` |
 | Layer algebra and provenance | `vegetation/src/layer.rs` | `VegetationLayer`, `VegetationLayerOperator`, `ProvenanceTable` |
 | Persistent reducer and envelopes | `vegetation/src/mutation.rs` | `VegetationState`, `VegetationMutation`, `reduce_mutations` |
+| Typed transitions and delivery | `vegetation/src/mutation.rs`, `runtime_world.rs` | `VegetationTransitionKind`, `VegetationEvent`, `drain_events` |
+| Biological clock and checkpoints | `vegetation/src/ecology.rs` | `EcologyClock`, `EcologyState`, `EcologyCellSummary`, `checkpoint_identity` |
+| Combustible state a fire system reads | `vegetation/src/runtime_world.rs` | `combustion_sample`, `VegetationCombustionSample`, `PlantFlags::IGNITED` |
 | Runtime generations and queries | `vegetation/src/runtime_world.rs` | `VegetationWorld`, `VegetationCellGeneration`, `VegetationPlantHandle` |
 | Strict snapshot codecs | `vegetation/src/state_codec.rs` | `VegetationState::from_canonical_bytes`, `SaveStateEnvelope::from_canonical_bytes` |
 | Facet demand and publication | `spatial/src/residency.rs` | `ResidencyManager`, `GenerationToken`, `GenerationSlot` |
