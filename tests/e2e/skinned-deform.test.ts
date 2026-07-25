@@ -245,11 +245,19 @@ test("playing the weight clip deforms the geometry on the GPU", async () => {
   await engine.call("set-morph-weights", { entity: morphId, weights: [0] });
   await engine.settle(200);
   const rest = await screenshot("morph-rest");
-  // Full bulge (weight 1) — the top face lifts by +1, a large silhouette change. If the morph
-  // compute pass did not run, the two frames would be identical.
+  // Full bulge (weight 1) — the top face lifts by +1, a large silhouette change. If the
+  // morph compute pass did not run, the frames would stay identical. The capture polls:
+  // the deformed frame lands within the deadline or the morph genuinely never ran.
   await engine.call("set-morph-weights", { entity: morphId, weights: [1] });
-  await engine.settle(300);
-  const bulged = await screenshot("morph-bulged");
+  const deadline = Date.now() + 10_000;
+  let bulged = rest;
+  for (;;) {
+    await engine.settle(300);
+    bulged = await screenshot("morph-bulged");
+    if (!bulged.equals(rest) || Date.now() >= deadline) {
+      break;
+    }
+  }
   expect(bulged.equals(rest)).toBe(false);
 });
 

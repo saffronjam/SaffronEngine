@@ -23,8 +23,14 @@ beforeAll(async () => {
   // Need a drawn scene for the per-pass breakdown + throughput counters to be non-trivial.
   await engine.call("add-entity", { preset: "cube" });
   caps = await engine.call<ProfilerModeResult>("profiler.set-mode", { args: ["timestamps"] });
-  // Let several frames record + read back (read-back lags by MaxFramesInFlight frames).
-  await engine.settle(500);
+  // Let the frame telemetry warm up: the project-load reset withholds the smoothed
+  // CPU headline for its warm-up frames, so poll (each query is itself a redraw
+  // signal) until the headline is live instead of guessing a wall-clock delay.
+  for (let i = 0; i < 40; i++) {
+    const stats = await engine.call<RenderStats>("render-stats");
+    if (stats.cpuFrameMs > 0) break;
+    await engine.settle(250);
+  }
 });
 afterAll(async () => {
   await engine?.shutdown();
@@ -45,7 +51,9 @@ test("render-stats reports throughput counters and the CPU/GPU split", async () 
   expect(stats.drawCalls).toBeGreaterThan(0);
   expect(stats.triangles).toBeGreaterThan(0);
   expect(stats.sceneGatherMs).toBeGreaterThanOrEqual(0);
-  expect(stats.instanceUploadBytes).toBeGreaterThan(0);
+  // Steady scene: the GPU-scene mirror stages (near-)zero table bytes per frame —
+  // render preparation scales with changes, never with instance count.
+  expect(stats.instanceUploadBytes).toBeLessThan(65536);
   expect(stats.retainedMeshCpuBytes).toBeGreaterThan(0);
   expect(stats.shadowDrawCalls).toBeGreaterThanOrEqual(0);
   expect(stats.rtInstances).toBeGreaterThanOrEqual(0);
