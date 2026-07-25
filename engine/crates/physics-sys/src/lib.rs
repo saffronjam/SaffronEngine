@@ -127,6 +127,19 @@ pub fn create_body(
     )
 }
 
+/// Create every body in `creates` (analytic shapes only) and insert them through Jolt's batched
+/// broadphase path (`AddBodiesPrepare` + `AddBodiesFinalize`, kept asleep). Returns one raw
+/// `BodyID` per input row, position-aligned; a failed create yields [`INVALID_BODY_ID`] in its
+/// slot while the rest of the batch still lands.
+pub fn create_static_batch(world: &mut UniquePtr<JoltWorld>, creates: &[BodyCreate]) -> Vec<u32> {
+    bridge::ffi::jolt_create_static_batch(world.pin_mut(), creates)
+}
+
+/// Remove and destroy every listed body in one batch. [`INVALID_BODY_ID`] sentinels are skipped.
+pub fn remove_bodies(world: &mut UniquePtr<JoltWorld>, ids: &[u32]) {
+    bridge::ffi::jolt_remove_bodies(world.pin_mut(), ids);
+}
+
 /// A body's world position (`xyz`) and rotation (`xyzw`), read each step for the dynamic
 /// transform write-back.
 pub fn body_position_rotation(world: &UniquePtr<JoltWorld>, id: u32) -> ([f32; 3], [f32; 4]) {
@@ -149,6 +162,11 @@ pub fn body_is_active(world: &UniquePtr<JoltWorld>, id: u32) -> bool {
 /// A body's current linear velocity (`xyz`).
 pub fn body_linear_velocity(world: &UniquePtr<JoltWorld>, id: u32) -> [f32; 3] {
     bridge::ffi::jolt_body_linear_velocity(world, id)
+}
+
+/// A body's current angular velocity (`xyz`, radians per second about each world axis).
+pub fn body_angular_velocity(world: &UniquePtr<JoltWorld>, id: u32) -> [f32; 3] {
+    bridge::ffi::jolt_body_angular_velocity(world, id)
 }
 
 /// Activate the body and apply a center-of-mass impulse (`xyz`).

@@ -350,6 +350,78 @@ namespace saffron::physics
         return id.GetIndexAndSequenceNumber();
     }
 
+    rust::Vec<std::uint32_t> jolt_create_static_batch(JoltWorld &world,
+                                                      rust::Slice<const BodyCreate> creates)
+    {
+        rust::Vec<std::uint32_t> ids;
+        ids.reserve(creates.size());
+        std::vector<JPH::BodyID> added;
+        added.reserve(creates.size());
+        JPH::BodyInterface &bi = world.system.GetBodyInterface();
+        for (const BodyCreate &create : creates)
+        {
+            const JPH::Vec3 offset(create.offset[0], create.offset[1], create.offset[2]);
+            const JPH::ShapeRefC shape = wrap_offset(
+                build_collider_shape(create, rust::Slice<const float>(),
+                                     rust::Slice<const float>(),
+                                     rust::Slice<const std::uint32_t>()),
+                offset);
+            if (shape == nullptr)
+            {
+                ids.push_back(JPH::BodyID::cInvalidBodyID);
+                continue;
+            }
+            const JPH::RVec3 position(create.position[0], create.position[1],
+                                      create.position[2]);
+            const JPH::Quat rotation(create.rotation[0], create.rotation[1], create.rotation[2],
+                                     create.rotation[3]);
+            JPH::BodyCreationSettings settings(shape, position, rotation,
+                                               static_cast<JPH::EMotionType>(create.motion),
+                                               static_cast<JPH::ObjectLayer>(create.object_layer));
+            settings.mIsSensor = create.is_sensor;
+            settings.mFriction = create.friction;
+            settings.mRestitution = create.restitution;
+            JPH::Body *body = bi.CreateBody(settings);
+            if (body == nullptr)
+            {
+                std::fprintf(stderr, "physics: batch body create failed (body limit reached?)\n");
+                ids.push_back(JPH::BodyID::cInvalidBodyID);
+                continue;
+            }
+            ids.push_back(body->GetID().GetIndexAndSequenceNumber());
+            added.push_back(body->GetID());
+        }
+        if (!added.empty())
+        {
+            JPH::BodyInterface::AddState state =
+                bi.AddBodiesPrepare(added.data(), static_cast<int>(added.size()));
+            bi.AddBodiesFinalize(added.data(), static_cast<int>(added.size()), state,
+                                 JPH::EActivation::DontActivate);
+        }
+        return ids;
+    }
+
+    void jolt_remove_bodies(JoltWorld &world, rust::Slice<const std::uint32_t> ids)
+    {
+        std::vector<JPH::BodyID> bodies;
+        bodies.reserve(ids.size());
+        for (const std::uint32_t id : ids)
+        {
+            const JPH::BodyID body(id);
+            if (!body.IsInvalid())
+            {
+                bodies.push_back(body);
+            }
+        }
+        if (bodies.empty())
+        {
+            return;
+        }
+        JPH::BodyInterface &bi = world.system.GetBodyInterface();
+        bi.RemoveBodies(bodies.data(), static_cast<int>(bodies.size()));
+        bi.DestroyBodies(bodies.data(), static_cast<int>(bodies.size()));
+    }
+
     void jolt_body_position_rotation(const JoltWorld &world, std::uint32_t id,
                                      std::array<float, 3> &position, std::array<float, 4> &rotation)
     {
@@ -374,6 +446,12 @@ namespace saffron::physics
     std::array<float, 3> jolt_body_linear_velocity(const JoltWorld &world, std::uint32_t id)
     {
         const JPH::Vec3 v = world.system.GetBodyInterface().GetLinearVelocity(body_id(id));
+        return { v.GetX(), v.GetY(), v.GetZ() };
+    }
+
+    std::array<float, 3> jolt_body_angular_velocity(const JoltWorld &world, std::uint32_t id)
+    {
+        const JPH::Vec3 v = world.system.GetBodyInterface().GetAngularVelocity(body_id(id));
         return { v.GetX(), v.GetY(), v.GetZ() };
     }
 

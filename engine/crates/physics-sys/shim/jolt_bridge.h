@@ -276,11 +276,15 @@ namespace saffron::physics
                                    rust::Slice<const float> hull_points,
                                    rust::Slice<const float> mesh_vertices,
                                    rust::Slice<const std::uint32_t> mesh_indices);
+    rust::Vec<std::uint32_t> jolt_create_static_batch(JoltWorld &world,
+                                                      rust::Slice<const BodyCreate> creates);
+    void jolt_remove_bodies(JoltWorld &world, rust::Slice<const std::uint32_t> ids);
     void jolt_body_position_rotation(const JoltWorld &world, std::uint32_t id,
                                      std::array<float, 3> &position, std::array<float, 4> &rotation);
     std::array<float, 3> jolt_body_position(const JoltWorld &world, std::uint32_t id);
     bool jolt_body_is_active(const JoltWorld &world, std::uint32_t id);
     std::array<float, 3> jolt_body_linear_velocity(const JoltWorld &world, std::uint32_t id);
+    std::array<float, 3> jolt_body_angular_velocity(const JoltWorld &world, std::uint32_t id);
     void jolt_body_add_impulse(JoltWorld &world, std::uint32_t id, const std::array<float, 3> &impulse);
     void jolt_body_add_force(JoltWorld &world, std::uint32_t id, const std::array<float, 3> &force);
     void jolt_body_set_linear_velocity(JoltWorld &world, std::uint32_t id,

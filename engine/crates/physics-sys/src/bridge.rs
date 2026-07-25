@@ -218,6 +218,18 @@ pub mod ffi {
             mesh_indices: &[u32],
         ) -> u32;
 
+        /// Create every body in `creates` (analytic shapes only — the geometry slices of
+        /// [`jolt_create_body`] never apply) and insert them through Jolt's batched broadphase
+        /// path (`BodyInterface::AddBodiesPrepare` + `AddBodiesFinalize`, `DontActivate`).
+        /// Returns one raw `BodyID` per input row, position-aligned; a failed create yields
+        /// the invalid id sentinel in its slot and the rest of the batch still lands.
+        fn jolt_create_static_batch(world: Pin<&mut JoltWorld>, creates: &[BodyCreate])
+        -> Vec<u32>;
+
+        /// Remove and destroy every listed body in one batch (`BodyInterface::RemoveBodies` +
+        /// `DestroyBodies`). Invalid-id sentinels in `ids` are skipped.
+        fn jolt_remove_bodies(world: Pin<&mut JoltWorld>, ids: &[u32]);
+
         /// Read a body's world position+rotation (`BodyInterface::GetPositionAndRotation`) into
         /// `position` (`xyz`) and `rotation` (`xyzw`). The dynamic write-back reads this each step.
         /// `id` is a raw `BodyID`.
@@ -239,6 +251,10 @@ pub mod ffi {
         /// A body's current linear velocity (`BodyInterface::GetLinearVelocity`). `id` is a raw
         /// `BodyID`.
         fn jolt_body_linear_velocity(world: &JoltWorld, id: u32) -> [f32; 3];
+
+        /// A body's current angular velocity (`BodyInterface::GetAngularVelocity`, radians per
+        /// second about each world axis). `id` is a raw `BodyID`.
+        fn jolt_body_angular_velocity(world: &JoltWorld, id: u32) -> [f32; 3];
 
         /// Activate the body, then apply a center-of-mass impulse (`ActivateBody` + `AddImpulse`).
         /// `id` is a raw `BodyID`; the safe layer only calls this for a Dynamic body.
