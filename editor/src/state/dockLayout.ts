@@ -21,6 +21,7 @@ export const SCENE_PANEL_IDS = [
   "profiler",
   "physics",
   "scriptLogs",
+  "vegetation",
   "material",
   "timeline",
   "hierarchy",
@@ -36,6 +37,8 @@ export const ASSET_EDITOR_PANEL_IDS = [
   "assetTimeline",
   "materialEdit",
   "assetStats",
+  "vegSummary",
+  "biomeGraph",
 ] as const;
 
 export type SceneDockPanelId = (typeof SCENE_PANEL_IDS)[number];
@@ -863,6 +866,7 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   profiler: "leaf:right",
   physics: "leaf:right",
   scriptLogs: "leaf:assets",
+  vegetation: "leaf:right",
   material: "leaf:right",
   timeline: "leaf:assets",
   hierarchy: "leaf:hierarchy",
@@ -874,6 +878,8 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   assetTimeline: "leaf:assetTimeline",
   materialEdit: "leaf:aeRight",
   assetStats: "leaf:aeLeft",
+  vegSummary: "leaf:aeRight",
+  biomeGraph: "leaf:skeleton",
 };
 
 /// Reset a kind's tree to its default positions WITHOUT closing the panels currently open:
