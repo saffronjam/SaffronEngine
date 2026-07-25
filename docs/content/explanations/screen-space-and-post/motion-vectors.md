@@ -17,8 +17,9 @@ the input-resolution buffer without converting pixel units.
 
 ## Reprojection
 
-The motion pass renders the instanced scene as a graphics prepass with its own depth attachment. Its
-vertex shader computes two clip positions for each surface point:
+The motion pass replays the frame's GPU-binned counted-indirect commands as a graphics prepass with
+its own depth attachment. Its vertex shader, `vertexMainExecutor`, computes two clip positions for
+each surface point:
 
 $$
 c_\text{cur}=P_\text{cur}M_\text{cur}x_\text{cur}, \qquad
@@ -26,7 +27,8 @@ c_\text{prev}=P_\text{prev}M_\text{prev}x_\text{prev}.
 $$
 
 $P$ is the camera view-projection matrix, $M$ is the instance model matrix, and $x$ is the vertex
-position stream. The fragment shader performs the perspective divides and writes
+position, pulled through buffer device address. The fragment shader performs the perspective divides
+and writes
 
 $$
 v_\text{uv}=\frac{1}{2}
@@ -45,14 +47,17 @@ per render view, so switching between the scene and asset-preview views does not
 The motion pass uses unjittered matrices; subpixel TAA jitter therefore does not create velocity on a
 static surface. On a view's first frame, previous equals current and camera velocity is zero.
 
-Rigid object motion comes from `Instance.model` and `Instance.prevModel`. The instancing cache records
-the prior transform by entity ID. A new or uncached entity uses its current model as the previous
-model, avoiding an artificial first-frame vector.
+Rigid object motion comes from the GPU-scene instance record, whose `transform_kind` selects the
+stored columns: a dynamic instance carries current and previous world matrices, while a static
+instance stores only current columns and reprojects with zero object motion. A new entity uses its
+current transform as the previous one, avoiding an artificial first-frame vector.
 
-Deformation motion comes from two vertex bindings. Static meshes bind the same position stream twice.
-Skinned and morphed batches bind current and previous deformed buffers, while tessellated batches bind
-the current micro-vertex buffer and its previous-factor counterpart. This lets bone motion, morph
-changes, and tessellation geomorphing produce per-pixel velocity rather than only whole-object motion.
+Deformation motion comes from the GPU-scene address block: the vertex shader reads this frame's
+position from the `deformedVertices` arena and last frame's from `prevDeformedVertices`, while a mesh
+with no deformation reads the same static stream for both. Displaced instances draw through the
+tessellation seam, binding the current micro-vertex buffer and its previous-factor counterpart. This
+lets bone motion, morph changes, and tessellation geomorphing produce per-pixel velocity rather than
+only whole-object motion.
 
 ## Depth and consumers
 
@@ -67,8 +72,8 @@ the vector value.
 
 SSGI and DFAO temporal accumulation sample the motion image directly, reject invalid or mismatched
 history, and write their next histories. ReSTIR reservoir reuse also declares a sampled read when the
-motion prepass is present. The renderer schedules motion when TAA, SSGI, or DFAO requires it; ReSTIR
-by itself does not arm the prepass.
+motion prepass is present. The renderer schedules motion when TAA, SSGI, DFAO, or the volumetric-cloud
+reprojection requires it; ReSTIR by itself does not arm the prepass.
 
 ## Example
 
@@ -86,11 +91,11 @@ Static regions remain black. Restore the normal viewport with `sa set-view-mode 
 
 | What | File | Symbols |
 |---|---|---|
-| Reprojection shader | `engine/assets/shaders/motion.slang` | `vertexMain`, `fragmentMain`, `Push`, `Instance` |
-| Format, push, and draw recording | `engine/crates/rendering/src/aa.rs` | `MOTION_FORMAT`, `MotionPush`, `record_motion`, `select_motion_streams` |
+| Reprojection shader | `engine/assets/shaders/motion.slang`, `engine/assets/shaders/global_gpu_data.slang` | `vertexMainExecutor`, `fragmentMain`, `Push`, `prevDeformedVertices` |
+| Format, push, and draw recording | `engine/crates/rendering/src/aa.rs`, `engine/crates/rendering/src/scene_pass.rs` | `MOTION_FORMAT`, `MotionPush`, `record_executor_depth_family`, `record_tess_depth_draws` |
 | Graph pass and gates | `engine/crates/rendering/src/renderer.rs` | `add_motion_pass`, `want_motion`, `motion_depth_resource` |
 | Per-view targets and camera history | `engine/crates/rendering/src/view_target.rs` | `motion`, `motion_depth`, `prev_view_proj`, `store_prev_view_proj` |
-| Object and deformation history | `engine/crates/rendering/src/instancing.rs`, `engine/crates/rendering/src/skinning.rs` | `Skinning::prev_model`, `Skinning::prev_deformed_buffer`, `wire_dispatches`, `wire_morph_dispatches` |
+| Object and deformation history | `engine/crates/rendering/src/instancing.rs`, `engine/crates/rendering/src/skinning.rs`, `engine/crates/rendering/src/renderer.rs` | `DeformationWork`, `submit_gpu_scene_deformations`, `Skinning::prev_model`, `Skinning::prev_deformed_buffer` |
 | Tessellation history | `engine/crates/rendering/src/renderer.rs`, `engine/crates/rendering/src/tessellation.rs`, `engine/crates/rendering/src/draw_list.rs` | `prev_factors`, `Tessellation::factor_layout_matches`, `TessDraw::prev_vertex_buffer` |
 | Temporal consumers | `engine/assets/shaders/taa.slang`, `engine/assets/shaders/ssgi_accum.slang`, `engine/assets/shaders/dfao_accum.slang`, `engine/assets/shaders/restir_reuse.slang` | `DilatedMotion`, `histUv`, `motion` |
 | Debug visualization | `engine/assets/shaders/motion_visualize.slang`, `engine/crates/rendering/src/renderer.rs` | `computeMain`, `add_motion_visualize_pass` |
