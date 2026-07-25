@@ -60,7 +60,7 @@ resvg = "0.44"
 usvg = "0.44"
 tiny-skia = "0.11"
 optimesh = "1.1.0"
-zstd = "=0.13.3"
+zstd = { version = "=0.13.3", default-features = false }
 
 # Syscalls & CLI.
 rustix = "0.38"

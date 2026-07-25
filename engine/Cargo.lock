@@ -2765,6 +2765,7 @@ dependencies = [
  "saffron-core",
  "saffron-geometry",
  "saffron-json",
+ "saffron-material",
  "saffron-rendering",
  "saffron-scene",
  "saffron-spatial",
@@ -2796,6 +2797,7 @@ dependencies = [
  "saffron-sceneedit",
  "saffron-spatial",
  "saffron-vegetation",
+ "saffron-wind",
  "saffron-window",
  "schemars 1.2.1",
  "serde",
@@ -2845,6 +2847,7 @@ dependencies = [
  "image",
  "optimesh",
  "saffron-core",
+ "saffron-material",
  "saffron-test-support",
  "serde_json",
  "sha2",
@@ -2877,6 +2880,8 @@ dependencies = [
  "saffron-signal",
  "saffron-spatial",
  "saffron-test-support",
+ "saffron-vegetation-gpu",
+ "saffron-wind",
  "saffron-window",
  "serde_json",
  "tracing",
@@ -2904,6 +2909,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "saffron-material"
+version = "0.1.0"
+dependencies = [
+ "saffron-core",
+ "saffron-spatial",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "saffron-physics"
 version = "0.1.0"
 dependencies = [
@@ -2914,6 +2928,7 @@ dependencies = [
  "saffron-geometry",
  "saffron-physics-sys",
  "saffron-scene",
+ "saffron-spatial",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2972,9 +2987,10 @@ dependencies = [
  "rustix 0.38.44",
  "saffron-core",
  "saffron-geometry",
+ "saffron-material",
  "saffron-spatial",
  "saffron-test-support",
- "saffron-vegetation",
+ "saffron-wind",
  "saffron-window",
  "serde",
  "serde_json",
@@ -3011,6 +3027,8 @@ dependencies = [
  "hecs",
  "saffron-core",
  "saffron-json",
+ "saffron-spatial",
+ "saffron-wind",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3039,6 +3057,7 @@ dependencies = [
  "mlua",
  "saffron-core",
  "saffron-scene",
+ "saffron-spatial",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
@@ -3071,14 +3090,33 @@ name = "saffron-vegetation"
 version = "0.1.0"
 dependencies = [
  "glam",
- "optimesh",
  "saffron-core",
  "saffron-geometry",
  "saffron-json",
+ "saffron-material",
  "saffron-spatial",
  "sha2",
  "thiserror 2.0.18",
  "zstd",
+]
+
+[[package]]
+name = "saffron-vegetation-gpu"
+version = "0.1.0"
+dependencies = [
+ "saffron-rendering",
+ "saffron-vegetation",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "saffron-wind"
+version = "0.1.0"
+dependencies = [
+ "glam",
 ]
 
 [[package]]
@@ -4363,6 +4401,7 @@ dependencies = [
  "anyhow",
  "atomic-write-file",
  "saffron-core",
+ "saffron-geometry",
  "saffron-protocol",
  "saffron-script",
  "saffron-spatial",
