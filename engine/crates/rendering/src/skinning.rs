@@ -283,6 +283,20 @@ impl Skinning {
     /// # Errors
     ///
     /// Returns [`crate::Error::Vk`] if growing a deformed buffer fails.
+    /// The frame slot's deformed + prev-deformed buffer device addresses for the
+    /// GPU-scene address block (0 when the buffer is not yet built).
+    pub fn frame_deformed_addresses(&self, frame: usize, device: &Device) -> (u64, u64) {
+        let address = |buffer: &Option<Buffer>| {
+            buffer
+                .as_ref()
+                .map_or(0, |buffer| device.buffer_device_address(buffer.handle()))
+        };
+        (
+            address(&self.frames[frame].deformed),
+            address(&self.frames[frame].prev_deformed),
+        )
+    }
+
     pub fn wire_dispatches(
         &mut self,
         frame: usize,
@@ -706,10 +720,13 @@ fn make_deformed_buffer(
     rt_supported: bool,
 ) -> Result<Buffer> {
     let size = u64::from(capacity) * size_of::<Vertex>() as u64;
-    let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::VERTEX_BUFFER;
+    // SHADER_DEVICE_ADDRESS always: the frame's GPU-scene address block carries the
+    // buffer for the executor vertex pull.
+    let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::VERTEX_BUFFER
+        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
     if rt_supported {
-        usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        usage |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
     }
     let alloc_info = vk_mem::AllocationCreateInfo {
         usage: vk_mem::MemoryUsage::AutoPreferDevice,

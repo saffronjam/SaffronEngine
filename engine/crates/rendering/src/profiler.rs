@@ -265,9 +265,9 @@ pub struct GpuProfiler {
     pub last_gpu_total_ms: f32,
     /// ns per timestamp tick (the device limit).
     pub timestamp_period: f32,
-    /// The graphics-queue `timestampValidBits` mask.
+    /// The common valid-bit mask used for every recorded queue.
     pub timestamp_mask: u64,
-    /// `validBits != 0 && timestampComputeAndGraphics`.
+    /// The graphics queue exposes timestamp bits.
     pub timestamps_supported: bool,
     /// The `pipelineStatisticsQuery` device feature present.
     pub pipeline_stats_supported: bool,
@@ -534,6 +534,18 @@ impl GpuProfiler {
         let total_ms = frame_span_ms(&records, &raw, self.timestamp_mask, self.timestamp_period);
         self.last_timings = timings;
         self.last_gpu_total_ms = total_ms;
+        // A frame this long approaches platform GPU-watchdog territory (device-loss risk);
+        // name the heaviest passes so the offender is identifiable from the log alone.
+        if total_ms > 500.0 {
+            let mut heaviest: Vec<(&str, f32)> = self
+                .last_timings
+                .iter()
+                .map(|t| (t.name.as_str(), t.gpu_ms))
+                .collect();
+            heaviest.sort_by(|a, b| b.1.total_cmp(&a.1));
+            heaviest.truncate(5);
+            tracing::warn!(total_ms, ?heaviest, "GPU frame ran long");
+        }
         if prior_gpu_frame_ms == 0.0 {
             total_ms
         } else {

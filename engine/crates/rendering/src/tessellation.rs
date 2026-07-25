@@ -315,7 +315,7 @@ pub struct TessBucket {
     pub mesh: Arc<GpuMesh>,
     /// The base offset into the frame's instance buffer for this instance's submesh-major block —
     /// the `firstInstance` the tessellated indirect draw must seed, and the key that links this
-    /// bucket to its [`crate::DrawBatch`] when `record_tess_prep` resolves the draw handles.
+    /// bucket to its [`crate::TessSceneDraw`] when `record_tess_prep` resolves the draw handles.
     pub base_instance: u32,
     /// The entity id, keying this bucket to its [`crate::DeformedRtInstance`] so `record_tess_prep`
     /// can fill the RT tessellated slice (and the per-entity `TessellatedBlas`). `0` when RT is unarmed.
