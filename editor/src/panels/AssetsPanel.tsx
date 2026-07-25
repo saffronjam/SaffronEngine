@@ -261,7 +261,6 @@ export function AssetsPanel() {
   const instantiateModel = useEditorStore((s) => s.instantiateModel);
   const nativeDialogOpen = useEditorStore((s) => s.nativeDialogOpen);
   const openImageViewerTab = useEditorStore((s) => s.openImageViewerTab);
-  const openVegetationAssetTab = useEditorStore((s) => s.openVegetationAssetTab);
   const openAssetEditorForAsset = useEditorStore((s) => s.openAssetEditorForAsset);
   const closeViewTab = useEditorStore((s) => s.closeViewTab);
   const setAssetsPanelHovered = useEditorStore((s) => s.setAssetsPanelHovered);
@@ -809,16 +808,17 @@ export function AssetsPanel() {
         asset.type === "mesh" ||
         asset.type === "animation" ||
         asset.type === "texture" ||
-        asset.type === "material";
-      if (asset.type === "plant" || asset.type === "biome" || asset.type === "vegetation-map") {
-        openVegetationAssetTab(asset.id, asset.name, asset.type);
-      } else if (ridesAssetEditor) {
+        asset.type === "material" ||
+        asset.type === "plant" ||
+        asset.type === "biome" ||
+        asset.type === "vegetation-map";
+      if (ridesAssetEditor) {
         openAssetEditorForAsset(asset.id, asset.name);
       } else {
         openImageViewerTab(asset);
       }
     },
-    [openImageViewerTab, openVegetationAssetTab, openAssetEditorForAsset],
+    [openImageViewerTab, openAssetEditorForAsset],
   );
 
   const confirmDeleteAssets = useCallback(
@@ -832,7 +832,6 @@ export function AssetsPanel() {
               await client.deleteAsset(asset.id);
               deletedIds.add(asset.id);
               closeViewTab(`imageViewer:${asset.id}`);
-              closeViewTab(`vegetationAsset:${asset.id}`);
               // The asset-editor tab is keyed by the owning model container (a sub-asset opens
               // its container's editor), so close both the asset's own key and its container's.
               closeViewTab(`assetEditor:${asset.id}`);

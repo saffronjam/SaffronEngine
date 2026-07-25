@@ -9,7 +9,7 @@ import { client } from "../control/client";
 import { useEditorStore } from "../state/store";
 import { errorText, notifyError } from "../lib/flash";
 import { SliderField } from "../components/SliderField";
-import type { RagdollResult } from "../protocol";
+import type { RagdollResult, WorldHitTargetDto } from "../protocol";
 import { cn } from "@/lib/utils";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
@@ -61,6 +61,16 @@ export function PhysicsPanel() {
     return m;
   }, [entities]);
   const label = (id: string): string => (id === "0" ? "—" : (nameById.get(id) ?? shortId(id)));
+  /// A tagged hit target's display label: the entity's name, or the plant's short id.
+  const targetLabel = (target: WorldHitTargetDto | undefined): string => {
+    if (!target) return "—";
+    if (target.kind === "scene-entity") return label(target.id);
+    return `plant ${target.plant.slice(0, 8)}`;
+  };
+  const targetKey = (target: WorldHitTargetDto | undefined, fallback: string): string => {
+    if (!target) return fallback;
+    return target.kind === "scene-entity" ? target.id : target.plant;
+  };
 
   // Ragdoll readout: refreshed from get-ragdoll on selection/play change and after each command.
   const [ragdoll, setRagdoll] = useState<RagdollResult | null>(null);
@@ -142,12 +152,12 @@ export function PhysicsPanel() {
               <div className="flex flex-col gap-1.5">
                 <SectionLabel>Bodies</SectionLabel>
                 <div className="flex flex-col gap-0.5">
-                  {physicsBodies.map((b) => (
+                  {physicsBodies.map((b, index) => (
                     <div
-                      key={b.entity}
+                      key={targetKey(b.target, `body-${index}`)}
                       className="grid grid-cols-[1fr_auto_auto] items-center gap-2 rounded-sm bg-muted/20 px-1.5 py-0.5 text-[11px]"
                     >
-                      <span className="truncate text-foreground">{label(b.entity)}</span>
+                      <span className="truncate text-foreground">{targetLabel(b.target)}</span>
                       <span className="font-mono text-muted-foreground">{b.motion}</span>
                       <span
                         className={cn(
@@ -197,9 +207,9 @@ export function PhysicsPanel() {
                             trigger
                           </span>
                         ) : null}
-                        <span className="truncate text-foreground">{label(c.entityA)}</span>
+                        <span className="truncate text-foreground">{targetLabel(c.targetA)}</span>
                         <span className="text-muted-foreground">↔</span>
-                        <span className="truncate text-foreground">{label(c.entityB)}</span>
+                        <span className="truncate text-foreground">{targetLabel(c.targetB)}</span>
                       </div>
                     ))}
                   </div>
