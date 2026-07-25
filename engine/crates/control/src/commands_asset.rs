@@ -192,7 +192,23 @@ fn field_channel_dto(channel: saffron_spatial::FieldChannel) -> FieldChannelDto 
     FieldChannelDto { kind, user }
 }
 
-fn source_provenance_dto(provenance: &SourceProvenance) -> VegetationSourceProvenanceDto {
+pub(crate) fn source_provenance_from_dto(
+    provenance: &VegetationSourceProvenanceDto,
+) -> SourceProvenance {
+    SourceProvenance {
+        source: provenance.source.clone(),
+        source_uri: provenance.source_uri.clone(),
+        license_id: provenance.license_id.clone(),
+        license_uri: provenance.license_uri.clone(),
+        author: provenance.author.clone(),
+        attribution: provenance.attribution.clone(),
+        requires_attribution: provenance.requires_attribution,
+    }
+}
+
+pub(crate) fn source_provenance_dto(
+    provenance: &SourceProvenance,
+) -> VegetationSourceProvenanceDto {
     VegetationSourceProvenanceDto {
         source: provenance.source.clone(),
         source_uri: provenance.source_uri.clone(),
@@ -204,7 +220,27 @@ fn source_provenance_dto(provenance: &SourceProvenance) -> VegetationSourceProve
     }
 }
 
-fn plant_source_selector_dto(selector: &PlantSourceSelector) -> PlantSourceSelectorDto {
+pub(crate) fn plant_source_selector_from_dto(
+    selector: &PlantSourceSelectorDto,
+) -> Result<PlantSourceSelector> {
+    let guid = |value: &saffron_protocol::VegetationGuid| -> Result<u128> {
+        u128::from_str_radix(&value.0, 16)
+            .map_err(|_| Error::command("selector identity must be 32 hex digits"))
+    };
+    Ok(match selector {
+        PlantSourceSelectorDto::Whole => PlantSourceSelector::Whole,
+        PlantSourceSelectorDto::Element { id, path } => PlantSourceSelector::Element {
+            id: guid(id)?,
+            path: path.clone(),
+        },
+        PlantSourceSelectorDto::Submesh { element, index } => PlantSourceSelector::Submesh {
+            element: guid(element)?,
+            index: *index,
+        },
+    })
+}
+
+pub(crate) fn plant_source_selector_dto(selector: &PlantSourceSelector) -> PlantSourceSelectorDto {
     match selector {
         PlantSourceSelector::Whole => PlantSourceSelectorDto::Whole,
         PlantSourceSelector::Element { id, path } => PlantSourceSelectorDto::Element {
@@ -300,6 +336,7 @@ fn plant_diagnostic_code_dto(code: PlantCompileDiagnosticCode) -> PlantCompileDi
         PlantCompileDiagnosticCode::BoundsMismatch => PlantCompileDiagnosticCodeDto::BoundsMismatch,
         PlantCompileDiagnosticCode::LimitExceeded => PlantCompileDiagnosticCodeDto::LimitExceeded,
         PlantCompileDiagnosticCode::SourceChanged => PlantCompileDiagnosticCodeDto::SourceChanged,
+        PlantCompileDiagnosticCode::OrphanedEdit => PlantCompileDiagnosticCodeDto::OrphanedEdit,
     }
 }
 
@@ -317,6 +354,7 @@ fn plant_diagnostic_code_text(code: PlantCompileDiagnosticCode) -> &'static str 
         PlantCompileDiagnosticCode::BoundsMismatch => "bounds-mismatch",
         PlantCompileDiagnosticCode::LimitExceeded => "limit-exceeded",
         PlantCompileDiagnosticCode::SourceChanged => "source-changed",
+        PlantCompileDiagnosticCode::OrphanedEdit => "orphaned-edit",
     }
 }
 
@@ -428,7 +466,7 @@ fn plant_sources_dto(
             .iter()
             .map(|source| plant_source_reference_dto(source, &updates))
             .collect(),
-        PlantFamilySource::Native(_) => Vec::new(),
+        PlantFamilySource::Native { .. } => Vec::new(),
     }
 }
 
@@ -464,6 +502,119 @@ fn vegetation_map_chunk_key_dto(
             VegetationMapChunkKind::EditorMetadata => VegetationMapChunkKindDto::EditorMetadata,
         },
     }
+}
+
+fn authored_field_tile_dto(
+    tile: &saffron_vegetation::AuthoredFieldTile,
+) -> saffron_protocol::AuthoredFieldTileDto {
+    saffron_protocol::AuthoredFieldTileDto {
+        channel: field_channel_dto(tile.channel),
+        layer: vegetation_guid(tile.layer),
+        dimensions: tile.dimensions,
+        quantum_bits: tile.quantum_bits,
+        values: tile.values.clone(),
+    }
+}
+
+fn plant_point_dto(point: &saffron_vegetation::PlantPoint) -> saffron_protocol::PlantPointDto {
+    saffron_protocol::PlantPointDto {
+        id: plant_id(point.id),
+        owner: world_cell_dto(point.owner),
+        local_position: point.position.local().ticks(),
+        orientation: point.orientation.bits(),
+        scale_bits: point.scale.map(|scale| scale.bits()),
+        bounds: world_bounds_dto(point.bounds),
+        family: WireUuid(point.family.value()),
+        variation: point.variation,
+        lifecycle: crate::commands_vegetation_runtime::lifecycle_dto(point.lifecycle),
+        phenotype: point.phenotype,
+        representation_class: point.representation_class,
+        deterministic_key: vegetation_guid(point.deterministic_key),
+        candidate: point.candidate.to_string(),
+        parent: point.parent.map(plant_id),
+        colony: point.colony.map(plant_id),
+        ecology_tick: point.ecology_tick.to_string(),
+        health: point.health.bits(),
+        moisture: point.moisture.bits(),
+        fuel: point.fuel.bits(),
+        phenology: point.phenology.bits(),
+        flags: point.flags.bits(),
+        interaction_policy: interaction_policy_dto(point.interaction_policy),
+        provenance: point.provenance,
+        attachment: point
+            .attachment
+            .map(|attachment| saffron_protocol::SurfaceAttachmentDto {
+                provider: attachment.provider.0.to_string(),
+                primitive: attachment.primitive.0.to_string(),
+                barycentric: attachment.barycentric.map(|value| value.bits()),
+                revision: attachment.revision.0.to_string(),
+            }),
+        surface_projection_bits: point.surface_projection.map(|value| value.bits()),
+    }
+}
+
+/// Serializes one authored chunk for the wire. Only the brush payload kinds cross:
+/// layer metadata is served by `vegetation-asset-summary`, and graph-instance /
+/// editor-metadata chunks have no wire payload shape.
+fn vegetation_map_chunk_dto(
+    chunk: &saffron_vegetation::VegetationMapChunk,
+) -> Result<saffron_protocol::VegetationMapChunkDto> {
+    let payload = match &chunk.payload {
+        saffron_vegetation::VegetationMapChunkPayload::Field(field) => {
+            saffron_protocol::VegetationMapChunkPayloadDto::Field {
+                fields: field.fields.iter().map(authored_field_tile_dto).collect(),
+                blockers: field.blockers.iter().map(authored_field_tile_dto).collect(),
+            }
+        }
+        saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(anchors) => {
+            saffron_protocol::VegetationMapChunkPayloadDto::AnchorOverride {
+                explicit_plants: anchors
+                    .explicit_plants
+                    .iter()
+                    .map(|anchor| saffron_protocol::ExplicitPlantAnchorDto {
+                        id: plant_id(anchor.id),
+                        layer: vegetation_guid(anchor.layer),
+                        family: WireUuid(anchor.family.value()),
+                        point: plant_point_dto(&anchor.point),
+                    })
+                    .collect(),
+                pins: anchors.pins.iter().copied().map(plant_id).collect(),
+                transform_overrides: anchors
+                    .transform_overrides
+                    .iter()
+                    .map(|value| PlantTransformOverrideDto {
+                        plant: plant_id(value.plant),
+                        global_ticks: value
+                            .position
+                            .global_ticks()
+                            .map(|component| component.to_string()),
+                        scale_bits: value.scale.map(|component| component.bits()),
+                    })
+                    .collect(),
+                state_overrides: anchors
+                    .state_overrides
+                    .iter()
+                    .map(|value| PlantStateOverrideDto {
+                        plant: plant_id(value.plant),
+                        health: value.health.map(|item| item.bits()),
+                        moisture: value.moisture.map(|item| item.bits()),
+                        fuel: value.fuel.map(|item| item.bits()),
+                        interaction_policy: value.interaction_policy.map(interaction_policy_dto),
+                    })
+                    .collect(),
+            }
+        }
+        _ => {
+            return Err(Error::command(
+                "chunk read serves field and anchor-override chunks",
+            ));
+        }
+    };
+    Ok(saffron_protocol::VegetationMapChunkDto {
+        key: vegetation_map_chunk_key_dto(chunk.key),
+        revision: chunk.revision.to_string(),
+        payload,
+    })
 }
 
 fn cook_node_address_dto(address: &CookNodeAddress) -> VegetationCookNodeAddressDto {
@@ -580,7 +731,7 @@ fn source_asset_dependency(
     id: Uuid,
 ) -> std::result::Result<VegetationManifestDependencyDto, String> {
     let entry = assets
-        .catalog
+        .catalog()
         .find(id)
         .ok_or_else(|| format!("catalog asset {} is missing", id.value()))?;
     let bytes = std::fs::read(assets.root.join(&entry.path)).map_err(|error| error.to_string())?;
@@ -695,7 +846,7 @@ fn map_authored_metadata(
     let mut issues = Vec::new();
     let mut dependencies = Vec::with_capacity(map.inventory.len().saturating_add(1));
     let manifest_hash = assets
-        .catalog
+        .catalog()
         .find(map.id)
         .ok_or_else(|| format!("catalog asset {} is missing", map.id.value()))
         .and_then(|entry| {
@@ -781,7 +932,9 @@ fn rejection_reason_index(reason: CandidateRejectionReason) -> usize {
     }
 }
 
-fn rejection_reason_dto(reason: CandidateRejectionReason) -> VegetationCandidateRejectionReasonDto {
+pub(crate) fn rejection_reason_dto(
+    reason: CandidateRejectionReason,
+) -> VegetationCandidateRejectionReasonDto {
     match reason {
         CandidateRejectionReason::SurfaceMiss => VegetationCandidateRejectionReasonDto::SurfaceMiss,
         CandidateRejectionReason::Threshold => VegetationCandidateRejectionReasonDto::Threshold,
@@ -804,6 +957,7 @@ fn current_map_cook_metadata(
     map: Uuid,
 ) -> Result<
     Option<(
+        VegetationBaseManifest,
         Vec<VegetationManifestDependencyDto>,
         VegetationCookStatisticsDto,
     )>,
@@ -823,13 +977,16 @@ fn current_map_cook_metadata(
             continue;
         }
         let artifact = store.read_cell(node.output_hash).map_err(Error::from)?;
-        let index = VegetationCellArtifactIndex::open(&artifact)?;
+        let index = VegetationCellArtifactIndex::open(
+            &artifact,
+            saffron_vegetation::VEGETATION_ARTIFACT_DECODE_LIMITS,
+        )?;
         let diagnostics = index
             .section(&artifact, VegetationCellSectionKind::RejectionDiagnostics)?
             .ok_or_else(|| {
                 Error::command("vegetation cell has no rejection diagnostics section")
             })?;
-        for (reason, count) in vegetation_rejection_totals(diagnostics)? {
+        for (reason, count) in vegetation_rejection_totals(diagnostics.as_ref())? {
             let total = &mut rejection_totals[rejection_reason_index(reason)];
             *total = total.saturating_add(count);
         }
@@ -904,10 +1061,59 @@ fn current_map_cook_metadata(
             })
             .collect(),
     };
-    Ok(Some((
-        manifest_dependencies_dto(&manifest.dependencies),
-        statistics,
-    )))
+    let dependencies = manifest_dependencies_dto(&manifest.dependencies);
+    Ok(Some((manifest, dependencies, statistics)))
+}
+
+/// Layers whose authored chunks differ from what `manifest` consumed (all layers
+/// carrying authored content when no manifest exists) — a recook would change the
+/// cooked output for these.
+fn dirty_map_layers(
+    map: Uuid,
+    inventory: &[saffron_vegetation::VegetationMapChunkReference],
+    manifest: Option<&VegetationBaseManifest>,
+) -> Vec<VegetationGuid> {
+    let layer_owned = |kind: VegetationMapChunkKind| {
+        matches!(
+            kind,
+            VegetationMapChunkKind::LayerMetadata
+                | VegetationMapChunkKind::Field
+                | VegetationMapChunkKind::AnchorOverride
+        )
+    };
+    let mut dirty = std::collections::BTreeSet::new();
+    let Some(manifest) = manifest else {
+        for reference in inventory {
+            if layer_owned(reference.key.kind) {
+                dirty.insert(reference.key.layer);
+            }
+        }
+        return dirty.into_iter().map(vegetation_guid).collect();
+    };
+    let consumed = manifest
+        .dependencies
+        .iter()
+        .filter_map(|dependency| match &dependency.address {
+            CookDependencyAddress::MapObject {
+                map: dependency_map,
+                key,
+            } if *dependency_map == map => Some((*key, dependency.content_hash)),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for reference in inventory {
+        if layer_owned(reference.key.kind)
+            && consumed.get(&reference.key).map(|hash| hash.bytes()) != Some(reference.content_hash)
+        {
+            dirty.insert(reference.key.layer);
+        }
+    }
+    for key in consumed.keys() {
+        if layer_owned(key.kind) && !inventory.iter().any(|reference| reference.key == *key) {
+            dirty.insert(key.layer);
+        }
+    }
+    dirty.into_iter().map(vegetation_guid).collect()
 }
 
 fn field_blend_dto(operator: FieldBlendOperator) -> FieldBlendOperatorDto {
@@ -1280,7 +1486,7 @@ fn selector_id(selector: &AssetSelector) -> u64 {
 pub(crate) fn resolve_asset(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<Uuid> {
     let by_id = selector_id(selector);
     let name = selector_string(selector);
-    for entry in &ctx.assets.catalog.entries {
+    for entry in &ctx.assets.catalog().entries {
         if entry.id.value() == by_id || entry.name == name {
             return Ok(entry.id);
         }
@@ -1293,7 +1499,7 @@ pub(crate) fn resolve_asset(ctx: &EngineContext<'_>, selector: &AssetSelector) -
 fn resolve_asset_index(ctx: &EngineContext<'_>, selector: &AssetSelector) -> Result<usize> {
     let by_id = selector_id(selector);
     let name = selector_string(selector);
-    for (i, entry) in ctx.assets.catalog.entries.iter().enumerate() {
+    for (i, entry) in ctx.assets.catalog().entries.iter().enumerate() {
         if entry.id.value() == by_id || entry.name == name {
             return Ok(i);
         }
@@ -1323,7 +1529,7 @@ fn preview_asset_placement(
     let asset = resolve_asset(ctx, selector)?;
     let entry = ctx
         .assets
-        .catalog
+        .catalog()
         .find(asset)
         .ok_or_else(|| Error::command(format!("no asset '{}'", asset.value())))?;
     if entry.asset_type != AssetType::Model {
@@ -1970,7 +2176,7 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
     //    baked `.spv`; it never invokes `slangc`). Mirrors the `material-cook` command's loop.
     let material_ids: Vec<Uuid> = ctx
         .assets
-        .catalog
+        .catalog()
         .entries
         .iter()
         .filter(|e| e.asset_type == AssetType::Material)
@@ -2493,8 +2699,466 @@ fn container_clips(
         .collect()
 }
 
+/// Grows one native family's graph and reports what it produced.
+fn plant_growth_dto(
+    family: &saffron_vegetation::PlantFamilyAsset,
+    variation: u32,
+) -> Result<saffron_protocol::BotanicalGrowthDto> {
+    let saffron_vegetation::PlantFamilySource::Native { graph, .. } = &family.source else {
+        return Err(Error::command(
+            "plant family has an imported source, not a botanical graph",
+        ));
+    };
+    let individual = graph
+        .variations
+        .get(variation as usize)
+        .ok_or_else(|| Error::command(format!("plant family declares no variation {variation}")))?;
+    let growth = saffron_vegetation::grow(graph, variation as usize)
+        .map_err(|error| Error::command(error.to_string()))?;
+    let assembly = &growth.assembly;
+    let geometry = saffron_vegetation::normalize_botanical_geometry(
+        saffron_vegetation::native_plant_source_id(family.id),
+        assembly,
+        &std::collections::BTreeMap::new(),
+    )
+    .map_err(|error| Error::command(error.to_string()))?;
+    let structure = saffron_vegetation::derive_family_structure(assembly)
+        .map_err(|error| Error::command(error.to_string()))?;
+    let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+    Ok(saffron_protocol::BotanicalGrowthDto {
+        graph: graph.identity().to_string(),
+        variation,
+        seed: individual.seed.to_string(),
+        age: individual.age.bits(),
+        variations: count(graph.variations.len()),
+        axes: count(assembly.axes.len()),
+        frames: count(assembly.frames.len()),
+        shells: count(assembly.shells.len()),
+        elements: count(assembly.elements.len()),
+        vertices: count(geometry.meshes.iter().map(|mesh| mesh.vertices.len()).sum()),
+        triangles: count(
+            geometry
+                .meshes
+                .iter()
+                .map(|mesh| mesh.indices.len() / 3)
+                .sum(),
+        ),
+        parts: count(structure.parts.len()),
+        spines: count(structure.spines.len()),
+        height_bits: structure.dimensions.height.bits(),
+        grafts: count(assembly.grafts.len()),
+        applied_edits: growth.diagnostics.applied,
+        orphans: growth
+            .diagnostics
+            .orphans
+            .iter()
+            .map(crate::botanical_dto::orphan_dto)
+            .collect(),
+    })
+}
+
 /// Registers plant compiler commands at the vegetation-domain tail of the central table.
+/// Registers the point-interchange commands: one door in from a content-creation tool, one out.
+pub fn register_interchange_commands(reg: &mut CommandRegistry) {
+    reg.register::<saffron_protocol::VegetationImportPointsParams, saffron_protocol::VegetationImportPointsResult>(
+        "vegetation-import-points",
+        "import instanced points from a content-creation tool into an authored map layer",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = resolve_asset(ctx, &params.map)?;
+            let layer = u128::from_str_radix(&params.layer.0, 16)
+                .map_err(|_| Error::command("layer must be 32 hex digits"))?;
+            let expected_generation = params
+                .expected_generation
+                .parse::<u64>()
+                .map_err(|_| Error::command("expectedGeneration is not a u64"))?;
+            let document: saffron_json::Value = saffron_json::parse_json(
+                &std::fs::read_to_string(&params.path)
+                    .map_err(|error| Error::command(error.to_string()))?,
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let families: std::collections::BTreeMap<String, saffron_core::Uuid> = params
+                .prototypes
+                .iter()
+                .map(|prototype| {
+                    (
+                        prototype.name.clone(),
+                        saffron_core::Uuid(prototype.family.0),
+                    )
+                })
+                .collect();
+            let payload = saffron_vegetation::read_houdini_points(&document, &families)
+                .map_err(|error| Error::command(error.to_string()))?;
+            // Bounds come from each family's own dimensions, so every named family has to be a real
+            // plant asset rather than a name the caller invented.
+            let mut dimensions = std::collections::BTreeMap::new();
+            for prototype in &payload.prototypes {
+                let plant = load_plant_family_asset(ctx.assets, prototype.family)
+                    .map_err(|error| Error::command(error.to_string()))?;
+                dimensions.insert(prototype.family.value(), plant.dimensions);
+            }
+            let anchors = saffron_vegetation::interchange_to_anchors(&payload, layer, &dimensions)
+                .map_err(|error| Error::command(error.to_string()))?;
+
+            // One chunk per tile the anchors landed in: an anchor lives in the tile of its own
+            // position, exactly as a brush gesture's anchors do.
+            let mut by_tile: std::collections::BTreeMap<
+                saffron_spatial::WorldCellKey,
+                Vec<saffron_vegetation::ExplicitPlantAnchor>,
+            > = std::collections::BTreeMap::new();
+            for anchor in anchors {
+                by_tile
+                    .entry(anchor.point.owner)
+                    .or_default()
+                    .push(anchor);
+            }
+            let existing = saffron_assets::load_vegetation_map_chunks(
+                ctx.assets,
+                map,
+                &by_tile
+                    .keys()
+                    .map(|tile| saffron_vegetation::VegetationMapChunkKey {
+                        layer,
+                        tile: saffron_vegetation::VegetationMapTileKey::Cell(*tile),
+                        kind: saffron_vegetation::VegetationMapChunkKind::AnchorOverride,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let previous: std::collections::BTreeMap<_, _> = existing
+                .into_iter()
+                .map(|chunk| (chunk.key, chunk))
+                .collect();
+            let total = by_tile.values().map(Vec::len).sum::<usize>();
+            let tiles = by_tile.len();
+            let upserts = by_tile
+                .into_iter()
+                .map(|(tile, explicit_plants)| {
+                    let key = saffron_vegetation::VegetationMapChunkKey {
+                        layer,
+                        tile: saffron_vegetation::VegetationMapTileKey::Cell(tile),
+                        kind: saffron_vegetation::VegetationMapChunkKind::AnchorOverride,
+                    };
+                    // An import replaces the layer's anchors for the tiles it touches and leaves
+                    // every other authored row alone.
+                    let mut anchor_chunk = match previous.get(&key).map(|chunk| &chunk.payload) {
+                        Some(saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(
+                            chunk,
+                        )) => chunk.clone(),
+                        _ => saffron_vegetation::VegetationMapAnchorChunk {
+                            explicit_plants: Vec::new(),
+                            pins: Vec::new(),
+                            transform_overrides: Vec::new(),
+                            state_overrides: Vec::new(),
+                            provenance: saffron_vegetation::ProvenanceTable::default(),
+                        },
+                    };
+                    anchor_chunk.explicit_plants = explicit_plants;
+                    saffron_vegetation::VegetationMapChunk {
+                        version: saffron_vegetation::VEGETATION_MAP_CHUNK_VERSION,
+                        map,
+                        key,
+                        revision: previous
+                            .get(&key)
+                            .map_or(1, |chunk| chunk.revision.saturating_add(1)),
+                        payload: saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(
+                            anchor_chunk,
+                        ),
+                    }
+                })
+                .collect();
+            saffron_assets::commit_vegetation_map_transaction(
+                ctx.assets,
+                map,
+                saffron_assets::VegetationMapTransaction {
+                    expected_generation,
+                    upserts,
+                    removals: Vec::new(),
+                },
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, map)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationImportPointsResult {
+                anchors: u32::try_from(total).unwrap_or(u32::MAX),
+                tiles: u32::try_from(tiles).unwrap_or(u32::MAX),
+                prototypes: u32::try_from(payload.prototypes.len()).unwrap_or(u32::MAX),
+                unsupported: payload.unsupported,
+                generation: root.generation.to_string(),
+            })
+        },
+    );
+    reg.register::<saffron_protocol::VegetationExportPointsParams, saffron_protocol::VegetationExportPointsResult>(
+        "vegetation-export-points",
+        "export one authored layer's anchors for a content-creation round trip",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let map = resolve_asset(ctx, &params.map)?;
+            let layer = u128::from_str_radix(&params.layer.0, 16)
+                .map_err(|_| Error::command("layer must be 32 hex digits"))?;
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, map)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let keys: Vec<_> = root
+                .inventory
+                .iter()
+                .map(|reference| reference.key)
+                .filter(|key| {
+                    key.layer == layer
+                        && key.kind == saffron_vegetation::VegetationMapChunkKind::AnchorOverride
+                })
+                .collect();
+            let chunks = saffron_assets::load_vegetation_map_chunks(ctx.assets, map, &keys)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let mut anchors = Vec::new();
+            for chunk in chunks {
+                if let saffron_vegetation::VegetationMapChunkPayload::AnchorOverride(payload) =
+                    chunk.payload
+                {
+                    anchors.extend(payload.explicit_plants);
+                }
+            }
+            anchors.sort_by_key(|anchor| anchor.id);
+            // The prototype names are the families' catalog names, which is what a content-creation
+            // tool shows an artist.
+            let names = anchors
+                .iter()
+                .filter_map(|anchor| {
+                    ctx.assets
+                        .catalog()
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == anchor.family)
+                        .map(|entry| (anchor.family.value(), entry.name.clone()))
+                })
+                .collect();
+            let payload = saffron_vegetation::anchors_to_interchange(&anchors, &names);
+            let document = saffron_vegetation::write_houdini_points(&payload);
+            std::fs::write(&params.path, saffron_json::dump_json(&document, 2))
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationExportPointsResult {
+                instances: u32::try_from(payload.instances.len()).unwrap_or(u32::MAX),
+                prototypes: u32::try_from(payload.prototypes.len()).unwrap_or(u32::MAX),
+                path: params.path.clone(),
+            })
+        },
+    );
+}
+
 pub fn register_plant_commands(reg: &mut CommandRegistry) {
+    reg.register::<saffron_protocol::PlantCreateParams, saffron_protocol::PlantCreateResult>(
+        "plant-create",
+        "create a native plant family from the starter botanical graph",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            if params.name.trim().is_empty() {
+                return Err(Error::command("plant name must not be empty"));
+            }
+            // A zero seed derives one from the name, so two plants created the same way are two
+            // different individuals rather than the same tree twice.
+            let seed = if params.seed.is_empty() || params.seed == "0" {
+                saffron_vegetation::ContentHash::of(params.name.as_bytes()).bytes()[..16]
+                    .try_into()
+                    .map(u128::from_be_bytes)
+                    .unwrap_or(1)
+            } else {
+                params
+                    .seed
+                    .parse::<u128>()
+                    .map_err(|_| Error::command("seed must be a decimal u128"))?
+            };
+            // Wire UUIDs are catalog identities already; a material that is not in the catalog is
+            // a caller mistake rather than something to invent a slot for.
+            let materials = params
+                .materials
+                .iter()
+                .map(|material| {
+                    let id = saffron_core::Uuid(material.0);
+                    ctx.assets
+                        .catalog()
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == id)
+                        .then_some(id)
+                        .ok_or_else(|| {
+                            Error::command(format!("no material asset '{}'", material.0))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let graph = saffron_vegetation::BotanicalGraphDocument::sapling(seed);
+            let family = saffron_vegetation::native_plant_family(
+                saffron_core::Uuid::new(),
+                params.name.trim(),
+                graph,
+                materials,
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let growth = plant_growth_dto(&family, 0)?;
+            let folder = if params.folder.trim().is_empty() {
+                "plants"
+            } else {
+                params.folder.trim()
+            };
+            let plant = saffron_assets::save_plant_family_asset(
+                ctx.assets,
+                family,
+                params.name.trim(),
+                folder,
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::PlantCreateResult {
+                plant: WireUuid(plant.value()),
+                growth,
+            })
+        },
+    );
+    reg.register::<saffron_protocol::PlantGrowthParams, saffron_protocol::PlantGraphResult>(
+        "plant-graph",
+        "read one native plant family's botanical graph and what it grows",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let saffron_vegetation::PlantFamilySource::Native { graph, grafts } = &plant.source
+            else {
+                return Err(Error::command(
+                    "plant family has an imported source, not a botanical graph",
+                ));
+            };
+            Ok(saffron_protocol::PlantGraphResult {
+                plant: WireUuid(id.value()),
+                graph: crate::botanical_dto::graph_dto(graph),
+                grafts: grafts
+                    .iter()
+                    .map(crate::botanical_dto::graft_source_dto)
+                    .collect(),
+                growth: plant_growth_dto(&plant, params.variation)?,
+            })
+        },
+    );
+    reg.register::<saffron_protocol::PlantGraphSetParams, saffron_protocol::PlantGraphResult>(
+        "plant-graph-set",
+        "replace one native plant family's botanical graph and regrow it",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let existing = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            if !matches!(
+                existing.source,
+                saffron_vegetation::PlantFamilySource::Native { .. }
+            ) {
+                return Err(Error::command(
+                    "plant family has an imported source, not a botanical graph",
+                ));
+            }
+            let graph = crate::botanical_dto::graph_from_dto(&params.graph)?;
+            // A graft source keeps whatever content hash the last cook observed; a newly declared
+            // one starts empty and the next cook records what it read.
+            let previous: std::collections::BTreeMap<u128, [u8; 32]> = match &existing.source {
+                saffron_vegetation::PlantFamilySource::Native { grafts, .. } => grafts
+                    .iter()
+                    .map(|graft| (graft.id, graft.content_hash))
+                    .collect(),
+                saffron_vegetation::PlantFamilySource::Imported(_) => Default::default(),
+            };
+            let mut grafts = params
+                .grafts
+                .iter()
+                .map(|graft| {
+                    let mut resolved = crate::botanical_dto::graft_source_from_dto(graft)?;
+                    if let Some(hash) = previous.get(&resolved.id) {
+                        resolved.content_hash = *hash;
+                    }
+                    Ok(resolved)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            grafts.sort_by_key(|graft| graft.id);
+            // The family's parts, spines, and dimensions are what the new graph grows, never the
+            // previous graph's leftovers: a native family's structure is a result.
+            let mut updated = saffron_vegetation::native_plant_family(
+                id,
+                &existing.name,
+                graph,
+                existing.material_slots.clone(),
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            if let saffron_vegetation::PlantFamilySource::Native {
+                grafts: declared, ..
+            } = &mut updated.source
+            {
+                *declared = grafts;
+            }
+            // Everything the artist authored around the graph survives the regrow. What the graph
+            // derives — variations, appearances, proxies, dimensions, spines — is the NEW graph's,
+            // never the previous one's leftovers.
+            updated.tags = existing.tags.clone();
+            updated.mechanics = existing.mechanics;
+            updated.interaction_policy = existing.interaction_policy;
+            updated.habitat = existing.habitat.clone();
+            updated.ecology = existing.ecology.clone();
+            saffron_vegetation::validate_plant_family(&updated)
+                .map_err(|error| Error::command(error.to_string()))?;
+            saffron_assets::update_plant_family_asset(ctx.assets, id, &updated)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let saffron_vegetation::PlantFamilySource::Native { graph, grafts } = &updated.source
+            else {
+                return Err(Error::command("regrown family lost its botanical graph"));
+            };
+            Ok(saffron_protocol::PlantGraphResult {
+                plant: WireUuid(id.value()),
+                graph: crate::botanical_dto::graph_dto(graph),
+                grafts: grafts
+                    .iter()
+                    .map(crate::botanical_dto::graft_source_dto)
+                    .collect(),
+                growth: plant_growth_dto(&updated, 0)?,
+            })
+        },
+    );
+    reg.register::<saffron_protocol::PlantGrowthParams, saffron_protocol::PlantElementsResult>(
+        "plant-elements",
+        "every element of one native plant family a manual edit can address",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let saffron_vegetation::PlantFamilySource::Native { graph, .. } = &plant.source else {
+                return Err(Error::command(
+                    "plant family has an imported source, not a botanical graph",
+                ));
+            };
+            let growth = saffron_vegetation::grow(graph, params.variation as usize)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::PlantElementsResult {
+                plant: WireUuid(id.value()),
+                axes: growth
+                    .assembly
+                    .axes
+                    .iter()
+                    .map(crate::botanical_dto::axis_dto)
+                    .collect(),
+                elements: growth
+                    .assembly
+                    .elements
+                    .iter()
+                    .map(crate::botanical_dto::placement_dto)
+                    .collect(),
+            })
+        },
+    );
+    reg.register::<saffron_protocol::PlantGrowthParams, saffron_protocol::BotanicalGrowthDto>(
+        "plant-growth",
+        "what one plant family's botanical graph grows",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            plant_growth_dto(&plant, params.variation)
+        },
+    );
     reg.register::<PlantValidateParams, PlantValidationResult>(
         "plant-validate",
         "validate one authored plant family and inspect its exact sources",
@@ -2721,13 +3385,13 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 .import_model(&params.path, saffron_assets::ImportOptions::default())
                 .map_err(|e| Error::command(e.to_string()))?;
             if let Some(attribution) = params.attribution {
-                ctx.assets
-                    .catalog
-                    .set_attribution(bake.model_id, attribution_from_dto(attribution));
+                let _ = ctx
+                    .assets
+                    .set_asset_attribution(bake.model_id, attribution_from_dto(attribution));
             }
             let name = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(bake.model_id)
                 .map(|entry| entry.name.clone())
                 .unwrap_or_default();
@@ -2745,10 +3409,10 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, params| {
             require_project_loaded(ctx)?;
             let id = resolve_asset(ctx, &params.asset)?;
-            let entry_type = ctx.assets.catalog.find(id).map(|e| e.asset_type);
+            let entry_type = ctx.assets.catalog().find(id).map(|e| e.asset_type);
             let entry_name = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .map(|e| e.name.clone())
                 .unwrap_or_default();
@@ -2854,7 +3518,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             }
             require_project_loaded(ctx)?;
             let folder = params.folder.unwrap_or_default();
-            if !folder.is_empty() && !has_folder(&ctx.assets.catalog, &folder) {
+            if !folder.is_empty() && !has_folder(ctx.assets.catalog(), &folder) {
                 return Err(Error::command(format!("no asset folder '{folder}'")));
             }
             let imported = import_vegetation_asset(ctx.assets, &params.path, &folder)
@@ -2871,7 +3535,146 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
     reg.register::<EmptyParams, AssetList>(
         "list-assets",
         "list the project asset catalog",
-        |ctx, _params| Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog)),
+        |ctx, _params| Ok(asset_list_dto(&ctx.assets.root, ctx.assets.catalog())),
+    );
+
+    reg.register::<saffron_protocol::VegetationMapLayerCommitParams, saffron_protocol::VegetationMapLayerCommitResult>(
+        "vegetation-map-layer-commit",
+        "commit one optimistic authored-map layer transaction (upserts + removals)",
+        |ctx, params| {
+            let id = resolve_asset(ctx, &params.map)?;
+            let expected_generation = params
+                .expected_generation
+                .parse::<u64>()
+                .map_err(|_| Error::command("expectedGeneration is not a u64"))?;
+            let upserts = params
+                .upserts
+                .iter()
+                .map(|layer| {
+                    let layer = crate::vegetation_layer_dto::layer_from_dto(layer)?;
+                    Ok(saffron_vegetation::VegetationMapChunk {
+                        version: saffron_vegetation::VEGETATION_MAP_CHUNK_VERSION,
+                        map: id,
+                        key: saffron_vegetation::VegetationMapChunkKey {
+                            layer: layer.id,
+                            tile: saffron_vegetation::VegetationMapTileKey::Global,
+                            kind: saffron_vegetation::VegetationMapChunkKind::LayerMetadata,
+                        },
+                        revision: layer.revision,
+                        payload: saffron_vegetation::VegetationMapChunkPayload::LayerMetadata(
+                            layer,
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let removals = params
+                .removals
+                .iter()
+                .map(|guid| {
+                    Ok(saffron_vegetation::VegetationMapChunkKey {
+                        layer: u128::from_str_radix(&guid.0, 16)
+                            .map_err(|_| Error::command("vegetation GUID is not canonical"))?,
+                        tile: saffron_vegetation::VegetationMapTileKey::Global,
+                        kind: saffron_vegetation::VegetationMapChunkKind::LayerMetadata,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            saffron_assets::commit_vegetation_map_transaction(
+                ctx.assets,
+                id,
+                saffron_assets::VegetationMapTransaction {
+                    expected_generation,
+                    upserts,
+                    removals,
+                },
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationMapLayerCommitResult {
+                generation: root.generation.to_string(),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::VegetationMapChunkCommitParams, saffron_protocol::VegetationMapChunkCommitResult>(
+        "vegetation-map-chunk-commit",
+        "commit one optimistic authored-map chunk transaction (a brush gesture's tiles + anchors)",
+        |ctx, params| {
+            let id = resolve_asset(ctx, &params.map)?;
+            let expected_generation = params
+                .expected_generation
+                .parse::<u64>()
+                .map_err(|_| Error::command("expectedGeneration is not a u64"))?;
+            let upserts = params
+                .upserts
+                .iter()
+                .map(|chunk| {
+                    Ok(saffron_vegetation::VegetationMapChunk {
+                        version: saffron_vegetation::VEGETATION_MAP_CHUNK_VERSION,
+                        map: id,
+                        key: crate::vegetation_layer_dto::chunk_key_from_dto(&chunk.key)?,
+                        revision: chunk
+                            .revision
+                            .parse::<u64>()
+                            .map_err(|_| Error::command("chunk revision is not a u64"))?,
+                        payload: {
+                            let key =
+                                crate::vegetation_layer_dto::chunk_key_from_dto(&chunk.key)?;
+                            crate::vegetation_layer_dto::chunk_payload_from_dto(
+                                id,
+                                key.layer,
+                                &chunk.payload,
+                            )?
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let removals = params
+                .removals
+                .iter()
+                .map(crate::vegetation_layer_dto::chunk_key_from_dto)
+                .collect::<Result<Vec<_>>>()?;
+            saffron_assets::commit_vegetation_map_transaction(
+                ctx.assets,
+                id,
+                saffron_assets::VegetationMapTransaction {
+                    expected_generation,
+                    upserts,
+                    removals,
+                },
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationMapChunkCommitResult {
+                generation: root.generation.to_string(),
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::VegetationMapChunkReadParams, saffron_protocol::VegetationMapChunkReadResult>(
+        "vegetation-map-chunk-read",
+        "read authored map chunks by logical key (a brush gesture's read-modify-write baseline)",
+        |ctx, params| {
+            let id = resolve_asset(ctx, &params.map)?;
+            let keys = params
+                .keys
+                .iter()
+                .map(crate::vegetation_layer_dto::chunk_key_from_dto)
+                .collect::<Result<Vec<_>>>()?;
+            let root = saffron_assets::load_vegetation_map_root(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let chunks = saffron_assets::load_vegetation_map_chunks(ctx.assets, id, &keys)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationMapChunkReadResult {
+                generation: root.generation.to_string(),
+                chunks: chunks
+                    .iter()
+                    .map(vegetation_map_chunk_dto)
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        },
     );
 
     reg.register::<VegetationAssetSummaryParams, VegetationAssetSummaryResult>(
@@ -2881,7 +3684,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let id = resolve_asset(ctx, &params.asset)?;
             let entry = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?
                 .clone();
@@ -2891,7 +3694,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                         .map_err(|error| Error::command(error.to_string()))?;
                     let source = match &plant.source {
                         PlantFamilySource::Imported(_) => PlantSourceKindDto::Imported,
-                        PlantFamilySource::Native(_) => PlantSourceKindDto::Native,
+                        PlantFamilySource::Native { .. } => PlantSourceKindDto::Native,
                     };
                     let validation = validate_plant_family_sources(
                         ctx.assets,
@@ -2905,7 +3708,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                             .iter()
                             .map(|source| source_provenance_dto(&source.provenance))
                             .collect(),
-                        PlantFamilySource::Native(_) => Vec::new(),
+                        PlantFamilySource::Native { .. } => Vec::new(),
                     };
                     (
                         VegetationAssetSummaryDto::Plant(PlantAssetSummaryDto {
@@ -2938,6 +3741,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                             id: WireUuid(id.value()),
                             name: biome.name,
                             version: biome.version,
+                            graph: biome.graph.clone(),
                             role: match biome.role {
                                 BiomeRole::Root => BiomeRoleDto::Root,
                                 BiomeRole::Module => BiomeRoleDto::Module,
@@ -2967,25 +3771,33 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                         .map_err(|error| Error::command(error.to_string()))?;
                     let (validation, authored_dependencies) =
                         map_authored_metadata(ctx.assets, &map);
-                    let (dependencies, latest_cook) =
+                    let (manifest, dependencies, latest_cook) =
                         match current_map_cook_metadata(ctx.assets, id)? {
-                            Some((dependencies, statistics)) => (dependencies, Some(statistics)),
-                            None => (authored_dependencies, None),
+                            Some((manifest, dependencies, statistics)) => {
+                                (Some(manifest), dependencies, Some(statistics))
+                            }
+                            None => (None, authored_dependencies, None),
                         };
+                    let dirty_layers = dirty_map_layers(id, &map.root.inventory, manifest.as_ref());
                     let layers = map.layers.iter().map(vegetation_layer_dto).collect();
                     (
                         VegetationAssetSummaryDto::VegetationMap(VegetationMapSummaryDto {
                             id: WireUuid(id.value()),
                             name: map.name.clone(),
                             version: map.version,
+                            generation: map.generation.to_string(),
                             bounds: world_bounds_dto(map.bounds),
                             layer_count: u32::try_from(map.layers.len()).unwrap_or(u32::MAX),
                             biome_instances: map
                                 .biome_instances
                                 .iter()
-                                .map(|instance| WireUuid(instance.biome.value()))
+                                .map(|instance| saffron_protocol::VegetationBiomeInstanceRefDto {
+                                    instance: vegetation_guid(instance.id),
+                                    biome: WireUuid(instance.biome.value()),
+                                })
                                 .collect(),
                             chunk_level: map.chunk_layout.level,
+                            dirty_layers,
                             validation,
                             provenance: Vec::new(),
                             dependencies,
@@ -3036,7 +3848,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     .map_err(|e| Error::command(e.to_string()))?;
             let name = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(extracted)
                 .map(|e| e.name.clone())
                 .unwrap_or_default();
@@ -3059,7 +3871,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 .map_err(|e| Error::command(e.to_string()))?;
             let name = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(sub_id)
                 .map(|e| e.name.clone())
                 .unwrap_or_default();
@@ -3097,7 +3909,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, params| {
             require_project_loaded(ctx)?;
             let id = resolve_asset(ctx, &params.asset)?;
-            if ctx.assets.catalog.find(id).map(|e| e.asset_type) != Some(AssetType::Model) {
+            if ctx.assets.catalog().find(id).map(|e| e.asset_type) != Some(AssetType::Model) {
                 return Err(Error::command(format!(
                     "asset {} is not a model",
                     id.value()
@@ -3105,7 +3917,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             }
             let path = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .map(|e| e.path.clone())
                 .unwrap_or_default();
@@ -3185,7 +3997,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let id = resolve_asset(ctx, &params.asset)?;
             let entry = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?;
             let container_id = if entry.asset_type == AssetType::Model {
@@ -3358,17 +4170,18 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 return Err(Error::command("usage: rename-asset {id|name} {newName}"));
             }
             let by_id = selector.parse::<u64>().unwrap_or(0);
-            let mut renamed = None;
-            for entry in &mut ctx.assets.catalog.entries {
-                if entry.id.value() == by_id || entry.name == selector {
-                    entry.name = params.name.clone();
-                    renamed = Some(entry.id);
-                    break;
-                }
-            }
-            let Some(id) = renamed else {
+            let Some(id) = ctx
+                .assets
+                .catalog()
+                .entries
+                .iter()
+                .find(|entry| entry.id.value() == by_id || entry.name == selector)
+                .map(|entry| entry.id)
+            else {
                 return Err(Error::command(format!("no asset '{selector}'")));
             };
+            let renamed = ctx.assets.rename_asset(id, params.name.clone());
+            debug_assert!(renamed, "selected asset remains catalogued");
             // Persist the new name to the durable sidecar so it survives a cold scan without a save.
             if let Err(err) = ctx.assets.write_asset_sidecar(id) {
                 tracing::warn!(
@@ -3377,7 +4190,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 );
             }
             Ok(asset_ref(
-                ctx.assets.catalog.find(id).expect("just renamed"),
+                ctx.assets.catalog().find(id).expect("just renamed"),
             ))
         },
     );
@@ -3391,11 +4204,11 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     "folder must be a non-empty path without empty segments",
                 ));
             }
-            if !has_folder(&ctx.assets.catalog, &params.folder) {
-                ctx.assets.catalog.folders.push(params.folder.clone());
+            if !has_folder(ctx.assets.catalog(), &params.folder) {
+                ctx.assets.add_catalog_folder(params.folder.clone());
                 ctx.scene_edit.scene_version += 1;
             }
-            Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
+            Ok(asset_list_dto(&ctx.assets.root, ctx.assets.catalog()))
         },
     );
 
@@ -3408,42 +4221,60 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     "folder path must be non-empty and cannot contain empty segments",
                 ));
             }
-            if !has_folder(&ctx.assets.catalog, &params.folder) {
+            if !has_folder(ctx.assets.catalog(), &params.folder) {
                 return Err(Error::command(format!(
                     "no asset folder '{}'",
                     params.folder
                 )));
             }
             if params.folder == params.name {
-                return Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog));
+                return Ok(asset_list_dto(&ctx.assets.root, ctx.assets.catalog()));
             }
             if is_folder_descendant(&params.name, &params.folder) {
                 return Err(Error::command("asset folder cannot be moved inside itself"));
             }
-            if has_folder(&ctx.assets.catalog, &params.name) {
+            if has_folder(ctx.assets.catalog(), &params.name) {
                 return Err(Error::command(format!(
                     "asset folder '{}' already exists",
                     params.name
                 )));
             }
-            for folder in &mut ctx.assets.catalog.folders {
-                if *folder == params.folder || is_folder_descendant(folder, &params.folder) {
-                    *folder = replace_folder_prefix(folder, &params.folder, &params.name);
-                }
-            }
-            let mut touched = Vec::new();
-            for entry in &mut ctx.assets.catalog.entries {
-                if entry.folder == params.folder
-                    || is_folder_descendant(&entry.folder, &params.folder)
-                {
-                    entry.folder =
-                        replace_folder_prefix(&entry.folder, &params.folder, &params.name);
-                    touched.push(entry.id);
-                }
+            let folders = ctx
+                .assets
+                .catalog_folders()
+                .iter()
+                .map(|folder| {
+                    if *folder == params.folder || is_folder_descendant(folder, &params.folder) {
+                        replace_folder_prefix(folder, &params.folder, &params.name)
+                    } else {
+                        folder.clone()
+                    }
+                })
+                .collect();
+            ctx.assets.replace_catalog_folders(folders);
+            let touched = ctx
+                .assets
+                .catalog()
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.folder == params.folder
+                        || is_folder_descendant(&entry.folder, &params.folder)
+                })
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>();
+            for id in &touched {
+                let folder = ctx
+                    .assets
+                    .catalog()
+                    .find(*id)
+                    .map(|entry| replace_folder_prefix(&entry.folder, &params.folder, &params.name))
+                    .expect("collected asset remains catalogued");
+                let _ = ctx.assets.move_asset_to_folder(*id, folder);
             }
             ctx.scene_edit.scene_version += 1;
             write_asset_sidecars(ctx.assets, &touched, "rename-asset-folder");
-            Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
+            Ok(asset_list_dto(&ctx.assets.root, ctx.assets.catalog()))
         },
     );
 
@@ -3452,8 +4283,8 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "delete-asset-folder {folder}",
         |ctx, params| {
             let mut removed = false;
-            let mut folders = Vec::with_capacity(ctx.assets.catalog.folders.len());
-            for folder in &ctx.assets.catalog.folders {
+            let mut folders = Vec::with_capacity(ctx.assets.catalog().folders.len());
+            for folder in &ctx.assets.catalog().folders {
                 if *folder == params.folder || is_folder_descendant(folder, &params.folder) {
                     removed = true;
                 } else {
@@ -3466,19 +4297,24 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     params.folder
                 )));
             }
-            ctx.assets.catalog.folders = folders;
-            let mut touched = Vec::new();
-            for entry in &mut ctx.assets.catalog.entries {
-                if entry.folder == params.folder
-                    || is_folder_descendant(&entry.folder, &params.folder)
-                {
-                    entry.folder.clear();
-                    touched.push(entry.id);
-                }
+            ctx.assets.replace_catalog_folders(folders);
+            let touched = ctx
+                .assets
+                .catalog()
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.folder == params.folder
+                        || is_folder_descendant(&entry.folder, &params.folder)
+                })
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>();
+            for id in &touched {
+                let _ = ctx.assets.move_asset_to_folder(*id, String::new());
             }
             ctx.scene_edit.scene_version += 1;
             write_asset_sidecars(ctx.assets, &touched, "delete-asset-folder");
-            Ok(asset_list_dto(&ctx.assets.root, &ctx.assets.catalog))
+            Ok(asset_list_dto(&ctx.assets.root, ctx.assets.catalog()))
         },
     );
 
@@ -3488,11 +4324,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, params| {
             let index = resolve_asset_index(ctx, &params.asset)?;
             let folder = params.folder.clone().unwrap_or_default();
-            if !folder.is_empty() && !has_folder(&ctx.assets.catalog, &folder) {
+            if !folder.is_empty() && !has_folder(ctx.assets.catalog(), &folder) {
                 return Err(Error::command(format!("no asset folder '{folder}'")));
             }
-            ctx.assets.catalog.entries[index].folder = folder;
-            let id = ctx.assets.catalog.entries[index].id;
+            let id = ctx.assets.catalog().entries[index].id;
+            let moved = ctx.assets.move_asset_to_folder(id, folder);
+            debug_assert!(moved, "selected asset remains catalogued");
             ctx.scene_edit.scene_version += 1;
             if let Err(err) = ctx.assets.write_asset_sidecar(id) {
                 tracing::warn!(
@@ -3500,7 +4337,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     id.value()
                 );
             }
-            Ok(asset_ref(&ctx.assets.catalog.entries[index]))
+            Ok(asset_ref(
+                ctx.assets.catalog().find(id).expect("just moved"),
+            ))
         },
     );
 
@@ -3521,7 +4360,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let id = resolve_asset(ctx, &params.asset)?;
             let entry = ctx
                 .assets
-                .catalog
+                .catalog()
                 .find(id)
                 .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?
                 .clone();
@@ -3561,15 +4400,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 return Err(Error::command("exit the asset preview first"));
             }
             let index = resolve_asset_index(ctx, &params.asset)?;
-            let entry = ctx.assets.catalog.entries[index].clone();
+            let entry = ctx.assets.catalog().entries[index].clone();
             saffron_assets::remove_vegetation_map_package(ctx.assets, &entry)
                 .map_err(|error| Error::command(error.to_string()))?;
             let cleared = clear_asset_usages(&mut ctx.scene_edit.scene, entry.id);
-            ctx.assets.catalog.remove(entry.id);
-            ctx.assets.mesh_by_uuid.remove(&entry.id.value());
-            ctx.assets.texture_by_uuid.remove(&entry.id.value());
-            // The deleted row (and any instance that referenced it as a parent) is now stale.
-            ctx.assets.invalidate_material_caches();
+            let removed = ctx.assets.delete_asset_entry(entry.id);
+            debug_assert!(removed.is_some(), "selected asset remains catalogued");
             let file_deleted = if entry.path.is_empty() {
                 false
             } else {
@@ -3615,7 +4451,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                 let id = resolve_asset(ctx, &params.asset)?;
                 let name = ctx
                     .assets
-                    .catalog
+                    .catalog()
                     .find(id)
                     .map(|e| e.name.clone())
                     .unwrap_or_default();
@@ -3728,9 +4564,9 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             let imported = import_material_folder(&mut *ctx.assets, &params.path, &params.name)
                 .map_err(|e| Error::command(e.to_string()))?;
             if let Some(attribution) = params.attribution {
-                ctx.assets
-                    .catalog
-                    .set_attribution(imported.material, attribution_from_dto(attribution));
+                let _ = ctx
+                    .assets
+                    .set_asset_attribution(imported.material, attribution_from_dto(attribution));
             }
             ctx.scene_edit.scene_version += 1;
             Ok(MaterialImportResultDto {
@@ -3746,7 +4582,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, _params| {
             let materials = ctx
                 .assets
-                .catalog
+                .catalog()
                 .entries
                 .iter()
                 .filter(|e| e.asset_type == AssetType::Material)
@@ -3988,6 +4824,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
             ctx.assets
                 .compile_material_graph(&raw.graph, id)
                 .map_err(|e| Error::command(e.to_string()))?;
+            let _ = ctx.assets.asset_edited(id);
             Ok(MaterialCompileResult {
                 id: WireUuid(id.value()),
                 ok: true,
@@ -4001,7 +4838,7 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         |ctx, _params| {
             let material_ids: Vec<Uuid> = ctx
                 .assets
-                .catalog
+                .catalog()
                 .entries
                 .iter()
                 .filter(|e| e.asset_type == AssetType::Material)
@@ -4025,13 +4862,12 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
                     .compile_material_mesh_shader(&raw.graph, id)
                     .is_ok()
                 {
+                    let _ = ctx.assets.asset_edited(id);
                     compiled += 1;
                 } else {
                     failed += 1;
                 }
             }
-            // The recompiled `_mesh.spv` artifacts change what `codegen_shader_for` resolves.
-            ctx.assets.invalidate_material_caches();
             Ok(MaterialCookResult { compiled, failed })
         },
     );
@@ -4079,6 +4915,10 @@ pub fn register_asset_commands(reg: &mut CommandRegistry) {
         "save-project",
         "save-project {path} — assets catalog + scene in one file",
         |ctx, params| {
+            // The save barrier: every promoted plant's live transform and velocity reduces
+            // through the vegetation reducer first, so the saved state is complete without
+            // waiting for a falling object to settle.
+            crate::commands_vegetation_runtime::flush_promoted_state(ctx)?;
             let mut path = params.path.clone().unwrap_or_default();
             let mut project = current_project_info(ctx);
             if path.is_empty() {
@@ -4329,7 +5169,7 @@ fn enter_asset_preview(
     let id = resolve_asset(ctx, &params.asset)?;
     let entry = ctx
         .assets
-        .catalog
+        .catalog()
         .find(id)
         .ok_or_else(|| Error::command(format!("no asset '{}'", id.value())))?;
     let entry_type = entry.asset_type;
@@ -4347,6 +5187,10 @@ fn enter_asset_preview(
     // material-graph editor's live pane drives.
     if entry_type == AssetType::Material {
         return enter_material_preview(ctx, id);
+    }
+    // A plant family previews as its compiled renderable form on the studio floor.
+    if entry_type == AssetType::Plant {
+        return enter_plant_preview(ctx, id);
     }
     let container_id = if entry_type == AssetType::Model {
         id
@@ -4466,6 +5310,7 @@ fn enter_asset_preview(
             bones,
             target: vec3(framing.target),
             distance: framing.distance,
+            plant_combinations: Vec::new(),
         },
     ))
 }
@@ -4502,6 +5347,81 @@ fn enter_builtin_preview(
         builtin.reserved_id(),
         PreviewEnv::Procedural,
     ))
+}
+
+/// Compiles a plant family through its retained recipe (content-addressed — an
+/// unchanged family republishes the identical artifact), registers its renderable
+/// form under the family id, and spawns the floor-standing entity carrying the
+/// family mesh with the family's material slots. Shared by the interactive plant
+/// preview and the thumbnail subject build.
+fn plant_preview_root(
+    assets: &mut AssetServer,
+    gpu: &dyn saffron_assets::GpuUploader,
+    scene: &mut Scene,
+    family: Uuid,
+) -> Result<(Entity, saffron_assets::PlantFamilyRender)> {
+    let plant = load_plant_family_asset(assets, family)
+        .map_err(|error| Error::command(error.to_string()))?;
+    let name = plant.name.clone();
+    let options = PlantRecookOptions {
+        limits: PlantCompileLimits::default(),
+        versions: vegetation_cook_versions(),
+        platform: portable_vegetation_platform_profile(None),
+    };
+    let published = match recook_plant_family(assets, &plant, &options).map_err(Error::from)? {
+        PlantRecookOutcome::Published(published) => published,
+        PlantRecookOutcome::Rejected(_) => {
+            return Err(Error::command(
+                "plant family does not validate — run plant-validate for diagnostics",
+            ));
+        }
+    };
+    let render = assets
+        .load_plant_family(gpu, family, published.publication.content_hash)
+        .ok_or_else(|| Error::command("plant family artifact did not load a renderable form"))?;
+    let root = scene.create_entity(&name);
+    let _ = scene.add_component(root, Mesh { mesh: family });
+    let _ = scene.add_component(
+        root,
+        MaterialSet {
+            slots: render
+                .materials
+                .iter()
+                .map(|material| MaterialSlot {
+                    material: *material,
+                    ..MaterialSlot::default()
+                })
+                .collect(),
+        },
+    );
+    Ok((root, render))
+}
+
+/// The `enter-asset-preview` branch for a plant family: [`plant_preview_root`] on an
+/// isolated scene, committed with the floor on; the result carries the authored
+/// combination domain the variation/phenotype scrub selects from.
+fn enter_plant_preview(ctx: &mut EngineContext<'_>, id: Uuid) -> Result<AssetPreviewResultWrap> {
+    let mut preview = Scene::new();
+    preview.catalog = ctx.scene_edit.scene.catalog.clone();
+    let assets = &mut *ctx.assets;
+    let mut built = None;
+    ctx.renderer.with_gpu_uploader(&mut |gpu| {
+        built = Some(plant_preview_root(assets, gpu, &mut preview, id));
+    });
+    let (root, render) = built.expect("build ran")?;
+    ctx.scene_edit.preview_show_floor = true;
+    let mut result = commit_preview_subject(ctx, preview, root, id, PreviewEnv::Procedural);
+    result.0.plant_combinations = render
+        .combinations
+        .iter()
+        .map(
+            |(variation, phenotype)| saffron_protocol::PlantCombinationDto {
+                variation: *variation,
+                phenotype: *phenotype,
+            },
+        )
+        .collect();
+    Ok(result)
 }
 
 /// The `enter-asset-preview` branch for a standalone texture: shade a preview sphere with an
@@ -4552,6 +5472,7 @@ fn enter_texture_preview(
             bones: Vec::new(),
             target: vec3(framing.target),
             distance: framing.distance,
+            plant_combinations: Vec::new(),
         },
     ))
 }
@@ -4674,6 +5595,7 @@ fn enter_material_preview(
             bones: Vec::new(),
             target: vec3(framing.target),
             distance: framing.distance,
+            plant_combinations: Vec::new(),
         },
     ))
 }
@@ -4808,7 +5730,7 @@ fn build_preview_scene(
     let root = match subject {
         PreviewSubject::Material(mid) => {
             let name = assets
-                .catalog
+                .catalog()
                 .find(mid)
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "Material".to_owned());
@@ -4818,12 +5740,9 @@ fn build_preview_scene(
         }
         PreviewSubject::TextureRole { tid, role } => {
             let material = preview_material_for_texture(role, tid);
-            assets.material_by_uuid.insert(
-                ephemeral_material_id.value(),
-                Some(std::sync::Arc::new(material)),
-            );
+            assets.seed_preview_material(ephemeral_material_id, material);
             let name = assets
-                .catalog
+                .catalog()
                 .find(tid)
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "Texture".to_owned());
@@ -4833,7 +5752,7 @@ fn build_preview_scene(
         }
         PreviewSubject::Mesh(mesh_id) => {
             let name = assets
-                .catalog
+                .catalog()
                 .find(mesh_id)
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "Mesh".to_owned());
@@ -4850,7 +5769,7 @@ fn build_preview_scene(
         }
         PreviewSubject::Model(model_id) => {
             let name = assets
-                .catalog
+                .catalog()
                 .find(model_id)
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "Model".to_owned());
@@ -4858,6 +5777,15 @@ fn build_preview_scene(
                 Ok(root) => root,
                 Err(err) => {
                     tracing::warn!("preview: model {model_id:?} failed to instantiate: {err}");
+                    Entity::NULL
+                }
+            }
+        }
+        PreviewSubject::Plant(family) => {
+            match plant_preview_root(assets, gpu, &mut scene, family) {
+                Ok((root, _)) => root,
+                Err(err) => {
+                    tracing::warn!("preview: plant {family:?} failed to build: {err}");
                     Entity::NULL
                 }
             }
@@ -4931,7 +5859,7 @@ fn thumbnail_subject_furnishing(subject: &PreviewSubject) -> (PreviewEnv, f32) {
         PreviewSubject::Material(_) | PreviewSubject::TextureRole { .. } => {
             (PreviewEnv::Procedural, THUMBNAIL_MATERIAL_FRAME_MARGIN)
         }
-        PreviewSubject::Mesh(_) | PreviewSubject::Model(_) => {
+        PreviewSubject::Mesh(_) | PreviewSubject::Model(_) | PreviewSubject::Plant(_) => {
             (PreviewEnv::Procedural, THUMBNAIL_MODEL_FRAME_MARGIN)
         }
         PreviewSubject::Hdri(tid) => (PreviewEnv::Hdri(*tid), THUMBNAIL_CHROME_BALL_FRAME_MARGIN),
@@ -4991,6 +5919,7 @@ fn commit_preview_subject(
         bones: Vec::new(),
         target: vec3(framing.target),
         distance: framing.distance,
+        plant_combinations: Vec::new(),
     })
 }
 
@@ -5059,6 +5988,7 @@ pub enum PreviewSubject {
     Mesh(Uuid),
     Model(Uuid),
     Hdri(Uuid),
+    Plant(Uuid),
 }
 
 /// A furnished, renderable preview scene built by [`build_preview_scene`].
@@ -5309,7 +6239,7 @@ mod tests {
     use saffron_spatial::{DecisionScalar, UnitInterval};
     use saffron_vegetation::{
         BIOME_ASSET_VERSION, BiomeAsset, BiomeGraphPolicy, BiomePaletteEntry, BiomeRole,
-        InteractionPolicy, MechanicalResponse, NativeBotanicalGraph, PLANT_ASSET_VERSION,
+        BotanicalGraphDocument, InteractionPolicy, MechanicalResponse, PLANT_ASSET_VERSION,
         PhenotypeRole, PlantDimensions, PlantFamilyAsset, PlantFamilySource, PlantPart,
         PlantPartSemantic, PlantPhenotype, PlantVariation,
     };
@@ -5341,7 +6271,7 @@ mod tests {
     /// Seeds a mesh catalog row, returning its decimal-string id.
     fn seed_mesh(ctx: &mut EngineContext<'_>, name: &str) -> u64 {
         let id = saffron_core::Uuid::new();
-        ctx.assets.catalog.put(AssetEntry {
+        ctx.assets.register_imported_asset(AssetEntry {
             id,
             name: name.to_owned(),
             asset_type: AssetType::Mesh,
@@ -5363,10 +6293,10 @@ mod tests {
             id: saffron_core::Uuid(9_100),
             name: "Oak".to_owned(),
             tags: Vec::new(),
-            source: PlantFamilySource::Native(NativeBotanicalGraph {
-                schema_hash: [1; 32],
-                graph: serde_json::Value::Object(Default::default()),
-            }),
+            source: PlantFamilySource::Native {
+                graph: BotanicalGraphDocument::sapling(0x5a11),
+                grafts: Vec::new(),
+            },
             parts: vec![PlantPart {
                 id: 12,
                 parent: None,
@@ -5396,12 +6326,13 @@ mod tests {
             variations: vec![PlantVariation {
                 id: 0,
                 name: "Default".to_owned(),
-                sources: Vec::new(),
+                sources: vec![saffron_vegetation::native_variation_source_id(0)],
                 active_parts: Vec::new(),
             }],
             phenotypes: vec![PlantPhenotype {
                 id: 0,
                 role: PhenotypeRole::Healthy,
+                season_window: None,
                 variation: 0,
                 material_remap: Vec::new(),
                 active_parts: Vec::new(),
@@ -5410,6 +6341,7 @@ mod tests {
             navigation_proxies: Vec::new(),
             interaction_policy: InteractionPolicy::Structural,
             habitat: None,
+            ecology: saffron_vegetation::PlantEcologyDeclaration::default(),
         };
         save_plant_family_asset(ctx.assets, plant, "Oak", "plants")
             .expect("save plant")
@@ -5544,7 +6476,7 @@ mod tests {
         with_stub(&mut renderer, |ctx| {
             let tex_id = {
                 let id = saffron_core::Uuid::new();
-                ctx.assets.catalog.put(AssetEntry {
+                ctx.assets.register_imported_asset(AssetEntry {
                     id,
                     name: "albedo".to_owned(),
                     asset_type: AssetType::Texture,
@@ -5626,7 +6558,7 @@ mod tests {
             assert_eq!(reply["result"]["name"], json!("new-name"));
             assert_eq!(
                 ctx.assets
-                    .catalog
+                    .catalog()
                     .find(saffron_core::Uuid(id))
                     .unwrap()
                     .name,
@@ -5649,7 +6581,7 @@ mod tests {
             let tex = saffron_core::Uuid::new();
             let rel = format!("textures/{}.png", tex.value());
             std::fs::create_dir_all(ctx.assets.root.join("textures")).unwrap();
-            ctx.assets.catalog.put(AssetEntry {
+            ctx.assets.register_imported_asset(AssetEntry {
                 id: tex,
                 name: "old".to_owned(),
                 asset_type: AssetType::Texture,
@@ -6107,6 +7039,9 @@ mod tests {
             "import-lut",
             "import-vegetation-asset",
             "list-assets",
+            "vegetation-map-layer-commit",
+            "vegetation-map-chunk-commit",
+            "vegetation-map-chunk-read",
             "vegetation-asset-summary",
             "scan-assets",
             "extract-subasset",
@@ -6205,7 +7140,7 @@ mod tests {
         let mut renderer = StubRenderer::default();
         with_stub(&mut renderer, |ctx| {
             let map = saffron_core::Uuid::new();
-            ctx.assets.catalog.put(AssetEntry {
+            ctx.assets.register_imported_asset(AssetEntry {
                 id: map,
                 name: "World vegetation".to_owned(),
                 asset_type: AssetType::VegetationMap,
@@ -6238,7 +7173,7 @@ mod tests {
             );
             assert_eq!(deleted["ok"], json!(true), "delete: {deleted:?}");
             assert_eq!(deleted["result"]["cleared"], usages["result"]["usages"]);
-            assert!(ctx.assets.catalog.find(map).is_none());
+            assert!(ctx.assets.catalog().find(map).is_none());
             assert_eq!(
                 ctx.scene_edit
                     .active_scene()
