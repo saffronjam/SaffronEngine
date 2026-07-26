@@ -2217,9 +2217,12 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
         &layout.resources.join("project.json"),
     )
     .map_err(|e| Error::command(format!("copy project.json: {e}")))?;
-    copy_dir_recursive(
+    // The authored vegetation sources stay behind: a runtime binds a cooked generation from the
+    // artifact store, and the project loader drops a catalog row whose file is absent.
+    copy_dir_filtered(
         &project_root.join("assets"),
         &layout.resources.join("assets"),
+        &|path| !is_authored_vegetation(path),
     )
     .map_err(|e| Error::command(format!("copy assets/: {e}")))?;
     let src = project_root.join("src");
@@ -2244,6 +2247,87 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
             player.display()
         ));
     }
+    // The cooked vegetation closure. The store lives beside `assets/` rather than inside it, so the
+    // asset copy above never carries it — and without it a player binds no manifest and the world
+    // comes up bare.
+    let maps: Vec<saffron_core::Uuid> = ctx
+        .assets
+        .catalog()
+        .entries
+        .iter()
+        .filter(|entry| entry.asset_type == AssetType::VegetationMap)
+        .map(|entry| entry.id)
+        .collect();
+    let declared_maps = maps.len();
+    let store = ctx.assets.vegetation_artifact_store();
+    let closure = saffron_assets::vegetation_export_closure(&store, maps)
+        .map_err(|error| Error::command(format!("vegetation export closure: {error}")))?;
+    let store_root = store.root().to_path_buf();
+    let packaged_root = layout.resources.join("cache").join("vegetation");
+    for file in &closure.files {
+        copy_file(
+            &store_root.join(&file.relative),
+            &packaged_root.join(&file.relative),
+        )
+        .map_err(|error| Error::command(format!("copy {}: {error}", file.relative.display())))?;
+    }
+    for map in &closure.maps {
+        if map.missing > 0 {
+            warnings.push(format!(
+                "vegetation map {} names {} artifact(s) the store does not hold; recook before shipping",
+                map.map.value(),
+                map.missing
+            ));
+        }
+    }
+    // A project with no vegetation map ships no vegetation and that is not a warning; a project that
+    // HAS one and never cooked it is.
+    if declared_maps > 0 && closure.maps.is_empty() {
+        warnings.push(format!(
+            "{declared_maps} vegetation map(s) have no cooked generation; the package ships no vegetation"
+        ));
+    }
+
+    // License attribution: every packaged plant source that says it requires attribution, written
+    // where a shipped build can show it. A licence obligation that lives only in the editor is an
+    // obligation the shipped product breaks.
+    let mut attributions: Vec<String> = Vec::new();
+    for entry in ctx
+        .assets
+        .catalog()
+        .entries
+        .iter()
+        .filter(|entry| entry.asset_type == AssetType::Plant)
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>()
+    {
+        let Ok(plant) = load_plant_family_asset(ctx.assets, entry) else {
+            continue;
+        };
+        let saffron_vegetation::PlantFamilySource::Imported(recipe) = &plant.source else {
+            continue;
+        };
+        for source in &recipe.sources {
+            let provenance = &source.provenance;
+            if !provenance.requires_attribution {
+                continue;
+            }
+            let line = format!(
+                "{} — {} ({}) — {}",
+                plant.name, provenance.attribution, provenance.license_id, provenance.source_uri
+            );
+            if !attributions.contains(&line) {
+                attributions.push(line);
+            }
+        }
+    }
+    attributions.sort();
+    if !attributions.is_empty() {
+        let text = format!("{}\n", attributions.join("\n"));
+        std::fs::write(layout.resources.join("ATTRIBUTION.txt"), text)
+            .map_err(|error| Error::command(format!("write ATTRIBUTION.txt: {error}")))?;
+    }
+
     let app_json = serde_json::to_string_pretty(&params.app)
         .map_err(|e| Error::command(format!("serialize app.json: {e}")))?;
     std::fs::write(layout.resources.join("app.json"), app_json)
@@ -2253,6 +2337,30 @@ fn export_app(ctx: &mut EngineContext<'_>, params: &ExportAppParams) -> Result<E
     Ok(ExportAppResult {
         path: layout.root.to_string_lossy().into_owned(),
         warnings,
+        vegetation: closure
+            .maps
+            .iter()
+            .map(|map| saffron_protocol::ExportVegetationMapDto {
+                map: WireUuid(map.map.value()),
+                manifest_identity: map.manifest_identity.clone(),
+                plants: map.plants.to_string(),
+                cells: map.cells.to_string(),
+                missing: map.missing.to_string(),
+                baseline: map.baseline,
+                macro_plants: map.macro_plants.to_string(),
+                facets: map
+                    .facet_bytes
+                    .iter()
+                    .map(|facet| saffron_protocol::ExportVegetationFacetDto {
+                        facet: format!("{:?}", facet.kind),
+                        cells: facet.cells.to_string(),
+                        bytes: facet.bytes.to_string(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        vegetation_bytes: closure.total_bytes.to_string(),
+        attributions: attributions.len() as u32,
     })
 }
 
@@ -2480,14 +2588,41 @@ fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Recursively copies a directory tree (files + subdirectories) into `dst`.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_dir_filtered(src, dst, &|_| true)
+}
+
+/// Authored vegetation sources a runtime never reads: it binds a cooked generation from the artifact
+/// store and streams the cells that generation names.
+const AUTHORED_VEGETATION: [&str; 3] = ["splant", "sbiome", "svegmap"];
+
+/// Whether one path is an authored vegetation source or its sidecar package.
+///
+/// Excluding these from an exported package is safe because the project loader treats the filesystem
+/// as the source of truth and drops a catalog row whose file is absent, and because vegetation binds
+/// by identity through the artifact store rather than through the catalog.
+fn is_authored_vegetation(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    AUTHORED_VEGETATION.iter().any(|extension| {
+        name.ends_with(&format!(".{extension}")) || name.ends_with(&format!(".{extension}.data"))
+    })
+}
+
+/// Copies a tree, skipping whatever the filter rejects.
+fn copy_dir_filtered(src: &Path, dst: &Path, keep: &dyn Fn(&Path) -> bool) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let from = entry.path();
+        if !keep(&from) {
+            continue;
+        }
         let to = dst.join(entry.file_name());
         if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+            copy_dir_filtered(&from, &to, keep)?;
         } else if file_type.is_file() {
             std::fs::copy(&from, &to)?;
         }
@@ -2772,11 +2907,6 @@ pub fn register_interchange_commands(reg: &mut CommandRegistry) {
                 .expected_generation
                 .parse::<u64>()
                 .map_err(|_| Error::command("expectedGeneration is not a u64"))?;
-            let document: saffron_json::Value = saffron_json::parse_json(
-                &std::fs::read_to_string(&params.path)
-                    .map_err(|error| Error::command(error.to_string()))?,
-            )
-            .map_err(|error| Error::command(error.to_string()))?;
             let families: std::collections::BTreeMap<String, saffron_core::Uuid> = params
                 .prototypes
                 .iter()
@@ -2787,8 +2917,41 @@ pub fn register_interchange_commands(reg: &mut CommandRegistry) {
                     )
                 })
                 .collect();
-            let payload = saffron_vegetation::read_houdini_points(&document, &families)
-                .map_err(|error| Error::command(error.to_string()))?;
+            // The extension picks the reader: a Houdini point cloud and a glTF instancing node say
+            // the same thing in different files, and both land in the one interchange vocabulary.
+            let extension = std::path::Path::new(&params.path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let payload = match extension.as_str() {
+                "geo" | "json" => {
+                    let document: saffron_json::Value = saffron_json::parse_json(
+                        &std::fs::read_to_string(&params.path)
+                            .map_err(|error| Error::command(error.to_string()))?,
+                    )
+                    .map_err(|error| Error::command(error.to_string()))?;
+                    saffron_vegetation::read_houdini_points(&document, &families)
+                        .map_err(|error| Error::command(error.to_string()))?
+                }
+                "usda" | "usd" => {
+                    let text = std::fs::read_to_string(&params.path)
+                        .map_err(|error| Error::command(error.to_string()))?;
+                    saffron_vegetation::read_usd_point_instancers(&text, &families)
+                        .map_err(|error| Error::command(error.to_string()))?
+                }
+                "gltf" | "glb" => {
+                    let instancing = saffron_geometry::read_gltf_instancing(&params.path)
+                        .map_err(|error| Error::command(error.to_string()))?;
+                    saffron_vegetation::gltf_instancing_to_interchange(&instancing, &families)
+                        .map_err(|error| Error::command(error.to_string()))?
+                }
+                other => {
+                    return Err(Error::command(format!(
+                        "no point reader for '{other}'; expected geo, usda, gltf, or glb"
+                    )));
+                }
+            };
             // Bounds come from each family's own dimensions, so every named family has to be a real
             // plant asset rather than a name the caller invented.
             let mut dimensions = std::collections::BTreeMap::new();
@@ -2853,7 +3016,36 @@ pub fn register_interchange_commands(reg: &mut CommandRegistry) {
                             provenance: saffron_vegetation::ProvenanceTable::default(),
                         },
                     };
-                    anchor_chunk.explicit_plants = explicit_plants;
+                    // Every anchor carries a lineage record saying an explicit anchor accepted it,
+                    // the same shape a brush gesture's anchors carry, so the chunk explains where
+                    // each plant came from.
+                    let mut provenance = saffron_vegetation::ProvenanceTable::default();
+                    let mut rows = explicit_plants;
+                    for anchor in &mut rows {
+                        let decision =
+                            provenance.intern_decision(saffron_vegetation::ProvenanceDecision {
+                                parents: Vec::new(),
+                                subgraph_path: Vec::new(),
+                                node: layer,
+                                operator: saffron_vegetation::GraphOperator::ExplicitAnchors,
+                                candidate: anchor.point.candidate,
+                                outcome:
+                                    saffron_vegetation::ProvenanceDecisionOutcome::Accepted,
+                            });
+                        let record = provenance.intern(saffron_vegetation::ProvenanceRecord {
+                            map,
+                            layer,
+                            biome: saffron_core::Uuid(0),
+                            decision,
+                            candidate: anchor.point.candidate,
+                            family: Some(anchor.family),
+                            plant: Some(anchor.id),
+                            variation: anchor.point.variation,
+                        });
+                        anchor.point.provenance = record.0;
+                    }
+                    anchor_chunk.provenance = provenance;
+                    anchor_chunk.explicit_plants = rows;
                     saffron_vegetation::VegetationMapChunk {
                         version: saffron_vegetation::VEGETATION_MAP_CHUNK_VERSION,
                         map,
@@ -2932,8 +3124,24 @@ pub fn register_interchange_commands(reg: &mut CommandRegistry) {
                 })
                 .collect();
             let payload = saffron_vegetation::anchors_to_interchange(&anchors, &names);
-            let document = saffron_vegetation::write_houdini_points(&payload);
-            std::fs::write(&params.path, saffron_json::dump_json(&document, 2))
+            let extension = std::path::Path::new(&params.path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let text = match extension.as_str() {
+                "geo" | "json" => saffron_json::dump_json(
+                    &saffron_vegetation::write_houdini_points(&payload),
+                    2,
+                ),
+                "usda" | "usd" => saffron_vegetation::write_usd_point_instancer(&payload),
+                other => {
+                    return Err(Error::command(format!(
+                        "no point writer for '{other}'; expected geo or usda"
+                    )));
+                }
+            };
+            std::fs::write(&params.path, text)
                 .map_err(|error| Error::command(error.to_string()))?;
             Ok(saffron_protocol::VegetationExportPointsResult {
                 instances: u32::try_from(payload.instances.len()).unwrap_or(u32::MAX),
@@ -6922,6 +7130,44 @@ mod tests {
                     .is_none()
             );
         });
+    }
+
+    /// An exported package carries the cooked artifacts and leaves the authored vegetation sources
+    /// behind: the runtime binds a generation from the artifact store and never reads them.
+    #[test]
+    fn authored_vegetation_sources_are_not_packaged() {
+        for name in [
+            "forest.splant",
+            "meadow.sbiome",
+            "world.svegmap",
+            "world.svegmap.data",
+        ] {
+            assert!(
+                super::is_authored_vegetation(
+                    std::path::Path::new("/project/assets/vegetation")
+                        .join(name)
+                        .as_path()
+                ),
+                "{name} is an authored source"
+            );
+        }
+        // Everything a runtime does read stays.
+        for name in [
+            "bark.smat",
+            "oak.smesh",
+            "oak.smodel",
+            "bark.png",
+            "world.svegmanifest",
+            "cell.svegcell",
+            "oak.splantc",
+        ] {
+            assert!(
+                !super::is_authored_vegetation(
+                    std::path::Path::new("/project/assets").join(name).as_path()
+                ),
+                "{name} is packaged"
+            );
+        }
     }
 
     #[test]

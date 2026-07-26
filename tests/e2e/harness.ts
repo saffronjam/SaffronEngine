@@ -21,7 +21,7 @@ export const ENGINE_BIN =
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-const IS_MACOS = process.platform === "darwin";
+export const IS_MACOS = process.platform === "darwin";
 
 /// A rejected engine command carrying the exact shared control failure.
 export class EngineCallError extends Error {
@@ -37,7 +37,7 @@ export class EngineCallError extends Error {
 /// macOS has no Wayland compositor; the offscreen host needs none. It needs MoltenVK's ICD plus
 /// Homebrew's validation-layer manifest and dynamic-library directory. Applied only when Vulkan
 /// discovery is not already configured, so an explicit override still wins.
-function macosVulkanEnv(): Record<string, string> {
+export function macosVulkanEnv(): Record<string, string> {
   const candidates = [
     "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
     "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",

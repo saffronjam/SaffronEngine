@@ -141,6 +141,55 @@ selectors, provenance, conflicts, diagnostics, normalized counts, source updates
 dependencies. `plant-recook` runs the same preparation and publishes the validated `.splantc`, with
 an optional platform profile.
 
+## Verifying what is on disk
+
+An artifact's file name *is* the hash of its bytes, so verifying the store is a rehash rather than a
+comparison against a side table that could itself rot. `vegetation-verify-artifacts` walks every
+artifact the current generations name and reports each fault as `absent` or `corrupt`.
+
+Repair deletes rather than rewrites. The bytes are the only copy, so there is nothing to rewrite from,
+and the cooker's cache-miss path is already the thing that produces them — removing a corrupt artifact
+is exactly what makes the next cook republish it.
+
+```sh
+sa vegetation-verify-artifacts '{"repair":true}'
+#   checked=41  repaired=1  faults=[{"path":"cells/9f….svegcell","fault":"corrupt"}]
+```
+
+## What an export packages
+
+A player never reads an authored `.splant`, `.sbiome`, or `.svegmap`. It binds a map's current
+generation from the artifact store and streams the cells that generation names, so an exported package
+carries the store's closure: the generation root, its manifest, and every compiled family and cell the
+manifest names.
+
+The closure comes from the manifest, not from a directory scan. A scan would copy every artifact the
+project ever cooked, superseded generations included, which is how a package quietly grows to several
+times the size of the world it ships.
+
+A generation may also ship a starting state. `vegetation-state-baseline` publishes the runtime's
+current persistent state as that generation's baseline, behind the same promoted-plant flush a save
+takes, and the runtime imports it when it binds the generation — so a shipped world boots into what the
+author saw rather than into an untouched one. The baseline is keyed by the manifest it belongs to,
+because a generation has exactly one starting state, and one that does not decode against that
+generation is a hard error rather than a silent skip.
+
+Every packaged plant source whose provenance requires attribution gets a line in the package's
+`ATTRIBUTION.txt`. A licence obligation that lives only in the editor is one the shipped product
+breaks.
+
+`export-app` reports what it packaged, per map: the manifest identity, family and cell counts, macro
+plants, closure bytes, and stored bytes per cell facet. The facet figures come from each cell's table
+of contents rather than by decoding it — a size report that decodes every section costs as much as
+loading the world it reports on. An artifact the manifest names but the store does not hold is a
+warning naming the map and the count, because a package built on a partial cook fails at the player's
+first frame instead of at export.
+
+The authored `.splant`, `.sbiome`, and `.svegmap` files stay behind, along with their sidecar
+packages. That is safe on two counts: the project loader treats the filesystem as the source of truth
+and drops a catalog row whose file is absent, and vegetation binds by identity through the artifact
+store rather than through the catalog.
+
 ## In the code
 
 | What | File | Symbols |
