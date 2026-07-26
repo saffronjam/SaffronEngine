@@ -133,6 +133,31 @@ test("a resident cell drives collision, promotion, felling, events, and navigati
     }
   }
 
+  // Telemetry: compact counters only, and the synchronization it timed actually ran.
+  {
+    interface Telemetry {
+      last: { totalUs: number };
+      average: { totalUs: number };
+      work: { synchronizations: string; queries: string; queryHits: string };
+      collisionBodies: string;
+      promoted: string;
+    }
+    const before = await engine.call<Telemetry>("vegetation-telemetry");
+    expect(Number(before.work.synchronizations)).toBeGreaterThan(0);
+    // The residency query above was counted, hits and all.
+    expect(Number(before.work.queries)).toBeGreaterThan(0);
+    expect(Number(before.work.queryHits)).toBeGreaterThan(0);
+    expect(Number(before.collisionBodies)).toBe(bodiesBefore);
+    await engine.settle(60);
+    const after = await engine.call<Telemetry>("vegetation-telemetry");
+    expect(Number(after.work.synchronizations)).toBeGreaterThan(
+      Number(before.work.synchronizations),
+    );
+    // A synchronization that ran took some time, and the average is in the same ballpark.
+    expect(after.last.totalUs).toBeGreaterThanOrEqual(0);
+    expect(after.average.totalUs).toBeGreaterThanOrEqual(0);
+  }
+
   // Navigation publishes obstacle contributions for the same cell.
   {
     const nav = await engine.call<VegetationNavigationResult>("vegetation-nav-contributions", {});

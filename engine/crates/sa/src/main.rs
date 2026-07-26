@@ -411,6 +411,7 @@ fn format_text(cmd: &str, result: &Value) -> Vec<String> {
         "vegetation-promote" | "vegetation-demote" | "vegetation-fell" => {
             vec![format_promotion(result)]
         }
+        "vegetation-telemetry" => format_vegetation_telemetry(result),
         "plant-elements" => format_plant_elements(result),
         "plant-create" | "plant-graph" | "plant-graph-set" | "plant-growth" => {
             format_plant_growth(result)
@@ -840,6 +841,60 @@ fn format_fit_collider(result: &Value) -> String {
 }
 
 /// A tagged world-hit target's display form: `entity=<uuid>`, `plant=<hex>`, or `unowned`.
+/// The `vegetation-telemetry` lines: the last synchronization's stage times, the running average,
+/// then the work counters and what is resident.
+fn format_vegetation_telemetry(result: &Value) -> Vec<String> {
+    let stages = |value: &Value| {
+        format!(
+            "residency={:.2}ms  promotion={:.2}ms  collision={:.2}ms  nav={:.2}ms  ecology={:.2}ms  total={:.2}ms",
+            field_u64(value, "residencyUs") as f64 / 1000.0,
+            field_u64(value, "promotionUs") as f64 / 1000.0,
+            field_u64(value, "collisionUs") as f64 / 1000.0,
+            field_u64(value, "navigationUs") as f64 / 1000.0,
+            field_u64(value, "ecologyUs") as f64 / 1000.0,
+            field_u64(value, "totalUs") as f64 / 1000.0,
+        )
+    };
+    let null = Value::Null;
+    let work = result.get("work").unwrap_or(&null);
+    vec![
+        format!("  last     {}", stages(result.get("last").unwrap_or(&null))),
+        format!(
+            "  average  {}",
+            stages(result.get("average").unwrap_or(&null))
+        ),
+        format!(
+            "  syncs={}  queries={} (hits {})  mutations={} ({} bytes)  snapshots={} ({} bytes)  ecologyTicks={}",
+            field_str(work, "synchronizations"),
+            field_str(work, "queries"),
+            field_str(work, "queryHits"),
+            field_str(work, "mutations"),
+            field_str(work, "mutationBytes"),
+            field_str(work, "snapshots"),
+            field_str(work, "snapshotBytes"),
+            field_str(work, "ecologyTicks"),
+        ),
+        format!(
+            "  bodies={}  navContributions={}  promoted={}",
+            field_str(result, "collisionBodies"),
+            field_str(result, "navigationContributions"),
+            field_str(result, "promoted"),
+        ),
+        {
+            let queue = result.get("cookQueue").unwrap_or(&Value::Null);
+            format!(
+                "  cook live={}  submitted={}  completed={}  cancelled={}  superseded={}  failed={}",
+                field_str(queue, "live"),
+                field_str(queue, "submitted"),
+                field_str(queue, "completed"),
+                field_str(queue, "cancelled"),
+                field_str(queue, "superseded"),
+                field_str(queue, "failed"),
+            )
+        },
+    ]
+}
+
 /// A Q15.16 bit pattern as metres.
 fn q16(bits: i64) -> f64 {
     bits as f64 / 65_536.0

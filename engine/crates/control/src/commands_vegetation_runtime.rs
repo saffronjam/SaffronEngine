@@ -74,7 +74,125 @@ pub(crate) fn register_runtime_vegetation_commands(reg: &mut CommandRegistry) {
         |ctx, params| {
             require_runtime(ctx)?;
             let season = season_mille(ctx);
-            runtime_query(runtime(ctx)?, ctx.assets, season, params)
+            let result = runtime_query(runtime(ctx)?, ctx.assets, season, params)?;
+            if let Some(telemetry) = ctx.vegetation_telemetry.as_deref_mut() {
+                telemetry.record_query(result.hits.len());
+            }
+            Ok(result)
+        },
+    );
+    reg.register::<saffron_protocol::VegetationVerifyParams, saffron_protocol::VegetationVerifyResult>(
+        "vegetation-verify-artifacts",
+        "rehash every artifact the current generations name, optionally removing corrupt ones",
+        |ctx, params| {
+            let maps: Vec<saffron_core::Uuid> = ctx
+                .assets
+                .catalog()
+                .entries
+                .iter()
+                .filter(|entry| entry.asset_type == saffron_scene::AssetType::VegetationMap)
+                .map(|entry| entry.id)
+                .collect();
+            let store = ctx.assets.vegetation_artifact_store();
+            let report =
+                saffron_assets::verify_vegetation_artifacts(&store, maps, params.repair)
+                    .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationVerifyResult {
+                checked: report.checked.to_string(),
+                repaired: report.repaired.to_string(),
+                faults: report
+                    .faults
+                    .iter()
+                    .map(|fault| saffron_protocol::VegetationArtifactFaultDto {
+                        path: fault.relative.display().to_string(),
+                        fault: fault.fault.name().to_owned(),
+                    })
+                    .collect(),
+            })
+        },
+    );
+    reg.register::<saffron_protocol::EmptyParams, saffron_protocol::VegetationStateBaselineResult>(
+        "vegetation-state-baseline",
+        "publish the current runtime vegetation state as the generation's starting state",
+        |ctx, _| {
+            require_runtime(ctx)?;
+            // The same barrier a save takes: a promoted plant's live transform reduces through the
+            // reducer first, so the baseline is complete without waiting for anything to settle.
+            flush_promoted_state(ctx)?;
+            let world = runtime(ctx)?;
+            let identity = world.manifest_identity();
+            let bytes = world
+                .persistent_state()
+                .canonical_bytes()
+                .map_err(Error::from)?;
+            let cells = world.persistent_state().cells().len();
+            ctx.assets
+                .vegetation_artifact_store()
+                .publish_baseline(identity, &bytes)
+                .map_err(|error| Error::command(error.to_string()))?;
+            Ok(saffron_protocol::VegetationStateBaselineResult {
+                manifest_identity: identity.to_string(),
+                bytes: bytes.len().to_string(),
+                cells: cells.to_string(),
+            })
+        },
+    );
+    reg.register::<saffron_protocol::EmptyParams, saffron_protocol::VegetationTelemetryResult>(
+        "vegetation-telemetry",
+        "compact vegetation runtime telemetry: stage times, work counters, resident bytes",
+        |ctx, _| {
+            require_runtime(ctx)?;
+            let resident_bytes = facet_bytes_dto(
+                runtime(ctx)?
+                    .residency_report()
+                    .map_err(Error::from)?
+                    .resident_bytes,
+            );
+            let collision_bodies = ctx
+                .vegetation_collision
+                .map_or(0, |report| report.resident_bodies);
+            let navigation_contributions = ctx
+                .vegetation_navigation
+                .as_deref()
+                .map_or(0, |seam| seam.report().contributions as u64);
+            let promoted = ctx
+                .vegetation_promotion
+                .as_deref()
+                .map_or(0, |promotion| promotion.report().promoted);
+            let telemetry = ctx
+                .vegetation_telemetry
+                .as_deref()
+                .ok_or_else(|| Error::command("vegetation telemetry is not available"))?;
+            let times = |times: saffron_runtime::VegetationStageTimes| {
+                saffron_protocol::VegetationStageTimesDto {
+                    residency_us: times.residency.as_micros() as u64,
+                    promotion_us: times.promotion.as_micros() as u64,
+                    collision_us: times.collision.as_micros() as u64,
+                    navigation_us: times.navigation.as_micros() as u64,
+                    ecology_us: times.ecology.as_micros() as u64,
+                    total_us: times.total().as_micros() as u64,
+                }
+            };
+            let work = telemetry.work();
+            Ok(saffron_protocol::VegetationTelemetryResult {
+                last: times(telemetry.last()),
+                average: times(telemetry.average()),
+                work: saffron_protocol::VegetationWorkCountersDto {
+                    synchronizations: work.synchronizations.to_string(),
+                    queries: work.queries.to_string(),
+                    query_hits: work.query_hits.to_string(),
+                    mutations: work.mutations.to_string(),
+                    mutation_bytes: work.mutation_bytes.to_string(),
+                    snapshots: work.snapshots.to_string(),
+                    snapshot_bytes: work.snapshot_bytes.to_string(),
+                    ecology_ticks: work.ecology_ticks.to_string(),
+                },
+                resident_bytes,
+                collision_bodies: collision_bodies.to_string(),
+                navigation_contributions: navigation_contributions.to_string(),
+                promoted: promoted.to_string(),
+                cook_queue: cook_queue_dto(ctx),
+            })
         },
     );
     reg.register::<VegetationRuntimePlantParams, VegetationRuntimePlantInspectResult>(
@@ -208,7 +326,13 @@ pub(crate) fn register_runtime_vegetation_commands(reg: &mut CommandRegistry) {
         |ctx, _| {
             require_runtime(ctx)?;
             flush_promoted_state(ctx)?;
-            snapshot_dto(runtime(ctx)?)
+            let snapshot = snapshot_dto(runtime(ctx)?)?;
+            if let Some(telemetry) = ctx.vegetation_telemetry.as_deref_mut() {
+                // The hex payload is two characters a byte; the snapshot's own size is what a
+                // caller budgets against.
+                telemetry.record_snapshot(snapshot.data_hex.len() / 2);
+            }
+            Ok(snapshot)
         },
     );
     reg.register::<saffron_protocol::VegetationMutateParams, saffron_protocol::VegetationMutateResult>(
@@ -224,9 +348,16 @@ pub(crate) fn register_runtime_vegetation_commands(reg: &mut CommandRegistry) {
             let applied = u32::try_from(records.len()).map_err(|_| {
                 Error::command("vegetation mutation batch exceeds u32 records")
             })?;
+            let bytes = records
+                .iter()
+                .filter_map(|record| record.canonical_byte_len().ok())
+                .sum::<usize>();
             runtime_mut(ctx)?
                 .apply_confirmed_mutations(&records)
                 .map_err(Error::from)?;
+            if let Some(telemetry) = ctx.vegetation_telemetry.as_deref_mut() {
+                telemetry.record_mutation(bytes);
+            }
             Ok(saffron_protocol::VegetationMutateResult { applied })
         },
     );
@@ -844,6 +975,22 @@ fn snapshot_dto(world: &VegetationWorld) -> Result<VegetationStateSnapshotDto> {
         bytes: bytes.len().to_string(),
         data_hex: encode_hex(&bytes),
     })
+}
+
+/// The cook queue's counters, read from the manager rather than derived from a job walk.
+fn cook_queue_dto(
+    ctx: &crate::registry::EngineContext<'_>,
+) -> saffron_protocol::VegetationCookQueueDto {
+    let (counters, live) = ctx.vegetation_cook_jobs.counters();
+    saffron_protocol::VegetationCookQueueDto {
+        live: live.to_string(),
+        submitted: counters.submitted.to_string(),
+        completed: counters.completed.to_string(),
+        cancelled: counters.cancelled.to_string(),
+        superseded: counters.superseded.to_string(),
+        failed: counters.failed.to_string(),
+        latency_us: counters.latency_us.to_string(),
+    }
 }
 
 fn facet_bytes_dto(bytes: [u64; saffron_spatial::FACET_COUNT]) -> VegetationRuntimeFacetBytesDto {

@@ -29,4 +29,5 @@ needs editing when a component is added.
 | `plant-promotion` | Transient entity views for macro plants, and state write-back | `runtime/src/vegetation_promotion.rs` · `VegetationPromotion`, `PlantOrigin` |
 | `ecology-catchup` | Fixed ecology ticks, dependency regions, and budgeted catch-up | `vegetation/src/ecology_region.rs` · `advance_region` |
 | `vegetation-navigation` | Obstacle/cost contributions and dirty-region delivery | `runtime/src/vegetation_navigation.rs` · `VegetationNavigationSeam` |
+| `vegetation-telemetry` | Compact stage times and work counters, no per-instance readback | `runtime/src/vegetation_telemetry.rs` · `VegetationTelemetry` |
 | `wind-field` | One deterministic sampled wind field every consumer reads identically | `wind/src/lib.rs` · `WindProfile`, `sample` |
