@@ -22,6 +22,7 @@ export const SCENE_PANEL_IDS = [
   "physics",
   "scriptLogs",
   "vegetation",
+  "ecologyTimeline",
   "material",
   "timeline",
   "hierarchy",
@@ -38,6 +39,7 @@ export const ASSET_EDITOR_PANEL_IDS = [
   "materialEdit",
   "assetStats",
   "vegSummary",
+  "plantGraph",
   "biomeGraph",
 ] as const;
 
@@ -867,6 +869,7 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   physics: "leaf:right",
   scriptLogs: "leaf:assets",
   vegetation: "leaf:right",
+  ecologyTimeline: "leaf:right",
   material: "leaf:right",
   timeline: "leaf:assets",
   hierarchy: "leaf:hierarchy",
@@ -879,6 +882,7 @@ export const DEFAULT_LEAF: Record<DockPanelId, DockNodeId> = {
   materialEdit: "leaf:aeRight",
   assetStats: "leaf:aeLeft",
   vegSummary: "leaf:aeRight",
+  plantGraph: "leaf:skeleton",
   biomeGraph: "leaf:skeleton",
 };
 

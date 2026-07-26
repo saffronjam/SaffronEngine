@@ -529,6 +529,24 @@ export const client = {
   vegetationMutate(records: CommandParamsMap["vegetation-mutate"]["records"]) {
     return call("vegetation-mutate", { records });
   },
+  plantGraph(plant: string) {
+    return call("plant-graph", { plant, variation: 0 });
+  },
+  plantGraphSet(params: CommandParamsMap["plant-graph-set"]) {
+    return call("plant-graph-set", params);
+  },
+  plantElements(plant: string, variation = 0) {
+    return call("plant-elements", { plant, variation });
+  },
+  plantValidate(plant: string) {
+    return call("plant-validate", { plant });
+  },
+  vegetationEcologyStatus() {
+    return call("vegetation-ecology-status");
+  },
+  vegetationAdvanceEcology(params: CommandParamsMap["vegetation-advance-ecology"]) {
+    return call("vegetation-advance-ecology", params);
+  },
   vegetationRuntimeInspect(plant: string) {
     return call("vegetation-runtime-inspect", { plant });
   },

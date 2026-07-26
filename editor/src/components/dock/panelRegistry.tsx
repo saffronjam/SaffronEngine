@@ -25,6 +25,8 @@ import { PhysicsPanel } from "../../panels/PhysicsPanel";
 import { ScriptLogsPanel } from "../../panels/ScriptLogsPanel";
 import { MaterialEditorPanel } from "../../panels/MaterialEditorPanel";
 import { VegetationPanel } from "../../panels/VegetationPanel";
+import { EcologyTimelinePanel } from "../../panels/EcologyTimelinePanel";
+import { PlantGraphPanel } from "../../panels/PlantGraphPanel";
 import { TimelinePanel } from "../../panels/TimelinePanel";
 import { HierarchyPanel } from "../../panels/HierarchyPanel";
 import { AssetsPanel } from "../../panels/AssetsPanel";
@@ -125,6 +127,14 @@ export const SCENE_PANEL_REGISTRY: Record<SceneDockPanelId, DockPanelDef> = {
     renderer: "onlyWhenVisible",
     component: VegetationPanel,
   },
+  ecologyTimeline: {
+    id: "ecologyTimeline",
+    title: "Ecology Timeline",
+    closable: true,
+    group: "diagnostics",
+    renderer: "onlyWhenVisible",
+    component: EcologyTimelinePanel,
+  },
   timeline: {
     id: "timeline",
     title: "Timeline",
@@ -212,6 +222,13 @@ export const ASSET_EDITOR_PANEL_REGISTRY: Record<AssetEditorDockPanelId, DockPan
     closable: true,
     renderer: "onlyWhenVisible",
     component: VegetationSummaryPanel,
+  },
+  plantGraph: {
+    id: "plantGraph",
+    title: "Plant Graph",
+    closable: true,
+    renderer: "onlyWhenVisible",
+    component: PlantGraphPanel,
   },
   biomeGraph: {
     id: "biomeGraph",

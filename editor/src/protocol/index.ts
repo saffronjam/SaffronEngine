@@ -207,6 +207,7 @@ export type {
   Vec4,
   ViewportNativeInfoResult,
   WireUuid,
+  BotanicalGraphDto,
 } from "./sa-types";
 
 export type Uuid = WireUuid;
