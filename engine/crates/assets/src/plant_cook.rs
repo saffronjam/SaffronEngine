@@ -339,6 +339,9 @@ fn resolve_plant_inputs(
             .clone();
         match resolved {
             Ok(mut resolved) => {
+                if let Some(notice) = attribution_notice(source, &resolved.origin) {
+                    issues.push(notice);
+                }
                 resolved.snapshot.source = source.id;
                 if source.role == PlantSourceRole::Geometry
                     && geometry_first_semantic(asset, source.id)
@@ -443,6 +446,9 @@ fn resolve_native_plant_input(
 
 #[derive(Clone)]
 struct ResolvedPlantSource {
+    /// What the source file states about what wrote it and how it may be reused. Empty for a source
+    /// whose format has no asset block to state it in.
+    origin: saffron_geometry::ImportedOrigin,
     snapshot: PlantSourceSnapshot,
     material_documents: BTreeMap<u64, Vec<u8>>,
     coverage_images: BTreeMap<u64, ResolvedCoverageImage>,
@@ -578,6 +584,7 @@ fn resolve_catalog_model(
     };
     snapshot.content_hash = source_snapshot_hash(&snapshot);
     Ok(ResolvedPlantSource {
+        origin: saffron_geometry::ImportedOrigin::default(),
         snapshot,
         material_documents,
         coverage_images,
@@ -646,6 +653,7 @@ fn resolve_catalog_mesh(
     };
     snapshot.content_hash = source_snapshot_hash(&snapshot);
     Ok(ResolvedPlantSource {
+        origin: saffron_geometry::ImportedOrigin::default(),
         snapshot,
         material_documents,
         coverage_images,
@@ -670,6 +678,7 @@ fn resolve_catalog_material_source(
     };
     snapshot.content_hash = source_snapshot_hash(&snapshot);
     Ok(ResolvedPlantSource {
+        origin: saffron_geometry::ImportedOrigin::default(),
         snapshot,
         material_documents,
         coverage_images,
@@ -1087,6 +1096,7 @@ fn resolve_imported_model(
     path: &Path,
     graph: ImportedModel,
 ) -> Result<ResolvedPlantSource> {
+    let origin = graph.origin.clone();
     let model_key = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -1183,6 +1193,7 @@ fn resolve_imported_model(
     };
     snapshot.content_hash = source_snapshot_hash(&snapshot);
     Ok(ResolvedPlantSource {
+        origin,
         snapshot,
         material_documents,
         coverage_images,
@@ -1533,6 +1544,38 @@ fn material_texture_ids(material: &MaterialAsset) -> Vec<Uuid> {
     }
     textures.retain(|texture| texture.value() != 0);
     textures
+}
+
+/// Reports what a source file states about its own origin when the authored provenance does not
+/// already carry it.
+///
+/// A studio's plant export usually names the tool that wrote it, and some tools' licences require
+/// attribution. The file's statement is surfaced verbatim rather than folded into the authored
+/// provenance: filling in a licence the engine inferred would put a legal claim in the artifact that
+/// nobody authored.
+fn attribution_notice(
+    source: &PlantSourceReference,
+    origin: &saffron_geometry::ImportedOrigin,
+) -> Option<PlantCompileDiagnostic> {
+    if origin.generator.is_empty() && origin.copyright.is_empty() {
+        return None;
+    }
+    let stated = !origin.copyright.is_empty();
+    let recorded = !source.provenance.attribution.trim().is_empty();
+    if recorded || !stated {
+        return None;
+    }
+    Some(PlantCompileDiagnostic {
+        severity: PlantCompileDiagnosticSeverity::Warning,
+        code: PlantCompileDiagnosticCode::MissingSource,
+        source: Some(source.id),
+        selector: Some(source.selector.clone()),
+        path: "source.imported.sources.provenance.attribution".to_owned(),
+        message: format!(
+            "source file states copyright '{}' from generator '{}' and the plant source records no attribution",
+            origin.copyright, origin.generator
+        ),
+    })
 }
 
 fn resolution_issue(source: &PlantSourceReference, message: String) -> PlantCompileDiagnostic {
@@ -3243,6 +3286,67 @@ mod tests {
         assert_eq!(observed[0], observed[1]);
     }
 
+    /// A native family built the ordinary way — several variations, derived appearances, derived
+    /// proxies — publishes through the shared recook, and its hierarchy offers a use combination for
+    /// every authored (variation, phenotype) pair.
+    #[test]
+    fn a_multi_variation_native_family_publishes_with_every_combination() {
+        let (_scratch, mut assets, bark, _mesh) = fixture_server("native-variations");
+        let leaf = save_material_asset(&mut assets, &MaterialAsset::default(), "Leaf", "plants")
+            .expect("save leaf material");
+        let mut graph = saffron_vegetation::BotanicalGraphDocument::sapling(0x5a11);
+        graph
+            .variations
+            .push(saffron_vegetation::BotanicalVariation {
+                seed: 0x5a11,
+                age: saffron_spatial::UnitInterval::from_bits(24_000),
+                name: "Sapling".to_owned(),
+            });
+        let family = saffron_vegetation::native_plant_family(
+            Uuid(9_411),
+            "Variegated",
+            graph,
+            vec![bark, leaf],
+        )
+        .expect("the family builds");
+        assert_eq!(family.variations.len(), 2);
+        assert!(!family.collision_proxies.is_empty());
+        assert!(!family.navigation_proxies.is_empty());
+        let expected: Vec<(u32, u32)> = family
+            .phenotypes
+            .iter()
+            .map(|phenotype| (phenotype.variation, phenotype.id))
+            .collect();
+
+        let family_slots = family.material_slots.len();
+        let saved = save_family(&mut assets, family);
+        let outcome = recook_plant_family(&mut assets, &saved, &options()).expect("recook");
+        let PlantRecookOutcome::Published(published) = outcome else {
+            panic!("a derived native family was rejected");
+        };
+        assert!(published.validation.compile.publishable());
+        // Two variations, two geometry sources, and a use combination per authored pair.
+        let compiled = published
+            .validation
+            .compile
+            .family
+            .as_ref()
+            .expect("a published family");
+        assert_eq!(compiled.sources.len(), 1, "one native graph source");
+        assert!(compiled.meshes.len() >= 2, "one mesh set per variation");
+        let materials: Vec<saffron_geometry::VirtualHierarchyMaterial> = (0..family_slots)
+            .map(|slot| saffron_geometry::VirtualHierarchyMaterial::opaque(slot as u32))
+            .collect();
+        let hierarchy = saffron_vegetation::plant_hierarchy_input(&saved, compiled, &materials)
+            .expect("a portable hierarchy input");
+        let offered: Vec<(u32, u32)> = hierarchy
+            .combinations
+            .iter()
+            .map(|combination| (combination.variation, combination.phenotype))
+            .collect();
+        assert_eq!(offered, expected);
+    }
+
     #[test]
     fn portable_hierarchy_round_trip_and_cut_are_hole_free() {
         let (_scratch, mut assets, material, mesh) = fixture_server("portable-hierarchy");
@@ -3725,5 +3829,51 @@ mod e2e_fixture {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    fn source() -> PlantSourceReference {
+        PlantSourceReference {
+            id: 10,
+            locator: PlantSourceLocator::File("file:///plants/oak.gltf".to_owned()),
+            role: PlantSourceRole::Geometry,
+            selector: PlantSourceSelector::Whole,
+            content_hash: [0; 32],
+            settings: PlantImportSettings::default(),
+            provenance: saffron_vegetation::SourceProvenance::default(),
+        }
+    }
+
+    /// A file that states a copyright the plant source does not record raises it, so an export from a
+    /// tool whose licence requires attribution cannot be cooked in silence.
+    #[test]
+    fn a_stated_copyright_without_recorded_attribution_is_reported() {
+        let origin = saffron_geometry::ImportedOrigin {
+            generator: "SpeedTree Modeler 9.5.2".to_owned(),
+            copyright: "(c) 2026 Example Studio".to_owned(),
+        };
+        let notice = attribution_notice(&source(), &origin).expect("a notice");
+        assert_eq!(notice.severity, PlantCompileDiagnosticSeverity::Warning);
+        assert!(notice.message.contains("SpeedTree Modeler 9.5.2"));
+        assert!(notice.message.contains("Example Studio"));
+
+        // Once the source records an attribution there is nothing to raise.
+        let mut recorded = source();
+        recorded.provenance.attribution = "Oak by Example Studio".to_owned();
+        assert!(attribution_notice(&recorded, &origin).is_none());
+
+        // A generator alone is not a licence claim, and a file that states nothing raises nothing.
+        let generator_only = saffron_geometry::ImportedOrigin {
+            generator: "Blender 4.2".to_owned(),
+            copyright: String::new(),
+        };
+        assert!(attribution_notice(&source(), &generator_only).is_none());
+        assert!(
+            attribution_notice(&source(), &saffron_geometry::ImportedOrigin::default()).is_none()
+        );
     }
 }

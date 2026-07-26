@@ -23,6 +23,17 @@ settings, semantic-part mapping, and provenance. A native source embeds one type
 Both fill the same normalized parts, dimensions, spines, mechanics, phenotype, collision, navigation,
 interaction, and habitat fields.
 
+A plant export from a commercial modeller is an ordinary glTF or OBJ import: nothing about the tool
+that wrote it needs its own code path, which is why the importer accepts one without knowing what
+produced it. What does need care is attribution. A file's own asset block states what wrote it and
+what it says about reuse, and the plant compiler raises a warning when a source file states a copyright
+that the plant source records no attribution for.
+
+The statement is surfaced verbatim rather than folded into the authored provenance. Filling in a
+licence the engine inferred from a tool name would put a legal claim in the artifact that nobody
+authored. Reimport settings ride on the source reference itself, so a recook reads the file exactly as
+the first import did.
+
 Plant-family tags are stable nonzero `PlantTagId` values stored in sorted, unique order. They classify
 the family independently of a biome palette and participate in canonical `.splant`, `.splantc`, and
 generation-manifest identities. The artifact store rejects a manifest whose plant tags differ from
