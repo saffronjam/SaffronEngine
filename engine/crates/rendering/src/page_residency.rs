@@ -64,6 +64,11 @@ pub struct PageResidencyStats {
     pub ready: u64,
     /// Cumulative evictions.
     pub evictions: u64,
+    /// Pages that went from requested to resident, which is what a fault costs.
+    pub faults: u64,
+    /// Microseconds those faults took, summed. Divided by `faults` it is the mean fault latency;
+    /// kept as a sum so the counter stays additive and the caller picks the window.
+    pub fault_latency_us: u64,
 }
 
 enum PageState {
@@ -77,6 +82,8 @@ enum PageState {
 struct PageEntry {
     generation: u32,
     state: PageState,
+    /// When the page was last requested, so publication can price the fault.
+    requested_at: Option<std::time::Instant>,
     parent: Option<GpuHandle>,
     guaranteed_root: bool,
     resident_children: u32,
@@ -91,6 +98,8 @@ pub struct PageResidency {
     budgets: PageResidencyBudgets,
     resident_bytes: u64,
     evictions: u64,
+    faults: u64,
+    fault_latency_us: u64,
     frame: u64,
 }
 
@@ -143,6 +152,7 @@ impl PageResidency {
                 resident_children: 0,
                 last_demand_frame: frame,
                 priority: if guaranteed_root { u64::MAX } else { 0 },
+                requested_at: guaranteed_root.then(std::time::Instant::now),
             },
         );
     }
@@ -188,6 +198,7 @@ impl PageResidency {
             entry.priority = entry.priority.max(priority);
             if matches!(entry.state, PageState::Unloaded) {
                 entry.state = PageState::Requested;
+                entry.requested_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -200,6 +211,7 @@ impl PageResidency {
             entry.priority = entry.priority.max(priority);
             if matches!(entry.state, PageState::Unloaded) {
                 entry.state = PageState::Requested;
+                entry.requested_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -320,6 +332,8 @@ impl PageResidency {
             resident_bytes: self.resident_bytes,
             budget_bytes: self.budgets.max_resident_bytes,
             evictions: self.evictions,
+            faults: self.faults,
+            fault_latency_us: self.fault_latency_us,
             ..PageResidencyStats::default()
         };
         for entry in self.pages.values() {
@@ -349,6 +363,13 @@ impl PageResidency {
                 "page publication requires a ready payload".to_owned(),
             ));
         };
+        // A fault is the whole round trip: the frame the page was demanded to the moment its payload
+        // is resident. Timing it at publication rather than at the worker's return is deliberate —
+        // what a stutter costs is when the geometry can be drawn, not when the bytes arrived.
+        if let Some(requested) = entry.requested_at.take() {
+            self.faults += 1;
+            self.fault_latency_us += requested.elapsed().as_micros() as u64;
+        }
         let length = u64::try_from(bytes.len())
             .map_err(|_| Error::InvalidUploadData("page payload exceeds u64".to_owned()))?;
         let guaranteed_root = entry.guaranteed_root;
@@ -483,6 +504,34 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// A fault is the round trip from demand to residency, and the counters stay additive so a
+    /// caller picks its own window. No device needed: the state machine owns the timing.
+    #[test]
+    fn a_demand_that_never_publishes_is_not_a_fault() {
+        let mut residency = PageResidency::new(PageResidencyBudgets::default());
+        let handle = GpuHandle {
+            index: 4,
+            generation: 1,
+        };
+        residency.register_page(handle, None, false);
+        assert_eq!(residency.stats().faults, 0);
+        residency.demand(handle, 7);
+        // Demanded, not resident: a fault is only priced once the payload can be drawn.
+        let stats = residency.stats();
+        assert_eq!(stats.requested, 1);
+        assert_eq!(stats.faults, 0);
+        assert_eq!(stats.fault_latency_us, 0);
+
+        // A guaranteed root is demanded at registration, so its clock starts there.
+        let root = GpuHandle {
+            index: 5,
+            generation: 1,
+        };
+        residency.register_page(root, None, true);
+        assert_eq!(residency.stats().requested, 2);
+        assert_eq!(residency.stats().faults, 0);
     }
 
     struct Fixture {

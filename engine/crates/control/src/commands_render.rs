@@ -662,6 +662,8 @@ pub fn register_render_commands(reg: &mut CommandRegistry) {
                     loading: residency.loading,
                     ready: residency.ready,
                     evictions: residency.evictions,
+                    faults: residency.faults,
+                    fault_latency_us: residency.fault_latency_us,
                 },
                 visibility: {
                     let words = ctx.renderer.visibility_counters();
