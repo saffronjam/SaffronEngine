@@ -16,7 +16,7 @@ saffron-material = { path = "../material" }
 glam = { workspace = true, features = ["bytemuck"] }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
-gltf = { workspace = true, features = ["KHR_materials_emissive_strength"] }
+gltf = { workspace = true, features = ["KHR_materials_emissive_strength", "extensions"] }
 serde_json.workspace = true
 tobj = { workspace = true }
 image = { workspace = true }

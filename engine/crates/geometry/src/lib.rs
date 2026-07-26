@@ -25,6 +25,7 @@ mod alpha_card;
 mod conditioning;
 mod error;
 mod gltf_import;
+mod gltf_instancing;
 mod hierarchy_reference;
 mod image_decode;
 mod obj_import;
@@ -49,6 +50,7 @@ pub use conditioning::{
 };
 pub use error::{Error, Result};
 pub use gltf_import::import_gltf_model;
+pub use gltf_instancing::{GltfInstance, GltfInstanceSet, GltfInstancing, read_gltf_instancing};
 pub use hierarchy_reference::*;
 pub use image_decode::{
     decode_image, decode_image_from_memory, decode_image_from_memory_hdr, decode_image_hdr,
@@ -83,7 +85,7 @@ pub use sub_id::sub_id_for;
 pub use translate::translate_model;
 pub use types::{
     AlphaMode, AnimClip, AnimInterp, AnimPath, AnimTarget, AnimTrack, DecodedImage,
-    DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedSkin,
+    DecodedImageFloat, ImportedMaterial, ImportedModel, ImportedNode, ImportedOrigin, ImportedSkin,
     MaterialMapRole, Mesh, MeshCounts, MorphData, MorphDelta, MorphTarget, Ray, SkinPayload,
     Submesh, TextureSource, Vertex, VertexSkin, compute_tangents,
 };
