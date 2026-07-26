@@ -102,6 +102,13 @@ evaluator calls shared with the future editor, not a second debug interpreter.
 - [x] Cross-cell competition is identical whether neighbours cook serially, reversed, or in parallel.
 - [ ] Every dual-domain node passes Rust/Slang equivalence on NVIDIA, AMD, and MoltenVK before it can
   carry `EquivalentGpu`.
+  (HARDWARE-GATED, and the gate is the only thing holding it. This machine enumerates exactly one
+  Vulkan device — `Apple M4` through `MoltenVK`, api 1.4.334 — so the NVIDIA and AMD arms cannot be run
+  here at all, and no amount of code closes them. What IS verified on MoltenVK: the dual-domain
+  qualification corpus covers every declared operator with resident programs, the ABI and corpus hashes
+  are pinned, branching and terminal masks preserve exact semantics, and only complete
+  program/profile/artifact evidence is admitted — `saffron-vegetation` `graph_gpu` 7/7. Recorded rather
+  than claimed: a box that says three vendors is not closed by one.)
 - [x] The compiler rejects cosmetic-to-authoritative dependencies, unbounded local influence, cycles,
   and NaN/overflow inputs with typed diagnostics.
 - [x] Concrete-job preflight exposes retained/generated inputs and admission/execution peaks, defines

@@ -110,6 +110,13 @@ to bind pose.
 - [x] Cell encode/decode, parent/child, face ownership, negative coordinates, and origin rebasing pass
   exhaustive boundary/property tests.
 - [ ] RNG and fixed numeric goldens are byte-identical in Rust and Slang on NVIDIA, AMD, and MoltenVK.
+  (HARDWARE-GATED, and the gate is the only thing holding it. This machine enumerates exactly one
+  Vulkan device — `Apple M4` through `MoltenVK`, api 1.4.334 — so the NVIDIA and AMD arms cannot be run
+  here at all, and no amount of code closes them. What IS verified on MoltenVK: the dual-domain
+  qualification corpus covers every declared operator with resident programs, the ABI and corpus hashes
+  are pinned, branching and terminal masks preserve exact semantics, and only complete
+  program/profile/artifact evidence is admitted — `saffron-vegetation` `graph_gpu` 7/7. Recorded rather
+  than claimed: a box that says three vendors is not closed by one.)
 - [x] Shuffled job order, worker count, source order, and cancellation cannot change published bytes.
 - [x] A late result with an old generation token is discarded in a named race test.
 - [x] Mesh surface queries return the same hit, normal, tags, and attachment after render-origin

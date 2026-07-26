@@ -74,18 +74,53 @@ map path.
 
 - [ ] Static nondeforming whole-family/variation representations may share compacted BLAS where their
   transforms/material classification permit.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [ ] For structured deformation, materialize the selected assembly hierarchy into GPU geometry for
   BLAS build/update through the shared deformation output and cache policy. Do not assume KHR AS
   supports nested micro-instance parts inside one plant BLAS.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [ ] Represent aggregate voxel clusters through cooked triangle surfaces or procedural AABBs with
   intersection/hit shading that matches raster aggregate moments.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [ ] Standard KHR any-hit over canonical coverage remains baseline-correct.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [ ] Derive optional `VK_KHR_opacity_micromap` data from the exact coverage texture/mip/classification
   source and validate conservative/unknown states. OMM removes cost, never correctness.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [ ] Add optional `VK_NV_cluster_acceleration_structure` and partitioned-AS execution over canonical
   cluster/page data only after KHR correctness; no NVIDIA-specific plant representation.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [ ] Track BLAS/TLAS build/update/compaction time, memory, selected representation, OMM hit classes,
   and page demand without copying vendor performance thresholds.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 
 ## Acceptance
 
@@ -105,11 +140,22 @@ map path.
 - [ ] Main/depth/VSM/GI/reflection/RT select compatible hierarchy cuts and coverage.
 - [ ] Triangle↔aggregate transitions stay within defined direct/indirect/transmission/normal error.
 - [ ] KHR any-hit output is correct without OMM; OMM/vendor tiers match it within tolerance.
+  (RAY-TRACING HARDWARE ABSENT. `vulkaninfo` on this machine reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: the only device is `Apple M4` through
+  MoltenVK, and `Device::new` accordingly resolves `rt_supported = false` from
+  `has_as && has_rq && has_deferred`. Nothing in this box can be exercised here, and no code change
+  closes it. Recorded rather than claimed.)
 - [x] Physical-atlas VSM and full raster quality pass on MoltenVK without sparse-residency dependency.
   (The atlas is one ordinary image — `vsm.rs`: "No sparse binding" — and the whole e2e suite,
   including the new `vsm` file, runs on MoltenVK on an Apple M4. e2e `vsm` 4/4 with the shadow-page
   debug channel rendering validation-clean and returning to lit.)
 - [ ] Standard gate, cross-platform validation, visual/timing captures, and shadow/GI/RT docs are green.
+  (GREEN: the standard gate (`just engine`, `just prepare-for-commit`, `just schema`, `just test`,
+  `just e2e` 328/328) and the shadow/GI docs three-check —
+  `explanations/shadows-and-culling/virtual-shadow-maps.md` and the GI pages pass hugo, the link check,
+  and the style check at 0/0; `tests/e2e/vsm.test.ts` covers the physical atlas at 4/4. OUTSTANDING and
+  hardware-gated: cross-platform validation needs a second adapter, and the RT half of the docs cannot
+  be validated against a run because this device reports no ray-tracing extensions.)
 
 ## NO-LEGACY gate
 

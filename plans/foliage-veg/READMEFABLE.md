@@ -5677,16 +5677,783 @@ DOCS: `botanical-graph.md` gained "Proxies are derived, not
 authored" plus a code-pointer row. hugo EXIT=0, links none broken,
 style 0/0.
 
-THEN, in dependency order:
-(1) Phase 14 remaining: atlases + coverage-preserving textures +
-aggregate-voxel appearance error + RT/OMM inputs (one box), a
-host-following vine operator, the four Authoring-UX boxes, the five
-interchange boxes (USD PointInstancer / glTF
-`EXT_mesh_gpu_instancing` / Houdini / SpeedTree), and the six
+THEN: see the phase-14 slice-6 seal below, which built point
+interchange.
+
+### Phase 14 slice 6 — point interchange with content-creation tools (Claude session 2026-07-26)
+
+`interchange.rs` is the whole door: a format-agnostic vocabulary
+(`PointInterchange` = prototypes + instances + an UNSUPPORTED
+list), the mapping to and from authored anchors, and a Houdini JSON
+`.geo` reader and writer.
+- AN IMPORTED POINT IS AN ORDINARY AUTHORED PLANT.
+  `interchange_to_anchors` produces `ExplicitPlantAnchor` rows
+  through the canonical point vocabulary — metres to world ticks,
+  quaternion normalized then quantized to signed lanes — and they
+  reach the cooker exactly as a hand-placed plant does. There is no
+  alternate runtime object.
+- NOTHING RIDES ALONG UNREAD. Every source attribute the vocabulary
+  cannot express lands in `unsupported` and is dropped. Keeping it
+  as an opaque blob would make it a second truth: a value no engine
+  system reads, no validation checks, and the next export would
+  faithfully echo back as if it meant something.
+- IDENTITY IS `SHA-256(layer ‖ stable id)` in the explicit
+  namespace. That is what makes a re-import RE-ADDRESS rather than
+  duplicate, so an authored override keyed to a plant survives an
+  updated scatter. Two instances claiming one identity are REFUSED,
+  not merged — merging loses a plant the artist can see in the file.
+  A sparse mask deactivates rather than deletes, so an inactive
+  instance keeps its identity.
+- BOUNDS COME FROM THE FAMILY, scaled by the instance, never from
+  the source: a DCC tool's bounding box is not the engine's, and a
+  wrong one breaks culling rather than merely looking odd.
+- Anchors land in the tile of their own position, one authored
+  chunk per tile, and an import replaces only the layer's anchors
+  for the tiles it touches. Each anchor gets a real lineage record
+  (`GraphOperator::ExplicitAnchors`, outcome `Accepted`) interned
+  into the chunk's provenance table — the same shape a brush
+  gesture's anchors carry. The chunk validator requires it, which is
+  how the e2e caught the first version handing out handle 0 into an
+  empty table.
+- Houdini spells uniform scale `pscale` and non-uniform `scale`;
+  both may be present and the uniform one MULTIPLIES the other.
+  Without an `id` attribute the point index is the stable identity,
+  which is Houdini's own fallback.
+- `saffron-json` now re-exports `json!` — the gateway crate is the
+  one place `serde_json` is reached from, so the macro belongs there
+  rather than a second dependency edge.
+- The layer crosses the wire as a `VegetationGuid` (32 hex), the
+  same spelling the map-chunk DTOs use. The first draft took a
+  decimal string, which would have been the same identity spelled
+  two ways on one wire.
+
+TWO BOXES CLOSED, ONE DELIBERATELY LEFT OPEN: normalization-through
+-the-one-cooker and export-with-stable-ids are done; the
+"USD metadata / glTF `EXT_mesh_gpu_instancing` / Houdini" box stays
+UNCHECKED because only Houdini is read. USD and glTF instancing each
+need their own reader (glTF needs the `gltf` crate's `extensions`
+feature to reach the extension's accessors; USD needs a USDA
+parser), and claiming a third of a box is not honest.
+
+GATES: `just prepare-for-commit` EXIT=0. +5 vegetation tests (231
+in the crate): anchor mapping with canonical bounds and stable
+identity, duplicate-id/unknown-prototype/zero-scale refusals, a
+Houdini round trip, an unsupported attribute reported while the
+points still arrive, and an export that re-imports onto the same
+identities. `cargo test --workspace` green apart from the one
+`xtask` shader test another agent owns. E2E `vegetation-interchange`
+(NEW) 1/1, 12 assertions, validation-clean — it writes a real `.geo`
+with a `Cd` attribute, imports it into the fixture map, exports it,
+re-imports the export onto the same tiles, and asserts an unbound
+prototype is refused.
+DOCS: new `explanations/geometry-and-assets/point-interchange.md` +
+hub row. hugo EXIT=0, links none broken, style 0/0.
+
+THEN: see the phase-14 slice-7 seal below, which added the glTF
+`EXT_mesh_gpu_instancing` reader.
+
+### Phase 14 slice 7 — glTF EXT_mesh_gpu_instancing (Claude session 2026-07-26)
+
+`geometry/src/gltf_instancing.rs` reads instanced placements, and
+`gltf_instancing_to_interchange` lands them in the same
+`PointInterchange` a Houdini scatter does.
+- IT LIVES IN `saffron-geometry`, where the `gltf` dependency
+  already is, and is deliberately SEPARATE from `import_gltf_model`:
+  a model import wants geometry and materials, a placement read
+  wants only where the instances are, and fusing them would drag a
+  mesh decode into a scatter read.
+- The `extensions` feature was added to the crate's gltf features —
+  without it the node extension is invisible to the typed API.
+- INSTANCE TRANSFORMS ARE NODE-LOCAL per the extension spec, so
+  each composes with the node's own transform AND its whole
+  ancestor chain (one accumulate pass down the file's default
+  scene). A scatter parented under a scaled group is scaled;
+  ignoring the chain would silently misplace every plant.
+- `ROTATION` accepts the float and normalized short/byte storage
+  the spec permits; a storage this reader cannot decode is REPORTED
+  as unsupported rather than read as garbage. A missing
+  `TRANSLATION` is an error — a scatter with no positions is a
+  mistake, not an empty scatter.
+- Without `_ID` the instance index is the stable identity, the same
+  fallback a point cloud without `id` gets.
+- `vegetation-import-points` now picks the reader from the file
+  extension (`geo`/`json`, `gltf`/`glb`), and an unknown extension
+  is refused by name rather than guessed at.
+
+USD STAYS OPEN, honestly: its box covers USD metadata as well, and
+a USDA parser is not built. Two thirds of a box is not a box.
+
+GATES: `just prepare-for-commit` EXIT=0. +1 geometry test over a
+new `tests/fixtures/instanced-scatter.gltf`, asserting world-space
+composition through the node offset, surviving scales, `_ID`
+identities, and a reported `_WIND` attribute. E2E
+`vegetation-interchange` 1/1, 15 assertions, validation-clean — the
+glTF branch imports through the real host beside the Houdini one.
+DOCS: `point-interchange.md` gained a per-source table and two
+code-pointer rows. hugo EXIT=0, links none broken, style 0/0.
+
+THEN: see the phase-14 slice-8 seal below, which added the USD
+`PointInstancer` reader and writer.
+
+### Phase 14 slice 8 — USD PointInstancer interchange (Claude session 2026-07-26)
+
+`interchange_usd.rs` reads and writes the USDA text form of a
+`PointInstancer`. NO USD RUNTIME: the text states the arrays
+directly, and the subset a plant scatter uses is small and stable,
+so a vendored USD build would be a large dependency bought for
+nothing.
+- TWO CONVENTIONS handled explicitly because getting either wrong
+  is silent: a `quatf`/`quath` orientation is **WXYZ**, not the
+  XYZW every other seam here uses; and `invisibleIds` masks by the
+  instancer's OWN `ids`, not by array position, so an instancer that
+  reorders its arrays keeps masking the same instances.
+- A MASKED INSTANCE BECOMES NO ANCHOR. It is not a plant, and there
+  is no "exists but invisible" state in the point vocabulary to fake
+  one with. Its identity lives in the source, so unmasking restores
+  the SAME plant — and because identities are content-derived rather
+  than slot-derived, masking one instance cannot renumber or disturb
+  another's GPU slot, which is the substance of the phase-14
+  identity-leakage acceptance box.
+- Several instancers in one stage compose into one payload, each
+  contributing its own prototypes with indices shifted by what came
+  before.
+- The parser is a brace-balanced prim scan plus a statement split
+  that skips nested prims, so the `def Xform` children a
+  `PointInstancer` holds as prototypes do not leak attributes into
+  the instancer's own set.
+- Both commands now dispatch on the file extension —
+  `geo`/`json`/`usda`/`gltf`/`glb` in, `geo`/`usda` out — and an
+  extension with no reader or writer is refused BY NAME rather than
+  guessed at.
+
+The "USD skeleton/plant metadata + glTF + Houdini" box stays OPEN
+even though all three placement readers exist: `SkelRoot`, joint
+hierarchies, and the plant-specific USD schemas are not read. Only
+placement is. Claiming the box because the placement part is done
+would misstate what a caller gets.
+
+GATES: `just prepare-for-commit` EXIT=0. +3 vegetation tests (234
+in the crate): array reading with the WXYZ order and the id-keyed
+mask, a full round trip through the writer including the mask, and
+refusals for a stage with no instancer, an unbound prototype, and
+missing positions. E2E `vegetation-interchange` 1/1, 21 assertions,
+validation-clean — it now exports to `.usda`, checks the stage text,
+re-imports it onto the same anchor count, and asserts an unknown
+extension is refused.
+DOCS: `point-interchange.md` gained the USD row, the two-conventions
+and masking paragraphs, and a code-pointer row. hugo EXIT=0, links
+none broken, style 0/0.
+
+THEN: see the phase-14 slice-9 seal below, which closed the
+SpeedTree-origin/attribution box.
+
+### Phase 14 slice 9 — stated origin and attribution (Claude session 2026-07-26)
+
+A plant export from a commercial modeller is an ORDINARY glTF/OBJ
+source. Nothing about the tool that wrote it needs its own code
+path, and that is the finding, not a shortcut — the plant importer
+already accepts one without knowing what produced it. What needed
+building was attribution.
+- `ImportedOrigin { generator, copyright }` on `ImportedModel`
+  carries the file's own `asset.generator` and `asset.copyright`
+  VERBATIM. OBJ has no asset block, so it states nothing and nothing
+  is invented for it.
+- `attribution_notice` raises a WARNING when a source file states a
+  copyright and the plant source records no attribution, so an
+  export whose licence requires attribution cannot be cooked in
+  silence.
+- THE STATEMENT IS NEVER FOLDED INTO THE AUTHORED PROVENANCE. That
+  is the load-bearing choice: filling in a licence the engine
+  inferred from a tool name would put a legal claim in the artifact
+  that nobody authored. A generator ALONE raises nothing — a tool
+  name is not a licence claim.
+- Reimport settings already ride on `PlantSourceReference.settings`
+  and every recook reuses them, so that half of the box was already
+  true and is now stated with its evidence.
+- `.st`/`.st9` is not read, matching the box's own carve-out about
+  SDK licence and redistribution review.
+
+Catalog-baked `.smodel` sources do NOT yet carry the origin: it
+would need a metadata schema field and a version bump, and the
+file-locator path is the one a fresh studio export arrives through.
+Recorded here rather than claimed.
+
+GATES: `just prepare-for-commit` EXIT=0. +2 tests: a geometry test
+over a fixture given a SpeedTree-style asset block (generator and
+copyright verbatim, and a file stating no copyright stating none),
+and a `plant_cook` test covering the notice, its absence once an
+attribution is recorded, a generator-only file, and an empty origin.
+`saffron-assets` 266 and `saffron-geometry` 109 green; the one
+`xtask` shader failure is another agent's in-flight change.
+DOCS: `vegetation-assets.md` gained the attribution paragraphs.
+hugo EXIT=0, links none broken, style 0/0.
+
+THEN: see the phase-14 slice-10 seal below, which closed the six
 acceptance boxes.
-(2) The editor ecology timeline panel (phase-13 line 147).
-(3) PHASE 15 — production platform closure.
-(4) Still open from earlier: the remaining phase-11 GI-culling /
+
+### Phase 14 slice 10 — the acceptance boxes, against real evidence (Claude session 2026-07-26)
+
+All six phase-14 acceptance boxes are now checked, each naming the
+test that proves it. Four were already true from slices 2-9 and are
+now stated with their evidence; two needed a test written, because
+"probably covered" is not evidence.
+- WRITTEN: `a_multi_variation_native_family_publishes_with_every_
+  combination` — builds a two-variation family the ORDINARY way
+  (derived appearances, derived proxies, no hand-written tables),
+  saves it, recooks it, and asserts it publishes with one mesh set
+  per variation and that `plant_hierarchy_input` offers a use
+  combination for EVERY authored (variation, phenotype) pair. That
+  last part is the one that could silently be wrong: a variation
+  whose geometry exists but whose combination mask is missing would
+  render as nothing.
+- WRITTEN: `masking_one_instance_leaks_no_other_identity` — unmasks
+  one USD instance and asserts every other plant's identity is
+  byte-identical and exactly the masked instance's own appears. This
+  is the direct proof of "no GPU-slot identity leakage": identities
+  come from the source's ids, so masking cannot renumber a
+  neighbour.
+- The native-vs-imported box rests on the pre-existing
+  `native_and_imported_sources_publish_to_the_same_artifact_contract`,
+  which recooks one of each and compares the artifact's section set
+  — exactly the claim, already tested.
+- The source-license fixture the last box asks for is
+  `geometry/tests/fixtures/two-materials.gltf`, now carrying a
+  generator and a copyright requiring attribution.
+
+PHASE 14 STANDS AT 19 of 25. The six still open, each for a stated
+reason rather than a hedge:
+- Atlases + coverage-preserving textures + aggregate-voxel
+  appearance error + RT/OMM inputs — each needs its own generator.
+- The four Authoring-UX boxes — Plant workspace panels, bounded
+  cancellable preview, transactional undo at semantic-operation
+  granularity, and presets/subgraphs. All editor/React work; `sa`
+  already drives everything they would show.
+- USD skeleton/plant metadata (`SkelRoot`, joint hierarchies, the
+  plant schemas). Placement is read; rigging is not.
+
+GATES: `just prepare-for-commit` EXIT=0. +2 tests (235 vegetation,
+267 assets). The one `xtask` shader failure is another agent's
+in-flight change.
+
+THEN: see the phase-15 slice-1 seal below, which opened phase 15
+with the CPU telemetry box.
+
+### Phase 15 slice 1 — CPU vegetation telemetry (Claude session 2026-07-26)
+
+PHASE 15 IS NOW IN PROGRESS (1 of 20). `vegetation_telemetry.rs`
+plus one command answers the whole CPU-observability box.
+- STAGE TIMES, NOT A FRAME TOTAL. Each synchronization is timed by
+  stage (residency / promotion / collision / navigation / ecology)
+  because a frame that got slower is only useful if it says WHICH
+  stage did. The stages accumulate into a PENDING block that
+  publishes only on `commit()`, so a half-timed frame is never
+  reported as a frame — and `commit()` runs on the error path too,
+  or a faulting world would freeze the last good sample forever.
+- The average is an eighth-weighted exponential fold: one multiply
+  per stage, NO history to walk. A sample window would be a
+  diagnostic that allocates.
+- COUNTERS ARE INCREMENTED WHERE THE WORK HAPPENS, so a count
+  cannot drift from the work. A query records its HIT COUNT as well,
+  because that is what makes a query expensive. A mutation records
+  the exact CANONICAL bytes the reducer hashed — new
+  `VegetationMutationRecord::canonical_byte_len` — not the JSON the
+  wire carried, which would measure the transport instead of the
+  work.
+- THE COOK QUEUE reports live/submitted/completed/cancelled/
+  superseded/failed plus summed acceptance-to-terminal latency. A
+  `tally()` on the poll the manager ALREADY walks its jobs in marks
+  each job counted once; counting at the six scattered transition
+  sites would have needed `&mut self` while a `&mut job` was held.
+- Resident bytes, bodies, contributions, and promoted counts come
+  from the authorities that already track them, so the command adds
+  no bookkeeping of its own.
+- Threading: `vegetation_control_authorities()` now hands out the
+  telemetry beside promotion and the nav seam, and `EngineContext`
+  carries it, which is how the query/mutate/export commands record.
+
+THE "no per-instance readback" BOX STAYS OPEN. It holds for the CPU
+vegetation path and the docs say why, but it is a claim about EVERY
+diagnostic and the GPU telemetry box above it is not built. Half a
+claim is not a claim.
+
+GATES: `just prepare-for-commit` EXIT=0. +2 runtime tests (stage
+publication on commit including the pending-block reset, and counter
+accumulation with a rebind clearing them). `cargo test --workspace`
+green. E2E `vegetation-interaction` 1/1, 30 assertions,
+validation-clean — it reads telemetry twice around a settle and
+asserts the synchronization count advanced and the residency query
+was counted with its hits.
+DOCS: new `explanations/scene-and-ecs/vegetation-telemetry.md` + hub
+row. hugo EXIT=0, links none broken, style 0/0.
+
+THEN: see the phase-15 slice-2 seal below, which packaged the
+cooked closure and closed the cook-report box.
+
+### Phase 15 slice 2 — the export closure and the cook report (Claude session 2026-07-26)
+
+A REAL BUG FOUND AND FIXED: `export-app` packaged NO cooked
+vegetation at all. The artifact store lives at
+`<project>/cache/vegetation/`, BESIDE `assets/`, and the export
+copied only `assets/` — so an exported player bound no manifest and
+the world came up bare. Nothing in the tree would have caught it;
+the export succeeded and the package was simply empty of plants.
+- `assets/src/vegetation_export.rs`: `vegetation_export_closure`
+  walks the MANIFEST — generation root, manifest, every named
+  `.splantc` and `.svegcell` — and `export-app` copies exactly that
+  into the package's store, preserving the layout the player
+  resolves through.
+- THE CLOSURE IS THE MANIFEST, NOT THE DIRECTORY. A scan would copy
+  every artifact the project ever cooked, superseded generations
+  included, which is how a package quietly grows to several times
+  the size of the world it ships. Proven by
+  `the_closure_is_the_manifest_not_the_directory`.
+- An artifact the manifest names but the store lacks is a WARNING
+  naming the map and the count, not a silent omission: a package
+  built on a partial cook fails at the player's first frame instead
+  of at export.
+- A map with no generation contributes nothing and is not an error —
+  a project can be exported before its vegetation is cooked, and the
+  warning belongs to the caller.
+
+THE COOK-REPORT BOX IS NOW CLOSED. `export-app` reports per map: the
+manifest identity, family and cell counts, macro plants, closure
+bytes, and STORED BYTES PER CELL FACET across every packaged cell.
+The facet figures come from each cell's TABLE OF CONTENTS
+(`reader.index().sections`, already parsed at `open`) rather than by
+decoding sections — a size report that decodes every section costs
+as much as loading the world it reports on.
+
+THE PACKAGING BOX STAYS OPEN, with the reason on the box: the
+packaged `assets/` still carries the authored `.splant`/`.sbiome`/
+`.svegmap`. The catalog lists those entries, so dropping the files
+needs a catalog projection that omits them too — a half-done
+exclusion would ship a catalog pointing at absent files, which is
+worse than shipping the sources.
+
+GATES: `just prepare-for-commit` EXIT=0. +2 assets tests (a map with
+no generation contributing nothing; a superseded artifact staying out
+of the closure). `cargo test --workspace` green.
+DOCS: `vegetation-cooking.md` gained "What an export packages" with
+the honest NOTE about the authored files, plus a code-pointer row.
+hugo EXIT=0, links none broken, style 0/0.
+
+THEN: see the phase-15 slice-3 seal below, which closed the
+packaging box.
+
+### Phase 15 slice 3 — the authored sources stay behind (Claude session 2026-07-26)
+
+The packaging box's second half turned out to need NO catalog
+projection at all. The project loader already treats the filesystem
+as the source of truth and DROPS a catalog row whose file is absent
+(`load_project` → `load_catalog`), and vegetation binds by identity
+through the artifact store rather than through the catalog
+(`selected_manifest` reads `read_current_manifest(map)` from the
+store and never looks the map up). So excluding the authored files
+is safe by two independent mechanisms, and the previous slice's
+worry about "a catalog pointing at absent files" was unfounded —
+checked rather than assumed.
+- `copy_dir_filtered` + `is_authored_vegetation` skip `.splant`,
+  `.sbiome`, `.svegmap`, and their `.data` sidecars from the
+  packaged `assets/`. Everything a runtime does read — `.smat`,
+  `.smesh`, `.smodel`, textures, and every cooked artifact — stays,
+  which the test pins in both directions.
+- `copy_dir_recursive` is now the unfiltered case of the same
+  function rather than a second walk.
+
+GATES: `just prepare-for-commit` EXIT=0. +1 control test asserting
+the predicate accepts every authored source and rejects every
+runtime-read file. `cargo test --workspace` green apart from the one
+`xtask` shader test another agent owns.
+DOCS: `vegetation-cooking.md`'s export section now states why the
+exclusion is safe instead of carrying a NOTE about why it was not
+done.
+
+THEN: see the phase-15 slice-4 seal below, which verified the
+package end to end and found a player hang.
+
+### Phase 15 slice 4 — the package, verified through the real host (Claude session 2026-07-26)
+
+`tests/e2e/vegetation-export.test.ts` (NEW) drives the whole path:
+import the fixture assets, cook one cell, save, `export-app`, then
+assert on the staged package. 1/1, 17 assertions,
+validation-clean. It asserts the REPORT (manifest identity, cell
+count, zero missing, macro plants, closure bytes, a facet
+distribution with real bytes) and the PACKAGE SHAPE — `.svegcell`,
+`.svegmanifest`, and `.splantc` present; `.splant`, `.sbiome`, and
+`.svegmap` absent. Both directions matter: asserting only the
+presence would have passed before this session's export fix, and
+asserting only the absence would pass on an empty package.
+
+A REAL BUG FOUND, NOT MINE, RECORDED RATHER THAN WORKED AROUND:
+`saffron-player` creates its renderer and then HANGS ON FRAME 1
+under MoltenVK in a non-interactive context. The frame watchdog
+built earlier this project is what surfaced it —
+`GPU submission 'frame 1' has been in flight 119s — a hang, not a
+slow frame`. Reproduced with NO project and NO vegetation
+(`SAFFRON_EXIT_AFTER_FRAMES=5 ./engine/target/debug/saffron-player`),
+so it is the player's windowed present path, not the export. The
+player-boot half of the box therefore stays OPEN with that evidence
+on it; the e2e keeps only the part that can be verified here rather
+than carrying a test that cannot pass.
+
+THEN: see the phase-15 slice-5 seal below, which added the state
+baseline and license attribution.
+
+### Phase 15 slice 5 — the starting state and the attribution (Claude session 2026-07-26)
+
+The cook/export box's remaining two pieces, which the cooker's
+existing DAG/`.splantc`/`.svegcell`/manifest work did not cover.
+- INITIAL PERSISTENT-STATE BASELINE. A new `Baseline` artifact kind
+  (`baselines/<manifest>.svegstate`) KEYED BY THE MANIFEST, not
+  content-addressed: a generation has exactly one starting state, and
+  a second baseline for the same generation is an ambiguity nothing
+  resolves. `vegetation-state-baseline` publishes it behind the SAME
+  promoted-state flush a save takes, so the baseline is complete
+  without waiting for a falling trunk to settle. The export closure
+  carries it, and the runtime imports it when it binds that
+  generation — so a package boots into the world the author saw
+  rather than an untouched one.
+  A baseline that does not decode against the generation is a HARD
+  ERROR at publish and at bind, not a silent skip: importing another
+  world's state into this one would look like corruption later.
+- LICENSE ATTRIBUTION. `export-app` writes `ATTRIBUTION.txt`, one
+  deduplicated sorted line per packaged plant source whose provenance
+  says it requires attribution, and reports the count. An obligation
+  that lives only in the editor is one the shipped product breaks —
+  which is also why slice 9's attribution notice refuses to invent
+  the licence rather than the other way round.
+
+GATES: `just prepare-for-commit` EXIT=0. `cargo test --workspace`
+green apart from the one `xtask` shader test another agent owns. E2E
+`vegetation-export` 1/1, 21 assertions, validation-clean — it now
+plays, publishes a baseline, exports, and asserts the `.svegstate`
+is in the package and the report says `baseline: true`.
+DOCS: `vegetation-cooking.md`'s export section gained the baseline
+and attribution paragraphs. hugo EXIT=0, links none broken, style
+0/0.
+
+THEN: see the phase-15 slice-6 seal below, which built corruption
+repair.
+
+### Phase 15 slice 6 — verification and repair (Claude session 2026-07-26)
+
+Most of the work-item box turned out to be ALREADY TRUE and is now
+stated with its evidence rather than assumed: atomic publish
+(`AtomicWriteFile`, re-read and rehashed before the publication is
+reported), cancellation (`GraphCancellationToken` plus the queue
+transitions this session started counting), RESUME BY CONSTRUCTION
+(content addressing means a re-run hits the cache for every node
+that published and re-does only the rest — the cook statistics
+report it as hits against misses), cache sharing (one
+content-addressed lock-guarded store), and deterministic package
+ordering (the closure is a `BTreeSet` walked in canonical path
+order).
+- BUILT: `verify_vegetation_artifacts`. An artifact's file NAME IS
+  THE HASH OF ITS BYTES, so verification is a rehash and needs no
+  side table that could itself rot. Faults are `absent` (the
+  manifest names it, the store lacks it) or `corrupt` (the bytes do
+  not hash to the name).
+- REPAIR DELETES RATHER THAN REWRITES. The bytes are the only copy,
+  so there is nothing to rewrite from, and the cooker's cache-miss
+  path is already the thing that produces them — removing a corrupt
+  artifact is exactly what makes the next cook republish it.
+- Only the content-addressed kinds are rehashed. A generation root
+  and a baseline are KEYED by what they belong to, so there is no
+  hash in the name to check them against; conflating the two would
+  report every baseline as corrupt.
+
+The box stays OPEN for the one piece that is genuinely missing:
+parallel/DISTRIBUTED work-item manifests. A serializable claim/publish
+unit separate machines can take is its own design, and the cook queue
+is single-process today. Five of six sub-clauses done is not the box.
+
+GATES: `just prepare-for-commit` EXIT=0. +1 assets test (the
+name-is-the-identity property, keyed kinds excluded, and an empty
+store verifying sound). `cargo test --workspace` green apart from the
+one `xtask` shader test another agent owns. E2E `vegetation-export`
+1/1, 24 assertions, validation-clean — it verifies the real cooked
+store before exporting.
+DOCS: `vegetation-cooking.md` gained "Verifying what is on disk" and
+a code-pointer row. hugo EXIT=0, links none broken, style 0/0.
+
+THEN: see the phase-15 slice-7 seal below, which added page-fault
+latency and audited the GPU telemetry box.
+
+### Phase 15 slice 7 — page faults, and what the GPU already reports (Claude session 2026-07-26)
+
+The GPU-telemetry box turned out to be MOSTLY ALREADY BUILT, and the
+audit is the deliverable: `render-stats` already carries instances,
+triangles, semantic records, aggregate-voxel records, max cut depth,
+frustum and occlusion cull counts, HZB retests, transparent draws,
+micro candidates, sub-quad triangles, draws and batches, RT
+instances, VRAM against budget, per-pass timings, a pipeline-stats
+profiler mode, the whole VSM page/cache/dirty/evict/overflow set,
+page residency, and BOTH counter words for overflow and pressure. The
+flag words are the load-bearing part — a silent capacity clamp is how
+geometry disappears, which this session hit for real in the
+transparent-draw bound.
+- BUILT: PAGE FAULTS AND LATENCY. A fault is priced from demand to
+  the moment the payload CAN BE DRAWN, not to when the bytes
+  arrived — what a stutter costs is when the geometry appears. Kept
+  as a count plus a summed microsecond total so the counter stays
+  additive and the caller picks its own window, rather than a mean
+  the manager would have to maintain.
+- A guaranteed root is demanded at registration, so its clock starts
+  there; the test pins that a demand that never publishes is NOT a
+  fault, which is what stops a stalled page from inflating the
+  latency total.
+
+THE BOX STAYS OPEN for what is genuinely absent: a distinct bin
+count, overdraw, deformation counts, and BLAS build/memory metrics.
+OMM metrics CANNOT exist — the `VK_EXT_opacity_micromap` derivation
+is not built and this machine has no ray-tracing hardware to
+exercise it. Listing what is missing beats checking a box on the
+strength of what is present.
+
+GATES: `just prepare-for-commit` EXIT=0. +1 rendering test, no device
+needed (the state machine owns the timing). `cargo test --workspace`
+green apart from the one `xtask` shader test another agent owns.
+
+THEN: see the phase-13/12/4/5 closure seal below.
+
+### Phases 13, 12, 4 and 5 CLOSED — the timeline panel and a clean full suite (Claude session 2026-07-26)
+
+FOUR PHASES WENT TO COMPLETED, three of them on one piece of
+evidence that had never been obtainable before.
+
+**THE FULL E2E SUITE IS GREEN: 328/328 across 51 files.** That is the
+first fully clean run of the session. Earlier windows recorded the
+suite as unable to finish clean on this machine, with failures moving
+between runs; the `alpha_blend` device-loss fixed earlier this session
+was the cause, and its 4 cases now pass. Alongside it: `just engine`
+and `just prepare-for-commit` EXIT=0, `cargo test --workspace` green,
+`just schema` EXIT=0 with all 249 manifest-driven control checks, and
+the docs three-check at hugo 0 / links none broken / style 0-0.
+
+A BUG OF MY OWN, CAUGHT BY THAT RUN: the export warning added in
+phase-15 slice 2 fired on a project with NO vegetation map at all, so
+the pre-existing `export-app` test's empty-warnings assertion failed.
+The assertion was right and the warning was wrong — a project without
+vegetation shipping no vegetation is not a warning. The condition is
+now "declared maps but no cooked generation", which is the case worth
+warning about. Fixing the code rather than the test is the point.
+
+**PHASE 13 → COMPLETED** (28/28). The last box was the editor ecology
+timeline panel: `EcologyTimelinePanel.tsx`, registered as the
+`ecologyTimeline` dock panel.
+- STEP AND RUN, NEVER A SEEK BAR. Biological time moves forward only
+  and it moves by EXECUTING ticks — there is no analytical
+  fast-forward. A slider would promise something the simulation
+  cannot do.
+- Run advances in CHUNKS and re-reads the clock between them, so a
+  catch-up owing thousands of ticks stays interruptible and the panel
+  keeps repainting. The pause flag is a REF, not state: a stale
+  closure would keep stepping after the user pressed pause.
+- The region table separates CAUGHT UP from WAITING ON RESIDENCY.
+  Different problems — one is work still owed, the other is ground
+  that has not loaded — and collapsing them would hide which.
+- Two editor rules were violated in the first draft and fixed: a
+  local error banner (the editor has exactly ONE error location, the
+  Toaster) and a native `title=` attribute (tooltips are the Radix
+  primitive). Both are in `editor/AGENTS.md`; neither would have been
+  caught by tsc.
+
+**PHASE 12 → COMPLETED** (26/26), **PHASE 4 → COMPLETED** (23/23),
+**PHASE 5 → COMPLETED** (28/28). All three were held by a
+"standard gate + suite + docs are green" box and nothing else. The
+evidence above closes all three at once.
+
+THEN: see the phase-14 slice-11 seal below, which built the Plant
+Graph panel and closed the undo box.
+
+### Phase 14 slice 11 — the Plant Graph panel and semantic undo (Claude session 2026-07-26)
+
+`editor/src/panels/PlantGraphPanel.tsx`, the `plantGraph`
+asset-editor dock panel.
+- UNDO AT SEMANTIC GRANULARITY, and this is the load-bearing design:
+  one recorded edit is one thing an artist would say they did, and its
+  INVERSE IS THE PREVIOUS GRAPH DOCUMENT replayed through the SAME one
+  write path. For a derived model that is the only honest inverse —
+  nothing reconstructs the old parts, dimensions, spines, or proxies by
+  hand, because regrowing the old graph produces them. A second
+  "restore" path would be a second truth about what the family is.
+- Transactional falls out of the seam: `plant-graph-set` replaces the
+  whole document in one call and revalidates the regrown family before
+  saving, so a refused edit changes nothing.
+- The panel edits ONLY what the graph owns (the document and its
+  variation list) and READS BACK everything derived. It also carries
+  the grafts through unchanged on every write, because a graph edit is
+  not a graft edit.
+- TWO PROTOCOL-TYPING FACTS found while wiring it, worth recording:
+  ts-rs does not honour serde's `#[serde(default)]`, so
+  `PlantGrowthParams.variation` and `PlantGraphSetParams.grafts` are
+  REQUIRED in the generated TS even though the wire defaults them —
+  the client wrappers pass them explicitly. And ts-rs does not honour
+  `#[serde(tag = "kind")]` either: `BotanicalEditActionDto` generates
+  as an EXTERNALLY tagged union while the wire is internally tagged, so
+  the generated type does not describe the JSON. The panel avoids
+  depending on that shape rather than casting around it; a real fix
+  belongs in the codegen and is recorded here, not papered over.
+- Two `editor/AGENTS.md` rules caught by oxlint/tsc and fixed: an
+  unused catch binding (an imported family having no graph is a FACT
+  about the asset, not a failed operation, so it is stated in place
+  rather than toasted), and the required Tooltip primitive.
+
+The Plant-workspace box stays OPEN with its remaining views named:
+the 3D preview, wind/interaction preview, lifecycle/season timeline,
+materials/atlas view, collision/nav view, and hierarchy/voxel/error
+view. Each needs its own render surface in the asset-editor island
+rather than a readout table, and claiming the box on the tables that
+exist would misstate what an artist gets.
+
+GATES: `just prepare-for-commit` EXIT=0 (oxfmt, oxlint, tsc, clippy,
+cargo fmt).
+
+THEN: see the platform-parity seal below.
+
+### Phase 15 platform parity — audited, and the gate named (Claude session 2026-07-26)
+
+Two boxes closed by AUDIT rather than by new code, which is the
+honest outcome when the property is already true:
+- **Apple/MoltenVK validated.** Every gate in this plan runs on
+  exactly this configuration (`Apple M4` / `MoltenVK` / api 1.4.334,
+  the only device the machine enumerates): `just e2e` 328/328,
+  `just schema` with 249 manifest checks, `cargo test --workspace`,
+  and the standard gate. MoltenVK lacks
+  `VK_KHR_draw_indirect_count`, so every fixed-slice indirect draw is
+  bounded by the REAL RECORD COUNT instead
+  (`ExecutorDrawInputs::draw_bound`, clamped to the live bound the
+  mirror publishes) — the required indexed-MDI path, not a lesser
+  one, and the transparent pass takes the same bound. Mesh shaders
+  are absent and nothing degrades for it: the executor path is THE
+  path, not a fallback.
+- **Feature bits, not vendor identity.** Audited every use of
+  `vendor_id`, `device_id`, `driver_id`, the UUIDs, and
+  `molten_vk`: all are RECORDED into evidence records and read by
+  nothing that chooses behaviour — `is_molten_vk()` has exactly
+  three callers and all three only stamp it. Behaviour keys on
+  `capabilities.draw_indirect_count` (from
+  `features12.draw_indirect_count`), the mesh-shader feature struct,
+  and advertised limits. That is precisely what lets one code path
+  serve a device with a missing feature.
+
+THE GATE IS NAMED ON EVERY BOX IT HOLDS, in phases 1, 3, and 15: this
+machine enumerates ONE Vulkan device. The NVIDIA and AMD arms, the
+cross-platform image comparison, and the Rust/Slang goldens across
+three vendors cannot be run here and NO CODE CHANGE CLOSES THEM. Each
+box now carries that sentence plus what IS verified on MoltenVK, so a
+future session on other hardware knows exactly what to run rather
+than re-deriving the blocker.
+
+THEN: see the closure-audit seal below.
+
+### Phase 15 final closure + the hardware map (Claude session 2026-07-26)
+
+A REAL BUG FIXED, and it had been failing `just test` all session
+while I mis-attributed it: the `xtask`
+`geometry_passes_use_the_canonical_coverage_module` test still listed
+`point_shadow.slang`, which a COMMITTED refactor
+(`7a583784 retire the meshlet and point-shadow raster paths`) deleted.
+Not another agent's in-flight change as I had assumed — a stale
+reference in the tree. `git log` on the file settled it. The list now
+names the three geometry passes that exist, and `just test` EXIT=0 for
+the first time this session. Checking provenance beats assuming
+provenance.
+
+THREE PHASE-15 BOXES CLOSED:
+- **Protocol/inventory regeneration.** The inventories are ENFORCED,
+  not reviewed: five `xtask` byte-identity tests refuse drift between
+  what the DTOs generate and what is committed;
+  `registry_covers_the_protocol_manifest` fails on a registered
+  command the manifest does not name and vice versa; `just schema`
+  runs 249 live-vs-schema checks; `bun run check` regenerates and
+  typechecks so a panel referencing a dead DTO fails the build —
+  which is exactly how this session's ts-rs codegen facts surfaced.
+- **Docs completeness.** One page per concept with its hub row across
+  spatial cells, plant assets, biomes, botanical authoring,
+  interchange, cooking, rendering, wind, VSM, interaction/physics,
+  persistence, ecology, and tooling — verified by the docs-page
+  three checks together, where `check_style.py` at 0/0 is what
+  enforces the timeless-present rule.
+- (plus the two platform boxes from the previous seal.)
+
+THE HARDWARE MAP IS NOW WRITTEN ON EVERY BOX IT GATES, with the
+verification command rather than a vague "no hardware":
+- **No second adapter.** `vulkaninfo --summary` lists exactly one
+  device: `Apple M4` / MoltenVK / api 1.4.334. That gates the NVIDIA
+  and AMD boxes, the cross-platform image comparison, and the
+  Rust/Slang goldens in phases 1 and 3.
+- **No ray tracing.** `vulkaninfo` reports ZERO occurrences of
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`, so
+  `Device::new` resolves `rt_supported = false`. That gates EIGHT
+  phase-11 boxes (shared compacted BLAS, deformation materialization,
+  voxel clusters as AABBs, KHR any-hit baseline, OMM derivation, NV
+  cluster AS, BLAS/TLAS tracking, and the any-hit/OMM parity
+  acceptance), each now annotated with that fact.
+- **No software rasterizer.** `just run-software` forces llvmpipe, a
+  Mesa driver with no macOS equivalent, so the software arm of the
+  headless box needs the Linux toolbox. Headless itself IS validated —
+  it is the mode the whole 328-test suite runs in.
+- **One live bug**, not a gap: `saffron-player` hangs on frame 1 under
+  MoltenVK in a non-interactive context, which blocks the player-smoke
+  arm of two boxes.
+
+A future session on other hardware can now run down that list without
+re-deriving any of it.
+
+THEN, in dependency order:
+(1) Phase 14's remaining 5: the Plant-workspace render surfaces,
+bounded cancellable preview, presets/subgraphs (`.splant` internal
+modules — no new asset format), the generator outputs (atlases,
+coverage textures, aggregate-voxel appearance error, RT/OMM inputs),
+and USD rigging.
+(2) Phase 15's buildable remainder: distributed work-item manifests,
+and the GPU-telemetry remainder that has subsystems behind it (bins,
+overdraw, deformation counts).
+(3) Phase 11's non-RT boxes: aggregate-voxel injection/sampling parity
+(the `parity_occupancy`/`aggregate_transmittance` helpers exist and
+are tested; wiring them through injection is the work) and the
+GI/reflection culling parameterization audit.
+(4) Everything else waits on hardware or on the player hang.
+(2) Phase 15's remaining 14: the software/headless box, performance
+closure, distributed work-item manifests, the GPU-telemetry
+remainder (bins, overdraw, deformation, BLAS), the determinism/
+failure matrix, and the final repository-closure cluster.
+(3) Phase 11's 14 open boxes, several of which need ray-tracing
+hardware this machine does not have.
+(4) The player-boot box, blocked on the frame-1 hang in phase-15
+slice 4.
+(2) Phase 15's remaining 16: platform parity (several need NVIDIA/AMD
+hardware this machine lacks and must be recorded, not claimed),
+performance closure, distributed work-item manifests, the GPU
+telemetry remainder, and the final repository-closure cluster.
+(3) Phase 14's generator boxes (atlases, coverage textures,
+aggregate-voxel appearance error, RT/OMM inputs) and USD rigging.
+(4) Phase 11's 14 open boxes, and the single hardware-gated box each
+in phases 1 and 3 (Rust/Slang goldens on NVIDIA + AMD + MoltenVK —
+only MoltenVK exists here).
+(5) The player-boot box, which waits on the frame-1 hang recorded in
+phase-15 slice 4.
+(2) The editor workstream: the phase-13 ecology timeline panel and
+the four phase-14 Authoring-UX boxes.
+(3) Phase 15's platform-parity and performance clusters — several
+require NVIDIA/AMD hardware this machine does not have and must be
+recorded honestly rather than claimed.
+(4) Phase 14's generator boxes (atlases, coverage textures,
+aggregate-voxel appearance error, RT/OMM inputs) and USD rigging.
+(5) Distributed work-item manifests, and the player-boot box that
+waits on the frame-1 hang recorded in slice 4.
+(6) Still open from earlier: the remaining phase-11 GI-culling /
+KHR-RT policy boxes, the phase-11 triangle↔voxel parity box,
+phase-12's last gate box, and a full-suite re-verify when the machine
+is fresh.
+(2) The GPU telemetry box, which also unblocks the
+no-per-instance-readback box.
+(3) The editor workstream: the phase-13 ecology timeline panel and
+the four phase-14 Authoring-UX boxes.
+(4) Phase 14's generator boxes (atlases, coverage textures,
+aggregate-voxel appearance error, RT/OMM inputs) and USD rigging.
+(5) Still open from earlier: the remaining phase-11 GI-culling /
 KHR-RT policy boxes (RT hardware unavailable on this Mac — record
 honestly, do not claim), the phase-11 triangle↔voxel parity box,
 phase-12's last gate box, and a full-suite re-verify when the

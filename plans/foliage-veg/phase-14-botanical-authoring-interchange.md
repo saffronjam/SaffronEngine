@@ -117,26 +117,57 @@ second editable plant source, and no native-only renderer path exists.
 
 - [ ] Add structure tree/graph, 3D preview, semantic selection, parameter inspector, family variation
   browser, wind/interaction preview, lifecycle/season timeline, materials/atlas view, collision/nav,
-  hierarchy/voxel/error, and validation/cook-stat panels to the Plant workspace.
+  hierarchy/voxel/error, and validation/cook-stat panels to the Plant workspace. (`PlantGraphPanel`
+  (the `plantGraph` asset-editor dock panel) carries the STRUCTURE readout (axes, elements, shells,
+  grafts, vertices, triangles, parts, height, applied edits, graph identity), the FAMILY VARIATION
+  BROWSER with per-variation age editing, the addressable ELEMENT list — which is also the semantic
+  selection surface, since an edit targets one of those identities — the orphaned-edit list, and the
+  VALIDATION/COOK-STAT readout from `plant-validate`. NOT YET: the 3D preview, the wind/interaction
+  preview, the lifecycle/season timeline, the materials/atlas view, the collision/nav view, and the
+  hierarchy/voxel/error view. Each needs its own render surface in the asset-editor island rather than
+  a readout, and the box stays open rather than claiming the tables that are done.)
 - [ ] Allow real-time bounded preview and cancellation without changing final deterministic output.
-- [ ] Make every graph/manual edit transactional and undoable at semantic-operation granularity.
+- [x] Make every graph/manual edit transactional and undoable at semantic-operation granularity.
+  (Transactional at the seam: `plant-graph-set` replaces the whole document in one call and revalidates
+  the regrown family before it saves, so a refused edit changes nothing. Undoable through the editor's
+  existing `pushEdit`: `PlantGraphPanel.apply` records ONE edit per artist-level operation — "Add
+  variation", "Set variation age" — whose inverse is the PREVIOUS GRAPH DOCUMENT replayed through the
+  same one write path. That is what keeps undo honest for a derived model: nothing reconstructs the old
+  parts, dimensions, spines, or proxies by hand, because regrowing the old graph produces them. Never
+  keystroke granularity, and never a second write path for the inverse.)
 - [ ] Provide presets/subgraphs through `.splant` internal modules or ordinary plant references with
   explicit interfaces; do not add `.splantgraph`.
 
 ## Point and plant interchange
 
-- [ ] Import/export OpenUSD `PointInstancer` positions/orientations/scales/prototypes/stable IDs and
+- [x] Import/export OpenUSD `PointInstancer` positions/orientations/scales/prototypes/stable IDs and
   sparse masks through the canonical point schema, preserving provenance and explicit unsupported
-  attributes.
+  attributes. (`interchange_usd.rs` reads and writes the USDA text form — no USD runtime needed, since
+  the text states the arrays directly. Two conventions handled explicitly: a `quatf` orientation is
+  WXYZ, and `invisibleIds` masks by the instancer's own `ids` rather than by array position, so
+  reordering the arrays keeps masking the same instances. A masked instance becomes no anchor and its
+  identity stays in the source, which is what lets unmasking restore the same plant; identities are
+  content-derived, so masking one instance cannot disturb another's GPU slot. Every anchor carries a
+  real `ExplicitAnchors` provenance record, and every unexpressible attribute is reported.)
 - [ ] Support standard USD skeleton/plant metadata, glTF including `EXT_mesh_gpu_instancing` where
   appropriate, and Houdini point/field attributes as source inputs. (Houdini JSON `.geo` point clouds
-  ARE read — `read_houdini_points` handles `P`, `orient`/`rot`, `scale`/`pscale`, `id`, and
-  `name`/`variant`, reporting every other attribute. USD metadata and glTF
-  `EXT_mesh_gpu_instancing` each need their own reader and neither is built; the box stays open rather
-  than claiming a third of it.)
-- [ ] Accept standard geometry/skeleton/material exports originating from SpeedTree and preserve
+  are read by `read_houdini_points` — `P`, `orient`/`rot`, `scale`/`pscale`, `id`, `name`/`variant` —
+  and glTF `EXT_mesh_gpu_instancing` by `read_gltf_instancing`, which composes each instance transform
+  with its node's whole ancestor chain and reports every instance attribute it cannot express.
+  USD `PointInstancer` prims by `read_usd_point_instancers` over the USDA text form.
+  `vegetation-import-points` picks the reader from the file extension. USD SKELETON/PLANT METADATA —
+  `SkelRoot`, joint hierarchies, and the plant-specific schemas — is NOT read; only placement is. The
+  box stays open rather than claiming the part that is done.)
+- [x] Accept standard geometry/skeleton/material exports originating from SpeedTree and preserve
   attribution/reimport settings. Direct proprietary `.st`/`.st9` support is added only after SDK
-  license, platform, and redistribution review; it is not promised by this plan.
+  license, platform, and redistribution review; it is not promised by this plan. (A SpeedTree export is
+  an ordinary glTF/OBJ plant source — no tool-specific path, which is the point. `ImportedOrigin`
+  carries the file's own `asset.generator` and `asset.copyright` verbatim through import, and
+  `attribution_notice` raises a Warning when a file states a copyright the plant source records no
+  attribution for; the statement is never folded into the authored provenance, because a licence the
+  engine inferred would be a legal claim nobody authored. Reimport settings already ride on
+  `PlantSourceReference.settings` and are reused by every recook. `.st`/`.st9` is not read, matching
+  this box's own carve-out.)
 - [x] Normalize every source through the Phase-4 plant importer and Phase-6 cooker. Source-specific
   metadata that cannot map is reported, not retained as an alternate runtime object.
   (`interchange.rs`: an imported instance becomes an ordinary `ExplicitPlantAnchor` through the
@@ -157,15 +188,41 @@ second editable plant source, and no native-only renderer path exists.
 
 ## Acceptance
 
-- [ ] Native and imported versions of equivalent plant structure produce the same normalized family
-  schema and render/runtime path.
-- [ ] Procedural parameter edits preserve surviving semantic manual offsets and report orphaned ones.
-- [ ] Generated family variations, phenotype states, wind rig, collision/nav, virtual hierarchy, and
+- [x] Native and imported versions of equivalent plant structure produce the same normalized family
+  schema and render/runtime path. (`native_and_imported_sources_publish_to_the_same_artifact_contract`
+  recooks one of each through `recook_plant_family` and asserts both publish into the same folder with
+  the identical `PlantCompiledSectionKind::ALL` section set present — one cooker, one artifact shape,
+  no native-only path. `native_source_uses_the_shared_normalized_family_contract` asserts the native
+  family reaches it as an ordinary `NormalizedPlantFamily`.)
+- [x] Procedural parameter edits preserve surviving semantic manual offsets and report orphaned ones.
+  (`an_edit_survives_an_unrelated_parameter_change` lengthens a trunk and the leaf offset still lands;
+  `a_vanished_target_is_reported_as_an_orphan` thins the phyllotaxis and gets the edit back with
+  `TargetMissing`. The `vegetation-botanical` e2e drives the same pair through the real host and checks
+  the compiler's `orphaned-edit` warning.)
+- [x] Generated family variations, phenotype states, wind rig, collision/nav, virtual hierarchy, and
   materials pass all existing plant validation gates.
-- [ ] USD PointInstancer stable IDs/sparse deactivation round-trip without GPU-slot identity leakage.
-- [ ] Source reimport never silently loses semantic overrides or creates separately authored generated
-  assets.
-- [ ] Standard gate, asset-editor E2E, source-license fixtures, and botanical/interchange docs are green.
+  (`a_multi_variation_native_family_publishes_with_every_combination` builds a two-variation family the
+  ordinary way — derived appearances, derived proxies — saves it, recooks it, asserts it is publishable
+  with one mesh set per variation, and asserts `plant_hierarchy_input` offers a use combination for
+  every authored (variation, phenotype) pair. `proxies_are_derived_from_the_grown_plant` runs
+  `validate_plant_family` over the derived family.)
+- [x] USD PointInstancer stable IDs/sparse deactivation round-trip without GPU-slot identity leakage.
+  (`a_point_instancer_round_trips` carries ids and the `invisibleIds` mask through the writer and back;
+  `masking_one_instance_leaks_no_other_identity` unmasks one instance and asserts every other plant's
+  identity is unchanged and exactly the masked instance's own appears — identities come from the
+  source's ids rather than from a slot, so nothing renumbers.)
+- [x] Source reimport never silently loses semantic overrides or creates separately authored generated
+  assets. (`disappeared_manual_target_blocks_publication_without_dropping_target`: an imported manual
+  semantic target whose element vanished blocks publication and stays in the recipe. On the native
+  side an orphaned edit is reported and retained, and `source.native.generatedPayload` refuses a
+  snapshot that tries to stand in for grown geometry — a native family's generated geometry never
+  becomes a second editable source.)
+- [x] Standard gate, asset-editor E2E, source-license fixtures, and botanical/interchange docs are
+  green. (`just prepare-for-commit` EXIT=0; `vegetation-botanical` 6/6, `vegetation-interchange` 1/1,
+  `vegetation-interaction` 1/1, `vegetation-ecology` 2/2, all validation-clean; the source-license
+  fixture is `geometry/tests/fixtures/two-materials.gltf`, which states a generator and a copyright
+  requiring attribution; `botanical-graph.md` and `point-interchange.md` pass hugo, the link check, and
+  the style check at 0/0.)
 
 ## NO-LEGACY gate
 
