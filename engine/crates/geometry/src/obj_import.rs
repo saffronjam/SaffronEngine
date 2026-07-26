@@ -126,6 +126,8 @@ pub fn import_obj_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
         animations: Vec::new(),
         skin: None,
         morph: None,
+        // OBJ has no asset block, so it states nothing about its origin.
+        origin: crate::types::ImportedOrigin::default(),
     })
 }
 

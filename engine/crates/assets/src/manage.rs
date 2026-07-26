@@ -1202,6 +1202,7 @@ mod tests {
     /// A static model with one material that references an embedded texture (albedo).
     fn one_material_graph() -> ImportedModel {
         ImportedModel {
+            origin: Default::default(),
             nodes: vec![saffron_geometry::ImportedNode {
                 name: "mesh".to_owned(),
                 mesh: Some(tri_mesh()),

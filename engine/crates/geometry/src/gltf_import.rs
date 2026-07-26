@@ -190,6 +190,21 @@ pub fn import_gltf_model(path: impl AsRef<Path>) -> Result<ImportedModel> {
         animations,
         skin,
         morph: model_morph,
+        // Verbatim from the file's own asset block: what wrote it and what it says about reuse.
+        origin: crate::types::ImportedOrigin {
+            generator: document
+                .as_json()
+                .asset
+                .generator
+                .clone()
+                .unwrap_or_default(),
+            copyright: document
+                .as_json()
+                .asset
+                .copyright
+                .clone()
+                .unwrap_or_default(),
+        },
     })
 }
 

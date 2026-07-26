@@ -518,6 +518,22 @@ pub struct ImportedModel {
     /// has no blend shapes. Mesh-global: the target names ride the mesh-level
     /// `extras.targetNames` and the weight vector is shared across the mesh's primitives.
     pub morph: Option<MorphData>,
+    /// What the source file says produced it, verbatim, and what it says about reuse.
+    ///
+    /// A studio's plant export usually names its authoring tool, and some tools' licences require
+    /// attribution. Recording what the file states — rather than inferring a licence from a tool
+    /// name — is what lets the attribution survive a reimport without the engine making a legal
+    /// judgement.
+    pub origin: ImportedOrigin,
+}
+
+/// What a source file states about where it came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportedOrigin {
+    /// The tool that wrote the file, verbatim; empty when it declares none.
+    pub generator: String,
+    /// The file's own copyright line, verbatim; empty when it declares none.
+    pub copyright: String,
 }
 
 impl ImportedModel {

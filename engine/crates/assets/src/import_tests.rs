@@ -102,6 +102,7 @@ fn town_graph() -> ImportedModel {
         }],
     };
     ImportedModel {
+        origin: Default::default(),
         nodes: vec![
             // The skinned mesh node (mesh_node 0) carries the mesh node-locally.
             saffron_geometry::ImportedNode {
@@ -308,6 +309,7 @@ fn unrigged_graph_bakes_no_skin_and_unrigged_rows() {
         animations: Vec::new(),
         skin: None,
         morph: None,
+        origin: Default::default(),
     };
     let bake = assets
         .bake_model(&graph, ImportOptions::default(), "/tmp/flat.obj", Uuid(0))

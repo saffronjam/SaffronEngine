@@ -57,6 +57,7 @@ fn triangle_mesh() -> Mesh {
 /// A graph with one material (no textures) so the bake writes a small container.
 fn flat_graph() -> ImportedModel {
     ImportedModel {
+        origin: Default::default(),
         nodes: vec![saffron_geometry::ImportedNode {
             name: "mesh".to_owned(),
             mesh: Some(triangle_mesh()),

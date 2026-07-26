@@ -116,6 +116,7 @@ fn instantiate_flat_model_spawns_one_mesh_entity_referencing_its_material() {
         animations: Vec::new(),
         skin: None,
         morph: None,
+        origin: Default::default(),
     };
     let model_id = bake_into_catalog(&mut assets, &graph, "/tmp/flat.obj");
 
@@ -217,6 +218,7 @@ fn instantiate_animated_single_morph_node_keeps_its_player() {
                 }],
             }],
         }),
+        origin: Default::default(),
     };
     let model_id = bake_into_catalog(&mut assets, &graph, "/tmp/morph.gltf");
 
@@ -277,6 +279,7 @@ fn instantiate_multi_material_model_spawns_a_material_set_in_slot_order() {
         animations: Vec::new(),
         skin: None,
         morph: None,
+        origin: Default::default(),
     };
     let model_id = bake_into_catalog(&mut assets, &graph, "/tmp/two.obj");
 
@@ -333,6 +336,7 @@ fn rigged_graph() -> ImportedModel {
     // A 90-degree rotation about Y, stored on the joint node.
     let joint_rotation = Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2);
     ImportedModel {
+        origin: Default::default(),
         nodes: vec![
             // The skinned mesh node (mesh_node 0) carries the mesh node-locally.
             ImportedNode {
