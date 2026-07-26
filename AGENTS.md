@@ -227,6 +227,18 @@ sa                  → {saffron-protocol, saffron-control-client}         the c
 - There is no engine UI toolkit: the in-viewport gizmo is a **native overlay** (`OverlayVertex` /
   `submit_overlay` in `saffron-rendering`; `build_scene_edit_overlay` in `saffron-host`), and the full
   editor UI is the React/CEF frontend.
+- **The DAG is an invariant, not a description.** Two edges that must stay absent:
+  `saffron-rendering` never imports `saffron_vegetation` (tripwire:
+  `grep -rn saffron_vegetation engine/crates/rendering/` returns nothing — vegetation reaches the
+  renderer through `saffron-assets`), and `saffron-host` has no direct `saffron-vegetation`
+  dependency, re-exporting what it needs through `saffron-runtime`. Adding an edge means updating
+  this list **and** `docs/content/explanations/architecture-and-conventions/module-dag.md` in the
+  same change.
+- **Seven engine crates carry their own `AGENTS.md`** with the rules that bite at that depth:
+  `crates/{vegetation,spatial,assets,runtime,control,protocol,vegetation-gpu}`. Read the one for the
+  directory you are editing; nested files elsewhere cover `editor/`, `editor/src/panels/`,
+  `editor/src/storefront/`, `editor/shell/src/connectors/`, `packager/`, `schemas/control/`,
+  `engine/assets/icons/`, and `tests/e2e/`.
 
 ## Layout
 
@@ -332,9 +344,23 @@ a feature — follow and update a matching plan rather than starting cold.
   sensors/triggers + a contact-event ring to scripts; kinematic bone-following; a `CharacterVirtual`
   controller; raycast/shapecast queries + a Luau `sa.raycast`; and a motor-driven ragdoll routed through
   the pose-buffer override/weight blend layer — passive, active, and partial, with import auto-fit);
-  and the persistent GPU scene with GPU-driven rendering (a journal-driven mirror + device tables,
+  the persistent GPU scene with GPU-driven rendering (a journal-driven mirror + device tables,
   byte-locked page residency with a streaming worker, per-view HZB occlusion + hierarchy traversal +
   GPU binning, counted-indirect executor draws with BDA vertex pulling for every raster pass, a GPU
-  radix-sorted transparent pass, and a tessellation-seam path for displaced instances).
+  radix-sorted transparent pass, and a tessellation-seam path for displaced instances);
+  and vegetation as a deterministic world system (below).
+- **Vegetation** is the largest single subsystem and spans nine directories, each with its own
+  `AGENTS.md`. Three authored asset types — `.splant` plant families, `.sbiome` placement/ecology
+  rule graphs, `.svegmap` world authoring — compile through a content-addressed cooker into
+  disposable `.splantc` / `.svegcell` artifacts under `<project>/cache/vegetation/`, **beside**
+  `assets/` rather than inside it. A compact runtime store overlays persistent mutations, and the
+  renderer consumes the result through the same GPU Scene as ordinary meshes, so grass, trees,
+  painting, physics promotion, saves, shadows, GI, and ray tracing share one source of truth.
+  Placement is integer-exact end to end (Q15.16 scalars, counter-based Philox, an integer trig
+  table) so a plant grows identically on every target. Also built: the native botanical graph with a
+  nondestructive manual-edit layer, a fixed-tick ecology clock with dependency-region catch-up,
+  Houdini/USD/glTF point interchange, batched collision proxies and navigation contributions, and
+  the editor's five vegetation panels. Per-concept reference lives across the
+  `geometry-and-assets`, `scene-and-ecs`, and `physics` docs hubs.
 - **Not yet:** transient render-graph resources (graph-created images + aliasing) + async compute;
   the optional `VK_EXT_mesh_shader` executor; hardware GPU in the toolbox.
