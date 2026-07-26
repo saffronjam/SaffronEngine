@@ -1535,9 +1535,71 @@ export interface VegetationPointPrototypeDto {
   family: WireUuid;
 }
 
+export interface VegetationStageTimesDto {
+  residencyUs: number;
+  promotionUs: number;
+  collisionUs: number;
+  navigationUs: number;
+  ecologyUs: number;
+  totalUs: number;
+}
+
+export interface VegetationWorkCountersDto {
+  synchronizations: string;
+  queries: string;
+  queryHits: string;
+  mutations: string;
+  mutationBytes: string;
+  snapshots: string;
+  snapshotBytes: string;
+  ecologyTicks: string;
+}
+
+export interface VegetationArtifactFaultDto {
+  path: string;
+  fault: string;
+}
+
+export interface VegetationVerifyParams {
+  repair: boolean;
+}
+
+export interface VegetationVerifyResult {
+  checked: string;
+  repaired: string;
+  faults: VegetationArtifactFaultDto[];
+}
+
+export interface VegetationStateBaselineResult {
+  manifestIdentity: string;
+  bytes: string;
+  cells: string;
+}
+
+export interface VegetationCookQueueDto {
+  live: string;
+  submitted: string;
+  completed: string;
+  cancelled: string;
+  superseded: string;
+  failed: string;
+  latencyUs: string;
+}
+
+export interface VegetationTelemetryResult {
+  last: VegetationStageTimesDto;
+  average: VegetationStageTimesDto;
+  work: VegetationWorkCountersDto;
+  residentBytes: VegetationRuntimeFacetBytesDto;
+  collisionBodies: string;
+  navigationContributions: string;
+  promoted: string;
+  cookQueue: VegetationCookQueueDto;
+}
+
 export interface VegetationImportPointsParams {
   map: AssetSelector;
-  layer: string;
+  layer: VegetationGuid;
   path: string;
   prototypes: VegetationPointPrototypeDto[];
   expectedGeneration: string;
@@ -1553,7 +1615,7 @@ export interface VegetationImportPointsResult {
 
 export interface VegetationExportPointsParams {
   map: AssetSelector;
-  layer: string;
+  layer: VegetationGuid;
   path: string;
 }
 
@@ -2066,6 +2128,8 @@ export interface PageResidencyStatsDto {
   loading: number;
   ready: number;
   evictions: number;
+  faults: number;
+  faultLatencyUs: number;
 }
 
 export interface SceneVisibilityStatsDto {
@@ -3110,9 +3174,29 @@ export interface ExportAppParams {
   app: AppManifest;
 }
 
+export interface ExportVegetationFacetDto {
+  facet: string;
+  cells: string;
+  bytes: string;
+}
+
+export interface ExportVegetationMapDto {
+  map: WireUuid;
+  manifestIdentity: string;
+  plants: string;
+  cells: string;
+  missing: string;
+  baseline: boolean;
+  macroPlants: string;
+  facets: ExportVegetationFacetDto[];
+}
+
 export interface ExportAppResult {
   path: string;
   warnings: string[];
+  vegetation: ExportVegetationMapDto[];
+  vegetationBytes: string;
+  attributions: number;
 }
 
 export interface AssignAssetResult {
@@ -4254,6 +4338,9 @@ export interface CommandParamsMap {
   "vegetation-advance-ecology": VegetationAdvanceEcologyParams;
   "vegetation-ecology-status": EmptyParams;
   "vegetation-combustion": VegetationCombustionParams;
+  "vegetation-verify-artifacts": VegetationVerifyParams;
+  "vegetation-state-baseline": EmptyParams;
+  "vegetation-telemetry": EmptyParams;
   "vegetation-import-points": VegetationImportPointsParams;
   "vegetation-export-points": VegetationExportPointsParams;
   "plant-create": PlantCreateParams;
@@ -4495,6 +4582,9 @@ export interface CommandResultMap {
   "vegetation-advance-ecology": VegetationEcologyReportDto;
   "vegetation-ecology-status": VegetationEcologyStatusDto;
   "vegetation-combustion": VegetationCombustionDto;
+  "vegetation-verify-artifacts": VegetationVerifyResult;
+  "vegetation-state-baseline": VegetationStateBaselineResult;
+  "vegetation-telemetry": VegetationTelemetryResult;
   "vegetation-import-points": VegetationImportPointsResult;
   "vegetation-export-points": VegetationExportPointsResult;
   "plant-create": PlantCreateResult;

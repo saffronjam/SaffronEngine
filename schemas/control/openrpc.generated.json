@@ -2976,6 +2976,60 @@
       }
     },
     {
+      "name": "vegetation-verify-artifacts",
+      "summary": "rehash every artifact the current generations name, optionally removing corrupt ones",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VegetationVerifyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationVerifyResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-state-baseline",
+      "summary": "publish the current runtime vegetation state as the generation's starting state",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationStateBaselineResult"
+        }
+      }
+    },
+    {
+      "name": "vegetation-telemetry",
+      "summary": "compact vegetation runtime telemetry: stage times, work counters, resident bytes",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/EmptyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VegetationTelemetryResult"
+        }
+      }
+    },
+    {
       "name": "vegetation-import-points",
       "summary": "import instanced points from a content-creation tool into an authored map layer",
       "params": [
@@ -8453,11 +8507,90 @@
             "items": {
               "type": "string"
             }
+          },
+          "vegetation": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExportVegetationMapDto"
+            }
+          },
+          "vegetationBytes": {
+            "type": "string"
+          },
+          "attributions": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
           "path",
-          "warnings"
+          "warnings",
+          "vegetation",
+          "vegetationBytes",
+          "attributions"
+        ]
+      },
+      "ExportVegetationFacetDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "facet": {
+            "type": "string"
+          },
+          "cells": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "facet",
+          "cells",
+          "bytes"
+        ]
+      },
+      "ExportVegetationMapDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "map": {
+            "type": "string"
+          },
+          "manifestIdentity": {
+            "type": "string"
+          },
+          "plants": {
+            "type": "string"
+          },
+          "cells": {
+            "type": "string"
+          },
+          "missing": {
+            "type": "string"
+          },
+          "baseline": {
+            "type": "boolean"
+          },
+          "macroPlants": {
+            "type": "string"
+          },
+          "facets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExportVegetationFacetDto"
+            }
+          }
+        },
+        "required": [
+          "map",
+          "manifestIdentity",
+          "plants",
+          "cells",
+          "missing",
+          "baseline",
+          "macroPlants",
+          "facets"
         ]
       },
       "ExposedParamDto": {
@@ -10446,6 +10579,14 @@
           "evictions": {
             "type": "integer",
             "minimum": 0
+          },
+          "faults": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "faultLatencyUs": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -10456,7 +10597,9 @@
           "requested",
           "loading",
           "ready",
-          "evictions"
+          "evictions",
+          "faults",
+          "faultLatencyUs"
         ]
       },
       "PathParams": {
@@ -17208,6 +17351,22 @@
           }
         ]
       },
+      "VegetationArtifactFaultDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "fault": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "fault"
+        ]
+      },
       "VegetationArtifactSectionCodecDto": {
         "type": "string",
         "enum": [
@@ -18037,6 +18196,42 @@
           "totalNodes",
           "cacheHits",
           "publishedCells"
+        ]
+      },
+      "VegetationCookQueueDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "live": {
+            "type": "string"
+          },
+          "submitted": {
+            "type": "string"
+          },
+          "completed": {
+            "type": "string"
+          },
+          "cancelled": {
+            "type": "string"
+          },
+          "superseded": {
+            "type": "string"
+          },
+          "failed": {
+            "type": "string"
+          },
+          "latencyUs": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "live",
+          "submitted",
+          "completed",
+          "cancelled",
+          "superseded",
+          "failed",
+          "latencyUs"
         ]
       },
       "VegetationCookRejectionTotalDto": {
@@ -18986,7 +19181,10 @@
             "$ref": "#/components/schemas/AssetSelector"
           },
           "layer": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
           },
           "path": {
             "type": "string"
@@ -19640,7 +19838,10 @@
             "$ref": "#/components/schemas/AssetSelector"
           },
           "layer": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
           },
           "path": {
             "type": "string"
@@ -23098,6 +23299,64 @@
           "microCount"
         ]
       },
+      "VegetationStageTimesDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "residencyUs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "promotionUs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "collisionUs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "navigationUs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ecologyUs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "totalUs": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "residencyUs",
+          "promotionUs",
+          "collisionUs",
+          "navigationUs",
+          "ecologyUs",
+          "totalUs"
+        ]
+      },
+      "VegetationStateBaselineResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "manifestIdentity": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "string"
+          },
+          "cells": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "manifestIdentity",
+          "bytes",
+          "cells"
+        ]
+      },
       "VegetationStateImportParams": {
         "type": "object",
         "additionalProperties": false,
@@ -23132,6 +23391,46 @@
           "contentHash",
           "bytes",
           "dataHex"
+        ]
+      },
+      "VegetationTelemetryResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "last": {
+            "$ref": "#/components/schemas/VegetationStageTimesDto"
+          },
+          "average": {
+            "$ref": "#/components/schemas/VegetationStageTimesDto"
+          },
+          "work": {
+            "$ref": "#/components/schemas/VegetationWorkCountersDto"
+          },
+          "residentBytes": {
+            "$ref": "#/components/schemas/VegetationRuntimeFacetBytesDto"
+          },
+          "collisionBodies": {
+            "type": "string"
+          },
+          "navigationContributions": {
+            "type": "string"
+          },
+          "promoted": {
+            "type": "string"
+          },
+          "cookQueue": {
+            "$ref": "#/components/schemas/VegetationCookQueueDto"
+          }
+        },
+        "required": [
+          "last",
+          "average",
+          "work",
+          "residentBytes",
+          "collisionBodies",
+          "navigationContributions",
+          "promoted",
+          "cookQueue"
         ]
       },
       "VegetationTopologyCellDiffDto": {
@@ -23564,6 +23863,80 @@
         "required": [
           "valid",
           "issues"
+        ]
+      },
+      "VegetationVerifyParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "repair": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": []
+      },
+      "VegetationVerifyResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "checked": {
+            "type": "string"
+          },
+          "repaired": {
+            "type": "string"
+          },
+          "faults": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VegetationArtifactFaultDto"
+            }
+          }
+        },
+        "required": [
+          "checked",
+          "repaired",
+          "faults"
+        ]
+      },
+      "VegetationWorkCountersDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "synchronizations": {
+            "type": "string"
+          },
+          "queries": {
+            "type": "string"
+          },
+          "queryHits": {
+            "type": "string"
+          },
+          "mutations": {
+            "type": "string"
+          },
+          "mutationBytes": {
+            "type": "string"
+          },
+          "snapshots": {
+            "type": "string"
+          },
+          "snapshotBytes": {
+            "type": "string"
+          },
+          "ecologyTicks": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "synchronizations",
+          "queries",
+          "queryHits",
+          "mutations",
+          "mutationBytes",
+          "snapshots",
+          "snapshotBytes",
+          "ecologyTicks"
         ]
       },
       "ViewModeDto": {

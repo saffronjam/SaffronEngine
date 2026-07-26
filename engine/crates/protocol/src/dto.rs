@@ -190,6 +190,42 @@ pub struct ExportAppParams {
     pub app: AppManifest,
 }
 
+/// Stored bytes one cell facet occupies across a map's cells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct ExportVegetationFacetDto {
+    /// Canonical facet name.
+    pub facet: String,
+    /// Cells that carry it.
+    pub cells: String,
+    /// Stored bytes it occupies across those cells.
+    pub bytes: String,
+}
+
+/// One map's contribution to an exported package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct ExportVegetationMapDto {
+    /// The authored map.
+    pub map: Uuid,
+    /// Identity of the manifest the package binds.
+    pub manifest_identity: String,
+    /// Compiled families the manifest names.
+    pub plants: String,
+    /// Cooked cells the manifest names.
+    pub cells: String,
+    /// Artifacts the manifest names that the store does not hold.
+    pub missing: String,
+    /// Whether the generation ships an initial persistent-state baseline.
+    pub baseline: bool,
+    /// Macro plants across every cell the manifest names.
+    pub macro_plants: String,
+    /// Stored bytes per cell facet, in canonical section order.
+    pub facets: Vec<ExportVegetationFacetDto>,
+}
+
 /// `export-app` result: the staged app directory and any non-fatal warnings raised during cook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -199,6 +235,12 @@ pub struct ExportAppResult {
     pub path: String,
     /// Non-fatal warnings (e.g. a material that failed to pre-bake), for the editor to surface.
     pub warnings: Vec<String>,
+    /// What the cooked vegetation closure contributed: one entry per map with a generation.
+    pub vegetation: Vec<ExportVegetationMapDto>,
+    /// Bytes the vegetation closure carries.
+    pub vegetation_bytes: String,
+    /// Attribution lines written to `ATTRIBUTION.txt`, one per packaged source that requires it.
+    pub attributions: u32,
 }
 
 /// The `add-entity` preset selector.
@@ -669,6 +711,10 @@ pub struct PageResidencyStatsDto {
     pub ready: u64,
     /// Cumulative evictions.
     pub evictions: u64,
+    /// Pages that went from requested to resident, which is what a fault costs.
+    pub faults: u64,
+    /// Microseconds those faults took, summed; over `faults` it is the mean fault latency.
+    pub fault_latency_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

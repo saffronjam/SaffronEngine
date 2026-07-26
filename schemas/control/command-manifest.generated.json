@@ -1157,6 +1157,27 @@
       "skip": "requires an exact bound vegetation runtime generation"
     },
     {
+      "name": "vegetation-verify-artifacts",
+      "params": "VegetationVerifyParams",
+      "result": "VegetationVerifyResult",
+      "status": "typed",
+      "skip": "requires a loaded project"
+    },
+    {
+      "name": "vegetation-state-baseline",
+      "params": "EmptyParams",
+      "result": "VegetationStateBaselineResult",
+      "status": "typed",
+      "skip": "requires a bound vegetation runtime"
+    },
+    {
+      "name": "vegetation-telemetry",
+      "params": "EmptyParams",
+      "result": "VegetationTelemetryResult",
+      "status": "typed",
+      "skip": "requires a bound vegetation runtime"
+    },
+    {
       "name": "vegetation-import-points",
       "params": "VegetationImportPointsParams",
       "result": "VegetationImportPointsResult",
