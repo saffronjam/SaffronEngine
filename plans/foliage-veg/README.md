@@ -2,6 +2,9 @@
 
 **Status:** IN PROGRESS
 
+Start at [`READMESUMMARY.md`](READMESUMMARY.md) for where every phase stands and what the current
+hardware gates; [`READMEFABLE.md`](READMEFABLE.md) carries the full design record.
+
 This planset builds vegetation as a deterministic world system, not as a collection of foliage
 draw calls. Three vegetation-specific logical asset types describe plant families, biome rules,
 and world authoring. A shared spatial substrate evaluates them into immutable, cell-addressed

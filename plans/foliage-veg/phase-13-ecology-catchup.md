@@ -1,6 +1,6 @@
 # Phase 13 — Lifecycle ecology and deterministic catch-up
 
-**Status:** IN PROGRESS (core complete; two cross-phase boxes open — see lines 52 and 143)
+**Status:** COMPLETED
 
 **Depends on:** Phases 3, 5, and 12
 
@@ -144,7 +144,17 @@ advance a bounded fixture and dump canonical cell/checkpoint hashes.
   every cell's boundary summary. Age, life stage, health, moisture, and fuel per plant already come
   from `vegetation-runtime-inspect`; shade and suitability are the summary's canopy plus the tick
   rules that read it; emitted transitions come from `vegetation-drain-events`.
-- [ ] Editor timeline panel: pause-step-run over the ecology clock, with the region/catch-up overlay.
+- [x] Editor timeline panel: pause-step-run over the ecology clock, with the region/catch-up overlay.
+  (`editor/src/panels/EcologyTimelinePanel.tsx`, registered as the `ecologyTimeline` dock panel.
+  STEP and RUN, never a seek bar: biological time only moves forward and it moves by EXECUTING ticks,
+  so a slider that could drag the clock backwards would promise something the simulation cannot do.
+  Run advances in chunks and re-reads the clock between them, so a catch-up owing thousands of ticks
+  stays interruptible and the panel keeps repainting; the pause flag is a ref rather than state, or a
+  stale closure would keep stepping after the user pressed pause. The region table separates CAUGHT UP
+  from WAITING ON RESIDENCY — different problems: one is work still owed, the other is ground that has
+  not loaded — and reports the world tick, rule-set version, region radius, checkpoint, and the last
+  advance's ticks run against ticks owed. Failures route through the Toaster per the editor's one
+  error location, and the checkpoint uses the Tooltip primitive rather than a native `title`.)
   Belongs with the phase-9 authoring surfaces rather than the simulation core.
 
 ## Acceptance

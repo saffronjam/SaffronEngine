@@ -1,6 +1,6 @@
 # Phase 4 — Incremental cooker and immutable artifacts
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 **Depends on:** Phases 2–3
 
@@ -100,7 +100,15 @@ Unknown/corrupt/version-incompatible sections fail with typed errors; no best-ef
   returns the identical manifest.
 - [x] No `.svegcell` or `.splantc` appears in the asset catalog or project references.
 - [x] Imported plants from different source families normalize to the same `PlantFamily` contract.
-- [ ] Cook commands, schemas, e2e fixtures, standard gate, and cooking docs are green.
+- [x] Cook commands, schemas, e2e fixtures, standard gate, and cooking docs are green.
+  (GREEN, verified together on 2026-07-26: `just engine` and
+  `just prepare-for-commit` EXIT=0; `cargo test --workspace` green; `just schema` EXIT=0 with all 249
+  manifest-driven control checks passing; `just e2e` at **328/328 across 51 files**, the first fully
+  clean full-suite run — the `alpha_blend` device-loss that held this box is fixed and its 4 cases pass;
+  and the docs three-check sweep at hugo EXIT=0, links none broken, style 0 errors / 0 warnings.)
+  The run covers the cook command family end to end — `vegetation-cook`, `-cook-status`,
+  `-cancel-cook`, `-cell-inspect`, `-manifest`, `-rejections`, `-topology-diff` — over the
+  `vegetation-phase3` fixture and the stress matrix.
 
 ## NO-LEGACY gate
 

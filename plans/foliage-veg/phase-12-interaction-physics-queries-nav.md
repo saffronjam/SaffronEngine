@@ -1,6 +1,6 @@
 # Phase 12 — Interaction, physics, queries, navigation, and promotion
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 **Depends on:** Phases 5, 8, and 10
 
@@ -212,14 +212,15 @@ obstacle while promoted.
   damage record twice: the first commits and emits exactly one `damaged` transition, the replay
   emits none. The reducer errors on a transaction id reused with DIFFERENT contents, and
   `committed_records_emit_one_typed_transition_and_replays_emit_none` pins the emission contract.)
-- [ ] Standard gate, Jolt determinism tests, Luau/control E2E, and interaction/query docs are green.
-  (GREEN: `just engine`, `just prepare-for-commit`, the Jolt `determinism_gate` (5x in fresh
-  processes after the scene-ordering fix), every phase-12 crate suite, the docs 3-check sweep, and
-  `just e2e` at 312/314 — including the new `vegetation-interaction` acceptance driver and the whole
-  vegetation graph/stress matrix. NOT GREEN, and the only thing holding this box: the two
-  `alpha_blend` cases, which die on the pre-existing MoltenVK device-loss during project reload —
-  a phase-11 blocker under separate investigation (see READMEFABLE window #4), unrelated to
-  vegetation.)
+- [x] Standard gate, Jolt determinism tests, Luau/control E2E, and interaction/query docs are green.
+  (GREEN, verified together on 2026-07-26: `just engine` and
+  `just prepare-for-commit` EXIT=0; `cargo test --workspace` green; `just schema` EXIT=0 with all 249
+  manifest-driven control checks passing; `just e2e` at **328/328 across 51 files**, the first fully
+  clean full-suite run — the `alpha_blend` device-loss that held this box is fixed and its 4 cases pass;
+  and the docs three-check sweep at hugo EXIT=0, links none broken, style 0 errors / 0 warnings.)
+  The Jolt `determinism_gate` passes 5x in fresh processes after the scene-ordering fix, every phase-12
+  crate suite is green, and the run includes the `vegetation-interaction` acceptance driver and the
+  whole vegetation graph/stress matrix.
 
 ## NO-LEGACY gate
 

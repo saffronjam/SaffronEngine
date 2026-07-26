@@ -1,6 +1,6 @@
 # Phase 5 — Runtime cell store, queries, and persistence baseline
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 **Depends on:** Phases 1 and 4
 
@@ -74,7 +74,15 @@ macro generation remains authoritative.
   specified hysteresis.
 - [x] CPU memory and query work scale with resident cell facets/macro plants, never micro blade count.
 - [x] `sa` query/state commands and protocol DTOs use opaque string `PlantId`s and generated TS.
-- [ ] Standard gate and runtime vegetation/persistence docs are green.
+- [x] Standard gate and runtime vegetation/persistence docs are green.
+  (GREEN, verified together on 2026-07-26: `just engine` and
+  `just prepare-for-commit` EXIT=0; `cargo test --workspace` green; `just schema` EXIT=0 with all 249
+  manifest-driven control checks passing; `just e2e` at **328/328 across 51 files**, the first fully
+  clean full-suite run — the `alpha_blend` device-loss that held this box is fixed and its 4 cases pass;
+  and the docs three-check sweep at hugo EXIT=0, links none broken, style 0 errors / 0 warnings.)
+  `vegetation-state.md`, `plant-promotion.md`, `ecology-catchup.md`, and `vegetation-telemetry.md`
+  carry the runtime and persistence concepts, and the run exercises residency, the reducer, snapshot
+  export/import, and the state baseline.
 
 ## NO-LEGACY gate
 
