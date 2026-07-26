@@ -86,6 +86,7 @@ pub struct RuntimeSession {
     vegetation_families: PlantFamilyCache,
     /// Published navigation contributions and the dirty world regions they moved.
     vegetation_navigation: VegetationNavigationSeam,
+    vegetation_telemetry: crate::VegetationTelemetry,
 }
 
 impl Default for RuntimeSession {
@@ -132,6 +133,7 @@ impl RuntimeSession {
             vegetation_promotion: VegetationPromotion::default(),
             vegetation_families: PlantFamilyCache::default(),
             vegetation_navigation: VegetationNavigationSeam::default(),
+            vegetation_telemetry: crate::VegetationTelemetry::default(),
         }
     }
 
@@ -391,6 +393,17 @@ impl RuntimeSession {
     /// Reconciles the exact cooked generation, shared spatial demand, and bounded cell-load
     /// workers, then synchronizes the collision facet: every physics-resident cell generation's
     /// batched Jolt proxies are created/removed against the live play world at this one point.
+    /// The vegetation runtime's compact telemetry.
+    #[must_use]
+    pub fn vegetation_telemetry(&self) -> &crate::VegetationTelemetry {
+        &self.vegetation_telemetry
+    }
+
+    /// The vegetation runtime's telemetry, for the seams that record into it.
+    pub fn vegetation_telemetry_mut(&mut self) -> &mut crate::VegetationTelemetry {
+        &mut self.vegetation_telemetry
+    }
+
     pub fn synchronize_vegetation(
         &mut self,
         scene: &mut Scene,
@@ -402,10 +415,15 @@ impl RuntimeSession {
         let bound_identity = vegetation_ref
             .as_ref()
             .map(|world| world.manifest_identity());
-        match self
-            .vegetation_scheduler
-            .advance(&mut vegetation_ref, scene, assets, spatial)
-        {
+        let scheduled = {
+            let scheduler = &mut self.vegetation_scheduler;
+            let vegetation = &mut vegetation_ref;
+            self.vegetation_telemetry
+                .stage(crate::VegetationStage::Residency, || {
+                    scheduler.advance(vegetation, scene, assets, spatial)
+                })
+        };
+        match scheduled {
             Ok(status) => {
                 self.vegetation_status = status;
                 let mut world_ref = self.physics.borrow_mut();
@@ -423,28 +441,30 @@ impl RuntimeSession {
                     (mut world, Some(vegetation)) => {
                         // Promotion commits first: the collision pass below then sees the
                         // suppression it just applied, so a plant never has two owners.
-                        self.vegetation_promotion.advance(
-                            vegetation,
-                            scene,
-                            assets,
-                            &mut self.vegetation_families,
-                            world.as_deref_mut(),
-                        );
-                        if let Some(world) = world {
-                            self.vegetation_collision.advance(
+                        let promotion = &mut self.vegetation_promotion;
+                        let families = &mut self.vegetation_families;
+                        let telemetry = &mut self.vegetation_telemetry;
+                        telemetry.stage(crate::VegetationStage::Promotion, || {
+                            promotion.advance(
                                 vegetation,
-                                world,
+                                scene,
                                 assets,
-                                &mut self.vegetation_families,
+                                families,
+                                world.as_deref_mut(),
                             );
+                        });
+                        if let Some(world) = world {
+                            let collision = &mut self.vegetation_collision;
+                            telemetry.stage(crate::VegetationStage::Collision, || {
+                                collision.advance(vegetation, world, assets, families);
+                            });
                         }
                         // Navigation publishes from the same committed state, after promotion has
                         // decided which plants are moving.
-                        self.vegetation_navigation.advance(
-                            vegetation,
-                            assets,
-                            &mut self.vegetation_families,
-                        );
+                        let navigation = &mut self.vegetation_navigation;
+                        telemetry.stage(crate::VegetationStage::Navigation, || {
+                            navigation.advance(vegetation, assets, families);
+                        });
                     }
                     (Some(world), None) => {
                         self.vegetation_promotion.abandon(scene, Some(world));
@@ -457,6 +477,7 @@ impl RuntimeSession {
                         self.vegetation_navigation.clear();
                     }
                 }
+                self.vegetation_telemetry.commit();
                 Ok(())
             }
             Err(error) => {
@@ -464,6 +485,7 @@ impl RuntimeSession {
                     reason: VegetationRuntimeUnavailableReason::Fault,
                     detail: Some(error.to_string()),
                 };
+                self.vegetation_telemetry.commit();
                 Err(error)
             }
         }
@@ -474,10 +496,15 @@ impl RuntimeSession {
     /// [`vegetation_cell`](Self::vegetation_cell), so all three borrow independently.
     pub fn vegetation_control_authorities(
         &mut self,
-    ) -> (&mut VegetationPromotion, &mut VegetationNavigationSeam) {
+    ) -> (
+        &mut VegetationPromotion,
+        &mut VegetationNavigationSeam,
+        &mut crate::VegetationTelemetry,
+    ) {
         (
             &mut self.vegetation_promotion,
             &mut self.vegetation_navigation,
+            &mut self.vegetation_telemetry,
         )
     }
 

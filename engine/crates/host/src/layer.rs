@@ -583,7 +583,7 @@ impl HostLayer {
         let play_active = physics.is_some();
         let vegetation_cell = self.runtime.vegetation_cell();
         let mut vegetation_ref = vegetation_cell.borrow_mut();
-        let (promotion, navigation) = self.runtime.vegetation_control_authorities();
+        let (promotion, navigation, telemetry) = self.runtime.vegetation_control_authorities();
         // Promotion is play-only; the navigation seam publishes in Edit as well.
         let vegetation_promotion = play_active.then_some(promotion);
         let vegetation_navigation = Some(navigation);
@@ -599,6 +599,7 @@ impl HostLayer {
             vegetation_collision,
             vegetation_promotion,
             vegetation_navigation,
+            vegetation_telemetry: Some(telemetry),
             physics: physics.as_mut(),
         })
     }
@@ -973,7 +974,7 @@ impl HostLayer {
         // pure projection. Skinning is off for the resolve (bounds only, no skin stream).
         let vegetation_cell = self.runtime.vegetation_cell();
         let vegetation = vegetation_cell.borrow();
-        let (_, navigation) = self.runtime.vegetation_control_authorities();
+        let (_, navigation, _) = self.runtime.vegetation_control_authorities();
         let (depth_tested, on_top) = match self.uploader.as_ref() {
             Some(uploader) => {
                 let gpu = RendererUploader::new(uploader, renderer.descriptors(), false);

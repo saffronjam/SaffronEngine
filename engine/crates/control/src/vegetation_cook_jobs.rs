@@ -58,6 +58,10 @@ impl CookJobState {
 }
 
 struct CookJob {
+    /// When the queue accepted it, for the latency a terminal state records.
+    accepted: std::time::Instant,
+    /// Whether a terminal state has already been counted, so one job counts once.
+    counted: bool,
     map: Uuid,
     scope: VegetationCookScopeDto,
     workers: u16,
@@ -73,11 +77,33 @@ pub(crate) struct ReadyVegetationCook {
     pub(crate) cancellation: GraphCancellationToken,
 }
 
+/// What the cook queue has done.
+///
+/// Counters rather than a status walk, so a caller asking how the queue is doing reads eight numbers
+/// instead of every job's payload. The tally that maintains them runs on the poll the manager already
+/// walks its jobs in, and counts each job's terminal state exactly once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CookQueueCounters {
+    /// Jobs accepted.
+    pub(crate) submitted: u64,
+    /// Jobs that published.
+    pub(crate) completed: u64,
+    /// Jobs a caller cancelled.
+    pub(crate) cancelled: u64,
+    /// Jobs a newer request superseded.
+    pub(crate) superseded: u64,
+    /// Jobs that failed.
+    pub(crate) failed: u64,
+    /// Microseconds from acceptance to a terminal state, summed.
+    pub(crate) latency_us: u64,
+}
+
 /// Owns bounded background cook workers and retained terminal results.
 pub(crate) struct VegetationCookJobs {
     next_job: u64,
     jobs: BTreeMap<u64, CookJob>,
     active_by_map: BTreeMap<u64, u64>,
+    counters: CookQueueCounters,
 }
 
 impl Default for VegetationCookJobs {
@@ -86,11 +112,40 @@ impl Default for VegetationCookJobs {
             next_job: 1,
             jobs: BTreeMap::new(),
             active_by_map: BTreeMap::new(),
+            counters: CookQueueCounters::default(),
         }
     }
 }
 
 impl VegetationCookJobs {
+    /// Counts every job that reached a terminal state since the last tally.
+    fn tally(&mut self) {
+        for job in self.jobs.values_mut() {
+            if job.counted || !job.state.is_terminal() {
+                continue;
+            }
+            job.counted = true;
+            self.counters.latency_us += job.accepted.elapsed().as_micros() as u64;
+            match &job.state {
+                CookJobState::Completed(_) => self.counters.completed += 1,
+                CookJobState::Cancelled => self.counters.cancelled += 1,
+                CookJobState::Superseded => self.counters.superseded += 1,
+                CookJobState::Failed(_) => self.counters.failed += 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// Queue counters, plus how many jobs are live right now.
+    pub(crate) fn counters(&self) -> (CookQueueCounters, u64) {
+        let live = self
+            .jobs
+            .values()
+            .filter(|job| !job.state.is_terminal())
+            .count() as u64;
+        (self.counters, live)
+    }
+
     pub(crate) fn enqueue(
         &mut self,
         project: CookProjectView,
@@ -129,6 +184,8 @@ impl VegetationCookJobs {
         let map = request.map;
         let workers = request.workers;
         let job = CookJob {
+            accepted: std::time::Instant::now(),
+            counted: false,
             map,
             scope,
             workers,
@@ -137,8 +194,10 @@ impl VegetationCookJobs {
             state: CookJobState::Queued(CookTask { project, request }),
         };
         self.jobs.insert(job_id, job);
+        self.counters.submitted += 1;
         self.active_by_map.insert(map.value(), job_id);
         self.start_queued()?;
+        self.tally();
         self.retain_terminals();
         Ok(job_dto(job_id, self.job(job_id)?))
     }
@@ -146,6 +205,7 @@ impl VegetationCookJobs {
     pub(crate) fn poll_ready(&mut self) -> Result<Vec<ReadyVegetationCook>> {
         let ready = self.poll_workers()?;
         self.start_queued()?;
+        self.tally();
         self.retain_terminals();
         Ok(ready)
     }
@@ -489,6 +549,8 @@ mod tests {
 
     fn running_job(map: Uuid, result: WorkerCookResult, workers: u16) -> CookJob {
         CookJob {
+            accepted: std::time::Instant::now(),
+            counted: false,
             map,
             scope: VegetationCookScopeDto::All,
             workers,
@@ -646,6 +708,8 @@ mod tests {
             jobs.jobs.insert(
                 job_id,
                 CookJob {
+                    accepted: std::time::Instant::now(),
+                    counted: false,
                     map: Uuid(1_000 + job_id),
                     scope: VegetationCookScopeDto::All,
                     workers: 1,

@@ -270,6 +270,22 @@ pub struct VegetationMutationRecord {
     pub mutation: VegetationMutation,
 }
 
+impl VegetationMutationRecord {
+    /// Bytes this record occupies in a transaction's canonical form.
+    ///
+    /// The exact size the reducer hashes and a caller budgets against, rather than a guess from the
+    /// wire form, which carries JSON framing the reducer never sees.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NumericOverflow`] when a payload length exceeds the canonical bound.
+    pub fn canonical_byte_len(&self) -> Result<usize> {
+        let mut bytes = Vec::new();
+        push_record(&mut bytes, self)?;
+        Ok(bytes.len())
+    }
+}
+
 /// Canonical field-tile address in persistent state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FieldTileKey {

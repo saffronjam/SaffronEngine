@@ -47,6 +47,8 @@ pub struct ControlPollContext<'a> {
     pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
     /// The navigation contribution seam.
     pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
+    /// The vegetation runtime's compact telemetry.
+    pub vegetation_telemetry: Option<&'a mut saffron_runtime::VegetationTelemetry>,
     /// Live play-mode physics world, absent in edit mode.
     pub physics: Option<&'a mut World>,
 }
@@ -186,6 +188,7 @@ impl ControlContext {
             vegetation_collision,
             vegetation_promotion,
             vegetation_navigation,
+            vegetation_telemetry,
             physics,
         } = context;
         let mut mutated = false;
@@ -240,6 +243,7 @@ impl ControlContext {
             vegetation_collision,
             vegetation_promotion,
             vegetation_navigation,
+            vegetation_telemetry,
             physics,
             vegetation_jobs: &mut self.vegetation_jobs,
             vegetation_cook_jobs: &mut self.vegetation_cook_jobs,

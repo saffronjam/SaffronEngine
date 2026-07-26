@@ -464,6 +464,8 @@ pub struct EngineContext<'a> {
     pub vegetation_promotion: Option<&'a mut saffron_runtime::VegetationPromotion>,
     /// The navigation contribution seam: published contributions and dirty regions.
     pub vegetation_navigation: Option<&'a mut saffron_runtime::VegetationNavigationSeam>,
+    /// The vegetation runtime's compact telemetry.
+    pub vegetation_telemetry: Option<&'a mut saffron_runtime::VegetationTelemetry>,
     /// The live play physics world, or `None` in Edit.
     pub physics: Option<&'a mut World>,
     /// Owned asynchronous vegetation evaluation jobs and retained results.
@@ -776,7 +778,7 @@ pub fn is_read_only_command(name: &str) -> bool {
         | "vegetation-cell-inspect" | "vegetation-manifest"
         | "vegetation-runtime-status" | "vegetation-runtime-cell"
         | "vegetation-runtime-query" | "vegetation-runtime-inspect"
-        | "vegetation-combustion" | "vegetation-ecology-status"
+        | "vegetation-combustion" | "vegetation-ecology-status" | "vegetation-telemetry"
         | "vegetation-state-export"
         | "plant-validate" | "plant-growth" | "plant-graph" | "plant-elements"
         // project-load phase + progress the editor's loading screen polls each tick

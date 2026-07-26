@@ -19,6 +19,7 @@ mod vegetation_collision;
 mod vegetation_family;
 mod vegetation_navigation;
 mod vegetation_promotion;
+mod vegetation_telemetry;
 
 pub use bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
@@ -38,4 +39,7 @@ pub use vegetation_navigation::{
 };
 pub use vegetation_promotion::{
     PlantPromotionState, VegetationPromotion, VegetationPromotionError, VegetationPromotionReport,
+};
+pub use vegetation_telemetry::{
+    VegetationStage, VegetationStageTimes, VegetationTelemetry, VegetationWorkCounters,
 };
