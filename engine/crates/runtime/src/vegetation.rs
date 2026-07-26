@@ -273,10 +273,20 @@ impl VegetationRuntimeScheduler {
                 ));
             }
             self.join_workers()?;
-            *runtime = Some(VegetationWorld::new(
-                manifest,
-                VegetationResidencyBudgets::default(),
-            )?);
+            let mut world = VegetationWorld::new(manifest, VegetationResidencyBudgets::default())?;
+            // A shipped world often starts with authored disturbance or growth already in it. The
+            // baseline is that starting state, keyed by the generation it belongs to, so a package
+            // boots into the world the author saw rather than into an untouched one. A baseline that
+            // does not decode against this generation is a hard error: importing it would apply
+            // another world's state to this one.
+            let baseline = assets
+                .vegetation_artifact_store()
+                .read_baseline_if_present(identity)
+                .map_err(|error| VegetationRuntimeError::Asset(Box::new(error)))?;
+            if let Some(bytes) = baseline {
+                world.import_state_snapshot(&bytes)?;
+            }
+            *runtime = Some(world);
             self.missing_cells.clear();
         }
         let world = runtime.as_mut().expect("runtime was initialized");

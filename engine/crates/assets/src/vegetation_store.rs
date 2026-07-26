@@ -21,6 +21,12 @@ pub enum VegetationArtifactKind {
     Manifest,
     /// Canonical dependency graph for one cooked generation.
     CookGraph,
+    /// Initial persistent-state baseline for one cooked generation.
+    ///
+    /// A shipped world often starts with authored disturbance or growth already in it. The baseline
+    /// is that starting state, keyed by the manifest it belongs to, so a package boots into the world
+    /// the author saw rather than into an untouched one.
+    Baseline,
 }
 
 impl VegetationArtifactKind {
@@ -30,6 +36,7 @@ impl VegetationArtifactKind {
             Self::Cell => "cells",
             Self::Manifest => "manifests",
             Self::CookGraph => "cook-graphs",
+            Self::Baseline => "baselines",
         }
     }
 
@@ -37,6 +44,7 @@ impl VegetationArtifactKind {
         match self {
             Self::Plant => "splantc",
             Self::Cell => "svegcell",
+            Self::Baseline => "svegstate",
             Self::Manifest => "svegmanifest",
             Self::CookGraph => "svegcook",
         }
@@ -120,6 +128,45 @@ impl VegetationArtifactStore {
             saffron_vegetation::VegetationBaseManifest::from_canonical_bytes(bytes)?;
             Ok(())
         })
+    }
+
+    /// Publishes one initial persistent-state baseline under the manifest it belongs to.
+    ///
+    /// Keyed by the manifest rather than content-addressed: a generation has exactly one starting
+    /// state, and a second baseline for the same generation would be an ambiguity nothing resolves.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the write fails, and a vegetation error when the snapshot does not decode
+    /// against `manifest` — a baseline for another generation would import as garbage.
+    pub fn publish_baseline(&self, manifest: ContentHash, bytes: &[u8]) -> Result<PathBuf> {
+        saffron_vegetation::VegetationState::from_canonical_bytes(bytes, manifest.bytes())?;
+        let path = self.path(VegetationArtifactKind::Baseline, manifest);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| Error::Io(error.to_string()))?;
+        }
+        let mut file = AtomicWriteFile::options()
+            .open(&path)
+            .map_err(|error| Error::Io(error.to_string()))?;
+        file.write_all(bytes)
+            .map_err(|error| Error::Io(error.to_string()))?;
+        file.commit()
+            .map_err(|error| Error::Io(error.to_string()))?;
+        Ok(path)
+    }
+
+    /// Reads the baseline for one generation, absent when the generation ships none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the read fails.
+    pub fn read_baseline_if_present(&self, manifest: ContentHash) -> Result<Option<Vec<u8>>> {
+        let path = self.path(VegetationArtifactKind::Baseline, manifest);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::Io(error.to_string())),
+        }
     }
 
     /// Publishes one strictly validated canonical vegetation cook graph.

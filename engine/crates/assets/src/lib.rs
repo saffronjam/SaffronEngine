@@ -60,6 +60,7 @@ mod thumbnail;
 mod time_of_day;
 mod vegetation;
 mod vegetation_cooker;
+mod vegetation_export;
 mod vegetation_store;
 
 pub use cache::{AssetCache, resolve_cached};
@@ -163,6 +164,11 @@ pub use vegetation_cooker::{
     PlantSourceAcceptance, StagedVegetationCook, VegetationCookEvent, VegetationCookOutput,
     VegetationCookRequest, VegetationCookStatistics, commit_staged_vegetation_cook,
     portable_vegetation_platform_profile, stage_vegetation_cook, vegetation_cook_versions,
+};
+pub use vegetation_export::{
+    VegetationArtifactFault, VegetationExportClosure, VegetationExportFacet, VegetationExportFile,
+    VegetationExportMap, VegetationFaultKind, VegetationVerifyReport, vegetation_export_closure,
+    verify_vegetation_artifacts,
 };
 pub use vegetation_store::{
     VegetationArtifactKind, VegetationArtifactPublication, VegetationArtifactStore,
