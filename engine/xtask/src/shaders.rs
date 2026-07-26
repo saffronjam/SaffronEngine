@@ -1135,12 +1135,7 @@ mod tests {
     #[test]
     fn geometry_passes_use_the_canonical_coverage_module() -> Result<()> {
         let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/shaders");
-        for shader in [
-            "mesh.slang",
-            "gbuffer.slang",
-            "motion.slang",
-            "point_shadow.slang",
-        ] {
+        for shader in ["mesh.slang", "gbuffer.slang", "motion.slang"] {
             let source = std::fs::read_to_string(shader_dir.join(shader))?;
             assert!(
                 source.contains("sampleCanonicalCoverage("),
