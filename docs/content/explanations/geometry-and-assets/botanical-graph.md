@@ -148,6 +148,29 @@ edit targets. Edits ride the graph document itself, so `plant-graph-set` is the 
 the layer is part of the graph's content identity — a document that differs only by a hand offset is a
 different plant.
 
+## Appearances are authored, not derived
+
+Parts, dimensions, spines and proxies all fall out of growing the graph. Phenotypes do not: which
+appearances a family can render in — healthy, senescent, harvested, burned — is a decision about the
+species rather than a consequence of its geometry, so it is authored.
+
+`plant-phenotypes` reads the list and replaces it whole. Whole rather than field-by-field, because
+the set has to hold together: a phenotype names a declared variation, two on one variation may not
+share a role, a material remap moves between real slots, and a family needs a healthy appearance. The
+family validator judges that, and the command adds no second rule beside it — a refused replacement
+leaves the stored set exactly as it was.
+
+A second phenotype on the same variation is what makes a transition possible at all. It renders the
+same grown geometry through a material remap, or through a subset of active parts when the change is
+a silhouette rather than a colour, so an autumn form costs no second walk of the graph.
+
+```sh
+sa plant-phenotypes '{"plant":"Silver birch"}'
+sa plant-phenotypes '{"plant":"Silver birch","phenotypes":[
+  {"id":0,"role":"healthy","variation":0},
+  {"id":1,"role":"senescent","variation":0,"seasonWindow":[700,900]}]}'
+```
+
 ## Proxies are derived, not authored
 
 Collision and navigation proxies are a result of what grew, like the dimensions. A capsule stands in
@@ -224,6 +247,34 @@ leaves", and the thousands of instanced leaves are micro transforms under that o
 are the axes, its dimensions are the grown plant's own bounds, and its submeshes are one homogeneous
 range per material slot.
 
+## Presets are ordinary plants
+
+A leaf cluster, a bough, a flower head — authoring one twice is how two copies drift apart. A
+`ModuleCall` node grows another `.splant` at each incoming frame, so a preset is authored once and
+called wherever it belongs.
+
+The preset is an ordinary `.splant` carrying the module role. It opens, previews, and cooks like any
+family, which is what keeps it editable rather than a second document format. There is no
+`.splantgraph`, and there is no separate subgraph file.
+
+The interface is small and explicit: which module, which of its variations, and what to scale it by.
+Each has a consumer in the evaluator, which is the test of whether a parameter is real rather than a
+knob that reads nothing. The bindings live on the calling family beside its graph, keyed by a
+call-site GUID the node names, so two calls of one module carry different settings.
+
+Identities rebase through the call GUID, which is what makes two copies separately editable: an
+authored edit addresses the element at *that* call site and never moves the other. Depth is bounded
+and a chain that revisits an asset is rejected, because a preset that reaches itself has no fixed
+point.
+
+Both directions of the binding are checked when the family is written. A call whose GUID names no
+reference would resolve to nothing; a reference with no call is a binding an author edits expecting
+an effect it cannot have.
+
+Growing states which it is at every call site. A path that grew a module-calling graph without its
+modules would report a plant missing its presets and call it a success, so there is no default —
+either a resolver that can reach them, or one that refuses.
+
 ## Creating one
 
 `plant-create` mints a native family from the starter graph — a tapering trunk swept into bark,
@@ -248,6 +299,8 @@ is refused rather than silently binding slot zero twice.
 |---|---|---|
 | Type system and document | `vegetation/src/botanical.rs` | `BotanicalDomain`, `BotanicalOperator`, `BotanicalGraphDocument`, `validate` |
 | Growing | `vegetation/src/botanical.rs` | `grow`, `BotanicalGrowth`, `BotanicalAssembly`, `BotanicalElementId` |
+| Module calls | `vegetation/src/botanical.rs`, `vegetation/src/asset.rs` | `BotanicalModuleResolver`, `NoBotanicalModules`, `PlantFamilyRole`, `PlantModuleReference` |
+| Module resolution | `assets/src/plant_cook.rs` | `PlantModules`, `PlantModules::for_family` |
 | Variations and appearances | `vegetation/src/botanical_compile.rs` | `native_variations`, `native_phenotypes`, `widest_family_structure` |
 | Derived proxies | `vegetation/src/botanical_compile.rs` | `derive_family_proxies`, `MAX_DERIVED_COLLISION_PROXIES` |
 | Manual edit layer | `vegetation/src/botanical_edit.rs` | `BotanicalManualEdit`, `apply_manual_edits`, `BotanicalEditOrphan` |
@@ -255,7 +308,7 @@ is refused rather than silently binding slot zero twice.
 | Graft source resolution | `assets/src/plant_cook.rs` | `resolve_native_plant_input`, `resolve_plant_source` |
 | Generating the family | `vegetation/src/botanical_compile.rs` | `normalize_botanical_geometry`, `derive_family_structure`, `native_plant_family` |
 | Shared compile path | `vegetation/src/plant_compile.rs` | `compile_plant_family`, `NormalizedPlantFamily` |
-| Control surface | `control/src/commands_asset.rs` | `plant-create`, `plant-elements`, `plant-graph`, `plant-graph-set` |
+| Control surface | `control/src/commands_asset.rs` | `plant-create`, `plant-elements`, `plant-graph`, `plant-graph-set`, `plant-phenotypes` |
 
 ## Related
 
