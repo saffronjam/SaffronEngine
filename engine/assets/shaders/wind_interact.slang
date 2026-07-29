@@ -58,7 +58,9 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
         header.centerTexel[0] = pc.center0;
         header.centerTexel[1] = pc.center1;
         header.generation = 0u;
-        header.reserved = uint3(0u);
+        header.reserved0 = 0u;
+        header.reserved1 = 0u;
+        header.reserved2 = 0u;
         *(GpuInteractionHeader*)pc.field = header;
     }
     uint cascade = index / (GPU_INTERACTION_TEXELS * GPU_INTERACTION_TEXELS);

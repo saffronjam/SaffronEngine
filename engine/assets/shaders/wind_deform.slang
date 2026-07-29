@@ -20,6 +20,11 @@ struct WindDeformPush
     uint64_t sources;
     uint sourceCount;
     uint reserved;
+    // The interaction cascade centres the PREVIOUS frame integrated. An instance whose
+    // covering cascade differs between those centres and the live ones reads a jumped
+    // displacement, which is the scroll reset this pass has to flag.
+    int2 prevCenter0;
+    int2 prevCenter1;
 };
 
 [[vk::push_constant]] WindDeformPush pc;
@@ -57,6 +62,8 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
 
     // The instance-local bounds sphere: the vegetation static payload's explicit
     // conservative sphere when present, else the prototype sphere.
+    let prototype = gpuSceneLoadPrototype(addresses, instance.prototype.index);
+    let response = gpuSceneMechanicalResponse(prototype);
     float4 localBounds;
     if ((instance.flags & GPU_SCENE_INSTANCE_FLAG_EXPLICIT_BOUNDS) != 0u
         && instance.transformKind == GPU_SCENE_TRANSFORM_STATIC)
@@ -65,7 +72,6 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     }
     else
     {
-        let prototype = gpuSceneLoadPrototype(addresses, instance.prototype.index);
         localBounds = prototype.bounds;
     }
     float topLocalY = localBounds.y + localBounds.w;
@@ -87,15 +93,48 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
     // current words and last frame's current words become the previous words.
     float3 interactionPrevious = (*out).interactionCurrent;
     float3 interaction = gpuSceneInteractionSample(addresses.interactionField, c3.xz);
+    // A scroll reset is not motion. The field re-centres on the camera and zeroes every
+    // texel that scrolled in, so an instance whose covering cascade changed reads a value
+    // with no relation to the one it read last frame. Comparing the cascade the previous
+    // centres chose against the one the live centres choose names exactly those instances;
+    // an instance that merely moved within a cascade keeps its absolute texels and is not
+    // flagged, which is the distinction a whole-frame history reset cannot make.
+    int2 center0, center1;
+    gpuSceneInteractionCenters(addresses.interactionField, center0, center1);
+    float interactionReset =
+        (addresses.interactionField != 0
+         && gpuSceneInteractionCascade(c3.xz, center0, center1)
+                != gpuSceneInteractionCascade(c3.xz, pc.prevCenter0, pc.prevCenter1))
+            ? 1.0
+            : 0.0;
     // The branch mode: one oscillation whose angular frequency follows the shear-
     // scaled mean speed over the plant height (taller plants swing slower) and whose
     // amplitude follows the sampled speed; the quadrature at both frame times lets a
     // per-use phase offset apply with no time in the vertex path.
+    //
+    // Structure enters through the family's authored response. A stiff sapling and a
+    // supple reed of the same height must not sway alike: stiffness raises the frequency
+    // as sqrt(k) (the harmonic-oscillator relation) and divides the amplitude, drag
+    // scales how hard the field pushes, flutter scales the leaf term, damping bleeds
+    // amplitude, and the bend limit caps the result. A prototype with no authored
+    // response keeps the unit values, which is the height-derived model exactly.
     float meanSpeed = length(swayCurrent) / 0.06;
     float plantHeight = max(topLocalY, 0.5);
-    float branchOmega = clamp(6.0 / plantHeight + meanSpeed * 0.15, 0.8, 14.0);
-    float branchAmplitude = min(meanSpeed * 0.02, 0.5) * min(plantHeight * 0.25, 1.0);
-    float flutterAmplitude = min(meanSpeed * 0.012, 0.2);
+    float stiffness = response.authored ? max(response.stiffness, 0.05) : 1.0;
+    float drag = response.authored ? response.drag : 1.0;
+    float flutter = response.authored ? response.flutter : 1.0;
+    float settle = response.authored ? (1.0 - 0.5 * response.damping) : 1.0;
+    // A zero authored limit is "unlimited": a plant that may not bend at all is a prop,
+    // not a bend limit, and reading it as zero would freeze every authored family.
+    float bendLimit = (response.authored && response.bendLimit > 0.0)
+        ? response.bendLimit * 2.0
+        : 1e30;
+    float branchOmega =
+        clamp((6.0 / plantHeight + meanSpeed * 0.15) * sqrt(stiffness), 0.8, 30.0);
+    float branchAmplitude = min(
+        min(meanSpeed * 0.02, 0.5) * min(plantHeight * 0.25, 1.0) * drag * settle / stiffness,
+        bendLimit);
+    float flutterAmplitude = min(min(meanSpeed * 0.012, 0.2) * flutter * settle, bendLimit);
     float4 branchQuadrature = float4(
         sin(branchOmega * pc.timeCurrent),
         cos(branchOmega * pc.timeCurrent),
@@ -110,7 +149,7 @@ void computeMain(uint3 tid: SV_DispatchThreadID)
         swayPrevious,
         inflation,
         interaction,
-        0.0,
+        interactionReset,
         interactionPrevious,
         0.0,
         branchQuadrature,
