@@ -573,6 +573,9 @@ async function runContract(): Promise<number> {
       SAFFRON_CONTROL_SOCK: SOCK,
       SAFFRON_APPDATA_DIR: appDataPath,
       SAFFRON_SCRATCH_PROJECT: "1",
+      // No window, no compositor: the host takes the no-surface offscreen device, so the
+      // contract test runs anywhere the GPU (or llvmpipe) does.
+      SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
     },
     stdout: "pipe",
     stderr: "pipe",
