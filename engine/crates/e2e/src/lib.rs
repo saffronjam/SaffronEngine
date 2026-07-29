@@ -8,9 +8,9 @@
 //! `saffron-protocol` types, so this harness and the `sa` CLI cannot drift on framing or the `Uuid`
 //! decimal-string encoding.
 //!
-//! Boot isolation: each [`TestEngine`] launches the host on a per-run control socket. Linux also
-//! gets a per-run headless Weston socket; macOS uses the host's native offscreen path. It honors
-//! `SAFFRON_ANIMA_BIN` so it can run against an alternate host binary.
+//! Boot isolation: each [`TestEngine`] launches the host on a per-run control socket, rendering
+//! offscreen so no compositor is involved on any platform. It honors `SAFFRON_ANIMA_BIN` so it can
+//! run against an alternate host binary.
 
 #![deny(unsafe_code)]
 
@@ -110,17 +110,13 @@ fn value_token(value: &str) -> &str {
     &value[..end]
 }
 
-/// How long to wait for the Weston socket file to appear before giving up.
-#[cfg(target_os = "linux")]
-const WESTON_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long to wait for the host's control socket to appear (or the host to exit) after launch.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A failure booting or driving the engine under test.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A child process (weston or the host) could not be spawned.
+    /// The host process could not be spawned.
     #[error("spawning {what}: {source}")]
     Spawn {
         /// Which process failed to spawn.
@@ -128,7 +124,7 @@ pub enum Error {
         /// The underlying OS error.
         source: std::io::Error,
     },
-    /// A boot precondition timed out (the weston socket, or the control socket).
+    /// A boot precondition timed out (the control socket).
     #[error("timeout waiting for {what}")]
     Timeout {
         /// What the boot was waiting for.
@@ -209,10 +205,8 @@ fn spawn_reader(
 pub struct TestEngine {
     client: Client,
     host: Option<Captured>,
-    weston: Option<Captured>,
     log: Arc<Mutex<String>>,
     control_socket: String,
-    wayland_socket_path: Option<PathBuf>,
     appdata_dir: PathBuf,
 }
 
@@ -231,42 +225,6 @@ impl TestEngine {
                 .as_nanos()
         );
 
-        #[cfg(target_os = "linux")]
-        let (mut weston, wayland_socket_path, runtime, wl_socket) = {
-            let runtime = runtime_dir();
-            let wl_socket = format!("wl-e2e-{stamp}");
-            let wayland_socket_path = PathBuf::from(&runtime).join(&wl_socket);
-            let weston_log = Arc::new(Mutex::new(String::new()));
-            let weston_child = Command::new("weston")
-                .args([
-                    "--backend=headless",
-                    "--width=1280",
-                    "--height=720",
-                    &format!("--socket={wl_socket}"),
-                    "--idle-time=0",
-                ])
-                .env("XDG_RUNTIME_DIR", &runtime)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|source| Error::Spawn {
-                    what: "weston",
-                    source,
-                })?;
-            let weston = Captured::capture(weston_child, &weston_log);
-
-            if !wait_for(WESTON_TIMEOUT, || wayland_socket_path.exists()) {
-                weston.terminate();
-                return Err(Error::Timeout {
-                    what: "weston socket",
-                });
-            }
-            (Some(weston), Some(wayland_socket_path), runtime, wl_socket)
-        };
-
-        #[cfg(target_os = "macos")]
-        let (mut weston, wayland_socket_path) = (None::<Captured>, None::<PathBuf>);
-
         let control_socket = format!("/tmp/saffron-e2e-{stamp}.sock");
         let log = Arc::new(Mutex::new(String::new()));
 
@@ -276,18 +234,18 @@ impl TestEngine {
         // `appdata/` would otherwise land. The caller can still override `SAFFRON_APPDATA_DIR`.
         let appdata_dir = std::env::temp_dir().join(format!("saffron-e2e-appdata-{stamp}"));
 
+        // The host renders offscreen and reads back — no surface, so no compositor is needed
+        // and device selection is free to take the discrete GPU. A windowed boot would have to
+        // qualify on present support, which a headless compositor's surface denies to a
+        // discrete adapter, silently demoting the whole suite to the software rasterizer.
         let mut command = Command::new(engine_binary());
         command
             .env("SAFFRON_CONTROL_SOCK", &control_socket)
             .env("SAFFRON_APPDATA_DIR", &appdata_dir)
+            .env("SAFFRON_EDITOR_NATIVE_VIEWPORT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(target_os = "linux")]
-        command
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("WAYLAND_DISPLAY", &wl_socket)
-            .env("SDL_VIDEODRIVER", "wayland");
         #[cfg(target_os = "macos")]
         configure_macos_host(&mut command);
         for (key, value) in env {
@@ -307,20 +265,11 @@ impl TestEngine {
         if host_has_exited(&mut host) {
             let captured = current_log(&log);
             host.terminate();
-            if let Some(weston) = weston.take() {
-                weston.terminate();
-            }
-            if let Some(path) = &wayland_socket_path {
-                let _ = std::fs::remove_file(path);
-            }
             let _ = std::fs::remove_dir_all(&appdata_dir);
             return Err(Error::EngineExited { log: captured });
         }
         if !appeared {
             host.terminate();
-            if let Some(weston) = weston.take() {
-                weston.terminate();
-            }
             let _ = std::fs::remove_dir_all(&appdata_dir);
             return Err(Error::Timeout {
                 what: "control socket",
@@ -330,10 +279,8 @@ impl TestEngine {
         let mut engine = Self {
             client: Client::new(control_socket.clone()),
             host: Some(host),
-            weston,
             log,
             control_socket,
-            wayland_socket_path,
             appdata_dir,
         };
         if env.iter().any(|(key, value)| {
@@ -430,13 +377,7 @@ impl TestEngine {
         if let Some(host) = self.host.take() {
             host.terminate();
         }
-        if let Some(weston) = self.weston.take() {
-            weston.terminate();
-        }
         let _ = std::fs::remove_file(&self.control_socket);
-        if let Some(path) = &self.wayland_socket_path {
-            let _ = std::fs::remove_file(path);
-        }
         let _ = std::fs::remove_dir_all(&self.appdata_dir);
     }
 }
@@ -444,17 +385,10 @@ impl TestEngine {
 impl Drop for TestEngine {
     fn drop(&mut self) {
         // Backstop for a test that panics before `shutdown`: never leak a child process.
-        if self.host.is_some() || self.weston.is_some() {
+        if self.host.is_some() {
             self.shutdown();
         }
     }
-}
-
-/// `XDG_RUNTIME_DIR` if set, else `/run/user/<uid>`.
-#[cfg(target_os = "linux")]
-fn runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", rustix::process::getuid().as_raw()))
 }
 
 #[cfg(target_os = "macos")]

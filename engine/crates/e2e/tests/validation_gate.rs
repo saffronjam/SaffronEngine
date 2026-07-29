@@ -9,9 +9,15 @@
 //! goes green-with-empty-errors, the gate has been silently disabled and the suite has lost its
 //! only headless detector for GPU-state bugs.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use saffron_e2e::TestEngine;
+
+/// How long to wait for the planted error to reach the captured log. The control socket opens
+/// before the first frame records, and how long that first frame takes is a property of the
+/// device — a software rasterizer under a headless compositor is far slower than a discrete
+/// GPU — so the gate polls to a generous deadline rather than sleeping a fixed span.
+const DETECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Booting with the plant env set surfaces the planted validation error through the harness's
 /// `validation_errors()` filter — the detector is live (the inverse of every other test's
@@ -21,16 +27,21 @@ fn planted_validation_error_is_detected() {
     let mut engine =
         TestEngine::boot(&[("SAFFRON_VK_PLANT_VALIDATION_ERROR", "1")]).expect("boot engine");
 
-    // Render a few frames so the planted out-of-spec command is recorded and submitted, and the
-    // validation layer's message reaches the captured log.
-    engine.settle(Duration::from_millis(600));
-
-    let errors = engine.validation_errors();
+    // Poll until the planted out-of-spec command has been recorded, submitted, and its
+    // validation message has reached the captured log.
+    let deadline = Instant::now() + DETECT_TIMEOUT;
+    let mut errors = engine.validation_errors();
+    while errors.is_empty() && Instant::now() < deadline {
+        engine.settle(Duration::from_millis(100));
+        errors = engine.validation_errors();
+    }
     assert!(
         !errors.is_empty(),
         "the planted validation error was NOT detected — the gate is silently disabled \
          (wrong messenger prefix, or the validation layer is not enabled). \
-         A green here means every other test's `validation_errors() == []` proves nothing."
+         A green here means every other test's `validation_errors() == []` proves nothing.\n\
+         captured host log:\n{}",
+        engine.log()
     );
     // The planted error is the zero-width viewport VUID, not some unrelated incidental issue.
     assert!(
