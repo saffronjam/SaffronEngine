@@ -128,7 +128,7 @@ impl CookVersionSet {
     pub const fn current() -> Self {
         Self {
             schema: 2,
-            compiler: 2,
+            compiler: 5,
             evaluator: 5,
             numeric: 1,
             simulation: 1,
@@ -270,7 +270,7 @@ impl Ord for CookNodeAddress {
 }
 
 impl CookNodeAddress {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let valid = match self {
             Self::Plant { family } => family.value() != 0,
             Self::GlobalStage {
@@ -339,7 +339,7 @@ impl CookNodeAddress {
         }
     }
 
-    fn canonical_bytes(&self) -> Vec<u8> {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         let mut writer = BinaryWriter::new();
         self.encode(&mut writer);
         writer.finish()
@@ -748,7 +748,7 @@ impl CookNodeRecord {
         Ok(ContentHash::of(&writer.finish()))
     }
 
-    fn encode(&self, writer: &mut BinaryWriter) -> Result<()> {
+    pub(crate) fn encode(&self, writer: &mut BinaryWriter) -> Result<()> {
         self.address.encode(writer);
         writer.bytes(&self.cook_key.bytes());
         writer.bytes(&self.output_hash.bytes());
@@ -761,7 +761,7 @@ impl CookNodeRecord {
         Ok(())
     }
 
-    fn decode(reader: &mut BinaryReader<'_>) -> Result<Self> {
+    pub(crate) fn decode(reader: &mut BinaryReader<'_>) -> Result<Self> {
         let address = CookNodeAddress::decode(reader)?;
         let cook_key = ContentHash::new(reader.array()?);
         let output_hash = ContentHash::new(reader.array()?);
@@ -940,7 +940,7 @@ fn validate_node_dependencies(
     Ok(())
 }
 
-fn canonical_dependencies(
+pub(crate) fn canonical_dependencies(
     dependencies: &[CookDependency],
 ) -> Result<Vec<(Vec<u8>, CookDependency)>> {
     let mut dependencies = dependencies

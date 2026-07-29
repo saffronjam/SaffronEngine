@@ -4,17 +4,18 @@ use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use saffron_core::Uuid;
-use saffron_spatial::WorldCellKey;
+use saffron_spatial::{DecisionScalar, UnitInterval, WorldCellKey};
 
 use crate::binary::{BinaryReader, BinaryWriter};
 use crate::{
-    ContentHash, Error, PlantTagId, Result, VegetationContentHasher, vegetation_content_hash,
+    ContentHash, Error, MechanicalResponse, PlantTagId, Result, VegetationContentHasher,
+    vegetation_content_hash,
 };
 
 /// Current `.svegcell` container version.
 pub const VEGETATION_CELL_ARTIFACT_VERSION: u32 = 1;
 /// Current `.splantc` container version.
-pub const PLANT_COMPILED_ARTIFACT_VERSION: u32 = 2;
+pub const PLANT_COMPILED_ARTIFACT_VERSION: u32 = 4;
 /// Current `.svegcell` section payload version.
 pub const VEGETATION_CELL_SECTION_VERSION: u32 = 1;
 /// Current `.splantc` section payload version.
@@ -74,7 +75,7 @@ pub fn vegetation_cell_artifact_schema_hash() -> ContentHash {
 /// Stable schema identity of the `.splantc` header and TOC vocabulary.
 #[must_use]
 pub fn plant_compiled_artifact_schema_hash() -> ContentHash {
-    ContentHash::of(b"saffron-anima/splantc/schema/v2/strict-toc+all-15-sections+family+cook+platform+stored-payload-hash+raw-or-zstd-checksummed-sections+decoded-size-and-content-hash+family-tags+portable-triangle-voxel-hierarchy+deformation+pages+ray-tracing")
+    ContentHash::of(b"saffron-anima/splantc/schema/v3/strict-toc+all-15-sections+family-atlas+family+cook+platform+stored-payload-hash+raw-or-zstd-checksummed-sections+decoded-size-and-content-hash+family-tags+portable-triangle-voxel-hierarchy+deformation+pages+ray-tracing")
 }
 
 /// Exact section-storage codec recorded in a derived artifact TOC.
@@ -190,11 +191,15 @@ pub enum PlantCompiledSectionKind {
     RayTracing = 14,
     /// Validation statistics and normalized-source diagnostics.
     Validation = 15,
+    /// The family-space signed distance field derived from the aggregate occupancy —
+    /// what lets a placed plant occlude global illumination. SDST bytes
+    /// (`saffron_geometry::sdf_set_to_bytes`), one field per family.
+    DistanceField = 16,
 }
 
 impl PlantCompiledSectionKind {
     /// Complete known vocabulary in canonical TOC order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::SourceNormalization,
         Self::PartTable,
         Self::Geometry,
@@ -210,6 +215,7 @@ impl PlantCompiledSectionKind {
         Self::PageDirectory,
         Self::RayTracing,
         Self::Validation,
+        Self::DistanceField,
     ];
 
     fn from_id(id: u16) -> Result<Self> {
@@ -715,6 +721,67 @@ impl PlantCompiledArtifactIndex {
             });
         }
         Ok(tags)
+    }
+
+    /// Reads the family's authored wind and bend response from the semantic part table.
+    ///
+    /// The renderer's wind prepass derives its response from the plant's height alone
+    /// unless it has this; a stiff sapling and a supple reed of the same height would
+    /// otherwise sway identically.
+    pub fn mechanical_response(&self, bytes: &[u8]) -> Result<MechanicalResponse> {
+        let section = self
+            .section(bytes, PlantCompiledSectionKind::PartTable)?
+            .ok_or_else(|| Error::ArtifactFormat {
+                format: ".splantc",
+                field: "sections.partTable".to_owned(),
+            })?;
+        let mut reader = BinaryReader::new(section.as_ref(), ".splantc part table");
+        let domain_length = reader.length()?;
+        if reader.take(domain_length)? != b"saffron-anima/splantc/part-table/v2" {
+            return Err(Error::ArtifactFormat {
+                format: ".splantc part table",
+                field: "domain".to_owned(),
+            });
+        }
+        let tag_count = reader.count(8)?;
+        for _ in 0..tag_count {
+            reader.u64()?;
+        }
+        let part_count = reader.count(8)?;
+        for _ in 0..part_count {
+            reader.u128()?;
+            if reader.u8()? != 0 {
+                reader.u128()?;
+            }
+            reader.u8()?;
+            reader.u32()?;
+            let source_count = reader.count(16)?;
+            for _ in 0..source_count {
+                reader.u128()?;
+            }
+        }
+        // `PlantDimensions`: height, trunk radius, crown radius (2), root radius (2),
+        // and the conservative local bounds (3 + 3).
+        for _ in 0..12 {
+            reader.i32()?;
+        }
+        let response = MechanicalResponse {
+            stiffness: DecisionScalar::from_bits(reader.i32()?),
+            drag: DecisionScalar::from_bits(reader.i32()?),
+            flutter: DecisionScalar::from_bits(reader.i32()?),
+            damage_threshold: DecisionScalar::from_bits(reader.i32()?),
+            break_threshold: DecisionScalar::from_bits(reader.i32()?),
+            damping: UnitInterval::from_bits(reader.u16()?),
+            bend_limit: UnitInterval::from_bits(reader.u16()?),
+        };
+        if response.stiffness.bits() < 0 || response.drag.bits() < 0 || response.flutter.bits() < 0
+        {
+            return Err(Error::ArtifactFormat {
+                format: ".splantc part table",
+                field: "mechanics".to_owned(),
+            });
+        }
+        Ok(response)
     }
 }
 
@@ -2201,6 +2268,10 @@ mod tests {
             .section(&bytes, PlantCompiledSectionKind::Validation)
             .unwrap()
             .unwrap();
-        assert_eq!(decoded.as_ref(), sections.last().unwrap().bytes);
+        let expected = sections
+            .iter()
+            .find(|section| section.kind == PlantCompiledSectionKind::Validation)
+            .unwrap();
+        assert_eq!(decoded.as_ref(), expected.bytes);
     }
 }
