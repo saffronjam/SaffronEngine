@@ -56,7 +56,8 @@ Constructors and builders:
 |---|---|
 | `RgPass::graphics(name, extent)` | graphics pass on the graphics queue |
 | `RgPass::graphics_commands(name)` | graphics body that owns its rendering scopes |
-| `RgPass::compute(name)` | compute pass preferring independent compute |
+| `RgPass::compute(name)` | compute pass on the graphics queue |
+| `.queue(preference)` | opt a compute pass into independent compute |
 | `.access(resource, usage)` | declare a whole-resource access |
 | `.access_buffer(resource, range, usage)` | declare a byte-ranged buffer access |
 | `.color(attachment)` | append a color attachment in MRT order |
