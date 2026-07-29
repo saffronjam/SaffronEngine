@@ -25,8 +25,8 @@ pub use bridge::{
     RuntimeScriptBridge, ScriptLogLine, SharedPhysics, SharedScene, SharedScriptSink,
 };
 pub use saffron_vegetation::{
-    CandidateRejectionReason, PlantLifecycle, VegetationCellSectionKind, VegetationWorld,
-    decode_vegetation_rejection_diagnostics,
+    CandidateRejectionReason, PlantCollisionShape, PlantId, PlantLifecycle,
+    VegetationCellSectionKind, VegetationWorld, decode_vegetation_rejection_diagnostics,
 };
 pub use session::RuntimeSession;
 pub use vegetation::{

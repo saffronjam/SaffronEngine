@@ -63,14 +63,29 @@ pub struct VegetationTelemetry {
     average: VegetationStageTimes,
     work: VegetationWorkCounters,
     pending: VegetationStageTimes,
+    /// Completed stage spans awaiting a profiler that can accept them.
+    ///
+    /// Timed on `CLOCK_MONOTONIC` so they share the renderer's span epoch exactly — a capture that
+    /// placed these on a second timeline would show cooking and residency floating beside the
+    /// frame rather than inside it, which is worse than not showing them.
+    spans: Vec<(VegetationStage, u64, u64)>,
+}
+
+/// The monotonic clock the renderer's CPU spans are stamped on.
+fn monotonic_now_ns() -> u64 {
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 impl VegetationTelemetry {
     /// Times one stage, folding its duration into the synchronization in progress.
     pub fn stage<T>(&mut self, stage: VegetationStage, body: impl FnOnce() -> T) -> T {
         let started = Instant::now();
+        let started_ns = monotonic_now_ns();
         let value = body();
         let elapsed = started.elapsed();
+        self.spans
+            .push((stage, started_ns, elapsed.as_nanos() as u64));
         let slot = match stage {
             VegetationStage::Residency => &mut self.pending.residency,
             VegetationStage::Promotion => &mut self.pending.promotion,
@@ -97,6 +112,14 @@ impl VegetationTelemetry {
         fold(&mut self.average.collision, self.last.collision);
         fold(&mut self.average.navigation, self.last.navigation);
         fold(&mut self.average.ecology, self.last.ecology);
+    }
+
+    /// Takes the completed stage spans, leaving the buffer empty.
+    ///
+    /// Drained rather than read so a consumer that stops pumping cannot grow it without bound —
+    /// the spans are only useful to a profiler that is actually capturing.
+    pub fn take_spans(&mut self) -> Vec<(VegetationStage, u64, u64)> {
+        std::mem::take(&mut self.spans)
     }
 
     /// Records one answered query and how many plants it returned.
@@ -159,6 +182,20 @@ pub enum VegetationStage {
     Navigation,
     /// Ecology ticks.
     Ecology,
+}
+
+impl VegetationStage {
+    /// The stable span name this stage appears under in a capture.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Residency => "vegetation-residency",
+            Self::Promotion => "vegetation-promotion",
+            Self::Collision => "vegetation-collision",
+            Self::Navigation => "vegetation-navigation",
+            Self::Ecology => "vegetation-ecology",
+        }
+    }
 }
 
 #[cfg(test)]

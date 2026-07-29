@@ -2829,7 +2829,6 @@ dependencies = [
 name = "saffron-e2e"
 version = "0.1.0"
 dependencies = [
- "rustix 0.38.44",
  "saffron-control-client",
  "saffron-protocol",
  "serde",
@@ -3006,6 +3005,7 @@ name = "saffron-runtime"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "rustix 0.38.44",
  "saffron-animation",
  "saffron-assets",
  "saffron-core",

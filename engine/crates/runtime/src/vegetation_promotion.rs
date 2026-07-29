@@ -972,6 +972,9 @@ mod tests {
 
     fn family_fixture() -> saffron_vegetation::PlantFamilyAsset {
         saffron_vegetation::PlantFamilyAsset {
+            role: saffron_vegetation::PlantFamilyRole::Family,
+            modules: Vec::new(),
+            module_recursion_limit: saffron_vegetation::MAX_PLANT_MODULE_RECURSION,
             version: saffron_vegetation::PLANT_ASSET_VERSION,
             id: Uuid(4),
             name: "fixture".to_owned(),
