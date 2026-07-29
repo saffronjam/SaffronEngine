@@ -26,6 +26,13 @@ use crate::{Result, checked};
 pub const SCENE_VISIBILITY_PASS_CULL: u32 = 0;
 /// Retest pass kind (re-test the retest list against the current pyramid).
 pub const SCENE_VISIBILITY_PASS_RETEST: u32 = 1;
+/// Reach pass kind (keep every instance whose world sphere meets the reach box).
+///
+/// Global illumination is not a camera: a march gathers from behind the eye and a
+/// reflection shows what the camera cannot, so neither the frustum nor the depth pyramid
+/// is a sound rejection for it. The reach box is the only one that is.
+pub const SCENE_VISIBILITY_PASS_REACH: u32 = 2;
+
 /// Counter word: visible count.
 pub const SCENE_VISIBILITY_COUNTER_VISIBLE: usize = 0;
 /// Counter word: retest count.
@@ -36,8 +43,9 @@ pub const SCENE_VISIBILITY_COUNTER_OVERFLOW: usize = 2;
 pub const SCENE_VISIBILITY_COUNTER_RECORDS: usize = 3;
 /// Counter word: record overflow flags.
 pub const SCENE_VISIBILITY_COUNTER_RECORD_OVERFLOW: usize = 4;
-/// Total counter words per frame slot.
-pub const SCENE_VISIBILITY_COUNTER_WORDS: u64 = 16;
+/// Total counter words per frame slot. Words ride the one fence-gated readback the
+/// frame already copies, so a new counter costs a wider block and never a second copy.
+pub const SCENE_VISIBILITY_COUNTER_WORDS: u64 = 24;
 
 /// Counter word: generated micro-blade candidates this frame.
 pub const SCENE_VISIBILITY_COUNTER_MICRO_CANDIDATES: usize = 9;
@@ -52,6 +60,35 @@ pub const SCENE_VISIBILITY_COUNTER_CULLED_OCCLUSION: usize = 14;
 /// Counter word: emitted triangles whose whole record projects under a 2×2 quad —
 /// the quad-utilization pressure the rasterizer pays for sub-quad geometry.
 pub const SCENE_VISIBILITY_COUNTER_SUB_QUAD_TRIANGLES: usize = 15;
+/// Counter word: hierarchy nodes the traversal rejected on their swept bounds, each
+/// dropping the whole subtree beneath it.
+pub const SCENE_VISIBILITY_COUNTER_CULLED_NODES: usize = 16;
+/// Counter word: hierarchy nodes the traversal reached with a resolved assembly use —
+/// the denominator the culled count is a fraction of.
+pub const SCENE_VISIBILITY_COUNTER_VISITED_NODES: usize = 17;
+/// Counter word: executor buckets that received at least one record — the indirect draws the
+/// frame issues, counted on the pass that already touches every record.
+pub const SCENE_VISIBILITY_COUNTER_BINS: usize = 18;
+/// Counter word: deformed instances this view composed bounds for.
+pub const SCENE_VISIBILITY_COUNTER_DEFORMED: usize = 19;
+
+/// Samples a geometry fragment shader actually covered, counted at word 20.
+///
+/// A helper invocation's atomics are discarded by the spec, so this counts REAL lanes while the
+/// `FRAGMENT_SHADER_INVOCATIONS` pipeline statistic counts every lane including helpers. Their
+/// ratio is quad utilization — the fraction of a shaded 2x2 quad that was not wasted — which no
+/// pipeline statistic reports on its own and which foliage, all thin slivers, destroys.
+pub const SCENE_VISIBILITY_COUNTER_COVERED_SAMPLES: usize = 20;
+
+/// Counter word: deformed instances the interaction field's re-centring scroll reset this
+/// frame — their stored displacement jumped rather than moved, so the reactive-coverage
+/// pass marks them and TAA stops reprojecting them. Counted beside
+/// [`SCENE_VISIBILITY_COUNTER_DEFORMED`], so the two share a denominator.
+pub const SCENE_VISIBILITY_COUNTER_INTERACTION_RESET: usize = 21;
+
+/// Counter word: instances the reach pass rejected — outside the window any march can
+/// read, so no gather can be missing them.
+pub const SCENE_VISIBILITY_COUNTER_CULLED_REACH: usize = 22;
 
 /// Micro-blade candidates a frame slot can hold.
 pub const SCENE_MICRO_CANDIDATE_CAPACITY: u32 = 65_536;
@@ -161,10 +198,13 @@ pub const SCENE_VISIBILITY_COUNTER_TRIANGLES: usize = 8;
 /// Pair elements per radix workgroup.
 pub const SCENE_RADIX_WORKGROUP: u32 = 256;
 
-/// The traversal push: view origin plus error and capacity dimensions.
+/// The traversal push: the view plus error and capacity dimensions.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SceneTraversalPush {
+    /// World → clip for the node cull: a node whose swept world bounds leave this
+    /// frustum is rejected along with its whole subtree.
+    pub view_proj: [f32; 16],
     /// World-space camera position.
     pub eye: [f32; 3],
     /// Projected pixels per metre at 1 m.
@@ -186,11 +226,139 @@ pub struct SceneTraversalPush {
     /// Monotonic frame counter for transition-state staleness and once-per-frame
     /// phase advancement.
     pub frame_stamp: u32,
-    /// Padding word (matches the shader push block).
-    pub reserved0: u32,
+    /// Debug: pin the hierarchy cut instead of letting projected error choose it.
+    /// [`SCENE_CUT_AUTO`], [`SCENE_CUT_FORCE_COARSE`], or [`SCENE_CUT_FORCE_FINE`].
+    ///
+    /// A representation comparison needs the cut to move while the camera holds still.
+    /// Reaching the aggregate form by flying the camera out shrinks the subject at the same
+    /// time, so the resulting image difference conflates the two.
+    pub representation_override: u32,
+    /// Nonzero: reject a node whose swept world bounds leave [`Self::view_proj`],
+    /// dropping its subtree with it. Zero walks every node of every visible instance.
+    ///
+    /// The cull is a pure reduction over provably out-of-view geometry, so a host with
+    /// it off renders the identical frame — which is what
+    /// `tests/e2e/node-cull-parity.test.ts` asserts, boothing two hosts that differ in
+    /// exactly this.
+    pub node_cull: u32,
+    /// Nonzero: walk for page demand only and emit no draw records.
+    pub demand_only: u32,
+    /// [`SceneViewClass::ordinal`] of the view this walk serves; rides every
+    /// missing-page request so the CPU prices the demand by who missed.
+    pub view_class: u32,
 }
 
-const _: () = assert!(size_of::<SceneTraversalPush>() == 48);
+/// Follow the projected-error threshold (production).
+pub const SCENE_CUT_AUTO: u32 = 0;
+/// Never refine: the coarsest resident cut, which is where aggregate voxels live.
+pub const SCENE_CUT_FORCE_COARSE: u32 = 1;
+/// Always refine: the finest resident cut, which is triangle clusters.
+pub const SCENE_CUT_FORCE_FINE: u32 = 2;
+
+const _: () = assert!(size_of::<SceneTraversalPush>() == 124);
+
+/// What a view wants from the scene, which is what decides how finely its traversal
+/// refines and how urgently the pages it misses are streamed.
+///
+/// A shadow page and a global-illumination gather both read the same scene as the camera
+/// and neither needs it at the camera's fidelity; pricing all three alike either wastes
+/// the refinement budget on geometry nobody resolves or lets the cheapest reader evict
+/// the pages the image is made of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SceneViewClass {
+    /// The camera: its cut is the image, so it refines to pixel-scale error.
+    Camera,
+    /// One shadow-atlas page.
+    ShadowPage,
+    /// The global-illumination reach view.
+    Gi,
+}
+
+/// Distinct [`SceneViewClass`] values, for per-class tables.
+pub const SCENE_VIEW_CLASSES: usize = 3;
+
+impl SceneViewClass {
+    /// Every class, in ordinal order.
+    pub const ALL: [Self; SCENE_VIEW_CLASSES] = [Self::Camera, Self::ShadowPage, Self::Gi];
+
+    /// The class's dense index — the value the traversal push carries and every
+    /// per-class table is keyed on.
+    #[must_use]
+    pub fn ordinal(self) -> u32 {
+        match self {
+            Self::Camera => 0,
+            Self::ShadowPage => 1,
+            Self::Gi => 2,
+        }
+    }
+
+    /// The class an ordinal names, or [`Self::Camera`] for a value no class claims — the
+    /// only safe reading of a word the GPU wrote into a request record.
+    #[must_use]
+    pub fn from_ordinal(ordinal: u32) -> Self {
+        match ordinal {
+            1 => Self::ShadowPage,
+            2 => Self::Gi,
+            _ => Self::Camera,
+        }
+    }
+
+    /// The class's bit in an overflow mask.
+    #[must_use]
+    pub fn bit(self) -> u32 {
+        1 << self.ordinal()
+    }
+
+    /// The page-demand priority a missing-page request from this class carries.
+    ///
+    /// A miss is a hole in a read that already happened, so every band sits above the
+    /// CPU prioritizer's predicted scores; the bands then order the classes against each
+    /// other, which is what keeps a gather from evicting the image.
+    #[must_use]
+    pub fn page_demand_priority(self) -> u64 {
+        match self {
+            Self::Camera => u64::MAX / 2,
+            Self::ShadowPage => u64::MAX / 4,
+            Self::Gi => u64::MAX / 8,
+        }
+    }
+}
+
+/// Refinement threshold for a view whose cut is an image: refine until the projected
+/// appearance error is under a pixel.
+pub const SCENE_ERROR_THRESHOLD_IMAGE_PX: f32 = 1.0;
+/// Refinement threshold for the global-illumination reach view. A gather resolves
+/// geometry through a distance field at cascade-voxel scale, so silhouette error a pixel
+/// wide is far below anything it can express.
+pub const SCENE_ERROR_THRESHOLD_GI_PX: f32 = 16.0;
+
+/// The GI occluder-scatter push: the reach window plus the two capacities.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GiOccluderScatterPush {
+    /// Minimum corner of the reach window; `w` unused.
+    pub reach_min: [f32; 4],
+    /// Maximum corner of the reach window; `w` unused.
+    pub reach_max: [f32; 4],
+    /// Element capacity of the occluder output region.
+    pub capacity: u32,
+    /// Element capacity of the reach view's visible list.
+    pub list_capacity: u32,
+    /// Reserved ABI words.
+    pub reserved: [u32; 2],
+}
+
+const _: () = assert!(size_of::<GiOccluderScatterPush>() == 48);
+
+/// How one view's hierarchy walk refines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TraversalTuning {
+    /// Refine while the projected appearance error exceeds this many pixels.
+    pub error_threshold_px: f32,
+    /// The cut pin: [`SCENE_CUT_AUTO`], [`SCENE_CUT_FORCE_COARSE`], or
+    /// [`SCENE_CUT_FORCE_FINE`].
+    pub representation_override: u32,
+}
 
 /// Texels one directory entry's workgroup covers; a larger tile raises the
 /// record-pressure flag rather than silently thinning.
@@ -276,17 +444,22 @@ pub struct SceneVisibilityPush {
     pub hzb_extent: [u32; 2],
     /// HZB mip count.
     pub hzb_mip_count: u32,
-    /// [`SCENE_VISIBILITY_PASS_CULL`] or [`SCENE_VISIBILITY_PASS_RETEST`].
+    /// [`SCENE_VISIBILITY_PASS_CULL`], [`SCENE_VISIBILITY_PASS_RETEST`], or
+    /// [`SCENE_VISIBILITY_PASS_REACH`].
     pub pass_kind: u32,
     /// Whether the previous pyramid and history words are trustworthy.
     pub history_valid: u32,
     /// Element capacity of the visible/retest/history lists.
     pub list_capacity: u32,
-    /// Reserved ABI words.
+    /// Alignment padding ahead of the reach corners, which are 16-byte aligned.
     pub reserved: [u32; 2],
+    /// Minimum corner of the reach pass's world box; `w` is unused.
+    pub reach_min: [f32; 4],
+    /// Maximum corner of the reach pass's world box; `w` is unused.
+    pub reach_max: [f32; 4],
 }
 
-const _: () = assert!(size_of::<SceneVisibilityPush>() == 160);
+const _: () = assert!(size_of::<SceneVisibilityPush>() == 192);
 
 /// The byte size of the visibility push.
 pub const SCENE_VISIBILITY_PUSH_SIZE: u32 = size_of::<SceneVisibilityPush>() as u32;
@@ -314,9 +487,14 @@ pub struct WindDeformPush {
     pub source_count: u32,
     /// Reserved ABI word.
     pub reserved: u32,
+    /// Cascade-0 centre the previous frame's interaction step integrated, in absolute
+    /// world texel coordinates.
+    pub prev_center0: [i32; 2],
+    /// Cascade-1 centre the previous frame's interaction step integrated.
+    pub prev_center1: [i32; 2],
 }
 
-const _: () = assert!(size_of::<WindDeformPush>() == 64);
+const _: () = assert!(size_of::<WindDeformPush>() == 80);
 
 /// The byte size of the wind deformation push.
 pub const WIND_DEFORM_PUSH_SIZE: u32 = size_of::<WindDeformPush>() as u32;
@@ -523,8 +701,11 @@ impl SceneVisibility {
         };
         let bin_count_layout = make(&[sb, sb, sb, sb], compute)?;
         let bin_seed_layout = make(&[sb, sb], compute)?;
-        let bin_scatter_layout = make(&[sb, sb, sb, sb, ub, sb], compute)?;
-        let executor_layout = make(&[sb, ub], vk::ShaderStageFlags::VERTEX)?;
+        let bin_scatter_layout = make(&[sb, sb, sb, sb, ub, sb, sb], compute)?;
+        let executor_layout = make(
+            &[sb, ub, sb],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::MESH_EXT,
+        )?;
         let micro_layout = make(&[sb, sb, ub, sb], compute)?;
         let transparent_keys_layout = make(&[sb, sb, sb, ub], compute)?;
         let radix_histogram_layout = make(&[sb, sb, sb], compute)?;
@@ -638,6 +819,15 @@ impl Drop for SceneVisibility {
     }
 }
 
+/// Bytes of one `VkDrawMeshTasksIndirectCommandEXT` (three u32 group counts).
+pub const MESH_TASK_COMMAND_STRIDE: u64 = 12;
+
+/// Triangles one mesh workgroup emits. Three vertices per triangle are emitted without
+/// deduplication — a cluster carries no local vertex table, only a flat index range — so this
+/// is bounded by the vertex limit rather than the primitive one: 62 x 3 = 186 output vertices,
+/// inside the 256 every supported tier reports, and 2 x 62 covers a full 124-triangle cluster.
+pub const MESH_TRIANGLES_PER_GROUP: u32 = 62;
+
 /// One frame slot's lists and its cull/retest sets.
 struct VisibilityFrame {
     counters: Buffer,
@@ -649,6 +839,9 @@ struct VisibilityFrame {
     bin_cursors: Buffer,
     bucket_table: Buffer,
     commands: Buffer,
+    /// The mesh executor's per-command dispatch arguments, filled by the same scatter that
+    /// writes `commands`: one `VkDrawMeshTasksIndirectCommandEXT` per draw, at the same slot.
+    mesh_args: Buffer,
     pairs: [Buffer; 2],
     histograms: Buffer,
     transparent_commands: Buffer,
@@ -702,7 +895,11 @@ impl SceneVisibilityView {
         let record_bytes = u64::from(record_capacity) * size_of::<crate::GpuDrawRecord>() as u64;
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST
-            | vk::BufferUsageFlags::TRANSFER_SRC;
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            // The counters are also reached by DEVICE ADDRESS: the geometry fragment shaders
+            // increment the covered-sample word through the scene address block rather than
+            // through a descriptor set, so no raster pass needs a binding it otherwise would not.
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         let device_local = vk_mem::AllocationCreateInfo {
             usage: vk_mem::MemoryUsage::AutoPreferDevice,
             ..Default::default()
@@ -771,6 +968,15 @@ impl SceneVisibilityView {
                 storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
                 &device_local,
             )?;
+            // One `VkDrawMeshTasksIndirectCommandEXT` (three u32s) per draw slot, parallel to
+            // `commands`. The scatter knows each draw's triangle count, so it writes the group
+            // count directly and no conversion pass is needed.
+            let mesh_args = Buffer::new(
+                device.resources(),
+                u64::from(record_capacity) * MESH_TASK_COMMAND_STRIDE,
+                storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
+                &device_local,
+            )?;
             let workgroups = record_capacity.div_ceil(SCENE_RADIX_WORKGROUP);
             let pairs = [
                 Buffer::new(
@@ -834,7 +1040,9 @@ impl SceneVisibilityView {
             write_storage(raw, bin_scatter_set, 2, &bin_cursors);
             write_storage(raw, bin_scatter_set, 3, &commands);
             write_storage(raw, bin_scatter_set, 5, &bucket_table);
+            write_storage(raw, bin_scatter_set, 6, &mesh_args);
             write_storage(raw, executor_set, 0, &records);
+            write_storage(raw, executor_set, 2, &commands);
             write_storage(raw, micro_set, 0, &counters);
             write_storage(raw, micro_set, 1, &records);
             write_storage(raw, micro_set, 3, &micro_scratch);
@@ -880,6 +1088,7 @@ impl SceneVisibilityView {
                 bin_cursors,
                 bucket_table,
                 commands,
+                mesh_args,
                 pairs,
                 histograms,
                 transparent_commands,
@@ -938,6 +1147,11 @@ impl SceneVisibilityView {
     /// The frame slot's counters buffer (visible / retest / overflow words).
     pub fn counters(&self, frame: usize) -> vk::Buffer {
         self.frames[frame].counters.handle()
+    }
+
+    /// The frame slot's counters buffer as a device address, for shaders with no binding for it.
+    pub fn counters_address(&self, device: &Device, frame: usize) -> u64 {
+        device.buffer_device_address(self.frames[frame].counters.handle())
     }
 
     /// The frame slot's visible slot list.
@@ -1122,10 +1336,12 @@ impl SceneVisibilityView {
         let counters_res = graph.import_buffer(slot.counters.handle(), None);
         let bin_counts_res = graph.import_buffer(slot.bin_counts.handle(), None);
         let commands_res = graph.import_buffer(slot.commands.handle(), None);
+        let mesh_args_res = graph.import_buffer(slot.mesh_args.handle(), None);
         let raw = device.raw().clone();
         let counters = slot.counters.handle();
         let bin_counts = slot.bin_counts.handle();
         let commands = slot.commands.handle();
+        let mesh_args = slot.mesh_args.handle();
         // The transition state table is cross-frame: zero it exactly once, on the
         // view's first recorded frame, so stale allocations never alias live keys.
         let transitions = (!self
@@ -1135,7 +1351,8 @@ impl SceneVisibilityView {
         let mut clear = RgPass::compute("visibility-clear")
             .access(counters_res, RgUsage::TransferWrite)
             .access(bin_counts_res, RgUsage::TransferWrite)
-            .access(commands_res, RgUsage::TransferWrite);
+            .access(commands_res, RgUsage::TransferWrite)
+            .access(mesh_args_res, RgUsage::TransferWrite);
         if transitions.is_some() {
             let transitions_res = graph.import_buffer(self.transitions.handle(), None);
             clear = clear.access(transitions_res, RgUsage::TransferWrite);
@@ -1148,6 +1365,9 @@ impl SceneVisibilityView {
                     raw.cmd_fill_buffer(cmd, counters, 0, SCENE_VISIBILITY_COUNTER_WORDS * 4, 0);
                     raw.cmd_fill_buffer(cmd, bin_counts, 0, vk::WHOLE_SIZE, 0);
                     raw.cmd_fill_buffer(cmd, commands, 0, vk::WHOLE_SIZE, 0);
+                    // Unwritten mesh-task slots must dispatch nothing, exactly as unwritten
+                    // indexed commands draw nothing.
+                    raw.cmd_fill_buffer(cmd, mesh_args, 0, vk::WHOLE_SIZE, 0);
                     if let Some(transitions) = transitions {
                         raw.cmd_fill_buffer(cmd, transitions, 0, vk::WHOLE_SIZE, 0);
                     }
@@ -1452,6 +1672,7 @@ impl SceneVisibilityView {
         ExecutorDrawInputs {
             executor_set: slot.executor_set,
             commands: slot.commands.handle(),
+            mesh_args: slot.mesh_args.handle(),
             counters: slot.counters.handle(),
             bucket_counts: slot.bin_counts.handle(),
             record_capacity: self.record_capacity,
@@ -1460,6 +1681,11 @@ impl SceneVisibilityView {
     }
 
     /// The frame slot's indirect command stream (for graph usage declarations).
+    pub fn mesh_args(&self, frame: usize) -> vk::Buffer {
+        self.frames[frame].mesh_args.handle()
+    }
+
+    /// The frame slot's indexed indirect command stream.
     pub fn commands(&self, frame: usize) -> vk::Buffer {
         self.frames[frame].commands.handle()
     }
@@ -1822,6 +2048,8 @@ pub struct ExecutorDrawInputs {
     pub executor_set: vk::DescriptorSet,
     /// The frame slot's indirect command stream.
     pub commands: vk::Buffer,
+    /// The frame slot's mesh-task dispatch arguments, parallel to `commands`.
+    pub mesh_args: vk::Buffer,
     /// The frame slot's counters buffer (overflow/pressure words).
     pub counters: vk::Buffer,
     /// The frame slot's per-bucket count buffer (the draws' indirect counts).
@@ -1839,6 +2067,18 @@ pub struct ExecutorDrawInputs {
     pub draw_bound: u32,
 }
 
+/// Which bucket a recorder draws, where its count word sits, and whether the device can read
+/// that count on the GPU. Shared by both executors so the two draw calls stay the same shape.
+#[derive(Clone, Copy)]
+pub struct ExecutorBucketDraw {
+    /// The bucket's command-slice base and capacity.
+    pub bucket: ExecutorBucket,
+    /// Its index into the per-bucket count buffer.
+    pub index: u32,
+    /// Whether `drawIndirectCount` is available; without it the draw count is named host-side.
+    pub draw_indirect_count: bool,
+}
+
 /// Issues one draw bucket's counted indirect draw into a live graphics pass body. The
 /// caller binds the mesh set roster, the push, and the pages-arena index buffer once
 /// per pass ([`record_executor_pass_prefix`]); each bucket then binds its PSO and
@@ -1850,10 +2090,13 @@ pub fn record_executor_bucket_draw(
     cmd: vk::CommandBuffer,
     pipeline: (vk::Pipeline, vk::PipelineLayout),
     inputs: ExecutorDrawInputs,
-    bucket: ExecutorBucket,
-    bucket_index: u32,
-    draw_indirect_count: bool,
+    draw: ExecutorBucketDraw,
 ) {
+    let ExecutorBucketDraw {
+        bucket,
+        index: bucket_index,
+        draw_indirect_count,
+    } = draw;
     // SAFETY: the ash seam. The PSO/buffers are valid this frame; the indirect stream,
     // counts, and slice bases were built by the bucket passes this frame.
     unsafe {
@@ -1876,6 +2119,51 @@ pub fn record_executor_bucket_draw(
                 u64::from(bucket.base) * 20,
                 draws,
                 20,
+            );
+        }
+    }
+}
+
+/// Issues one draw bucket's counted mesh-task dispatch — the mesh executor's counterpart to
+/// [`record_executor_bucket_draw`], reading the *same* per-bucket count word against the
+/// mesh-args stream the scatter filled beside the indexed commands. One workgroup covers
+/// [`MESH_TRIANGLES_PER_GROUP`] triangles of one draw; the shader recovers which draw from
+/// `DrawIndex` and which block from its group id.
+pub fn record_executor_bucket_draw_mesh(
+    raw: &ash::Device,
+    dispatch: &ash::ext::mesh_shader::Device,
+    cmd: vk::CommandBuffer,
+    pipeline: (vk::Pipeline, vk::PipelineLayout),
+    inputs: ExecutorDrawInputs,
+    draw: ExecutorBucketDraw,
+) {
+    let ExecutorBucketDraw {
+        bucket,
+        index: bucket_index,
+        draw_indirect_count,
+    } = draw;
+    // SAFETY: the ash seam. The PSO/buffers are valid this frame; the mesh-args stream, counts,
+    // and slice bases were written by the bucket passes this frame.
+    unsafe {
+        raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.0);
+        let draws = bucket.capacity.min(inputs.draw_bound);
+        if draw_indirect_count {
+            dispatch.cmd_draw_mesh_tasks_indirect_count(
+                cmd,
+                inputs.mesh_args,
+                u64::from(bucket.base) * MESH_TASK_COMMAND_STRIDE,
+                inputs.bucket_counts,
+                u64::from(bucket_index) * 4,
+                draws,
+                MESH_TASK_COMMAND_STRIDE as u32,
+            );
+        } else {
+            dispatch.cmd_draw_mesh_tasks_indirect(
+                cmd,
+                inputs.mesh_args,
+                u64::from(bucket.base) * MESH_TASK_COMMAND_STRIDE,
+                draws,
+                MESH_TASK_COMMAND_STRIDE as u32,
             );
         }
     }
@@ -1909,6 +2197,34 @@ pub fn record_executor_pass_prefix(
             bytemuck::bytes_of(&view_proj),
         );
         raw.cmd_bind_index_buffer(cmd, page_index_buffer, 0, vk::IndexType::UINT32);
+    }
+}
+
+/// Binds the executor set and the mesh executor's push — the view-projection plus the bucket's
+/// command-slice base, which `SV_DrawIndex` is relative to. No index buffer: the mesh stage
+/// reads indices through the address block rather than through a bound stream.
+pub fn record_executor_mesh_prefix(
+    raw: &ash::Device,
+    cmd: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    inputs: ExecutorDrawInputs,
+    view_proj: [f32; 16],
+    slice_base: u32,
+) {
+    let mut push = [0_u8; crate::MESH_EXECUTOR_PUSH_SIZE as usize];
+    push[..64].copy_from_slice(bytemuck::bytes_of(&view_proj));
+    push[64..].copy_from_slice(&slice_base.to_ne_bytes());
+    // SAFETY: the ash seam. The set is valid this frame; the push spans the declared range.
+    unsafe {
+        raw.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            layout,
+            0,
+            &[inputs.executor_set],
+            &[],
+        );
+        raw.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::MESH_EXT, 0, &push);
     }
 }
 
@@ -2210,7 +2526,6 @@ mod tests {
                     transform: GpuSceneTransform::Dynamic(transform),
                     material_overrides: std::sync::Arc::from([]),
                     deformation: None,
-                    sdf: None,
                     source_generation: 1,
                     flags: 0,
                     combination: 0,
@@ -2304,6 +2619,8 @@ mod tests {
                     ),
                     shader_index: 0,
                     flags: 0,
+                    proxy_albedo: 0,
+                    occupancy: 1.0,
                 })
                 .expect("resident material");
             pending.stage_record(GlobalGpuTableKind::Material, resident_material);
@@ -2393,11 +2710,12 @@ mod tests {
                         },
                         materials: std::sync::Arc::from([material]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: scene_root,
                         bounds: [0.0, 0.0, 0.0, 1.0],
                         source_generation: 1,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -2418,7 +2736,8 @@ mod tests {
                 .expect("record");
             one_shot(&device, |cmd| graph.execute(&device, cmd));
 
-            let block = uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0);
+            let block =
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, 0);
             let address_ubo = Buffer::new(
                 device.resources(),
                 size_of::<crate::GpuSceneAddressBlock>() as u64,
@@ -2481,6 +2800,8 @@ mod tests {
                     history_valid: 0,
                     list_capacity: 64,
                     reserved: [0; 2],
+                    reach_min: [0.0; 4],
+                    reach_max: [0.0; 4],
                 },
             );
             view.add_traversal_pass(
@@ -2489,6 +2810,7 @@ mod tests {
                 &traversal,
                 0,
                 SceneTraversalPush {
+                    view_proj: view_proj.to_cols_array(),
                     eye: [0.0, 0.0, 5.0],
                     proj_scale: 1000.0,
                     error_threshold_px: 0.0,
@@ -2498,7 +2820,10 @@ mod tests {
                     tess_seam: 0,
                     transition_frames: 0,
                     frame_stamp: 0,
-                    reserved0: 0,
+                    representation_override: SCENE_CUT_AUTO,
+                    node_cull: 1,
+                    demand_only: 0,
+                    view_class: SceneViewClass::Camera.ordinal(),
                 },
             );
             one_shot(&device, |cmd| graph.execute(&device, cmd));
@@ -2530,15 +2855,18 @@ mod tests {
                 .expect("root")
                 .node as usize];
             assert_eq!(
-                requested.len(),
+                requested.requests.len(),
                 root_node.children.len(),
                 "every missing child page is requested exactly once"
             );
             for child in &root_node.children {
                 let child_page = hierarchy.nodes[*child as usize].page;
                 assert!(
-                    requested.contains(&device_pages[child_page as usize].index),
-                    "child page {child_page} requested"
+                    requested.requests.iter().any(|(slot, class)| {
+                        *slot == device_pages[child_page as usize].index
+                            && *class == SceneViewClass::Camera
+                    }),
+                    "child page {child_page} requested, priced as the camera's"
                 );
             }
 
@@ -2615,6 +2943,8 @@ mod tests {
                     ),
                     shader_index: 0,
                     flags: 0,
+                    proxy_albedo: 0,
+                    occupancy: 1.0,
                 })
                 .expect("resident material");
             pending.stage_record(GlobalGpuTableKind::Material, resident_material);
@@ -2712,11 +3042,12 @@ mod tests {
                         },
                         materials: std::sync::Arc::from([material]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: scene_root,
                         bounds: [0.0, 0.0, 0.0, 1.0],
                         source_generation: 1,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -2737,7 +3068,8 @@ mod tests {
                 .expect("record");
             one_shot(&device, |cmd| graph.execute(&device, cmd));
 
-            let block = uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0);
+            let block =
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, 0);
             let address_ubo = Buffer::new(
                 device.resources(),
                 size_of::<crate::GpuSceneAddressBlock>() as u64,
@@ -2802,6 +3134,8 @@ mod tests {
                         history_valid: 0,
                         list_capacity: 64,
                         reserved: [0; 2],
+                        reach_min: [0.0; 4],
+                        reach_max: [0.0; 4],
                     },
                 );
                 view.add_traversal_pass(
@@ -2810,6 +3144,7 @@ mod tests {
                     &traversal,
                     0,
                     SceneTraversalPush {
+                        view_proj: view_proj.to_cols_array(),
                         eye: [0.0, 0.0, 5.0],
                         proj_scale: 1000.0,
                         error_threshold_px: threshold,
@@ -2819,7 +3154,10 @@ mod tests {
                         tess_seam: 0,
                         transition_frames: frames,
                         frame_stamp: stamp,
-                        reserved0: 0,
+                        representation_override: SCENE_CUT_AUTO,
+                        node_cull: 1,
+                        demand_only: 0,
+                        view_class: SceneViewClass::Camera.ordinal(),
                     },
                 );
                 one_shot(&device, |cmd| graph.execute(&device, cmd));
@@ -2887,6 +3225,88 @@ mod tests {
         assert_eq!(validation_issue_count(), before);
     }
 
+    /// Depth texels a 64x64 target holds that are nearer than the clear — the "did it
+    /// rasterize" measure both executors are scored by.
+    fn count_written_depth(device: &Device, target: &Image) -> usize {
+        let staging = Buffer::new(
+            device.resources(),
+            64 * 64 * 4,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+        )
+        .expect("staging");
+        let raw = device.raw().clone();
+        one_shot(device, |cmd| {
+            let barrier = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(target.handle())
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            let barriers = [barrier];
+            // SAFETY: the ash seam. One-off readback under the fence below.
+            unsafe {
+                raw.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+                );
+                raw.cmd_copy_image_to_buffer(
+                    cmd,
+                    target.handle(),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging.handle(),
+                    &[vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D::default(),
+                        image_extent: vk::Extent3D {
+                            width: 64,
+                            height: 64,
+                            depth: 1,
+                        },
+                    }],
+                );
+            }
+        });
+        let mut depth_bytes = vec![0_u8; 64 * 64 * 4];
+        // SAFETY: HOST_VISIBLE + MAPPED; the copy completed under the fence.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                staging.mapped_ptr(),
+                depth_bytes.as_mut_ptr(),
+                depth_bytes.len(),
+            );
+        }
+        let written = depth_bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .filter(|depth| *depth < 0.999)
+            .count();
+        device.wait_idle().expect("idle after readback");
+        written
+    }
+
     #[test]
     fn executor_draws_the_binned_cut_depth_only() {
         use crate::gpu_scene_upload::{
@@ -2927,6 +3347,13 @@ mod tests {
             let executor = pipelines
                 .request_scene_executor_depth(visibility.executor_layout())
                 .expect("executor pso");
+            // The mesh executor is optional: a device without `VK_EXT_mesh_shader` runs the
+            // indexed path alone, which is the supported configuration on MoltenVK.
+            let executor_mesh = device.capabilities.mesh_shader.then(|| {
+                pipelines
+                    .request_scene_executor_depth_mesh(visibility.executor_layout())
+                    .expect("mesh executor pso")
+            });
 
             let mut gpu_data = GlobalGpuData::new(&device).expect("GlobalGpuData");
             let mut uploader = GpuSceneUploader::new(&device).expect("uploader");
@@ -3043,6 +3470,8 @@ mod tests {
                     ),
                     shader_index: 0,
                     flags: 0,
+                    proxy_albedo: 0,
+                    occupancy: 1.0,
                 })
                 .expect("resident material");
             pending.stage_record(GlobalGpuTableKind::Material, resident_material);
@@ -3076,11 +3505,12 @@ mod tests {
                         geometry,
                         materials: std::sync::Arc::from([scene_material]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: scene_root,
                         bounds: [0.5, 0.5, 0.0, 1.0],
                         source_generation: 1,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -3101,7 +3531,8 @@ mod tests {
                 .expect("record");
             one_shot(&device, |cmd| graph.execute(&device, cmd));
 
-            let block = uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0);
+            let block =
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, 0);
             let address_ubo = Buffer::new(
                 device.resources(),
                 size_of::<crate::GpuSceneAddressBlock>() as u64,
@@ -3153,6 +3584,24 @@ mod tests {
                 },
             )
             .expect("depth target");
+            let depth_mesh = Image::new(
+                device.resources(),
+                &ImageDesc {
+                    extent: vk::Extent2D {
+                        width: 64,
+                        height: 64,
+                    },
+                    format: vk::Format::D32_SFLOAT,
+                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                    aspect: vk::ImageAspectFlags::DEPTH,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                },
+            )
+            .expect("mesh depth target");
 
             let mut graph = RenderGraph::new();
             let hzb_res = graph.import_image(
@@ -3181,6 +3630,8 @@ mod tests {
                     history_valid: 0,
                     list_capacity: 64,
                     reserved: [0; 2],
+                    reach_min: [0.0; 4],
+                    reach_max: [0.0; 4],
                 },
             );
             view.add_traversal_pass(
@@ -3189,6 +3640,7 @@ mod tests {
                 &traversal,
                 0,
                 SceneTraversalPush {
+                    view_proj: view_proj.to_cols_array(),
                     eye: [0.5, 0.5, 5.0],
                     proj_scale: 100_000.0,
                     error_threshold_px: 0.0,
@@ -3198,7 +3650,10 @@ mod tests {
                     tess_seam: 0,
                     transition_frames: 0,
                     frame_stamp: 0,
-                    reserved0: 0,
+                    representation_override: SCENE_CUT_AUTO,
+                    node_cull: 1,
+                    demand_only: 0,
+                    view_class: SceneViewClass::Camera.ordinal(),
                 },
             );
             let class_bits = crate::GpuMaterialClass::new(
@@ -3235,6 +3690,9 @@ mod tests {
             let executor_layout = executor.layout();
             let draw_count_supported = device.capabilities.draw_indirect_count;
             let raw_draw = device.raw().clone();
+            // The indexed pass body takes ownership of `buckets`; the mesh pass below draws the
+            // same list.
+            let mesh_buckets = buckets.clone();
             graph.add_pass(
                 RgPass::graphics(
                     "executor-depth",
@@ -3272,13 +3730,82 @@ mod tests {
                             cmd,
                             (executor_handle, executor_layout),
                             draw_inputs,
-                            *bucket,
-                            bucket_index as u32,
-                            draw_count_supported,
+                            ExecutorBucketDraw {
+                                bucket: *bucket,
+                                index: bucket_index as u32,
+                                draw_indirect_count: draw_count_supported,
+                            },
                         );
                     }
                 }),
             );
+            // The mesh executor over the SAME records, into its own depth target. It reads the
+            // command stream as data rather than as draw arguments, so any divergence means one
+            // executor ignored records the binner emitted.
+            if let Some(mesh_pso) = executor_mesh.as_ref() {
+                let mesh_args_res = graph.import_buffer(view.mesh_args(0), None);
+                let depth_mesh_res = graph.import_image(
+                    depth_mesh.handle(),
+                    depth_mesh.view(),
+                    vk::ImageAspectFlags::DEPTH,
+                    vk::ImageLayout::UNDEFINED,
+                    None,
+                );
+                let mesh_handle = mesh_pso.handle();
+                let mesh_layout = mesh_pso.layout();
+                let raw_mesh = device.raw().clone();
+                let mesh_dispatch = device
+                    .mesh_shader_dispatch()
+                    .expect("mesh dispatch")
+                    .clone();
+                graph.add_pass(
+                    RgPass::graphics(
+                        "executor-depth-mesh",
+                        vk::Extent2D {
+                            width: 64,
+                            height: 64,
+                        },
+                    )
+                    .depth_attachment(RgAttachment {
+                        resource: depth_mesh_res,
+                        load_op: vk::AttachmentLoadOp::CLEAR,
+                        store_op: vk::AttachmentStoreOp::STORE,
+                        clear_value: vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        },
+                        resolve: None,
+                    })
+                    .access(mesh_args_res, RgUsage::IndirectCommandRead)
+                    .access(counters_res, RgUsage::IndirectCountRead)
+                    .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
+                        for (bucket_index, bucket) in mesh_buckets.iter().enumerate() {
+                            record_executor_mesh_prefix(
+                                &raw_mesh,
+                                cmd,
+                                mesh_layout,
+                                draw_inputs,
+                                vp,
+                                bucket.base,
+                            );
+                            record_executor_bucket_draw_mesh(
+                                &raw_mesh,
+                                &mesh_dispatch,
+                                cmd,
+                                (mesh_handle, mesh_layout),
+                                draw_inputs,
+                                ExecutorBucketDraw {
+                                    bucket: *bucket,
+                                    index: bucket_index as u32,
+                                    draw_indirect_count: draw_count_supported,
+                                },
+                            );
+                        }
+                    }),
+                );
+            }
             one_shot(&device, |cmd| graph.execute(&device, cmd));
 
             let counters = read_words(&device, view.counters(0), 8);
@@ -3286,89 +3813,34 @@ mod tests {
             assert_eq!(counters[4], 0, "no record overflow");
 
             // The quad must have written depth: count texels nearer than the clear.
-            let staging = Buffer::new(
-                device.resources(),
-                64 * 64 * 4,
-                vk::BufferUsageFlags::TRANSFER_DST,
-                &vk_mem::AllocationCreateInfo {
-                    usage: vk_mem::MemoryUsage::Auto,
-                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
-                        | vk_mem::AllocationCreateFlags::MAPPED,
-                    ..Default::default()
-                },
-            )
-            .expect("staging");
-            let raw = device.raw().clone();
-            one_shot(&device, |cmd| {
-                let barrier = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ)
-                    .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .image(depth_target.handle())
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::DEPTH,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
-                let barriers = [barrier];
-                // SAFETY: the ash seam. One-off readback under the fence below.
-                unsafe {
-                    raw.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&barriers),
-                    );
-                    raw.cmd_copy_image_to_buffer(
-                        cmd,
-                        depth_target.handle(),
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        staging.handle(),
-                        &[vk::BufferImageCopy {
-                            buffer_offset: 0,
-                            buffer_row_length: 0,
-                            buffer_image_height: 0,
-                            image_subresource: vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                                mip_level: 0,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            },
-                            image_offset: vk::Offset3D::default(),
-                            image_extent: vk::Extent3D {
-                                width: 64,
-                                height: 64,
-                                depth: 1,
-                            },
-                        }],
-                    );
-                }
-            });
-            let mut depth_bytes = vec![0_u8; 64 * 64 * 4];
-            // SAFETY: HOST_VISIBLE + MAPPED; the copy completed under the fence.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    staging.mapped_ptr(),
-                    depth_bytes.as_mut_ptr(),
-                    depth_bytes.len(),
-                );
-            }
-            let written = depth_bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .filter(|depth| *depth < 0.999)
-                .count();
+            let written = count_written_depth(&device, &depth_target);
             assert!(
                 written > 100,
                 "the executor rasterized the quad ({written} depth texels written)"
             );
 
+            // Both executors consume one binned cut, so they must cover the same pixels. The
+            // bound is a proportion rather than an exact match: the mesh path emits three
+            // vertices per triangle without deduplication, so a shared edge is rasterized from
+            // two independently interpolated triangles and a boundary texel may resolve either
+            // way.
+            if executor_mesh.is_some() {
+                let mesh_written = count_written_depth(&device, &depth_mesh);
+                assert!(
+                    mesh_written > 100,
+                    "the mesh executor rasterized the quad ({mesh_written} depth texels written)"
+                );
+                let spread = written.abs_diff(mesh_written);
+                assert!(
+                    spread * 50 <= written.max(mesh_written),
+                    "indexed and mesh executors disagree on coverage \
+                     (indexed {written}, mesh {mesh_written})"
+                );
+            }
+
             device.wait_idle().expect("idle");
-            drop(staging);
             drop(depth_target);
+            drop(depth_mesh);
             drop(view);
             drop(open);
             drop(address_ubo);
@@ -3457,6 +3929,8 @@ mod tests {
                     ),
                     shader_index: 0,
                     flags: 0,
+                    proxy_albedo: 0,
+                    occupancy: 1.0,
                 })
                 .expect("resident material");
             pending.stage_record(GlobalGpuTableKind::Material, resident_material);
@@ -3544,11 +4018,12 @@ mod tests {
                         },
                         materials: std::sync::Arc::from([scene_material]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: scene_root,
                         bounds: [0.5, 0.5, 0.0, 1.0],
                         source_generation: 1,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -3572,7 +4047,8 @@ mod tests {
                 .expect("record");
             one_shot(&device, |cmd| graph.execute(&device, cmd));
 
-            let block = uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0);
+            let block =
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, 0);
             let address_ubo = Buffer::new(
                 device.resources(),
                 size_of::<crate::GpuSceneAddressBlock>() as u64,
@@ -3634,6 +4110,8 @@ mod tests {
                     history_valid: 0,
                     list_capacity: 64,
                     reserved: [0; 2],
+                    reach_min: [0.0; 4],
+                    reach_max: [0.0; 4],
                 },
             );
             view.add_traversal_pass(
@@ -3642,6 +4120,7 @@ mod tests {
                 &traversal,
                 0,
                 SceneTraversalPush {
+                    view_proj: view_proj.to_cols_array(),
                     eye: [0.5, 0.5, 5.0],
                     proj_scale: 100_000.0,
                     error_threshold_px: 0.0,
@@ -3651,7 +4130,10 @@ mod tests {
                     tess_seam: 0,
                     transition_frames: 0,
                     frame_stamp: 0,
-                    reserved0: 0,
+                    representation_override: SCENE_CUT_AUTO,
+                    node_cull: 1,
+                    demand_only: 0,
+                    view_class: SceneViewClass::Camera.ordinal(),
                 },
             );
             // The view matrix's third row measures view-space depth.
@@ -3829,11 +4311,12 @@ mod tests {
                         },
                         materials: std::sync::Arc::from([material]),
                         deformation: None,
-                        sdf: None,
+                        sdfs: Vec::new().into(),
                         root_page: page,
                         bounds: [0.0, 0.0, 0.0, 1.0],
                         source_generation: 1,
                         flags: 0,
+                        mechanics: [0; 4],
                     },
                 ))
                 .expect("prototype")
@@ -3854,7 +4337,8 @@ mod tests {
                 .expect("record");
             one_shot(&device, |cmd| graph.execute(&device, cmd));
 
-            let block = uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0);
+            let block =
+                uploader.build_address_block(&device, &gpu_data, WORLD, 0, (0, 0), 0, 0, 0, 0);
             let address_ubo = Buffer::new(
                 device.resources(),
                 size_of::<crate::GpuSceneAddressBlock>() as u64,
@@ -3892,6 +4376,8 @@ mod tests {
                 history_valid,
                 list_capacity: 64,
                 reserved: [0; 2],
+                reach_min: [0.0; 4],
+                reach_max: [0.0; 4],
             };
             let address = (
                 address_ubo.handle(),
