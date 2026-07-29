@@ -37,7 +37,7 @@ struct Push
     float4 sunDir;        // xyz = direction the sun travels, w = sun intensity
     float4 sunColor;      // rgb sun color, w = frame index (for ray rotation)
     float4 budgetOffset;  // x = round-robin probe-budget offset
-    int4 scrollBase;      // xyz = toroidal scroll base (wrapMod(snapBase, count)), w = SDF instance count
+    int4 scrollBase;      // xyz = toroidal scroll base (wrapMod(snapBase, count)), w reserved
 };
 [[vk::push_constant]] Push pc;
 
@@ -125,7 +125,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     float rot = frac(pc.sunColor.w * 0.618033988749895);
     float3 dir = sphericalFibonacci(ray, pc.probeCount.w, rot);
 
-    uint count = uint(pc.scrollBase.w);
+    uint count = sdfInstanceCount();
     uint interior = uint(pc.volumeMin.w);  // irradiance octahedral tile interior
 
     // Sphere-march the unified field (near MDF -> far GDF). A hit is the field distance dropping

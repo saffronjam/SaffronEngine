@@ -206,6 +206,7 @@ struct GbufferOut
 [shader("fragment")]
 GbufferOut fragmentMain(VertexOutput input, bool isFront : SV_IsFrontFace)
 {
+    gpuSceneCountCoveredSample(gpuSceneAddresses);
     // Mirrors the depth and forward passes' stochastic crossfade share exactly.
     if (!gpuTransitionCovered(input.transition, uint2(input.position.xy)))
     {

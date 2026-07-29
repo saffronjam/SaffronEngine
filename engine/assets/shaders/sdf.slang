@@ -50,6 +50,16 @@ public struct GdfParams
 };
 [[vk::binding(10, 1)]] ConstantBuffer<GdfParams> gdfParams;
 
+// The occluder scatter's meta words for this frame slot (binding 15): [0] instances
+// written, [1] culled against the reach window, [2] dropped to capacity. The count is
+// GPU-produced, so no push constant can carry it.
+[[vk::binding(15, 1)]] StructuredBuffer<uint> sdfInstanceMeta;
+
+public uint sdfInstanceCount()
+{
+    return sdfInstanceMeta[0];
+}
+
 // Probes every per-mesh SDF occluder at a world sample given the cone-footprint radius
 // (`footprint`, world units). The global minimum signed distance over instances is kept;
 // `openness` is the min over instances so the cone can early-out only where every nearby block

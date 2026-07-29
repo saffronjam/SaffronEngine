@@ -54,8 +54,18 @@ public struct VertexOutput
 struct Camera
 {
     float4x4 viewProj;
+    // The bucket's command-slice base, which the mesh executor's `SV_DrawIndex` is relative to.
+    // Unread by the vertex entries; the range is sized for it either way.
+    uint sliceBase;
 };
 [[vk::push_constant]] Camera camera;
+
+/// The bucket's command-slice base for the mesh executor. The push block itself stays private;
+/// this is the one field a consumer outside this module needs.
+public uint executorSliceBase()
+{
+    return camera.sliceBase;
+}
 
 // Bindless: one global albedo array (set 0) indexed per-instance. Partially bound +
 // update-after-bind on the C++ side; sampled with NonUniformResourceIndex. The size
