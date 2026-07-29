@@ -1,6 +1,6 @@
 # Foliage and vegetation
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 Start at [`READMESUMMARY.md`](READMESUMMARY.md) for where every phase stands and what the current
 hardware gates; [`READMEFABLE.md`](READMEFABLE.md) carries the full design record.
