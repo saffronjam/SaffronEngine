@@ -93,7 +93,11 @@ fixed records reference by range.
 `GpuSceneUploader` drains the scene's coalesced writes each frame into graph-owned transfer
 passes: it reserves slot capacity, enqueues any buffer growth (a preserving copy that runs
 before writes targeting the grown buffer), serializes every record, and stages the bytes
-through the shared frame upload ring. A slot's header travels in the same write as its
+through the shared frame upload ring. Every arena byte reads as zero until a staged write
+covers it: a fresh table clears before its first use and growth zero-fills the tail beyond the
+preserved prefix, because the address block advertises physical capacity and capacity-wide
+dispatches read every slot header — recycled device memory under an unwritten slot would
+otherwise read as a garbage occupancy word whose record walks off into a wild device address. A slot's header travels in the same write as its
 record, so a partially published slot is never observable. Removals write the header with
 the occupied flag cleared. The companion `GpuScenePendingUploads` queue carries the asset
 mirror's resident-table stages, retirements, vertex and index streams, and packed material
