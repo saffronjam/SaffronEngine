@@ -337,10 +337,16 @@ pub enum AlarmEventKind {
 pub struct ActiveAlarm {
     /// `hash(metric + "|" + pass)` — the coalescing key.
     pub fingerprint: u64,
-    /// The metric: `frame-budget`, `frame-hitch`, `burn-rate`, `vram`, `pso-compile`.
+    /// The metric: `frame-budget`, `frame-hitch`, `burn-rate`, `vram`, `pso-compile`,
+    /// `visibility-overflow`, `visibility-pressure`.
     pub metric: String,
     /// The offending pass, empty for whole-frame alarms.
     pub pass: String,
+    /// What the breach belongs to, empty for whole-frame alarms — a vegetation cell, a plant
+    /// family and the asset it came from, or whatever else raised it. An alarm without an owner
+    /// says a budget broke; one with an owner says which content broke it, which is the
+    /// difference between a number to watch and a thing to fix.
+    pub owner: String,
     /// The (escalating) severity.
     pub severity: AlarmSeverity,
     /// The current breached value (ms for time metrics, % for vram/burn).
@@ -370,6 +376,8 @@ pub struct AlarmEvent {
     pub metric: String,
     /// The offending pass, empty for whole-frame alarms.
     pub pass: String,
+    /// What the breach belongs to; see [`ActiveAlarm::owner`].
+    pub owner: String,
     /// The severity.
     pub severity: AlarmSeverity,
     /// Firing or resolved.
@@ -442,8 +450,40 @@ impl Default for AlarmState {
     }
 }
 
-/// FNV-1a over `metric + "|" + pass` — the alarm fingerprint that coalesces repeats.
-fn alarm_fingerprint(metric: &str, pass: &str) -> u64 {
+/// FNV-1a over `metric + "|" + pass + "|" + owner` — the alarm fingerprint that coalesces
+/// repeats. The owner is part of the key so two cells over the same budget stay two alarms: a
+/// single coalesced one would name whichever cell breached last and hide the rest.
+/// An alarm's identity: the metric, the pass it belongs to, and the content that owns it. All
+/// three make the fingerprint, so they travel together rather than as three positional strings a
+/// caller can transpose.
+#[derive(Clone, Copy)]
+struct AlarmKey<'a> {
+    metric: &'a str,
+    pass: &'a str,
+    owner: &'a str,
+}
+
+impl<'a> AlarmKey<'a> {
+    /// A whole-frame alarm: no pass, no owner.
+    const fn frame(metric: &'a str) -> Self {
+        Self {
+            metric,
+            pass: "",
+            owner: "",
+        }
+    }
+
+    /// A budget an outside subsystem owns.
+    const fn owned(metric: &'a str, owner: &'a str) -> Self {
+        Self {
+            metric,
+            pass: "",
+            owner,
+        }
+    }
+}
+
+fn alarm_fingerprint(metric: &str, pass: &str, owner: &str) -> u64 {
     let mut hash = 14695981039346656037u64;
     let mut mix = |text: &str| {
         for c in text.bytes() {
@@ -454,7 +494,30 @@ fn alarm_fingerprint(metric: &str, pass: &str) -> u64 {
     mix(metric);
     mix("|");
     mix(pass);
+    mix("|");
+    mix(owner);
     hash
+}
+
+/// One budget breach a subsystem outside this crate observed, with the content that owns it.
+///
+/// The renderer's own detectors read frame timings and GPU counters and can name a pass at best.
+/// A vegetation cell over its plant budget, or a family whose predicted blade density outruns
+/// what the field can hold, is invisible from here — the crate has no vegetation dependency and
+/// must not grow one. So the owner computes the breach and hands it in, and the alarm machinery
+/// (coalescing, escalation, FIRING/RESOLVED events, the drain cursor) applies to it unchanged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OwnedBudgetBreach {
+    /// The metric name, e.g. `vegetation-cell-plants`.
+    pub metric: String,
+    /// What owns the breach — a cell key, a family and its source asset, a provenance string.
+    pub owner: String,
+    /// How bad it is.
+    pub severity: AlarmSeverity,
+    /// The observed value.
+    pub value: f32,
+    /// The budget it crossed.
+    pub threshold: f32,
 }
 
 /// The per-frame inputs the alarm detectors read besides the frame history.
@@ -471,6 +534,19 @@ pub struct AlarmInputs {
     pub vram_budget_bytes: u64,
     /// PSOs compiled this frame (a mid-frame compile is a hitch).
     pub pipelines_created: u32,
+    /// The visibility pass's overflow flag word: a capacity that filled and CLAMPED.
+    ///
+    /// Nonzero means geometry the frame should have drawn was silently dropped, which is the one
+    /// failure that looks like a correct render. The flags existed on the wire and raised nothing,
+    /// so noticing required a person to go and read them.
+    pub visibility_overflow_flags: u32,
+    /// The visibility pass's pressure flag word: a capacity approaching its limit but not yet lost.
+    pub visibility_pressure_flags: u32,
+    /// This frame's owned budget breaches from outside this crate — see [`OwnedBudgetBreach`].
+    /// The list is the COMPLETE set of breaches that hold right now: an owned alarm whose breach
+    /// is absent resolves, so a caller that stops reporting a cell resolves its alarm rather than
+    /// leaving it firing forever.
+    pub owned_budgets: Vec<OwnedBudgetBreach>,
     /// Whether the viewport is focused (rendering at the full target rate). While unfocused the
     /// loop paces render down and on resume it re-converges the temporal effects, so those frame
     /// timings are unrepresentative; the frame-time detectors stay quiet until the viewport has
@@ -514,13 +590,17 @@ impl AlarmState {
     fn raise(
         &mut self,
         now_ns: u64,
-        metric: &str,
-        pass: &str,
+        key: AlarmKey<'_>,
         severity: AlarmSeverity,
         value: f32,
         threshold: f32,
     ) {
-        let fingerprint = alarm_fingerprint(metric, pass);
+        let AlarmKey {
+            metric,
+            pass,
+            owner,
+        } = key;
+        let fingerprint = alarm_fingerprint(metric, pass, owner);
         if let Some(active) = self
             .active
             .iter_mut()
@@ -537,6 +617,7 @@ impl AlarmState {
                     fingerprint,
                     metric: metric.to_string(),
                     pass: pass.to_string(),
+                    owner: owner.to_string(),
                     severity,
                     kind: AlarmEventKind::Firing,
                     value,
@@ -553,6 +634,7 @@ impl AlarmState {
             fingerprint,
             metric: metric.to_string(),
             pass: pass.to_string(),
+            owner: owner.to_string(),
             severity,
             value,
             threshold,
@@ -568,6 +650,7 @@ impl AlarmState {
             fingerprint,
             metric: metric.to_string(),
             pass: pass.to_string(),
+            owner: owner.to_string(),
             severity,
             kind: AlarmEventKind::Firing,
             value,
@@ -580,8 +663,13 @@ impl AlarmState {
     }
 
     /// Clear an active alarm if present, emitting one RESOLVED (with duration + peak).
-    fn clear(&mut self, now_ns: u64, metric: &str, pass: &str) {
-        let fingerprint = alarm_fingerprint(metric, pass);
+    fn clear(&mut self, now_ns: u64, key: AlarmKey<'_>) {
+        let AlarmKey {
+            metric,
+            pass,
+            owner,
+        } = key;
+        let fingerprint = alarm_fingerprint(metric, pass, owner);
         if let Some(pos) = self
             .active
             .iter()
@@ -592,6 +680,7 @@ impl AlarmState {
                 fingerprint,
                 metric: a.metric,
                 pass: a.pass,
+                owner: a.owner,
                 severity: a.severity,
                 kind: AlarmEventKind::Resolved,
                 value: a.peak,
@@ -643,9 +732,9 @@ impl AlarmState {
             self.budget_warn_held_sec = 0.0;
             self.budget_crit_held_sec = 0.0;
             self.hitch_clear_frames = 0;
-            self.clear(now_ns, "frame-budget", "");
-            self.clear(now_ns, "frame-hitch", "");
-            self.clear(now_ns, "burn-rate", "");
+            self.clear(now_ns, AlarmKey::frame("frame-budget"));
+            self.clear(now_ns, AlarmKey::frame("frame-hitch"));
+            self.clear(now_ns, AlarmKey::frame("burn-rate"));
         }
 
         // frame-budget: sustained over-budget with hysteresis (enter 1.2× / exit 1.0×) +
@@ -674,14 +763,13 @@ impl AlarmState {
                 };
                 self.raise(
                     now_ns,
-                    "frame-budget",
-                    "",
+                    AlarmKey::frame("frame-budget"),
                     severity,
                     self.ema_frame_ms,
                     enter_th,
                 );
             } else if self.ema_frame_ms < exit_th {
-                self.clear(now_ns, "frame-budget", "");
+                self.clear(now_ns, AlarmKey::frame("frame-budget"));
             }
         }
 
@@ -707,8 +795,7 @@ impl AlarmState {
                 };
                 self.raise(
                     now_ns,
-                    "frame-hitch",
-                    "",
+                    AlarmKey::frame("frame-hitch"),
                     severity,
                     frame_time_ms,
                     median + mad * 3.5 / 0.6745,
@@ -716,7 +803,7 @@ impl AlarmState {
             } else {
                 self.hitch_clear_frames += 1;
                 if self.hitch_clear_frames >= 10 {
-                    self.clear(now_ns, "frame-hitch", "");
+                    self.clear(now_ns, AlarmKey::frame("frame-hitch"));
                 }
             }
         }
@@ -729,8 +816,7 @@ impl AlarmState {
             if sli_short > 0.5 && sli_long > 0.5 {
                 self.raise(
                     now_ns,
-                    "burn-rate",
-                    "",
+                    AlarmKey::frame("burn-rate"),
                     AlarmSeverity::Critical,
                     sli_short * 100.0,
                     50.0,
@@ -738,15 +824,45 @@ impl AlarmState {
             } else if sli_short > 0.1 && sli_long > 0.1 {
                 self.raise(
                     now_ns,
-                    "burn-rate",
-                    "",
+                    AlarmKey::frame("burn-rate"),
                     AlarmSeverity::Warning,
                     sli_short * 100.0,
                     10.0,
                 );
             } else if sli_short < 0.05 {
-                self.clear(now_ns, "burn-rate", "");
+                self.clear(now_ns, AlarmKey::frame("burn-rate"));
             }
+        }
+
+        // capacity: a clamp has already lost geometry, so it is CRITICAL rather than a warning —
+        // there is no recovering the draw that was dropped, and a frame that looks right while
+        // missing content is the failure mode the flags exist to make loud. Pressure is the warning
+        // ahead of it: the budget is nearly gone but nothing has been lost yet.
+        if inputs.visibility_overflow_flags != 0 {
+            self.raise(
+                now_ns,
+                AlarmKey::frame("visibility-overflow"),
+                AlarmSeverity::Critical,
+                f32::from(
+                    u16::try_from(inputs.visibility_overflow_flags.count_ones()).unwrap_or(0),
+                ),
+                0.0,
+            );
+        } else {
+            self.clear(now_ns, AlarmKey::frame("visibility-overflow"));
+        }
+        if inputs.visibility_pressure_flags != 0 {
+            self.raise(
+                now_ns,
+                AlarmKey::frame("visibility-pressure"),
+                AlarmSeverity::Warning,
+                f32::from(
+                    u16::try_from(inputs.visibility_pressure_flags.count_ones()).unwrap_or(0),
+                ),
+                0.0,
+            );
+        } else {
+            self.clear(now_ns, AlarmKey::frame("visibility-pressure"));
         }
 
         // vram: usage fraction of the device-local budget (only known when profiling).
@@ -755,8 +871,7 @@ impl AlarmState {
             if frac >= config.vram_crit_frac {
                 self.raise(
                     now_ns,
-                    "vram",
-                    "",
+                    AlarmKey::frame("vram"),
                     AlarmSeverity::Critical,
                     frac * 100.0,
                     config.vram_crit_frac * 100.0,
@@ -764,14 +879,13 @@ impl AlarmState {
             } else if frac >= config.vram_warn_frac {
                 self.raise(
                     now_ns,
-                    "vram",
-                    "",
+                    AlarmKey::frame("vram"),
                     AlarmSeverity::Warning,
                     frac * 100.0,
                     config.vram_warn_frac * 100.0,
                 );
             } else if frac < config.vram_warn_frac * 0.95 {
-                self.clear(now_ns, "vram", "");
+                self.clear(now_ns, AlarmKey::frame("vram"));
             }
         }
 
@@ -779,14 +893,42 @@ impl AlarmState {
         if inputs.pipelines_created > 0 {
             self.raise(
                 now_ns,
-                "pso-compile",
-                "",
+                AlarmKey::frame("pso-compile"),
                 AlarmSeverity::Info,
                 inputs.pipelines_created as f32,
                 0.0,
             );
         } else {
-            self.clear(now_ns, "pso-compile", "");
+            self.clear(now_ns, AlarmKey::frame("pso-compile"));
+        }
+
+        // Owned budgets: raised by whoever can see the content, resolved by absence. Clearing the
+        // stale ones first would drop and immediately re-raise an alarm that is still breaching —
+        // one FIRING/RESOLVED pair per frame in the drain — so this raises, then clears only what
+        // this frame did not report.
+        for breach in &inputs.owned_budgets {
+            self.raise(
+                now_ns,
+                AlarmKey::owned(&breach.metric, &breach.owner),
+                breach.severity,
+                breach.value,
+                breach.threshold,
+            );
+        }
+        let stale: Vec<(String, String)> = self
+            .active
+            .iter()
+            .filter(|alarm| !alarm.owner.is_empty())
+            .filter(|alarm| {
+                !inputs
+                    .owned_budgets
+                    .iter()
+                    .any(|breach| breach.metric == alarm.metric && breach.owner == alarm.owner)
+            })
+            .map(|alarm| (alarm.metric.clone(), alarm.owner.clone()))
+            .collect();
+        for (metric, owner) in stale {
+            self.clear(now_ns, AlarmKey::owned(&metric, &owner));
         }
     }
 
@@ -953,6 +1095,9 @@ mod tests {
                 vram_usage_bytes: 0,
                 vram_budget_bytes: 0,
                 pipelines_created: 0,
+                visibility_overflow_flags: 0,
+                visibility_pressure_flags: 0,
+                owned_budgets: Vec::new(),
                 focused,
             };
             alarms.tick(&history, &config, &inputs);
@@ -1022,6 +1167,9 @@ mod tests {
                     vram_usage_bytes: 0,
                     vram_budget_bytes: 0,
                     pipelines_created: 0,
+                    visibility_overflow_flags: 0,
+                    visibility_pressure_flags: 0,
+                    owned_budgets: Vec::new(),
                     focused: true,
                 },
             );
@@ -1071,6 +1219,9 @@ mod tests {
                 vram_usage_bytes: 99,
                 vram_budget_bytes: 100, // 99% ≥ crit 95%
                 pipelines_created: 0,
+                visibility_overflow_flags: 0,
+                visibility_pressure_flags: 0,
+                owned_budgets: Vec::new(),
                 focused: true,
             },
         );
@@ -1092,6 +1243,9 @@ mod tests {
                 vram_usage_bytes: 50,
                 vram_budget_bytes: 100, // 50% < 0.8*0.95 = 76%
                 pipelines_created: 0,
+                visibility_overflow_flags: 0,
+                visibility_pressure_flags: 0,
+                owned_budgets: Vec::new(),
                 focused: true,
             },
         );
@@ -1126,6 +1280,9 @@ mod tests {
                     vram_usage_bytes: 0,
                     vram_budget_bytes: 0,
                     pipelines_created: if i % 2 == 0 { 1 } else { 0 },
+                    visibility_overflow_flags: 0,
+                    visibility_pressure_flags: 0,
+                    owned_budgets: Vec::new(),
                     focused: true,
                 },
             );
@@ -1140,18 +1297,71 @@ mod tests {
     }
 
     #[test]
-    fn alarm_fingerprint_coalesces_by_metric_and_pass() {
+    fn alarm_fingerprint_coalesces_by_metric_pass_and_owner() {
         assert_eq!(
-            alarm_fingerprint("frame-budget", ""),
-            alarm_fingerprint("frame-budget", "")
+            alarm_fingerprint("frame-budget", "", ""),
+            alarm_fingerprint("frame-budget", "", "")
         );
         assert_ne!(
-            alarm_fingerprint("frame-budget", ""),
-            alarm_fingerprint("frame-hitch", "")
+            alarm_fingerprint("frame-budget", "", ""),
+            alarm_fingerprint("frame-hitch", "", "")
         );
         assert_ne!(
-            alarm_fingerprint("vram", "scene"),
-            alarm_fingerprint("vram", "tonemap")
+            alarm_fingerprint("vram", "scene", ""),
+            alarm_fingerprint("vram", "tonemap", "")
         );
+        // The owner is part of the key so two cells over the same budget stay two alarms; keying
+        // on the metric alone would name whichever breached last and hide every other one.
+        assert_ne!(
+            alarm_fingerprint("vegetation-cell-plants", "", "cell 0,0,0 L0"),
+            alarm_fingerprint("vegetation-cell-plants", "", "cell 1,0,0 L0")
+        );
+    }
+
+    #[test]
+    fn an_owned_budget_fires_while_reported_and_resolves_when_it_stops() {
+        // The contract the reporter has to hold up: the breach set is COMPLETE every frame, so an
+        // owned alarm resolves by absence. A reporter that published only on breach would leave
+        // its alarms firing after the condition cleared, and nothing downstream would notice.
+        let mut alarms = AlarmState::default();
+        let history = FrameHistory::default();
+        let config = PerfConfig::default();
+        let breach = OwnedBudgetBreach {
+            metric: "vegetation-cell-plants".to_owned(),
+            owner: "cell 0,0,0 L0".to_owned(),
+            severity: AlarmSeverity::Warning,
+            value: 9.0,
+            threshold: 4.0,
+        };
+        let inputs = |budgets: Vec<OwnedBudgetBreach>| AlarmInputs {
+            frame_time_ms: 1.0,
+            dt_sec: 0.016,
+            now_ns: 1_000_000,
+            vram_usage_bytes: 0,
+            vram_budget_bytes: 0,
+            pipelines_created: 0,
+            visibility_overflow_flags: 0,
+            visibility_pressure_flags: 0,
+            owned_budgets: budgets,
+            focused: true,
+        };
+
+        alarms.tick(&history, &config, &inputs(vec![breach.clone()]));
+        let active = alarms.active();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].owner, "cell 0,0,0 L0");
+        assert_eq!(active[0].metric, "vegetation-cell-plants");
+
+        // Reported again: coalesced in place rather than raising a second alarm.
+        alarms.tick(&history, &config, &inputs(vec![breach]));
+        assert_eq!(alarms.active().len(), 1);
+        assert_eq!(alarms.active()[0].count, 2);
+
+        alarms.tick(&history, &config, &inputs(Vec::new()));
+        assert!(alarms.active().iter().all(|alarm| alarm.owner.is_empty()));
+        let drained = alarms.drain(0);
+        assert!(drained.events.iter().any(|event| {
+            event.owner == "cell 0,0,0 L0" && event.kind == AlarmEventKind::Resolved
+        }));
     }
 }
