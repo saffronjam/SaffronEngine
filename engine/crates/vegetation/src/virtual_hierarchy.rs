@@ -10,8 +10,8 @@ use saffron_geometry::{
 };
 
 use crate::{
-    AlphaClassification, Error, MaterialSurface, NormalizedPlantFamily, PlantFamilyAsset,
-    PlantPartSemantic, PlantSourceRole, PlantSourceSelector, Result,
+    AlphaClassification, Error, MaterialSurface, NormalizedPlantFamily, NormalizedPlantMesh,
+    PlantFamilyAsset, PlantPartSemantic, PlantSourceRole, PlantSourceSelector, Result,
 };
 
 /// Adapts one resolved plant material to the canonical hierarchy material contract.
@@ -82,13 +82,13 @@ pub fn plant_hierarchy_input(
                     weights: skin.weights,
                 })
                 .collect(),
-            aggregation: if disconnected_foliage(semantic_for_source(asset, mesh.source)) {
+            aggregation: if disconnected_foliage(semantic_for_mesh(asset, mesh)) {
                 PortableAggregationMode::Disconnected
             } else {
                 PortableAggregationMode::Contiguous
             },
         });
-        add_micro_instances(asset, mesh.source, prototype, &mut micro_instances);
+        add_micro_instances(asset, mesh, prototype, &mut micro_instances);
     }
 
     let combinations = use_combinations(asset, family, &micro_instances);
@@ -150,12 +150,34 @@ fn use_combinations(
     combinations
 }
 
-fn semantic_for_source(asset: &PlantFamilyAsset, source: u128) -> PlantPartSemantic {
-    asset
-        .parts
+/// The part an exact Part-destination semantic target binds this normalized row to —
+/// the binding the compile's partition made total for every multi-part source.
+fn target_part_for_mesh(asset: &PlantFamilyAsset, mesh: &NormalizedPlantMesh) -> Option<u128> {
+    let crate::PlantFamilySource::Imported(recipe) = &asset.source else {
+        return None;
+    };
+    recipe
+        .semantic_targets
         .iter()
-        .find(|part| part.sources.contains(&source))
-        .map_or(PlantPartSemantic::Trunk, |part| part.semantic)
+        .find_map(|target| match target.destination {
+            crate::PlantSemanticDestination::Part(part)
+                if target.source == mesh.source && target.selector == mesh.selector =>
+            {
+                Some(part)
+            }
+            _ => None,
+        })
+}
+
+fn semantic_for_mesh(asset: &PlantFamilyAsset, mesh: &NormalizedPlantMesh) -> PlantPartSemantic {
+    let part = match target_part_for_mesh(asset, mesh) {
+        Some(id) => asset.parts.iter().find(|part| part.id == id),
+        None => asset
+            .parts
+            .iter()
+            .find(|part| part.sources.contains(&mesh.source)),
+    };
+    part.map_or(PlantPartSemantic::Trunk, |part| part.semantic)
 }
 
 fn disconnected_foliage(semantic: PlantPartSemantic) -> bool {
@@ -201,17 +223,28 @@ pub fn plant_prototype_selector_hash(
 
 fn add_micro_instances(
     asset: &PlantFamilyAsset,
-    source: u128,
+    mesh: &NormalizedPlantMesh,
     prototype: u32,
     output: &mut Vec<MicroInstance>,
 ) {
     let identity = [
         65_536, 0, 0, 0, 0, 65_536, 0, 0, 0, 0, 65_536, 0, 0, 0, 0, 65_536,
     ];
+    // A row an exact semantic target binds belongs to that part alone: the compile
+    // splits a multi-part source into per-part rows, and a use placing more than its
+    // own part's geometry draws coincident duplicates no phenotype mask can hide.
+    if let Some(part) = target_part_for_mesh(asset, mesh) {
+        output.push(MicroInstance {
+            part,
+            prototype,
+            transform_bits: identity,
+        });
+        return;
+    }
     for part in asset
         .parts
         .iter()
-        .filter(|part| part.sources.contains(&source))
+        .filter(|part| part.sources.contains(&mesh.source))
     {
         output.push(MicroInstance {
             part: part.id,
@@ -224,7 +257,7 @@ fn add_micro_instances(
         .any(|instance| instance.prototype == prototype)
     {
         output.push(MicroInstance {
-            part: source,
+            part: mesh.source,
             prototype,
             transform_bits: identity,
         });
@@ -316,6 +349,9 @@ mod tests {
     fn phenotype_active_parts_mask_the_uses() {
         let fixed = |value: i32| DecisionScalar::from_integer(value).expect("scalar");
         let asset = PlantFamilyAsset {
+            role: crate::PlantFamilyRole::Family,
+            modules: Vec::new(),
+            module_recursion_limit: crate::MAX_PLANT_MODULE_RECURSION,
             version: PLANT_ASSET_VERSION,
             id: saffron_core::Uuid(1),
             name: "Mask fixture".to_owned(),
