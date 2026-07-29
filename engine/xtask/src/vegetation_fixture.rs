@@ -35,6 +35,10 @@ const TRUNK_OBJ_PATH: &str = "models/e2e-birch.obj";
 const BIOME: Uuid = Uuid(7_300_002);
 const MAP: Uuid = Uuid(7_300_003);
 const DEFAULT_MATERIAL: Uuid = Uuid(1);
+/// The seasonal family's second (crown) slot. Distinct from the default slot — the asset
+/// validator requires unique slot ids — and absent from the catalog, so it resolves through
+/// the imported OBJ material.
+const CANOPY_MATERIAL: Uuid = Uuid(7_300_012);
 const AUTHORED_LAYER: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
 const BIOME_INSTANCE: u128 = 0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0001;
 
@@ -54,6 +58,7 @@ struct Recipe {
     micro_dims: [u32; 3],
     cells: &'static [(i64, i64, i64)],
     seasonal: bool,
+    multi_object: bool,
     expected_plant: &'static str,
     expected_accepted: &'static str,
 }
@@ -71,6 +76,7 @@ const CANONICAL: Recipe = Recipe {
     micro_dims: [8, 1, 8],
     cells: &[(0, 0, 0)],
     seasonal: false,
+    multi_object: false,
     expected_plant: "13a5f40885613ffa491fd721727fbb08",
     expected_accepted: "2",
 };
@@ -89,6 +95,7 @@ const STRESS: &[Recipe] = &[
         micro_dims: [16, 1, 16],
         cells: &[(0, 0, 0)],
         seasonal: false,
+        multi_object: false,
         expected_plant: "",
         expected_accepted: "1",
     },
@@ -105,6 +112,24 @@ const STRESS: &[Recipe] = &[
         micro_dims: [8, 1, 8],
         cells: &[(0, 0, 0), (-1, 0, 0), (0, 0, -1), (1, 0, 0)],
         seasonal: true,
+        multi_object: false,
+        expected_plant: "",
+        expected_accepted: "1",
+    },
+    Recipe {
+        file: "vegetation-canopy.json",
+        stress: Some("canopy"),
+        plant_id: Uuid(7_350_001),
+        biome_id: Uuid(7_350_002),
+        map_id: Uuid(7_350_003),
+        layer: 0x1111_2222_3333_4444_5555_6666_7777_8895,
+        instance: 0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0015,
+        trunk_height: 8,
+        coverage_count: 6,
+        micro_dims: [8, 1, 8],
+        cells: &[(0, 0, 0), (-1, 0, 0), (0, 0, -1), (1, 0, 0)],
+        seasonal: true,
+        multi_object: true,
         expected_plant: "",
         expected_accepted: "1",
     },
@@ -121,6 +146,7 @@ const STRESS: &[Recipe] = &[
         micro_dims: [8, 1, 8],
         cells: &[(0, 0, 0)],
         seasonal: false,
+        multi_object: false,
         expected_plant: "",
         expected_accepted: "1",
     },
@@ -137,6 +163,7 @@ const STRESS: &[Recipe] = &[
         micro_dims: [8, 1, 8],
         cells: &[(-1, 0, 0), (0, 0, 0), (1, 0, 0)],
         seasonal: false,
+        multi_object: false,
         expected_plant: "",
         expected_accepted: "1",
     },
@@ -156,6 +183,10 @@ struct Fixture {
     map_objects: Vec<MapObject>,
     trunk_obj_hex: String,
     trunk_obj_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trunk_mtl_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trunk_mtl_path: Option<String>,
     plant: String,
     biome: String,
     map: String,
@@ -184,7 +215,7 @@ pub fn write_all(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 fn write_recipe(recipe: &Recipe, path: &Path) -> Result<()> {
-    let trunk = trunk_obj(recipe.trunk_height);
+    let trunk = trunk_obj(recipe.trunk_height, recipe.multi_object);
     let plant = write_plant_asset(&plant(recipe, &trunk))?;
     let biome = write_biome_asset(&biome(recipe))?;
     let chunks = map_chunks(recipe);
@@ -231,6 +262,10 @@ fn write_recipe(recipe: &Recipe, path: &Path) -> Result<()> {
         map_hex: hex(&map),
         trunk_obj_hex: hex(trunk.as_bytes()),
         trunk_obj_path: TRUNK_OBJ_PATH.to_owned(),
+        trunk_mtl_hex: recipe.multi_object.then(|| hex(trunk_mtl().as_bytes())),
+        trunk_mtl_path: recipe
+            .multi_object
+            .then(|| "models/e2e-birch.mtl".to_owned()),
         map_objects: encoded_chunks
             .into_iter()
             .map(|(reference, bytes)| MapObject {
@@ -258,11 +293,17 @@ fn write_recipe(recipe: &Recipe, path: &Path) -> Result<()> {
 }
 
 /// A watertight 1×8×1 m box trunk with per-face normals and UVs — the smallest
-/// renderable geometry the plant compiler accepts.
-fn trunk_obj(height: i32) -> String {
-    let mut obj = String::from("o e2e-birch-trunk\n");
+/// renderable geometry the plant compiler accepts. With `canopy`, a second material
+/// run adds a crown box above the trunk, so the family cooks as two submeshes with
+/// two material slots — the multi-object shape the phenotype fixtures need.
+fn trunk_obj(height: i32, canopy: bool) -> String {
+    let mut obj = String::new();
+    if canopy {
+        obj.push_str("mtllib e2e-birch.mtl\n");
+    }
+    obj.push_str("o e2e-birch-trunk\n");
     let (x, y, z) = (0.5_f32, height as f32, 0.5_f32);
-    let corners = [
+    let mut corners = vec![
         [-x, 0.0, -z],
         [x, 0.0, -z],
         [x, y, -z],
@@ -272,7 +313,22 @@ fn trunk_obj(height: i32) -> String {
         [x, y, z],
         [-x, y, z],
     ];
-    for corner in corners {
+    if canopy {
+        // The crown: a wider box from the trunk top, inside the widened authored bounds.
+        let (cx, cz) = (1.5_f32, 1.5_f32);
+        let (base, top) = (y, y + 2.0);
+        corners.extend([
+            [-cx, base, -cz],
+            [cx, base, -cz],
+            [cx, top, -cz],
+            [-cx, top, -cz],
+            [-cx, base, cz],
+            [cx, base, cz],
+            [cx, top, cz],
+            [-cx, top, cz],
+        ]);
+    }
+    for corner in &corners {
         let _ = writeln!(obj, "v {} {} {}", corner[0], corner[1], corner[2]);
     }
     for uv in [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]] {
@@ -297,19 +353,39 @@ fn trunk_obj(height: i32) -> String {
         ([1, 2, 6, 5], 5),
         ([4, 8, 7, 3], 6),
     ];
-    for (quad, normal) in faces {
-        let _ = writeln!(
-            obj,
-            "f {}/1/{normal} {}/2/{normal} {}/3/{normal}",
-            quad[0], quad[1], quad[2]
-        );
-        let _ = writeln!(
-            obj,
-            "f {}/1/{normal} {}/3/{normal} {}/4/{normal}",
-            quad[0], quad[2], quad[3]
-        );
+    let write_box = |obj: &mut String, base: usize| {
+        for (quad, normal) in faces {
+            let _ = writeln!(
+                obj,
+                "f {}/1/{normal} {}/2/{normal} {}/3/{normal}",
+                base + quad[0],
+                base + quad[1],
+                base + quad[2]
+            );
+            let _ = writeln!(
+                obj,
+                "f {}/1/{normal} {}/3/{normal} {}/4/{normal}",
+                base + quad[0],
+                base + quad[2],
+                base + quad[3]
+            );
+        }
+    };
+    if canopy {
+        obj.push_str("usemtl material_0\n");
+    }
+    write_box(&mut obj, 0);
+    if canopy {
+        obj.push_str("usemtl material_1\n");
+        write_box(&mut obj, 8);
     }
     obj
+}
+
+/// The material library the canopy trunk references: two named materials, so the OBJ's
+/// two `usemtl` runs survive import as two submeshes with two material slots.
+fn trunk_mtl() -> String {
+    "newmtl material_0\nKd 0.55 0.45 0.35\nnewmtl material_1\nKd 0.85 0.55 0.20\n".to_owned()
 }
 
 /// The OBJ importer's default material element for the trunk file — the id derives
@@ -358,16 +434,25 @@ fn plant(recipe: &Recipe, trunk_obj: &str) -> PlantFamilyAsset {
             sources: vec![10, 11],
             active_parts: Vec::new(),
         });
+        // The senescent phenotype drops the crown — only the trunk part stays active — so a
+        // phenotype flip is a visible geometry change, not a copy of the healthy one.
         phenotypes.push(PlantPhenotype {
             id: 1,
             role: PhenotypeRole::Senescent,
             season_window: None,
             variation: 1,
             material_remap: Vec::new(),
-            active_parts: Vec::new(),
+            active_parts: if recipe.multi_object {
+                vec![1]
+            } else {
+                Vec::new()
+            },
         });
     }
     PlantFamilyAsset {
+        role: saffron_vegetation::PlantFamilyRole::Family,
+        modules: Vec::new(),
+        module_recursion_limit: saffron_vegetation::MAX_PLANT_MODULE_RECURSION,
         version: PLANT_ASSET_VERSION,
         id: recipe.plant_id,
         name: "E2E silver birch".to_owned(),
@@ -387,43 +472,125 @@ fn plant(recipe: &Recipe, trunk_obj: &str) -> PlantFamilyAsset {
                     id: 11,
                     locator: PlantSourceLocator::File(TRUNK_OBJ_PATH.to_owned()),
                     role: PlantSourceRole::Material,
-                    selector: trunk_material_selector(),
+                    selector: if recipe.multi_object {
+                        PlantSourceSelector::Whole
+                    } else {
+                        trunk_material_selector()
+                    },
                     content_hash: vegetation_content_hash(trunk_obj.as_bytes()),
                     settings: PlantImportSettings::default(),
                     provenance: provenance(),
                 },
             ],
-            semantic_targets: vec![
-                PlantManualSemanticTarget {
-                    id: 30,
-                    source: 10,
-                    selector: PlantSourceSelector::Whole,
-                    destination: PlantSemanticDestination::Part(1),
-                },
-                PlantManualSemanticTarget {
-                    id: 31,
-                    source: 11,
-                    selector: trunk_material_selector(),
-                    destination: PlantSemanticDestination::MaterialSlot(0),
-                },
-            ],
+            semantic_targets: if recipe.multi_object {
+                // Two material runs → two submeshes of the one merged element: the trunk part
+                // takes submesh 0, the crown part submesh 1, each material run its own slot.
+                let element = u128::from(
+                    saffron_geometry::sub_id_for("e2e-birch", "mesh", "e2e-birch", 0).value(),
+                );
+                vec![
+                    PlantManualSemanticTarget {
+                        id: 30,
+                        source: 10,
+                        selector: PlantSourceSelector::Submesh { element, index: 0 },
+                        destination: PlantSemanticDestination::Part(1),
+                    },
+                    PlantManualSemanticTarget {
+                        id: 31,
+                        source: 10,
+                        selector: PlantSourceSelector::Submesh { element, index: 1 },
+                        destination: PlantSemanticDestination::Part(2),
+                    },
+                    PlantManualSemanticTarget {
+                        id: 32,
+                        source: 11,
+                        selector: trunk_material_selector(),
+                        destination: PlantSemanticDestination::MaterialSlot(0),
+                    },
+                    PlantManualSemanticTarget {
+                        id: 33,
+                        source: 11,
+                        selector: PlantSourceSelector::Element {
+                            id: u128::from(
+                                saffron_geometry::sub_id_for(
+                                    "e2e-birch",
+                                    "material",
+                                    "material_1",
+                                    1,
+                                )
+                                .value(),
+                            ),
+                            path: "materials/material_1".to_owned(),
+                        },
+                        destination: PlantSemanticDestination::MaterialSlot(1),
+                    },
+                ]
+            } else {
+                vec![
+                    PlantManualSemanticTarget {
+                        id: 30,
+                        source: 10,
+                        selector: PlantSourceSelector::Whole,
+                        destination: PlantSemanticDestination::Part(1),
+                    },
+                    PlantManualSemanticTarget {
+                        id: 31,
+                        source: 11,
+                        selector: trunk_material_selector(),
+                        destination: PlantSemanticDestination::MaterialSlot(0),
+                    },
+                ]
+            },
         }),
-        parts: vec![PlantPart {
-            id: 1,
-            parent: None,
-            semantic: PlantPartSemantic::Trunk,
-            material_slot: 0,
-            sources: vec![10],
-        }],
+        parts: if recipe.multi_object {
+            vec![
+                PlantPart {
+                    id: 1,
+                    parent: None,
+                    semantic: PlantPartSemantic::Trunk,
+                    material_slot: 0,
+                    sources: vec![10],
+                },
+                PlantPart {
+                    id: 2,
+                    parent: Some(1),
+                    semantic: PlantPartSemantic::Leaf,
+                    material_slot: 1,
+                    sources: vec![10],
+                },
+            ]
+        } else {
+            vec![PlantPart {
+                id: 1,
+                parent: None,
+                semantic: PlantPartSemantic::Trunk,
+                material_slot: 0,
+                sources: vec![10],
+            }]
+        },
         dimensions: PlantDimensions {
             height: fixed(height),
             trunk_radius: fixed(1),
             crown_radius: [fixed(2); 2],
             root_radius: [fixed(2); 2],
             local_bounds_min: [fixed(-2), fixed(0), fixed(-2)],
-            local_bounds_max: [fixed(2), fixed(height), fixed(2)],
+            local_bounds_max: [
+                fixed(2),
+                // The crown rises above the trunk, and the authored conservative bounds must
+                // contain it or the cook rejects at dimensions.localBounds.
+                fixed(if recipe.multi_object {
+                    height + 2
+                } else {
+                    height
+                }),
+                fixed(2),
+            ],
         },
-        material_slots: vec![DEFAULT_MATERIAL],
+        material_slots: if recipe.multi_object {
+            vec![DEFAULT_MATERIAL, CANOPY_MATERIAL]
+        } else {
+            vec![DEFAULT_MATERIAL]
+        },
         spines: Vec::new(),
         mechanics: MechanicalResponse {
             stiffness: fixed(1),
