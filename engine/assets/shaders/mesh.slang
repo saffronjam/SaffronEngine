@@ -1,5 +1,6 @@
 import lighting;
 import global_gpu_data;
+import scene_bin_common;
 
 // The unlit permutation stays a consumer spec constant so the PSO can specialize it (constant_id 0);
 // keeping it out of the module avoids relying on spec-constant export across the link.
@@ -109,6 +110,11 @@ VertexOutput vertexMain(VertexInput input, uint instanceIndex : SV_VulkanInstanc
 // vertex path below indexes it by firstInstance.
 [[vk::binding(4, 2)]] StructuredBuffer<GpuDrawRecord> executorRecords;
 
+// The binner's indexed command stream. The indexed path consumes these as draw arguments;
+// the mesh executor below reads the identical words as data, which is what makes the two
+// executors share one cluster cut rather than each selecting its own.
+[[vk::binding(5, 2)]] StructuredBuffer<DrawIndexedIndirectCommand> executorCommands;
+
 float2 executorOctToVector(uint packed)
 {
     float2 oct = float2(
@@ -134,8 +140,14 @@ float3 executorDecodeNormal(uint packed)
 // arena is the index buffer), SV_VulkanInstanceID is the record index the bin scatter
 // stored in firstInstance. Geometry pulls through buffer device addresses; the emitted
 // interface is `VertexOutput`, so every fragment entry shades identically.
-[shader("vertex")]
-VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+// The whole per-vertex body, shared by the indexed and mesh executor entries below. Agreement
+// between the two executors is vertex-for-vertex or it is nothing, so there is one copy of this
+// arithmetic and both entries call it.
+// Takes the record *index* rather than the record: passing `GpuDrawRecord` by value across a
+// function boundary makes Slang emit a natural-layout copy of the struct, which then collides
+// with the std430 layout the buffer-device-address pointers below require, and the module fails
+// spirv-val. Loading inside keeps one layout.
+VertexOutput executorVertexOutput(uint recordIndex, uint vertexIndex)
 {
     let addresses = gpuSceneAddresses;
     let record = executorRecords[recordIndex];
@@ -229,6 +241,61 @@ VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex
         record.transition);
 }
 
+// Indexed-MDI executor vertex path: SV_VertexID is the pulled index value (the pages arena is
+// the index buffer), SV_VulkanInstanceID is the record index the bin scatter stored in
+// firstInstance.
+[shader("vertex")]
+VertexOutput vertexMainExecutor(uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
+{
+    return executorVertexOutput(recordIndex, vertexIndex);
+}
+
+// Mesh-shader executor: the same records, the same cut, reached through a mesh stage. One
+// workgroup covers MESH_TRIANGLES_PER_GROUP triangles of one draw — `SV_DrawIndex` names the
+// draw within the bucket's slice, the group id names the block within it, and the scatter sized
+// the group count from that draw's own index count.
+//
+// Vertices go out un-deduplicated (three per triangle), which is what caps a group at 62: 186
+// output vertices against the 256 limit, not the primitive limit.
+[shader("mesh")]
+[outputtopology("triangle")]
+[numthreads(MESH_TRIANGLES_PER_GROUP, 1, 1)]
+void meshMainExecutor(
+    uint threadIndex: SV_GroupIndex,
+    uint3 groupId: SV_GroupID,
+    uint drawIndex: SV_DrawIndex,
+    out vertices VertexOutput verts[MESH_TRIANGLES_PER_GROUP * 3],
+    out indices uint3 tris[MESH_TRIANGLES_PER_GROUP])
+{
+    let command = executorCommands[executorSliceBase() + drawIndex];
+
+    let totalTriangles = command.indexCount / 3u;
+    let firstTriangle = groupId.x * MESH_TRIANGLES_PER_GROUP;
+    uint triangles = 0u;
+    if (firstTriangle < totalTriangles)
+    {
+        triangles = min(MESH_TRIANGLES_PER_GROUP, totalTriangles - firstTriangle);
+    }
+    SetMeshOutputCounts(triangles * 3u, triangles);
+    if (threadIndex >= triangles)
+    {
+        return;
+    }
+
+    // `firstIndex` offsets the PAGES arena, not the global index arena — the indexed path binds
+    // `gpu_data.pages` as its index buffer and the scatter derives `firstIndex` from a page byte
+    // offset. Reading `addresses.indices` here rasterizes nothing.
+    uint* indexBlob = (uint*)(gpuSceneAddresses.pageBytes);
+    let triangle = firstTriangle + threadIndex;
+    let base = threadIndex * 3u;
+    for (uint corner = 0u; corner < 3u; ++corner)
+    {
+        let vertexIndex = indexBlob[command.firstIndex + triangle * 3u + corner];
+        verts[base + corner] = executorVertexOutput(command.firstInstance, vertexIndex);
+    }
+    tris[threadIndex] = uint3(base, base + 1u, base + 2u);
+}
+
 [shader("vertex")]
 VertexOutput vertexMainSkinned(SkinnedVertexInput input, uint instanceIndex : SV_VulkanInstanceID)
 {
@@ -287,14 +354,16 @@ float reactiveCoverageFragment(VertexOutput input) : SV_Target
 
 // Transition-reactive vertex path: re-walks the opaque record stream and keeps only
 // content whose reprojected history is unreliable — micro blades (regenerated per
-// frame) and records mid representation-transition. Every other record collapses to a
+// frame), records mid representation-transition, and instances the wind prepass flagged
+// as reading a scroll-reset interaction displacement. Every other record collapses to a
 // degenerate off-screen point, so it rasterizes nothing.
 [shader("vertex")]
 VertexOutput vertexMainReactiveTransition(
     uint vertexIndex : SV_VertexID, uint recordIndex : SV_VulkanInstanceID)
 {
     let record = executorRecords[recordIndex];
-    if (record.representation != GPU_REPRESENTATION_MICRO_BLADE && record.transition == 0u)
+    if (record.representation != GPU_REPRESENTATION_MICRO_BLADE && record.transition == 0u
+        && !gpuSceneWindInteractionReset(gpuSceneAddresses, record.instance.index))
     {
         VertexOutput collapsed = {};
         collapsed.position = float4(2.0e9, 2.0e9, 2.0e9, 1.0);
