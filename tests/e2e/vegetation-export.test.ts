@@ -118,10 +118,10 @@ test("an exported package carries its cooked vegetation and no authored sources"
   expect(map.facets.length).toBeGreaterThan(0);
   expect(map.facets.some((facet) => Number(facet.bytes) > 0)).toBe(true);
 
-  // The package carries the cooked closure and none of the authored sources.
-  const resources = IS_MACOS
-    ? join(exported.path, "Contents", "Resources")
-    : join(exported.path, "resources");
+  // The package carries the cooked closure and none of the authored sources. Only the macOS
+  // bundle nests its payload; every other platform stages it at the export root itself
+  // (`ExportLayout::resources`).
+  const resources = IS_MACOS ? join(exported.path, "Contents", "Resources") : exported.path;
   const files = tree(resources);
   expect(files.some((file) => file.endsWith(".svegcell"))).toBe(true);
   expect(files.some((file) => file.endsWith(".svegmanifest"))).toBe(true);
