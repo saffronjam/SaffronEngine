@@ -698,10 +698,15 @@ mod tests {
     }
 
     fn first_leaf(document: &BotanicalGraphDocument) -> BotanicalElementId {
-        grow(document, 0)
-            .expect("the starter graph grows")
-            .assembly
-            .elements[0]
+        grow(
+            document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly
+        .elements[0]
             .id
     }
 
@@ -719,7 +724,13 @@ mod tests {
                 scale: scalar(UNCHANGED),
             },
         });
-        let before = grow(&document, 0).expect("the edited graph grows");
+        let before = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the edited graph grows");
         assert_eq!(before.diagnostics.applied, 1);
         assert!(before.diagnostics.is_clean());
 
@@ -733,7 +744,13 @@ mod tests {
             unreachable!("the node matched a trunk");
         };
         *length = scalar(6 << 16);
-        let after = grow(&document, 0).expect("the longer graph grows");
+        let after = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the longer graph grows");
         assert_eq!(
             after.diagnostics.applied, 1,
             "the edit still found its leaf"
@@ -745,13 +762,18 @@ mod tests {
     #[test]
     fn a_vanished_target_is_reported_as_an_orphan() {
         let plain = BotanicalGraphDocument::sapling(0x5a11);
-        let last = grow(&plain, 0)
-            .expect("the starter graph grows")
-            .assembly
-            .elements
-            .last()
-            .expect("the starter graph places leaves")
-            .id;
+        let last = grow(
+            &plain,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly
+        .elements
+        .last()
+        .expect("the starter graph places leaves")
+        .id;
         let mut document = offset(BotanicalManualEdit {
             target: last,
             action: BotanicalEditAction::Transform {
@@ -769,7 +791,13 @@ mod tests {
             unreachable!("the node matched phyllotaxis");
         };
         *nodes = 2;
-        let growth = grow(&document, 0).expect("the sparser graph grows");
+        let growth = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the sparser graph grows");
         assert_eq!(growth.diagnostics.applied, 0);
         assert_eq!(
             growth.diagnostics.orphans,
@@ -789,7 +817,14 @@ mod tests {
     #[test]
     fn removing_an_axis_takes_what_it_carries() {
         let plain = BotanicalGraphDocument::sapling(0x5a11);
-        let grown = grow(&plain, 0).expect("the starter graph grows").assembly;
+        let grown = grow(
+            &plain,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly;
         let root = grown
             .axes
             .iter()
@@ -800,7 +835,14 @@ mod tests {
             target: root,
             action: BotanicalEditAction::Remove,
         });
-        let after = grow(&document, 0).expect("the edited graph grows").assembly;
+        let after = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the edited graph grows")
+        .assembly;
         assert_eq!(after.axes.len(), grown.axes.len() - 1);
         assert_eq!(after.shells.len(), grown.shells.len() - 1);
         assert!(!after.axes.iter().any(|axis| axis.id == root));
@@ -816,7 +858,14 @@ mod tests {
     #[test]
     fn a_trim_takes_what_sat_above_the_cut() {
         let plain = BotanicalGraphDocument::sapling(0x5a11);
-        let grown = grow(&plain, 0).expect("the starter graph grows").assembly;
+        let grown = grow(
+            &plain,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly;
         let trunk = grown
             .axes
             .iter()
@@ -830,9 +879,14 @@ mod tests {
                 at: UnitInterval::from_bits(32_768),
             },
         });
-        let after = grow(&document, 0)
-            .expect("the trimmed graph grows")
-            .assembly;
+        let after = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the trimmed graph grows")
+        .assembly;
         let cut = after
             .axes
             .iter()
@@ -860,7 +914,14 @@ mod tests {
     #[test]
     fn an_axis_transform_carries_what_hangs_off_it() {
         let plain = BotanicalGraphDocument::sapling(0x5a11);
-        let grown = grow(&plain, 0).expect("the starter graph grows").assembly;
+        let grown = grow(
+            &plain,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly;
         let trunk = grown
             .axes
             .iter()
@@ -875,7 +936,14 @@ mod tests {
                 scale: scalar(UNCHANGED),
             },
         });
-        let after = grow(&document, 0).expect("the moved graph grows").assembly;
+        let after = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the moved graph grows")
+        .assembly;
         for (before, moved) in grown.elements.iter().zip(&after.elements) {
             assert_eq!(before.id, moved.id);
             assert_eq!(
@@ -897,7 +965,13 @@ mod tests {
                 at: UnitInterval::from_bits(32_767),
             },
         });
-        let growth = grow(&document, 0).expect("the graph grows");
+        let growth = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the graph grows");
         assert_eq!(growth.diagnostics.applied, 0);
         assert_eq!(
             growth.diagnostics.orphans[0].reason,
@@ -967,8 +1041,22 @@ mod tests {
             age: UnitInterval::from_bits(32_768),
             name: "Sapling".to_owned(),
         });
-        let mature = grow(&document, 0).expect("the mature tree grows").assembly;
-        let young = grow(&document, 1).expect("the sapling grows").assembly;
+        let mature = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the mature tree grows")
+        .assembly;
+        let young = grow(
+            &document,
+            1,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the sapling grows")
+        .assembly;
 
         assert_eq!(mature.axes.len(), young.axes.len());
         assert_eq!(mature.elements.len(), young.elements.len());
@@ -1002,8 +1090,22 @@ mod tests {
             age: UnitInterval::ONE,
             name: "Second".to_owned(),
         });
-        let first = grow(&document, 0).expect("the first grows").assembly;
-        let second = grow(&document, 1).expect("the second grows").assembly;
+        let first = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the first grows")
+        .assembly;
+        let second = grow(
+            &document,
+            1,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the second grows")
+        .assembly;
         assert_eq!(first.axes.len(), second.axes.len(), "the same species");
         assert_ne!(first.elements, second.elements, "a different individual");
 
@@ -1022,7 +1124,14 @@ mod tests {
     #[test]
     fn a_graft_stands_in_for_the_element_it_replaces() {
         let plain = BotanicalGraphDocument::sapling(0x5a11);
-        let grown = grow(&plain, 0).expect("the starter graph grows").assembly;
+        let grown = grow(
+            &plain,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly;
         let leaf = grown.elements[0].clone();
         let document = offset(BotanicalManualEdit {
             target: leaf.id,
@@ -1031,7 +1140,13 @@ mod tests {
                 selector: crate::PlantSourceSelector::Whole,
             },
         });
-        let growth = grow(&document, 0).expect("the grafted graph grows");
+        let growth = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the grafted graph grows");
         assert_eq!(growth.diagnostics.applied, 1);
         assert!(growth.diagnostics.is_clean());
         assert_eq!(growth.assembly.grafts.len(), 1);
@@ -1059,14 +1174,19 @@ mod tests {
     #[test]
     fn a_graft_on_an_axis_is_reported() {
         let plain = BotanicalGraphDocument::sapling(0x5a11);
-        let trunk = grow(&plain, 0)
-            .expect("the starter graph grows")
-            .assembly
-            .axes
-            .iter()
-            .find(|axis| axis.element == BotanicalElement::Trunk)
-            .expect("the starter graph grows a trunk")
-            .id;
+        let trunk = grow(
+            &plain,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the starter graph grows")
+        .assembly
+        .axes
+        .iter()
+        .find(|axis| axis.element == BotanicalElement::Trunk)
+        .expect("the starter graph grows a trunk")
+        .id;
         let document = offset(BotanicalManualEdit {
             target: trunk,
             action: BotanicalEditAction::Graft {
@@ -1074,7 +1194,13 @@ mod tests {
                 selector: crate::PlantSourceSelector::Whole,
             },
         });
-        let growth = grow(&document, 0).expect("the graph grows");
+        let growth = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the graph grows");
         assert_eq!(growth.diagnostics.applied, 0);
         assert_eq!(
             growth.diagnostics.orphans[0].reason,
@@ -1132,7 +1258,14 @@ mod tests {
             ],
             edges: vec![edge(1, "axes", 2, "axes"), edge(2, "shells", 3, "shells")],
         };
-        let grown = grow(&document, 0).expect("the drawn graph grows").assembly;
+        let grown = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the drawn graph grows")
+        .assembly;
         assert_eq!(grown.axes.len(), 1);
         assert_eq!(
             grown.axes[0].points,

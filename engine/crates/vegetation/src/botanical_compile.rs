@@ -866,11 +866,15 @@ pub fn native_plant_family(
     name: &str,
     graph: crate::BotanicalGraphDocument,
     materials: Vec<saffron_core::Uuid>,
+    modules: &dyn crate::BotanicalModuleResolver,
 ) -> Result<crate::PlantFamilyAsset> {
     // Every declared variation grows, because the family's parts, dimensions, and material slots
     // must contain all of them — a slot only the sapling binds is still a slot.
     let grown = (0..graph.variations.len())
-        .map(|index| crate::grow(&graph, index).map(|growth| growth.assembly))
+        .map(|index| {
+            crate::grow(&graph, index, modules, &crate::BotanicalBudget::COOK)
+                .map(|growth| growth.assembly)
+        })
         .collect::<Result<Vec<_>>>()?;
     let structure = widest_family_structure(&grown)?;
     let slots = grown
@@ -902,6 +906,9 @@ pub fn native_plant_family(
     let (collision_proxies, navigation_proxies) =
         derive_family_proxies(&grown[0], &structure.dimensions);
     Ok(crate::PlantFamilyAsset {
+        role: crate::PlantFamilyRole::Family,
+        modules: Vec::new(),
+        module_recursion_limit: crate::MAX_PLANT_MODULE_RECURSION,
         version: crate::PLANT_ASSET_VERSION,
         id,
         name: name.to_owned(),
@@ -943,7 +950,14 @@ mod tests {
     #[test]
     fn a_grown_plant_generates_geometry_joints_and_structure() {
         let document = crate::botanical::tests_support::birch();
-        let assembly = grow(&document, 0).expect("the birch grows").assembly;
+        let assembly = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the birch grows")
+        .assembly;
         let geometry =
             normalize_botanical_geometry(7, &assembly, &BTreeMap::new()).expect("geometry");
 
@@ -1007,7 +1021,16 @@ mod tests {
         assert_ne!(rows[0].sources, rows[1].sources, "one source each");
 
         let grown: Vec<BotanicalAssembly> = (0..2)
-            .map(|index| grow(&document, index).unwrap().assembly)
+            .map(|index| {
+                grow(
+                    &document,
+                    index,
+                    &crate::NoBotanicalModules,
+                    &crate::BotanicalBudget::COOK,
+                )
+                .unwrap()
+                .assembly
+            })
             .collect();
         let widest = widest_family_structure(&grown).expect("structure");
         let mature = derive_family_structure(&grown[0]).expect("mature structure");
@@ -1027,7 +1050,14 @@ mod tests {
     #[test]
     fn proxies_are_derived_from_the_grown_plant() {
         let document = crate::BotanicalGraphDocument::sapling(0x5a11);
-        let assembly = grow(&document, 0).unwrap().assembly;
+        let assembly = grow(
+            &document,
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         let structure = derive_family_structure(&assembly).unwrap();
         let (collision, navigation) = derive_family_proxies(&assembly, &structure.dimensions);
 
@@ -1064,6 +1094,7 @@ mod tests {
             "Derived",
             document,
             vec![saffron_core::Uuid(1), saffron_core::Uuid(2)],
+            &crate::NoBotanicalModules,
         )
         .expect("the family builds");
         assert_eq!(family.collision_proxies, collision);
@@ -1076,7 +1107,16 @@ mod tests {
     #[test]
     fn phenotypes_follow_the_classes_a_variation_grew() {
         let document = crate::BotanicalGraphDocument::sapling(0x5a11);
-        let grown = vec![grow(&document, 0).unwrap().assembly];
+        let grown = vec![
+            grow(
+                &document,
+                0,
+                &crate::NoBotanicalModules,
+                &crate::BotanicalBudget::COOK,
+            )
+            .unwrap()
+            .assembly,
+        ];
         let roles: Vec<crate::PhenotypeRole> = native_phenotypes(&grown)
             .iter()
             .map(|phenotype| phenotype.role)
@@ -1094,7 +1134,16 @@ mod tests {
                 *element = BotanicalElement::Fruit;
             }
         }
-        let grown = vec![grow(&fruiting, 0).unwrap().assembly];
+        let grown = vec![
+            grow(
+                &fruiting,
+                0,
+                &crate::NoBotanicalModules,
+                &crate::BotanicalBudget::COOK,
+            )
+            .unwrap()
+            .assembly,
+        ];
         let phenotypes = native_phenotypes(&grown);
         let roles: Vec<crate::PhenotypeRole> =
             phenotypes.iter().map(|phenotype| phenotype.role).collect();
@@ -1137,13 +1186,27 @@ mod tests {
         let document = crate::botanical::tests_support::birch();
         let first = normalize_botanical_geometry(
             7,
-            &grow(&document, 0).unwrap().assembly,
+            &grow(
+                &document,
+                0,
+                &crate::NoBotanicalModules,
+                &crate::BotanicalBudget::COOK,
+            )
+            .unwrap()
+            .assembly,
             &BTreeMap::new(),
         )
         .unwrap();
         let again = normalize_botanical_geometry(
             7,
-            &grow(&document, 0).unwrap().assembly,
+            &grow(
+                &document,
+                0,
+                &crate::NoBotanicalModules,
+                &crate::BotanicalBudget::COOK,
+            )
+            .unwrap()
+            .assembly,
             &BTreeMap::new(),
         )
         .unwrap();
@@ -1170,6 +1233,7 @@ mod tests {
             "Sapling",
             crate::BotanicalGraphDocument::sapling(0x5a11),
             materials,
+            &crate::NoBotanicalModules,
         )
         .expect("the sapling becomes a family");
         crate::validate_plant_family(&family).expect("a created family validates");
@@ -1192,6 +1256,7 @@ mod tests {
                 "Sapling",
                 crate::BotanicalGraphDocument::sapling(0x5a11),
                 vec![saffron_core::Uuid(11)],
+                &crate::NoBotanicalModules,
             )
             .is_err()
         );
@@ -1205,13 +1270,30 @@ mod tests {
         other.variations[0].seed += 1;
         let first = normalize_botanical_geometry(
             7,
-            &grow(&document, 0).unwrap().assembly,
+            &grow(
+                &document,
+                0,
+                &crate::NoBotanicalModules,
+                &crate::BotanicalBudget::COOK,
+            )
+            .unwrap()
+            .assembly,
             &BTreeMap::new(),
         )
         .unwrap();
-        let second =
-            normalize_botanical_geometry(7, &grow(&other, 0).unwrap().assembly, &BTreeMap::new())
-                .unwrap();
+        let second = normalize_botanical_geometry(
+            7,
+            &grow(
+                &other,
+                0,
+                &crate::NoBotanicalModules,
+                &crate::BotanicalBudget::COOK,
+            )
+            .unwrap()
+            .assembly,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_ne!(first.meshes, second.meshes);
     }
 }

@@ -392,6 +392,19 @@ pub enum BotanicalOperator {
         /// How much the roll may vary per element.
         jitter: UnitInterval,
     },
+    /// Grows another `.splant` module at each incoming frame.
+    ///
+    /// A preset is a whole small plant — a leaf cluster, a bough, a flower head — and authoring it
+    /// twice is how two copies drift apart. The module is an ordinary `.splant` with a module role,
+    /// so it opens, previews, and cooks like any family; this operator places what it grows.
+    ///
+    /// The interface is explicit and small on purpose: which variation of the module to grow and
+    /// what to scale it by. Both have a consumer in the evaluator, which is the test of whether a
+    /// parameter is real.
+    ModuleCall {
+        /// Names the asset's [`PlantModuleReference`] with the matching call GUID.
+        call_guid: u128,
+    },
     /// The single family output. Every shell and element reaching it is in the compiled family.
     Family,
 }
@@ -410,6 +423,7 @@ impl BotanicalOperator {
             Self::Roots { .. } => "roots",
             Self::Shell { .. } => "shell",
             Self::Instance { .. } => "instance",
+            Self::ModuleCall { .. } => "moduleCall",
             Self::Family => "family",
         }
     }
@@ -424,7 +438,9 @@ impl BotanicalOperator {
                 &[("axes", BotanicalDomain::Spines)]
             }
             Self::Roots { .. } | Self::Shell { .. } => &[("axes", BotanicalDomain::Spines)],
-            Self::Instance { .. } => &[("frames", BotanicalDomain::Frames)],
+            Self::Instance { .. } | Self::ModuleCall { .. } => {
+                &[("frames", BotanicalDomain::Frames)]
+            }
             Self::Family => &[
                 ("shells", BotanicalDomain::Shells),
                 ("elements", BotanicalDomain::Elements),
@@ -443,6 +459,11 @@ impl BotanicalOperator {
             Self::Phyllotaxis { .. } => &[("frames", BotanicalDomain::Frames)],
             Self::Shell { .. } => &[("shells", BotanicalDomain::Shells)],
             Self::Instance { .. } => &[("elements", BotanicalDomain::Elements)],
+            // A module contributes finished family geometry, so it emits both surface kinds.
+            Self::ModuleCall { .. } => &[
+                ("shells", BotanicalDomain::Shells),
+                ("elements", BotanicalDomain::Elements),
+            ],
             Self::Family => &[],
         }
     }
@@ -934,6 +955,9 @@ fn push_operator(bytes: &mut Vec<u8>, operator: &BotanicalOperator) {
             push_scalar(bytes, *size);
             push_unit(bytes, *jitter);
         }
+        BotanicalOperator::ModuleCall { call_guid } => {
+            bytes.extend_from_slice(&call_guid.to_be_bytes());
+        }
         BotanicalOperator::Family => {}
     }
 }
@@ -1028,6 +1052,13 @@ fn validate_operator(operator: &BotanicalOperator) -> Result<()> {
         BotanicalOperator::Instance { size, .. } => {
             if size.bits() <= 0 {
                 return Err(field("instance.size"));
+            }
+        }
+        BotanicalOperator::ModuleCall { call_guid } => {
+            // Zero is the absent GUID everywhere in this crate; a call that names it names
+            // no reference and would resolve to whichever module sorted first.
+            if *call_guid == 0 {
+                return Err(field("moduleCall.callGuid"));
             }
         }
         BotanicalOperator::Family | BotanicalOperator::Tropism { .. } => {}
@@ -1280,6 +1311,51 @@ pub struct BotanicalGrowth {
     pub assembly: BotanicalAssembly,
     /// Edits that landed, and the ones that had nothing to land on.
     pub diagnostics: BotanicalEditDiagnostics,
+    /// Whether a preview budget stopped the walk before the graph finished.
+    ///
+    /// A truncated growth is a picture, never a family: it is the authored plant up to a cut, and
+    /// publishing one would put a half-grown tree in the world. [`BotanicalBudget::COOK`] can
+    /// never set this, which is what keeps the cooked result independent of any preview.
+    pub truncated: bool,
+}
+
+/// How much of a graph one growth may build.
+///
+/// Preview and cook are the same walk under different bounds rather than two evaluators, because
+/// two would drift and the preview would stop predicting the plant. The bound only ever *stops*
+/// the walk early — it never changes an element that was built — so a preview is a prefix of the
+/// cooked result and never a different plant.
+#[derive(Clone, Debug, Default)]
+pub struct BotanicalBudget {
+    /// Axes to build before stopping, or `None` for the authored graph's own ceiling.
+    pub axes: Option<usize>,
+    /// Placed elements to build before stopping, or `None` for no additional bound.
+    pub elements: Option<usize>,
+    /// Cooperative cancellation, checked once per node.
+    pub cancellation: Option<crate::GraphCancellationToken>,
+}
+
+impl BotanicalBudget {
+    /// The cook budget: the authored graph in full, with nothing to cancel it.
+    ///
+    /// Named rather than defaulted so a caller states which it is. A path that previewed under a
+    /// bound and published the result would ship a truncated plant, and the compiler asks for this
+    /// value explicitly.
+    pub const COOK: Self = Self {
+        axes: None,
+        elements: None,
+        cancellation: None,
+    };
+
+    /// Whether the walk should stop now.
+    fn spent(&self, axes: usize, elements: usize) -> bool {
+        self.axes.is_some_and(|bound| axes >= bound)
+            || self.elements.is_some_and(|bound| elements >= bound)
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::GraphCancellationToken::is_cancelled)
+    }
 }
 
 /// Grows one of the plants a graph describes and lays its manual edits over the result.
@@ -1293,17 +1369,73 @@ pub struct BotanicalGrowth {
 ///
 /// Propagates validation, fails when `variation` names no declared individual, and fails when the
 /// graph would grow past [`MAX_AXES`].
-pub fn grow(document: &BotanicalGraphDocument, variation: usize) -> Result<BotanicalGrowth> {
-    let mut assembly = grow_nodes(document, variation)?;
+pub fn grow(
+    document: &BotanicalGraphDocument,
+    variation: usize,
+    modules: &dyn BotanicalModuleResolver,
+    budget: &BotanicalBudget,
+) -> Result<BotanicalGrowth> {
+    let (mut assembly, truncated) = grow_nodes(document, variation, modules, budget)?;
+    // Edits apply to a truncated preview too: an edit whose target was not reached simply has
+    // nothing to land on, which is the orphan path that already exists.
     let diagnostics = apply_manual_edits(&mut assembly, &document.edits);
     Ok(BotanicalGrowth {
         assembly,
         diagnostics,
+        truncated,
     })
 }
 
+/// Q15.16 one: the scale at which a module places at its authored size.
+const DECISION_ONE: i32 = 1 << 16;
+
+/// Supplies what a [`BotanicalOperator::ModuleCall`] names.
+///
+/// Recursion lives here rather than in [`grow`], because the depth bound and the cycle check need
+/// the chain of assets a call reaches through, and `grow` sees one document at a time. An
+/// implementation that grows a module calls `grow` again with a resolver that knows it is one level
+/// deeper.
+pub trait BotanicalModuleResolver {
+    /// Grows the module the call site names, in the module's own local frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the call GUID names no reference, the module is missing, its role
+    /// is not a module, the chain revisits an asset, or the depth bound is reached.
+    fn grow_module(&self, call_guid: u128) -> Result<BotanicalModuleGrowth>;
+}
+
+/// One resolved module call: what it grew and how large to place it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotanicalModuleGrowth {
+    /// The module's assembly in its own local frame.
+    pub assembly: BotanicalAssembly,
+    /// Uniform scale applied when placing it, where one is the module's authored size.
+    pub scale: DecisionScalar,
+}
+
+/// The resolver for a graph that may not call modules.
+///
+/// Every caller states which it is rather than defaulting, so a path that quietly grew a graph
+/// without its modules and reported success cannot exist.
+pub struct NoBotanicalModules;
+
+impl BotanicalModuleResolver for NoBotanicalModules {
+    fn grow_module(&self, _call_guid: u128) -> Result<BotanicalModuleGrowth> {
+        Err(Error::ArtifactFormat {
+            format: "botanical graph",
+            field: "moduleCall.unsupported".to_owned(),
+        })
+    }
+}
+
 /// Grows what the nodes alone describe, before any manual edit.
-fn grow_nodes(document: &BotanicalGraphDocument, variation: usize) -> Result<BotanicalAssembly> {
+fn grow_nodes(
+    document: &BotanicalGraphDocument,
+    variation: usize,
+    modules: &dyn BotanicalModuleResolver,
+    budget: &BotanicalBudget,
+) -> Result<(BotanicalAssembly, bool)> {
     document.validate()?;
     let individual = document
         .variations
@@ -1339,6 +1471,7 @@ fn grow_nodes(document: &BotanicalGraphDocument, variation: usize) -> Result<Bot
     let mut family_axes: BTreeMap<BotanicalElementId, BotanicalAxis> = BTreeMap::new();
     let mut frame_axes: BTreeMap<BotanicalElementId, BotanicalAxis> = BTreeMap::new();
     let mut assembly = BotanicalAssembly::default();
+    let mut truncated = false;
 
     for guid in order {
         let node = document.node(guid).ok_or_else(|| Error::ArtifactFormat {
@@ -1649,6 +1782,82 @@ fn grow_nodes(document: &BotanicalGraphDocument, variation: usize) -> Result<Bot
                     .collect();
                 elements_out.insert(guid, placed);
             }
+            BotanicalOperator::ModuleCall { call_guid } => {
+                let grown = modules.grow_module(*call_guid)?;
+                // The module's geometry is authored in its own frame, so each incoming frame gets
+                // its own copy translated there and scaled by the call site's factor and the
+                // caller's age. Identities rebase through the call GUID and the frame ordinal, so
+                // two call sites of the same module address different elements and an authored
+                // edit still names the one it was made on.
+                let mut shells = Vec::new();
+                let mut elements = Vec::new();
+                for (ordinal, frame) in input_frames("frames").iter().enumerate() {
+                    let ordinal = u32::try_from(ordinal).map_err(|_| Error::NumericOverflow)?;
+                    let rebase = |id: BotanicalElementId| id.child(*call_guid, ordinal);
+                    let place = |value: DecisionScalar| -> DecisionScalar {
+                        DecisionScalar::from_bits(
+                            i32::try_from(
+                                (i64::from(scaled_by_age(value)) * i64::from(grown.scale.bits()))
+                                    / i64::from(DECISION_ONE),
+                            )
+                            .unwrap_or(i32::MAX),
+                        )
+                    };
+                    let offset = |point: [DecisionScalar; 3]| -> [DecisionScalar; 3] {
+                        [0, 1, 2].map(|axis| {
+                            DecisionScalar::from_bits(
+                                place(point[axis])
+                                    .bits()
+                                    .saturating_add(frame.position[axis].bits()),
+                            )
+                        })
+                    };
+                    for axis in &grown.assembly.axes {
+                        family_axes.insert(
+                            rebase(axis.id),
+                            BotanicalAxis {
+                                id: rebase(axis.id),
+                                parent: axis.parent.map(rebase),
+                                frame: axis.frame.map(rebase),
+                                element: axis.element,
+                                points: axis.points.iter().map(|point| offset(*point)).collect(),
+                                radii: axis.radii.iter().map(|radius| place(*radius)).collect(),
+                            },
+                        );
+                    }
+                    for module_frame in &grown.assembly.frames {
+                        frame_axes.remove(&rebase(module_frame.id));
+                        assembly.frames.push(BotanicalFrame {
+                            id: rebase(module_frame.id),
+                            axis: rebase(module_frame.axis),
+                            position: offset(module_frame.position),
+                            direction: module_frame.direction,
+                            radius: place(module_frame.radius),
+                            along: module_frame.along,
+                        });
+                    }
+                    shells.extend(grown.assembly.shells.iter().map(|shell| BotanicalShell {
+                        id: rebase(shell.id),
+                        axis: rebase(shell.axis),
+                        element: shell.element,
+                        material_slot: shell.material_slot,
+                        sides: shell.sides,
+                    }));
+                    elements.extend(grown.assembly.elements.iter().map(|element| {
+                        BotanicalPlacement {
+                            id: rebase(element.id),
+                            frame: rebase(element.frame),
+                            element: element.element,
+                            material_slot: element.material_slot,
+                            position: offset(element.position),
+                            size: place(element.size),
+                            roll: element.roll,
+                        }
+                    }));
+                }
+                shells_out.insert(guid, shells);
+                elements_out.insert(guid, elements);
+            }
             BotanicalOperator::Family => {
                 for from in incoming("shells") {
                     if let Some(shells) = shells_out.get(&from) {
@@ -1667,6 +1876,16 @@ fn grow_nodes(document: &BotanicalGraphDocument, variation: usize) -> Result<Bot
                 format: "botanical graph",
                 field: "axes".to_owned(),
             });
+        }
+        // The budget stops the walk between nodes, never inside one. A node that ran produced
+        // exactly what it would have produced unbounded, which is what makes a preview a prefix
+        // of the cooked plant rather than a different one.
+        if budget.spent(
+            axes_out.values().map(Vec::len).sum::<usize>(),
+            elements_out.values().map(Vec::len).sum::<usize>(),
+        ) {
+            truncated = true;
+            break;
         }
     }
 
@@ -1694,7 +1913,7 @@ fn grow_nodes(document: &BotanicalGraphDocument, variation: usize) -> Result<Bot
     assembly.frames.sort_by_key(|frame| frame.id);
     assembly.shells.sort_by_key(|shell| shell.id);
     assembly.elements.sort_by_key(|element| element.id);
-    Ok(assembly)
+    Ok((assembly, truncated))
 }
 
 /// A straight axis of `segments` segments from `base` along `direction`, tapering by `taper`.
@@ -2068,8 +2287,20 @@ mod tests {
     #[test]
     fn a_graph_grows_the_same_plant_every_time() {
         let document = birch();
-        let first = grow(&document, 0).expect("the birch grows");
-        let again = grow(&document, 0).expect("the birch grows again");
+        let first = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the birch grows");
+        let again = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the birch grows again");
         assert_eq!(first, again, "growing is a pure function of the document");
         let first = first.assembly;
 
@@ -2117,8 +2348,22 @@ mod tests {
         let document = birch();
         let mut other = document.clone();
         other.variations[0].seed = 0xb17c5;
-        let first = grow(&document, 0).unwrap().assembly;
-        let second = grow(&other, 0).unwrap().assembly;
+        let first = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
+        let second = grow(
+            &other,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         assert_ne!(
             first.axes, second.axes,
             "a different seed grows a different individual"
@@ -2135,7 +2380,14 @@ mod tests {
     #[test]
     fn element_identity_survives_an_unrelated_parameter_change() {
         let document = birch();
-        let before = grow(&document, 0).unwrap().assembly;
+        let before = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         let mut edited = document.clone();
         // Change how big the leaves are: the branches it hangs them on are untouched.
         for node in &mut edited.nodes {
@@ -2143,7 +2395,14 @@ mod tests {
                 *size = DecisionScalar::from_bits(8_000);
             }
         }
-        let after = grow(&edited, 0).unwrap().assembly;
+        let after = grow(
+            &edited,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         let axis_ids = |assembly: &BotanicalAssembly| -> Vec<u128> {
             assembly.axes.iter().map(|axis| axis.id.value()).collect()
         };
@@ -2211,8 +2470,22 @@ mod tests {
         document.edges.push(edge(9, "axes", 6, "axes"));
         document.edges.sort();
 
-        let straight = grow(&birch(), 0).unwrap().assembly;
-        let drooped = grow(&document, 0).unwrap().assembly;
+        let straight = grow(
+            &birch(),
+            0,
+            &crate::NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
+        let drooped = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         let tips = |assembly: &BotanicalAssembly| -> Vec<i32> {
             assembly
                 .axes
@@ -2244,7 +2517,14 @@ mod tests {
     #[test]
     fn pruning_keeps_the_strongest_in_canonical_order() {
         let document = birch();
-        let grown = grow(&document, 0).unwrap().assembly;
+        let grown = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .unwrap()
+        .assembly;
         let branches: Vec<BotanicalAxis> = grown
             .axes
             .iter()
@@ -2293,5 +2573,238 @@ mod tests {
         let mut edited = document.clone();
         edited.variations[0].seed += 1;
         assert_ne!(document.identity(), edited.identity());
+    }
+
+    /// A resolver standing in for the asset layer: it grows one fixed module for every call.
+    struct OneModule {
+        scale: DecisionScalar,
+    }
+
+    impl BotanicalModuleResolver for OneModule {
+        fn grow_module(&self, _call_guid: u128) -> Result<BotanicalModuleGrowth> {
+            Ok(BotanicalModuleGrowth {
+                assembly: grow(
+                    &birch(),
+                    0,
+                    &NoBotanicalModules,
+                    &crate::BotanicalBudget::COOK,
+                )?
+                .assembly,
+                scale: self.scale,
+            })
+        }
+    }
+
+    /// Replaces the birch's leaf placement with a module call on the same frames.
+    fn birch_calling_a_module(call_guid: u128) -> BotanicalGraphDocument {
+        let mut document = birch();
+        let leaves = document
+            .nodes
+            .iter()
+            .position(|node| matches!(node.operator, BotanicalOperator::Instance { .. }))
+            .expect("the birch places leaves");
+        document.nodes[leaves].operator = BotanicalOperator::ModuleCall { call_guid };
+        // The family output took the leaves on its `elements` pin; a module also feeds shells.
+        let family = document
+            .nodes
+            .iter()
+            .find(|node| matches!(node.operator, BotanicalOperator::Family))
+            .expect("the birch has a family output")
+            .guid;
+        let module = document.nodes[leaves].guid;
+        document.edges.push(BotanicalEdge {
+            from_node: module,
+            from_pin: "shells".to_owned(),
+            to_node: family,
+            to_pin: "shells".to_owned(),
+        });
+        document.edges.sort();
+        document
+    }
+
+    #[test]
+    fn a_module_call_grows_the_module_at_every_frame() {
+        let document = birch_calling_a_module(0x11);
+        let alone = grow(
+            &birch(),
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the birch grows")
+        .assembly;
+        let composed = grow(
+            &document,
+            0,
+            &OneModule {
+                scale: DecisionScalar::from_integer(1).unwrap(),
+            },
+            &BotanicalBudget::COOK,
+        )
+        .expect("the composed birch grows")
+        .assembly;
+        // Each frame the leaves used now carries a whole birch, so the composed family holds
+        // strictly more surface than either the caller or one copy of the module.
+        assert!(composed.shells.len() > alone.shells.len());
+        assert!(!composed.shells.is_empty());
+    }
+
+    #[test]
+    fn a_module_places_at_its_call_sites_scale() {
+        let document = birch_calling_a_module(0x11);
+        let grow_at = |scale: i32| {
+            grow(
+                &document,
+                0,
+                &OneModule {
+                    scale: DecisionScalar::from_integer(scale).unwrap(),
+                },
+                &BotanicalBudget::COOK,
+            )
+            .expect("the composed birch grows")
+            .assembly
+            .local_bounds()
+        };
+        let (_, small) = grow_at(1);
+        let (_, large) = grow_at(4);
+        // Scale is the call site's, so the same module reaches further at a larger one.
+        assert!(large[1].bits() > small[1].bits());
+    }
+
+    #[test]
+    fn two_call_sites_of_one_module_address_different_elements() {
+        // The whole point of a preset: two copies must be separately editable. Identities rebase
+        // through the call GUID, so an authored edit on one never moves the other.
+        let first = grow(
+            &birch_calling_a_module(0x11),
+            0,
+            &OneModule {
+                scale: DecisionScalar::from_integer(1).unwrap(),
+            },
+            &BotanicalBudget::COOK,
+        )
+        .expect("the first call grows")
+        .assembly;
+        let second = grow(
+            &birch_calling_a_module(0x22),
+            0,
+            &OneModule {
+                scale: DecisionScalar::from_integer(1).unwrap(),
+            },
+            &BotanicalBudget::COOK,
+        )
+        .expect("the second call grows")
+        .assembly;
+        let ids = |assembly: &BotanicalAssembly| {
+            assembly
+                .shells
+                .iter()
+                .map(|shell| shell.id)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        // The caller's own shells are the same in both, so the comparison is over what the module
+        // contributed — everything the plain birch did not already have.
+        let caller = ids(&grow(
+            &birch(),
+            0,
+            &NoBotanicalModules,
+            &crate::BotanicalBudget::COOK,
+        )
+        .expect("the birch grows")
+        .assembly);
+        let from_first: std::collections::BTreeSet<_> =
+            ids(&first).difference(&caller).copied().collect();
+        let from_second: std::collections::BTreeSet<_> =
+            ids(&second).difference(&caller).copied().collect();
+        assert!(!from_first.is_empty());
+        assert_eq!(from_first.len(), from_second.len());
+        assert!(from_first.is_disjoint(&from_second));
+    }
+
+    #[test]
+    fn a_bounded_preview_is_a_prefix_of_the_cooked_plant() {
+        // The claim the box makes: a preview may stop early but must never change what it built.
+        // If a bound altered an element rather than omitting it, the preview would stop predicting
+        // the plant and an artist would be tuning against a picture of something else.
+        let document = birch();
+        let full = grow(&document, 0, &NoBotanicalModules, &BotanicalBudget::COOK)
+            .expect("the birch grows");
+        assert!(!full.truncated);
+        let bounded = grow(
+            &document,
+            0,
+            &NoBotanicalModules,
+            &BotanicalBudget {
+                axes: Some(1),
+                ..BotanicalBudget::default()
+            },
+        )
+        .expect("the bounded birch grows");
+        assert!(bounded.truncated, "the bound stopped the walk");
+        assert!(bounded.assembly.axes.len() < full.assembly.axes.len());
+        // Every axis the preview built is byte-identical to the one the cook builds.
+        let cooked: std::collections::BTreeMap<_, _> = full
+            .assembly
+            .axes
+            .iter()
+            .map(|axis| (axis.id, axis))
+            .collect();
+        for axis in &bounded.assembly.axes {
+            assert_eq!(
+                cooked.get(&axis.id).copied(),
+                Some(axis),
+                "a previewed axis differs from the cooked one"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cook_budget_can_never_truncate() {
+        // The separation the box asks for: no preview bound can reach the cooked result, because
+        // the cook path names a budget that carries none.
+        assert!(BotanicalBudget::COOK.axes.is_none());
+        assert!(BotanicalBudget::COOK.elements.is_none());
+        assert!(BotanicalBudget::COOK.cancellation.is_none());
+        let full = grow(&birch(), 0, &NoBotanicalModules, &BotanicalBudget::COOK)
+            .expect("the birch grows");
+        assert!(!full.truncated);
+    }
+
+    #[test]
+    fn a_cancelled_preview_stops_and_says_so() {
+        // Cancellation is the same mechanism as a bound: it stops the walk between nodes, so what
+        // was built is still exactly what the cook would build.
+        let token = crate::GraphCancellationToken::default();
+        token.cancel();
+        let growth = grow(
+            &birch(),
+            0,
+            &NoBotanicalModules,
+            &BotanicalBudget {
+                cancellation: Some(token),
+                ..BotanicalBudget::default()
+            },
+        )
+        .expect("a cancelled growth reports rather than fails");
+        assert!(growth.truncated);
+        let full = grow(&birch(), 0, &NoBotanicalModules, &BotanicalBudget::COOK)
+            .expect("the birch grows");
+        assert!(growth.assembly.shells.len() < full.assembly.shells.len());
+    }
+
+    #[test]
+    fn a_graph_grown_without_modules_refuses_a_module_call() {
+        // The resolver is explicit at every call site precisely so this cannot pass quietly: a
+        // path that grew a module-calling graph without its modules would report a plant that is
+        // missing its presets and call it a success.
+        assert!(
+            grow(
+                &birch_calling_a_module(0x11),
+                0,
+                &NoBotanicalModules,
+                &crate::BotanicalBudget::COOK
+            )
+            .is_err()
+        );
     }
 }
