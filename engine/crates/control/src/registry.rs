@@ -53,6 +53,17 @@ pub type VegetationComputeExecutor = Arc<dyn saffron_vegetation::GraphComputeExe
 /// hands a transient [`GpuUploader`] to the asset loaders (`import_texture`,
 /// `load_mesh_asset`, `ensure_preview_floor_mesh`, `resolve_material_asset`,
 /// `pick_entity`, …) the asset/scene handlers drive.
+/// One plant's captured wind prepass record joined with the response that produced it.
+pub struct PlantWindRecord {
+    /// The GPU-scene instance slot the plant mirrors to.
+    pub slot: u32,
+    /// The record the prepass wrote, which every raster pass then applies.
+    pub record: saffron_rendering::GpuWindInstanceRecord,
+    /// The family's authored response in its cooked integer form; all zero when the
+    /// prototype carries none.
+    pub mechanics: [u32; 4],
+}
+
 pub trait ControlRenderer {
     /// The full per-frame draw + timing + telemetry snapshot.
     fn render_stats(&self) -> RenderStatsFull;
@@ -60,9 +71,29 @@ pub trait ControlRenderer {
     /// Population and rebuild counters of the persistent GPU-scene mirror.
     fn gpu_scene_mirror_stats(&self) -> saffron_assets::GpuSceneMirrorStats;
     fn page_residency_stats(&self) -> saffron_rendering::PageResidencyStats;
-    fn visibility_counters(&self) -> [u32; 16];
+    fn visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize];
+    /// The same, for the global-illumination reach view.
+    fn gi_visibility_counters(
+        &self,
+    ) -> [u32; saffron_rendering::SCENE_VISIBILITY_COUNTER_WORDS as usize];
+    /// Deformed instances the interaction field's re-centring scroll has reset since boot.
+    fn wind_interaction_resets(&self) -> u64;
     /// Per-family and per-cell vegetation render population.
     fn vegetation_breakdown(&self) -> saffron_assets::VegetationRenderBreakdown;
+    /// The resident-population budgets whose breaches raise owner-named alarms.
+    fn vegetation_budgets(&self) -> saffron_assets::VegetationBudgets;
+    /// Replaces those budgets.
+    fn set_vegetation_budgets(&mut self, budgets: saffron_assets::VegetationBudgets);
+    /// One resident plant's wind prepass record, captured from the GPU on demand, beside
+    /// the authored family response the prepass was given. `None` when the plant is not
+    /// mirrored or no frame has created the record buffer yet.
+    fn capture_plant_wind_record(
+        &self,
+        cell: saffron_spatial::WorldCellKey,
+        plant: saffron_vegetation::PlantId,
+    ) -> std::result::Result<Option<PlantWindRecord>, String>;
     /// GPU missing-page requests drained since startup.
     fn page_faults(&self) -> u64;
 
@@ -176,8 +207,62 @@ pub trait ControlRenderer {
     fn rt_reflections_enabled(&self) -> bool;
     /// Toggles ray-traced reflections (the caller gates on [`ControlRenderer::rt_supported`]).
     fn set_rt_reflections(&mut self, enabled: bool);
+    /// Whether a mesh stage is available on this device.
+    fn mesh_shader_supported(&self) -> bool;
+    /// Whether the shaded executor is running through the mesh stage this frame.
+    fn mesh_executor_active(&self) -> bool;
+    /// Occluders dropped from this frame's SDF list for want of capacity.
+    fn sdf_instances_dropped(&self) -> u32;
+    /// Occluders the cascade-window gate excluded this frame.
+    fn sdf_instances_culled(&self) -> u32;
+    /// Ray instances excluded by the reachable-GI gate.
+    fn rt_instances_culled(&self) -> u32;
+    /// Whether opacity micromaps can be attached to triangle geometry on this device.
+    fn rt_omm_supported(&self) -> bool;
     /// The built static-mesh BLAS count.
     fn rt_blas_count(&self) -> u32;
+    /// Skinned refit structures active this frame.
+    fn rt_skinned_blas_count(&self) -> u32;
+    /// Tessellated full-rebuild structures active this frame.
+    fn rt_tessellated_blas_count(&self) -> u32;
+    /// Whether cluster acceleration structures are enabled on this device.
+    fn cluster_as_supported(&self) -> bool;
+    /// Distinct cluster-composed bottom-level structures referenced this frame.
+    fn rt_cluster_blas_count(&self) -> u32;
+    /// Cluster acceleration structures those bottom levels compose.
+    fn rt_clas_count(&self) -> u32;
+    /// Whether the top-level structure is partitioned on this device.
+    fn ptlas_supported(&self) -> bool;
+    /// The partitioned structure's last build as `(partitions, writes, updates)`.
+    fn rt_ptlas_ops(&self) -> (u32, u32, u32);
+    /// Why the active view's temporal history was last invalidated.
+    fn view_history_invalidation(&self) -> &'static str;
+    /// Shadow pages a frame may render.
+    fn vsm_page_budget(&self) -> u32;
+    /// Sets the per-frame shadow-page render budget.
+    fn set_vsm_page_budget(&mut self, pages: u32);
+    /// Missing-page requests one view class may raise per frame.
+    fn page_request_budget(&self) -> u32;
+    /// Sets that budget.
+    fn set_page_request_budget(&mut self, entries: u32);
+    /// Cumulative GPU microseconds in out-of-graph structure builds and compactions.
+    fn rt_accel_build_us(&self) -> u64;
+    /// Distinct opacity micromaps this frame's structures reference.
+    /// `view`'s pinned hierarchy cut, or `SCENE_CUT_AUTO`.
+    fn cut_override(&self, view: saffron_rendering::SceneViewClass) -> u32;
+    /// Pins the cut `view` draws.
+    fn set_cut_override(&mut self, view: saffron_rendering::SceneViewClass, cut: u32);
+    fn rt_omm_micromaps(&self) -> u32;
+    /// Micro-triangles settled opaque, settled transparent, and left unknown.
+    fn rt_omm_classes(&self) -> (u64, u64, u64);
+    /// AS-storage bytes the distinct bottom-level structures occupy.
+    fn rt_blas_bytes(&self) -> u64;
+    /// What those structures would occupy uncompacted.
+    fn rt_blas_built_bytes(&self) -> u64;
+    /// AS-storage bytes this frame's top-level structure occupies.
+    fn rt_tlas_bytes(&self) -> u64;
+    /// Build-scratch bytes held for this frame's structure builds.
+    fn rt_scratch_bytes(&self) -> u64;
 
     /// The cached PSO count.
     fn pipeline_count(&self) -> u32;

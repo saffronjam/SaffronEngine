@@ -519,6 +519,9 @@ fn operator_dto(operator: &BotanicalOperator) -> BotanicalOperatorDto {
                 })
                 .collect(),
         },
+        BotanicalOperator::ModuleCall { call_guid } => BotanicalOperatorDto::ModuleCall {
+            call_guid: saffron_protocol::VegetationGuid(format!("{call_guid:032x}")),
+        },
         BotanicalOperator::Family => BotanicalOperatorDto::Family,
     }
 }
@@ -638,6 +641,10 @@ fn operator_from_dto(operator: &BotanicalOperatorDto) -> Result<BotanicalOperato
                     radius: fixed(point.radius_bits),
                 })
                 .collect(),
+        },
+        BotanicalOperatorDto::ModuleCall { call_guid } => BotanicalOperator::ModuleCall {
+            call_guid: u128::from_str_radix(&call_guid.0, 16)
+                .map_err(|_| Error::command("moduleCall.callGuid must be 32 hex digits"))?,
         },
         BotanicalOperatorDto::Family => BotanicalOperator::Family,
     })
