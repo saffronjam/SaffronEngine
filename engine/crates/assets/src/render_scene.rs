@@ -26,15 +26,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use saffron_geometry::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
+use saffron_geometry::glam::{Mat4, Vec2, Vec3, Vec4};
 use saffron_geometry::{
     Ray, Vertex, ray_aabb_slab, ray_triangle_coordinates, world_aabb_from_corners,
 };
 use saffron_rendering::{
     CloudRenderSettings, ClusterCamera, CoverageSourceKind, EnvSource, FOG_SHAPE_BOX,
     FOG_SHAPE_SPHERE, FogRenderSettings, FogVolumeUpload, GpuLight, GpuMesh, MAX_FOG_VOLUMES,
-    MAX_REFLECTION_PROBES, Material, ReflectionProbeUpload, SceneLighting, SdfInstance,
-    SkyRenderSettings, SkygenParams,
+    MAX_REFLECTION_PROBES, Material, ReflectionProbeUpload, SceneLighting, SkyRenderSettings,
+    SkygenParams,
 };
 use saffron_scene::{
     AtmosphereRole, Camera, CameraView, DirectionalLight, Entity, FogShape, FogVolume, IdComponent,
@@ -97,9 +97,8 @@ pub trait SceneRenderer: GpuUploader {
     fn set_rt_scene(&mut self, instances: Vec<saffron_rendering::RtInstanceInput>);
     /// Snaps the camera-centered DDGI probe clipmap to the camera + passes the sun for the trace.
     fn set_ddgi_scene(&mut self, cam_pos: Vec3, sun_dir: Vec3, sun_color: Vec3, sun_intensity: f32);
-    /// Uploads this frame's per-static-instance SDF list (the lighting cone-trace iterates
-    /// it for directional sky occlusion).
-    fn set_sdf_scene(&mut self, instances: &[SdfInstance]);
+    /// Records ray instances dropped for sitting outside the reachable GI window.
+    fn record_rt_culled(&mut self, culled: u32);
     /// Folds the frame's reflection-probe uploads in.
     fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]);
     /// Folds the frame's local fog-volume uploads in (injected into the froxel grid).
@@ -215,7 +214,7 @@ impl GpuUploader for RendererScene<'_> {
         hierarchy: &saffron_geometry::PortableVirtualHierarchy,
         skin: &[saffron_geometry::VertexSkin],
         morph: Option<&saffron_geometry::MorphData>,
-        sdf_bake: Option<&saffron_rendering::SdfBake>,
+        sdf: saffron_rendering::SdfSource<'_>,
     ) -> saffron_rendering::Result<Arc<GpuMesh>> {
         self.uploader.upload_mesh(
             self.renderer.descriptors(),
@@ -223,7 +222,7 @@ impl GpuUploader for RendererScene<'_> {
             hierarchy,
             skin,
             morph,
-            sdf_bake,
+            sdf,
         )
     }
 
@@ -333,8 +332,8 @@ impl SceneRenderer for RendererScene<'_> {
             .set_ddgi_scene(cam_pos, sun_dir, sun_color, sun_intensity);
     }
 
-    fn set_sdf_scene(&mut self, instances: &[SdfInstance]) {
-        self.renderer.set_sdf_scene(instances);
+    fn record_rt_culled(&mut self, culled: u32) {
+        self.renderer.record_rt_culled(culled);
     }
 
     fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]) {
@@ -861,7 +860,7 @@ pub fn render_scene<R: SceneRenderer>(
 
     let gather_started = Instant::now();
     let mut build = FrameSceneBuild::default();
-    gather_static_frame_facts(renderer, scene, assets, mirror, &mut build);
+    gather_static_frame_facts(renderer, scene, assets, mirror, eye_position, &mut build);
     if renderer.skinning_enabled() {
         gather_skinned_frame_facts(renderer, scene, assets, mirror, &mut build);
     }
@@ -871,7 +870,7 @@ pub fn render_scene<R: SceneRenderer>(
         renderable_count,
         scene_min,
         scene_max,
-        sdf_instances,
+        rt_instances_culled,
         rt_instances,
     } = build;
     let scene_gather_elapsed = gather_started.elapsed();
@@ -888,11 +887,7 @@ pub fn render_scene<R: SceneRenderer>(
     // world-space, referenced by an identity transform), so they are excluded here.
     renderer.set_rt_scene(rt_instances);
 
-    // Upload the frame's per-static-instance SDF occluder list (empty when no static
-    // mesh carries a baked field — that resets the count). Independent of DDGI: the
-    // lighting cone-trace reads it for directional sky occlusion whether DDGI is on or
-    // off.
-    renderer.set_sdf_scene(&sdf_instances);
+    renderer.record_rt_culled(rt_instances_culled);
 
     // DDGI: snap the camera-centered probe clipmap to the camera and pass the sun. The trace
     // sphere-marches the real distance field (per-mesh MDF near + Global SDF far), so it needs no
@@ -1244,10 +1239,8 @@ struct FrameSceneBuild {
     renderable_count: usize,
     scene_min: Vec3,
     scene_max: Vec3,
-    /// One [`SdfInstance`] per static draw whose mesh carries a baked signed distance field — the
-    /// lighting cone-trace's + the GDF composite's per-instance occluder list. Its base color rides
-    /// the reserved `.w` of the world/local AABB corners (the GDF albedo cache's per-cell color).
-    sdf_instances: Vec<SdfInstance>,
+    /// Ray instances dropped for sitting outside the reachable GI window.
+    rt_instances_culled: u32,
     /// The frame's static RT instances (skinned casters ride the deformation gather's
     /// refit entries instead).
     rt_instances: Vec<saffron_rendering::RtInstanceInput>,
@@ -1261,7 +1254,7 @@ impl Default for FrameSceneBuild {
             renderable_count: 0,
             scene_min: Vec3::splat(f32::MAX),
             scene_max: Vec3::splat(f32::MIN),
-            sdf_instances: Vec::new(),
+            rt_instances_culled: 0,
             rt_instances: Vec::new(),
         }
     }
@@ -1271,13 +1264,66 @@ impl Default for FrameSceneBuild {
 /// SDF occluder list, the static RT instances, and one [`DeformationWork`] item per
 /// morphing or displaced instance. Draw commands come from the GPU scene's visibility
 /// traversal; nothing here builds a draw list.
+/// Whether a mesh's world bounds intersect the window a GI or reflection ray can reach.
+///
+/// The test is deliberately the same one the SDF occluders use. Both lists feed consumers that read
+/// off-screen geometry — a reflection shows what the camera cannot, and a march gathers from behind
+/// it — so the camera frustum would delete contributors that legitimately matter, while the coarsest
+/// cascade window is a bound on reach rather than on visibility.
+fn gi_reachable(
+    model: &Mat4,
+    local_min: Vec3,
+    local_max: Vec3,
+    gi_min: Vec3,
+    gi_max: Vec3,
+) -> bool {
+    let mut world_min = Vec3::splat(f32::MAX);
+    let mut world_max = Vec3::splat(f32::MIN);
+    world_aabb_from_corners(model, local_min, local_max, &mut world_min, &mut world_max);
+    gi_window_intersects(world_min, world_max, gi_min, gi_max)
+}
+
+/// Whether already-computed world bounds intersect the reachable window.
+///
+/// The SDF and ray lists both cut against this one predicate rather than repeating the comparison,
+/// so the two cannot drift into disagreeing about what "reachable" means — which would show up as
+/// a reflection and a cone trace gathering from different sets of occluders.
+fn gi_window_intersects(world_min: Vec3, world_max: Vec3, gi_min: Vec3, gi_max: Vec3) -> bool {
+    !(world_max.cmplt(gi_min).any() || world_min.cmpgt(gi_max).any())
+}
+
 fn gather_static_frame_facts<R: SceneRenderer>(
     renderer: &R,
     scene: &mut Scene,
     assets: &mut AssetServer,
     mirror: &crate::GpuSceneMirror,
+    eye: Vec3,
     build: &mut FrameSceneBuild,
 ) {
+    // Global-illumination occluders are gated on the distance-field cascade window, not the
+    // camera frustum: light reaches a visible surface from off-screen, so frustum-culling this
+    // list would delete occluders that legitimately darken it. An occluder outside the coarsest
+    // cascade cannot influence any march, which is what makes this cut sound.
+    let (gi_min, gi_max) = saffron_rendering::gi_occluder_bounds(eye);
+    // Vegetation never enters the ECS, so the scan below cannot see it. Its placed plants
+    // reach the TLAS through the mirror, which built their ray inputs while syncing the
+    // resident cells.
+    // Cut against the same window as everything else in this list. A resident cell can extend far
+    // past what any ray reaches, and splicing its plants in wholesale was the half of the list that
+    // stayed ungated while the SDF occluders were already cut.
+    for instance in mirror.vegetation_ray_instances() {
+        if gi_reachable(
+            &instance.model,
+            instance.mesh.bounds_min,
+            instance.mesh.bounds_max,
+            gi_min,
+            gi_max,
+        ) {
+            build.rt_instances.push(instance);
+        } else {
+            build.rt_instances_culled += 1;
+        }
+    }
     let scene_instance = scene.instance_id();
     let displacement = renderer.displacement_enabled();
     let mut meshes: Vec<(Entity, MeshComponent)> = Vec::new();
@@ -1303,61 +1349,36 @@ fn gather_static_frame_facts<R: SceneRenderer>(
         build.scene_min = build.scene_min.min(box_min);
         build.scene_max = build.scene_max.max(box_max);
         build.renderable_count += 1;
-        // A static instance contributes one SDF occluder per baked field — one tight field
-        // per primitive (and per spatial chunk of an oversized primitive). Each carries the
-        // shared world→local transform, the field's OWN world AABB (for the cone-march's
-        // per-sample cull, tight so many small fields cull independently), and its bindless
-        // slot + encode clamp.
-        if !mesh_ref.sdfs().is_empty() {
-            // The fields store distances in local (rest) units, but the cone-trace marches and
-            // compares in world space. The instance's world scale (the mean basis-column length
-            // of the model's upper-left 3×3) converts a sampled local distance to world units,
-            // keeping the AO footprint correct under non-unit instance scale — shared by every
-            // field of this mesh (they share its local frame).
-            let basis = Mat3::from_mat4(model);
-            let world_scale =
-                (basis.x_axis.length() + basis.y_axis.length() + basis.z_axis.length()) / 3.0;
-            let world_to_local = model.inverse();
-            let uvec = |a: [u32; 3]| saffron_geometry::glam::UVec4::new(a[0], a[1], a[2], 0);
-            // The base color rides the reserved `.w` of the world/local AABB corners (r, g, b) —
-            // the GDF composite splats it into the lite albedo cache the DDGI trace reads. The
-            // brick sample reads only `.xyz`, so this packing is transparent to it.
-            let albedo = materials.proxy_albedo;
-            for field in mesh_ref.sdfs() {
-                let mut field_min = Vec3::splat(f32::MAX);
-                let mut field_max = Vec3::splat(f32::MIN);
-                world_aabb_from_corners(
-                    &model,
-                    field.bounds_min,
-                    field.bounds_max,
-                    &mut field_min,
-                    &mut field_max,
-                );
-                build.sdf_instances.push(SdfInstance {
-                    world_to_local,
-                    world_min: field_min.extend(albedo.x),
-                    world_max: field_max.extend(albedo.y),
-                    local_min: field.bounds_min.extend(albedo.z),
-                    local_max: field.bounds_max.extend(materials.occupancy),
-                    params: Vec4::new(
-                        field.bindless_index() as f32,
-                        field.max_dist,
-                        world_scale,
-                        field.mip_count as f32,
-                    ),
-                    voxel_dims: uvec(field.voxel_dims),
-                    indir_dims: uvec(field.indirection_dims),
-                    atlas_bricks: uvec(field.atlas_bricks),
-                });
-            }
-        }
         // RT: each static instance carries its stable GPU-scene instance slot as its
-        // `instanceCustomIndex` (the sentinel for unmirrored system visuals) and its
-        // opacity class, so ray candidates on non-opaque instances resolve canonical
-        // coverage through the scene tables.
-        let force_opaque = materials.submeshes.iter().all(|material| {
+        // `instanceCustomIndex` (the sentinel for unmirrored system visuals), so ray candidates
+        // on non-opaque geometry resolve canonical coverage through the scene tables.
+        //
+        // Opacity itself lives on the BLAS geometry, per submesh, from the cooked material class.
+        // An entity may bind a material the cook did not see — one mesh instanced with materials
+        // chosen at runtime — so the instance only overrides when the two DISAGREE. Agreement is
+        // the common case and the one that matters: it leaves the geometry flags in charge, which
+        // is the only way an attached micromap governs anything, since a per-instance force
+        // overrides a micromap outright per spec.
+        let resolved_opaque = materials.submeshes.iter().all(|material| {
             material.blend_mode == saffron_core::BlendMode::Opaque && material.thin_sheet.is_none()
         });
+        let opacity_override =
+            (resolved_opaque != mesh_ref.cooked_opaque).then_some(resolved_opaque);
+        // The same cascade window the SDF occluders are cut against, for the same reason: a ray
+        // consumer reads geometry it cannot see on screen, so the frustum is the wrong gate, but an
+        // occluder outside the coarsest cascade cannot influence any march or reflection either.
+        // Leaving this list ungated meant the reflection and ReSTIR half of the frame uploaded
+        // every mesh in the scene while the SDF half was already cut.
+        if !gi_reachable(
+            &model,
+            mesh_ref.bounds_min,
+            mesh_ref.bounds_max,
+            gi_min,
+            gi_max,
+        ) {
+            build.rt_instances_culled += 1;
+            continue;
+        }
         let custom_index = mirror
             .instance_slot(scene_instance, entity, false)
             .unwrap_or(saffron_rendering::RT_UNMIRRORED_INSTANCE);
@@ -1365,7 +1386,10 @@ fn gather_static_frame_facts<R: SceneRenderer>(
             model,
             mesh: Arc::clone(&mesh_ref),
             custom_index,
-            force_opaque,
+            opacity_override,
+            // An entity places an assembly at its base combination; vegetation points carry
+            // their own, resolved where the mirror expands them.
+            combination: 0,
         });
         let morph_weights = morph_weights_for(scene, entity);
         let displace = if displacement {
@@ -2404,10 +2428,10 @@ mod tests {
             hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
-            sdf_bake: Option<&saffron_rendering::SdfBake>,
+            sdf: saffron_rendering::SdfSource<'_>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
             let (uploader, descriptors) = self.gpu.expect("upload_mesh needs a GPU fixture");
-            uploader.upload_mesh(descriptors, mesh, hierarchy, skin, morph, sdf_bake)
+            uploader.upload_mesh(descriptors, mesh, hierarchy, skin, morph, sdf)
         }
 
         fn upload_texture(
@@ -2480,7 +2504,7 @@ mod tests {
         ) {
             self.calls.borrow_mut().push(Call::DdgiScene);
         }
-        fn set_sdf_scene(&mut self, _instances: &[SdfInstance]) {}
+        fn record_rt_culled(&mut self, _culled: u32) {}
         fn submit_reflection_probes(&mut self, probes: &[ReflectionProbeUpload]) {
             self.calls
                 .borrow_mut()
@@ -3324,6 +3348,44 @@ mod tests {
     /// (cache fill), and `&mut R: SceneRenderer` (setters) as three disjoint borrows of three
     /// distinct values — no `RefCell`, no interior mutability on the engine state. This
     /// compiles, which *is* the assertion; the body just exercises the call once.
+    #[test]
+    fn the_ray_cut_keeps_what_a_ray_can_reach_and_drops_what_it_cannot() {
+        // The ray list is cut against REACH, not visibility, and the difference is the whole point:
+        // a reflection shows the camera what it cannot see and a march gathers from behind it, so
+        // a frustum test would delete contributors that legitimately change the picture. An
+        // occluder outside the coarsest cascade cannot influence either, which is what makes this
+        // cut sound where a frustum cut would not be.
+        let gi_min = Vec3::new(-10.0, -10.0, -10.0);
+        let gi_max = Vec3::new(10.0, 10.0, 10.0);
+        let unit_min = Vec3::splat(-0.5);
+        let unit_max = Vec3::splat(0.5);
+
+        // Directly behind the eye, well inside the window: a frustum cull gets this backwards.
+        let behind = Mat4::from_translation(Vec3::new(0.0, 0.0, 9.0));
+        assert!(gi_reachable(&behind, unit_min, unit_max, gi_min, gi_max));
+
+        // Far outside the coarsest cascade: provably unable to contribute.
+        let away = Mat4::from_translation(Vec3::new(0.0, 0.0, 40.0));
+        assert!(!gi_reachable(&away, unit_min, unit_max, gi_min, gi_max));
+
+        // Straddling the boundary counts as reachable — the cut may only drop what it can PROVE
+        // unreachable, so the inclusive edge is the conservative direction.
+        let straddling = Mat4::from_translation(Vec3::new(0.0, 0.0, 10.4));
+        assert!(gi_reachable(
+            &straddling,
+            unit_min,
+            unit_max,
+            gi_min,
+            gi_max
+        ));
+
+        // A scaled instance is tested on its WORLD extent, not its local one: a large object whose
+        // origin sits outside the window still reaches into it.
+        let scaled =
+            Mat4::from_scale(Vec3::splat(40.0)) * Mat4::from_translation(Vec3::new(0.0, 0.0, 0.55));
+        assert!(gi_reachable(&scaled, unit_min, unit_max, gi_min, gi_max));
+    }
+
     #[test]
     fn disjoint_three_value_borrow_shape_compiles() {
         let mut renderer = RecordingRenderer::new(320, 240, true);

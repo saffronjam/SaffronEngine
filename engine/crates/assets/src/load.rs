@@ -29,7 +29,7 @@ use saffron_geometry::{
     load_animation_from_bytes, load_mesh_from_bytes, load_mesh_hierarchy_from_bytes,
     load_mesh_morph_from_bytes, load_mesh_skin_from_bytes, translate_model,
 };
-use saffron_rendering::{GpuMesh, GpuTexture, SdfBake};
+use saffron_rendering::{GpuMesh, GpuTexture, SdfBake, SdfSource};
 use saffron_scene::{AssetType, Colorspace};
 
 use crate::error::{Error, Result};
@@ -170,7 +170,13 @@ impl AssetServer {
         // `.smesh` carries its sparse deltas; the deform pass reads them on the GPU.
         let skin = load_mesh_skin_from_bytes(&bytes).unwrap_or_default();
         let morph = load_mesh_morph_from_bytes(&bytes).ok().flatten();
-        match gpu.upload_mesh(&mesh, &hierarchy, &skin, morph.as_ref(), sdf_bake.as_ref()) {
+        match gpu.upload_mesh(
+            &mesh,
+            &hierarchy,
+            &skin,
+            morph.as_ref(),
+            sdf_bake.as_ref().map_or(SdfSource::None, SdfSource::Bake),
+        ) {
             Ok(mesh_ref) => Some(mesh_ref),
             Err(err) => {
                 tracing::warn!("mesh {}: {err}", sub_id.value());
@@ -683,7 +689,7 @@ impl AssetServer {
                 return false;
             }
         };
-        match gpu.upload_mesh(mesh, &hierarchy, &[], None, None) {
+        match gpu.upload_mesh(mesh, &hierarchy, &[], None, SdfSource::None) {
             Ok(mesh_ref) => {
                 self.page_source_by_uuid.insert(
                     PREVIEW_FLOOR_MESH_ID.value(),
@@ -721,7 +727,7 @@ impl AssetServer {
                 return None;
             }
         };
-        match gpu.upload_mesh(&mesh, &hierarchy, &[], None, None) {
+        match gpu.upload_mesh(&mesh, &hierarchy, &[], None, SdfSource::None) {
             Ok(mesh_ref) => {
                 self.page_source_by_uuid.insert(
                     key,
@@ -739,10 +745,11 @@ impl AssetServer {
     }
 
     /// Seeds the editor-camera gizmo mesh (the reserved [`crate::EDITOR_CAMERA_MESH_ID`])
-    /// into the GPU mesh cache from the engine's `models/editor-camera.glb`, plus its dark
-    /// material under [`crate::EDITOR_CAMERA_MATERIAL_ID`]. A failed translate/upload
-    /// caches `None`, so the load is attempted exactly once (until a project-switch cache
-    /// clear re-seeds on demand).
+    /// into the GPU mesh cache from the engine's `models/editor-camera.glb`. Its dark
+    /// material is answered analytically from [`crate::EDITOR_CAMERA_MATERIAL_ID`] by the
+    /// material loader, so nothing is cached for it here. A failed translate/upload caches
+    /// `None`, so the load is attempted exactly once (until a project-switch cache clear
+    /// re-seeds on demand).
     fn seed_editor_camera_mesh(&mut self, gpu: &dyn GpuUploader) -> Option<Arc<GpuMesh>> {
         let key = crate::EDITOR_CAMERA_MESH_ID.value();
         let fail = |assets: &mut Self, err: String| {
@@ -765,7 +772,7 @@ impl AssetServer {
             Ok(hierarchy) => hierarchy,
             Err(err) => return fail(self, err.to_string()),
         };
-        let mesh_ref = match gpu.upload_mesh(mesh, &hierarchy, skin, None, None) {
+        let mesh_ref = match gpu.upload_mesh(mesh, &hierarchy, skin, None, SdfSource::None) {
             Ok(mesh_ref) => mesh_ref,
             Err(err) => return fail(self, err.to_string()),
         };
@@ -1002,7 +1009,7 @@ mod tests {
             hierarchy: &saffron_geometry::PortableVirtualHierarchy,
             skin: &[saffron_geometry::VertexSkin],
             morph: Option<&saffron_geometry::MorphData>,
-            sdf_bake: Option<&saffron_rendering::SdfBake>,
+            sdf: saffron_rendering::SdfSource<'_>,
         ) -> saffron_rendering::Result<Arc<GpuMesh>> {
             self.mesh_uploads.fetch_add(1, Ordering::SeqCst);
             if self.fail_mesh_uploads {
@@ -1010,8 +1017,7 @@ mod tests {
                     "injected upload failure".to_owned(),
                 ));
             }
-            self.inner
-                .upload_mesh(mesh, hierarchy, skin, morph, sdf_bake)
+            self.inner.upload_mesh(mesh, hierarchy, skin, morph, sdf)
         }
 
         fn upload_texture(
@@ -1502,12 +1508,14 @@ mod tests {
         let first = assets
             .load_mesh_asset(&gpu, crate::EDITOR_CAMERA_MESH_ID)
             .expect("the editor-camera model seeds on first resolve");
-        assert!(
-            assets
-                .material_by_uuid
-                .get(&crate::EDITOR_CAMERA_MATERIAL_ID.value())
-                .is_some_and(|entry| entry.is_some()),
-            "the dark material seeds beside the mesh"
+        // The gizmo's dark material is answered analytically by the material loader, so it
+        // resolves without a catalog row and without a cache entry.
+        let material = assets
+            .resolve_slot_material(crate::EDITOR_CAMERA_MATERIAL_ID, &serde_json::Value::Null);
+        assert_eq!(
+            material.base_color,
+            editor_camera_material_asset().base_color,
+            "the reserved id resolves to the dark gizmo material"
         );
 
         // The cache contract: a second resolve returns the same live `Arc` without
