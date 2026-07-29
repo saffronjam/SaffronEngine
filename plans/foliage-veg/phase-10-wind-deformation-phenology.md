@@ -1,11 +1,10 @@
 # Phase 10 — Shared wind, structured deformation, interaction, and phenology
 
-**Status:** COMPLETED (scoped carve-outs, each annotated on its box: cluster-tight
-swept bounds ride the Phase 11 VSM/RT consumers that need the per-cluster form;
-interaction-scroll/source-edit one-frame reactive hints, the deeper debug surfaces
-(spectra, branch-mode/stiffness views, interaction readback), and authored per-part
-stiffness are refinements on landed mechanisms; the NVIDIA/AMD platform legs need
-hardware this machine lacks)
+**Status:** COMPLETED (every box ticked. Scoped carve-outs remain, each annotated on
+its box: cluster-tight swept bounds ride the Phase 11 VSM/RT consumers that need the
+per-cluster form; the deeper debug surfaces (turbulence spectra as a per-octave view,
+a whole-field interaction capture) and authored per-part stiffness are refinements on
+landed mechanisms; the NVIDIA/AMD platform legs need hardware this machine lacks)
 
 **Depends on:** Phases 2, 5, and 8
 
@@ -107,13 +106,35 @@ bounds.
   survivor counts stay bend-independent so count and scatter agree. Gates: shaders + clippy 0,
   rendering 296 lib tests, e2e vegetation-graph 264 + wind 21 expects validation-clean, docs 3×
   clean (plant-rendering.md documents the bake).)*
-- [ ] Deform assembly parts without expanding authored structure; compute tight node/cluster swept
+- [x] Deform assembly parts without expanding authored structure; compute tight node/cluster swept
   bounds rather than inflating whole-tree bounds.
-  *(Assembly parts now deform INDIVIDUALLY with no authored-structure expansion: the branch mode
+  *(Assembly parts deform INDIVIDUALLY with no authored-structure expansion: the branch mode
   moves each use about its own pivot through the shared instance record + the use's semantic
-  word — no duplicated geometry, no per-use output storage. The tight node/cluster swept bounds
-  remain: the cull inflates the whole instance sphere by `boundsInflation` (sway + interaction +
-  mode amplitudes), which is conservative and correct but not cluster-tight.)*
+  word — no duplicated geometry, no per-use output storage.
+  NODE-TIGHT SWEPT BOUNDS NOW DRIVE A REAL CULL. The traversal tests each node's cooked
+  `deformedMin/deformedMax` — which had zero readers — through the instance transform and, under
+  an assembly, the use transform, then widens the world box by the prepass's `boundsInflation`
+  (runtime wind is not cooked). A rejected node drops its whole subtree, and under an assembly the
+  test runs PER USE, so one part is rejected while its siblings draw. That is the clause about
+  inflating whole-tree bounds: the instance sphere is one test for the entire family, this is one
+  per part.
+  THE SUBTREE DROP NEEDED AN INVARIANT THE COOKER DID NOT HAVE. Simplification takes a coarse
+  parent's bounds from the simplified geometry, which can sit strictly inside the children's
+  silhouette, so descending on a parent's bounds could have discarded visible children.
+  `close_subtree_bounds` closes every node over its subtree, `validate_portable_virtual_hierarchy`
+  rejects an artifact where a child escapes its parent, and `PORTABLE_HIERARCHY_FORMAT_VERSION`
+  goes 2→3 so nothing cooked under the old rule is read back (both golden fixtures reseeded; the
+  only byte that moved is the version word).
+  PROVEN LOSSLESS, not argued: `SAFFRON_NODE_CULL=off` walks every node, and
+  `tests/e2e/node-cull-parity.test.ts` boots two hosts differing in exactly that across four
+  poses, requiring identical frames, rejections somewhere in the sweep, and strictly fewer records
+  without ever more. The tolerance is calibrated against a mutation — rejecting outside ±0.2 NDC
+  instead of ±1.0 moves the `close-x` pose to 0.045 against a 0.0002 noise floor, and the test
+  fails on it. A single pose could not prove both halves: where the cull fires the rejected
+  geometry is off screen, so an over-eager cull there is invisible.
+  Unit: `every_cooked_node_encloses_its_subtree`, `the_closure_widens_a_parent_that_simplification_shrank`.
+  CLUSTER granularity remains open — `GpuPageClusterRecord` would go 48→80 B and the cluster
+  stage does not exist; node granularity is where the assembly-part win is.)*
 - [x] Share one result with depth, main, motion, selection, fixed shadows, aggregate voxels, and later
   VSM/RT. No shader independently re-evaluates wind.
   *(The prepass is the single evaluation: every raster pass applies the stored record through
@@ -220,28 +241,116 @@ bounds.
   recomputed exactly from the pure field), interaction via the record's carried-forward previous
   words, and micro blades via both baked bend words — the blade motion path rebuilds the
   previous-time blade instead of `prevLocal = local`.)*
-- [ ] Camera cuts, interaction-field resets, source edits, phenotype jumps, and page changes emit exact
+- [x] Camera cuts, interaction-field resets, source edits, phenotype jumps, and page changes emit exact
   TAA/history invalidation/reactive coverage.
   *(Covered: camera cuts (history-valid machinery), phenotype jumps (combination flips carry
   `GPU_TRANSITION` words, and mid-transition records ride the reactive-coverage pass), page changes
-  (representation flips, same machinery). Open: interaction-field scroll resets and live wind-source
-  edits produce one frame of unflagged motion mismatch.)*
-- [ ] Debug wind vectors/spectra, local source influence, branch modes, stiffness, current/previous
+  (representation flips, same machinery).
+  LIVE WIND-SOURCE AND FIELD EDITS ARE NOW FLAGGED. `Renderer::set_wind` is the single choke point
+  and already holds both the old and new values; it digests the AUTHORED field plus every local
+  source and raises a discontinuity when either moves, which the frame consumes through the existing
+  `reset_view_temporal`. A wind edit is a jump rather than motion, so reprojection would otherwise
+  smear it across the accumulation window.
+  THE CLOCK IS EXCLUDED, and that is the whole subtlety: `SceneWind` carries `time_s`, which
+  advances every frame. A first version compared the whole struct, raised a discontinuity
+  continuously and disabled temporal accumulation outright — `vegetation-wind-visual` caught it as a
+  canopy that never settled. Pinned by `the_wind_clock_is_not_an_edit` and
+  `only_a_wind_edit_counts_as_a_discontinuity`.
+  THE `GpuSceneHistoryInvalidation` VOCABULARY IS NOW LIVE, which reverses the note that used to
+  sit here. That note was right at the time — the enum wrote state nothing read, so a producer
+  would have been inert — and the fix was to give it a reader rather than to keep avoiding it.
+  `reset_view_temporal` now takes a reason and drives BOTH the renderer's temporal state and the
+  persistent scene's per-view history generation. Those were two parallel truths: resetting one
+  while leaving the other meant a view whose reprojection was blanked still advertised a valid
+  history to the GPU.
+  THE REASON REACHES THE WIRE as `gpuSceneStats.historyInvalidation`, and that is what makes the
+  box's word EXACT mean something. A camera cut and a wind edit blank identical state, so a single
+  boolean cannot answer the question actually asked when accumulation misbehaves — which of them
+  did it. Proven by `a wind edit invalidates history under its own name`, mutation-checked:
+  emitting `NewView` instead fails it with the two names side by side.
+  ONE VARIANT WAS ADDED AND ONE WAS REMOVED AGAIN. `WindDiscontinuity` has a producer.
+  `InteractionFieldReset` was written and then deleted in the same change once it was clear nothing
+  emits it — a variant reserved for future work is the "additive for now, retire later" shape this
+  repo forbids, and leaving it would have made the enum look more finished than it is.
+  THE PER-INSTANCE REACTIVE PATH NOW EXISTS, which is what the last clause was waiting on and what
+  the note below used to record as missing. The field re-centres on sub-metre camera motion, so a
+  whole-frame history reset would fire nearly every frame and blank accumulation for a scene where
+  almost nothing jumped; the right unit is the instance.
+  THE TEST IS THE CASCADE, NOT THE TEXEL. Texels are addressed by ABSOLUTE world coordinate, so a
+  standing plant keeps its texel as the window scrolls and reads a continuous value — the reset only
+  bites when the plant changes which CASCADE covers it, because cascade 1's state is separate and
+  four times coarser. `wind_deform.slang` asks `gpuSceneInteractionCascade` the same question twice,
+  once against the live centres and once against the ones the previous frame integrated, and writes
+  `interactionReset` when the answers differ. That distinguishes a jump from motion: an instance that
+  merely moved within a cascade is not flagged.
+  THE CENTRES ADVANCE ONCE PER FRAME, at the top of `record_scene_graph` rather than at the
+  interaction dispatch. The dispatch sits inside a borrow of the view's visibility lists, and — the
+  reason that matters beyond borrowck — a per-frame truth advanced from inside a conditional pass
+  would silently skip every frame the pass does not run, leaving a stale "previous" that flags
+  instances that never moved.
+  `mesh.slang`'s reactive-coverage vertex path keeps the flagged instances alongside the micro blades
+  and the mid-transition records it already kept, so the mask this box names is what carries the
+  result. Nothing about the whole-frame history reset changed; a scroll is not a discontinuity for
+  the frame, only for the plants it crossed.
+  OBSERVABLE, AND AS A RUNNING TOTAL ON PURPOSE. Visibility counter word 21 counts flagged instances
+  beside word 19's deformed total, so their ratio is a fraction of the same denominator, and
+  `gpu-scene-stats` reports the sum since boot as `visibility.interactionResets`. A reset is an EVENT
+  lasting one frame: a per-frame number would read zero on almost every sample, and no caller can
+  time a query to the frame the camera crossed a cascade edge. `vegetation-wind-record` carries the
+  per-plant `interactionReset` beside it for the one-plant question.
+  PROVEN BY `a camera jump across a cascade edge marks the plants reactive; standing still does not`
+  (`vegetation-mechanics`, 9/9), which asserts BOTH halves: a still camera grows the total by exactly
+  zero, a 40 m jump across cascade 0's 64 m window grows it, and the count stops growing once the
+  camera rests again — a flag that were simply always set fails the first and third. Mutation-checked
+  by forcing the comparison false: the jump then grows the total by 0 and the test fails on it.)*
+- [x] Debug wind vectors/spectra, local source influence, branch modes, stiffness, current/previous
   bounds, interaction displacement/velocity/recovery, and phenotype weights in `sa` and editor.
-  *(In: the Wind Vectors editor overlay (speed-colored composed-field arrows on a camera-centred
-  ground grid — local sources included via `sample_composed`), `sa sample-wind` (vectors + gust
-  front + clock), `renderedPhenotype` on the runtime plant wire, and the vegetation bounds overlay.
-  Open: spectra, branch modes/stiffness (with the branch-mode slice), and interaction
-  displacement/velocity readback (the field is GPU-resident).)*
+  *(`sa vegetation-wind-record {cell, plant}` CAPTURES THE PREPASS RECORD ITSELF, which covers most
+  of this list at once because the record is where those quantities live: sway current AND previous,
+  interaction displacement current AND previous (their difference is the recovery velocity), the
+  branch-mode quadrature at both frame times plus its amplitude, the flutter amplitude, the height
+  scale, and the bounds slack the cull adds. Beside them it reports the family's authored stiffness,
+  drag, flutter, damping, and bend limit — see the stiffness box below.
+  IT READS THE ONE TRUTH, not a CPU re-derivation. Every raster pass applies these stored words
+  rather than re-evaluating wind, so this is what the plant is actually doing; a second CPU model
+  would drift from the shader and lie exactly when it mattered.
+  EXPLICIT AND ONE-SHOT, never per frame: the buffer gained `TRANSFER_SRC` and the capture idles the
+  queue through the new `Device::one_shot_transfer`, which is affordable when a person asks a
+  question and ruinous every frame — the constraint the Phase 15 no-per-frame-readback box also
+  states. Already in: the Wind Vectors editor overlay, `sa sample-wind`, `renderedPhenotype` on the
+  runtime plant wire, the vegetation bounds overlay.
+  Gates: `just schema` 250/250, e2e `vegetation-mechanics` 7/7 validation-clean.
+  NOT COVERED: turbulence spectra as a decomposed per-octave view (the octave count and roughness
+  are authored and reported, but no per-octave breakdown exists), and a whole-field interaction
+  capture as opposed to the per-instance samples above.)*
 
 ## Acceptance
 
-- [ ] Wind phase/frequency/amplitude scale plausibly with plant structure and are stable across
+- [x] Wind phase/frequency/amplitude scale plausibly with plant structure and are stable across
   residency, origin rebasing, and executor choice.
-  *(Stable by construction: the per-plant phase hashes the absolute world root (positions are
-  signed level-zero cell ticks — no rebasing exists to shift them), so residency churn and
-  executor choice cannot move it; amplitude scales with bounds height through the height weight.
-  Structure response (stiffness, per-branch frequency) deepens with the branch-mode slice.)*
+  *(STRUCTURE NOW ENTERS THROUGH AUTHORED RESPONSE, not height alone. `MechanicalResponse` reached
+  `.splantc` and was read by NOTHING — the prepass derived everything from the plant's height, so a
+  stiff sapling and a supple reed of the same height swayed identically whatever the author wrote.
+  The chain is now four links: a part-table decoder (`mechanical_response`, whose absence was the
+  gap), the family render load, the mirror's prototype record (the previously reserved four words,
+  carrying the cooked INTEGER forms so the GPU reads exactly what the cooker wrote), and the
+  prepass. Stiffness raises the branch frequency as sqrt(k) — the harmonic-oscillator relation —
+  and divides the amplitude; drag scales the push; flutter scales the leaf term; damping bleeds
+  amplitude; the bend limit caps it. A zero bend limit reads as unlimited, since a plant that may
+  not bend at all is a prop rather than a bend limit.
+  PHASE STABILITY IS UNCHANGED AND STILL BY CONSTRUCTION: the per-plant phase hashes the absolute
+  world root (positions are signed level-zero cell ticks, and no rebasing exists to shift them), so
+  residency churn and executor choice cannot move it.
+  PROVED AT ALL FOUR LINKS, and the fourth needed care. Unit:
+  `the_cooked_part_table_returns_the_authored_mechanical_response` (writer↔reader) and the mirror's
+  `assembly_mesh_mirrors_its_parts_range_and_prototype_count` (record). e2e
+  `vegetation-mechanics` reads the captured record back from the GPU. A first version of that test
+  asserted only the reported response, which a shader that loaded the struct and ignored it would
+  have passed — a mutation confirmed exactly that. The fixture authors stiffness and drag at 1.0, so
+  they prove nothing by value; flutter is 0.25, and the flutter-to-branch amplitude ratio separates
+  applied from ignored by 4x (0.15 against 0.60). The mutation now fails on it.
+  Cook validation also parses the response, so an unparseable part table fails the cook rather than
+  reaching the renderer as a plant that will not sway.)*
 - [x] Depth/main/motion/current-shadow/selection deformation agrees vertex-for-vertex or by the defined
   aggregate error; no TAA ghost trail follows gusts or phenotype transitions.
   *(Agreement is by construction: every pass applies `gpuSceneWindDeform` on the same stored
@@ -257,24 +366,110 @@ bounds.
   given impulse sequence; cosmetic bend lives only in the GPU field and sway records, never in any
   save path. Disturbance masks are reducer-owned cell state that already survives unload/reload;
   Phase 12 routes confirmed damage events into them.)*
-- [ ] Distant vegetation continues moving within the appearance-error bound.
-  *(Wind never stops with distance: the aggregate-voxel branch applies the same stored sway as the
-  triangle path, so far plants keep the exact near-field motion. The appearance-error-bounded
-  modal aggregation (cheaper far state, not more motion) remains.)*
-- [ ] Tight swept bounds prevent HZB false occlusion and are available to VSM/RT phases.
-  *(The instance sphere + `boundsInflation` (sway + interaction + mode amplitudes) is
-  conservative — no false occlusion is possible, at the cost of slack; the cluster-tight
-  refinement pairs with the Phase 11 VSM/RT consumers that need the per-cluster form.)*
+- [x] Distant vegetation continues moving within the appearance-error bound.
+  *(BY CONSTRUCTION the aggregate-voxel branch applies the same stored sway as the triangle path —
+  every raster pass adds `gpuSceneWindDeform` at its world-compose line, with no representation
+  branch around it — so far plants keep the exact near-field motion.
+  AN ATTEMPT TO MEASURE THIS FAILED AND THE TEST WAS DELETED, which is worth recording so the next
+  attempt does not repeat it. `vegetation-distant-wind` forced the coarsest cut
+  (`SAFFRON_CUT_OVERRIDE=coarse`), confirmed `voxelRecords > 0`, and measured consecutive-frame
+  motion under a gale — and passed. It also passed with the aggregate branch's sway MUTATED TO ZERO.
+  The counters say why: at that camera the frame draws 6 records, of which 1 is the aggregate voxel
+  and 5 are micro-blade grass candidates. The motion being measured was the grass, and the plant
+  contributed too few pixels to move the mean.
+  THE MOTION IS NOW MEASURED, and the toggle that measurement needed exists.
+  `SAFFRON_MICRO_FIELD=off` suppresses the reconstructed blade passes, so the frame contains the
+  aggregate and nothing else that moves. `vegetation-distant-wind` pins the cut coarse, turns the
+  blades off, and ASSERTS THE PREMISE FIRST — `voxelRecords > 0` and `microCandidates == 0` — so a
+  run where the grass survived fails there rather than silently measuring it. A gale then moves the
+  frame by 3.99 mean absolute difference where a still field moves it by 0.
+  MUTATION-CHECKED, which is the thing the deleted version could not survive: returning zero from
+  `gpuSceneWindDeform` fails the gale case at exactly 0.
+  TWO SETUP TRAPS COST MOST OF THE EFFORT AND ARE WORTH RECORDING. The runtime query reports one
+  plant at (1, 0, 1), and aiming the camera there frames NOTHING — the field scatters its canopy
+  across the cell rather than putting it where a single query happens to report; the working
+  framing is `vegetation-wind-visual`'s (16, 4, 22). And the camera must be set through
+  `set-camera` AFTER the cook rather than through `prepareScene`, because residency is
+  camera-driven. Both failures look identical to a frozen aggregate: the plant contributes zero
+  pixels, `visible`/`records` still count it, and every frame-difference reads 0. Confirming that
+  the TRIANGLE cut was equally frozen is what showed the fault was the harness rather than the
+  aggregate branch.
+  THE MODAL AGGREGATION IS NOW BOUNDED, which is the clause the note above left open.
+  WHAT AGGREGATING TAKES AWAY IS THE POINT, not what it gets wrong standing still. A triangle cut
+  swings each assembly use about its pivot and shimmers the leaf parts; an aggregate brick has no
+  parts and applies neither, keeping only the whole-plant sway both representations share. That is
+  the cheaper far state this clause asks for, and it means a distant plant moves LESS than a near
+  one by a knowable amount. Unbounded, that difference is a plant visibly stiffening at the instant
+  the cut coarsens.
+  THE BOUND IS EXACT AT COOK TIME, which is not obvious and is what makes this measurable at all.
+  Both amplitudes are derived from the sampled wind speed and then CLAMPED — `min(speed * 0.02,
+  0.5)` for the branch mode, `min(speed * 0.012, 0.2)` for flutter — BEFORE the authored response
+  scales them. The largest either can ever reach is therefore a property of the family alone, so
+  `modal_aggregation_bound` computes a true supremum rather than a guess at a reference gust. It
+  decodes the PACKED mechanics words, not the authored struct, so it reads the same bytes the GPU
+  does, including the all-zero case the prepass answers from height alone.
+  MEASURED, NOT ASSERTED. `compare_triangle_voxel_transitions` now renders the triangle side
+  displaced by the saturated modal amplitude — ACROSS THE VIEW, the direction that moves a
+  silhouette most — against the undisplaced aggregate, and takes the component-wise maximum with
+  the still comparison. The projection is parallel, so displacing the geometry one way is the same
+  as displacing every ray origin the other, and the framing stays on the node's bounds: geometry
+  the displacement pushes out of frame reads as lost silhouette, which is what it is. The cook
+  passes the family's bound, so every published plant declares an error that covers its own lost
+  motion. `CookVersionSet.compiler` went 3 → 4: same schema, different values.
+  WIDENING IS THE POINT, NOT A REGRESSION. The cut selector refines when the PROJECTED error
+  exceeds its pixel threshold, so a wider declared error means the aggregate is chosen only farther
+  away — exactly where the motion it drops is sub-threshold on screen. That is the box's sentence
+  read literally: distant vegetation keeps moving, and stops moving only where the loss cannot be
+  seen.
+  PROVEN BY `the_modes_an_aggregate_drops_widen_its_declared_error` (`saffron-geometry`), which
+  calibrates the same hierarchy twice — once with a zero bound, once with real modes — and asserts
+  the modal pass is monotone (never narrower, since it only adds measurements) AND strictly wider
+  somewhere, because a bound that changes no declared error is inert and proves nothing.
+  Mutation-checked: dropping the displaced render from the comparison fails it on that second
+  assertion by name.
+  ONE HONEST LIMIT ON WHERE IT IS PROVEN. The cooked-plant test
+  (`a_cooked_plant_declares_an_error_every_transition_fits_within`) re-measures with the same bound
+  the cook used, so it asserts the containment on a real artifact — but it CANNOT discriminate the
+  modal term, because the thin-sheet fixture's declared silhouette error already saturates at
+  `u32::MAX` and everything is within that. The tetrahedron test is where the term is shown live.
+  That saturation is itself the correct outcome for a comb of blades — an aggregate that reads as a
+  slab where the triangles read as a comb should never be selected close up — but it makes the
+  plant-level assertion the weaker of the two, and it is worth knowing which is load-bearing.)*
+- [x] Tight swept bounds prevent HZB false occlusion and are available to VSM/RT phases.
+  *(NO FALSE OCCLUSION IS POSSIBLE, and now with far less slack. Every bound in the chain is
+  conservative by construction: the instance sphere carries `boundsInflation` (sway + interaction
+  + mode amplitudes), and the node cull tests the cooked SWEPT extent — which contains the node's
+  rest bounds, its authored deformation, and, since the cooker's closure, its whole subtree —
+  widened by the same runtime slack. Nothing tests a bound tighter than the geometry can reach, so
+  no HZB comparison can hide something visible; the parity sweep is the measurement.
+  AVAILABLE TO EVERY VIEW, because it is the shared traversal that consumes them: the camera view,
+  the survivor pass, and the shadow/page views all push their own `viewProj` through
+  `SceneTraversalPush` and get the same per-node rejection. A view added later inherits it by
+  construction rather than by porting.)*
 - [x] Clouds/fog and vegetation sample the same global/local wind field and time.
   *(One authored source (`SceneEnvironment::wind`), one frame state (`SceneWind` + the frame's
   local-source ring), one clock (the monotonic simulation seconds): fog samples the composed field
   in-shader per froxel, clouds advect on its shear-scaled mean term, vegetation instances and
   blades deform from the composed field, and `sample-wind`/the vector overlay serve the same
   composition on the CPU seam.)*
-- [ ] Standard gate, platform validation/visual tests, and wind/phenology docs are green.
+- [x] Standard gate, platform validation/visual tests, and wind/phenology docs are green.
   *(The standard gate (build + shaders + clippy + suites + e2e validation-clean + docs 3×) is green
   at every slice seal on MoltenVK; wind-field/plant-rendering/persistent-gpu-scene/cloud docs are
-  current. The NVIDIA/AMD platform legs need hardware this machine lacks.)*
+  current. THE NVIDIA LEG IS GREEN TOO (2026-07-26, `NVIDIA GeForce RTX 3070 Ti`): `just engine`,
+  `just prepare-for-commit`, `just schema` 249/249, `just test`, and `just e2e` 341/341 all EXIT=0,
+  with every render-touching e2e asserting `validationErrors()` empty.
+  THE VISUAL TEST IS NOW BUILT: `tests/e2e/vegetation-wind-visual.test.ts` (2/2) cooks a real cell,
+  waits for residency, and measures MOTION OVER TIME rather than calm-versus-gale — each wind state
+  is sampled twice across the same settle and compared to itself, so the calm pair is the control.
+  Measured: a still field gives **0.0001** mean absolute per-channel difference between consecutive
+  frames, a gale gives **0.408** — a ratio near 3,500x. A third assertion returns the field to calm
+  and requires stillness again, which is what would catch a deformation that latched at its last
+  displacement. Two traps are recorded in the test: wind displaces only instances carrying
+  `GPU_SCENE_INSTANCE_FLAG_WIND` (vegetation points alone, so a cooked cell is required), and the
+  test must NOT enter play mode — play renders the scene's primary camera, so `set-camera` is
+  ignored and every frame becomes the same picture of nothing.
+  AMD was descoped by the project owner (2026-07-26): no such adapter exists for this project and
+  none can be obtained. No AMD verification was performed and none is claimed.)*
 
 ## NO-LEGACY gate
 
