@@ -127,11 +127,13 @@ cargo run -p xtask -- shaders    # compile engine/assets/shaders/*.slang → SPI
 ### Headless runs & the verification gate
 
 - `SAFFRON_EXIT_AFTER_FRAMES=N ./engine/target/debug/saffron-host` exits after N frames.
-- **No display?** Run a headless compositor in the toolbox, then point the window backend at it:
-  `weston --backend=headless --width=1280 --height=720 --socket=wl-x --idle-time=0 &`, then
-  `export WAYLAND_DISPLAY=wl-x`. Use a unique `--socket` + `SAFFRON_CONTROL_SOCK` per run, and capture
-  the exit code to a file *before* any `pkill` (the toolbox wrapper surfaces the pkill signal, not the
-  real exit code). `just run-engine-headless [frames]` wraps this.
+- **No display?** Set `SAFFRON_EDITOR_NATIVE_VIEWPORT=1`: the host opens no window and takes a
+  no-surface offscreen device, so no compositor is involved. Use a unique `SAFFRON_CONTROL_SOCK` per
+  run, and capture the exit code to a file *before* any `pkill` (the toolbox wrapper surfaces the
+  pkill signal, not the real exit code). `just run-engine-headless [frames]` wraps this, and both
+  test harnesses boot the host this way. A **windowed** host does need a compositor — and note that a
+  headless one denies present support to the discrete adapter, so a windowed boot there silently
+  lands on llvmpipe.
 - **Want the NVIDIA GPU in a headless/ad-hoc run?** It is available (see the GPU note above). Export
   `VK_ADD_DRIVER_FILES=/run/host/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json` before launching the
   host, or just use the `just run-engine-headless` recipe which already does it. A bespoke script that

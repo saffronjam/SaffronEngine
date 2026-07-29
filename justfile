@@ -265,6 +265,7 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     RECIPE=test; {{reenter}}
+    {{gpu_driver}}
     cd "{{engine}}" && cargo test --workspace
 
 # execute the Phase-1/Phase-3 Rust/Slang corpus on one physical GPU and emit bound JSON evidence
