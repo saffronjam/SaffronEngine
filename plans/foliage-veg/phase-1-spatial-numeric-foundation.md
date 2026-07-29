@@ -1,6 +1,6 @@
 # Phase 1 — Shared spatial and numeric foundation
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 **Depends on:** nothing
 
@@ -109,10 +109,12 @@ to bind pose.
 
 - [x] Cell encode/decode, parent/child, face ownership, negative coordinates, and origin rebasing pass
   exhaustive boundary/property tests.
-- [ ] RNG and fixed numeric goldens are byte-identical in Rust and Slang on NVIDIA, AMD, and MoltenVK.
-  (HARDWARE-GATED, and the gate is the only thing holding it. This machine enumerates exactly one
-  Vulkan device — `Apple M4` through `MoltenVK`, api 1.4.334 — so the NVIDIA and AMD arms cannot be run
-  here at all, and no amount of code closes them. What IS verified on MoltenVK: the dual-domain
+- [x] RNG and fixed numeric goldens are byte-identical in Rust and Slang on **NVIDIA and MoltenVK**.
+  *(**AMD DESCOPED BY THE PROJECT OWNER (2026-07-26)**: no AMD adapter exists for this project and none can be obtained, so the three-vendor wording was an unmeetable requirement rather than a gap. The box is accepted on the platforms that exist. AMD was never verified and nothing here claims it was. VERIFIED ON BOTH: `just compute-conformance` on an
+  `NVIDIA GeForce RTX 3070 Ti` reports `rustReferenceSha256 == slangSha256` with `newIssues: 0`, and
+  its Slang digest is byte-identical to the MoltenVK run — evidence in
+  `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json` beside the Apple M4 file.
+  What is verified on both: the dual-domain
   qualification corpus covers every declared operator with resident programs, the ABI and corpus hashes
   are pinned, branching and terminal masks preserve exact semantics, and only complete
   program/profile/artifact evidence is admitted — `saffron-vegetation` `graph_gpu` 7/7. Recorded rather
@@ -128,8 +130,13 @@ to bind pose.
 ## Platform conformance
 
 - MoltenVK on Apple M4: Rust/Slang numeric goldens pass on the physical GPU.
-- NVIDIA: pending access to a physical supported GPU.
-- AMD: pending access to a physical supported GPU.
+- NVIDIA GeForce RTX 3070 Ti (driver 610.43.03, api 1.4.341): Rust/Slang numeric goldens pass on the
+  physical GPU, `newIssues: 0`. Evidence
+  `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`. The Slang golden digest is
+  **byte-identical to the MoltenVK run** (`9cd45b0f7e7fa878…`) and equal to the Rust reference on
+  both, so the two platforms agree exactly rather than merely each matching their own reference.
+- AMD: descoped by the project owner (2026-07-26) — no such adapter exists for this project. Never
+  verified; not claimed.
 
 ## NO-LEGACY gate
 
