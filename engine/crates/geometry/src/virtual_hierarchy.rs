@@ -23,7 +23,7 @@ pub const PORTABLE_CLUSTER_MAX_TRIANGLES: usize = 124;
 /// Canonical aggregate brick edge in voxels.
 pub const PORTABLE_VOXEL_BRICK_EDGE: u8 = 8;
 /// Canonical envelope version for the five portable hierarchy sections.
-pub const PORTABLE_HIERARCHY_FORMAT_VERSION: u32 = 2;
+pub const PORTABLE_HIERARCHY_FORMAT_VERSION: u32 = 4;
 
 const PORTABLE_HIERARCHY_MAGIC: &[u8; 4] = b"PVHR";
 
@@ -31,7 +31,7 @@ const TRIANGLE_DOMAIN: &[u8] = b"saffron-anima/portable/triangle-hierarchy/v1";
 const VOXEL_DOMAIN: &[u8] = b"saffron-anima/portable/voxel-hierarchy/v1";
 const DEFORMATION_DOMAIN: &[u8] = b"saffron-anima/portable/deformation/v1";
 const PAGE_DOMAIN: &[u8] = b"saffron-anima/portable/page-directory/v1";
-const RAY_TRACING_DOMAIN: &[u8] = b"saffron-anima/portable/ray-tracing/v1";
+const RAY_TRACING_DOMAIN: &[u8] = b"saffron-anima/portable/ray-tracing/v2";
 
 /// Format-neutral aggregate material moments stored as canonical integer bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,6 +132,16 @@ pub enum VirtualMaterialClass {
 }
 
 impl VirtualMaterialClass {
+    /// Whether a ray may commit a hit on this material without consulting the coverage classifier.
+    ///
+    /// Only a fully covered surface qualifies. Masked and thin-sheet surfaces carry cut-out
+    /// coverage, and a transmissive one attenuates rather than blocking, so all three must surface
+    /// ray candidates for `gpuSceneRayCandidateCovered` to resolve.
+    #[must_use]
+    pub const fn is_opaque(self) -> bool {
+        matches!(self, Self::Opaque)
+    }
+
     fn from_tag(tag: u8, format: &'static str) -> Result<Self> {
         match tag {
             0 => Ok(Self::Opaque),
@@ -180,7 +190,12 @@ impl VirtualHierarchyMaterial {
                     AlphaClassification::Transmissive => VirtualMaterialClass::Transmissive,
                 },
                 moments: standard_moments(),
-                opacity_micromap: false,
+                // A masked standard surface carries cut-out coverage resolved against a constant
+                // cutoff, which is the case a micromap refines best: the ray path collapses to a
+                // step at that cutoff, so a micro-triangle whose whole footprint sits on one side
+                // of it is provable. An opaque surface has no coverage to refine and a
+                // transmissive one attenuates rather than cutting out, so neither qualifies.
+                opacity_micromap: matches!(alpha, AlphaClassification::Masked),
             },
             MaterialSurface::ThinSheetFoliage(parameters) => Self {
                 slot,
@@ -595,6 +610,29 @@ pub struct PortableVirtualHierarchy {
     pub roots: Vec<u32>,
     /// RT/coverage derivation metadata.
     pub ray_tracing: Vec<PortableRayTracingRecord>,
+    /// Derived opacity micromaps, keyed by the flattened submesh whose BLAS geometry they refine.
+    ///
+    /// Empty when nothing was derived — no coverage plane, policy off, or every triangle uniform.
+    /// A micromap may only ever REMOVE classifier work, so an absent one is always correct and
+    /// never a rendering difference.
+    pub opacity_micromaps: Vec<PortableOpacityMicromap>,
+}
+
+/// One submesh's derived opacity micromap, in the exact shape `vkCmdBuildMicromapsEXT` reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PortableOpacityMicromap {
+    /// The flattened-mesh submesh whose BLAS geometry this refines.
+    pub submesh: u32,
+    /// One index per geometry triangle; negatives are the format's uniform-triangle specials.
+    pub indices: Vec<i32>,
+    /// `(data_offset, subdivision_level, format)` per referenced block.
+    pub blocks: Vec<(u32, u16, u16)>,
+    /// Packed two-bit micro-triangle states.
+    pub data: Vec<u8>,
+    /// `(count, subdivision_level, format)` usage rows.
+    pub usage: Vec<(u32, u32, u32)>,
+    /// Micro-triangles proven opaque, proven transparent, and left unknown.
+    pub classes: (u64, u64, u64),
 }
 
 /// Complete format-neutral input to the sole portable hierarchy cooker.
@@ -1038,6 +1076,7 @@ pub fn cook_portable_virtual_hierarchy(
     });
     set_parent(&mut cooked.nodes, &mesh_roots, root_node)?;
     cooked.roots.push(root_node);
+    close_subtree_bounds(&mut cooked)?;
     assign_pages(&mut cooked)?;
     cooked.ray_tracing = build_ray_tracing(&cooked)?;
     validate_portable_virtual_hierarchy(&cooked)?;
@@ -1717,6 +1756,48 @@ const fn standard_moments() -> PortableMaterialMoments {
     }
 }
 
+/// Widen every node's static and deformed bounds until they enclose its whole subtree.
+///
+/// Hierarchical culling descends: a view that rejects a node stops walking, so rejecting
+/// it must also reject everything below it. Simplification chooses a coarse parent's
+/// bounds from the simplified geometry, which can sit inside the children's silhouette,
+/// so the enclosure is established here rather than assumed.
+fn close_subtree_bounds(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> {
+    // Pre-order: a parent always precedes its descendants, so the reverse visits every
+    // child before its parent without assuming anything about node ordering.
+    let mut order = Vec::with_capacity(hierarchy.nodes.len());
+    let mut stack = hierarchy.roots.clone();
+    let mut seen = BTreeSet::new();
+    while let Some(node_id) = stack.pop() {
+        if !seen.insert(node_id) {
+            return Err(format_error("portable hierarchy", "bounds.nodeCycle"));
+        }
+        let node = hierarchy
+            .nodes
+            .get(node_id as usize)
+            .ok_or_else(|| format_error("portable hierarchy", "bounds.node"))?;
+        stack.extend(node.children.iter().copied());
+        order.push(node_id);
+    }
+    for node_id in order.into_iter().rev() {
+        let node = &hierarchy.nodes[node_id as usize];
+        let mut bounds = node.bounds;
+        let mut deformed = node.deformed_bounds;
+        for child in &node.children.clone() {
+            let child = hierarchy
+                .nodes
+                .get(*child as usize)
+                .ok_or_else(|| format_error("portable hierarchy", "bounds.child"))?;
+            bounds = bounds.union(child.bounds);
+            deformed = deformed.union(child.deformed_bounds);
+        }
+        let node = &mut hierarchy.nodes[node_id as usize];
+        node.bounds = bounds;
+        node.deformed_bounds = deformed;
+    }
+    Ok(())
+}
+
 fn assign_pages(hierarchy: &mut PortableVirtualHierarchy) -> Result<()> {
     let mut queue = VecDeque::new();
     for root in &hierarchy.roots {
@@ -1881,6 +1962,14 @@ pub fn validate_portable_virtual_hierarchy(hierarchy: &PortableVirtualHierarchy)
             || node.page as usize >= hierarchy.pages.len()
             || !bounds_contains(node.deformed_bounds, node.bounds)
             || node.children.windows(2).any(|pair| pair[0] >= pair[1])
+            // The traversal culls whole subtrees on one node's bounds; a child reaching
+            // outside its parent would let a view reject geometry it can see.
+            || node.children.iter().any(|child| {
+                hierarchy.nodes.get(*child as usize).is_none_or(|child| {
+                    !bounds_contains(node.bounds, child.bounds)
+                        || !bounds_contains(node.deformed_bounds, child.deformed_bounds)
+                })
+            })
         {
             return Err(format_error("portable hierarchy", "nodes"));
         }
@@ -2053,6 +2142,8 @@ pub struct PageDirectorySection {
 pub struct RayTracingSection {
     /// Per-node RT/coverage records.
     pub records: Vec<PortableRayTracingRecord>,
+    /// Derived opacity micromaps, keyed by flattened submesh.
+    pub opacity_micromaps: Vec<PortableOpacityMicromap>,
 }
 
 impl PortableVirtualHierarchy {
@@ -2238,6 +2329,31 @@ impl PortableVirtualHierarchy {
             writer.u8(record.material_class as u8);
             writer.bool(record.opacity_micromap);
             writer.bool(record.requires_any_hit);
+        }
+        writer.length(self.opacity_micromaps.len())?;
+        for micromap in &self.opacity_micromaps {
+            writer.u32(micromap.submesh);
+            writer.length(micromap.indices.len())?;
+            for &index in &micromap.indices {
+                writer.u32(index as u32);
+            }
+            writer.length(micromap.blocks.len())?;
+            for &(offset, level, format) in &micromap.blocks {
+                writer.u32(offset);
+                writer.u16(level);
+                writer.u16(format);
+            }
+            writer.length(micromap.data.len())?;
+            writer.bytes(&micromap.data);
+            writer.length(micromap.usage.len())?;
+            for &(count, level, format) in &micromap.usage {
+                writer.u32(count);
+                writer.u32(level);
+                writer.u32(format);
+            }
+            writer.u64(micromap.classes.0);
+            writer.u64(micromap.classes.1);
+            writer.u64(micromap.classes.2);
         }
         Ok(writer.finish())
     }
@@ -2704,11 +2820,44 @@ pub fn decode_ray_tracing(bytes: &[u8]) -> Result<RayTracingSection> {
             requires_any_hit: reader.bool()?,
         });
     }
+    let micromap_count = reader.length()?;
+    let mut opacity_micromaps = Vec::with_capacity(micromap_count);
+    for _ in 0..micromap_count {
+        let submesh = reader.u32()?;
+        let index_count = reader.length()?;
+        let mut indices = Vec::with_capacity(index_count);
+        for _ in 0..index_count {
+            indices.push(reader.u32()? as i32);
+        }
+        let block_count = reader.length()?;
+        let mut blocks = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            blocks.push((reader.u32()?, reader.u16()?, reader.u16()?));
+        }
+        let data_len = reader.length()?;
+        let data = reader.take(data_len)?.to_vec();
+        let usage_count = reader.length()?;
+        let mut usage = Vec::with_capacity(usage_count);
+        for _ in 0..usage_count {
+            usage.push((reader.u32()?, reader.u32()?, reader.u32()?));
+        }
+        opacity_micromaps.push(PortableOpacityMicromap {
+            submesh,
+            indices,
+            blocks,
+            data,
+            usage,
+            classes: (reader.u64()?, reader.u64()?, reader.u64()?),
+        });
+    }
     reader.complete()?;
     if records.windows(2).any(|pair| pair[0].node >= pair[1].node) {
         return Err(format_error("portable ray tracing", "record.order"));
     }
-    Ok(RayTracingSection { records })
+    Ok(RayTracingSection {
+        records,
+        opacity_micromaps,
+    })
 }
 
 /// Strictly combines the five final hierarchy sections and validates all cross-references.
@@ -2735,6 +2884,7 @@ pub fn decode_portable_virtual_hierarchy_sections(
         pages: pages.pages,
         roots: pages.roots,
         ray_tracing: ray_tracing.records,
+        opacity_micromaps: ray_tracing.opacity_micromaps,
     };
     if hierarchy.ray_tracing.len() != hierarchy.nodes.len()
         || hierarchy
@@ -2988,6 +3138,70 @@ mod tests {
         assert_eq!(
             decode_portable_virtual_hierarchy(&bytes).unwrap(),
             hierarchy
+        );
+    }
+
+    #[test]
+    fn every_cooked_node_encloses_its_subtree() {
+        // The traversal culls a whole subtree on one node's swept bounds, so a child
+        // reaching outside its parent would let a view reject geometry it can see.
+        let hierarchy = cook_portable_virtual_hierarchy(&multi_page_input()).unwrap();
+        assert!(hierarchy.nodes.len() > 2, "the tree has interior nodes");
+        for node in &hierarchy.nodes {
+            for child in &node.children {
+                let child = &hierarchy.nodes[*child as usize];
+                assert!(
+                    bounds_contains(node.bounds, child.bounds),
+                    "node {} must enclose child {}",
+                    node.id,
+                    child.id
+                );
+                assert!(
+                    bounds_contains(node.deformed_bounds, child.deformed_bounds),
+                    "node {} must sweep over child {}",
+                    node.id,
+                    child.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_closure_widens_a_parent_that_simplification_shrank() {
+        // Simplification picks a coarse parent's bounds from the simplified geometry,
+        // which can sit strictly inside the children's silhouette. Without the closure
+        // the enclosure above is a coincidence of the input, not a property.
+        let node = |id: u32, children: Vec<u32>, half: i32| PortableHierarchyNode {
+            id,
+            representation: HierarchyRepresentation::Voxel { brick: 0 },
+            parent: None,
+            children,
+            page: u32::MAX,
+            bounds: PortableBounds {
+                min_bits: [-half; 3],
+                max_bits: [half; 3],
+            },
+            deformed_bounds: PortableBounds {
+                min_bits: [-half; 3],
+                max_bits: [half; 3],
+            },
+            appearance_error: AppearanceError::default(),
+        };
+        let mut hierarchy = PortableVirtualHierarchy {
+            nodes: vec![node(0, vec![1], 65_536), node(1, Vec::new(), 262_144)],
+            roots: vec![0],
+            ..PortableVirtualHierarchy::default()
+        };
+        assert!(
+            !bounds_contains(hierarchy.nodes[0].bounds, hierarchy.nodes[1].bounds),
+            "the fixture starts with the child outside its parent"
+        );
+        close_subtree_bounds(&mut hierarchy).unwrap();
+        assert_eq!(hierarchy.nodes[0].bounds.max_bits, [262_144; 3]);
+        assert_eq!(hierarchy.nodes[0].deformed_bounds.min_bits, [-262_144; 3]);
+        assert_eq!(
+            hierarchy.nodes[1].bounds.max_bits, [262_144; 3],
+            "a leaf keeps its own bounds"
         );
     }
 

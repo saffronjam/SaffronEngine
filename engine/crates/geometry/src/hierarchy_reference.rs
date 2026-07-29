@@ -19,6 +19,43 @@ pub struct HierarchyReferenceFixture {
     pub light_direction: Vec3,
 }
 
+/// The per-part wind modes an aggregate voxel cannot express, at their wind-independent
+/// saturation, in the hierarchy's local units.
+///
+/// The triangle representation swings each assembly use about its pivot (the branch mode) and
+/// shimmers leaf parts across the wind (flutter). An aggregate brick has no parts and applies
+/// neither — it keeps only the whole-plant sway, which both representations share. That
+/// collapse is the point of aggregating, and it is also an appearance difference the declared
+/// transition error has to cover, or a plant visibly stiffens as the cut coarsens.
+///
+/// Both amplitudes SATURATE: the runtime clamps the wind term before scaling it by the authored
+/// response, so the largest displacement either mode can ever reach is a property of the family
+/// alone and not of any particular gust. That is what makes a cook-time bound possible.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModalAggregationBound {
+    /// Saturated branch-mode amplitude. The node's own extent supplies the lever.
+    pub branch: f32,
+    /// Saturated leaf-flutter amplitude.
+    pub flutter: f32,
+}
+
+impl ModalAggregationBound {
+    /// The largest displacement the modes can apply inside a node spanning `extent` local
+    /// units. The branch term scales by the lever from the use pivot, clamped exactly as the
+    /// vertex path clamps it; the flutter term is height-weighted and so bounded by its
+    /// amplitude alone.
+    #[must_use]
+    pub fn displacement(self, extent: f32) -> f32 {
+        self.branch.max(0.0) * extent.clamp(0.0, 4.0) * 0.25 + self.flutter.max(0.0)
+    }
+
+    /// Whether the family applies no modal terms at all, so aggregating drops nothing.
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        self.branch <= 0.0 && self.flutter <= 0.0
+    }
+}
+
 /// Measured error for one voxel node against its finest triangle descendants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriangleVoxelReferenceComparison {
@@ -78,6 +115,7 @@ pub fn compare_triangle_voxel_transitions(
     hierarchy: &PortableVirtualHierarchy,
     fixtures: &[HierarchyReferenceFixture],
     resolution: u32,
+    modal: ModalAggregationBound,
 ) -> Result<Vec<TriangleVoxelReferenceComparison>> {
     validate_portable_virtual_hierarchy(hierarchy)?;
     if fixtures.is_empty() || !(8..=512).contains(&resolution) {
@@ -108,18 +146,40 @@ pub fn compare_triangle_voxel_transitions(
         let triangles = triangle_payload(hierarchy, &triangle_nodes)?;
         let voxel_triangles = voxel_payload(voxel)?;
         let mut measured = AppearanceError::default();
+        // The modes swing the triangles and leave the aggregate still, so the transition is
+        // measured at both ends of that swing: undisplaced (the shape difference alone) and
+        // displaced by the saturated modal amplitude (the difference a distant plant shows
+        // when the cut takes its motion away). The component-wise maximum is the bound.
+        let extent = bounds_extent(node.bounds);
+        let displacements = if modal.is_zero() {
+            vec![0.0]
+        } else {
+            vec![0.0, modal.displacement(extent)]
+        };
         for fixture in fixtures {
-            let triangle_image =
-                render_reference(&triangles, node.bounds, *fixture, resolution as usize);
-            let voxel_image =
-                render_reference(&voxel_triangles, node.bounds, *fixture, resolution as usize);
-            measured = measured.max(measure_images(
-                &triangle_image,
-                &voxel_image,
+            let voxel_image = render_reference(
+                &voxel_triangles,
                 node.bounds,
                 *fixture,
                 resolution as usize,
-            ));
+                0.0,
+            );
+            for across in &displacements {
+                let triangle_image = render_reference(
+                    &triangles,
+                    node.bounds,
+                    *fixture,
+                    resolution as usize,
+                    *across,
+                );
+                measured = measured.max(measure_images(
+                    &triangle_image,
+                    &voxel_image,
+                    node.bounds,
+                    *fixture,
+                    resolution as usize,
+                ));
+            }
         }
         comparisons.push(TriangleVoxelReferenceComparison {
             voxel_node: node.id,
@@ -251,11 +311,18 @@ fn voxel_payload(voxel: &PortableVoxelBrick) -> Result<Vec<ReferenceTriangle>> {
     Ok(output)
 }
 
+/// Renders `triangles` under `fixture`, optionally displaced `across` local units along the
+/// view's horizontal screen axis — the direction that moves a silhouette most, and so the
+/// worst case for a mode the aggregate does not apply. The projection is parallel, so
+/// displacing the geometry one way is the same as displacing every ray origin the other, and
+/// the framing stays on `bounds`: geometry the displacement pushes out of frame reads as lost
+/// silhouette, which is what it is.
 fn render_reference(
     triangles: &[ReferenceTriangle],
     bounds: PortableBounds,
     fixture: HierarchyReferenceFixture,
     resolution: usize,
+    across: f32,
 ) -> Vec<Option<ReferenceSample>> {
     let view = fixture.view_direction.normalize();
     let helper = if view.z.abs() < 0.9 { Vec3::Z } else { Vec3::Y };
@@ -273,7 +340,7 @@ fn render_reference(
         for x in 0..resolution {
             let px = projected_x.0 + (x as f32 + 0.5) * width / resolution as f32;
             let py = projected_y.0 + (y as f32 + 0.5) * height / resolution as f32;
-            let origin = right * px + up * py + view * origin_depth;
+            let origin = right * (px - across) + up * py + view * origin_depth;
             let mut nearest = f32::INFINITY;
             let mut sample = None;
             for triangle in triangles {
@@ -436,6 +503,13 @@ fn average_error(total: u128, count: u128) -> u32 {
     u32::try_from((total + count / 2) / count).unwrap_or(u32::MAX)
 }
 
+/// The node's largest local-space side, the lever the branch mode swings over inside it.
+fn bounds_extent(bounds: PortableBounds) -> f32 {
+    (0..3)
+        .map(|axis| (bounds.max_bits[axis] - bounds.min_bits[axis]) as f32 / 65_536.0)
+        .fold(0.0_f32, f32::max)
+}
+
 fn bounds_corners(bounds: PortableBounds) -> [Vec3; 8] {
     std::array::from_fn(|corner| {
         Vec3::from_array(std::array::from_fn(|axis| {
@@ -482,6 +556,57 @@ fn ray_triangle(origin: Vec3, direction: Vec3, positions: [Vec3; 3]) -> Option<f
     (distance >= 0.0).then_some(distance)
 }
 
+/// What one calibration pass changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoxelErrorCalibration {
+    /// Voxel nodes whose declared error was widened to cover what a render actually showed.
+    pub widened: Vec<u32>,
+    /// Voxel nodes measured, widened or not.
+    pub measured: u32,
+}
+
+/// Derives each aggregate-voxel node's declared appearance error from a measured render instead of
+/// from the analytic estimate the cooker starts with.
+///
+/// The cooker's estimate is a function of the brick's bounds and material moments — cheap, and
+/// necessarily a guess about how wrong the aggregate will *look*. The cut selector then trusts that
+/// number to decide when a voxel brick may stand in for triangles. When the estimate is low, the
+/// swap happens too early and pops on screen; the fix is not a fudge factor but a measurement.
+///
+/// This renders every transition device-free, takes the component-wise maximum across the fixtures,
+/// and widens any declared error the measurement exceeds. It only ever widens: a measured error
+/// below the estimate means the estimate was conservative, and narrowing to the measurement would
+/// trust a finite fixture set to have found the worst view.
+///
+/// # Errors
+///
+/// Propagates the reference comparison's errors: an invalid hierarchy, an empty fixture set, or a
+/// resolution outside `8..=512`.
+pub fn calibrate_voxel_appearance_error(
+    hierarchy: &mut PortableVirtualHierarchy,
+    fixtures: &[HierarchyReferenceFixture],
+    resolution: u32,
+    modal: ModalAggregationBound,
+) -> Result<VoxelErrorCalibration> {
+    let comparisons = compare_triangle_voxel_transitions(hierarchy, fixtures, resolution, modal)?;
+    let mut calibration = VoxelErrorCalibration {
+        widened: Vec::new(),
+        measured: u32::try_from(comparisons.len()).unwrap_or(u32::MAX),
+    };
+    for comparison in &comparisons {
+        if comparison.is_within_declared_error() {
+            continue;
+        }
+        let node = hierarchy
+            .nodes
+            .get_mut(comparison.voxel_node as usize)
+            .ok_or_else(|| reference_error("node"))?;
+        node.appearance_error = node.appearance_error.max(comparison.measured);
+        calibration.widened.push(comparison.voxel_node);
+    }
+    Ok(calibration)
+}
+
 fn reference_error(field: &str) -> Error {
     Error::HierarchyFormat {
         format: "portable hierarchy reference",
@@ -520,12 +645,108 @@ mod tests {
         }
     }
 
+    /// A comb of thin separated blades.
+    ///
+    /// The calibration fixture has to be geometry the analytic estimate is blind to, and thin
+    /// features are exactly that: a voxel brick at its own resolution fills the gaps between the
+    /// blades, so the aggregate reads as a slab while the triangles read as a comb. The estimate
+    /// derives from bounds and occupancy and cannot see the difference.
+    fn comb() -> Mesh {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for blade in 0..6_u32 {
+            let x = -1.0 + blade as f32 * 0.34;
+            let base = vertices.len() as u32;
+            for corner in [
+                Vec3::new(x, -1.0, -0.02),
+                Vec3::new(x + 0.06, -1.0, -0.02),
+                Vec3::new(x + 0.06, 1.0, 0.02),
+                Vec3::new(x, 1.0, 0.02),
+            ] {
+                vertices.push(Vertex {
+                    position: corner,
+                    normal: Vec3::Z,
+                    ..Vertex::default()
+                });
+            }
+            indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        let index_count = indices.len() as u32;
+        Mesh {
+            vertices,
+            indices,
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count,
+                vertex_offset: 0,
+                material_slot: 0,
+            }],
+        }
+    }
+
+    /// The cooked hierarchy the calibration tests measure and rewrite.
+    fn fixture_hierarchy() -> PortableVirtualHierarchy {
+        let input = PortableHierarchyInput::from_mesh(&comb(), &[]).unwrap();
+        cook_portable_virtual_hierarchy(&input).unwrap()
+    }
+
+    #[test]
+    fn the_modes_an_aggregate_drops_widen_its_declared_error() {
+        // A distant plant keeps the whole-plant sway and loses the per-part branch mode and
+        // leaf flutter, because an aggregate brick has no parts to swing. That loss is an
+        // appearance difference the declared transition error has to cover, and the only way
+        // to know it is covered is to measure the transition with the modes applied to the
+        // triangle side and not to the aggregate — which is what the bound parameter does.
+        let fixtures = canonical_hierarchy_reference_fixtures();
+        let input = PortableHierarchyInput::from_mesh(&tetrahedron(), &[]).unwrap();
+        let mut still = cook_portable_virtual_hierarchy(&input).unwrap();
+        let mut moving = still.clone();
+        calibrate_voxel_appearance_error(
+            &mut still,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("still calibration");
+        let modes = ModalAggregationBound {
+            branch: 0.5,
+            flutter: 0.2,
+        };
+        assert!(!modes.is_zero());
+        calibrate_voxel_appearance_error(&mut moving, &fixtures, 32, modes)
+            .expect("moving calibration");
+
+        // Only ever wider: the modal pass adds measurements, it never removes one, so no node
+        // may come out narrower than the still calibration left it.
+        for (moving, still) in moving.nodes.iter().zip(&still.nodes) {
+            assert!(moving.appearance_error.silhouette >= still.appearance_error.silhouette);
+            assert!(moving.appearance_error.coverage >= still.appearance_error.coverage);
+            assert!(moving.appearance_error.transmission >= still.appearance_error.transmission);
+            assert!(moving.appearance_error.material >= still.appearance_error.material);
+        }
+        // And strictly wider somewhere, or the bound is inert and this proves nothing.
+        assert!(
+            moving
+                .nodes
+                .iter()
+                .zip(&still.nodes)
+                .any(|(moving, still)| moving.appearance_error != still.appearance_error),
+            "the dropped modes changed no declared error"
+        );
+    }
+
     #[test]
     fn reference_renderer_measures_all_components_over_direction_fixtures() {
         let input = PortableHierarchyInput::from_mesh(&tetrahedron(), &[]).unwrap();
         let hierarchy = cook_portable_virtual_hierarchy(&input).unwrap();
         let fixtures = canonical_hierarchy_reference_fixtures();
-        let comparisons = compare_triangle_voxel_transitions(&hierarchy, &fixtures, 32).unwrap();
+        let comparisons = compare_triangle_voxel_transitions(
+            &hierarchy,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .unwrap();
         assert!(!comparisons.is_empty());
         assert!(comparisons.iter().all(|comparison| {
             comparison.fixture_count == fixtures.len() as u32
@@ -537,5 +758,102 @@ mod tests {
                 .iter()
                 .any(|comparison| comparison.measured.silhouette > 0)
         );
+    }
+
+    #[test]
+    fn calibration_makes_every_transition_fit_its_declared_error() {
+        // The property the cut selector needs: after calibration, no voxel node claims to be a
+        // better stand-in than a render says it is. Before it, the declared value is an analytic
+        // guess, and a low guess swaps to the aggregate too early and pops.
+        let mut hierarchy = fixture_hierarchy();
+        let fixtures = canonical_hierarchy_reference_fixtures();
+        let before = compare_triangle_voxel_transitions(
+            &hierarchy,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("the fixture measures");
+        assert!(!before.is_empty(), "the fixture has transitions to measure");
+
+        let calibration = calibrate_voxel_appearance_error(
+            &mut hierarchy,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("calibration runs");
+        assert_eq!(calibration.measured as usize, before.len());
+        // Without this the assertion below would pass on a hierarchy whose analytic estimate
+        // already covered every measurement, proving nothing about the calibration.
+        assert!(
+            !calibration.widened.is_empty(),
+            "the fixture must actually need widening"
+        );
+
+        let after = compare_triangle_voxel_transitions(
+            &hierarchy,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("the calibrated fixture measures");
+        for comparison in &after {
+            assert!(
+                comparison.is_within_declared_error(),
+                "node {} still exceeds its declared error",
+                comparison.voxel_node
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_only_widens() {
+        // A measured error below the estimate means the estimate was conservative. Narrowing to
+        // the measurement would trust a finite fixture set to have found the worst view, which is
+        // exactly the assumption a measured calibration exists to avoid.
+        let mut hierarchy = fixture_hierarchy();
+        let declared: Vec<AppearanceError> = hierarchy
+            .nodes
+            .iter()
+            .map(|node| node.appearance_error)
+            .collect();
+        calibrate_voxel_appearance_error(
+            &mut hierarchy,
+            &canonical_hierarchy_reference_fixtures(),
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("calibration runs");
+        for (node, before) in hierarchy.nodes.iter().zip(&declared) {
+            assert!(node.appearance_error.silhouette >= before.silhouette);
+            assert!(node.appearance_error.coverage >= before.coverage);
+            assert!(node.appearance_error.transmission >= before.transmission);
+            assert!(node.appearance_error.material >= before.material);
+            assert!(node.appearance_error.normal_distribution >= before.normal_distribution);
+        }
+    }
+
+    #[test]
+    fn calibration_is_idempotent() {
+        // A second pass has nothing left to widen, which is what "the declared value now covers
+        // the measurement" means operationally — and what a cooker re-running it must rely on.
+        let mut hierarchy = fixture_hierarchy();
+        let fixtures = canonical_hierarchy_reference_fixtures();
+        calibrate_voxel_appearance_error(
+            &mut hierarchy,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("first pass");
+        let second = calibrate_voxel_appearance_error(
+            &mut hierarchy,
+            &fixtures,
+            32,
+            ModalAggregationBound::default(),
+        )
+        .expect("second pass");
+        assert!(second.widened.is_empty());
     }
 }
