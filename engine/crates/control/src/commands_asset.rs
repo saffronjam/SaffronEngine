@@ -2835,9 +2835,106 @@ fn container_clips(
 }
 
 /// Grows one native family's graph and reports what it produced.
+/// The growth budget a preview request names, or the cook budget when it names none.
+fn preview_budget(axes: Option<u32>, elements: Option<u32>) -> saffron_vegetation::BotanicalBudget {
+    saffron_vegetation::BotanicalBudget {
+        axes: axes.map(|value| value as usize),
+        elements: elements.map(|value| value as usize),
+        cancellation: None,
+    }
+}
+
+/// One authored appearance on the wire.
+fn phenotype_dto(
+    phenotype: &saffron_vegetation::PlantPhenotype,
+) -> saffron_protocol::PlantPhenotypeDto {
+    use saffron_vegetation::PhenotypeRole;
+    saffron_protocol::PlantPhenotypeDto {
+        id: phenotype.id,
+        role: match phenotype.role {
+            PhenotypeRole::Healthy => saffron_protocol::PhenotypeRoleDto::Healthy,
+            PhenotypeRole::Harvested => saffron_protocol::PhenotypeRoleDto::Harvested,
+            PhenotypeRole::Damaged => saffron_protocol::PhenotypeRoleDto::Damaged,
+            PhenotypeRole::Burned => saffron_protocol::PhenotypeRoleDto::Burned,
+            PhenotypeRole::Dead => saffron_protocol::PhenotypeRoleDto::Dead,
+            PhenotypeRole::Flowering => saffron_protocol::PhenotypeRoleDto::Flowering,
+            PhenotypeRole::Fruiting => saffron_protocol::PhenotypeRoleDto::Fruiting,
+            PhenotypeRole::Senescent => saffron_protocol::PhenotypeRoleDto::Senescent,
+            PhenotypeRole::Wet => saffron_protocol::PhenotypeRoleDto::Wet,
+        },
+        variation: phenotype.variation,
+        season_window: phenotype
+            .season_window
+            .map(|(start, end)| [u32::from(start), u32::from(end)]),
+        material_remap: phenotype
+            .material_remap
+            .iter()
+            .map(|(from, to)| [*from, *to])
+            .collect(),
+        // Part identities are u128 and stay strings end to end; narrowing one through a JSON
+        // number would corrupt it silently.
+        active_parts: phenotype
+            .active_parts
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
+}
+
+fn phenotype_from_dto(
+    dto: &saffron_protocol::PlantPhenotypeDto,
+) -> Result<saffron_vegetation::PlantPhenotype> {
+    use saffron_vegetation::PhenotypeRole;
+    let season_window = dto
+        .season_window
+        .map(|[start, end]| {
+            let narrow = |value: u32| {
+                u16::try_from(value)
+                    .ok()
+                    .filter(|value| *value < 1000)
+                    .ok_or_else(|| {
+                        Error::command("seasonWindow is per-mille of the year (0..1000)")
+                    })
+            };
+            Result::Ok((narrow(start)?, narrow(end)?))
+        })
+        .transpose()?;
+    Ok(saffron_vegetation::PlantPhenotype {
+        id: dto.id,
+        role: match dto.role {
+            saffron_protocol::PhenotypeRoleDto::Healthy => PhenotypeRole::Healthy,
+            saffron_protocol::PhenotypeRoleDto::Harvested => PhenotypeRole::Harvested,
+            saffron_protocol::PhenotypeRoleDto::Damaged => PhenotypeRole::Damaged,
+            saffron_protocol::PhenotypeRoleDto::Burned => PhenotypeRole::Burned,
+            saffron_protocol::PhenotypeRoleDto::Dead => PhenotypeRole::Dead,
+            saffron_protocol::PhenotypeRoleDto::Flowering => PhenotypeRole::Flowering,
+            saffron_protocol::PhenotypeRoleDto::Fruiting => PhenotypeRole::Fruiting,
+            saffron_protocol::PhenotypeRoleDto::Senescent => PhenotypeRole::Senescent,
+            saffron_protocol::PhenotypeRoleDto::Wet => PhenotypeRole::Wet,
+        },
+        season_window,
+        variation: dto.variation,
+        material_remap: dto
+            .material_remap
+            .iter()
+            .map(|[from, to]| (*from, *to))
+            .collect(),
+        active_parts: dto
+            .active_parts
+            .iter()
+            .map(|part| {
+                part.parse::<u128>()
+                    .map_err(|_| Error::command("activeParts entries are decimal part identities"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
 fn plant_growth_dto(
+    assets: &saffron_assets::AssetServer,
     family: &saffron_vegetation::PlantFamilyAsset,
     variation: u32,
+    budget: &saffron_vegetation::BotanicalBudget,
 ) -> Result<saffron_protocol::BotanicalGrowthDto> {
     let saffron_vegetation::PlantFamilySource::Native { graph, .. } = &family.source else {
         return Err(Error::command(
@@ -2848,7 +2945,8 @@ fn plant_growth_dto(
         .variations
         .get(variation as usize)
         .ok_or_else(|| Error::command(format!("plant family declares no variation {variation}")))?;
-    let growth = saffron_vegetation::grow(graph, variation as usize)
+    let modules = saffron_assets::PlantModules::for_family(assets, family);
+    let growth = saffron_vegetation::grow(graph, variation as usize, &modules, budget)
         .map_err(|error| Error::command(error.to_string()))?;
     let assembly = &growth.assembly;
     let geometry = saffron_vegetation::normalize_botanical_geometry(
@@ -2861,6 +2959,7 @@ fn plant_growth_dto(
         .map_err(|error| Error::command(error.to_string()))?;
     let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     Ok(saffron_protocol::BotanicalGrowthDto {
+        truncated: growth.truncated,
         graph: graph.identity().to_string(),
         variation,
         seed: individual.seed.to_string(),
@@ -3198,9 +3297,15 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                 params.name.trim(),
                 graph,
                 materials,
+                &saffron_vegetation::NoBotanicalModules,
             )
             .map_err(|error| Error::command(error.to_string()))?;
-            let growth = plant_growth_dto(&family, 0)?;
+            let growth = plant_growth_dto(
+                ctx.assets,
+                &family,
+                0,
+                &saffron_vegetation::BotanicalBudget::COOK,
+            )?;
             let folder = if params.folder.trim().is_empty() {
                 "plants"
             } else {
@@ -3240,7 +3345,12 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                     .iter()
                     .map(crate::botanical_dto::graft_source_dto)
                     .collect(),
-                growth: plant_growth_dto(&plant, params.variation)?,
+                growth: plant_growth_dto(
+                    ctx.assets,
+                    &plant,
+                    params.variation,
+                    &preview_budget(params.max_axes, params.max_elements),
+                )?,
             })
         },
     );
@@ -3284,11 +3394,16 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
             grafts.sort_by_key(|graft| graft.id);
             // The family's parts, spines, and dimensions are what the new graph grows, never the
             // previous graph's leftovers: a native family's structure is a result.
+            // The regrown family inherits the module table it is called with: `plant-graph-set`
+            // replaces the graph, and a graph whose module calls lost their bindings would fail
+            // validation on the way back in.
+            let module_resolver = saffron_assets::PlantModules::for_family(ctx.assets, &existing);
             let mut updated = saffron_vegetation::native_plant_family(
                 id,
                 &existing.name,
                 graph,
                 existing.material_slots.clone(),
+                &module_resolver,
             )
             .map_err(|error| Error::command(error.to_string()))?;
             if let saffron_vegetation::PlantFamilySource::Native {
@@ -3320,10 +3435,319 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                     .iter()
                     .map(crate::botanical_dto::graft_source_dto)
                     .collect(),
-                growth: plant_growth_dto(&updated, 0)?,
+                growth: plant_growth_dto(
+                    ctx.assets,
+                    &updated,
+                    0,
+                    &saffron_vegetation::BotanicalBudget::COOK,
+                )?,
             })
         },
     );
+    reg.register::<
+        saffron_protocol::PlantPhenotypesParams,
+        saffron_protocol::PlantPhenotypesResult,
+    >(
+        "plant-phenotypes",
+        "plant-phenotypes {plant, phenotypes?} — read or replace one family's authored appearances",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let mut plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            if let Some(phenotypes) = &params.phenotypes {
+                plant.phenotypes = phenotypes
+                    .iter()
+                    .map(phenotype_from_dto)
+                    .collect::<Result<Vec<_>>>()?;
+                // The family validator is the authority, not this command: it is what knows a
+                // phenotype must name a declared variation, that two on one variation may not share
+                // a role, that a remap must move between real slots, and that a family needs a
+                // healthy appearance. Rejecting here would be a second rule to keep in sync.
+                saffron_vegetation::validate_plant_family(&plant)
+                    .map_err(|error| Error::command(error.to_string()))?;
+                saffron_assets::update_plant_family_asset(ctx.assets, id, &plant)
+                    .map_err(|error| Error::command(error.to_string()))?;
+            }
+            Ok(saffron_protocol::PlantPhenotypesResult {
+                plant: WireUuid(id.value()),
+                phenotypes: plant.phenotypes.iter().map(phenotype_dto).collect(),
+            })
+        },
+    );
+    reg.register::<saffron_protocol::PlantProxiesParams, saffron_protocol::PlantProxiesResult>(
+        "plant-proxies",
+        "plant-proxies {plant} — the collision and navigation proxies a family derived",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let metres = |value: saffron_spatial::DecisionScalar| value.bits() as f32 / 65_536.0;
+            Ok(saffron_protocol::PlantProxiesResult {
+                plant: WireUuid(id.value()),
+                collision: plant
+                    .collision_proxies
+                    .iter()
+                    .map(|proxy| saffron_protocol::PlantCollisionProxyDto {
+                        shape: match proxy.shape {
+                            saffron_vegetation::PlantCollisionShape::Box => {
+                                saffron_protocol::PlantCollisionShapeDto::Box
+                            }
+                            saffron_vegetation::PlantCollisionShape::Sphere => {
+                                saffron_protocol::PlantCollisionShapeDto::Sphere
+                            }
+                            saffron_vegetation::PlantCollisionShape::Capsule => {
+                                saffron_protocol::PlantCollisionShapeDto::Capsule
+                            }
+                            saffron_vegetation::PlantCollisionShape::ConvexHull => {
+                                saffron_protocol::PlantCollisionShapeDto::ConvexHull
+                            }
+                        },
+                        center_m: [
+                            metres(proxy.center[0]),
+                            metres(proxy.center[1]),
+                            metres(proxy.center[2]),
+                        ],
+                        dimensions_m: [
+                            metres(proxy.dimensions[0]),
+                            metres(proxy.dimensions[1]),
+                            metres(proxy.dimensions[2]),
+                        ],
+                        breakable: proxy.breakable,
+                    })
+                    .collect(),
+                navigation: plant
+                    .navigation_proxies
+                    .iter()
+                    .map(|proxy| saffron_protocol::PlantNavigationProxyDto {
+                        footprint_m: proxy
+                            .footprint
+                            .iter()
+                            .map(|point| [metres(point[0]), metres(point[1])])
+                            .collect(),
+                        height_m: metres(proxy.height),
+                        cost: f32::from(proxy.cost.bits()) / 65_535.0,
+                    })
+                    .collect(),
+            })
+        },
+    );
+
+    reg.register::<
+        saffron_protocol::PlantSeasonPhenotypeParams,
+        saffron_protocol::PlantSeasonPhenotypeResult,
+    >(
+        "plant-season-phenotype",
+        "plant-season-phenotype {plant, seasonMille, lifecycle?} — the appearance a family renders then",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            if params.season_mille > 999 {
+                return Err(Error::command("seasonMille is per-mille of the year (0..1000)"));
+            }
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let lifecycle = params.lifecycle.map_or(
+                saffron_vegetation::PlantLifecycle::Mature,
+                crate::commands_vegetation_runtime::lifecycle_from_dto,
+            );
+            // The engine's own resolver, not a second reading of the same rules: lifecycle wins
+            // over season (a dead plant does not turn autumnal), and the cooked phenotype is the
+            // fallback throughout. A preview that resolved this differently from the renderer would
+            // be showing an appearance the scene never picks.
+            let phenotype = saffron_vegetation::resolve_rendered_phenotype(
+                plant
+                    .phenotypes
+                    .iter()
+                    .map(|entry| (entry.id, entry.role, entry.season_window)),
+                plant.phenotypes.first().map_or(0, |entry| entry.id),
+                lifecycle,
+                u16::try_from(params.season_mille).unwrap_or(0),
+            );
+            let variation = plant
+                .phenotypes
+                .iter()
+                .find(|entry| entry.id == phenotype)
+                .map_or(0, |entry| entry.variation);
+            Ok(saffron_protocol::PlantSeasonPhenotypeResult {
+                plant: WireUuid(id.value()),
+                phenotype,
+                variation,
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::PlantHierarchyParams, saffron_protocol::PlantHierarchyResult>(
+        "plant-hierarchy",
+        "plant-hierarchy {plant} — the cooked cut: each node's representation, page, and declared error",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let options = saffron_assets::PlantRecookOptions {
+                limits: PlantCompileLimits::default(),
+                versions: vegetation_cook_versions(),
+                platform: portable_vegetation_platform_profile(None),
+            };
+            let published = match recook_plant_family(ctx.assets, &plant, &options)
+                .map_err(Error::from)?
+            {
+                saffron_assets::PlantRecookOutcome::Published(published) => published,
+                saffron_assets::PlantRecookOutcome::Rejected(_) => {
+                    return Err(Error::command(
+                        "plant family does not validate — run plant-validate for diagnostics",
+                    ));
+                }
+            };
+            let hierarchy = saffron_assets::plant_family_hierarchy(
+                ctx.assets,
+                published.publication.content_hash,
+            )
+            .map_err(Error::from)?;
+            // Depth is computed once here rather than left to the reader: a caller that walked
+            // parents per row would be O(n²) on a family with thousands of nodes, and the shape of
+            // the cut is the first thing anyone looks at.
+            //
+            // The walk goes DOWN from the roots rather than reading each node's parent in array
+            // order. The cooker emits leaves before the roots that own them, so a parent's depth is
+            // usually still unset when its child is visited, and an array-order pass reports every
+            // node one level below its root — a two-level family reads as if it were flat.
+            let mut depth = vec![0_u32; hierarchy.nodes.len()];
+            let mut frontier: Vec<u32> = hierarchy.roots.clone();
+            let mut visited = vec![false; hierarchy.nodes.len()];
+            for root in &frontier {
+                if let Some(seen) = visited.get_mut(*root as usize) {
+                    *seen = true;
+                }
+            }
+            while let Some(index) = frontier.pop() {
+                let Some(node) = hierarchy.nodes.get(index as usize) else {
+                    continue;
+                };
+                let child_depth = depth[index as usize].saturating_add(1);
+                for child in &node.children {
+                    // The guard is against a malformed tree, not an expected shape: a cycle would
+                    // otherwise spin here forever.
+                    match visited.get_mut(*child as usize) {
+                        Some(seen) if !*seen => *seen = true,
+                        _ => continue,
+                    }
+                    depth[*child as usize] = child_depth;
+                    frontier.push(*child);
+                }
+            }
+            let mut triangle_nodes = 0;
+            let mut voxel_nodes = 0;
+            let nodes = hierarchy
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    let (representation, primitives) = match node.representation {
+                        saffron_geometry::HierarchyRepresentation::Triangles { count, .. } => {
+                            triangle_nodes += 1;
+                            ("triangles", count)
+                        }
+                        saffron_geometry::HierarchyRepresentation::Voxel { brick } => {
+                            voxel_nodes += 1;
+                            let triangles = hierarchy
+                                .voxel_bricks
+                                .get(brick as usize)
+                                .map_or(0, |brick| {
+                                    u32::try_from(brick.indices.len() / 3).unwrap_or(u32::MAX)
+                                });
+                            ("voxel", triangles)
+                        }
+                    };
+                    saffron_protocol::PlantHierarchyNodeDto {
+                        id: node.id,
+                        parent: node.parent,
+                        depth: depth.get(index).copied().unwrap_or(0),
+                        representation: representation.to_owned(),
+                        primitives,
+                        page: node.page,
+                        child_count: u32::try_from(node.children.len()).unwrap_or(u32::MAX),
+                        appearance_error: saffron_protocol::AppearanceErrorDto {
+                            silhouette: node.appearance_error.silhouette,
+                            coverage: node.appearance_error.coverage,
+                            transmission: node.appearance_error.transmission,
+                            material: node.appearance_error.material,
+                            normal_distribution: node.appearance_error.normal_distribution,
+                            total: node.appearance_error.total,
+                        },
+                    }
+                })
+                .collect();
+            Ok(saffron_protocol::PlantHierarchyResult {
+                plant: WireUuid(id.value()),
+                triangle_nodes,
+                voxel_nodes,
+                nodes,
+            })
+        },
+    );
+
+    reg.register::<saffron_protocol::PlantAtlasParams, saffron_protocol::PlantAtlasResult>(
+        "plant-atlas",
+        "plant-atlas {plant, level?} — one cooked family's packed coverage atlas as a PNG",
+        |ctx, params| {
+            require_project_loaded(ctx)?;
+            let id = resolve_asset(ctx, &params.plant)?;
+            let plant = load_plant_family_asset(ctx.assets, id)
+                .map_err(|error| Error::command(error.to_string()))?;
+            let options = saffron_assets::PlantRecookOptions {
+                limits: PlantCompileLimits::default(),
+                versions: vegetation_cook_versions(),
+                platform: portable_vegetation_platform_profile(None),
+            };
+            // Recooking is a cache hit for a family already cooked, so this reads the published
+            // artifact rather than packing a second atlas — the family's UVs address exactly one
+            // layout, and a fresh packing would not be it.
+            let published =
+                match recook_plant_family(ctx.assets, &plant, &options).map_err(Error::from)? {
+                    saffron_assets::PlantRecookOutcome::Published(published) => published,
+                    saffron_assets::PlantRecookOutcome::Rejected(_) => {
+                        return Err(Error::command(
+                            "plant family does not validate — run plant-validate for diagnostics",
+                        ));
+                    }
+                };
+            let atlas = saffron_assets::plant_family_atlas_image(
+                ctx.assets,
+                published.publication.content_hash,
+                params.level,
+            )
+            .map_err(Error::from)?
+            .ok_or_else(|| {
+                Error::command(
+                    "this family cooked no packed atlas: its slots resolve to catalog materials",
+                )
+            })?;
+            Ok(saffron_protocol::PlantAtlasResult {
+                plant: WireUuid(id.value()),
+                level: params.level,
+                level_count: atlas.level_count,
+                width: atlas.width,
+                height: atlas.height,
+                gutter: atlas.gutter,
+                placements: atlas
+                    .placements
+                    .iter()
+                    .map(|placement| saffron_protocol::PlantAtlasPlacementDto {
+                        slot: placement.slot,
+                        x: placement.x,
+                        y: placement.y,
+                        width: placement.width,
+                        height: placement.height,
+                    })
+                    .collect(),
+                base64: base64_encode(&atlas.png),
+            })
+        },
+    );
+
     reg.register::<saffron_protocol::PlantGrowthParams, saffron_protocol::PlantElementsResult>(
         "plant-elements",
         "every element of one native plant family a manual edit can address",
@@ -3337,8 +3761,14 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
                     "plant family has an imported source, not a botanical graph",
                 ));
             };
-            let growth = saffron_vegetation::grow(graph, params.variation as usize)
-                .map_err(|error| Error::command(error.to_string()))?;
+            let modules = saffron_assets::PlantModules::for_family(ctx.assets, &plant);
+            let growth = saffron_vegetation::grow(
+                graph,
+                params.variation as usize,
+                &modules,
+                &saffron_vegetation::BotanicalBudget::COOK,
+            )
+            .map_err(|error| Error::command(error.to_string()))?;
             Ok(saffron_protocol::PlantElementsResult {
                 plant: WireUuid(id.value()),
                 axes: growth
@@ -3364,7 +3794,12 @@ pub fn register_plant_commands(reg: &mut CommandRegistry) {
             let id = resolve_asset(ctx, &params.plant)?;
             let plant = load_plant_family_asset(ctx.assets, id)
                 .map_err(|error| Error::command(error.to_string()))?;
-            plant_growth_dto(&plant, params.variation)
+            plant_growth_dto(
+                ctx.assets,
+                &plant,
+                params.variation,
+                &preview_budget(params.max_axes, params.max_elements),
+            )
         },
     );
     reg.register::<PlantValidateParams, PlantValidationResult>(
@@ -6497,6 +6932,9 @@ mod tests {
         let material = save_material_asset(ctx.assets, &default_material_asset(), "Leaf", "plants")
             .expect("save plant material");
         let plant = PlantFamilyAsset {
+            role: saffron_vegetation::PlantFamilyRole::Family,
+            modules: Vec::new(),
+            module_recursion_limit: saffron_vegetation::MAX_PLANT_MODULE_RECURSION,
             version: PLANT_ASSET_VERSION,
             id: saffron_core::Uuid(9_100),
             name: "Oak".to_owned(),
@@ -6606,6 +7044,174 @@ mod tests {
             assert_eq!(scan["ok"], json!(true));
             assert_eq!(scan["result"]["added"], json!(0));
             assert_eq!(scan["result"]["removed"], json!(0));
+        });
+    }
+
+    /// `plant-phenotypes` reads a family's appearances and replaces them as one operation,
+    /// refusing a set the family validator will not accept.
+    #[test]
+    fn plant_phenotypes_reads_replaces_and_refuses_an_invalid_set() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "phenotypes");
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
+            let plant = seed_native_plant(ctx);
+
+            // A scaffolded family carries exactly one appearance, which is why nothing could
+            // author a transition before this command existed.
+            let read = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-phenotypes", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(read["ok"], json!(true));
+            assert_eq!(
+                read["result"]["phenotypes"].as_array().map(Vec::len),
+                Some(1)
+            );
+            assert_eq!(read["result"]["phenotypes"][0]["role"], json!("healthy"));
+
+            // A second appearance on the same variation with a different role is exactly what a
+            // seasonal transition needs, and what the family validator allows.
+            let replaced = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "plant-phenotypes",
+                    "params": {
+                        "plant": plant.to_string(),
+                        "phenotypes": [
+                            { "id": 0, "role": "healthy", "variation": 0 },
+                            { "id": 1, "role": "senescent", "variation": 0, "seasonWindow": [700, 900] },
+                        ],
+                    },
+                }),
+            );
+            assert_eq!(replaced["ok"], json!(true));
+            assert_eq!(
+                replaced["result"]["phenotypes"].as_array().map(Vec::len),
+                Some(2)
+            );
+
+            // It persisted rather than only being echoed: a later read sees the new set.
+            let again = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-phenotypes", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(again["result"]["phenotypes"][1]["role"], json!("senescent"));
+            assert_eq!(
+                again["result"]["phenotypes"][1]["seasonWindow"],
+                json!([700, 900])
+            );
+
+            // And the validator is the authority: a family with no healthy appearance is refused,
+            // and refusing means the stored set did not change.
+            let refused = reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "plant-phenotypes",
+                    "params": {
+                        "plant": plant.to_string(),
+                        "phenotypes": [{ "id": 0, "role": "senescent", "variation": 0 }],
+                    },
+                }),
+            );
+            assert_eq!(refused["ok"], json!(false));
+            let unchanged = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-phenotypes", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(
+                unchanged["result"]["phenotypes"].as_array().map(Vec::len),
+                Some(2),
+                "a refused replacement still changed the family"
+            );
+        });
+    }
+
+    /// `plant-season-phenotype` resolves through the engine's own rule: lifecycle first, then the
+    /// seasonal window, with the cooked phenotype as the fallback.
+    #[test]
+    fn plant_season_phenotype_follows_lifecycle_then_season() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "season");
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
+            let plant = seed_native_plant(ctx);
+            reg.dispatch(
+                ctx,
+                &json!({
+                    "cmd": "plant-phenotypes",
+                    "params": {
+                        "plant": plant.to_string(),
+                        "phenotypes": [
+                            { "id": 0, "role": "healthy", "variation": 0 },
+                            { "id": 1, "role": "senescent", "variation": 0, "seasonWindow": [600, 800] },
+                        ],
+                    },
+                }),
+            );
+            let mut at = |mille: u32, lifecycle: Option<&str>| {
+                let mut params = json!({ "plant": plant.to_string(), "seasonMille": mille });
+                if let Some(state) = lifecycle {
+                    params["lifecycle"] = json!(state);
+                }
+                reg.dispatch(
+                    ctx,
+                    &json!({ "cmd": "plant-season-phenotype", "params": params }),
+                )
+            };
+
+            // Inside the authored window the senescent appearance wins; outside it the healthy one
+            // does. Both directions, because a resolver stuck on either answer passes one of them.
+            assert_eq!(at(700, None)["result"]["phenotype"], json!(1));
+            assert_eq!(at(100, None)["result"]["phenotype"], json!(0));
+
+            // Lifecycle overrides the season: a dead plant in autumn is dead, not autumnal. With no
+            // dead appearance authored it falls back to the cooked one rather than taking the
+            // seasonal match, which is the part a season-first resolver gets wrong.
+            assert_eq!(at(700, Some("dead"))["result"]["phenotype"], json!(0));
+
+            // And the range is guarded rather than wrapped silently.
+            assert_eq!(at(1000, None)["ok"], json!(false));
+        });
+    }
+
+    /// `plant-proxies` reports the derived proxies in metres, which is what the overlay draws.
+    #[test]
+    fn plant_proxies_reports_what_the_family_derived() {
+        let reg = registry();
+        let mut renderer = StubRenderer::default();
+        with_stub(&mut renderer, |ctx| {
+            scratch_root(ctx, "proxies");
+            ctx.scene_edit.project_phase = ProjectPhase::Ready;
+            let plant = seed_native_plant(ctx);
+            let reply = reg.dispatch(
+                ctx,
+                &json!({ "cmd": "plant-proxies", "params": { "plant": plant.to_string() } }),
+            );
+            assert_eq!(reply["ok"], json!(true));
+
+            // Proxies are derived, so a family that grew nothing thick enough legitimately reports
+            // none. What must hold either way is the SHAPE of the reply — the overlay reads these
+            // fields directly, and a missing array would draw nothing while looking fine.
+            assert!(reply["result"]["collision"].is_array());
+            assert!(reply["result"]["navigation"].is_array());
+            for proxy in reply["result"]["collision"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+            {
+                // Metres, not Q15.16 bits: a dimension in raw fixed point would draw a capsule
+                // sixty-five thousand times too big and look like a broken overlay rather than a
+                // unit mistake.
+                let dimensions = proxy["dimensionsM"].as_array().expect("dimensions");
+                assert_eq!(dimensions.len(), 3);
+                assert!(
+                    dimensions
+                        .iter()
+                        .all(|value| value.as_f64().is_some_and(|v| v < 1.0e4))
+                );
+            }
         });
     }
 
