@@ -13,6 +13,10 @@
 // them, keyed on the flip node so the shares stay exactly complementary. The state
 // advances once per frame (stamp-guarded, so the survivor pass never double-steps).
 //
+// A demand-only walk (`Push::demandOnly`) runs the same descent for its page requests
+// and emits nothing — the shape a view takes when it reads the scene through something
+// other than the record stream but still has to keep what it reads resident.
+//
 // Set 0: b0 = counters (3 records count, 4 record overflow), b1 = visible slot list,
 // b2 = the semantic record stream, b3 = the GPU-scene address block, b4 = the
 // cross-frame transition state table.
@@ -34,8 +38,16 @@ static const uint TRANSITION_MODE_DESCENDED = 2u;
 [[vk::binding(3, 0)]] ConstantBuffer<GpuSceneAddressBlock> sceneAddresses;
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint> transitions;
 
+// Cut overrides for `Push::representationOverride`.
+static const uint SCENE_CUT_AUTO = 0u;
+static const uint SCENE_CUT_FORCE_COARSE = 1u;
+static const uint SCENE_CUT_FORCE_FINE = 2u;
+
 struct Push
 {
+    // World → clip for the node cull. The walk rejects a node whose swept world bounds
+    // leave this frustum and never descends into it.
+    float4x4 viewProj;
     float3 eye;
     float projScale;
     float errorThresholdPx;
@@ -50,7 +62,21 @@ struct Push
     uint transitionFrames;
     // Monotonic frame counter for state staleness and once-per-frame advancement.
     uint frameStamp;
-    uint reserved0;
+    // Debug: pin the hierarchy cut instead of letting projected error choose it.
+    // 0 = follow the error threshold, 1 = never refine (coarsest cut, aggregate voxels),
+    // 2 = always refine (finest cut, triangle clusters). A representation comparison needs
+    // the cut to move while the camera holds still; distance moves both at once.
+    uint representationOverride;
+    // Zero: skip the node cull and walk every node of every visible instance. The
+    // cull is a pure reduction, so a host with it off must render the identical frame.
+    uint nodeCull;
+    // Nonzero: walk for page demand only and emit no draw records. A view that reads
+    // the scene through something other than the record stream still has to keep the
+    // pages it reads resident, and that is the whole of what its walk is for.
+    uint demandOnly;
+    // Which class of view this walk serves; rides every missing-page request so the
+    // CPU prices the demand by who missed rather than treating every miss alike.
+    uint viewClass;
 };
 [[vk::push_constant]] Push pc;
 
@@ -120,11 +146,86 @@ float assemblyUseScale(GpuAssemblyUseRecord use)
     return max((length(c0) + length(c1) + length(c2)) / 3.0, 1e-4);
 }
 
-// The stable flip key of one (instance slot, page) pair — never zero, so zero marks
-// an empty table entry.
-uint transitionKey(uint slot, uint page)
+// Whether this node's swept world bounds leave the view entirely.
+//
+// The local box is the node's DEFORMED bounds: the cooked swept extent, which encloses
+// the node's rest geometry, its authored deformation, and — by the cooker's subtree
+// closure — every descendant. Runtime wind is not cooked, so the world box additionally
+// gains the prepass record's world-space sway slack, the same term the instance sphere
+// adds. A rejected node therefore never hides geometry the frame can see, at any level
+// of the walk, which is what lets the rejection take the whole subtree with it.
+bool nodeCulled(
+    GpuSceneAddressBlock addresses,
+    GpuSceneInstanceGpuRecord instance,
+    uint slot,
+    GpuPageNodeRecord node,
+    GpuGeometryRecord geometry,
+    uint use)
 {
-    uint hash = slot * 0x9e3779b9u ^ page * 0x85ebca6bu;
+    float4 c0, c1, c2, c3;
+    gpuSceneInstanceColumns(instance, false, c0, c1, c2, c3);
+    bool assemblyUse = use != GPU_ASSEMBLY_NO_USE;
+    GpuAssemblyUseRecord useRecord;
+    if (assemblyUse)
+    {
+        useRecord = gpuSceneAssemblyUse(addresses, geometry, geometry.reserved, use);
+    }
+    float3 worldMin = float3(1e30);
+    float3 worldMax = float3(-1e30);
+    for (uint corner = 0u; corner < 8u; ++corner)
+    {
+        float3 local = float3(
+            (corner & 1u) != 0u ? node.deformedMax.x : node.deformedMin.x,
+            (corner & 2u) != 0u ? node.deformedMax.y : node.deformedMin.y,
+            (corner & 4u) != 0u ? node.deformedMax.z : node.deformedMin.z);
+        if (assemblyUse)
+        {
+            local = gpuSceneAssemblyTransformPoint(useRecord, local);
+        }
+        float3 world = c0.xyz * local.x + c1.xyz * local.y + c2.xyz * local.z + c3.xyz;
+        worldMin = min(worldMin, world);
+        worldMax = max(worldMax, world);
+    }
+    if ((instance.flags & GPU_SCENE_INSTANCE_FLAG_WIND) != 0u
+        && addresses.windRecords != 0)
+    {
+        GpuWindInstanceRecord* record = (GpuWindInstanceRecord*)(
+            addresses.windRecords + uint64_t(slot) * GPU_WIND_INSTANCE_RECORD_SIZE);
+        float slack = (*record).boundsInflation;
+        worldMin -= float3(slack);
+        worldMax += float3(slack);
+    }
+    float3 ndcMin = float3(1e30);
+    float3 ndcMax = float3(-1e30);
+    for (uint corner = 0u; corner < 8u; ++corner)
+    {
+        float3 world = float3(
+            (corner & 1u) != 0u ? worldMax.x : worldMin.x,
+            (corner & 2u) != 0u ? worldMax.y : worldMin.y,
+            (corner & 4u) != 0u ? worldMax.z : worldMin.z);
+        float4 clip = mul(pc.viewProj, float4(world, 1.0));
+        // Straddling the near plane: the projected extent is unbounded, so keep it.
+        if (clip.w <= 1e-5)
+        {
+            return false;
+        }
+        float3 ndc = clip.xyz / clip.w;
+        ndcMin = min(ndcMin, ndc);
+        ndcMax = max(ndcMax, ndc);
+    }
+    return ndcMax.x < -1.0 || ndcMin.x > 1.0 || ndcMax.y < -1.0 || ndcMin.y > 1.0
+        || ndcMax.z < 0.0 || ndcMin.z > 1.0;
+}
+
+// The stable flip key of one (instance slot, page, use) triple — never zero, so zero
+// marks an empty table entry. An assembly visits one node once per use and each use's
+// cut decision is its own: sharing one entry would let two uses read each other's mode
+// as a flip and restart the crossfade forever, which draws the aggregate over the fine
+// geometry every frame. `GPU_ASSEMBLY_NO_USE + 1u` is zero, so a plain mesh's key is
+// exactly the old (slot, page) hash.
+uint transitionKey(uint slot, uint page, uint use)
+{
+    uint hash = slot * 0x9e3779b9u ^ page * 0x85ebca6bu ^ ((use + 1u) * 0xc2b2ae35u);
     hash ^= hash >> 16u;
     hash *= 0x7feb352du;
     hash ^= hash >> 15u;
@@ -182,6 +283,10 @@ void emitNodeRecords(
     uint transition,
     bool subQuad)
 {
+    if (pc.demandOnly != 0u)
+    {
+        return;
+    }
     GpuDrawRecord record;
     record.geometry = prototype.geometry;
     record.instance = GpuHandle(slot, instance.sourceGeneration);
@@ -324,7 +429,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         GpuPageRecord page;
         if (!pageResident(addresses, pageHandle, page))
         {
-            gpuSceneRequestPage(addresses, pageHandle.index);
+            gpuSceneRequestPage(addresses, pageHandle.index, pc.viewClass);
             continue;
         }
         let node = gpuScenePageNode(addresses, page);
@@ -408,11 +513,29 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
             useScale = assemblyUseScale(useRecord);
         }
 
+        // Counter word 17: nodes reached with a resolved use — the denominator.
+        InterlockedAdd(counters[17], 1u);
+        if (pc.nodeCull != 0u && nodeCulled(addresses, instance, slot, node, geometry, use))
+        {
+            // Counter word 16: nodes rejected on their swept bounds, subtree and all.
+            InterlockedAdd(counters[16], 1u);
+            continue;
+        }
+
         // Refine when the projected error is still too large, every child payload is
         // resident, and the stack can hold the children; otherwise draw this node.
         float projectedPx =
             (float(node.appearanceTotal) / 65536.0) * scale * useScale * pc.projScale / distance;
-        bool refine = node.childCount != 0u && projectedPx > pc.errorThresholdPx
+        bool wantRefine = projectedPx > pc.errorThresholdPx;
+        if (pc.representationOverride == SCENE_CUT_FORCE_COARSE)
+        {
+            wantRefine = false;
+        }
+        else if (pc.representationOverride == SCENE_CUT_FORCE_FINE)
+        {
+            wantRefine = true;
+        }
+        bool refine = node.childCount != 0u && wantRefine
             && depth + node.childCount <= SCENE_TRAVERSAL_STACK_DEPTH;
         if (refine)
         {
@@ -422,7 +545,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
                 GpuPageRecord childRecord;
                 if (!pageResident(addresses, childHandle, childRecord))
                 {
-                    gpuSceneRequestPage(addresses, childHandle.index);
+                    gpuSceneRequestPage(addresses, childHandle.index, pc.viewClass);
                     refine = false;
                 }
             }
@@ -436,7 +559,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         bool emitParentDuringRefine = false;
         if (pc.transitionFrames != 0u && inherited == 0u)
         {
-            uint key = transitionKey(slot, pageHandle.index);
+            uint key = transitionKey(slot, pageHandle.index, use);
             uint entry = transitionSlot(key);
             if (entry != 0xffffffffu)
             {
