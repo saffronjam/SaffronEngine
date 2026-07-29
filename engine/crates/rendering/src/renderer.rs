@@ -176,6 +176,10 @@ pub const VIEW_COUNT: usize = 3;
 /// clamps + logs.
 pub const MAX_SDF_INSTANCES: u32 = 4096;
 
+/// Bytes of one frame slot's SDF-scatter meta slice: occluders written, culled against
+/// the reach window, dropped to capacity, and a reserved word.
+pub const SDF_META_SLOT_BYTES: u64 = 16;
+
 /// Frames of frame-timing telemetry dropped after a project load, covering the cold-pipeline
 /// warm-up (PSO compiles, acceleration-structure builds, GI convergence) so the HUD's average
 /// reflects steady state, not the load-transition spike.
@@ -256,6 +260,9 @@ pub struct RenderStatsFull {
     pub cpu_wait_ms: f32,
     /// Instances published into the active frame TLAS.
     pub rt_instances: u32,
+    /// TLAS instances placed through the aggregate-representation structure — a family
+    /// packed as one coarse instance instead of its per-use expansion.
+    pub rt_aggregate_instances: u32,
     /// Device-local VRAM usage in bytes (`0` until profiled).
     pub vram_usage_bytes: u64,
     /// Device-local VRAM budget in bytes (`0` until profiled).
@@ -739,6 +746,55 @@ struct WindDeformRecords {
 /// handle is freed under a live GPU read, then destroys the borrowing sub-state in
 /// the correct order; the `device` field drops last by declaration order.
 pub struct Renderer {
+    /// Routes the shaded executor through `VK_EXT_mesh_shader` instead of the indexed path,
+    /// from `SAFFRON_MESH_EXECUTOR=1` and only where the device supports a mesh stage.
+    ///
+    /// The mesh executor is an *optional second* executor over the same binned records, not a
+    /// replacement — MoltenVK has no mesh stage and runs the indexed path at full quality — so
+    /// it is opt-in rather than the default. `tests/e2e/mesh-executor-parity.test.ts` boots two
+    /// hosts differing in exactly this and requires the frames to agree.
+    mesh_executor: bool,
+    /// Whether reconstructed micro-blade field passes run. On unless `SAFFRON_MICRO_FIELD=off`.
+    ///
+    /// Grass is reconstructed GPU-side rather than mirrored, so it shares no toggle with the
+    /// hierarchy cut — pinning the cut coarse leaves the blades drawing exactly as before.
+    micro_field_enabled: bool,
+    /// Whether the traversal rejects a hierarchy node whose swept world bounds leave the
+    /// view, dropping its subtree with it. On unless `SAFFRON_NODE_CULL=off`.
+    ///
+    /// The instance sphere is the coarsest possible bound for a plant or a building — one
+    /// test for the whole tree. The node cull is the sub-instance one, and because it tests
+    /// the cooked swept extent it is a pure reduction over geometry the frame provably
+    /// cannot see. `tests/e2e/node-cull-parity.test.ts` boots two hosts differing in exactly
+    /// this and requires byte-identical frames. Read once at construction.
+    node_cull: bool,
+    /// Pins the hierarchy cut instead of letting projected error choose it.
+    ///
+    /// `SAFFRON_CUT_OVERRIDE` (`coarse` / `fine`; unset follows the error threshold) is the INITIAL
+    /// value, not a second mechanism: a boot-time pin is what a comparison test needs before the
+    /// first frame, and `set-hierarchy-cut` moves the same field afterwards.
+    ///
+    /// A representation comparison needs the cut to move while the camera holds still —
+    /// reaching the aggregate form by flying the camera out shrinks the subject at the same
+    /// time, so the resulting image difference conflates the two. Read once at construction.
+    ///
+    /// Keyed by [`crate::SceneViewClass::ordinal`]: the classes read the scene at different
+    /// fidelities, so pinning one to compare it must not drag the others with it.
+    cut_override: [u32; crate::SCENE_VIEW_CLASSES],
+    /// Occluders dropped from this frame's SDF list for want of capacity (rt-stats).
+    sdf_instances_dropped: u32,
+    /// Occluders the cascade-window gate excluded this frame (rt-stats).
+    sdf_instances_culled: u32,
+    /// Ray instances excluded by the cascade-window gate this frame.
+    rt_instances_culled: u32,
+    /// A wind edit landed since the last frame, so temporal history describes a field that no
+    /// longer exists. Consumed and cleared by the frame that resets on it.
+    wind_discontinuity: bool,
+    /// Live local wind sources last frame, and a digest of each, for discontinuity detection.
+    wind_source_count: usize,
+    wind_source_digest: Vec<u64>,
+    /// Digest of the authored global field, excluding the clock.
+    wind_authored_digest: u64,
     /// The clear color applied to the scene/swapchain image each frame (RGBA).
     pub clear_color: [f32; 4],
     /// Wireframe view mode — drives the per-draw PSO `wireframe` permutation (gated on
@@ -956,6 +1012,14 @@ pub struct Renderer {
     global_gpu_data: crate::GlobalGpuData,
     /// Device tables of the persistent GPU scene plus its frame upload translation.
     gpu_scene_uploader: crate::GpuSceneUploader,
+    /// CPU spans measured outside this crate, awaiting the next frame slot to be written into.
+    pending_cpu_spans: Vec<(String, u64, u64)>,
+    /// Shadow pages the frame may render, which is also the only way to force page churn.
+    ///
+    /// A 4096² atlas of 32² tiles holds 1024 pages, so an ordinary scene never approaches
+    /// eviction and the reconvergence path cannot be exercised from outside. Lowering this is what
+    /// makes churn reachable in a test without inventing a scene large enough to exhaust the atlas.
+    vsm_page_budget: usize,
     /// Per-world wind sway record buffers (one record per instance slot), written by
     /// the wind deformation prepass and read through the address block.
     wind_deform_records: std::collections::HashMap<u64, WindDeformRecords>,
@@ -964,11 +1028,33 @@ pub struct Renderer {
     scene_wind: SceneWind,
     /// The virtual shadow map: the physical atlas + page-table ring.
     vsm_gpu: crate::vsm::VsmGpu,
+    /// The owned budget breaches the frame's alarm tick reads, replaced whole by
+    /// [`Self::set_owned_budgets`].
+    owned_budgets: Vec<crate::OwnedBudgetBreach>,
+    /// Deformed instances the interaction field's scroll has reset since boot, summed
+    /// over every frame's counter readback. A scroll reset is an EVENT — any single
+    /// frame's count is almost always zero — so the running total is the quantity worth
+    /// reporting, and it is what makes the reset observable from outside the frame.
+    wind_interaction_resets: u64,
+    /// The interaction-field cascade centres this frame integrates, in absolute world
+    /// texel coordinates, and the ones the previous frame did. The wind prepass compares
+    /// the two to name the instances a re-centring scroll reset out from under.
+    interaction_centers: [[i32; 2]; 2],
+    /// The previous frame's [`Self::interaction_centers`].
+    interaction_centers_previous: [[i32; 2]; 2],
     /// The VSM CPU residency authority (allocation, LRU, cooldown, dirty pages).
     vsm_residency: crate::VsmResidency,
     /// Per-directional-level page-render visibility views, built lazily by the
     /// page-render block.
     vsm_views: Vec<Option<crate::SceneVisibilityView>>,
+    /// The global-illumination reach view, built lazily beside the camera's.
+    ///
+    /// A gather is not a camera: it reads occluders behind the eye and behind the depth
+    /// pyramid, so it cannot share the camera's list, and reading the whole scene instead
+    /// is what this view exists to stop.
+    gi_view: Option<crate::SceneVisibilityView>,
+    /// The reach view's counters from the latest completed frame.
+    gi_visibility_counters: [u32; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
     /// The dirty pages this frame rasterizes.
     vsm_render_pages: Vec<crate::VsmRenderPage>,
     /// The frame's directional virtual-shadow space.
@@ -1053,16 +1139,15 @@ pub struct Renderer {
     rt: crate::Rt,
     restir: crate::Restir,
 
-    /// The per-static-instance SDF SSBO: one [`crate::SdfInstance`] per static draw that
-    /// carries a baked field, host-mapped + sized to a fixed capacity (grow-not-needed,
-    /// the same discipline as the DDGI box buffer). The lighting cone-trace iterates the
-    /// first [`Self::sdf_instance_count`] entries. Phase 2 builds + uploads it; Phase 3
-    /// binds it into the lighting set and reads it.
+    /// The SDF-occluder SSBO the occluder scatter writes on device: one
+    /// [`MAX_SDF_INSTANCES`]-entry region per frame slot, consumed by the GDF
+    /// cull/composite and the DDGI near-field march through per-slot descriptor slices.
     sdf_instances: crate::Buffer,
-    /// The active SDF-instance count uploaded this frame.
-    sdf_instance_count: u32,
-    /// The SDF-instance SSBO capacity (entries).
-    sdf_instance_capacity: u32,
+    /// The scatter's meta words, one 16-byte slice per frame slot: occluders written,
+    /// culled against the reach window, dropped to capacity.
+    sdf_meta: crate::Buffer,
+    /// Fence-gated host copy of [`Self::sdf_meta`], read on slot reuse for render-stats.
+    sdf_meta_readback: crate::Buffer,
     /// Whether GDF reflection occlusion (the per-pixel reflection-cone march against the Global
     /// Distance Field that occludes the reflected skybox under overhangs) is enabled. The one
     /// remaining per-pixel SDF consumer; indirect diffuse occlusion is DDGI ray-miss + GTAO.
@@ -1122,6 +1207,51 @@ fn chromatic_light(radiance: Vec3, trim: f32) -> (Vec3, f32) {
     } else {
         (radiance / luminance, luminance * trim.max(0.0))
     }
+}
+
+/// A digest of the authored global wind field, deliberately excluding `time_s`.
+///
+/// The clock advances every frame; folding it in would make every frame look like an edit.
+fn wind_authored_digest(wind: &crate::SceneWind) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut fold = |value: u64| {
+        digest ^= value;
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    fold(u64::from(wind.orientation.to_bits()));
+    fold(u64::from(wind.speed.to_bits()));
+    fold(u64::from(wind.gust.to_bits()));
+    fold(u64::from(wind.turbulence_octaves));
+    fold(u64::from(wind.turbulence_roughness.to_bits()));
+    fold(u64::from(wind.gust_frequency.to_bits()));
+    fold(u64::from(wind.reference_height.to_bits()));
+    fold(u64::from(wind.height_exponent.to_bits()));
+    fold(u64::from(wind.seed));
+    digest
+}
+
+/// A stable digest of one local wind source's authored state, for detecting an edit.
+///
+/// Position, radius, strength and kind — everything that changes what the field looks like.
+/// Bit patterns rather than float comparison, so a value that round-trips unchanged compares
+/// equal without an epsilon nobody can justify.
+fn wind_source_digest(source: &saffron_wind::LocalWindSource) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut fold = |value: u64| {
+        digest ^= value;
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    fold(u64::from((source.position.x as f32).to_bits()));
+    fold(u64::from((source.position.y as f32).to_bits()));
+    fold(u64::from((source.position.z as f32).to_bits()));
+    fold(u64::from(source.direction.x.to_bits()));
+    fold(u64::from(source.direction.y.to_bits()));
+    fold(u64::from(source.direction.z.to_bits()));
+    fold(u64::from(source.strength.to_bits()));
+    fold(u64::from(source.radius.to_bits()));
+    fold(u64::from(source.falloff.to_bits()));
+    fold(source.kind as u64);
+    digest
 }
 
 impl Renderer {
@@ -1529,20 +1659,17 @@ impl Renderer {
         let software_gpu = device.capabilities.software_gpu;
         let device_name = facts.device_name;
 
-        // The per-static-instance SDF SSBO: host-mapped + persistently mapped, sized to a
-        // fixed capacity (grow-not-needed, the DDGI box-buffer discipline). Built once;
-        // `set_sdf_scene` rewrites its prefix each frame.
-        let sdf_instance_bytes =
-            u64::from(MAX_SDF_INSTANCES) * size_of::<crate::SdfInstance>() as u64;
+        // The SDF-occluder SSBO the scatter writes on device: one region per frame in
+        // flight (a frame in flight never shares GPU-written buffers), each holding up to
+        // [`MAX_SDF_INSTANCES`] occluders.
+        let sdf_slot_bytes = u64::from(MAX_SDF_INSTANCES) * size_of::<crate::SdfInstance>() as u64;
         let sdf_alloc = vk_mem::AllocationCreateInfo {
-            usage: vk_mem::MemoryUsage::Auto,
-            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                | vk_mem::AllocationCreateFlags::MAPPED,
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
             ..Default::default()
         };
         let sdf_instances = match crate::Buffer::new(
             device.resources(),
-            sdf_instance_bytes,
+            sdf_slot_bytes * crate::MAX_FRAMES_IN_FLIGHT as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             &sdf_alloc,
         ) {
@@ -1552,13 +1679,65 @@ impl Renderer {
                 return Err(err);
             }
         };
-        // Wire the persistent SDF-occluder SSBO into binding 8 of every frame slot's light
-        // set (set 1); the sky-occlusion cone-trace reads the first `sdf_occlusion.x` entries.
-        lighting.bind_sdf_instances(&descriptors, sdf_instances.handle(), sdf_instances.size());
-        // Wire the same SSBO into the GDF cull + composite sets (they bin/min the same per-mesh
-        // instances), and wire the GDF cascade samplers + params UBO into binding 9/10 of every
-        // light set (the consumers' far-field tap). Both are persistent (one-time wire-up).
-        global_sdf.bind_scene(sdf_instances.handle(), sdf_instances.size());
+        // The scatter's meta words, one 16-byte slice per frame slot: [0] occluders
+        // written, [1] culled against the reach window, [2] dropped to capacity. The
+        // consumers read the count here because it is GPU-produced; the readback twin
+        // feeds render-stats on slot reuse.
+        let sdf_meta = match crate::Buffer::new(
+            device.resources(),
+            SDF_META_SLOT_BYTES * crate::MAX_FRAMES_IN_FLIGHT as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC,
+            &sdf_alloc,
+        ) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                let _ = device.wait_idle();
+                return Err(err);
+            }
+        };
+        let sdf_meta_readback = match crate::Buffer::new(
+            device.resources(),
+            SDF_META_SLOT_BYTES * crate::MAX_FRAMES_IN_FLIGHT as u64,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+        ) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                let _ = device.wait_idle();
+                return Err(err);
+            }
+        };
+        // SAFETY: HOST_VISIBLE + MAPPED, zeroed before any read.
+        unsafe {
+            std::ptr::write_bytes(
+                sdf_meta_readback.mapped_ptr(),
+                0,
+                sdf_meta_readback.size() as usize,
+            );
+        }
+        // Wire the occluder SSBO slices into binding 8 (+ the meta at 15) of every frame
+        // slot's light set (set 1), and into the GDF cull + composite + scatter sets.
+        // Persistent one-time wire-up; the buffers never reallocate.
+        lighting.bind_sdf_instances(
+            &descriptors,
+            sdf_instances.handle(),
+            sdf_slot_bytes,
+            sdf_meta.handle(),
+            SDF_META_SLOT_BYTES,
+        );
+        global_sdf.bind_scene(
+            sdf_instances.handle(),
+            sdf_slot_bytes,
+            sdf_meta.handle(),
+            SDF_META_SLOT_BYTES,
+        );
         lighting.bind_gdf(&global_sdf);
         // Wire the froxel integration volume into binding 11 of every light set (set 1) so the
         // forward transparent path samples the same volumetric fog the composite applies to opaque.
@@ -1569,6 +1748,22 @@ impl Renderer {
         ddgi.bind_gdf_albedo(&global_sdf);
 
         let mut renderer = Self {
+            mesh_executor: device.capabilities.mesh_shader
+                && std::env::var("SAFFRON_MESH_EXECUTOR").as_deref() == Ok("1"),
+            sdf_instances_dropped: 0,
+            sdf_instances_culled: 0,
+            rt_instances_culled: 0,
+            wind_discontinuity: false,
+            wind_source_count: 0,
+            wind_source_digest: Vec::new(),
+            wind_authored_digest: 0,
+            node_cull: std::env::var("SAFFRON_NODE_CULL").as_deref() != Ok("off"),
+            micro_field_enabled: std::env::var("SAFFRON_MICRO_FIELD").as_deref() != Ok("off"),
+            cut_override: [match std::env::var("SAFFRON_CUT_OVERRIDE").as_deref() {
+                Ok("coarse") => crate::SCENE_CUT_FORCE_COARSE,
+                Ok("fine") => crate::SCENE_CUT_FORCE_FINE,
+                _ => crate::SCENE_CUT_AUTO,
+            }; crate::SCENE_VIEW_CLASSES],
             clear_color: [0.05, 0.06, 0.08, 1.0],
             wireframe: false,
             use_depth_prepass: true,
@@ -1656,13 +1851,21 @@ impl Renderer {
             views,
             global_gpu_data,
             gpu_scene_uploader,
+            pending_cpu_spans: Vec::new(),
+            vsm_page_budget: crate::VSM_DEFAULT_PAGE_BUDGET,
             wind_deform_records: std::collections::HashMap::new(),
             scene_wind: SceneWind::default(),
             vsm_gpu,
+            owned_budgets: Vec::new(),
+            wind_interaction_resets: 0,
+            interaction_centers: [[0; 2]; 2],
+            interaction_centers_previous: [[0; 2]; 2],
             vsm_residency: crate::VsmResidency::default(),
             vsm_views: (0..crate::VSM_DIRECTIONAL_LEVELS + 1 + crate::vsm::VSM_POINT_FACES)
                 .map(|_| None)
                 .collect(),
+            gi_view: None,
+            gi_visibility_counters: [0; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
             vsm_render_pages: Vec::new(),
             vsm_space: crate::VsmDirectionalSpace::build(
                 saffron_geometry::glam::Vec3::NEG_Y,
@@ -1707,8 +1910,8 @@ impl Renderer {
             rt,
             restir,
             sdf_instances,
-            sdf_instance_count: 0,
-            sdf_instance_capacity: MAX_SDF_INSTANCES,
+            sdf_meta,
+            sdf_meta_readback,
             sky_occlusion: true,
             descriptors,
             bindless_free_list,
@@ -1805,6 +2008,26 @@ impl Renderer {
         self.visibility_counters
     }
 
+    /// The same, for the global-illumination reach view. All zero while the distance
+    /// field is off, which is the honest reading of a view that did not run.
+    pub fn gi_visibility_counters(&self) -> [u32; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize] {
+        self.gi_visibility_counters
+    }
+
+    /// Replaces the budget breaches the alarm tick raises alongside its own detectors.
+    ///
+    /// The set is complete rather than incremental — a breach that stops being reported resolves —
+    /// so the caller publishes EVERY frame, with an empty list when nothing is over budget. A
+    /// reporter that publishes only on breach leaves its alarms firing after the condition clears.
+    pub fn set_owned_budgets(&mut self, breaches: Vec<crate::OwnedBudgetBreach>) {
+        self.owned_budgets = breaches;
+    }
+
+    /// Deformed instances the interaction field's re-centring scroll has reset since boot.
+    pub fn wind_interaction_resets(&self) -> u64 {
+        self.wind_interaction_resets
+    }
+
     /// GPU missing-page requests drained since startup (the page-fault total).
     pub fn page_faults(&self) -> u64 {
         self.page_faults
@@ -1826,6 +2049,21 @@ impl Renderer {
         self.page_residency.stats()
     }
 
+    /// Missing-page requests one view class may append per frame.
+    #[must_use]
+    pub fn page_request_budget(&self) -> u32 {
+        self.gpu_scene_uploader.page_request_budget()
+    }
+
+    /// Sets that budget, clamped to a usable region.
+    ///
+    /// A scene big enough to fill a 4096-entry region from one class is not a scene a test
+    /// can conjure, so the overflow path is unreachable from outside without this — the
+    /// same reason [`Self::set_vsm_page_budget`] exists.
+    pub fn set_page_request_budget(&mut self, entries: u32) {
+        self.gpu_scene_uploader.set_page_request_budget(entries);
+    }
+
     /// The active view's page-demand context: the eye for projected error, the
     /// projection scale (pixels per metre at unit distance), and the view-projection
     /// for frustum visibility probability.
@@ -1839,10 +2077,14 @@ impl Renderer {
         } else {
             0.0
         };
+        let eye = view.inverse().col(3).truncate();
+        let (gi_min, gi_max) = crate::gi_occluder_bounds(eye);
         crate::PageDemandView {
-            eye: view.inverse().col(3).truncate(),
+            eye,
             proj_scale,
             view_proj: inv_projection.inverse() * view,
+            gi_min,
+            gi_max,
         }
     }
 
@@ -1874,7 +2116,17 @@ impl Renderer {
     /// fields arena + entry count) the micro reconstruction pass dispatches over,
     /// or `None` while no field tiles are resident.
     pub fn set_micro_field_directory(&mut self, directory: Option<(u32, u32)>) {
-        self.micro_field_directory = directory;
+        // `SAFFRON_MICRO_FIELD=off` suppresses the reconstructed blade passes so a test can see an
+        // aggregate plant ALONE. Without it the two are inseparable: micro blades scatter across
+        // the whole ground plane, so no screen region contains one and not the other, and a
+        // measurement of "distant vegetation moving" is really a measurement of the grass. That is
+        // not hypothetical — it is why the first attempt at this passed with the aggregate branch's
+        // sway mutated to zero.
+        self.micro_field_directory = if self.micro_field_enabled {
+            directory
+        } else {
+            None
+        };
     }
 
     /// The most recent frame's GPU-scene upload-translation counters.
@@ -2088,7 +2340,7 @@ impl Renderer {
             return;
         }
         self.active_view = view;
-        self.reset_view_temporal(view);
+        self.reset_view_temporal(view, crate::GpuSceneHistoryInvalidation::NewView);
     }
 
     /// The most recent frame's draw counters (derived from the visibility readback).
@@ -2467,41 +2719,44 @@ impl Renderer {
             .set_scene(cam_pos, sun_dir, sun_color, sun_intensity);
     }
 
-    /// Uploads this frame's per-static-instance SDF list into the host-mapped SSBO,
-    /// clamped to [`MAX_SDF_INSTANCES`]. The lighting cone-trace (Phase 3) iterates the
-    /// first [`Renderer::sdf_instance_count`] entries. Overflow is clamped + warned.
-    pub fn set_sdf_scene(&mut self, instances: &[crate::SdfInstance]) {
-        let count = (instances.len() as u32).min(self.sdf_instance_capacity);
-        if instances.len() as u32 > self.sdf_instance_capacity {
-            tracing::warn!(
-                "SDF instance count {} exceeds capacity {}; clamping (a global distance \
-                 field is the future perf path)",
-                instances.len(),
-                self.sdf_instance_capacity
-            );
-        }
-        if count > 0 {
-            let mapped = self
-                .sdf_instances
-                .mapped_bytes()
-                .expect("SDF instance SSBO is host-mapped");
-            let bytes: &[u8] = bytemuck::cast_slice(&instances[..count as usize]);
-            mapped[..bytes.len()].copy_from_slice(bytes);
-        }
-        self.sdf_instance_count = count;
-        // Feed the same clamped slice to the GDF so the near cascade composites only the voxels
-        // around occluders that actually moved this frame instead of the whole 128³ window.
-        self.global_sdf.set_instances(&instances[..count as usize]);
+    /// Whether a mesh stage is available on this device.
+    pub fn mesh_shader_supported(&self) -> bool {
+        self.device.capabilities.mesh_shader
     }
 
-    /// The active SDF-instance count uploaded this frame.
-    pub fn sdf_instance_count(&self) -> u32 {
-        self.sdf_instance_count
+    /// Whether the shaded executor is running through the mesh stage this frame.
+    pub fn mesh_executor_active(&self) -> bool {
+        self.mesh_executor
     }
 
-    /// The SDF-instance SSBO handle + size (for the Phase 3 lighting-set bind).
-    pub fn sdf_instance_buffer(&self) -> (vk::Buffer, vk::DeviceSize) {
-        (self.sdf_instances.handle(), self.sdf_instances.size())
+    /// Records ray instances the cascade-window gate excluded this frame.
+    ///
+    /// Named apart from a drop the way `sdfInstancesCulled` is: culling is a claim about REACH,
+    /// and only that claim is sound. An instance lost to capacity is a different event and must
+    /// not be counted here, or a scene silently losing reflections would read as one being
+    /// efficiently cut.
+    pub fn record_rt_culled(&mut self, culled: u32) {
+        self.rt_instances_culled = culled;
+    }
+
+    /// Ray instances the cascade-window gate excluded this frame.
+    #[must_use]
+    pub fn rt_instances_culled(&self) -> u32 {
+        self.rt_instances_culled
+    }
+
+    /// Occluders the cascade-window gate excluded this frame — the ones that provably cannot
+    /// affect any march, as opposed to the ones dropped for want of capacity.
+    pub fn sdf_instances_culled(&self) -> u32 {
+        self.sdf_instances_culled
+    }
+
+    /// Occluders the scatter dropped this frame for want of capacity.
+    ///
+    /// Past the cap, occluders vanish from GI with nothing to coarsen into; a log line
+    /// cannot be asserted on, so the count is reported.
+    pub fn sdf_instances_dropped(&self) -> u32 {
+        self.sdf_instances_dropped
     }
 
     /// Writes this frame's camera transforms + incoming sun direction for the
@@ -2614,6 +2869,12 @@ impl Renderer {
         let rt_refl = self.rt.use_rt_reflections() && self.ssao.ready && view.prev_view_proj_valid;
         let prev_vp = view.prev_view_proj;
         self.lighting.set_frame_rt_reflections(rt_refl, prev_vp);
+        // Fold the ray-query shadow gate (point_shadow_meta.z). Unlike reflections this reads
+        // `shadows_enabled`, which also requires a TLAS built this frame: the shadow term has
+        // no screen-space fallback to blend against, so tracing an empty scene would light
+        // every surface unshadowed for a frame.
+        self.lighting
+            .set_frame_rt_shadows(self.rt.shadows_enabled());
         // Fold this frame's froxel volumetric-fog params so the forward transparent path samples the
         // integration volume only when volumetric fog is authored (matching the composite's gate).
         self.lighting.set_frame_froxel_fog(
@@ -2647,6 +2908,29 @@ impl Renderer {
         wind: &SceneWind,
         sources: &[saffron_wind::LocalWindSource],
     ) -> Result<()> {
+        // A live edit to the wind field is a discontinuity, not motion: the deformation jumps
+        // rather than sweeping, so last frame's pixels describe positions this frame's geometry
+        // never occupied. Accumulating across it smears the jump over the reprojection window.
+        //
+        // The comparison is on the authored field and the source *set*, not on the clock: wind
+        // advances every frame by design, and treating that as a discontinuity would reset the
+        // history continuously and disable temporal accumulation outright.
+        // Compare the AUTHORED field only. `SceneWind` carries `time_s`, which advances every
+        // frame by design — comparing the whole struct fires a discontinuity continuously and
+        // disables temporal accumulation outright, which is the opposite of the intent.
+        let authored_changed = wind_authored_digest(wind) != self.wind_authored_digest;
+        let sources_changed = self.wind_source_count != sources.len()
+            || sources
+                .iter()
+                .take(64)
+                .zip(self.wind_source_digest.iter())
+                .any(|(source, previous)| wind_source_digest(source) != *previous);
+        if authored_changed || sources_changed {
+            self.wind_discontinuity = true;
+        }
+        self.wind_authored_digest = wind_authored_digest(wind);
+        self.wind_source_count = sources.len();
+        self.wind_source_digest = sources.iter().take(64).map(wind_source_digest).collect();
         self.scene_wind = *wind;
         while self.wind_source_ring.len() < crate::MAX_FRAMES_IN_FLIGHT {
             self.wind_source_ring.push(crate::Buffer::new(
@@ -3959,6 +4243,169 @@ impl Renderer {
         self.rt.frame_instance_count()
     }
 
+    /// Whether opacity micromaps can be attached to triangle geometry on this device.
+    pub fn omm_supported(&self) -> bool {
+        self.device.omm_supported()
+    }
+
+    /// The tessellated full-rebuild BLAS active this frame (rt-stats).
+    pub fn rt_tessellated_blas_count(&self) -> u32 {
+        self.rt.tessellated_blas_count()
+    }
+
+    /// Whether cluster acceleration structures are enabled on this device.
+    pub fn cluster_as_supported(&self) -> bool {
+        self.device.cluster_as_supported()
+    }
+
+    /// Distinct cluster-composed bottom-level structures referenced this frame.
+    pub fn rt_cluster_blas_count(&self) -> u32 {
+        self.rt.cluster_blas_count()
+    }
+
+    /// Cluster acceleration structures those bottom levels compose.
+    pub fn rt_clas_count(&self) -> u32 {
+        self.rt.clas_count()
+    }
+
+    /// Whether the top-level structure is partitioned on this device.
+    pub fn ptlas_supported(&self) -> bool {
+        self.device.ptlas_supported()
+    }
+
+    /// The partitioned structure's last build as `(partitions, writes, updates)`; all zero
+    /// where the top level is the KHR TLAS.
+    pub fn rt_ptlas_ops(&self) -> (u32, u32, u32) {
+        self.rt.ptlas_stats().map_or((0, 0, 0), |stats| {
+            (stats.partitions, stats.writes, stats.updates)
+        })
+    }
+
+    /// AS-storage bytes the distinct bottom-level structures occupy this frame (rt-stats).
+    pub fn rt_blas_bytes(&self) -> u64 {
+        self.rt.blas_bytes()
+    }
+
+    /// Why the active view's temporal history was last invalidated.
+    #[must_use]
+    pub fn view_history_invalidation(&self) -> &'static str {
+        self.persistent_gpu_scene
+            .view(self.active_view.gpu_scene_view())
+            .map_or("unknown", |state| state.invalidation.name())
+    }
+
+    /// Shadow pages the frame may render.
+    #[must_use]
+    pub fn vsm_page_budget(&self) -> usize {
+        self.vsm_page_budget
+    }
+
+    /// Sets the per-frame shadow-page render budget, clamped to at least one.
+    ///
+    /// Zero would stall the atlas permanently rather than throttle it — a hole that can never
+    /// drain is not a smaller budget, it is a broken one.
+    pub fn set_vsm_page_budget(&mut self, budget: usize) {
+        self.vsm_page_budget = budget.max(1);
+    }
+
+    /// Records an already-measured CPU span into this frame's profiler buffer.
+    ///
+    /// The seam for work that happens OUTSIDE this crate — the vegetation sync measures its own
+    /// stage durations and had nowhere to put them, so a capture showed the frame's render passes
+    /// against a gap where cooking, residency, and promotion actually ran. A caller that already
+    /// knows when its work started and how long it took needs the numbers carried, not re-measured.
+    ///
+    /// A no-op while the profiler is off, like every other span here.
+    pub fn record_cpu_span(&mut self, name: &str, start_ns: u64, duration_ns: u64) {
+        if self.gpu_profiler.mode == ProfilerMode::Off {
+            return;
+        }
+        // Queued rather than written straight through: this is called from OUTSIDE the frame, where
+        // the slot index the span buffers are keyed by is not in scope. The next graph build drains
+        // it into the right slot.
+        self.pending_cpu_spans
+            .push((name.to_owned(), start_ns, duration_ns));
+    }
+
+    /// Cumulative GPU microseconds in out-of-graph structure builds and compactions (rt-stats).
+    ///
+    /// The render graph times the per-frame refits and the TLAS build as named scopes; this covers
+    /// the two that run OUTSIDE it on the uploader's private pool — the initial static build and
+    /// its compaction — which are the two that scale with content rather than with frame rate.
+    #[must_use]
+    pub fn rt_accel_build_us(&self) -> u64 {
+        self.device.resources().accel_build_nanos() / 1_000
+    }
+
+    /// Distinct opacity micromaps this frame's structures reference (rt-stats).
+    #[must_use]
+    /// `view`'s pinned hierarchy cut, or [`crate::SCENE_CUT_AUTO`] when projected error chooses it.
+    /// The ray gather reads the same override the camera traversal is pushed, so a run that pins
+    /// the cut pins BOTH representations rather than leaving rays on triangles the raster stopped
+    /// drawing.
+    pub fn cut_override(&self, view: crate::SceneViewClass) -> u32 {
+        self.cut_override[view.ordinal() as usize]
+    }
+
+    /// Pins `view`'s hierarchy cut, or returns it to following projected error.
+    ///
+    /// Boot-time env was enough while only a test needed it. An author comparing a plant's triangle
+    /// and aggregate forms needs the cut to move while the camera holds still — flying out shrinks
+    /// the subject at the same time, so the resulting difference conflates the two — and restarting
+    /// the host to see the other representation is not a comparison anyone makes twice.
+    pub fn set_cut_override(&mut self, view: crate::SceneViewClass, cut: u32) {
+        self.cut_override[view.ordinal() as usize] = match cut {
+            crate::SCENE_CUT_FORCE_COARSE => crate::SCENE_CUT_FORCE_COARSE,
+            crate::SCENE_CUT_FORCE_FINE => crate::SCENE_CUT_FORCE_FINE,
+            // Anything else follows the error threshold, which is the only safe reading of a value
+            // the traversal would otherwise compare against constants it does not know.
+            _ => crate::SCENE_CUT_AUTO,
+        };
+    }
+
+    /// How `view`'s hierarchy walk refines: the projected-error threshold it refines under
+    /// and the cut it is pinned to.
+    ///
+    /// The classes read the same scene for different ends, and a walk tuned for the image is
+    /// the wrong walk for anything that is not the image.
+    #[must_use]
+    pub fn traversal_tuning(&self, view: crate::SceneViewClass) -> crate::TraversalTuning {
+        crate::TraversalTuning {
+            error_threshold_px: match view {
+                crate::SceneViewClass::Camera | crate::SceneViewClass::ShadowPage => {
+                    crate::SCENE_ERROR_THRESHOLD_IMAGE_PX
+                }
+                crate::SceneViewClass::Gi => crate::SCENE_ERROR_THRESHOLD_GI_PX,
+            },
+            representation_override: self.cut_override(view),
+        }
+    }
+
+    pub fn rt_omm_micromaps(&self) -> u32 {
+        self.rt.omm_micromaps()
+    }
+
+    /// Micro-triangles settled opaque, settled transparent, and left unknown (rt-stats).
+    #[must_use]
+    pub fn rt_omm_classes(&self) -> (u64, u64, u64) {
+        self.rt.omm_classes()
+    }
+
+    /// What those structures would occupy uncompacted (rt-stats).
+    pub fn rt_blas_built_bytes(&self) -> u64 {
+        self.rt.blas_built_bytes()
+    }
+
+    /// AS-storage bytes this frame's top-level structure occupies (rt-stats).
+    pub fn rt_tlas_bytes(&self) -> u64 {
+        self.rt.tlas_bytes()
+    }
+
+    /// Build-scratch bytes held for this frame's TLAS + BLAS builds (rt-stats).
+    pub fn rt_scratch_bytes(&self) -> u64 {
+        self.rt.scratch_bytes()
+    }
+
     /// Captures this frame's static mesh instances (parallel world transforms + meshes) for
     /// the `tlas-build` pass, arming the build when RT shadows are on. Skinned instances
     /// ride the draw list.
@@ -3993,16 +4440,42 @@ impl Renderer {
             && self.views[self.active_view.index()].restir.ready()
     }
 
+    /// Whether a wind edit landed since the last frame, clearing the flag.
+    ///
+    /// Read once per frame by the temporal reset. Wind advancing on its own clock is motion,
+    /// not a discontinuity, and never sets this — resetting on the clock would disable
+    /// temporal accumulation entirely.
+    pub fn take_wind_discontinuity(&mut self) -> bool {
+        std::mem::take(&mut self.wind_discontinuity)
+    }
+
     /// Resets a view's temporal state — its motion reprojection, SSGI/TAA history, the
     /// ReSTIR reservoir history, and the (scene-global) DDGI probes re-converge for the
     /// view.
-    pub fn reset_view_temporal(&mut self, view: ViewId) {
+    pub fn reset_view_temporal(
+        &mut self,
+        view: ViewId,
+        reason: crate::GpuSceneHistoryInvalidation,
+    ) {
         let target = &mut self.views[view.index()];
         target.prev_view_proj_valid = false;
         target.history_valid = false;
         target.restir.reset_history();
         // The scene-global probes re-converge for the new view.
         self.ddgi.reset_history();
+        // The persistent scene keeps its own per-view history generation, and it is what the
+        // visibility pass consults — resetting the renderer's temporal state while leaving that
+        // generation untouched means a view whose reprojection was blanked still advertises a
+        // valid history to the GPU. Both move together, and the reason travels with them so the
+        // record says WHY a frame re-converged rather than only that it did.
+        if let Ok(state) = self
+            .persistent_gpu_scene
+            .view_mut(view.gpu_scene_view())
+            .map_err(|err| tracing::warn!("view history invalidation: {err}"))
+            && let Err(err) = state.invalidate(reason)
+        {
+            tracing::warn!("view history invalidation: {err}");
+        }
     }
 
     /// Stashes an ad-hoc record closure replayed inside the scene pass after the
@@ -4138,6 +4611,10 @@ impl Renderer {
         self.views[i]
             .restir
             .build(&self.device, &self.descriptors, &self.restir, input)?;
+        // The shm capture ring is display-extent; resize it here, under this function's idle.
+        if self.shm_publish_enabled[i] {
+            self.views[i].size_shm_capture(&self.device, display)?;
+        }
         self.clouds.bind_view(
             i,
             crate::clouds::CloudViewBindings {
@@ -4256,7 +4733,24 @@ impl Renderer {
     /// gates whether [`Renderer::render_scene_offscreen`] folds the BGRA8 readback into the
     /// frame command buffer this frame.
     pub fn set_shm_publish_enabled(&mut self, view: ViewId, enabled: bool) {
-        self.shm_publish_enabled[view.index()] = enabled;
+        let i = view.index();
+        if self.shm_publish_enabled[i] == enabled {
+            return;
+        }
+        self.shm_publish_enabled[i] = enabled;
+        if !enabled {
+            return;
+        }
+        // Arming is the other seam that may size the capture ring, so it idles first for the
+        // same reason the resize does.
+        let extent = self.views[i].published_extent();
+        if let Err(err) = self
+            .device
+            .wait_idle()
+            .and_then(|()| self.views[i].size_shm_capture(&self.device, extent))
+        {
+            tracing::error!("shm capture ring: {err}");
+        }
     }
 
     /// Drains the pipelined BGRA8 bytes staged at the last begin-frame fence wait, if any —
@@ -4320,17 +4814,20 @@ impl Renderer {
         if render_extent.width == 0 || render_extent.height == 0 {
             return Ok(());
         }
-        // The offscreen is now the DISPLAY extent (the resolve reconstructs to it), so the blit
-        // is 1:1 — it survives only to convert RGBA16F → BGRA8, at matching extent.
-        self.views[active].ensure_shm_capture(&self.device, slot, publish_extent)?;
-
         let raw = self.device.raw();
         let view = &self.views[active];
         let from_layout = view.offscreen.layout;
         let src_image = view.offscreen.handle();
-        let capture = view.shm_capture.slots[slot]
+        // The ring is sized at the resize / publish-arm seams, both of which hold a device
+        // idle — a slot may never be replaced here, mid-recording, because a readback into
+        // the old one can still be in flight. A slot that is absent or stale means publish
+        // was armed after this frame's seam ran; the next frame has it.
+        let Some(capture) = view.shm_capture.slots[slot]
             .as_ref()
-            .expect("shm capture ensured above");
+            .filter(|capture| capture.extent == publish_extent)
+        else {
+            return Ok(());
+        };
         let dst_image = capture.image.handle();
         let staging = capture.staging.handle();
 
@@ -5209,6 +5706,7 @@ impl Renderer {
             scene_gather_ms: self.scene_gather_ms,
             cpu_wait_ms: self.cpu_wait_ms,
             rt_instances: self.rt.frame_instance_count(),
+            rt_aggregate_instances: self.rt.aggregate_instance_count(),
             vram_usage_bytes: self.vram_usage_bytes,
             vram_budget_bytes: self.vram_budget_bytes,
             software_gpu: self.software_gpu,
@@ -5335,6 +5833,12 @@ impl Renderer {
             vram_usage_bytes: self.vram_usage_bytes,
             vram_budget_bytes: self.vram_budget_bytes,
             pipelines_created: self.stats.pipelines_created,
+            // Word 2 is the overflow set and word 4 the pressure set; both come from the same
+            // fence-gated readback the rest of the counters ride, so raising an alarm from them
+            // costs nothing beyond reading two words already in hand.
+            visibility_overflow_flags: self.visibility_counters[2],
+            visibility_pressure_flags: self.visibility_counters[4],
+            owned_budgets: self.owned_budgets.clone(),
             focused: self.reactive.power_state == PowerState::Focused,
         };
         self.alarms
@@ -5551,10 +6055,14 @@ impl Renderer {
         let _watch = crate::watchdog::watch("frame", self.frame_serial());
         // SAFETY: the ash seam. The fence belongs to this device; the wait blocks until this
         // slot's prior GPU work completes, so its per-frame buffers/sets are free to reuse.
-        checked(
+        let waited = checked(
             unsafe { raw.wait_for_fences(&[in_flight], true, u64::MAX) },
             "wait_for_fences (begin)",
-        )?;
+        );
+        if waited.as_ref().is_err_and(crate::Error::is_device_loss) {
+            self.device.log_device_loss_checkpoints();
+        }
+        waited?;
         // The slot's prior GPU work is done, so its transient scratch allocations are free to
         // recycle: rewind the pool's acquire cursors for this frame index.
         self.transient.begin_frame(self.frames.index());
@@ -5600,6 +6108,40 @@ impl Renderer {
         )?;
         self.frames.reset_command_pools(&self.device)?;
         self.frame_begun = true;
+        Ok(())
+    }
+
+    /// Closes a frame that [`Renderer::begin_offscreen_frame`] opened but nothing submitted,
+    /// by signalling the slot's in-flight fence with an empty submit.
+    ///
+    /// `begin_offscreen_frame` waits the slot fence and then **resets** it, so the slot is only
+    /// usable again once something signals it. A layer that draws nothing that frame — a player
+    /// whose project failed to load, a host whose viewport is not sized yet — never reaches
+    /// `render_scene_offscreen`, and the next frame then waits a fence that can never signal.
+    /// That deadlock surfaces through the watchdog as `GPU submission 'frame N' has been in
+    /// flight`, which reads as a GPU hang and is not one.
+    ///
+    /// The loop calls this at the end of every frame so the invariant holds without depending on
+    /// what a layer chose to draw.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Vk`] if the empty submit fails.
+    pub fn finish_unsubmitted_frame(&mut self) -> Result<()> {
+        if !self.frame_begun {
+            return Ok(());
+        }
+        self.frame_begun = false;
+        let fence = self.frames.in_flight();
+        let submit = vk::SubmitInfo2::default();
+        let submits = [submit];
+        self.device.graphics_queue.submit2(
+            self.device.raw(),
+            &submits,
+            fence,
+            "queue_submit2 (empty frame)",
+        )?;
+        self.frames.advance();
         Ok(())
     }
 
@@ -6521,7 +7063,7 @@ impl Renderer {
                 let _ = self.vsm_residency.demand(key, serial);
             }
         }
-        self.vsm_render_pages = self.vsm_residency.take_render_pages(64);
+        self.vsm_render_pages = self.vsm_residency.take_render_pages(self.vsm_page_budget);
         let table = self
             .vsm_gpu
             .publish_table(&self.device, frame, &self.vsm_residency);
@@ -6556,6 +7098,68 @@ impl Renderer {
             .map(|records| records.buffer.handle())
     }
 
+    /// Captures one instance slot's wind prepass record: the sway at both frame times,
+    /// the interaction displacement at both, the branch-mode quadrature and amplitudes,
+    /// the height scale, and the bounds slack.
+    ///
+    /// EXPLICIT AND ONE-SHOT, never per frame. The records are device-local and this
+    /// idles the queue to read them, which is affordable when a person asks a question
+    /// and ruinous every frame. It is also the only view of what the prepass actually
+    /// computed: every raster pass reads these words rather than re-deriving wind, so a
+    /// disagreement between the authored response and the motion on screen is visible
+    /// here and nowhere else.
+    ///
+    /// Returns `None` before the first frame has created the buffer, or for a slot past
+    /// its capacity.
+    pub fn capture_wind_record(
+        &self,
+        slot: u32,
+    ) -> crate::Result<Option<crate::GpuWindInstanceRecord>> {
+        let world = self.active_view.gpu_scene_world();
+        let Some(records) = self.wind_deform_records.get(&world.0) else {
+            return Ok(None);
+        };
+        if slot >= records.capacity {
+            return Ok(None);
+        }
+        let stride = size_of::<crate::GpuWindInstanceRecord>() as u64;
+        let staging = crate::Buffer::new(
+            self.device.resources(),
+            stride,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::AutoPreferHost,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+        )?;
+        let source = records.buffer.handle();
+        let destination = staging.handle();
+        let offset = u64::from(slot) * stride;
+        self.device.one_shot_transfer(|raw, cmd| {
+            // SAFETY: the ash seam. Both buffers outlive the submit this records into,
+            // and the copy is inside each one's allocated size.
+            unsafe {
+                raw.cmd_copy_buffer(
+                    cmd,
+                    source,
+                    destination,
+                    &[vk::BufferCopy {
+                        src_offset: offset,
+                        dst_offset: 0,
+                        size: stride,
+                    }],
+                );
+            }
+        })?;
+        // SAFETY: HOST_VISIBLE + MAPPED, one record long, and the transfer's fence was
+        // waited before this returns.
+        let record =
+            unsafe { std::ptr::read(staging.mapped_ptr().cast::<crate::GpuWindInstanceRecord>()) };
+        Ok(Some(record))
+    }
+
     /// Pass order (the `beginFrameGraph` slice this phase fills): `light-cull` (compute)
     /// → the virtual-shadow page passes (per-space cull/bin chains + atlas raster) →
     /// optional `depth-prepass` → `scene`. The graph derives every barrier from the
@@ -6565,12 +7169,33 @@ impl Renderer {
         frame: usize,
         pipelines: FramePipelines,
     ) -> Result<RecordedSceneGraph> {
+        // The interaction field re-centres on the camera, and the centres are what the wind
+        // prepass compares to find the instances a scroll reset. Advance them once, here,
+        // rather than where the interaction pass is recorded: that site sits inside a borrow
+        // of the view's visibility lists, and a per-frame truth advanced from inside a
+        // conditional pass would skip the frames the pass does not run.
+        let eye = self.page_demand_view().eye;
+        self.interaction_centers_previous = self.interaction_centers;
+        self.interaction_centers = [0u32, 1u32].map(|cascade| {
+            let texel = 0.25_f32 * (1u32 << (2 * cascade)) as f32;
+            [
+                (eye.x / texel).floor() as i32,
+                (eye.z / texel).floor() as i32,
+            ]
+        });
         // CPU span over this frame's render-graph CONSTRUCTION (cull + scene/lighting/post
         // pass declarations), closed just before `execute-render-graph` opens — a top-level
         // sibling of it. A no-op when the profiler is `Off`.
         let profile_cpu = self.gpu_profiler.mode != ProfilerMode::Off;
         let build_span = if profile_cpu {
+            let pending = std::mem::take(&mut self.pending_cpu_spans);
             let CpuProfiler { registry, buffers } = &mut self.cpu_profiler;
+            // Spans measured outside this crate — the vegetation sync's stages — land here, in the
+            // slot they belong to, so a capture shows them beside the passes rather than as a gap.
+            for (name, start_ns, duration_ns) in pending {
+                let index = buffers[frame].begin_span(registry, &name, start_ns);
+                buffers[frame].end_span(index, start_ns.saturating_add(duration_ns));
+            }
             Some(buffers[frame].begin_span(registry, "build-frame-graph", cpu_now_ns()))
         } else {
             None
@@ -6615,10 +7240,14 @@ impl Renderer {
                 self.vsm_demanded = demanded;
             }
         }
-        for slot in self.gpu_scene_uploader.drain_page_requests(frame) {
+        let requests = self.gpu_scene_uploader.drain_page_requests(frame);
+        for (slot, class) in requests.requests {
             self.page_faults += 1;
-            self.page_residency.demand_slot(slot, u64::MAX / 2);
+            self.page_residency
+                .demand_slot(slot, class.page_demand_priority());
         }
+        self.page_residency
+            .note_dropped_requests(requests.dropped, requests.overflow_classes);
         self.page_residency.publish_ready(
             &mut self.global_gpu_data,
             &mut self.pending_gpu_scene_uploads,
@@ -6633,6 +7262,24 @@ impl Renderer {
             &mut self.global_gpu_data,
             frame,
         )?;
+        // The scatter's meta slice clears every frame whether or not the scatter runs:
+        // a frame with no reach view reads zero occluders rather than a stale slot.
+        {
+            let meta_res = graph.import_buffer(self.sdf_meta.handle(), None);
+            let raw_clear = self.device.raw().clone();
+            let meta = self.sdf_meta.handle();
+            let offset = frame as u64 * SDF_META_SLOT_BYTES;
+            graph.add_pass(
+                RgPass::compute("sdf-meta-clear")
+                    .access(meta_res, RgUsage::TransferWrite)
+                    .body(move |cmd, _scopes| {
+                        // SAFETY: the ash seam; the buffer is TRANSFER_DST.
+                        unsafe {
+                            raw_clear.cmd_fill_buffer(cmd, meta, offset, SDF_META_SLOT_BYTES, 0);
+                        }
+                    }),
+            );
+        }
         self.last_gpu_scene_upload = self.gpu_scene_uploader.record_frame(
             &self.device,
             &mut graph,
@@ -6662,6 +7309,7 @@ impl Renderer {
                 u64::from(wind_capacity) * size_of::<crate::GpuWindInstanceRecord>() as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 &vk_mem::AllocationCreateInfo {
                     usage: vk_mem::MemoryUsage::AutoPreferDevice,
@@ -6735,6 +7383,17 @@ impl Renderer {
             self.skinning.frame_deformed_addresses(frame, &self.device),
             wind_records_address,
             interaction_address,
+            // Only armed while the profiler is: an atomic in every geometry fragment is a real
+            // cost, and a zero address is the same idiom every other optional address here uses,
+            // so an unprofiled frame executes no increment at all.
+            if self.gpu_profiler.mode == ProfilerMode::Off {
+                0
+            } else {
+                self.views[self.active_view.index()]
+                    .visibility_view
+                    .as_ref()
+                    .map_or(0, |view| view.counters_address(&self.device, frame))
+            },
             self.views[self.active_view.index()].jitter_index,
         );
         self.gpu_scene_uploader
@@ -6807,6 +7466,9 @@ impl Renderer {
             self.pipelines
                 .request_scene_bin_scatter(self.scene_visibility.bin_scatter_layout()),
         );
+        let gi_scatter_pso = self
+            .pipelines
+            .request_gi_occluder_scatter(self.global_sdf.scatter_layout());
         let transparent_sort_psos = (
             self.pipelines
                 .request_transparent_keys(self.scene_visibility.transparent_keys_layout()),
@@ -6819,6 +7481,13 @@ impl Renderer {
             self.pipelines
                 .request_transparent_reorder(self.scene_visibility.transparent_reorder_layout()),
         );
+        // A wind edit lands as a jump in the deformation, so the reprojection that assumes
+        // continuous motion is describing geometry that no longer exists. Reset before the
+        // frame's temporal passes read their history.
+        if self.take_wind_discontinuity() {
+            let view = self.active_view;
+            self.reset_view_temporal(view, crate::GpuSceneHistoryInvalidation::WindDiscontinuity);
+        }
         let mut visibility_active = false;
         let mut visibility_history_valid = false;
         let mut executor_buckets: Vec<crate::ExecutorBucket> = Vec::new();
@@ -6891,6 +7560,42 @@ impl Renderer {
                         }
                     };
             }
+            // The reach view runs whenever the distance field does — it is the field's
+            // occluder set that it culls for — and holds one record slot, because a
+            // demand-only walk emits none.
+            let gi_reach_active = self.global_sdf.enabled() || self.ddgi.enabled();
+            if gi_reach_active
+                && self
+                    .gi_view
+                    .as_ref()
+                    .is_none_or(|view| view.capacity() < instance_capacity)
+            {
+                self.device.wait_idle()?;
+                if let Some(mut old) = self.gi_view.take() {
+                    old.free_sets(&self.descriptors);
+                }
+                self.gi_view = match crate::SceneVisibilityView::new(
+                    &self.device,
+                    &self.descriptors,
+                    &self.scene_visibility,
+                    instance_capacity,
+                    1,
+                    1,
+                ) {
+                    Ok(view) => Some(view),
+                    Err(err) => {
+                        tracing::error!("gi reach view rebuild: {err}");
+                        None
+                    }
+                };
+            }
+            // A view that did not run reports zeros rather than the last frame it did:
+            // a stale count reads as live telemetry and there is nothing in the number
+            // itself to say otherwise.
+            self.gi_visibility_counters = match self.gi_view.as_ref() {
+                Some(view) if gi_reach_active => view.read_counters(frame),
+                _ => [0; crate::SCENE_VISIBILITY_COUNTER_WORDS as usize],
+            };
             if let Some(pyramid) = self.views[self.active_view.index()].hzb_pyramid.as_mut() {
                 pyramid.begin_frame();
             }
@@ -6901,6 +7606,23 @@ impl Renderer {
                 // The slot's fence completed before this frame reused it, so its
                 // readback words are last use's final counters.
                 self.visibility_counters = lists.read_counters(frame);
+                // The scatter's meta words ride the same fence: culled is a sound claim
+                // about reach, dropped is geometry lost to capacity.
+                // SAFETY: HOST_VISIBLE + MAPPED, zeroed at construction; the slot's
+                // fence completed before reuse.
+                let meta = unsafe {
+                    self.sdf_meta_readback
+                        .mapped_ptr()
+                        .add(frame * SDF_META_SLOT_BYTES as usize)
+                        .cast::<[u32; 4]>()
+                        .read_unaligned()
+                };
+                self.sdf_instances_culled = meta[1];
+                self.sdf_instances_dropped = meta[2];
+                self.wind_interaction_resets =
+                    self.wind_interaction_resets.saturating_add(u64::from(
+                        self.visibility_counters[crate::SCENE_VISIBILITY_COUNTER_INTERACTION_RESET],
+                    ));
                 // The GPU decides the frame's draws; the stats mirror the slot's
                 // last-use readback: emitted records = indirect draw commands,
                 // visible instances, and the traversal's rasterized-triangle count.
@@ -6953,6 +7675,16 @@ impl Renderer {
                     lists.records(frame),
                     u64::from(lists.record_capacity()) * size_of::<crate::GpuDrawRecord>() as u64,
                 );
+                // Binding 5 is the same binned command stream the indexed draw consumes as
+                // arguments; the mesh executor reads it as data to recover its draw from
+                // `SV_DrawIndex`. Bound unconditionally so the set is complete whether or not
+                // a mesh PSO is selected this frame — an unwritten binding is a validation error.
+                self.descriptors.write_storage_buffer(
+                    self.instancing.instance_set(frame),
+                    5,
+                    lists.commands(frame),
+                    u64::from(lists.record_capacity()) * 20,
+                );
                 // The kernels look records up in the bucket table, so it publishes
                 // before the binning passes execute.
                 lists.write_bucket_table(frame, &bucket_table);
@@ -6980,14 +7712,6 @@ impl Renderer {
                 // read.
                 if let Some(interact_pso) = &wind_interact_pso {
                     let wind = self.lighting.wind_deform_push();
-                    let eye = self.page_demand_view().eye;
-                    let center_for = |cascade: u32| {
-                        let texel = 0.25_f32 * (1u32 << (2 * cascade)) as f32;
-                        [
-                            (eye.x / texel).floor() as i32,
-                            (eye.z / texel).floor() as i32,
-                        ]
-                    };
                     lists.add_wind_interact_pass(
                         &self.device,
                         &mut graph,
@@ -6997,8 +7721,8 @@ impl Renderer {
                         crate::WindInteractPush {
                             field: interaction_address,
                             impulses: interaction_impulse_address,
-                            center0: center_for(0),
-                            center1: center_for(1),
+                            center0: self.interaction_centers[0],
+                            center1: self.interaction_centers[1],
                             impulse_count: interaction_impulse_count,
                             dt: (wind.time_current - wind.time_previous).max(0.0),
                             reserved: [0; 2],
@@ -7014,7 +7738,11 @@ impl Renderer {
                         wind_records_res,
                         interaction_field_res,
                         instance_capacity,
-                        self.lighting.wind_deform_push(),
+                        crate::WindDeformPush {
+                            prev_center0: self.interaction_centers_previous[0],
+                            prev_center1: self.interaction_centers_previous[1],
+                            ..self.lighting.wind_deform_push()
+                        },
                     );
                 }
                 lists.add_cull_pass(
@@ -7034,30 +7762,175 @@ impl Renderer {
                         history_valid: u32::from(visibility_history_valid),
                         list_capacity: lists.capacity(),
                         reserved: [0; 2],
+                        reach_min: [0.0; 4],
+                        reach_max: [0.0; 4],
                     },
                 );
                 visibility_active = true;
+                // The reach view, beside the camera's: the same instance sweep classified
+                // against the window a march can read instead of against the frustum and
+                // the depth pyramid, then walked for page demand alone. Its list is what
+                // the distance field's occluder set is drawn from, and pricing its misses
+                // below the camera's is what stops a gather evicting the image.
+                if let (true, Some(gi_view), Some(cull_pso), Some(traversal_pso)) = (
+                    gi_reach_active,
+                    self.gi_view.as_ref(),
+                    visibility_psos.0.as_ref(),
+                    visibility_psos.1.as_ref(),
+                ) {
+                    let demand = self.page_demand_view();
+                    let tuning = self.traversal_tuning(crate::SceneViewClass::Gi);
+                    gi_view.write_frame_bindings(
+                        &self.device,
+                        &self.scene_visibility,
+                        frame,
+                        previous_view,
+                        hzb_pyramid.current().1,
+                        address_slice,
+                    );
+                    gi_view.add_cull_pass(
+                        &self.device,
+                        &mut graph,
+                        cull_pso,
+                        frame,
+                        previous_res,
+                        wind_records_res,
+                        instance_capacity,
+                        crate::SceneVisibilityPush {
+                            view_proj,
+                            prev_view_proj: view_proj,
+                            hzb_extent: [hzb_pyramid.extent().width, hzb_pyramid.extent().height],
+                            hzb_mip_count: hzb_pyramid.mip_count(),
+                            pass_kind: crate::SCENE_VISIBILITY_PASS_REACH,
+                            // The reach pass reads neither the pyramid nor the history
+                            // words, so there is no previous frame for it to trust.
+                            history_valid: 0,
+                            list_capacity: gi_view.capacity(),
+                            reserved: [0; 2],
+                            reach_min: demand.gi_min.extend(0.0).to_array(),
+                            reach_max: demand.gi_max.extend(0.0).to_array(),
+                        },
+                    );
+                    gi_view.add_traversal_pass(
+                        &self.device,
+                        &mut graph,
+                        traversal_pso,
+                        frame,
+                        crate::SceneTraversalPush {
+                            view_proj,
+                            eye: demand.eye.to_array(),
+                            proj_scale: demand.proj_scale,
+                            error_threshold_px: tuning.error_threshold_px,
+                            record_capacity: gi_view.record_capacity(),
+                            list_capacity: gi_view.capacity(),
+                            survivor: 0,
+                            tess_seam: 0,
+                            // Settled cuts only: a reach walk that touched the shared
+                            // flip-state table would fabricate camera-view crossfades out
+                            // of its own refine decisions.
+                            transition_frames: 0,
+                            frame_stamp: self.frame_serial as u32,
+                            representation_override: tuning.representation_override,
+                            // The node cull is a frustum test and the reach view has no
+                            // frustum; rejecting on one would drop the very occluders it
+                            // exists to keep.
+                            node_cull: 0,
+                            demand_only: 1,
+                            view_class: crate::SceneViewClass::Gi.ordinal(),
+                        },
+                    );
+                    gi_view.add_counters_readback_pass(&self.device, &mut graph, frame);
+                    // The occluder scatter: the reach view's visible list becomes this
+                    // frame's SDF occluder region, on device. The meta slice was cleared
+                    // by the frame's transfer prologue; the GDF cull and the DDGI
+                    // near-field march read the region and its count through per-slot
+                    // descriptor slices, so their passes declare reads on the same
+                    // imported buffers and the graph orders them after this write.
+                    if let Some(scatter_pso) = &gi_scatter_pso {
+                        self.global_sdf.write_scatter_inputs(
+                            frame,
+                            (
+                                gi_view.counters(frame),
+                                crate::SCENE_VISIBILITY_COUNTER_WORDS * 4,
+                            ),
+                            (gi_view.visible(frame), u64::from(gi_view.capacity()) * 4),
+                            address_slice,
+                        );
+                        let instances_res = graph.import_buffer(self.sdf_instances.handle(), None);
+                        let meta_res = graph.import_buffer(self.sdf_meta.handle(), None);
+                        let counters_res = graph.import_buffer(gi_view.counters(frame), None);
+                        let raw_scatter = self.device.raw().clone();
+                        let pipeline = Arc::clone(scatter_pso);
+                        let set = self.global_sdf.scatter_set(frame);
+                        let push = crate::GiOccluderScatterPush {
+                            reach_min: demand.gi_min.extend(0.0).to_array(),
+                            reach_max: demand.gi_max.extend(0.0).to_array(),
+                            capacity: MAX_SDF_INSTANCES,
+                            list_capacity: gi_view.capacity(),
+                            reserved: [0; 2],
+                        };
+                        let groups = gi_view.capacity().max(1).div_ceil(64);
+                        graph.add_pass(
+                            RgPass::compute("gi-occluder-scatter")
+                                .access(counters_res, RgUsage::StorageReadCompute)
+                                .access(instances_res, RgUsage::StorageWriteCompute)
+                                .access(meta_res, RgUsage::StorageReadWriteCompute)
+                                .body(move |cmd, _scopes| {
+                                    // SAFETY: the ash seam. PSO/set valid this frame;
+                                    // the push spans the declared range.
+                                    unsafe {
+                                        raw_scatter.cmd_bind_pipeline(
+                                            cmd,
+                                            vk::PipelineBindPoint::COMPUTE,
+                                            pipeline.handle(),
+                                        );
+                                        raw_scatter.cmd_bind_descriptor_sets(
+                                            cmd,
+                                            vk::PipelineBindPoint::COMPUTE,
+                                            pipeline.layout(),
+                                            0,
+                                            &[set],
+                                            &[],
+                                        );
+                                        raw_scatter.cmd_push_constants(
+                                            cmd,
+                                            pipeline.layout(),
+                                            vk::ShaderStageFlags::COMPUTE,
+                                            0,
+                                            bytemuck::bytes_of(&push),
+                                        );
+                                        raw_scatter.cmd_dispatch(cmd, groups, 1, 1);
+                                    }
+                                }),
+                        );
+                    }
+                }
                 // Stages 2-3: traverse the culled instances (classified against the
                 // previous pyramid) into the record stream, then bin into indirect
                 // commands — the provisional cut the raster passes consume.
                 if let Some(traversal_pso) = &visibility_psos.1 {
                     let demand = self.page_demand_view();
+                    let camera_tuning = self.traversal_tuning(crate::SceneViewClass::Camera);
                     lists.add_traversal_pass(
                         &self.device,
                         &mut graph,
                         traversal_pso,
                         frame,
                         crate::SceneTraversalPush {
+                            view_proj,
                             eye: demand.eye.to_array(),
                             proj_scale: demand.proj_scale,
-                            error_threshold_px: 1.0,
+                            error_threshold_px: camera_tuning.error_threshold_px,
                             record_capacity: lists.record_capacity(),
                             list_capacity: lists.capacity(),
                             survivor: 0,
                             tess_seam,
                             transition_frames: crate::GPU_TRANSITION_FRAMES,
                             frame_stamp: self.frame_serial as u32,
-                            reserved0: 0,
+                            representation_override: camera_tuning.representation_override,
+                            node_cull: u32::from(self.node_cull),
+                            demand_only: 0,
+                            view_class: crate::SceneViewClass::Camera.ordinal(),
                         },
                     );
                     // Micro-field reconstruction appends blade records to the same
@@ -7151,6 +8024,13 @@ impl Renderer {
         }
         // F1: resolve each frame bucket's executor mesh PSO for the pass bodies (the
         // borrow of `self.pipelines` must not overlap the visibility block's `lists`).
+        // Cloned once per frame so the pass bodies (which outlive this borrow) can dispatch
+        // mesh tasks; `None` whenever the mesh executor is off or unsupported.
+        let scene_mesh_dispatch: Option<ash::ext::mesh_shader::Device> = self
+            .mesh_executor
+            .then(|| self.device.mesh_shader_dispatch().cloned())
+            .flatten();
+        let survivor_mesh_dispatch = scene_mesh_dispatch.clone();
         let executor_draws: Vec<(crate::ExecutorBucket, bool, Arc<crate::Pipeline>)> =
             executor_buckets
                 .iter()
@@ -7158,7 +8038,11 @@ impl Renderer {
                     let material =
                         crate::bucket_material(&self.global_gpu_data.executor_shaders, *bucket);
                     self.pipelines
-                        .request_executor_mesh_pipeline(&material, self.wireframe)
+                        .request_executor_mesh_pipeline(
+                            &material,
+                            self.wireframe,
+                            self.mesh_executor,
+                        )
                         .map(|pso| (*bucket, material.blend, pso))
                 })
                 .collect();
@@ -7337,16 +8221,33 @@ impl Renderer {
         self.rt.reset_frame_ready();
         let deformed_rt = self.scene_draw_list.deformed_rt_instances.clone();
         let has_skinned_rt = !deformed_rt.is_empty();
+        // Representation selection projects through the camera view's own cut parameters,
+        // so the ray representation swaps to the aggregate exactly where the raster
+        // traversal draws it.
+        let rt_cut_view = {
+            let demand = self.page_demand_view();
+            let tuning = self.traversal_tuning(crate::SceneViewClass::Camera);
+            crate::RtCutView {
+                eye: demand.eye.to_array(),
+                proj_scale: demand.proj_scale,
+                error_threshold_px: tuning.error_threshold_px,
+                representation_override: tuning.representation_override,
+            }
+        };
         if self.rt.build_pending()
             && self.rt.has_instances(&deformed_rt)
-            && let Some(plan) =
-                self.rt
-                    .prepare_tlas_build(&self.device, frame, &deformed_rt, deformed_handle)
+            && let Some(plan) = self.rt.prepare_tlas_build(
+                &self.device,
+                frame,
+                &deformed_rt,
+                deformed_handle,
+                rt_cut_view,
+            )
         {
             let raw_body = raw.clone();
             let mut tlas_pass = RgPass::compute("tlas-build").body(
-                move |cmd, _scopes: &mut NestedScopeRecorder| {
-                    crate::record_tlas_build_plan(&raw_body, cmd, &plan);
+                move |_cmd, scopes: &mut NestedScopeRecorder| {
+                    crate::record_tlas_build_plan(&raw_body, &plan, scopes);
                 },
             );
             // Declare the deformed-buffer read so the graph orders this after the skin
@@ -7865,6 +8766,7 @@ impl Renderer {
                             scene_draw_count_supported,
                             &scene_draws,
                             false,
+                            scene_mesh_dispatch.as_ref(),
                         );
                     }
                     // The tessellation seam: displaced instances' amplified draws
@@ -8148,6 +9050,8 @@ impl Renderer {
                             history_valid: u32::from(visibility_history_valid),
                             list_capacity: lists.capacity(),
                             reserved: [0; 2],
+                            reach_min: [0.0; 4],
+                            reach_max: [0.0; 4],
                         },
                     );
                 }
@@ -8159,22 +9063,27 @@ impl Renderer {
                 if survivor_planned {
                     if let Some(traversal_pso) = &visibility_psos.1 {
                         let demand = self.page_demand_view();
+                        let survivor_tuning = self.traversal_tuning(crate::SceneViewClass::Camera);
                         lists.add_traversal_pass(
                             &self.device,
                             &mut graph,
                             traversal_pso,
                             frame,
                             crate::SceneTraversalPush {
+                                view_proj,
                                 eye: demand.eye.to_array(),
                                 proj_scale: demand.proj_scale,
-                                error_threshold_px: 1.0,
+                                error_threshold_px: survivor_tuning.error_threshold_px,
                                 record_capacity: lists.record_capacity(),
                                 list_capacity: lists.capacity(),
                                 survivor: 1,
                                 tess_seam,
                                 transition_frames: crate::GPU_TRANSITION_FRAMES,
                                 frame_stamp: self.frame_serial as u32,
-                                reserved0: 0,
+                                representation_override: survivor_tuning.representation_override,
+                                node_cull: u32::from(self.node_cull),
+                                demand_only: 0,
+                                view_class: crate::SceneViewClass::Camera.ordinal(),
                             },
                         );
                     }
@@ -8219,6 +9128,7 @@ impl Renderer {
                                         survivor_count,
                                         &survivor_draws,
                                         false,
+                                        survivor_mesh_dispatch.as_ref(),
                                     );
                                 });
                             });
@@ -8258,6 +9168,32 @@ impl Renderer {
                     }
                 }
                 lists.add_counters_readback_pass(&self.device, &mut graph, frame);
+            }
+            // The scatter meta's fence-gated host copy, after every consumer has read
+            // the slice this frame.
+            {
+                let meta_res = graph.import_buffer(self.sdf_meta.handle(), None);
+                let readback_res = graph.import_buffer(self.sdf_meta_readback.handle(), None);
+                let raw_copy = self.device.raw().clone();
+                let meta = self.sdf_meta.handle();
+                let readback = self.sdf_meta_readback.handle();
+                let offset = frame as u64 * SDF_META_SLOT_BYTES;
+                graph.add_pass(
+                    RgPass::compute("sdf-meta-readback")
+                        .access(meta_res, RgUsage::TransferRead)
+                        .access(readback_res, RgUsage::TransferWrite)
+                        .body(move |cmd, _scopes| {
+                            let region = vk::BufferCopy {
+                                src_offset: offset,
+                                dst_offset: offset,
+                                size: SDF_META_SLOT_BYTES,
+                            };
+                            // SAFETY: the ash seam; both buffers outlive the frame.
+                            unsafe {
+                                raw_copy.cmd_copy_buffer(cmd, meta, readback, &[region]);
+                            }
+                        }),
+                );
             }
             // The final HZB rebuild reads the survivor-updated depth over the same
             // imported pyramid resource, publishing the complete cut as next frame's
@@ -8751,10 +9687,14 @@ impl Renderer {
         let trace_handle = trace.handle();
         let trace_pipeline_layout = trace.layout();
         let trace_set = self.ddgi.trace_set();
-        let trace_push = self.ddgi.trace_push(self.sdf_instance_count);
+        let trace_push = self.ddgi.trace_push();
         let trace_groups_x = DDGI_RAYS_PER_PROBE.div_ceil(64);
         let raw_body = raw.clone();
+        let sdf_instances_res = graph.import_buffer(self.sdf_instances.handle(), None);
+        let sdf_meta_res = graph.import_buffer(self.sdf_meta.handle(), None);
         let mut trace_pass = RgPass::compute("ddgi-trace")
+            .access(sdf_instances_res, RgUsage::StorageReadCompute)
+            .access(sdf_meta_res, RgUsage::StorageReadCompute)
             .access(irr_res, RgUsage::SampledReadCompute)
             .access(ray_res, RgUsage::StorageImageRwCompute)
             .access(sky_sh, RgUsage::StorageReadCompute);
@@ -8915,6 +9855,11 @@ impl Renderer {
         // each cascade volume (the composite writes them, the downstream consumers sample them). The
         // cull list is per-frame-in-flight so frame N+1's clear/rebuild never races frame N's reads.
         let cull_res = graph.import_buffer(self.global_sdf.cull_buffer(frame), None);
+        // The occluder region + meta the scatter wrote earlier this frame: declared on
+        // the cull (and the composite, which reads instances through the cull list) so
+        // the graph orders both after the scatter's write.
+        let sdf_instances_res = graph.import_buffer(self.sdf_instances.handle(), None);
+        let sdf_meta_res = graph.import_buffer(self.sdf_meta.handle(), None);
         let mut cascade_res = [RgResource { index: 0 }; crate::GDF_CASCADES as usize];
         let mut cascade_slots = [None; crate::GDF_CASCADES as usize];
         let mut occupancy_res = [RgResource { index: 0 }; crate::GDF_CASCADES as usize];
@@ -8945,13 +9890,15 @@ impl Renderer {
             let layout = cull.layout();
             let bindless_set = self.descriptors.bindless_set();
             let cull_set = self.global_sdf.cull_set(frame);
-            let push = self.global_sdf.cull_push(self.sdf_instance_count);
+            let push = self.global_sdf.cull_push(MAX_SDF_INSTANCES);
             let counter_bytes = self.global_sdf.cull_counter_bytes();
             let cull_buffer = self.global_sdf.cull_buffer(frame);
             let groups = MAX_SDF_INSTANCES.div_ceil(64);
             let raw_body = raw.clone();
             graph.add_pass(
                 RgPass::compute("gdf-cull")
+                    .access(sdf_instances_res, RgUsage::StorageReadCompute)
+                    .access(sdf_meta_res, RgUsage::StorageReadCompute)
                     .access(cull_res, RgUsage::StorageWriteCompute)
                     .body(move |cmd, _scopes: &mut NestedScopeRecorder| {
                         // SAFETY: the ash seam. The PSO/sets are valid this frame. The fill zeroes
@@ -9023,8 +9970,9 @@ impl Renderer {
                 dispatches.push((push, g.0, g.1, g.2));
             }
         }
-        let mut composite_pass =
-            RgPass::compute("gdf-composite").access(cull_res, RgUsage::StorageReadCompute);
+        let mut composite_pass = RgPass::compute("gdf-composite")
+            .access(cull_res, RgUsage::StorageReadCompute)
+            .access(sdf_instances_res, RgUsage::StorageReadCompute);
         for cascade in cascade_res {
             composite_pass = composite_pass.access(cascade, RgUsage::StorageImageRwCompute);
         }
@@ -12219,6 +13167,7 @@ impl Renderer {
                 ));
             }
         }
+        let shadow_tuning = self.traversal_tuning(crate::SceneViewClass::ShadowPage);
         for (view_slot, cull_view_proj, group_pages) in groups {
             let needs_view = self.vsm_views[view_slot]
                 .as_ref()
@@ -12280,6 +13229,8 @@ impl Renderer {
                     history_valid: 0,
                     list_capacity: view.capacity(),
                     reserved: [0; 2],
+                    reach_min: [0.0; 4],
+                    reach_max: [0.0; 4],
                 },
             );
             view.add_traversal_pass(
@@ -12288,9 +13239,10 @@ impl Renderer {
                 traversal_pso,
                 frame,
                 crate::SceneTraversalPush {
+                    view_proj: level_view_proj,
                     eye: demand.eye.to_array(),
                     proj_scale: demand.proj_scale,
-                    error_threshold_px: 1.0,
+                    error_threshold_px: shadow_tuning.error_threshold_px,
                     record_capacity: view.record_capacity(),
                     list_capacity: view.capacity(),
                     survivor: 0,
@@ -12300,7 +13252,10 @@ impl Renderer {
                     // refine decisions and fabricate camera-view crossfades.
                     transition_frames: 0,
                     frame_stamp,
-                    reserved0: 0,
+                    representation_override: shadow_tuning.representation_override,
+                    node_cull: u32::from(self.node_cull),
+                    demand_only: 0,
+                    view_class: crate::SceneViewClass::ShadowPage.ordinal(),
                 },
             );
             view.add_binning_passes(&self.device, graph, bin_psos, frame, false, micro_template);
@@ -13278,6 +14233,69 @@ impl Drop for Renderer {
 
 #[cfg(test)]
 mod tests {
+    /// The clock must not read as an edit.
+    ///
+    /// `SceneWind` carries `time_s`, which advances every frame. An earlier version compared
+    /// the whole struct and so raised a discontinuity continuously, disabling temporal
+    /// accumulation entirely — the wind visual test caught it as a canopy that never settled.
+    #[test]
+    fn the_wind_clock_is_not_an_edit() {
+        let mut wind = crate::SceneWind::default();
+        let base = super::wind_authored_digest(&wind);
+        wind.time_s += 1234.5;
+        assert_eq!(
+            super::wind_authored_digest(&wind),
+            base,
+            "the clock is not an edit"
+        );
+        wind.speed += 1.0;
+        assert_ne!(
+            super::wind_authored_digest(&wind),
+            base,
+            "a speed change is"
+        );
+    }
+
+    /// A wind edit is a discontinuity; wind advancing on its own clock is not.
+    ///
+    /// This distinction is the whole point of the flag. Wind changes every frame by design, so
+    /// a detector that keyed on the field's *value over time* would fire continuously and
+    /// disable temporal accumulation outright — the opposite of the intent.
+    #[test]
+    fn only_a_wind_edit_counts_as_a_discontinuity() {
+        use saffron_wind::{LocalWindSource, WindSourceKind};
+        let source = |strength: f32| LocalWindSource {
+            kind: WindSourceKind::Directional,
+            position: saffron_geometry::glam::DVec3::new(1.0, 2.0, 3.0),
+            direction: saffron_geometry::glam::Vec3::X,
+            strength,
+            radius: 4.0,
+            falloff: 0.5,
+        };
+        // Identical sources digest identically, so no edit is reported.
+        assert_eq!(
+            super::wind_source_digest(&source(1.0)),
+            super::wind_source_digest(&source(1.0))
+        );
+        // Any authored change moves the digest.
+        assert_ne!(
+            super::wind_source_digest(&source(1.0)),
+            super::wind_source_digest(&source(1.5))
+        );
+        let mut moved = source(1.0);
+        moved.radius = 4.25;
+        assert_ne!(
+            super::wind_source_digest(&source(1.0)),
+            super::wind_source_digest(&moved)
+        );
+        let mut turned = source(1.0);
+        turned.direction = saffron_geometry::glam::Vec3::Y;
+        assert_ne!(
+            super::wind_source_digest(&source(1.0)),
+            super::wind_source_digest(&turned)
+        );
+    }
+
     use super::*;
     use crate::validation_issue_count;
     use vk_mem::Alloc;
@@ -13309,8 +14327,17 @@ mod tests {
             .expect("offscreen clear+readback succeeds");
         device.wait_idle().expect("idle after the run");
 
-        // The image is R8G8B8A8_UNORM; the cleared floats round to these bytes.
-        assert_eq!(cleared, [64, 128, 191, 255], "the clear color reads back");
+        // The image is R8G8B8A8_UNORM; the cleared floats quantize to these bytes. `0.5`
+        // lands exactly halfway (127.5), and the spec leaves the tie-break to the
+        // implementation, so each channel is checked to within one quantization step.
+        let expected = [64u8, 128, 191, 255];
+        for (channel, (&got, &want)) in cleared.iter().zip(&expected).enumerate() {
+            assert!(
+                got.abs_diff(want) <= 1,
+                "the clear color reads back: channel {channel} was {got}, expected {want}±1 \
+                 (full readback {cleared:?})"
+            );
+        }
         let after = validation_issue_count();
         assert_eq!(
             before,
@@ -14484,7 +15511,14 @@ mod tests {
         };
         let hierarchy = crate::upload::hierarchy_for_upload(&mesh, &[]).expect("cook hierarchy");
         let mesh = uploader
-            .upload_mesh(renderer.descriptors(), &mesh, &hierarchy, &[], None, None)
+            .upload_mesh(
+                renderer.descriptors(),
+                &mesh,
+                &hierarchy,
+                &[],
+                None,
+                crate::SdfSource::None,
+            )
             .expect("upload_mesh");
         let mut rgba = vec![0u8; 8 * 8 * 4];
         for (i, px) in rgba.chunks_exact_mut(4).enumerate() {

@@ -192,6 +192,10 @@ impl FrameHost for Renderer {
         if self.swapchain().is_some() {
             self.present_active_view_to_swapchain()?;
         }
+        // A layer that drew nothing this frame never reached `render_scene_offscreen`, leaving the
+        // slot fence reset-but-unsignalled and the next frame waiting on it forever. Close it here
+        // so the loop's invariant does not depend on what a layer chose to draw.
+        self.finish_unsubmitted_frame()?;
         Ok(())
     }
 
