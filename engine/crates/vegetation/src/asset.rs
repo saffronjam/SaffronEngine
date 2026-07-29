@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Current `.splant` document version.
-pub const PLANT_ASSET_VERSION: u32 = 4;
+pub const PLANT_ASSET_VERSION: u32 = 5;
 /// Current `.sbiome` document version.
 pub const BIOME_ASSET_VERSION: u32 = 1;
 /// Current `.svegmap` manifest version.
@@ -580,7 +580,49 @@ pub struct PlantFamilyAsset {
     pub habitat: Option<HabitatPreferences>,
     /// Species ecology rules and relations.
     pub ecology: PlantEcologyDeclaration,
+    /// Whether the family places in a world or exists to be called by one.
+    pub role: PlantFamilyRole,
+    /// The `.splant` modules this family's graph calls, by call-site GUID.
+    pub modules: Vec<PlantModuleReference>,
+    /// How deep the module chain below this family may reach.
+    pub module_recursion_limit: u16,
 }
+
+/// Whether a family places in a world or exists as a reusable preset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlantFamilyRole {
+    /// An ordinary family a biome may place.
+    #[default]
+    Family,
+    /// A reusable preset another family's graph calls. It is still an ordinary `.splant` — it
+    /// opens, previews, and cooks like any family, which is what keeps a preset editable rather
+    /// than a second document format.
+    Module,
+}
+
+/// One call site's binding of a `.splant` module.
+///
+/// The interface is deliberately small: which module, which of its variations, and what to scale
+/// it by. Each has a consumer in the evaluator, which is the test of whether a parameter is real
+/// rather than a knob that reads nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlantModuleReference {
+    /// The referenced `.splant`, which must carry [`PlantFamilyRole::Module`].
+    pub plant: Uuid,
+    /// Stable call-site GUID, named by the graph's `ModuleCall` node.
+    pub call_guid: u128,
+    /// Which of the module's variations to grow.
+    pub variation: u32,
+    /// Uniform scale applied when placing it, where one is the module's authored size.
+    pub scale: DecisionScalar,
+}
+
+/// The deepest module chain any family may declare.
+///
+/// A bound rather than a budget: a preset that calls a preset is ordinary authoring, and a chain
+/// that keeps going is a cycle the author cannot see. The resolver rejects at the declared limit,
+/// and this caps what may be declared.
+pub const MAX_PLANT_MODULE_RECURSION: u16 = 8;
 
 /// Root biome or reusable typed module role.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1548,6 +1590,56 @@ pub fn validate_plant_family(asset: &PlantFamilyAsset) -> Result<()> {
             format: ".splant",
             field: "ecology.relations".to_owned(),
         });
+    }
+    validate_plant_modules(asset)?;
+    Ok(())
+}
+
+/// The module table's own invariants: a bounded declared depth, unique non-zero call GUIDs, no
+/// self-reference, and exactly one reference per `ModuleCall` node in the graph.
+///
+/// The last one matters in both directions. A call with no reference would resolve to nothing, and
+/// a reference with no call is a binding an author edits expecting an effect it cannot have.
+fn validate_plant_modules(asset: &PlantFamilyAsset) -> Result<()> {
+    let field = |name: &str| crate::Error::InvalidFormat {
+        format: ".splant",
+        field: name.to_owned(),
+    };
+    if asset.module_recursion_limit > MAX_PLANT_MODULE_RECURSION {
+        return Err(field("moduleRecursionLimit"));
+    }
+    let call_guids: std::collections::BTreeSet<_> = asset
+        .modules
+        .iter()
+        .map(|module| module.call_guid)
+        .collect();
+    if call_guids.len() != asset.modules.len() || call_guids.contains(&0) {
+        return Err(field("modules.callGuid"));
+    }
+    if asset.modules.iter().any(|module| {
+        module.plant.value() == 0 || module.plant == asset.id || module.scale.bits() <= 0
+    }) {
+        return Err(field("modules"));
+    }
+    let PlantFamilySource::Native { graph, .. } = &asset.source else {
+        // An imported family has no graph to call from, so a module table on one is a binding
+        // nothing can read.
+        return if asset.modules.is_empty() {
+            Ok(())
+        } else {
+            Err(field("modules.source"))
+        };
+    };
+    let mut called = std::collections::BTreeSet::new();
+    for node in &graph.nodes {
+        if let crate::BotanicalOperator::ModuleCall { call_guid } = &node.operator
+            && (!called.insert(*call_guid) || !call_guids.contains(call_guid))
+        {
+            return Err(field("modules.callGuid"));
+        }
+    }
+    if called.len() != asset.modules.len() {
+        return Err(field("modules"));
     }
     Ok(())
 }

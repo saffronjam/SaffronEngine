@@ -18,7 +18,7 @@ const MAP_CHUNK_MAGIC: &[u8; 8] = b"SVEGCH01";
 /// SHA-256 identity of the `.splant` binary field vocabulary.
 #[must_use]
 pub fn plant_asset_schema_hash() -> [u8; 32] {
-    sha256(b"saffron-anima/splant/schema/v4/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotypes+collision+navigation+interaction+habitat+ecology+botanical")
+    sha256(b"saffron-anima/splant/schema/v5/typed-locators+per-source-provenance+role+selector+coordinate-policy+semantic-targets+family-tags+parts+dimensions+materials+spines+mechanics+variations+phenotypes+collision+navigation+interaction+habitat+ecology+botanical+family-role+modules")
 }
 
 /// SHA-256 identity of the `.sbiome` binary field vocabulary.
@@ -139,6 +139,18 @@ pub fn write_plant_asset(asset: &PlantFamilyAsset) -> Result<Vec<u8>> {
         Ok(())
     })?;
     write_plant_ecology(&mut writer, &asset.ecology)?;
+    writer.u32(match asset.role {
+        crate::PlantFamilyRole::Family => 0,
+        crate::PlantFamilyRole::Module => 1,
+    });
+    writer.u16(asset.module_recursion_limit);
+    writer.vec(&asset.modules, |writer, module| {
+        writer.uuid(module.plant);
+        writer.u128(module.call_guid);
+        writer.u32(module.variation);
+        writer.fixed(module.scale);
+        Ok(())
+    })?;
     Ok(writer.finish())
 }
 
@@ -221,6 +233,20 @@ pub fn read_plant_asset(bytes: &[u8]) -> Result<PlantFamilyAsset> {
             })
         })?,
         ecology: read_plant_ecology(&mut reader)?,
+        role: match reader.u32()? {
+            0 => crate::PlantFamilyRole::Family,
+            1 => crate::PlantFamilyRole::Module,
+            _ => return Err(reader.invalid("role")),
+        },
+        module_recursion_limit: reader.u16()?,
+        modules: reader.vec(|reader| {
+            Ok(crate::PlantModuleReference {
+                plant: reader.uuid()?,
+                call_guid: reader.u128()?,
+                variation: reader.u32()?,
+                scale: reader.fixed()?,
+            })
+        })?,
     };
     reader.complete()?;
     validate_plant_family(&asset)?;
@@ -502,6 +528,10 @@ fn write_botanical_operator(
             writer.fixed(*size);
             writer.unit(*jitter);
         }
+        Op::ModuleCall { call_guid } => {
+            writer.u8(10);
+            writer.u128(*call_guid);
+        }
         Op::Family => writer.u8(8),
         Op::Drawn { element, points } => {
             writer.u8(9);
@@ -620,6 +650,9 @@ fn read_botanical_operator(reader: &mut Reader<'_>) -> Result<crate::BotanicalOp
             jitter: reader.unit()?,
         },
         8 => Op::Family,
+        10 => Op::ModuleCall {
+            call_guid: reader.u128()?,
+        },
         9 => Op::Drawn {
             element: crate::BotanicalElement::try_from(reader.u32()?)?,
             points: reader.vec(|reader| {
@@ -2610,6 +2643,9 @@ mod tests {
 
     fn plant() -> PlantFamilyAsset {
         PlantFamilyAsset {
+            role: crate::PlantFamilyRole::Family,
+            modules: Vec::new(),
+            module_recursion_limit: crate::MAX_PLANT_MODULE_RECURSION,
             version: PLANT_ASSET_VERSION,
             id: Uuid(11),
             name: "Oak".to_owned(),
@@ -2677,6 +2713,50 @@ mod tests {
         let decoded = read_plant_asset(&bytes).unwrap();
         assert_eq!(decoded, asset);
         assert_eq!(write_plant_asset(&decoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_module_table_round_trips_and_is_matched_against_the_graph() {
+        // The four things a format change moves together are the writer, the reader, the version
+        // constant, and the schema-hash domain. This is the writer/reader half; the version and
+        // domain are asserted by the header check every read performs.
+        let mut native = plant();
+        let call_guid = 0x5eed_u128;
+        let mut graph = crate::BotanicalGraphDocument::sapling(0x1234);
+        let leaves = graph
+            .nodes
+            .iter()
+            .position(|node| matches!(node.operator, crate::BotanicalOperator::Instance { .. }))
+            .expect("the sapling places leaves");
+        graph.nodes[leaves].operator = crate::BotanicalOperator::ModuleCall { call_guid };
+        native.source = crate::PlantFamilySource::Native {
+            graph,
+            grafts: Vec::new(),
+        };
+        native.modules = vec![crate::PlantModuleReference {
+            plant: saffron_core::Uuid(0x9_0001),
+            call_guid,
+            variation: 0,
+            scale: fixed(2),
+        }];
+        native.module_recursion_limit = 4;
+        let bytes = write_plant_asset(&native).unwrap();
+        let decoded = read_plant_asset(&bytes).unwrap();
+        assert_eq!(decoded, native);
+        assert_eq!(write_plant_asset(&decoded).unwrap(), bytes);
+
+        // Both directions are rejected at the format rather than at growth time. A call whose
+        // GUID names no reference resolves to nothing; a reference with no call is a binding an
+        // author edits expecting an effect it cannot have.
+        let mut orphaned = native.clone();
+        orphaned.modules[0].call_guid = call_guid + 1;
+        assert!(write_plant_asset(&orphaned).is_err());
+        let mut unbound = native.clone();
+        unbound.modules.clear();
+        assert!(write_plant_asset(&unbound).is_err());
+        let mut self_call = native.clone();
+        self_call.modules[0].plant = self_call.id;
+        assert!(write_plant_asset(&self_call).is_err());
     }
 
     #[test]

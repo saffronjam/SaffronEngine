@@ -603,7 +603,7 @@ fn decode_plant(reader: &mut BinaryReader<'_>) -> Result<VegetationManifestPlant
     })
 }
 
-fn encode_cell(writer: &mut BinaryWriter, cell: &VegetationManifestCell) -> Result<()> {
+pub(crate) fn encode_cell(writer: &mut BinaryWriter, cell: &VegetationManifestCell) -> Result<()> {
     writer.cell(cell.cell);
     writer.bounds(cell.bounds);
     writer.bytes(&cell.artifact_hash.bytes());
@@ -664,7 +664,7 @@ fn encode_cell(writer: &mut BinaryWriter, cell: &VegetationManifestCell) -> Resu
     Ok(())
 }
 
-fn decode_cell(reader: &mut BinaryReader<'_>) -> Result<VegetationManifestCell> {
+pub(crate) fn decode_cell(reader: &mut BinaryReader<'_>) -> Result<VegetationManifestCell> {
     let cell = reader.cell()?;
     let bounds = reader.bounds()?;
     let artifact_hash = ContentHash::new(reader.array()?);
