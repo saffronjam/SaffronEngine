@@ -862,6 +862,12 @@ impl VegetationWorld {
         self.effective = effective;
         self.predictions = predictions;
         self.publish_state_rebuilds(staged)?;
+        // A confirmed mutation changes what a cell renders as — a phenotype override, a
+        // lifecycle change, a transform — so every adapter caching beside the generation id
+        // must re-derive the cell, exactly as a promotion does.
+        for cell in &changed_cells {
+            self.bump_bulk_revision(*cell);
+        }
         // Only a confirmed commit is observable. A prediction is transient and a replay is a
         // no-op, so neither reaches the ring — every consumer sees each transition exactly once.
         self.record_transitions(&reduction.transitions);
@@ -2545,6 +2551,46 @@ mod tests {
             facets: ResidencyMask::one(facet),
             priority: 10,
         }
+    }
+
+    /// A confirmed mutation must bump its cell's bulk revision: a render adapter caches the
+    /// revision beside the generation id and re-derives the cell when either moves, so a
+    /// phenotype override that left the revision alone would keep rendering the old
+    /// combination while the runtime reported the new one.
+    #[test]
+    fn a_confirmed_mutation_bumps_the_cell_bulk_revision() {
+        let (mut world, artifact, plant) = fixture();
+        world.update_source(source()).unwrap();
+        let cell = WorldCellKey::base(0, 0, 0);
+        let staged = world
+            .begin_load(cell, ResidencyMask::one(ResidencyFacet::Physics))
+            .unwrap()
+            .stage(&artifact)
+            .unwrap();
+        assert!(world.publish_staged(staged).unwrap());
+        let before = world.cell_bulk_revision(cell);
+        world
+            .apply_confirmed_mutations(&[VegetationMutationRecord {
+                header: crate::MutationHeader {
+                    cell,
+                    transaction: 7,
+                    authority: 2,
+                    logical_tick: 3,
+                    idempotency_key: 9,
+                    base_revision: None,
+                },
+                mutation: crate::VegetationMutation::StateOverride {
+                    plant,
+                    lifecycle: None,
+                    phenotype: Some(1),
+                    health: None,
+                    moisture: None,
+                    fuel: None,
+                    interaction_policy: None,
+                },
+            }])
+            .unwrap();
+        assert_eq!(world.cell_bulk_revision(cell), before + 1);
     }
 
     #[test]

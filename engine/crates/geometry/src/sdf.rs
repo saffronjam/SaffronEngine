@@ -23,7 +23,7 @@ use glam::Vec3;
 use crate::error::{Error, Result};
 
 /// `SDST` byte-image version. Bumped when the header or brick encoding changes.
-pub const SDF_FORMAT_VERSION: u32 = 3;
+pub const SDF_FORMAT_VERSION: u32 = 4;
 
 /// Prefiltered mip levels of the brick atlas (UE's `NumMips` default). Mip 0 is the fine
 /// field; each coarser mip halves the voxel resolution and is band-limited by a conservative
@@ -227,8 +227,16 @@ pub struct SdfHeader {
     /// The coarse coverage volume dims (one texel per brick block): the conservative
     /// distance to the nearest surface anywhere in each block, the empty-space oracle.
     pub coverage_dims: [u32; 3],
+    /// The field's own aggregate occupancy in unorm16 (`0` = the field carries none and
+    /// the occluder resolves occupancy from the drawn material — every triangle bake).
+    /// A cooked plant field carries the CALIBRATED aggregate here, because the material
+    /// a placed plant draws slot 0 with is its trunk, and a canopy is not a solid.
+    pub occupancy_unorm: u32,
+    /// The field's own proxy albedo, rgb packed 8:8:8 unorm low-to-high (`0` = resolve
+    /// from the drawn material).
+    pub proxy_albedo: u32,
     /// Padding to a 16-byte multiple (keeps the `Pod` round-trip exact).
-    pub _pad: [u32; 3],
+    pub _pad: u32,
 }
 
 const _: () = assert!(size_of::<SdfHeader>() == 112, "SdfHeader must be 112 bytes");
@@ -344,7 +352,12 @@ impl Sdf {
                 occupied_bricks: occupied,
                 mip_count: SDF_MIP_COUNT,
                 coverage_dims: indir,
-                _pad: [0; 3],
+                // Solid by default: a triangle-baked field is a wall, and a wall
+                // occludes outright. A producer with calibrated porosity (a cooked
+                // plant canopy) overwrites this.
+                occupancy_unorm: 65_535,
+                proxy_albedo: 0,
+                _pad: 0,
             },
             indirection,
             atlas,
