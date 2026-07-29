@@ -76,6 +76,39 @@ impl<T: HasDisplayHandle + HasWindowHandle> WindowSurface for T {}
 pub struct Capabilities {
     /// KHR acceleration-structure + ray-query present and enabled.
     pub rt_supported: bool,
+    /// `VK_EXT_opacity_micromap::micromap` is enabled: the device can attach opacity
+    /// micromaps to triangle geometry, letting a ray resolve coverage without invoking the
+    /// any-hit classifier on micro-triangles known to be wholly covered or wholly cut out.
+    /// Requires [`Self::rt_supported`]; a micromap is only meaningful under an AS build.
+    pub opacity_micromap: bool,
+    /// `maxOpacity4StateSubdivisionLevel` — the deepest 4-state subdivision this device accepts.
+    ///
+    /// A usage row above it is a VU violation, which on this class of driver is DEVICE LOSS rather
+    /// than a validation message, so a cooked derivation has to be clamped against it at upload
+    /// rather than trusted. Zero when the extension is absent.
+    pub omm_max_subdivision: u32,
+    /// `VK_NV_cluster_acceleration_structure::clusterAccelerationStructure` is enabled: cooked
+    /// triangle clusters build directly into cluster acceleration structures, and per-prototype
+    /// bottom-level structures compose from cluster references instead of re-deriving from
+    /// triangle streams. Requires [`Self::rt_supported`], and only at the transcribed spec
+    /// revision — any other revision refuses to enable (a hand-written binding has no
+    /// generator following a layout change).
+    pub cluster_acceleration_structure: bool,
+    /// `VK_NV_partitioned_acceleration_structure::partitionedAccelerationStructure` is enabled:
+    /// the top-level structure is partitioned, so a frame rewrites only the partitions whose
+    /// instances changed instead of rebuilding the whole table. Requires [`Self::rt_supported`],
+    /// and only at the transcribed spec revision.
+    pub partitioned_acceleration_structure: bool,
+    /// `maxPartitionCount` from the partitioned-AS properties; zero when the extension is
+    /// absent. Partition assignment clamps against it, and a scene needing more partitions
+    /// folds the excess into the global partition rather than addressing past the bound.
+    pub max_partition_count: u32,
+    /// `maxTrianglesPerCluster`, `maxVerticesPerCluster`, `clusterScratchByteAlignment`,
+    /// `clusterByteAlignment`, `clusterBottomLevelByteAlignment` from the cluster-AS
+    /// properties, in that order. All zero when the extension is absent. A cooked cluster
+    /// above either count bound falls back to the KHR triangle build for its whole mesh
+    /// rather than splitting.
+    pub cluster_as_limits: [u32; 5],
     /// `VK_EXT_mesh_shader::meshShader` is enabled.
     pub mesh_shader: bool,
     /// `VK_EXT_mesh_shader::taskShader` is enabled independently of mesh shaders.
@@ -286,6 +319,16 @@ pub struct Device {
     // only when `capabilities.rt_supported` — the build path and the `AccelerationStructure`
     // Drop go through it; on a software device it stays `None` and every RT path is a no-op.
     accel: Option<accel::Device>,
+    // The `VK_EXT_opacity_micromap` device dispatch (micromap build + copy), present only
+    // when `capabilities.opacity_micromap`; `None` everywhere else.
+    opacity_micromap: Option<ash::ext::opacity_micromap::Device>,
+    // The `VK_NV_cluster_acceleration_structure` dispatch (hand-resolved: the pinned ash
+    // ships no binding), present only when `capabilities.cluster_acceleration_structure`
+    // and both entry points resolved; `None` everywhere else.
+    cluster_as: Option<crate::vk_nv_cluster::Dispatch>,
+    // The `VK_NV_partitioned_acceleration_structure` dispatch, hand-resolved on the same
+    // terms; `None` everywhere the extension is absent.
+    ptlas: Option<crate::vk_nv_ptlas::Dispatch>,
     // The `VK_EXT_mesh_shader` device dispatch (`cmd_draw_mesh_tasks`), present only when
     // mesh shaders are enabled; `None` on hardware/llvmpipe without the extension.
     mesh_shader: Option<ash::ext::mesh_shader::Device>,
@@ -427,14 +470,15 @@ impl Device {
         let compute_queue_index = selection.compute_queue.map(|queue| queue.index);
         log_selected_device(&instance, physical_device);
 
-        let (device, calibrated_ts_enabled) = create_logical_device(
-            &instance,
-            physical_device,
-            graphics_queue_family,
-            selection.compute_queue,
-            &selection.capabilities,
-            require_present,
-        )?;
+        let (device, calibrated_ts_enabled, checkpoints_enabled, device_fault_enabled) =
+            create_logical_device(
+                &instance,
+                physical_device,
+                graphics_queue_family,
+                selection.compute_queue,
+                &selection.capabilities,
+                require_present,
+            )?;
         // SAFETY: the family/index pair was just used to create the device with one
         // queue at index 0 of that family.
         let graphics_queue =
@@ -453,6 +497,40 @@ impl Device {
         // enabled on the device.
         let accel = if selection.capabilities.rt_supported {
             Some(accel::Device::new(&instance, &device))
+        } else {
+            None
+        };
+        // Resolve the micromap dispatch only when the extension was enabled on the device.
+        let opacity_micromap = if selection.capabilities.opacity_micromap {
+            Some(ash::ext::opacity_micromap::Device::new(&instance, &device))
+        } else {
+            None
+        };
+        // Resolve the cluster-AS dispatch only when the extension was enabled. Unlike ash's
+        // generated loaders, a null proc address here yields `None` rather than a panicking
+        // stub, and the capability is withdrawn with it so no caller sees "supported" with
+        // no way to build.
+        let ptlas = if selection.capabilities.partitioned_acceleration_structure {
+            let dispatch = crate::vk_nv_ptlas::Dispatch::load(&instance, &device);
+            if dispatch.is_none() {
+                tracing::warn!(
+                    "partitioned acceleration structures advertised but the entry points did \
+                     not resolve — disabling"
+                );
+            }
+            dispatch
+        } else {
+            None
+        };
+        let cluster_as = if selection.capabilities.cluster_acceleration_structure {
+            let dispatch = crate::vk_nv_cluster::Dispatch::load(&instance, &device);
+            if dispatch.is_none() {
+                tracing::warn!(
+                    "cluster acceleration structures advertised but the entry points did not \
+                     resolve — disabling"
+                );
+            }
+            dispatch
         } else {
             None
         };
@@ -488,7 +566,45 @@ impl Device {
         } else {
             tracing::info!("calibrated timestamps unavailable — GPU spans stay on their own axis");
         }
-        let resources = DeviceResources::new(device, allocator);
+        // Every acceleration-structure build scratch address must be a multiple of
+        // `minAccelerationStructureScratchOffsetAlignment` (VUID-…-pInfos-03710). The
+        // resource bundle carries it so the scratch allocator can demand it from VMA.
+        let mut selection = selection;
+        let scratch_alignment = if selection.capabilities.rt_supported {
+            let mut accel_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+            let mut omm_props = vk::PhysicalDeviceOpacityMicromapPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut accel_props);
+            if selection.capabilities.opacity_micromap {
+                props2 = props2.push_next(&mut omm_props);
+            }
+            // SAFETY: the ash seam. Fills the chained AS properties for a device that
+            // enabled `VK_KHR_acceleration_structure`, and the micromap properties only when
+            // that extension was enabled too.
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            selection.capabilities.omm_max_subdivision =
+                omm_props.max_opacity4_state_subdivision_level;
+            vk::DeviceSize::from(
+                accel_props
+                    .min_acceleration_structure_scratch_offset_alignment
+                    .max(1),
+            )
+        } else {
+            1
+        };
+        // Resolve the loss-diagnostic dispatches only when their extensions were enabled on the
+        // device; a device loss then names the last pass each queue stage reached and the
+        // driver's fault report.
+        let checkpoints =
+            checkpoints_enabled.then(|| crate::checkpoints::Checkpoints::new(&instance, &device));
+        let device_fault =
+            device_fault_enabled.then(|| crate::checkpoints::DeviceFault::new(&instance, &device));
+        let resources = DeviceResources::new(
+            device,
+            allocator,
+            scratch_alignment,
+            checkpoints,
+            device_fault,
+        );
 
         // The surface queries are valid only when a surface exists. The windowed host
         // queries it for its swapchain format + capture support; the offscreen host has no
@@ -505,6 +621,8 @@ impl Device {
 
         let capabilities = Capabilities {
             capture_supported,
+            cluster_acceleration_structure: cluster_as.is_some(),
+            partitioned_acceleration_structure: ptlas.is_some(),
             ..selection.capabilities
         };
         log_software_gpu(&capabilities);
@@ -521,6 +639,9 @@ impl Device {
             resources: Some(resources),
             swapchain_loader,
             accel,
+            opacity_micromap,
+            cluster_as,
+            ptlas,
             mesh_shader,
             calibrated_ts,
             surface_loader,
@@ -582,6 +703,53 @@ impl Device {
     /// `Drop`. `None` on a software device.
     pub fn accel_dispatch(&self) -> Option<&accel::Device> {
         self.accel.as_ref()
+    }
+
+    /// Whether opacity micromaps can be attached to triangle geometry on this device.
+    pub fn omm_supported(&self) -> bool {
+        self.capabilities.opacity_micromap
+    }
+
+    /// The `VK_EXT_opacity_micromap` device dispatch (micromap build + copy), present only
+    /// when [`Capabilities::opacity_micromap`]; `None` everywhere else.
+    pub fn omm_dispatch(&self) -> Option<&ash::ext::opacity_micromap::Device> {
+        self.opacity_micromap.as_ref()
+    }
+
+    /// The deepest 4-state subdivision level this device accepts in a micromap usage row.
+    #[must_use]
+    pub fn omm_max_subdivision(&self) -> u32 {
+        self.capabilities.omm_max_subdivision
+    }
+
+    /// The `VK_NV_cluster_acceleration_structure` dispatch, present only when
+    /// [`Capabilities::cluster_acceleration_structure`]; `None` everywhere else.
+    pub(crate) fn cluster_as_dispatch(&self) -> Option<&crate::vk_nv_cluster::Dispatch> {
+        self.cluster_as.as_ref()
+    }
+
+    /// Whether cluster acceleration structures are enabled on this device.
+    #[must_use]
+    pub fn cluster_as_supported(&self) -> bool {
+        self.cluster_as.is_some()
+    }
+
+    /// The `VK_NV_partitioned_acceleration_structure` dispatch, present only when
+    /// [`Capabilities::partitioned_acceleration_structure`]; `None` everywhere else.
+    pub(crate) fn ptlas_dispatch(&self) -> Option<&crate::vk_nv_ptlas::Dispatch> {
+        self.ptlas.as_ref()
+    }
+
+    /// Whether the top-level structure is partitioned on this device.
+    #[must_use]
+    pub fn ptlas_supported(&self) -> bool {
+        self.ptlas.is_some()
+    }
+
+    /// The device's `maxPartitionCount`; zero when partitioned structures are absent.
+    #[must_use]
+    pub fn max_partition_count(&self) -> u32 {
+        self.capabilities.max_partition_count
     }
 
     /// The `VK_EXT_mesh_shader` device dispatch (`cmd_draw_mesh_tasks`), present only when
@@ -742,10 +910,104 @@ impl Device {
     ///
     /// Returns [`Error::Vk`] if `vkDeviceWaitIdle` fails.
     pub fn wait_idle(&self) -> Result<()> {
-        if let Some(queue) = &self.compute_queue {
-            queue.wait_queue_idle(self.bundle().device())?;
+        let result = (|| {
+            if let Some(queue) = &self.compute_queue {
+                queue.wait_queue_idle(self.bundle().device())?;
+            }
+            self.graphics_queue.wait_device_idle(self.bundle().device())
+        })();
+        if result.as_ref().is_err_and(Error::is_device_loss) {
+            self.log_device_loss_checkpoints();
         }
-        self.graphics_queue.wait_device_idle(self.bundle().device())
+        result
+    }
+
+    /// Logs every queue's last-reached diagnostic checkpoints and the driver's fault report
+    /// after a device loss, naming the submission the GPU wedged in. A no-op without the
+    /// diagnostic extensions.
+    pub fn log_device_loss_checkpoints(&self) {
+        let checkpoints = self.bundle().checkpoints();
+        self.graphics_queue.log_device_loss_checkpoints(checkpoints);
+        if let Some(queue) = &self.compute_queue {
+            queue.log_device_loss_checkpoints(checkpoints);
+        }
+        self.bundle().log_device_fault();
+    }
+
+    /// Records `body` on a throwaway command buffer, submits it, and waits for it.
+    ///
+    /// For out-of-band work a person asked for — a debug capture, a test — never for
+    /// anything on the frame path, which submits through the frame ring instead. The
+    /// wait is the whole point: the caller reads the result immediately after.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Vk`] if any of the pool, buffer, fence, submit, or wait fails.
+    /// Every resource this creates is destroyed before returning, on success or failure.
+    pub fn one_shot_transfer<F>(&self, body: F) -> Result<()>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer),
+    {
+        let raw = self.raw();
+        let pool_info =
+            vk::CommandPoolCreateInfo::default().queue_family_index(self.graphics_queue_family);
+        // SAFETY: the ash seam. The pool, buffer, and fence are created here and
+        // destroyed below on every path; the fence is waited before anything is freed.
+        unsafe {
+            let pool = raw
+                .create_command_pool(&pool_info, None)
+                .map_err(|result| Error::Vk {
+                    context: "one-shot command pool",
+                    result,
+                })?;
+            let recorded = (|| -> Result<()> {
+                let alloc = vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+                let cmd = raw
+                    .allocate_command_buffers(&alloc)
+                    .map_err(|result| Error::Vk {
+                        context: "one-shot command buffer",
+                        result,
+                    })?[0];
+                let fence = raw
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .map_err(|result| Error::Vk {
+                        context: "one-shot fence",
+                        result,
+                    })?;
+                let submitted = (|| -> Result<()> {
+                    raw.begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|result| Error::Vk {
+                        context: "one-shot begin",
+                        result,
+                    })?;
+                    body(raw, cmd);
+                    raw.end_command_buffer(cmd).map_err(|result| Error::Vk {
+                        context: "one-shot end",
+                        result,
+                    })?;
+                    let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+                    let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_info)];
+                    self.graphics_queue
+                        .submit2(raw, &submit, fence, "one-shot")?;
+                    raw.wait_for_fences(&[fence], true, u64::MAX)
+                        .map_err(|result| Error::Vk {
+                            context: "one-shot wait",
+                            result,
+                        })
+                })();
+                raw.destroy_fence(fence, None);
+                submitted
+            })();
+            raw.destroy_command_pool(pool, None);
+            recorded
+        }
     }
 }
 
@@ -1453,6 +1715,117 @@ fn probe_optional_features(
         (false, false)
     };
 
+    // The micromap extension is only meaningful when acceleration structures are also present,
+    // so it inherits the RT gate rather than being probed independently.
+    let omm_extension = rt_supported && has_ext(ash::ext::opacity_micromap::NAME);
+    let opacity_micromap = if omm_extension {
+        let mut omm_feat = vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default();
+        let mut omm_feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut omm_feat);
+        // SAFETY: the ash seam. Fills the chained micromap feature struct.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut omm_feat2) };
+        omm_feat.micromap != 0
+    } else {
+        false
+    };
+
+    // Cluster acceleration structures inherit the RT gate the same way, plus the spec-revision
+    // belt: the transcribed structs follow revision 4 of the header exactly, and a revision
+    // bump can move layouts with no generator following it here.
+    let cluster_spec = extensions
+        .iter()
+        .find(|ext| {
+            ext.extension_name_as_c_str()
+                .map(|n| n == crate::vk_nv_cluster::NAME)
+                .unwrap_or(false)
+        })
+        .map(|ext| ext.spec_version);
+    let cluster_extension =
+        rt_supported && cluster_spec == Some(crate::vk_nv_cluster::SPEC_VERSION);
+    let (cluster_acceleration_structure, cluster_as_limits) = if cluster_extension {
+        let mut cluster_feat =
+            crate::vk_nv_cluster::PhysicalDeviceClusterAccelerationStructureFeaturesNV::default();
+        let mut cluster_feat2 = vk::PhysicalDeviceFeatures2 {
+            p_next: (&raw mut cluster_feat).cast(),
+            ..Default::default()
+        };
+        // SAFETY: the extension seam. The chained struct is the extension's feature query
+        // shape at the probed spec revision, alive across the call.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut cluster_feat2) };
+        if cluster_feat.cluster_acceleration_structure != 0 {
+            let mut cluster_props =
+                crate::vk_nv_cluster::PhysicalDeviceClusterAccelerationStructurePropertiesNV::default();
+            let mut props2 = vk::PhysicalDeviceProperties2 {
+                p_next: (&raw mut cluster_props).cast(),
+                ..Default::default()
+            };
+            // SAFETY: the extension seam, same shape contract as the feature query.
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            (
+                true,
+                [
+                    cluster_props.max_triangles_per_cluster,
+                    cluster_props.max_vertices_per_cluster,
+                    cluster_props.cluster_scratch_byte_alignment,
+                    cluster_props.cluster_byte_alignment,
+                    cluster_props.cluster_bottom_level_byte_alignment,
+                ],
+            )
+        } else {
+            (false, [0; 5])
+        }
+    } else {
+        (false, [0; 5])
+    };
+
+    // Partitioned top-level structures inherit the same RT gate and spec-revision belt, and
+    // one more: they are taken only when asked for.
+    //
+    // The extension executes correctly here — a partitioned structure renders a frame
+    // byte-identical to the KHR one — but the SDK's validation layers do not model it: they
+    // report a descriptor-type mismatch for a shader variable that has no partitioned SPIR-V
+    // form to declare (the extension defines no SPIR-V capability), and cannot resolve the
+    // structure's address to an acceleration-structure object because a partitioned structure
+    // is memory rather than an object. Neither is fixable from here, and a default-on path
+    // that cannot be validated is worse than an opt-in one that can. Remove the flag when the
+    // layers catch up.
+    let ptlas_spec = extensions
+        .iter()
+        .find(|ext| {
+            ext.extension_name_as_c_str()
+                .map(|n| n == crate::vk_nv_ptlas::NAME)
+                .unwrap_or(false)
+        })
+        .map(|ext| ext.spec_version);
+    let ptlas_extension = rt_supported
+        && ptlas_spec == Some(crate::vk_nv_ptlas::SPEC_VERSION)
+        && std::env::var_os("SAFFRON_PTLAS").is_some();
+    let (partitioned_acceleration_structure, max_partition_count) = if ptlas_extension {
+        let mut ptlas_feat =
+            crate::vk_nv_ptlas::PhysicalDevicePartitionedAccelerationStructureFeaturesNV::default();
+        let mut ptlas_feat2 = vk::PhysicalDeviceFeatures2 {
+            p_next: (&raw mut ptlas_feat).cast(),
+            ..Default::default()
+        };
+        // SAFETY: the extension seam. The chained struct is the extension's feature query
+        // shape at the probed spec revision, alive across the call.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut ptlas_feat2) };
+        if ptlas_feat.partitioned_acceleration_structure != 0 {
+            let mut ptlas_props =
+                crate::vk_nv_ptlas::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
+            let mut props2 = vk::PhysicalDeviceProperties2 {
+                p_next: (&raw mut ptlas_props).cast(),
+                ..Default::default()
+            };
+            // SAFETY: the extension seam, same shape contract as the feature query.
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            (true, ptlas_props.max_partition_count)
+        } else {
+            (false, 0)
+        }
+    } else {
+        (false, 0)
+    };
+
     let mesh_extension = has_ext(ash::ext::mesh_shader::NAME);
     let mut features11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -1500,6 +1873,11 @@ fn probe_optional_features(
         &subgroup_size_properties,
         mesh_extension.then_some((&mesh_features, &mesh_properties)),
         rt_supported,
+        opacity_micromap,
+        cluster_acceleration_structure,
+        cluster_as_limits,
+        partitioned_acceleration_structure,
+        max_partition_count,
         acceleration_structure_indirect_build,
         has_ext(ash::ext::memory_budget::NAME),
         software_gpu,
@@ -1521,6 +1899,11 @@ fn resolve_capabilities(
         &vk::PhysicalDeviceMeshShaderPropertiesEXT<'_>,
     )>,
     rt_supported: bool,
+    opacity_micromap: bool,
+    cluster_acceleration_structure: bool,
+    cluster_as_limits: [u32; 5],
+    partitioned_acceleration_structure: bool,
+    max_partition_count: u32,
     acceleration_structure_indirect_build: bool,
     memory_budget: bool,
     software_gpu: bool,
@@ -1539,6 +1922,14 @@ fn resolve_capabilities(
     .unwrap_or(0);
     Capabilities {
         rt_supported,
+        opacity_micromap,
+        // Filled from `VkPhysicalDeviceOpacityMicromapPropertiesEXT` once the device exists;
+        // the selection pass only decides whether the extension is enabled at all.
+        omm_max_subdivision: 0,
+        cluster_acceleration_structure,
+        cluster_as_limits,
+        partitioned_acceleration_structure,
+        max_partition_count,
         mesh_shader: mesh_features.is_some_and(|features| features.mesh_shader != 0),
         task_shader: mesh_features.is_some_and(|features| features.task_shader != 0),
         max_mesh_work_group_count: mesh_properties
@@ -1636,7 +2027,7 @@ fn create_logical_device(
     compute_queue: Option<AsyncComputeQueue>,
     capabilities: &Capabilities,
     enable_swapchain: bool,
-) -> Result<(ash::Device, bool)> {
+) -> Result<(ash::Device, bool, bool, bool)> {
     let single_queue_priority = [1.0_f32];
     let two_queue_priorities = [1.0_f32, 1.0_f32];
     let mut queue_infos = if compute_queue
@@ -1692,6 +2083,15 @@ fn create_logical_device(
         device_extensions.push(ash::khr::ray_query::NAME.as_ptr());
         device_extensions.push(ash::khr::deferred_host_operations::NAME.as_ptr());
     }
+    if capabilities.opacity_micromap {
+        device_extensions.push(ash::ext::opacity_micromap::NAME.as_ptr());
+    }
+    if capabilities.cluster_acceleration_structure {
+        device_extensions.push(crate::vk_nv_cluster::NAME.as_ptr());
+    }
+    if capabilities.partitioned_acceleration_structure {
+        device_extensions.push(crate::vk_nv_ptlas::NAME.as_ptr());
+    }
     if enable_mesh_extension {
         device_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
     }
@@ -1710,6 +2110,23 @@ fn create_logical_device(
         && std::env::var_os("SAFFRON_DISABLE_CALIBRATION").is_none();
     if enable_calibrated_ts {
         device_extensions.push(calibrated_timestamps::NAME.as_ptr());
+    }
+    // VK_NV_device_diagnostic_checkpoints: named per-pass progress markers so a device loss
+    // reports which submission the GPU wedged in.
+    let enable_checkpoints = has_ext(ash::nv::device_diagnostic_checkpoints::NAME);
+    if enable_checkpoints {
+        device_extensions.push(ash::nv::device_diagnostic_checkpoints::NAME.as_ptr());
+    }
+    // VK_EXT_device_fault: the driver's post-loss fault report (kind + faulting addresses).
+    let mut fault_query = vk::PhysicalDeviceFaultFeaturesEXT::default();
+    if has_ext(ash::ext::device_fault::NAME) {
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_query);
+        // SAFETY: the ash seam. Fills the chained fault feature struct.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+    }
+    let enable_device_fault = fault_query.device_fault != 0;
+    if enable_device_fault {
+        device_extensions.push(ash::ext::device_fault::NAME.as_ptr());
     }
 
     let mut enabled_core = vk::PhysicalDeviceFeatures::default().shader_int64(true);
@@ -1752,9 +2169,22 @@ fn create_logical_device(
         .acceleration_structure(enable_rt)
         .acceleration_structure_indirect_build(capabilities.acceleration_structure_indirect_build);
     let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(enable_rt);
+    let mut omm_feat = vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default()
+        .micromap(capabilities.opacity_micromap);
     let mut ms_feat = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
         .mesh_shader(capabilities.mesh_shader)
         .task_shader(capabilities.task_shader);
+    let mut fault_feat = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
+    let mut cluster_feat =
+        crate::vk_nv_cluster::PhysicalDeviceClusterAccelerationStructureFeaturesNV {
+            cluster_acceleration_structure: vk::TRUE,
+            ..Default::default()
+        };
+    let mut ptlas_feat =
+        crate::vk_nv_ptlas::PhysicalDevicePartitionedAccelerationStructureFeaturesNV {
+            partitioned_acceleration_structure: vk::TRUE,
+            ..Default::default()
+        };
 
     let mut create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
@@ -1766,8 +2196,24 @@ fn create_logical_device(
     if enable_rt {
         create_info = create_info.push_next(&mut as_feat).push_next(&mut rq_feat);
     }
+    if capabilities.opacity_micromap {
+        create_info = create_info.push_next(&mut omm_feat);
+    }
     if enable_mesh_extension {
         create_info = create_info.push_next(&mut ms_feat);
+    }
+    if enable_device_fault {
+        create_info = create_info.push_next(&mut fault_feat);
+    }
+    // The transcribed feature structs cannot ride ash's typed `push_next`, so each heads the
+    // chain by hand: it points at whatever was built so far, and the create info points at it.
+    if capabilities.cluster_acceleration_structure {
+        cluster_feat.p_next = create_info.p_next.cast_mut();
+        create_info.p_next = (&raw const cluster_feat).cast();
+    }
+    if capabilities.partitioned_acceleration_structure {
+        ptlas_feat.p_next = create_info.p_next.cast_mut();
+        create_info.p_next = (&raw const ptlas_feat).cast();
     }
 
     // SAFETY: the ash seam. The feature chain + extension pointers outlive the
@@ -1778,7 +2224,12 @@ fn create_logical_device(
             result,
         },
     )?;
-    Ok((device, enable_calibrated_ts))
+    Ok((
+        device,
+        enable_calibrated_ts,
+        enable_checkpoints,
+        enable_device_fault,
+    ))
 }
 
 /// Creates the VMA allocator over the ash instance/device.
@@ -1885,6 +2336,15 @@ fn log_software_gpu(capabilities: &Capabilities) {
         tracing::info!("ray tracing available (KHR acceleration_structure + ray_query)");
     } else {
         tracing::info!("ray tracing unavailable — RT passes disabled");
+    }
+    if capabilities.cluster_acceleration_structure {
+        tracing::info!("cluster acceleration structures available");
+    }
+    if capabilities.partitioned_acceleration_structure {
+        tracing::info!(
+            "partitioned top-level structure available (up to {} partitions)",
+            capabilities.max_partition_count
+        );
     }
 }
 
@@ -2035,10 +2495,20 @@ mod tests {
             true,
             true,
             true,
+            [128, 256, 64, 128, 256],
+            true,
+            8_192,
+            true,
+            true,
             false,
         );
 
         assert!(capabilities.mesh_shader);
+        assert!(capabilities.opacity_micromap);
+        assert!(capabilities.cluster_acceleration_structure);
+        assert_eq!(capabilities.cluster_as_limits, [128, 256, 64, 128, 256]);
+        assert!(capabilities.partitioned_acceleration_structure);
+        assert_eq!(capabilities.max_partition_count, 8_192);
         assert!(!capabilities.task_shader);
         assert_eq!(capabilities.max_mesh_work_group_count, [11, 12, 13]);
         assert_eq!(capabilities.max_task_payload_size, 4_096);

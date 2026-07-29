@@ -18,6 +18,7 @@
 mod aa;
 mod budget;
 mod canonical_coverage;
+mod checkpoints;
 mod clouds;
 mod compute_dispatch;
 mod conformance;
@@ -53,6 +54,8 @@ mod renderer;
 mod resources;
 mod restir;
 mod rt;
+mod rt_cluster;
+mod rt_ptlas;
 mod scene_pass;
 mod shader_artifact;
 mod shm_publish;
@@ -69,6 +72,8 @@ mod transient;
 mod upload;
 mod view_target;
 mod visibility;
+mod vk_nv_cluster;
+mod vk_nv_ptlas;
 mod vsm;
 mod watchdog;
 
@@ -111,7 +116,7 @@ pub use frame::MAX_FRAMES_IN_FLIGHT;
 pub use frame_history::{
     ALARM_EVENT_RING_CAPACITY, ALARM_RESUME_SETTLE_FRAMES, ActiveAlarm, AlarmDrain, AlarmEvent,
     AlarmEventKind, AlarmInputs, AlarmSeverity, AlarmState, FRAME_HISTORY_CAPACITY, FrameHistory,
-    FrameHistoryStats, FrameSample, PerfConfig,
+    FrameHistoryStats, FrameSample, OwnedBudgetBreach, PerfConfig,
 };
 pub use froxel_fog::{
     AP_FAR_M, AP_GRID, AerialParamsUbo, AerialPerspective, FOG_SHAPE_BOX, FOG_SHAPE_SPHERE,
@@ -143,12 +148,12 @@ pub use global_gpu_data::{
     GpuMaterialTableRecord, GpuMicroCandidate, GpuPageRecord, GpuPassClass, GpuPrototypeRecord,
     GpuPsoBin, GpuRangeAllocator, GpuRecordRetirement, GpuRepresentation,
     GpuSceneInstanceGpuRecord, GpuSceneLightGpuRecord, GpuSceneOverrideGpuRecord,
-    GpuScenePageGpuRecord, GpuScenePrototypeGpuRecord, GpuSceneReferenceGpuRecord, GpuSidedness,
-    GpuSkeletonJointRecord, GpuSkeletonRecord, GpuSubmeshRecord, GpuTableDescriptor,
-    GpuTableSlotHeader, GpuTextureTableRecord, GpuTransparency, GpuWindInstanceRecord,
-    ImmutableGpuTable, IndexArena, InverseBindArena, MICRO_BLADE_INDEX_COUNT,
-    MICRO_BLADE_VERTEX_COUNT, MaterialParameterArena, MaterialTable, PageArena,
-    PageDependencyArena, PageTable, PartArena, PrototypeMaterialArena, PrototypeTable,
+    GpuScenePageGpuRecord, GpuScenePrototypeGpuRecord, GpuSceneReferenceGpuRecord,
+    GpuSdfTableRecord, GpuSidedness, GpuSkeletonJointRecord, GpuSkeletonRecord, GpuSubmeshRecord,
+    GpuTableDescriptor, GpuTableSlotHeader, GpuTextureTableRecord, GpuTransparency,
+    GpuWindInstanceRecord, ImmutableGpuTable, IndexArena, InverseBindArena,
+    MICRO_BLADE_INDEX_COUNT, MICRO_BLADE_VERTEX_COUNT, MaterialParameterArena, MaterialTable,
+    PageArena, PageDependencyArena, PageTable, PartArena, PrototypeMaterialArena, PrototypeTable,
     ResidentGpuTable, SceneDeformationTable, SceneInstanceTable, SceneLightTable,
     SceneMaterialTable, SceneOverrideArena, ScenePageTable, ScenePrototypeTable, SceneSdfTable,
     SkeletonJointArena, SkeletonTable, SubmeshArena, TextureTable, UploadSlice, VertexArena,
@@ -157,11 +162,12 @@ pub use global_gpu_data::{
 pub use global_sdf::{
     GDF_BAND_FRACTION, GDF_CASCADE0_EXTENT, GDF_CASCADES, GDF_EXPONENT, GDF_FORMAT, GDF_MAX_CULLED,
     GDF_NEAR_HANDOFF, GDF_RES, GdfCompositePush, GdfCullPush, GdfParamsUbo, GdfRegion, GlobalSdf,
+    gi_occluder_bounds,
 };
 pub use gpu_scene_upload::{
     GpuArenaUploadRequest, GpuSceneAddressBlock, GpuScenePendingUploads, GpuSceneTableDescriptors,
     GpuSceneTableStorage, GpuSceneUploadRunStats, GpuSceneUploader, GpuSceneWorldDescriptors,
-    GpuSceneWorldTables, record_pending_global_uploads,
+    GpuSceneWorldTables, PAGE_REQUEST_CAPACITY, PageRequestDrain, record_pending_global_uploads,
 };
 pub use gpu_types::{GpuLight, InstanceData, Material, MaterialParamsData, SdfInstance};
 pub use hzb::{HZB_MAX_MIPS, HZB_PUSH_SIZE, Hzb, HzbPyramid};
@@ -190,7 +196,10 @@ pub use page_payload::{
     GPU_PAGE_NODE_NO_PROTOTYPE, GPU_PAGE_PAYLOAD_FLAG_GUARANTEED_ROOT, GpuPageClusterRecord,
     GpuPageNodeRecord, GpuPageVoxelVertex, PagePayload, build_page_payload,
 };
-pub use page_residency::{PageDemandView, PageResidency, PageResidencyBudgets, PageResidencyStats};
+pub use page_residency::{
+    PAGE_DEMAND_PREDICTED_CEILING, PageDemandView, PageResidency, PageResidencyBudgets,
+    PageResidencyStats,
+};
 pub use persistent_gpu_scene::*;
 pub use pipelines::{DEPTH_FORMAT, OFFSCREEN_COLOR_FORMAT, Pipelines, PsoKey};
 pub use profiler::{
@@ -212,7 +221,7 @@ pub use renderer::{FogRenderSettings, RenderStatsFull, Renderer, VIEW_COUNT, Vie
 pub use resources::{
     AccelerationStructure, BindlessFreeList, Buffer, DefaultHeightMinMax, DeviceResources, GpuLut,
     GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D,
-    ImageDesc, MeshAssembly, MinMaxPyramid, Pipeline,
+    ImageDesc, MeshAssembly, Micromap, MinMaxPyramid, Pipeline, RtBlas,
 };
 pub use restir::{
     InitialPush as RestirInitialPush, RESTIR_CANDIDATE_COUNT, RESTIR_INITIAL_PUSH_SIZE,
@@ -221,9 +230,11 @@ pub use restir::{
     ReusePush as RestirReusePush, reservoir_bytes as restir_reservoir_bytes, wants_restir,
 };
 pub use rt::{
-    BlasRefitOp, MeshBlasBuild, RT_UNMIRRORED_INSTANCE, Rt, RtInstanceInput, RtScene, TlasBuildOp,
-    TlasBuildPlan, record_mesh_blas_build, record_tlas_build_plan,
+    BlasRefitOp, MeshBlasBuild, MeshBlasGeometry, RT_UNMIRRORED_INSTANCE, Rt, RtCutView,
+    RtInstanceInput, RtScene, TlasBuildOp, TlasBuildPlan, record_blas_compaction,
+    record_mesh_blas_build, record_micromap_build, record_tlas_build_plan,
 };
+pub use rt_cluster::ClusterBlas;
 pub use scene_pass::{
     MeshPassSets, record_executor_buckets, record_executor_depth_family,
     record_executor_transparent_stream, record_tess_depth_draws, record_tess_scene_draws,
@@ -257,34 +268,48 @@ pub use thumbnail::{
     PngTransfer, ThumbnailPng, convert_to_rgb, encode_to_png, format_pixel_bytes, write_png_file,
 };
 pub use transient::{FROXEL_VOLUME_KEYS, RenderGraphResources};
-pub use upload::{GpuQueue, SdfBake, TextureMipLevel, Uploader};
+pub use upload::{GpuQueue, SdfBake, SdfSource, TextureMipLevel, Uploader};
 pub use view_target::ViewTarget;
 pub use visibility::{
     ExecutorBucket, ExecutorDrawInputs, GpuWindSourceRecord, InteractionImpulse,
-    SCENE_BUCKET_PRESSURE, SCENE_EXECUTOR_BUCKET_CAPACITY, SCENE_MICRO_CANDIDATE_CAPACITY,
-    SCENE_MICRO_FIELD_PUSH_SIZE, SCENE_MICRO_TEXEL_BUDGET, SCENE_RADIX_WORKGROUP,
-    SCENE_TRANSITION_PRESSURE, SCENE_TRANSITION_STATE_CAPACITY, SCENE_TRANSPARENT_OVERFLOW,
-    SCENE_TRAVERSAL_OVERFLOW_RECORDS, SCENE_TRAVERSAL_PUSH_SIZE,
-    SCENE_VISIBILITY_COUNTER_CULLED_FRUSTUM, SCENE_VISIBILITY_COUNTER_CULLED_OCCLUSION,
+    MESH_TASK_COMMAND_STRIDE, MESH_TRIANGLES_PER_GROUP, SCENE_BUCKET_PRESSURE,
+    SCENE_EXECUTOR_BUCKET_CAPACITY, SCENE_MICRO_CANDIDATE_CAPACITY, SCENE_MICRO_FIELD_PUSH_SIZE,
+    SCENE_MICRO_TEXEL_BUDGET, SCENE_RADIX_WORKGROUP, SCENE_TRANSITION_PRESSURE,
+    SCENE_TRANSITION_STATE_CAPACITY, SCENE_TRANSPARENT_OVERFLOW, SCENE_TRAVERSAL_OVERFLOW_RECORDS,
+    SCENE_TRAVERSAL_PUSH_SIZE, SCENE_VISIBILITY_COUNTER_BINS,
+    SCENE_VISIBILITY_COUNTER_COVERED_SAMPLES, SCENE_VISIBILITY_COUNTER_CULLED_FRUSTUM,
+    SCENE_VISIBILITY_COUNTER_CULLED_NODES, SCENE_VISIBILITY_COUNTER_CULLED_OCCLUSION,
+    SCENE_VISIBILITY_COUNTER_DEFORMED, SCENE_VISIBILITY_COUNTER_INTERACTION_RESET,
     SCENE_VISIBILITY_COUNTER_MAX_CUT_DEPTH, SCENE_VISIBILITY_COUNTER_MICRO_CANDIDATES,
     SCENE_VISIBILITY_COUNTER_OVERFLOW, SCENE_VISIBILITY_COUNTER_RECORD_OVERFLOW,
     SCENE_VISIBILITY_COUNTER_RECORDS, SCENE_VISIBILITY_COUNTER_RETEST,
     SCENE_VISIBILITY_COUNTER_SUB_QUAD_TRIANGLES, SCENE_VISIBILITY_COUNTER_TRANSITIONING,
     SCENE_VISIBILITY_COUNTER_TRANSPARENT, SCENE_VISIBILITY_COUNTER_TRIANGLES,
-    SCENE_VISIBILITY_COUNTER_VISIBLE, SCENE_VISIBILITY_COUNTER_VOXEL_RECORDS,
-    SCENE_VISIBILITY_COUNTER_WORDS, SCENE_VISIBILITY_OVERFLOW_RETEST,
-    SCENE_VISIBILITY_OVERFLOW_VISIBLE, SCENE_VISIBILITY_PASS_CULL, SCENE_VISIBILITY_PASS_RETEST,
-    SCENE_VISIBILITY_PUSH_SIZE, SCENE_VISIBILITY_RECORD_CAPACITY, SceneMicroFieldPush,
-    SceneTraversalPush, SceneVisibility, SceneVisibilityPush, SceneVisibilityView,
-    TransparentSortPipelines, WIND_DEFORM_PUSH_SIZE, WIND_INTERACT_PUSH_SIZE, WindDeformPush,
-    WindInteractPush, bucket_material, build_executor_buckets, record_executor_bucket_draw,
-    record_executor_pass_prefix,
+    SCENE_VISIBILITY_COUNTER_VISIBLE, SCENE_VISIBILITY_COUNTER_VISITED_NODES,
+    SCENE_VISIBILITY_COUNTER_VOXEL_RECORDS, SCENE_VISIBILITY_COUNTER_WORDS,
+    SCENE_VISIBILITY_OVERFLOW_RETEST, SCENE_VISIBILITY_OVERFLOW_VISIBLE,
+    SCENE_VISIBILITY_PASS_CULL, SCENE_VISIBILITY_PASS_RETEST, SCENE_VISIBILITY_PUSH_SIZE,
+    SCENE_VISIBILITY_RECORD_CAPACITY, SceneMicroFieldPush, SceneTraversalPush, SceneVisibility,
+    SceneVisibilityPush, SceneVisibilityView, TransparentSortPipelines, WIND_DEFORM_PUSH_SIZE,
+    WIND_INTERACT_PUSH_SIZE, WindDeformPush, WindInteractPush, bucket_material,
+    build_executor_buckets, record_executor_bucket_draw, record_executor_bucket_draw_mesh,
+    record_executor_mesh_prefix, record_executor_pass_prefix,
 };
+pub use visibility::{
+    ExecutorBucketDraw, GiOccluderScatterPush, SCENE_CUT_AUTO, SCENE_CUT_FORCE_COARSE,
+    SCENE_CUT_FORCE_FINE, SCENE_ERROR_THRESHOLD_GI_PX, SCENE_ERROR_THRESHOLD_IMAGE_PX,
+    SCENE_VIEW_CLASSES, SCENE_VISIBILITY_COUNTER_CULLED_REACH, SCENE_VISIBILITY_PASS_REACH,
+    SceneViewClass, TraversalTuning,
+};
+
+/// Bytes of the mesh executor's push block: the view-projection matrix plus the bucket's
+/// command-slice base, which `SV_DrawIndex` is relative to.
+pub const MESH_EXECUTOR_PUSH_SIZE: u32 = 68;
 pub use vsm::{
-    VSM_ATLAS_SIZE, VSM_ATLAS_TILES, VSM_COMPACT_PUSH_SIZE, VSM_DEMAND_CAPACITY,
-    VSM_DEMAND_PUSH_SIZE, VSM_DIRECTIONAL_LEVELS, VSM_LEVEL_PAGES, VSM_LEVEL0_EXTENT_M,
-    VSM_PAGE_SIZE, VSM_TABLE_RESIDENT, VsmCompactPush, VsmCounters, VsmDemand, VsmDemandPush,
-    VsmDirectionalSpace, VsmPageKey, VsmRenderPage, VsmResidency, vsm_table_entry,
+    VSM_ATLAS_SIZE, VSM_ATLAS_TILES, VSM_COMPACT_PUSH_SIZE, VSM_DEFAULT_PAGE_BUDGET,
+    VSM_DEMAND_CAPACITY, VSM_DEMAND_PUSH_SIZE, VSM_DIRECTIONAL_LEVELS, VSM_LEVEL_PAGES,
+    VSM_LEVEL0_EXTENT_M, VSM_PAGE_SIZE, VSM_TABLE_RESIDENT, VsmCompactPush, VsmCounters, VsmDemand,
+    VsmDemandPush, VsmDirectionalSpace, VsmPageKey, VsmRenderPage, VsmResidency, vsm_table_entry,
 };
 
 use ash::vk;
@@ -379,6 +404,21 @@ pub enum Error {
     /// A per-queue timeline semaphore exhausted its monotonic value space.
     #[error("render-graph timeline semaphore value overflowed")]
     TimelineValueOverflow,
+}
+
+impl Error {
+    /// Whether this is a Vulkan `ERROR_DEVICE_LOST` — the paths that observe one report the
+    /// device's last-reached diagnostic checkpoints before propagating.
+    #[must_use]
+    pub fn is_device_loss(&self) -> bool {
+        matches!(
+            self,
+            Self::Vk {
+                result: vk::Result::ERROR_DEVICE_LOST,
+                ..
+            }
+        )
+    }
 }
 
 /// A `Result` whose error is this crate's [`Error`].
