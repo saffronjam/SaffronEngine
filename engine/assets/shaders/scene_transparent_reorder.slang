@@ -9,15 +9,6 @@
 import global_gpu_data;
 import scene_bin_common;
 
-struct DrawIndexedIndirectCommand
-{
-    uint indexCount;
-    uint instanceCount;
-    uint firstIndex;
-    int vertexOffset;
-    uint firstInstance;
-};
-
 [[vk::binding(0, 0)]] RWStructuredBuffer<uint> counters;
 [[vk::binding(1, 0)]] StructuredBuffer<uint2> pairs;
 [[vk::binding(2, 0)]] StructuredBuffer<GpuDrawRecord> records;

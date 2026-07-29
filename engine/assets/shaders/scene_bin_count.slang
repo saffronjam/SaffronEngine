@@ -41,5 +41,13 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         InterlockedOr(counters[4], SCENE_BUCKET_PRESSURE);
         return;
     }
-    InterlockedAdd(bucketCounts[bucket], 1u);
+    uint previous;
+    InterlockedAdd(bucketCounts[bucket], 1u, previous);
+    // Counter word 18: buckets that received their first record. Counting the transition rather
+    // than scanning the table afterwards keeps this on the pass that already touches every record,
+    // and the answer is the number of indirect draws the executor will issue.
+    if (previous == 0u)
+    {
+        InterlockedAdd(counters[18], 1u);
+    }
 }

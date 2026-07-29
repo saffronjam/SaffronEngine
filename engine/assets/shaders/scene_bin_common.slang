@@ -5,6 +5,32 @@
 
 public static const uint SCENE_EXECUTOR_BUCKET_CAPACITY = 512u;
 
+// Triangles one mesh-executor workgroup emits. Three vertices per triangle go out without
+// deduplication — a cluster carries no local vertex table, only a flat index range — so the
+// bound is the 256-vertex output limit, not the primitive one: 62 x 3 = 186. Two groups cover
+// a full 124-triangle cluster.
+public static const uint MESH_TRIANGLES_PER_GROUP = 62u;
+
+// One binned draw. The scatter writes these as `VkDrawIndexedIndirectCommand`; the indexed
+// executor consumes them as draw arguments and the mesh executor reads the same words as data.
+public struct DrawIndexedIndirectCommand
+{
+    public uint indexCount;
+    public uint instanceCount;
+    public uint firstIndex;
+    public int vertexOffset;
+    public uint firstInstance;
+};
+
+// The mesh executor's per-draw dispatch arguments (`VkDrawMeshTasksIndirectCommandEXT`),
+// written by the scatter beside each indexed command so both executors read one count word.
+public struct DrawMeshTasksIndirectCommand
+{
+    public uint groupCountX;
+    public uint groupCountY;
+    public uint groupCountZ;
+};
+
 public struct SceneBucketTable
 {
     public uint liveCount;

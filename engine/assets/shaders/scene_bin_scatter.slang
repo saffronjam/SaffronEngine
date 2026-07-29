@@ -6,21 +6,27 @@
 import global_gpu_data;
 import scene_bin_common;
 
-struct DrawIndexedIndirectCommand
-{
-    uint indexCount;
-    uint instanceCount;
-    uint firstIndex;
-    int vertexOffset;
-    uint firstInstance;
-};
-
 [[vk::binding(0, 0)]] RWStructuredBuffer<uint> counters;
 [[vk::binding(1, 0)]] StructuredBuffer<GpuDrawRecord> records;
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint> bucketCursors;
 [[vk::binding(3, 0)]] RWStructuredBuffer<DrawIndexedIndirectCommand> commands;
 [[vk::binding(4, 0)]] ConstantBuffer<GpuSceneAddressBlock> sceneAddresses;
 [[vk::binding(5, 0)]] StructuredBuffer<SceneBucketTable> bucketTable;
+[[vk::binding(6, 0)]] RWStructuredBuffer<DrawMeshTasksIndirectCommand> meshArgs;
+
+// The mesh executor's dispatch arguments for the same draw, written at the same slot. The
+// group count comes from this draw's own index count, so every representation is covered —
+// a factor sized for triangle clusters would silently drop micro-blade and voxel geometry,
+// whose index counts obey different bounds.
+void writeMeshArgs(uint slot, uint indexCount)
+{
+    DrawMeshTasksIndirectCommand args;
+    args.groupCountX = (indexCount / 3u + (MESH_TRIANGLES_PER_GROUP - 1u))
+        / MESH_TRIANGLES_PER_GROUP;
+    args.groupCountY = 1u;
+    args.groupCountZ = 1u;
+    meshArgs[slot] = args;
+}
 
 struct Push
 {
@@ -72,6 +78,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         command.indexCount = pc.microIndexCount;
         command.firstIndex = pc.microFirstIndex;
         commands[slot] = command;
+        writeMeshArgs(slot, command.indexCount);
         return;
     }
 
@@ -93,4 +100,5 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         command.firstIndex = uint(indexBlob / 4u) + cluster.firstIndex;
     }
     commands[slot] = command;
+    writeMeshArgs(slot, command.indexCount);
 }
