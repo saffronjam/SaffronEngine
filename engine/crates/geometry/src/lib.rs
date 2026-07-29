@@ -29,6 +29,7 @@ mod gltf_instancing;
 mod hierarchy_reference;
 mod image_decode;
 mod obj_import;
+mod opacity_micromap;
 mod picking;
 mod portable_binary;
 mod primitives;
@@ -56,6 +57,11 @@ pub use image_decode::{
     decode_image, decode_image_from_memory, decode_image_from_memory_hdr, decode_image_hdr,
 };
 pub use obj_import::import_obj_model;
+pub use opacity_micromap::{
+    AlphaBounds, CoverageRule, CoverageSourcePlane, MAX_SUBDIVISION_LEVEL, MicroState,
+    MicromapClasses, MicromapTriangle, MicromapUsage, OPACITY_FORMAT_4_STATE, OpacityMicromapBuild,
+    barycentrics_to_index, derive_opacity_micromap, micro_triangle_corners, subdivision_level,
+};
 pub use picking::{
     MeshBvh, MeshNearestHit, MeshRayHit, TriangleClosestPoint, TriangleRayHit,
     closest_point_coordinates, closest_point_on_triangle, generate_normals, ray_aabb_slab,
