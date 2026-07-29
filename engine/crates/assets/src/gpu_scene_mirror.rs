@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use saffron_core::{BlendMode, Uuid};
+use saffron_geometry::glam::Mat4;
 use saffron_geometry::{PortableHierarchyPage, Vertex};
 use saffron_material::{
     AlphaClassification, CoverageMipMetadata, CoverageSource, MaterialSurface,
@@ -122,6 +123,12 @@ enum MirrorLightKind {
 struct MaterialKey {
     material: u64,
     overrides: String,
+    /// The plant family whose packed atlas replaces this material's own textures, or 0.
+    ///
+    /// Two families may bind the same material and pack different atlases, so the family has to
+    /// be part of the key — without it the first family's record would be handed to the second,
+    /// and its UVs address a rectangle in a different atlas.
+    atlas_family: u64,
 }
 
 impl MaterialKey {
@@ -131,6 +138,7 @@ impl MaterialKey {
         Self {
             material: slot.material.value(),
             overrides: saffron_json::dump_json_sorted(&slot.overrides, -1),
+            atlas_family: 0,
         }
     }
 
@@ -138,6 +146,16 @@ impl MaterialKey {
         Self {
             material: material.value(),
             overrides: Self::EMPTY_OVERRIDES.to_owned(),
+            atlas_family: 0,
+        }
+    }
+
+    /// The same material as read through one family's packed atlas.
+    fn from_atlased_material(material: Uuid, family: Uuid) -> Self {
+        Self {
+            material: material.value(),
+            overrides: Self::EMPTY_OVERRIDES.to_owned(),
+            atlas_family: family.value(),
         }
     }
 
@@ -145,11 +163,12 @@ impl MaterialKey {
         Self {
             material: 0,
             overrides: Self::EMPTY_OVERRIDES.to_owned(),
+            atlas_family: 0,
         }
     }
 
     fn is_default(&self) -> bool {
-        self.material == 0 && self.overrides == Self::EMPTY_OVERRIDES
+        self.material == 0 && self.overrides == Self::EMPTY_OVERRIDES && self.atlas_family == 0
     }
 
     fn overrides_value(&self) -> saffron_json::Value {
@@ -184,6 +203,14 @@ struct MeshPage {
     scene: GpuScenePageHandle,
 }
 
+/// One baked field's device-table record and its scene reference — retained so mesh
+/// refresh and removal can retire both halves.
+#[derive(Clone, Copy)]
+struct MeshSdf {
+    scene: saffron_rendering::GpuSceneSdfHandle,
+    device: GpuHandle,
+}
+
 struct MeshEntry {
     mesh: Arc<GpuMesh>,
     geometry: GpuHandle,
@@ -193,8 +220,13 @@ struct MeshEntry {
     parts_range: GpuArenaRange,
     pages: Vec<MeshPage>,
     payload_source: Option<PagePayloadSource>,
+    /// One entry per baked field, in [`GpuMesh::sdfs`] order.
+    sdfs: Vec<MeshSdf>,
     prototype: GpuScenePrototypeHandle,
     slot_count: u32,
+    /// The mesh's authored mechanical response as published to its prototype record,
+    /// retained so a debug capture can report what the prepass was given.
+    mechanics: [u32; 4],
     refs: usize,
 }
 
@@ -275,6 +307,33 @@ pub struct VegetationFamilyRenderRow {
     pub micro_predicted: u64,
 }
 
+/// What a resident vegetation population is expected to stay inside, per owner.
+///
+/// These are not renderer budgets and cannot be: the renderer sees passes and counters, not cells
+/// and families. A breach here says WHICH content is over, which is the difference between a
+/// number to watch and a thing to go and fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VegetationBudgets {
+    /// Mirrored plants one cell may hold.
+    pub cell_plants: u32,
+    /// Mirrored instances one family may hold across every resident cell.
+    pub family_instances: u32,
+    /// Cooked blade-candidate upper bound one family may contribute.
+    pub family_micro_predicted: u64,
+}
+
+impl Default for VegetationBudgets {
+    fn default() -> Self {
+        // Generous by design: the point is to catch a cell or family that has run away, not to
+        // narrate an ordinary scene. A project tightens them through `vegetation-budgets`.
+        Self {
+            cell_plants: 4_096,
+            family_instances: 16_384,
+            family_micro_predicted: 4_000_000,
+        }
+    }
+}
+
 /// One cell's resident render population.
 #[derive(Clone, Copy, Debug)]
 pub struct VegetationCellRenderRow {
@@ -326,6 +385,7 @@ pub struct GpuSceneMirror {
     shared_rebuilds: u64,
     world_rebuilds: u64,
     worker: PageStreamWorker,
+    vegetation_budgets: VegetationBudgets,
 }
 
 struct SyncCtx<'a, 'b> {
@@ -446,6 +506,45 @@ impl GpuSceneMirror {
         Self::default()
     }
 
+    /// Ray inputs for every resident plant, derived from retained state rather than from a
+    /// sync delta — the TLAS must reflect the whole resident set each frame, and a delta pass
+    /// sees only the cells that changed, so a steady frame would publish nothing and silently
+    /// stop every plant casting.
+    ///
+    /// A multi-prototype family expands in `Rt` into one TLAS instance per use its combination
+    /// leaves active; a single-prototype family is cooked as a plain mesh and places directly.
+    #[must_use]
+    pub fn vegetation_ray_instances(&self) -> Vec<saffron_rendering::RtInstanceInput> {
+        let mut instances = Vec::new();
+        for world in self.worlds.values() {
+            for entry in world.plants.values() {
+                let Some(mesh) = self.shared.meshes.get(&entry.mesh) else {
+                    continue;
+                };
+                if mesh.mesh.assembly_blas.is_empty() && mesh.mesh.blas.is_none() {
+                    continue;
+                }
+                let GpuSceneTransform::Static(placement) = entry.record.transform else {
+                    continue;
+                };
+                instances.push(saffron_rendering::RtInstanceInput {
+                    model: static_placement_matrix(&placement),
+                    mesh: Arc::clone(&mesh.mesh),
+                    custom_index: saffron_rendering::RT_UNMIRRORED_INSTANCE,
+                    // A plant never overrides. Vegetation binds the materials it was cooked with —
+                    // there is no entity here to reassign one — so the per-submesh classes baked
+                    // into the structure are authoritative, and leaving them in charge is what
+                    // lets a micromap refine them. Forcing here would make every plant's micromap
+                    // inert, and would put the coverage classifier on opaque trunk submeshes that
+                    // nothing needs to test.
+                    opacity_override: None,
+                    combination: entry.record.combination,
+                });
+            }
+        }
+        instances
+    }
+
     /// Current population and rebuild counters.
     /// A sound upper bound on the draw records the visibility pass can emit for this mirror: one
     /// record per mirrored instance per submesh slot.
@@ -524,6 +623,30 @@ impl GpuSceneMirror {
             .instances
             .get(&(entity, source))
             .map(|entry| entry.handle.raw().index)
+    }
+
+    /// The GPU-scene instance slot mirroring one resident plant, and the family's
+    /// authored mechanical response, for the wind-record capture.
+    ///
+    /// A plant is not an ECS entity — it streams from the cell store — so the entity
+    /// lookup above cannot reach it, and the debug surfaces that inspect a swaying plant
+    /// need exactly this pair.
+    #[must_use]
+    pub fn plant_instance_slot(
+        &self,
+        cell: WorldCellKey,
+        plant: PlantId,
+    ) -> Option<(u32, [u32; 4])> {
+        let entry = self
+            .worlds
+            .values()
+            .find_map(|world| world.plants.get(&(cell, plant)))?;
+        let mechanics = self
+            .shared
+            .meshes
+            .get(&entry.mesh)
+            .map_or([0; 4], |mesh| mesh.mechanics);
+        Some((entry.handle.raw().index, mechanics))
     }
 
     /// Host bytes retained across mirrored meshes for exact surface and deformation
@@ -613,6 +736,9 @@ impl GpuSceneMirror {
         self.drive_page_streaming(world, scene, Some(view), &mut target)?;
         let bins = self.live_executor_bins(target.gpu_data);
         let GpuSceneMirrorTarget { .. } = target;
+        // Published every frame, complete, and empty when nothing is over — an owned alarm
+        // resolves by ABSENCE, so reporting only on breach would leave one firing forever.
+        renderer.set_owned_budgets(self.vegetation_budget_breaches(assets));
         renderer.set_live_executor_bins(bins);
         renderer.set_micro_field_directory(self.micro_field_directory(world));
         renderer.set_live_draw_record_bound(self.live_draw_record_bound());
@@ -741,28 +867,56 @@ impl GpuSceneMirror {
             struct MeshDemand {
                 distance: f32,
                 in_frustum: bool,
+                /// Inside the window a GI or reflection ray reaches, whether or not on screen.
+                gi_reachable: bool,
                 moved: bool,
             }
             let mut mesh_stats: HashMap<u64, MeshDemand> = HashMap::new();
             if let Some(world_state) = self.worlds.get(&world.0) {
-                for ((entity, _), instance) in &world_state.instances {
-                    let Some(state) = scene.world_transform_state(*entity) else {
-                        continue;
-                    };
-                    let position = state.current.col(3).truncate();
+                // Both stores in one loop: a plant's pages fault exactly like a scene
+                // instance's, and vegetation is where the paged geometry mostly IS, so a
+                // prioritizer that walked only the ECS side would be scoring the smaller
+                // half of the scene and leaving the larger half to demand-on-miss.
+                let placed = world_state
+                    .instances
+                    .iter()
+                    .filter_map(|((entity, _), instance)| {
+                        let state = scene.world_transform_state(*entity)?;
+                        Some((
+                            instance.mesh,
+                            state.current.col(3).truncate(),
+                            instance.world_revision != instance.previous_world_revision,
+                        ))
+                    })
+                    .chain(world_state.plants.values().filter_map(|plant| {
+                        let GpuSceneTransform::Static(placement) = plant.record.transform else {
+                            return None;
+                        };
+                        // A placed plant is static by construction, so it never scores the
+                        // motion boost.
+                        Some((
+                            plant.mesh,
+                            static_placement_matrix(&placement).col(3).truncate(),
+                            false,
+                        ))
+                    }));
+                for (mesh, position, moved) in placed {
                     let distance = (position - view.eye).length().max(0.05);
                     let clip = view.view_proj * position.extend(1.0);
                     let in_frustum = clip.w > 0.0
                         && clip.x.abs() <= clip.w * 1.2
                         && clip.y.abs() <= clip.w * 1.2;
-                    let moved = instance.world_revision != instance.previous_world_revision;
-                    let stats = mesh_stats.entry(instance.mesh).or_insert(MeshDemand {
+                    let gi_reachable =
+                        position.cmpge(view.gi_min).all() && position.cmple(view.gi_max).all();
+                    let stats = mesh_stats.entry(mesh).or_insert(MeshDemand {
                         distance: f32::INFINITY,
                         in_frustum: false,
+                        gi_reachable: false,
                         moved: false,
                     });
                     stats.distance = stats.distance.min(distance);
                     stats.in_frustum |= in_frustum;
+                    stats.gi_reachable |= gi_reachable;
                     stats.moved |= moved;
                 }
             }
@@ -785,14 +939,14 @@ impl GpuSceneMirror {
                 let error_metres = page.transition_error.total as f32 / 65_536.0;
                 let distance = (stats.distance - radius).max(0.05);
                 let mut projected = error_metres * view.proj_scale / distance;
-                if !stats.in_frustum {
-                    projected *= 0.25;
-                }
+                projected *= page_demand_reach_weight(stats.in_frustum, stats.gi_reachable);
                 if stats.moved {
                     projected *= 2.0;
                 }
                 if projected > 0.25 {
-                    let priority = (projected * 1024.0).min(1e18) as u64;
+                    let priority = (projected * 1024.0)
+                        .min(saffron_rendering::PAGE_DEMAND_PREDICTED_CEILING as f32)
+                        as u64;
                     target.residency.demand(handle, priority);
                 }
             }
@@ -1007,6 +1161,9 @@ impl GpuSceneMirror {
                     continue;
                 }
                 let slot_count = shared.meshes[&family.value()].slot_count;
+                // A family that cooked an atlas addresses it from its UVs, so every slot of every
+                // point in this family reads the atlas rather than the slot's own image.
+                let atlas = render.atlas.clone();
                 // The rendered phenotype derives from typed lifecycle state and the
                 // seasonal phase — never inferred from the active mesh.
                 let rendered_phenotype = saffron_vegetation::resolve_rendered_phenotype(
@@ -1041,11 +1198,23 @@ impl GpuSceneMirror {
                     if material.value() == 0 {
                         continue;
                     }
-                    overrides.push((slot, MaterialKey::from_material(*material)));
+                    overrides.push((
+                        slot,
+                        atlas.as_ref().map_or_else(
+                            || MaterialKey::from_material(*material),
+                            |_| MaterialKey::from_atlased_material(*material, family),
+                        ),
+                    ));
                 }
                 let mut override_records = Vec::with_capacity(overrides.len());
                 for (slot, material_key) in &overrides {
-                    let handle = shared.intern_material(material_key, assets, gpu, target)?;
+                    let handle = shared.intern_material(
+                        material_key,
+                        assets,
+                        gpu,
+                        target,
+                        atlas.as_ref(),
+                    )?;
                     override_records.push(GpuSceneMaterialOverride {
                         slot: *slot,
                         material: handle,
@@ -1090,17 +1259,17 @@ impl GpuSceneMirror {
                     } else {
                         0
                     };
+                let placement = GpuSceneStaticTransform::new(
+                    points.positions[index],
+                    points.orientations[index],
+                    points.scales[index],
+                    0,
+                );
                 let record = GpuSceneInstanceRecord {
                     prototype: shared.meshes[&family.value()].prototype,
-                    transform: GpuSceneTransform::Static(GpuSceneStaticTransform::new(
-                        points.positions[index],
-                        points.orientations[index],
-                        points.scales[index],
-                        0,
-                    )),
+                    transform: GpuSceneTransform::Static(placement),
                     material_overrides: Arc::from(override_records),
                     deformation: None,
-                    sdf: None,
                     source_generation: shared.generation,
                     flags,
                     combination,
@@ -1213,6 +1382,89 @@ impl GpuSceneMirror {
     /// `(family, plant instances, field tiles, predicted micro candidates)` rows and
     /// `(cell, plants, field tiles)` rows, both in stable sorted order.
     #[must_use]
+    /// This frame's vegetation budget breaches, named by the content that owns them.
+    ///
+    /// Resolves each family to its catalog name so the alarm reads as the asset an author knows
+    /// rather than as a bare id — the provenance half of "actionable". A family that is no longer
+    /// in the catalog keeps its id, which is itself the useful thing to see.
+    pub fn vegetation_budget_breaches(
+        &self,
+        assets: &AssetServer,
+    ) -> Vec<saffron_rendering::OwnedBudgetBreach> {
+        let budgets = self.vegetation_budgets;
+        let breakdown = self.vegetation_breakdown();
+        let mut breaches = Vec::new();
+        let mut push = |metric: &str, owner: String, value: f64, threshold: f64| {
+            if threshold <= 0.0 || value <= threshold {
+                return;
+            }
+            breaches.push(saffron_rendering::OwnedBudgetBreach {
+                metric: metric.to_owned(),
+                owner,
+                // Over budget is a warning; half again over is a wall an author has to act on
+                // rather than watch.
+                severity: if value >= threshold * 1.5 {
+                    saffron_rendering::AlarmSeverity::Critical
+                } else {
+                    saffron_rendering::AlarmSeverity::Warning
+                },
+                value: value as f32,
+                threshold: threshold as f32,
+            });
+        };
+        for row in &breakdown.cells {
+            let coordinates = row.cell.coordinates();
+            push(
+                "vegetation-cell-plants",
+                format!(
+                    "cell {},{},{} L{}",
+                    coordinates[0],
+                    coordinates[1],
+                    coordinates[2],
+                    row.cell.level()
+                ),
+                f64::from(row.plants),
+                f64::from(budgets.cell_plants),
+            );
+        }
+        for row in &breakdown.families {
+            let owner = assets
+                .catalog()
+                .entries
+                .iter()
+                .find(|entry| entry.id.value() == row.family)
+                .map_or_else(
+                    || format!("family {}", row.family),
+                    |entry| format!("family {} ({})", entry.name, row.family),
+                );
+            push(
+                "vegetation-family-instances",
+                owner.clone(),
+                f64::from(row.instances),
+                f64::from(budgets.family_instances),
+            );
+            push(
+                "vegetation-family-blades",
+                owner,
+                row.micro_predicted as f64,
+                budgets.family_micro_predicted as f64,
+            );
+        }
+        breaches
+    }
+
+    /// The budgets [`Self::vegetation_budget_breaches`] measures against.
+    #[must_use]
+    pub fn vegetation_budgets(&self) -> VegetationBudgets {
+        self.vegetation_budgets
+    }
+
+    /// Replaces the vegetation budgets. A zero disables that budget rather than alarming on
+    /// everything, which is the only reading that lets a project opt one out.
+    pub fn set_vegetation_budgets(&mut self, budgets: VegetationBudgets) {
+        self.vegetation_budgets = budgets;
+    }
+
     pub fn vegetation_breakdown(&self) -> VegetationRenderBreakdown {
         use std::collections::BTreeMap;
         let mut families: BTreeMap<u64, (u32, u32, u64)> = BTreeMap::new();
@@ -1465,8 +1717,9 @@ impl GpuSceneMirror {
         match reloaded {
             Some(mesh) => {
                 let payload_source = assets.page_payload_source(Uuid(id));
+                let mechanics = packed_mechanics(assets.plant_family_mechanics(Uuid(id)));
                 self.shared
-                    .replace_mesh_content(id, mesh, payload_source, target)
+                    .replace_mesh_content(id, mesh, payload_source, mechanics, target)
             }
             None => self.drop_mesh(id, target),
         }
@@ -1837,7 +2090,7 @@ fn resolve_instance(
     }
     let mut override_records = Vec::with_capacity(overrides.len());
     for (slot, material_key) in &overrides {
-        let handle = shared.intern_material(material_key, ctx.assets, ctx.gpu, ctx.target)?;
+        let handle = shared.intern_material(material_key, ctx.assets, ctx.gpu, ctx.target, None)?;
         override_records.push(GpuSceneMaterialOverride {
             slot: *slot,
             material: handle,
@@ -1896,7 +2149,6 @@ fn resolve_instance(
         transform: GpuSceneTransform::Dynamic(transform),
         material_overrides: Arc::from(override_records),
         deformation: deformation.map(|entry| entry.scene),
-        sdf: None,
         source_generation: shared.generation,
         flags: 0,
         combination,
@@ -2041,6 +2293,39 @@ fn plant_bounds_sphere(
     ]
 }
 
+/// A placed plant's world matrix, from the same quantized values the GPU record carries:
+/// orientation as a unit quaternion in 1/32767ths, scale in 1/65536ths, position in metres.
+///
+/// Absolute world metres rather than render-relative — the TLAS is built in the same space the
+/// static-mesh instances use, and rebasing is not a thing this engine does.
+/// A placed instance's world matrix, from the same quantized values the GPU record carries:
+/// orientation as a unit quaternion in 1/32767ths, scale in Q15.16, position as signed cell
+/// coordinates plus cell-local ticks.
+fn static_placement_matrix(placement: &GpuSceneStaticTransform) -> Mat4 {
+    use saffron_geometry::glam::{Quat, Vec3};
+    let rotation = Quat::from_xyzw(
+        f32::from(placement.orientation[0]) / 32_767.0,
+        f32::from(placement.orientation[1]) / 32_767.0,
+        f32::from(placement.orientation[2]) / 32_767.0,
+        f32::from(placement.orientation[3]) / 32_767.0,
+    )
+    .normalize();
+    let scale = Vec3::new(
+        placement.scale[0] as f32 / 65_536.0,
+        placement.scale[1] as f32 / 65_536.0,
+        placement.scale[2] as f32 / 65_536.0,
+    );
+    // Global ticks are cell coordinates scaled by the cell span plus the cell-local offset,
+    // the same composition `WorldPosition::world_meters` performs.
+    let cell_ticks = f64::from(saffron_spatial::BASE_CELL_TICKS);
+    let translation = saffron_geometry::glam::DVec3::new(
+        placement.cell[0] as f64 * cell_ticks + f64::from(placement.local_ticks[0]),
+        placement.cell[1] as f64 * cell_ticks + f64::from(placement.local_ticks[1]),
+        placement.cell[2] as f64 * cell_ticks + f64::from(placement.local_ticks[2]),
+    ) / f64::from(saffron_spatial::LOCAL_TICKS_PER_METER);
+    Mat4::from_scale_rotation_translation(scale, rotation, translation.as_vec3())
+}
+
 fn pack_field_tiles(tiles: &[MicroFieldTile]) -> Result<PackedFieldTiles> {
     let mut packed = Vec::new();
     let mut offsets = Vec::with_capacity(tiles.len());
@@ -2146,7 +2431,6 @@ fn reconcile_field_instances(
             )),
             material_overrides: Arc::from([]),
             deformation: None,
-            sdf: None,
             source_generation: shared.generation,
             flags: GPU_SCENE_INSTANCE_FLAG_MICRO_FIELD,
             vegetation: None,
@@ -2326,7 +2610,7 @@ impl SharedMirror {
             .unwrap_or(1)
             .max(1);
         let default_key = MaterialKey::default_key();
-        let default_handle = self.intern_material(&default_key, assets, gpu, target)?;
+        let default_handle = self.intern_material(&default_key, assets, gpu, target, None)?;
         for _ in 0..slot_count {
             self.ref_material(&default_key);
         }
@@ -2334,6 +2618,8 @@ impl SharedMirror {
             std::iter::repeat_n(default_handle, slot_count as usize).collect();
 
         let bounds = prototype_bounds(&mesh);
+        let mechanics = packed_mechanics(assets.plant_family_mechanics(Uuid(id)));
+        let sdfs = insert_mesh_sdfs(&mesh, self.generation, target)?;
         let result = target
             .gpu_scene
             .apply_shared_delta(GpuSceneSharedDelta::CreatePrototype(
@@ -2341,11 +2627,12 @@ impl SharedMirror {
                     geometry,
                     materials,
                     deformation: None,
-                    sdf: None,
+                    sdfs: sdfs.iter().map(|sdf| sdf.scene).collect(),
                     root_page,
                     bounds,
                     source_generation: self.generation,
                     flags: 0,
+                    mechanics,
                 },
             ))
             .map_err(gpu_scene_error)?;
@@ -2361,8 +2648,10 @@ impl SharedMirror {
             parts_range,
             pages,
             payload_source,
+            sdfs,
             prototype,
             slot_count,
+            mechanics,
             refs: 0,
         })
     }
@@ -2374,6 +2663,7 @@ impl SharedMirror {
         id: u64,
         mesh: Arc<GpuMesh>,
         payload_source: Option<PagePayloadSource>,
+        mechanics: [u32; 4],
         target: &mut GpuSceneMirrorTarget<'_>,
     ) -> Result<()> {
         let InsertedGeometry {
@@ -2413,6 +2703,11 @@ impl SharedMirror {
             std::iter::repeat_n(default_handle, new_slot_count as usize).collect();
         let bounds = prototype_bounds(&mesh);
 
+        let old_sdfs: Vec<MeshSdf> = entry.sdfs.clone();
+        if let Some(entry) = self.meshes.get_mut(&id) {
+            entry.mechanics = mechanics;
+        }
+        let sdfs = insert_mesh_sdfs(&mesh, self.generation, target)?;
         target
             .gpu_scene
             .apply_shared_delta(GpuSceneSharedDelta::UpdatePrototype {
@@ -2421,14 +2716,25 @@ impl SharedMirror {
                     geometry,
                     materials,
                     deformation: None,
-                    sdf: None,
+                    sdfs: sdfs.iter().map(|sdf| sdf.scene).collect(),
                     root_page,
                     bounds,
                     source_generation: self.generation,
                     flags: 0,
+                    mechanics,
                 },
             })
             .map_err(gpu_scene_error)?;
+        // The refreshed record no longer references the old fields, so they retire now.
+        for sdf in old_sdfs.iter().rev() {
+            target
+                .gpu_scene
+                .apply_shared_delta(GpuSceneSharedDelta::RemoveSdf(sdf.scene))
+                .map_err(gpu_scene_error)?;
+            target
+                .pending
+                .retire_record(GlobalGpuTableKind::Sdf, sdf.device);
+        }
 
         for page in old_pages.iter().rev() {
             target
@@ -2474,6 +2780,7 @@ impl SharedMirror {
         entry.submesh_range = submesh_range;
         entry.parts_range = parts_range;
         entry.pages = pages;
+        entry.sdfs = sdfs;
         entry.payload_source = payload_source;
         entry.slot_count = new_slot_count;
         Ok(())
@@ -2493,6 +2800,15 @@ impl SharedMirror {
             .gpu_scene
             .apply_shared_delta(GpuSceneSharedDelta::RemovePrototype(entry.prototype))
             .map_err(gpu_scene_error)?;
+        for sdf in entry.sdfs.iter().rev() {
+            target
+                .gpu_scene
+                .apply_shared_delta(GpuSceneSharedDelta::RemoveSdf(sdf.scene))
+                .map_err(gpu_scene_error)?;
+            target
+                .pending
+                .retire_record(GlobalGpuTableKind::Sdf, sdf.device);
+        }
         for page in entry.pages.iter().rev() {
             target
                 .gpu_scene
@@ -2542,13 +2858,22 @@ impl SharedMirror {
         assets: &mut AssetServer,
         gpu: &dyn GpuUploader,
         target: &mut GpuSceneMirrorTarget<'_>,
+        atlas: Option<&Arc<saffron_rendering::GpuTexture>>,
     ) -> Result<GpuSceneMaterialHandle> {
         if let Some(entry) = self.materials.get(key) {
             return Ok(entry.scene_handle);
         }
         let overrides = key.overrides_value();
         let asset = assets.resolve_slot_material(Uuid(key.material), &overrides);
-        let submesh = assets.resolve_material_asset(gpu, &asset);
+        let mut submesh = assets.resolve_material_asset(gpu, &asset);
+        // A family that cooked an atlas has UVs addressing it, so the slot's own image is no
+        // longer what those UVs index — the packed atlas is. Substituting here keeps the whole
+        // material path (params, codegen, coverage) identical for atlased and un-atlased families.
+        if let Some(atlas) = atlas {
+            submesh.albedo_texture = Some(Arc::clone(atlas));
+            submesh.coverage_texture = Some(Arc::clone(atlas));
+        }
+        let submesh = submesh;
         let codegen_shader = assets.codegen_shader_for(Uuid(key.material));
         let device = self.build_material_device_records(
             key,
@@ -2687,12 +3012,22 @@ impl SharedMirror {
                 range: parameters,
                 data: Box::new(params),
             });
+        let pack = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
         let table = target.gpu_data.materials.insert(GpuMaterialTableRecord {
             base_color_texture: albedo,
             normal_texture: normal,
             coverage: coverage.unwrap_or(GpuHandle::INVALID),
             parameter_index: parameters.first,
             material_class: material_class(submesh, asset.unlit),
+            proxy_albedo: pack(submesh.base_color.x)
+                | (pack(submesh.base_color.y) << 8)
+                | (pack(submesh.base_color.z) << 16),
+            occupancy: submesh.thin_sheet.as_ref().map_or(1.0, |sheet| {
+                crate::render_material::derive_parity_occupancy(
+                    sheet.transmission.to_array(),
+                    sheet.thickness,
+                )
+            }),
             shader_index: codegen_shader.map_or(0, |shader| {
                 target.gpu_data.executor_shaders.register(shader)
             }),
@@ -2828,6 +3163,24 @@ impl SharedMirror {
     }
 }
 
+/// Packs a plant family's authored response into the prototype record's four words, in
+/// the cooked integer forms so the GPU reads exactly what the cooker wrote. All zero for
+/// anything that is not a plant family, which the wind prepass reads as "derive the
+/// response from the plant's height alone".
+pub(crate) fn packed_mechanics(
+    mechanics: Option<saffron_vegetation::MechanicalResponse>,
+) -> [u32; 4] {
+    let Some(mechanics) = mechanics else {
+        return [0; 4];
+    };
+    [
+        mechanics.stiffness.bits() as u32,
+        mechanics.drag.bits() as u32,
+        mechanics.flutter.bits() as u32,
+        u32::from(mechanics.damping.bits()) | (u32::from(mechanics.bend_limit.bits()) << 16),
+    ]
+}
+
 fn prototype_bounds(mesh: &GpuMesh) -> [f32; 4] {
     let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
     let radius = (mesh.bounds_max - center).length();
@@ -2939,6 +3292,56 @@ fn insert_geometry(
     })
 }
 
+/// Publishes one mesh's baked signed distance fields: a device-table record per field
+/// (the grid placement + atlas identity the occluder scatter reads) and a scene
+/// reference each, returned in [`GpuMesh::sdfs`] order for the prototype's range.
+fn insert_mesh_sdfs(
+    mesh: &GpuMesh,
+    generation: u32,
+    target: &mut GpuSceneMirrorTarget<'_>,
+) -> Result<Vec<MeshSdf>> {
+    let mut sdfs = Vec::with_capacity(mesh.sdfs().len());
+    for field in mesh.sdfs() {
+        let uvec = |a: [u32; 3], w: u32| [a[0], a[1], a[2], w];
+        let device = target
+            .gpu_data
+            .sdfs
+            .insert(saffron_rendering::GpuSdfTableRecord {
+                local_min: [
+                    field.bounds_min.x,
+                    field.bounds_min.y,
+                    field.bounds_min.z,
+                    field.max_dist,
+                ],
+                local_max: [
+                    field.bounds_max.x,
+                    field.bounds_max.y,
+                    field.bounds_max.z,
+                    0.0,
+                ],
+                voxel_dims: uvec(field.voxel_dims, field.bindless_index()),
+                indirection_dims: uvec(field.indirection_dims, field.mip_count),
+                atlas_bricks: uvec(field.atlas_bricks, field.proxy_albedo),
+            })
+            .map_err(Error::Render)?;
+        target.pending.stage_record(GlobalGpuTableKind::Sdf, device);
+        let result = target
+            .gpu_scene
+            .apply_shared_delta(GpuSceneSharedDelta::CreateSdf(
+                saffron_rendering::GpuSceneSdfRecord {
+                    resource: device,
+                    source_revision: u64::from(generation),
+                },
+            ))
+            .map_err(gpu_scene_error)?;
+        let GpuSceneSharedDeltaResult::SdfCreated(scene) = result else {
+            unreachable!("create sdf returns SdfCreated");
+        };
+        sdfs.push(MeshSdf { scene, device });
+    }
+    Ok(sdfs)
+}
+
 fn insert_pages(
     hierarchy_pages: &[PortableHierarchyPage],
     generation: u32,
@@ -3042,6 +3445,22 @@ fn build_coverage_record(
         &metadata,
         OpacityMicromapDerivation::default(),
     )))
+}
+
+/// How much of a page's projected error survives, given what actually reads it this frame.
+///
+/// Three tiers rather than on-screen or not. A page feeding a cone march or a reflection is
+/// genuinely read even when nothing on screen shows it — ranking it alongside content nothing
+/// consults is what let GI march against pages that were never demanded. On-screen content still
+/// wins outright, because a missing page there is a visible hole rather than a soft gather.
+fn page_demand_reach_weight(in_frustum: bool, gi_reachable: bool) -> f32 {
+    if in_frustum {
+        1.0
+    } else if gi_reachable {
+        0.5
+    } else {
+        0.25
+    }
 }
 
 #[cfg(test)]
@@ -3349,6 +3768,20 @@ mod tests {
     }
 
     /// A registered assembly mesh (two prototypes placed by identity uses) mirrors into
+    /// A distinctive authored response, so a prototype record that carries it cannot be
+    /// confused with the all-zero "not a plant family" value.
+    fn mechanics_fixture() -> saffron_vegetation::MechanicalResponse {
+        saffron_vegetation::MechanicalResponse {
+            stiffness: saffron_spatial::DecisionScalar::from_bits(3 << 16),
+            damping: saffron_spatial::UnitInterval::from_bits(9_000),
+            drag: saffron_spatial::DecisionScalar::from_bits(2 << 16),
+            flutter: saffron_spatial::DecisionScalar::from_bits(5 << 16),
+            bend_limit: saffron_spatial::UnitInterval::from_bits(21_000),
+            damage_threshold: saffron_spatial::DecisionScalar::from_bits(0),
+            break_threshold: saffron_spatial::DecisionScalar::from_bits(0),
+        }
+    }
+
     /// a geometry record whose parts range holds the packed prototype + use tables and
     /// whose reserved word carries the prototype count — the executor's table split.
     #[test]
@@ -3364,7 +3797,13 @@ mod tests {
             false,
         );
         let uploaded = gpu
-            .upload_mesh(&flat, &hierarchy, &[], None, None)
+            .upload_mesh(
+                &flat,
+                &hierarchy,
+                &[],
+                None,
+                saffron_rendering::SdfSource::None,
+            )
             .expect("assembly upload");
         let assembly = uploaded.assembly.as_ref().expect("assembly table");
         let expected_bytes = u32::try_from(assembly.byte_len()).unwrap();
@@ -3375,6 +3814,7 @@ mod tests {
             family_id,
             Arc::clone(&uploaded),
             Arc::new(hierarchy),
+            mechanics_fixture(),
         );
         let mut scene = Scene::new();
         let entity = scene.create_entity("Family");
@@ -3395,6 +3835,25 @@ mod tests {
             "prototype count rides the reserved word"
         );
         assert_eq!(record.parts, entry.parts_range);
+
+        // The family's authored response reaches its prototype record. The wind prepass
+        // reads it there, and a mirror that dropped it on the floor would leave every
+        // plant swaying on the height-derived defaults with nothing to show for it.
+        let mechanics = mechanics_fixture();
+        assert_eq!(
+            harness
+                .gpu_scene
+                .prototype(entry.prototype)
+                .expect("prototype record")
+                .mechanics,
+            [
+                mechanics.stiffness.bits() as u32,
+                mechanics.drag.bits() as u32,
+                mechanics.flutter.bits() as u32,
+                u32::from(mechanics.damping.bits())
+                    | (u32::from(mechanics.bend_limit.bits()) << 16),
+            ],
+        );
 
         drop(uploaded);
         harness.finish();
@@ -3439,17 +3898,25 @@ mod tests {
             false,
         );
         let uploaded = gpu
-            .upload_mesh(&flat, &hierarchy, &[], None, None)
+            .upload_mesh(
+                &flat,
+                &hierarchy,
+                &[],
+                None,
+                saffron_rendering::SdfSource::None,
+            )
             .expect("assembly upload");
         harness.assets.register_family_render(
             family_id,
             Arc::clone(&uploaded),
             Arc::new(hierarchy),
+            mechanics_fixture(),
         );
         harness.assets.plant_render_by_hash.insert(
             artifact_hash,
             Some(crate::PlantFamilyRender {
                 mesh: Arc::clone(&uploaded),
+                atlas: None,
                 materials: Arc::from([] as [Uuid; 0]),
                 combinations: Arc::from([(0_u32, 0_u32), (0, 1)]),
                 phenotypes: Arc::from([
@@ -3468,6 +3935,7 @@ mod tests {
                         material_remap: Arc::from([]),
                     },
                 ]),
+                mechanics: mechanics_fixture(),
             }),
         );
 
@@ -4048,6 +4516,25 @@ mod tests {
 
         harness.finish();
         assert_eq!(validation_issue_count(), before);
+    }
+
+    #[test]
+    fn gi_reachable_pages_outrank_pages_nothing_reads() {
+        // The ordering that matters, stated as an inequality rather than as three magic numbers:
+        // on-screen beats GI-reachable beats unreachable. Before this, the middle case did not
+        // exist — a page feeding a reflection was ranked with one nothing consults, which is how
+        // GI ended up marching against pages that were never demanded.
+        let visible = page_demand_reach_weight(true, false);
+        let gi_only = page_demand_reach_weight(false, true);
+        let neither = page_demand_reach_weight(false, false);
+        assert!(visible > gi_only, "on-screen content must win outright");
+        assert!(
+            gi_only > neither,
+            "a page a march reads must outrank one nothing reads"
+        );
+        // On-screen wins whether or not it is also reachable: a missing page there is a visible
+        // hole, not a soft gather, so the two flags must not compound into a higher tier.
+        assert_eq!(visible, page_demand_reach_weight(true, true));
     }
 
     #[test]
