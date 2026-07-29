@@ -453,17 +453,32 @@ impl RgPass {
 
     /// A compute pass with the given name, no render area (compute passes open no
     /// rendering scope).
+    ///
+    /// It runs on the graphics queue unless it opts into [`RgQueuePreference::AsyncCompute`]
+    /// through [`RgPass::queue`]. Independent execution is a per-pass claim that every
+    /// dependency the pass produces is *declared*, because that is what the graph turns into
+    /// the cross-queue release/acquire pair — a pass whose consumers reach its output some
+    /// other way has no such handoff, and naming a graphics stage from a compute-only queue
+    /// is invalid besides.
     pub fn compute(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             kind: RgPassKind::Compute,
-            queue: RgQueuePreference::AsyncCompute,
+            queue: RgQueuePreference::Graphics,
             accesses: Vec::new(),
             colors: Vec::new(),
             depth: None,
             render_area: vk::Extent2D::default(),
             execute: None,
         }
+    }
+
+    /// Selects the queue this pass prefers. Only a compute pass can leave the graphics
+    /// queue, and only where the device exposes an independent compute family.
+    #[must_use]
+    pub fn queue(mut self, queue: RgQueuePreference) -> Self {
+        self.queue = queue;
+        self
     }
 
     /// Declares a non-attachment `(resource, usage)` access.
@@ -782,6 +797,49 @@ fn seed_image_state(r: &mut RgResourceState) {
     }
 }
 
+/// Pipeline stages only a graphics-capable queue can express.
+const GRAPHICS_ONLY_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::DRAW_INDIRECT.as_raw()
+        | vk::PipelineStageFlags2::VERTEX_INPUT.as_raw()
+        | vk::PipelineStageFlags2::VERTEX_SHADER.as_raw()
+        | vk::PipelineStageFlags2::TESSELLATION_CONTROL_SHADER.as_raw()
+        | vk::PipelineStageFlags2::TESSELLATION_EVALUATION_SHADER.as_raw()
+        | vk::PipelineStageFlags2::GEOMETRY_SHADER.as_raw()
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw()
+        | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
+        | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
+        | vk::PipelineStageFlags2::ALL_GRAPHICS.as_raw()
+        | vk::PipelineStageFlags2::INDEX_INPUT.as_raw()
+        | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT.as_raw()
+        | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS.as_raw(),
+);
+
+/// The source scope of a same-queue barrier, expressed in terms `queue` can name.
+///
+/// An image imported for the first time carries an *assumed* source stage describing work
+/// outside the graph — `FRAGMENT_SHADER` for one already in `SHADER_READ_ONLY_OPTIMAL`. It
+/// has no recorded queue owner, so the barrier lands on whichever queue first touches it,
+/// and a graphics stage named on the async-compute queue is invalid
+/// (`VUID-vkCmdPipelineBarrier2-srcStageMask-09675`). Widen the whole scope to
+/// `ALL_COMMANDS` + `MEMORY_READ|MEMORY_WRITE`: legal on every queue, and a superset of what
+/// it replaces. A resource with a recorded owner never reaches this — a queue change goes
+/// through the release/acquire pair instead, whose source scope rides its own queue.
+fn queue_source_scope(
+    stage: vk::PipelineStageFlags2,
+    access: vk::AccessFlags2,
+    queue: RgQueueAssignment,
+) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    if queue == RgQueueAssignment::AsyncCompute && stage.intersects(GRAPHICS_ONLY_STAGES) {
+        (
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        )
+    } else {
+        (stage, access)
+    }
+}
+
 /// The barriers a single pass needs, derived from its declared usage.
 #[derive(Default)]
 struct DerivedBarriers {
@@ -909,10 +967,11 @@ fn apply_access_queued(
             );
         }
     } else if layout_change || hazard {
+        let (src_stage, src_access) = queue_source_scope(r.last_stage, r.last_access, queue);
         barriers.image.push(
             vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(r.last_stage)
-                .src_access_mask(r.last_access)
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
                 .dst_stage_mask(target.stage)
                 .dst_access_mask(target.access)
                 .old_layout(r.layout)
@@ -1743,6 +1802,9 @@ impl RenderGraph {
                 let pass = passes[pass_index]
                     .take()
                     .expect("each render-graph pass belongs to one batch");
+                if let Some(checkpoints) = device.resources().checkpoints() {
+                    checkpoints.mark(command_buffer, &pass.name);
+                }
                 let barriers = &plan.passes[pass_index];
                 let gpu_timestamps_supported = batch.queue == RgQueueAssignment::Graphics
                     || device
@@ -2044,10 +2106,8 @@ mod tests {
         ));
     }
 
-    fn compute_on_graphics(name: &str) -> RgPass {
-        let mut pass = RgPass::compute(name);
-        pass.queue = RgQueuePreference::Graphics;
-        pass
+    fn async_compute(name: &str) -> RgPass {
+        RgPass::compute(name).queue(RgQueuePreference::AsyncCompute)
     }
 
     fn owned_buffer_state(queue: RgQueueAssignment, family: u32) -> RgExternalBufferState {
@@ -2658,7 +2718,7 @@ mod tests {
             .alloc_external_buffer_state(owned_buffer_state(RgQueueAssignment::AsyncCompute, 5));
         let buffer = graph.import_buffer(vk::Buffer::null(), Some(state));
         let range = RgBufferRange::new(32, 64).unwrap();
-        graph.add_pass(RgPass::compute("count").access_buffer(
+        graph.add_pass(async_compute("count").access_buffer(
             buffer,
             range,
             RgUsage::StorageWriteCompute,
@@ -2706,8 +2766,8 @@ mod tests {
     fn async_compute_preference_falls_back_to_the_same_graphics_pass() {
         let mut graph = RenderGraph::new();
         let buffer = graph.import_buffer(vk::Buffer::null(), None);
-        graph.add_pass(RgPass::compute("count").access(buffer, RgUsage::StorageWriteCompute));
-        graph.add_pass(RgPass::compute("consume").access(buffer, RgUsage::StorageReadCompute));
+        graph.add_pass(async_compute("count").access(buffer, RgUsage::StorageWriteCompute));
+        graph.add_pass(async_compute("consume").access(buffer, RgUsage::StorageReadCompute));
 
         let schedule = graph.barrier_schedule(RgQueueFamilies::graphics_only(3));
         assert_eq!(schedule[0].queue, RgQueueAssignment::Graphics);
@@ -2731,7 +2791,7 @@ mod tests {
             lifetime: RgBufferLifetime::Transient,
         });
         graph.add_pass(
-            RgPass::compute("tess-factor")
+            async_compute("tess-factor")
                 .access(scratch, RgUsage::StorageWriteCompute)
                 .body(|_, _| {}),
         );
@@ -2763,7 +2823,7 @@ mod tests {
             RgPass::graphics("scene", vk::Extent2D::default())
                 .color(RgAttachment::clear_store(color)),
         );
-        graph.add_pass(RgPass::compute("tonemap").access(color, RgUsage::StorageImageRwCompute));
+        graph.add_pass(async_compute("tonemap").access(color, RgUsage::StorageImageRwCompute));
 
         assert_eq!(
             graph.queue_assignments(RgQueueFamilies {
@@ -2788,17 +2848,17 @@ mod tests {
             graph.alloc_external_buffer_state(owned_buffer_state(RgQueueAssignment::Graphics, 2));
         let second = graph.import_buffer(vk::Buffer::from_raw(2), Some(second_state));
         let whole = RgBufferRange::new(0, 256).unwrap();
-        graph.add_pass(RgPass::compute("async-produce").access_buffer(
+        graph.add_pass(async_compute("async-produce").access_buffer(
             first,
             whole,
             RgUsage::StorageWriteCompute,
         ));
         graph.add_pass(
-            compute_on_graphics("graphics-transfer")
+            RgPass::compute("graphics-transfer")
                 .access_buffer(first, whole, RgUsage::StorageReadCompute)
                 .access_buffer(second, whole, RgUsage::StorageWriteCompute),
         );
-        graph.add_pass(RgPass::compute("async-consume").access_buffer(
+        graph.add_pass(async_compute("async-consume").access_buffer(
             second,
             whole,
             RgUsage::StorageReadCompute,
@@ -2837,10 +2897,10 @@ mod tests {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             Some(slot),
         );
-        graph.add_pass(RgPass::compute("compute-a").access(image, RgUsage::SampledReadCompute));
-        graph.add_pass(RgPass::compute("compute-b").access(image, RgUsage::SampledReadCompute));
-        graph.add_pass(compute_on_graphics("graphics-a"));
-        graph.add_pass(compute_on_graphics("graphics-b"));
+        graph.add_pass(async_compute("compute-a").access(image, RgUsage::SampledReadCompute));
+        graph.add_pass(async_compute("compute-b").access(image, RgUsage::SampledReadCompute));
+        graph.add_pass(RgPass::compute("graphics-a"));
+        graph.add_pass(RgPass::compute("graphics-b"));
 
         let plan = graph.submission_plan(RgQueueFamilies {
             graphics: 1,
@@ -2868,8 +2928,7 @@ mod tests {
             vk::ImageLayout::UNDEFINED,
             Some(slot),
         );
-        graph
-            .add_pass(RgPass::compute("async-write").access(image, RgUsage::StorageImageRwCompute));
+        graph.add_pass(async_compute("async-write").access(image, RgUsage::StorageImageRwCompute));
 
         let plan = graph.submission_plan(RgQueueFamilies {
             graphics: 7,
@@ -2900,9 +2959,7 @@ mod tests {
             vk::ImageLayout::UNDEFINED,
             Some(slot),
         );
-        graph.add_pass(
-            compute_on_graphics("graphics-read").access(image, RgUsage::SampledReadCompute),
-        );
+        graph.add_pass(RgPass::compute("graphics-read").access(image, RgUsage::SampledReadCompute));
 
         let plan = graph.submission_plan(RgQueueFamilies {
             graphics: 7,

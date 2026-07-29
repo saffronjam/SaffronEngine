@@ -80,6 +80,9 @@ pub struct PsoKey {
     /// The indexed-MDI executor vertex path: no vertex input bindings, the
     /// `vertexMainExecutor` entry pulling geometry through buffer device addresses.
     pub executor: bool,
+    /// The executor variant reached through a mesh stage instead of a vertex one. Only ever
+    /// set alongside `executor`; gated on [`crate::Capabilities::mesh_shader`] by the caller.
+    pub mesh_shader: bool,
 }
 
 /// The übershader PSO cache + the lazy thumbnail/preview pipelines.
@@ -179,6 +182,7 @@ pub struct Pipelines {
     /// brick array set 0 + the GDF cull/composite set 1), built lazily once those layouts are known.
     gdf_cull: Option<Arc<Pipeline>>,
     gdf_composite: Option<Arc<Pipeline>>,
+    gi_occluder_scatter: Option<Arc<Pipeline>>,
 
     /// The three ReSTIR DI compute PSOs (initial candidate sampling / temporal+spatial
     /// reuse / resolve incl. the TLAS visibility ray), built lazily once the device-shared
@@ -197,6 +201,7 @@ pub struct Pipelines {
     scene_bin_seed: Option<Arc<Pipeline>>,
     scene_bin_scatter: Option<Arc<Pipeline>>,
     scene_executor_depth: Option<Arc<Pipeline>>,
+    scene_executor_depth_mesh: Option<Arc<Pipeline>>,
     scene_micro_count: Option<Arc<Pipeline>>,
     scene_micro_scan: Option<Arc<Pipeline>>,
     scene_micro_scatter: Option<Arc<Pipeline>>,
@@ -360,6 +365,7 @@ impl Pipelines {
             dfao: None,
             specocc: None,
             gdf_cull: None,
+            gi_occluder_scatter: None,
             gdf_composite: None,
             restir_initial: None,
             restir_reuse: None,
@@ -375,6 +381,7 @@ impl Pipelines {
             scene_bin_seed: None,
             scene_bin_scatter: None,
             scene_executor_depth: None,
+            scene_executor_depth_mesh: None,
             scene_micro_count: None,
             scene_micro_scan: None,
             scene_micro_scatter: None,
@@ -456,6 +463,7 @@ impl Pipelines {
         &mut self,
         material: &Material,
         wireframe: bool,
+        mesh_shader: bool,
     ) -> Option<Arc<Pipeline>> {
         let wireframe = wireframe && self.fill_mode_non_solid;
         let alpha_to_coverage =
@@ -469,6 +477,7 @@ impl Pipelines {
             alpha_to_coverage,
             sample_count: self.sample_count,
             executor: true,
+            mesh_shader,
         };
         if let Some(pipeline) = self.cache.get(&key) {
             return Some(Arc::clone(pipeline));
@@ -506,6 +515,7 @@ impl Pipelines {
             blend: material.blend,
             alpha_to_coverage,
             sample_count: self.sample_count,
+            mesh_shader: false,
             executor: false,
         };
         if let Some(pipeline) = self.cache.get(&key) {
@@ -1017,6 +1027,30 @@ impl Pipelines {
             }
             Err(err) => {
                 tracing::error!("request_gdf_cull: {err}");
+                None
+            }
+        }
+    }
+
+    /// The GI occluder-scatter compute PSO: one set (`scatter_layout` — the reach
+    /// view's lists, the occluder output, the meta words, and the scene address block),
+    /// a 48-byte push.
+    pub fn request_gi_occluder_scatter(
+        &mut self,
+        scatter_layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.gi_occluder_scatter {
+            return Some(Arc::clone(pipeline));
+        }
+        let set_layouts = [scatter_layout];
+        match self.build_compute_multi("shaders/gi_occluder_scatter.spv", &set_layouts, 48) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.gi_occluder_scatter = Some(Arc::clone(&pipeline));
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_gi_occluder_scatter: {err}");
                 None
             }
         }
@@ -1588,7 +1622,7 @@ impl Pipelines {
         let push_constant = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)];
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
         let set_layouts = [layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
@@ -1623,6 +1657,125 @@ impl Pipelines {
                 unsafe { raw.destroy_pipeline_layout(pipeline_layout, None) };
                 return Err(Error::Vk {
                     context: "create_graphics_pipelines (scene executor depth)",
+                    result,
+                });
+            }
+        };
+        Ok(Pipeline::from_parts(
+            &self.resources,
+            pipeline,
+            pipeline_layout,
+        ))
+    }
+
+    /// The mesh-shader executor's depth PSO — the same records and the same attachment as
+    /// [`Self::request_scene_executor_depth`], reached through a mesh stage instead of a vertex
+    /// one. Callers gate on [`crate::Capabilities::mesh_shader`]; there is no fallback here,
+    /// because the indexed executor is not a fallback but the other supported path.
+    pub fn request_scene_executor_depth_mesh(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<Arc<Pipeline>> {
+        if let Some(pipeline) = &self.scene_executor_depth_mesh {
+            return Some(Arc::clone(pipeline));
+        }
+        match self.build_scene_executor_depth_mesh(layout) {
+            Ok(pipeline) => {
+                let pipeline = Arc::new(pipeline);
+                self.scene_executor_depth_mesh = Some(Arc::clone(&pipeline));
+                self.pipelines_created += 1;
+                Some(pipeline)
+            }
+            Err(err) => {
+                tracing::error!("request_scene_executor_depth_mesh: {err}");
+                None
+            }
+        }
+    }
+
+    fn build_scene_executor_depth_mesh(&self, layout: vk::DescriptorSetLayout) -> Result<Pipeline> {
+        let raw = self.resources.device();
+        let module = self.load_shader_module("shaders/scene_executor_depth_mesh.spv")?;
+        let result = self.build_scene_executor_depth_mesh_with_module(raw, module, layout);
+        // SAFETY: the ash seam. The module is consumed by pipeline creation; freeing it
+        // after creation is valid and required.
+        unsafe { raw.destroy_shader_module(module, None) };
+        result
+    }
+
+    fn build_scene_executor_depth_mesh_with_module(
+        &self,
+        raw: &ash::Device,
+        module: vk::ShaderModule,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<Pipeline> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(module)
+                .name(c"meshMain"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"fragmentMain"),
+        ];
+        // A mesh pipeline names neither vertex input nor input assembly: the mesh stage
+        // produces the primitives itself.
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
+        let push_constant = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::MESH_EXT)
+            .offset(0)
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
+        let set_layouts = [layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant);
+        // SAFETY: the ash seam. The set layouts outlive the call; the layout is owned by
+        // the returned `Pipeline`.
+        let pipeline_layout = checked(
+            unsafe { raw.create_pipeline_layout(&layout_info, None) },
+            "create_pipeline_layout (scene executor depth mesh)",
+        )?;
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(&stages)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(pipeline_layout);
+        // SAFETY: the ash seam. The create-info chain outlives the call; on failure the
+        // layout is freed exactly once.
+        let created = unsafe {
+            raw.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        let pipeline = match created {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => {
+                // SAFETY: the ash seam. The layout was created above; freed once here.
+                unsafe { raw.destroy_pipeline_layout(pipeline_layout, None) };
+                return Err(Error::Vk {
+                    context: "create_graphics_pipelines (scene executor depth mesh)",
                     result,
                 });
             }
@@ -2354,18 +2507,20 @@ impl Pipelines {
             .map_entries(&spec_entries)
             .data(&spec_data);
 
-        let vertex_entry: &CStr = if key.executor {
-            c"vertexMainExecutor"
+        let (geometry_stage, geometry_entry): (vk::ShaderStageFlags, &CStr) = if key.mesh_shader {
+            (vk::ShaderStageFlags::MESH_EXT, c"meshMainExecutor")
+        } else if key.executor {
+            (vk::ShaderStageFlags::VERTEX, c"vertexMainExecutor")
         } else if key.skinned {
-            c"vertexMainSkinned"
+            (vk::ShaderStageFlags::VERTEX, c"vertexMainSkinned")
         } else {
-            c"vertexMain"
+            (vk::ShaderStageFlags::VERTEX, c"vertexMain")
         };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
+                .stage(geometry_stage)
                 .module(module)
-                .name(vertex_entry),
+                .name(geometry_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
@@ -2493,10 +2648,17 @@ impl Pipelines {
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
 
+        // viewProj, plus the mesh executor's command-slice base. The range covers the base for
+        // every variant even though only the mesh entry reads it — one push shape across the
+        // family is worth four unread bytes, and a range wider than the shader uses is legal.
         let push_constant = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(if key.mesh_shader {
+                vk::ShaderStageFlags::MESH_EXT
+            } else {
+                vk::ShaderStageFlags::VERTEX
+            })
             .offset(0)
-            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)]; // viewProj
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
 
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&self.set_layouts)
@@ -2508,11 +2670,9 @@ impl Pipelines {
             "create_pipeline_layout (mesh)",
         )?;
 
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .push_next(&mut rendering_info)
             .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
             .viewport_state(&viewport_state)
             .rasterization_state(&raster)
             .multisample_state(&multisample)
@@ -2520,6 +2680,13 @@ impl Pipelines {
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic)
             .layout(layout);
+        // A mesh pipeline names neither vertex input nor input assembly: the mesh stage produces
+        // its own primitives, and supplying either is invalid rather than merely ignored.
+        if !key.mesh_shader {
+            pipeline_info = pipeline_info
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly);
+        }
 
         // SAFETY: the ash seam. The create-info chain outlives the call; the cache
         // (`VK_NULL_HANDLE`) is the no-cache path. On failure the layout is freed.
@@ -2627,7 +2794,7 @@ impl Pipelines {
         let push_constant = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)];
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
         // The depth pre-pass binds the same set prefix as the mesh layout (0 bindless,
         // 1 light, 2 instance) so the viewProj push + instance read match the scene pass.
         let set_layouts = &self.set_layouts[..3];
@@ -2744,7 +2911,7 @@ impl Pipelines {
         let push_constant = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)];
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
         // Same set prefix as the mesh layout (0 bindless, 1 light, 2 instance); the coverage pass
         // binds only set 2 + the viewProj push, matching the depth prepass.
         let set_layouts = &self.set_layouts[..3];
@@ -2986,7 +3153,7 @@ impl Pipelines {
         let push_constant = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)]; // viewProj
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)]; // viewProj
         let set_layouts = &self.set_layouts[..3];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(set_layouts)
@@ -3261,7 +3428,7 @@ impl Pipelines {
         let push_constant = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(size_of::<saffron_geometry::glam::Mat4>() as u32)];
+            .size(crate::MESH_EXECUTOR_PUSH_SIZE)];
         let set_layouts = &self.set_layouts[..3];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(set_layouts)
@@ -3903,6 +4070,7 @@ mod tests {
             alpha_to_coverage: false,
             sample_count: vk::SampleCountFlags::TYPE_1,
             executor: false,
+            mesh_shader: false,
         };
         let mut set = HashSet::new();
         set.insert(base.clone());
@@ -3939,10 +4107,17 @@ mod tests {
                 executor: true,
                 ..base.clone()
             },
+            // The mesh-stage executor is a distinct PSO over the same records, so it must not
+            // collide with the indexed one in the cache.
+            PsoKey {
+                executor: true,
+                mesh_shader: true,
+                ..base.clone()
+            },
         ] {
             assert!(set.insert(variant));
         }
-        assert_eq!(set.len(), 8);
+        assert_eq!(set.len(), 9);
     }
 
     /// The same variant requested twice returns the *same* `Arc` (one PSO, a cache
