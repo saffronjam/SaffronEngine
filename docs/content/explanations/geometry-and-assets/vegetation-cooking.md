@@ -73,6 +73,24 @@ flowchart LR
     J --> R["atomic current root"]
 ```
 
+## The work plan
+
+Cell cooks execute through a published work plan rather than a loop. After evaluation, staging
+builds one `CookWorkManifest`: an item per cell in coarsest-level-first order, each carrying a
+payload (its own, ancestor-independent dependency half, published to the store), an own-input key
+hashed under its own domain string, and `blocked_by` — the containing planned cell at every coarser
+level, always an earlier item, so acyclicity holds by construction.
+
+Execution is a claim protocol on disk, keyed by the plan's content identity. A claimant wins an
+item by atomically creating its claim file, verifies the payload against the item's own-input key,
+composes the full cook key only once its ancestors' completions publish their output hashes, cooks
+and publishes the cell, and records a completion marker separate from the claim — so a swept claim
+never erases a finished result. A stale sweep at plan start frees claims whose lease expired
+without a completion; sweeping is safe because publication is idempotent by content address. The
+single committer then assembles completions in item order into the generation's manifest and cook
+graph. The in-process worker pool is the local degenerate case of a remote fleet: it races the
+same on-disk claims a remote claimant would, and an interrupted run's completions count on resume.
+
 ## Artifact facets
 
 `.svegcell` and `.splantc` use strict tables of contents. Each section records its kind, semantic
@@ -104,12 +122,21 @@ and platform hashes. Its directory records plant tags and exact cell-to-cell con
 Store validation cross-checks the graph outputs, manifest rows, compiled plant headers, tag tables,
 cell headers, section tables, and dependency targets before root publication.
 
-The compiled plant table contains all fifteen required facets: source normalization, part table,
+The compiled plant table contains all sixteen required facets: source normalization, part table,
 geometry, materials and coverage, skeleton and weights, phenotypes, collision, navigation,
 provenance, triangle hierarchy, voxel hierarchy, deformation, page directory, ray-tracing metadata,
-and validation. The triangle and voxel sections form one portable hierarchy with parent-first page
-dependencies and a guaranteed drawable root. See [virtual geometry](../virtual-geometry/) for its
-cluster, aggregate, residency, and global GPU contracts.
+validation, and the distance field. The triangle and voxel sections form one portable hierarchy
+with parent-first page dependencies and a guaranteed drawable root. See
+[virtual geometry](../virtual-geometry/) for its cluster, aggregate, residency, and global GPU
+contracts.
+
+The distance-field section is what lets a placed plant occlude
+[global illumination](../../global-illumination-and-raytracing/distance-field-reflection-occlusion/):
+a family-space SDST field derived from the coarsest aggregate voxel brick's occupancy — the same
+grid the aggregate raster form draws — through an exact integer distance transform, so the bytes
+are identical on every target. It is encoded by the same codec the mesh bake's sidecar uses; at
+load the family's mesh carries it like any baked field, and the occluder scatter emits it per
+placed plant. A family that cooked no voxel brick writes an empty section and occludes nothing.
 
 Work estimates participate in canonical graph and manifest bytes. Measured duration, memory, byte
 counts, rejection totals, and cache-hit state remain job observations. `vegetation-cook-status` and
@@ -201,6 +228,7 @@ store rather than through the catalog.
 | Portable triangle/voxel hierarchy | `vegetation/src/virtual_hierarchy.rs` | `cook_portable_virtual_hierarchy`, `validate_portable_virtual_hierarchy` |
 | Read guards and catalog snapshot | `assets/src/cook_reader.rs` | `CookProjectView`, `CookAssetReader`, `AuthoredInputGuard` |
 | Staging, journal recovery, and commit | `assets/src/vegetation_cooker.rs` | `stage_vegetation_cook`, `StagedVegetationCook`, `commit_staged_vegetation_cook` |
+| Work plan, claims, and completions | `vegetation/src/cook_work.rs`, `assets/src/vegetation_cooker.rs`, `assets/src/vegetation_store.rs` | `CookWorkManifest`, `CookWorkPayload`, `CookWorkCompletion`, `cook_work_own_input_key`, `run_work_items`, `cook_one_cell`, `claim_work_item`, `sweep_stale_work_claims` |
 | Content-addressed publication | `assets/src/vegetation_store.rs` | `VegetationArtifactStore`, `publish_generation_locked` |
 | Asynchronous jobs and commands | `control/src/vegetation_cook_jobs.rs`, `control/src/commands_vegetation.rs` | `VegetationCookJobs`, `register_vegetation_commands` |
 
