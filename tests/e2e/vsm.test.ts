@@ -26,16 +26,28 @@ async function vsm() {
   return stats.vsm;
 }
 
-/// Renders until the atlas has rasterized at least one page, so the counters describe real work.
+/// Renders until the atlas has rasterized at least one page, returning the PEAK of each counter
+/// across the wait rather than one frame's sample.
+///
+/// Every counter describes a single frame, and they do not peak together: a page is allocated on
+/// the frame that first demands it and rasterized on a later one. The peak is what lets an
+/// assertion talk about the window instead of whichever frame the poll landed on.
 async function awaitRenderedPages(timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
+  const peak = { requested: 0, hits: 0, allocated: 0, rendered: 0, dirtied: 0, overflow: 0 };
   for (;;) {
     const counters = await vsm();
-    if (counters.rendered > 0) {
-      return counters;
+    for (const key of Object.keys(peak) as (keyof typeof peak)[]) {
+      peak[key] = Math.max(peak[key], counters[key] ?? 0);
+    }
+    if (peak.rendered > 0) {
+      return peak;
     }
     if (Date.now() >= deadline) {
-      throw new Error(`timeout waiting for a rasterized shadow page: ${JSON.stringify(counters)}`);
+      throw new Error(
+        `timeout waiting for a rasterized shadow page: peak ${JSON.stringify(peak)}, ` +
+          `last ${JSON.stringify(counters)}`,
+      );
     }
     await engine.settle(50);
   }
@@ -93,10 +105,14 @@ test("the page atlas serves directional, spot, and point shadow casters", async 
   await engine.settle(200);
 
   const counters = await awaitRenderedPages();
-  // The starter scene's directional light plus the spot and point casters all demand pages, and
-  // the atlas answers them: nothing overflowed.
+  // The starter scene's directional light plus the spot and point casters all demand pages, the
+  // atlas answers every one of them from residency, and it rasterizes them — with nothing
+  // overflowing. `allocated` is deliberately not asserted here: allocation is a one-time event as
+  // each page first becomes resident, so by the time a caster is set up and polled it reads 0 on
+  // every frame. That it stays 0 while demand is served is the point of the next test.
   expect(counters.requested).toBeGreaterThan(0);
-  expect(counters.allocated).toBeGreaterThan(0);
+  expect(counters.hits).toBe(counters.requested);
+  expect(counters.rendered).toBeGreaterThan(0);
   expect(counters.overflow).toBe(0);
   expect(engine.validationErrors()).toEqual([]);
 });
