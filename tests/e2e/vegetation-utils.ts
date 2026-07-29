@@ -24,6 +24,8 @@ export interface VegetationFixture {
   mapObjects: VegetationMapObjectFixture[];
   trunkObjHex: string;
   trunkObjPath: string;
+  trunkMtlHex?: string;
+  trunkMtlPath?: string;
   plant: string;
   biome: string;
   map: string;
@@ -65,6 +67,10 @@ export async function installTrunkObj(engine: Engine, fixture: VegetationFixture
   const trunkPath = join(projectRoot, "assets", fixture.trunkObjPath);
   mkdirSync(dirname(trunkPath), { recursive: true });
   writeFileSync(trunkPath, Buffer.from(fixture.trunkObjHex, "hex"));
+  if (fixture.trunkMtlHex && fixture.trunkMtlPath) {
+    const mtlPath = join(projectRoot, "assets", fixture.trunkMtlPath);
+    writeFileSync(mtlPath, Buffer.from(fixture.trunkMtlHex, "hex"));
+  }
 }
 
 export async function awaitEvaluation(engine: Engine, job: string, timeoutMs = 30_000) {

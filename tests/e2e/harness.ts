@@ -2,9 +2,9 @@
 // the JSON-over-unix-socket control plane — the same wire the editor and `sa` CLI use.
 // Tests are plain TypeScript on `bun test`.
 //
-// Each Engine spawns its own headless weston so runs are isolated and never open a window,
-// then launches the saffron-host binary pointed at a per-run control socket. Engine
-// stdout+stderr (incl. validation messages) is captured into `.log` for assertions.
+// Each Engine launches the saffron-host binary pointed at a per-run control socket, rendering
+// offscreen so no window and no compositor are involved. Engine stdout+stderr (incl. validation
+// messages) is captured into `.log` for assertions.
 
 import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
@@ -53,9 +53,7 @@ export function macosVulkanEnv(): Record<string, string> {
     },
   ];
   const icd = candidates.find((p) => existsSync(p)) ?? candidates[0];
-  // Run the offscreen (no-window) host: macOS has no tested windowed Metal-surface path, and
-  // offscreen is the mode the editor drives anyway.
-  const env: Record<string, string> = { SAFFRON_EDITOR_NATIVE_VIEWPORT: "1" };
+  const env: Record<string, string> = {};
   if (process.env.VK_ICD_FILENAMES === undefined) env.VK_ICD_FILENAMES = icd;
   const layer = layerCandidates.find(
     ({ manifest, library }) => existsSync(manifest) && existsSync(library),
@@ -87,7 +85,6 @@ export class Engine {
   /// and never pollute the source tree. A caller that passes its own `SAFFRON_APPDATA_DIR` owns it.
   readonly appdata: string;
   private proc: ChildProcess;
-  private weston: ChildProcess | null;
   private exited = false;
   private buf = "";
   private nextId = 1;
@@ -95,13 +92,11 @@ export class Engine {
 
   private constructor(
     proc: ChildProcess,
-    weston: ChildProcess | null,
     socketPath: string,
     appdata: string,
     ownsAppdata: boolean,
   ) {
     this.proc = proc;
-    this.weston = weston;
     this.socketPath = socketPath;
     this.appdata = appdata;
     this.ownsAppdata = ownsAppdata;
@@ -119,27 +114,7 @@ export class Engine {
   }
 
   static async boot(env: Record<string, string> = {}): Promise<Engine> {
-    const runtime = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`;
     const stamp = `${process.pid}-${Date.now()}`;
-    const wlSocket = `wl-e2e-${stamp}`;
-    // The offscreen host needs no window surface. On Linux the harness still boots a headless
-    // weston so any Wayland-touching path has a compositor; macOS has no Wayland (the host renders
-    // through MoltenVK offscreen), so there is nothing to spawn.
-    let weston: ChildProcess | null = null;
-    if (!IS_MACOS) {
-      weston = spawn(
-        "weston",
-        [
-          "--backend=headless",
-          "--width=1280",
-          "--height=720",
-          `--socket=${wlSocket}`,
-          "--idle-time=0",
-        ],
-        { env: { ...process.env, XDG_RUNTIME_DIR: runtime }, stdio: "ignore" },
-      );
-      await waitFor(() => existsSync(join(runtime, wlSocket)), 10_000, "weston socket");
-    }
 
     // A per-boot app-data root under the temp dir so a booted project (e.g. SAFFRON_SCRATCH_PROJECT)
     // writes its userdata/ there and never pollutes the source tree — the host runs with cwd=REPO,
@@ -155,18 +130,19 @@ export class Engine {
       cwd: REPO,
       env: {
         ...process.env,
-        XDG_RUNTIME_DIR: runtime,
-        // Wayland only matters to the Linux path; macOS renders offscreen through MoltenVK.
-        ...(IS_MACOS
-          ? macosVulkanEnv()
-          : { WAYLAND_DISPLAY: wlSocket, SDL_VIDEODRIVER: "wayland" }),
+        ...(IS_MACOS ? macosVulkanEnv() : {}),
+        // The offscreen (no-window) host on every platform: it needs no compositor, so runs are
+        // isolated by construction, and device selection is free to take the discrete GPU — a
+        // windowed boot has to qualify on present support, which a headless compositor denies to
+        // a discrete adapter. It is also the mode the editor drives.
+        SAFFRON_EDITOR_NATIVE_VIEWPORT: "1",
         SAFFRON_CONTROL_SOCK: socketPath,
         SAFFRON_APPDATA_DIR: appdata,
         ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const engine = new Engine(proc, weston, socketPath, appdata, ownsAppdata);
+    const engine = new Engine(proc, socketPath, appdata, ownsAppdata);
     proc.stdout?.on("data", (d) => (engine.buf += d.toString()));
     proc.stderr?.on("data", (d) => (engine.buf += d.toString()));
     proc.on("exit", () => (engine.exited = true));
@@ -374,7 +350,6 @@ export class Engine {
       // already gone, or quit raced the socket close
     }
     this.proc.kill("SIGTERM");
-    this.weston?.kill("SIGTERM");
     await delay(100);
     this.cleanupAppdata();
   }

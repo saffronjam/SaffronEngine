@@ -14,16 +14,16 @@ cd tests/e2e && bun test       # inside the toolbox (host bun on PATH)
 
 | File | Role |
 |---|---|
-| `harness.ts` | `Engine.boot()` starts the engine (`SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`) on a per-run control socket, with headless Weston on Linux and the native offscreen path on macOS. It captures stdout/stderr into `.log` and exposes `call(cmd, params)` + `validationErrors()`. Always `shutdown()`. |
+| `harness.ts` | `Engine.boot()` starts the engine (`SAFFRON_ANIMA_BIN`, defaulting to `engine/target/debug/saffron-host`) on a per-run control socket, rendering through the native offscreen path. It captures stdout/stderr into `.log` and exposes `call(cmd, params)` + `validationErrors()`. Always `shutdown()`. |
 | `*.test.ts` | The suite, grouped by area: control plane + rendering (`rendering`, `control`, `scene`, `camera`, `picking`, `play`, `perf`, `profiler`, `toggles`, `assets`, `hierarchy`, …), animation (`animation*`, `foot-ik`), skinning (`skinning`, `skinned-*`, `skeleton-overlay`), scripting (`script`), materials (`material*`), physics (`physics-*`), vegetation (`vegetation-*`, see below), and pixel/golden render checks (`*_render`, `material_scene_codegen`). |
 | `fixtures/` | JSON scene and asset recipes the tests cook from. The `vegetation-*.json` ones are **generated** — see below. |
 
 ## Conventions
 
-- **No display setup needed.** Each `Engine` uses a unique control socket. Linux starts its own
-  headless Weston socket; macOS runs the native offscreen host through MoltenVK. Build the engine
-  first with `just engine`; Linux needs `weston`, and macOS needs Homebrew's
-  `vulkan-validationlayers`. The harness configures its manifest and dynamic-library search path.
+- **No display setup needed.** Each `Engine` uses a unique control socket and boots the host
+  offscreen, so no window and no compositor are involved on any platform. Build the engine first
+  with `just engine`; macOS needs Homebrew's `vulkan-validationlayers`, and the harness configures
+  its manifest and dynamic-library search path.
   The `just` recipes cap the suite at four concurrent engine hosts so GPU initialization and socket
   startup remain deterministic.
 - **Assert on `validationErrors()`.** The engine runs with validation layers on; a test that
