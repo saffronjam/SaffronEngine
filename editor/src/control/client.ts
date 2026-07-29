@@ -541,8 +541,32 @@ export const client = {
   plantValidate(plant: string) {
     return call("plant-validate", { plant });
   },
+  plantAtlas(params: CommandParamsMap["plant-atlas"]) {
+    return call("plant-atlas", params);
+  },
+  plantHierarchy(params: CommandParamsMap["plant-hierarchy"]) {
+    return call("plant-hierarchy", params);
+  },
+  plantSeasonPhenotype(params: CommandParamsMap["plant-season-phenotype"]) {
+    return call("plant-season-phenotype", params);
+  },
+  plantProxies(params: CommandParamsMap["plant-proxies"]) {
+    return call("plant-proxies", params);
+  },
+  plantPhenotypes(params: CommandParamsMap["plant-phenotypes"]) {
+    return call("plant-phenotypes", params);
+  },
+  setHierarchyCut(params: CommandParamsMap["set-hierarchy-cut"] = {}) {
+    return call("set-hierarchy-cut", params);
+  },
   vegetationEcologyStatus() {
     return call("vegetation-ecology-status");
+  },
+  vegetationTelemetry() {
+    return call("vegetation-telemetry");
+  },
+  vegetationBudgets(params: CommandParamsMap["vegetation-budgets"] = {}) {
+    return call("vegetation-budgets", params);
   },
   vegetationAdvanceEcology(params: CommandParamsMap["vegetation-advance-ecology"]) {
     return call("vegetation-advance-ecology", params);
@@ -898,6 +922,10 @@ export const client = {
     return call("set-clouds", cloud);
   },
   /// Merge shared global wind fields over the current environment's wind block.
+  /// Stages one push into the world interaction field, applied on the next frame.
+  emitInteractionImpulse(params: CommandParamsMap["emit-interaction-impulse"]) {
+    return call("emit-interaction-impulse", params);
+  },
   setWind(wind: Partial<Environment["wind"]>): Promise<Environment> {
     return call("set-wind", wind);
   },

@@ -1514,7 +1514,11 @@ export interface BotanicalEditOrphanDto {
   reason: BotanicalEditOrphanReasonDto;
 }
 
-export type BotanicalOperatorDto = { "Drawn": { element: BotanicalElementDto, points: Array<BotanicalDrawnPointDto>, } } | { "Trunk": { element: BotanicalElementDto, length_bits: number, base_radius_bits: number, taper: Array<BotanicalCurvePointDto>, segments: number, } } | { "Branch": { element: BotanicalElementDto, length_ratio: number, radius_ratio: number, declination: number, jitter: number, segments: number, } } | { "Phyllotaxis": { pattern: PhyllotaxisPatternDto, count: number, nodes: number, start: number, end: number, divergence: number, } } | { "Tropism": { kind_of: TropismKindDto, strength: number, } } | { "Prune": { rule: PruneRuleDto, threshold_bits: number, count: number, } } | { "Roots": { depth_ratio: number, spread_ratio: number, count: number, } } | { "Shell": { material_slot: number, sides: number, } } | { "Instance": { element: BotanicalElementDto, material_slot: number, size_bits: number, jitter: number, } } | "Family";
+export type BotanicalOperatorDto = { "Drawn": { element: BotanicalElementDto, points: Array<BotanicalDrawnPointDto>, } } | { "Trunk": { element: BotanicalElementDto, length_bits: number, base_radius_bits: number, taper: Array<BotanicalCurvePointDto>, segments: number, } } | { "Branch": { element: BotanicalElementDto, length_ratio: number, radius_ratio: number, declination: number, jitter: number, segments: number, } } | { "Phyllotaxis": { pattern: PhyllotaxisPatternDto, count: number, nodes: number, start: number, end: number, divergence: number, } } | { "Tropism": { kind_of: TropismKindDto, strength: number, } } | { "Prune": { rule: PruneRuleDto, threshold_bits: number, count: number, } } | { "Roots": { depth_ratio: number, spread_ratio: number, count: number, } } | { "Shell": { material_slot: number, sides: number, } } | { "Instance": { element: BotanicalElementDto, material_slot: number, size_bits: number, jitter: number, } } | { "ModuleCall": { 
+/**
+ * Call-site GUID as a canonical 32-hex-digit string.
+ */
+call_guid: VegetationGuid, } } | "Family";
 
 export interface BotanicalNodeDto {
   guid: string;
@@ -1558,6 +1562,195 @@ export interface VegetationWorkCountersDto {
 export interface VegetationArtifactFaultDto {
   path: string;
   fault: string;
+}
+
+export interface UsdSkeletonsParams {
+  path: string;
+}
+
+export interface UsdSkeletonsResult {
+  skeletons: UsdSkeletonDto[];
+  unsupported: string[];
+}
+
+export interface UsdSkeletonDto {
+  name: string;
+  skelRoot?: string;
+  joints: UsdJointDto[];
+}
+
+export interface UsdJointDto {
+  path: string;
+  parent?: number;
+  rest: number[];
+  bind: number[];
+}
+
+export interface VegetationWindRecordParams {
+  cell: WorldCellDto;
+  plant: PlantId;
+}
+
+export interface VegetationWindRecordResult {
+  slot: number;
+  swayCurrentM: [number, number, number];
+  swayPreviousM: [number, number, number];
+  interactionCurrentM: [number, number, number];
+  interactionPreviousM: [number, number, number];
+  interactionReset: boolean;
+  branchQuadrature: [number, number, number, number];
+  branchAmplitudeM: number;
+  flutterAmplitudeM: number;
+  heightScale: number;
+  boundsInflationM: number;
+  mechanics?: VegetationMechanicsDto;
+}
+
+export interface VegetationBudgetsParams {
+  cellPlants?: number;
+  familyInstances?: number;
+  familyMicroPredicted?: string;
+}
+
+export interface VegetationBudgetsResult {
+  cellPlants: number;
+  familyInstances: number;
+  familyMicroPredicted: string;
+}
+
+export type PhenotypeRoleDto = "healthy" | "harvested" | "damaged" | "burned" | "dead" | "flowering" | "fruiting" | "senescent" | "wet";
+
+export interface PlantPhenotypeDto {
+  id: number;
+  role: PhenotypeRoleDto;
+  variation: number;
+  seasonWindow?: [number, number];
+  materialRemap: [number, number][];
+  activeParts: string[];
+}
+
+export interface PlantPhenotypesParams {
+  plant: AssetSelector;
+  phenotypes?: PlantPhenotypeDto[];
+}
+
+export interface PlantPhenotypesResult {
+  plant: WireUuid;
+  phenotypes: PlantPhenotypeDto[];
+}
+
+export type HierarchyCutDto = "auto" | "coarse" | "fine";
+
+export type HierarchyCutViewDto = "camera" | "shadow" | "gi";
+
+export interface SetHierarchyCutParams {
+  cut?: HierarchyCutDto;
+  view?: HierarchyCutViewDto;
+}
+
+export interface HierarchyCutResult {
+  view: HierarchyCutViewDto;
+  cut: HierarchyCutDto;
+}
+
+export interface PlantAtlasPlacementDto {
+  slot: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PlantAtlasParams {
+  plant: AssetSelector;
+  level: number;
+}
+
+export interface PlantAtlasResult {
+  plant: WireUuid;
+  level: number;
+  levelCount: number;
+  width: number;
+  height: number;
+  gutter: number;
+  placements: PlantAtlasPlacementDto[];
+  base64: string;
+}
+
+export interface AppearanceErrorDto {
+  silhouette: number;
+  coverage: number;
+  transmission: number;
+  material: number;
+  normalDistribution: number;
+  total: number;
+}
+
+export interface PlantHierarchyNodeDto {
+  id: number;
+  parent?: number;
+  depth: number;
+  representation: string;
+  primitives: number;
+  page: number;
+  childCount: number;
+  appearanceError: AppearanceErrorDto;
+}
+
+export interface PlantHierarchyParams {
+  plant: AssetSelector;
+}
+
+export interface PlantHierarchyResult {
+  plant: WireUuid;
+  triangleNodes: number;
+  voxelNodes: number;
+  nodes: PlantHierarchyNodeDto[];
+}
+
+export interface PlantSeasonPhenotypeParams {
+  plant: AssetSelector;
+  seasonMille: number;
+  lifecycle?: PlantLifecycleDto;
+}
+
+export interface PlantSeasonPhenotypeResult {
+  plant: WireUuid;
+  phenotype: number;
+  variation: number;
+}
+
+export type PlantCollisionShapeDto = "box" | "sphere" | "capsule" | "convexHull";
+
+export interface PlantCollisionProxyDto {
+  shape: PlantCollisionShapeDto;
+  centerM: [number, number, number];
+  dimensionsM: [number, number, number];
+  breakable: boolean;
+}
+
+export interface PlantNavigationProxyDto {
+  footprintM: [number, number][];
+  heightM: number;
+  cost: number;
+}
+
+export interface PlantProxiesParams {
+  plant: AssetSelector;
+}
+
+export interface PlantProxiesResult {
+  plant: WireUuid;
+  collision: PlantCollisionProxyDto[];
+  navigation: PlantNavigationProxyDto[];
+}
+
+export interface VegetationMechanicsDto {
+  stiffness: number;
+  drag: number;
+  flutter: number;
+  damping: number;
+  bendLimit: number;
 }
 
 export interface VegetationVerifyParams {
@@ -1670,6 +1863,7 @@ export interface BotanicalGrowthDto {
   elements: number;
   vertices: number;
   triangles: number;
+  truncated: boolean;
   parts: number;
   spines: number;
   heightBits: number;
@@ -1686,6 +1880,8 @@ export interface PlantCreateResult {
 export interface PlantGrowthParams {
   plant: AssetSelector;
   variation: number;
+  maxAxes?: number;
+  maxElements?: number;
 }
 
 export interface BotanicalAxisDto {
@@ -1908,6 +2104,7 @@ export interface RenderStatsDto {
   shadowDrawCalls: number;
   vsm: VsmStatsDto;
   rtInstances: number;
+  rtAggregateInstances: number;
   frameMs: number;
   fps: number;
   gpuMs: number;
@@ -1945,7 +2142,31 @@ export interface RenderStatsDto {
   restir: boolean;
   ssr: boolean;
   rtReflections: boolean;
+  meshShader: boolean;
+  meshExecutor: boolean;
+  sdfInstancesDropped: number;
+  sdfInstancesCulled: number;
+  rtInstancesCulled: number;
+  ommSupported: boolean;
   blasCount: number;
+  skinnedBlasCount: number;
+  tessellatedBlasCount: number;
+  clusterAsSupported: boolean;
+  clusterBlasCount: number;
+  clasCount: number;
+  ptlasSupported: boolean;
+  ptlasPartitions: number;
+  ptlasWrites: number;
+  ptlasUpdates: number;
+  accelBuildUs: string;
+  ommMicromaps: number;
+  ommOpaque: string;
+  ommTransparent: string;
+  ommUnknown: string;
+  blasBytes: string;
+  blasBuiltBytes: string;
+  tlasBytes: string;
+  rtScratchBytes: string;
   pipelines: number;
   bindlessTextures: number;
   bindlessFree: number;
@@ -1968,6 +2189,7 @@ export interface RenderStatsDto {
 }
 
 export interface GpuSceneMirrorStatsDto {
+  historyInvalidation: string;
   meshes: number;
   materials: number;
   textures: number;
@@ -2130,6 +2352,8 @@ export interface PageResidencyStatsDto {
   evictions: number;
   faults: number;
   faultLatencyUs: number;
+  requestsDropped: number;
+  requestOverflowClasses: number;
 }
 
 export interface SceneVisibilityStatsDto {
@@ -2144,6 +2368,14 @@ export interface SceneVisibilityStatsDto {
   culledFrustum: number;
   culledOcclusion: number;
   subQuadTriangles: number;
+  visitedNodes: number;
+  bins: number;
+  deformed: number;
+  interactionResets: number;
+  coveredSamples: number;
+  culledNodes: number;
+  giReachVisible: number;
+  giReachCulled: number;
   overflowFlags: number;
   pressureFlags: number;
 }
@@ -2314,6 +2546,7 @@ export interface AlarmEventDto {
   fingerprint: string;
   metric: string;
   pass: string;
+  owner: string;
   severity: AlarmSeverityDto;
   state: AlarmStateDto;
   value: number;
@@ -2552,6 +2785,7 @@ export interface ActiveAlarmDto {
   fingerprint: string;
   metric: string;
   pass: string;
+  owner: string;
   severity: AlarmSeverityDto;
   value: number;
   threshold: number;
@@ -2644,6 +2878,23 @@ export interface TonemapResult {
 
 export interface SetRtShadowsResult {
   rtShadows: boolean;
+}
+
+export interface VsmPageBudgetParams {
+  pages?: number;
+}
+
+export interface VsmPageBudgetResult {
+  pages: number;
+}
+
+export interface PageRequestBudgetParams {
+  entries?: number;
+}
+
+export interface PageRequestBudgetResult {
+  entries: number;
+  capacity: number;
 }
 
 export interface SetRestirResult {
@@ -4202,6 +4453,9 @@ export interface CommandParamsMap {
   "get-render-quality": EmptyParams;
   "set-tonemap": SetTonemapParams;
   "set-rt-shadows": ToggleParams;
+  "set-hierarchy-cut": SetHierarchyCutParams;
+  "vsm-page-budget": VsmPageBudgetParams;
+  "page-request-budget": PageRequestBudgetParams;
   "set-restir": ToggleParams;
   "set-ssr": ToggleParams;
   "set-rt-reflections": ToggleParams;
@@ -4338,6 +4592,9 @@ export interface CommandParamsMap {
   "vegetation-advance-ecology": VegetationAdvanceEcologyParams;
   "vegetation-ecology-status": EmptyParams;
   "vegetation-combustion": VegetationCombustionParams;
+  "vegetation-usd-skeletons": UsdSkeletonsParams;
+  "vegetation-wind-record": VegetationWindRecordParams;
+  "vegetation-budgets": VegetationBudgetsParams;
   "vegetation-verify-artifacts": VegetationVerifyParams;
   "vegetation-state-baseline": EmptyParams;
   "vegetation-telemetry": EmptyParams;
@@ -4347,6 +4604,11 @@ export interface CommandParamsMap {
   "plant-graph": PlantGrowthParams;
   "plant-graph-set": PlantGraphSetParams;
   "plant-growth": PlantGrowthParams;
+  "plant-proxies": PlantProxiesParams;
+  "plant-season-phenotype": PlantSeasonPhenotypeParams;
+  "plant-hierarchy": PlantHierarchyParams;
+  "plant-atlas": PlantAtlasParams;
+  "plant-phenotypes": PlantPhenotypesParams;
   "plant-elements": PlantGrowthParams;
   "plant-validate": PlantValidateParams;
   "plant-recook": PlantRecookParams;
@@ -4446,6 +4708,9 @@ export interface CommandResultMap {
   "get-render-quality": RenderQualityResult;
   "set-tonemap": TonemapResult;
   "set-rt-shadows": SetRtShadowsResult;
+  "set-hierarchy-cut": HierarchyCutResult;
+  "vsm-page-budget": VsmPageBudgetResult;
+  "page-request-budget": PageRequestBudgetResult;
   "set-restir": SetRestirResult;
   "set-ssr": SetSsrResult;
   "set-rt-reflections": SetRtReflectionsResult;
@@ -4582,6 +4847,9 @@ export interface CommandResultMap {
   "vegetation-advance-ecology": VegetationEcologyReportDto;
   "vegetation-ecology-status": VegetationEcologyStatusDto;
   "vegetation-combustion": VegetationCombustionDto;
+  "vegetation-usd-skeletons": UsdSkeletonsResult;
+  "vegetation-wind-record": VegetationWindRecordResult;
+  "vegetation-budgets": VegetationBudgetsResult;
   "vegetation-verify-artifacts": VegetationVerifyResult;
   "vegetation-state-baseline": VegetationStateBaselineResult;
   "vegetation-telemetry": VegetationTelemetryResult;
@@ -4591,6 +4859,11 @@ export interface CommandResultMap {
   "plant-graph": PlantGraphResult;
   "plant-graph-set": PlantGraphResult;
   "plant-growth": BotanicalGrowthDto;
+  "plant-proxies": PlantProxiesResult;
+  "plant-season-phenotype": PlantSeasonPhenotypeResult;
+  "plant-hierarchy": PlantHierarchyResult;
+  "plant-atlas": PlantAtlasResult;
+  "plant-phenotypes": PlantPhenotypesResult;
   "plant-elements": PlantElementsResult;
   "plant-validate": PlantValidationResult;
   "plant-recook": PlantRecookResult;
