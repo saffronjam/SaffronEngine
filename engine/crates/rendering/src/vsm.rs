@@ -17,6 +17,13 @@ pub const VSM_PAGE_SIZE: u32 = 128;
 pub const VSM_ATLAS_SIZE: u32 = 4096;
 /// Physical tiles per atlas side.
 pub const VSM_ATLAS_TILES: u32 = VSM_ATLAS_SIZE / VSM_PAGE_SIZE;
+
+/// Shadow pages a frame renders by default.
+///
+/// Chosen so a wind gust re-dirtying the resolving clip levels drains over a few frames rather
+/// than in one spike; the atlas holds far more than this, so the budget is a pacing control rather
+/// than a capacity one.
+pub const VSM_DEFAULT_PAGE_BUDGET: usize = 64;
 /// Directional clip levels (level `k` spans [`VSM_LEVEL0_EXTENT_M`] · 2^k).
 pub const VSM_DIRECTIONAL_LEVELS: u32 = 8;
 /// Logical pages per directional-level side.

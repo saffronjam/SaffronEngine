@@ -399,6 +399,7 @@ pub struct Lighting {
     frame_ddgi_flag: bool,
     frame_ssr_flag: bool,
     frame_rt_reflections_flag: bool,
+    frame_rt_shadows_flag: bool,
     frame_prev_view_proj: Mat4,
     frame_froxel_fog: Vec4,
     frame_cloud_shadow_right: Vec4,
@@ -465,6 +466,7 @@ impl Lighting {
             frame_ddgi_flag: false,
             frame_ssr_flag: false,
             frame_rt_reflections_flag: false,
+            frame_rt_shadows_flag: false,
             frame_prev_view_proj: Mat4::IDENTITY,
             frame_froxel_fog: Vec4::ZERO,
             frame_cloud_shadow_right: Vec4::X,
@@ -519,10 +521,25 @@ impl Lighting {
         &self,
         descriptors: &Descriptors,
         buffer: vk::Buffer,
-        size: vk::DeviceSize,
+        slot_bytes: vk::DeviceSize,
+        meta: vk::Buffer,
+        meta_slot_bytes: vk::DeviceSize,
     ) {
-        for frame in &self.frames {
-            descriptors.write_storage_buffer(frame.light_set, 8, buffer, size);
+        for (slot, frame) in self.frames.iter().enumerate() {
+            descriptors.write_storage_buffer_slice(
+                frame.light_set,
+                8,
+                buffer,
+                slot as vk::DeviceSize * slot_bytes,
+                slot_bytes,
+            );
+            descriptors.write_storage_buffer_slice(
+                frame.light_set,
+                15,
+                meta,
+                slot as vk::DeviceSize * meta_slot_bytes,
+                meta_slot_bytes,
+            );
         }
     }
 
@@ -685,12 +702,12 @@ impl Lighting {
                 0,
             ),
             point_shadow: self.point_shadow_pos.extend(self.point_shadow_far),
-            // .z = RT-shadow flag (folded by the RT phase); .w = the debug view-mode
-            // channel the mesh fragment outputs instead of shading.
+            // .z = the ray-query shadow gate; .w = the debug view-mode channel the mesh
+            // fragment outputs instead of shading.
             point_shadow_meta: UVec4::new(
                 self.point_shadow_light_index,
                 u32::from(self.point_shadow_pending),
-                0,
+                u32::from(self.frame_rt_shadows_flag),
                 self.debug_channel,
             ),
             // screen_flags = (contact, ssgi, ddgi, restir); the mesh gates the DDGI
@@ -781,7 +798,8 @@ impl Lighting {
         self.frame_vsm_page_table = page_table;
     }
 
-    /// The frame's wind words as the wind deformation prepass push consumes them.
+    /// The frame's wind words as the wind deformation prepass push consumes them. The
+    /// interaction cascade centres are the renderer's, filled in at the dispatch.
     pub(crate) fn wind_deform_push(&self) -> crate::WindDeformPush {
         crate::WindDeformPush {
             dir_speed_gust: self.frame_wind_dir_speed_gust.to_array(),
@@ -793,6 +811,8 @@ impl Lighting {
             sources: self.frame_wind_sources,
             source_count: self.frame_wind_meta.z,
             reserved: 0,
+            prev_center0: [0; 2],
+            prev_center1: [0; 2],
         }
     }
 
@@ -834,6 +854,14 @@ impl Lighting {
     /// when the trace ran this frame.
     pub fn set_frame_ssr(&mut self, ssr_enabled: bool) {
         self.frame_ssr_flag = ssr_enabled;
+    }
+
+    /// Folds this frame's ray-query shadow flag (`point_shadow_meta.z`) into the next
+    /// [`Lighting::set_scene_lighting`] write. It gates every punctual and directional
+    /// shadow term onto a traced ray instead of the shadow-map sample, so it is only set
+    /// when a TLAS was actually built this frame.
+    pub fn set_frame_rt_shadows(&mut self, enabled: bool) {
+        self.frame_rt_shadows_flag = enabled;
     }
 
     /// Folds this frame's RT-reflection flag (`extra_flags.y`) + the previous frame's

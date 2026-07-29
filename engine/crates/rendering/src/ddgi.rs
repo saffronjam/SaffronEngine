@@ -529,9 +529,9 @@ impl Ddgi {
         self.frame_index.wrapping_mul(DDGI_PROBE_BUDGET) % DDGI_PROBE_TOTAL
     }
 
-    /// The trace push for this frame. `sdf_count` is the renderer's active SDF-instance count (the
-    /// near-field MDF loop bound).
-    pub fn trace_push(&self, sdf_count: u32) -> TracePush {
+    /// The trace push for this frame. The near-field occluder count is GPU-produced and read
+    /// from the scatter's meta words, not pushed.
+    pub fn trace_push(&self) -> TracePush {
         let s = self.scroll_base();
         TracePush {
             probe_count: UVec4::new(
@@ -545,7 +545,7 @@ impl Ddgi {
             sun_dir: self.sun_dir.extend(self.sun_intensity),
             sun_color: self.sun_color.extend(self.frame_index as f32),
             budget_offset: Vec4::new(self.round_robin_offset() as f32, 0.0, 0.0, 0.0),
-            scroll_base: IVec4::new(s.x, s.y, s.z, sdf_count as i32),
+            scroll_base: IVec4::new(s.x, s.y, s.z, 0),
         }
     }
 
