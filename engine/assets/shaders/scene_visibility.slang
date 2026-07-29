@@ -8,6 +8,11 @@
 // the CURRENT HZB with current transforms and merges survivors. Both passes write the
 // per-slot visibility history word the next frame's cull reads.
 //
+// The reach pass (kind 2) serves global illumination, which is not a camera: a march
+// gathers from behind the eye and a reflection shows what the camera cannot, so neither
+// the frustum nor the depth pyramid is a sound rejection. It keeps every instance whose
+// world sphere meets the reach box and rejects the rest.
+//
 // Set 0: b0 = counters (0 visible, 1 retest, 2 overflow flags), b1 = visible slot list,
 // b2 = retest slot list, b3 = per-slot history words, b4 = HZB max pyramid,
 // b5 = the GPU-scene address block.
@@ -16,6 +21,7 @@ import global_gpu_data;
 
 public static const uint SCENE_VISIBILITY_PASS_CULL = 0u;
 public static const uint SCENE_VISIBILITY_PASS_RETEST = 1u;
+public static const uint SCENE_VISIBILITY_PASS_REACH = 2u;
 public static const uint SCENE_VISIBILITY_OVERFLOW_VISIBLE = 1u;
 public static const uint SCENE_VISIBILITY_OVERFLOW_RETEST = 2u;
 
@@ -35,7 +41,11 @@ struct Push
     uint passKind;
     uint historyValid;
     uint listCapacity;
+    // Alignment padding ahead of the reach corners, which are 16-byte aligned.
     uint2 reserved;
+    // The reach pass's world box; `w` is unused.
+    float4 reachMin;
+    float4 reachMax;
 };
 [[vk::push_constant]] Push pc;
 
@@ -71,6 +81,22 @@ SphereBounds worldSphere(
         GpuWindInstanceRecord* record = (GpuWindInstanceRecord*)(
             sceneAddresses.windRecords + uint64_t(slot) * GPU_WIND_INSTANCE_RECORD_SIZE);
         sphere.radius += (*record).boundsInflation;
+        // Counter word 19: deformed instances this view composed bounds for. Counted here rather
+        // than in the prepass because the prepass has no counter binding, and because this is the
+        // more useful number anyway: deformation work that reached a view, not slots that merely
+        // carry the flag.
+        if (!previous)
+        {
+            InterlockedAdd(counters[19], 1u);
+            // Counter word 21: of those, the ones the interaction field's re-centring scroll
+            // reset out from under this frame. Counted against word 19 on purpose — the two
+            // share a denominator, so their ratio is the fraction of deformed instances whose
+            // interaction displacement jumped rather than moved.
+            if ((*record).interactionReset != 0.0)
+            {
+                InterlockedAdd(counters[21], 1u);
+            }
+        }
     }
     return sphere;
 }
@@ -193,6 +219,22 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     }
     let prototype = gpuSceneLoadPrototype(addresses, instance.prototype.index);
     SphereBounds sphere = worldSphere(instance, slot, prototype.bounds, false);
+    if (pc.passKind == SCENE_VISIBILITY_PASS_REACH)
+    {
+        // Reach keeps whatever a gather can read, which is a world-box test and nothing
+        // else: an occluder behind the eye still shadows what the eye sees, and one the
+        // depth pyramid hides still bounces light onto what is in front of it.
+        if (any(sphere.center + sphere.radius < pc.reachMin.xyz)
+            || any(sphere.center - sphere.radius > pc.reachMax.xyz))
+        {
+            // Counter word 22: instances outside the window any march can reach.
+            InterlockedAdd(counters[22], 1u);
+            history[slot] = 0u;
+            return;
+        }
+        appendVisible(slot);
+        return;
+    }
     float3 ndcMin;
     float3 ndcMax;
     bool bounded = screenBounds(sphere, pc.viewProj, ndcMin, ndcMax);
