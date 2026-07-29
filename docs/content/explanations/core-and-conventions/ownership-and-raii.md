@@ -103,6 +103,16 @@ flowchart TD
 > resource alive and can outlive the device. Release host-held clones in `on_detach` /
 > `on_exit`; `run` has already idled the GPU by then.
 
+Miss one and the process does not fail where the mistake is. The retained clone keeps the
+device alive through its own destruction, and the crash lands inside the driver at
+`vkDestroyInstance` — a segfault with no Rust frame in it, preceded by validation reporting
+`VkDevice has not been destroyed` and listing the leaked handles. Those object reports name
+the resources still held, which is the fastest route back to the field that held them.
+
+The caches are easy to miss because they are indirect: `AssetServer`'s asset caches and the
+GPU-scene mirror both retain `Arc<GpuMesh>`/`Arc<GpuTexture>` for their mirrored prototypes and
+interned textures. A layer that owns either must release both.
+
 ## In the code
 
 | What | File | Symbols |
@@ -114,6 +124,7 @@ flowchart TD
 | The PSO cache | `crates/rendering/src/pipelines.rs` | `Pipelines`, `PsoKey` |
 | The idle barrier | `crates/app/src/lib.rs` | `FrameHost::wait_gpu_idle` |
 | The teardown order | `crates/app/src/lib.rs` | `run`, `finish` |
+| Releasing retained GPU clones | `crates/host/src/layer.rs`, `crates/player/src/main.rs` | `HostLayer::teardown_recording`, `PlayerLayer::on_detach` |
 
 ## Related
 
