@@ -29,8 +29,8 @@ saffron-vegetation = { path = "../vegetation" }
 resvg.workspace = true
 usvg.workspace = true
 tiny-skia.workspace = true
+image.workspace = true
 
 [dev-dependencies]
 ash.workspace = true
-image.workspace = true
 saffron-test-support = { path = "../test-support" }

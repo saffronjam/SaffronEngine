@@ -362,7 +362,10 @@ pub fn verify_vegetation_artifacts(
 /// The hash a content-addressed artifact's name claims, or `None` for a keyed one.
 fn content_addressed_identity(relative: &Path) -> Option<String> {
     let directory = relative.parent()?.file_name()?.to_str()?;
-    if !matches!(directory, "plants" | "cells" | "manifests" | "cook-graphs") {
+    if !matches!(
+        directory,
+        "plants" | "cells" | "manifests" | "cook-graphs" | "work-payloads"
+    ) {
         return None;
     }
     relative
