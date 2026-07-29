@@ -23,6 +23,7 @@
 //! must idle the GPU *before* clearing — a runtime UAF that `Drop` ordering alone
 //! cannot catch.
 
+mod atlas;
 mod cache;
 mod catalog;
 mod codegen;
@@ -63,6 +64,10 @@ mod vegetation_cooker;
 mod vegetation_export;
 mod vegetation_store;
 
+pub use atlas::{
+    AtlasLayout, AtlasPlacement, DEFAULT_ATLAS_GUTTER, FamilyAtlas, FamilySlotImage,
+    generate_family_atlas, pack_atlas,
+};
 pub use cache::{AssetCache, resolve_cached};
 pub use catalog::{
     catalog_folders_from_json, catalog_folders_to_json, catalog_from_json, catalog_to_json,
@@ -78,8 +83,8 @@ pub use environment_profile::{
 pub use error::{Error, Result};
 pub use gpu::{GpuUploader, RendererUploader};
 pub use gpu_scene_mirror::{
-    GpuSceneMirror, GpuSceneMirrorStats, GpuSceneMirrorTarget, VegetationCellRenderRow,
-    VegetationFamilyRenderRow, VegetationRenderBreakdown,
+    GpuSceneMirror, GpuSceneMirrorStats, GpuSceneMirrorTarget, VegetationBudgets,
+    VegetationCellRenderRow, VegetationFamilyRenderRow, VegetationRenderBreakdown,
 };
 pub use graph::{emit_graph_surface, lower_graph_to_params};
 pub use import::{
@@ -117,11 +122,14 @@ pub use names::{
 };
 pub use page_stream::{PageLoadRequest, PageLoadResult, PagePayloadSource, PageStreamWorker};
 pub use plant_cook::{
-    PlantRecookOptions, PlantRecookOutcome, PlantValidationOutcome, PreparedPlantFamily,
-    PublishedPlantRecook, prepare_plant_family_sources, recook_plant_family,
+    PlantModules, PlantRecookOptions, PlantRecookOutcome, PlantValidationOutcome,
+    PreparedPlantFamily, PublishedPlantRecook, prepare_plant_family_sources, recook_plant_family,
     validate_plant_family_sources,
 };
-pub use plant_render::{PlantFamilyRender, PlantPhenotypeRender};
+pub use plant_render::{
+    PlantAtlasImage, PlantFamilyRender, PlantPhenotypeRender, plant_family_atlas_image,
+    plant_family_hierarchy,
+};
 pub use project::{
     LUARC_JSON, NewProject, PROJECT_VERSION, ProjectHost, ProjectInfo, ProjectSidecar,
     STARTER_SCRIPT, app_data_root, create_project_script, default_display_name,
@@ -318,6 +326,9 @@ pub struct AssetServer {
     /// Per-mesh page-payload source (artifact slice or retained cooked hierarchy),
     /// recorded at mesh load for the page-stream worker.
     page_source_by_uuid: std::collections::HashMap<u64, crate::page_stream::PagePayloadSource>,
+    /// Each loaded plant family's authored wind and bend response, keyed by family id,
+    /// recorded beside its mesh so the mirror's generic prototype path can find it.
+    plant_mechanics_by_uuid: std::collections::HashMap<u64, saffron_vegetation::MechanicalResponse>,
     /// Loaded plant-family renders keyed by exact `.splantc` identity. `None` = negative
     /// marker (a failed load, not retried until a cache clear).
     plant_render_by_hash: std::collections::HashMap<
@@ -395,6 +406,7 @@ impl AssetServer {
             root,
             catalog: AssetCatalog::default(),
             mesh_by_uuid: AssetCache::new(),
+            plant_mechanics_by_uuid: std::collections::HashMap::new(),
             page_source_by_uuid: std::collections::HashMap::new(),
             plant_render_by_hash: std::collections::HashMap::new(),
             mesh_bvh_by_uuid: AssetCache::new(),
@@ -803,6 +815,7 @@ impl AssetServer {
     fn clear_loaded_asset_state(&mut self) {
         self.clear_thumbnail_queue();
         self.mesh_by_uuid.clear();
+        self.plant_mechanics_by_uuid.clear();
         self.plant_render_by_hash.clear();
         self.mesh_bvh_by_uuid.clear();
         self.texture_by_uuid.clear();
