@@ -40,16 +40,78 @@ pub struct DeviceResources {
     /// The ash logical device (a cheap handle + `Arc`'d fn table — its own clone is
     /// not used; this single owned copy is destroyed in [`Drop`]).
     device: ash::Device,
+    /// `minAccelerationStructureScratchOffsetAlignment`, or 1 on a non-RT device.
+    scratch_alignment: vk::DeviceSize,
+    /// The diagnostic-checkpoint dispatch + marker registry; `None` when the device does not
+    /// carry `VK_NV_device_diagnostic_checkpoints`. Lives in the bundle because both halves
+    /// need it: the executor and the uploader mark, and the device-loss paths report.
+    checkpoints: Option<crate::checkpoints::Checkpoints>,
+    /// The `VK_EXT_device_fault` dispatch; `None` when the device does not carry the feature.
+    device_fault: Option<crate::checkpoints::DeviceFault>,
+    /// Cumulative GPU nanoseconds in out-of-graph acceleration-structure builds and compactions.
+    ///
+    /// Held here because the two halves live apart: the uploader records the spans, and the
+    /// renderer reports the stats, and they share only this bundle. It is a session total rather
+    /// than a per-frame figure because that is what the work is — structures are built when content
+    /// arrives, not every frame.
+    accel_build_ns: std::sync::atomic::AtomicU64,
 }
 
 impl DeviceResources {
+    /// Adds GPU nanoseconds to the out-of-graph structure-build total.
+    pub fn add_accel_build_nanos(&self, nanos: u64) {
+        self.accel_build_ns
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Cumulative GPU nanoseconds in out-of-graph structure builds and compactions.
+    #[must_use]
+    pub fn accel_build_nanos(&self) -> u64 {
+        self.accel_build_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Bundles the allocator + device. Called once by [`super::Device::new`]; the
     /// returned `Arc` is the canonical holder cloned into every resource.
-    pub(crate) fn new(device: ash::Device, allocator: Allocator) -> Arc<Self> {
+    pub(crate) fn new(
+        device: ash::Device,
+        allocator: Allocator,
+        scratch_alignment: vk::DeviceSize,
+        checkpoints: Option<crate::checkpoints::Checkpoints>,
+        device_fault: Option<crate::checkpoints::DeviceFault>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             allocator: Some(allocator),
             device,
+            scratch_alignment,
+            checkpoints,
+            device_fault,
+            accel_build_ns: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The diagnostic-checkpoint dispatch, when the extension is enabled on the device.
+    pub(crate) fn checkpoints(&self) -> Option<&crate::checkpoints::Checkpoints> {
+        self.checkpoints.as_ref()
+    }
+
+    /// Logs the driver's fault report after a device loss. A no-op without
+    /// `VK_EXT_device_fault`.
+    pub(crate) fn log_device_fault(&self) {
+        let Some(device_fault) = self.device_fault.as_ref() else {
+            return;
+        };
+        for line in device_fault.report() {
+            tracing::error!("{line}");
+        }
+    }
+
+    /// The device's acceleration-structure build-scratch alignment. Every scratch address
+    /// handed to `vkCmdBuildAccelerationStructuresKHR` must be a multiple of it
+    /// (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03710); the driver reports 128 on
+    /// current NVIDIA hardware, and a misaligned build loses the device.
+    pub(crate) fn scratch_alignment(&self) -> vk::DeviceSize {
+        self.scratch_alignment
     }
 
     /// The ash logical device (resource creation / view + handle teardown).
@@ -117,6 +179,44 @@ pub struct Buffer {
 unsafe impl Send for Buffer {}
 
 impl Buffer {
+    /// Creates a host-visible buffer holding `bytes` with `usage`.
+    ///
+    /// Build inputs that are written once and read by the device — micromap state blocks,
+    /// triangle descriptors, index streams — want exactly this shape: no staging copy, no
+    /// transfer pass, just a mapped write the build reads by device address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Vk`] if the buffer cannot be created.
+    pub fn from_slice_with_usage(
+        resources: &Arc<DeviceResources>,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> crate::Result<Self> {
+        // 256-byte aligned: micromap and acceleration-structure build inputs are read by
+        // device address, and the spec requires those addresses aligned. A misaligned input
+        // is invalid rather than merely slow.
+        let buffer = Self::with_alignment(
+            resources,
+            bytes.len().max(1) as vk::DeviceSize,
+            usage,
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::Auto,
+                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                    | vk_mem::AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+            256,
+        )?;
+        if !bytes.is_empty() {
+            // SAFETY: the allocation is `MAPPED` and at least `bytes.len()` long.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.mapped_ptr(), bytes.len());
+            }
+        }
+        Ok(buffer)
+    }
+
     /// Creates a buffer of `size` with `usage`, allocated per `alloc_info`.
     ///
     /// When `alloc_info` requests `MAPPED`, [`Buffer::mapped`] returns the persistent
@@ -131,16 +231,37 @@ impl Buffer {
         usage: vk::BufferUsageFlags,
         alloc_info: &vk_mem::AllocationCreateInfo,
     ) -> crate::Result<Self> {
+        Self::with_alignment(resources, size, usage, alloc_info, 1)
+    }
+
+    /// Creates a buffer whose device address is a multiple of `min_alignment`.
+    ///
+    /// VMA suballocates from larger blocks, so a plain [`Buffer::new`] only inherits the
+    /// buffer's own memory-requirement alignment. Acceleration-structure build scratch
+    /// needs more than that ([`DeviceResources::scratch_alignment`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::Error::Vk`] if `vmaCreateBufferWithAlignment` fails.
+    pub fn with_alignment(
+        resources: &Arc<DeviceResources>,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        alloc_info: &vk_mem::AllocationCreateInfo,
+        min_alignment: vk::DeviceSize,
+    ) -> crate::Result<Self> {
         let buffer_info = vk::BufferCreateInfo::default().size(size).usage(usage);
         // SAFETY: the VMA seam. The create-infos are valid for the call; the
         // returned buffer + allocation are owned and freed in `Drop`.
         let (buffer, allocation) = checked_vma(
             unsafe {
-                resources
-                    .allocator()
-                    .create_buffer(&buffer_info, alloc_info)
+                resources.allocator().create_buffer_with_alignment(
+                    &buffer_info,
+                    alloc_info,
+                    min_alignment.max(1),
+                )
             },
-            "vmaCreateBuffer",
+            "vmaCreateBufferWithAlignment",
         )?;
         let mapped = resources
             .allocator()
@@ -889,6 +1010,12 @@ pub struct GpuSdf {
     pub atlas_bricks: [u32; 3],
     /// The prefiltered atlas mip levels (the brick atlas image carries this many mips).
     pub mip_count: u32,
+    /// The field's own aggregate occupancy in unorm16 (`0` = resolve from the drawn
+    /// material), from the cooked header.
+    pub occupancy_unorm: u32,
+    /// The field's own proxy albedo, rgb 8:8:8 unorm packed (`0` = resolve from the
+    /// drawn material), from the cooked header.
+    pub proxy_albedo: u32,
 }
 
 // SAFETY: as [`GpuTexture`] — the free-list is `Arc<Mutex<_>>` (Send+Sync); the
@@ -938,6 +1065,10 @@ pub struct GpuSdfParts {
     pub atlas_bricks: [u32; 3],
     /// The prefiltered atlas mip levels.
     pub mip_count: u32,
+    /// The field's cooked aggregate occupancy in unorm16 (`0` = resolve from material).
+    pub occupancy_unorm: u32,
+    /// The field's cooked proxy albedo, packed 8:8:8 (`0` = resolve from material).
+    pub proxy_albedo: u32,
 }
 
 impl GpuSdf {
@@ -968,6 +1099,8 @@ impl GpuSdf {
             indirection_dims: parts.indirection_dims,
             atlas_bricks: parts.atlas_bricks,
             mip_count: parts.mip_count,
+            occupancy_unorm: parts.occupancy_unorm,
+            proxy_albedo: parts.proxy_albedo,
         }
     }
 
@@ -1045,6 +1178,18 @@ pub struct GpuMesh {
     pub vertex_count: u32,
     /// The draw ranges over the shared vertex/index buffers.
     pub submeshes: Vec<Submesh>,
+    /// The opacity micromaps the BLAS geometries reference, retained for the mesh's lifetime.
+    ///
+    /// A built structure holds only device addresses into these, so dropping one while a BLAS
+    /// still references it frees memory the traversal reads — a fault that surfaces far from its
+    /// cause. They live exactly as long as the mesh whose geometry they refine.
+    pub micromaps: Vec<Arc<Micromap>>,
+    /// Whether every submesh's BLAS geometry was built `OPAQUE`, from the cooked material class.
+    ///
+    /// An entity compares its resolved materials against this to decide whether it must override
+    /// the structure's opacity. Equal means the geometry flags already say what the entity wants,
+    /// and the instance can leave them alone — which is what an attached micromap requires.
+    pub cooked_opaque: bool,
     /// Local-space AABB minimum (for ray picking).
     pub bounds_min: Vec3,
     /// Local-space AABB maximum (for ray picking).
@@ -1056,8 +1201,22 @@ pub struct GpuMesh {
     /// CPU copy of the skin stream parallel to [`GpuMesh::cpu_vertices`] (empty
     /// when unskinned).
     pub cpu_skin: Vec<VertexSkin>,
-    /// The ray-tracing BLAS (`None` when RT is unsupported or not yet built).
+    /// The ray-tracing BLAS (`None` when RT is unsupported or not yet built, and always
+    /// `None` for an assembly — see [`GpuMesh::assembly_blas`]).
     pub blas: Option<Arc<AccelerationStructure>>,
+    /// One bottom-level structure per assembly prototype, in prototype-id order; empty for an
+    /// ordinary mesh. KHR acceleration structures have no notion of nested micro-instance
+    /// parts inside one structure, so a family's ray representation is one structure per
+    /// prototype plus one TLAS instance per placed use. On a device with cluster
+    /// acceleration structures each entry is the cluster-composed build over the
+    /// prototype's cooked clusters; the KHR triangle build everywhere else.
+    pub assembly_blas: Vec<RtBlas>,
+    /// The aggregate-representation structure: one family-space BLAS over the root cut's
+    /// voxel-brick surfaces, with the largest root appearance-error total. TLAS packing
+    /// projects that error exactly as the raster traversal does and swaps a distant
+    /// instance to this single structure instead of expanding per use. `None` when the
+    /// root cut is not fully voxel or RT is off.
+    pub aggregate_blas: Option<(Arc<AccelerationStructure>, u32)>,
     /// The per-mesh signed distance fields — one tight field per primitive (and per spatial
     /// chunk of an oversized primitive), empty when the mesh baked none (a degenerate mesh, or
     /// a build without SDF support). Held here so the fields live exactly as long as the mesh
@@ -1073,6 +1232,50 @@ pub struct GpuMesh {
     pub assembly: Option<MeshAssembly>,
 }
 
+/// One bottom-level structure a TLAS instance can reference by device address: the KHR
+/// triangle build, or the cluster-composed build on a device with
+/// `VK_NV_cluster_acceleration_structure`. The two are interchangeable at every consumer —
+/// an instance carries only the address — so which one a mesh holds is a device capability,
+/// never a content property.
+#[derive(Clone)]
+pub enum RtBlas {
+    /// The `VK_KHR_acceleration_structure` triangle build.
+    Khr(Arc<AccelerationStructure>),
+    /// The cluster-composed build over the mesh's cooked triangle clusters.
+    Cluster(Arc<crate::rt_cluster::ClusterBlas>),
+}
+
+impl RtBlas {
+    /// The device address a TLAS instance references.
+    #[must_use]
+    pub fn address(&self) -> vk::DeviceAddress {
+        match self {
+            Self::Khr(blas) => blas.address,
+            Self::Cluster(blas) => blas.address(),
+        }
+    }
+
+    /// Bytes of bottom-level storage this structure occupies (for a cluster build, the
+    /// bottom level plus its CLAS pool — both live for the structure's lifetime).
+    #[must_use]
+    pub fn size(&self) -> vk::DeviceSize {
+        match self {
+            Self::Khr(blas) => blas.size(),
+            Self::Cluster(blas) => blas.size() + blas.clas_bytes(),
+        }
+    }
+
+    /// Bytes the original build reserved ([`AccelerationStructure::built_size`]; a cluster
+    /// build has no compaction copy, so it equals [`Self::size`]).
+    #[must_use]
+    pub fn built_size(&self) -> vk::DeviceSize {
+        match self {
+            Self::Khr(blas) => blas.built_size(),
+            Self::Cluster(blas) => blas.size() + blas.clas_bytes(),
+        }
+    }
+}
+
 /// The assembly-part table a multi-prototype [`GpuMesh`] carries: the records the mirror
 /// packs into the geometry's parts-arena range (prototype records first, then use records).
 #[derive(Clone, Debug, Default)]
@@ -1086,6 +1289,11 @@ pub struct MeshAssembly {
     pub combinations: Vec<(u32, u32)>,
     /// The packed active-use mask words, `mask_words` per combination.
     pub masks: Vec<u32>,
+    /// Each prototype's `(first_index, index_count)` slice of the flattened index stream,
+    /// in prototype-id order. One BLAS is built per entry: KHR acceleration structures have
+    /// no notion of nested micro-instance parts, so a family's ray representation is one
+    /// structure per prototype plus one TLAS instance per placed use.
+    pub prototype_index_ranges: Vec<(u32, u32)>,
 }
 
 impl MeshAssembly {
@@ -1206,6 +1414,10 @@ pub struct GpuMeshParts {
     pub vertex_count: u32,
     /// The draw ranges.
     pub submeshes: Vec<Submesh>,
+    /// Whether every submesh's geometry was built `OPAQUE` from its cooked material class.
+    pub cooked_opaque: bool,
+    /// The opacity micromaps the BLAS geometries reference; retained for the mesh's lifetime.
+    pub micromaps: Vec<Arc<Micromap>>,
     /// Local-space AABB minimum.
     pub bounds_min: Vec3,
     /// Local-space AABB maximum.
@@ -1218,6 +1430,11 @@ pub struct GpuMeshParts {
     pub cpu_skin: Vec<VertexSkin>,
     /// The built ray-tracing BLAS (`None` when RT is unsupported).
     pub blas: Option<Arc<AccelerationStructure>>,
+    /// One structure per assembly prototype; empty for a plain mesh.
+    pub assembly_blas: Vec<RtBlas>,
+    /// The aggregate-representation structure over the root cut's voxel-brick surfaces
+    /// (family space), with the largest root appearance-error total the selection projects.
+    pub aggregate_blas: Option<(Arc<AccelerationStructure>, u32)>,
     /// The uploaded per-mesh signed distance fields (one per primitive / chunk; empty when
     /// none was baked).
     pub sdfs: Vec<Arc<GpuSdf>>,
@@ -1242,12 +1459,16 @@ impl GpuMesh {
             index_count: parts.index_count,
             vertex_count: parts.vertex_count,
             submeshes: parts.submeshes,
+            cooked_opaque: parts.cooked_opaque,
+            micromaps: parts.micromaps,
             bounds_min: parts.bounds_min,
             bounds_max: parts.bounds_max,
             cpu_vertices: parts.cpu_vertices.into(),
             cpu_indices: parts.cpu_indices.into(),
             cpu_skin: parts.cpu_skin,
             blas: parts.blas,
+            assembly_blas: parts.assembly_blas,
+            aggregate_blas: parts.aggregate_blas,
             sdfs: parts.sdfs,
             hierarchy_pages: parts.hierarchy_pages,
             assembly: parts.assembly,
@@ -1381,6 +1602,11 @@ pub struct AccelerationStructure {
     allocation: vk_mem::Allocation,
     /// The device address (for TLAS instance references / shader binding).
     pub address: vk::DeviceAddress,
+    /// Bytes of AS storage this structure occupies.
+    size: vk::DeviceSize,
+    /// Bytes the original build reserved. Equal to [`Self::size`] unless the structure came
+    /// out of a compaction copy, so the difference is the saving that copy realized.
+    built_size: vk::DeviceSize,
 }
 
 // SAFETY: the dispatch is a handle + fn-pointer table (Clone, no thread affinity);
@@ -1392,11 +1618,175 @@ unsafe impl Send for AccelerationStructure {}
 // `Arc<Mutex<_>>`, so `GpuMesh: Sync` requires `AccelerationStructure: Sync`.
 unsafe impl Sync for AccelerationStructure {}
 
+/// A built opacity micromap plus the per-triangle index buffer the geometry chain points at.
+///
+/// Modelled on [`AccelerationStructure`], including the **dedicated** allocation: micromap
+/// storage sits alongside acceleration-structure storage in the driver's world, and sharing a
+/// memory block with ordinary buffers is what wedged the GPU when acceleration structures did
+/// it. The dispatch is cloned at construction because the destroy entry point is an extension
+/// command.
+pub struct Micromap {
+    resources: Arc<DeviceResources>,
+    dispatch: ash::ext::opacity_micromap::Device,
+    handle: vk::MicromapEXT,
+    buffer: vk::Buffer,
+    allocation: vk_mem::Allocation,
+    /// The `i32` per-triangle index stream, referenced by the geometry chain.
+    index_buffer: Buffer,
+    index_address: vk::DeviceAddress,
+    /// Usage rows the geometry chain must repeat verbatim.
+    usage: Vec<vk::MicromapUsageEXT>,
+    /// What the derivation settled, for telemetry.
+    classes: (u64, u64, u64),
+    size: vk::DeviceSize,
+}
+
+// SAFETY: the dispatch is a handle + fn-pointer table; the buffer/allocation carry no
+// thread-affine state. A micromap rides inside an `Arc` shared exactly like a BLAS.
+unsafe impl Send for Micromap {}
+// SAFETY: every field is shared read-only after construction.
+unsafe impl Sync for Micromap {}
+
+impl Micromap {
+    /// The micromap handle.
+    pub fn handle(&self) -> vk::MicromapEXT {
+        self.handle
+    }
+
+    /// The per-triangle index buffer's device address.
+    pub fn index_address(&self) -> vk::DeviceAddress {
+        self.index_address
+    }
+
+    /// The per-triangle index buffer. Owned here so it outlives every geometry chain that
+    /// references its address.
+    pub fn index_buffer(&self) -> vk::Buffer {
+        self.index_buffer.handle()
+    }
+
+    /// The usage rows the geometry chain repeats.
+    pub fn usage(&self) -> &[vk::MicromapUsageEXT] {
+        &self.usage
+    }
+
+    /// Bytes of micromap storage.
+    pub fn size(&self) -> vk::DeviceSize {
+        self.size
+    }
+
+    /// `(opaque, transparent, unknown)` micro-triangle counts the derivation produced.
+    pub fn classes(&self) -> (u64, u64, u64) {
+        self.classes
+    }
+
+    /// Creates the backing storage and the micromap object over it of `size` bytes. The build
+    /// is recorded separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::Error::Vk`] if the storage buffer or the micromap cannot be created.
+    pub fn create(
+        resources: &Arc<DeviceResources>,
+        dispatch: &ash::ext::opacity_micromap::Device,
+        size: vk::DeviceSize,
+        index_buffer: Buffer,
+        usage: Vec<vk::MicromapUsageEXT>,
+        classes: (u64, u64, u64),
+    ) -> crate::Result<Self> {
+        let buffer_info = vk::BufferCreateInfo::default().size(size.max(1)).usage(
+            vk::BufferUsageFlags::MICROMAP_STORAGE_EXT
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        );
+        let alloc_info = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+            ..Default::default()
+        };
+        // SAFETY: the VMA seam. The create-info is valid; both are freed in `Drop` (or below
+        // on a create failure).
+        let (buffer, allocation) = checked_vma(
+            unsafe {
+                resources
+                    .allocator()
+                    .create_buffer(&buffer_info, &alloc_info)
+            },
+            "vmaCreateBuffer (micromap storage)",
+        )?;
+        let create_info = vk::MicromapCreateInfoEXT::default()
+            .buffer(buffer)
+            .size(size.max(1))
+            .ty(vk::MicromapTypeEXT::OPACITY_MICROMAP);
+        // SAFETY: the ash seam, through the raw function table — ash 0.38 ships no high-level
+        // wrapper for this extension. The backing buffer covers `size`; the handle is destroyed
+        // in `Drop` through the cloned dispatch.
+        let mut handle = vk::MicromapEXT::null();
+        let created = unsafe {
+            (dispatch.fp().create_micromap_ext)(
+                dispatch.device(),
+                &create_info,
+                std::ptr::null(),
+                &mut handle,
+            )
+        };
+        let handle = match created.result().map(|()| handle) {
+            Ok(handle) => handle,
+            Err(result) => {
+                let mut allocation = allocation;
+                // SAFETY: the VMA seam. Free the storage before the early return.
+                unsafe {
+                    resources
+                        .allocator()
+                        .destroy_buffer(buffer, &mut allocation)
+                };
+                return Err(crate::Error::Vk {
+                    context: "create_micromap",
+                    result,
+                });
+            }
+        };
+        let index_address = resources.buffer_device_address(index_buffer.handle());
+        Ok(Self {
+            resources: Arc::clone(resources),
+            dispatch: dispatch.clone(),
+            handle,
+            buffer,
+            allocation,
+            index_buffer,
+            index_address,
+            usage,
+            classes,
+            size,
+        })
+    }
+}
+
+impl Drop for Micromap {
+    fn drop(&mut self) {
+        // SAFETY: the ash/VMA seam. The device is idle (the loop waits before teardown); the
+        // handle and buffer are owned here and freed exactly once.
+        unsafe {
+            (self.dispatch.fp().destroy_micromap_ext)(
+                self.dispatch.device(),
+                self.handle,
+                std::ptr::null(),
+            );
+            self.resources
+                .allocator()
+                .destroy_buffer(self.buffer, &mut self.allocation);
+        }
+    }
+}
+
 impl AccelerationStructure {
     /// Allocates an AS-storage backing buffer of `size`, creates the acceleration
     /// structure of `kind` over it, and queries its device address. The backing buffer
     /// carries `ACCELERATION_STRUCTURE_STORAGE | SHADER_DEVICE_ADDRESS` usage; the build is
     /// recorded separately by the caller.
+    ///
+    /// The allocation is **dedicated**: acceleration-structure storage does not share a
+    /// memory block with ordinary buffers. Suballocating it alongside them wedges the GPU —
+    /// not at the build, but on an unrelated later submission — so the isolation is a
+    /// correctness requirement here, not a tuning choice.
     ///
     /// # Errors
     ///
@@ -1413,6 +1803,7 @@ impl AccelerationStructure {
         );
         let alloc_info = vk_mem::AllocationCreateInfo {
             usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
             ..Default::default()
         };
         // SAFETY: the VMA seam. The create-info is valid; the buffer + allocation are
@@ -1461,7 +1852,25 @@ impl AccelerationStructure {
             buffer,
             allocation,
             address,
+            size,
+            built_size: size,
         })
+    }
+
+    /// Bytes of AS storage this structure occupies.
+    pub fn size(&self) -> vk::DeviceSize {
+        self.size
+    }
+
+    /// Bytes the original build reserved, before any compaction copy.
+    pub fn built_size(&self) -> vk::DeviceSize {
+        self.built_size
+    }
+
+    /// Records that this structure is the compacted copy of a build that reserved
+    /// `built_size` bytes, so the saving stays attributable after the source is dropped.
+    pub fn note_compacted_from(&mut self, built_size: vk::DeviceSize) {
+        self.built_size = built_size;
     }
 
     /// The acceleration-structure handle.
@@ -1663,6 +2072,8 @@ mod tests {
                     .expect("create_buffer")
             };
             let parts = GpuMeshParts {
+                cooked_opaque: true,
+                micromaps: Vec::new(),
                 vertex: make_buffer(96, vk::BufferUsageFlags::VERTEX_BUFFER),
                 index: make_buffer(48, vk::BufferUsageFlags::INDEX_BUFFER),
                 skin: None,
@@ -1677,6 +2088,8 @@ mod tests {
                 cpu_indices: Vec::new(),
                 cpu_skin: Vec::new(),
                 blas: None,
+                assembly_blas: Vec::new(),
+                aggregate_blas: None,
                 sdfs: Vec::new(),
                 hierarchy_pages: Vec::new(),
                 assembly: None,

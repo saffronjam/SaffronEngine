@@ -196,7 +196,10 @@ impl Descriptors {
         partial.bindless_set_layout =
             Some(create_bindless_layout(raw, texture_capacity, sdf_capacity)?);
         partial.light_set_layout = Some(create_light_layout(raw, partial.shadow_sampler.unwrap())?);
-        partial.instance_set_layout = Some(create_instance_layout(raw)?);
+        partial.instance_set_layout = Some(create_instance_layout(
+            raw,
+            device.capabilities.mesh_shader,
+        )?);
         partial.ibl_set_layout = Some(create_ibl_layout(raw)?);
         partial.ssao_mesh_set_layout = Some(create_ssao_mesh_layout(
             raw,
@@ -206,7 +209,10 @@ impl Descriptors {
         // Sets 6/7 (TLAS + ReSTIR radiance) need the AS extension, so they exist only
         // when RT is supported; the mesh PSO appends them to its layout only then.
         if device.capabilities.rt_supported {
-            partial.rt_mesh_set_layout = Some(create_rt_mesh_layout(raw)?);
+            partial.rt_mesh_set_layout = Some(create_rt_mesh_layout(
+                raw,
+                device.capabilities.partitioned_acceleration_structure,
+            )?);
             partial.restir_mesh_set_layout = Some(create_restir_mesh_layout(raw)?);
         }
         partial.cluster_set_layout = Some(create_cluster_layout(raw)?);
@@ -220,6 +226,7 @@ impl Descriptors {
         partial.descriptor_pool = Some(create_descriptor_pool(
             raw,
             device.capabilities.rt_supported,
+            device.capabilities.partitioned_acceleration_structure,
         )?);
         partial.bindless_pool = Some(create_bindless_pool(raw, texture_capacity, sdf_capacity)?);
 
@@ -733,6 +740,33 @@ impl Descriptors {
     /// material SSBO rebind after a grow. Host access to a descriptor set is externally
     /// synchronized, but these per-frame sets are only touched on the render thread
     /// (after the frame's fence is waited), so no lock is taken here.
+    /// Writes a byte slice of a storage buffer into `binding` of `set`.
+    pub fn write_storage_buffer_slice(
+        &self,
+        set: vk::DescriptorSet,
+        binding: u32,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    ) {
+        let buffer_info = [vk::DescriptorBufferInfo {
+            buffer,
+            offset,
+            range,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(binding)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buffer_info);
+        // SAFETY: the ash seam. The set and buffer outlive the call.
+        unsafe {
+            self.resources
+                .device()
+                .update_descriptor_sets(&[write], &[]);
+        }
+    }
+
     pub fn write_storage_buffer(
         &self,
         set: vk::DescriptorSet,
@@ -1265,6 +1299,14 @@ fn create_light_layout(
             .descriptor_type(sampler)
             .descriptor_count(crate::GDF_CASCADES)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+        // The occluder scatter's meta words (binding 15): the GPU-produced instance
+        // count the DDGI near-field march bounds itself by. COMPUTE-only, like the
+        // instance list it counts.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(15)
+            .descriptor_type(storage)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1287,7 +1329,16 @@ fn light_binding(slot: u32, kind: vk::DescriptorType) -> vk::DescriptorSetLayout
 
 /// Set 2: per-instance array (vertex) + joint palette (vertex) + per-material params
 /// (vertex and fragment), all storage buffers.
-fn instance_layout_bindings() -> [vk::DescriptorSetLayoutBinding<'static>; 5] {
+/// Set-2 bindings. `mesh_shader` widens the stage flags of the executor-facing bindings so the
+/// mesh executor can read them; naming a stage the device does not support is invalid, so the
+/// flag must come from [`crate::Capabilities::mesh_shader`] rather than being assumed.
+fn instance_layout_bindings(mesh_shader: bool) -> [vk::DescriptorSetLayoutBinding<'static>; 6] {
+    let executor_stages = if mesh_shader {
+        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::MESH_EXT
+    } else {
+        vk::ShaderStageFlags::VERTEX
+    };
+    let scene_stages = executor_stages | vk::ShaderStageFlags::FRAGMENT;
     let storage = vk::DescriptorType::STORAGE_BUFFER;
     [
         vk::DescriptorSetLayoutBinding::default()
@@ -1311,18 +1362,26 @@ fn instance_layout_bindings() -> [vk::DescriptorSetLayoutBinding<'static>; 5] {
             .binding(3)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            .stage_flags(scene_stages),
         // The active view's semantic record stream the executor vertex path indexes.
         vk::DescriptorSetLayoutBinding::default()
             .binding(4)
             .descriptor_type(storage)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX),
+            .stage_flags(executor_stages),
+        // The binner's indexed command stream. The indexed executor consumes it as draw
+        // arguments; the mesh executor reads the same words as data, recovering its draw from
+        // `SV_DrawIndex` and its triangle block from the group id.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(5)
+            .descriptor_type(storage)
+            .descriptor_count(1)
+            .stage_flags(executor_stages),
     ]
 }
 
-fn create_instance_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    let bindings = instance_layout_bindings();
+fn create_instance_layout(raw: &ash::Device, mesh_shader: bool) -> Result<vk::DescriptorSetLayout> {
+    let bindings = instance_layout_bindings(mesh_shader);
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
     checked(
@@ -1421,12 +1480,21 @@ fn create_ddgi_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout>
     )
 }
 
-/// Set 6 (mesh pipeline, RT only): the TLAS — one fragment-stage acceleration
-/// structure.
-fn create_rt_mesh_layout(raw: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+/// Set 6 (mesh pipeline, RT only): the top-level structure — one fragment-stage
+/// acceleration structure.
+///
+/// The descriptor TYPE is a per-device variant: a partitioned structure binds as
+/// `PARTITIONED_ACCELERATION_STRUCTURE_NV` rather than `ACCELERATION_STRUCTURE_KHR`. The
+/// shader declaration is identical either way — only the layout distinguishes them — which
+/// is why this is one binding with two types rather than two bindings.
+fn create_rt_mesh_layout(raw: &ash::Device, partitioned: bool) -> Result<vk::DescriptorSetLayout> {
     let bindings = [light_binding(
         0,
-        vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        if partitioned {
+            crate::vk_nv_ptlas::DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV
+        } else {
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
+        },
     )];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: the ash seam.
@@ -1601,7 +1669,11 @@ fn compute_binding(slot: u32, kind: vk::DescriptorType) -> vk::DescriptorSetLayo
 /// (`FREE_DESCRIPTOR_SET` so freed sets return capacity). Sized for headroom: the
 /// bindless count, the per-frame light/instance UBOs/SSBOs, and the per-view
 /// post-process storage images.
-fn create_descriptor_pool(raw: &ash::Device, rt_supported: bool) -> Result<vk::DescriptorPool> {
+fn create_descriptor_pool(
+    raw: &ash::Device,
+    rt_supported: bool,
+    partitioned: bool,
+) -> Result<vk::DescriptorPool> {
     let frames = crate::frame::MAX_FRAMES_IN_FLIGHT as u32;
     let views = VIEW_COUNT;
     // Bloom binds one set per pyramid pass (up to `BLOOM_PASSES_PER_FRAME` per view), and its mip
@@ -1675,7 +1747,11 @@ fn create_descriptor_pool(raw: &ash::Device, rt_supported: bool) -> Result<vk::D
     ];
     if rt_supported {
         pool_sizes.push(pool_size(
-            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            if partitioned {
+                crate::vk_nv_ptlas::DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV
+            } else {
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
+            },
             frames + 2 + views,
         ));
     }
@@ -1765,7 +1841,7 @@ mod tests {
 
     #[test]
     fn material_params_binding_covers_vertex_and_fragment_consumers() {
-        let binding = instance_layout_bindings()[2];
+        let binding = instance_layout_bindings(false)[2];
         assert_eq!(binding.binding, 2);
         assert_eq!(binding.descriptor_type, vk::DescriptorType::STORAGE_BUFFER);
         assert_eq!(
