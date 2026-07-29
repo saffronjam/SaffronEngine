@@ -22,15 +22,16 @@ use ash::vk;
 use saffron_geometry::glam::Vec3;
 use saffron_geometry::{
     GridDesc, Mesh, MeshConditioning, MorphData, MorphDelta, PortableVirtualHierarchy, Sdf,
-    Submesh, VertexSkin, bake_grid, build_min_max_pyramid, sdf_chunk_cores, sdf_set_from_bytes,
-    sdf_set_to_bytes, validate_portable_virtual_hierarchy,
+    Submesh, Vertex, VertexSkin, bake_grid, build_min_max_pyramid, sdf_chunk_cores,
+    sdf_set_from_bytes, sdf_set_to_bytes, validate_portable_virtual_hierarchy,
 };
 use vk_mem::Alloc;
 
 use crate::descriptors::Descriptors;
 use crate::resources::{
-    ConditioningBuffers, DeviceResources, GpuLut, GpuMesh, GpuMeshParts, GpuSdf, GpuSdfParts,
-    GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, MinMaxPyramid, MorphBuffers,
+    Buffer, ConditioningBuffers, DeviceResources, GpuLut, GpuMesh, GpuMeshParts, GpuSdf,
+    GpuSdfParts, GpuTexture, GpuTextureParts, Image, Image3D, ImageDesc, MinMaxPyramid,
+    MorphBuffers,
 };
 use crate::{Device, Error, GradeUniform, Pipeline, Result, checked};
 
@@ -45,6 +46,22 @@ pub struct SdfBake {
     /// The `assets/cache` directory the baked field is read from / written to (a content
     /// hash of the mesh keys it). `None` bakes every time (no sidecar).
     pub cache_dir: Option<PathBuf>,
+}
+
+/// Where a mesh's signed distance fields come from at upload.
+///
+/// A mesh either bakes from its own triangles on device (imported assets — the sidecar
+/// cache keys on content), carries fields something else already derived (a plant family's
+/// cooked field, from the aggregate occupancy in family space — its triangle stream is
+/// prototype-local, so a triangle bake would be wrong-space), or has none.
+#[derive(Clone, Copy)]
+pub enum SdfSource<'a> {
+    /// No fields; the mesh casts no distance-field occlusion.
+    None,
+    /// GPU jump-flood bake from the uploaded triangles, sidecar-cached.
+    Bake(&'a SdfBake),
+    /// Pre-derived fields, uploaded as-is.
+    Cooked(&'a [Sdf]),
 }
 
 fn validate_upload_hierarchy(mesh: &Mesh, hierarchy: &PortableVirtualHierarchy) -> Result<()> {
@@ -77,6 +94,120 @@ fn validate_upload_hierarchy(mesh: &Mesh, hierarchy: &PortableVirtualHierarchy) 
 }
 
 /// Builds the assembly-part table for a hierarchy that places prototypes through uses —
+/// Rebuilds the cooked micromaps for `hierarchy`, keyed by the flattened submesh each refines.
+///
+/// A row whose subdivision level exceeds the device cap is DROPPED rather than clamped: clamping
+/// would mean re-deriving the states at a coarser level, and a block decoded at the wrong level is
+/// not conservative, it is wrong. Dropping is always safe — an absent micromap only costs the
+/// classifier work it would have removed.
+fn cooked_micromap_builds(
+    hierarchy: &PortableVirtualHierarchy,
+    max_subdivision: u32,
+) -> Vec<(u32, saffron_geometry::OpacityMicromapBuild)> {
+    hierarchy
+        .opacity_micromaps
+        .iter()
+        .filter(|micromap| {
+            micromap
+                .usage
+                .iter()
+                .all(|&(_, level, _)| level <= max_subdivision)
+        })
+        .map(|micromap| {
+            (
+                micromap.submesh,
+                saffron_geometry::OpacityMicromapBuild {
+                    indices: micromap.indices.clone(),
+                    blocks: micromap
+                        .blocks
+                        .iter()
+                        .map(|&(data_offset, subdivision_level, format)| {
+                            saffron_geometry::MicromapTriangle {
+                                data_offset,
+                                subdivision_level,
+                                format,
+                            }
+                        })
+                        .collect(),
+                    data: micromap.data.clone(),
+                    usage: micromap
+                        .usage
+                        .iter()
+                        .map(|&(count, subdivision_level, format)| {
+                            saffron_geometry::MicromapUsage {
+                                count,
+                                subdivision_level,
+                                format,
+                            }
+                        })
+                        .collect(),
+                    classes: saffron_geometry::MicromapClasses {
+                        opaque: micromap.classes.0,
+                        transparent: micromap.classes.1,
+                        unknown: micromap.classes.2,
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
+/// A two-timestamp pool for the out-of-graph structure submits, when the device can time them.
+///
+/// `None` on a device whose graphics queue reports no timestamp bits — the builds still run, they
+/// are simply not measured, which is the honest outcome rather than a fabricated zero.
+fn accel_timestamp_pool(device: &Device) -> Option<(vk::QueryPool, f32)> {
+    let facts = device.profiler_facts();
+    if device.accel_dispatch().is_none()
+        || !facts.timestamps_supported
+        || facts.timestamp_period <= 0.0
+    {
+        return None;
+    }
+    let info = vk::QueryPoolCreateInfo::default()
+        .query_type(vk::QueryType::TIMESTAMP)
+        .query_count(2);
+    // SAFETY: the ash seam. The create-info is valid; the pool is owned and freed in `Drop`.
+    let pool = unsafe { device.raw().create_query_pool(&info, None) }.ok()?;
+    Some((pool, facts.timestamp_period))
+}
+
+/// Per-submesh opacity as the cooker classified it, in the mesh's global submesh order.
+///
+/// A triangle cluster records the `(prototype, source_submesh)` it came from alongside the
+/// material class resolved for it at cook, so the classes a BLAS build needs are already in the
+/// artifact — no runtime material resolution and no format change. Prototypes own contiguous runs
+/// of the submesh table in id order, which is the same walk the per-prototype index ranges use.
+///
+/// A submesh no cluster covers — simplified away, or a degenerate range — is reported NON-OPAQUE.
+/// That is the conservative direction: a non-opaque geometry surfaces ray candidates for the
+/// coverage classifier, where guessing opaque would commit hits on geometry nothing verified.
+fn cooked_submesh_opacity(hierarchy: &PortableVirtualHierarchy, submesh_count: usize) -> Vec<bool> {
+    let mut by_pair = std::collections::BTreeMap::<(u32, u32), bool>::new();
+    for cluster in &hierarchy.triangle_clusters {
+        let opaque = cluster.material_class.is_opaque();
+        by_pair
+            .entry((cluster.prototype, cluster.source_submesh))
+            // Clusters of one submesh share its material, so this only ever confirms. The `&&`
+            // is what keeps a disagreement conservative rather than order-dependent.
+            .and_modify(|resolved| *resolved = *resolved && opaque)
+            .or_insert(opaque);
+    }
+    let mut opacity = Vec::with_capacity(submesh_count);
+    for prototype in &hierarchy.prototypes {
+        for source_submesh in 0..prototype.submesh_count {
+            opacity.push(
+                by_pair
+                    .get(&(prototype.id, source_submesh))
+                    .copied()
+                    .unwrap_or(false),
+            );
+        }
+    }
+    opacity.resize(submesh_count, false);
+    opacity
+}
+
 /// `None` for the trivial single-prototype, single-identity-use shape every plain mesh
 /// cooks to (its executor path stays base-free).
 fn assembly_from_hierarchy(
@@ -193,6 +324,9 @@ fn assembly_from_hierarchy(
         uses,
         combinations,
         masks,
+        // Filled by `upload_mesh`, which is where the flattened submesh table — the
+        // authoritative index layout — is in scope.
+        prototype_index_ranges: Vec::new(),
     }))
 }
 
@@ -282,6 +416,21 @@ impl GpuQueue {
         )
     }
 
+    /// Logs the queue's last-reached diagnostic checkpoints after a device loss, so the log
+    /// names the wedged submission. A no-op when the extension is absent.
+    pub(crate) fn log_device_loss_checkpoints(
+        &self,
+        checkpoints: Option<&crate::checkpoints::Checkpoints>,
+    ) {
+        let Some(checkpoints) = checkpoints else {
+            return;
+        };
+        let queue = self.inner.lock().expect("gpu queue mutex");
+        for line in checkpoints.last_reached(*queue) {
+            tracing::error!("device loss checkpoint: {line}");
+        }
+    }
+
     /// Presents one swapchain image under the same external-synchronization lock as submits.
     pub(crate) fn present(
         &self,
@@ -321,12 +470,31 @@ pub struct Uploader {
     /// RT is supported. `None` on a software device —
     /// the mesh's `blas` then stays `None` and the engine renders via the shadow-map path.
     accel: Option<ash::khr::acceleration_structure::Device>,
+    /// Whether the device advertises `VK_EXT_opacity_micromap`, which decides whether a BLAS may
+    /// be built granting instances permission to disable a micromap. Without the extension that
+    /// permission is an invalid flag rather than an inert one.
+    omm_supported: bool,
+    /// The micromap dispatch, present only when the device enabled `VK_EXT_opacity_micromap`.
+    omm: Option<ash::ext::opacity_micromap::Device>,
+    /// The cluster-AS builder, present only when the device enabled
+    /// `VK_NV_cluster_acceleration_structure`; an assembly prototype's structure then
+    /// composes from its cooked clusters instead of the KHR triangle build.
+    cluster: Option<crate::rt_cluster::ClusterBlasBuilder>,
+    /// The device's `maxOpacity4StateSubdivisionLevel`; a cooked row above it is device-loss class.
+    omm_max_subdivision: u32,
     /// The two GPU jump-flood bake compute pipelines (voxelize → JFA) the SDF bake dispatches
     /// on the one-off command buffer; the sign pass is on the host. Owned here (not the
     /// renderer's frame PSO cache) because the bake runs on the upload path — including the
     /// thumbnail worker's own [`Uploader`]. `None` if the bake pipelines fail to build (a
     /// missing shader): the mesh then uploads with no field, not a fatal error.
     bake: Option<BakePipelines>,
+    /// Two-timestamp pool bracketing the out-of-graph acceleration-structure submits.
+    ///
+    /// The render graph brackets every pass it owns, but the INITIAL static BLAS build and its
+    /// compaction run here on a private one-off pool, so no pass scope covers them. They are also
+    /// the two that scale with content rather than with frame rate, which makes them the ones worth
+    /// knowing about when a project's load time grows.
+    accel_timestamps: Option<(vk::QueryPool, f32)>,
 }
 
 // SAFETY: the pool handle is owned by this `Uploader` and used only from the thread
@@ -364,7 +532,12 @@ impl Uploader {
             queue: queue.clone(),
             command_pool,
             accel: device.accel_dispatch().cloned(),
+            omm_supported: device.omm_supported(),
+            omm: device.omm_dispatch().cloned(),
+            cluster: crate::rt_cluster::ClusterBlasBuilder::new(device),
+            omm_max_subdivision: device.omm_max_subdivision(),
             bake,
+            accel_timestamps: accel_timestamp_pool(device),
         })
     }
 
@@ -388,6 +561,88 @@ impl Uploader {
     where
         R: FnOnce(vk::CommandBuffer),
     {
+        self.with_one_off_commands_timed(label, false, record)
+    }
+
+    /// Accumulates GPU time into [`Uploader::accel_build_ns`] when `timed` and the device can.
+    ///
+    /// Only the acceleration-structure submits ask for this. Timing every one-off would charge
+    /// staging copies and SDF bakes to a number the caller reads as "structure build time", which
+    /// is worse than not measuring: a wrong attribution survives every sanity check.
+    fn with_one_off_commands_timed<R>(
+        &self,
+        label: &'static str,
+        timed: bool,
+        record: R,
+    ) -> Result<()>
+    where
+        R: FnOnce(vk::CommandBuffer),
+    {
+        let timing = timed.then_some(self.accel_timestamps.as_ref()).flatten();
+        let record = |cmd: vk::CommandBuffer| {
+            if let Some((pool, _)) = timing {
+                // SAFETY: the ash seam. Resets both queries and stamps the opening one on a
+                // buffer this call owns for its whole lifetime.
+                unsafe {
+                    self.raw().cmd_reset_query_pool(cmd, *pool, 0, 2);
+                    self.raw().cmd_write_timestamp2(
+                        cmd,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        *pool,
+                        0,
+                    );
+                }
+            }
+            record(cmd);
+            if let Some((pool, _)) = timing {
+                // SAFETY: the ash seam. Stamps the closing query on the same owned buffer.
+                unsafe {
+                    self.raw().cmd_write_timestamp2(
+                        cmd,
+                        vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                        *pool,
+                        1,
+                    );
+                }
+            }
+        };
+        self.submit_one_off(label, record)?;
+        if timing.is_some() {
+            self.accumulate_accel_time();
+        }
+        Ok(())
+    }
+
+    /// Reads the bracketed span out of the pool and adds it to the running total.
+    ///
+    /// The submit has already been waited, so both queries resolve without a stall. A read that
+    /// fails is dropped rather than counted as zero — a zero would understate the total and read
+    /// as a fast build rather than as an unmeasured one.
+    fn accumulate_accel_time(&self) {
+        let Some((pool, period)) = self.accel_timestamps.as_ref() else {
+            return;
+        };
+        let mut stamps = [0_u64; 2];
+        // SAFETY: the ash seam. The submit completed on its fence, so both queries are available.
+        let read = unsafe {
+            self.raw().get_query_pool_results(
+                *pool,
+                0,
+                &mut stamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        };
+        if read.is_ok() {
+            let elapsed = stamps[1].saturating_sub(stamps[0]);
+            self.resources
+                .add_accel_build_nanos((elapsed as f64 * f64::from(*period)) as u64);
+        }
+    }
+
+    fn submit_one_off<R>(&self, label: &'static str, record: R) -> Result<()>
+    where
+        R: FnOnce(vk::CommandBuffer),
+    {
         let started = std::time::Instant::now();
         let raw = self.raw();
         let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -408,6 +663,9 @@ impl Uploader {
                 unsafe { raw.begin_command_buffer(cmd, &begin) },
                 "begin_command_buffer (one-off)",
             )?;
+            if let Some(checkpoints) = self.resources.checkpoints() {
+                checkpoints.mark(cmd, label);
+            }
             record(cmd);
             // SAFETY: the ash seam. Ends the recording opened above.
             checked(
@@ -463,19 +721,203 @@ impl Uploader {
         // SAFETY: the ash seam. The fence was waited (or the submit failed before
         // signaling it), so it is idle and destroyed exactly once.
         unsafe { raw.destroy_fence(fence, None) };
+        if result.as_ref().is_err_and(crate::Error::is_device_loss) {
+            self.queue
+                .log_device_loss_checkpoints(self.resources.checkpoints());
+            self.resources.log_device_fault();
+        }
         result
     }
 
     /// Builds the per-mesh BLAS once (a synchronous one-off submit, like the upload copy)
     /// when RT is supported, returning a shared [`crate::AccelerationStructure`]. The build
     /// scratch is held across the submit then dropped. `None` on a software device.
+    /// Builds every cooked micromap the device can accept, returning them keyed by submesh.
+    ///
+    /// A failure is logged, not fatal: the family renders with the coverage classifier doing the
+    /// work the micromap would have removed, which is the same picture at a higher cost.
+    fn build_cooked_micromaps(
+        &self,
+        hierarchy: &PortableVirtualHierarchy,
+    ) -> Vec<(u32, Arc<crate::Micromap>)> {
+        // `SAFFRON_OMM=off` suppresses attachment so two hosts can differ in exactly this and
+        // nothing else. A micromap may only remove classifier work, so the two must render the
+        // same picture — which is the claim, and is only testable if it can be turned off.
+        if std::env::var("SAFFRON_OMM").is_ok_and(|value| value == "off") {
+            return Vec::new();
+        }
+        let Some(dispatch) = self.omm.as_ref() else {
+            return Vec::new();
+        };
+        let builds = cooked_micromap_builds(hierarchy, self.omm_max_subdivision);
+        let mut built = Vec::with_capacity(builds.len());
+        for (submesh, build) in &builds {
+            // The staging buffers the build reads by address must outlive the submit, so they are
+            // held across `with_one_off_commands` and dropped only after it returns.
+            let mut retained = None;
+            let recorded = self.with_one_off_commands_timed("micromap build", true, |cmd| {
+                match crate::record_micromap_build(&self.resources, dispatch, cmd, build) {
+                    Ok((micromap, data, triangles, indices)) => {
+                        retained = Some((micromap, data, triangles, indices));
+                    }
+                    Err(err) => tracing::warn!("micromap build failed: {err}"),
+                }
+            });
+            match (recorded, retained) {
+                (Ok(()), Some((micromap, ..))) => built.push((*submesh, Arc::new(micromap))),
+                (Err(err), _) => tracing::warn!("micromap submit failed: {err}"),
+                (Ok(()), None) => {}
+            }
+        }
+        built
+    }
+
+    /// Builds the aggregate-representation BLAS: one structure over the root cut's
+    /// voxel-brick surfaces, in family space, returned with the largest root
+    /// appearance-error total — the number TLAS packing projects to choose it. Returns
+    /// `None` when RT is off, any root is not a voxel brick (a triangle root already
+    /// draws the fine geometry, so nothing coarser stands in), or the surfaces are empty.
+    ///
+    /// The build inputs are fresh host-visible buffers read by device address during the
+    /// synchronous build; the finished structure does not reference them, so they drop
+    /// on return.
+    fn build_aggregate_blas(
+        &self,
+        hierarchy: &PortableVirtualHierarchy,
+    ) -> Result<Option<(Arc<crate::AccelerationStructure>, u32)>> {
+        if self.accel.is_none() || hierarchy.roots.is_empty() {
+            return Ok(None);
+        }
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut error_total = 0_u32;
+        for &root in &hierarchy.roots {
+            let Some(node) = hierarchy.nodes.get(root as usize) else {
+                return Ok(None);
+            };
+            let saffron_geometry::HierarchyRepresentation::Voxel { brick } = node.representation
+            else {
+                return Ok(None);
+            };
+            let Some(brick) = hierarchy.voxel_bricks.get(brick as usize) else {
+                return Ok(None);
+            };
+            let base = vertices.len() as u32;
+            vertices.extend(brick.vertices.iter().map(|vertex| Vertex {
+                position: Vec3::new(
+                    vertex.position_bits[0] as f32 / 65_536.0,
+                    vertex.position_bits[1] as f32 / 65_536.0,
+                    vertex.position_bits[2] as f32 / 65_536.0,
+                ),
+                ..Vertex::default()
+            }));
+            indices.extend(brick.indices.iter().map(|index| base + index));
+            error_total = error_total.max(node.appearance_error.total);
+        }
+        if indices.len() < 3 {
+            return Ok(None);
+        }
+        let usage = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        let vertex_buffer =
+            Buffer::from_slice_with_usage(&self.resources, bytemuck::cast_slice(&vertices), usage)?;
+        let index_buffer =
+            Buffer::from_slice_with_usage(&self.resources, bytemuck::cast_slice(&indices), usage)?;
+        let geometry = crate::MeshBlasGeometry {
+            micromap: None,
+            // An aggregate merges its sources' coverage into solid occupancy, so its
+            // triangles commit like the raster brick surface shades: no per-hit classifier.
+            opaque: true,
+            vertex_buffer: vertex_buffer.handle(),
+            vertex_count: vertices.len() as u32,
+            index_buffer: index_buffer.handle(),
+            first_index: 0,
+            index_count: indices.len() as u32,
+        };
+        Ok(self
+            .build_mesh_blas(&[geometry])?
+            .map(|blas| (blas, error_total)))
+    }
+
+    /// Composes one assembly prototype's bottom-level structure from its cooked triangle
+    /// clusters on a cluster-AS device. `Ok(None)` when the device has no cluster support,
+    /// the prototype's clusters do not exactly cover its fine index range (a partial
+    /// structure would trace geometry the raster never draws), or a cluster exceeds the
+    /// device's cluster limits — the caller then takes the KHR triangle build.
+    fn build_prototype_cluster_blas(
+        &self,
+        hierarchy: &PortableVirtualHierarchy,
+        prototype: u32,
+        span: std::ops::Range<usize>,
+        mesh: &Mesh,
+        submesh_opaque: &[bool],
+    ) -> Result<Option<crate::rt_cluster::ClusterBlas>> {
+        let Some(builder) = self.cluster.as_ref() else {
+            return Ok(None);
+        };
+        let clusters: Vec<_> = hierarchy
+            .triangle_clusters
+            .iter()
+            .filter(|cluster| cluster.prototype == prototype)
+            .collect();
+        if clusters.is_empty() {
+            return Ok(None);
+        }
+        let span_indices: u64 = span
+            .clone()
+            .filter_map(|submesh| mesh.submeshes.get(submesh))
+            .map(|submesh| u64::from(submesh.index_count))
+            .sum();
+        let cluster_indices: u64 = clusters
+            .iter()
+            .map(|cluster| cluster.local_indices.len() as u64)
+            .sum();
+        if span_indices != cluster_indices {
+            return Ok(None);
+        }
+        let vertex_base: u64 = hierarchy
+            .prototypes
+            .iter()
+            .take(prototype as usize)
+            .map(|prototype| u64::from(prototype.vertex_count))
+            .sum();
+        let mut inputs = Vec::with_capacity(clusters.len());
+        for cluster in &clusters {
+            let mut positions = Vec::with_capacity(cluster.source_vertices.len());
+            for source in &cluster.source_vertices {
+                let index = usize::try_from(vertex_base + u64::from(*source)).map_err(|_| {
+                    Error::InvalidUploadData("cluster vertex index exceeds usize".to_owned())
+                })?;
+                let Some(vertex) = mesh.vertices.get(index) else {
+                    return Ok(None);
+                };
+                positions.push([vertex.position.x, vertex.position.y, vertex.position.z]);
+            }
+            inputs.push(crate::rt_cluster::ClusterBuildInput {
+                cluster_id: cluster.id,
+                geometry_index: cluster.source_submesh,
+                opaque: submesh_opaque
+                    .get(span.start + cluster.source_submesh as usize)
+                    .copied()
+                    .unwrap_or(false),
+                positions,
+                local_indices: cluster.local_indices.clone(),
+            });
+        }
+        let Some(plan) = builder.plan(&self.resources, &inputs)? else {
+            return Ok(None);
+        };
+        self.with_one_off_commands_timed("cluster_blas_build", true, |cmd| {
+            builder.record(&self.resources, cmd, &plan);
+        })?;
+        Ok(Some(builder.finish(plan)?))
+    }
+
     fn build_mesh_blas(
         &self,
-        vertex_buffer: vk::Buffer,
-        vertex_count: u32,
-        index_buffer: vk::Buffer,
-        index_count: u32,
+        geometries: &[crate::MeshBlasGeometry<'_>],
     ) -> Result<Option<Arc<crate::AccelerationStructure>>> {
+        let index_count: u32 = geometries.iter().map(|geometry| geometry.index_count).sum();
         let Some(dispatch) = self.accel.as_ref() else {
             return Ok(None);
         };
@@ -500,31 +942,126 @@ impl Uploader {
                 unsafe { raw.begin_command_buffer(cmd, &begin) },
                 "begin_command_buffer (blas)",
             )?;
+            let timing = self.accel_timestamps.as_ref();
+            if let Some((pool, _)) = timing {
+                // SAFETY: the ash seam. Resets both queries and opens the span on this buffer.
+                unsafe {
+                    raw.cmd_reset_query_pool(cmd, *pool, 0, 2);
+                    raw.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, *pool, 0);
+                }
+            }
             let build = crate::record_mesh_blas_build(
                 &self.resources,
                 dispatch,
                 cmd,
-                vertex_buffer,
-                vertex_count,
-                index_buffer,
-                index_count,
+                geometries,
+                self.omm_supported,
             )?;
+            if let Some((pool, _)) = timing {
+                // SAFETY: the ash seam. Closes the span opened above on the same buffer.
+                unsafe {
+                    raw.cmd_write_timestamp2(
+                        cmd,
+                        vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                        *pool,
+                        1,
+                    );
+                }
+            }
             // SAFETY: the ash seam. Ends the recording opened above.
             checked(
                 unsafe { raw.end_command_buffer(cmd) },
                 "end_command_buffer (blas)",
             )?;
             self.submit_and_wait(cmd)?;
+            self.accumulate_accel_time();
             Ok(build)
         })();
         // SAFETY: the ash seam. The submit was waited (or never happened), so the buffer is
         // idle and freed exactly once.
         unsafe { raw.free_command_buffers(self.command_pool, &[cmd]) };
         // The scratch is no longer needed once the build submit completed; drop it.
-        built.map(|build| {
-            drop(build.scratch);
-            Some(Arc::new(build.blas))
-        })
+        let mut build = built?;
+        // The scratch is no longer needed once the build submit completed.
+        build.scratch = None;
+        // A driver that declines to shrink keeps the built structure — compaction is a memory
+        // win, never a correctness precondition.
+        let blas = match self.compact_mesh_blas(dispatch, &build)? {
+            Some(compacted) => compacted,
+            None => build.blas,
+        };
+        Ok(Some(Arc::new(blas)))
+    }
+
+    /// Compacts a freshly built mesh BLAS: reads its compacted size from a device query and
+    /// copies it into an exactly-sized structure. Returns `None` when the driver reports no
+    /// saving, leaving the caller its built structure.
+    ///
+    /// A static mesh's structure lives for the whole session, so the slack the build reserves
+    /// would be held for the whole session too.
+    fn compact_mesh_blas(
+        &self,
+        dispatch: &ash::khr::acceleration_structure::Device,
+        build: &crate::MeshBlasBuild,
+    ) -> Result<Option<crate::AccelerationStructure>> {
+        let raw = self.raw();
+        let pool_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+            .query_count(1);
+        // SAFETY: the ash seam. The pool is destroyed below on every path.
+        let pool = checked(
+            unsafe { raw.create_query_pool(&pool_info, None) },
+            "create_query_pool (blas compaction)",
+        )?;
+        let compacted = (|| -> Result<Option<crate::AccelerationStructure>> {
+            let structures = [build.blas.handle()];
+            self.with_one_off_commands_timed("blas_compacted_size", true, |cmd| {
+                // SAFETY: the ash seam. The pool is reset before the write, and the build
+                // completed in the previous submit.
+                unsafe {
+                    raw.cmd_reset_query_pool(cmd, pool, 0, 1);
+                    dispatch.cmd_write_acceleration_structures_properties(
+                        cmd,
+                        &structures,
+                        vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                        pool,
+                        0,
+                    );
+                }
+            })?;
+            let mut sizes = [0u64; 1];
+            // SAFETY: the ash seam. The query was written by the submit just waited.
+            checked(
+                unsafe {
+                    raw.get_query_pool_results(
+                        pool,
+                        0,
+                        &mut sizes,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                },
+                "get_query_pool_results (blas compaction)",
+            )?;
+            // A driver may decline to shrink; copying into a same-or-larger structure would
+            // only cost memory, so keep the built one.
+            if sizes[0] == 0 || sizes[0] >= build.built_size {
+                return Ok(None);
+            }
+            let mut result = None;
+            self.with_one_off_commands_timed("blas_compact", true, |cmd| {
+                result = Some(crate::record_blas_compaction(
+                    &self.resources,
+                    dispatch,
+                    cmd,
+                    &build.blas,
+                    sizes[0],
+                ));
+            })?;
+            result.expect("the compaction recorder ran").map(Some)
+        })();
+        // SAFETY: the ash seam. Every submit above was waited, so the pool is idle.
+        unsafe { raw.destroy_query_pool(pool, None) };
+        compacted
     }
 
     /// Uploads a mesh's vertex + index streams (and the optional [`VertexSkin`]
@@ -535,7 +1072,7 @@ impl Uploader {
     /// vertices (one [`VertexSkin`] per vertex); it carries `STORAGE` usage too (the
     /// compute skinning prepass reads it).
     ///
-    /// When `sdf_bake` is present the per-mesh signed distance field is GPU jump-flood baked
+    /// A [`SdfSource::Bake`] GPU jump-flood bakes the per-mesh signed distance field
     /// (or read from the sidecar cache) from the mesh geometry, uploaded as the sparse SDST
     /// v2 brick atlas + indirection volume into the bindless SDF arrays of `descriptors`,
     /// and stored on the returned mesh — so the field lives exactly as long as the mesh and
@@ -554,7 +1091,7 @@ impl Uploader {
         hierarchy: &PortableVirtualHierarchy,
         skin: &[VertexSkin],
         morph: Option<&MorphData>,
-        sdf_bake: Option<&SdfBake>,
+        sdf: SdfSource<'_>,
     ) -> Result<Arc<GpuMesh>> {
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             return Err(Error::EmptyMesh);
@@ -700,21 +1237,116 @@ impl Uploader {
         // available. A failure is logged, not fatal — the mesh renders without RT shadows.
         // An assembly's shape is its placed uses, not the concatenated prototype streams,
         // so it carries no merged BLAS (its RT representation is per-use instancing).
-        let assembly = assembly_from_hierarchy(hierarchy)?;
+        // One geometry per submesh, each carrying its own cooked opacity: a single-geometry
+        // structure can hold only one class, so one masked submesh would force the coverage
+        // classifier onto every other submesh in the mesh.
+        let submesh_opaque = cooked_submesh_opacity(hierarchy, mesh.submeshes.len());
+        // Build every cooked micromap first, on its own submit. The BLAS build reads them by
+        // device address, so they have to be complete and barriered before it starts — and they
+        // must outlive every structure referencing them, which is why `GpuMesh` retains them.
+        let micromaps = self.build_cooked_micromaps(hierarchy);
+        let submesh_geometry = |submesh: usize| crate::MeshBlasGeometry {
+            micromap: micromaps
+                .iter()
+                .find(|(index, _)| *index as usize == submesh)
+                .map(|(_, micromap)| micromap.as_ref()),
+            opaque: submesh_opaque.get(submesh).copied().unwrap_or(false),
+            vertex_buffer: vertex.0,
+            vertex_count: mesh.vertices.len() as u32,
+            index_buffer: index.0,
+            first_index: mesh.submeshes[submesh].first_index,
+            index_count: mesh.submeshes[submesh].index_count,
+        };
+        let mut assembly = assembly_from_hierarchy(hierarchy)?;
+        // An assembly's prototypes each own a contiguous run of the flattened submesh table,
+        // in prototype-id order, so a prototype's index slice spans its submeshes. This is the
+        // range each per-prototype BLAS builds over.
+        let mut assembly_blas = Vec::new();
+        if let Some(assembly) = assembly.as_mut() {
+            let mut submesh = 0_usize;
+            let mut prototype_spans = Vec::new();
+            for prototype in &hierarchy.prototypes {
+                let start = submesh.min(mesh.submeshes.len());
+                let end = (submesh + prototype.submesh_count as usize).min(mesh.submeshes.len());
+                let span = &mesh.submeshes[start..end];
+                let first_index = span.first().map_or(0, |s| s.first_index);
+                let index_count: u32 = span.iter().map(|s| s.index_count).sum();
+                assembly
+                    .prototype_index_ranges
+                    .push((first_index, index_count));
+                prototype_spans.push(start..end);
+                submesh += prototype.submesh_count as usize;
+            }
+            // One structure per prototype, one geometry per submesh within it. A failure is
+            // logged, not fatal: the family renders without ray-traced shadows rather than not
+            // at all. A cluster-AS device composes the structure from the prototype's cooked
+            // clusters; anything that disqualifies that build falls back to the KHR triangles —
+            // including a span with cooked opacity micromaps, which only the KHR geometry
+            // chain attaches.
+            for (prototype_index, span) in prototype_spans.into_iter().enumerate() {
+                let span_micromapped = micromaps
+                    .iter()
+                    .any(|(index, _)| span.contains(&(*index as usize)));
+                let clustered = if span_micromapped {
+                    None
+                } else {
+                    match self.build_prototype_cluster_blas(
+                        hierarchy,
+                        prototype_index as u32,
+                        span.clone(),
+                        mesh,
+                        &submesh_opaque,
+                    ) {
+                        Ok(built) => built,
+                        Err(err) => {
+                            tracing::warn!("cluster BLAS build failed: {err}; using the KHR build");
+                            None
+                        }
+                    }
+                };
+                if let Some(blas) = clustered {
+                    assembly_blas.push(crate::RtBlas::Cluster(Arc::new(blas)));
+                    continue;
+                }
+                let geometries: Vec<_> = span.map(submesh_geometry).collect();
+                match self.build_mesh_blas(&geometries) {
+                    Ok(Some(blas)) => assembly_blas.push(crate::RtBlas::Khr(blas)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!("assembly prototype BLAS build failed: {err}");
+                        assembly_blas.clear();
+                        break;
+                    }
+                }
+            }
+            if assembly_blas.len() != assembly.prototype_index_ranges.len() {
+                // A partial set would place some uses and silently drop others, which is worse
+                // than placing none: the canopy would cast a half-complete shadow.
+                assembly_blas.clear();
+            }
+        }
         let blas = if assembly.is_some() {
             None
         } else {
-            match self.build_mesh_blas(
-                vertex.0,
-                mesh.vertices.len() as u32,
-                index.0,
-                mesh.indices.len() as u32,
-            ) {
+            let geometries: Vec<_> = (0..mesh.submeshes.len()).map(submesh_geometry).collect();
+            match self.build_mesh_blas(&geometries) {
                 Ok(blas) => blas,
                 Err(err) => {
                     tracing::warn!("BLAS build failed: {err}");
                     None
                 }
+            }
+        };
+        // The aggregate representation: one family-space structure over the root cut's
+        // voxel-brick surfaces. TLAS packing swaps a distant instance to it — one instance
+        // for the whole family instead of one per use — mirroring the raster traversal,
+        // which draws exactly these bricks once the root's projected error fits under the
+        // threshold. A failure is logged, not fatal: the instance keeps the fine structures.
+        let aggregate_blas = match self.build_aggregate_blas(hierarchy) {
+            Ok(aggregate) => aggregate,
+            Err(err) => {
+                tracing::warn!("aggregate BLAS build failed: {err}");
+                None
             }
         };
 
@@ -740,10 +1372,18 @@ impl Uploader {
         // upload each into the bindless SDF arrays. A failure is logged, not fatal: the mesh
         // renders without a field (the cone-trace simply omits an instance with no SDF slot). A
         // degenerate mesh (< 1 triangle) bakes no field.
-        let gpu_sdfs = match sdf_bake
-            .filter(|_| mesh.indices.len() >= 3 && !cpu_positions.is_empty())
-        {
-            Some(bake) => {
+        let gpu_sdfs = match sdf {
+            SdfSource::Cooked(fields) => fields
+                .iter()
+                .filter_map(|field| match self.upload_sdf(descriptors, field) {
+                    Ok(uploaded) => Some(uploaded),
+                    Err(err) => {
+                        tracing::warn!("cooked SDF upload failed: {err}");
+                        None
+                    }
+                })
+                .collect(),
+            SdfSource::Bake(bake) if mesh.indices.len() >= 3 && !cpu_positions.is_empty() => {
                 match self.bake_or_load_sdf(&cpu_positions, &mesh.indices, &mesh.submeshes, bake) {
                     Ok(fields) => fields
                         .iter()
@@ -761,7 +1401,7 @@ impl Uploader {
                     }
                 }
             }
-            None => Vec::new(),
+            _ => Vec::new(),
         };
 
         // Build + upload the watertight-conditioning buffers (edges/weld/basis). A failure is logged,
@@ -783,12 +1423,19 @@ impl Uploader {
             index_count: mesh.indices.len() as u32,
             vertex_count: mesh.vertices.len() as u32,
             submeshes: mesh.submeshes.clone(),
+            cooked_opaque: submesh_opaque.iter().all(|&opaque| opaque),
+            micromaps: micromaps
+                .into_iter()
+                .map(|(_, micromap)| micromap)
+                .collect(),
             bounds_min,
             bounds_max,
             cpu_vertices: mesh.vertices.clone(),
             cpu_indices: mesh.indices.clone(),
             cpu_skin: skin.to_vec(),
             blas,
+            assembly_blas,
+            aggregate_blas,
             sdfs: gpu_sdfs,
             hierarchy_pages: hierarchy.pages.clone(),
             assembly,
@@ -924,6 +1571,8 @@ impl Uploader {
                 bounds_min: Vec3::from(h.bounds_min),
                 bounds_max: Vec3::from(h.bounds_max),
                 max_dist: h.max_dist,
+                occupancy_unorm: h.occupancy_unorm,
+                proxy_albedo: h.proxy_albedo,
                 voxel_dims: h.dims,
                 indirection_dims: h.indirection_dims,
                 atlas_bricks: h.atlas_bricks,
@@ -3013,6 +3662,9 @@ impl Drop for Uploader {
         // flight); the pool is destroyed exactly once. The `Arc<DeviceResources>`
         // keeps the device alive for the call.
         unsafe {
+            if let Some((pool, _)) = self.accel_timestamps {
+                self.resources.device().destroy_query_pool(pool, None);
+            }
             self.resources
                 .device()
                 .destroy_command_pool(self.command_pool, None);
@@ -4214,7 +4866,14 @@ mod tests {
         let plain_hierarchy = hierarchy_for_upload(&mesh, &[]).expect("cook hierarchy");
 
         let plain = uploader
-            .upload_mesh(&descriptors, &mesh, &plain_hierarchy, &[], None, None)
+            .upload_mesh(
+                &descriptors,
+                &mesh,
+                &plain_hierarchy,
+                &[],
+                None,
+                crate::SdfSource::None,
+            )
             .expect("unskinned upload");
         assert_eq!(plain.index_count, 3);
         assert_eq!(plain.vertex_count, 3);
@@ -4228,7 +4887,14 @@ mod tests {
         let skin = vec![VertexSkin::default(); mesh.vertices.len()];
         let skinned_hierarchy = hierarchy_for_upload(&mesh, &skin).expect("cook hierarchy");
         let skinned = uploader
-            .upload_mesh(&descriptors, &mesh, &skinned_hierarchy, &skin, None, None)
+            .upload_mesh(
+                &descriptors,
+                &mesh,
+                &skinned_hierarchy,
+                &skin,
+                None,
+                crate::SdfSource::None,
+            )
             .expect("skinned upload");
         assert!(
             skinned.skin_buffer().is_some(),
@@ -4243,7 +4909,7 @@ mod tests {
             &plain_hierarchy,
             &[VertexSkin::default()],
             None,
-            None,
+            crate::SdfSource::None,
         );
         assert!(matches!(bad, Err(Error::SkinMismatch { .. })));
 
