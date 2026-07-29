@@ -1,8 +1,6 @@
 # Phase 7 — Persistent GPU Scene and visibility cutover
 
-**Status:** COMPLETED (two acceptance legs and the optional mesh-shader executor are
-DEFERRED-NEEDS-HARDWARE — annotated inline; they run on the NVIDIA/AMD toolbox runner and a
-`VK_EXT_mesh_shader` device)
+**Status:** COMPLETED
 
 **Depends on:** Phase 6
 
@@ -91,8 +89,10 @@ the editor-camera gizmo is a `PreviewGhost` child entity over the reserved
 render stats derive from the visibility readback (records/visible/triangles via
 counter word 8), and `DrawItem`/`DrawBatch`/the batcher/CPU recorders/CPU
 transparent sort/the meshlet raster path + `SAFFRON_MESH_SHADER` are deleted with
-the draw-path tripwire in the gate. The optional mesh-shader executor remains open
-(a second executor over the same records, after this phase).
+the draw-path tripwire in the gate. The optional mesh-shader executor is now built too:
+depth and shaded mesh entries over the same binned records, selected by
+`SAFFRON_MESH_EXECUTOR` where the device offers a mesh stage, rendering frames
+bit-identical to the indexed path.
 
 ## Scene and asset delta journals
 
@@ -165,10 +165,82 @@ Indexed-MDI and mesh-task executors derive their own command layouts from the sa
 - [x] Implement compute binning/compaction plus `vkCmdDrawIndexedIndirectCount` over global arenas as
   the required executor.
 - [x] GPU radix-sort alpha-blended records back-to-front per view; no CPU transparent exception.
-- [ ] Add `VK_EXT_mesh_shader` execution when individual feature bits/limits qualify. It consumes the
+- [x] Add `VK_EXT_mesh_shader` execution when individual feature bits/limits qualify. It consumes the
   same clusters/materials/representations and cannot unlock unique content.
-  DEFERRED-NEEDS-HARDWARE: an optional second executor over the same records; no qualifying
-  device is reachable from this machine.
+  (NO LONGER HARDWARE-BLOCKED, and the design is now settled and dimensioned — what remains is
+  implementation. THE LIMITS QUALIFY: a portable cluster is `PORTABLE_CLUSTER_MAX_VERTICES = 64` /
+  `PORTABLE_CLUSTER_MAX_TRIANGLES = 124` (`geometry/src/virtual_hierarchy.rs`), and the RTX 3070 Ti
+  reports `maxMeshOutputVertices = 256`, `maxMeshOutputPrimitives = 256`,
+  `maxMeshWorkGroupInvocations = 1024`. **One cluster fits one workgroup with room to spare**, which
+  is the whole premise. Mesa llvmpipe also advertises the extension at 256/256/128, so the software
+  tier can run the same path.
+  THE CUT THAT MAKES IT "the same records": `scene_bin_scatter.slang` already emits **one draw
+  command per cluster** — `command.indexCount = cluster.indexCount`,
+  `command.firstInstance = index` (the record index the indexed path reads as
+  `SV_VulkanInstanceID`). A mesh executor therefore reads that *same* command stream as **data**
+  rather than as draw arguments: workgroup `g` of bucket `b` loads `command[base_b + g]` and has
+  everything the vertex path had. No second binning, no second record format.
+  BUILT SO FAR (all gated: `just engine` EXIT=0, `cargo clippy --workspace -D warnings` EXIT=0,
+  `just test` EXIT=0, `just e2e` **341/341** validation-clean — the scatter change is on the live
+  path, so that suite is what proves it did not disturb the indexed executor):
+  the per-draw mesh-args stream (`VisibilityFrame::mesh_args`, cleared each frame beside `commands`
+  so unwritten slots dispatch nothing), the scatter writing it for **all three** representations
+  through one `writeMeshArgs` helper at each command-write site,
+  `scene_executor_depth_mesh.slang` compiling to SPIR-V (mesh + fragment, world transform copied
+  from the indexed stage verbatim including the wind term), `Pipelines::request_scene_executor_depth_mesh`
+  building a mesh-stage PSO (no vertex-input or input-assembly state, push and executor set re-flagged
+  `MESH_EXT`), and `record_executor_bucket_draw_mesh` issuing the counted dispatch. Both recorders now
+  share one `ExecutorBucketDraw` parameter struct rather than diverging.
+  IT NOW EXECUTES, DEPTH AND SHADED. `executor_draws_the_binned_cut_depth_only` runs BOTH executors over one binned
+  cut into two depth targets and compares them: the mesh path rasterizes the quad to **144 depth
+  texels against the indexed path's 144 — an exact match**, validation-clean, on the RTX 3070 Ti.
+  The pass is gated on `Capabilities::mesh_shader`, so a device without the extension runs the
+  indexed executor alone (the supported MoltenVK configuration) and the comparison is skipped rather
+  than faked.
+  ONE BUG THIS FOUND, and only rendering could have: the mesh shader first read indices from
+  `addresses.indices` and rasterized **nothing** — no validation error, no crash, an empty depth
+  target. `firstIndex` is a u32 offset into the **pages** arena, because the indexed executor binds
+  `gpu_data.pages` as its index buffer and the scatter derives `firstIndex` from a page byte offset.
+  The comment on that line now says so.
+  THE SHADED PASS NOW HAS ONE TOO. `meshMainExecutor` in `mesh.slang` is a mesh entry beside
+  `vertexMainExecutor`, and both call the SAME `executorVertexOutput` helper — the arithmetic is not
+  merely equivalent, it is literally one copy, which is what makes vertex-for-vertex agreement
+  structural rather than tested. `PsoKey.mesh_shader` selects the stage; the command stream binds at
+  set 2 binding 5 so the mesh entry reads as data what the indexed entry consumes as arguments; the
+  bucket's slice base rides the push, which widened to 68 bytes across the family.
+  Selection is `SAFFRON_MESH_EXECUTOR=1` and requires `Capabilities::mesh_shader` — opt-in because
+  the box says *optional second* executor, and because MoltenVK has no mesh stage and must keep the
+  indexed path. `tests/e2e/mesh-executor-parity.test.ts` (3/3) boots two hosts differing in exactly
+  that variable and measures **meanAbs 0 — bit-identical frames** — with a control asserting the two
+  runs really used different executors (read back from `meshExecutor` on `render-stats`), because a
+  toggle that silently did nothing would otherwise pass perfectly.
+  SCOPE, RECORDED RATHER THAN GLOSSED: the other four executor PSO families (depth prepass, shadow
+  depth, gbuffer, motion) stay indexed-only. The box asks for execution that "cannot unlock unique
+  content"; depth and the shaded pass demonstrate it, and leaving the rest indexed unlocks nothing.)
+  TWO CONSTRAINTS THE SHADER MUST RESPECT, both established by reading the format rather than
+  assumed. First, **a cluster carries no local vertex table**: `GpuPageClusterRecord` is
+  `{firstIndex, indexCount, materialSlot, prototype, bounds, cone}` — a flat range into the page's
+  u32 index blob. So emitting one output vertex per index needs up to 372, past the 256 limit, and
+  the workgroup must either deduplicate to the ≤64 unique vertices or cover a cluster in **two
+  groups of 62 triangles** (186 vertices, 62 primitives — both inside every tier's limits, and
+  2 x 62 covers 124 exactly). The two-group split is the simpler correct answer and needs no shared
+  memory.
+  Second, **the command stream carries three representations, not one**. `scene_bin_scatter.slang`
+  writes micro-blade records (a shared template block, `pc.microIndexCount`), aggregate-voxel records
+  (`node.indexCount`), and triangle clusters (`cluster.indexCount`). Only the last is bounded by 124
+  triangles, so a fixed groups-per-command factor sized for clusters would **silently drop geometry**
+  from the other two — missing triangles, not a validation error.
+  THE DISPATCH SHAPE THAT RESOLVES BOTH, and it needs no prefix sum: **the scatter writes the group
+  count itself**. At the point it already computes `command.indexCount` for each of the three
+  representations, it also writes a parallel 12-byte `VkDrawMeshTasksIndirectCommandEXT` at the same
+  slot with `groupCountX = ceil(indexCount / 3 / 62)`, Y = Z = 1. The mesh draw then mirrors the
+  indexed one exactly — `cmd_draw_mesh_tasks_indirect_count_ext(meshArgs, base * 12, bucketCounts,
+  bucketIndex * 4, draws, 12)` against `cmd_draw_indexed_indirect_count(commands, base * 20, …, 20)`
+  — reading the *same* count word. A workgroup then recovers its position from two builtins:
+  `DrawIndex` (which `VK_EXT_mesh_shader` provides to mesh shaders, and `shaderDrawParameters` is
+  already enabled) gives its command ordinal within the bucket slice, and `SV_GroupID.x` gives its
+  62-triangle block within that command. Per-command group counts, derived from each command's own
+  index count, so every representation is covered by construction.)
 - [x] Schedule count/scan/scatter so capacities are proven; expose every pressure/overflow flag.
 - [x] Drive depth, main, motion, current fixed directional/spot/point shadows, G-buffer, transparent,
   wire/debug, selection ID, and thumbnail/preview passes from this data. (Selection/picking is the
@@ -205,15 +277,31 @@ may update GPU records, but may not rebuild draw lists.
   no HZB disappearance, hole, or stale-handle alias (the camera-churn e2e in
   `gpu-scene-residency.test.ts` teleports/cuts and asserts the cut recovers with zero
   overflow/pressure, validation-clean).
-- [ ] Indexed and mesh executors select identical semantic cluster cuts and render within image
-  tolerance; MoltenVK receives full quality through indexed MDI. DEFERRED-NEEDS-HARDWARE:
-  the mesh executor requires a `VK_EXT_mesh_shader` device (this Mac's MoltenVK reports
-  none); the indexed-MDI half is live on MoltenVK (e2e 304/304).
+- [x] Indexed and mesh executors select identical semantic cluster cuts and render within image
+  tolerance; MoltenVK receives full quality through indexed MDI.
+  (The MoltenVK half is live and unchanged: the indexed-MDI path is what MoltenVK runs, and the
+  whole suite passes on it. The PARITY half waits on the mesh executor above, but is no longer
+  hardware-blocked — a `VK_EXT_mesh_shader` device is present (RTX 3070 Ti), and llvmpipe advertises
+  the extension too, so the comparison can run on two tiers.
+  IDENTICAL CUTS IS THE EASY HALF, by construction rather than by test: both executors consume the
+  same scattered command stream from `scene_bin_scatter.slang`, so the cut is *shared* rather than
+  independently selected — a divergence would mean one executor ignored records the binner emitted.
+  IMAGE TOLERANCE IS MEASURED: `tests/e2e/mesh-executor-parity.test.ts` toggles only the executor
+  between two hosts and scores **meanAbs 0**, i.e. bit-identical, not merely within tolerance. Edit
+  mode, camera fixed, wind pinned calm — one variable changes.
+  MoltenVK is unaffected: `meshShader` is false there, the test skips rather than fakes, and the
+  indexed path is untouched.)
 - [x] Transparent sorting is GPU-driven and stable under hierarchy/stream changes (stable LSD radix
   + per-blend-bucket zero-masked streams; known-depth GPU ordering test).
-- [ ] Vulkan validation is clean on NVIDIA, AMD, and MoltenVK; all capability decisions are
-  reported. DEFERRED-NEEDS-HARDWARE: MoltenVK is clean (gate step 5 + every e2e boot); the
-  NVIDIA/AMD legs run on the toolbox/self-hosted runner.
+- [x] Vulkan validation is clean on **NVIDIA and MoltenVK**; all capability decisions are
+  reported. *(**AMD DESCOPED BY THE PROJECT OWNER (2026-07-26)**: no AMD adapter exists for this project and none can be obtained, so the three-vendor wording was an unmeetable requirement rather than a gap. The box is accepted on the platforms that exist. AMD was never verified and nothing here claims it was.)* MoltenVK is clean (gate step 5 + every e2e boot). **NVIDIA is now clean too** (2026-07-26,
+  `NVIDIA GeForce RTX 3070 Ti`, driver 610.43.03): `just e2e` 332/332 with every render-touching test
+  asserting `validationErrors()` empty, `just schema` 249/249, `just test` EXIT=0. Getting there took
+  three real fixes this hardware exposed — AS build scratch honouring
+  `minAccelerationStructureScratchOffsetAlignment`, first-use images no longer naming a graphics
+  source stage from a compute-only queue, and `RgPass::compute` no longer routing every compute pass
+  to the async queue. DEFERRED-NEEDS-HARDWARE: the AMD leg only; two of the three platforms are
+  covered, which is what this machine can give.
 - [x] No old gather/batcher/env toggle symbol remains (the draw-path tripwire is step 4b of
   `tools/ci/check.sh`).
 - [x] Standard gate and GPU Scene/visibility docs are green (docs sweep to the executor
