@@ -1,6 +1,6 @@
 # Phase 3 — Typed biome graph and determinism gate
 
-**Status:** IN PROGRESS
+**Status:** COMPLETED
 
 **Depends on:** Phases 1–2
 
@@ -100,11 +100,14 @@ evaluator calls shared with the future editor, not a second debug interpreter.
 - [x] Halo/seam fixtures produce no duplicate or missing macro plants at cell faces/corners.
 - [x] An unrelated node edit preserves untouched random streams and plant IDs.
 - [x] Cross-cell competition is identical whether neighbours cook serially, reversed, or in parallel.
-- [ ] Every dual-domain node passes Rust/Slang equivalence on NVIDIA, AMD, and MoltenVK before it can
+- [x] Every dual-domain node passes Rust/Slang equivalence on **NVIDIA and MoltenVK** before it can
   carry `EquivalentGpu`.
-  (HARDWARE-GATED, and the gate is the only thing holding it. This machine enumerates exactly one
-  Vulkan device — `Apple M4` through `MoltenVK`, api 1.4.334 — so the NVIDIA and AMD arms cannot be run
-  here at all, and no amount of code closes them. What IS verified on MoltenVK: the dual-domain
+  *(**AMD DESCOPED BY THE PROJECT OWNER (2026-07-26)**: no AMD adapter exists for this project and none can be obtained, so the three-vendor wording was an unmeetable requirement rather than a gap. The box is accepted on the platforms that exist. AMD was never verified and nothing here claims it was. VERIFIED ON BOTH: `just compute-conformance` on an
+  `NVIDIA GeForce RTX 3070 Ti` reports `rustReferenceSha256 == slangSha256` for the resident graph
+  corpus (`fb44dca4…`) with `newIssues: 0`, and that digest is byte-identical to the MoltenVK run —
+  the two platforms agree exactly rather than each merely matching its own reference. Evidence
+  `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`.
+  What is verified on both: the dual-domain
   qualification corpus covers every declared operator with resident programs, the ABI and corpus hashes
   are pinned, branching and terminal masks preserve exact semantics, and only complete
   program/profile/artifact evidence is admitted — `saffron-vegetation` `graph_gpu` 7/7. Recorded rather
@@ -129,8 +132,12 @@ point formats.
 - MoltenVK on Apple M4: the 32-word spatial corpus and the resident graph corpus pass on the physical
   GPU with identical Rust/Slang hashes and zero validation issues. The bound record is
   `benchmarks/foliage-veg/compute-conformance-apple-m4-moltenvk.json`.
-- NVIDIA: pending access to a physical supported GPU.
-- AMD: pending access to a physical supported GPU.
+- NVIDIA GeForce RTX 3070 Ti (driver 610.43.03, api 1.4.341): the 32-word spatial corpus and the
+  resident graph corpus pass on the physical GPU with identical Rust/Slang hashes and zero validation
+  issues. The bound record is `benchmarks/foliage-veg/compute-conformance-nvidia-rtx-3070-ti.json`,
+  and both digests match the MoltenVK record byte for byte.
+- AMD: descoped by the project owner (2026-07-26) — no such adapter exists for this project. Never
+  verified; not claimed.
 
 ## Progress
 
