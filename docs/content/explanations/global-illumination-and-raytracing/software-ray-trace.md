@@ -90,6 +90,28 @@ sees beyond a canopy, and a ray whose transmittance saturates inside dense matte
 aggregate hit: the cell's cached colour, an occupancy-gradient normal, and the sun dimmed by the
 canopy above.
 
+That density is **derived, not authored**. A plant seen close up is triangles; far away it is one
+aggregate voxel. Were the voxel's occupancy an independently authored number, it would transmit a
+different amount of light than the leaves it stands in for, and the plant would change brightness at
+the switch.
+
+So occupancy is solved from the surface's own optics: the density at which marching the sheet's mean
+thickness transmits the sheet's mean transmission. Both representations then describe one optical
+depth, and since the same extinction step serves indirect irradiance, sky visibility and the
+reflection cone, each inherits that continuity.
+
+The extinction coefficient is achromatic, so one density stands for three colour channels. The
+channel mean is the reduction used, because it preserves total transmitted energy rather than
+favouring a perceptual weighting the marches do not apply.
+
+Testing that continuity needs care. The cut follows projected appearance error, so reaching the
+aggregate form in a normal frame means moving the camera away — which shrinks the subject at the
+same moment it coarsens it, and the difference cannot separate the two.
+
+The cut is pinned instead. `SAFFRON_CUT_OVERRIDE` forces the traversal to stop refining or to refine
+fully, leaving camera, scene and lighting identical across two runs. The two cuts then render
+visibly different pictures carrying the same amount of light.
+
 The sun march multiplies its transmittance into $V_\text{sun}$, so surfaces under foliage receive
 dappled rather than absent sunlight. The
 [DFAO cones and the reflection cone](../distance-field-reflection-occlusion/) apply the same
@@ -125,6 +147,8 @@ second moments used for Chebyshev visibility.
 | Probe world position (toroidal) | `ddgi_trace.slang` | `probeWorldPos`, `wrapMod` |
 | Round-robin constants | `rendering/src/ddgi.rs` | `DDGI_PROBE_BUDGET`, `DDGI_PROBE_CYCLE`, `Ddgi::trace_push` |
 | Trace graph pass | `rendering/src/renderer.rs` | `Renderer::add_ddgi_passes` |
+| Occluder-list pressure | `rendering/src/renderer.rs` | `set_sdf_scene`, `MAX_SDF_INSTANCES`, `sdf_instances_dropped` |
+| Occupancy parity | `material/src/lib.rs`, `assets/src/render_material.rs` | `parity_occupancy`, `aggregate_transmittance`, `AGGREGATE_EXTINCTION_PER_METER`, `derive_parity_occupancy` |
 | Updated-tile filter | `ddgi_blend_irradiance.slang`, `ddgi_blend_distance.slang` | `probeTraced` |
 
 ## Related

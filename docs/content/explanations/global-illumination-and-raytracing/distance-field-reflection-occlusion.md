@@ -122,7 +122,34 @@ the cones march never composites.
 | Frame gate + pass wiring | `crates/rendering/src/renderer.rs` | `want_sky_occlusion`, `set_sky_occlusion` |
 | Lighting UBO bit | `crates/rendering/src/lighting.rs` | `set_frame_sdf_occlusion` |
 | GDF cascade constants | `crates/rendering/src/global_sdf.rs` | `GDF_CASCADES`, `GDF_RES`, `GDF_CASCADE0_EXTENT` |
+| The reach predicate | `crates/rendering/src/global_sdf.rs`, `crates/assets/src/render_scene.rs` | `gi_occluder_bounds`, `gi_reachable` |
+| The occluder scatter | `assets/shaders/gi_occluder_scatter.slang`, `renderer.rs`, `global_sdf.rs` | `GiOccluderScatterPush`, `GlobalSdf::write_scatter_inputs`, `SDF_META_SLOT_BYTES` |
+| The resident SDF table | `global_gpu_data.rs`, `gpu_scene_mirror.rs` | `GpuSdfTableRecord`, `GpuScenePrototypeGpuRecord::sdf_range`, `insert_mesh_sdfs` |
 | Control command | `crates/control/src/commands_render.rs` | `set-sky-occlusion` |
+
+## What the field is composited from
+
+The clipmap the cones tap is composited from an occluder set the GPU produces: the
+[reach view](../../frame-and-render-graph/hierarchical-visibility/) culls instance slots
+against `gi_occluder_bounds(eye)` — the coarsest cascade's window dilated by one
+cascade-0 extent, the last position from which anything can affect a march — and the
+`gi-occluder-scatter` pass turns its visible list into one `SdfInstance` per baked field
+of each surviving instance. The fields are many and tight on purpose (one per primitive
+and per spatial chunk), and the scatter re-tests each field's own world AABB against the
+window, so an instance straddling the window edge keeps only the fields inside it. The
+CPU never sees the occluder list; the count reaches the GDF cull and the DDGI near-field
+march through the scatter's meta words, because a GPU-produced count cannot ride a push
+constant.
+
+Reach is the predicate everywhere: the ray list still cuts against the same function
+(`rtInstancesCulled`), and the scatter reports `sdfInstancesCulled` for its per-field
+window rejects. *Culled* is a claim about reach and nothing else — geometry lost to
+capacity is counted as *dropped*, separately, because the two say opposite things about
+whether the picture is right.
+
+The near cascade reconverges on occluder motion through the same staggered round-robin
+full refresh the far cascades always used: the occluder set is GPU-produced, so no
+CPU-side AABB diff can dirty the near field ahead of it.
 
 ## Porous matter
 
