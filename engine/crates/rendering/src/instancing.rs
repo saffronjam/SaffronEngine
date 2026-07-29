@@ -1174,7 +1174,14 @@ mod tests {
         ];
         let hierarchy = crate::upload::hierarchy_for_upload(&mesh, &skin).expect("cook hierarchy");
         uploader
-            .upload_mesh(descriptors, &mesh, &hierarchy, &skin, None, None)
+            .upload_mesh(
+                descriptors,
+                &mesh,
+                &hierarchy,
+                &skin,
+                None,
+                crate::SdfSource::None,
+            )
             .expect("upload skinned")
     }
 }

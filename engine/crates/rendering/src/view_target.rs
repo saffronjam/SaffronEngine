@@ -449,59 +449,57 @@ impl ViewTarget {
             shm_capture: ShmCapture::default(),
         })
     }
-
-    /// Ensures frame slot `slot`'s BGRA8 shm-capture target exists at `extent`, (re)creating
-    /// it on an extent change. The caller has waited this
-    /// slot's frame fence, so the previous target is idle and freed when replaced; recreating
-    /// drops `valid` (no completed bytes at the new size yet). Returns [`crate::Error::Vk`]
-    /// if the device lacks BLIT_SRC on the offscreen format or BLIT_DST on BGRA8 (optimal
-    /// tiling), or any allocation fails.
+    /// (Re)creates every capture slot at `extent`, replacing whatever the ring held.
+    ///
+    /// **Only call this where the device is idle.** A slot's image and staging buffer are
+    /// freed the moment they are replaced, and a readback recorded into them may still be
+    /// in flight — freeing under it loses the device. The two seams that qualify both hold
+    /// an idle already: the render-extent resize and arming shm publish. `record_shm_copy`
+    /// therefore only ever *uses* a slot.
+    ///
+    /// Recreating drops `valid`: no completed bytes exist at the new size yet.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Vk`] on an unsupported blit format or a failing allocation.
-    pub fn ensure_shm_capture(
-        &mut self,
-        device: &Device,
-        slot: usize,
-        extent: vk::Extent2D,
-    ) -> Result<()> {
-        if let Some(capture) = self.shm_capture.slots[slot].as_ref()
-            && capture.extent == extent
-        {
+    /// Returns [`crate::Error::Vk`] if the device lacks BLIT_SRC on the offscreen format or
+    /// BLIT_DST on BGRA8 (optimal tiling), or any allocation fails.
+    pub fn size_shm_capture(&mut self, device: &Device, extent: vk::Extent2D) -> Result<()> {
+        if extent.width == 0 || extent.height == 0 {
             return Ok(());
         }
         require_shm_blit_support(device, self.offscreen.format)?;
-
         let resources = device.resources();
-        // No view: a TRANSFER-only image cannot back an image view, and the blit/copy
-        // address it by handle + layout, never through a view.
-        let image = Image::new_no_view(
-            resources,
-            &ImageDesc::color_2d(
+        for slot in 0..MAX_FRAMES_IN_FLIGHT {
+            // No view: a TRANSFER-only image cannot back an image view, and the blit/copy
+            // address it by handle + layout, never through a view.
+            let image = Image::new_no_view(
+                resources,
+                &ImageDesc::color_2d(
+                    extent,
+                    vk::Format::B8G8R8A8_UNORM,
+                    vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+                ),
+            )?;
+            let bytes =
+                vk::DeviceSize::from(extent.width) * vk::DeviceSize::from(extent.height) * 4;
+            let staging = Buffer::new(
+                resources,
+                bytes,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::Auto,
+                    flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
+                        | vk_mem::AllocationCreateFlags::MAPPED,
+                    ..Default::default()
+                },
+            )?;
+            self.shm_capture.slots[slot] = Some(ShmCaptureSlot {
+                image,
+                staging,
                 extent,
-                vk::Format::B8G8R8A8_UNORM,
-                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
-            ),
-        )?;
-        let bytes = vk::DeviceSize::from(extent.width) * vk::DeviceSize::from(extent.height) * 4;
-        let staging = Buffer::new(
-            resources,
-            bytes,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            &vk_mem::AllocationCreateInfo {
-                usage: vk_mem::MemoryUsage::Auto,
-                flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_RANDOM
-                    | vk_mem::AllocationCreateFlags::MAPPED,
-                ..Default::default()
-            },
-        )?;
-        self.shm_capture.slots[slot] = Some(ShmCaptureSlot {
-            image,
-            staging,
-            extent,
-            valid: false,
-        });
+                valid: false,
+            });
+        }
         Ok(())
     }
 

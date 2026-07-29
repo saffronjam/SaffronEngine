@@ -27,6 +27,7 @@ pub fn record_executor_buckets(
     draw_indirect_count: bool,
     draws: &[(crate::ExecutorBucket, bool, std::sync::Arc<crate::Pipeline>)],
     transparent: bool,
+    mesh_dispatch: Option<&ash::ext::mesh_shader::Device>,
 ) -> u32 {
     let live: Vec<_> = draws
         .iter()
@@ -40,6 +41,11 @@ pub fn record_executor_buckets(
         cmd,
         first.layout(),
         view_proj,
+        if mesh_dispatch.is_some() {
+            vk::ShaderStageFlags::MESH_EXT
+        } else {
+            vk::ShaderStageFlags::VERTEX
+        },
         sets.bindless,
         sets.light,
         sets.instance,
@@ -64,15 +70,42 @@ pub fn record_executor_buckets(
         unsafe {
             raw.cmd_set_cull_mode(cmd, bucket_cull_mode(*bucket));
         }
-        crate::record_executor_bucket_draw(
-            raw,
-            cmd,
-            (pso.handle(), pso.layout()),
-            inputs,
-            *bucket,
-            bucket_index as u32,
+        let draw = crate::ExecutorBucketDraw {
+            bucket: *bucket,
+            index: bucket_index as u32,
             draw_indirect_count,
-        );
+        };
+        if let Some(dispatch) = mesh_dispatch {
+            // The mesh entry recovers its draw from `SV_DrawIndex`, which counts from zero
+            // within this bucket's slice — so the slice base rides the push, updated per
+            // bucket at the tail of the shared viewProj block.
+            // SAFETY: the ash seam. The range was declared to cover this offset.
+            unsafe {
+                raw.cmd_push_constants(
+                    cmd,
+                    pso.layout(),
+                    vk::ShaderStageFlags::MESH_EXT,
+                    size_of::<Mat4>() as u32,
+                    &bucket.base.to_ne_bytes(),
+                );
+            }
+            crate::record_executor_bucket_draw_mesh(
+                raw,
+                dispatch,
+                cmd,
+                (pso.handle(), pso.layout()),
+                inputs,
+                draw,
+            );
+        } else {
+            crate::record_executor_bucket_draw(
+                raw,
+                cmd,
+                (pso.handle(), pso.layout()),
+                inputs,
+                draw,
+            );
+        }
         recorded += 1;
     }
     recorded
@@ -200,6 +233,7 @@ pub fn record_executor_transparent_stream(
         cmd,
         first.layout(),
         view_proj,
+        vk::ShaderStageFlags::VERTEX,
         sets.bindless,
         sets.light,
         sets.instance,
@@ -266,6 +300,7 @@ pub fn record_tess_scene_draws(
         cmd,
         first.pso.layout(),
         view_proj,
+        vk::ShaderStageFlags::VERTEX,
         sets.bindless,
         sets.light,
         sets.instance,
@@ -415,6 +450,7 @@ fn bind_mesh_descriptor_sets(
     cmd: vk::CommandBuffer,
     layout: vk::PipelineLayout,
     view_proj: saffron_geometry::glam::Mat4,
+    push_stage: vk::ShaderStageFlags,
     bindless_set: vk::DescriptorSet,
     light_set: vk::DescriptorSet,
     instance_set: vk::DescriptorSet,
@@ -506,6 +542,6 @@ fn bind_mesh_descriptor_sets(
                 &[],
             );
         }
-        raw.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::VERTEX, 0, view_proj);
+        raw.cmd_push_constants(cmd, layout, push_stage, 0, view_proj);
     }
 }
