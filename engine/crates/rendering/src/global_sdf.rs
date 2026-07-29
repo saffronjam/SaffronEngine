@@ -39,7 +39,7 @@ use saffron_geometry::glam::{IVec3, IVec4, UVec3, UVec4, Vec3, Vec4};
 use crate::descriptors::Descriptors;
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::resources::{Buffer, DeviceResources, Image3D};
-use crate::{Device, Result, SdfInstance, checked};
+use crate::{Device, Result, checked};
 
 /// Cascades in the clipmap (finest first).
 pub const GDF_CASCADES: u32 = 3;
@@ -212,38 +212,6 @@ pub fn cascade_dirty_regions(
     regions
 }
 
-/// The voxel region a world AABB overlaps in cascade `center`'s window (padded one voxel for the
-/// brick border) in global voxel coords, or `None` when the AABB is fully outside the window.
-/// Device-free so the AABB→region math is unit-testable.
-fn world_aabb_to_region(
-    world_min: Vec3,
-    world_max: Vec3,
-    center: IVec3,
-    vsize: f32,
-) -> Option<GdfRegion> {
-    let half = GDF_RES as i32 / 2;
-    let win_lo = center - IVec3::splat(half);
-    let win_hi = center + IVec3::splat(half);
-    let lo = ((world_min / vsize).floor().as_ivec3() - IVec3::ONE).max(win_lo);
-    let hi = ((world_max / vsize).ceil().as_ivec3() + IVec3::ONE).min(win_hi);
-    let size = hi - lo;
-    if size.min_element() <= 0 {
-        return None;
-    }
-    Some(GdfRegion {
-        base: lo,
-        size: size.as_uvec3(),
-    })
-}
-
-/// Whether an instance's world AABB moved enough to redirty its near-cascade voxels. A small
-/// epsilon absorbs float jitter in a re-derived-but-unchanged transform so a static scene diffs to
-/// zero moved occluders.
-fn aabb_changed(prev: &[Vec3; 2], cur: &[Vec3; 2]) -> bool {
-    const EPS: f32 = 1.0e-4;
-    (prev[0] - cur[0]).abs().max_element() > EPS || (prev[1] - cur[1]).abs().max_element() > EPS
-}
-
 /// Deduplicates exactly-equal regions and, past a small cap, collapses the set to a single full
 /// window (many tiny composite dispatches cost more than one full one). Overlaps are otherwise left
 /// as-is — the composite min-blend is idempotent, so a voxel recomposited twice is harmless.
@@ -281,6 +249,7 @@ struct FrameGdf {
     params_ubo: Buffer,
     cull_set: vk::DescriptorSet,
     composite_set: vk::DescriptorSet,
+    scatter_set: vk::DescriptorSet,
 }
 
 /// The Global-SDF sub-state: the shared cascade volumes + sampler + compute layouts, and a
@@ -311,6 +280,7 @@ pub struct GlobalSdf {
 
     cull_layout: vk::DescriptorSetLayout,
     composite_layout: vk::DescriptorSetLayout,
+    scatter_layout: vk::DescriptorSetLayout,
 
     /// The camera eye this frame (the cascade placement center before snapping).
     eye: Vec3,
@@ -327,17 +297,29 @@ pub struct GlobalSdf {
     full_slab: [u32; GDF_CASCADES as usize],
     /// Round-robins the staggered far-cascade full refresh (one cascade fully refreshed per frame).
     frame: u32,
-    /// This frame's per-instance world AABBs (`[min, max]`, `.xyz` world space), mirroring the
-    /// uploaded [`SdfInstance`] list. The near cascade diffs these against `prev_aabbs` to composite
-    /// only the voxels around occluders that actually moved, rather than re-tracing all 128³ voxels.
-    cur_aabbs: Vec<[Vec3; 2]>,
-    /// The AABBs as of the last composited frame (the diff base). Committed in `advance_frame`.
-    prev_aabbs: Vec<[Vec3; 2]>,
 }
 
-/// Above this many moved occluders in one frame, the near cascade takes a single full refresh
-/// instead of many small dirty regions — the per-region dispatch overhead would exceed the win.
+/// Past this many dirty regions in one frame the set collapses to one covering window —
+/// the per-region dispatch overhead would exceed the win.
 const GDF_MAX_DIRTY_INSTANCES: usize = 24;
+
+/// The world-space bounds an occluder must intersect to affect global illumination, given an
+/// eye position: the outermost cascade's window, dilated by one cascade-0 extent.
+///
+/// An occluder outside the coarsest cascade cannot influence any march, so this is the correct
+/// gate for the GI occluder list — **not** the camera frustum, which would drop occluders that
+/// shadow visible surfaces from off-screen.
+///
+/// The dilation covers a frame of camera motion: the window is derived from the eye the gather
+/// sees, and the cascades re-centre later in the frame, so a margin keeps the cull conservative
+/// rather than racing that ordering.
+#[must_use]
+pub fn gi_occluder_bounds(eye: Vec3) -> (Vec3, Vec3) {
+    let coarsest = GDF_CASCADES - 1;
+    let centre = cascade_center_voxel(coarsest, eye).as_vec3() * cascade_voxel_size(coarsest);
+    let reach = cascade_half_extent(coarsest) + GDF_CASCADE0_EXTENT;
+    (centre - Vec3::splat(reach), centre + Vec3::splat(reach))
+}
 
 impl GlobalSdf {
     /// Allocates the cascade volumes + cull SSBO + params UBO, the linear-repeat sampler, the two
@@ -442,6 +424,7 @@ impl GlobalSdf {
                     unsafe {
                         raw.destroy_descriptor_set_layout(layouts.0, None);
                         raw.destroy_descriptor_set_layout(layouts.1, None);
+                        raw.destroy_descriptor_set_layout(layouts.2, None);
                         raw.destroy_sampler(sampler, None);
                     }
                     return Err(err);
@@ -460,14 +443,13 @@ impl GlobalSdf {
             sampler,
             cull_layout: layouts.0,
             composite_layout: layouts.1,
+            scatter_layout: layouts.2,
             eye: Vec3::ZERO,
             cur_center: [IVec3::ZERO; GDF_CASCADES as usize],
             prev_center: [IVec3::ZERO; GDF_CASCADES as usize],
             has_history: [false; GDF_CASCADES as usize],
             full_slab: [0; GDF_CASCADES as usize],
             frame: 0,
-            cur_aabbs: Vec::new(),
-            prev_aabbs: Vec::new(),
         };
 
         gdf.write_static_descriptors();
@@ -484,9 +466,6 @@ impl GlobalSdf {
     pub fn set_enabled(&mut self, enabled: bool) {
         if enabled && !self.use_gdf {
             self.has_history = [false; GDF_CASCADES as usize];
-            // Drop the diff base so the first frame back on takes a full refresh (count mismatch)
-            // and never trusts a stale pre-disable AABB snapshot.
-            self.prev_aabbs.clear();
         }
         self.use_gdf = enabled;
     }
@@ -517,18 +496,6 @@ impl GlobalSdf {
         self.write_params_ubo(frame);
     }
 
-    /// Records this frame's uploaded SDF-instance world AABBs, the diff source the near cascade
-    /// uses to composite only the voxels around occluders that moved. Called from the renderer with
-    /// the same clamped instance slice it uploaded to the SSBO, before the composite passes build.
-    pub fn set_instances(&mut self, instances: &[SdfInstance]) {
-        self.cur_aabbs.clear();
-        self.cur_aabbs.extend(
-            instances
-                .iter()
-                .map(|i| [i.world_min.truncate(), i.world_max.truncate()]),
-        );
-    }
-
     /// The cull push for this frame (per-cascade world bounds + the instance count). `count` is the
     /// renderer's active SDF-instance count.
     pub fn cull_push(&self, count: u32) -> GdfCullPush {
@@ -546,15 +513,11 @@ impl GlobalSdf {
     /// The dirty regions to composite for cascade `c` this frame. Empty when the cascade needs no
     /// update this frame.
     ///
-    /// The near cascade (`c == 0`) updates incrementally: the toroidal scroll slabs the camera
-    /// exposed, unioned with the voxel regions around any occluder whose world AABB changed since
-    /// the last composite (both its vacated and its new footprint, so stale near-distance clears).
-    /// A static scene with a still camera composites nothing — the field already holds valid data.
-    /// It falls back to a single full refresh on first fill, a scroll past a full window, an
-    /// instance-count change, or more than [`GDF_MAX_DIRTY_INSTANCES`] moved occluders (the modern
-    /// Global-SDF clipmap update; UE recomposites near-field dirty regions, not the whole cascade).
-    /// The far cascades are staggered — one fully refreshes per frame, round-robined across them
-    /// (mirroring the DDGI probe-budget round-robin), reconverging within `GDF_CASCADES - 1` frames.
+    /// Between full-refresh cycles a cascade composites only the toroidal scroll slabs
+    /// the camera exposed; a static scene with a still camera composites nothing. Every
+    /// cascade fully refreshes on a staggered round-robin (one per frame, slab-amortized),
+    /// which is also what reconverges the field on occluder motion — the occluder set is
+    /// GPU-produced, so no CPU-side AABB diff can dirty the near field ahead of it.
     pub fn dirty_regions(&self, c: u32) -> Vec<GdfRegion> {
         // An in-flight full refresh emits one z-slab per frame — never the whole
         // `GDF_RES`³ volume in one command buffer (a submission that large is the kind
@@ -575,29 +538,26 @@ impl GlobalSdf {
             );
         }
 
-        // Near cascade: toroidal scroll slabs plus the vacated + new footprint of every
-        // occluder that moved this frame.
-        let mut regions = cascade_dirty_regions(
+        // Near cascade between full-refresh cycles: the toroidal scroll slabs the
+        // camera exposed. Occluder motion reconverges through the round-robin full
+        // refresh below — the occluder set is GPU-produced, so the CPU has no
+        // per-occluder AABBs to diff.
+        merge_regions(cascade_dirty_regions(
             self.prev_center[0],
             self.cur_center[0],
             true,
             false,
             GDF_RES as i32,
-        );
-        for (prev, cur) in self.prev_aabbs.iter().zip(self.cur_aabbs.iter()) {
-            if !aabb_changed(prev, cur) {
-                continue;
-            }
-            regions.extend(self.instance_region(prev[0], prev[1]));
-            regions.extend(self.instance_region(cur[0], cur[1]));
-        }
-        merge_regions(regions)
+        ))
     }
 
     /// Arms each cascade's full-refresh slab cursor for this frame: first fill, a
-    /// scroll past a whole window, the far-cascade round-robin, or (near cascade) an
-    /// instance-count change or too many moved occluders. Called once per frame after
-    /// the centers + instance AABBs update, before the graph builds.
+    /// scroll past a whole window, or the round-robin that keeps every cascade
+    /// reconverging on occluder motion. Every cascade joins the round-robin because
+    /// the occluder set is GPU-produced — the CPU has no per-occluder AABBs to dirty
+    /// the near field with, so the near field reconverges on the same staggered
+    /// cadence the far cascades always used. Called once per frame after the centers
+    /// update, before the graph builds.
     pub fn prepare_frame_regions(&mut self) {
         for c in 0..GDF_CASCADES as usize {
             if self.full_slab[c] < GDF_FULL_SLABS {
@@ -607,23 +567,8 @@ impl GlobalSdf {
                 .abs()
                 .max_element()
                 >= GDF_RES as i32;
-            let mut arm = !self.has_history[c] || scrolled_out;
-            if c == 0 {
-                arm = arm || self.cur_aabbs.len() != self.prev_aabbs.len() || {
-                    let mut moved = 0usize;
-                    self.prev_aabbs
-                        .iter()
-                        .zip(self.cur_aabbs.iter())
-                        .filter(|(prev, cur)| aabb_changed(prev, cur))
-                        .any(|_| {
-                            moved += 1;
-                            moved > GDF_MAX_DIRTY_INSTANCES
-                        })
-                };
-            } else {
-                let round_robin = (c as u32 - 1) == self.frame % (GDF_CASCADES - 1);
-                arm = arm || round_robin;
-            }
+            let round_robin = c as u32 == self.frame % GDF_CASCADES;
+            let arm = !self.has_history[c] || scrolled_out || round_robin;
             if arm {
                 self.full_slab[c] = 0;
             }
@@ -642,16 +587,6 @@ impl GlobalSdf {
             base,
             size: UVec3::new(GDF_RES, GDF_RES, depth),
         }
-    }
-
-    /// The cascade-0 voxel region a world AABB overlaps, clipped to the near cascade's window.
-    fn instance_region(&self, world_min: Vec3, world_max: Vec3) -> Option<GdfRegion> {
-        world_aabb_to_region(
-            world_min,
-            world_max,
-            self.cur_center[0],
-            cascade_voxel_size(0),
-        )
     }
 
     /// The composite push for one dirty `region` of cascade `c`.
@@ -745,7 +680,6 @@ impl GlobalSdf {
     /// bumps the round-robin frame index. Only called when the chain ran this frame.
     pub fn advance_frame(&mut self) {
         self.prev_center = self.cur_center;
-        self.prev_aabbs.clone_from(&self.cur_aabbs);
         for c in 0..GDF_CASCADES as usize {
             if self.full_slab[c] < GDF_FULL_SLABS {
                 self.full_slab[c] += 1;
@@ -760,12 +694,70 @@ impl GlobalSdf {
     /// Binds the renderer-owned SDF-instance SSBO into every frame slot's compute sets (the cull +
     /// composite read the same per-mesh instance list the cone trace does). One-time wire-up at
     /// construction.
-    pub fn bind_scene(&self, buffer: vk::Buffer, size: vk::DeviceSize) {
+    pub fn bind_scene(
+        &self,
+        buffer: vk::Buffer,
+        slot_bytes: vk::DeviceSize,
+        meta: vk::Buffer,
+        meta_slot_bytes: vk::DeviceSize,
+    ) {
         let raw = self.resources.device();
-        for frame in &self.frames {
-            write_storage_buffer(raw, frame.cull_set, 0, buffer, size);
-            write_storage_buffer(raw, frame.composite_set, 0, buffer, size);
+        for (slot, frame) in self.frames.iter().enumerate() {
+            let offset = slot as vk::DeviceSize * slot_bytes;
+            let meta_offset = slot as vk::DeviceSize * meta_slot_bytes;
+            write_storage_buffer(raw, frame.cull_set, 0, buffer, offset, slot_bytes);
+            write_storage_buffer(raw, frame.composite_set, 0, buffer, offset, slot_bytes);
+            write_storage_buffer(raw, frame.cull_set, 2, meta, meta_offset, meta_slot_bytes);
+            write_storage_buffer(raw, frame.scatter_set, 2, buffer, offset, slot_bytes);
+            write_storage_buffer(
+                raw,
+                frame.scatter_set,
+                3,
+                meta,
+                meta_offset,
+                meta_slot_bytes,
+            );
         }
+    }
+
+    /// Writes frame slot `frame`'s scatter inputs: the reach view's counters (b0) and
+    /// visible list (b1), plus the frame's scene address-block slice (b4). Rewritten
+    /// whenever the reach view rebuilds, which reallocates both lists.
+    pub fn write_scatter_inputs(
+        &self,
+        frame: usize,
+        counters: (vk::Buffer, vk::DeviceSize),
+        visible: (vk::Buffer, vk::DeviceSize),
+        addresses: (vk::Buffer, u64, u64),
+    ) {
+        let raw = self.resources.device();
+        let set = self.frames[frame].scatter_set;
+        write_storage_buffer(raw, set, 0, counters.0, 0, counters.1);
+        write_storage_buffer(raw, set, 1, visible.0, 0, visible.1);
+        let info = [vk::DescriptorBufferInfo {
+            buffer: addresses.0,
+            offset: addresses.1,
+            range: addresses.2,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&info);
+        // SAFETY: the ash seam. The set + buffer outlive the call.
+        unsafe { raw.update_descriptor_sets(&[write], &[]) };
+    }
+
+    /// Frame slot `frame`'s scatter set.
+    #[must_use]
+    pub fn scatter_set(&self, frame: usize) -> vk::DescriptorSet {
+        self.frames[frame].scatter_set
+    }
+
+    /// The scatter set layout, for pipeline creation.
+    #[must_use]
+    pub fn scatter_layout(&self) -> vk::DescriptorSetLayout {
+        self.scatter_layout
     }
 
     /// Writes the cascade samplers (binding 9, an array) + frame slot `frame`'s params UBO
@@ -835,6 +827,7 @@ impl GlobalSdf {
                 frame.cull_set,
                 1,
                 frame.cull_buffer.handle(),
+                0,
                 frame.cull_buffer.size(),
             );
             write_storage_buffer(
@@ -842,6 +835,7 @@ impl GlobalSdf {
                 frame.composite_set,
                 1,
                 frame.cull_buffer.handle(),
+                0,
                 frame.cull_buffer.size(),
             );
             let write = vk::WriteDescriptorSet::default()
@@ -1011,6 +1005,7 @@ impl Drop for GlobalSdf {
         unsafe {
             raw.destroy_descriptor_set_layout(self.cull_layout, None);
             raw.destroy_descriptor_set_layout(self.composite_layout, None);
+            raw.destroy_descriptor_set_layout(self.scatter_layout, None);
             raw.destroy_sampler(self.sampler, None);
         }
     }
@@ -1022,7 +1017,11 @@ impl Drop for GlobalSdf {
 fn build_frame(
     resources: &Arc<DeviceResources>,
     descriptors: &Descriptors,
-    layouts: (vk::DescriptorSetLayout, vk::DescriptorSetLayout),
+    layouts: (
+        vk::DescriptorSetLayout,
+        vk::DescriptorSetLayout,
+        vk::DescriptorSetLayout,
+    ),
 ) -> Result<FrameGdf> {
     // The cull list: header (per-cascade counters + pad) + per-cascade index segments. Device-local
     // — GPU-built (atomic append) + GPU-read (composite); the counters are cleared each frame by a
@@ -1033,11 +1032,13 @@ fn build_frame(
     let params_ubo = make_mapped_uniform_buffer(resources, size_of::<GdfParamsUbo>() as u64)?;
     let cull_set = descriptors.allocate_set(layouts.0)?;
     let composite_set = descriptors.allocate_set(layouts.1)?;
+    let scatter_set = descriptors.allocate_set(layouts.2)?;
     Ok(FrameGdf {
         cull_buffer,
         params_ubo,
         cull_set,
         composite_set,
+        scatter_set,
     })
 }
 
@@ -1181,11 +1182,18 @@ fn initialize_volumes(
     result
 }
 
-fn build_layouts(raw: &ash::Device) -> Result<(vk::DescriptorSetLayout, vk::DescriptorSetLayout)> {
+fn build_layouts(
+    raw: &ash::Device,
+) -> Result<(
+    vk::DescriptorSetLayout,
+    vk::DescriptorSetLayout,
+    vk::DescriptorSetLayout,
+)> {
     let sb = vk::DescriptorType::STORAGE_BUFFER;
     let si = vk::DescriptorType::STORAGE_IMAGE;
-    // Cull set: instances (b0, read) + cull list (b1, rw).
-    let cull = make_compute_layout(raw, &[(sb, 1), (sb, 1)])?;
+    let ub = vk::DescriptorType::UNIFORM_BUFFER;
+    // Cull set: instances (b0, read) + cull list (b1, rw) + the scatter meta words (b2, read).
+    let cull = make_compute_layout(raw, &[(sb, 1), (sb, 1), (sb, 1)])?;
     // Composite set: instances (b0) + cull list (b1) + cascade volumes (b2, array of GDF_CASCADES)
     // + the lite albedo cache (b3, single storage image, written for the finest cascade) + the
     // porous-occupancy volumes (b4, array of GDF_CASCADES).
@@ -1206,7 +1214,20 @@ fn build_layouts(raw: &ash::Device) -> Result<(vk::DescriptorSetLayout, vk::Desc
             return Err(err);
         }
     };
-    Ok((cull, composite))
+    // Scatter set: the reach view's counters (b0) + visible list (b1) + the occluder
+    // output region (b2, rw) + the meta words (b3, rw) + the scene address block (b4).
+    let scatter = match make_compute_layout(raw, &[(sb, 1), (sb, 1), (sb, 1), (sb, 1), (ub, 1)]) {
+        Ok(layout) => layout,
+        Err(err) => {
+            // SAFETY: the ash seam. Free both earlier layouts on this partial-failure path.
+            unsafe {
+                raw.destroy_descriptor_set_layout(cull, None);
+                raw.destroy_descriptor_set_layout(composite, None);
+            }
+            return Err(err);
+        }
+    };
+    Ok((cull, composite, scatter))
 }
 
 /// A compute-stage set layout with one binding per `(type, count)` entry, in order.
@@ -1314,11 +1335,12 @@ fn write_storage_buffer(
     set: vk::DescriptorSet,
     binding: u32,
     buffer: vk::Buffer,
+    offset: vk::DeviceSize,
     size: vk::DeviceSize,
 ) {
     let info = [vk::DescriptorBufferInfo {
         buffer,
-        offset: 0,
+        offset,
         range: size,
     }];
     let write = vk::WriteDescriptorSet::default()
@@ -1354,6 +1376,43 @@ fn write_uniform_buffer(
 
 #[cfg(test)]
 mod tests {
+    /// The GI gate is a reach test, not a visibility test.
+    ///
+    /// This is the distinction the whole cut turns on: an occluder behind the camera still
+    /// shadows what the camera sees, so it must survive, while one beyond the coarsest cascade
+    /// cannot influence any march and must not. A frustum test would invert exactly this.
+    #[test]
+    fn gi_bounds_keep_occluders_behind_the_eye_and_drop_unreachable_ones() {
+        let eye = Vec3::new(10.0, 2.0, -30.0);
+        let (min, max) = super::gi_occluder_bounds(eye);
+
+        // The eye is inside its own window, and the window reaches at least the coarsest
+        // cascade's half extent in every direction.
+        assert!(min.cmple(eye).all() && max.cmpge(eye).all());
+        let reach = super::cascade_half_extent(super::GDF_CASCADES - 1);
+        assert!(
+            max.x - eye.x >= reach,
+            "the window must reach the coarsest cascade"
+        );
+
+        let inside = |p: Vec3| min.cmple(p).all() && max.cmpge(p).all();
+        // Directly behind the eye, well within reach: a frustum cull would drop this, and it
+        // is precisely the occluder that darkens what is in front.
+        assert!(inside(eye + Vec3::new(0.0, 0.0, -8.0)));
+        assert!(inside(eye + Vec3::new(0.0, 0.0, 8.0)));
+        // Far beyond any cascade: unreachable, so excluding it changes nothing.
+        assert!(!inside(eye + Vec3::splat(4000.0)));
+    }
+
+    /// The window travels with the eye rather than being anchored at the origin — otherwise a
+    /// scene far from the origin would cull everything.
+    #[test]
+    fn gi_bounds_follow_the_eye() {
+        let (near_min, _) = super::gi_occluder_bounds(Vec3::ZERO);
+        let (far_min, _) = super::gi_occluder_bounds(Vec3::new(5000.0, 0.0, 0.0));
+        assert!(far_min.x > near_min.x + 4000.0);
+    }
+
     use std::sync::Mutex;
 
     use super::*;
@@ -1457,32 +1516,6 @@ mod tests {
         let jump = cascade_dirty_regions(c, c + IVec3::new(res, 0, 0), true, false, res);
         assert_eq!(jump.len(), 1);
         assert_eq!(jump[0].size, UVec3::splat(res as u32));
-    }
-
-    /// A world AABB maps to a padded voxel box clipped to the cascade window; an AABB fully outside
-    /// the window contributes nothing (the near cascade never composites off-window occluders).
-    #[test]
-    fn world_aabb_to_region_pads_and_clips() {
-        let vsize = cascade_voxel_size(0); // 0.25 m
-        let center = IVec3::ZERO;
-        // A 1 m cube at the origin: [0,1]³ → [-1, 5) voxels after one-voxel pad, inside the window.
-        let r = world_aabb_to_region(Vec3::ZERO, Vec3::splat(1.0), center, vsize).unwrap();
-        assert_eq!(r.base, IVec3::splat(-1));
-        assert_eq!(r.size, UVec3::splat(6));
-        // An AABB well past the +x window edge clips to nothing.
-        let far = Vec3::splat(1000.0);
-        assert!(world_aabb_to_region(far, far + Vec3::splat(1.0), center, vsize).is_none());
-    }
-
-    /// The change test ignores sub-epsilon jitter (a static instance diffs to unchanged) but flags a
-    /// real translation.
-    #[test]
-    fn aabb_changed_ignores_jitter_flags_motion() {
-        let a = [Vec3::ZERO, Vec3::splat(1.0)];
-        let jitter = [Vec3::splat(1e-6), Vec3::splat(1.0 + 1e-6)];
-        assert!(!aabb_changed(&a, &jitter));
-        let moved = [Vec3::new(0.5, 0.0, 0.0), Vec3::new(1.5, 1.0, 1.0)];
-        assert!(aabb_changed(&a, &moved));
     }
 
     /// Region merge drops empties, and collapses an over-cap set into one covering window.
