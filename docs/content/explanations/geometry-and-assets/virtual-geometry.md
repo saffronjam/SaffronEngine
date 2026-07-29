@@ -47,7 +47,20 @@ one import-time cook.
 The device-free reference evaluator orthographically renders finest triangle descendants and their
 aggregate voxel parent over six deterministic view/light fixtures. It measures silhouette distance,
 coverage, transmission, material response, and normal moments against the node's declared
-`AppearanceError`.
+`AppearanceError`. The plant cook runs it on every family and widens any declared error the
+measurement exceeds — only ever upward, since a measured error below the estimate means the estimate
+was conservative and narrowing would trust six fixtures to have found the worst view.
+
+The measurement also covers what aggregating takes away. A triangle cut swings each assembly use
+about its pivot and shimmers the leaves; an aggregate brick has no parts, so it keeps only the
+whole-plant sway. The evaluator therefore renders the triangle side displaced by the modes'
+saturated amplitude — across the view, the direction that moves a silhouette most — against the
+undisplaced aggregate, and the difference widens the declared error like any other. Both amplitudes
+saturate before the authored response scales them, so the worst case is a property of the family
+rather than of any particular gust, and the bound is exact at cook time. The effect at runtime is
+that the cut selector reaches for an aggregate only once the motion it drops projects to less than
+its error threshold: distant vegetation keeps moving, and stops moving only where the loss is
+invisible.
 
 ## Compiled plant artifact
 
